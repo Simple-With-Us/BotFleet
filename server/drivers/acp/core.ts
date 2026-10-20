@@ -440,15 +440,18 @@ class AcpResumeError extends Error {
  *  over a transient or ambiguous error is the silent loss the resume guard
  *  exists to prevent; a session the provider names as wedged can never be
  *  loaded again, so refusing it forever only bricks the thread. */
-export function isPoisonedSessionError(error: unknown): boolean {
-  let current: unknown = error;
-  for (let depth = 0; depth < 4 && current != null; depth += 1) {
-    const record = current as { message?: unknown; data?: unknown; cause?: unknown };
-    const text = [record.message, typeof record.data === "string" ? record.data : ""]
-      .filter((part): part is string => typeof part === "string")
-      .join(" ");
-    if (/unfinished turn|pending input/i.test(text)) return true;
-    current = record.cause;
+export function isPoisonedSessionError(error: Error | null | undefined): boolean {
+  let current: Error | null | undefined = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current) return false;
+    // Core attaches `data` to a JSON-RPC error with Object.assign (SAFETY note below).
+    // SAFETY: any other thrown value has no `data`, and the `?.` tolerates a non-object.
+    const data = (current as { data?: string } | null)?.data;
+    if (/unfinished turn|pending input/i.test(`${current.message} ${data ?? ""}`)) return true;
+    // A non-Error cause simply ends the walk instead of being read as provider text.
+    // SAFETY: `cause` is the standard Error cause chain, read only to walk it.
+    const cause = (current as { cause?: Error } | null)?.cause;
+    current = cause instanceof Error ? cause : null;
   }
   return false;
 }
@@ -1736,7 +1739,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 sessionModelsState = parsedSessionResult.success ? parsedSessionResult.data.models : undefined;
                 sessionId = cursor;
               } catch (error) {
-                if (!isPoisonedSessionError(error)) {
+                if (!(error instanceof Error && isPoisonedSessionError(error))) {
                   // The harness withheld inline replay because this cursor said
                   // the native session held the conversation.  Starting empty
                   // here would silently discard everything before this prompt.
