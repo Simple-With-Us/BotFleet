@@ -55,7 +55,10 @@ const storeValue = {
   flushBotPatches: async () => {},
   refreshInstances: async () => {},
 };
-const mountCard = () => createElement(StoreContext.Provider, { value: storeValue }, createElement(LocalVmRuntimeCard));
+const mountCard = (providers = config.botDefaults!.computerProviders!) => {
+  const testConfig = { ...config, botDefaults: { ...config.botDefaults, computerProviders: providers } } as ConfigStatus;
+  return createElement(StoreContext.Provider, { value: { ...storeValue, state: { ...initialState, config: testConfig } } }, createElement(LocalVmRuntimeCard));
+};
 
 /** The status the live harness answered with on 2026-10-08, with OrbStack up:
  * the daemon answers, the BotFleet desktop image has never been built, and no
@@ -100,7 +103,7 @@ async function flush() {
 }
 
 /** Mount the card against `payload` and return what a person can read. */
-async function readCard(payload: Record<string, unknown>) {
+async function readCard(payload: unknown, providers?: NonNullable<ConfigStatus["botDefaults"]>["computerProviders"]) {
   globalThis.fetch = (async () =>
     new Response(JSON.stringify(payload), {
       status: 200,
@@ -110,7 +113,7 @@ async function readCard(payload: Record<string, unknown>) {
   document.body.appendChild(host);
   root = createRoot(host);
   await act(async () => {
-    root!.render(mountCard());
+    root!.render(mountCard(providers));
   });
   await flush();
   await flush();
@@ -168,6 +171,97 @@ describe("LocalVmRuntimeCard when the status check itself fails", () => {
     expect(text).toContain("Status unavailable");
     expect(text).toContain("Load failed");
     expect(text).not.toMatch(/Something Went Wrong|start docker first/i);
+    expect(text).toContain("BotFleet could not confirm whether a Local VM exists.");
+    expect(text).toContain("Durable workspace: status unavailable");
+    expect(text).toContain("Local image: status unavailable");
+    expect(text).not.toContain("Delete VM");
+    expect(text).not.toContain("Open the Podman installation guide");
+    expect(text).not.toContain("Start the container runtime above first.");
+  });
+
+  it("treats a successful null status body as unknown and never shows delete or create controls", async () => {
+    const card = await readCard(null);
+    expect(card.text).toContain("Status unavailable");
+    expect(card.text).toContain("Re-check status before creating or removing a VM.");
+    expect(card.text).toContain("Durable workspace: status unavailable");
+    expect(card.text).toContain("Local image: status unavailable");
+    expect(card.buttons).not.toContain("Delete VM");
+    expect(card.buttons).not.toContain("Create Local VM");
+    expect(card.text).not.toContain("Open the Podman installation guide");
+  });
+});
+
+describe("LocalVmRuntimeCard when the VM is confirmed missing", () => {
+  it("shows image preparation before creation and directs an off provider to its settings toggle", async () => {
+    const providers = { ...config.botDefaults!.computerProviders!, localVm: false };
+    const card = await readCard(DAEMON_UP_NO_IMAGE, providers);
+    expect(card.buttons).toContain("Prepare Linux Desktop");
+    expect(card.buttons).not.toContain("Create Local VM");
+    expect(card.text).toContain("Prepare the Linux desktop above first.");
+    expect(card.text).toContain("Local VM is turned off in Computer settings.");
+    expect(host?.querySelector('a[href="#setting-computers-providers"]')?.textContent).toBe("Enable Local VM in Computer settings");
+    expect(card.buttons).not.toContain("Delete VM");
+    expect(card.text).toContain("Durable workspace: not created");
+    expect(card.text).toContain("Local image: not prepared");
+  });
+
+  it("offers creation only after the image is prepared and the provider is enabled", async () => {
+    const card = await readCard({ ...DAEMON_UP_NO_IMAGE, image: true });
+    expect(card.buttons).toContain("Create Local VM");
+    expect(card.buttons).not.toContain("Delete VM");
+  });
+
+  it("starts a verified Docker container that has never booted without offering replacement", async () => {
+    const card = await readCard({
+      ...DAEMON_UP_NO_IMAGE,
+      image: true,
+      imageMatches: true,
+      managed: true,
+      container: "created",
+      network: "loopback",
+      security: "hardened",
+      persistence: "durable",
+      ready: false,
+      problem: "Start the Local VM",
+    });
+    expect(card.pill).toBe("Ready to start");
+    expect(card.buttons).toContain("Start Local VM");
+    expect(card.buttons).toContain("Delete VM");
+    expect(card.buttons).not.toContain("Delete and Recreate");
+    expect(card.buttons).not.toContain("Create Local VM");
+  });
+
+  it("keeps a previously-started stopped VM on the confirmed replace path", async () => {
+    const card = await readCard({
+      ...DAEMON_UP_NO_IMAGE,
+      image: true,
+      imageMatches: true,
+      managed: true,
+      container: "stopped",
+      network: "loopback",
+      security: "hardened",
+      persistence: "durable",
+      problem: "This VM was previously stopped",
+    });
+    expect(card.text).toContain("Replace the Older or Unsafe VM");
+    expect(card.buttons).toContain("Delete and Recreate");
+    expect(card.buttons).not.toContain("Start Local VM");
+  });
+
+  it("does not offer first start when a never-started container fails a safety check", async () => {
+    const card = await readCard({
+      ...DAEMON_UP_NO_IMAGE,
+      image: true,
+      imageMatches: true,
+      managed: true,
+      container: "created",
+      network: "unsafe",
+      security: "hardened",
+      persistence: "durable",
+      problem: "The VM network is unsafe",
+    });
+    expect(card.buttons).toContain("Delete and Recreate");
+    expect(card.buttons).not.toContain("Start Local VM");
   });
 });
 
