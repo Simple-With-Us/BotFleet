@@ -126,7 +126,7 @@
     "@assistant-ui/store": "^0.3.21",
     "@oxlint/plugins": "1.88.0",
     "@playwright/test": "^1.62.0",
-    "@sentry/vite-plugin": "^5.0.0",
+    "@sentry/vite-plugin": "^11.0.0",
     "@tailwindcss/vite": "^4.1.11",
     "@types/node": "^26.2.0",
     "@types/react": "^19.1.9",
