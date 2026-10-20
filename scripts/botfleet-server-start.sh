@@ -19,7 +19,7 @@ set -euo pipefail
 # bots launch with their BF-<ROLE> seat (AGENT_LAUNCH_SEAT) and the matching
 # seat prompt. Without this, launchIdentityFor returns a null seat and every
 # BF role starts seatless. An explicit operator value still wins.
-export BOTFLEET_FLEET_SEAT_PROMPTS="${BOTFLEET_FLEET_SEAT_PROMPTS:-1}"
+export BOTFLEET_FLEET_SEAT_PROMPTS="${BOTFLEET_FLEET_SEAT_PROMPTS-1}"
 
 ROOT="${BOTFLEET_SERVER_ROOT:-$HOME/apps/botfleet-server}"
 # The runtime root is the release store's pointer, not a git checkout.
