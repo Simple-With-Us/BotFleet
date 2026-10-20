@@ -1928,7 +1928,7 @@ describe("RoutineManager", () => {
       expect(h.started).toHaveLength(0);
     });
 
-    it("closes a Sentry check-in when a scheduled run is skipped because the bot is stopped", async () => {
+    it("emits no Sentry check-in when a scheduled run is skipped because the bot is stopped (BF-2476)", async () => {
       const h = harness();
       const routine = h.manager.create({
         name: "Housekeeper sweep",
@@ -1939,10 +1939,12 @@ describe("RoutineManager", () => {
       h.manager.snoozeBot("compiler-bot");
       h.setNow(routine.nextRunAt!);
       await h.manager.tick();
-      expect(h.checkInStarts).toHaveLength(1);
-      expect(h.checkInFinishes).toHaveLength(1);
-      expect(h.checkInFinishes[0]).toMatchObject({ checkInId: "check-in-1", ok: true });
+      // A stopped bot is a deliberate pause, never a success: no check-in
+      // may be opened, and none may be closed `ok` (BF-2476).
+      expect(h.checkInStarts).toHaveLength(0);
+      expect(h.checkInFinishes).toHaveLength(0);
       expect(h.started).toHaveLength(0);
+      expect(h.manager.listRuns()[0]).toMatchObject({ outcomeCode: "bot_stopped" });
     });
 
     it("cancels all queued, running, and waiting runs for a bot", async () => {
@@ -2776,7 +2778,7 @@ describe("bot on/off switch", () => {
     expect(run).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED });
   });
 
-  it("skips a scheduled run, advances the schedule, and closes the Sentry check-in as ok", async () => {
+  it("skips a scheduled run, advances the schedule, and emits no Sentry check-in (BF-2476)", async () => {
     const h = harness();
     const routine = h.manager.create({ name: "Morning sweep", prompt: "sweep", botId: "sweeper", schedule: daily });
     const due = routine.nextRunAt!;
@@ -2791,8 +2793,9 @@ describe("bot on/off switch", () => {
     // Advanced, so turning the bot on resumes at the NEXT occurrence rather
     // than replaying a backlog.
     expect(h.manager.listRoutines()[0]!.nextRunAt).toBeGreaterThan(due);
-    expect(h.checkInFinishes).toHaveLength(1);
-    expect(h.checkInFinishes[0]).toMatchObject({ ok: true });
+    // BF-2476: a bot that is off never ran, so no check-in may close `ok`.
+    expect(h.checkInStarts).toHaveLength(0);
+    expect(h.checkInFinishes).toHaveLength(0);
     expect(h.failed).toHaveLength(0);
   });
 

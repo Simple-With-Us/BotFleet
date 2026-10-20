@@ -1223,13 +1223,13 @@ export class RoutineManager {
           // The schedule still advances (below), so turning the bot back on
           // resumes at the next occurrence instead of replaying the backlog.
           // The run is recorded as skipped with its reason; it is not
-          // `missed`, which would count as needing attention.
+          // `missed`, which would count as needing attention.  No Sentry
+          // Crons check-in is emitted for a skipped run: Sentry has no
+          // skipped status, and closing one `ok` would report success for
+          // work that never ran (BF-2476).  The run record itself, with
+          // outcomeCode `bot_off`, is the deliberate-pause signal.
           const skipped = this.newRun(routine, scheduledFor, false);
           this.skipForOff(skipped);
-          if (routine.schedule.type === "daily") {
-            const checkInId = this.options.checkInStart?.(skipped, routine);
-            if (checkInId) this.options.checkInFinish?.(skipped, checkInId, true);
-          }
         } else if (snoozed) {
           const skipped = this.newRun(routine, scheduledFor, false);
           skipped.status = "missed";
@@ -1238,10 +1238,11 @@ export class RoutineManager {
           skipped.outcomeCode = "bot_stopped";
           skipped.failurePhase = "lifecycle";
           this.emitRun(skipped);
-          if (routine.schedule.type === "daily") {
-            const checkInId = this.options.checkInStart?.(skipped, routine);
-            if (checkInId) this.options.checkInFinish?.(skipped, checkInId, true);
-          }
+          // No Sentry Crons check-in here either (BF-2476): a stopped bot
+          // is a deliberate pause, not a success and not a fault, and the
+          // only statuses Sentry offers are `ok` and `error`.  The run
+          // record above already says `bot_stopped`; reporting `ok` made
+          // the monitor green for work that never ran.
         } else if (late > CATCH_UP_MS) {
           const missed = this.newRun(routine, scheduledFor, false);
           missed.status = "missed";
