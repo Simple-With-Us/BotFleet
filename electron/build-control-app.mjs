@@ -1,19 +1,20 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import os from "node:os";
+import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { installServerControls } from "./server-controls.mjs";
 
 const project = fileURLToPath(new URL("../", import.meta.url));
 const bundle = path.join(project, "electron/resources/BotFleet Control.app");
-const scratch = mkdtempSync(path.join(os.tmpdir(), "botfleet-control-build-"));
-try {
-  execFileSync("/usr/bin/swift", ["test", "--package-path", path.join(project, "mac-control"), "--scratch-path", path.join(scratch, "tests"), "--jobs", "2"], { stdio: "inherit", timeout: 300_000 });
+// Keep Swift's architecture-keyed module cache between builds.  Recompiling
+// the entire SDK for tests and each release slice wastes minutes on every run.
+const scratch = path.join(project, "mac-control/.build");
+function buildControlApp() {
+  execFileSync("/usr/bin/swift", ["test", "--package-path", path.join(project, "mac-control"), "--scratch-path", scratch, "--jobs", "2"], { stdio: "inherit", timeout: 600_000 });
   const slices = [];
   for (const arch of ["arm64", "x86_64"]) {
-    const args = ["build", "--package-path", path.join(project, "mac-control"), "--configuration", "release", "--arch", arch, "--scratch-path", path.join(scratch, arch), "--jobs", "2"];
-    execFileSync("/usr/bin/swift", args, { stdio: "inherit", timeout: 300_000 });
+    const args = ["build", "--package-path", path.join(project, "mac-control"), "--configuration", "release", "--arch", arch, "--scratch-path", scratch, "--jobs", "2"];
+    execFileSync("/usr/bin/swift", args, { stdio: "inherit", timeout: 600_000 });
     const bin = execFileSync("/usr/bin/swift", [...args, "--show-bin-path"], { encoding: "utf8", timeout: 30_000 }).trim();
     slices.push(path.join(bin, "BotFleetControl"));
   }
@@ -48,6 +49,6 @@ try {
   execFileSync("/usr/bin/codesign", ["--verify", "--strict", bundle], { stdio: "inherit" });
   if (process.argv.includes("--install")) console.log(`Installed ${installServerControls(bundle)}`);
   else console.log(`Built ${bundle}`);
-} finally {
-  rmSync(scratch, { recursive: true, force: true });
 }
+
+buildControlApp();

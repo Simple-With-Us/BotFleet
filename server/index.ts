@@ -12671,6 +12671,9 @@ async function takeRuntimeFence(force: boolean) {
 }
 
 function endRuntimeQuiesce(): RuntimeQuiesceAnswer {
+  if (controlShutdownPending) {
+    return { safeToRestart: false, activeWorkCount: currentRuntimeReadiness().activeWorkCount, quiescing: true };
+  }
   if (runtimeFencing) {
     // A forced quiesce is still interrupting and saving work.  Releasing now
     // would land its snapshot and its held messages on an unfenced harness:
@@ -14810,7 +14813,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           ?? (target.key === SHARED_LOCAL_VM_TARGET.key
             ? store.bots.map((bot) => localVmLeaseFor(localVmTargetForBot(bot.id)).current(localVmOwnerBusy)?.botId).find(Boolean)
             : undefined),
-        busy: () => store.bots.some((bot) => bot.busy) || localVmActiveThreads.size > 0
+        busy: () => runtimeFencing || updateDrain.active || (runtimeQuiescing && !controlShutdownPending)
+          || store.bots.some((bot) => bot.busy) || localVmActiveThreads.size > 0
           || localVmLifecycleBusy.size > 0 || localVmImageBusy || localVmProvisionBusy
           || (localVmModeChangeBusy && !ownControlLock),
         action: async (action, target) => {
@@ -14860,6 +14864,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             activeWorkCount: () => currentRuntimeReadiness(ownAdmissionActive).activeWorkCount ?? 1,
             fence: () => {
               reserveControl();
+              cancelFenceLease();
               controlShutdownPending = true;
               runtimeQuiescing = true;
             },
