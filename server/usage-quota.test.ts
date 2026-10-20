@@ -36,7 +36,8 @@ const opus: RemoteQuotaWindow = {
 describe("usage quota mapping", () => {
   it("preserves structured HTTP plan metadata without interpreting billing", () => {
     const poller = new UsageQuotaPoller();
-    poller.applyPayload({ ok: true, generatedAt: new Date().toISOString(), windows: [{ ...opus, skip: false, planName: "Ultra", planMetadata: { ...planMetadata, secret: "drop", userSubtitle: "x".repeat(501) } }], skipModelTypes: [], skipModelIds: [] }, []);
+    const untrustedMetadata = { ...planMetadata, secret: "drop", userSubtitle: "x".repeat(501) };
+    poller.applyPayload({ ok: true, generatedAt: new Date().toISOString(), windows: [{ ...opus, skip: false, planName: "Ultra", planMetadata: untrustedMetadata }], skipModelTypes: [], skipModelIds: [] }, []);
     const window = poller.getWindows()[0];
     expect(window.planMetadata).toEqual({
       detectedPlanName: "Ultra", userPlanName: "My Pro", userCostUsd: "20.00",
