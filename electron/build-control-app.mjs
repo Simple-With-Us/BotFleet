@@ -16,7 +16,14 @@ function buildControlApp() {
     const args = ["build", "--package-path", path.join(project, "mac-control"), "--configuration", "release", "--arch", arch, "--scratch-path", scratch, "--jobs", "2"];
     execFileSync("/usr/bin/swift", args, { stdio: "inherit", timeout: 600_000 });
     const bin = execFileSync("/usr/bin/swift", [...args, "--show-bin-path"], { encoding: "utf8", timeout: 30_000 }).trim();
-    slices.push(path.join(bin, "BotFleetControl"));
+    // New Swift build systems can report one Products/Release path for both
+    // architectures.  Preserve each result before the next build replaces it.
+    const sliceDirectory = path.join(scratch, "control-slices", arch);
+    mkdirSync(sliceDirectory, { recursive: true });
+    const slice = path.join(sliceDirectory, "BotFleetControl");
+    copyFileSync(path.join(bin, "BotFleetControl"), slice);
+    execFileSync("/usr/bin/lipo", ["-verify_arch", arch, slice], { stdio: "inherit" });
+    slices.push(slice);
   }
   const contents = path.join(bundle, "Contents");
   mkdirSync(path.join(contents, "MacOS"), { recursive: true });
