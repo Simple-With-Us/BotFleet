@@ -404,8 +404,10 @@ fi
 # "carry on and start the harness", and an unguarded bare call would abort the
 # whole script on exactly the ordinary, marker-absent path.  The exit 0 inside
 # the function still exits -- that is an `exit`, not a return status.
-honour_startup_policy
-honour_shutdown_marker || true
+if [ "$HEAL_ONLY" != true ]; then
+  honour_startup_policy
+  honour_shutdown_marker || true
+fi
 
 # --heal-only must prepare the checkout even when the currently running
 # harness is healthy (e.g. during an update while the old process still

@@ -53,7 +53,6 @@ function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = 
       BOTFLEET_STARTUP_ENABLED_MARKER: fixture.enabled,
       BOTFLEET_STARTUP_SESSION: fixture.session,
       BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
-      BF_CONTROL_STARTUP_POLICY_V1: "1",
       // Explicit rather than inherited: every other test in this file models
       // a person or a generic launchd run, not this specific agent, and an
       // XPC_SERVICE_NAME leaking in from the shell would silently change which
@@ -584,6 +583,22 @@ test("the launchd tick leaves the marker in place", () => {
     writeFileSync(fixture.marker, "stopped on purpose\n");
     run(fixture, { xpcServiceName: "app.botfleet.server" });
     assert.ok(existsSync(fixture.marker), "the marker must survive the tick, or the next one would restart it");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("dependency preparation preserves a deliberate stop and boot policy", () => {
+  const fixture = makeFixture({ withDependencies: true });
+  try {
+    writeFileSync(fixture.marker, "intentionally stopped\n");
+    writeFileSync(fixture.disabled, "");
+    writeFileSync(fixture.session, "previous-boot\n");
+    const result = run(fixture, { args: ["--heal-only"] });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(fixture.marker, "utf8"), "intentionally stopped\n");
+    assert.equal(readFileSync(fixture.session, "utf8"), "previous-boot\n");
+    assert.equal(existsSync(fixture.disabled), true);
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
