@@ -2000,6 +2000,10 @@ describe("RoutineManager", () => {
       });
       expect(webhookRun.status).toBe("cancelled");
       expect(webhookRun.outcomeCode).toBe("cancelled");
+      // BF-2462: never persisted — no run row, no prompt copy.
+      expect(webhookRun.prompt).toBe("");
+      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.skippedDeliveryCount()).toBe(1);
 
       const resourceRun = h.manager.enqueueResource({
         triggerId: "res-1",
@@ -2011,6 +2015,29 @@ describe("RoutineManager", () => {
         receivedAt: Date.now(),
       });
       expect(resourceRun.status).toBe("cancelled");
+      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.skippedDeliveryCount()).toBe(2);
+      h.manager.flushNow();
+      expect(readFileSync(h.options.file!, "utf8")).not.toContain("Run while snoozed");
+    });
+
+    it("does not persist or rewrite routines.json for repeated snoozed webhooks (BF-2462)", () => {
+      const h = harness();
+      h.manager.snoozeBot("compiler-bot");
+      h.manager.flushNow();
+      const before = readFileSync(h.options.file!, "utf8");
+      for (let i = 0; i < 5; i++) {
+        h.manager.enqueueWebhook({
+          webhookId: "wh-1", webhookName: "Hook 1", prompt: `secret-prompt-${i}`,
+          botId: "compiler-bot", runOn: "bot", deliveryId: `d-${i}`, receivedAt: Date.now(),
+        });
+      }
+      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.skippedDeliveryCount("wh-1", "webhook")).toBe(5);
+      h.manager.flushNow();
+      const after = readFileSync(h.options.file!, "utf8");
+      expect(after).toBe(before);
+      expect(after).not.toContain("secret-prompt");
     });
 
     it("requeues cancelled runs and clears snooze on runNow", async () => {
@@ -2751,7 +2778,9 @@ describe("bot on/off switch", () => {
     h.setBot("ready");
     await h.manager.tick();
     expect(h.started).toHaveLength(0);
-    expect(h.manager.listRuns()[0]?.status).toBe("cancelled");
+    // BF-2462: skipped webhook is not persisted as a run.
+    expect(h.manager.listRuns()).toHaveLength(0);
+    expect(h.manager.skippedDeliveryCount()).toBe(1);
   });
 
   it("skips a webhook even while the bot is busy, instead of folding it into a deferred backlog", () => {
@@ -2803,7 +2832,8 @@ describe("bot on/off switch", () => {
     const routine = h.manager.create({ name: "Sweep", prompt: "sweep", botId: "sweeper", schedule: daily });
     h.setNow(routine.nextRunAt! + 1000);
     await h.manager.tick();
-    expect(h.manager.listRuns().length).toBeGreaterThanOrEqual(2);
+    // BF-2462: only the scheduled skipped run is persisted; the webhook is not.
+    expect(h.manager.listRuns().length).toBeGreaterThanOrEqual(1);
     for (const run of h.manager.listRuns()) {
       expect(ROUTINE_ATTENTION_STATUSES.some((status) => status === run.status)).toBe(false);
     }
