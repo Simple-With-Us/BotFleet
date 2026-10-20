@@ -69,6 +69,9 @@ test("installation refuses an unrelated bundle or a symlink", { skip: process.pl
   mkdirSync(path.join(f.target, "Contents"), { recursive: true });
   writeFileSync(path.join(f.target, "Contents", "Info.plist"), "unrelated app");
   assert.throws(() => installServerControls(f.source, { applications: f.applications }), /Unexpected control app identity/);
+  rmSync(path.join(f.target, "Contents", "Info.plist"));
+  symlinkSync(path.join(f.source, "Contents", "Info.plist"), path.join(f.target, "Contents", "Info.plist"));
+  assert.throws(() => installServerControls(f.source, { applications: f.applications }));
 });
 
 test("opening an unavailable control app reports failure without launching anything", async () => {

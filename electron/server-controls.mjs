@@ -1,4 +1,4 @@
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { closeSync, constants, cpSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
@@ -29,7 +29,19 @@ export async function shutdownAttachedServer(port, { request = fetch, timeout = 
 
 function checkBundle(bundle) {
   if (lstatSync(bundle).isSymbolicLink()) throw new Error("The control app must be a regular app bundle");
-  const plist = readFileSync(path.join(bundle, "Contents", "Info.plist"), "utf8");
+  const plistPath = path.join(bundle, "Contents", "Info.plist");
+  const fd = openSync(plistPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  let plist;
+  try {
+    const handle = fstatSync(fd);
+    const current = statSync(plistPath);
+    if (!handle.isFile() || handle.nlink !== 1 || handle.dev !== current.dev || handle.ino !== current.ino) {
+      throw new Error("Unsafe control app metadata path");
+    }
+    plist = readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
   if (!plist.includes(`<string>${bundleId}</string>`)) throw new Error("Unexpected control app identity");
 }
 
