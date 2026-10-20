@@ -105,7 +105,7 @@ export function selectionWithContextCap(current: ModelSelection, cap: number | u
 /** "512K", "1M": how a cap or window reads on a button. */
 export function contextCapLabel(tokens: number): string {
   if (tokens >= 1_000_000 && tokens % 1_000_000 === 0) return `${tokens / 1_000_000}M`;
-  return `${Math.round(tokens / 1024)}K`;
+  return `${Math.floor(tokens / 1024)}K`;
 }
 
 /** Whether the selected model's driver sends a per-bot output limit. */

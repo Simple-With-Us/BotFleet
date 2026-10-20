@@ -670,7 +670,8 @@ describe("Effort section in the chat model menu", () => {
     expect(html).toContain("Max Input Tokens");
     expect(html).toContain("No Limit (1M)");
     expect(html).toContain(">512K<");
-    expect(html).toContain('placeholder="Custom"');
+    expect(html).toContain('placeholder="No limit"');
+    expect(html).toContain('aria-label="Max Input Tokens"');
     expect(html).toContain("Empty is no limit.");
     // A saved value that is not a preset shows in the custom field.
     const custom = renderToStaticMarkup(
