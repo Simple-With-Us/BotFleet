@@ -111,6 +111,22 @@ rather than an outage.
   sessions reconnected with the vault identity, which proves the
   identity still reaches a release-launched harness.
 
+## Switching The Running Program Onto A New Release
+
+A pointer swap is not a running program.  The launcher PROBES the port
+and exits 0 when a harness is already answering, so `launchctl kickstart`
+on its own leaves the OLD release serving: the probe finds it healthy and
+starts nothing.  Switching is therefore stop-then-start:
+
+1.  swap the pointer (`harness-release.mjs activate <commit>`),
+2.  stop the running harness, which holds the port,
+3.  start the job (`launchctl kickstart -k gui/$(id -u)/app.botfleet.server`).
+
+The previous release stays on disk, so a rollback is one more swap and the
+same three steps.  The CLI's own hint says exactly this, because an
+operator told only "kickstart" would believe an update applied when it
+had not.
+
 ## Follow-ups
 
 1. The updater (`ubf`) still prepares releases from a checkout and does

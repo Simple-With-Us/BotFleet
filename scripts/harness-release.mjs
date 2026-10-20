@@ -72,7 +72,16 @@ function restartHint(env) {
   // "BotFleet-Companion" is the companion's store, and comparing it
   // case-sensitively would name the wrong job.
   const job = basename(effectiveRoot).toLowerCase() === "botfleet-companion" ? "app.botfleet.companion" : "app.botfleet.server";
-  return `restart ${job} to pick the new release up (launchctl kickstart -k gui/$(id -u)/${job})`;
+  // The launcher REFUSES to start a second harness while one is healthy,
+  // so a kickstart on its own leaves the OLD release serving: the probe
+  // finds :8799 answering and exits 0.  Switching the running program onto
+  // the new release is therefore stop-then-start, and saying only
+  // "kickstart" would leave an operator believing an update applied when
+  // it did not.
+  return [
+    `to pick the new release up, stop the running harness (it holds :8799, and the launcher will not start a second one),`,
+    `then start it: launchctl kickstart -k gui/$(id -u)/${job}`,
+  ].join(" ");
 }
 
 async function main() {

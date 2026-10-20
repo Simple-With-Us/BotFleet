@@ -994,3 +994,30 @@ test("the CLI names the job that runs the store it acted on", async (t) => {
   const mixed = await runCli(["swap", commit, "--store", mixedRoot]);
   assert.match(mixed.stdout, /app\.botfleet\.companion/);
 });
+
+test("the restart hint says stop before start, because the launcher will not start a second harness", async (t) => {
+  // The launcher probes the port and exits 0 when a harness is already
+  // answering, so a kickstart on its own leaves the OLD release serving.
+  // An operator told only "kickstart" would believe an update applied
+  // when it did not, so the hint has to say stop-then-start.
+  const dir = await mkdtemp(join(tmpdir(), "bf-release-hint-"));
+  const root = join(dir, "botfleet");
+  const env = { ...process.env, BOTFLEET_RELEASES_ROOT: root };
+  t.after(async () => {
+    // A promoted release is read-only, so the store's own discard path
+    // restores write permission before the tree is removed.
+    for (const commit of await listReleases(env)) {
+      await discardRelease(commit, env).catch(() => {});
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+  const { repo, commit } = await sourceRepo(t);
+  await stageRelease({ commit, repo, env, install: false });
+  await promoteStaging({ commit, env });
+  const { stdout } = await run(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), "harness-release.mjs"), "swap", commit, "--store", root], {
+    encoding: "utf8",
+    env,
+  });
+  assert.match(stdout, /stop the running harness/i);
+  assert.match(stdout, /kickstart/);
+});
