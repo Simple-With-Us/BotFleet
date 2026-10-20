@@ -425,6 +425,7 @@ export class UsageQuotaPoller {
           headers: { authorization: `Bearer ${token}`, accept: "application/json", "user-agent": "BotFleet/1.0" },
           signal: AbortSignal.timeout(10_000),
         });
+        // SAFETY: response.json() returns any; the ok check below narrows it.
         const body = (await response.json().catch(() => null)) as { error?: string } | null;
         if (!response.ok || !body || typeof body !== "object" || !("ok" in body) || body.ok !== true) {
           this.lastError = `HTTP ${response.status}`;
@@ -439,6 +440,8 @@ export class UsageQuotaPoller {
         for (const row of parsed.data.windows) {
           const window = remoteQuotaWindowSchema.safeParse(row);
           if (window.success) {
+            // SAFETY: the schema just proved the shape; planMetadata stays
+            // unknown here and is zod-parsed per window in applyPayload.
             windows.push(window.data as RemoteQuotaWindow);
           } else {
             console.warn("usage-quota: dropping a malformed /api/quota-windows row:", window.error.issues[0]?.message);
