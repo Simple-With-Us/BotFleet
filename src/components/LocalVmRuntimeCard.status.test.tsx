@@ -58,9 +58,16 @@ const storeValue = {
 const mountCard = (
   providers: NonNullable<NonNullable<ConfigStatus["botDefaults"]>["computerProviders"]> = config.botDefaults!.computerProviders!,
 ) => {
+  const botDefaults = config.botDefaults!;
   const testConfig: ConfigStatus = {
     ...config,
-    botDefaults: { ...config.botDefaults, computerProviders: providers },
+    botDefaults: {
+      ...botDefaults,
+      computers: botDefaults.computers,
+      cloudBackend: botDefaults.cloudBackend,
+      allowedComputers: botDefaults.allowedComputers,
+      computerProviders: providers,
+    },
   };
   return createElement(StoreContext.Provider, { value: { ...storeValue, state: { ...initialState, config: testConfig } } }, createElement(LocalVmRuntimeCard));
 };
