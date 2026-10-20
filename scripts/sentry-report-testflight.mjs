@@ -52,7 +52,7 @@ function parseApi(schema, raw) {
 // validation body.
 function parseJsonObject(body) {
   const value = parseJson(body);
-  return value && !Array.isArray(value) ? value : null;
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
 }
 
 function parseJson(body) {
