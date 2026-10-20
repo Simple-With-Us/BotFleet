@@ -686,6 +686,47 @@ describe("harness HTTP API", () => {
     expect(body.static).toBe(true);
   });
 
+  it("native server controls expose VM state without configuration secrets", async () => {
+    const response = await api("GET", "/api/system/control");
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ activeBotCount: 0, persistOnExit: expect.any(Boolean) });
+    expect(response.body.localVms).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: "shared", running: false, state: "missing" }),
+    ]));
+    expect(Object.keys(response.body).sort()).toEqual(["activeBotCount", "localVms", "persistOnExit"]);
+  });
+
+  it("native server controls reject companion replays and non-JSON shutdowns", async () => {
+    expect((await fetch(`${BASE}/api/system/control`, {
+      headers: { "x-botfleet-companion": "1" },
+    })).status).toBe(403);
+    expect((await fetch(`${BASE}/api/system/control/stop`, { method: "POST" })).status).toBe(415);
+    expect((await fetch(`${BASE}/api/system/control/stop`, {
+      method: "POST", headers: { "content-type": "application/json", "x-botfleet-companion": "1" }, body: "{}",
+    })).status).toBe(403);
+    expect((await api("GET", "/api/health")).status).toBe(200);
+  });
+
+  it("native server controls refuse another admission before writing a shutdown marker", async () => {
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { authorization: `Bearer ${owner.nonce}` };
+    const held = request({ hostname: "127.0.0.1", port: PORT, path: "/api/bots", method: "POST",
+      headers: { "content-type": "application/json", "content-length": "2" } });
+    held.on("error", () => {});
+    held.write("{");
+    const active = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()).activeWorkCount;
+    try {
+      await expect.poll(active).toBe(1);
+      const refused = await api("POST", "/api/system/control/stop", {});
+      expect(refused.status).toBe(409);
+      expect(existsSync(join(home, ".botfleet", "stopped.marker"))).toBe(false);
+      expect((await api("GET", "/api/health")).status).toBe(200);
+    } finally {
+      held.destroy();
+      await expect.poll(active).toBe(0);
+    }
+  });
+
   it("returns 400 for a doubled-slash request target without killing the harness", async () => {
     // audit C1: `new URL("//", base)` throws; the parse must stay inside the
     // request guard so a proxy that passes `//` cannot crash the API port.
