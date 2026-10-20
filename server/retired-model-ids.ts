@@ -23,7 +23,7 @@ const RETIRED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
   "DeepSeek-V4.1-Pro": "DeepSeek-V4-Pro",
 };
 
-/** Retirements that apply to one engine instance only, keyed by instance id.
+/** The dsh instance's own M3.1 Flash rename.
  *
  *  The installed dsh engine renamed `MiniMax-M3.1-Flash-Preview` to
  *  `MiniMax-M3.1-Flash` (see `DSH_MINIMAX_M31_FLASH_MODEL` in
@@ -31,17 +31,15 @@ const RETIRED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
  *  turn sent with the old id fails "unknown model".  mcode and the native
  *  `minimax` driver still serve the Preview id, so this cannot sit in the
  *  global map above: it would move their bots onto an id they do not offer. */
-const INSTANCE_RETIRED_MODEL_REPLACEMENTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
-  dsh: {
-    "MiniMax-M3.1-Flash-Preview": "MiniMax-M3.1-Flash",
-  },
-};
+const DSH_INSTANCE_ID = "dsh";
+const DSH_RETIRED_M31_PREVIEW = "MiniMax-M3.1-Flash-Preview";
+const DSH_M31_FLASH = "MiniMax-M3.1-Flash";
 
+/** The instance-scoped replacement for a model id, or `undefined` when the
+ *  instance has no retirement of its own for it. */
 function instanceReplacement(model: string, instanceId: string | undefined): string | undefined {
-  if (instanceId === undefined) return undefined;
-  const scoped = INSTANCE_RETIRED_MODEL_REPLACEMENTS[instanceId];
-  if (!scoped || !Object.prototype.hasOwnProperty.call(scoped, model)) return undefined;
-  return scoped[model];
+  if (instanceId === DSH_INSTANCE_ID && model === DSH_RETIRED_M31_PREVIEW) return DSH_M31_FLASH;
+  return undefined;
 }
 
 /** Live replacement for a retired model id, or the input when it is still

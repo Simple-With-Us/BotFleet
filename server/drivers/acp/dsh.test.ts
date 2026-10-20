@@ -954,12 +954,16 @@ describe("dsh model option resolution (Clutch #54 consumer)", () => {
 // `reasoningEfforts` (stock dsh does not catalog M3.1).  The live catalog
 // gates the picker on that entry, and configureSession is Clutch's.
 describe("DSH MiniMax M3.1 reasoning effort", () => {
+  // Clutch's per-model table (and configureSession) still key M3.1 by the
+  // retired Preview id; the installed engine and the picker row use the
+  // renamed id (BOTFLEET-4E).
   const M31 = "MiniMax-M3.1-Flash-Preview";
+  const M31_ROW = "MiniMax-M3.1-Flash";
   const M31_LEVELS = ["low", "medium", "high", "xhigh", "max"];
-  const m31Entry = (extra = "") =>
+  const m31Entry = (extra = "", id = M31_ROW) =>
     `llm-pi-ai:\n  providers:\n    minimax:\n      apiKeyEnv: MINIMAX_API_KEY\n      models:\n` +
     `        - id: MiniMax-M2.7-highspeed\n` +
-    `        - id: ${M31}\n          contextWindow: 1000000\n${extra}`;
+    `        - id: ${id}\n          contextWindow: 1000000\n${extra}`;
   const CONFIGURED =
     "          reasoningEfforts: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }\n" +
     "          compat: { forceAdaptiveThinking: true }\n";
@@ -987,7 +991,7 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
 
     it("offers M3.1's levels, xhigh included, when the settings entry declares them", () => {
       const catalog = catalogWith(m31Entry(CONFIGURED));
-      expect(levelsOf(catalog, M31)).toEqual(M31_LEVELS);
+      expect(levelsOf(catalog, M31_ROW)).toEqual(M31_LEVELS);
       // Every other row keeps no levels of its own: DeepSeek takes the
       // engine-wide list, and the client's DSH MiniMax rule hides M2.7.
       for (const id of ["DeepSeek-V4.1-Flash", "DeepSeek-V4-Pro", "MiniMax-M2.7-highspeed"]) {
@@ -997,8 +1001,8 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
 
     it("offers no M3.1 level when the entry has no reasoningEfforts, so dsh never refuses a pick", () => {
       // The adaptive flag is set in both, so reasoningEfforts is what is missing.
-      expect(levelsOf(catalogWith(m31Entry(ADAPTIVE)), M31)).toEqual([]);
-      expect(levelsOf(catalogWith(m31Entry(`          reasoningEfforts: false\n${ADAPTIVE}`)), M31)).toEqual([]);
+      expect(levelsOf(catalogWith(m31Entry(ADAPTIVE)), M31_ROW)).toEqual([]);
+      expect(levelsOf(catalogWith(m31Entry(`          reasoningEfforts: false\n${ADAPTIVE}`)), M31_ROW)).toEqual([]);
     });
 
     it("offers no M3.1 level unless the entry forces adaptive thinking", () => {
@@ -1006,14 +1010,14 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
       // xhigh and max to high, and sends no output_config.effort, so most of
       // the levels would run the same request.
       const efforts = "          reasoningEfforts: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }\n";
-      expect(levelsOf(catalogWith(m31Entry(efforts)), M31)).toEqual([]);
+      expect(levelsOf(catalogWith(m31Entry(efforts)), M31_ROW)).toEqual([]);
       expect(
-        levelsOf(catalogWith(m31Entry(`${efforts}          compat: { forceAdaptiveThinking: false }\n`)), M31),
+        levelsOf(catalogWith(m31Entry(`${efforts}          compat: { forceAdaptiveThinking: false }\n`)), M31_ROW),
       ).toEqual([]);
     });
 
     it("offers no M3.1 level without a settings file", () => {
-      expect(levelsOf(catalogWith(null), M31)).toEqual([]);
+      expect(levelsOf(catalogWith(null), M31_ROW)).toEqual([]);
     });
 
     it("reads the entry from the engine home when DSH_HOME is set", () => {
@@ -1021,14 +1025,23 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
       const engineHome = join(home, "engine-home");
       mkdirSync(engineHome, { recursive: true });
       writeFileSync(join(engineHome, "settings.yaml"), m31Entry(CONFIGURED), "utf8");
-      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: engineHome }), M31)).toEqual(M31_LEVELS);
+      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: engineHome }), M31_ROW)).toEqual(M31_LEVELS);
       // The old lookup went one .dsh too deep and found nothing.
-      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: join(home, "missing") }), M31)).toEqual([]);
+      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: join(home, "missing") }), M31_ROW)).toEqual([]);
     });
 
     it("keeps only the levels the entry maps", () => {
       const subset = "          reasoningEfforts: { high: high, max: max }\n";
-      expect(levelsOf(catalogWith(m31Entry(subset + ADAPTIVE)), M31)).toEqual(["high", "max"]);
+      expect(levelsOf(catalogWith(m31Entry(subset + ADAPTIVE)), M31_ROW)).toEqual(["high", "max"]);
+    });
+
+    it("reads levels only from the renamed entry, never a stale Preview one", () => {
+      // A settings file written before the rename declares the Preview id.
+      // That row is excluded and the engine refuses it, so its levels must
+      // not light up the renamed row.
+      const catalog = catalogWith(m31Entry(CONFIGURED, M31));
+      expect(levelsOf(catalog, M31_ROW)).toEqual([]);
+      expect(catalog.options.some((option) => option.id === M31)).toBe(false);
     });
   });
 

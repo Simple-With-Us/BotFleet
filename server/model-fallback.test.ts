@@ -1480,7 +1480,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
   const T0 = 1_780_000_000_000;
   const CHAIN: ModelSelection[] = [
     { instanceId: "grok", model: "grok-4.7" },
-    { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+    { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
     { instanceId: "claude", model: "claude-sonnet-5" },
   ];
   const doomed = (...instances: string[]) => (botId: string, instanceId: string) =>
@@ -1548,7 +1548,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
       isDoomed: doomed("grok"),
       now: T0,
     });
-    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview", nextUsed: 2 });
+    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 2 });
     // nextUsed still points past the entry that was chosen, so the second
     // failure of the same turn walks on to the third rather than re-offering
     // the dead first entry.
@@ -1611,7 +1611,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
           botId: "bot2",
           now: T0,
         }),
-      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview", nextUsed: 2 });
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 2 });
     } finally {
       doomedDispatches.clear();
     }
@@ -1624,7 +1624,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
       model: "gemini-3.8-pro-high",
       fallbacks: [
         { instanceId: "grok", model: "grok-4.7" },
-        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
         { instanceId: "claude", model: "claude-sonnet-5" },
       ],
     };
@@ -1649,7 +1649,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
 
     // Nothing dead: the first usable entry, untouched.
     expect(registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: () => false }).selection)
-      .toMatchObject({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" });
+      .toMatchObject({ instanceId: "dsh", model: "MiniMax-M3.1-Flash" });
 
     // dsh cannot start for this bot, so the next saved engine is the third.
     const skipped = registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: doomed("dsh") });
@@ -1681,7 +1681,7 @@ describe("the default doomed gate is live, not a stub", () => {
   const T0 = 1_780_000_000_000;
   const CHAIN: ModelSelection[] = [
     { instanceId: "grok", model: "grok-4.7" },
-    { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+    { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
     { instanceId: "claude", model: "claude-sonnet-5" },
   ];
 
@@ -1723,7 +1723,7 @@ describe("the default doomed gate is live, not a stub", () => {
           botId: "bot-default-gate-clean",
           now: T0,
         }),
-      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview", nextUsed: 2 });
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 2 });
     } finally {
       doomedDispatches.clear();
     }
@@ -1734,7 +1734,7 @@ describe("the default doomed gate is live, not a stub", () => {
     const primary: ModelSelection = {
       instanceId: "antigravity",
       model: "gemini-3.8-pro-high",
-      fallbacks: [{ instanceId: "grok", model: "grok-4.7" }, { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" }],
+      fallbacks: [{ instanceId: "grok", model: "grok-4.7" }, { instanceId: "dsh", model: "MiniMax-M3.1-Flash" }],
     };
     registry.record({
       botId: "bot-default-gate",
@@ -2104,7 +2104,9 @@ describe("launchFallbackTurn and a stopped turn", () => {
 });
 
 describe("retired MiniMax-M3 ids are rewritten before failover", () => {
-  it("selectTurnFallback returns the live Flash Preview id for a MiniMax-M3 entry", () => {
+  it("selectTurnFallback returns dsh's live M3.1 Flash id for a MiniMax-M3 entry", () => {
+    // dsh's engine dropped the Preview suffix, so a dsh MiniMax-M3 entry lands
+    // on MiniMax-M3.1-Flash rather than the Preview spelling dsh refuses.
     const next = selectTurnFallback({
       ok: false,
       produced: false,
@@ -2117,9 +2119,20 @@ describe("retired MiniMax-M3 ids are rewritten before failover", () => {
     });
     expect(next).toEqual({
       instanceId: "dsh",
-      model: "MiniMax-M3.1-Flash-Preview",
+      model: "MiniMax-M3.1-Flash",
       nextUsed: 1,
     });
+  });
+
+  it("selectTurnFallback heals a saved dsh Flash Preview entry onto MiniMax-M3.1-Flash (BOTFLEET-4E)", () => {
+    const next = selectTurnFallback({
+      ok: false,
+      produced: false,
+      fallbacks: [{ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" }],
+      used: 0,
+      current: { instanceId: "grok", model: "grok-4.7" },
+    });
+    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 1 });
   });
 
   it("resolveModel heals a Director-shaped MiniMax-M3 primary without waiting for rejection", () => {
@@ -2130,9 +2143,11 @@ describe("retired MiniMax-M3 ids are rewritten before failover", () => {
       fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3" }],
     });
     expect(resolved.isFallback).toBe(false);
+    // Each engine gets its own live spelling: dsh dropped the Preview suffix,
+    // the native MiniMax driver still serves it.
     expect(resolved.selection).toEqual({
       instanceId: "dsh",
-      model: "MiniMax-M3.1-Flash-Preview",
+      model: "MiniMax-M3.1-Flash",
       fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" }],
     });
   });
