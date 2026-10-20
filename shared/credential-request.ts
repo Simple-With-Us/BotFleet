@@ -109,6 +109,8 @@ export const CREDENTIAL_TARGETS: Readonly<
       helpUrl: spec.helpUrl,
     },
   ]),
+  // SAFETY: Object.fromEntries over CREDENTIAL_TARGET_SPECS keys, which are
+  // exactly CredentialTargetId; every entry supplies all four display fields.
 ) as Record<
   CredentialTargetId,
   { label: string; description: string; placeholder: string; helpUrl: string }
