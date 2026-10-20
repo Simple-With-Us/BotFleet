@@ -22,7 +22,8 @@ function buildControlApp() {
     mkdirSync(sliceDirectory, { recursive: true });
     const slice = path.join(sliceDirectory, "BotFleetControl");
     copyFileSync(path.join(bin, "BotFleetControl"), slice);
-    execFileSync("/usr/bin/lipo", ["-verify_arch", arch, slice], { stdio: "inherit" });
+    const sliceArchs = execFileSync("/usr/bin/lipo", ["-archs", slice], { encoding: "utf8" }).trim().split(/\s+/);
+    if (sliceArchs.length !== 1 || sliceArchs[0] !== arch) throw new Error(`Expected a ${arch} control slice, found ${sliceArchs.join(", ")}`);
     slices.push(slice);
   }
   const contents = path.join(bundle, "Contents");
@@ -49,8 +50,8 @@ function buildControlApp() {
 `);
   const executable = path.join(contents, "MacOS", "BotFleetControl");
   execFileSync("/usr/bin/lipo", ["-create", ...slices, "-output", executable], { stdio: "inherit" });
-  const archs = execFileSync("/usr/bin/lipo", ["-archs", executable], { encoding: "utf8" });
-  if (!archs.includes("arm64") || !archs.includes("x86_64")) throw new Error("Control app must be universal");
+  const archs = new Set(execFileSync("/usr/bin/lipo", ["-archs", executable], { encoding: "utf8" }).trim().split(/\s+/));
+  if (archs.size !== 2 || !archs.has("arm64") || !archs.has("x86_64")) throw new Error("Control app must be universal");
   execFileSync("/usr/bin/plutil", ["-lint", path.join(contents, "Info.plist")], { stdio: "inherit" });
   execFileSync("/usr/bin/codesign", ["--force", "--sign", process.env.BOTFLEET_CONTROL_SIGN_IDENTITY || "-", "--options", "runtime", bundle], { stdio: "inherit" });
   execFileSync("/usr/bin/codesign", ["--verify", "--strict", bundle], { stdio: "inherit" });
