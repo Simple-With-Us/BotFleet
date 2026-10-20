@@ -63,6 +63,42 @@ public struct QuotaPlanMetadata: Codable, Hashable, Sendable {
     public var showCostAndRenewal: Bool?
     public var hasMismatch: Bool
 
+    public init(
+        detectedPlanName: String? = nil,
+        userPlanName: String? = nil,
+        userCostUsd: String? = nil,
+        userRenewalDateText: String? = nil,
+        userSubtitle: String? = nil,
+        showCostAndRenewal: Bool? = nil,
+        hasMismatch: Bool = false
+    ) {
+        self.detectedPlanName = detectedPlanName
+        self.userPlanName = userPlanName
+        self.userCostUsd = userCostUsd
+        self.userRenewalDateText = userRenewalDateText
+        self.userSubtitle = userSubtitle
+        self.showCostAndRenewal = showCostAndRenewal
+        self.hasMismatch = hasMismatch
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case detectedPlanName, userPlanName, userCostUsd, userRenewalDateText, userSubtitle, showCostAndRenewal, hasMismatch
+    }
+
+    /// Lenient per-field decode, matching shared/quota-plan-metadata.ts: one
+    /// missing or mistyped field defaults instead of discarding the whole
+    /// metadata block (Kody review, PR #1280).
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        detectedPlanName = try? container.decodeIfPresent(String.self, forKey: .detectedPlanName)
+        userPlanName = try? container.decodeIfPresent(String.self, forKey: .userPlanName)
+        userCostUsd = try? container.decodeIfPresent(String.self, forKey: .userCostUsd)
+        userRenewalDateText = try? container.decodeIfPresent(String.self, forKey: .userRenewalDateText)
+        userSubtitle = try? container.decodeIfPresent(String.self, forKey: .userSubtitle)
+        showCostAndRenewal = try? container.decodeIfPresent(Bool.self, forKey: .showCostAndRenewal)
+        hasMismatch = (try? container.decodeIfPresent(Bool.self, forKey: .hasMismatch)) ?? false
+    }
+
     public var displayLines: [String] {
         var lines: [String] = []
         if let name = detectedPlanName, !name.isEmpty { lines.append("Detected Plan: \(name)") }
