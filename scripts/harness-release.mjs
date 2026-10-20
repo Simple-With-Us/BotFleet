@@ -68,10 +68,13 @@ function flag(args, name) {
  */
 function restartHint(env) {
   const effectiveRoot = env.BOTFLEET_RELEASES_ROOT || join(env.HOME ?? "", ".botfleet");
-  // Case-folded: a volume can be case-insensitive, so a store root named
-  // "BotFleet-Companion" is the companion's store, and comparing it
-  // case-sensitively would name the wrong job.
-  const job = basename(effectiveRoot).toLowerCase() === "botfleet-companion" ? "app.botfleet.companion" : "app.botfleet.server";
+  // The store roots are DOT-PREFIXED (~/.botfleet, ~/.botfleet-companion),
+  // so the leading dots come off before the comparison — otherwise the
+  // companion's own store reads as the harness's and the hint names the
+  // wrong job.  And it is case-folded, because a volume can be
+  // case-insensitive and hold the same directory under a different case.
+  const storeName = basename(effectiveRoot).replace(/^\.+/, "").toLowerCase();
+  const job = storeName === "botfleet-companion" ? "app.botfleet.companion" : "app.botfleet.server";
   // The launcher REFUSES to start a second harness while one is healthy,
   // so a kickstart on its own leaves the OLD release serving: the probe
   // finds :8799 answering and exits 0.  Switching the running program onto
@@ -166,7 +169,12 @@ async function main() {
     // (the first activation), so it is checked rather than printed blindly.
     if (result.previous) process.stdout.write(`previous release kept: ${result.previous}\n`);
     if (!result.atomic) {
-      process.stdout.write("the pointer swap was not atomic; the old release was put back\n");
+      // The swap SUCCEEDED, non-atomically: the platform refused
+      // rename-over, so the pointer was removed and re-created, and for an
+      // instant it was absent.  The previous release is still on disk.
+      process.stdout.write(
+        "the pointer swap was not atomic (this platform refused rename-over, so the pointer was briefly absent); the previous release is still on disk\n",
+      );
     }
     // A swap is not live until the program restarts, so the hint belongs
     // here as much as it does on activate.

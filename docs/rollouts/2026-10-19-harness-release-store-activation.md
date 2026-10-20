@@ -27,14 +27,15 @@ Three real failures came from that shape, all recorded before this work:
   `node_modules` into place under the running process, so an unverified
   new version had no rollback: the old tree was already gone.
 
-The repository already had the answer — PR #858 (merged 2026-10-06) added
-`scripts/harness-release-store.mjs`: immutable per-commit release
-directories, a `staging` area, one atomically swapped pointer, and a
-launcher that refuses to mutate a release.  What was missing was the half
-that makes it usable: nothing staged or promoted a release, and the
-LaunchAgent still pointed at the checkout.  The rollout doc for #858
-called that "a separate on-demand operator step that pauses for the
-owner".  The owner's directive is that pause being released.
+The repository already had the answer: an earlier change (merged
+2026-10-06) added `scripts/harness-release-store.mjs` — immutable
+per-commit release directories, a `staging` area, one atomically swapped
+pointer, and a launcher that refuses to mutate a release.  What was
+missing was the half that makes it usable: nothing staged or promoted a
+release, and the LaunchAgent still pointed at the checkout.  That
+change's own rollout doc called the missing half "a separate on-demand
+operator step that pauses for the owner".  The owner's directive is that
+pause being released.
 
 ## What changed here
 
