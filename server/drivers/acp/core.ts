@@ -44,6 +44,7 @@ import {
   SLOW_INIT_LOG_MS,
 } from "./init-deadline.ts";
 import { estimateCatalogCost } from "../../gen-ai-cost.ts";
+import { classifyResumeFailure, recoveryPromptFor } from "../../resume-recovery.ts";
 import { boundText } from "../../../shared/item-io.ts";
 import { annotatePromptBudget, captureTurnPrompt } from "../../sentry-ai.ts";
 import {
@@ -1728,6 +1729,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             let sessionResult: any = null;
             let sessionModelsState: z.infer<typeof acpSessionResultModels> | undefined;
             let fallbackNotice: string | undefined;
+            // The harness replay, when a poisoned saved session forces a
+            // fresh one (BF-2447): recoveryText carries the conversation so
+            // the new session is not blank (Sentry review on #1272).
+            let poisonedRebuild: { text: string; replayed: boolean } | null = null;
             if (cursor) {
               try {
                 sessionResult = await request(
@@ -1761,6 +1766,28 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   message:
                     "The saved session was left holding an unfinished turn, so its earlier native history was discarded and a fresh session was started.  Context from earlier in this thread may be missing.",
                 });
+                // The load was rejected before this turn's prompt was
+                // submitted and before anything streamed, so this is the
+                // safe side of the recovery boundary (before-accept).
+                const failure = classifyResumeFailure({
+                  attempted: true,
+                  rejected: true,
+                  promptSubmitted: false,
+                  producedOutput: false,
+                });
+                poisonedRebuild = recoveryPromptFor({
+                  recoveryText: turn.recoveryText,
+                  currentText: turn.text,
+                  failure,
+                });
+                if (poisonedRebuild.replayed) {
+                  // The replay is in the prompt now; let the harness say so.
+                  try {
+                    turn.onReplayRecovered?.();
+                  } catch (replayError) {
+                    console.error("acp: onReplayRecovered threw", replayError);
+                  }
+                }
               }
             }
             if (!sessionId) {
@@ -1784,6 +1811,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 type: "session.started",
                 sessionId,
                 model: selectedModel ?? init?._meta?.modelState?.currentModelId ?? cliTurn.model ?? null,
+                ...(poisonedRebuild?.replayed ? { rebuilt: true } : {}),
               });
             };
 
@@ -1897,11 +1925,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // "/name args" with no persona in front.  Every other turn is
             // shielded so a leading slash in the composed text cannot run as a
             // command (the persona normally leads, so this is a second lock).
+            // A poisoned-session rebuild replaces the turn's own text with
+            // the harness replay, which already carries this message once.
+            const promptTurn = poisonedRebuild?.replayed ? { ...turn, text: poisonedRebuild.text } : turn;
             const composed = support.buildPromptText
-              ? support.buildPromptText(turn)
-              : turn.system
-                ? `${turn.system}\n\n${turn.text}`
-                : turn.text;
+              ? support.buildPromptText(promptTurn)
+              : promptTurn.system
+                ? `${promptTurn.system}\n\n${promptTurn.text}`
+                : promptTurn.text;
             let text: string;
             if (turn.command) {
               // A command turn is the bare "/name args" the agent parses.  It
@@ -1917,7 +1948,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               const budgeted = applyAcpPromptBudget({
                 composed,
                 sections: turn.systemSections,
-                userText: turn.text,
+                userText: promptTurn.text,
                 budgetBytes,
               });
               annotatePromptBudget(threadId, turnId, budgeted);
