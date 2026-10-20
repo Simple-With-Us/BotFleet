@@ -164,6 +164,7 @@ public actor DatabaseService {
         try execute(sql: "PRAGMA journal_mode = WAL;")
         try execute(sql: "PRAGMA synchronous = NORMAL;")
         try execute(sql: "PRAGMA foreign_keys = ON;")
+        try execute(sql: "PRAGMA recursive_triggers = ON;")
 
         try createSchema()
     }
