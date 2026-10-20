@@ -240,7 +240,10 @@ const support: AcpSupport = {
   selectModel: {
     configId: "model",
     valueForModel: (model, advertised) => mcodeModelOptionValue(model, advertised),
-    modelForValue: (value) => mcodeModelForValue(value),
+    modelForValue: (value) => {
+      const decoded = parseMcodeModelValue(value);
+      return decoded ? mcodeCatalogPickerId(decoded) : null;
+    },
   },
   // mcode's only ACP auth method is a terminal `mcode login`
   // (packages/tui/src/acp/agent.ts, AUTH_METHOD_ID "minimax-code-login",
@@ -388,10 +391,15 @@ export function mcodePickerId(selection: { modelId: string; variant?: string }):
 /** The picker id for an advertised wire value: the shipped catalog id when one
  *  matches (so a renamed `MiniMax-M3.1-Flash` reports as the saved
  *  Preview-spelled row), otherwise the folded advertised id. */
-export function mcodeModelForValue(value: unknown): string | null {
+export function mcodeModelForValue(value: string): string | null {
   const decoded = parseMcodeModelValue(value);
-  if (!decoded) return null;
-  const picker = mcodePickerId(decoded);
+  return decoded ? mcodeCatalogPickerId(decoded) : null;
+}
+
+/** mcodePickerId, snapped onto the shipped catalog row it names when one
+ *  matches under mcodeModelKey. */
+function mcodeCatalogPickerId(selection: { modelId: string; variant?: string }): string {
+  const picker = mcodePickerId(selection);
   return catalogIdFor(picker) ?? picker;
 }
 
