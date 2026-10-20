@@ -15,6 +15,7 @@ import {
   isPricedMinimaxEndpoint,
   loadLocalMiniMaxConfig,
   MinimaxDriver,
+  minimaxWindowTokens,
   MINIMAX_PRICE_PER_MILLION,
   type MinimaxConfig,
 } from "./minimax.ts";
@@ -2315,5 +2316,26 @@ describe("MinimaxDriver", () => {
       expect(instance.adapter.capabilities?.effortLevels).toEqual(M31_LEVELS);
       await instance.dispose();
     });
+  });
+});
+
+describe("minimaxWindowTokens", () => {
+  // The catalog row's own cap is the budget source (Kody review, PR #1283):
+  // the 512K Flash row is a deliberate billing-tier cap, and the shared
+  // table's published 1M would push those turns into the higher input tier.
+  const options = [
+    { id: "MiniMax-M3.1-Flash", contextWindow: 524_288 },
+    { id: "MiniMax-M3.1-Flash-1M", contextWindow: 1_000_000 },
+  ] as unknown as Parameters<typeof minimaxWindowTokens>[1];
+
+  it("prefers the catalog row's own cap over the shared published table", () => {
+    expect(minimaxWindowTokens("MiniMax-M3.1-Flash", options)).toBe(524_288);
+    expect(minimaxWindowTokens("MiniMax-M3.1-Flash-1M", options)).toBe(1_000_000);
+  });
+
+  it("falls back to the shared table for an id the catalog does not carry, and stays undefined for an unknown one", () => {
+    expect(minimaxWindowTokens("MiniMax-M2.7", options)).toBe(204_800);
+    expect(minimaxWindowTokens("some-other-model", options)).toBeUndefined();
+    expect(minimaxWindowTokens(undefined, options)).toBeUndefined();
   });
 });
