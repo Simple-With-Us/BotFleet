@@ -169,7 +169,13 @@ async function main() {
     const result = await swapCurrent({ commit, env });
     process.stdout.write(`current: ${releasePath(commit, env)}\n`);
     if (result.previous) process.stdout.write(`previous release kept: ${result.previous}\n`);
-    process.stdout.write("restart the harness to run the new release (launchctl kickstart -k gui/$(id -u)/app.botfleet.server)\n");
+    // The store decides which program this release is for, so the restart
+    // hint does not assume the harness: the sidecar runs its own store and
+    // its own launchd job.
+    const job = store ? "app.botfleet.companion" : "app.botfleet.server";
+    process.stdout.write(
+      `restart the job that runs this store to pick the new release up (launchctl kickstart -k gui/$(id -u)/${job})\n`,
+    );
     return 0;
   }
 
