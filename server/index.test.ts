@@ -555,7 +555,9 @@ afterAll(async () => {
 
 describe("harness HTTP API", () => {
   it("restores encrypted workspace credentials only through authenticated runtime memory", async () => {
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const owner = z.object({ nonce: z.string().min(1) }).parse(
+      JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")),
+    );
     const restore = (body: unknown, nonce = owner.nonce) => fetch(`${BASE}/api/runtime/credentials`, {
       method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${nonce}` },
       body: JSON.stringify(body),
