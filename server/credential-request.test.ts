@@ -61,7 +61,8 @@ describe("credential request allowlist", () => {
   it("derives every target from one spec row tied to the server registry (BF-2437)", () => {
     const byId = new Map(SECRET_FIELDS.map((field) => [field.id, field]));
     for (const [id, spec] of Object.entries(CREDENTIAL_TARGET_SPECS)) {
-      expect(CREDENTIAL_TARGETS[id as CredentialTargetId].label).toBe(spec.label);
+      if (!isCredentialTargetId(id)) throw new Error(`spec key is not a target id: ${id}`);
+      expect(CREDENTIAL_TARGETS[id].label).toBe(spec.label);
       const field = byId.get(spec.secretFieldId);
       expect(field, `${id} -> ${spec.secretFieldId}`).toBeDefined();
       expect(field?.secret).toBe(true);

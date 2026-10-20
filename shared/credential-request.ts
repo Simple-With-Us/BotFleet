@@ -20,10 +20,12 @@ export interface CredentialTargetSpec {
   helpUrl: string;
   /** Field in server/secret-map.ts SECRET_FIELDS this target feeds. */
   secretFieldId: string;
-  /** Config location the saved value lands in. */
+  /** Config location the saved value lands in, as registry field id. */
   configPath: readonly string[];
-  /** Extra fields written alongside the value (e.g. a provider pin). */
-  configExtra?: Readonly<Record<string, string>>;
+  /** Build the config patch that stores a saved value. */
+  patch: (value: string) => CredentialConfig;
+  /** True when the config already holds a value for this target. */
+  isConfigured: (config: CredentialConfig) => boolean;
 }
 
 export const CREDENTIAL_TARGET_SPECS = {
@@ -34,6 +36,8 @@ export const CREDENTIAL_TARGET_SPECS = {
     helpUrl: "https://console.x.ai/",
     secretFieldId: "xai.key",
     configPath: ["xai", "key"],
+    patch: (value) => ({ xai: { key: value } }),
+    isConfigured: (config) => Boolean(config.xai?.key),
   },
   deepseekApiKey: {
     label: "DeepSeek API key",
@@ -42,6 +46,8 @@ export const CREDENTIAL_TARGET_SPECS = {
     helpUrl: "https://platform.deepseek.com/api_keys",
     secretFieldId: "deepseek.key",
     configPath: ["deepseek", "key"],
+    patch: (value) => ({ deepseek: { key: value } }),
+    isConfigured: (config) => Boolean(config.deepseek?.key),
   },
   boxToken: {
     label: "Box API key",
@@ -50,6 +56,8 @@ export const CREDENTIAL_TARGET_SPECS = {
     helpUrl: "https://docs.ascii.dev/box/api-keys",
     secretFieldId: "box.token",
     configPath: ["box", "token"],
+    patch: (value) => ({ box: { token: value } }),
+    isConfigured: (config) => Boolean(config.box?.token),
   },
   opencodeGoApiKey: {
     label: "OpenCode API key",
@@ -58,6 +66,8 @@ export const CREDENTIAL_TARGET_SPECS = {
     helpUrl: "https://opencode.ai/docs/providers/",
     secretFieldId: "opencodeGo.apiKey",
     configPath: ["opencodeGo", "apiKey"],
+    patch: (value) => ({ opencodeGo: { apiKey: value } }),
+    isConfigured: (config) => Boolean(config.opencodeGo?.apiKey),
   },
   ttsKey: {
     label: "MiniMax API key",
@@ -66,7 +76,8 @@ export const CREDENTIAL_TARGET_SPECS = {
     helpUrl: "https://platform.MiniMax.io/account/api-keys",
     secretFieldId: "tts.key",
     configPath: ["tts", "key"],
-    configExtra: { provider: "minimax" },
+    patch: (value) => ({ tts: { key: value, provider: "minimax" } }),
+    isConfigured: (config) => Boolean(config.tts?.key),
   },
   openaiImageApiKey: {
     label: "OpenAI API key (avatar fallback)",
@@ -75,11 +86,14 @@ export const CREDENTIAL_TARGET_SPECS = {
     helpUrl: "https://platform.openai.com/api-keys",
     secretFieldId: "imageGen.key",
     configPath: ["imageGen", "key"],
+    patch: (value) => ({ imageGen: { key: value } }),
+    isConfigured: (config) => Boolean(config.imageGen?.key),
   },
 } as const satisfies Record<string, CredentialTargetSpec>;
 
 export type CredentialTargetId = keyof typeof CREDENTIAL_TARGET_SPECS;
 
+// SAFETY: the entries come from CREDENTIAL_TARGET_SPECS, whose keys are exactly CredentialTargetId.
 export const CREDENTIAL_TARGETS: Readonly<
   Record<
     CredentialTargetId,
@@ -114,33 +128,11 @@ export function isCredentialTargetId(value: unknown): value is CredentialTargetI
 }
 
 export function credentialConfigPatch(id: CredentialTargetId, value: string): CredentialConfig {
-  const spec: CredentialTargetSpec = CREDENTIAL_TARGET_SPECS[id];
-  const patch: Record<string, unknown> = {};
-  let cursor: Record<string, unknown> = patch;
-  for (let i = 0; i < spec.configPath.length - 1; i++) {
-    const next: Record<string, unknown> = {};
-    cursor[spec.configPath[i]] = next;
-    cursor = next;
-  }
-  cursor[spec.configPath[spec.configPath.length - 1]] = value;
-  if (spec.configExtra) {
-    let parent: Record<string, unknown> = patch;
-    for (let i = 0; i < spec.configPath.length - 1; i++) {
-      parent = parent[spec.configPath[i]] as Record<string, unknown>;
-    }
-    Object.assign(parent, spec.configExtra);
-  }
-  return patch as CredentialConfig;
+  return CREDENTIAL_TARGET_SPECS[id].patch(value);
 }
 
 export function credentialIsConfigured(config: CredentialConfig, id: CredentialTargetId): boolean {
-  const spec: CredentialTargetSpec = CREDENTIAL_TARGET_SPECS[id];
-  let cursor: unknown = config;
-  for (const key of spec.configPath) {
-    if (cursor === null || typeof cursor !== "object") return false;
-    cursor = (cursor as Record<string, unknown>)[key];
-  }
-  return Boolean(cursor);
+  return CREDENTIAL_TARGET_SPECS[id].isConfigured(config);
 }
 
 export function isReusableCredentialRequest(
