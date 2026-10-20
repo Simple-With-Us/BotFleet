@@ -16,6 +16,25 @@
 set -euo pipefail
 
 ROOT="${BOTFLEET_SERVER_ROOT:-$HOME/apps/botfleet-server}"
+# The runtime root is the release store's pointer, not a git checkout.
+#
+# A checkout is a mutable working tree: an update rewrote it under a live
+# server, a seat's branch deleted files the harness still imported, and a
+# janitor removed its node_modules from under a serving process.  A promoted
+# release is immutable and named by the commit it holds, and the pointer at
+# ~/.botfleet/current is the only thing that changes when the harness moves
+# to a new version.
+#
+# The pointer wins when it exists.  BOTFLEET_SERVER_ROOT still overrides it
+# (tests point it at a fixture), and the legacy checkout path stays the
+# fallback for a machine that has never promoted a release, so nothing
+# breaks on a fresh install.
+if [ -z "${BOTFLEET_SERVER_ROOT:-}" ]; then
+  STORE_POINTER="$HOME/.botfleet/current"
+  if [ -e "$STORE_POINTER" ] || [ -L "$STORE_POINTER" ]; then
+    ROOT="$STORE_POINTER"
+  fi
+fi
 # `current` is a symlink into ~/.botfleet/releases/<commit>.  Resolve it once,
 # physically, so every later path is the real directory: `cd -P` means the
 # server's own working directory is the release rather than the pointer, which

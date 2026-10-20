@@ -54,7 +54,28 @@ test("the deployed paths the agent runs are the ones the repo documents", () => 
   // A watchdog pointed at a path nobody builds is worse than no watchdog: it
   // looks healthy and does nothing.
   assert.match(plist, /<string>\/Users\/jay\/apps\/botfleet-server-start\.sh<\/string>/);
-  assert.match(plist, /<string>\/Users\/jay\/apps\/botfleet-server<\/string>/);
+  // The runtime root is the release store's pointer, not a checkout.  A
+  // checkout is a mutable working tree: an update rewrote it under a live
+  // server, a seat's branch deleted files the harness still imported, and the
+  // janitor removed its node_modules from under a serving process.
+  assert.match(
+    plist,
+    /<key>BOTFLEET_SERVER_ROOT<\/key>\s*<string>\/Users\/jay\/\.botfleet\/current<\/string>/,
+    "the agent must run the release the pointer names, not a git checkout",
+  );
+  // launchd refuses to start a job whose working directory does not exist, so
+  // the working directory is the store root (which always exists) rather than
+  // the pointer (which a missing release would leave dangling).
+  assert.match(
+    plist,
+    /<key>WorkingDirectory<\/key>\s*<string>\/Users\/jay\/\.botfleet<\/string>/,
+    "the working directory must be the store root, not the pointer",
+  );
+  assert.doesNotMatch(
+    plist,
+    /<string>\/Users\/jay\/apps\/botfleet-server<\/string>/,
+    "the deployment checkout must not be a deployed path any more",
+  );
 });
 
 test("the script the agent runs does exit cleanly when a harness is healthy", () => {
