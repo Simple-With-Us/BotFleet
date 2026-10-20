@@ -3298,34 +3298,34 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     resetApnsKeyCache();
   });
 
-  it.skipIf(process.platform === "win32")("reads AUTHKEY_<KEY_ID> through fleet-secrets and never a file under the home folder", () => {
+  it.skipIf(process.platform === "win32")("reads AUTHKEY_<KEY_ID> through fleet-secrets and never a file under the home folder", async () => {
     const argsFile = join(dir, "args");
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" > '${argsFile}'\n${pemScript(testP8())}`);
     process.env.APNS_KEY_ID = "KEY1234567";
-    const config = loadApnsConfig();
+    const config = await loadApnsConfig();
     expect(config?.keyId).toBe("KEY1234567");
     expect(config?.p8).toContain("BEGIN PRIVATE KEY");
     expect(readFileSync(argsFile, "utf8").trim()).toBe("get AUTHKEY_KEY1234567");
     expect(apnsKeySource()).toBe("Infisical AUTHKEY_KEY1234567");
   });
 
-  it.skipIf(process.platform === "win32")("reads the shared key from APNS_KEY_P8 and its id from APNS_KEY_ID by default", () => {
+  it.skipIf(process.platform === "win32")("reads the shared key from APNS_KEY_P8 and its id from APNS_KEY_ID by default", async () => {
     const argsFile = join(dir, "args");
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
       `echo "$@" >> '${argsFile}'\ncase "$2" in\n  APNS_KEY_ID) echo ROTATED001 ;;\n  APNS_KEY_P8) ${pemScript(testP8())}\n ;;\n  *) exit 3 ;;\nesac`,
     );
-    const config = loadApnsConfig();
+    const config = await loadApnsConfig();
     expect(config?.keyId).toBe("ROTATED001");
     expect(config?.p8).toContain("BEGIN PRIVATE KEY");
     expect(readFileSync(argsFile, "utf8").trim().split("\n")).toEqual(["get APNS_KEY_P8", "get APNS_KEY_ID"]);
     expect(apnsKeySource()).toBe("Infisical APNS_KEY_P8");
   });
 
-  it.skipIf(process.platform === "win32")("falls back to the shared key id when Infisical has no usable APNS_KEY_ID", () => {
+  it.skipIf(process.platform === "win32")("falls back to the shared key id when Infisical has no usable APNS_KEY_ID", async () => {
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
       `case "$2" in\n  APNS_KEY_P8) ${pemScript(testP8())}\n ;;\n  *) exit 3 ;;\nesac`,
     );
-    expect(loadApnsConfig()?.keyId).toBe(SHARED_APNS_KEY_ID);
+    expect((await loadApnsConfig())?.keyId).toBe(SHARED_APNS_KEY_ID);
     expect(SHARED_APNS_KEY_ID).toBe("HSJ98QN95V");
   });
 
@@ -3335,7 +3335,7 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
   // failure looks like "no key", and APNs stays off.  These three tests pin
   // the ceiling above the measured worst case, the override that widens it,
   // and the refusal to honour a nonsense override.
-  it.skipIf(process.platform === "win32")("keeps the read ceiling above the slowest measured vault read", () => {
+  it.skipIf(process.platform === "win32")("keeps the read ceiling above the slowest measured vault read", async () => {
     // Measured on the fleet Mac:  3.6-5.3 s warm, 16.6 s cold cache.  The
     // ceiling is derived from the measurement, and this asserts the ordering
     // that keeps it true if either number is retuned:  a ceiling at or below
@@ -3344,15 +3344,47 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     expect(APNS_VAULT_READ_TIMEOUT_MS).toBeGreaterThan(16_600);
   });
 
-  it.skipIf(process.platform === "win32")("honours a narrowed read ceiling from the environment", () => {
+  it.skipIf(process.platform === "win32")("honours a narrowed read ceiling from the environment", async () => {
     // A ceiling of 1 ms kills the read before the fake can answer, which is
     // exactly how a slow vault looks to the sidecar.
     process.env.APNS_VAULT_READ_TIMEOUT_MS = "1";
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
-    expect(loadApnsConfig()).toBeNull();
+    // The read is async now, so a read started by an earlier test can still be
+    // in flight.  The cache is cleared here as well as in `beforeEach` so this
+    // test never depends on the order the suite happens to run in.
+    resetApnsKeyCache();
+    expect(await loadApnsConfig()).toBeNull();
   });
 
-  it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a positive number", () => {
+  it.skipIf(process.platform === "win32")("does not block the event loop while the vault answers", async () => {
+    // The read takes 400 ms.  A synchronous read freezes the event loop for
+    // that whole window, so a timer scheduled alongside it cannot fire until
+    // the read has already finished — which is exactly the stall the raised
+    // ceiling made five times worse.  The read is async, so the timer fires
+    // while the read is still running.
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`sleep 0.4\nexit 3`);
+    resetApnsKeyCache();
+    let fired = false;
+    const timer = setTimeout(() => {
+      fired = true;
+    }, 50);
+    await loadApnsConfig();
+    clearTimeout(timer);
+    expect(fired).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("runs one vault read when two callers miss the cache together", async () => {
+    // The read is async now, so two callers can reach the vault at once.  A
+    // synchronous read could not be interleaved; an async one can, and two
+    // concurrent reads would double the wall time of the slow case.
+    const calls = join(dir, "calls");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" >> '${calls}'\nsleep 0.3\nexit 3`);
+    resetApnsKeyCache();
+    await Promise.all([loadApnsConfig(), apnsKeyStamp()]);
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a positive number", async () => {
     // `Number("-1")` is a number, so a negative override would otherwise
     // become a ceiling that fires instantly — the failure this ceiling
     // exists to remove, reintroduced through the override.
@@ -3360,11 +3392,11 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
       process.env.APNS_VAULT_READ_TIMEOUT_MS = bad;
       resetApnsKeyCache();
       process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
-      expect(loadApnsConfig()?.p8).toContain("BEGIN PRIVATE KEY");
+      expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
     }
   });
 
-  it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a whole number of milliseconds", () => {
+  it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a whole number of milliseconds", async () => {
     // Node's execFileSync rejects a fractional timeout with ERR_OUT_OF_RANGE:
     // the read throws, the catch swallows it, and the key silently vanishes
     // — the same "no key" outcome the ceiling exists to prevent.
@@ -3372,11 +3404,11 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
       process.env.APNS_VAULT_READ_TIMEOUT_MS = bad;
       resetApnsKeyCache();
       process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
-      expect(loadApnsConfig()?.p8).toContain("BEGIN PRIVATE KEY");
+      expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
     }
   });
 
-  it.skipIf(process.platform === "win32")("does not read the vault again straight after a slow failed read", () => {
+  it.skipIf(process.platform === "win32")("does not read the vault again straight after a slow failed read", async () => {
     // The failure is cached from the moment the read FINISHED.  A read that
     // outlasts the retry window used to leave an already-expired entry
     // behind, so the next caller — `refreshConfig` asks for the stamp and
@@ -3386,81 +3418,81 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     process.env.APNS_VAULT_RETRY_MS = "100";
     process.env.APNS_VAULT_READ_TIMEOUT_MS = "300";
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" >> '${calls}'\nsleep 1\nexit 3`);
-    expect(loadApnsConfig()).toBeNull();
-    expect(apnsKeyStamp()).toBeNull();
+    expect(await loadApnsConfig()).toBeNull();
+    expect(await apnsKeyStamp()).toBeNull();
     expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(1);
   });
 
-  it.skipIf(process.platform === "win32")("keeps the last good key id when only the id read fails, and stamps the id", () => {
+  it.skipIf(process.platform === "win32")("keeps the last good key id when only the id read fails, and stamps the id", async () => {
     const pem = testP8();
     const ok = `case "$2" in\n  APNS_KEY_ID) echo ROTATED001 ;;\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;
     const noId = `case "$2" in\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(ok);
-    const good = apnsKeyStamp();
-    expect(loadApnsConfig()?.keyId).toBe("ROTATED001");
+    const good = await apnsKeyStamp();
+    expect((await loadApnsConfig())?.keyId).toBe("ROTATED001");
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(noId);
     vi.useFakeTimers();
     try {
       vi.setSystemTime(Date.now() + APNS_VAULT_CACHE_MS + 1);
-      expect(loadApnsConfig()?.keyId).toBe("ROTATED001");
-      expect(apnsKeyStamp()).toBe(good);
+      expect((await loadApnsConfig())?.keyId).toBe("ROTATED001");
+      expect(await apnsKeyStamp()).toBe(good);
       // A cold start with no id falls back to the built-in id, and the stamp
       // differs, so a fault recorded under it does not outlive the real id.
       resetApnsKeyCache();
-      expect(loadApnsConfig()?.keyId).toBe(SHARED_APNS_KEY_ID);
-      expect(apnsKeyStamp()).not.toBe(good);
+      expect((await loadApnsConfig())?.keyId).toBe(SHARED_APNS_KEY_ID);
+      expect(await apnsKeyStamp()).not.toBe(good);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("uses the shared key id with an injected APNS_P8 and no pinned id", () => {
+  it("uses the shared key id with an injected APNS_P8 and no pinned id", async () => {
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
     process.env.APNS_P8 = testP8();
-    expect(loadApnsConfig()?.keyId).toBe("HSJ98QN95V");
+    expect((await loadApnsConfig())?.keyId).toBe("HSJ98QN95V");
   });
 
-  it.skipIf(process.platform === "win32")("stamps the key with a digest, so a rotated key changes the stamp", () => {
+  it.skipIf(process.platform === "win32")("stamps the key with a digest, so a rotated key changes the stamp", async () => {
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
-    const first = apnsKeyStamp();
+    const first = await apnsKeyStamp();
     expect(first).toMatch(/^Infisical APNS_KEY_P8:[0-9a-f]{16}$/);
     resetApnsKeyCache();
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
-    expect(apnsKeyStamp()).not.toBe(first);
+    expect(await apnsKeyStamp()).not.toBe(first);
   });
 
-  it.skipIf(process.platform === "win32")("keeps the last good key through a transient fleet-secrets failure", () => {
+  it.skipIf(process.platform === "win32")("keeps the last good key through a transient fleet-secrets failure", async () => {
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
-    const good = loadApnsConfig();
+    const good = await loadApnsConfig();
     expect(good?.p8).toContain("BEGIN PRIVATE KEY");
     // Fail every later read and let the retry window pass.
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
     vi.useFakeTimers();
     try {
       vi.setSystemTime(Date.now() + APNS_VAULT_CACHE_MS + 1);
-      expect(loadApnsConfig()?.p8).toBe(good?.p8);
+      expect((await loadApnsConfig())?.p8).toBe(good?.p8);
       vi.setSystemTime(Date.now() + APNS_VAULT_RETRY_MS + 1);
-      expect(loadApnsConfig()?.p8).toBe(good?.p8);
+      expect((await loadApnsConfig())?.p8).toBe(good?.p8);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("reads as no key when fleet-secrets fails", () => {
+  it("reads as no key when fleet-secrets fails", async () => {
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
-    expect(loadApnsConfig()).toBeNull();
-    expect(apnsKeyStamp()).toBeNull();
+    expect(await loadApnsConfig()).toBeNull();
+    expect(await apnsKeyStamp()).toBeNull();
   });
 
-  it("prefers APNS_P8 and then APNS_P8_PATH over Infisical", () => {
+  it("prefers APNS_P8 and then APNS_P8_PATH over Infisical", async () => {
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
     process.env.APNS_P8 = testP8();
-    expect(loadApnsConfig()?.p8).toContain("BEGIN PRIVATE KEY");
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
     delete process.env.APNS_P8;
     const file = join(dir, "AuthKey.p8");
     writeFileSync(file, testP8(), { mode: 0o600 });
     process.env.APNS_P8_PATH = file;
-    expect(loadApnsConfig()?.p8).toContain("BEGIN PRIVATE KEY");
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
     expect(apnsKeySource()).toBe(file);
   });
 });

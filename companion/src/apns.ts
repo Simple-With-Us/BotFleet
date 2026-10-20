@@ -3,10 +3,11 @@
 // leaves this process; tests inject sendImpl.
 import { connect as http2Connect, constants as http2Constants, type ClientHttp2Session, type ClientHttp2Stream } from "node:http2";
 import { createHash, createPrivateKey, sign as cryptoSign } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { isFiniteJsonNumber, isJsonObject, isJsonString, type JsonObject, type JsonValue } from "./json.ts";
 import { DATA_DIR, writeFileAtomic } from "./state.ts";
@@ -77,7 +78,7 @@ export const APNS_VAULT_READ_TIMEOUT_MS = 3 * APNS_VAULT_READ_BUDGET_MS;
  * timeout and the read stops working, which the sidecar reads as "no key" and
  * turns APNs pushes off.  `Number("-1")` is a number, so a negative value
  * sails through a `|| fallback` and becomes a timeout that fires instantly.
- * `Number("0.5")` is a number too, and Node's `execFileSync` rejects a
+ * `Number("0.5")` is a number too, and Node's `execFile` rejects a
  * fractional timeout with ERR_OUT_OF_RANGE — so the read throws, the catch
  * swallows it, and the key silently disappears. */
 function positiveIntegerEnv(name: string, fallback: number): number {
@@ -105,19 +106,42 @@ interface VaultKey {
 
 let vaultKey: VaultKey | null = null;
 
+/** The read in flight, so two callers that miss the cache together cause ONE
+ * vault read rather than two.  A synchronous read could not be interleaved;
+ * an async one can, and two concurrent reads would double the wall time of
+ * exactly the slow case this module exists to survive. */
+let vaultReadInFlight: Promise<VaultKey> | null = null;
+
+/** Bumped by `resetApnsKeyCache`.  A read that started before the bump must
+ * not write its answer into the cache the caller just cleared. */
+let vaultGeneration = 0;
+
 /** Test seam: forget the cached Infisical read. */
 export function resetApnsKeyCache(): void {
   vaultKey = null;
+  vaultReadInFlight = null;
+  vaultGeneration++;
 }
 
-function fleetSecretsGet(name: string): string | null {
+const execFileAsync = promisify(execFile);
+
+/** One `fleet-secrets` read, off the event loop.
+ *
+ * The read is an Infisical round-trip:  3.6-5.3 s warm, 16.6 s cold on the
+ * fleet Mac, and the ceiling above allows up to 49.8 s for a slower vault.
+ * Run synchronously, that window is time the sidecar cannot answer a request,
+ * fire a timer, or drain a push queue for — and the two reads a cold start
+ * needs are sequential, so the worst case froze the event loop for ~100 s.
+ * The read is async and the caller awaits it, and the same `timeout` still
+ * bounds it:  the child is killed at the ceiling, and a killed read is still
+ * a failed read, which is what turns APNs pushes off. */
+async function fleetSecretsGet(name: string): Promise<string | null> {
   try {
-    const out = execFileSync(fleetSecretsBin(), ["get", name], {
+    const { stdout } = await execFileAsync(fleetSecretsBin(), ["get", name], {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
       timeout: vaultReadTimeoutMs(),
     });
-    return out.replace(/\n$/, "");
+    return stdout.replace(/\n$/, "");
   } catch {
     return null;
   }
@@ -125,46 +149,59 @@ function fleetSecretsGet(name: string): string | null {
 
 /** The key id Infisical names for the shared key, or null when the read
  * fails or does not look like an Apple key id. */
-function sharedKeyId(): string | null {
-  const id = fleetSecretsGet(SHARED_APNS_KEY_ID_NAME)?.trim();
+async function sharedKeyId(): Promise<string | null> {
+  const id = (await fleetSecretsGet(SHARED_APNS_KEY_ID_NAME))?.trim();
   return id && /^[A-Z0-9]{10}$/.test(id) ? id : null;
 }
 
-function readVault(now = Date.now()): VaultKey {
-  const pin = pinnedKeyId() ?? "";
-  const retryMs = vaultRetryMs();
-  if (vaultKey && vaultKey.pin === pin && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : retryMs)) {
-    return vaultKey;
-  }
-  const p8 = fleetSecretsGet(apnsVaultName(pin || undefined));
+/** The read itself, away from the cache check. */
+async function readVaultFromVault(pin: string, retryMs: number, generation: number): Promise<VaultKey> {
+  const p8 = await fleetSecretsGet(apnsVaultName(pin || undefined));
   // The entry is stamped when the read FINISHED, not when it started.  A read
   // that runs longer than the retry window would otherwise leave an
   // already-expired entry behind, and the very next caller — `refreshConfig`
-  // asks for the stamp and then the config — would run another full blocking
-  // read instead of the cached answer.
+  // asks for the stamp and then the config — would run another full read
+  // instead of the cached answer.
   const completedAt = Date.now();
+  const store = (next: VaultKey): VaultKey => {
+    if (generation === vaultGeneration) vaultKey = next;
+    return next;
+  };
   if (p8 === null && vaultKey && vaultKey.pin === pin && vaultKey.p8) {
     // A transient failure keeps the last good key (pushes keep flowing) and
     // is retried after the short window rather than the long one.
-    vaultKey = { ...vaultKey, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) };
-    return vaultKey;
+    return store({ ...vaultKey, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) });
   }
   if (pin || p8 === null) {
-    vaultKey = { pin, keyId: pin || SHARED_APNS_KEY_ID, p8, at: completedAt };
-    return vaultKey;
+    return store({ pin, keyId: pin || SHARED_APNS_KEY_ID, p8, at: completedAt });
   }
-  const id = sharedKeyId();
+  const id = await sharedKeyId();
   if (id) {
-    vaultKey = { pin, keyId: id, p8, at: completedAt };
-    return vaultKey;
+    return store({ pin, keyId: id, p8, at: completedAt });
   }
   // The PEM read but its id did not:  keep the last good id for the same
   // key, otherwise use the built-in id, and retry after the short window
   // either way.  The id is part of the stamp, so a fault Apple records
   // against a wrong fallback id clears once the real id is read.
   const keyId = vaultKey && vaultKey.pin === pin && vaultKey.p8 === p8 ? vaultKey.keyId : SHARED_APNS_KEY_ID;
-  vaultKey = { pin, keyId, p8, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) };
-  return vaultKey;
+  return store({ pin, keyId, p8, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) });
+}
+
+async function readVault(now = Date.now()): Promise<VaultKey> {
+  const pin = pinnedKeyId() ?? "";
+  const retryMs = vaultRetryMs();
+  if (vaultKey && vaultKey.pin === pin && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : retryMs)) {
+    return vaultKey;
+  }
+  if (!vaultReadInFlight) {
+    const read = readVaultFromVault(pin, retryMs, vaultGeneration);
+    vaultReadInFlight = read;
+    const clear = () => {
+      if (vaultReadInFlight === read) vaultReadInFlight = null;
+    };
+    void read.then(clear, clear);
+  }
+  return vaultReadInFlight;
 }
 
 /** Where the signing key comes from, as text for status lines.  Never the
@@ -178,7 +215,7 @@ export function apnsKeySource(): string {
   return `Infisical ${apnsVaultName(pinnedKeyId())}`;
 }
 
-function resolveP8(): { p8: string; origin: string; keyId: string } | null {
+async function resolveP8(): Promise<{ p8: string; origin: string; keyId: string } | null> {
   const pinned = pinnedKeyId();
   const inline = process.env.APNS_P8?.trim();
   if (inline) return { p8: inline, origin: "env", keyId: pinned ?? SHARED_APNS_KEY_ID };
@@ -195,7 +232,7 @@ function resolveP8(): { p8: string; origin: string; keyId: string } | null {
       return null;
     }
   }
-  const got = readVault();
+  const got = await readVault();
   return got.p8 ? { p8: got.p8, origin: "vault", keyId: got.keyId } : null;
 }
 
@@ -209,8 +246,8 @@ function resolveP8(): { p8: string; origin: string; keyId: string } | null {
 // fault persisted before the upgrade therefore never matches and is cleared
 // once on load:  the safe direction, since a key that is still bad is simply
 // re-recorded by the next push Apple refuses.
-export function apnsKeyStamp(): string | null {
-  const got = resolveP8();
+export async function apnsKeyStamp(): Promise<string | null> {
+  const got = await resolveP8();
   if (!got) return null;
   // The key id is hashed with the PEM:  the same PEM under a different id is
   // a different signing identity to Apple.
@@ -218,10 +255,10 @@ export function apnsKeyStamp(): string | null {
   return `${apnsKeySource()}:${digest}`;
 }
 
-export function loadApnsConfig(): ApnsConfig | null {
+export async function loadApnsConfig(): Promise<ApnsConfig | null> {
   const teamId = process.env.APNS_TEAM_ID?.trim() || "CC8UTF7ATG";
   const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet.ios";
-  const got = resolveP8();
+  const got = await resolveP8();
   if (!got) return null;
   const { p8, keyId } = got;
   if (!p8.includes("BEGIN PRIVATE KEY")) return null;
@@ -2158,9 +2195,9 @@ export function watchHarnessNotifications(options: {
   /** Explicit config pins the sender; `undefined` discovers it from disk and
    * keeps looking until it appears, then watches for it changing. */
   config?: ApnsConfig | null;
-  loadConfig?: () => ApnsConfig | null;
+  loadConfig?: () => ApnsConfig | null | Promise<ApnsConfig | null>;
   /** Fingerprint of the key file, so a rotated key is noticed. */
-  keyStamp?: () => string | null;
+  keyStamp?: () => string | null | Promise<string | null>;
   /** Retire a token Apple has rejected.  The token is named so a phone
    * that registered a replacement while this send was in flight keeps it. */
   forgetToken?: (deviceId: string, token: string) => void;
@@ -2338,24 +2375,27 @@ export function watchHarnessNotifications(options: {
     loggedQueueFull.delete(deviceId);
   };
 
-  const onKeyFault = (config: ApnsConfig, reason: string, errorTimestamp?: number) => {
+  const onKeyFault = async (config: ApnsConfig, reason: string, errorTimestamp?: number) => {
     if (keyFault) return;
     keyFault = true;
-    // Pin the verdict to the file that is on disk right now: only a
-    // DIFFERENT file clears it, here and across restarts.
-    const stamp = keyStamp();
-    if (stamp !== null) discoveredStamp = stamp;
     // `discovered` is deliberately kept.  Nulling it here is what used to
     // make a later rotation skip the key-identity comparison in
     // `refreshConfig`, so the replacement .p8 was signed against the
     // provider token cached for the key Apple had just refused — and was
     // refused in turn, permanently.  The refused key's token and its TLS
-    // sessions are worthless either way, so drop them now.
+    // sessions are worthless either way, so drop them now, before the await
+    // below, so nothing can reuse them in the meantime.
     invalidateProviderToken(config);
     dropHttp2Sessions();
     sessionFingerprints.clear();
     const at = now();
     health.rejectKey(at, reason, errorTimestamp);
+    // Pin the verdict to the file that is on disk right now: only a
+    // DIFFERENT file clears it, here and across restarts.  The read is
+    // served from the four-minute cache the key check just refreshed, so
+    // this await is a microtask, not a vault round-trip.
+    const stamp = await keyStamp();
+    if (stamp !== null) discoveredStamp = stamp;
     keyFaultStore?.save({ reason, at, keyStamp: discoveredStamp, errorTimestamp });
     console.warn(`companion: APNs refused the signing key (${reason}); pushes are off until the key file changes`);
     // Leave the stream so the pump re-enters the key check rather than
@@ -2391,12 +2431,43 @@ export function watchHarnessNotifications(options: {
     circuitRetries.set(deviceId, cancel);
   };
 
+  // A key fault Apple has already delivered survives this process.  Without
+  // this, every Electron relaunch resumed full-rate sends against a key
+  // Apple had refused days earlier — and every surface, including the
+  // phone's own settings row, went on reporting pushes as on.
+  const persistedFault = keyFaultStore?.load() ?? null;
+  /** Whether the persisted fault has already been weighed against the key on
+   * disk.  The weighing needs a stamp, and the stamp needs the vault, so it
+   * happens inside the first `refreshConfig` — which the pump awaits before
+   * it sends anything.  Checking it at construction would have meant either a
+   * blocking read on the event loop or a window where a push goes out against
+   * a key Apple already refused. */
+  let persistedFaultChecked = persistedFault === null;
+
   /** Look at the key file and reload when it has changed.  Runs on a timer
    * rather than only when the stream reconnects: a sidecar whose harness
    * stays up for days never reconnects, and a key dropped in or rotated
    * under it would otherwise go unnoticed for exactly as long. */
-  const refreshConfig = (): ApnsConfig | null => {
-    const stamp = keyStamp();
+  const refreshConfig = async (): Promise<ApnsConfig | null> => {
+    const stamp = await keyStamp();
+    if (!persistedFaultChecked) {
+      persistedFaultChecked = true;
+      if (persistedFault) {
+        if (stamp !== null && stamp === persistedFault.keyStamp) {
+          keyFault = true;
+          discoveredStamp = stamp;
+          health.rejectKey(persistedFault.at, persistedFault.reason, persistedFault.errorTimestamp);
+          console.warn(
+            `companion: APNs pushes stay off — Apple refused this signing key (${persistedFault.reason}) ` +
+              `and the key has not changed since.  Replace ${apnsKeySource()} to turn them back on.`,
+          );
+        } else {
+          // A different file, or no file at all: the verdict was about a key we
+          // no longer hold, so it has nothing left to say.
+          keyFaultStore?.save(null);
+        }
+      }
+    }
     if (keyFault) {
       // Apple refuses what is on disk.  Only a different file can help.
       if (stamp === null || stamp === discoveredStamp) return null;
@@ -2423,7 +2494,7 @@ export function watchHarnessNotifications(options: {
       // cached against it.
       return discovered;
     }
-    const loaded = loadConfig();
+    const loaded = await loadConfig();
     // Whatever is on disk now may not be what the cached token was signed
     // with.  Compare key identity rather than the file stamp: a .p8 rewritten
     // with identical bytes — a secrets sync, a backup restore — is the same
@@ -2462,30 +2533,8 @@ export function watchHarnessNotifications(options: {
     return fixed ?? discovered;
   };
 
-  // A key fault Apple has already delivered survives this process.  Without
-  // this, every Electron relaunch resumed full-rate sends against a key
-  // Apple had refused days earlier — and every surface, including the
-  // phone's own settings row, went on reporting pushes as on.
-  const persistedFault = keyFaultStore?.load() ?? null;
-  if (persistedFault) {
-    const stamp = keyStamp();
-    if (stamp !== null && stamp === persistedFault.keyStamp) {
-      keyFault = true;
-      discoveredStamp = stamp;
-      health.rejectKey(persistedFault.at, persistedFault.reason, persistedFault.errorTimestamp);
-      console.warn(
-        `companion: APNs pushes stay off — Apple refused this signing key (${persistedFault.reason}) ` +
-          `and the key has not changed since.  Replace ${apnsKeySource()} to turn them back on.`,
-      );
-    } else {
-      // A different file, or no file at all: the verdict was about a key we
-      // no longer hold, so it has nothing left to say.
-      keyFaultStore?.save(null);
-    }
-  }
-
   const keyTimer = setInterval(() => {
-    refreshConfig();
+    void refreshConfig();
   }, recheckMs);
   keyTimer.unref?.();
 
@@ -2565,7 +2614,7 @@ export function watchHarnessNotifications(options: {
     if (result.reason === INVALID_PROVIDER_TOKEN) {
       const current = fixed ?? discovered;
       if (current !== null && providerTokenKey(config) === providerTokenKey(current)) {
-        onKeyFault(config, result.reason, result.errorTimestamp);
+        void onKeyFault(config, result.reason, result.errorTimestamp);
       }
       return;
     }
@@ -2718,7 +2767,7 @@ export function watchHarnessNotifications(options: {
       // rotation and wave through a rejection of the key still in use.
       const current = fixed ?? discovered;
       if (current !== null && providerTokenKey(config) === providerTokenKey(current)) {
-        onKeyFault(config, result.reason, result.errorTimestamp);
+        void onKeyFault(config, result.reason, result.errorTimestamp);
       } else if (!keyFault) {
         console.warn("companion: APNs refused a signing key that has since been replaced; the replacement stands");
       }
@@ -2904,7 +2953,7 @@ export function watchHarnessNotifications(options: {
 
   const pump = async () => {
     while (!stopped) {
-      const config = refreshConfig();
+      const config = await refreshConfig();
       if (!config) {
         await pause(recheckMs);
         continue;
