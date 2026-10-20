@@ -15,6 +15,12 @@
 # no harness is currently serving), so rotating here is safe.
 set -euo pipefail
 
+# BF-2456 (owner decision, 2026-10-18): the operator fleet is on, so role
+# bots launch with their BF-<ROLE> seat (AGENT_LAUNCH_SEAT) and the matching
+# seat prompt. Without this, launchIdentityFor returns a null seat and every
+# BF role starts seatless. An explicit operator value still wins.
+export BOTFLEET_FLEET_SEAT_PROMPTS="${BOTFLEET_FLEET_SEAT_PROMPTS-1}"
+
 ROOT="${BOTFLEET_SERVER_ROOT:-$HOME/apps/botfleet-server}"
 # The runtime root is the release store's pointer, not a git checkout.
 #
