@@ -202,6 +202,11 @@ function runRelease(fixture) {
       BOTFLEET_FAIL_LEDGER: fixture.ledger,
       BOTFLEET_FAIL_STORM_THRESHOLD: "20",
       BOTFLEET_FAIL_WINDOW_SECONDS: "3600",
+      BOTFLEET_SHUTDOWN_MARKER: join(fixture.dir, "stopped.marker"),
+      BOTFLEET_STARTUP_DISABLED_MARKER: join(fixture.dir, "startup-disabled.marker"),
+      BOTFLEET_STARTUP_ENABLED_MARKER: join(fixture.dir, "startup-enabled.marker"),
+      BOTFLEET_STARTUP_SESSION: join(fixture.dir, "startup-session"),
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
     },
   });
 }
@@ -378,6 +383,11 @@ function runIdentity(fixture, extraEnv = {}) {
       BOTFLEET_FAIL_LEDGER: fixture.ledger,
       BOTFLEET_FAIL_STORM_THRESHOLD: "20",
       BOTFLEET_FAIL_WINDOW_SECONDS: "3600",
+      BOTFLEET_SHUTDOWN_MARKER: join(fixture.dir, "stopped.marker"),
+      BOTFLEET_STARTUP_DISABLED_MARKER: join(fixture.dir, "startup-disabled.marker"),
+      BOTFLEET_STARTUP_ENABLED_MARKER: join(fixture.dir, "startup-enabled.marker"),
+      BOTFLEET_STARTUP_SESSION: join(fixture.dir, "startup-session"),
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
     },
   });
 }
@@ -769,6 +779,10 @@ test("the store pointer is the runtime root when it exists", () => {
       BOTFLEET_HEAL_STAMP: join(dir, "heal-stamp"),
       BOTFLEET_FAIL_LEDGER: join(dir, "ledger"),
       BOTFLEET_SHUTDOWN_MARKER: join(dir, "stopped.marker"),
+      BOTFLEET_STARTUP_DISABLED_MARKER: join(dir, "startup-disabled.marker"),
+      BOTFLEET_STARTUP_ENABLED_MARKER: join(dir, "startup-enabled.marker"),
+      BOTFLEET_STARTUP_SESSION: join(dir, "startup-session"),
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
     },
   });
   assert.equal(result.status, 0, result.stderr);
@@ -802,6 +816,10 @@ test("without a store pointer the legacy checkout path still works", () => {
       BOTFLEET_HEAL_STAMP: join(dir, "heal-stamp"),
       BOTFLEET_FAIL_LEDGER: join(dir, "ledger"),
       BOTFLEET_SHUTDOWN_MARKER: join(dir, "stopped.marker"),
+      BOTFLEET_STARTUP_DISABLED_MARKER: join(dir, "startup-disabled.marker"),
+      BOTFLEET_STARTUP_ENABLED_MARKER: join(dir, "startup-enabled.marker"),
+      BOTFLEET_STARTUP_SESSION: join(dir, "startup-session"),
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
     },
   });
   assert.equal(result.status, 0, result.stderr);
