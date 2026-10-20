@@ -27,14 +27,15 @@ Three real failures came from that shape, all recorded before this work:
   `node_modules` into place under the running process, so an unverified
   new version had no rollback: the old tree was already gone.
 
-The repository already had the answer — PR #858 (merged 2026-10-06) added
-`scripts/harness-release-store.mjs`: immutable per-commit release
-directories, a `staging` area, one atomically swapped pointer, and a
-launcher that refuses to mutate a release.  What was missing was the half
-that makes it usable: nothing staged or promoted a release, and the
-LaunchAgent still pointed at the checkout.  The rollout doc for #858
-called that "a separate on-demand operator step that pauses for the
-owner".  The owner's directive is that pause being released.
+The repository already had the answer: an earlier change (merged
+2026-10-06) added `scripts/harness-release-store.mjs` — immutable
+per-commit release directories, a `staging` area, one atomically swapped
+pointer, and a launcher that refuses to mutate a release.  What was
+missing was the half that makes it usable: nothing staged or promoted a
+release, and the LaunchAgent still pointed at the checkout.  That
+change's own rollout doc called the missing half "a separate on-demand
+operator step that pauses for the owner".  The owner's directive is that
+pause being released.
 
 ## What changed here
 
@@ -110,6 +111,22 @@ rather than an outage.
   its working directory is the release, not the checkout, and the Zulip
   sessions reconnected with the vault identity, which proves the
   identity still reaches a release-launched harness.
+
+## Switching The Running Program Onto A New Release
+
+A pointer swap is not a running program.  The launcher PROBES the port
+and exits 0 when a harness is already answering, so `launchctl kickstart`
+on its own leaves the OLD release serving: the probe finds it healthy and
+starts nothing.  Switching is therefore stop-then-start:
+
+1.  swap the pointer (`harness-release.mjs activate <commit>`),
+2.  stop the running harness, which holds the port,
+3.  start the job (`launchctl kickstart -k gui/$(id -u)/app.botfleet.server`).
+
+The previous release stays on disk, so a rollback is one more swap and the
+same three steps.  The CLI's own hint says exactly this, because an
+operator told only "kickstart" would believe an update applied when it
+had not.
 
 ## Follow-ups
 

@@ -951,7 +951,12 @@ test("the CLI names the job that runs the store it acted on", async (t) => {
     // A promoted release is read-only, so the tree cannot be removed
     // directly: the store's own discard path restores write permission
     // first, which is the same thing an operator does to reclaim disk.
-    for (const root of [join(dir, "botfleet-companion"), join(dir, "botfleet"), join(dir, "mixed", "BotFleet-Companion")]) {
+    for (const root of [
+      join(dir, "botfleet-companion"),
+      join(dir, "botfleet"),
+      join(dir, "mixed", "BotFleet-Companion"),
+      join(dir, "dotted", ".botfleet-companion"),
+    ]) {
       const env = { ...process.env, BOTFLEET_RELEASES_ROOT: root };
       for (const commit of await listReleases(env)) {
         await discardRelease(commit, env).catch(() => {});
@@ -993,4 +998,42 @@ test("the CLI names the job that runs the store it acted on", async (t) => {
   await promoteStaging({ commit, env: { ...process.env, ...mixedEnv } });
   const mixed = await runCli(["swap", commit, "--store", mixedRoot]);
   assert.match(mixed.stdout, /app\.botfleet\.companion/);
+
+  // The real store roots are DOT-PREFIXED (~/.botfleet,
+  // ~/.botfleet-companion), so the comparison has to strip the leading
+  // dots.  Without that, the companion's own store reads as the harness's
+  // and the hint names the wrong job.
+  const dotted = join(dir, "dotted", ".botfleet-companion");
+  const dottedEnv = { BOTFLEET_RELEASES_ROOT: dotted };
+  await stageRelease({ commit, repo, env: { ...process.env, ...dottedEnv }, install: false });
+  await promoteStaging({ commit, env: { ...process.env, ...dottedEnv } });
+  const dottedOut = await runCli(["swap", commit, "--store", dotted]);
+  assert.match(dottedOut.stdout, /app\.botfleet\.companion/);
+});
+
+test("the restart hint says stop before start, because the launcher will not start a second harness", async (t) => {
+  // The launcher probes the port and exits 0 when a harness is already
+  // answering, so a kickstart on its own leaves the OLD release serving.
+  // An operator told only "kickstart" would believe an update applied
+  // when it did not, so the hint has to say stop-then-start.
+  const dir = await mkdtemp(join(tmpdir(), "bf-release-hint-"));
+  const root = join(dir, "botfleet");
+  const env = { ...process.env, BOTFLEET_RELEASES_ROOT: root };
+  t.after(async () => {
+    // A promoted release is read-only, so the store's own discard path
+    // restores write permission before the tree is removed.
+    for (const commit of await listReleases(env)) {
+      await discardRelease(commit, env).catch(() => {});
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+  const { repo, commit } = await sourceRepo(t);
+  await stageRelease({ commit, repo, env, install: false });
+  await promoteStaging({ commit, env });
+  const { stdout } = await run(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), "harness-release.mjs"), "swap", commit, "--store", root], {
+    encoding: "utf8",
+    env,
+  });
+  assert.match(stdout, /stop the running harness/i);
+  assert.match(stdout, /kickstart/);
 });
