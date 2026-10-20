@@ -27,8 +27,8 @@ type Option = ModelCatalog["options"][number];
  *  where the tags belong BESIDE the slug rather than on a line of their own. */
 const ROWS: Option[] = [
   {
-    id: "MiniMax-M3.1-Flash-Preview",
-    label: "MiniMax M3.1 Flash Preview · thinking",
+    id: "MiniMax-M3.1-Flash",
+    label: "MiniMax M3.1 Flash · thinking",
     contextWindow: 1_000_000,
     badge: "Preview",
     badgeTitle: "Preview build — expect churn.",
@@ -57,7 +57,7 @@ const ENGINE: QuotaEngineInfo = {
       capped: false,
       windowsLabel: "5hr/Week",
       models: {
-        "MiniMax-M3.1-Flash-Preview": {
+        "MiniMax-M3.1-Flash": {
           capped: false,
           remainingPercent: 67,
           secondaryRemainingPercent: 96,
@@ -106,7 +106,7 @@ export default function ModelRowsVisualFixture() {
       <Column
         testid="model-rows-wide"
         width={364}
-        defaultId="MiniMax-M3.1-Flash-Preview"
+        defaultId="MiniMax-M3.1-Flash"
       />
       {/* The sidebar width, where every slug in the field report collapsed. */}
       <Column testid="model-rows-narrow" width={260} defaultId="minimax-m2.5" />

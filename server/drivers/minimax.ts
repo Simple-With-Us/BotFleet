@@ -89,12 +89,17 @@ const MINIMAX_RETIRED_MODEL_IDS: readonly string[] = [
   // Dropped as dominated: same $0.30/$1.20 as M3.1's <=512K tier for a
   // fifth of the context.
   "MiniMax-M2.7",
-  // Superseded by MiniMax-M3.1-Flash-Preview.
+  // Superseded by MiniMax-M3.1-Flash.
   "MiniMax-M3",
+  // The former spellings of the two M3.1 Flash rows.  MiniMax renamed them
+  // and the API keeps serving the retired ids, so a live list would
+  // otherwise re-inflate a dead row next to its live replacement.
+  "MiniMax-M3.1-Flash-Preview",
+  "MiniMax-M3.1-Flash-Preview-1M",
 ];
 
 /** The `reasoning_effort` values MiniMax accepts on /v1/chat/completions, for
- *  MiniMax-M3.1-Flash-Preview only.  Source:
+ *  MiniMax-M3.1-Flash only.  Source:
  *  https://platform.minimax.io/docs/api-reference/text-openai-api.  The field
  *  is sent top-level and never paired with a `thinking` object:
  *   - omitting it means `max`, which is what Default sends;
@@ -106,19 +111,19 @@ const MINIMAX_RETIRED_MODEL_IDS: readonly string[] = [
 const M31_EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 
 const MODELS: ModelCatalog = {
-  default: "MiniMax-M3.1-Flash-Preview",
+  default: "MiniMax-M3.1-Flash",
   options: [
     {
-      id: "MiniMax-M3.1-Flash-Preview",
-      label: "MiniMax M3.1 Flash Preview (512K)",
+      id: "MiniMax-M3.1-Flash",
+      label: "MiniMax M3.1 Flash (512K)",
       contextWindow: 524_288,
       effortLevels: [...M31_EFFORT_LEVELS],
       defaultEffort: "max",
       supportsMaxOutput: true,
     },
     {
-      id: "MiniMax-M3.1-Flash-Preview-1M",
-      label: "MiniMax M3.1 Flash Preview (1M)",
+      id: "MiniMax-M3.1-Flash-1M",
+      label: "MiniMax M3.1 Flash (1M)",
       contextWindow: 1_000_000,
       effortLevels: [...M31_EFFORT_LEVELS],
       defaultEffort: "max",
@@ -150,8 +155,8 @@ const MODELS: ModelCatalog = {
  *  against the pricing page above as the maintenance cost of having a
  *  cost column at all. */
 export const MINIMAX_PRICE_PER_MILLION: ChatCompletionsPriceTable = {
-  "MiniMax-M3.1-Flash-Preview": [{ input: 0.3, output: 1.2, cachedInput: 0.06 }],
-  "MiniMax-M3.1-Flash-Preview-1M": [
+  "MiniMax-M3.1-Flash": [{ input: 0.3, output: 1.2, cachedInput: 0.06 }],
+  "MiniMax-M3.1-Flash-1M": [
     { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
     { input: 0.6, output: 2.4, cachedInput: 0.12 },
   ],
@@ -1050,8 +1055,8 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           defaultEffort: known?.defaultEffort,
           supportsMaxOutput: known?.supportsMaxOutput,
         });
-        if (id === "MiniMax-M3.1-Flash-Preview") {
-          const m1 = MODELS.options.find((m) => m.id === "MiniMax-M3.1-Flash-Preview-1M");
+        if (id === "MiniMax-M3.1-Flash") {
+          const m1 = MODELS.options.find((m) => m.id === "MiniMax-M3.1-Flash-1M");
           if (m1 && !seen.has(m1.id)) {
             seen.add(m1.id);
             options.push({

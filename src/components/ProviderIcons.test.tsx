@@ -203,7 +203,7 @@ describe("provider marks", () => {
     // the DSH engine reaches the deliberate brand mark by model, not by driver
     // kind — so it carries the brand paint, pinned theme-hook-free per above.
     const html = renderToStaticMarkup(
-      createElement(ProviderMark, { driverKind: "dshAgent", model: "MiniMax-M3.1-Flash-Preview", size: 16 }),
+      createElement(ProviderMark, { driverKind: "dshAgent", model: "MiniMax-M3.1-Flash", size: 16 }),
     );
     expect(html).not.toContain("var(--");
     expect(html).not.toMatch(/color-accent|color-ink/);
