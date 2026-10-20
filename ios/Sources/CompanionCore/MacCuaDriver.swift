@@ -254,11 +254,34 @@ public final class MacCuaDriver: @unchecked Sendable {
         button: CuaMouseButton = .left,
         steps: Int = 10
     ) -> Bool {
+        let downType: CGEventType
+        let draggedType: CGEventType
+        let upType: CGEventType
+        let mouseButton: CGMouseButton
+
+        switch button {
+        case .left:
+            downType = .leftMouseDown
+            draggedType = .leftMouseDragged
+            upType = .leftMouseUp
+            mouseButton = .left
+        case .right:
+            downType = .rightMouseDown
+            draggedType = .rightMouseDragged
+            upType = .rightMouseUp
+            mouseButton = .right
+        case .center:
+            downType = .otherMouseDown
+            draggedType = .otherMouseDragged
+            upType = .otherMouseUp
+            mouseButton = .center
+        }
+
         guard let downEvent = CGEvent(
             mouseEventSource: nil,
-            mouseType: .leftMouseDown,
+            mouseType: downType,
             mouseCursorPosition: start,
-            mouseButton: .left
+            mouseButton: mouseButton
         ) else {
             return false
         }
@@ -273,9 +296,9 @@ public final class MacCuaDriver: @unchecked Sendable {
 
             if let dragEvent = CGEvent(
                 mouseEventSource: nil,
-                mouseType: .leftMouseDragged,
+                mouseType: draggedType,
                 mouseCursorPosition: currentPoint,
-                mouseButton: .left
+                mouseButton: mouseButton
             ) {
                 dragEvent.post(tap: .cghidEventTap)
             }
@@ -283,9 +306,9 @@ public final class MacCuaDriver: @unchecked Sendable {
 
         guard let upEvent = CGEvent(
             mouseEventSource: nil,
-            mouseType: .leftMouseUp,
+            mouseType: upType,
             mouseCursorPosition: end,
-            mouseButton: .left
+            mouseButton: mouseButton
         ) else {
             return false
         }
@@ -349,9 +372,11 @@ public final class MacCuaDriver: @unchecked Sendable {
     public func typeText(_ text: String) -> Bool {
         guard !text.isEmpty else { return true }
 
-        let utf16Chars = Array(text.utf16)
-        for char in utf16Chars {
-            var charCode = char
+        // Iterate Characters, not UTF-16 code units: a non-BMP scalar (emoji,
+        // extended scripts) is a surrogate pair and both halves must ride in a
+        // single CGEvent or the character is corrupted.
+        for character in text {
+            var utf16Units = Array(character.utf16)
             guard let downEvent = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true) else {
                 return false
             }
@@ -359,8 +384,8 @@ public final class MacCuaDriver: @unchecked Sendable {
                 return false
             }
 
-            downEvent.keyboardSetUnicodeString(stringLength: 1, unicodeString: &charCode)
-            upEvent.keyboardSetUnicodeString(stringLength: 1, unicodeString: &charCode)
+            downEvent.keyboardSetUnicodeString(stringLength: utf16Units.count, unicodeString: &utf16Units)
+            upEvent.keyboardSetUnicodeString(stringLength: utf16Units.count, unicodeString: &utf16Units)
 
             downEvent.post(tap: .cghidEventTap)
             upEvent.post(tap: .cghidEventTap)

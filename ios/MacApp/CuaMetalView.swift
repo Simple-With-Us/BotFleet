@@ -21,7 +21,14 @@ public struct CuaMetalView: NSViewRepresentable {
 
     public func makeNSView(context: Context) -> MTKView {
         guard let device = MTLCreateSystemDefaultDevice() else {
-            return MTKView()
+            // Loud, inert fallback: a bare MTKView() has no device or delegate,
+            // so rendering silently no-ops while looking attached. Say so, and
+            // make sure it never schedules draws.
+            NSLog("CuaMetalView: MTLCreateSystemDefaultDevice() returned nil; CUA inspector rendering is disabled on this Mac.")
+            let fallback = MTKView()
+            fallback.isPaused = true
+            fallback.enableSetNeedsDisplay = false
+            return fallback
         }
 
         let mtkView = MTKView(frame: .zero, device: device)
