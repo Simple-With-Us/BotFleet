@@ -1,0 +1,201 @@
+import AppKit
+import BotFleetControlCore
+import ServiceManagement
+
+@main
+final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let api = ControlAPI()
+    private let startup = StartupPolicy()
+    private var item: NSStatusItem?
+    private let menu = NSMenu()
+    private var status: ControlStatus?
+    private var persistOnExit: Bool?
+    private var isLoading = false
+    private var isBusy = false
+    private var problem: String?
+
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = ControlApp()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        menu.delegate = self
+        showIcon()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showIcon()
+        return true
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if isBusy {
+            showError("A server action is still in progress.  Wait for it to finish before quitting Control.")
+            return .terminateCancel
+        }
+        return .terminateNow
+    }
+
+    private func showIcon() {
+        guard item == nil else { return }
+        let newItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        newItem.button?.image = NSImage(systemSymbolName: "server.rack", accessibilityDescription: "BotFleet Control")
+        newItem.button?.image?.isTemplate = true
+        newItem.button?.toolTip = "BotFleet Control"
+        newItem.menu = menu
+        item = newItem
+        rebuildMenu()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard !isBusy, !isLoading else { return }
+        isLoading = true
+        rebuildMenu()
+        Task { @MainActor in
+            do {
+                status = try await api.status()
+                persistOnExit = status?.persistOnExit
+                problem = nil
+            } catch {
+                status = nil
+                persistOnExit = nil
+                problem = error.localizedDescription
+            }
+            isLoading = false
+            rebuildMenu()
+        }
+    }
+
+    private func add(_ title: String, selector: Selector? = nil, enabled: Bool = true, state: NSControl.StateValue = .off) {
+        let entry = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        entry.target = self
+        entry.isEnabled = enabled
+        entry.state = state
+        menu.addItem(entry)
+    }
+
+    private func rebuildMenu() {
+        menu.removeAllItems()
+        let ready = !isLoading && !isBusy
+        if isLoading { add("Server: Loading…") }
+        else if let status {
+            add("Server: running (\(status.activeBotCount) active bots)")
+            add("Local VMs: \(status.runningVMCount) running of \(status.localVms.count)")
+            for vm in status.localVms { add("  \(vm.name): \(vm.state ?? (vm.running ? "running" : "unknown"))") }
+        } else {
+            add("Server: offline or unknown")
+            add("Local VMs: unknown while server is offline")
+        }
+        if let problem { add("Error: \(problem)") }
+        if status?.sharedVM?.state == "stopped" { add("Local VM requires recreation in BotFleet") }
+        if !startup.supportsPolicy { add("Update BotFleet to manage server startup") }
+        menu.addItem(.separator())
+        add("Start Server", selector: #selector(startServer), enabled: ready && startup.supportsPolicy && status == nil)
+        add("Stop Server And Local VMs…", selector: #selector(stopServer), enabled: ready && status != nil)
+        add("Start Local VM", selector: #selector(startVM), enabled: ready && status?.canStartSharedVM == true)
+        add("Stop Local VMs…", selector: #selector(stopVMs), enabled: ready && status?.runningVMCount ?? 0 > 0)
+        menu.addItem(.separator())
+        add("Keep Server Running After Quitting BotFleet", selector: #selector(togglePersist), enabled: ready && persistOnExit != nil,
+            state: persistOnExit == true ? .on : .off)
+        add("Start Server At Login", selector: #selector(toggleStartup), enabled: ready && startup.supportsPolicy,
+            state: startup.startsAtLogin ? .on : .off)
+        add("Launch Control At Login", selector: #selector(toggleControlLogin), enabled: ready,
+            state: SMAppService.mainApp.status == .enabled ? .on : .off)
+        menu.addItem(.separator())
+        add("Open BotFleet", selector: #selector(openBotFleet))
+        add("Hide Menu Bar Icon…", selector: #selector(hideIcon), enabled: ready)
+        add("Quit Control", selector: #selector(quitControl), enabled: !isBusy)
+    }
+
+    private func run(refresh: Bool = true, _ action: @escaping () async throws -> Void) {
+        guard !isBusy && !isLoading else { return }
+        isBusy = true
+        problem = nil
+        rebuildMenu()
+        Task { @MainActor in
+            do {
+                try await action()
+                if !refresh { status = nil; persistOnExit = nil }
+            }
+            catch { problem = error.localizedDescription; showError(error.localizedDescription) }
+            isBusy = false
+            rebuildMenu()
+            if refresh { menuWillOpen(menu) }
+        }
+    }
+
+    private func showError(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "BotFleet Control Could Not Complete the Action"
+        alert.informativeText = message
+        alert.runModal()
+    }
+
+    private func confirm(_ title: String, _ message: String) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    @objc private func startServer() {
+        run { [self] in try startup.startServer() }
+    }
+
+    @objc private func stopServer() {
+        guard let status else { return }
+        let count = status.activeBotCount
+        let message = "This stops the server and its local VMs.  \(count) bot turn(s) are active; the server will refuse while bots or leases are busy."
+        guard confirm("Stop BotFleet Server And Local VMs?", message) else { return }
+        run(refresh: false) { [self] in try await api.stopServer() }
+    }
+
+    @objc private func startVM() { run { [self] in try await api.startVM() } }
+
+    @objc private func stopVMs() {
+        guard confirm("Stop Local VMs?", "Running local VMs will stop.  The server will refuse while bots or leases are busy.") else { return }
+        run { [self] in try await api.stopVMs() }
+    }
+
+    @objc private func togglePersist() {
+        guard let current = persistOnExit else { return }
+        run { [self] in try await api.setPersistOnExit(!current) }
+    }
+
+    @objc private func toggleStartup() {
+        run { [self] in try startup.setStartsAtLogin(!startup.startsAtLogin) }
+    }
+
+    @objc private func toggleControlLogin() {
+        run {
+            if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
+            else { try SMAppService.mainApp.register() }
+        }
+    }
+
+    @objc private func openBotFleet() {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "app.botfleet.macos") else {
+            showError("BotFleet is not installed in Applications.")
+            return
+        }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+            if let error { DispatchQueue.main.async { self.showError(error.localizedDescription) } }
+        }
+    }
+
+    @objc private func hideIcon() {
+        guard confirm("Hide Menu Bar Icon?", "Open BotFleet Control again to restore the icon.  Hiding it leaves the server unchanged.") else { return }
+        if let item { NSStatusBar.system.removeStatusItem(item) }
+        item = nil
+    }
+
+    @objc private func quitControl() { NSApplication.shared.terminate(nil) }
+}

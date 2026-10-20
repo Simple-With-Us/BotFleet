@@ -57,6 +57,7 @@ files:
   - "!electron/resources/recorder-helper.swift"
   - "!electron/resources/recorder-helper-Info.plist"
   - "!electron/resources/BotFleet Recorder.app/**"
+  - "!electron/resources/BotFleet Control.app/**"
   - "!**/node_modules/**"
   - package.json
 
@@ -139,6 +140,8 @@ mac:
       to: BotFleet Speech.app
     - from: electron/resources/BotFleet Recorder.app
       to: BotFleet Recorder.app
+    - from: electron/resources/BotFleet Control.app
+      to: BotFleet Control.app
     # CUA must live outside ASAR. prepare-cua stages the signed executable and
     # a self-contained JS/native SDK bundle selected for macOS arm64.
     # ${arch} resolves per built arch — each bundle carries its own natives

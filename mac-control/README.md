@@ -1,0 +1,11 @@
+# BotFleet Control
+
+`BotFleetControl` is a small AppKit menu bar app for the local BotFleet Server.  It requires macOS 13 or newer, has no third-party dependencies, and does not start the server when launched.
+
+Build and test with `swift build --package-path mac-control` and `swift test --package-path mac-control`.  The executable product is `BotFleetControl`.  Package it as `BotFleet Control.app` with bundle ID `app.botfleet.control.macos` and `LSUIElement=true`.  The app itself calls `NSApplication.setActivationPolicy(.accessory)`.
+
+The menu checks `http://127.0.0.1:8799/api/health` for a ready BotFleet identity before reading or changing server state.  It reads `/api/system/control` when the menu opens and shows Local VM state as unknown while the server is offline.  “Start Local VM” is available only when the shared VM is missing; a stopped VM needs recreation in BotFleet Computer settings.  Server and VM actions use the corresponding `/api/system/control/*` routes; changing “Keep Server Running After Quitting BotFleet” uses `PATCH /api/config`.  The app discards all other configuration data and does not log API bodies.
+
+“Start Server At Login” records `kern.bootsessionuuid` in `~/.botfleet/startup-session`, then writes either `startup-enabled.marker` or `startup-disabled.marker` and removes the opposite marker.  “Start Server” enables and bootstraps `app.botfleet.server` if needed, removes `~/.botfleet/stopped.marker`, and kickstarts without terminating a running instance; a failed kickstart restores a previous stopped marker.  Both controls require the installed `~/apps/botfleet-server-start.sh` wrapper to contain `BF_CONTROL_STARTUP_POLICY_V1`; unsupported installations show an update message.  The wrapper allows recovery during the current boot, honors disabled login startup on the next boot, and treats explicit enabled startup as authority to clear a stopped marker from an older boot.
+
+“Launch Control At Login” uses `SMAppService.mainApp`.  Hiding the icon leaves the process and server running; opening `BotFleet Control.app` again restores the icon.  Quitting Control never changes the server.  Closing the Electron BotFleet window releases Electron; the server's separate “Keep Server Running After Quitting BotFleet” setting determines whether it continues.

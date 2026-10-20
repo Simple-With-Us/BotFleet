@@ -108,7 +108,46 @@ FAIL_STORM_THRESHOLD="${BOTFLEET_FAIL_STORM_THRESHOLD:-20}"
 # hand is asking for the server, so that clears the marker and starts -- which
 # is the recovery path when someone stops it and then changes their mind.
 SHUTDOWN_MARKER="${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/stopped.marker}"
+STARTUP_DISABLED_MARKER="${BOTFLEET_STARTUP_DISABLED_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-disabled.marker}"
+STARTUP_ENABLED_MARKER="${BOTFLEET_STARTUP_ENABLED_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-enabled.marker}"
+STARTUP_SESSION="${BOTFLEET_STARTUP_SESSION:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-session}"
 LAUNCHD_SERVICE_NAME="${XPC_SERVICE_NAME:-}"
+
+boot_session() {
+  if [ -n "${BOTFLEET_BOOT_SESSION_OVERRIDE:-}" ]; then
+    printf '%s' "$BOTFLEET_BOOT_SESSION_OVERRIDE"
+  else
+    /usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null
+  fi
+}
+
+# The V1 policy is opt-in until the installed wrapper has been upgraded.
+honour_startup_policy() {
+  # BF_CONTROL_STARTUP_POLICY_V1.  Marker absence preserves the original
+  # launchd behaviour; no environment opt-in is needed by installed users.
+  if invoked_by_launchd && [ ! -f "$STARTUP_DISABLED_MARKER" ] && [ ! -f "$STARTUP_ENABLED_MARKER" ]; then return 0; fi
+  local current recorded
+  current="$(boot_session)" || { log_err "cannot read boot session"; exit 1; }
+  [ -n "$current" ] || { log_err "boot session is empty"; exit 1; }
+  if ! invoked_by_launchd; then
+    mkdir -p "$(dirname "$STARTUP_SESSION")"
+    printf '%s\n' "$current" >"$STARTUP_SESSION"
+    return 0
+  fi
+  recorded="$(cat "$STARTUP_SESSION" 2>/dev/null || true)"
+  if [ -f "$STARTUP_DISABLED_MARKER" ] && [ "$recorded" != "$current" ]; then
+    log "startup is disabled at login; leaving the stopped marker unchanged"
+    exit 0
+  fi
+  # Explicit login enablement outranks a stop from a PREVIOUS boot only.
+  # On this boot an intentional Stop must remain durable through every tick.
+  if [ ! -f "$STARTUP_DISABLED_MARKER" ] && [ -f "$STARTUP_ENABLED_MARKER" ] && [ "$recorded" != "$current" ]; then
+    mkdir -p "$(dirname "$STARTUP_SESSION")"
+    printf '%s\n' "$current" >"$STARTUP_SESSION"
+    rm -f "$SHUTDOWN_MARKER"
+    log "startup is enabled at login; starting for this boot"
+  fi
+}
 
 # True when launchd invoked us rather than a person.
 invoked_by_launchd() {
@@ -365,6 +404,7 @@ fi
 # "carry on and start the harness", and an unguarded bare call would abort the
 # whole script on exactly the ordinary, marker-absent path.  The exit 0 inside
 # the function still exits -- that is an `exit`, not a return status.
+honour_startup_policy
 honour_shutdown_marker || true
 
 # --heal-only must prepare the checkout even when the currently running

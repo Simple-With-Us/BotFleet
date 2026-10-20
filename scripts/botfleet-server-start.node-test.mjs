@@ -29,7 +29,7 @@ function makeFixture({ withDependencies = false } = {}) {
   // (18799 was tried) collided with something else already listening on
   // it, making health() see a false positive and every test past it fail.
   const port = 20000 + Math.floor(Math.random() * 20000);
-  return { dir, serverRoot, ledger: join(dir, "ledger"), marker: join(dir, "stopped.marker"), port };
+  return { dir, serverRoot, ledger: join(dir, "ledger"), marker: join(dir, "stopped.marker"), disabled: join(dir, "startup-disabled.marker"), enabled: join(dir, "startup-enabled.marker"), session: join(dir, "startup-session"), port };
 }
 
 function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = "/bin/echo", xpcServiceName = "" } = {}) {
@@ -49,6 +49,11 @@ function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = 
       // that could see the owner's actual shutdown sentinel would both read
       // his state and be able to clear it.
       BOTFLEET_SHUTDOWN_MARKER: fixture.marker,
+      BOTFLEET_STARTUP_DISABLED_MARKER: fixture.disabled,
+      BOTFLEET_STARTUP_ENABLED_MARKER: fixture.enabled,
+      BOTFLEET_STARTUP_SESSION: fixture.session,
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
+      BF_CONTROL_STARTUP_POLICY_V1: "1",
       // Explicit rather than inherited: every other test in this file models
       // a person or a generic launchd run, not this specific agent, and an
       // XPC_SERVICE_NAME leaking in from the shell would silently change which
@@ -579,6 +584,89 @@ test("the launchd tick leaves the marker in place", () => {
     writeFileSync(fixture.marker, "stopped on purpose\n");
     run(fixture, { xpcServiceName: "app.botfleet.server" });
     assert.ok(existsSync(fixture.marker), "the marker must survive the tick, or the next one would restart it");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("login-disabled launchd run stays stopped until explicitly started this boot", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.disabled, "disabled\n");
+    writeFileSync(fixture.marker, "stopped\n");
+    const blocked = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.equal(blocked.status, 0);
+    assert.match(blocked.stdout, /startup is disabled at login/);
+    assert.ok(existsSync(fixture.marker));
+    assert.ok(!existsSync(fixture.session));
+    run(fixture);
+    assert.equal(readFileSync(fixture.session, "utf8").trim(), "fixture-boot");
+    assert.ok(!existsSync(fixture.marker));
+    assert.ok(existsSync(fixture.disabled));
+    const sameBoot = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.doesNotMatch(sameBoot.stdout, /startup is disabled at login/);
+    writeFileSync(fixture.session, "previous-boot\n");
+    const nextBoot = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.match(nextBoot.stdout, /startup is disabled at login/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("explicit login enablement starts on the next boot and clears an older stop", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.enabled, "enabled\n");
+    writeFileSync(fixture.marker, "stopped\n");
+    writeFileSync(fixture.session, "previous-boot\n");
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.match(result.stdout, /startup is enabled at login/);
+    assert.ok(!existsSync(fixture.marker));
+    assert.equal(readFileSync(fixture.session, "utf8").trim(), "fixture-boot");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a stop during the current boot remains stopped despite login enablement", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.enabled, "enabled\n");
+    writeFileSync(fixture.marker, "stopped\n");
+    writeFileSync(fixture.session, "fixture-boot\n");
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.match(result.stdout, /shut down on purpose/);
+    assert.ok(existsSync(fixture.marker));
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("without explicit login enablement an older stop stays durable", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.marker, "stopped\n");
+    writeFileSync(fixture.session, "previous-boot\n");
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.match(result.stdout, /shut down on purpose/);
+    assert.ok(existsSync(fixture.marker));
+    assert.equal(readFileSync(fixture.session, "utf8").trim(), "previous-boot");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("disabled login policy wins if both startup markers exist", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.enabled, "enabled\n");
+    writeFileSync(fixture.disabled, "disabled\n");
+    writeFileSync(fixture.marker, "stopped\n");
+    writeFileSync(fixture.session, "previous-boot\n");
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.match(result.stdout, /startup is disabled at login/);
+    assert.ok(existsSync(fixture.marker));
+    assert.equal(readFileSync(fixture.session, "utf8").trim(), "previous-boot");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }

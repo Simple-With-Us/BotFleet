@@ -1,6 +1,8 @@
 import { app, BrowserWindow, WebContentsView, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, screen, session, shell, systemPreferences, Tray, utilityProcess } from "electron";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { openServerControls, shutdownAttachedServer } from "./server-controls.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -2332,6 +2334,14 @@ function setupApplicationMenu() {
           label: "Open Data Folder",
           click: () => shell.openPath(DATA_DIR),
         },
+        ...(isMac ? [{
+          label: "Server Controls…",
+          click: () => openServerControls({
+            source: app.isPackaged ? path.join(process.resourcesPath, "BotFleet Control.app") : fileURLToPath(new URL("./resources/BotFleet Control.app", import.meta.url)),
+            shell,
+            dialog,
+          }),
+        }] : []),
         { type: "separator" },
         isMac ? { role: "close" } : { role: "quit" },
       ],
@@ -2425,7 +2435,10 @@ app.whenReady().then(async () => {
   // the harness alone.  Launching the app is the documented way back, so clear
   // it first — before anything here tries to reach a server, so the request
   // below is never made against a marker that says "stay down".
-  clearHarnessShutdownMarker();
+  if (!wantsSafeStorageExport(process.argv) && !updateCredentialPreparationPath) {
+    recordExplicitStartupSession();
+    clearHarnessShutdownMarker();
+  }
   if (wantsSafeStorageExport(process.argv)) {
     try {
       const result = await readSecureCredentials({
@@ -2480,6 +2493,11 @@ app.whenReady().then(async () => {
   tray = new Tray(trayIcon);
   tray.setToolTip("BotFleet");
   tray.setContextMenu(Menu.buildFromTemplate([
+    ...(process.platform === "darwin" ? [{ label: "Server Controls…", click: () => openServerControls({
+      source: app.isPackaged ? path.join(process.resourcesPath, "BotFleet Control.app") : fileURLToPath(new URL("./resources/BotFleet Control.app", import.meta.url)),
+      shell,
+      dialog,
+    }) }] : []),
     { label: "Show BotFleet", click: () => {
         if (app.dock) app.dock.show();
         if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -2641,10 +2659,8 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform === "darwin" && app.dock) {
-    app.dock.hide();
-    return;
-  }
+  // Background controls live in the independent native app.  Closing the
+  // desktop must release Electron, its helpers and its sleep blocker.
   app.quit();
 });
 
@@ -2707,13 +2723,12 @@ function serverPersistsOnExit() {
 // already a number — reading it also removes the NaN case a non-numeric OMB_PORT
 // would produce here.
 function requestAttachedHarnessShutdown() {
-  return fetch(`http://127.0.0.1:${SERVER_PORT}/api/system/shutdown`, {
-    method: "POST",
-    // The route is loopback-only, and the bound address is loopback-only too,
-    // so a short ceiling is enough; it exists so a wedged harness cannot hold
-    // the app open past CUA_STOP_TIMEOUT_MS.
-    signal: AbortSignal.timeout(2000),
-  }).then((res) => res.text()).catch(() => "");
+  return shutdownAttachedServer(SERVER_PORT).catch((error) => {
+    dialog.showErrorBox(
+      "Could Not Confirm Server Shutdown",
+      `The server or a Local VM may still be running.\u00a0 ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
 }
 
 // Clear the "stopped on purpose" sentinel when the app starts, which is the
@@ -2736,6 +2751,23 @@ function clearHarnessShutdownMarker() {
   } catch {
     // Already gone, or a path we cannot touch.  Either way the app launching
     // is the intent, and the wrapper treats a missing marker as "start".
+  }
+}
+
+function recordExplicitStartupSession() {
+  if (process.platform !== "darwin") return;
+  // BF_CONTROL_STARTUP_POLICY_V1: a direct app launch allows this boot even
+  // when login startup is disabled.  Marker absence keeps default behavior.
+  const dir = process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet");
+  try {
+    const current = process.env.BOTFLEET_BOOT_SESSION_OVERRIDE
+      || execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8" }).trim();
+    if (!current) throw new Error("boot session is empty");
+    const sessionPath = process.env.BOTFLEET_STARTUP_SESSION ?? path.join(dir, "startup-session");
+    fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+    fs.writeFileSync(sessionPath, `${current}\n`, { mode: 0o600 });
+  } catch (error) {
+    console.error("Could not record explicit server start for this boot:", error);
   }
 }
 
