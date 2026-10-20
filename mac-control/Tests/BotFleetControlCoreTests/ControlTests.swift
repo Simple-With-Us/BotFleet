@@ -72,7 +72,7 @@ final class ControlTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
         let runner = MockCommands()
-        let policy = StartupPolicy(home: home, commands: runner, uid: 501)
+        let policy = StartupPolicy(home: home, commands: runner, uid: 501, environment: [:])
         XCTAssertEqual(policy.loginPolicy, .legacy)
         XCTAssertFalse(policy.startsAtLogin)
         XCTAssertFalse(policy.supportsPolicy)
@@ -92,11 +92,25 @@ final class ControlTests: XCTestCase {
         XCTAssertEqual(runner.calls, ["/usr/sbin/sysctl -n kern.bootsessionuuid", "/usr/sbin/sysctl -n kern.bootsessionuuid"])
     }
 
+    func testStartupPolicyHonorsConfiguredDataDirectory() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dataDirectory = home.appendingPathComponent("separate-data")
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        let policy = StartupPolicy(home: home, commands: MockCommands(), uid: 501,
+                                   environment: ["OMB_DATA_DIR": dataDirectory.path])
+        try policy.setStartsAtLogin(false)
+        XCTAssertEqual(policy.loginPolicy, .disabled)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dataDirectory.appendingPathComponent("startup-disabled.marker").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/startup-disabled.marker").path))
+    }
+
     func testInstalledServerDistinguishesStoppedAndRunningWithoutStarting() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
         let runner = MockCommands()
-        let policy = StartupPolicy(home: home, commands: runner, uid: 501)
+        let policy = StartupPolicy(home: home, commands: runner, uid: 501, environment: [:])
         XCTAssertEqual(policy.installedServerState, .notInstalled)
         try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
         try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
@@ -184,7 +198,7 @@ final class ControlTests: XCTestCase {
         try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
         try Data().write(to: home.appendingPathComponent(".botfleet/stopped.marker"))
         let runner = MockCommands()
-        try StartupPolicy(home: home, commands: runner, uid: 501).startServer()
+        try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).startServer()
         XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/stopped.marker").path))
         XCTAssertEqual(runner.calls, [
             "/usr/sbin/sysctl -n kern.bootsessionuuid",
@@ -207,7 +221,7 @@ final class ControlTests: XCTestCase {
         try Data().write(to: marker)
         let runner = MockCommands()
         runner.failKickstart = true
-        XCTAssertThrowsError(try StartupPolicy(home: home, commands: runner, uid: 501).startServer())
+        XCTAssertThrowsError(try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).startServer())
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
     }
 

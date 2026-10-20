@@ -30,6 +30,15 @@ test("desktop quit waits for Local VM shutdown beyond two seconds", async () => 
   });
 });
 
+test("desktop quit accepts an already stopped server but preserves uncertain failures", async () => {
+  await shutdownAttachedServer(28799, {
+    request: async () => { throw new TypeError("fetch failed: ECONNREFUSED"); },
+  });
+  await assert.rejects(shutdownAttachedServer(28799, {
+    request: async () => { throw new DOMException("The request timed out", "TimeoutError"); },
+  }), /timed out/);
+});
+
 function fixture(t) {
   const root = mkdtempSync(path.join(tmpdir(), "botfleet-control-install-test-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));

@@ -7,13 +7,20 @@ const bundleName = "BotFleet Control.app";
 const bundleId = "app.botfleet.control.macos";
 
 export async function shutdownAttachedServer(port, { request = fetch, timeout = 300_000 } = {}) {
-  const response = await request(`http://127.0.0.1:${port}/api/system/control/stop`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-    signal: AbortSignal.timeout(timeout),
-    redirect: "error",
-  });
+  let response;
+  try {
+    response = await request(`http://127.0.0.1:${port}/api/system/control/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(timeout),
+      redirect: "error",
+    });
+  } catch (error) {
+    // A refused loopback connection means the server has already stopped.
+    if (error instanceof TypeError && /fetch failed|ECONNREFUSED/i.test(error.message)) return;
+    throw error;
+  }
   const report = await response.json();
   if (!response.ok || report?.ok !== true) {
     throw new Error(report?.error || report?.detail?.localVmNote || "The server did not confirm shutdown");

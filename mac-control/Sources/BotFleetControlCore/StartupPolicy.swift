@@ -85,18 +85,26 @@ public final class StartupPolicy {
     private let files: FileManager
     private let commands: CommandRunning
     private let uid: UInt32
+    private let environment: [String: String]
 
     public init(home: URL = FileManager.default.homeDirectoryForCurrentUser,
                 files: FileManager = .default,
                 commands: CommandRunning = ProcessCommandRunner(),
-                uid: UInt32 = getuid()) {
+                uid: UInt32 = getuid(),
+                environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.home = home
         self.files = files
         self.commands = commands
         self.uid = uid
+        self.environment = environment
     }
 
-    private var dataDirectory: URL { home.appendingPathComponent(".botfleet", isDirectory: true) }
+    private var dataDirectory: URL {
+        if let value = environment["OMB_DATA_DIR"], !value.isEmpty, value.hasPrefix("/") {
+            return URL(fileURLWithPath: value, isDirectory: true)
+        }
+        return home.appendingPathComponent(".botfleet", isDirectory: true)
+    }
     private var wrapper: URL { home.appendingPathComponent("apps/botfleet-server-start.sh") }
     private var agent: URL { home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist") }
     private var disabled: URL { dataDirectory.appendingPathComponent("startup-disabled.marker") }
