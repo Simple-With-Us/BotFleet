@@ -37,6 +37,12 @@ public enum StartupPolicyError: LocalizedError {
     }
 }
 
+public enum ServerLoginPolicy: Equatable {
+    case legacy
+    case enabled
+    case disabled
+}
+
 public final class StartupPolicy {
     private let home: URL
     private let files: FileManager
@@ -67,7 +73,13 @@ public final class StartupPolicy {
         return source.contains("BF_CONTROL_STARTUP_POLICY_V1")
     }
 
-    public var startsAtLogin: Bool { !files.fileExists(atPath: disabled.path) }
+    public var loginPolicy: ServerLoginPolicy {
+        if files.fileExists(atPath: disabled.path) { return .disabled }
+        if files.fileExists(atPath: enabled.path) { return .enabled }
+        return .legacy
+    }
+
+    public var startsAtLogin: Bool { loginPolicy == .enabled }
 
     public func setStartsAtLogin(_ enabled: Bool) throws {
         guard supportsPolicy else { throw StartupPolicyError.updateRequired }

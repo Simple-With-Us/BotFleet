@@ -23,6 +23,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        menu.autoenablesItems = false
         menu.delegate = self
         showIcon()
     }
@@ -73,7 +74,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func add(_ title: String, selector: Selector? = nil, enabled: Bool = true, state: NSControl.StateValue = .off) {
         let entry = NSMenuItem(title: title, action: selector, keyEquivalent: "")
         entry.target = self
-        entry.isEnabled = enabled
+        entry.isEnabled = selector != nil && enabled
         entry.state = state
         menu.addItem(entry)
     }
@@ -102,7 +103,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("Keep Server Running After Quitting BotFleet", selector: #selector(togglePersist), enabled: ready && persistOnExit != nil,
             state: persistOnExit == true ? .on : .off)
         add("Start Server At Login", selector: #selector(toggleStartup), enabled: ready && startup.supportsPolicy,
-            state: startup.startsAtLogin ? .on : .off)
+            state: startup.loginPolicy == .legacy ? .mixed : (startup.startsAtLogin ? .on : .off))
+        if startup.loginPolicy == .legacy { add("Login startup: legacy behavior") }
         add("Launch Control At Login", selector: #selector(toggleControlLogin), enabled: ready,
             state: SMAppService.mainApp.status == .enabled ? .on : .off)
         menu.addItem(.separator())
