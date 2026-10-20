@@ -24,7 +24,7 @@ jobs:
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.type == 'Bot' &&
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@b718446588a365406cb0eb3aca7feec3a3fe5903
+    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       # Pass only secrets the reusable declares (MINIMAX_API_KEY, and GH_PAT,
@@ -44,3 +44,4 @@ jobs:
         5. Commit with a subject starting "autofix:" and push to the PR branch.  Stop after one round.
         6. If a comment is not a real defect or is unclear, change nothing for it.
         This repo's verify command: `pnpm typecheck && pnpm test`.
+
