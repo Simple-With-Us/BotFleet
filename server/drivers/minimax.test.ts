@@ -2324,9 +2324,9 @@ describe("minimaxWindowTokens", () => {
   // the 512K Flash row is a deliberate billing-tier cap, and the shared
   // table's published 1M would push those turns into the higher input tier.
   const options = [
-    { id: "MiniMax-M3.1-Flash", contextWindow: 524_288 },
-    { id: "MiniMax-M3.1-Flash-1M", contextWindow: 1_000_000 },
-  ] as unknown as Parameters<typeof minimaxWindowTokens>[1];
+    { id: "MiniMax-M3.1-Flash", label: "MiniMax M3.1 Flash (512K)", contextWindow: 524_288 },
+    { id: "MiniMax-M3.1-Flash-1M", label: "MiniMax M3.1 Flash (1M)", contextWindow: 1_000_000 },
+  ];
 
   it("prefers the catalog row's own cap over the shared published table", () => {
     expect(minimaxWindowTokens("MiniMax-M3.1-Flash", options)).toBe(524_288);
