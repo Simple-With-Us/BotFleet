@@ -431,6 +431,28 @@ class AcpResumeError extends Error {
   }
 }
 
+/** A saved session the provider itself left wedged: a prompt timeout or idle
+ *  stall killed the child after `session/cancel`, but the persisted session
+ *  still holds the open turn, so every later `session/load` is refused with
+ *  an unfinished-turn or pending-input rejection (BF-2447).  That one
+ *  rejection is classified apart from every other resume failure.  A missing
+ *  or corrupt session still fails closed above, because discarding history
+ *  over a transient or ambiguous error is the silent loss the resume guard
+ *  exists to prevent; a session the provider names as wedged can never be
+ *  loaded again, so refusing it forever only bricks the thread. */
+export function isPoisonedSessionError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current != null; depth += 1) {
+    const record = current as { message?: unknown; data?: unknown; cause?: unknown };
+    const text = [record.message, typeof record.data === "string" ? record.data : ""]
+      .filter((part): part is string => typeof part === "string")
+      .join(" ");
+    if (/unfinished turn|pending input/i.test(text)) return true;
+    current = record.cause;
+  }
+  return false;
+}
+
 /** One spelling for a turn's stop reason.
  *
  * The ACP wire format is camelCase and several agents send `endTurn`, while
@@ -1714,10 +1736,28 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 sessionModelsState = parsedSessionResult.success ? parsedSessionResult.data.models : undefined;
                 sessionId = cursor;
               } catch (error) {
-                // The harness withheld inline replay because this cursor said
-                // the native session held the conversation.  Starting empty
-                // here would silently discard everything before this prompt.
-                throw new AcpResumeError({ cause: error });
+                if (!isPoisonedSessionError(error)) {
+                  // The harness withheld inline replay because this cursor said
+                  // the native session held the conversation.  Starting empty
+                  // here would silently discard everything before this prompt.
+                  throw new AcpResumeError({ cause: error });
+                }
+                // Recovery valve (BF-2447): the provider named this saved
+                // session as wedged, so it can never be loaded again.  Fall
+                // through to `session/new` below instead of refusing every
+                // later turn on the thread.  The discard is deliberate and
+                // visible: the same trade the harness already makes when it
+                // drops the resume cursor after `resume_failed`, taken one
+                // turn earlier so this turn can still run.
+                console.warn(
+                  `[acp] ${DRIVER_KIND} saved session ${cursor} is poisoned (unfinished turn or pending input); discarding its native history and starting a fresh session`,
+                );
+                emit({
+                  ...base(threadId, turnId),
+                  type: "runtime.notice",
+                  message:
+                    "The saved session was left holding an unfinished turn, so its earlier native history was discarded and a fresh session was started.  Context from earlier in this thread may be missing.",
+                });
               }
             }
             if (!sessionId) {

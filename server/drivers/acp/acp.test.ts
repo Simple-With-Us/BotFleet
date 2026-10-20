@@ -19,7 +19,7 @@ import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../../testing/launch-identity.ts";
 import { MODEL_REJECTED_STOP_REASON } from "../../model-fallback.ts";
 import { classifyError } from "../retry.ts";
-import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
+import { createAcpDriver, isPoisonedSessionError, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
 import {
   ACP_PROMPT_SECTION_OMITTED,
   acpPromptCeilingRefusal,
@@ -599,6 +599,39 @@ describe("ACP turns (fake CLI)", () => {
     expect(methods).toContain("session/load");
     expect(methods).not.toContain("session/new");
     expect(methods).not.toContain("session/prompt");
+  });
+
+  it("falls back to a fresh session when the saved session is poisoned (BF-2447)", async () => {
+    const dump = join(scratch, "resume-poisoned-rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = dump;
+    await create(GrokAgentDriver, "resume-poisoned");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned",
+      text: "continue",
+      resumeCursor: "wedged-native-session",
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((event) => event.type === "session.started")).toBe(true);
+    const notice = recorder.events.find((event) => event.type === "runtime.notice");
+    expect(notice?.message).toMatch(/unfinished turn/i);
+    expect(notice?.message).toMatch(/discarded/i);
+    const methods = JSON.parse(readFileSync(dump, "utf8")) as string[];
+    expect(methods).toContain("session/load");
+    expect(methods).toContain("session/new");
+    expect(methods).toContain("session/prompt");
+  });
+
+  it("classifies only the wedged-session rejection as poisoned (BF-2447)", () => {
+    expect(isPoisonedSessionError(new Error("The saved Muse session has an unfinished turn or pending input"))).toBe(true);
+    expect(isPoisonedSessionError(new Error("session has pending input"))).toBe(true);
+    expect(isPoisonedSessionError({ message: "resume failed", cause: new Error("unfinished turn") })).toBe(true);
+    expect(isPoisonedSessionError(new Error("saved session is gone"))).toBe(false);
+    expect(isPoisonedSessionError(new Error("authentication required"))).toBe(false);
+    expect(isPoisonedSessionError(null)).toBe(false);
+    expect(isPoisonedSessionError(undefined)).toBe(false);
   });
 
   it("classifies authentication rejected during ACP resume as setup", async () => {
