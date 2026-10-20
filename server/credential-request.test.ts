@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CREDENTIAL_TARGET_SPECS,
   CREDENTIAL_TARGETS,
   credentialConfigPatch,
   credentialIsConfigured,
@@ -10,6 +11,7 @@ import {
   type CredentialConfig,
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
+import { SECRET_FIELDS } from "./secret-map.ts";
 
 const MAPPINGS: Array<[CredentialTargetId, CredentialConfig]> = [
   ["xaiApiKey", { xai: { key: "secret" } }],
@@ -54,6 +56,17 @@ describe("credential request allowlist", () => {
     expect(isReusableCredentialRequest(card, "xaiApiKey", "pixel", true)).toBe(false);
     expect(isReusableCredentialRequest(card, "xaiApiKey", "pixel", false)).toBe(true);
     expect(isReusableCredentialRequest({ ...card, secret: { ...card.secret, provided: true } }, "xaiApiKey", "atlas", true)).toBe(false);
+  });
+
+  it("derives every target from one spec row tied to the server registry (BF-2437)", () => {
+    const byId = new Map(SECRET_FIELDS.map((field) => [field.id, field]));
+    for (const [id, spec] of Object.entries(CREDENTIAL_TARGET_SPECS)) {
+      expect(CREDENTIAL_TARGETS[id as CredentialTargetId].label).toBe(spec.label);
+      const field = byId.get(spec.secretFieldId);
+      expect(field, `${id} -> ${spec.secretFieldId}`).toBeDefined();
+      expect(field?.secret).toBe(true);
+      expect(spec.configPath.join(".")).toBe(spec.secretFieldId);
+    }
   });
 
   it("preserves the original save or decline outcome when retrying", () => {
