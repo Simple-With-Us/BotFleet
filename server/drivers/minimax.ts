@@ -135,6 +135,20 @@ const MODELS: ModelCatalog = {
   ],
 };
 
+/** The prompt-budget window for a MiniMax model: the catalog row's own cap
+ *  when the id is one the catalog carries - the 512K Flash row is a deliberate
+ *  client-side billing-tier cap, and budgeting it at the shared table's
+ *  published 1M would push those turns into the higher input tier (Kody
+ *  review, PR #1283) - else the shared published table, else undefined. */
+export function minimaxWindowTokens(
+  model: string | undefined,
+  options: ModelCatalog["options"],
+): number | undefined {
+  if (!model) return undefined;
+  const row = options.find((option) => option.id === model);
+  return row?.contextWindow ?? contextWindowFor(model);
+}
+
 /** Published MiniMax API rates, USD per million tokens, STANDARD service
  *  tier — this driver never sends `service_tier: "priority"`.  Source:
  *  https://platform.minimax.io/docs/guides/pricing-paygo, verified
@@ -717,7 +731,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           // No config at all must not inherit the ACP 128 KiB default: a MiniMax
           // bot has a 1M window.  Without an override or a cap the budget is the
           // model's own window (80% of it), and off for a model with no known one.
-          const windowTokens = contextWindowFor(model);
+          const windowTokens = minimaxWindowTokens(model, models.options);
           const unconfigured =
             config.promptBudgetBytes === undefined && config.contextCapTokens === undefined && turn.contextCapTokens === undefined;
           const budgetBytes = unconfigured && windowTokens === undefined
