@@ -77,6 +77,17 @@ export { dshWrapSpawn, isDshEngineCli, isStockDshCli } from "./dsh-mcp.ts";
 export const DSH_DEEPSEEK_PRO_MODEL = "DeepSeek-V4-Pro";
 export const DSH_DEEPSEEK_FLASH_MODEL = "DeepSeek-V4.1-Flash";
 
+/** The DSH-hosted MiniMax M3.1 Flash row.  The installed dsh engine dropped
+ *  the `-Preview` suffix (it now declares `minimax/MiniMax-M3.1-Flash`), and
+ *  Clutch's model matching has no MiniMax alias family, so sending the old
+ *  `MiniMax-M3.1-Flash-Preview` spelling failed every turn with "unknown
+ *  model".  The retired spelling is excluded below and saved dsh selections
+ *  are rewritten onto this id by `retired-model-ids.ts`.  mcode and the native
+ *  MiniMax HTTP driver still use the Preview id and are untouched. */
+export const DSH_MINIMAX_M31_FLASH_MODEL = "MiniMax-M3.1-Flash";
+/** The pre-rename spelling of {@link DSH_MINIMAX_M31_FLASH_MODEL}. */
+export const DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL = "MiniMax-M3.1-Flash-Preview";
+
 export const STATIC_DSH_MODELS: ModelCatalog = {
   default: DSH_DEEPSEEK_FLASH_MODEL,
   options: [
@@ -99,13 +110,19 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
         `Text and reasoning only — lacks vision. Switch to ${DSH_DEEPSEEK_FLASH_MODEL} to attach an image.`,
     },
     {
-      id: "MiniMax-M3.1-Flash-Preview",
-      label: "MiniMax-M3.1-Flash-Preview",
+      id: DSH_MINIMAX_M31_FLASH_MODEL,
+      label: DSH_MINIMAX_M31_FLASH_MODEL,
       images: true,
       contextWindow: 1_000_000,
-      badge: "Preview",
+      badge: "Token Plan",
       badgeTitle:
         "Frontier multimodal coding model with a 1M context window. MiniMax offers it through Token Plan and MiniMax Code, so it needs a Token Plan key.",
+      // Clutch's per-model effort table still keys M3.1 by the retired
+      // Preview id, so the static map cannot vouch for any level on this id.
+      // `readDshModelCatalog` fills in what the install's settings entry
+      // declares; this explicit `[]` keeps the engine-wide DeepSeek levels off
+      // the row when nothing reads the file.
+      effortLevels: [],
     },
     {
       id: "MiniMax-M2.7-highspeed",
@@ -124,7 +141,7 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
  *  the live read below and the static fallback agree on what is excluded. */
 const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   "MiniMax-M2.7",
-  // Superseded by MiniMax-M3.1-Flash-Preview.  Dropping it from the static
+  // Superseded by MiniMax-M3.1-Flash.  Dropping it from the static
   // options is not enough: a settings file written while M3 shipped still
   // declares it, and the live-catalog union below would re-add it.
   "MiniMax-M3",
@@ -134,6 +151,10 @@ const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   // `deepseek-v4-pro` is deliberately absent: it is still declared, and
   // `dshSameModel` folds it onto `DeepSeek-V4-Pro` row without a duplicate.
   "deepseek-v4-flash",
+  // Renamed to MiniMax-M3.1-Flash by the installed engine.  A settings file
+  // written before the rename still declares it, and the union below would
+  // re-add a row the engine refuses at turn time.
+  DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL,
 ];
 
 /** The installed engine declares the models it can actually serve in its own
@@ -261,6 +282,49 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
  *  models; it cannot retire them.  Removals need an explicit exclusion in
  *  `DSH_EXCLUDED_MODEL_IDS`, which is how `MiniMax-M2.7` and the retired
  *  pre-rename `deepseek-v4-flash` id are handled. */
+/** Whether a settings entry's id names `model`, ignoring case.  The declared
+ *  `string | undefined` is a promise a hand-edited file may break, so the id
+ *  is re-checked as a string before it is lowercased. */
+function isM31FlashEntryId(id: string | undefined, model: string): boolean {
+  return isJsonString(id) && id.toLowerCase() === model.toLowerCase();
+}
+
+/** One provider map with the renamed M3.1 entry answering to the retired
+ *  Preview id, and any stale Preview entry dropped so it cannot shadow the
+ *  live one.  Every other entry, and every field of the renamed one
+ *  (`reasoningEfforts`, `compat`), is carried through untouched. */
+function m31EffortProviders(
+  providers: Readonly<Record<string, DshProviderBlock>> | undefined,
+): Readonly<Record<string, DshProviderBlock>> | undefined {
+  if (!providers) return undefined;
+  return Object.fromEntries(
+    Object.entries(providers).map(([route, block]): [string, DshProviderBlock] => {
+      if (!block || !Array.isArray(block.models)) return [route, block];
+      const models = block.models
+        .filter((entry) => !isM31FlashEntryId(entry?.id, DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL))
+        .map((entry) =>
+          isM31FlashEntryId(entry?.id, DSH_MINIMAX_M31_FLASH_MODEL)
+            ? { ...entry, id: DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL }
+            : entry,
+        );
+      return [route, { ...block, models }];
+    }),
+  );
+}
+
+/** The parsed settings as Clutch's Preview-keyed effort table needs to see
+ *  them, so the `MiniMax-M3.1-Flash` entry's declared levels reach the
+ *  renamed row.  `undefined` stays `undefined`: no file still answers `[]`. */
+function m31EffortView(settings: DshSettings | undefined): DshSettings | undefined {
+  if (!settings) return undefined;
+  const piAi = settings["llm-pi-ai"];
+  return {
+    ...settings,
+    "llm-pi-ai": piAi ? { ...piAi, providers: m31EffortProviders(piAi.providers) } : piAi,
+    providers: m31EffortProviders(settings.providers),
+  };
+}
+
 export function readDshModelCatalog(
   environment: Record<string, string | undefined> = process.env,
 ): ModelCatalog {
@@ -301,8 +365,11 @@ export function readDshModelCatalog(
   // offers a level this dsh would refuse.  A missing or unreadable file
   // answers `[]` for those rows too.
   const installedLevels = dshInstalledEffortLevels(settings);
+  // Clutch still keys M3.1 by the retired Preview id, so ask it about the
+  // renamed entry through a view where that entry answers to the old id.
+  const m31Levels = dshInstalledEffortLevels(m31EffortView(settings))[DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL];
   for (const option of options) {
-    const levels = installedLevels[option.id];
+    const levels = option.id === DSH_MINIMAX_M31_FLASH_MODEL ? m31Levels : installedLevels[option.id];
     if (levels) option.effortLevels = [...levels];
   }
   // The static default is always in the union, so a refresh cannot move a

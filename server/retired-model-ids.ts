@@ -23,17 +23,45 @@ const RETIRED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
   "DeepSeek-V4.1-Pro": "DeepSeek-V4-Pro",
 };
 
+/** The dsh instance's own M3.1 Flash rename.
+ *
+ *  The installed dsh engine renamed `MiniMax-M3.1-Flash-Preview` to
+ *  `MiniMax-M3.1-Flash` (see `DSH_MINIMAX_M31_FLASH_MODEL` in
+ *  `drivers/acp/dsh.ts`), and Clutch has no MiniMax alias family, so a dsh
+ *  turn sent with the old id fails "unknown model".  mcode and the native
+ *  `minimax` driver still serve the Preview id, so this cannot sit in the
+ *  global map above: it would move their bots onto an id they do not offer. */
+const DSH_INSTANCE_ID = "dsh";
+const DSH_RETIRED_M31_PREVIEW = "MiniMax-M3.1-Flash-Preview";
+const DSH_M31_FLASH = "MiniMax-M3.1-Flash";
+
+/** The instance-scoped replacement for a model id, or `undefined` when the
+ *  instance has no retirement of its own for it. */
+function instanceReplacement(model: string, instanceId: string | undefined): string | undefined {
+  if (instanceId === DSH_INSTANCE_ID && model === DSH_RETIRED_M31_PREVIEW) return DSH_M31_FLASH;
+  return undefined;
+}
+
 /** Live replacement for a retired model id, or the input when it is still
  *  current.  Exact match only — MiniMax-M3.1-Flash-Preview and
- *  MiniMax-M2.7-highspeed must not match the retired stems. */
-export function rewriteRetiredModelId(model: string): string {
-  return RETIRED_MODEL_REPLACEMENTS[model] ?? model;
+ *  MiniMax-M2.7-highspeed must not match the retired stems.
+ *
+ *  Pass `instanceId` to also apply that instance's own retirements; the
+ *  global rewrite runs first, so dsh's `MiniMax-M3` lands on the dsh M3.1
+ *  Flash id rather than the Preview spelling dsh no longer offers. */
+export function rewriteRetiredModelId(model: string, instanceId?: string): string {
+  const global = RETIRED_MODEL_REPLACEMENTS[model] ?? model;
+  return instanceReplacement(global, instanceId) ?? global;
 }
 
 /** True when the model id is one the product has already retired from
- *  every catalog that used to advertise it. */
-export function isRetiredModelId(model: string): boolean {
-  return Object.prototype.hasOwnProperty.call(RETIRED_MODEL_REPLACEMENTS, model);
+ *  every catalog that used to advertise it, or (with `instanceId`) from that
+ *  instance's catalog. */
+export function isRetiredModelId(model: string, instanceId?: string): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(RETIRED_MODEL_REPLACEMENTS, model) ||
+    instanceReplacement(model, instanceId) !== undefined
+  );
 }
 
 /** Rewrite primary + nested fallbacks.  Effort and instanceId stay put —
@@ -44,7 +72,7 @@ export function rewriteModelSelection(selection: ModelSelection): {
   changed: boolean;
 } {
   let changed = false;
-  const model = rewriteRetiredModelId(selection.model);
+  const model = rewriteRetiredModelId(selection.model, selection.instanceId);
   if (model !== selection.model) changed = true;
   let fallbacks = selection.fallbacks;
   if (fallbacks && fallbacks.length > 0) {

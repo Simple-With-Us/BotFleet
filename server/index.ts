@@ -201,7 +201,7 @@ import {
   type TurnFallbackPick,
 } from "./model-fallback.ts";
 import { enableModelRejectionPersist, modelRejections } from "./model-rejections.ts";
-import { rewriteModelSelection } from "./retired-model-ids.ts";
+import { rewriteModelSelection, rewriteRetiredModelId } from "./retired-model-ids.ts";
 import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
@@ -213,6 +213,7 @@ import {
   filterConnectorToolsList,
 } from "./connector-verdict.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
+import { requestHarnessShutdown } from "./harness-lifecycle.ts";
 import { botFleetStatusSystemPrompt } from "./botfleet-status-capsule.ts";
 import {
   BOX_GATEWAY_PATH,
@@ -283,6 +284,7 @@ import {
   saveConfig,
   showToolCallsEnabled,
   summarizeToolCallsEnabled,
+  remoteDesktopLaunchAllowed,
   skillRecorderEnabled,
   syncCredentialEnv,
   patchInstanceConfig,
@@ -4588,14 +4590,18 @@ const NON_THINKING_MINIMAX_FLASH = "MiniMax-M3.1-Flash-Preview";
  *  dsh, then the MiniMax HTTP engine, and only when that engine is enabled
  *  and lists the id.  No such row means the caller leaves thinking in place. */
 function nonThinkingFlashSelection(currentInstanceId: string): { instanceId: string; model: string } | undefined {
+  // dsh spells this model `MiniMax-M3.1-Flash` since its engine dropped the
+  // Preview suffix; the instance-scoped rewrite answers each engine's own id.
+  const flashFor = (instanceId: string): string => rewriteRetiredModelId(NON_THINKING_MINIMAX_FLASH, instanceId);
   const offers = (instanceId: string): boolean => {
     const instance = registry.get(instanceId);
     if (!instance || instance.enabled === false) return false;
-    return instance.models.options.some((option) => option.id === NON_THINKING_MINIMAX_FLASH);
+    const model = flashFor(instanceId);
+    return instance.models.options.some((option) => option.id === model);
   };
-  if (offers(currentInstanceId)) return { instanceId: currentInstanceId, model: NON_THINKING_MINIMAX_FLASH };
+  if (offers(currentInstanceId)) return { instanceId: currentInstanceId, model: flashFor(currentInstanceId) };
   for (const instanceId of ["dsh", "minimax"]) {
-    if (offers(instanceId)) return { instanceId, model: NON_THINKING_MINIMAX_FLASH };
+    if (offers(instanceId)) return { instanceId, model: flashFor(instanceId) };
   }
   return undefined;
 }
@@ -14723,14 +14729,64 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, { message: patched });
     }
     if (method === "POST" && path === "/api/desktop/open") {
-      // Raising the desktop is a physical action on this computer, so only a
-      // connection from this computer may ask for it, whatever Host it sends.
+      // Raising the desktop is a physical action on this computer.  Two gates,
+      // and they are not alternatives to each other.
+      //
+      // The loopback check is the local-only defence: only a request that
+      // actually arrived from this machine may ask.  It is not, on its own, a
+      // defence against a phone.  The Companion sidecar replays a paired
+      // device's request to 127.0.0.1 — by design, since it strips Host and
+      // Origin so the device cannot spoof either — and that replay satisfies
+      // the check below by construction (companion/src/proxy.ts states this in
+      // its own header).  So for every phone caller this branch is reached
+      // with a loopback address that says nothing about where the person is.
+      //
+      // The policy check is therefore separate and in front, and it is the one
+      // that actually governs remote callers.  Keep both: if this one is ever
+      // dropped in a refactor the remote path silently re-opens, and if the
+      // loopback one is dropped the endpoint becomes reachable by anything that
+      // can speak to the port.
       if (!isLoopbackAddress(req.socket.remoteAddress)) {
         return json(res, 403, { error: "forbidden: the desktop can only be opened from this computer" });
+      }
+      if (!remoteDesktopLaunchAllowed(cfg)) {
+        // Deliberately distinct from the message above: this one is the owner
+        // saying no, and the phone surfaces it verbatim, so the person is
+        // told to go and change a setting rather than left guessing why a
+        // button does nothing.
+        return json(res, 403, { error: "Opening the desktop app from iOS is disabled in Mac settings" });
       }
       const result = await openBotFleetDesktop();
       if (!result.ok) return json(res, 503, { error: result.error ?? "could not open BotFleet" });
       return json(res, 200, { ok: true });
+    }
+    // One-click full shutdown.  Loopback-only like every route that stops
+    // something on this computer, and it is what writes the sentinel the
+    // launchd wrapper reads — without that marker the 5-minute StartInterval
+    // would treat the clean exit as a crash and resurrect the harness, which
+    // is exactly what makes a manual "shut it down" impossible today.
+    if (method === "POST" && path === "/api/system/shutdown") {
+      if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        return json(res, 403, { error: "forbidden: the harness can only be shut down from this computer" });
+      }
+      const stopping = await requestHarnessShutdown({
+        stopLocalVm: async () => {
+          // Same lease check the Computer panel's own stop route makes.  The
+          // harness is about to go away either way, but yanking a VM out from
+          // under a bot mid-turn destroys work the person did not ask to lose,
+          // so a leased VM is left running and reported instead.  It will be
+          // reclaimed by the runtime's own idle reaper.
+          const owner = localVmLeaseFor(SHARED_LOCAL_VM_TARGET).current(localVmOwnerBusy);
+          if (owner) {
+            return { stopped: false, note: `the Local VM is in use by ${owner}; left running` };
+          }
+          await containerComputerAction("stop", undefined, undefined, SHARED_LOCAL_VM_TARGET);
+          localVmIdleFor(SHARED_LOCAL_VM_TARGET).cancel();
+          return { stopped: true };
+        },
+      });
+      if (!stopping.ok) return json(res, 500, { error: stopping.error });
+      return json(res, 200, { ok: true, detail: stopping.detail });
     }
     if (method === "POST" && path === "/api/bots") {
       const body = await readBody(req);

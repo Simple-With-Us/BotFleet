@@ -554,6 +554,30 @@ const appConfigSchema = z.object({
     secretPath: optionalText,
     caCertPath: optionalText,
   }).strict().optional(),
+  // Lifecycle policy for the always-on harness itself: who may wake it, who
+  // may raise the desktop, and what quitting the desktop app does to it.
+  //
+  // Every field is optional and every ABSENT field means the conservative
+  // choice, so an existing config file keeps its behaviour with no migration.
+  // `allowRemoteDesktopLaunch` defaults to false because the path it guards
+  // reaches this Mac from a phone: the Companion sidecar replays a device
+  // request to 127.0.0.1, which satisfies the loopback-only check in the
+  // harness by construction (companion/src/proxy.ts says so in its header).
+  // A named permission that is off until asked for is the only defensible
+  // default for that.
+  //
+  // `persistOnExit` defaults to TRUE, deliberately, and is the one place this
+  // section does not take the conservative option.  False means quitting the
+  // desktop app tears down the harness and the local VM.  The harness is
+  // launchd-supervised and is documented as always-on in MAC-LOCAL-PROCESSES,
+  // and every paired phone depends on it answering after the window closes;
+  // defaulting this to false would turn a normal quit into an outage.  The
+  // native Mac app is the thing that wants false, and it does not exist yet —
+  // when it lands it opts in here explicitly rather than inheriting it.
+  server: z.object({
+    allowRemoteDesktopLaunch: z.boolean().optional(),
+    persistOnExit: z.boolean().optional(),
+  }).strict().optional(),
   features: featureConfigSchema.optional(),
   conversationMode: z.enum(STORED_CONVERSATION_MODES).optional(),
   busySendDefault: z.enum(BUSY_SEND_DEFAULTS).optional(),
@@ -793,6 +817,15 @@ export interface AppConfig {
     environment?: string;
     secretPath?: string;
     caCertPath?: string;
+  };
+  /** Lifecycle policy for the always-on harness.  Absent means the
+   *  conservative choice for every field; see the zod schema above for why
+   *  `persistOnExit` is the exception. */
+  server?: {
+    /** May a paired phone raise the BotFleet window on this Mac? */
+    allowRemoteDesktopLaunch?: boolean;
+    /** Does the harness outlive the desktop app's window? */
+    persistOnExit?: boolean;
   };
   /** Opt-in product experiments. Every flag defaults to disabled. */
   features?: {
@@ -1185,6 +1218,31 @@ export interface AgentProxySettings {
 export function agentProxyEnabled(cfg: AppConfig): boolean {
   return cfg.agentProxy?.enabled === true;
 }
+
+/** May a paired phone raise the BotFleet window on this computer?
+ *
+ *  Off unless the owner turned it on.  This is the only thing standing
+ *  between a phone on someone else's network and a window appearing on this
+ *  Mac, because the sidecar replays the device request to 127.0.0.1 and the
+ *  harness's loopback-only check on `/api/desktop/open` is satisfied by
+ *  that replay rather than by the caller actually being local. */
+export function remoteDesktopLaunchAllowed(cfg: AppConfig): boolean {
+  return cfg.server?.allowRemoteDesktopLaunch === true;
+}
+
+/** Does the harness outlive the desktop app's window?
+ *
+ *  True when unset: the harness is launchd-supervised and documented as
+ *  always-on, so a quit that tore it down would strand every paired phone.
+ *
+ *  Deliberately not consumed by this file's callers.  The one place that has
+ *  to act on it is Electron's quit path, and `electron/main.mjs` is plain ESM
+ *  that cannot import this TypeScript module — so it reads the field from the
+ *  config file directly, with its own copy of the `!== false` default.  That
+ *  duplicated default is the thing to watch: if it is ever changed here it
+ *  must be changed there in the same commit, or quitting the app will quietly
+ *  do something other than what this comment says. */
+export const SERVER_PERSISTS_ON_EXIT_WHEN_UNSET = true;
 
 /** Resolve stored Agent Proxy settings against defaults. */
 export function agentProxySettings(cfg: AppConfig): AgentProxySettings {

@@ -84,7 +84,7 @@ describe("DshAgentDriver config", () => {
     expect(STATIC_DSH_MODELS.options.map((option) => option.id)).toEqual([
       "DeepSeek-V4.1-Flash",
       "DeepSeek-V4-Pro",
-      "MiniMax-M3.1-Flash-Preview",
+      "MiniMax-M3.1-Flash",
       "MiniMax-M2.7-highspeed",
     ]);
   });
@@ -113,8 +113,8 @@ describe("DshAgentDriver config", () => {
     expect(byId.get("DeepSeek-V4-Pro")?.badgeTitle).toContain("Switch to DeepSeek-V4.1-Flash to attach an image");
     expect(byId.get("DeepSeek-V4.1-Flash")?.images).toBe(true);
     expect(byId.get("DeepSeek-V4-Pro")?.images).toBe(false);
-    // Preview: Token Plan / MiniMax Code only, so it needs a Token Plan key.
-    expect(byId.get("MiniMax-M3.1-Flash-Preview")?.badge).toBe("Preview");
+    // Token Plan / MiniMax Code only, so it needs a Token Plan key.
+    expect(byId.get("MiniMax-M3.1-Flash")?.badge).toBe("Token Plan");
     // 2x Cost: $0.60/$2.40 against M3's $0.30/$1.20.
     expect(byId.get("MiniMax-M2.7-highspeed")?.badge).toBe("2x the $");
     // M3 is out of the picker entirely (superseded by M3.1 Flash Preview);
@@ -132,7 +132,7 @@ describe("DshAgentDriver config", () => {
 
   it("keeps every MiniMax row on a 1M-or-204k context window", () => {
     const byId = new Map(STATIC_DSH_MODELS.options.map((option) => [option.id, option]));
-    expect(byId.get("MiniMax-M3.1-Flash-Preview")?.contextWindow).toBe(1_000_000);
+    expect(byId.get("MiniMax-M3.1-Flash")?.contextWindow).toBe(1_000_000);
     expect(byId.get("MiniMax-M2.7-highspeed")?.contextWindow).toBe(204_800);
   });
 
@@ -636,7 +636,7 @@ describe("readDshModelCatalog", () => {
   });
 
   it("adds a model the static catalog has never heard of", () => {
-    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n        - id: MiniMax-M4\n"));
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash\n        - id: MiniMax-M4\n"));
     const catalog = readDshModelCatalog({ HOME: home });
     expect(catalog.options.map((option) => option.id)).toContain("MiniMax-M4");
   });
@@ -645,7 +645,7 @@ describe("readDshModelCatalog", () => {
     // This profile configures only the minimax provider.  deepseek-v4-flash is
     // the static default and is still reachable, so the live read must not drop
     // it -- that would silently remove a working engine from the picker.
-    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n"));
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash\n"));
     const catalog = readDshModelCatalog({ HOME: home });
     for (const id of STATIC_IDS) expect(catalog.options.map((option) => option.id)).toContain(id);
   });
@@ -687,9 +687,9 @@ describe("readDshModelCatalog", () => {
   });
 
   it("keeps the hand-written label for a model it already knows", () => {
-    const known = STATIC_DSH_MODELS.options.find((option) => option.id === "MiniMax-M3.1-Flash-Preview")!;
-    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n          name: Renamed By Profile\n"));
-    const row = readDshModelCatalog({ HOME: home }).options.find((option) => option.id === "MiniMax-M3.1-Flash-Preview");
+    const known = STATIC_DSH_MODELS.options.find((option) => option.id === "MiniMax-M3.1-Flash")!;
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash\n          name: Renamed By Profile\n"));
+    const row = readDshModelCatalog({ HOME: home }).options.find((option) => option.id === "MiniMax-M3.1-Flash");
     expect(row?.label).toBe(known.label);
     expect(row?.images).toBe(true);
   });
@@ -704,13 +704,26 @@ describe("readDshModelCatalog", () => {
     expect(ids).toContain("MiniMax-M2.7-highspeed");
   });
 
+  it("drops the retired MiniMax-M3.1-Flash-Preview spelling a stale settings file still declares", () => {
+    // BOTFLEET-4E: the installed engine renamed the model to
+    // MiniMax-M3.1-Flash and refuses the Preview id at turn time, so the
+    // union must not re-add a row every turn on it would fail.
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n        - id: MiniMax-M3.1-Flash\n"));
+    const catalog = readDshModelCatalog({ HOME: home });
+    const ids = catalog.options.map((o) => o.id);
+    expect(ids).not.toContain("MiniMax-M3.1-Flash-Preview");
+    expect(ids.filter((id) => id === "MiniMax-M3.1-Flash")).toHaveLength(1);
+    // Clutch cannot vouch for any effort level on the renamed id yet.
+    expect(catalog.options.find((o) => o.id === "MiniMax-M3.1-Flash")?.effortLevels).toEqual([]);
+  });
+
   it("merges several provider blocks into one catalog", () => {
     writeSettings(llmPiAi(
-      "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n",
+      "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash\n",
     ));
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
     expect(ids).toContain("DeepSeek-V4-Pro");
-    expect(ids).toContain("MiniMax-M3.1-Flash-Preview");
+    expect(ids).toContain("MiniMax-M3.1-Flash");
     // `deepseek-v4-pro` is the id dsh still declares for Pro: it folds onto
     // the V4.1 row and never survives the union as its own stale row.
     expect(ids).not.toContain("deepseek-v4-pro");
@@ -941,12 +954,16 @@ describe("dsh model option resolution (Clutch #54 consumer)", () => {
 // `reasoningEfforts` (stock dsh does not catalog M3.1).  The live catalog
 // gates the picker on that entry, and configureSession is Clutch's.
 describe("DSH MiniMax M3.1 reasoning effort", () => {
+  // Clutch's per-model table (and configureSession) still key M3.1 by the
+  // retired Preview id; the installed engine and the picker row use the
+  // renamed id (BOTFLEET-4E).
   const M31 = "MiniMax-M3.1-Flash-Preview";
+  const M31_ROW = "MiniMax-M3.1-Flash";
   const M31_LEVELS = ["low", "medium", "high", "xhigh", "max"];
-  const m31Entry = (extra = "") =>
+  const m31Entry = (extra = "", id = M31_ROW) =>
     `llm-pi-ai:\n  providers:\n    minimax:\n      apiKeyEnv: MINIMAX_API_KEY\n      models:\n` +
     `        - id: MiniMax-M2.7-highspeed\n` +
-    `        - id: ${M31}\n          contextWindow: 1000000\n${extra}`;
+    `        - id: ${id}\n          contextWindow: 1000000\n${extra}`;
   const CONFIGURED =
     "          reasoningEfforts: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }\n" +
     "          compat: { forceAdaptiveThinking: true }\n";
@@ -974,7 +991,7 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
 
     it("offers M3.1's levels, xhigh included, when the settings entry declares them", () => {
       const catalog = catalogWith(m31Entry(CONFIGURED));
-      expect(levelsOf(catalog, M31)).toEqual(M31_LEVELS);
+      expect(levelsOf(catalog, M31_ROW)).toEqual(M31_LEVELS);
       // Every other row keeps no levels of its own: DeepSeek takes the
       // engine-wide list, and the client's DSH MiniMax rule hides M2.7.
       for (const id of ["DeepSeek-V4.1-Flash", "DeepSeek-V4-Pro", "MiniMax-M2.7-highspeed"]) {
@@ -984,8 +1001,8 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
 
     it("offers no M3.1 level when the entry has no reasoningEfforts, so dsh never refuses a pick", () => {
       // The adaptive flag is set in both, so reasoningEfforts is what is missing.
-      expect(levelsOf(catalogWith(m31Entry(ADAPTIVE)), M31)).toEqual([]);
-      expect(levelsOf(catalogWith(m31Entry(`          reasoningEfforts: false\n${ADAPTIVE}`)), M31)).toEqual([]);
+      expect(levelsOf(catalogWith(m31Entry(ADAPTIVE)), M31_ROW)).toEqual([]);
+      expect(levelsOf(catalogWith(m31Entry(`          reasoningEfforts: false\n${ADAPTIVE}`)), M31_ROW)).toEqual([]);
     });
 
     it("offers no M3.1 level unless the entry forces adaptive thinking", () => {
@@ -993,14 +1010,14 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
       // xhigh and max to high, and sends no output_config.effort, so most of
       // the levels would run the same request.
       const efforts = "          reasoningEfforts: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }\n";
-      expect(levelsOf(catalogWith(m31Entry(efforts)), M31)).toEqual([]);
+      expect(levelsOf(catalogWith(m31Entry(efforts)), M31_ROW)).toEqual([]);
       expect(
-        levelsOf(catalogWith(m31Entry(`${efforts}          compat: { forceAdaptiveThinking: false }\n`)), M31),
+        levelsOf(catalogWith(m31Entry(`${efforts}          compat: { forceAdaptiveThinking: false }\n`)), M31_ROW),
       ).toEqual([]);
     });
 
     it("offers no M3.1 level without a settings file", () => {
-      expect(levelsOf(catalogWith(null), M31)).toEqual([]);
+      expect(levelsOf(catalogWith(null), M31_ROW)).toEqual([]);
     });
 
     it("reads the entry from the engine home when DSH_HOME is set", () => {
@@ -1008,14 +1025,23 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
       const engineHome = join(home, "engine-home");
       mkdirSync(engineHome, { recursive: true });
       writeFileSync(join(engineHome, "settings.yaml"), m31Entry(CONFIGURED), "utf8");
-      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: engineHome }), M31)).toEqual(M31_LEVELS);
+      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: engineHome }), M31_ROW)).toEqual(M31_LEVELS);
       // The old lookup went one .dsh too deep and found nothing.
-      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: join(home, "missing") }), M31)).toEqual([]);
+      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: join(home, "missing") }), M31_ROW)).toEqual([]);
     });
 
     it("keeps only the levels the entry maps", () => {
       const subset = "          reasoningEfforts: { high: high, max: max }\n";
-      expect(levelsOf(catalogWith(m31Entry(subset + ADAPTIVE)), M31)).toEqual(["high", "max"]);
+      expect(levelsOf(catalogWith(m31Entry(subset + ADAPTIVE)), M31_ROW)).toEqual(["high", "max"]);
+    });
+
+    it("reads levels only from the renamed entry, never a stale Preview one", () => {
+      // A settings file written before the rename declares the Preview id.
+      // That row is excluded and the engine refuses it, so its levels must
+      // not light up the renamed row.
+      const catalog = catalogWith(m31Entry(CONFIGURED, M31));
+      expect(levelsOf(catalog, M31_ROW)).toEqual([]);
+      expect(catalog.options.some((option) => option.id === M31)).toBe(false);
     });
   });
 

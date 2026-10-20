@@ -555,10 +555,10 @@ export function effectiveFallbackTiers(
   let previous = primary;
   let effective = 1;
   for (const candidate of fallbacks ?? []) {
-    const prevKey = { instanceId: previous.instanceId, model: rewriteRetiredModelId(previous.model) };
-    const candKey = { instanceId: candidate.instanceId, model: rewriteRetiredModelId(candidate.model) };
+    const prevKey = { instanceId: previous.instanceId, model: rewriteRetiredModelId(previous.model, previous.instanceId) };
+    const candKey = { instanceId: candidate.instanceId, model: rewriteRetiredModelId(candidate.model, candidate.instanceId) };
     if (sameEngine(prevKey, candKey)) {
-      const primaryKey = { instanceId: primary.instanceId, model: rewriteRetiredModelId(primary.model) };
+      const primaryKey = { instanceId: primary.instanceId, model: rewriteRetiredModelId(primary.model, primary.instanceId) };
       redundant.push({
         instanceId: candidate.instanceId,
         model: candidate.model,
@@ -710,7 +710,7 @@ export function selectTurnFallback(input: {
     // Heal retired picker ids before same-engine / rejection checks so a
     // saved MiniMax-M3 entry cannot loop against a live Flash Preview
     // primary or burn another unknown-model spawn.
-    const model = rewriteRetiredModelId(next.model);
+    const model = rewriteRetiredModelId(next.model, next.instanceId);
     if (input.current && sameEngine({ instanceId: next.instanceId, model }, input.current)) continue;
     // Skip in place, never re-order: the remaining entries are still the
     // owner's saved preference order, and nextUsed still points past the
