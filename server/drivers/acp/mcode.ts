@@ -39,14 +39,14 @@ export const STATIC_MCODE_MODELS: ModelCatalog = {
   options: [
     {
       id: "MiniMax-M3.1-Flash-Preview-thinking",
-      label: "MiniMax M3.1 Flash Preview · thinking (512K)",
+      label: "MiniMax M3.1 Flash · thinking (512K)",
       contextWindow: 524_288,
       effortLevels: [...MCODE_M31_EFFORT_LEVELS],
       defaultEffort: "max",
     },
     {
       id: "MiniMax-M3.1-Flash-Preview-thinking-1M",
-      label: "MiniMax M3.1 Flash Preview · thinking (1M)",
+      label: "MiniMax M3.1 Flash · thinking (1M)",
       contextWindow: 1_000_000,
       effortLevels: [...MCODE_M31_EFFORT_LEVELS],
       defaultEffort: "max",
@@ -57,6 +57,21 @@ export const STATIC_MCODE_MODELS: ModelCatalog = {
     { id: "MiniMax-M2.7-highspeed-thinking", label: "MiniMax M2.7 Highspeed · thinking", effortLevels: [] },
   ],
 };
+
+/** Comparison key for an mcode model id.  MiniMax Code renamed the M3.1 flash
+ *  model from `MiniMax-M3.1-Flash-Preview` to `MiniMax-M3.1-Flash` (the session
+ *  now advertises `m:minimax:MiniMax-M3.1-Flash:v:thinking`), while older CLIs
+ *  still advertise the Preview id.  The picker ids stay as shipped, because
+ *  saved bot selections carry them, so both spellings must compare equal. */
+export function mcodeModelKey(id: string): string {
+  return id.trim().toLowerCase().replace(/-flash-preview(?=-|$)/, "-flash");
+}
+
+/** The shipped catalog id an id names, ignoring the Preview rename, or null. */
+function catalogIdFor(id: string): string | null {
+  const key = mcodeModelKey(id);
+  return STATIC_MCODE_MODELS.options.find((option) => mcodeModelKey(option.id) === key)?.id ?? null;
+}
 
 /** Give every catalog row an explicit `effortLevels`, `[]` where it declares
  *  none.  The client (src/lib/model-effort.ts) treats a row with no list as
@@ -144,7 +159,6 @@ export function readMcodeModelCatalog(
   environment: Record<string, string | undefined> = process.env,
 ): ModelCatalog {
   const options = STATIC_MCODE_MODELS.options.map((option) => ({ ...option }));
-  const ids = new Set(options.map((option) => option.id));
   let preferred: string | null = null;
   let contextWindow: number | null = null;
 
@@ -157,14 +171,14 @@ export function readMcodeModelCatalog(
     if (typeof window === "number" && window > 0) contextWindow = window;
     if (configured) {
       const variant = settings.defaultModelVariant;
-      let folded =
+      const folded =
         typeof variant === "string" && variant.trim() ? `${configured}-${variant.trim()}` : configured;
-      if (contextWindow && contextWindow >= 1_000_000 && ids.has(`${folded}-1M`)) {
-        folded = `${folded}-1M`;
-      }
+      // Matched through catalogIdFor so the renamed `MiniMax-M3.1-Flash`
+      // still lands on the shipped (Preview-spelled) row.
+      const wide = contextWindow && contextWindow >= 1_000_000 ? catalogIdFor(`${folded}-1M`) : null;
       // Only a default that is actually on offer is adopted; one that is not
       // would send every turn to a row the picker never showed.
-      if (ids.has(folded)) preferred = folded;
+      preferred = wide ?? catalogIdFor(folded);
     }
   } catch {
     // No config, unreadable, or unparseable: the shipped catalog stands.
@@ -228,7 +242,7 @@ const support: AcpSupport = {
     valueForModel: (model, advertised) => mcodeModelOptionValue(model, advertised),
     modelForValue: (value) => {
       const decoded = parseMcodeModelValue(value);
-      return decoded ? mcodePickerId(decoded) : null;
+      return decoded ? mcodeCatalogPickerId(decoded) : null;
     },
   },
   // mcode's only ACP auth method is a terminal `mcode login`
@@ -374,6 +388,21 @@ export function mcodePickerId(selection: { modelId: string; variant?: string }):
   return selection.variant ? `${selection.modelId}-${selection.variant}` : selection.modelId;
 }
 
+/** The picker id for an advertised wire value: the shipped catalog id when one
+ *  matches (so a renamed `MiniMax-M3.1-Flash` reports as the saved
+ *  Preview-spelled row), otherwise the folded advertised id. */
+export function mcodeModelForValue(value: string): string | null {
+  const decoded = parseMcodeModelValue(value);
+  return decoded ? mcodeCatalogPickerId(decoded) : null;
+}
+
+/** mcodePickerId, snapped onto the shipped catalog row it names when one
+ *  matches under mcodeModelKey. */
+function mcodeCatalogPickerId(selection: { modelId: string; variant?: string }): string {
+  const picker = mcodePickerId(selection);
+  return catalogIdFor(picker) ?? picker;
+}
+
 /** Match the picker model against the session's advertised model options and
  *  return the advertised wire value verbatim: the providerId inside is the
  *  user's own login/BYOK config, never something to construct. Returns null
@@ -386,10 +415,12 @@ export function mcodeModelOptionValue(model: string, advertised: unknown): strin
   ) as { options?: Array<{ value?: unknown; name?: unknown }> } | undefined;
   if (!modelOption) return null;
   const available = Array.isArray(modelOption.options) ? modelOption.options : [];
-  const wanted = model.trim().toLowerCase().replace(/-1m$/, "");
+  // mcodeModelKey makes a saved `...-Flash-Preview-...` id match a CLI that
+  // now advertises the renamed `MiniMax-M3.1-Flash`, and vice versa.
+  const wanted = mcodeModelKey(model.trim().replace(/-1m$/i, ""));
   for (const option of available) {
     const decoded = parseMcodeModelValue(option?.value);
-    if (decoded && mcodePickerId(decoded).toLowerCase() === wanted && typeof option?.value === "string") {
+    if (decoded && mcodeModelKey(mcodePickerId(decoded)) === wanted && typeof option?.value === "string") {
       return option.value;
     }
   }

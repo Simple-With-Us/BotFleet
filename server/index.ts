@@ -201,7 +201,7 @@ import {
   type TurnFallbackPick,
 } from "./model-fallback.ts";
 import { enableModelRejectionPersist, modelRejections } from "./model-rejections.ts";
-import { rewriteModelSelection } from "./retired-model-ids.ts";
+import { rewriteModelSelection, rewriteRetiredModelId } from "./retired-model-ids.ts";
 import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
@@ -4590,14 +4590,18 @@ const NON_THINKING_MINIMAX_FLASH = "MiniMax-M3.1-Flash-Preview";
  *  dsh, then the MiniMax HTTP engine, and only when that engine is enabled
  *  and lists the id.  No such row means the caller leaves thinking in place. */
 function nonThinkingFlashSelection(currentInstanceId: string): { instanceId: string; model: string } | undefined {
+  // dsh spells this model `MiniMax-M3.1-Flash` since its engine dropped the
+  // Preview suffix; the instance-scoped rewrite answers each engine's own id.
+  const flashFor = (instanceId: string): string => rewriteRetiredModelId(NON_THINKING_MINIMAX_FLASH, instanceId);
   const offers = (instanceId: string): boolean => {
     const instance = registry.get(instanceId);
     if (!instance || instance.enabled === false) return false;
-    return instance.models.options.some((option) => option.id === NON_THINKING_MINIMAX_FLASH);
+    const model = flashFor(instanceId);
+    return instance.models.options.some((option) => option.id === model);
   };
-  if (offers(currentInstanceId)) return { instanceId: currentInstanceId, model: NON_THINKING_MINIMAX_FLASH };
+  if (offers(currentInstanceId)) return { instanceId: currentInstanceId, model: flashFor(currentInstanceId) };
   for (const instanceId of ["dsh", "minimax"]) {
-    if (offers(instanceId)) return { instanceId, model: NON_THINKING_MINIMAX_FLASH };
+    if (offers(instanceId)) return { instanceId, model: flashFor(instanceId) };
   }
   return undefined;
 }
