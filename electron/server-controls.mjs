@@ -6,7 +6,7 @@ import os from "node:os";
 const bundleName = "BotFleet Control.app";
 const bundleId = "app.botfleet.control.macos";
 
-export async function shutdownAttachedServer(port, { request = fetch, timeout = 2000 } = {}) {
+export async function shutdownAttachedServer(port, { request = fetch, timeout = 300_000 } = {}) {
   const response = await request(`http://127.0.0.1:${port}/api/system/control/stop`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

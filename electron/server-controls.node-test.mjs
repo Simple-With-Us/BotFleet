@@ -18,6 +18,18 @@ test("desktop quit uses the protected all-VM shutdown and surfaces a refusal", a
   await assert.rejects(shutdownAttachedServer(28799, { request: async () => ({ ok: true, json: async () => ({ ok: false }) }) }), /did not confirm/);
 });
 
+test("desktop quit waits for Local VM shutdown beyond two seconds", async () => {
+  await shutdownAttachedServer(28799, {
+    request: async (_url, { signal }) => {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, 2_500);
+        signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+      });
+      return { ok: true, json: async () => ({ ok: true }) };
+    },
+  });
+});
+
 function fixture(t) {
   const root = mkdtempSync(path.join(tmpdir(), "botfleet-control-install-test-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));

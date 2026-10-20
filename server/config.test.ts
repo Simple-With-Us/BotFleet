@@ -861,6 +861,14 @@ describe("saveConfig section merge", () => {
     rmSync(join(DATA_DIR, "config.json"), { force: true });
   });
 
+  it("persists server quit policy and retains it through another server setting", () => {
+    saveConfig({ server: { persistOnExit: false } });
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+
+    saveConfig({ server: { allowRemoteDesktopLaunch: true } });
+    expect(loadConfig().server).toMatchObject({ persistOnExit: false, allowRemoteDesktopLaunch: true });
+  });
+
   it("persists usage URL and token, and a later URL-only patch keeps the token", () => {
     saveConfig({ usage: { ingestUrl: "https://usage.example.com", ingestToken: "tok_abc" } });
     expect(loadConfig().usage).toMatchObject({

@@ -14891,7 +14891,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             return json(res, 500, { ok: false, error: stopping.error, detail: stopping.detail });
           }
           const partial = stopping.detail.localVmStop === "failed";
-          return json(res, partial ? 500 : 200, { ok: !partial, detail: stopping.detail });
+          if (partial) {
+            return json(res, 500, {
+              ok: false,
+              error: "Server shutdown is proceeding, but one or more Local VMs could not be stopped.  Check Computer settings before assuming they are off.",
+              detail: stopping.detail,
+            });
+          }
+          return json(res, 200, { ok: true, detail: stopping.detail });
         }
       } catch (error) {
         const failure = localComputerActionError(error);
