@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { basename, dirname, join, win32 } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -937,4 +938,48 @@ test("staging refuses a commit that is already a release, before installing anyt
   );
   // And no staging tree is left behind by the refusal.
   await assert.rejects(() => stat(stagingPath(commit, env)), /ENOENT/);
+});
+
+
+test("the CLI names the job that runs the store it acted on", async (t) => {
+  // The restart hint must follow the STORE, not the presence of a flag: an
+  // explicit `--store <harness store>` is still the harness, and telling an
+  // operator to restart the sidecar's job for it would send them to the
+  // wrong program.
+  const dir = await mkdtemp(join(tmpdir(), "bf-release-cli-"));
+  t.after(async () => {
+    // A promoted release is read-only, so the tree cannot be removed
+    // directly: the store's own discard path restores write permission
+    // first, which is the same thing an operator does to reclaim disk.
+    for (const root of [join(dir, "botfleet-companion"), join(dir, "botfleet")]) {
+      const env = { ...process.env, BOTFLEET_RELEASES_ROOT: root };
+      for (const commit of await listReleases(env)) {
+        await discardRelease(commit, env).catch(() => {});
+      }
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const runCli = (args, env = {}) =>
+    run(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), "harness-release.mjs"), ...args], {
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    });
+
+  // A store named for the companion is the companion's.
+  const companionRoot = join(dir, "botfleet-companion");
+  const companionEnv = { BOTFLEET_RELEASES_ROOT: companionRoot };
+  const { repo, commit } = await sourceRepo(t);
+  await stageRelease({ commit, repo, env: { ...process.env, ...companionEnv }, install: false });
+  await promoteStaging({ commit, env: { ...process.env, ...companionEnv } });
+  const companion = await runCli(["swap", commit, "--store", companionRoot]);
+  assert.match(companion.stdout, /app\.botfleet\.companion/);
+
+  // The default store is the harness's, with or without an explicit flag.
+  const harnessRoot = join(dir, "botfleet");
+  const harnessEnv = { BOTFLEET_RELEASES_ROOT: harnessRoot };
+  await stageRelease({ commit, repo, env: { ...process.env, ...harnessEnv }, install: false });
+  await promoteStaging({ commit, env: { ...process.env, ...harnessEnv } });
+  const harness = await runCli(["swap", commit, "--store", harnessRoot]);
+  assert.match(harness.stdout, /app\.botfleet\.server/);
 });

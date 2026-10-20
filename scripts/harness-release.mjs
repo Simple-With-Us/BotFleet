@@ -20,6 +20,7 @@
 // swap, and the harness is restarted separately (launchd's periodic tick
 // picks up the new pointer).
 
+import { basename, join } from "node:path";
 import {
   currentCommit,
   listReleases,
@@ -56,6 +57,19 @@ function flag(args, name) {
   const index = args.indexOf(name);
   if (index === -1) return undefined;
   return args[index + 1];
+}
+
+/**
+ * The launchd job that runs a store, and the line to print after a swap.
+ *
+ * The job follows the STORE, not the presence of a flag: an explicit
+ * `--store <harness store>` is still the harness, and naming the sidecar's
+ * job for it would send an operator to restart the wrong program.
+ */
+function restartHint(env) {
+  const effectiveRoot = env.BOTFLEET_RELEASES_ROOT || join(env.HOME ?? "", ".botfleet");
+  const job = basename(effectiveRoot) === "botfleet-companion" ? "app.botfleet.companion" : "app.botfleet.server";
+  return `restart ${job} to pick the new release up (launchctl kickstart -k gui/$(id -u)/${job})`;
 }
 
 async function main() {
@@ -142,6 +156,9 @@ async function main() {
     if (!result.atomic) {
       process.stdout.write("the pointer swap was not atomic; the old release was put back\n");
     }
+    // A swap is not live until the program restarts, so the hint belongs
+    // here as much as it does on activate.
+    process.stdout.write(`${restartHint(env)}\n`);
     return 0;
   }
 
@@ -169,13 +186,7 @@ async function main() {
     const result = await swapCurrent({ commit, env });
     process.stdout.write(`current: ${releasePath(commit, env)}\n`);
     if (result.previous) process.stdout.write(`previous release kept: ${result.previous}\n`);
-    // The store decides which program this release is for, so the restart
-    // hint does not assume the harness: the sidecar runs its own store and
-    // its own launchd job.
-    const job = store ? "app.botfleet.companion" : "app.botfleet.server";
-    process.stdout.write(
-      `restart the job that runs this store to pick the new release up (launchctl kickstart -k gui/$(id -u)/${job})\n`,
-    );
+    process.stdout.write(`${restartHint(env)}\n`);
     return 0;
   }
 
