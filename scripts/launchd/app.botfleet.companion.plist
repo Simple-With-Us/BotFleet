@@ -36,7 +36,7 @@
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>BOTFLEET_COMPANION_ROOT</key>
-		<string>/Users/jay/.botfleet/current</string>
+		<string>/Users/jay/.botfleet-companion/current</string>
 		<key>HOME</key>
 		<string>/Users/jay</string>
 		<key>PATH</key>
@@ -68,6 +68,6 @@
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
 	<key>WorkingDirectory</key>
-	<string>/Users/jay/.botfleet</string>
+	<string>/Users/jay/.botfleet-companion</string>
 </dict>
 </plist>

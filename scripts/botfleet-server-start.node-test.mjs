@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -608,18 +608,20 @@ test("no marker means the tick behaves exactly as before", () => {
 });
 
 /**
- * Compare two paths for "the same directory" without comparing dialects.
+ * A fake node that records the directory it ran in, by writing a marker
+ * file into its own working directory.
  *
- * The launcher runs under the platform's shell, and on Windows that shell
- * reports a path in its own dialect (`/c/Users/...`) while Node reports the
- * native one (`C:\\Users\\...`).  They name the same directory, so a test
- * that compares the strings fails on Windows for a reason that has nothing
- * to do with the behavior under test.  So the comparison is on the TAIL of
- * the path, with the separators and the case normalized.
+ * Comparing the reported path as a string is not good enough: the launcher
+ * runs under the platform's shell, and on Windows that shell reports a path
+ * in its own dialect (`/c/Users/...`) while Node reports the native one
+ * (`C:\Users\...`).  Both name the same directory, and a suffix match over
+ * either is loose enough to pass for a sibling checkout.
+ *
+ * So the marker is the assertion: wherever it LANDS is the directory the
+ * harness actually ran in, whatever dialect the shell used to say so.
  */
-function samePathTail(actual, expectedTail) {
-  const normalize = (value) => String(value).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-  return normalize(actual).endsWith(normalize(expectedTail));
+function fakeNodeScript(markerName) {
+  return `#!/bin/bash\ntouch "$PWD/${markerName}"\necho fake\n`;
 }
 
 // --- The store pointer is the runtime root ------------------------------------
@@ -645,11 +647,10 @@ test("the store pointer is the runtime root when it exists", () => {
   const pointer = join(storeHome, ".botfleet", "current");
   symlinkSync(releaseDir, pointer);
 
-  // The stub node prints its working directory, so the assertion is on the
-  // directory the harness would actually run from.
-  const stamp = join(dir, "cwd.txt");
+  // The stub node writes a marker into its own working directory, so the
+  // assertion is on the directory the harness actually ran in.
   const node = join(dir, "fake-node");
-  writeFileSync(node, `#!/bin/bash\npwd -P > "${stamp}"\necho fake\n`);
+  writeFileSync(node, fakeNodeScript("ran-here.txt"));
   chmodSync(node, 0o755);
 
   const port = 20000 + Math.floor(Math.random() * 20000);
@@ -668,11 +669,11 @@ test("the store pointer is the runtime root when it exists", () => {
     },
   });
   assert.equal(result.status, 0, result.stderr);
-  // The physical release directory, not the pointer and not a checkout.
-  assert.ok(
-    samePathTail(readFileSync(stamp, "utf8").trim(), `.botfleet/releases/${"a".repeat(40)}`),
-    `the harness must run from the release, not the pointer: ${readFileSync(stamp, "utf8").trim()}`,
-  );
+  // The marker must have landed in the RELEASE, and nowhere else: not in the
+  // store root, not beside the pointer, and not in the fixture root.
+  assert.ok(existsSync(join(releaseDir, "ran-here.txt")), "the harness must run from the release directory");
+  assert.equal(existsSync(join(storeHome, ".botfleet", "ran-here.txt")), false, "the harness must not run from the store root");
+  assert.equal(existsSync(join(dir, "ran-here.txt")), false, "the harness must not run from the fixture root");
 });
 
 test("without a store pointer the legacy checkout path still works", () => {
@@ -681,9 +682,8 @@ test("without a store pointer the legacy checkout path still works", () => {
   mkdirSync(join(serverRoot, "server"), { recursive: true });
   writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
   mkdirSync(join(serverRoot, "node_modules", "yaml"), { recursive: true });
-  const stamp = join(dir, "cwd.txt");
   const node = join(dir, "fake-node");
-  writeFileSync(node, `#!/bin/bash\npwd -P > "${stamp}"\necho fake\n`);
+  writeFileSync(node, fakeNodeScript("ran-here.txt"));
   chmodSync(node, 0o755);
 
   const port = 20000 + Math.floor(Math.random() * 20000);
@@ -702,8 +702,6 @@ test("without a store pointer the legacy checkout path still works", () => {
     },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.ok(
-    samePathTail(readFileSync(stamp, "utf8").trim(), `/${basename(serverRoot)}`),
-    `the harness must still run from the legacy checkout path: ${readFileSync(stamp, "utf8").trim()}`,
-  );
+  assert.ok(existsSync(join(serverRoot, "ran-here.txt")), "the harness must still run from the legacy checkout path");
+  assert.equal(existsSync(join(dir, "ran-here.txt")), false, "the harness must not run from the fixture root");
 });

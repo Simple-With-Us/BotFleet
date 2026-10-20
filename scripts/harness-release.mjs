@@ -39,6 +39,8 @@ function usage() {
       "usage: harness-release.mjs <command> [args]",
       "",
       "  stage <commit> [--repo <path>] [--skip-install]   export a commit and install its deps",
+      "                                                   (--skip-install is for staging only)",
+      "  (every command accepts --store <root> for a separate store namespace)",
       "  promote <commit>                                  move staging into releases/",
       "  swap <commit>                                     point current at a release",
       "  activate <commit> [--repo <path>]                 stage, promote and swap",
@@ -62,7 +64,12 @@ async function main() {
     usage();
     return 0;
   }
-  const env = process.env;
+  const env = { ...process.env };
+  // A separate store root, so two programs that version independently do
+  // not share one pointer: the server and the companion sidecar each move
+  // their own release, and swapping one cannot change what the other runs.
+  const store = flag(args, "--store");
+  if (store) env.BOTFLEET_RELEASES_ROOT = store;
 
   if (command === "status") {
     const physical = await resolveCurrent(env);
@@ -139,11 +146,22 @@ async function main() {
   }
 
   if (command === "activate") {
+    // A release without its dependencies is dead on arrival, and a promoted
+    // release is READ-ONLY, so the launcher's self-heal cannot install into
+    // it: the harness would sit there failing to import a module until an
+    // operator swapped the pointer back.  That is the outage the store
+    // exists to prevent, so activate always installs.
+    if (args.includes("--skip-install")) {
+      process.stderr.write(
+        "harness-release: activate always installs dependencies.  A release without node_modules cannot start, and a promoted release is read-only, so nothing could repair it.  Use `stage --skip-install` for a tree you will not promote.\n",
+      );
+      return 2;
+    }
     await stageRelease({
       commit,
       repo: flag(args, "--repo"),
       env,
-      install: !args.includes("--skip-install"),
+      install: true,
       log: (line) => process.stdout.write(`${line}\n`),
     });
     const path = await promoteStaging({ commit, env });

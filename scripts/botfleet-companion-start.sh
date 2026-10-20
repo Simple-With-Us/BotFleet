@@ -28,7 +28,11 @@ ROOT="${BOTFLEET_COMPANION_ROOT:-$HOME/apps/botfleet-companion}"
 # BOTFLEET_COMPANION_ROOT still overrides it, and the legacy checkout path
 # stays the fallback for a machine that has never promoted a release.
 if [ -z "${BOTFLEET_COMPANION_ROOT:-}" ]; then
-  COMPANION_STORE_POINTER="$HOME/.botfleet/current"
+  # The COMPANION's own store, not the harness's.  The two version
+  # independently: one pointer would mean swapping the server's release
+  # changes what the sidecar runs, and vice versa, with no way to roll one
+  # back without the other.
+  COMPANION_STORE_POINTER="$HOME/.botfleet-companion/current"
   if [ -e "$COMPANION_STORE_POINTER" ] || [ -L "$COMPANION_STORE_POINTER" ]; then
     ROOT="$COMPANION_STORE_POINTER"
   fi
