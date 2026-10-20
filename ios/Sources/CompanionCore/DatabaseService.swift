@@ -164,7 +164,6 @@ public actor DatabaseService {
         try execute(sql: "PRAGMA journal_mode = WAL;")
         try execute(sql: "PRAGMA synchronous = NORMAL;")
         try execute(sql: "PRAGMA foreign_keys = ON;")
-        try execute(sql: "PRAGMA recursive_triggers = ON;")
 
         try createSchema()
     }
@@ -217,18 +216,18 @@ public actor DatabaseService {
         );
 
         CREATE TRIGGER IF NOT EXISTS trg_messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(content, thread_id, message_id)
-            VALUES (new.content, new.thread_id, new.id);
+            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+            VALUES (new.rowid, new.content, new.thread_id, new.id);
         END;
 
         CREATE TRIGGER IF NOT EXISTS trg_messages_ad AFTER DELETE ON messages BEGIN
-            DELETE FROM messages_fts WHERE message_id = old.id;
+            DELETE FROM messages_fts WHERE rowid = old.rowid;
         END;
 
         CREATE TRIGGER IF NOT EXISTS trg_messages_au AFTER UPDATE ON messages BEGIN
-            DELETE FROM messages_fts WHERE message_id = old.id;
-            INSERT INTO messages_fts(content, thread_id, message_id)
-            VALUES (new.content, new.thread_id, new.id);
+            DELETE FROM messages_fts WHERE rowid = old.rowid;
+            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+            VALUES (new.rowid, new.content, new.thread_id, new.id);
         END;
 
         CREATE TABLE IF NOT EXISTS routine_runs (
@@ -340,8 +339,16 @@ public actor DatabaseService {
     public func insertMessage(_ message: MessageRecord) throws {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let sql = """
-        INSERT OR REPLACE INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);
+        INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(id) DO UPDATE SET
+            thread_id = excluded.thread_id,
+            role = excluded.role,
+            kind = excluded.kind,
+            content = excluded.content,
+            created_at = excluded.created_at,
+            model = excluded.model,
+            active_leaf_id = excluded.active_leaf_id;
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
