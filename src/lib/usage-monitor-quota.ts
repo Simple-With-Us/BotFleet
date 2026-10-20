@@ -1,3 +1,4 @@
+import type { QuotaPlanMetadata } from "../../shared/quota-plan-metadata";
 import { formatResetCountdown, isGeminiQuotaModel, type QuotaDisplayLine, type QuotaDisplayModel } from "./quota-display";
 import { canonicalQuotaProvider, isSupportedQuotaProvider, normalizeQuotaProviderKey } from "../../server/quota-window-map";
 
@@ -21,6 +22,7 @@ export type UsageMonitorQuotaWindow = {
    *  the allowance belongs to, what is left of it in dollars, requests or
    *  credits, and the producer's own verdict. */
   planName?: string | null;
+  planMetadata?: QuotaPlanMetadata;
   absoluteRemaining?: number | null;
   absoluteLimit?: number | null;
   quotaUnit?: string | null;

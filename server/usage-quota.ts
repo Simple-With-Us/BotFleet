@@ -1,3 +1,5 @@
+import { parseQuotaPlanMetadata } from "../shared/quota-plan-metadata.ts";
+import type { QuotaPlanMetadata } from "../shared/quota-plan-metadata.ts";
 import { mergeLocalQuotaWindows, readLocalQuotaSnapshot, type LocalQuotaFreshness } from "./local-usage-monitor.ts";
 import { quotaCooldowns } from "./model-fallback.ts";
 import {
@@ -37,6 +39,7 @@ export type RemoteQuotaWindow = {
   skipReason: string | null;
   /** The plan the allowance belongs to, as the producer names it ("ultra"). */
   planName?: string | null;
+  planMetadata?: QuotaPlanMetadata;
   /** What is left and what the plan holds, in `quotaUnit` — dollars for a
    *  Cursor plan, requests for a MiniMax pool, credits for Grok.  A window
    *  can report these with no percentage at all. */
@@ -257,7 +260,9 @@ export class UsageQuotaPoller {
   }
 
   applyPayload(payload: QuotaWindowsPayload, instances: QuotaPollerInstance[]): void {
-    this.windows = Array.isArray(payload.windows) ? payload.windows : [];
+    this.windows = Array.isArray(payload.windows)
+      ? payload.windows.map((window) => ({ ...window, planMetadata: parseQuotaPlanMetadata(window.planMetadata) }))
+      : [];
     const nextOwned = new Set<string>();
     for (const window of this.windows) {
       const kinds = new Set(driverKindsForWindow(window));
