@@ -1308,11 +1308,16 @@ export class WebhookManager {
     trigger.lastRunId = run.id;
     trigger.deliveryCount += 1;
     trigger.updatedAt = now;
+    // A delivery skipped because the bot is off or snoozed comes back as an
+    // unpersisted cancelled receipt.  Record it as ignored with its reason so
+    // the activity log does not claim it was accepted.
+    const skipped = run.status === "cancelled";
     this.appendAttempt(trigger, event, {
-      outcome: "accepted",
+      outcome: skipped ? "ignored" : "accepted",
       statusCode: 202,
       deliveryId,
       runId: run.id,
+      ...(skipped && run.error ? { reason: run.error } : {}),
     });
     // This just added a new entry to `this.deliveries` — the record that
     // makes a retried delivery idempotent. It must be durable before the
