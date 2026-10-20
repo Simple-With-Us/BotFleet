@@ -37,6 +37,10 @@ public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {
     private let streamQueue = DispatchQueue(label: "app.botfleet.screen-stream", qos: .userInteractive)
 
     public private(set) var isStreaming: Bool = false
+    /// Set synchronously before the first `await` in `startStreaming` so a
+    /// concurrent call (actors are re-entrant at suspension points) fails fast
+    /// instead of racing a second SCStream over `activeStream`.
+    private var isStarting: Bool = false
 
     public override init() {
         super.init()
@@ -101,6 +105,11 @@ public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {
         if isStreaming {
             await stopStreaming()
         }
+        guard !isStarting else {
+            throw ScreenStreamError.streamInitializationFailed("startStreaming is already in progress")
+        }
+        isStarting = true
+        defer { isStarting = false }
 
         let content = try await availableContent()
         let targetDisplayID = displayID ?? CGMainDisplayID()
@@ -119,13 +128,19 @@ public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
 
+        // Wire the handler before `startCapture`: frames the delegate receives
+        // in the gap between capture start and these assignments would fail
+        // `dispatchFrame`'s guard and the first frames would be dropped.
         do {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: streamQueue)
-            try await stream.startCapture()
             self.activeStream = stream
             self.frameHandler = onFrame
             self.isStreaming = true
+            try await stream.startCapture()
         } catch {
+            self.isStreaming = false
+            self.frameHandler = nil
+            self.activeStream = nil
             throw ScreenStreamError.streamInitializationFailed(error.localizedDescription)
         }
     }
