@@ -163,9 +163,9 @@ the field leaves the stored value untouched).
    inert.` and the ship continues — a missing DSN never fails a TestFlight
    upload.  `scripts/ios-fleet/ship-testflight.sh` logs the same condition
    locally and, under `GITHUB_ACTIONS`, emits its own `::warning::` too.
-4. **Public desktop releases** (`release.yml`'s `mac` / `windows` / `linux`
-   jobs, plus the standalone `package-win.yml` and `package-linux.yml`
-   workflows).  Each package job runs a "Resolve the Sentry DSN" step before
+4. **Public desktop releases** (`release.yml`'s `mac` jobs; BF-2500 removed
+   the `windows` and `linux` jobs and the standalone `package-win.yml` and
+   `package-linux.yml` workflows).  Each package job runs a "Resolve the Sentry DSN" step before
    its `pnpm package:*` step: Infisical prod for both `SENTRY_DSN` and
    `VITE_SENTRY_DSN`, the GitHub secret as `SENTRY_DSN`'s fallback, and
    `VITE_SENTRY_DSN` copied from whichever `SENTRY_DSN` resolved to when

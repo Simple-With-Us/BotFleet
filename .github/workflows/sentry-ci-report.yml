@@ -36,10 +36,12 @@ name: Sentry CI Report
 # pipeline):
 #   CI,
 #   iOS TestFlight ship (GitHub-hosted macOS),
-#   Package Ubuntu,
-#   Validate Desktop Packages,
 #   Release,
 #   Sentry Deploy
+#
+# `Package Ubuntu` (`package-linux.yml`) and `Validate Desktop Packages`
+# (`package-win.yml`) were entries here until BF-2500 deleted both workflows;
+# the list now names only workflows that exist on `main`.
 #
 # `iOS TestFlight Release` (`ios-testflight.yml`) was the entry here through
 # 2026-09-04; that workflow was deleted the same day and replaced by
@@ -76,8 +78,6 @@ on:
       # a stale entry here silently disables alerting for that pipeline.
       - CI
       - iOS TestFlight ship (GitHub-hosted macOS)
-      - Package Ubuntu
-      - Validate Desktop Packages
       - Release
       - Sentry Deploy
     types: [completed]
