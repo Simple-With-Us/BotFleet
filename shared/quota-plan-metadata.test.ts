@@ -16,6 +16,16 @@ describe("quota plan metadata", () => {
     expect(parseQuotaPlanMetadata([])).toBeUndefined();
   });
 
+  it("rejects C1 controls and Unicode line and paragraph terminators", () => {
+    for (const character of ["\u0085", "\u009d", "\u2028", "\u2029"]) {
+      expect(parseQuotaPlanMetadata({ userSubtitle: `split${character}lines` }))
+        .toEqual({ hasMismatch: false });
+    }
+    expect(parseQuotaPlanMetadata({ userSubtitle: "plain\u00a0text" })).toEqual({
+      hasMismatch: false, userSubtitle: "plain\u00a0text",
+    });
+  });
+
   it("displays separate identities, entered cost and renewal, and mismatch", () => {
     expect(quotaPlanMetadataLines(planMetadata)).toEqual([
       "Detected Plan: Ultra", "Entered Plan: My Pro", "Work account",

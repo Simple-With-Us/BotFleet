@@ -4,7 +4,13 @@ const displayTextSchema = z.string().max(500).refine((value) => {
   if (!value.trim()) return false;
   for (const character of value) {
     const codePoint = character.codePointAt(0);
-    if (codePoint !== undefined && (codePoint < 32 || codePoint === 127)) return false;
+    // SAFETY: C0 and DEL can split a value, and so can the C1 range plus the
+    // Unicode line and paragraph terminators, so the guard covers all of them.
+    if (
+      codePoint !== undefined &&
+      (codePoint < 32 || codePoint === 127 || (codePoint >= 0x80 && codePoint <= 0x9f) ||
+        codePoint === 0x2028 || codePoint === 0x2029)
+    ) return false;
   }
   return true;
 });
