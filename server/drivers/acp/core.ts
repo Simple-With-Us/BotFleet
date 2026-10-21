@@ -1675,16 +1675,19 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // prepared once: the same text is filed with the event and
               // fingerprinted for the update that may follow
               const announced = "rawInput" in u ? prepareInput(u.rawInput) : undefined;
-              const toolCallId = typeof u.toolCallId === "string" ? u.toolCallId : undefined;
+              const parsedToolCallId = z.string().max(256).safeParse(u.toolCallId);
+              const toolCallId = parsedToolCallId.success ? parsedToolCallId.data : undefined;
               if (toolCallId !== undefined) {
                 openToolCalls.add(toolCallId);
                 if (announced !== undefined) toolInputs.set(toolCallId, textSignature(announced.text));
               }
               flushAssistantText();
-              const titleText = typeof u.title === "string" ? u.title : undefined;
+              const parsedTitle = z.string().max(256).safeParse(u.title);
+              const titleText = parsedTitle.success ? parsedTitle.data : undefined;
               const parsedCommand = acpRawInputCommand.safeParse(u.rawInput);
               const commandText = parsedCommand.success ? parsedCommand.data.command : undefined;
-              const kindText = typeof u.kind === "string" ? u.kind : undefined;
+              const parsedKind = z.string().max(64).safeParse(u.kind);
+              const kindText = parsedKind.success ? parsedKind.data : undefined;
               // ACP hands us `kind`, `locations` and `rawInput` alongside the
               // title.  Folding all of it into one 80-char title was what left
               // the transcript showing `read_file` seven times with no paths;
@@ -1709,7 +1712,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               if (bypassedBy) return tripAllowlist(bypassedBy);
               // The schema lets a call's input arrive or settle on an update,
               // at any status: take it when it is new text for this call.
-              const toolCallId = typeof u.toolCallId === "string" ? u.toolCallId : undefined;
+              const parsedToolCallId = z.string().max(256).safeParse(u.toolCallId);
+              const toolCallId = parsedToolCallId.success ? parsedToolCallId.data : undefined;
               const settled = toolCallId !== undefined && "rawInput" in u ? prepareInput(u.rawInput) : undefined;
               const settledSignature = settled === undefined ? undefined : textSignature(settled.text);
               const newInput = settled !== undefined && toolCallId !== undefined && toolInputs.get(toolCallId) !== settledSignature ? settled : undefined;
