@@ -1,12 +1,12 @@
 /**
  * Credentials an agent may ask the person to provide through an inline
- * card. The id is the entire authority surface: agents never choose a
+ * card.  The id is the entire authority surface: agents never choose a
  * config path, label, URL, or arbitrary field name.
  *
  * Data-driven (BF-2437): every target is one row in
- * CREDENTIAL_TARGET_SPECS. The card metadata, the config patch, and the
+ * CREDENTIAL_TARGET_SPECS.  The card metadata, the config patch, and the
  * configured check are all derived from that row, so adding a target is
- * a one-row change instead of edits in four places. Each row names the
+ * a one-row change instead of edits in four places.  Each row names the
  * server registry field it feeds (`secretFieldId` in
  * server/secret-map.ts SECRET_FIELDS); a test keeps the two in sync.
  * Which registered fields appear here at all is a security decision for

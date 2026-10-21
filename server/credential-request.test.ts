@@ -70,6 +70,19 @@ describe("credential request allowlist", () => {
     }
   });
 
+  it("keeps patch and isConfigured in step with configPath (BF-2437)", () => {
+    for (const [id, spec] of Object.entries(CREDENTIAL_TARGET_SPECS)) {
+      if (!isCredentialTargetId(id)) throw new Error(`spec key is not a target id: ${id}`);
+      // The saved patch lands the value at exactly spec.configPath.
+      const patch = credentialConfigPatch(id, "secret");
+      expect(patch, `${id} patch`).toHaveProperty([...spec.configPath], "secret");
+      // The configured check reads that same leaf: blank it and the card is unconfigured again.
+      expect(credentialIsConfigured(patch, id), `${id} configured after save`).toBe(true);
+      const blanked: CredentialConfig = JSON.parse(JSON.stringify(patch).replace('"secret"', '""'));
+      expect(credentialIsConfigured(blanked, id), `${id} configured with blank ${spec.configPath.join(".")}`).toBe(false);
+    }
+  });
+
   it("preserves the original save or decline outcome when retrying", () => {
     expect(credentialResumeOutcome({ provided: true })).toBe("provided");
     expect(credentialResumeOutcome({ dismissed: true })).toBe("dismissed");
