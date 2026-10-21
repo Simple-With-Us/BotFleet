@@ -695,7 +695,11 @@ describe("harness HTTP API", () => {
     expect(response.body.localVms).toEqual(expect.arrayContaining([
       expect.objectContaining({ key: "shared", running: false, state: "missing" }),
     ]));
-    expect(Object.keys(response.body).sort()).toEqual(["activeBotCount", "localVms", "persistOnExit"]);
+    // The response also carries the work that is holding a stop, so the
+    // Control app can name it instead of reporting a bare total.  Each entry
+    // is a count and a plain label, and nothing else.
+    z.array(z.object({ count: z.number(), label: z.string() }).strict()).parse(response.body.blockingWork);
+    expect(Object.keys(response.body).sort()).toEqual(["activeBotCount", "blockingWork", "localVms", "persistOnExit"]);
   });
 
   it("native server controls reject companion replays and non-JSON shutdowns", async () => {
@@ -724,6 +728,10 @@ describe("harness HTTP API", () => {
       await expect.poll(active).toBe(1);
       const refused = await api("POST", "/api/system/control/stop", {});
       expect(refused.status).toBe(409);
+      // The refusal names the work that is holding the stop, so the owner can
+      // act on it instead of being told only that something is busy.
+      expect(refused.body.error).toContain("active operation(s) must finish before the server can stop");
+      expect(refused.body.error).toContain("in-flight request");
       expect(existsSync(join(home, ".botfleet", "stopped.marker"))).toBe(false);
       expect((await api("GET", "/api/health")).status).toBe(200);
     } finally {

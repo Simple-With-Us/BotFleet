@@ -21,7 +21,7 @@ import { buildTurnContext } from "../../turn-context.ts";
 import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../../testing/launch-identity.ts";
 import { MODEL_REJECTED_STOP_REASON } from "../../model-fallback.ts";
 import { classifyError } from "../retry.ts";
-import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
+import { createAcpDriver, isPoisonedSessionError, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
 import {
   ACP_PROMPT_SECTION_OMITTED,
   acpPromptCeilingRefusal,
@@ -374,6 +374,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_MODE;
     delete process.env.FAKE_ACP_DUMP;
     delete process.env.FAKE_ACP_RPC_DUMP;
+    delete process.env.FAKE_ACP_RPC_APPEND_FILE;
     delete process.env.FAKE_ACP_EXIT_GATE;
     delete process.env.FAKE_ACP_DESCENDANT_PID;
     delete process.env.XAI_API_KEY;
@@ -846,6 +847,106 @@ describe("ACP turns (fake CLI)", () => {
     expect(methods).toContain("session/load");
     expect(methods).not.toContain("session/new");
     expect(methods).not.toContain("session/prompt");
+  });
+
+  it("falls back to a fresh session when the saved session is poisoned (BF-2447)", async () => {
+    const dump = join(scratch, "resume-poisoned-rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = dump;
+    await create(GrokAgentDriver, "resume-poisoned");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned",
+      text: "continue",
+      resumeCursor: "wedged-native-session",
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((event) => event.type === "session.started")).toBe(true);
+    const notice = recorder.events.find((event) => event.type === "runtime.notice");
+    expect(notice?.message).toMatch(/unfinished turn/i);
+    expect(notice?.message).toMatch(/discarded/i);
+    const methods: string[] = JSON.parse(readFileSync(dump, "utf8"));
+    expect(methods).toContain("session/load");
+    expect(methods).toContain("session/new");
+    expect(methods).toContain("session/prompt");
+  });
+
+  it("a relaunch after a poisoned-session recovery resends the replayed context (BF-2447)", async () => {
+    // The dump file is per-launch (each child overwrites it), so the
+    // cross-launch method counts below come from the append file instead.
+    const appended = join(scratch, "resume-poisoned-retry-rpc.jsonl");
+    process.env.FAKE_ACP_RPC_APPEND_FILE = appended;
+    // One launch dies at session/prompt, after the recovery already rebuilt
+    // the prompt: the relaunch must skip the doomed session/load but still
+    // send the replay, not the bare turn text.
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_FAIL_AT_PROMPT = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches-poisoned");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "resume-poisoned");
+
+    let recovered = 0;
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned-retry",
+      text: "continue",
+      resumeCursor: "wedged-native-session",
+      recoveryText: "REPLAYED CONVERSATION SO FAR\n\ncontinue",
+      onReplayRecovered: () => {
+        recovered += 1;
+      },
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed", 25_000);
+
+    expect(done).toMatchObject({ ok: true });
+    // The replay reached the prompt on both attempts: once before the prompt
+    // died, once on the relaunch that skipped the doomed session/load.
+    expect(recovered).toBe(2);
+    expect(recorder.events.filter((event) => event.type === "turn.retrying")).toHaveLength(1);
+    // SAFETY: every line was written by the fake CLI's recordMethod as { pid, method, cwd }.
+    const methods: string[] = readFileSync(appended, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => (JSON.parse(line) as { method: string }).method);
+    expect(methods.filter((method) => method === "session/load")).toHaveLength(1);
+    expect(methods.filter((method) => method === "session/new")).toHaveLength(2);
+  }, 40_000);
+
+  it("a second poisoned session on the same thread still announces its own discard (BF-2447)", async () => {
+    await create(GrokAgentDriver, "resume-poisoned");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned-twice",
+      text: "continue",
+      resumeCursor: "wedged-native-session",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned-twice",
+      text: "and more",
+      resumeCursor: "wedged-again-session",
+    });
+    await vi.waitFor(
+      () => {
+        expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(2);
+      },
+      { timeout: 25_000 },
+    );
+
+    // One notice per discarded session: keyed by cursor, not by message
+    // text, so the second wedged session is not silenced by the first.
+    const notices = recorder.events.filter((event) => event.type === "runtime.notice");
+    expect(notices).toHaveLength(2);
+  });
+
+  it("classifies only the wedged-session rejection as poisoned (BF-2447)", () => {
+    expect(isPoisonedSessionError(new Error("The saved Muse session has an unfinished turn or pending input"))).toBe(true);
+    expect(isPoisonedSessionError(new Error("session has pending input"))).toBe(true);
+    expect(isPoisonedSessionError(new Error("resume failed", { cause: new Error("unfinished turn") }))).toBe(true);
+    expect(isPoisonedSessionError(new Error("saved session is gone"))).toBe(false);
+    expect(isPoisonedSessionError(new Error("authentication required"))).toBe(false);
+    expect(isPoisonedSessionError(null)).toBe(false);
+    expect(isPoisonedSessionError(undefined)).toBe(false);
   });
 
   it("classifies authentication rejected during ACP resume as setup", async () => {

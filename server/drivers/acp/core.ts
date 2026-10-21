@@ -44,6 +44,7 @@ import {
   SLOW_INIT_LOG_MS,
 } from "./init-deadline.ts";
 import { estimateCatalogCost } from "../../gen-ai-cost.ts";
+import { classifyResumeFailure, recoveryPromptFor } from "../../resume-recovery.ts";
 import { boundText, cutText } from "../../../shared/item-io.ts";
 import { annotatePromptBudget, captureTurnPrompt } from "../../sentry-ai.ts";
 import {
@@ -382,6 +383,10 @@ const SUMMARY_COLLECTOR_MAX_CHARS = ACP_HISTORY_NOTE_MAX_CHARS * 4;
 // forever without ever finishing must still die eventually.
 const DEFAULT_PROMPT_MAX_MS = 18 * 60_000;
 const MIN_PROMPT_TIMEOUT_MS = 1_000;
+
+// Recovery-callback failures are logged once, message-only: a repeating
+// onReplayRecovered throw must not keep writing attached error payloads.
+let replayRecoveredErrorLogged = false;
 const MAX_PROMPT_TIMEOUT_MS = 20 * 60_000;
 // Renewable: restarts on every inbound line (session/update or a permission
 // request), so this only trips on TOTAL silence — see `request`'s `armIdle`.
@@ -495,6 +500,31 @@ export function maskCredentialPreview(value: string): string {
   const material = value.trim();
   if (material.length <= 12) return "unavailable";
   return `${material.slice(0, 8)}…${material.slice(-4)}`;
+}
+
+/** A saved session the provider itself left wedged: a prompt timeout or idle
+ *  stall killed the child after `session/cancel`, but the persisted session
+ *  still holds the open turn, so every later `session/load` is refused with
+ *  an unfinished-turn or pending-input rejection (BF-2447).  That one
+ *  rejection is classified apart from every other resume failure.  A missing
+ *  or corrupt session still fails closed above, because discarding history
+ *  over a transient or ambiguous error is the silent loss the resume guard
+ *  exists to prevent; a session the provider names as wedged can never be
+ *  loaded again, so refusing it forever only bricks the thread. */
+export function isPoisonedSessionError(error: Error | null | undefined): boolean {
+  let current: Error | null | undefined = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current) return false;
+    // Core attaches `data` to a JSON-RPC error with Object.assign (SAFETY note below).
+    // SAFETY: any other thrown value has no `data`, and the `?.` tolerates a non-object.
+    const data = (current as { data?: string } | null)?.data;
+    if (/unfinished turn|pending input/i.test(`${current.message} ${data ?? ""}`)) return true;
+    // A non-Error cause simply ends the walk instead of being read as provider text.
+    // SAFETY: `cause` is the standard Error cause chain, read only to walk it.
+    const cause = (current as { cause?: Error } | null)?.cause;
+    current = cause instanceof Error ? cause : null;
+  }
+  return false;
 }
 
 /** One spelling for a turn's stop reason.
@@ -714,7 +744,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // row still resolves that same row in place when the retry's summary lands.
       const retryState = new Map<
         string,
-        { attempt: number; cancelled: boolean; compressionAnnounced?: boolean; compressionSettled?: boolean; compressionItemId?: string; compressionPreview?: string; compressionKind?: string; compressionBody?: string }
+        { attempt: number; cancelled: boolean; compressionAnnounced?: boolean; compressionSettled?: boolean; compressionItemId?: string; compressionPreview?: string; compressionKind?: string; compressionBody?: string; poisonedCursor?: string; poisonedRebuild?: { text: string; replayed: boolean } }
       >();
       /** Model-written history summaries, per thread.  Rolled forward as more
        *  drops arrive (only the newly dropped turns go back to the model),
@@ -1820,7 +1850,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             let sessionResult: any = null;
             let sessionModelsState: z.infer<typeof acpSessionResultModels> | undefined;
             let fallbackNotice: string | undefined;
-            if (cursor) {
+            // The harness replay, when a poisoned saved session forces a
+            // fresh one (BF-2447): recoveryText carries the conversation so
+            // the new session is not blank (Sentry review on #1272).
+            let poisonedRebuild: { text: string; replayed: boolean } | null = null;
+            // A cursor already found poisoned stays poisoned across a
+            // relaunch: skip the doomed session/load so the retry goes
+            // straight to session/new without a second notice.
+            if (cursor && retry.poisonedCursor !== cursor) {
               try {
                 sessionResult = await request(
                   support.resumeMethod ?? "session/load",
@@ -1831,11 +1868,80 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 sessionModelsState = parsedSessionResult.success ? parsedSessionResult.data.models : undefined;
                 sessionId = cursor;
               } catch (error) {
-                // The harness withheld inline replay because this cursor said
-                // the native session held the conversation.  Starting empty
-                // here would silently discard everything before this prompt.
-                throw new AcpResumeError({ cause: error });
+                if (!(error instanceof Error && isPoisonedSessionError(error))) {
+                  // The harness withheld inline replay because this cursor said
+                  // the native session held the conversation.  Starting empty
+                  // here would silently discard everything before this prompt.
+                  throw new AcpResumeError({ cause: error });
+                }
+                // Recovery valve (BF-2447): the provider named this saved
+                // session as wedged, so it can never be loaded again.  Fall
+                // through to `session/new` below instead of refusing every
+                // later turn on the thread.  The discard is deliberate and
+                // visible: the same trade the harness already makes when it
+                // drops the resume cursor after `resume_failed`, taken one
+                // turn earlier so this turn can still run.
+                console.warn(
+                  `[acp] ${DRIVER_KIND} saved session ${cursor} is poisoned (unfinished turn or pending input); discarding its native history and starting a fresh session`,
+                );
+                retry.poisonedCursor = cursor;
+                // Once per DISCARDED session, not once per thread: the
+                // poisoned-cursor guard above already stops a relaunch from
+                // republishing the notice, while a later wedged session on
+                // the same thread must still announce that its history was
+                // dropped.
+                {
+                  const poisonedNotice =
+                    "The saved session was left holding an unfinished turn, so its earlier native history was discarded and a fresh session was started.  Context from earlier in this thread may be missing.";
+                  const noticeKey = `poisoned-session:${cursor}`;
+                  let heard = runtimeNoticesByThread.get(threadId);
+                  if (!heard) {
+                    heard = new Set();
+                    runtimeNoticesByThread.set(threadId, heard);
+                  }
+                  if (!heard.has(noticeKey)) {
+                    heard.add(noticeKey);
+                    emit({ ...base(threadId, turnId), type: "runtime.notice", message: poisonedNotice });
+                  }
+                }
+                // The load was rejected before this turn's prompt was
+                // submitted and before anything streamed, so this is the
+                // safe side of the recovery boundary (before-accept).
+                const failure = classifyResumeFailure({
+                  attempted: true,
+                  rejected: true,
+                  promptSubmitted: false,
+                  producedOutput: false,
+                });
+                poisonedRebuild = recoveryPromptFor({
+                  recoveryText: turn.recoveryText,
+                  currentText: turn.text,
+                  failure,
+                });
+                // The relaunch below re-enters sendTurn with the same cursor
+                // and skips the doomed session/load, so the rebuilt prompt
+                // must survive the hop on the retry entry: without it the
+                // retried attempt sends the bare turn text into a second
+                // fresh session and silently drops the replayed conversation.
+                retry.poisonedRebuild = poisonedRebuild;
+
               }
+            } else if (cursor) {
+              // A relaunch after the recovery above: the cursor is known
+              // poisoned, so there is no session/load to rebuild from — carry
+              // the rebuilt prompt instead of sending the bare turn text.
+              // Recomputed when the entry has none (same pure inputs, same
+              // prompt) so the replay never depends on write ordering.
+              poisonedRebuild = retry.poisonedRebuild ?? recoveryPromptFor({
+                recoveryText: turn.recoveryText,
+                currentText: turn.text,
+                failure: classifyResumeFailure({
+                  attempted: true,
+                  rejected: true,
+                  promptSubmitted: false,
+                  producedOutput: false,
+                }),
+              });
             }
             if (!sessionId) {
               sessionResult = await request(
@@ -1858,6 +1964,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 type: "session.started",
                 sessionId,
                 model: selectedModel ?? init?._meta?.modelState?.currentModelId ?? cliTurn.model ?? null,
+                ...(poisonedRebuild?.replayed ? { rebuilt: true } : {}),
               });
             };
 
@@ -2090,11 +2197,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // "/name args" with no persona in front.  Every other turn is
             // shielded so a leading slash in the composed text cannot run as a
             // command (the persona normally leads, so this is a second lock).
+            // A poisoned-session rebuild replaces the turn's own text with
+            // the harness replay, which already carries this message once.
+            const promptTurn = poisonedRebuild?.replayed ? { ...turn, text: poisonedRebuild.text } : turn;
             const composed = support.buildPromptText
-              ? support.buildPromptText(turn)
-              : turn.system
-                ? `${turn.system}\n\n${turn.text}`
-                : turn.text;
+              ? support.buildPromptText(promptTurn)
+              : promptTurn.system
+                ? `${promptTurn.system}\n\n${promptTurn.text}`
+                : promptTurn.text;
             let text: string;
             if (turn.command) {
               // A command turn is the bare "/name args" the agent parses.  It
@@ -2148,7 +2258,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               const planned = applyAcpPromptBudget({
                 composed,
                 sections: turn.systemSections,
-                userText: turn.text,
+                userText: promptTurn.text,
                 budgetBytes,
                 maxHistoryTurns,
                 collectDroppedText: true,
@@ -2215,6 +2325,21 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 emit({ ...base(threadId, turnId), type: "runtime.error", message: refusal.message });
                 settle(false, "prompt_too_large");
                 return;
+              }
+              if (poisonedRebuild?.replayed) {
+                // The replay survived budgeting into the prompt actually being
+                // sent; only now may the transcript claim it.  A trimmed-out
+                // or refused replay must not be recorded.
+                try {
+                  turn.onReplayRecovered?.();
+                } catch (replayError) {
+                  if (!replayRecoveredErrorLogged) {
+                    replayRecoveredErrorLogged = true;
+                    console.error(
+                      `acp: onReplayRecovered threw: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
+                    );
+                  }
+                }
               }
               const trim = describeAcpPromptTrim(
                 budgeted,

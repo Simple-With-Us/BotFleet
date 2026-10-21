@@ -3,6 +3,9 @@ import Foundation
 public protocol CommandRunning {
     func run(_ executable: String, _ arguments: [String]) throws -> String
     func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String
+    /// Runs a command with an explicit environment.  A menu bar app inherits
+    /// no shell PATH, so a command that needs one has to be given it.
+    func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String
 }
 
 public struct CommandExitError: LocalizedError {
@@ -14,6 +17,10 @@ public extension CommandRunning {
     func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
         try run(executable, arguments)
     }
+
+    func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
+        try run(executable, arguments, timeout: timeout)
+    }
 }
 
 public struct ProcessCommandRunner: CommandRunning {
@@ -22,9 +29,13 @@ public struct ProcessCommandRunner: CommandRunning {
         try run(executable, arguments, timeout: 15)
     }
     public func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
+        try run(executable, arguments, environment: ProcessInfo.processInfo.environment, timeout: timeout)
+    }
+    public func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        process.environment = environment
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice

@@ -526,6 +526,60 @@ export class RoutineManager {
   private readonly botSnoozeUntil = new Map<string, number>();
   /** Coarse hold-reason signatures already persisted and broadcast. */
   private readonly publishedHoldBuckets = new Map<string, string>();
+  /** Deliveries dropped because the bot was snoozed/off (BF-2462). In-memory
+   * only: counting them must not rewrite routines.json. */
+  private skippedDeliveryTotal = 0;
+  private readonly skippedDeliveriesByTrigger = new Map<string, number>();
+
+  /** BF-2462: a webhook/resource delivery for a snoozed/off bot will never
+   * run, so do not persist a run (or its prompt copy) for it. Persisting
+   * ~1,970 instant cancelled rows rewrote all of routines.json with fsync
+   * per delivery and evicted real history. Return a transient receipt so
+   * callers still get 202 + status/outcomeCode, bump a counter, and store
+   * no prompt copy. */
+  private skippedDelivery(input: {
+    routineId: string;
+    routineName: string;
+    botId: string;
+    runOn: RoutineRunOn;
+    receivedAt: number;
+    off: boolean;
+    triggerSource: "webhook" | "resource";
+    webhookId: string;
+    deliveryId: string;
+  }): RoutineRun {
+    this.skippedDeliveryTotal += 1;
+    const key = `${input.triggerSource}:${input.webhookId}`;
+    this.skippedDeliveriesByTrigger.set(key, (this.skippedDeliveriesByTrigger.get(key) ?? 0) + 1);
+    return {
+      id: randomUUID(),
+      routineId: input.routineId,
+      routineName: input.routineName,
+      prompt: "",
+      botId: input.botId,
+      runOn: input.runOn,
+      scheduledFor: input.receivedAt,
+      status: "cancelled",
+      outcomeCode: input.off ? "bot_off" : "cancelled",
+      failurePhase: "lifecycle",
+      error: input.off ? BOT_OFF_SKIPPED : undefined,
+      finishedAt: this.now(),
+      manual: false,
+      triggerSource: input.triggerSource,
+      webhookId: input.webhookId,
+      deliveryId: input.deliveryId,
+      createdAt: this.now(),
+    };
+  }
+
+  skippedDeliveryCount(triggerId?: string, triggerSource?: "webhook" | "resource"): number {
+    if (!triggerId) return this.skippedDeliveryTotal;
+    if (triggerSource) return this.skippedDeliveriesByTrigger.get(`${triggerSource}:${triggerId}`) ?? 0;
+    return (
+      (this.skippedDeliveriesByTrigger.get(`webhook:${triggerId}`) ?? 0) +
+      (this.skippedDeliveriesByTrigger.get(`resource:${triggerId}`) ?? 0)
+    );
+  }
 
   constructor(options: RoutineManagerOptions) {
     this.options = options;
@@ -997,6 +1051,19 @@ export class RoutineManager {
       });
       if (deferred) return deferred;
     }
+    if (snoozed) {
+      return this.skippedDelivery({
+        routineId: input.webhookId,
+        routineName: input.webhookName,
+        botId: input.botId,
+        runOn: input.runOn,
+        receivedAt: input.receivedAt,
+        off,
+        triggerSource: "webhook",
+        webhookId: input.webhookId,
+        deliveryId: input.deliveryId,
+      });
+    }
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: input.webhookId,
@@ -1005,11 +1072,7 @@ export class RoutineManager {
       botId: input.botId,
       runOn: input.runOn,
       scheduledFor: input.receivedAt,
-      status: snoozed ? "cancelled" : "queued",
-      outcomeCode: off ? "bot_off" : snoozed ? "cancelled" : undefined,
-      failurePhase: snoozed ? "lifecycle" : undefined,
-      error: off ? BOT_OFF_SKIPPED : undefined,
-      finishedAt: snoozed ? this.now() : undefined,
+      status: "queued",
       manual: false,
       triggerSource: "webhook",
       webhookId: input.webhookId,
@@ -1019,9 +1082,7 @@ export class RoutineManager {
     this.runs.push(run);
     this.save();
     this.emitRun(run);
-    if (!snoozed) {
-      queueMicrotask(() => void this.tick());
-    }
+    queueMicrotask(() => void this.tick());
     return { ...run };
   }
 
@@ -1058,6 +1119,19 @@ export class RoutineManager {
       });
       if (deferred) return deferred;
     }
+    if (snoozed) {
+      return this.skippedDelivery({
+        routineId: input.triggerId,
+        routineName: input.triggerName,
+        botId: input.botId,
+        runOn: input.runOn,
+        receivedAt: input.receivedAt,
+        off,
+        triggerSource: "resource",
+        webhookId: input.triggerId,
+        deliveryId: input.deliveryId,
+      });
+    }
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: input.triggerId,
@@ -1066,11 +1140,7 @@ export class RoutineManager {
       botId: input.botId,
       runOn: input.runOn,
       scheduledFor: input.receivedAt,
-      status: snoozed ? "cancelled" : "queued",
-      outcomeCode: off ? "bot_off" : snoozed ? "cancelled" : undefined,
-      failurePhase: snoozed ? "lifecycle" : undefined,
-      error: off ? BOT_OFF_SKIPPED : undefined,
-      finishedAt: snoozed ? this.now() : undefined,
+      status: "queued",
       manual: false,
       triggerSource: "resource",
       webhookId: input.triggerId,
@@ -1080,9 +1150,7 @@ export class RoutineManager {
     this.runs.push(run);
     this.save();
     this.emitRun(run);
-    if (!snoozed) {
-      queueMicrotask(() => void this.tick());
-    }
+    queueMicrotask(() => void this.tick());
     return { ...run };
   }
 
@@ -1223,13 +1291,17 @@ export class RoutineManager {
           // The schedule still advances (below), so turning the bot back on
           // resumes at the next occurrence instead of replaying the backlog.
           // The run is recorded as skipped with its reason; it is not
-          // `missed`, which would count as needing attention.
+          // `missed`, which would count as needing attention.  Sentry has no
+          // skipped status, so the pause is reported explicitly: the check-in
+          // opens and closes non-ok (never `ok` for work that never ran, per
+          // BF-2476), because emitting nothing would let Sentry synthesize a
+          // `missed` check-in at the deadline with no context.  The run
+          // record itself, with outcomeCode `bot_off`, is the
+          // deliberate-pause signal.
           const skipped = this.newRun(routine, scheduledFor, false);
           this.skipForOff(skipped);
-          if (routine.schedule.type === "daily") {
-            const checkInId = this.options.checkInStart?.(skipped, routine);
-            if (checkInId) this.options.checkInFinish?.(skipped, checkInId, true);
-          }
+          skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
+          if (skipped.sentryCheckInId) this.options.checkInFinish?.(skipped, skipped.sentryCheckInId, false);
         } else if (snoozed) {
           const skipped = this.newRun(routine, scheduledFor, false);
           skipped.status = "missed";
@@ -1237,11 +1309,13 @@ export class RoutineManager {
           skipped.error = botAutomationsPausedMessage();
           skipped.outcomeCode = "bot_stopped";
           skipped.failurePhase = "lifecycle";
+          skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
           this.emitRun(skipped);
-          if (routine.schedule.type === "daily") {
-            const checkInId = this.options.checkInStart?.(skipped, routine);
-            if (checkInId) this.options.checkInFinish?.(skipped, checkInId, true);
-          }
+          // Same explicit-pause reporting as above (BF-2476): a stopped bot
+          // is a deliberate pause, not a success — the check-in opens and
+          // closes non-ok, because the only statuses Sentry offers are `ok`
+          // and `error` and emitting nothing would synthesize `missed`.
+          if (skipped.sentryCheckInId) this.options.checkInFinish?.(skipped, skipped.sentryCheckInId, false);
         } else if (late > CATCH_UP_MS) {
           const missed = this.newRun(routine, scheduledFor, false);
           missed.status = "missed";
