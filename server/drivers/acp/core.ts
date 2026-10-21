@@ -357,6 +357,10 @@ const LOAD_SESSION_TIMEOUT = 120_000; // history replay on a long thread is slow
 // forever without ever finishing must still die eventually.
 const DEFAULT_PROMPT_MAX_MS = 18 * 60_000;
 const MIN_PROMPT_TIMEOUT_MS = 1_000;
+
+// Recovery-callback failures are logged once, message-only: a repeating
+// onReplayRecovered throw must not keep writing attached error payloads.
+let replayRecoveredErrorLogged = false;
 const MAX_PROMPT_TIMEOUT_MS = 20 * 60_000;
 // Renewable: restarts on every inbound line (session/update or a permission
 // request), so this only trips on TOTAL silence — see `request`'s `armIdle`.
@@ -669,7 +673,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // `compressionAnnounced` outlives a relaunch (the entry is cleared only when the
       // logical turn settles), so a retried attempt that trims the same prompt
       // does not publish a second "Compressing Context" row.
-      const retryState = new Map<string, { attempt: number; cancelled: boolean; compressionAnnounced?: boolean }>();
+      const retryState = new Map<string, { attempt: number; cancelled: boolean; compressionAnnounced?: boolean; poisonedCursor?: string }>();
       /** Substitution notices (model pinned to a session variant, etc.) once per thread. */
       const runtimeNoticesByThread = new Map<string, Set<string>>();
       // A relaunch waits real seconds; the fakes in acp.test.ts scale that
@@ -1733,7 +1737,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // fresh one (BF-2447): recoveryText carries the conversation so
             // the new session is not blank (Sentry review on #1272).
             let poisonedRebuild: { text: string; replayed: boolean } | null = null;
-            if (cursor) {
+            // A cursor already found poisoned stays poisoned across a
+            // relaunch: skip the doomed session/load so the retry goes
+            // straight to session/new without a second notice.
+            if (cursor && retry.poisonedCursor !== cursor) {
               try {
                 sessionResult = await request(
                   support.resumeMethod ?? "session/load",
@@ -1760,12 +1767,21 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 console.warn(
                   `[acp] ${DRIVER_KIND} saved session ${cursor} is poisoned (unfinished turn or pending input); discarding its native history and starting a fresh session`,
                 );
-                emit({
-                  ...base(threadId, turnId),
-                  type: "runtime.notice",
-                  message:
-                    "The saved session was left holding an unfinished turn, so its earlier native history was discarded and a fresh session was started.  Context from earlier in this thread may be missing.",
-                });
+                retry.poisonedCursor = cursor;
+                // Once per thread: a relaunch must not republish the notice.
+                {
+                  const poisonedNotice =
+                    "The saved session was left holding an unfinished turn, so its earlier native history was discarded and a fresh session was started.  Context from earlier in this thread may be missing.";
+                  let heard = runtimeNoticesByThread.get(threadId);
+                  if (!heard) {
+                    heard = new Set();
+                    runtimeNoticesByThread.set(threadId, heard);
+                  }
+                  if (!heard.has(poisonedNotice)) {
+                    heard.add(poisonedNotice);
+                    emit({ ...base(threadId, turnId), type: "runtime.notice", message: poisonedNotice });
+                  }
+                }
                 // The load was rejected before this turn's prompt was
                 // submitted and before anything streamed, so this is the
                 // safe side of the recovery boundary (before-accept).
@@ -1780,14 +1796,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   currentText: turn.text,
                   failure,
                 });
-                if (poisonedRebuild.replayed) {
-                  // The replay is in the prompt now; let the harness say so.
-                  try {
-                    turn.onReplayRecovered?.();
-                  } catch (replayError) {
-                    console.error("acp: onReplayRecovered threw", replayError);
-                  }
-                }
+
               }
             }
             if (!sessionId) {
@@ -1961,6 +1970,21 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 emit({ ...base(threadId, turnId), type: "runtime.error", message: refusal.message });
                 settle(false, "prompt_too_large");
                 return;
+              }
+              if (poisonedRebuild?.replayed) {
+                // The replay survived budgeting into the prompt actually being
+                // sent; only now may the transcript claim it.  A trimmed-out
+                // or refused replay must not be recorded.
+                try {
+                  turn.onReplayRecovered?.();
+                } catch (replayError) {
+                  if (!replayRecoveredErrorLogged) {
+                    replayRecoveredErrorLogged = true;
+                    console.error(
+                      `acp: onReplayRecovered threw: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
+                    );
+                  }
+                }
               }
               const trim = describeAcpPromptTrim(budgeted, budgetBytes);
               if (trim && !retry.compressionAnnounced) {
