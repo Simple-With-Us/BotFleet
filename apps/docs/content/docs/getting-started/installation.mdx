@@ -13,8 +13,8 @@ Choose your computer below.  Each macOS link always downloads the latest publish
 |---|---|---|
 | macOS Apple silicon | [Download `.dmg`](https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet.dmg) | Signed with the BotFleet Developer ID.  Drag to Applications. |
 | macOS Intel | [Download `.dmg`](https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet-intel.dmg) | Same app, built for Intel Macs. |
-| Windows x64 | Not published yet | The release workflow builds a per-user installer, but no Windows build has shipped.  Build from source below. |
-| Ubuntu 24.04 x64 | Not published yet | The release workflow builds a `.deb` and an AppImage, but no Ubuntu build has shipped.  Build from source below. |
+| Windows x64 | Not published | CI and the release workflow no longer build a Windows installer (BF-2500).  Build from source below. |
+| Ubuntu 24.04 x64 | Not published | CI and the release workflow no longer build a `.deb` or an AppImage (BF-2500).  Build from source below. |
 
 <Callout type="info" title="Updates are manual for now">
   In-app **Check for updates** reads a `latest-mac.yml` feed that the current release does not carry yet.  Until the release workflow publishes a full asset set, install a newer build by downloading it from the releases repository.

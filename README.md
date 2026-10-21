@@ -116,8 +116,8 @@ See the [OpenMausBot repository](https://github.com/milind-soni/OpenMausBot) for
 |---|---|---|
 | **macOS** (Apple silicon) | [BotFleet.dmg](https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet.dmg) | Drag it to Applications, open it.  Signed with the BotFleet Developer ID. |
 | **macOS** (Intel) | [BotFleet-intel.dmg](https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet-intel.dmg) | Same app, built for Intel Macs. |
-| **Windows** (x64) | Not published yet | The Windows installer is built by the release workflow but no Windows build has shipped.  Watch the [releases page](https://github.com/Simple-With-Us/BotFleet/releases) or build from source below. |
-| **Ubuntu 24.04** (x64) | Not published yet | Ubuntu packages are built by the release workflow but no Ubuntu build has shipped.  See the [Ubuntu Desktop guide](docs/linux-desktop.md) to build one from source. |
+| **Windows** (x64) | Not published | CI and the release workflow no longer build a Windows installer (BF-2500).  Build from source below. |
+| **Ubuntu 24.04** (x64) | Not published | CI and the release workflow no longer build Ubuntu packages (BF-2500).  See the [Ubuntu Desktop guide](docs/linux-desktop.md) to build one from source. |
 
 In-app **Check for updates** reads `latest-mac.yml` from the GitHub release.
 

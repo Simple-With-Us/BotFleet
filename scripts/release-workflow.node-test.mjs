@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,31 +14,6 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const VERSION = "1.0.31";
 const builderRequire = createRequire(createRequire(import.meta.url).resolve("electron-builder"));
 
-function hash(file, algorithm, encoding) {
-  return createHash(algorithm).update(readFileSync(file)).digest(encoding);
-}
-
-function feed(directory, version, urls) {
-  const entries = urls.map((url) => ({
-    url,
-    sha512: hash(join(directory, url), "sha512", "base64"),
-    size: readFileSync(join(directory, url)).length,
-  }));
-  return [
-    `version: ${version}`,
-    "files:",
-    ...entries.flatMap((entry) => [
-      `  - url: ${entry.url}`,
-      `    sha512: ${entry.sha512}`,
-      `    size: ${entry.size}`,
-    ]),
-    `path: ${entries[0].url}`,
-    `sha512: ${entries[0].sha512}`,
-    "releaseDate: '2026-09-12T00:00:00.000Z'",
-    "",
-  ].join("\n");
-}
-
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-release-"));
   const files = [
@@ -47,12 +21,9 @@ function fixture() {
     `BotFleet-${VERSION}-x64.zip`,
     `BotFleet-${VERSION}-arm64.dmg`,
     `BotFleet-${VERSION}-x64.dmg`,
-    `BotFleet-${VERSION}-setup.exe`,
-    `BotFleet-${VERSION}-x86_64.AppImage`,
-    `BotFleet-${VERSION}-amd64.deb`,
   ];
   for (const file of files) writeFileSync(join(directory, file), `bytes:${file}`);
-  for (const file of files.slice(0, 5)) {
+  for (const file of files) {
     execFileSync(process.platform === "win32" ? "python" : "python3", ["-c", `
 import base64,gzip,hashlib,json,sys
 from pathlib import Path
@@ -63,18 +34,7 @@ Path(str(p)+".blockmap").write_bytes(gzip.compress(json.dumps(blockmap).encode()
   }
   cpSync(join(directory, files[2]), join(directory, "BotFleet.dmg"));
   cpSync(join(directory, files[3]), join(directory, "BotFleet-intel.dmg"));
-  cpSync(join(directory, files[4]), join(directory, "BotFleet-setup.exe"));
-  cpSync(join(directory, files[5]), join(directory, "BotFleet.AppImage"));
-  cpSync(join(directory, files[6]), join(directory, "BotFleet-amd64.deb"));
   writeFileSync(join(directory, "latest-mac.yml"), buildMacFeed(directory, VERSION, "2026-09-12T00:00:00.000Z"));
-  writeFileSync(join(directory, "latest.yml"), feed(directory, VERSION, [files[4]]));
-  writeFileSync(join(directory, "latest-linux.yml"), feed(directory, VERSION, [files[5], files[6]]));
-  writeFileSync(
-    join(directory, "SHA256SUMS-ubuntu-x64.txt"),
-    [files[6], files[5]]
-      .map((file) => `${hash(join(directory, file), "sha256", "hex")}  ${file}`)
-      .join("\n") + "\n",
-  );
   return { directory, files };
 }
 
@@ -99,24 +59,6 @@ test("the verifier rejects stale feed bytes and stale stable downloads", () => {
   } finally {
     rmSync(staleFeed.directory, { recursive: true, force: true });
     rmSync(staleAlias.directory, { recursive: true, force: true });
-  }
-});
-
-test("the Linux feed must include and verify both generated package formats", () => {
-  const missingDeb = fixture();
-  const staleDeb = fixture();
-  try {
-    writeFileSync(join(missingDeb.directory, "latest-linux.yml"),
-      feed(missingDeb.directory, VERSION, [missingDeb.files[5]]));
-    assert.throws(() => verifyReleaseAssets(missingDeb.directory, VERSION),
-      /latest-linux.yml: expected .*amd64\.deb/);
-
-    writeFileSync(join(staleDeb.directory, staleDeb.files[6]), "changed deb after feed generation");
-    assert.throws(() => verifyReleaseAssets(staleDeb.directory, VERSION),
-      /latest-linux.yml: hash or size mismatch .*amd64\.deb/);
-  } finally {
-    rmSync(missingDeb.directory, { recursive: true, force: true });
-    rmSync(staleDeb.directory, { recursive: true, force: true });
   }
 });
 
@@ -187,16 +129,6 @@ test("release workflow defaults to artifacts and requires explicit release mutat
   assert.match(workflow, /node scripts\/verify-release-tag\.mjs\n\s+cd assets/);
   assert.match(workflow, /existing draft targets \$existing_target, not pinned \$SHA/);
   assert.match(workflow, /node scripts\/verify-release-assets\.mjs uploaded "\$VERSION"/);
-});
-
-test("the windows packaging gate asserts the owner as well as the repo it names", () => {
-  const workflow = readFileSync(join(ROOT, ".github/workflows/package-win.yml"), "utf8").replace(/\r\n/g, "\n");
-  const builder = readFileSync(join(ROOT, "electron-builder.yml"), "utf8").replace(/\r\n/g, "\n");
-  // The error text names Simple-With-Us/BotFleet, so the gate has to check both halves.
-  assert.match(workflow, /grep -q "\^owner: Simple-With-Us\$" "\$res\/app-update\.yml"/);
-  assert.match(workflow, /grep -q "\^repo: BotFleet\$" "\$res\/app-update\.yml"/);
-  // …and both halves have to match what electron-builder actually publishes.
-  assert.match(builder, /publish:\n\s+- provider: github\n\s+owner: Simple-With-Us\n\s+repo: BotFleet/);
 });
 
 test("release tags must resolve to the pinned build, including nested annotated tags", async () => {

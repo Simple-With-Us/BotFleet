@@ -50,7 +50,7 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
   assert.equal(isIosPath("server/index.ts"), false);
 
   for (const path of ["electron/main.mjs", "electron-builder.yml", "third_party/cloudflared/README.md",
-    "scripts/prepare-cloudflared.mjs", "scripts/package-linux.mjs", "package.json", "pnpm-lock.yaml"]) {
+    "scripts/prepare-cloudflared.mjs", "scripts/prepare-cua-linux.mjs", "package.json", "pnpm-lock.yaml"]) {
     assert.equal(isPackagingPath(path), true, path);
   }
   assert.equal(isPackagingPath(".github/workflows/ci.yml"), false);
@@ -99,7 +99,7 @@ test("the CLI emits only GitHub outputs for a NUL-delimited path list", () => {
 
 test("every protected check stays present and takes the same fail-closed scope output", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
-  const requiredJobs = ["test", "package-linux"];
+  const requiredJobs = ["test"];
 
   assert.equal(Object.hasOwn(workflow.on, "workflow_dispatch"), true);
   assert.equal(Object.hasOwn(workflow.on, "schedule"), true);
@@ -128,32 +128,15 @@ test("every protected check stays present and takes the same fail-closed scope o
   assert.doesNotMatch(source, /paths-ignore:/);
 });
 
-test("packaging job gates on its own area, the same way docs_only does", () => {
+test("no Linux packaging job remains in ci.yml (BF-2500 clean break)", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
-  const areaJobs = [
-    { jobId: "package-linux", output: "packaging_changed", fastPathName: "Packaging-unrelated fast path" },
-  ];
 
-  for (const { jobId, output, fastPathName } of areaJobs) {
-    const job = workflow.jobs[jobId];
-    const docsFastPath = job.steps.find((step) => step.name === "Documentation-only fast path");
-    const areaFastPath = job.steps.find((step) => step.name === fastPathName);
-    assert.ok(areaFastPath, `${jobId} is missing "${fastPathName}"`);
-    assert.equal(
-      areaFastPath.if,
-      `needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.${output} != 'true'`,
-      jobId,
-    );
-
-    const expensiveSteps = job.steps.filter((step) => step !== docsFastPath && step !== areaFastPath);
-    assert.ok(expensiveSteps.length > 0, jobId);
-    for (const step of expensiveSteps) {
-      assert.match(
-        step.if,
-        new RegExp(`needs\\.changes\\.outputs\\.${output} == 'true'`),
-        `${jobId}: ${step.name ?? step.run ?? step.uses}`,
-      );
-    }
+  // The Ubuntu desktop package job is gone with the Windows matrix leg; the
+  // mac gate lives in mac-package-gate.yml and the VM image in
+  // vm-image-build.yml, neither of which is a ci.yml job.
+  assert.equal(workflow.jobs["package-linux"], undefined);
+  for (const job of Object.values(workflow.jobs)) {
+    assert.doesNotMatch(JSON.stringify(job), /package-linux|windows-latest/);
   }
 
   // Neither the docs_only-only "test" job nor the changes job itself gained
@@ -345,14 +328,14 @@ test("the weekly full run is registered with the Sentry cron reporter", () => {
 test("every host runs the canonical complete test chain without masking failures", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const job = workflow.jobs.test;
-  // The required context stays "typecheck + test (macos-latest)".  Hosted
-  // macos-latest does not allocate a runner (BF-2066), so the mac leg runs
-  // on macos-14.  Ubuntu and Windows keep their own labels.
+  // The required contexts stay "typecheck + test (macos-latest)" and
+  // "typecheck + test (ubuntu-latest)".  Hosted macos-latest does not
+  // allocate a runner (BF-2066), so the mac leg runs on macos-14.
+  // Ubuntu keeps its own label.
   assert.equal(job.name, "typecheck + test (${{ matrix.check }})");
   assert.deepEqual(job.strategy.matrix.include, [
     { os: "macos-14", check: "macos-latest" },
     { os: "ubuntu-latest", check: "ubuntu-latest" },
-    { os: "windows-latest", check: "windows-latest" },
   ]);
   assert.match(String(job["runs-on"]), /matrix\.os/);
   assert.doesNotMatch(String(job["runs-on"]), /macos-latest/);

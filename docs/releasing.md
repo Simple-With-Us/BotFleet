@@ -1,8 +1,8 @@
 # Releasing
 
 One workflow builds everything: **Actions → Release → Run workflow**.  It
-builds macOS (arm64 + x64, signed, notarized, stapled), Windows, and Ubuntu
-from a single pinned commit, verifies every artifact the way a user would
+builds macOS (arm64 + x64, signed, notarized, stapled) from a single pinned
+commit, verifies every artifact the way a user would
 receive it, and preserves one complete artifact set in Actions.  That default
 mode does not create or change a GitHub Release.  Tick **draft** to upload the
 verified set to a draft on this repository's own
@@ -32,9 +32,6 @@ electron-updater reads a feed file, not the DMG:
 - **macOS:** `latest-mac.yml` plus the `BotFleet-<version>-arm64.zip` and
   `BotFleet-<version>-x64.zip` it lists (and their `.blockmap` files).
   The DMGs are for humans; the updater downloads the zips.
-- **Windows:** `latest.yml` plus `BotFleet-<version>-setup.exe` and its
-  `.blockmap`.
-- **Ubuntu:** `latest-linux.yml` plus the AppImage.
 
 A release that carries only DMGs, as
 [`v0.1.38`](https://github.com/Simple-With-Us/BotFleet/releases/tag/v0.1.38)

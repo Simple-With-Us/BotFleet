@@ -6,16 +6,16 @@ protocols:
   - name: BotFleet package install
     schemes: [botfleet]
 
-# In-app auto-update reads latest-mac.yml + the .zip (macOS) or latest.yml +
-# the NSIS .exe (Windows) from this repository's own GitHub Releases:
-# Simple-With-Us/BotFleet, the only place BotFleet releases exist (owner
-# rule, 2026-09-02: one repository per app; no separate releases repo).
+# In-app auto-update reads latest-mac.yml + the .zip (macOS) from this
+# repository's own GitHub Releases: Simple-With-Us/BotFleet, the only place
+# BotFleet releases exist (owner rule, 2026-09-02: one repository per app; no
+# separate releases repo).
 # The repo is public, so no token ever reaches a user's machine. Baked into
-# app-update.yml; both metadata files are emitted here even with
-# --publish never, and must be uploaded to the GitHub release alongside the
-# artifacts — a release missing latest-mac.yml or latest.yml leaves every
-# install stranded on its installed version. Exactly one provider entry:
-# electron-updater reads the first and a duplicate only invites drift.
+# app-update.yml; latest-mac.yml is emitted here even with --publish never,
+# and must be uploaded to the GitHub release alongside the artifacts — a
+# release missing it leaves every install stranded on its installed version.
+# Exactly one provider entry: electron-updater reads the first and a duplicate
+# only invites drift.
 publish:
   - provider: github
     owner: Simple-With-Us
