@@ -354,6 +354,50 @@ env -u ASC_KEY_P8 -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8
 ' || fail "a named key file that names nothing broke the run"
 grep -q '^ASC_KEY_P8 /asc$' "$FAKE_LOG" || fail "fleet-secrets was not consulted for the credential"
 
+# 2k. An inherited ASC_KEY_PATH does not survive a failed resolution:  the
+#     path is cleared, so nothing downstream can pick it up and hand xcodebuild
+#     a credential this run never resolved.
+: > "$FAKE_LOG"
+env -u ASC_KEY_P8 -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+  ASC_KEY_ID=NOSUCHKEY0 ASC_ISSUER_ID=any-issuer ASC_KEY_PATH="${tmp}/named-file.p8" bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  load_secrets
+  [[ "$AUTH_MODE" == none ]]
+  # The named path is gone:  nothing downstream can pick it up.
+  [[ -z "${ASC_KEY_PATH:-}" ]]
+' || fail "an inherited ASC_KEY_PATH survived a failed resolution"
+
+# 2l. An ASC_KEY_P8 that is not a private key is removed from the environment,
+#     so the client never resolves a credential the shell layer refused.
+: > "$FAKE_LOG"
+env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+  ASC_KEY_ID=NOSUCHKEY0 ASC_ISSUER_ID=any-issuer ASC_KEY_P8="not a private key at all" bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  load_secrets
+  [[ "$AUTH_MODE" == none ]]
+  [[ -z "${ASC_KEY_P8:-}" ]]
+' || fail "an unusable ASC_KEY_P8 stayed in the environment"
+
+# 2m. The same for the APPLE_API_* trio:  the client looks for those names
+#     first, so an unusable one has to be removed rather than left behind.
+#     The credential is then the one Infisical holds, and the client sees it.
+: > "$FAKE_LOG"
+env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
+  APPLE_API_KEY_ID=BADKEY00001 APPLE_API_ISSUER_ID=bad-issuer \
+  APPLE_API_KEY_P8_BASE64="not a private key at all" bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  load_secrets
+  [[ "$AUTH_MODE" == api_key ]]
+  # The credential is the /asc one, not the unusable APPLE_API_* one.
+  same_env_as_file "'"$tmp"'/asc.p8"
+  [[ -z "${APPLE_API_KEY_P8_BASE64:-}" ]]
+  [[ -z "${APPLE_API_KEY_ID:-}" ]]
+  [[ -z "${APPLE_API_ISSUER_ID:-}" ]]
+' || fail "an unusable APPLE_API_* trio stayed in the environment"
+
 # 3. The credential never travels in a command argument.  The secret reaches
 #    the child through the environment, so its own argv must not carry it.
 argv="$(env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \

@@ -221,8 +221,12 @@ asc_tmp_dir() {
 load_secrets() {
   AUTH_MODE="none"
   #  A named ASC_KEY_PATH is not a credential source.  It is remembered only
-  #  so the run can say that it ignored it.
+  #  so the run can say that it ignored it, and it is cleared here:  an
+  #  inherited path must never reach xcodebuild when the resolution below
+  #  fails, because then it would be a credential this run never resolved.
+  #  Only the staging copy written from the resolved credential is exported.
   local named_path="${ASC_KEY_PATH:-}"
+  unset ASC_KEY_PATH
   local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" key_pem="" rc=0
   local key_path="" asc_kid=""
 
@@ -247,6 +251,12 @@ load_secrets() {
     else
       logerr "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key"
     fi
+    if [[ -z "$key_pem" ]]; then
+      #  An unusable source is removed from the environment.  The client looks
+      #  for these names first, so leaving them behind would have it resolve a
+      #  broken credential instead of the one this shell layer resolved.
+      unset APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+    fi
   fi
 
   # 2. An ambient ASC_KEY_P8.  It is only usable when it really is a PEM
@@ -254,11 +264,16 @@ load_secrets() {
   if [[ -z "$key_pem" && -n "${ASC_KEY_P8:-}" ]]; then
     if [[ -z "$kid" || -z "$iss" ]]; then
       log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it"
+      unset ASC_KEY_P8
     else
       rc=0
       node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8" || rc=$?
       if [[ "$rc" -ne 0 ]]; then
         log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it"
+        #  The client would refuse this value, so it is removed from the
+        #  environment:  the client has to see the credential this shell layer
+        #  resolved, not one that cannot be used.
+        unset ASC_KEY_P8
       else
         key_pem="$ASC_KEY_P8"
       fi
