@@ -44,16 +44,33 @@ test("install and verify entrypoints exist", () => {
 // This test pins the bundle side, so the file cannot go missing again.
 test("the Control app bundle ships the vm-cli manifest", () => {
   const builder = readFileSync(join(ROOT, "electron/build-control-app.mjs"), "utf8").replace(/\r\n/g, "\n");
+  // Assert the exact source and destination pair: a generic "computer-vm-cli"
+  // mention anywhere in the file would not prove the manifest itself is
+  // copied into the bundle.
   assert.ok(
-    builder.includes("computer-vm-cli"),
-    "electron/build-control-app.mjs must copy the vm-cli manifest into the Control app bundle",
+    builder.includes('path.join(project, "scripts", "computer-vm-cli", "manifest.json")'),
+    "electron/build-control-app.mjs must copy scripts/computer-vm-cli/manifest.json from the repo",
+  );
+  assert.ok(
+    builder.includes('path.join(vmCliManifestDir, "manifest.json")'),
+    "electron/build-control-app.mjs must place manifest.json inside the bundle's computer-vm-cli directory",
   );
 
   // The resolver looks for the manifest relative to the helper's own
-  // directory, so the bundle must place it where the resolver will look.
+  // directory, and the bundle only satisfies the SERVER_ROOT candidate —
+  // so that candidate must come FIRST. Presence anywhere in the list is not
+  // enough: a later relative candidate would silently shadow the bundled copy.
   const resolver = readFileSync(join(ROOT, "server/vm-cli-manifest.ts"), "utf8").replace(/\r\n/g, "\n");
+  const candidates = [...resolver.matchAll(/join\((\w+),\s*"([^"]*computer-vm-cli\/manifest\.json)"\)/g)].map(
+    (match) => ({ root: match[1], path: match[2] }),
+  );
   assert.ok(
-    resolver.includes('join(SERVER_ROOT, "computer-vm-cli/manifest.json")'),
-    "the manifest must stay the first candidate so the bundle can satisfy it",
+    candidates.length > 0,
+    "server/vm-cli-manifest.ts must resolve the manifest from an explicit candidate list",
+  );
+  assert.equal(
+    candidates[0].root,
+    "SERVER_ROOT",
+    `the SERVER_ROOT candidate must come first so the Control app bundle satisfies it (found ${candidates[0].root}: ${candidates[0].path})`,
   );
 });
