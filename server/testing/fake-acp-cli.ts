@@ -395,10 +395,20 @@ export const boundedContentValue: z.ZodType<unknown> = z.lazy(() =>
     z.boolean(),
     z.null(),
     z.array(boundedContentValue).max(10_000),
-    z.record(z.string().max(256), boundedContentValue),
+    // record branch caps key COUNT as well as key length, mirroring
+    // ACP_JSON_MAX_KEYS in the driver:  many bounded values must not
+    // aggregate into an unbounded tree.
+    z.record(z.string().max(256), boundedContentValue).refine((record) => Object.keys(record).length <= 256, { message: "too many keys" }),
   ]),
 );
 export type BoundedContentValue = z.infer<typeof boundedContentValue>;
+
+// Top-level params view:  bounded keys and values AND a bounded entry
+// count, so one message cannot declare arbitrarily many bounded fields.
+export const paramsRecordSchema = z
+  .record(z.string().max(256), boundedContentValue)
+  .refine((record) => Object.keys(record).length <= 256, { message: "too many keys" });
+export type ParamsRecord = z.infer<typeof paramsRecordSchema>;
 
 // ask-peer mode: the "agents" MCP server entry from session/new's mcpServers.
 // The schema bounds the array and every string inside each entry, and the
@@ -546,9 +556,15 @@ function handle(rawMsg: unknown, resumed = false) {
   const msg = parsedEnvelope.data;
   // params is method-shaped and vendor-owned:  each case reads it through
   // this decoded record view and validates the fields it needs
-  // (session/prompt parses its own strict schema below).
-  const parsedParams = z.record(z.string().max(256), boundedContentValue).safeParse(msg.params);
-  const params = parsedParams.success ? parsedParams.data : {};
+  // (session/prompt parses its own strict schema below).  Absent params
+  // decode as {};  present-but-invalid params are rejected at the
+  // boundary with -32602 and never reach dispatch.
+  const parsedParams = paramsRecordSchema.safeParse(msg.params === undefined ? {} : msg.params);
+  if (!parsedParams.success) {
+    if (msg.id !== undefined) out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Invalid params" } });
+    return;
+  }
+  const params: ParamsRecord = parsedParams.data;
   // client's response to our permission request
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && msg.id === pendingPermissionId) {
     pendingPermissionId = null;
