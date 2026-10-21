@@ -16,10 +16,28 @@ public struct MacRootView: View {
             MacThreadListView()
                 .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 360)
         } detail: {
-            MacDetailChatView(inputText: $inputText)
+            HSplitView {
+                MacDetailChatView(inputText: $inputText)
+                    .frame(minWidth: 400)
+
+                if session.showCuaViewer {
+                    MacCuaInspectorView()
+                        .frame(minWidth: 320, idealWidth: 380)
+                }
+            }
         }
         .navigationTitle(session.activeTitle)
         .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        session.showCuaViewer.toggle()
+                    }
+                }) {
+                    Image(systemName: session.showCuaViewer ? "display.fill" : "display")
+                }
+                .help("Toggle Computer Use Agent (CUA) live viewer")
+            }
             ToolbarItem(placement: .automatic) {
                 HStack(spacing: 6) {
                     Circle()
@@ -427,3 +445,85 @@ struct MacComposerBar: View {
         .background(Color(NSColor.windowBackgroundColor))
     }
 }
+
+// MARK: - CUA Inspector View
+
+struct MacCuaInspectorView: View {
+    @EnvironmentObject private var session: MacSession
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Label("Computer Use", systemImage: "display")
+                    .font(.headline)
+
+                Spacer()
+
+                if session.isCuaStreaming {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 6, height: 6)
+                        Text("LIVE")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.red)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.red.opacity(0.12))
+                    .cornerRadius(4)
+                }
+
+                Button(action: { session.toggleCuaStreaming() }) {
+                    Image(systemName: session.isCuaStreaming ? "stop.fill" : "play.fill")
+                }
+                .help(session.isCuaStreaming ? "Stop live capture" : "Start live capture")
+                .accessibilityLabel(session.isCuaStreaming ? "Stop Live Capture" : "Start Live Capture")
+            }
+            .padding(12)
+            .background(Color(NSColor.windowBackgroundColor))
+
+            Divider()
+
+            // Metal Surface
+            ZStack {
+                CuaMetalView(pixelBuffer: session.cuaPixelBuffer)
+                    .background(Color.black)
+
+                if session.cuaPixelBuffer == nil {
+                    VStack(spacing: 8) {
+                        Image(systemName: "display")
+                            .font(.system(size: 32))
+                            .foregroundColor(.secondary)
+                        Text(session.isCuaStreaming ? "Waiting for the first frame…" : "CUA Standby")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        if !session.isCuaStreaming {
+                            Button("Start Live Capture") {
+                                session.startCuaStreaming()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .padding(.top, 4)
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Divider()
+
+            // Status bar
+            HStack {
+                Text(session.cuaStatusMessage ?? (session.isCuaStreaming ? "Live" : "Idle"))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+            .padding(8)
+            .background(Color(NSColor.windowBackgroundColor))
+        }
+    }
+}
+

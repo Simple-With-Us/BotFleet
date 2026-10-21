@@ -162,8 +162,17 @@ public actor DatabaseService {
         self.db = handle
 
         try execute(sql: "PRAGMA journal_mode = WAL;")
+        // sqlite3_exec reports no error when WAL is unsupported and SQLite
+        // silently keeps rollback journaling; read the mode back so the
+        // degradation is loud instead of invisible.
+        if let mode = try queryString(sql: "PRAGMA journal_mode;"), mode.lowercased() != "wal" {
+            NSLog("DatabaseService: WAL journal_mode unavailable (got '\(mode)'); concurrent reads and crash-safe writes are degraded on this filesystem.")
+        }
         try execute(sql: "PRAGMA synchronous = NORMAL;")
         try execute(sql: "PRAGMA foreign_keys = ON;")
+        // REPLACE-style writes fire delete+insert trigger pairs; without this,
+        // the FTS delete triggers do not cascade.
+        try execute(sql: "PRAGMA recursive_triggers = ON;")
 
         try createSchema()
     }
@@ -172,6 +181,18 @@ public actor DatabaseService {
         if let db = db {
             sqlite3_close(db)
         }
+    }
+
+    private func queryString(sql: String) throws -> String? {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        guard let cText = sqlite3_column_text(stmt, 0) else { return nil }
+        return String(cString: cText)
     }
 
     private func execute(sql: String) throws {
@@ -216,18 +237,18 @@ public actor DatabaseService {
         );
 
         CREATE TRIGGER IF NOT EXISTS trg_messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
-            VALUES (new.rowid, new.content, new.thread_id, new.id);
+            INSERT INTO messages_fts(content, thread_id, message_id)
+            VALUES (new.content, new.thread_id, new.id);
         END;
 
         CREATE TRIGGER IF NOT EXISTS trg_messages_ad AFTER DELETE ON messages BEGIN
-            DELETE FROM messages_fts WHERE rowid = old.rowid;
+            DELETE FROM messages_fts WHERE message_id = old.id;
         END;
 
         CREATE TRIGGER IF NOT EXISTS trg_messages_au AFTER UPDATE ON messages BEGIN
-            DELETE FROM messages_fts WHERE rowid = old.rowid;
-            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
-            VALUES (new.rowid, new.content, new.thread_id, new.id);
+            DELETE FROM messages_fts WHERE message_id = old.id;
+            INSERT INTO messages_fts(content, thread_id, message_id)
+            VALUES (new.content, new.thread_id, new.id);
         END;
 
         CREATE TABLE IF NOT EXISTS routine_runs (
