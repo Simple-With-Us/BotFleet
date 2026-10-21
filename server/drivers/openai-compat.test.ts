@@ -156,6 +156,67 @@ describe("OpenAICompatDriver", () => {
     await inst.dispose();
   });
 
+  it("sends max_completion_tokens on the OpenAI endpoint and stamps its fetched catalog", async () => {
+    const bodies: Array<{ max_tokens?: number; max_completion_tokens?: number }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [{ id: "gpt-x", name: "GPT X" }] }), { status: 200 });
+      }
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-openai",
+      displayName: "OpenAI",
+      enabled: true,
+      config: { url: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "sk-fake" },
+      environment: {},
+    });
+    await inst.refreshModels?.();
+    // The /models answer above is non-empty, so this asserts the stamp on
+    // fetched rows rather than the hand-written default catalog.
+    expect(inst.models.options).toEqual([{ id: "gpt-x", label: "GPT X", supportsMaxOutput: true }]);
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-oai", text: "hi", maxOutputTokens: 1024 });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(bodies[0].max_completion_tokens).toBe(1024);
+    expect(bodies[0]).not.toHaveProperty("max_tokens");
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("retries once without the output-limit field when the endpoint rejects it", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      if (bodies.length === 1) {
+        return new Response('{"error":"max_completion_tokens is not supported by this endpoint"}', { status: 400 });
+      }
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "maxout-retry",
+      displayName: "Maxout Retry",
+      enabled: true,
+      config: { url: "https://api.groq.com/openai/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "gsk-fake" },
+      environment: {},
+    });
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-maxout-retry", text: "hi", maxOutputTokens: 512 });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].max_completion_tokens).toBe(512);
+    expect(bodies[1]).not.toHaveProperty("max_completion_tokens");
+    recorder.stop();
+    await inst.dispose();
+  });
+
   it("sends no output-limit field and marks nothing on an unrecognized endpoint", async () => {
     const bodies: Array<{ max_tokens?: number; max_completion_tokens?: number }> = [];
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

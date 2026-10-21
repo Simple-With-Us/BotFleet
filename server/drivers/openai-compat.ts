@@ -250,18 +250,36 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       });
       let res = await request();
       if (!res.ok && opts.stream && (res.status === 400 || res.status === 422)) {
-        // Some compatible endpoints reject this optional OpenAI field.  Retry
-        // only an explicit validation rejection, before any stream or tools
-        // can run, and keep the original cancellation/deadline budget.
-        const rejection = await res.text().catch(() => "");
+        // Some compatible endpoints reject these optional OpenAI fields.
+        // Retry only an explicit validation rejection, before any stream or
+        // tools can run, and keep the original cancellation/deadline budget.
+        const unsupportedField =
+          /unsupported|not supported|does not support|doesn't support|do not support|cannot support|can't support|not permitted|unrecognized|unknown|unexpected|extra_forbidden/i;
+        let rejection = await res.text().catch(() => "");
         // Providers phrase the same 400 differently, so the wording check has to
         // cover active voice ("does not support") as well as the adjective and
         // passive forms ("unsupported", "not supported").  Matching only the
         // latter left a plain "This endpoint does not support stream_options"
         // rejection with no retry at all.
-        if (/stream_options/i.test(rejection) &&
-            /unsupported|not supported|does not support|doesn't support|do not support|cannot support|can't support|not permitted|unrecognized|unknown|unexpected|extra_forbidden/i.test(rejection)) {
+        if (/stream_options/i.test(rejection) && unsupportedField.test(rejection)) {
           delete bodyPayload.stream_options;
+          res = await request();
+          // The retry can itself hit the second recovery below, so only
+          // re-read the body when the status still asks for one.
+          rejection = !res.ok && (res.status === 400 || res.status === 422) ? await res.text().catch(() => "") : "";
+        }
+        // The output-limit field this driver sends is optional too: an
+        // endpoint that rejects max_tokens/max_completion_tokens gets the
+        // same one-shot recovery instead of failing the whole turn.
+        if (
+          !res.ok &&
+          (res.status === 400 || res.status === 422) &&
+          maxOutputParam !== null &&
+          bodyPayload[maxOutputParam] !== undefined &&
+          /max_(completion_)?tokens/i.test(rejection) &&
+          unsupportedField.test(rejection)
+        ) {
+          delete bodyPayload[maxOutputParam];
           res = await request();
         }
       }

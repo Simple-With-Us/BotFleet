@@ -91,6 +91,11 @@ describe("GrokDriver turns (fake fetch)", () => {
     script = [];
     await create();
     expect(instance.models.options.every((model) => model.supportsMaxOutput === true)).toBe(true);
+    // The server gate and the picker only bound the limit when the row
+    // knows the window, so the flag must never ride alone.
+    expect(
+      instance.models.options.every((model) => model.contextWindow !== undefined && model.contextWindow > 0),
+    ).toBe(true);
     await instance.adapter.sendTurn({ threadId: "t-max-out", text: "hi", maxOutputTokens: 4096 });
     await recorder.until((e) => e.type === "turn.completed");
     expect(requestBodies[0].max_completion_tokens).toBe(4096);
@@ -591,7 +596,7 @@ describe("GrokDriver live model catalog", () => {
     const instance = await create();
     await instance.refreshModels?.();
     const rows = instance.models.options.filter((option) => option.id === "grok-build-0.1");
-    expect(rows).toEqual([{ id: "grok-build-0.1", label: "Grok Build 0.1", supportsMaxOutput: true }]);
+    expect(rows).toEqual([{ id: "grok-build-0.1", label: "Grok Build 0.1", contextWindow: 256_000, supportsMaxOutput: true }]);
     expect(instance.models.options.map((option) => option.id)).toEqual(["grok-build-0.1", "grok-4.7"]);
   });
 

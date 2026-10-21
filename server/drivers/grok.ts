@@ -45,13 +45,17 @@ const DEFAULT_URL = "https://api.x.ai/v1";
 // "an upper bound for the number of tokens that can be generated for a
 // completion, only applies to visible output tokens"; `max_tokens` is
 // deprecated there), so the whole catalog carries supportsMaxOutput.
+// Context windows are per xAI's model table (https://docs.x.ai/docs/models,
+// fetched 2026-10-21): the server gate and the picker both bound the bot's
+// output limit against contextWindow, so a row with the flag and no window
+// would let an arbitrary limit reach xAI and fail the whole turn.
 const MODELS = {
   default: "grok-4.7",
   options: [
-    { id: "grok-4.7", label: "Grok 4.7", supportsMaxOutput: true },
-    { id: "grok-build-0.1", label: "Grok Build 0.1", supportsMaxOutput: true },
-    { id: "grok-4.6", label: "Grok 4.6", supportsMaxOutput: true },
-    { id: "grok-4.5", label: "Grok 4.5", supportsMaxOutput: true },
+    { id: "grok-4.7", label: "Grok 4.7", contextWindow: 500_000, supportsMaxOutput: true },
+    { id: "grok-build-0.1", label: "Grok Build 0.1", contextWindow: 256_000, supportsMaxOutput: true },
+    { id: "grok-4.6", label: "Grok 4.6", contextWindow: 500_000, supportsMaxOutput: true },
+    { id: "grok-4.5", label: "Grok 4.5", contextWindow: 500_000, supportsMaxOutput: true },
   ],
 };
 
