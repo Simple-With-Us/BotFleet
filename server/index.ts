@@ -7681,7 +7681,11 @@ async function startTurn(
       // The replayed-history cap and the model-written summary toggle.
       // Only a driver that budgets the prompt (ACP) honours them; the
       // rest ignore what they do not know.
-      const historySettings: { maxHistoryTurns?: number; historySummaryModel?: true } = {};
+      interface HistoryTurnSettings {
+        maxHistoryTurns?: number;
+        historySummaryModel?: true;
+      }
+      const historySettings: HistoryTurnSettings = {};
       const savedMaxHistoryTurns = z.number().safeParse(bot.maxHistoryTurns);
       if (savedMaxHistoryTurns.success) historySettings.maxHistoryTurns = savedMaxHistoryTurns.data;
       if (bot.historySummaryModel === true) historySettings.historySummaryModel = true;
@@ -10074,7 +10078,11 @@ async function runGroupMemberTurn(
       if (finalWorkspaceError) throw new Error(finalWorkspaceError);
       // Same per-bot history settings as the 1:1 lane; only a driver
       // that budgets the prompt (ACP) honours them.
-      const roomHistorySettings: { maxHistoryTurns?: number; historySummaryModel?: true } = {};
+      interface HistoryTurnSettings {
+        maxHistoryTurns?: number;
+        historySummaryModel?: true;
+      }
+      const roomHistorySettings: HistoryTurnSettings = {};
       const roomMaxHistoryTurns = z.number().safeParse(bot.maxHistoryTurns);
       if (roomMaxHistoryTurns.success) roomHistorySettings.maxHistoryTurns = roomMaxHistoryTurns.data;
       if (bot.historySummaryModel === true) roomHistorySettings.historySummaryModel = true;
