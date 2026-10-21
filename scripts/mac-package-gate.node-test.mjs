@@ -28,6 +28,7 @@ test("runs on the paths that actually broke Mac packaging", () => {
     reason: "mac-packaging-path",
   });
   assert.deepEqual(run(["electron-builder.yml"]), { run: true, reason: "mac-packaging-path" });
+  assert.deepEqual(run(["mac-control/Sources/BotFleetControl/main.swift"]), { run: true, reason: "mac-packaging-path" });
   assert.deepEqual(run(["scripts/prepare-cua.mjs"]), { run: true, reason: "mac-packaging-path" });
   assert.deepEqual(run(["scripts/prepare-cua-linux.mjs"]), {
     run: true,

@@ -214,6 +214,7 @@ import {
 } from "./connector-verdict.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { requestHarnessShutdown } from "./harness-lifecycle.ts";
+import { ControlConflict, createSystemControl, reserveSystemShutdown } from "./system-control.ts";
 import { botFleetStatusSystemPrompt } from "./botfleet-status-capsule.ts";
 import {
   BOX_GATEWAY_PATH,
@@ -947,6 +948,9 @@ if (bootTranscriptSweep) console.log(bootTranscriptSweep);
 // never the reason the process stays alive.
 const stopTranscriptSweeps = startTranscriptRetentionSweeps(transcriptDirs);
 let runtimeQuiescing = false;
+// A native Stop Server request owns this fence until its graceful SIGTERM.
+// An updater must not release it through DELETE /api/runtime/quiesce.
+let controlShutdownPending = false;
 // A forced quiesce is still interrupting and saving work.  The fence is up
 // (`runtimeQuiescing`) but not yet settled: it can still roll back, and the
 // held messages are not on disk yet.  An updater whose forced request timed
@@ -12667,6 +12671,9 @@ async function takeRuntimeFence(force: boolean) {
 }
 
 function endRuntimeQuiesce(): RuntimeQuiesceAnswer {
+  if (controlShutdownPending) {
+    return { safeToRestart: false, activeWorkCount: currentRuntimeReadiness().activeWorkCount, quiescing: true };
+  }
   if (runtimeFencing) {
     // A forced quiesce is still interrupting and saving work.  Releasing now
     // would land its snapshot and its held messages on an unfenced harness:
@@ -12827,6 +12834,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 403, { error: "forbidden: cross-site request" });
     }
     const mutatingApiRequest = isMutatingHarnessApiRequest(method, path);
+    if (controlShutdownPending && path === "/api/runtime/quiesce") {
+      return json(res, 503, { error: "server shutdown is in progress" });
+    }
     // The named Remote Access tunnel forwards with a loopback Host,
     // so the Host gate alone cannot distinguish a remote Access caller from the
     // owner.  Block mutating API traffic that carries Cloudflare edge markers
@@ -12836,7 +12846,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
     if (runtimeQuiescing && path.startsWith("/api/") && path !== "/api/runtime" && path !== "/api/runtime/quiesce" &&
         path !== "/api/health" && path !== "/api/update/status") {
-      return json(res, 503, { error: "BotFleet is quiescing for an update" });
+      return json(res, 503, { error: controlShutdownPending ? "server shutdown is in progress" : "BotFleet is quiescing for an update" });
     }
     if (mutatingApiRequest && !NON_JSON_BODY_ROUTES.has(path) && hasRequestBody(req) && !isJsonContentType(req)) {
       // the commands route names its code so a client can branch on it
@@ -14788,6 +14798,115 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!stopping.ok) return json(res, 500, { error: stopping.error });
       return json(res, 200, { ok: true, detail: stopping.detail });
     }
+    if (path === "/api/system/control" || path.startsWith("/api/system/control/")) {
+      if (!isLoopbackAddress(req.socket.remoteAddress) || req.headers["x-botfleet-companion"] === "1") {
+        return json(res, 403, { error: "server controls require this Mac" });
+      }
+      if (method === "POST" && !String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
+      }
+      let ownControlLock = false;
+      const control = createSystemControl({
+        targets: () => localVmModeSwitchTargets(store.bots.map((bot) => bot.id)),
+        status: (target) => containerComputerStatus(undefined, undefined, target),
+        owner: (target) => localVmLeaseFor(target).current(localVmOwnerBusy)?.botId
+          ?? (target.key === SHARED_LOCAL_VM_TARGET.key
+            ? store.bots.map((bot) => localVmLeaseFor(localVmTargetForBot(bot.id)).current(localVmOwnerBusy)?.botId).find(Boolean)
+            : undefined),
+        busy: () => runtimeFencing || updateDrain.active || (runtimeQuiescing && !controlShutdownPending)
+          || store.bots.some((bot) => bot.busy) || localVmActiveThreads.size > 0
+          || localVmLifecycleBusy.size > 0 || localVmImageBusy || localVmProvisionBusy
+          || (localVmModeChangeBusy && !ownControlLock),
+        action: async (action, target) => {
+          localVmLifecycleBusy.add(target.key);
+          try {
+            await containerComputerAction(action, undefined, undefined, target);
+            if (action === "run" || action === "start") localVmIdleFor(target).touch();
+          } finally {
+            localVmLifecycleBusy.delete(target.key);
+          }
+        },
+        afterStop: (target) => localVmIdleFor(target).cancel(),
+      });
+      const reserveControl = () => {
+        control.guard();
+        // The existing VM routes and turn admission respect this fence.
+        // Set it before the first await, and retain it through status probes.
+        localVmModeChangeBusy = true;
+        ownControlLock = true;
+      };
+      try {
+        if (method === "GET" && path === "/api/system/control") {
+          return json(res, 200, {
+            activeBotCount: store.bots.filter((bot) => bot.busy).length,
+            localVms: await control.list(),
+            persistOnExit: cfg.server?.persistOnExit !== false,
+          });
+        }
+        if (method === "POST" && path === "/api/system/control/vms/stop") {
+          reserveControl();
+          try {
+            return json(res, 200, { ok: true, detail: await control.stopAll() });
+          } finally { localVmModeChangeBusy = false; }
+        }
+        if (method === "POST" && path === "/api/system/control/vms/start") {
+          if (cfg.localVm?.mode === "per-bot" || localVmProviderOff(cfg)) {
+            return json(res, 409, { error: "Enable shared Local VM in Computer settings first" });
+          }
+          reserveControl();
+          try {
+            return json(res, 200, { ok: true, vm: await control.startShared() });
+          } finally { localVmModeChangeBusy = false; }
+        }
+        if (method === "POST" && path === "/api/system/control/stop") {
+          // No marker or VM effect until all active work and leases are clear.
+          const reservation = reserveSystemShutdown({
+            guard: () => control.guard(),
+            activeWorkCount: () => currentRuntimeReadiness(ownAdmissionActive).activeWorkCount ?? 1,
+            fence: () => {
+              reserveControl();
+              cancelFenceLease();
+              controlShutdownPending = true;
+              runtimeQuiescing = true;
+            },
+            unfence: () => {
+              controlShutdownPending = false;
+              runtimeQuiescing = false;
+              localVmModeChangeBusy = false;
+            },
+          });
+          let stopping;
+          try {
+            stopping = await requestHarnessShutdown({
+              stopLocalVm: () => control.stopAll(),
+              // Go through the registered signal handler so queued event logs,
+              // children and stores receive the normal graceful drain.
+              exit: () => process.kill(process.pid, "SIGTERM"),
+            });
+          } catch (error) {
+            reservation.release();
+            throw error;
+          }
+          if (!stopping.ok) {
+            reservation.release();
+            return json(res, 500, { ok: false, error: stopping.error, detail: stopping.detail });
+          }
+          const partial = stopping.detail.localVmStop === "failed";
+          if (partial) {
+            return json(res, 500, {
+              ok: false,
+              error: "Server shutdown is proceeding, but one or more Local VMs could not be stopped.  Check Computer settings before assuming they are off.",
+              detail: stopping.detail,
+            });
+          }
+          return json(res, 200, { ok: true, detail: stopping.detail });
+        }
+      } catch (error) {
+        const failure = localComputerActionError(error);
+        return json(res, error instanceof ControlConflict ? 409 : failure.status, { error: failure.error });
+      }
+      return json(res, 404, { error: "unknown server control" });
+    }
     if (method === "POST" && path === "/api/bots") {
       const body = await readBody(req);
       if (!body || typeof body !== "object" || Array.isArray(body)) {
@@ -16425,7 +16544,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       try {
         for (const target of affectedTargets) {
           const status = await containerComputerStatus(undefined, undefined, target).catch(() => null);
-          if (status?.container === "running" || status?.container === "stopped") {
+          if (status?.container === "running" || status?.container === "created" || status?.container === "stopped") {
             await containerComputerAction("remove", undefined, undefined, target);
           }
           // The idle backstop is keyed by target too; leaving it armed on a
