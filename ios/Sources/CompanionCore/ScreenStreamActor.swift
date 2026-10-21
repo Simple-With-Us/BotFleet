@@ -102,14 +102,19 @@ public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {
         frameRate: Int = 30,
         onFrame: @Sendable @escaping (CVPixelBuffer) -> Void
     ) async throws {
-        if isStreaming {
-            await stopStreaming()
-        }
+        // Claim the re-entrancy guard before any suspension point, including
+        // the `await stopStreaming()` restart path below: a concurrent call
+        // that arrives while this one is suspended must fail fast, not start a
+        // second SCStream or make this legitimate restart throw.
         guard !isStarting else {
             throw ScreenStreamError.streamInitializationFailed("startStreaming is already in progress")
         }
         isStarting = true
         defer { isStarting = false }
+
+        if isStreaming {
+            await stopStreaming()
+        }
 
         let content = try await availableContent()
         let targetDisplayID = displayID ?? CGMainDisplayID()
