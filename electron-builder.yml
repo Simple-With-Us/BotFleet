@@ -11,11 +11,11 @@ protocols:
 # BotFleet releases exist (owner rule, 2026-09-02: one repository per app; no
 # separate releases repo).
 # The repo is public, so no token ever reaches a user's machine. Baked into
-# app-update.yml; both metadata files are emitted here even with
-# --publish never, and must be uploaded to the GitHub release alongside the
-# artifacts — a release missing latest-mac.yml or latest.yml leaves every
-# install stranded on its installed version. Exactly one provider entry:
-# electron-updater reads the first and a duplicate only invites drift.
+# app-update.yml; latest-mac.yml is emitted here even with --publish never,
+# and must be uploaded to the GitHub release alongside the artifacts — a
+# release missing it leaves every install stranded on its installed version.
+# Exactly one provider entry: electron-updater reads the first and a duplicate
+# only invites drift.
 publish:
   - provider: github
     owner: Simple-With-Us
