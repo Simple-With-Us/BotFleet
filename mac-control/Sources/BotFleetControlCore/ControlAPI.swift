@@ -19,6 +19,9 @@ public struct ControlStatus: Decodable, Equatable {
 
 public enum ControlAPIError: LocalizedError, Equatable {
     case unavailable
+    /// The server answered the health check but did not answer the status
+    /// route in time.  It is running; it was just too slow.
+    case unresponsive
     case foreignService
     case invalidResponse
     case refused(String)
@@ -26,6 +29,7 @@ public enum ControlAPIError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .unavailable: return "BotFleet Server is unavailable."
+        case .unresponsive: return "BotFleet Server is running but did not answer in time."
         case .foreignService: return "Port 8799 is not answering as BotFleet Server."
         case .invalidResponse: return "BotFleet Server returned an invalid response.  Update BotFleet and try again."
         case .refused(let message): return message
@@ -43,9 +47,26 @@ public final class ControlAPI {
         self.baseURL = baseURL
     }
 
+    /// How long the status probe waits for the server's own answer.
+    ///
+    /// The route reads the state of every Local VM target, so on a busy Mac
+    /// it takes a while.  Fifteen seconds was close enough to what the route
+    /// actually cost under load that a slow server read as a stopped one,
+    /// which greyed out Start Local VM on a server that was running fine.
+    public static let statusTimeout: TimeInterval = 30
+
     public func status() async throws -> ControlStatus {
         try await verifyIdentity()
-        let data = try await send("/api/system/control", method: "GET", timeout: 15)
+        let data: Data
+        do {
+            data = try await send("/api/system/control", method: "GET", timeout: Self.statusTimeout)
+        } catch ControlAPIError.unavailable {
+            // The identity check already proved the server is alive and ready,
+            // so a failure here means it was too slow to answer, not that it
+            // is gone.  Reporting that as unavailable would offer to start a
+            // server that is already running.
+            throw ControlAPIError.unresponsive
+        }
         guard let status = try? decoder.decode(ControlStatus.self, from: data), status.activeBotCount >= 0 else {
             throw ControlAPIError.invalidResponse
         }

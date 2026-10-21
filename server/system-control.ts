@@ -4,6 +4,15 @@ export interface ControlVm { key: string; name: string; running: boolean; state:
 export interface ControlDeps<T extends ControlTarget> {
   targets(): T[];
   status(target: T): Promise<{ container: string }>;
+  /** Optional: read every target's state in one pass, keyed by target key.
+   *
+   *  `status` is called once per target, and each call repeats the probes
+   *  that are identical for every target: is a container runtime usable, and
+   *  is the prepared desktop image there.  With N targets that is N runtime
+   *  probes and N image probes for the same answers.  A caller that can share
+   *  those probes passes `statusAll` and gets one shared pass instead.  A
+   *  target the batch does not answer falls back to `status`. */
+  statusAll?(targets: T[]): Promise<Map<string, { container: string }>>;
   owner(target: T): string | undefined;
   busy(): boolean;
   action(action: "stop" | "run" | "start", target: T): Promise<void>;
@@ -40,6 +49,13 @@ export function createSystemControl<T extends ControlTarget>(deps: ControlDeps<T
     if (owned) throw new ControlConflict(`the Local VM ${owned.label} is being used by a bot`);
   };
   const inspect = async (targets: T[]) => {
+    if (deps.statusAll) {
+      const shared = await deps.statusAll(targets);
+      return Promise.all(targets.map(async (target) => ({
+        target,
+        state: shared.get(target.key) ?? await deps.status(target),
+      })));
+    }
     const states = await Promise.all(targets.map(async (target) => ({ target, state: await deps.status(target) })));
     return states;
   };
