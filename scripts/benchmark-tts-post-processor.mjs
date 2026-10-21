@@ -71,7 +71,7 @@ ${SAMPLE_INPUT}`;
 const MODELS = [
   // MiniMax Native
   {
-    id: "MiniMax-M3.1-Flash-Preview",
+    id: "MiniMax-M3.1-Flash",
     provider: "minimax-native",
     inputRate: 0.30,
     outputRate: 1.20,

@@ -153,7 +153,7 @@ export function unattendedModelDowngrade(
   // target's, and DSH refuses a level its settings do not declare.
   if (
     opts.automationSource === "webhook" &&
-    selection.model === "MiniMax-M3.1-Flash-Preview-thinking" &&
+    selection.model === "MiniMax-M3.1-Flash-thinking" &&
     opts.nonThinkingFlash?.instanceId &&
     opts.nonThinkingFlash.model &&
     !opts.isCooling?.(opts.nonThinkingFlash.instanceId, opts.nonThinkingFlash.model)
@@ -555,10 +555,10 @@ export function effectiveFallbackTiers(
   let previous = primary;
   let effective = 1;
   for (const candidate of fallbacks ?? []) {
-    const prevKey = { instanceId: previous.instanceId, model: rewriteRetiredModelId(previous.model, previous.instanceId) };
-    const candKey = { instanceId: candidate.instanceId, model: rewriteRetiredModelId(candidate.model, candidate.instanceId) };
+    const prevKey = { instanceId: previous.instanceId, model: rewriteRetiredModelId(previous.model) };
+    const candKey = { instanceId: candidate.instanceId, model: rewriteRetiredModelId(candidate.model) };
     if (sameEngine(prevKey, candKey)) {
-      const primaryKey = { instanceId: primary.instanceId, model: rewriteRetiredModelId(primary.model, primary.instanceId) };
+      const primaryKey = { instanceId: primary.instanceId, model: rewriteRetiredModelId(primary.model) };
       redundant.push({
         instanceId: candidate.instanceId,
         model: candidate.model,
@@ -708,9 +708,9 @@ export function selectTurnFallback(input: {
     const next = chain[i];
     if (!next?.instanceId) continue;
     // Heal retired picker ids before same-engine / rejection checks so a
-    // saved MiniMax-M3 entry cannot loop against a live Flash Preview
+    // saved MiniMax-M3 entry cannot loop against a live Flash
     // primary or burn another unknown-model spawn.
-    const model = rewriteRetiredModelId(next.model, next.instanceId);
+    const model = rewriteRetiredModelId(next.model);
     if (input.current && sameEngine({ instanceId: next.instanceId, model }, input.current)) continue;
     // Skip in place, never re-order: the remaining entries are still the
     // owner's saved preference order, and nextUsed still points past the

@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -856,9 +856,33 @@ describe("saveConfig section merge", () => {
   beforeEach(() => {
     mkdirSync(DATA_DIR, { recursive: true });
     rmSync(join(DATA_DIR, "config.json"), { force: true });
+    rmSync(join(DATA_DIR, "persist-on-exit.policy"), { force: true });
   });
   afterEach(() => {
     rmSync(join(DATA_DIR, "config.json"), { force: true });
+    rmSync(join(DATA_DIR, "persist-on-exit.policy"), { force: true });
+  });
+
+  it("persists server quit policy and retains it through another server setting", () => {
+    saveConfig({ server: { persistOnExit: false } });
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+    expect(readFileSync(join(DATA_DIR, "persist-on-exit.policy"), "utf8")).toBe("false\n");
+
+    saveConfig({ server: { allowRemoteDesktopLaunch: true } });
+    expect(loadConfig().server).toMatchObject({ persistOnExit: false, allowRemoteDesktopLaunch: true });
+  });
+
+  it("uses the strict offline policy and replaces it on an online save", () => {
+    saveConfig({ server: { persistOnExit: true } });
+    writeFileSync(join(DATA_DIR, "persist-on-exit.policy"), "false\n");
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+
+    saveConfig({ server: { persistOnExit: true } });
+    expect(readFileSync(join(DATA_DIR, "persist-on-exit.policy"), "utf8")).toBe("true\n");
+    expect(loadConfig().server?.persistOnExit).toBe(true);
+
+    writeFileSync(join(DATA_DIR, "persist-on-exit.policy"), "true\ntrailing");
+    expect(loadConfig().server?.persistOnExit).toBe(true);
   });
 
   it("persists usage URL and token, and a later URL-only patch keeps the token", () => {
