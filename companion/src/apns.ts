@@ -268,10 +268,17 @@ export async function apnsKeyStamp(): Promise<string | null> {
  * the operator can tell WHICH key Apple refused without the key ever being
  * printed.  The PEM armour is stripped first, so the preview describes the
  * key material and not the header.  An absent key previews as "unavailable"
- * rather than as an empty string, so the line still says something useful. */
+ * rather than as an empty string, so the line still says something useful.
+ *
+ * A material too short to mask also previews as "unavailable":  the first
+ * eight and the last four characters overlap once the material is twelve or
+ * fewer characters long, so the "masked" preview would reproduce the whole
+ * key.  A preview that prints the secret it exists to hide is worse than no
+ * preview at all, so the short case is refused. */
 export function keyPreview(p8: string | null | undefined): string {
   const material = (p8 ?? "").replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
   if (!material) return "unavailable";
+  if (material.length <= 12) return "unavailable";
   return `${material.slice(0, 8)}…${material.slice(-4)}`;
 }
 
@@ -2417,7 +2424,13 @@ export function watchHarnessNotifications(options: {
     const stamp = await keyStamp();
     if (stamp !== null) discoveredStamp = stamp;
     keyFaultStore?.save({ reason, at, keyStamp: discoveredStamp, errorTimestamp });
-    console.warn(`companion: APNs refused the signing key (${reason}); pushes are off until the key file changes`);
+    // Rule 43:  name the refused key by its masked preview, so an operator
+    // tailing the log can tell WHICH key Apple rejected.  The key itself is
+    // never printed.
+    console.warn(
+      `companion: APNs refused the signing key (${reason}; preview ${keyPreview(config.p8)}); ` +
+        `pushes are off until the key file changes`,
+    );
     // Leave the stream so the pump re-enters the key check rather than
     // sending the same doomed request for every notification that follows.
     abort?.abort();

@@ -3190,6 +3190,10 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
         return line !== "";
       });
     } finally {
+      // Restore the spy:  a console.warn left mocked here stays a no-op for
+      // every test that follows in this file and hides the sidecar's own
+      // warnings.
+      warn.mockRestore();
       watch.stop();
     }
     const material = p8.replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
@@ -3199,8 +3203,62 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
     expect(line).not.toContain(p8);
   });
 
-  it("clears the verdict when the key file fingerprint changes", async () => {
-    const store = memoryKeyFaultStore({
+  it("names the live refusal by a masked preview too, never by its value", async () => {
+    // The persisted-fault warning names the refused key by its masked preview.
+    // The LIVE refusal — the line printed the moment Apple refuses the key —
+    // must name it the same way, or the common case is the one warning with
+    // no way to tell which key Apple rejected.
+    const store = memoryKeyFaultStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const p8 = testP8();
+    const key = testConfig({ p8 });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => key,
+      keyStamp: () => "key-v1",
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false as const,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault" as const,
+      }),
+    });
+    let line = "";
+    try {
+      await waitFor(() => {
+        line = warn.mock.calls.map((call) => String(call[0])).find((text) => text.includes("refused the signing key")) ?? "";
+        return line !== "";
+      });
+    } finally {
+      warn.mockRestore();
+      watch.stop();
+    }
+    const material = p8.replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+    expect(line).toContain(`${material.slice(0, 8)}…${material.slice(-4)}`);
+    expect(line).not.toContain(material);
+    expect(line).not.toContain(p8);
+  });
+
+  it("refuses to preview a key too short to mask, rather than printing it whole", async () => {
+    // The first eight and the last four characters overlap once the material
+    // is twelve characters or shorter, so the "masked" preview would reproduce
+    // the whole key.  A preview that prints the secret it exists to hide is
+    // worse than no preview, so the short case previews as "unavailable".
+    expect(keyPreview("ABCDEFGH")).toBe("unavailable");
+    expect(keyPreview("ABCDEFGHIJKL")).toBe("unavailable");
+    expect(keyPreview("ABCDEFGHIJKLM")).not.toBe("unavailable");
+    // The refused-key warning takes the same short key and must not print it.
+    expect(keyPreview("ABCDEFGH")).not.toContain("ABCDEFGH");
+  });
+
+  it("clears the verdict when the key file fingerprint changes", async () => {    const store = memoryKeyFaultStore({
       reason: "InvalidProviderToken",
       at: 1_700_000_000_000,
       keyStamp: "key-v1",

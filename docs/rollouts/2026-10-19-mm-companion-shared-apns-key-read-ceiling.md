@@ -85,9 +85,10 @@ pushes off.
 
 ## Review findings
 
-Five review bots found real defects, all in the same shape as the bug it was
-fixing:  a value that looked fine and silently removed the key, or a change
-that looked safe and stopped the sidecar answering.
+Nine review findings across two rounds, all in the same shape as the bug it was
+fixing:  a value that looked fine and silently removed the key, a change that
+looked safe and stopped the sidecar answering, or a mask that looked masked and
+printed the key.
 
 1.  **The failure cache was stamped when the read STARTED.**  `readVault`
     captured `now` before the subprocess ran and stored that in the cache
@@ -141,6 +142,27 @@ that looked safe and stopped the sidecar answering.
     waits, so the ceiling always wins, and the outcome is the same on every
     machine.
 
+7.  **The mask degenerated and printed the whole key for a short one.**
+    `keyPreview()` takes the first eight and the last four characters of the
+    material, and those two slices overlap once the material is twelve
+    characters or shorter — so the "masked" preview of `ABCDEFGH` was
+    `ABCDEFGH…EFGH`, the whole key.  A preview that prints the secret it
+    exists to hide is worse than no preview, so a material that short now
+    previews as `unavailable`.  The new test fails against the old mask with
+    the full key in the received value.
+
+8.  **The live refusal named no key at all.**  The persisted-fault warning
+    carries the masked preview, but the line printed the moment Apple refuses
+    the key — the common case — carried only Apple's reason string, so an
+    operator could not tell which key was rejected.  The live warning now
+    carries the same masked preview.  The new test fails against the old
+    warning with no preview in the received line.
+
+9.  **A new test left `console.warn` mocked for the rest of the file.**  The
+    spy was installed and never restored, so every later test in the file ran
+    with the sidecar's warnings silenced.  The `finally` block now restores it,
+    matching the sibling tests in the same file.
+
 ## Files
 
 -  `companion/src/apns.ts` — `APNS_VAULT_READ_BUDGET_MS`,
@@ -148,17 +170,19 @@ that looked safe and stopped the sidecar answering.
     `vaultRetryMs()`, the completion stamp in `readVault`, the asynchronous
     `fleetSecretsGet()` with its in-flight guard, and the generation counter
     that keeps a cleared cache from being written back by a read already in
-    flight.  `keyPreview()` masks a rejected key for the persisted-fault
-    warning.
+    flight.  `keyPreview()` masks a rejected key for both the persisted-fault
+    and the live refusal warning, and refuses to preview a material too short
+    to mask.
 -  `companion/src/apns.test.ts` — the ordering invariant, the override, the
     refusal of a non-positive or fractional override, the slow-failed-read
     regression, the event-loop regression, the concurrent-read guard, the
-    slow-key-id-read regression, the masked-preview assertions and the
-    narrowed-ceiling test that no longer depends on who is faster.
+    slow-key-id-read regression, the masked-preview assertions for both
+    warnings, the short-material refusal, and the narrowed-ceiling test that no
+    longer depends on who is faster.
 
 ## Verification
 
--  `pnpm vitest run companion/src/apns.test.ts` — 140 passed (1 file).
+-  `pnpm vitest run companion/src/apns.test.ts` — 142 passed (1 file).
 -  `pnpm typecheck` — clean (exit 0).
 -  `pnpm lint` — baseline check passed;  4876 warnings against a baseline of
     4884, so eight fewer than the baseline allows.
@@ -168,6 +192,13 @@ that looked safe and stopped the sidecar answering.
 -  The slow-key-id-read regression test was run against the old stamping and
     fails there (four vault reads where there should be two), so it tests the
     defect and not the new code.
+-  The short-material test was run against the old mask and fails there
+    (`expected "ABCDEFGH…EFGH" to be "unavailable"`), so it tests the defect
+    and not the new code.
+-  The live-refusal test was run against the old warning and fails there
+    (`expected "companion: APNs refused the signing key (InvalidProviderToken);
+    pushes are off until the key file changes" to contain "MIGHAgEA…BeVr"`), so
+    it tests the defect and not the new code.
 -  Credential probe against the live Apple endpoint, using the lane's own
     `loadApnsConfig()`:  the sidecar resolved `keyId HSJ98QN95V` from
     `Infisical APNS_KEY_P8`, signed a provider token, and Apple answered
