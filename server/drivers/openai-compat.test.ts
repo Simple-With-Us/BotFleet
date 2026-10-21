@@ -248,6 +248,10 @@ describe("OpenAICompatDriver", () => {
     expect(bodies).toHaveLength(3);
     expect(bodies[0].max_completion_tokens).toBe(512);
     expect(bodies[0]).toHaveProperty("stream_options");
+    // One field per retry: the intermediate body drops only the field the
+    // endpoint rejected, so stream_options is still requested there.
+    expect(bodies[1]).not.toHaveProperty("max_completion_tokens");
+    expect(bodies[1]).toHaveProperty("stream_options");
     expect(bodies[2]).not.toHaveProperty("max_completion_tokens");
     expect(bodies[2]).not.toHaveProperty("stream_options");
     recorder.stop();
