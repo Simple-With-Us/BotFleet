@@ -457,6 +457,38 @@ function playInterleaveTurn() {
   out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "after" } } } });
 }
 
+/** The JSON-RPC envelope every inbound message is parsed against before
+ *  any field of it is read:  a bounded id, a bounded method name, and the
+ *  rest passed through for each method's own bounded schema.  A message
+ *  that does not fit is dropped unanswered — a reply echoes the id, and an
+ *  unvalidated id is never echoed. */
+export const jsonRpcEnvelopeSchema = z.object({
+  jsonrpc: z.literal("2.0").optional(),
+  id: z.union([z.string().max(256), z.number().int()]).optional(),
+  method: z.string().max(128).optional(),
+  params: z.unknown().optional(),
+  result: z.unknown().optional(),
+  error: z.unknown().optional(),
+}).passthrough();
+export type JsonRpcEnvelope = z.infer<typeof jsonRpcEnvelopeSchema>;
+
+/** A session/prompt payload's content block.  Bounded on the text, lenient
+ *  on everything else:  content blocks are vendor-owned (ACP agents add
+ *  fields as the protocol grows), so the schema passes unknown fields
+ *  through instead of rejecting a newer agent. */
+export const promptContentSchema = z
+  .object({ type: z.string().optional(), text: z.string().max(10_000_000) })
+  .passthrough();
+
+/** A session/prompt call's params, bounded and strict at the method level:
+ *  the one schema the handler parses, and the source of truth for the
+ *  derived type below. */
+export const promptParamsSchema = z.object({
+  sessionId: z.string().min(1).max(256),
+  prompt: z.array(promptContentSchema).max(1_000),
+}).strict();
+export type PromptParams = z.infer<typeof promptParamsSchema>;
+
 let buf = "";
 process.stdin.on("data", (c) => {
   buf += c;
@@ -475,7 +507,12 @@ process.stdin.on("data", (c) => {
   }
 });
 
-function handle(msg: any, resumed = false) {
+function handle(rawMsg: any, resumed = false) {
+  // The whole envelope is validated before a field is read:  every reply
+  // below echoes the PARSED id, never the raw one.
+  const parsedEnvelope = jsonRpcEnvelopeSchema.safeParse(rawMsg);
+  if (!parsedEnvelope.success) return;
+  const msg: any = parsedEnvelope.data;
   // client's response to our permission request
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && msg.id === pendingPermissionId) {
     pendingPermissionId = null;
@@ -654,21 +691,12 @@ function handle(msg: any, resumed = false) {
       break;
     }
     case "session/prompt": {
-      // The whole inbound payload is parsed against one strict, bounded
-      // method schema: a malformed or oversized session/prompt is rejected
+      // The whole inbound payload is parsed against one bounded method
+      // schema: a malformed or oversized session/prompt is rejected
       // with JSON-RPC -32602 before any field reaches downstream code, and
       // the handler reads the session id and prompt text only from the
       // validated result — never from the raw message.
-      const promptContentSchema = z
-        .object({ type: z.string().optional(), text: z.string().max(10_000_000) })
-        .catchall(z.unknown());
-      const parsedPromptParams = z
-        .object({
-          sessionId: z.string().min(1).max(256),
-          prompt: z.array(promptContentSchema).max(1_000),
-        })
-        .strict()
-        .safeParse(msg.params);
+      const parsedPromptParams = promptParamsSchema.safeParse(msg.params);
       if (!parsedPromptParams.success) {
         out({
           jsonrpc: "2.0",

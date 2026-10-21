@@ -48,7 +48,13 @@ test('visual: history compression editable', async ({ page }) => {
 
   await expect(page.getByTestId('history-compression-card')).toHaveScreenshot(
     'history-compression-editable.png',
-    stableShot,
+    {
+      ...stableShot,
+      // The Maximum History Turns value is user-controlled: mask it so a
+      // changed value cannot flake the comparison.
+      mask: [fixture.getByLabel('Maximum History Turns')],
+      maxDiffPixelRatio: 0.01,
+    },
   );
 });
 
@@ -61,6 +67,10 @@ test('visual: history compression read-only on an engine with its own history', 
 
   await expect(page.getByTestId('history-compression-card')).toHaveScreenshot(
     'history-compression-readonly.png',
-    stableShot,
+    {
+      ...stableShot,
+      mask: [fixture.getByLabel('Maximum History Turns')],
+      maxDiffPixelRatio: 0.01,
+    },
   );
 });

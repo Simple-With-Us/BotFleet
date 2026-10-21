@@ -104,6 +104,26 @@ import {
 const acpNonemptyString = z.string().min(1);
 
 const acpSessionSetModelParams = z.object({ modelId: acpNonemptyString }).passthrough();
+/** A session/update notification's envelope.  Bounded on the fields the
+ *  handler reads straight off the wire (sessionId, sessionUpdate,
+ *  content.text);  lenient past the envelope because ACP updates are
+ *  vendor-owned and grow fields — the rest of the handler keeps reading
+ *  the passthrough remainder.  A notification that does not fit this
+ *  shape is dropped, never handled from raw fields. */
+const acpSessionUpdateParams = z.object({
+  sessionId: z.string().min(1).max(256).optional(),
+  update: z
+    .object({
+      sessionUpdate: z.string().max(64),
+      // content is vendor-shaped (a chunk's {text}, a tool call's blocks, a
+      // newer field):  carried through unparsed and validated at the point
+      // of use — the summary collector parses and bounds the text itself.
+      content: z.unknown().optional(),
+    })
+    .passthrough()
+    .optional(),
+  _meta: z.object({ isReplay: z.boolean().optional() }).passthrough().optional(),
+}).passthrough();
 const acpAvailableModel = z.object({
   modelId: z.string().optional(),
   name: z.string().optional(),
@@ -478,6 +498,40 @@ const MISSING_SECRET_RE = /\b(missing|not set|not found|unset|undefined|empty|re
 export function missingProviderSecretVar(message: string): string | null {
   if (!MISSING_SECRET_RE.test(message)) return null;
   return CREDENTIAL_VAR_RE.exec(message)?.[1] ?? null;
+}
+
+/** The credential vocabulary a missing-value failure must mention to be
+ *  about a secret.  "Missing API key" names no variable but still says the
+ *  key was never set. */
+const MISSING_SECRET_VOCAB_RE =
+  /\b(api[\s_-]?key|auth(?:entication)?[\s_-]?token|provider[\s_-]?token|bearer[\s_-]?token|access[\s_-]?token|credentials?|secrets?|authentication|authorization)\b/i;
+/** Rejected-credential language around a named secret. */
+const REJECTED_SECRET_RE = /\b(invalid|rejected|revoked|expired|incorrect|not valid)\b/i;
+
+/** The credential variable a failure names, when it names one at all. */
+export function namedCredentialVar(message: string): string | null {
+  return CREDENTIAL_VAR_RE.exec(message)?.[1] ?? null;
+}
+
+/** Whether a failure reads as a provider secret that was never provided,
+ *  independent of whether the message names the variable.  A missing secret
+ *  that reached the extractive fallback would report a healthy turn while
+ *  the provider stays broken, so it must be judged on its own, not only
+ *  through `missingProviderSecretVar`. */
+export function isMissingProviderSecret(message: string): boolean {
+  return MISSING_SECRET_RE.test(message) && MISSING_SECRET_VOCAB_RE.test(message);
+}
+
+/** The engine's canonical credential variable:  the one the engine declares,
+ *  else the single provider key the operator's environment holds, else the
+ *  first of the provider credential names.  Named in the error so the
+ *  operator knows which variable to set. */
+export function canonicalCredentialVar(support: AcpSupport): string | null {
+  const declared = support.credentialEnv ?? [];
+  if (declared.length > 0) return declared[0]!;
+  const held = PROVIDER_CREDENTIAL_ENV.filter((name) => process.env[name]?.trim());
+  if (held.length === 1) return held[0]!;
+  return PROVIDER_CREDENTIAL_ENV[0] ?? null;
 }
 
 const PROVIDER_AUTH_RE =
@@ -1524,27 +1578,36 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // Vendor side-channels (e.g. grok's `_x.ai/*`) are teed to the
           // native log but never normalized: the prompt result is the settle.
           if (msg.method !== "session/update") return;
-          const p = msg.params ?? {};
-          const u = p.update ?? {};
+          // The boundary object is parsed whole, not picked at:  sessionId,
+          // sessionUpdate and content.text below come only from the parsed
+          // data, and a notification that does not fit the envelope stops
+          // here instead of riding the later handling on raw fields.  The
+          // schema stays lenient past the envelope — ACP updates are
+          // vendor-owned and grow fields — so passthrough keeps the rest of
+          // the switch reading what it always read.
+          const parsedNotification = acpSessionUpdateParams.safeParse(msg.params);
+          if (!parsedNotification.success) return;
+          const p = parsedNotification.data;
+          // The named envelope fields are parsed and bounded above;  the
+          // passthrough remainder stays vendor-shaped for the switch below.
+          const u = (p.update ?? {}) as Record<string, any>;
           // A history-summary session runs beside the turn's own session.
           // Its chunks collect into the summary note and must NEVER reach
           // the transcript: state.promptSent is already true when it runs.
-          const parsedUpdateSessionId = z.string().min(1).max(256).safeParse(p.sessionId);
-          // Present but malformed stops here:  a forged or truncated id must
-          // not ride the later handling paths on a null.  Absent stays on
-          // the old path — agents that omit the id on routine updates keep
-          // working, and the summary routing below simply does not match.
-          if (p.sessionId !== undefined && !parsedUpdateSessionId.success) return;
-          const updateSessionId = parsedUpdateSessionId.success ? parsedUpdateSessionId.data : null;
+          // Absent stays on the old path — agents that omit the id on
+          // routine updates keep working, and the summary routing below
+          // simply does not match.
+          const updateSessionId = p.sessionId ?? null;
           if (updateSessionId && summarySessions.has(updateSessionId)) {
             const collector = summarySessions.get(updateSessionId)!;
             if (u.sessionUpdate === "agent_message_chunk") {
-              const delta = u.content?.text;
-              const parsedDelta = z.string().safeParse(delta);
               // The derived note is clipped to ACP_HISTORY_NOTE_MAX_CHARS;
               // the collector stops a small multiple past it, so a chatty
-              // model cannot pin unbounded text per summarizing turn.
-              if (parsedDelta.success && collector.text.length < SUMMARY_COLLECTOR_MAX_CHARS) collector.text += parsedDelta.data;
+              // model cannot pin unbounded text per summarizing turn.  The
+              // bound is the SUM:  a single chunk larger than the remaining
+              // room is dropped whole, not appended past the cap.
+              const parsedDelta = z.string().max(SUMMARY_COLLECTOR_MAX_CHARS).safeParse(u.content?.text);
+              if (parsedDelta.success && collector.text.length + parsedDelta.data.length <= SUMMARY_COLLECTOR_MAX_CHARS) collector.text += parsedDelta.data;
             }
             return;
           }
@@ -2071,18 +2134,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             emitSessionStarted();
             state.promptSent = true;
-            /** First non-blank provider credential this child inherited, for
-             *  the masked preview a refused-key error may carry:  the preview
-             *  is first-8/last-4 (or "unavailable"), never the value. */
-            const credentialPreviewSource = (): string => {
-              const names = support.credentialEnv ?? PROVIDER_CREDENTIAL_ENV;
-              for (const name of names) {
-                // Empty or blank inherits nothing worth previewing;  a
-                // missing entry trims to nothing through the same check.
-                const value = env[name]?.trim();
-                if (value) return value;
-              }
-              return "";
+            /** The credential a refused-key error may preview, masked
+             *  first-8/last-4 (or "unavailable"), never the value:  the one
+             *  the provider named, or the engine's sole held candidate. */
+            const credentialPreviewSource = (namedVar: string | null): string => {
+              // The variable the provider named, else the engine's sole held
+              // candidate.  Any wider pick could mask and show an UNRELATED
+              // credential, and an ambiguous answer must read "unavailable"
+              // rather than point at the wrong secret.
+              const names = namedVar ? [namedVar] : (support.credentialEnv ?? PROVIDER_CREDENTIAL_ENV);
+              const held = names.filter((name) => env[name]?.trim());
+              if (held.length !== 1) return "";
+              return env[held[0]!]!.trim()!;
             };
             /** Model-written summary of the turns the budget dropped.  A side
              *  session on the same child does the writing;  its chunks are
@@ -2164,19 +2227,30 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 // extractive fallback is only for failures it can cover.
                 const message = error instanceof Error ? error.message : String(error);
                 const engineCode = support.classifyError?.({ text: message });
-                const secretVar = missingProviderSecretVar(message);
-                if (secretVar) {
-                  throw new Error(
-                    `History summary unavailable: provider secret ${secretVar} is missing.  Set it for this engine; the turn did not fall back to excerpts.`,
-                  );
-                }
+                const namedVar = namedCredentialVar(message);
+                // A refused credential is judged before a missing one:  a
+                // named key that was rejected is not a key that was never
+                // set.
                 if (
                   engineCode === "invalid_credentials"
                   || engineCode === "inactive_subscription"
                   || isProviderAuthFailure(message)
+                  || (namedVar !== null && REJECTED_SECRET_RE.test(message))
                 ) {
                   throw new Error(
-                    `History summary unavailable: the provider refused this engine's credential (preview ${maskCredentialPreview(credentialPreviewSource())}); the turn did not fall back to excerpts.`,
+                    `History summary unavailable: the provider refused this engine's credential (preview ${maskCredentialPreview(credentialPreviewSource(namedVar))}); the turn did not fall back to excerpts.`,
+                  );
+                }
+                // A missing secret is judged on its own, not only when the
+                // message names the variable:  "Missing API key" names none,
+                // and falling back to excerpts there would report a healthy
+                // turn while the provider stays broken.
+                if (namedVar !== null || isMissingProviderSecret(message)) {
+                  const missingVar = namedVar ?? canonicalCredentialVar(support);
+                  throw new Error(
+                    missingVar
+                      ? `History summary unavailable: provider secret ${missingVar} is missing.  Set it for this engine; the turn did not fall back to excerpts.`
+                      : `History summary unavailable: the provider secret this engine needs is missing.  Set it for this engine; the turn did not fall back to excerpts.`,
                   );
                 }
                 return null;

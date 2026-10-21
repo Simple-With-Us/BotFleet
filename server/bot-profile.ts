@@ -248,7 +248,7 @@ export type BotProfilePatchResult =
  * patch carries the complete record to store, or `undefined` to drop it.
  */
 export function parseBotProfilePatch(
-  input: BotProfilePatchInput,
+  input: unknown,
   strict = false,
   current?: { voices?: BotVoices } | null,
 ): BotProfilePatchResult {

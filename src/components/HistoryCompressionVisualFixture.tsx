@@ -8,7 +8,10 @@ import { historyTurnsCaption } from "../../shared/bot-profile";
 import type { HistorySummaryGate } from "@/lib/bot-settings-gates";
 import { HistoryCompressionField } from "./HistoryCompressionField";
 
-const stateSchema = z.enum(["editable", "readonly"]).catch("editable");
+/** The fixture's ?state= contract: the runtime schema and its derived type
+ *  are the single source of truth for what the harness accepts. */
+export const stateSchema = z.enum(["editable", "readonly"]).catch("editable");
+export type HistoryCompressionFixtureState = z.infer<typeof stateSchema>;
 
 const noop = () => {};
 
@@ -27,7 +30,7 @@ const readonlyGate: HistorySummaryGate = {
 };
 
 export default function HistoryCompressionVisualFixture() {
-  const state = stateSchema.parse(new URLSearchParams(window.location.search).get("state"));
+  const state: HistoryCompressionFixtureState = stateSchema.parse(new URLSearchParams(window.location.search).get("state"));
   const gate = state === "readonly" ? readonlyGate : editableGate;
   return (
     <div

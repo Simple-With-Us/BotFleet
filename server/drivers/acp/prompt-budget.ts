@@ -175,6 +175,18 @@ function utf8(text: string): number {
   return Buffer.byteLength(text, "utf8");
 }
 
+/** Clip to a byte budget without splitting a multi-byte character:  the
+ *  trailing bytes of a cut sequence are backed off until the slice decodes
+ *  cleanly, so the collected source never carries a replacement glyph. */
+function clipUtf8Bytes(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let buf = Buffer.from(text, "utf8").subarray(0, Math.max(0, maxBytes));
+  while (buf.length > 0 && buf.toString("utf8").endsWith("\uFFFD")) {
+    buf = buf.subarray(0, buf.length - 1);
+  }
+  return buf.toString("utf8");
+}
+
 /** Keep the section's surrounding newlines so the marker stays on its own
  *  line.  A block that is only newlines is returned unchanged. */
 function omittedReplacement(text: string): string {
@@ -421,9 +433,14 @@ export function applyAcpPromptBudget(input: {
     // the piece itself: an oversized dropped turn is clipped to the
     // remaining room instead of being collected whole.
     if (input.collectDroppedText && collectedBytes < ACP_SUMMARY_SOURCE_MAX_BYTES) {
+      // The room and the counter are BYTES (the cap is
+      // ACP_SUMMARY_SOURCE_MAX_BYTES), so the clip and the credit must be
+      // measured in UTF-8 bytes too:  a character count lets multi-byte
+      // text (emoji, CJK, accents) collect past the documented cap.
       const room = ACP_SUMMARY_SOURCE_MAX_BYTES - collectedBytes;
-      collected.push(room >= piece.text.length ? piece.text : piece.text.slice(0, room));
-      collectedBytes += Math.min(room, piece.text.length);
+      const clipped = clipUtf8Bytes(piece.text, room);
+      if (clipped) collected.push(clipped);
+      collectedBytes += utf8(clipped);
     }
     droppedTurns += 1;
     trimmed = true;

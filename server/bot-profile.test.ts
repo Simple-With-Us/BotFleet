@@ -318,7 +318,9 @@ describe("parseBotProfilePatch (maxHistoryTurns and historySummaryModel)", () =>
       // SAFETY: shape-malformed values must fail validation itself (so the
       // route answers 4xx) instead of being accepted and silently clearing
       // the setting.
-      expect(parseBotProfilePatch({ maxHistoryTurns: bad } as never, true).ok, String(bad)).toBe(false);
+      // The boundary takes unknown and the Zod parse inside rejects these;
+      // no cast means the test cannot drift from what the route will see.
+      expect(parseBotProfilePatch({ maxHistoryTurns: bad }, true).ok, String(bad)).toBe(false);
     }
   });
 
