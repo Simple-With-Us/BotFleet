@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 @testable import BotFleetControlCore
 
 final class WheelhouseTests: XCTestCase {
@@ -20,19 +21,40 @@ final class WheelhouseTests: XCTestCase {
         XCTAssertEqual(entry.state, .running)
     }
 
-    func testServerStateComesFromWhatTheControlAppAlreadyKnows() {
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: true, apiUnavailable: false,
-                                               installedServerState: .stopped), .running)
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, apiUnavailable: false,
-                                               installedServerState: .running), .running)
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, apiUnavailable: true,
-                                               installedServerState: .stopped), .stopped)
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, apiUnavailable: false,
-                                               installedServerState: .stopped), .unknown)
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, apiUnavailable: true,
-                                               installedServerState: .notInstalled), .unknown)
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, apiUnavailable: true,
-                                               installedServerState: .unknown), .unknown)
+    func testAServerThatAnswersOrHasALiveProcessIsRunning() {
+        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: true, installedServerState: .stopped,
+                                               serverPresence: .absent), .running)
+        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .running,
+                                               serverPresence: .absent), .running)
+    }
+
+    func testAnUnreachableServerThatStillHasAListenerIsUnknown() {
+        // The API did not answer, but something is still listening on the
+        // server's port: it is busy or booting, and it is not stopped.
+        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .stopped,
+                                               serverPresence: .present), .unknown)
+        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .unknown,
+                                               serverPresence: .present), .unknown)
+    }
+
+    func testTheServerIsStoppedOnlyWhenNothingIsListening() {
+        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .stopped,
+                                               serverPresence: .absent), .stopped)
+        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .notInstalled,
+                                               serverPresence: .absent), .stopped)
+    }
+
+    func testAnUnreachableServerIsNeverKnownToBeStopped() {
+        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .stopped,
+                                               serverPresence: .unknown), .unknown)
+    }
+
+    func testAnUnreachableServerNeverAsksForTheMCPServerToBeStopped() {
+        // The regression this guards: a transport error used to read as "the
+        // server is stopped", which stopped the MCP server under a live one.
+        let wheelhouse = Wheelhouse(serverState: .unknown, mcpServerState: .running)
+        XCTAssertNil(wheelhouse.mcpServerWanted)
+        XCTAssertEqual(Wheelhouse.action(for: wheelhouse.entries[0]), .none)
     }
 
     func testWheelhouseListsTheBotFleetMCPServer() {
@@ -41,6 +63,25 @@ final class WheelhouseTests: XCTestCase {
         XCTAssertEqual(wheelhouse.entries.first?.id, "botfleet-mcp")
         XCTAssertEqual(wheelhouse.entries.first?.title, "BotFleet MCP Server")
         XCTAssertEqual(wheelhouse.entries.first?.wanted, true)
+    }
+
+    // MARK: - Proving whether the server is really there
+
+    func testThePresenceProbeSeesSomethingListening() throws {
+        let (port, handle) = try openLoopbackPort()
+        defer { close(handle) }
+        XCTAssertEqual(ServerPresenceProbe(port: port).presence(), .present)
+    }
+
+    func testThePresenceProbeSeesAClosedPort() throws {
+        let (port, handle) = try openLoopbackPort()
+        close(handle)
+        XCTAssertEqual(ServerPresenceProbe(port: port).presence(), .absent)
+    }
+
+    func testThePresenceProbeCanBeGivenItsOwnProbe() {
+        let probe = ServerPresenceProbe(port: 1234, connect: { _ in .absent })
+        XCTAssertEqual(probe.presence(), .absent)
     }
 
     // MARK: - Actions
@@ -98,8 +139,8 @@ final class WheelhouseTests: XCTestCase {
 
     // MARK: - Observing the MCP server
 
-    func testMCPServerIsRunningOnlyWhenItAnswersAsTheBotFleetMCPServer() async {
-        let control = makeControl()
+    func testMCPServerIsRunningOnlyWhenItAnswersAsTheBotFleetMCPServer() async throws {
+        let control = try makeControl()
         WheelhouseURLProtocol.handler = { _ in
             .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp","tools":26}"#.utf8))
         }
@@ -107,15 +148,15 @@ final class WheelhouseTests: XCTestCase {
         XCTAssertEqual(state, .running)
     }
 
-    func testMCPServerIsStoppedWhenNothingAnswersIt() async {
-        let control = makeControl()
+    func testMCPServerIsStoppedWhenNothingAnswersIt() async throws {
+        let control = try makeControl()
         WheelhouseURLProtocol.handler = { _ in .failure(URLError(.cannotConnectToHost)) }
         let state = await control.state()
         XCTAssertEqual(state, .stopped)
     }
 
-    func testMCPServerIsUnknownWhenSomethingElseAnswersIt() async {
-        let control = makeControl()
+    func testMCPServerIsUnknownWhenSomethingElseAnswersIt() async throws {
+        let control = try makeControl()
         WheelhouseURLProtocol.handler = { _ in
             .response(200, Data(#"{"status":"ok","app":"some-other-service"}"#.utf8))
         }
@@ -123,11 +164,21 @@ final class WheelhouseTests: XCTestCase {
         XCTAssertEqual(state, .unknown)
     }
 
-    func testMCPServerIsUnknownWhenItAnswersWithSomethingBroken() async {
-        let control = makeControl()
+    func testMCPServerIsUnknownWhenItAnswersWithSomethingBroken() async throws {
+        let control = try makeControl()
         WheelhouseURLProtocol.handler = { _ in .response(200, Data(#"{"status":"ok"}"#.utf8)) }
         let state = await control.state()
         XCTAssertEqual(state, .unknown)
+    }
+
+    func testTheMCPControlRefusesToStartWithoutAnEndpoint() {
+        XCTAssertThrowsError(try McpServerControl(session: mockSession(), baseURL: nil,
+                                                 pm2: PM2Client(commands: PM2Commands(),
+                                                               nodePath: "/usr/bin/node",
+                                                               pm2Path: "/usr/bin/pm2"))) { error in
+            XCTAssertEqual(error as? McpServerError,
+                           .refused("Could not determine the BotFleet MCP Server endpoint."))
+        }
     }
 
     // MARK: - Changing the MCP server
@@ -135,7 +186,7 @@ final class WheelhouseTests: XCTestCase {
     func testUnknownStateIsNeverChanged() async throws {
         WheelhouseURLProtocol.handler = { _ in .failure(URLError(.timedOut)) }
         let commands = PM2Commands()
-        let control = makeControl(commands: commands)
+        let control = try makeControl(commands: commands)
         let state = try await control.setRunning(true)
         XCTAssertEqual(state, .unknown)
         XCTAssertTrue(commands.calls.isEmpty)
@@ -150,7 +201,7 @@ final class WheelhouseTests: XCTestCase {
                 : .failure(URLError(.cannotConnectToHost))
         }
         let commands = PM2Commands()
-        let control = makeControl(commands: commands)
+        let control = try makeControl(commands: commands)
         let state = try await control.setRunning(false, attempts: 2)
         XCTAssertEqual(state, .stopped)
         XCTAssertEqual(commands.calls.count, 1)
@@ -167,7 +218,7 @@ final class WheelhouseTests: XCTestCase {
                 : .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp"}"#.utf8))
         }
         let commands = PM2Commands()
-        let control = makeControl(commands: commands)
+        let control = try makeControl(commands: commands)
         let state = try await control.setRunning(true, attempts: 2)
         XCTAssertEqual(state, .running)
         XCTAssertEqual(commands.calls.count, 1)
@@ -175,18 +226,34 @@ final class WheelhouseTests: XCTestCase {
         XCTAssertTrue(commands.calls[0].contains("botfleet-mcp"))
     }
 
-    func testARefusedPM2IsReportedRatherThanClaimedAsSuccess() async {
+    func testARefusedPM2IsReportedRatherThanClaimedAsSuccess() async throws {
         WheelhouseURLProtocol.handler = { _ in
             .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp"}"#.utf8))
         }
         let commands = PM2Commands()
         commands.failure = CommandExitError(output: "pm2 said no")
-        let control = makeControl(commands: commands)
+        let control = try makeControl(commands: commands)
         do {
             _ = try await control.setRunning(false, attempts: 1)
             XCTFail("Expected the refusal to be reported")
         } catch {
             XCTAssertEqual(error as? McpServerError, .refused("pm2 said no"))
+        }
+    }
+
+    func testAPM2TimeoutIsReportedAsAPM2Problem() async throws {
+        WheelhouseURLProtocol.handler = { _ in
+            .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp"}"#.utf8))
+        }
+        let commands = PM2Commands()
+        commands.failure = StartupPolicyError.commandFailed
+        let control = try makeControl(commands: commands)
+        do {
+            _ = try await control.setRunning(false, attempts: 1)
+            XCTFail("Expected the timeout to be reported")
+        } catch {
+            XCTAssertEqual(error as? McpServerError,
+                           .refused("pm2 timed out before it could change the BotFleet MCP Server."))
         }
     }
 
@@ -197,11 +264,12 @@ final class WheelhouseTests: XCTestCase {
                         wanted: wanted, state: state)
     }
 
-    private func makeControl(commands: PM2Commands = PM2Commands()) -> McpServerControl {
-        McpServerControl(session: mockSession(),
-                         baseURL: URL(string: "http://127.0.0.1:8794")!,
-                         pm2: PM2Client(commands: commands, nodePath: "/usr/bin/node",
-                                        pm2Path: "/usr/bin/pm2"))
+    private func makeControl(commands: PM2Commands = PM2Commands()) throws -> McpServerControl {
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:8794"))
+        return try McpServerControl(session: mockSession(),
+                                    baseURL: url,
+                                    pm2: PM2Client(commands: commands, nodePath: "/usr/bin/node",
+                                                   pm2Path: "/usr/bin/pm2"))
     }
 
     private func mockSession() -> URLSession {
@@ -209,6 +277,41 @@ final class WheelhouseTests: XCTestCase {
         configuration.protocolClasses = [WheelhouseURLProtocol.self]
         return URLSession(configuration: configuration)
     }
+
+    /// Opens a loopback listener on an ephemeral port, so the presence probe
+    /// can be tested against a real socket.
+    private func openLoopbackPort() throws -> (port: Int, handle: Int32) {
+        let handle = socket(AF_INET, SOCK_STREAM, 0)
+        guard handle >= 0 else { throw SocketTestError.cannotCreate }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) { pointer -> Int32 in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.bind(handle, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else { close(handle); throw SocketTestError.cannotBind }
+        guard Darwin.listen(handle, 1) == 0 else { close(handle); throw SocketTestError.cannotListen }
+        var assigned = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &assigned) { pointer -> Int32 in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                getsockname(handle, sockaddrPointer, &length)
+            }
+        }
+        guard named == 0 else { close(handle); throw SocketTestError.cannotName }
+        return (Int(UInt16(bigEndian: assigned.sin_port)), handle)
+    }
+}
+
+private enum SocketTestError: Error {
+    case cannotCreate
+    case cannotBind
+    case cannotListen
+    case cannotName
 }
 
 private final class PM2Commands: CommandRunning {
@@ -232,9 +335,13 @@ private final class WheelhouseURLProtocol: URLProtocol {
     override func startLoading() {
         switch Self.handler(request) {
         case .response(let status, let body):
-            client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status,
-                                                                httpVersion: nil, headerFields: nil)!,
-                                cacheStoragePolicy: .notAllowed)
+            guard let url = request.url,
+                  let response = HTTPURLResponse(url: url, statusCode: status,
+                                                 httpVersion: nil, headerFields: nil) else {
+                client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+                return
+            }
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: body)
             client?.urlProtocolDidFinishLoading(self)
         case .failure(let error):

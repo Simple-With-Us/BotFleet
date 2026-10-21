@@ -108,9 +108,17 @@ public final class McpServerControl {
     private let baseURL: URL
     private let pm2: PM2Client
 
+    /// Prepares the MCP server control.
+    ///
+    /// The endpoint is optional so that a missing one is reported rather than
+    /// forced open: a crash over a URL would take the whole Control app down
+    /// for a problem the owner can read about in the menu.
     public init(session: URLSession = .shared,
-                baseURL: URL = URL(string: "http://127.0.0.1:\(McpServerControl.defaultPort)")!,
-                pm2: PM2Client = PM2Client()) {
+                baseURL: URL? = URL(string: "http://127.0.0.1:\(McpServerControl.defaultPort)"),
+                pm2: PM2Client = PM2Client()) throws {
+        guard let baseURL else {
+            throw McpServerError.refused("Could not determine the BotFleet MCP Server endpoint.")
+        }
         self.session = session
         self.baseURL = baseURL
         self.pm2 = pm2
@@ -166,10 +174,19 @@ public final class McpServerControl {
             } else {
                 _ = try pm2.run(["stop", PM2Client.mcpAppName])
             }
+        } catch let error as McpServerError {
+            throw error
         } catch let error as CommandExitError {
             throw McpServerError.refused(error.output.isEmpty
                 ? "pm2 could not change the BotFleet MCP Server."
                 : error.output)
+        } catch StartupPolicyError.commandFailed {
+            // The command runner reports a timeout as a generic command
+            // failure.  Say which command it was, so a slow pm2 is never
+            // reported as a problem with the BotFleet Server LaunchAgent.
+            throw McpServerError.refused("pm2 timed out before it could change the BotFleet MCP Server.")
+        } catch {
+            throw McpServerError.refused("pm2 could not change the BotFleet MCP Server.")
         }
         for _ in 0..<attempts {
             let next = await state()

@@ -9,20 +9,37 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let persistence = PersistencePolicy()
     private let offlineDocker = OfflineDockerVM()
     private let offlineVMHelper = OfflineVMHelper()
-    private let mcpServer = McpServerControl()
+    private let presenceProbe = ServerPresenceProbe()
+    private let mcpServer: McpServerControl?
+    private let mcpServerProblem: String?
     private var item: NSStatusItem?
     private let menu = NSMenu()
     private var status: ControlStatus?
     private var persistOnExit: Bool?
     private var installedServerState: InstalledServerState = .unknown
     private var apiUnavailable = false
+    private var serverPresence: ServerPresence = .unknown
     private var offlineVMs: OfflineDockerState = .unavailable
     private var helperVMs: [LocalVM]?
     private var vmProblem: String?
     private var mcpServerState: WheelhouseState = .unknown
     private var isLoading = false
     private var isBusy = false
+    private var isReconciling = false
     private var problem: String?
+
+    override init() {
+        do {
+            mcpServer = try McpServerControl()
+            mcpServerProblem = nil
+        } catch {
+            // The wheelhouse reports the problem in the menu instead of the
+            // app refusing to start over it.
+            mcpServer = nil
+            mcpServerProblem = error.localizedDescription
+        }
+        super.init()
+    }
 
     static func main() {
         let app = NSApplication.shared
@@ -72,6 +89,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 persistOnExit = status?.persistOnExit
                 installedServerState = .running
                 apiUnavailable = false
+                serverPresence = .present
                 offlineVMs = .unavailable
                 helperVMs = nil
                 vmProblem = nil
@@ -80,6 +98,9 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 status = nil
                 installedServerState = await Task.detached(priority: .userInitiated) { self.startup.installedServerState }.value
                 apiUnavailable = (error as? ControlAPIError) == .unavailable
+                // The API did not answer.  That is not proof that the server
+                // is gone, so ask the port itself.
+                serverPresence = await Task.detached(priority: .userInitiated) { self.presenceProbe.presence() }.value
                 persistOnExit = installedServerState == .stopped && apiUnavailable ? persistence.value : nil
                 if installedServerState == .stopped && apiUnavailable {
                     if offlineVMHelper.available {
@@ -97,17 +118,32 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 } else { offlineVMs = .unavailable; helperVMs = nil; vmProblem = nil }
                 problem = apiUnavailable && installedServerState == .stopped ? nil : error.localizedDescription
             }
-            await reconcileWheelhouse()
             isLoading = false
             rebuildMenu()
+            // The wheelhouse is reconciled behind the menu.  pm2 can take
+            // seconds to start or stop a service, and a menu that waits for
+            // it looks broken long before it is.
+            reconcileWheelhouseInBackground()
         }
     }
 
     /// What the Control app knows about the BotFleet Server itself.
     private func serverState() -> Wheelhouse.ServerState {
         Wheelhouse.serverState(statusAvailable: status != nil,
-                                apiUnavailable: apiUnavailable,
-                                installedServerState: installedServerState)
+                                installedServerState: installedServerState,
+                                serverPresence: serverPresence)
+    }
+
+    /// Brings the wheelhouse in line with what is wanted, without holding the
+    /// menu open while pm2 does its work.
+    private func reconcileWheelhouseInBackground() {
+        guard !isReconciling else { return }
+        isReconciling = true
+        Task { @MainActor in
+            await reconcileWheelhouse()
+            isReconciling = false
+            rebuildMenu()
+        }
     }
 
     /// Brings the wheelhouse in line with what is wanted.
@@ -116,7 +152,18 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// there is nothing to store and nothing to toggle.  The BotFleet MCP
     /// server is wanted exactly while the server is running.
     private func reconcileWheelhouse() async {
+        guard let mcpServer else {
+            problem = mcpServerProblem ?? "The BotFleet MCP Server could not be prepared."
+            return
+        }
         mcpServerState = await mcpServer.state()
+        // The decision is made on fresh evidence: if the server is not
+        // answering, look at its port before concluding that it is gone.
+        if status == nil {
+            serverPresence = await Task.detached(priority: .userInitiated) { self.presenceProbe.presence() }.value
+        } else {
+            serverPresence = .present
+        }
         let wheelhouse = Wheelhouse(serverState: serverState(), mcpServerState: mcpServerState)
         for entry in wheelhouse.entries {
             switch Wheelhouse.action(for: entry) {

@@ -92,17 +92,25 @@ public struct Wheelhouse: Equatable {
     /// Reads the server's state out of what the Control app already knows.
     ///
     /// A server that is answering is running.  A server with a live process
-    /// behind it is running too, even while its API is still coming up.  A
-    /// server that cannot be reached and has no process behind it is stopped.
-    /// Anything else — booting, unresponsive, or not installed — is unknown,
-    /// and the Control app does not act on it.
+    /// behind it is running too, even while its API is still coming up.
+    ///
+    /// A server that cannot be reached is not proof of anything.  The request
+    /// may have timed out, or the server may be busy under load, and a
+    /// timeout must never be read as "the server is gone": doing that would
+    /// stop a service that is still serving.  Only a port with nothing
+    /// listening behind it is proof that no server is running, and only then
+    /// is the server stopped.  Anything else — booting, busy, or not
+    /// installed — is unknown, and the Control app does not act on it.
     public static func serverState(statusAvailable: Bool,
-                                    apiUnavailable: Bool,
-                                    installedServerState: InstalledServerState) -> ServerState {
+                                    installedServerState: InstalledServerState,
+                                    serverPresence: ServerPresence) -> ServerState {
         if statusAvailable { return .running }
         if installedServerState == .running { return .running }
-        if apiUnavailable && installedServerState == .stopped { return .stopped }
-        return .unknown
+        switch serverPresence {
+        case .present: return .unknown
+        case .absent: return .stopped
+        case .unknown: return .unknown
+        }
     }
 
     /// The MCP server proxies every tool call to the BotFleet Server, so it
