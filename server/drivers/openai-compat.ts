@@ -78,6 +78,25 @@ export function sentryProviderForUrl(url: string): string {
   return "openai-compat";
 }
 
+/** The output-limit field a KNOWN endpoint documents, or null when the
+ *  endpoint is unrecognized and no field may be sent (a generic
+ *  OpenAI-compatible server is under no obligation to accept either name).
+ *
+ *  Sources (fetched 2026-10-21):
+ *   - OpenAI: `max_completion_tokens`; `max_tokens` deprecated
+ *     (openai-node completions.ts, mirroring platform.openai.com docs).
+ *   - Groq: `max_completion_tokens`; `max_tokens` deprecated
+ *     (https://console.groq.com/docs/api-reference#chat-create).
+ *   - OpenRouter: `max_tokens`
+ *     (https://openrouter.ai/docs/api-reference/chat-completion).
+ */
+export function maxOutputParamForUrl(url: string): "max_tokens" | "max_completion_tokens" | null {
+  const provider = sentryProviderForUrl(url);
+  if (provider === "openai" || provider === "groq") return "max_completion_tokens";
+  if (provider === "openrouter") return "max_tokens";
+  return null;
+}
+
 function decodeConfig(raw: unknown): OpenAICompatConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
   const envUrl = process.env.OPENAI_COMPAT_URL;
@@ -161,14 +180,21 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       "";
     const listeners = new Set<RuntimeEventListener>();
     const active = new Map<string, { abort: AbortController; turnId: string; startedAt: number }>();
-    let catalog = DEFAULT_MODELS;
+    // The output-limit field is endpoint-level for the providers above, so
+    // every option of a recognized endpoint carries supportsMaxOutput; an
+    // unrecognized endpoint's catalog stays unmarked and the picker hides
+    // the control.
+    const maxOutputParam = maxOutputParamForUrl(config.url);
+    const stampMaxOutput = (c: ModelCatalog): ModelCatalog =>
+      maxOutputParam === null ? c : { ...c, options: c.options.map((option) => ({ ...option, supportsMaxOutput: true })) };
+    let catalog = stampMaxOutput(DEFAULT_MODELS);
     if (config.models && config.models.length > 0) {
       const options: ModelCatalog["options"] = config.models.map((m) => {
         const id = typeof m === "string" ? m : m.id;
         const label = typeof m === "object" && m.label ? m.label : id;
         return { id, label, custom: true };
       });
-      catalog = { default: options[0].id, options };
+      catalog = stampMaxOutput({ default: options[0].id, options });
     }
 
     const emit = (event: RuntimeEvent) => {
@@ -192,6 +218,9 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         onChunk?: () => void;
         onDelta?: (d: string, streamKind?: "assistant_text" | "reasoning_text") => void;
         onUsage?: (usage: TurnUsage) => void;
+        /** The bot's optional output limit, sent under the field this
+         *  endpoint documents (maxOutputParamForUrl).  Absent sends nothing. */
+        maxOutputTokens?: number;
       },
     ): Promise<{
       text: string;
@@ -202,6 +231,9 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       const bodyPayload: any = { model, messages, stream: opts.stream, ...(opts.stream ? { stream_options: { include_usage: true } } : {}) };
       if (opts.tools && opts.tools.length > 0) {
         bodyPayload.tools = opts.tools;
+      }
+      if (maxOutputParam !== null && opts.maxOutputTokens !== undefined) {
+        bodyPayload[maxOutputParam] = opts.maxOutputTokens;
       }
       const headers: Record<string, string> = {
         "content-type": "application/json",
@@ -218,19 +250,50 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       });
       let res = await request();
       if (!res.ok && opts.stream && (res.status === 400 || res.status === 422)) {
-        // Some compatible endpoints reject this optional OpenAI field.  Retry
-        // only an explicit validation rejection, before any stream or tools
-        // can run, and keep the original cancellation/deadline budget.
-        const rejection = await res.text().catch(() => "");
+        // Some compatible endpoints reject these optional OpenAI fields.
+        // Retry only an explicit validation rejection, before any stream or
+        // tools can run, and keep the original cancellation/deadline budget.
+        const unsupportedField =
+          /unsupported|not supported|does not support|doesn't support|do not support|cannot support|can't support|not permitted|unrecognized|unknown|unexpected|extra_forbidden/i;
+        let rejection = await res.text().catch(() => "");
+        // One recovery per optional field, in either order: whichever field
+        // the endpoint names first, the retry can surface the other one, so
+        // each recovery re-reads the rejection for the next check.
+        const dropUnsupportedField = async (field: RegExp, strip: () => void): Promise<boolean> => {
+          if (!field.test(rejection) || !unsupportedField.test(rejection)) return false;
+          strip();
+          res = await request();
+          rejection = !res.ok && (res.status === 400 || res.status === 422) ? await res.text().catch(() => "") : "";
+          return true;
+        };
         // Providers phrase the same 400 differently, so the wording check has to
         // cover active voice ("does not support") as well as the adjective and
         // passive forms ("unsupported", "not supported").  Matching only the
         // latter left a plain "This endpoint does not support stream_options"
         // rejection with no retry at all.
-        if (/stream_options/i.test(rejection) &&
-            /unsupported|not supported|does not support|doesn't support|do not support|cannot support|can't support|not permitted|unrecognized|unknown|unexpected|extra_forbidden/i.test(rejection)) {
+        await dropUnsupportedField(/stream_options/i, () => {
           delete bodyPayload.stream_options;
-          res = await request();
+        });
+        // The output-limit field this driver sends is optional too: an
+        // endpoint that rejects max_tokens/max_completion_tokens gets the
+        // same recovery instead of failing the whole turn.
+        if (maxOutputParam !== null && bodyPayload[maxOutputParam] !== undefined) {
+          // The stream_options pass below runs only after a max-output
+          // retry actually fired, so a persistent single-field rejection
+          // still costs exactly one retry.
+          if (
+            await dropUnsupportedField(/max_(completion_)?tokens/i, () => {
+              delete bodyPayload[maxOutputParam];
+            })
+          ) {
+            // The max-output retry can surface a stream_options rejection
+            // the first pass never saw, when the endpoint names the fields
+            // one at a time.  The recovery order must not depend on which
+            // field it reports first.
+            await dropUnsupportedField(/stream_options/i, () => {
+              delete bodyPayload.stream_options;
+            });
+          }
         }
       }
       if (!res.ok) {
@@ -369,7 +432,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           options.push({ id, label });
         }
         if (options.length) {
-          catalog = { default: options[0].id, options };
+          catalog = stampMaxOutput({ default: options[0].id, options });
         }
       } catch {
         // keep DEFAULT_MODELS — never fail the instance on a catalog miss
@@ -477,6 +540,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
               stream: true,
               signal: opts.signal,
               tools: openAiTools,
+              maxOutputTokens: turn.maxOutputTokens,
               onChunk: opts.onChunk,
               // `onPublished` before the emit: from here this round can
               // never be retried, because a replay would show the person
