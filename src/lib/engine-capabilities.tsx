@@ -570,7 +570,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       crossBotCoordination:
         "Team tools ride the same generic ACP mount, so a DeepSeek bot can hand work to a peer and take it back.",
       longContext:
-        "Clutch serves 1M-token context models across DeepSeek V4.1 Flash, DeepSeek V4 Pro, Meta Muse Spark, and MiniMax M3.1 Flash Preview.",
+        "Clutch serves 1M-token context models across DeepSeek V4.1 Flash, DeepSeek V4 Pro, Meta Muse Spark, and MiniMax M3.1 Flash.",
       computerUse:
         "The Clutch ACP bridge mounts BotFleet's screen channel so a bot can inspect and drive a desktop under the standard approval cards.",
     },
@@ -649,8 +649,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       ],
     },
     defaultModels: [
-      { id: "MiniMax-M3.1-Flash-Preview", display: "MiniMax M3.1 Flash Preview (512K)", ctxTokens: 524_288 },
-      { id: "MiniMax-M3.1-Flash-Preview-1M", display: "MiniMax M3.1 Flash Preview (1M)", ctxTokens: 1_000_000 },
+      { id: "MiniMax-M3.1-Flash", display: "MiniMax M3.1 Flash (512K)", ctxTokens: 524_288 },
+      { id: "MiniMax-M3.1-Flash-1M", display: "MiniMax M3.1 Flash (1M)", ctxTokens: 1_000_000 },
       { id: "MiniMax-H3", display: "MiniMax H3", ctxTokens: 256_000 },
     ],
   },
@@ -714,8 +714,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       ],
     },
     defaultModels: [
-      { id: "MiniMax-M3.1-Flash-Preview-thinking", display: "MiniMax M3.1 Flash · thinking (512K)", ctxTokens: 524_288 },
-      { id: "MiniMax-M3.1-Flash-Preview-thinking-1M", display: "MiniMax M3.1 Flash · thinking (1M)", ctxTokens: 1_000_000 },
+      { id: "MiniMax-M3.1-Flash-thinking", display: "MiniMax M3.1 Flash · thinking (512K)", ctxTokens: 524_288 },
+      { id: "MiniMax-M3.1-Flash-thinking-1M", display: "MiniMax M3.1 Flash · thinking (1M)", ctxTokens: 1_000_000 },
       // Context length for the M2.7 tiers is not published in the CLI's own
       // catalog, so no figure is claimed here.
       { id: "MiniMax-M2.7-highspeed-thinking", display: "MiniMax M2.7 Highspeed · thinking" },

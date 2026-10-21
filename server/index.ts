@@ -4587,25 +4587,25 @@ bus.subscribe((event: RuntimeEvent) => {
 // mark at all (autoVerdict).
 type UnattendedSource = "job" | "outside";
 const unattendedBots = new Map<string, { at: number; source: UnattendedSource }>();
-const NON_THINKING_MINIMAX_FLASH = "MiniMax-M3.1-Flash-Preview";
+const NON_THINKING_MINIMAX_FLASH = "MiniMax-M3.1-Flash";
 
 /** A catalog row for non-thinking Flash, preferring the seat's own engine.
  *  mcode's picker does not offer this id, so a thinking mcode seat moves to
  *  dsh, then the MiniMax HTTP engine, and only when that engine is enabled
  *  and lists the id.  No such row means the caller leaves thinking in place. */
 function nonThinkingFlashSelection(currentInstanceId: string): { instanceId: string; model: string } | undefined {
-  // dsh spells this model `MiniMax-M3.1-Flash` since its engine dropped the
-  // Preview suffix; the instance-scoped rewrite answers each engine's own id.
-  const flashFor = (instanceId: string): string => rewriteRetiredModelId(NON_THINKING_MINIMAX_FLASH, instanceId);
+  // dsh and the MiniMax HTTP engine both spell this model
+  // `MiniMax-M3.1-Flash`, so one id serves every engine that offers it.
+  const flashFor = (): string => rewriteRetiredModelId(NON_THINKING_MINIMAX_FLASH);
   const offers = (instanceId: string): boolean => {
     const instance = registry.get(instanceId);
     if (!instance || instance.enabled === false) return false;
-    const model = flashFor(instanceId);
+    const model = flashFor();
     return instance.models.options.some((option) => option.id === model);
   };
-  if (offers(currentInstanceId)) return { instanceId: currentInstanceId, model: flashFor(currentInstanceId) };
+  if (offers(currentInstanceId)) return { instanceId: currentInstanceId, model: flashFor() };
   for (const instanceId of ["dsh", "minimax"]) {
-    if (offers(instanceId)) return { instanceId, model: flashFor(instanceId) };
+    if (offers(instanceId)) return { instanceId, model: flashFor() };
   }
   return undefined;
 }
