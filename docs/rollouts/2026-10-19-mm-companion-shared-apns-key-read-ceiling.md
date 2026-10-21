@@ -35,11 +35,11 @@ pushes off.
     (`APNS_VAULT_READ_TIMEOUT_MS`, three times it) are two names for one
     number, and a test asserts the ceiling stays at or above twice the
     budget.  A guard whose threshold drifts below its subject does not
-    announce itself:  nothing throws, it just stops guarding.
+    announce itself: nothing throws, it just stops guarding.
 
 -  **A read ceiling is a claim about latency, and a synchronous read spends
     that claim on the event loop.**  Widening the ceiling to survive a slow
-    vault is only safe if the read is asynchronous:  otherwise the ceiling is
+    vault is only safe if the read is asynchronous: otherwise the ceiling is
     also the time the sidecar is deaf, and widening it from 10 s to 49.8 s
     made a stall five times longer rather than shorter.  The read is async
     now, one read runs at a time however many callers miss the cache
@@ -54,7 +54,7 @@ pushes off.
 -  **A test that depends on who is faster is not a test.**  The narrowed
     ceiling test asserted that a 1 ms ceiling kills a read, and it proved that
     by racing the fake against the clock.  On a slow fork the fake lost and
-    the test passed;  on the CI runner's fast fork the fake answered inside
+    the test passed; on the CI runner's fast fork the fake answered inside
     the ceiling, the read succeeded, and the test failed.  The fix is not to
     make the fake slower on purpose but to make it deterministically slower
     than the ceiling, so the outcome is the same on every machine.  A test
@@ -69,7 +69,7 @@ pushes off.
     the PEM half of it.
 
 -  **Fail towards "pushes on", not "pushes off".**  The sidecar's behaviour on
-    a missing key predates this change and is right:  a key it cannot read is
+    a missing key predates this change and is right: a key it cannot read is
     not a key it should sign with.  The fix is therefore to make the read
     succeed, not to make the failure louder.
 
@@ -85,10 +85,12 @@ pushes off.
 
 ## Review findings
 
-Thirteen review findings across four rounds, all in the same shape as the bug
-it was fixing:  a value that looked fine and silently removed the key, a
+Fourteen review findings across four rounds, all in the same shape as the bug
+it was fixing: a value that looked fine and silently removed the key, a
 change that looked safe and stopped the sidecar answering, or a mask that
-looked masked and printed the key.
+looked masked and printed the key.  Finding 14 was added later, after the
+merged change was re-swept across the whole repository rather than the file
+it started in.
 
 1.  **The failure cache was stamped when the read STARTED.**  `readVault`
     captured `now` before the subprocess ran and stored that in the cache
@@ -136,7 +138,7 @@ looked masked and printed the key.
 
 6.  **A timing-dependent test passed on a Mac and failed in CI.**  The
     narrowed-ceiling test relied on the fake vault being slower than a 1 ms
-    ceiling, which is true on a slow fork and false on a fast one:  the CI
+    ceiling, which is true on a slow fork and false on a fast one: the CI
     runner answered inside the ceiling, so the read succeeded and the test
     failed.  A test that depends on who is faster is not a test.  The fake now
     waits, so the ceiling always wins, and the outcome is the same on every
@@ -176,14 +178,14 @@ looked masked and printed the key.
 
 11.  **The live refusal named a remedy that no longer exists.**  The warning
     said pushes are off "until the key file changes", but the key lives in
-    the vault and the fault clears only when the vault secret changes:  an
+    the vault and the fault clears only when the vault secret changes: an
     operator was pointed at a local `.p8` that is no longer read, and
     replacing it would not have turned pushes back on.  The warning now
     names the source, the same way the persisted-fault message does.
 
 12.  **The guard's stated rationale misstated why twelve characters are
     refused.**  The comment said the two slices overlap at twelve or fewer,
-    but at exactly twelve they are adjacent, not overlapping;  the reason the
+    but at exactly twelve they are adjacent, not overlapping; the reason the
     key is refused is that the mask COVERS it.  A maintainer who "corrected"
     the bound to `<` on the strength of the overlap story would have
     re-opened the full-key echo the guard exists to close.  The rule is now
@@ -197,6 +199,33 @@ looked masked and printed the key.
     "the APNs key file changed" when what changed was the vault secret.
     Every one of them now says "the signing key", so the next reader is not
     sent to a file that is not read.
+
+14.  **The sweep behind finding 13 was bounded by the file it started in, and
+    the class ran past that boundary.**  Finding 13 cleaned
+    `companion/src/apns.ts` and said "the whole file", which read as "the
+    whole codebase" and was not: two live sites outside it still named a key
+    file that does not exist.  The pairing page in `companion/src/control.ts`
+    told the operator to "Replace the key file to turn pushes back on" — the
+    same dead remedy, on the surface a person reads while holding their
+    phone — and `ios/Sources/CompanionCore/PushSenderHealth.swift` said the
+    signing key needed "the key file" replacing, on the phone itself.  A
+    sweep bounded by the file it began in is indistinguishable from a
+    complete sweep until someone checks the boundary, so this one now runs
+    across the repository.
+
+    The fix names the real source where the source is known.  The sidecar
+    reads the key from a vault, an injected environment value or an explicit
+    file, and `apnsKeySource()` already knows which; the control state
+    carries that name and the page renders it.  The phone has no such
+    field, and there the copy says "the signing key" — true in every case,
+    because a fresh signature from the same key cannot help.
+
+    The page's copy is asserted by driving the SERVED page rather than the
+    source of a helper in it: the helper can be correct while the page
+    never calls it, which is the shape of bug this finding is about.  The
+    test extracts the page's own module script, runs it against a stub DOM,
+    and asserts on what lands in the DOM — and it fails against the old
+    wording, so it tests the defect and not the new code.
 
 ## Files
 
@@ -216,13 +245,30 @@ looked masked and printed the key.
     warnings, the short-material refusal, the test that drives the
     refused-key warning with a short key, and the narrowed-ceiling test that
     no longer depends on who is faster.
+-  `companion/src/control.ts` — the control state carries the key's source
+    name (`keySource`), the pairing page renders that name as the remedy
+    instead of pointing at a file, and the fallback when an older sidecar
+    sends no source says "the signing key".  `page()` is exported so the
+    served wording can be asserted on.
+-  `companion/test/control-page.test.ts` — drives the served page's own
+    module script against a stub DOM and asserts on the copy that lands in
+    the DOM, across every state the page can be in.
+-  `ios/Sources/CompanionCore/PushSenderHealth.swift` — the key-rejected
+    row says the signing key needs replacing, not that a key file does.
+-  `ios/Tests/CompanionCoreTests/PushSenderHealthTests.swift` — the two
+    assertions and the doc comment that pinned the old wording.
 
 ## Verification
 
 -  `pnpm vitest run companion/src/apns.test.ts` — 143 passed (1 file).
+-  `pnpm vitest run companion/test/control-page.test.ts` — 5 passed (1 file).
+-  `pnpm vitest run companion/test/control.test.ts companion/test/control-page.test.ts`
+    — 27 passed (2 files).
+-  `cd ios && swift test` — 55 tests in 5 suites passed.
+-  `cd ios && swift test --filter PushSenderHealthTests` — 29 passed.
 -  `pnpm typecheck` — clean (exit 0).
--  `pnpm lint` — baseline check passed;  4876 warnings against a baseline of
-    4884, so eight fewer than the baseline allows.
+-  `pnpm lint` — baseline check passed; 4874 warnings against a baseline of
+    4884, so ten fewer than the baseline allows.
 -  The slow-failed-read regression test was run against the old stamping and
     fails there (`expected [ Array(2) ] to have a length of 1 but got 2`), so
     it tests the defect and not the new code.
@@ -243,22 +289,32 @@ looked masked and printed the key.
     prints the material directly and fails there (`expected "companion: APNs
     refused the signing k…" not to contain "ABCDEFGH"`), so it tests the
     material leak and not the new code.
+-  The pairing-page test was run against the old page copy — the helper
+    restored to "Replace the key file to turn pushes back on" — and fails
+    there (4 of its 5 tests fail, the last one being the state sweep that
+    catches the phrase in every branch), so it tests the defect and not the
+    new code.
 -  Credential probe against the live Apple endpoint, using the lane's own
-    `loadApnsConfig()`:  the sidecar resolved `keyId HSJ98QN95V` from
+    `loadApnsConfig()`: the sidecar resolved `keyId HSJ98QN95V` from
     `Infisical APNS_KEY_P8`, signed a provider token, and Apple answered
     **400 BadDeviceToken** for a non-existent device.  A refused key answers
     403 `InvalidProviderToken`; 400 is authentication succeeding and the
     device being unknown.  Nothing was delivered — the probe uses 64 zeroes.
+-  A real alert was later delivered through the released code against the
+    paired iPhone's registered token: APNs answered **200** on the first
+    attempt.  That is the delivery receipt this document's last section
+    used to say was missing.
 
 
 ## Next steps
 
--  The Mac runtime is deliberately parked:  `launchctl print-disabled
+-  The Mac runtime is deliberately parked: `launchctl print-disabled
     gui/501` lists `app.botfleet.companion` and `app.botfleet.server` as
     disabled, and `mac-process-watch` logs `SKIP launchd:app.botfleet.server
     disabled`.  Do not bootstrap them without the owner.
 -  When the owner re-enables the companion, re-point the runtime checkout to
     `origin/main` again and confirm the log line `Infisical APNS_KEY_P8`
     instead of the revoked-key path.
--  Still unconfirmed anywhere in the fleet:  a push that actually lands on a
-    phone.  Every check so far is credential-level.
+-  Still unconfirmed: that the alert appeared ON the phone.  APNs accepted
+    it and the phone holds the token, but the display is the one link
+    nobody can read from here.
