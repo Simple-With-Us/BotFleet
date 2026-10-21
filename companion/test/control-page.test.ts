@@ -24,9 +24,13 @@ const scriptOf = (html: string): string => {
 
 /** A DOM stub with just enough surface for the page's script: the elements
  *  it writes into, and a `querySelectorAll` that finds no buttons (this
- *  suite is about the copy, not about the click handlers). */
+ *  suite is about the copy, not about the click handlers).
+ *
+ *  The map holds what the page wrote, and a DOM lets a page write something
+ *  that is not a string, so the map is typed to allow that: the guards have
+ *  to catch it rather than the type system doing it for them. */
 const stubDom = () => {
-  const written = new Map<string, string>();
+  const written = new Map<string, string | null>();
   const nodes = new Map<string, { innerHTML: string; addEventListener: () => void }>();
   const element = (id: string) => {
     const node = {
@@ -35,7 +39,7 @@ const stubDom = () => {
     };
     Object.defineProperty(node, "innerHTML", {
       get: () => written.get(id) ?? "",
-      set: (value: string) => written.set(id, value),
+      set: (value: string | null) => written.set(id, value),
     });
     nodes.set(id, node);
     return node;
@@ -121,7 +125,7 @@ const stateWith = (push: PagePush | null, keySource?: string): PageState => {
 /** Run the page's own `render` over a state object and return what it wrote
  *  into each element.  The script is a module, so it is evaluated as one:
  *  the functions it declares are the ones the browser would call. */
-const renderPage = (state: PageState): Map<string, string> => {
+const renderPage = (state: PageState): Map<string, string | null> => {
   const html = page();
   const script = scriptOf(html);
   const dom = stubDom();
@@ -230,13 +234,24 @@ describe("the pairing page's refused-key remedy", () => {
 
     for (const state of states) {
       const written = renderPage(state);
-      // The sweep below only sees what the page wrote, so a page that rendered
-      // nothing would pass it for free.  Prove the page drew its panels
-      // first, or a broken page state would slip through as silence.
-      for (const id of ["where", "pair", "devices", "push"]) {
-        expect(written.get(id), `element ${id} was not rendered`).toBeDefined();
+      // The sweep below only sees what the page wrote, so a page that
+      // rendered nothing — or one that rendered blank panels — would pass it
+      // for free: blank copy cannot be wrong copy.  Prove first that every
+      // panel the sweep is about to inspect carries real content, or a broken
+      // page state would slip through as silence.
+      //
+      // The type check is deliberate and is not the same as `toBeDefined()`:
+      // a panel the page wrote as null is defined, so a definedness check
+      // would wave it through.
+      for (const [id, html] of written) {
+        expect(html, `element ${id} was not rendered as a string`).toBeTypeOf("string");
+        expect((html ?? "").trim().length, `element ${id} rendered blank`).toBeGreaterThan(0);
       }
-      expect([...written.values()].join(" "), "the page rendered nothing").not.toBe("");
+      // And the page is made of these four panels, so each one has to be
+      // there at all.
+      for (const id of ["where", "pair", "devices", "push"]) {
+        expect(written.has(id), `element ${id} was not rendered`).toBe(true);
+      }
       for (const [id, html] of written) {
         expect(html, `element ${id}`).not.toContain("the key file");
         expect(html, `element ${id}`).not.toContain("Replace the key file");

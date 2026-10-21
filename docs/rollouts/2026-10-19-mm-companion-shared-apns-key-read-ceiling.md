@@ -238,6 +238,30 @@ it started in.
     was correct, and the hole was real: a sweep that cannot fail is not a
     sweep.
 
+16.  **The guard added for finding 15 could not fail either.**  Kody reviewed
+    that fix and revised its own earlier suggestion: the assertion
+    `expect([...written.values()].join(" ")).not.toBe("")` cannot fail once
+    the four panels are known to be present, because joining four values with
+    a space separator is at least three characters and so is never the empty
+    string.  It also passes when the four panels exist but hold nothing but
+    whitespace, which is the one remaining way the sweep could pass
+    vacuously, and `toBeDefined()` accepts a `null` panel because null is
+    defined.
+
+    The guard now checks each rendered panel twice: that its value is a
+    string, and that it holds something other than whitespace.  The stub's
+    map is typed to allow a non-string so the null case is reachable rather
+    than theoretical, and the page's four panels are each required to be
+    present.
+
+    Both holes were demonstrated, not argued.  With every panel blanked, the
+    old guard let the sweep pass — the sweep test was the one test that
+    passed under that mutation, which is precisely the vacuous pass Kody
+    described — and the new guard fails it.  With every panel set to null,
+    the old guard's definedness check waves it through and the new guard
+    fails it on the type.  Both mutations are recorded as fails-first
+    evidence below.
+
 ## Files
 
 -  `companion/src/apns.ts` — `APNS_VAULT_READ_BUDGET_MS`,
@@ -264,7 +288,9 @@ it started in.
 -  `companion/test/control-page.test.ts` — drives the served page's own
     module script against a stub DOM and asserts on the copy that lands in
     the DOM, across every state the page can be in.  The sweep proves the page
-    rendered before it sweeps it, so it cannot pass on an empty page.
+    rendered before it sweeps it, so it cannot pass on an empty page, and it
+    proves each rendered panel is a non-empty string, so it cannot pass on
+    blank panels either.
 -  `ios/Sources/CompanionCore/PushSenderHealth.swift` — the key-rejected
     row says the signing key needs replacing, not that a key file does.
 -  `ios/Tests/CompanionCoreTests/PushSenderHealthTests.swift` — the two
@@ -293,6 +319,16 @@ it started in.
 -  The served-page sweep was run against a stubbed render that writes nothing
     and all five tests in the file fail, so the sweep cannot pass on a page
     that rendered nothing.
+-  The guard for that case was then run against a stubbed render that writes
+    all four panels but blanks them, and the sweep test PASSES under the
+    earlier guard — it is the one test that passes under that mutation —
+    and FAILS under the current one (`element where rendered blank: expected
+    0 to be greater than 0`).  So the earlier guard could not fail, and the
+    current one can.
+-  The same guard was run against a stubbed render that writes null into all
+    four panels, and the current guard fails it (`element where was not
+    rendered as a string: expected null to be type of 'string'`), where the
+    earlier definedness check would have accepted a null panel.
 -  The live-refusal test was run against the old warning and fails there
     (`expected "companion: APNs refused the signing key (InvalidProviderToken);
     pushes are off until the key file changes" to contain "MIGHAgEA…BeVr"`), so
@@ -323,10 +359,16 @@ it started in.
 
 ## Next steps
 
--  The Mac runtime is deliberately parked: `launchctl print-disabled
-    gui/501` lists `app.botfleet.companion` and `app.botfleet.server` as
-    disabled, and `mac-process-watch` logs `SKIP launchd:app.botfleet.server
-    disabled`.  Do not bootstrap them without the owner.
+-  The Mac runtime is deliberately parked by the owner: the companion and the
+    server are not running, and `~/.botfleet/stopped.marker` records that
+    they were shut down on purpose and stay down.  Do not bootstrap them
+    without the owner.
+-  Note that `launchctl print-disabled gui/501` currently lists
+    `app.botfleet.companion` and `app.botfleet.server` as ENABLED, so the
+    parked state rests on the marker rather than on the launchd disabled map,
+    and the companion's start script has no marker gate of its own.  That
+    drift is filed as board row BF-2537 and is the owner's to decide; it was
+    not changed from here.
 -  When the owner re-enables the companion, re-point the runtime checkout to
     `origin/main` again and confirm the log line `Infisical APNS_KEY_P8`
     instead of the revoked-key path.
