@@ -28,6 +28,7 @@ import {
   getOrOpenSession,
   inspectTransportError,
   isTransportFailure,
+  keyPreview,
   liveActivityContent,
   liveActivityPayload,
   liveActivityTopic,
@@ -3152,6 +3153,52 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
     expect(h.pushesOffReason).toBe("key-rejected");
   });
 
+  it("names the refused key by a masked preview, never by its value", async () => {
+    // Rule 43:  a rejected provider key is identified by its masked
+    // first-8/last-4 preview.  The operator has to be able to tell WHICH key
+    // Apple refused, and the key itself must never reach the log.
+    const store = memoryKeyFaultStore({
+      reason: "InvalidProviderToken",
+      at: 1_700_000_000_000,
+      keyStamp: "key-v1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const p8 = testP8();
+    const key = testConfig({ p8 });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => key,
+      keyStamp: () => "key-v1",
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false as const,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault" as const,
+      }),
+    });
+    let line = "";
+    try {
+      await waitFor(() => {
+        line = warn.mock.calls.map((call) => String(call[0])).find((text) => text.includes("pushes stay off")) ?? "";
+        return line !== "";
+      });
+    } finally {
+      watch.stop();
+    }
+    const material = p8.replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+    expect(line).toContain(`${material.slice(0, 8)}…${material.slice(-4)}`);
+    // The key itself, in any form, is not in the line.
+    expect(line).not.toContain(material);
+    expect(line).not.toContain(p8);
+  });
+
   it("clears the verdict when the key file fingerprint changes", async () => {
     const store = memoryKeyFaultStore({
       reason: "InvalidProviderToken",
@@ -3298,6 +3345,18 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     resetApnsKeyCache();
   });
 
+  it.skipIf(process.platform === "win32")("previews a signing key as a masked first-8/last-4, and never its value", () => {
+    // Rule 43:  a key is identified by its masked preview.  The preview is of
+    // the key MATERIAL, so the PEM armour is not part of what is shown.
+    const p8 = testP8();
+    const material = p8.replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+    expect(keyPreview(p8)).toBe(`${material.slice(0, 8)}…${material.slice(-4)}`);
+    expect(keyPreview(p8)).not.toContain(material);
+    // Nothing to preview says so plainly, rather than showing an empty one.
+    expect(keyPreview(null)).toBe("unavailable");
+    expect(keyPreview("")).toBe("unavailable");
+  });
+
   it.skipIf(process.platform === "win32")("reads AUTHKEY_<KEY_ID> through fleet-secrets and never a file under the home folder", async () => {
     const argsFile = join(dir, "args");
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" > '${argsFile}'\n${pemScript(testP8())}`);
@@ -3346,14 +3405,39 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
 
   it.skipIf(process.platform === "win32")("honours a narrowed read ceiling from the environment", async () => {
     // A ceiling of 1 ms kills the read before the fake can answer, which is
-    // exactly how a slow vault looks to the sidecar.
+    // exactly how a slow vault looks to the sidecar.  The fake has to be
+    // slower than the ceiling for that to hold on every machine:  a fake
+    // that answers inside the ceiling makes this test pass on a slow fork
+    // and fail on a fast one, which is how it was green on a Mac and red in
+    // CI.  The fake now waits, so the ceiling always wins.
     process.env.APNS_VAULT_READ_TIMEOUT_MS = "1";
-    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`sleep 2\n${pemScript(testP8())}`);
     // The read is async now, so a read started by an earlier test can still be
     // in flight.  The cache is cleared here as well as in `beforeEach` so this
     // test never depends on the order the suite happens to run in.
     resetApnsKeyCache();
     expect(await loadApnsConfig()).toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the cached answer when the key id read is slower than the retry window", async () => {
+    // The id read is part of the read.  An entry stamped before that read
+    // finished is already expired by the time it is stored when the id read
+    // takes longer than the retry window — and the raised ceiling allows
+    // exactly that — so the next caller runs a second full vault round trip
+    // instead of taking the cached answer.  The id read here takes half a
+    // second against a 200 ms retry window, so the two cases differ.
+    const calls = join(dir, "calls");
+    const pem = testP8();
+    process.env.APNS_VAULT_RETRY_MS = "200";
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
+      `echo "$@" >> '${calls}'\ncase "$2" in\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  APNS_KEY_ID) sleep 0.5; exit 3 ;;\n  *) exit 3 ;;\nesac`,
+    );
+    resetApnsKeyCache();
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    // The next caller, well inside the retry window, must be served from the
+    // cache:  one read of the PEM and one of the id, not twice that.
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(2);
   });
 
   it.skipIf(process.platform === "win32")("does not block the event loop while the vault answers", async () => {

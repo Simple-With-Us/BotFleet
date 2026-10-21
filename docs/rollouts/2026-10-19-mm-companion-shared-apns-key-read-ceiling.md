@@ -51,6 +51,23 @@ pushes off.
     an instant timeout — the same "no key" failure, through the new door.
     `0`, `-1`, `-5000`, `not-a-number` and `""` all fall back to the default.
 
+-  **A test that depends on who is faster is not a test.**  The narrowed
+    ceiling test asserted that a 1 ms ceiling kills a read, and it proved that
+    by racing the fake against the clock.  On a slow fork the fake lost and
+    the test passed;  on the CI runner's fast fork the fake answered inside
+    the ceiling, the read succeeded, and the test failed.  The fix is not to
+    make the fake slower on purpose but to make it deterministically slower
+    than the ceiling, so the outcome is the same on every machine.  A test
+    that can only pass on a slow machine is a test that will fail in CI.
+
+-  **Stamp the cache entry when the whole read finishes, not when its first
+    half does.**  The key id is a second read, and the raised ceiling allows
+    that read to outlive the retry window.  An entry stamped before the id
+    read was already expired by the time it was written, so the next caller
+    paid for a second full vault round trip — the exact cost the completion
+    stamp was introduced to remove.  The stamp belongs to the read, not to
+    the PEM half of it.
+
 -  **Fail towards "pushes on", not "pushes off".**  The sidecar's behaviour on
     a missing key predates this change and is right:  a key it cannot read is
     not a key it should sign with.  The fix is therefore to make the read
@@ -68,7 +85,7 @@ pushes off.
 
 ## Review findings
 
-Three review bots found real defects, all in the same shape as the bug it was
+Five review bots found real defects, all in the same shape as the bug it was
 fixing:  a value that looked fine and silently removed the key, or a change
 that looked safe and stopped the sidecar answering.
 
@@ -99,6 +116,31 @@ that looked safe and stopped the sidecar answering.
     bounded without the loop being held.  A test fires a timer while the vault
     is answering and fails against the synchronous read.
 
+4.  **The completion stamp was taken before the key-id read.**  `readVault`
+    stamps the entry when the PEM read finishes, but the key id is a second
+    read, and the raised ceiling allows that read to take longer than the
+    retry window.  An entry stamped before the id read was already expired by
+    the time it was written, so the next caller ran a second full vault round
+    trip instead of taking the cached answer.  The stamp is now taken when
+    the whole read finishes.  The new regression test fails against the old
+    stamping with four vault reads where there should be two.
+
+5.  **A refused key was named by its source, not by a masked preview.**  The
+    persisted-fault warning said which store held the key, but not which key
+    it was.  Rule 43 requires a rejected provider key to be identified by a
+    masked first-8/last-4 preview, so the operator can tell one bad key from
+    another without the key ever being printed.  `keyPreview()` strips the PEM
+    armour and returns `xxxx…yyyy`, and the warning carries it.  A test
+    asserts the preview is present and the key material is not.
+
+6.  **A timing-dependent test passed on a Mac and failed in CI.**  The
+    narrowed-ceiling test relied on the fake vault being slower than a 1 ms
+    ceiling, which is true on a slow fork and false on a fast one:  the CI
+    runner answered inside the ceiling, so the read succeeded and the test
+    failed.  A test that depends on who is faster is not a test.  The fake now
+    waits, so the ceiling always wins, and the outcome is the same on every
+    machine.
+
 ## Files
 
 -  `companion/src/apns.ts` — `APNS_VAULT_READ_BUDGET_MS`,
@@ -106,19 +148,26 @@ that looked safe and stopped the sidecar answering.
     `vaultRetryMs()`, the completion stamp in `readVault`, the asynchronous
     `fleetSecretsGet()` with its in-flight guard, and the generation counter
     that keeps a cleared cache from being written back by a read already in
-    flight.
+    flight.  `keyPreview()` masks a rejected key for the persisted-fault
+    warning.
 -  `companion/src/apns.test.ts` — the ordering invariant, the override, the
     refusal of a non-positive or fractional override, the slow-failed-read
-    regression, the event-loop regression and the concurrent-read guard.
+    regression, the event-loop regression, the concurrent-read guard, the
+    slow-key-id-read regression, the masked-preview assertions and the
+    narrowed-ceiling test that no longer depends on who is faster.
 
 ## Verification
 
--  `pnpm vitest run companion/src/apns.test.ts` — 135 passed (1 file).
--  `pnpm typecheck` — clean.
--  `pnpm lint` — baseline check passed.
+-  `pnpm vitest run companion/src/apns.test.ts` — 140 passed (1 file).
+-  `pnpm typecheck` — clean (exit 0).
+-  `pnpm lint` — baseline check passed;  4876 warnings against a baseline of
+    4884, so eight fewer than the baseline allows.
 -  The slow-failed-read regression test was run against the old stamping and
     fails there (`expected [ Array(2) ] to have a length of 1 but got 2`), so
     it tests the defect and not the new code.
+-  The slow-key-id-read regression test was run against the old stamping and
+    fails there (four vault reads where there should be two), so it tests the
+    defect and not the new code.
 -  Credential probe against the live Apple endpoint, using the lane's own
     `loadApnsConfig()`:  the sidecar resolved `keyId HSJ98QN95V` from
     `Infisical APNS_KEY_P8`, signed a provider token, and Apple answered

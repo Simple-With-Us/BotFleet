@@ -162,7 +162,7 @@ async function readVaultFromVault(pin: string, retryMs: number, generation: numb
   // already-expired entry behind, and the very next caller — `refreshConfig`
   // asks for the stamp and then the config — would run another full read
   // instead of the cached answer.
-  const completedAt = Date.now();
+  let completedAt = Date.now();
   const store = (next: VaultKey): VaultKey => {
     if (generation === vaultGeneration) vaultKey = next;
     return next;
@@ -176,6 +176,12 @@ async function readVaultFromVault(pin: string, retryMs: number, generation: numb
     return store({ pin, keyId: pin || SHARED_APNS_KEY_ID, p8, at: completedAt });
   }
   const id = await sharedKeyId();
+  // The read is not finished until the id read returns.  Stamping before it
+  // left an entry that was already expired by the time it was stored, when the
+  // id read took longer than the retry window — and the raised ceiling allows
+  // exactly that — so the next caller ran a second full vault round trip
+  // instead of taking the cached answer.
+  completedAt = Date.now();
   if (id) {
     return store({ pin, keyId: id, p8, at: completedAt });
   }
@@ -253,6 +259,20 @@ export async function apnsKeyStamp(): Promise<string | null> {
   // a different signing identity to Apple.
   const digest = createHash("sha256").update(`${got.keyId}\n${got.p8}`).digest("hex").slice(0, 16);
   return `${apnsKeySource()}:${digest}`;
+}
+
+/** A masked preview of a signing key:  the first eight and the last four
+ * characters of the key material, and nothing else.
+ *
+ * Rule 43:  a rejected provider key is identified by its masked preview, so
+ * the operator can tell WHICH key Apple refused without the key ever being
+ * printed.  The PEM armour is stripped first, so the preview describes the
+ * key material and not the header.  An absent key previews as "unavailable"
+ * rather than as an empty string, so the line still says something useful. */
+export function keyPreview(p8: string | null | undefined): string {
+  const material = (p8 ?? "").replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+  if (!material) return "unavailable";
+  return `${material.slice(0, 8)}…${material.slice(-4)}`;
 }
 
 export async function loadApnsConfig(): Promise<ApnsConfig | null> {
@@ -2457,9 +2477,15 @@ export function watchHarnessNotifications(options: {
           keyFault = true;
           discoveredStamp = stamp;
           health.rejectKey(persistedFault.at, persistedFault.reason, persistedFault.errorTimestamp);
+          // Rule 43:  a rejected provider key is identified by a masked
+          // first-8/last-4 preview, never by its value.  The key in hand is
+          // the one Apple refused — the stamp above matched it — and it is
+          // already in the vault cache, so this is not a second round trip.
+          const rejected = await loadConfig();
           console.warn(
-            `companion: APNs pushes stay off — Apple refused this signing key (${persistedFault.reason}) ` +
-              `and the key has not changed since.  Replace ${apnsKeySource()} to turn them back on.`,
+            `companion: APNs pushes stay off — Apple refused this signing key (${persistedFault.reason}; ` +
+              `preview ${keyPreview(rejected?.p8)}) and the key has not changed since.  ` +
+              `Replace ${apnsKeySource()} to turn them back on.`,
           );
         } else {
           // A different file, or no file at all: the verdict was about a key we
