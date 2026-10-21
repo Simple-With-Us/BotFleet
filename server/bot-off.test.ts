@@ -324,8 +324,18 @@ posixOnly("the bot On/Off switch", () => {
     expect(runNow.body.run).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", manual: true });
 
     const runs: WireRun[] = (await api("GET", "/api/routines")).body.runs ?? [];
-    const hookRun = runs.find((run) => run.id === accepted.runId);
-    expect(hookRun).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED });
+    // BF-2462: a webhook delivery for an Off bot is answered with a transient
+    // receipt.  No run row (and no prompt copy) is stored for it, so it is
+    // absent from the routine history.
+    expect(runs.find((run) => run.id === accepted.runId)).toBeUndefined();
+    expect(JSON.stringify(runs)).not.toContain("Triage the alert");
+    // The webhook activity log still records the delivery, as ignored with the
+    // skip reason, never as accepted.
+    const activityLog: Array<{ webhookId: string; runId?: string; outcome: string; reason?: string }> = (
+      await api("GET", "/api/webhooks")
+    ).body.attempts;
+    const attempt = activityLog.find((entry) => entry.runId === accepted.runId);
+    expect(attempt).toMatchObject({ webhookId: hook.body.webhook.id, outcome: "ignored", reason: BOT_OFF_SKIPPED });
     const manualRun = runs.find((run) => run.manual === true && run.botId === bot.id);
     expect(manualRun).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED });
 

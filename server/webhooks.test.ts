@@ -127,6 +127,36 @@ describe("WebhookManager", () => {
     expect(h.manager.list()[0]).toMatchObject({ lastRunId: "run-1", deliveryCount: 1 });
   });
 
+  it("logs a delivery the routine manager skipped as ignored with its reason, and a queued one as accepted (BF-2462)", () => {
+    const h = harness();
+    // A skipped delivery comes back as an unpersisted `cancelled` receipt:  an
+    // Off bot also carries its reason in `error` (its outcome code is `bot_off`,
+    // never a status), a snoozed bot carries none.
+    const receipts: Array<{ id: string; status?: string; error?: string }> = [
+      { id: "skip-off", status: "cancelled", error: "Skipped: this bot is off" },
+      { id: "skip-snoozed", status: "cancelled" },
+      { id: "run-queued", status: "queued" },
+    ];
+    const manager = new WebhookManager({ ...h.options, enqueue: () => receipts.shift()! });
+    const { webhook, secret } = create(manager);
+    for (const deliveryId of ["d-off", "d-snoozed", "d-queued"]) {
+      manager.receive(webhook.endpointId, secret, { payload: { lead: "Ada" }, contentType: "application/json", deliveryId });
+    }
+
+    const attempts = manager.listAttempts();
+    expect(attempts.find((attempt) => attempt.runId === "skip-off")).toMatchObject({
+      outcome: "ignored",
+      statusCode: 202,
+      reason: "Skipped: this bot is off",
+    });
+    const snoozed = attempts.find((attempt) => attempt.runId === "skip-snoozed");
+    expect(snoozed).toMatchObject({ outcome: "ignored", statusCode: 202 });
+    expect(snoozed).not.toHaveProperty("reason");
+    const queued = attempts.find((attempt) => attempt.runId === "run-queued");
+    expect(queued).toMatchObject({ outcome: "accepted", statusCode: 202 });
+    expect(queued).not.toHaveProperty("reason");
+  });
+
   it("uses an authenticated task from the payload when default instructions are empty", () => {
     const h = harness();
     const { webhook, secret } = h.manager.create({ name: "Direct tasks", prompt: "", botId: "maus-1" });

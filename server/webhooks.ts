@@ -1317,7 +1317,7 @@ export class WebhookManager {
       statusCode: 202,
       deliveryId,
       runId: run.id,
-      ...(skipped && run.error ? { reason: run.error } : {}),
+      reason: skipped ? run.error : undefined,
     });
     // This just added a new entry to `this.deliveries` — the record that
     // makes a retried delivery idempotent. It must be durable before the
