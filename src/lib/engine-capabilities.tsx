@@ -822,7 +822,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         notes:
           "Plans run from Plus at $19/month up to Ultra at $199/month, all with Kimi Code access, with a discount for annual billing.  Source:  https://www.kimi.ai/help/membership/membership-pricing",
       },
-      notes: "Subscription is the pricing mode.",
+      // No outer `notes`: UsageSection shows `pricing.notes` ahead of the
+      // subscription note, and the plan sentence belongs in the tooltip.
     },
     capabilities: {
       files: "yes",
@@ -874,7 +875,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         notes:
           "Individual plans:  Pro $20/month, Plus $100/month at about five times Pro's usage, Max $200/month at about ten.  Teams is $60/month plus $40 per seat.  Source:  https://factory.com/pricing",
       },
-      notes: "Subscription is the pricing mode.",
+      // No outer `notes`: UsageSection shows `pricing.notes` ahead of the
+      // subscription note, and the plan sentence belongs in the tooltip.
     },
     capabilities: {
       files: "yes",
@@ -900,7 +902,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         "BotFleet drives the Droid CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "The engine's own catalog spans several providers, which is why its row carries one badge rather than a model-family claim.",
         "Voice chat and live research are not available on this engine.",
-        "Pricing for this engine is not recorded in this build.",
+        "Factory's individual plans start at Pro $20 a month.",
       ],
     },
     defaultModels: [
