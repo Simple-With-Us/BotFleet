@@ -24,6 +24,7 @@ Verification uses these isolated fixtures:
 - [Packaged server smoke test](packaged-server.md) — server start-up and module resolution
 - [Model fallback on quota chips](quota-fallback.md) — provider failover when quota is exhausted
 - [Mac updater transaction](mac-updater.md) — signed update delivery and application
+- [Independent server controls](server-controls.md) — native menu bar controls, startup policy and protected VM shutdown
 - [Staged candidate smoke test](staged-candidate-smoke.md) — the pre-activation probe that runs a candidate before anything live is touched
 - [Connector grants](connector-grants.md) — per-bot third-party tool authorization
 - [Saved data faults](saved-data.md) — unreadable bots, rooms, routines and settings files are set aside, never deleted

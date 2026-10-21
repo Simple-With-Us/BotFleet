@@ -675,7 +675,7 @@ export interface ContainerComputerStatus {
   image: boolean;
   imageMatches: boolean;
   managed: boolean;
-  container: "running" | "stopped" | "missing";
+  container: "running" | "created" | "stopped" | "missing";
   network: "loopback" | "unsafe" | "unknown";
   security: "hardened" | "unsafe" | "unknown";
   persistence: "durable" | "unsafe" | "unknown";
@@ -746,6 +746,7 @@ function statusProblem(status: ContainerComputerStatus): string | null {
   if (status.network === "unsafe") return "The existing Local VM exposes its viewer publicly; recreate it";
   if (status.security === "unsafe") return "The existing Local VM is missing safety limits; recreate it";
   if (status.persistence === "unsafe") return "The existing Local VM is missing its durable workspace; recreate it";
+  if (status.container === "created") return "Start the newly created Local VM";
   if (status.container === "stopped") return "This desktop image cannot safely resume; recreate the Local VM";
   if (status.desktopUnreachable) return "Couldn't reach the Local VM desktop just now; retrying";
   if (status.desktop_error) return `The Local VM desktop failed to start: ${status.desktop_error}`;
@@ -988,11 +989,13 @@ export async function containerComputerStatus(
         }>;
         EffectiveCaps?: string[];
         BoundingCaps?: string[];
-        State?: { Running?: boolean };
+        State?: { Running?: boolean; Status?: string };
         Image?: string;
       }>;
       const detail = inspected[0];
-      status.container = detail?.State?.Running ? "running" : "stopped";
+      status.container = detail?.State?.Running
+        ? "running"
+        : detail?.State?.Status === "created" ? "created" : "stopped";
       status.network = dockerPortsAreLocal(detail?.HostConfig?.PortBindings) ? "loopback" : "unsafe";
       status.viewer_port = dockerViewerPort(detail?.NetworkSettings?.Ports, target.viewerPort);
       status.imageMatches =
@@ -1548,10 +1551,52 @@ export async function migrateVmWorkspace(
   return from;
 }
 
-async function ensureVmWorkspace(platform: NodeJS.Platform, target: LocalVmTarget): Promise<void> {
+export async function ensureVmWorkspace(platform: NodeJS.Platform, target: LocalVmTarget): Promise<void> {
   await migrateVmWorkspace(target);
   await mkdir(target.workspaceDir, { recursive: true, mode: 0o700 });
   if (platform !== "win32") await chmod(target.workspaceDir, 0o700);
+}
+
+/** Provision the shared desktop without starting it.  This is for a deliberate
+ * offline recovery: it uses the ordinary run contract, but Docker's `create`
+ * leaves the desktop off and never removes an existing container or image. */
+export async function createStoppedSharedLocalVm(
+  runner: CommandRunner = sh,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
+  if (loadConfig().localVm?.mode === "per-bot") {
+    throw Object.assign(new Error("Shared Local VM is disabled in per-bot Computer mode"), { status: 409 });
+  }
+  const { stdout } = await runner("docker", ["image", "inspect", "--format", "{{json .Config.Labels}}", IMAGE]);
+  const labels = z.record(z.string(), z.string()).safeParse(JSON.parse(stdout));
+  if (!labels.success || !imageLabelsMatch(labels.data)) {
+    throw Object.assign(new Error("The prepared BotFleet desktop image is missing or incompatible"), { status: 409 });
+  }
+  const host = await readRuntimeHost("docker", runner);
+  const runtimeLabel = await resolveRuntimeHostLabel("docker", runner);
+  const capacityError = localVmHostCapacityError(host, runtimeLabel);
+  if (capacityError) throw Object.assign(new Error(capacityError), { status: 409 });
+  const limits = await resolveContainerLimits("docker", runner, configuredContainerLimits());
+  await ensureVmWorkspace(platform, SHARED_LOCAL_VM_TARGET);
+  const target = SHARED_LOCAL_VM_TARGET.viewerPort && !(await loopbackPortFree(SHARED_LOCAL_VM_TARGET.viewerPort))
+    ? { ...SHARED_LOCAL_VM_TARGET, viewerPort: null }
+    : SHARED_LOCAL_VM_TARGET;
+  const runArgs = containerRunArgs(
+    "docker", randomBytes(6).toString("base64url"), target, platform,
+    {
+      shareCliCredentials: shareCliCredentialsConfigured(),
+      shareGpgPrivateKeys: shareGpgPrivateKeysConfigured(),
+      materializeCredentials: false,
+      limits,
+    },
+  );
+  try {
+    await runner("docker", ["create", ...runArgs.slice(2)], 2 * 60_000);
+  } catch {
+    // Docker errors may echo argv, including the private viewer password.
+    throw new Error("Docker could not create the stopped Local VM; check the local daemon and available resources");
+  }
+  forgetLocalVmGhToken(SHARED_LOCAL_VM_TARGET.containerName);
 }
 
 /** How long an image build may run.  The CLI layer downloads and installs
@@ -1631,9 +1676,12 @@ export async function containerComputerAction(
     throw Object.assign(new Error(before.problem ?? "This runtime cannot create a per-bot Local VM"), { status: 409 });
   }
   if (action === "start") {
-    throw Object.assign(new Error("This desktop image cannot safely resume; remove and recreate the Local VM"), {
-      status: 409,
-    });
+    if (before.container !== "created" || !before.imageMatches || !before.managed ||
+        before.network !== "loopback" || before.security !== "hardened" || before.persistence !== "durable") {
+      throw Object.assign(new Error("This desktop image cannot safely resume; recreate the Local VM in Computer settings"), {
+        status: 409,
+      });
+    }
   }
   if (action === "stop" && before.container !== "running") {
     throw Object.assign(new Error("The Local VM is not running"), { status: 409 });
@@ -1748,11 +1796,14 @@ export async function wakeContainerComputer(
 ): Promise<ContainerComputerStatus> {
   const canWake =
     Boolean(status.image && status.runtime && status.daemonUp && status.create_supported) &&
-    (status.container === "stopped" || status.container === "missing");
+    (status.container === "created" || status.container === "stopped" || status.container === "missing");
   if (!canWake) {
     return status;
   }
   try {
+    if (status.container === "created") {
+      return await containerComputerAction("start", runner, platform, target);
+    }
     if (status.container === "stopped") {
       await containerComputerAction("remove", runner, platform, target);
     }

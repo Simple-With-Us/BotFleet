@@ -108,13 +108,15 @@ test("autofix callers keep their least-privilege and fork guards", () => {
 
 test("Claude Autofix keeps the Sentry-capable pin and same-repository bot gate", () => {
   const claude = read(".github/workflows/claude-code-autofix.yml");
-  // AFC #657 was inspected: only sentry and sentry[bot] were added to the
-  // prior bot list.  Do not override that reviewed policy or restore the old pin.
+  // 2026-10-20: repinned to the AFC pin that retires MiniMax-M3.1-Flash-Preview,
+  // and the caller now passes allowed_bots explicitly - the reusable default
+  // drops claude/claude[bot] and refuses swu-echo dispatches, which blocked an
+  // owner-directed rerun (run 39531317324).
   assert.match(
     claude,
-    /claude-code-autofix-reusable\.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34/,
+    /claude-code-autofix-reusable\.yml@269247f93d1eee20fe7cee83d1fb70833de83bea/,
   );
-  assert.doesNotMatch(claude, /^\s+allowed_bots:/m);
+  assert.match(claude, /^\s+allowed_bots: .*swu-echo/m);
   const guard = claude.match(/^ {4}if: >-\n([\s\S]*?)^ {4}uses:/m)?.[1];
   assert.ok(guard, "Claude Autofix has a job-level guard");
   assert.equal(

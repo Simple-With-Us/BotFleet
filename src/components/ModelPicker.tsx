@@ -170,9 +170,9 @@ export function ContextSection({
         type="text"
         inputMode="numeric"
         value={text}
-        placeholder="Custom"
+        placeholder="No limit"
         disabled={disabled}
-        aria-label="Custom max input tokens"
+        aria-label="Max Input Tokens"
         aria-invalid={invalid}
         onChange={(event) => setText(event.target.value)}
         onBlur={commitCustom}

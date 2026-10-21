@@ -79,7 +79,7 @@ describe("DshAgentDriver config", () => {
     // Owner 2026-09-27.  DeepSeek's catalog is only two models: `deepseek-flash`
     // IS the image/video model, and its image tokens bill at the same rate as
     // text, so there is deliberately no third DeepSeek row.  MiniMax-M2.7
-    // (non-highspeed) stays out — M3.1 Flash Preview dominates it on context.
+    // (non-highspeed) stays out — M3.1 Flash dominates it on context.
     expect(STATIC_DSH_MODELS.default).toBe("DeepSeek-V4.1-Flash");
     expect(STATIC_DSH_MODELS.options.map((option) => option.id)).toEqual([
       "DeepSeek-V4.1-Flash",
@@ -117,7 +117,7 @@ describe("DshAgentDriver config", () => {
     expect(byId.get("MiniMax-M3.1-Flash")?.badge).toBe("Token Plan");
     // 2x Cost: $0.60/$2.40 against M3's $0.30/$1.20.
     expect(byId.get("MiniMax-M2.7-highspeed")?.badge).toBe("2x the $");
-    // M3 is out of the picker entirely (superseded by M3.1 Flash Preview);
+    // M3 is out of the picker entirely (superseded by M3.1 Flash);
     // the stale-settings-union guard for it is covered below.
     expect(byId.has("MiniMax-M3")).toBe(false);
   });
@@ -142,8 +142,8 @@ describe("DshAgentDriver config", () => {
     expect(dshModelOptionValue("DeepSeek-V4-Pro")).toBe('["deepseek-official","deepseek-v4-pro"]');
     expect(dshModelOptionValue("DeepSeek-V4.1-Flash")).toBe('["deepseek-official","deepseek-flash"]');
     expect(dshModelIdFromOptionValue('["deepseek-official","deepseek-v4-pro"]')).toBe("deepseek-v4-pro");
-    expect(dshModelOptionValue("MiniMax-M3.1-Flash-Preview")).toBe('["minimax","MiniMax-M3.1-Flash-Preview"]');
-    expect(dshModelIdFromOptionValue('["minimax","MiniMax-M3.1-Flash-Preview"]')).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(dshModelOptionValue("MiniMax-M3.1-Flash")).toBe('["minimax","MiniMax-M3.1-Flash"]');
+    expect(dshModelIdFromOptionValue('["minimax","MiniMax-M3.1-Flash"]')).toBe("MiniMax-M3.1-Flash");
     expect(dshModelIdFromOptionValue('["other-provider","DeepSeek-V4-Pro"]')).toBeNull();
     expect(dshModelIdFromOptionValue("DeepSeek-V4-Pro")).toBeNull();
   });
@@ -175,8 +175,8 @@ describe("DshAgentDriver config", () => {
   it("places the two newer MiniMax ids under the minimax provider", () => {
     // Spelled out so a change from prefix matching to a hardcoded allowlist
     // fails here with a readable message rather than at turn time.
-    expect(dshModelOptionValue("MiniMax-M3.1-Flash-Preview")).toBe(
-      '["minimax","MiniMax-M3.1-Flash-Preview"]',
+    expect(dshModelOptionValue("MiniMax-M3.1-Flash")).toBe(
+      '["minimax","MiniMax-M3.1-Flash"]',
     );
     expect(dshModelOptionValue("MiniMax-M2.7-highspeed")).toBe(
       '["minimax","MiniMax-M2.7-highspeed"]',
@@ -865,7 +865,7 @@ describe("dsh model option resolution (Clutch #54 consumer)", () => {
         {
           group: "minimax",
           options: [
-            { value: '["minimax","MiniMax-M3.1-Flash-Preview"]', name: "MiniMax-M3.1-Flash-Preview" },
+            { value: '["minimax","MiniMax-M3.1-Flash"]', name: "MiniMax-M3.1-Flash" },
           ],
         },
       ],
@@ -901,7 +901,7 @@ describe("dsh model option resolution (Clutch #54 consumer)", () => {
 
   it("refuses a retired MiniMax id instead of silently substituting another model", () => {
     // The #729 retired-id exclusion through the new resolution path: M3 is not
-    // advertised, and no alias family maps it onto M3.1-Flash-Preview, so the
+    // advertised, and no alias family maps it onto M3.1-Flash, so the
     // turn fails as a catalog outage rather than running a model nobody picked.
     let thrown: unknown;
     try {
@@ -918,7 +918,7 @@ describe("dsh model option resolution (Clutch #54 consumer)", () => {
     // DeepSeek id against a MiniMax-only advertisement: no cross-provider
     // match, so the same outage classification instead of a wrong-model turn.
     expect(() => dshModelOptionValue("DeepSeek-V4.1-Flash", [
-      { id: "model", options: [{ value: '["minimax","MiniMax-M3.1-Flash-Preview"]', name: "MiniMax-M3.1-Flash-Preview" }] },
+      { id: "model", options: [{ value: '["minimax","MiniMax-M3.1-Flash"]', name: "MiniMax-M3.1-Flash" }] },
     ])).toThrow(DshModelNotOfferedError);
   });
 
@@ -928,12 +928,12 @@ describe("dsh model option resolution (Clutch #54 consumer)", () => {
     // now lists offers as provider/id and says where the model is declared.
     let thrown: unknown;
     try {
-      dshModelOptionValue("MiniMax-M3.1-Flash-Preview", [
+      dshModelOptionValue("MiniMax-M3.1-Flash", [
         {
           id: "model",
           options: [
             { group: "deepseek-official", options: [{ value: '["deepseek-official","deepseek-flash"]', name: "DeepSeek-V4.1-Flash" }] },
-            { group: "minimax-cn", options: [{ value: '["minimax-cn","MiniMax-M3.1-Flash-Preview"]', name: "MiniMax-M3.1-Flash-Preview" }] },
+            { group: "minimax-cn", options: [{ value: '["minimax-cn","MiniMax-M3.1-Flash"]', name: "MiniMax-M3.1-Flash" }] },
           ],
         },
       ]);
@@ -943,8 +943,8 @@ describe("dsh model option resolution (Clutch #54 consumer)", () => {
     expect(thrown).toBeInstanceOf(DshModelNotOfferedError);
     const error = thrown as DshModelNotOfferedError;
     expect(error.elsewhere).toEqual(["minimax-cn"]);
-    expect(error.offered).toContain("minimax-cn/MiniMax-M3.1-Flash-Preview");
-    expect(error.message).toContain("MiniMax-M3.1-Flash-Preview is declared only under minimax-cn");
+    expect(error.offered).toContain("minimax-cn/MiniMax-M3.1-Flash");
+    expect(error.message).toContain("MiniMax-M3.1-Flash is declared only under minimax-cn");
     expect(dshSupport.classifyError?.(error)).toBe("model_catalog_outage");
   });
 });

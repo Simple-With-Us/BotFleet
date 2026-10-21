@@ -8,6 +8,7 @@ const generatedPaths = [
   "release",
   "electron/resources/speech-helper",
   "electron/resources/BotFleet Speech.app",
+  "electron/resources/BotFleet Control.app",
 ];
 
 await Promise.all(

@@ -35,17 +35,17 @@ const MCODE_DEFAULT_EFFORT = "default";
 const MCODE_INVALID_PARAMS = -32602;
 
 export const STATIC_MCODE_MODELS: ModelCatalog = {
-  default: "MiniMax-M3.1-Flash-Preview-thinking",
+  default: "MiniMax-M3.1-Flash-thinking",
   options: [
     {
-      id: "MiniMax-M3.1-Flash-Preview-thinking",
+      id: "MiniMax-M3.1-Flash-thinking",
       label: "MiniMax M3.1 Flash · thinking (512K)",
       contextWindow: 524_288,
       effortLevels: [...MCODE_M31_EFFORT_LEVELS],
       defaultEffort: "max",
     },
     {
-      id: "MiniMax-M3.1-Flash-Preview-thinking-1M",
+      id: "MiniMax-M3.1-Flash-thinking-1M",
       label: "MiniMax M3.1 Flash · thinking (1M)",
       contextWindow: 1_000_000,
       effortLevels: [...MCODE_M31_EFFORT_LEVELS],
@@ -59,15 +59,15 @@ export const STATIC_MCODE_MODELS: ModelCatalog = {
 };
 
 /** Comparison key for an mcode model id.  MiniMax Code renamed the M3.1 flash
- *  model from `MiniMax-M3.1-Flash-Preview` to `MiniMax-M3.1-Flash` (the session
- *  now advertises `m:minimax:MiniMax-M3.1-Flash:v:thinking`), while older CLIs
- *  still advertise the Preview id.  The picker ids stay as shipped, because
- *  saved bot selections carry them, so both spellings must compare equal. */
+ *  model, dropping the `-Preview` suffix, so a current session advertises
+ *  `m:minimax:MiniMax-M3.1-Flash:v:thinking` while an older CLI still
+ *  advertises the suffix.  Both spellings have to compare equal, or a CLI
+ *  that has not caught up with the rename becomes unselectable. */
 export function mcodeModelKey(id: string): string {
   return id.trim().toLowerCase().replace(/-flash-preview(?=-|$)/, "-flash");
 }
 
-/** The shipped catalog id an id names, ignoring the Preview rename, or null. */
+/** The shipped catalog id an id names, ignoring the rename, or null. */
 function catalogIdFor(id: string): string | null {
   const key = mcodeModelKey(id);
   return STATIC_MCODE_MODELS.options.find((option) => mcodeModelKey(option.id) === key)?.id ?? null;
@@ -146,7 +146,7 @@ function parseMcodeSettings(raw: string): McodeSettings {
  *  verified: a row is only selectable if the running session advertises a
  *  matching value, and an id the session does not advertise fails the turn
  *  with an opaque "does not offer".  mcode 0.5.5 is the concrete proof — it
- *  advertises `m:minimax:MiniMax-M3.1-Flash-Preview:v:` for the flash preview
+ *  advertises `m:minimax:MiniMax-M3.1-Flash:v:` for the no-variant flash row
  *  and then fails that exact selection on a real turn, while the same
  *  model's `v:thinking` sibling answers.  So the shipped rows are the
  *  advertised set, and discovery only moves the default onto whichever
@@ -173,8 +173,8 @@ export function readMcodeModelCatalog(
       const variant = settings.defaultModelVariant;
       const folded =
         typeof variant === "string" && variant.trim() ? `${configured}-${variant.trim()}` : configured;
-      // Matched through catalogIdFor so the renamed `MiniMax-M3.1-Flash`
-      // still lands on the shipped (Preview-spelled) row.
+      // Matched through catalogIdFor so a configured default that names the
+      // renamed id still lands on the shipped row.
       const wide = contextWindow && contextWindow >= 1_000_000 ? catalogIdFor(`${folded}-1M`) : null;
       // Only a default that is actually on offer is adopted; one that is not
       // would send every turn to a row the picker never showed.
@@ -389,8 +389,8 @@ export function mcodePickerId(selection: { modelId: string; variant?: string }):
 }
 
 /** The picker id for an advertised wire value: the shipped catalog id when one
- *  matches (so a renamed `MiniMax-M3.1-Flash` reports as the saved
- *  Preview-spelled row), otherwise the folded advertised id. */
+ *  matches (so an advertised id that still carries the retired suffix reports
+ *  as the shipped row), otherwise the folded advertised id. */
 export function mcodeModelForValue(value: string): string | null {
   const decoded = parseMcodeModelValue(value);
   return decoded ? mcodeCatalogPickerId(decoded) : null;
@@ -415,8 +415,8 @@ export function mcodeModelOptionValue(model: string, advertised: unknown): strin
   ) as { options?: Array<{ value?: unknown; name?: unknown }> } | undefined;
   if (!modelOption) return null;
   const available = Array.isArray(modelOption.options) ? modelOption.options : [];
-  // mcodeModelKey makes a saved `...-Flash-Preview-...` id match a CLI that
-  // now advertises the renamed `MiniMax-M3.1-Flash`, and vice versa.
+  // mcodeModelKey makes a picker id that still carries the retired suffix
+  // match a CLI that advertises the renamed id, and vice versa.
   const wanted = mcodeModelKey(model.trim().replace(/-1m$/i, ""));
   for (const option of available) {
     const decoded = parseMcodeModelValue(option?.value);

@@ -161,7 +161,7 @@ jobs:
     name: package + smoke (Ubuntu 24.04 x64)
     needs: changes
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 25
     steps:
       - name: Documentation-only fast path
