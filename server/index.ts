@@ -12035,21 +12035,40 @@ function runtimeWorkCounts(ownAdmissionActive = false, allowCredentialQueues = f
   };
 }
 
-/** The label for each kind of in-flight work.
- *
- *  A named contract rather than a bare `Record<string, string>`: the lint
- *  ratchet treats an open dictionary annotation as throwing away known type
- *  evidence, and a named owner keeps the index signature while saying what
- *  the map holds. */
-interface BlockingWorkLabels {
-  readonly [kind: string]: string;
-}
-
 /** What to call each kind of in-flight work, for a refusal the owner can act on.
  *
  *  These are the words a person would use, not the counters' names.  The
  *  counters exist to be summed; the names exist so a refusal says "1 routine
- *  run" instead of "1 routineRuns". */
+ *  run" instead of "1 routineRuns".
+ *
+ *  A named contract rather than a bare `Record<string, string>`: the lint
+ *  ratchet treats an open dictionary annotation as throwing away known type
+ *  evidence, and a named owner keeps the index signature while saying what
+ *  the map holds.  Every kind is a member, so a label cannot be dropped or
+ *  misspelled, and `scripts/blocking-work-labels.node-test.mjs` keeps these
+ *  members in step with the counters `runtimeWorkCounts` actually returns. */
+interface BlockingWorkLabels {
+  /** Every kind has a name.  An unknown kind has none, and is reported as such. */
+  readonly [kind: string]: string | undefined;
+  readonly boot: string;
+  readonly admissions: string;
+  readonly turns: string;
+  readonly completions: string;
+  readonly groupOperations: string;
+  readonly queuedSends: string;
+  readonly queuedRooms: string;
+  readonly delegations: string;
+  readonly connectors: string;
+  readonly secrets: string;
+  readonly vps: string;
+  readonly vpsModeChange: string;
+  readonly localVm: string;
+  readonly localVmChanges: string;
+  readonly restores: string;
+  readonly reloads: string;
+  readonly routineRuns: string;
+}
+
 const BLOCKING_WORK_LABELS: BlockingWorkLabels = {
   boot: "server start",
   admissions: "in-flight request",
@@ -12070,6 +12089,15 @@ const BLOCKING_WORK_LABELS: BlockingWorkLabels = {
   routineRuns: "routine run",
 };
 
+/** The words for a kind of work.
+ *
+ *  A kind with no label is a bug in this file, not a kind of work: say so
+ *  plainly rather than showing the owner a raw counter name like
+ *  "groupOperations", which is the machine's word and not theirs. */
+function blockingWorkLabel(kind: string): string {
+  return BLOCKING_WORK_LABELS[kind] ?? `unlabelled work (${kind})`;
+}
+
 /**
  * The work in flight, per kind, named for the owner.
  *
@@ -12083,7 +12111,7 @@ function blockingWorkBreakdown(ownAdmissionActive: boolean): { count: number; la
   const counts = runtimeWorkCounts(ownAdmissionActive);
   return Object.entries(counts)
     .filter(([, count]) => count > 0)
-    .map(([kind, count]) => ({ count, label: BLOCKING_WORK_LABELS[kind] ?? kind }));
+    .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
 }
 
 /** Whether the bot with this id is switched Off (a missing bot is not). */
