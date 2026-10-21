@@ -11,10 +11,31 @@ public struct ControlStatus: Decodable, Equatable {
     public let activeBotCount: Int
     public let localVms: [LocalVM]
     public let persistOnExit: Bool
+    /// The work in flight that would block a stop, per kind.
+    ///
+    /// The server counts ~18 kinds of work before it will stop, but this app
+    /// only knew the bot-turn count, so its confirmation could say "0 bot
+    /// turn(s) are active" and then the server would refuse the stop for
+    /// something else entirely.  The server sends the same breakdown it uses
+    /// for that refusal, so the dialog and the refusal agree.
+    public let blockingWork: [BlockingWork]?
 
     public var runningVMCount: Int { localVms.filter(\.running).count }
     public var sharedVM: LocalVM? { localVms.first { $0.key == "shared" } }
     public var canStartSharedVM: Bool { ["missing", "created"].contains(sharedVM?.state ?? "") }
+
+    /// The blocking work as a sentence, or nil when nothing is in flight.
+    public var blockingWorkSummary: String? {
+        let named = (blockingWork ?? []).filter { $0.count > 0 }
+        guard !named.isEmpty else { return nil }
+        return named.map { "\($0.count) \($0.label)\($0.count == 1 ? "" : "s")" }.joined(separator: ", ")
+    }
+}
+
+/// One kind of work that is in flight and would block a stop.
+public struct BlockingWork: Decodable, Equatable {
+    public let count: Int
+    public let label: String
 }
 
 public enum ControlAPIError: LocalizedError, Equatable {

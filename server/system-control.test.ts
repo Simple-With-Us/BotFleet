@@ -56,6 +56,51 @@ describe("system control", () => {
     expect(fence).not.toHaveBeenCalled();
   });
 
+  // The owner's refusal on Oct 21, 2026 read "2 active operation(s) must
+  // finish before the server can stop" while the Control app's confirmation
+  // right above it said "0 bot turn(s) are active".  A bare total cannot be
+  // acted on, so the refusal names the kinds instead.
+  it("names the work that blocks a stop", () => {
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 2,
+      blockingWork: () => [
+        { count: 1, label: "routine run" },
+        { count: 1, label: "queued message" },
+      ],
+      fence: () => {}, unfence: () => {},
+    })).toThrow(/2 active operation\(s\) must finish before the server can stop: 1 routine run, 1 queued message/);
+  });
+
+  it("pluralizes the blocking kinds", () => {
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 3,
+      blockingWork: () => [{ count: 3, label: "bot turn" }],
+      fence: () => {}, unfence: () => {},
+    })).toThrow(/: 3 bot turns$/);
+  });
+
+  it("keeps the bare count when the kinds are unknown", () => {
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 2,
+      fence: () => {}, unfence: () => {},
+    })).toThrow("2 active operation(s) must finish before the server can stop");
+  });
+
+  it("does not name a kind it has no work for", () => {
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 1,
+      blockingWork: () => [
+        { count: 0, label: "routine run" },
+        { count: 1, label: "bot turn" },
+      ],
+      fence: () => {}, unfence: () => {},
+    })).toThrow(/: 1 bot turn$/);
+  });
+
   it("refuses active work before touching a VM", async () => {
     const f = fixture();
     f.setBusy(true);

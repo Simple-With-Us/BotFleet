@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
@@ -11,9 +11,19 @@ const bundle = path.join(project, "electron/resources/BotFleet Control.app");
 // Keep Swift's architecture-keyed module cache between builds.  Recompiling
 // the entire SDK for tests and each release slice wastes minutes on every run.
 const scratch = path.join(project, "mac-control/.build");
-async function bundleOfflineVmHelper(resources) {
+export async function bundleOfflineVmHelper(resources) {
   mkdirSync(resources, { recursive: true });
   writeFileSync(path.join(resources, "build-identity.json"), JSON.stringify(readSourceBuildIdentity(project, { requireGit: true })) + "\n");
+  // The helper reads the vm-cli manifest at runtime, and it resolves it
+  // against the directory it runs from.  scripts/bundle-server.mjs ships the
+  // same file for the server bundle; without it here the offline Local VM
+  // actions fail with ENOENT on a path that does not exist inside the app.
+  const vmCliManifestDir = path.join(resources, "computer-vm-cli");
+  mkdirSync(vmCliManifestDir, { recursive: true });
+  copyFileSync(
+    path.join(project, "scripts", "computer-vm-cli", "manifest.json"),
+    path.join(vmCliManifestDir, "manifest.json"),
+  );
   await build({
     entryPoints: [path.join(project, "server/local-vm-offline-cli.ts")],
     outfile: path.join(resources, "botfleet-vm-control.mjs"),
@@ -86,4 +96,11 @@ async function buildControlApp() {
   else console.log(`Built ${bundle}`);
 }
 
-await buildControlApp();
+// The build runs when this file is the entry point, and only then: the
+// offline helper bundling is exported so a test can build the same bundle the
+// app ships and check what landed in it.  Both sides go through the real
+// path, because a lane that lives behind a symlink gives the loader the
+// resolved module URL and the command line the unresolved one.
+const isEntryPoint = process.argv[1] !== undefined && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isEntryPoint) await buildControlApp();

@@ -12035,6 +12035,85 @@ function runtimeWorkCounts(ownAdmissionActive = false, allowCredentialQueues = f
   };
 }
 
+/** What to call each kind of in-flight work, for a refusal the owner can act on.
+ *
+ *  These are the words a person would use, not the counters' names.  The
+ *  counters exist to be summed; the names exist so a refusal says "1 routine
+ *  run" instead of "1 routineRuns".
+ *
+ *  A named contract rather than a bare `Record<string, string>`: the lint
+ *  ratchet treats an open dictionary annotation as throwing away known type
+ *  evidence, and a named owner keeps the index signature while saying what
+ *  the map holds.  Every kind is a member, so a label cannot be dropped or
+ *  misspelled, and `scripts/blocking-work-labels.node-test.mjs` keeps these
+ *  members in step with the counters `runtimeWorkCounts` actually returns. */
+interface BlockingWorkLabels {
+  /** Every kind has a name.  An unknown kind has none, and is reported as such. */
+  readonly [kind: string]: string | undefined;
+  readonly boot: string;
+  readonly admissions: string;
+  readonly turns: string;
+  readonly completions: string;
+  readonly groupOperations: string;
+  readonly queuedSends: string;
+  readonly queuedRooms: string;
+  readonly delegations: string;
+  readonly connectors: string;
+  readonly secrets: string;
+  readonly vps: string;
+  readonly vpsModeChange: string;
+  readonly localVm: string;
+  readonly localVmChanges: string;
+  readonly restores: string;
+  readonly reloads: string;
+  readonly routineRuns: string;
+}
+
+const BLOCKING_WORK_LABELS: BlockingWorkLabels = {
+  boot: "server start",
+  admissions: "in-flight request",
+  turns: "bot turn",
+  completions: "completion",
+  groupOperations: "room turn",
+  queuedSends: "queued message",
+  queuedRooms: "queued room message",
+  delegations: "delegated task",
+  connectors: "connector resume",
+  secrets: "secret resume",
+  vps: "VPS thread",
+  vpsModeChange: "VPS mode change",
+  localVm: "Local VM task",
+  localVmChanges: "Local VM change",
+  restores: "file restore",
+  reloads: "provider reload",
+  routineRuns: "routine run",
+};
+
+/** The words for a kind of work.
+ *
+ *  A kind with no label is a bug in this file, not a kind of work: say so
+ *  plainly rather than showing the owner a raw counter name like
+ *  "groupOperations", which is the machine's word and not theirs. */
+function blockingWorkLabel(kind: string): string {
+  return BLOCKING_WORK_LABELS[kind] ?? `unlabelled work (${kind})`;
+}
+
+/**
+ * The work in flight, per kind, named for the owner.
+ *
+ * The refusal used to carry a bare total, which is a sum over all of these.
+ * A total cannot be acted on: the Control app's own confirmation counts only
+ * bot turns, so the owner could be told "0 bot turn(s) are active" and then
+ * "2 active operation(s) must finish before the server can stop" with nothing
+ * in between to explain the contradiction.  Naming the kinds closes that gap.
+ */
+function blockingWorkBreakdown(ownAdmissionActive: boolean): { count: number; label: string }[] {
+  const counts = runtimeWorkCounts(ownAdmissionActive);
+  return Object.entries(counts)
+    .filter(([, count]) => count > 0)
+    .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
+}
+
 /** Whether the bot with this id is switched Off (a missing bot is not). */
 function botIsOffId(botId: string): boolean {
   return botIsOff(store.bot(botId));
@@ -14855,6 +14934,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             activeBotCount: store.bots.filter((bot) => bot.busy).length,
             localVms: await control.list(),
             persistOnExit: cfg.server?.persistOnExit !== false,
+            // What would block a stop right now, per kind.  The Control app's
+            // confirmation says "N bot turn(s) are active", which counts only
+            // one of these kinds, so without this the dialog could promise a
+            // clean stop that the server then refuses for some other reason.
+            blockingWork: blockingWorkBreakdown(ownAdmissionActive),
           });
         }
         if (method === "POST" && path === "/api/system/control/vms/stop") {
@@ -14877,6 +14961,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           const reservation = reserveSystemShutdown({
             guard: () => control.guard(),
             activeWorkCount: () => currentRuntimeReadiness(ownAdmissionActive).activeWorkCount ?? 1,
+            blockingWork: () => blockingWorkBreakdown(ownAdmissionActive),
             fence: () => {
               reserveControl();
               cancelFenceLease();
