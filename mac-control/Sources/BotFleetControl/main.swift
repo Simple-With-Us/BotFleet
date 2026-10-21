@@ -9,6 +9,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let persistence = PersistencePolicy()
     private let offlineDocker = OfflineDockerVM()
     private let offlineVMHelper = OfflineVMHelper()
+    private let mcpServer = McpServerControl()
     private var item: NSStatusItem?
     private let menu = NSMenu()
     private var status: ControlStatus?
@@ -18,6 +19,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var offlineVMs: OfflineDockerState = .unavailable
     private var helperVMs: [LocalVM]?
     private var vmProblem: String?
+    private var mcpServerState: WheelhouseState = .unknown
     private var isLoading = false
     private var isBusy = false
     private var problem: String?
@@ -95,8 +97,51 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 } else { offlineVMs = .unavailable; helperVMs = nil; vmProblem = nil }
                 problem = apiUnavailable && installedServerState == .stopped ? nil : error.localizedDescription
             }
+            await reconcileWheelhouse()
             isLoading = false
             rebuildMenu()
+        }
+    }
+
+    /// What the Control app knows about the BotFleet Server itself.
+    private func serverState() -> Wheelhouse.ServerState {
+        Wheelhouse.serverState(statusAvailable: status != nil,
+                                apiUnavailable: apiUnavailable,
+                                installedServerState: installedServerState)
+    }
+
+    /// Brings the wheelhouse in line with what is wanted.
+    ///
+    /// The wanted state is derived from the BotFleet Server's own state, so
+    /// there is nothing to store and nothing to toggle.  The BotFleet MCP
+    /// server is wanted exactly while the server is running.
+    private func reconcileWheelhouse() async {
+        mcpServerState = await mcpServer.state()
+        let wheelhouse = Wheelhouse(serverState: serverState(), mcpServerState: mcpServerState)
+        for entry in wheelhouse.entries {
+            switch Wheelhouse.action(for: entry) {
+            case .start:
+                do { mcpServerState = try await mcpServer.setRunning(true) }
+                catch { problem = "BotFleet MCP Server: \(error.localizedDescription)" }
+            case .stop:
+                do { mcpServerState = try await mcpServer.setRunning(false) }
+                catch { problem = "BotFleet MCP Server: \(error.localizedDescription)" }
+            case .none:
+                break
+            }
+        }
+    }
+
+    /// Re-reads the server's own state after an action, and waits for that
+    /// state to settle, so the wheelhouse is reconciled against what is true
+    /// now rather than against what was true before the action.
+    private func refreshInstalledServerState(until settled: [InstalledServerState],
+                                             attempts: Int = 40) async {
+        for _ in 0..<attempts {
+            let state = await Task.detached(priority: .userInitiated) { self.startup.installedServerState }.value
+            installedServerState = state
+            if settled.contains(state) { return }
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
     }
 
@@ -136,6 +181,13 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let vmProblem { add("Local VM: \(vmProblem)") }
         if status?.sharedVM?.state == "stopped" { add("Local VM requires recreation in BotFleet") }
         if !startup.supportsPolicy { add("Update BotFleet to manage server startup") }
+        let wheelhouse = Wheelhouse(serverState: serverState(),
+                                    mcpServerState: mcpServerState)
+        if !wheelhouse.entries.isEmpty {
+            menu.addItem(.separator())
+            add("Wheelhouse:")
+            for entry in wheelhouse.entries { add("  \(entry.title): \(entry.summary)") }
+        }
         menu.addItem(.separator())
         add("Start Server", selector: #selector(startServer), enabled: ready && startup.supportsPolicy && apiUnavailable && installedServerState == .stopped)
         add("Stop Server And Local VMs…", selector: #selector(stopServer), enabled: ready && status != nil)
@@ -169,7 +221,9 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("Quit Control", selector: #selector(quitControl), enabled: !isBusy)
     }
 
-    private func run(refresh: Bool = true, _ action: @escaping () async throws -> Void) {
+    private func run(refresh: Bool = true,
+                     settlesWhen settled: [InstalledServerState] = [.running, .stopped, .notInstalled],
+                     _ action: @escaping () async throws -> Void) {
         guard !isBusy && !isLoading else { return }
         isBusy = true
         problem = nil
@@ -180,11 +234,12 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if !refresh {
                     status = nil
                     persistOnExit = nil
-                    installedServerState = .unknown
-                    apiUnavailable = false
+                    apiUnavailable = true
                     helperVMs = nil
                     offlineVMs = .unavailable
                 }
+                await refreshInstalledServerState(until: settled)
+                await reconcileWheelhouse()
             }
             catch { problem = error.localizedDescription; showError(error.localizedDescription) }
             isBusy = false
@@ -212,7 +267,11 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func startServer() {
-        run { [self] in try await Task.detached(priority: .userInitiated) { try self.startup.startServer() }.value }
+        // The server is wanted running, so wait for its process to appear
+        // before the wheelhouse decides what the MCP server should be doing.
+        run(settlesWhen: [.running, .notInstalled]) { [self] in
+            try await Task.detached(priority: .userInitiated) { try self.startup.startServer() }.value
+        }
     }
 
     @objc private func stopServer() {
@@ -220,7 +279,11 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let count = status.activeBotCount
         let message = "This stops the server and its local VMs.  \(count) bot turn(s) are active; the server will refuse while bots or leases are busy."
         guard confirm("Stop BotFleet Server And Local VMs?", message) else { return }
-        run(refresh: false) { [self] in try await api.stopServer() }
+        // The server is wanted stopped, so wait for its process to go away
+        // before the wheelhouse stops the services that only run with it.
+        run(refresh: false, settlesWhen: [.stopped, .notInstalled]) { [self] in
+            try await api.stopServer()
+        }
     }
 
     @objc private func startVM() { run { [self] in try await api.startVM() } }
