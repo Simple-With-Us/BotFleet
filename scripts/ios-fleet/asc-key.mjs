@@ -221,10 +221,10 @@ export function writePrivateKeyFile(keyPath, value) {
       return { error: `the staged key file ${keyPath} could not be verified` };
     }
     ftruncateSync(fd, 0);
-    writeSync(fd, pem);
-    //  The mode is enforced on the handle, so an existing file keeps no
-    //  permissions of its own.
+    //  The mode is set before the key is written, so the bytes never sit on
+    //  disk under the permissions the file had before.
     fchmodSync(fd, 0o600);
+    writeSync(fd, pem);
     return { pem };
   } catch {
     return { error: `the staged key file ${keyPath} could not be written` };
