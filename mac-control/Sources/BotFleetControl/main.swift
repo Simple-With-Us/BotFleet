@@ -324,8 +324,13 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func stopServer() {
         guard let status else { return }
-        let count = status.activeBotCount
-        let message = "This stops the server and its local VMs.  \(count) bot turn(s) are active; the server will refuse while bots or leases are busy."
+        // Say what will actually block the stop, not just the bot turns.  The
+        // server refuses on any kind of in-flight work, so a dialog that
+        // counts only bot turns could promise a clean stop and then the
+        // server would refuse it for something the owner was never shown.
+        let blocking = status.blockingWorkSummary
+        let message = blocking.map { "This stops the server and its local VMs.  The server will refuse while work is in flight: \($0)." }
+            ?? "This stops the server and its local VMs.  \(status.activeBotCount) bot turn(s) are active; the server will refuse while bots or leases are busy."
         guard confirm("Stop BotFleet Server And Local VMs?", message) else { return }
         // The server is wanted stopped, so wait for its process to go away
         // before the wheelhouse stops the services that only run with it.

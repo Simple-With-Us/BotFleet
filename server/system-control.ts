@@ -23,16 +23,41 @@ export class ControlConflict extends Error {}
 
 export interface ShutdownReservation { release(): void }
 
-/** Reserve shutdown before its first await.  All callbacks are synchronous. */
+/**
+ * What is holding a stop, named the way a person would say it.
+ *
+ * A bare count tells the owner that something is in flight but not what to
+ * do about it: the number is a sum over ~18 kinds of work, and the Control
+ * app's confirmation dialog counts only bot turns.  So a refusal could say
+ * "2 active operation(s) must finish" while the dialog right above it said
+ * "0 bot turn(s) are active", which reads as a contradiction rather than as
+ * an explanation.  Naming the kinds turns the refusal into something the
+ * owner can act on: wait for the routine, stop the bot, or quit it.
+ */
+export interface BlockingWork {
+  /** The count of work of this kind. */
+  count: number;
+  /** What to call it, e.g. "routine run" or "queued message". */
+  label: string;
+}
+
+/**
+ * Reserve shutdown before its first await.  All callbacks are synchronous.
+ *
+ * `blockingWork` is optional and only shapes the refusal message: a caller
+ * that cannot name its kinds still gets a correct, countable refusal.
+ */
 export function reserveSystemShutdown(options: {
   guard(): void;
   activeWorkCount(): number;
+  /** The kinds of work in flight, for a refusal the owner can act on. */
+  blockingWork?(): BlockingWork[];
   fence(): void;
   unfence(): void;
 }): ShutdownReservation {
   options.guard();
   const count = options.activeWorkCount();
-  if (count > 0) throw new ControlConflict(`${count} active operation(s) must finish before the server can stop`);
+  if (count > 0) throw new ControlConflict(shutdownRefusal(count, options.blockingWork?.()));
   options.fence();
   let released = false;
   return { release() {
@@ -40,6 +65,15 @@ export function reserveSystemShutdown(options: {
     released = true;
     options.unfence();
   } };
+}
+
+/** The message the owner sees when a stop is refused. */
+export function shutdownRefusal(count: number, blocking?: BlockingWork[]): string {
+  const head = `${count} active operation(s) must finish before the server can stop`;
+  const named = (blocking ?? []).filter((entry) => entry.count > 0);
+  if (!named.length) return head;
+  const breakdown = named.map((entry) => `${entry.count} ${entry.label}${entry.count === 1 ? "" : "s"}`).join(", ");
+  return `${head}: ${breakdown}`;
 }
 
 export function createSystemControl<T extends ControlTarget>(deps: ControlDeps<T>) {
