@@ -646,9 +646,31 @@ function handle(msg: any, resumed = false) {
       break;
     }
     case "session/prompt": {
-      const parsedPromptSessionId = z.string().safeParse(msg.params?.sessionId);
-      const promptSessionId = parsedPromptSessionId.success ? parsedPromptSessionId.data : null;
-      const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
+      // The whole inbound payload is parsed against one strict, bounded
+      // method schema: a malformed or oversized session/prompt is rejected
+      // with JSON-RPC -32602 before any field reaches downstream code, and
+      // the handler reads the session id and prompt text only from the
+      // validated result — never from the raw message.
+      const promptContentSchema = z
+        .object({ type: z.string().optional(), text: z.string().max(10_000_000) })
+        .catchall(z.unknown());
+      const parsedPromptParams = z
+        .object({
+          sessionId: z.string().min(1).max(256),
+          prompt: z.array(promptContentSchema).max(1_000),
+        })
+        .strict()
+        .safeParse(msg.params);
+      if (!parsedPromptParams.success) {
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32602, message: "Invalid params" },
+        });
+        break;
+      }
+      const promptSessionId = parsedPromptParams.data.sessionId;
+      const promptText = parsedPromptParams.data.prompt[0]?.text ?? "";
       const isSidePrompt =
         process.env.FAKE_ACP_MULTI_SESSION === "1" &&
         promptSessionId !== null &&

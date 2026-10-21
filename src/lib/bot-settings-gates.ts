@@ -27,8 +27,7 @@
 // one that does not honor the setting, gets an explanation and a way out —
 // not a vanished control.
 
-import { z } from "zod";
-import { DEFAULT_MAX_TOOL_ROUNDS, historyTurnsCaption, toolRoundsCaption } from "../../shared/bot-profile";
+import { DEFAULT_MAX_TOOL_ROUNDS, historyTurnsCaption, maxHistoryTurnsSchema, toolRoundsCaption } from "../../shared/bot-profile";
 import {
   DEFAULT_MAX_REVIEWS_PER_TURN,
   effectiveReviewHook,
@@ -196,7 +195,7 @@ export function honorsHistorySummary(engine: InstanceInfo | undefined): boolean 
  *  a saved value outlives the engine that honored it, hidden when there is
  *  nothing to say and nothing to set.  A saved cap of 0 IS a value — it
  *  drops every replayed turn — so only null/undefined reads as unset. */
-const savedMaxHistoryTurnsSchema = z.number();
+const savedMaxHistoryTurnsSchema = maxHistoryTurnsSchema;
 
 export function historySummaryGate(
   instances: InstanceInfo[],

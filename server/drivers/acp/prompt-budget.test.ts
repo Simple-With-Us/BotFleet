@@ -641,6 +641,17 @@ describe("collect dropped text", () => {
     expect(result.dropped.historyTexts?.length).toBe(2);
     expect(result.dropped.historyTexts?.[0]).toBe(t1);
   });
+
+  it("clips a single oversized turn to the remaining source budget", () => {
+    const huge = `User: big\n${"x".repeat(200 * 1024)}`;
+    const user = `${huge}\n\n${TURN_REPLY_CUE}\n\n${current}`;
+    const input = { composed: compose("", user), userText: user, sections: [] };
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: null, maxHistoryTurns: 0, collectDroppedText: true });
+    expect(result.dropped.historyTurns).toBe(1);
+    expect(result.dropped.historyTexts?.length).toBe(1);
+    expect(result.dropped.historyTexts?.[0]?.length).toBeLessThanOrEqual(64 * 1024);
+    expect(result.dropped.historyTexts?.[0]?.length).toBeGreaterThan(0);
+  });
 });
 
 describe("buildExtractiveHistoryNote", () => {
@@ -669,6 +680,14 @@ describe("buildExtractiveHistoryNote", () => {
     const excerpt = note.split("\n")[1]!;
     expect(excerpt.length).toBeLessThanOrEqual(160);
     expect(excerpt.endsWith("…")).toBe(true);
+  });
+
+  it("reports the dropped turns, not the collected texts, past the source cap", () => {
+    // Two of ten dropped turns fit the source cap: the note must still name
+    // all ten omissions, or the model is told the wrong history was lost.
+    const note = buildExtractiveHistoryNote(["User: first", "Assistant: second"], 10);
+    expect(note).toContain("[10 earlier turns omitted to fit the prompt budget.");
+    expect(note).toContain("… and 8 more turns.]");
   });
 });
 

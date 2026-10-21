@@ -18,7 +18,7 @@
 // dropped turns it covers, in place of one omission marker per turn.
 import { z } from "zod";
 
-import { MAX_HISTORY_TURNS } from "../../../shared/bot-profile.ts";
+import { MAX_HISTORY_TURNS, maxHistoryTurnsSchema } from "../../../shared/bot-profile.ts";
 import { contextWindowFor } from "../../model-context-windows.ts";
 
 import {
@@ -89,8 +89,6 @@ export const ACP_SUMMARY_SOURCE_MAX_BYTES = 64 * 1024;
  *  The extractive builder stays under it by construction; a model-written
  *  note is clipped to it before substitution. */
 export const ACP_HISTORY_NOTE_MAX_CHARS = 4096;
-
-const maxHistoryTurnsSchema = z.number().int().min(0).max(MAX_ACP_HISTORY_TURNS);
 
 /** A non-negative integer turn cap, or undefined (ignored) for anything else. */
 export function decodeAcpMaxHistoryTurns(raw: Parameters<typeof maxHistoryTurnsSchema.safeParse>[0]): number | undefined {
@@ -419,9 +417,13 @@ export function applyAcpPromptBudget(input: {
     if (index < 0) return false;
     const piece = nextHistory[index]!;
     const oldBytes = utf8(piece.text);
+    // The cap bounds the SOURCE text a summarizer reads, so it applies to
+    // the piece itself: an oversized dropped turn is clipped to the
+    // remaining room instead of being collected whole.
     if (input.collectDroppedText && collectedBytes < ACP_SUMMARY_SOURCE_MAX_BYTES) {
-      collected.push(piece.text);
-      collectedBytes += oldBytes;
+      const room = ACP_SUMMARY_SOURCE_MAX_BYTES - collectedBytes;
+      collected.push(room >= piece.text.length ? piece.text : piece.text.slice(0, room));
+      collectedBytes += Math.min(room, piece.text.length);
     }
     droppedTurns += 1;
     trimmed = true;
@@ -558,8 +560,13 @@ function clipLine(text: string, max: number): string {
 /** The extractive default note: one clipped line per dropped turn where the
  *  omission markers stood, so the slot still says what left.  No model call
  *  and no latency — and the fallback when a model-written summary fails.
- *  Stays under ACP_HISTORY_NOTE_MAX_CHARS by construction. */
-export function buildExtractiveHistoryNote(droppedTexts: readonly string[]): string {
+ *  Stays under ACP_HISTORY_NOTE_MAX_CHARS by construction.
+ *
+ *  `droppedTurns` is the turns the budget actually dropped.  The collected
+ *  texts stop at the source cap, so without it the note under-reports the
+ *  omission whenever more than ACP_SUMMARY_SOURCE_MAX_BYTES of replay was
+ *  trimmed; the texts array alone cannot tell those cases apart. */
+export function buildExtractiveHistoryNote(droppedTexts: readonly string[], droppedTurns?: number): string {
   const excerpts: string[] = [];
   let represented = 0;
   for (const text of droppedTexts) {
@@ -570,7 +577,7 @@ export function buildExtractiveHistoryNote(droppedTexts: readonly string[]): str
       represented += 1;
     }
   }
-  const turns = droppedTexts.length;
+  const turns = droppedTurns ?? droppedTexts.length;
   const more = turns - represented;
   const header = `[${turns} earlier ${turns === 1 ? "turn" : "turns"} omitted to fit the prompt budget.`;
   const body = excerpts.length > 0 ? `\n${excerpts.join("\n")}` : "";

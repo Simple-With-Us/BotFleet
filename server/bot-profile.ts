@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { botAvatarCropSchema, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
-import { BOT_PROFILE_LIMITS, MAX_HISTORY_TURNS, MAX_TOOL_ROUNDS } from "../shared/bot-profile.ts";
+import { BOT_PROFILE_LIMITS, MAX_TOOL_ROUNDS, maxHistoryTurnsSchema } from "../shared/bot-profile.ts";
 import { mergeBotVoices, type BotVoices } from "../shared/bot-voice.ts";
 import {
   CONNECTOR_SLUGS_MAX,
@@ -111,13 +111,11 @@ export function resolveMaxToolRounds(
   return parsed.success ? parsed.data : undefined;
 }
 
-const maxHistoryTurnsValueSchema = z.number().int().min(0).max(MAX_HISTORY_TURNS);
-
 /** Integer 0..MAX_HISTORY_TURNS, else absent. Empty/null/invalid all mean unset. */
 export function resolveMaxHistoryTurns(
   value: string | number | boolean | null | undefined,
 ): number | undefined {
-  const parsed = maxHistoryTurnsValueSchema.safeParse(value);
+  const parsed = maxHistoryTurnsSchema.safeParse(value);
   return parsed.success ? parsed.data : undefined;
 }
 
@@ -178,7 +176,10 @@ const profilePatchSchema = z.object({
   // Integer 1..MAX_TOOL_ROUNDS kept; null/"" /invalid → undefined (absent).
   maxToolRounds: z.any().optional(),
   // Integer 0..MAX_HISTORY_TURNS kept; null/"" /invalid → undefined (absent).
-  maxHistoryTurns: z.any().optional(),
+  // Arrays, objects and oversized strings never reach the resolver:  they
+  // fail the patch schema itself and take the API's validation-failure 4xx
+  // path instead of being accepted and silently clearing the setting.
+  maxHistoryTurns: z.union([z.string().max(64), z.number(), z.boolean(), z.null()]).optional(),
   historySummaryModel: z.boolean({ error: "historySummaryModel must be true or false" }).optional(),
 });
 

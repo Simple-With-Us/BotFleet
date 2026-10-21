@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import { ensureDirs } from "../../config.ts";
-import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
+import type { ModelCatalog, ProviderInstance, RuntimeEvent } from "../../contracts.ts";
 import type { ContextInjectionRef } from "../../../shared/context-injection.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { buildTurnContext } from "../../turn-context.ts";
@@ -37,6 +37,17 @@ import { McodeAgentDriver } from "./mcode.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
+
+/** One side-session prompt the fake CLI recorded: the session it went to and
+ *  the summarizer text it carried.  Strict, so a malformed dump line fails
+ *  the suite instead of bypassing the assertions that read it. */
+export const SidePromptSchema = z
+  .object({
+    sessionId: z.string().min(1).max(256),
+    text: z.string(),
+  })
+  .strict();
+export type SidePrompt = z.infer<typeof SidePromptSchema>;
 
 /** A harness that exists only in tests: it exercises the opt-in session-config
  *  model hook so PR 1 can prove the core capability without shipping a visible
@@ -600,22 +611,30 @@ describe("ACP turns (fake CLI)", () => {
   ];
   const replayText = (current: string, transcript: Array<{ role: "user" | "assistant"; text: string }> = SUMMARY_TRANSCRIPT) =>
     buildTurnContext({ text: current, transcript, rewound: false, fresh: true, replaysNatively: false }).turnText;
-  // SAFETY: recorder events are untyped; the lane's own compression emitter
-  // wrote the source and preview fields this suite reads.
+  // SAFETY: recorder events are typed RuntimeEvents;  the predicate narrows
+  // to compression injections so itemId/preview/io stay checked.
   const compressionRows = () =>
-    recorder.events.filter((e) => e.type === "context.injected" && (e as any).source === "compression") as any[];
-  // SAFETY: recorder events are untyped; the fake CLI emitted these fields.
+    recorder.events.filter(
+      (e): e is Extract<RuntimeEvent, { type: "context.injected" }> =>
+        e.type === "context.injected" && "source" in e && e.source === "compression",
+    );
+  // SAFETY: same narrowing for transcript text the fake CLI echoed back.
   const echoedPrompts = () =>
     recorder.events
-      .filter((e) => e.type === "item.completed" && (e as any).itemType === "assistant_text")
-      .map((e) => String((e as any).text));
+      .filter(
+        (e): e is Extract<RuntimeEvent, { type: "item.completed"; itemType: "assistant_text" }> =>
+          e.type === "item.completed" && "itemType" in e && e.itemType === "assistant_text",
+      )
+      .map((e) => e.text);
   // SAFETY: the side dump is written by the fake CLI in this suite, one
-  // { sessionId, text } JSON object per line.
-  const readSidePrompts = (path: string) =>
+  // { sessionId, text } JSON object per line — each line is parsed against
+  // the strict contract below, so a malformed record fails the test instead
+  // of slipping through an assertion.
+  const readSidePrompts = (path: string): SidePrompt[] =>
     readFileSync(path, "utf8")
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { sessionId: string; text: string });
+      .map((line) => SidePromptSchema.parse(JSON.parse(line)));
 
   it("runs the model-written summary behind a pending row that resolves in place", async () => {
     const gate = join(scratch, "summary-gate");
@@ -635,16 +654,22 @@ describe("ACP turns (fake CLI)", () => {
       onContextCompressed: (ref) => void compressed.push(ref),
     });
     // The gate holds the side session's prompt open: while the model is
-    // still writing, the row must already be up, pending.
-    // SAFETY: recorder events are untyped; the pending row is the
-    // compression injection this suite just triggered.
-    const pending = (await recorder.until(
-      (e) => {
-        // SAFETY: the compression emitter wrote preview; decode before reading.
-        const preview = z.string().safeParse((e as any).preview);
-        return e.type === "context.injected" && preview.success && preview.data.includes("summarizing 4 earlier turns");
-      },
-    )) as any;
+    // still writing, the row must already be up, pending.  The whole event
+    // is parsed against the compression-row contract;  preview and io come
+    // only from the validated result, never from a cast.
+    const pendingRowSchema = z
+      .object({
+        type: z.literal("context.injected"),
+        preview: z.string(),
+        io: z.object({ text: z.object({ text: z.string() }).optional() }).optional(),
+      })
+      .catchall(z.unknown());
+    const pending = pendingRowSchema.parse(
+      await recorder.until((e) => {
+        const parsed = pendingRowSchema.safeParse(e);
+        return parsed.success && parsed.data.preview.includes("summarizing 4 earlier turns");
+      }),
+    );
     expect(pending.io?.text?.text).toContain("The model is writing a summary");
     expect(echoedPrompts()).toHaveLength(0);
     writeFileSync(gate, "go");
@@ -751,8 +776,11 @@ describe("ACP turns (fake CLI)", () => {
       maxHistoryTurns: 2,
       system: "SYS-PERSONA",
     });
-    // SAFETY: recorder events are untyped; turn.completed carries ok.
-    const done = await recorder.until((e) => e.type === "turn.completed" && (e as any).ok === true, 30_000);
+    // SAFETY: turn.completed carries ok on the contract;  narrow to it.
+    const done = await recorder.until(
+      (e): e is Extract<RuntimeEvent, { type: "turn.completed" }> => e.type === "turn.completed" && "ok" in e && e.ok === true,
+      30_000,
+    );
     expect(done).toMatchObject({ ok: true });
     expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);
     // Pending, the crashed attempt's extractive final, then the relaunch's
@@ -764,6 +792,35 @@ describe("ACP turns (fake CLI)", () => {
     expect(rows[1].io?.text?.text).toContain("one excerpt line each");
     expect(rows[2].io?.text?.text).toContain("a summary the model wrote");
     expect(echoedPrompts().at(-1)).toContain("BRIEF-AFTER-RETRY");
+  }, 40_000);
+
+  it("does not re-announce an identical extractive row when a relaunch re-derives it", async () => {
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_FAIL = "new";
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_FAIL_AT_PROMPT = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-dedupe-state");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "echo-gated");
+    await instance.adapter.sendTurn({
+      threadId: "t-summary-dedupe",
+      text: replayText("what are my pets called?"),
+      historySummaryModel: true,
+      maxHistoryTurns: 2,
+      system: "SYS-PERSONA",
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId !== undefined);
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);
+    // Pending, then one extractive final: the relaunch derives the same
+    // deterministic note and must not publish the row a second time.  The
+    // stable itemId would make a real update an in-place replace;  an
+    // identical reading is not an update.
+    const rows = compressionRows();
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.itemId)).size).toBe(1);
+    expect(rows[0].preview).toContain("summarizing 4 earlier turns");
+    expect(rows[1].preview).toContain("4 earlier turns, 4 summarized");
+    expect(rows[1].io?.text?.text).toContain("one excerpt line each");
   }, 40_000);
 
   it("fails closed when a saved ACP session cannot be resumed", async () => {

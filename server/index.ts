@@ -152,7 +152,7 @@ import { ThreadWedgeGuard, type ThreadWedgeFailureInput } from "./thread-wedge-g
 import { effectiveFallbackTiers } from "./model-fallback.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
-import { effectiveToolRounds, toolBudgetPrompt, type DispatchHold } from "../shared/bot-profile.ts";
+import { effectiveToolRounds, toolBudgetPrompt, type DispatchHold, type MaxHistoryTurns, maxHistoryTurnsSchema } from "../shared/bot-profile.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
 import {
   activeTurnWorktreeLeases,
@@ -7682,11 +7682,11 @@ async function startTurn(
       // Only a driver that budgets the prompt (ACP) honours them; the
       // rest ignore what they do not know.
       interface HistoryTurnSettings {
-        maxHistoryTurns?: number;
+        maxHistoryTurns?: MaxHistoryTurns;
         historySummaryModel?: true;
       }
       const historySettings: HistoryTurnSettings = {};
-      const savedMaxHistoryTurns = z.number().safeParse(bot.maxHistoryTurns);
+      const savedMaxHistoryTurns = maxHistoryTurnsSchema.safeParse(bot.maxHistoryTurns);
       if (savedMaxHistoryTurns.success) historySettings.maxHistoryTurns = savedMaxHistoryTurns.data;
       if (bot.historySummaryModel === true) historySettings.historySummaryModel = true;
       const turnInput = {
@@ -10079,11 +10079,11 @@ async function runGroupMemberTurn(
       // Same per-bot history settings as the 1:1 lane; only a driver
       // that budgets the prompt (ACP) honours them.
       interface HistoryTurnSettings {
-        maxHistoryTurns?: number;
+        maxHistoryTurns?: MaxHistoryTurns;
         historySummaryModel?: true;
       }
       const roomHistorySettings: HistoryTurnSettings = {};
-      const roomMaxHistoryTurns = z.number().safeParse(bot.maxHistoryTurns);
+      const roomMaxHistoryTurns = maxHistoryTurnsSchema.safeParse(bot.maxHistoryTurns);
       if (roomMaxHistoryTurns.success) roomHistorySettings.maxHistoryTurns = roomMaxHistoryTurns.data;
       if (bot.historySummaryModel === true) roomHistorySettings.historySummaryModel = true;
       return instance.adapter.sendTurn({

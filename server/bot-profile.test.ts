@@ -303,13 +303,22 @@ describe("parseBotProfilePatch (maxHistoryTurns and historySummaryModel)", () =>
   });
 
   it("treats null, empty string, and invalid values as absent (clear)", () => {
-    for (const bad of [null, "", -1, 501, 1.5, "25", true, {}, []]) {
+    for (const bad of [null, "", -1, 501, 1.5, "25", true]) {
       // SAFETY: the test feeds deliberately invalid values to prove they are
       // cleared; the patch input type excludes them, hence the cast.
       expect(parseBotProfilePatch({ maxHistoryTurns: bad } as never, true), String(bad)).toEqual({
         ok: true,
         patch: { maxHistoryTurns: undefined },
       });
+    }
+  });
+
+  it("rejects arrays, objects, and oversized strings on the 4xx path", () => {
+    for (const bad of [{}, [], ["1"], "x".repeat(100)]) {
+      // SAFETY: shape-malformed values must fail validation itself (so the
+      // route answers 4xx) instead of being accepted and silently clearing
+      // the setting.
+      expect(parseBotProfilePatch({ maxHistoryTurns: bad } as never, true).ok, String(bad)).toBe(false);
     }
   });
 

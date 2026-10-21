@@ -1,6 +1,7 @@
 import { AlertTriangle, Bug, ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
 import { useState } from "react";
 import { api, useStore, type Bot } from "@/state/store";
+import type { BotUpdatePatch } from "@/state/bot-patch-queue";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { BotFallbackModels } from "./BotFallbackModels";
@@ -379,39 +380,16 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
     return null;
   };
   const patch = (
-    p: Partial<
-      Pick<
-        Bot,
-        | "name"
-        | "title"
-        | "description"
-        | "notifications"
-        | "computers"
-        | "cloudBackend"
-        | "autoStartVps"
-        | "color"
-        | "mascotExpression"
-        | "avatarUrl"
-        | "avatarCrop"
-        | "autoApprove"
-        | "autoReview"
-        | "bypassPermissions"
-        | "bypassLocalComputer"
-        | "speakReplies"
-        | "speechDevices"
-        | "voice"
-        | "voiceSummaryMode"
-        | "chiefOfStaff"
-        | "approvePeerComms"
-        | "alwaysAllow"
-        | "composio"
-        | "modelSelection"
-        | "maxToolRounds"
-        | "maxHistoryTurns"
-        | "historySummaryModel"
-        | "off"
-      >
-    > & { acknowledgeLocalAuto?: boolean; connectorTools?: Bot["connectorTools"] },
+    p: Partial<BotUpdatePatch> & {
+      // Panel-only fields the broad PATCH boundary (BotUpdatePatch) does not
+      // carry:  everything else derives from the canonical queue type, so a
+      // future whitelist on the queue cannot silently drop a setting the
+      // panel shows as saved.
+      autoReview?: Bot["autoReview"];
+      bypassLocalComputer?: Bot["bypassLocalComputer"];
+      alwaysAllow?: Bot["alwaysAllow"];
+      connectorTools?: Bot["connectorTools"];
+    },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
   const alwaysAllow = bot.alwaysAllow ?? [];
   const activeState = stateForBot(bot);
