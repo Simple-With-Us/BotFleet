@@ -787,7 +787,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       headline: "Meta's coding CLI, over a 1M-token window with no long-context premium.",
       prose: [
         "Muse Code runs inside BotFleet through Meta's Muse Spark models.  Files, terminal, this computer, computer use, image attachments, and long context are available.",
-        "The model a turn actually uses is your account's startup model, which the engine does not control yet; the matrix names Muse Spark 1.2 because that is the one this driver can point at.",
+        "The model a turn actually uses is your account's startup model, which the engine does not control yet; the matrix names Muse Spark 1.2 because that is the one this driver can point at.  Fleet accounts report muse-spark-1.3-contributor as that startup model.  Meta's docs verify the Contributor tier takes reasoning effort minimal, low, medium, high, and xhigh — never none, and not max, which is Standard-tier only (https://dev.meta.ai/docs/models, https://dev.meta.ai/docs/reasoning).  This driver exposes low through xhigh:  minimal is a docs-verified rung this build does not expose yet, because the shared effort union has no member for it.",
         "Connected apps, cross-bot coordination, and rooms are available through the adapter.  Web access, live research, and voice chat are not available on this engine.",
         "Voice chat is not available on this engine.  BotFleet drives Muse Code through a community ACP adapter, because Muse Code speaks its own session protocol rather than ACP.",
         "Signing in needs an API key:  a browser session stored in the Mac keychain is not readable by the adapter, so a keychain-only account cannot run a turn.",
@@ -808,7 +808,22 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     displayName: "Kimi",
     capabilityBadgeColor: "bg-slate-700 text-white",
     group: "Cloud",
-    pricing: { kind: "unknown", notes: "Pricing for this engine is not recorded in this build." },
+    pricing: {
+      kind: "subscription",
+      subscription: {
+        // Every current international plan includes Kimi Code; Plus is the
+        // cheapest way in.  Rolling 5-hour Kimi Code limit on a monthly
+        // shared credit pool.  Source:
+        // https://www.kimi.ai/help/membership/membership-pricing (fetched
+        // 2026-10-21; their page capture is dated 2026-10-19).
+        tierLabel: "Kimi Plus",
+        costPerMonth: 19,
+        includedQuota: "Kimi Code on every plan; rolling 5-hour limit, monthly shared credit pool",
+        notes:
+          "Plans run from Plus at $19/month up to Ultra at $199/month, all with Kimi Code access, with a discount for annual billing.  Source:  https://www.kimi.ai/help/membership/membership-pricing",
+      },
+      notes: "Subscription is the pricing mode.",
+    },
     capabilities: {
       files: "yes",
       terminal: "yes",
@@ -832,7 +847,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       prose: [
         "BotFleet drives the Kimi CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "Voice chat and live research are not available on this engine.",
-        "Pricing for this engine is not recorded in this build.",
+        "Kimi Code comes with every current membership plan, from Plus at $19 a month up.",
       ],
     },
     defaultModels: [
@@ -848,7 +863,19 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     displayName: "Droid",
     capabilityBadgeColor: "bg-stone-800 text-white",
     group: "Cloud",
-    pricing: { kind: "unknown", notes: "Pricing for this engine is not recorded in this build." },
+    pricing: {
+      kind: "subscription",
+      subscription: {
+        // Pro is the cheapest individual plan.  Source:
+        // https://factory.com/pricing (fetched 2026-10-21).
+        tierLabel: "Factory Pro",
+        costPerMonth: 20,
+        includedQuota: "Pro $20, Plus $100 (~5x Pro), Max $200 (~10x Pro) per month",
+        notes:
+          "Individual plans:  Pro $20/month, Plus $100/month at about five times Pro's usage, Max $200/month at about ten.  Teams is $60/month plus $40 per seat.  Source:  https://factory.com/pricing",
+      },
+      notes: "Subscription is the pricing mode.",
+    },
     capabilities: {
       files: "yes",
       terminal: "yes",
@@ -890,7 +917,11 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     displayName: "OpenCode",
     capabilityBadgeColor: "bg-teal-600 text-white",
     group: "Cloud",
-    pricing: { kind: "unknown", notes: "Pricing for this engine is not recorded in this build." },
+    pricing: {
+      kind: "unknown",
+      notes:
+        "The CLI is free and open-source.  Models run on the account's own provider keys at the provider's rates, or on OpenCode Zen pay-as-you-go sold at cost per 1M tokens (https://opencode.ai/docs/zen/, fetched 2026-10-21).  Rates live with the provider, so no single figure is claimed here.",
+    },
     capabilities: {
       files: "yes",
       terminal: "yes",
@@ -914,7 +945,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       prose: [
         "BotFleet drives the OpenCode CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "Voice chat and live research are not available on this engine.",
-        "Pricing for this engine is not recorded in this build.",
+        "The CLI itself is free and open-source.  Models run on the account's own provider keys at the provider's rates, or on OpenCode Zen pay-as-you-go sold at cost per 1M tokens (https://opencode.ai/docs/zen/, fetched 2026-10-21).",
       ],
     },
     // No hardcoded id: the free catalog rotates and the previous entry
@@ -1074,7 +1105,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       thisComputer: "no",
       connectedApps: "no",
       crossBotCoordination: "no",
-      computerUse: "no",
+      computerUse: "yes",
       imageAttachments: "no",
       roomCoordination: "no",
       webAccess: "yes",
@@ -1084,13 +1115,13 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     },
     capabilityNotes: {
       computerUse:
-        "Worth an audit:  this engine runs on a remote sandbox, yet its driver declares no screen channel at all.  A box you cannot see is a strange default, and it is the one cell on this row most likely to be wrong.",
+        "Audited:  the bot has the box's full desktop — Chrome, shell, and disk — driven through the Box substrate's own native facility.  BotFleet shows that screen live through a screenshot poll rather than its own screen channel, so the standard approval cards do not wrap what the bot does there.",
     },
     whyThisEngine: {
       headline: "A remote sandbox reached over its own API.",
       prose: [
         "BotFleet drives ASCII.dev Box as a remote sandbox.  Files, terminal, and web access are available.",
-        "Connected apps, peers, rooms, voice chat, computer use, long context, and live research are unavailable — including the screen channel, which is worth an audit on an engine that exists to be looked at.",
+        "Computer use is the point:  the bot has the box's full desktop (Chrome, shell, disk) and the chat shows its screen live through a screenshot poll, outside BotFleet's own screen channel and approval cards.  Connected apps, peers, rooms, voice chat, long context, and live research are unavailable.",
         "Pricing for this engine is not recorded in this build.",
       ],
     },
