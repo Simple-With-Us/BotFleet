@@ -93,5 +93,29 @@ struct MacCuaDriverTests {
         _ = driver.keyPress(keyCode: 0, modifiers: [.command])
         _ = driver.typeText("BotFleet Option A")
     }
+
+    @available(macOS 14.0, *)
+    @Test("Stream errors map to product copy with no framework text")
+    func testStreamErrorStatusCopy() {
+        let declined = ScreenStreamError.captureFailed(
+            "The user declined TCCs for application, window, display capture (SCStreamErrorDomain -3801)"
+        )
+        #expect(declined.statusMessage(hasScreenRecording: false) == "Screen recording permission needed")
+        #expect(ScreenStreamError.notAuthorized.statusMessage(hasScreenRecording: true) == "Screen recording permission needed")
+        #expect(ScreenStreamError.noDisplayFound.statusMessage(hasScreenRecording: true) == "No display available to capture")
+
+        let failures: [ScreenStreamError] = [
+            .streamInitializationFailed("SCStreamErrorDomain -3802"),
+            .captureFailed("SCStreamErrorDomain -3815"),
+        ]
+        for failure in failures {
+            for permitted in [true, false] {
+                let message = failure.statusMessage(hasScreenRecording: permitted)
+                #expect(!message.contains("SCStream"))
+                #expect(!message.contains("-38"))
+            }
+            #expect(failure.statusMessage(hasScreenRecording: true) == "Live capture could not start")
+        }
+    }
 }
 #endif

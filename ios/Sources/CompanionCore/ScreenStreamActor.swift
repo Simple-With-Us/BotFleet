@@ -27,6 +27,26 @@ public enum ScreenStreamError: LocalizedError, Sendable {
     }
 }
 
+@available(macOS 14.0, *)
+extension ScreenStreamError {
+    /// Short product copy for the CUA inspector status bar.  `errorDescription`
+    /// stays the developer string for logs, so no framework error text or
+    /// error code reaches the visible UI.
+    public func statusMessage(hasScreenRecording: Bool) -> String {
+        if !hasScreenRecording {
+            return "Screen recording permission needed"
+        }
+        switch self {
+        case .notAuthorized:
+            return "Screen recording permission needed"
+        case .noDisplayFound:
+            return "No display available to capture"
+        case .streamInitializationFailed, .captureFailed:
+            return "Live capture could not start"
+        }
+    }
+}
+
 /// Actor managing high-performance zero-copy ScreenCaptureKit streams and still captures.
 @available(macOS 14.0, *)
 public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {

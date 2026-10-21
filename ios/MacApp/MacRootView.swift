@@ -455,7 +455,7 @@ struct MacCuaInspectorView: View {
         VStack(spacing: 0) {
             // Header
             HStack {
-                Label("Computer Use (CUA)", systemImage: "display")
+                Label("Computer Use", systemImage: "display")
                     .font(.headline)
 
                 Spacer()
@@ -479,6 +479,7 @@ struct MacCuaInspectorView: View {
                     Image(systemName: session.isCuaStreaming ? "stop.fill" : "play.fill")
                 }
                 .help(session.isCuaStreaming ? "Stop live capture" : "Start live capture")
+                .accessibilityLabel(session.isCuaStreaming ? "Stop Live Capture" : "Start Live Capture")
             }
             .padding(12)
             .background(Color(NSColor.windowBackgroundColor))
@@ -495,11 +496,11 @@ struct MacCuaInspectorView: View {
                         Image(systemName: "display")
                             .font(.system(size: 32))
                             .foregroundColor(.secondary)
-                        Text(session.isCuaStreaming ? "Awaiting ScreenCaptureKit frame…" : "CUA Standby")
+                        Text(session.isCuaStreaming ? "Waiting for the first frame…" : "CUA Standby")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
                         if !session.isCuaStreaming {
-                            Button("Start ScreenCaptureKit Stream") {
+                            Button("Start Live Capture") {
                                 session.startCuaStreaming()
                             }
                             .buttonStyle(.borderedProminent)
@@ -515,7 +516,7 @@ struct MacCuaInspectorView: View {
 
             // Status bar
             HStack {
-                Text(session.cuaStatusMessage ?? (session.isCuaStreaming ? "Metal Zero-Copy 60fps" : "Idle"))
+                Text(session.cuaStatusMessage ?? (session.isCuaStreaming ? "Live" : "Idle"))
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()

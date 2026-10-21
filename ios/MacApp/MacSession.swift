@@ -266,16 +266,27 @@ public final class MacSession: ObservableObject {
     public func startCuaStreaming() {
         Task {
             do {
-                cuaStatusMessage = "Starting ScreenCaptureKit stream…"
+                cuaStatusMessage = "Starting live capture…"
                 try await ScreenStreamActor.shared.startStreaming { [weak self] buffer in
                     Task { @MainActor [weak self] in
                         self?.cuaPixelBuffer = buffer
                     }
                 }
                 isCuaStreaming = true
-                cuaStatusMessage = "Streaming live desktop via Metal"
+                cuaStatusMessage = "Live desktop shared"
             } catch {
-                cuaStatusMessage = "Stream error: \(error.localizedDescription)"
+                // The raw error is a developer string (framework domain codes,
+                // TCC denial text), so it goes to the log and the status bar
+                // gets product copy.
+                NSLog("CUA stream error: %@", error.localizedDescription)
+                let hasScreenRecording = MacCuaDriver.shared.checkPermissions().hasScreenRecording
+                if let streamError = error as? ScreenStreamError {
+                    cuaStatusMessage = streamError.statusMessage(hasScreenRecording: hasScreenRecording)
+                } else {
+                    cuaStatusMessage = hasScreenRecording
+                        ? "Live capture could not start"
+                        : "Screen recording permission needed"
+                }
                 isCuaStreaming = false
             }
         }
