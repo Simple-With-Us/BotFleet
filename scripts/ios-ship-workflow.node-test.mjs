@@ -275,12 +275,14 @@ test("scheduled-ship-gate skips empty last-ship on schedule", () => {
 test("asc-api.mjs resolves its credential from all three sources", () => {
   const asc = read("scripts/ios-fleet/asc-api.mjs");
   assert.match(asc, /function resolveCredential\(\)/);
-  // Source 1: ASC_* already exported.  Source 2: Infisical through fleet-secrets (AFC-359).
-  // Source 3: the APPLE_API_* names ios-ship.yml exports from Infisical.
+  // Source 1: the APPLE_API_* names ios-ship.yml exports from Infisical.
+  // Source 2: ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 in the environment.
+  // Source 3: Infisical through fleet-secrets (AFC-359).
+  assert.match(asc, /APPLE_API_KEY_P8_BASE64/);
   assert.match(asc, /process\.env\.ASC_KEY_ID/);
+  assert.match(asc, /process\.env\.ASC_KEY_P8/);
   assert.match(asc, /fleetSecretsGet\("ASC_KEY_ID", "\/asc"\)/);
   assert.doesNotMatch(asc, /homedir\(\), "\.secrets"/);
-  assert.match(asc, /APPLE_API_KEY_P8_BASE64/);
   // The base64 p8 is materialized privately and unlinked on exit.
   assert.match(asc, /Buffer\.from\(cleaned, "base64"\)/);
   assert.match(asc, /mkdtempSync\(join\(tmpdir\(\), "asc-key-"\)\)/);
@@ -289,6 +291,21 @@ test("asc-api.mjs resolves its credential from all three sources", () => {
   // Never print a value -- only the source and the key-id LENGTH.
   assert.match(asc, /key id length \$\{cred\.keyId\.length\}/);
   assert.doesNotMatch(asc, /console\.(log|error)\([^)]*privateKeyPem/);
+});
+
+test("asc-api.mjs never reads a named path as a credential source", () => {
+  // AFC-459 (Kody rule 42 on the CodeCaps PR #271 review):  a path on disk
+  // is not an approved secret source, so the client never reads one.  The
+  // shell layer owns the credential and hands the key over in the environment.
+  const asc = read("scripts/ios-fleet/asc-api.mjs");
+  assert.doesNotMatch(asc, /process\.env\.ASC_KEY_PATH/);
+  assert.doesNotMatch(asc, /fromFile\(/);
+  // The message names the path as the wrong thing to reach for.
+  assert.match(asc, /A path in ASC_KEY_PATH is not a credential source/);
+  // Every environment PEM is parsed before it is accepted, so a truncated key
+  // is a credential error rather than a signer stack trace.
+  assert.match(asc, /normalizePrivateKey/);
+  assert.match(asc, /import \{ normalizePrivateKey \} from "\.\/asc-key\.mjs"/);
 });
 
 test("asc-api.mjs says what it tried instead of failing on a missing file", () => {
@@ -334,6 +351,10 @@ test("asc-api.mjs stays dependency-free: it runs from a bare directory with no n
   try {
     const copy = join(tmp, "asc-api.mjs");
     writeFileSync(copy, src);
+    // The client imports asc-key.mjs, so the bare copy needs it too:  a
+    // missing sibling is ERR_MODULE_NOT_FOUND, which is the same failure this
+    // test exists to catch.
+    writeFileSync(join(tmp, "asc-key.mjs"), read("scripts/ios-fleet/asc-key.mjs"));
     const run = spawnSync(process.execPath, [copy, "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: { PATH: process.env.PATH || "", HOME: tmp },
