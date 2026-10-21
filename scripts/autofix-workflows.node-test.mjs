@@ -68,11 +68,12 @@ test("PR Autofix is not pinned to a reusable revision that deadlocks", () => {
   }
   // Exact-SHA guard (Kody on #1289): the pr-autofix caller passes
   // META_MODEL_API_TOKEN, which only the model-switch revision declares - a
-  // silent repin to anything else fails validation on every run.  a652e467 is
-  // that revision: closed host preset, fail-closed credential, request gate.
+  // silent repin to anything else fails validation on every run.  c97a2dae is
+  // that revision now: closed host preset, fail-closed credential, request gate,
+  // Validate Model Switch guard.
   assert.equal(
     ref,
-    "a652e46755412be2201a2f406e50a422c1376b4c",
+    "c97a2dae96762eb9ffc122c753f0dfb0a7840650",
     "pr-autofix-reusable.yml pin must stay on the model-switch revision",
   );
 });
@@ -122,11 +123,12 @@ test("Claude Autofix keeps the Sentry-capable pin and same-repository bot gate",
   // and the caller now passes allowed_bots explicitly - the reusable default
   // drops claude/claude[bot] and refuses swu-echo dispatches, which blocked an
   // owner-directed rerun (run 39531317324).
-  // 2026-10-21: repinned again for the org model switch (a652e46 carries the
-  // closed host preset,  the fail-closed credential,  and the request gate).
+  // 2026-10-21: repinned again for the org model switch (c97a2dae carries the
+  // closed host preset,  the fail-closed credential,  the request gate,  and the
+  // Validate Model Switch guard).
   assert.match(
     claude,
-    /claude-code-autofix-reusable\.yml@a652e46755412be2201a2f406e50a422c1376b4c/,
+    /claude-code-autofix-reusable\.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650/,
   );
   assert.match(claude, /^\s+allowed_bots: .*swu-echo/m);
   const guard = claude.match(/^ {4}if: >-\n([\s\S]*?)^ {4}uses:/m)?.[1];
