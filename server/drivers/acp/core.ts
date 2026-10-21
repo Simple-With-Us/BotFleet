@@ -110,20 +110,44 @@ const acpSessionSetModelParams = z.object({ modelId: acpNonemptyString }).passth
  *  vendor-owned and grow fields — the rest of the handler keeps reading
  *  the passthrough remainder.  A notification that does not fit this
  *  shape is dropped, never handled from raw fields. */
+// Vendor payloads are JSON:  every string, array and record value is
+// bounded, so one notification cannot pin unbounded memory, and fields a
+// newer agent adds still parse (any key, bounded value).  Depth follows the
+// JSON itself — the line was parsed before this schema runs.
+const ACP_JSON_STRING_MAX_CHARS = 64 * 1024;
+const ACP_JSON_ARRAY_MAX_ITEMS = 1_024;
+const acpBoundedJson: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.string().max(ACP_JSON_STRING_MAX_CHARS),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(acpBoundedJson).max(ACP_JSON_ARRAY_MAX_ITEMS),
+    z.record(z.string().max(256), acpBoundedJson),
+  ]),
+);
+// A chunk update's content block:  text is the field the transcript and the
+// summary collector read;  acpBoundedJson already caps its size.
+const acpChunkContent = z.object({ text: z.string().max(ACP_JSON_STRING_MAX_CHARS) }).passthrough();
+// A tool call's rawInput when it carries a shell-style command string.
+const acpRawInputCommand = z.object({ command: z.string() }).passthrough();
+
 const acpSessionUpdateParams = z.object({
   sessionId: z.string().min(1).max(256).optional(),
   update: z
     .object({
       sessionUpdate: z.string().max(64),
       // content is vendor-shaped (a chunk's {text}, a tool call's blocks, a
-      // newer field):  carried through unparsed and validated at the point
-      // of use — the summary collector parses and bounds the text itself.
-      content: z.unknown().optional(),
+      // newer field):  bounded here, carried through unparsed, and validated
+      // at the point of use — the summary collector bounds the text itself.
+      content: acpBoundedJson.optional(),
     })
-    .passthrough()
-    .optional(),
+    // Vendor-owned past the named fields:  any key, bounded value.
+    .catchall(acpBoundedJson)
+    .default({ sessionUpdate: "" }),
   _meta: z.object({ isReplay: z.boolean().optional() }).passthrough().optional(),
 }).passthrough();
+export type AcpSessionUpdateParams = z.infer<typeof acpSessionUpdateParams>;
 const acpAvailableModel = z.object({
   modelId: z.string().optional(),
   name: z.string().optional(),
@@ -1588,10 +1612,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           const parsedNotification = acpSessionUpdateParams.safeParse(msg.params);
           if (!parsedNotification.success) return;
           const p = parsedNotification.data;
-          // The named envelope fields are parsed and bounded above;  the
-          // passthrough remainder stays vendor-shaped for the switch below.
-          // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- vendor-shaped ACP update remainder past the bounded envelope; every field is validated at the point of use
-          const u = (p.update ?? {}) as Record<string, any>;
+          // The parsed update keeps its schema type:  the named fields are
+          // bounded above, the vendor remainder is bounded JSON, and each
+          // case narrows the fields it reads.
+          const u = p.update;
           // A history-summary session runs beside the turn's own session.
           // Its chunks collect into the summary note and must NEVER reach
           // the transcript: state.promptSent is already true when it runs.
@@ -1607,8 +1631,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // model cannot pin unbounded text per summarizing turn.  The
               // bound is the SUM:  a single chunk larger than the remaining
               // room is dropped whole, not appended past the cap.
-              const parsedDelta = z.string().max(SUMMARY_COLLECTOR_MAX_CHARS).safeParse(u.content?.text);
-              if (parsedDelta.success && collector.text.length + parsedDelta.data.length <= SUMMARY_COLLECTOR_MAX_CHARS) collector.text += parsedDelta.data;
+              const parsedDelta = acpChunkContent.safeParse(u.content);
+              if (parsedDelta.success && parsedDelta.data.text.length <= SUMMARY_COLLECTOR_MAX_CHARS && collector.text.length + parsedDelta.data.text.length <= SUMMARY_COLLECTOR_MAX_CHARS) collector.text += parsedDelta.data.text;
             }
             return;
           }
@@ -1624,8 +1648,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           if (!state.promptSent || p._meta?.isReplay === true) return;
           switch (u.sessionUpdate) {
             case "agent_message_chunk": {
-              const delta = u.content?.text;
-              if (typeof delta === "string" && delta) {
+              const parsedChunk = acpChunkContent.safeParse(u.content);
+              const delta = parsedChunk.success ? parsedChunk.data.text : undefined;
+              if (delta) {
                 state.text += delta;
                 // past this point a relaunch would repeat words the person
                 // already read — see maybeRetry
@@ -1635,8 +1660,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               break;
             }
             case "agent_thought_chunk": {
-              const delta = u.content?.text;
-              if (typeof delta === "string" && delta) {
+              const parsedChunk = acpChunkContent.safeParse(u.content);
+              const delta = parsedChunk.success ? parsedChunk.data.text : undefined;
+              if (delta) {
                 state.sawOutput = true;
                 emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "reasoning_text", delta });
               }
@@ -1648,12 +1674,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               if (bypassedBy) return tripAllowlist(bypassedBy);
               // prepared once: the same text is filed with the event and
               // fingerprinted for the update that may follow
-              const announced = u.rawInput === undefined ? undefined : prepareInput(u.rawInput);
-              if (typeof u.toolCallId === "string") {
-                openToolCalls.add(u.toolCallId);
-                if (announced !== undefined) toolInputs.set(u.toolCallId, textSignature(announced.text));
+              const announced = "rawInput" in u ? prepareInput(u.rawInput) : undefined;
+              const toolCallId = typeof u.toolCallId === "string" ? u.toolCallId : undefined;
+              if (toolCallId !== undefined) {
+                openToolCalls.add(toolCallId);
+                if (announced !== undefined) toolInputs.set(toolCallId, textSignature(announced.text));
               }
               flushAssistantText();
+              const titleText = typeof u.title === "string" ? u.title : undefined;
+              const parsedCommand = acpRawInputCommand.safeParse(u.rawInput);
+              const commandText = parsedCommand.success ? parsedCommand.data.command : undefined;
+              const kindText = typeof u.kind === "string" ? u.kind : undefined;
               // ACP hands us `kind`, `locations` and `rawInput` alongside the
               // title.  Folding all of it into one 80-char title was what left
               // the transcript showing `read_file` seven times with no paths;
@@ -1662,10 +1693,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 ...base(threadId, turnId),
                 type: "item.started",
                 itemType: "tool",
-                itemId: u.toolCallId,
-                title: String(u.title ?? u.rawInput?.command ?? "tool").slice(0, 80),
-                ...toolFields(u.title ?? u.rawInput?.command, u.rawInput, {
-                  hint: u.kind,
+                itemId: toolCallId,
+                title: String(titleText ?? commandText ?? "tool").slice(0, 80),
+                ...toolFields(titleText ?? commandText, u.rawInput, {
+                  hint: kindText,
                   locations: u.locations,
                   cwd: turn.cwd,
                 }),
@@ -1678,18 +1709,21 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               if (bypassedBy) return tripAllowlist(bypassedBy);
               // The schema lets a call's input arrive or settle on an update,
               // at any status: take it when it is new text for this call.
-              const settled = typeof u.toolCallId === "string" && u.rawInput !== undefined ? prepareInput(u.rawInput) : undefined;
+              const toolCallId = typeof u.toolCallId === "string" ? u.toolCallId : undefined;
+              const settled = toolCallId !== undefined && "rawInput" in u ? prepareInput(u.rawInput) : undefined;
               const settledSignature = settled === undefined ? undefined : textSignature(settled.text);
-              const newInput = settled !== undefined && toolInputs.get(u.toolCallId) !== settledSignature ? settled : undefined;
-              if (newInput !== undefined && settledSignature !== undefined) toolInputs.set(u.toolCallId, settledSignature);
+              const newInput = settled !== undefined && toolCallId !== undefined && toolInputs.get(toolCallId) !== settledSignature ? settled : undefined;
+              if (newInput !== undefined && settledSignature !== undefined && toolCallId !== undefined) toolInputs.set(toolCallId, settledSignature);
               if (u.status === "completed" || u.status === "failed") {
-                openToolCalls.delete(u.toolCallId);
-                if (typeof u.toolCallId === "string") toolInputs.delete(u.toolCallId);
+                if (toolCallId !== undefined) {
+                  openToolCalls.delete(toolCallId);
+                  toolInputs.delete(toolCallId);
+                }
                 emit({
                   ...base(threadId, turnId),
                   type: "item.completed",
                   itemType: "tool",
-                  itemId: u.toolCallId,
+                  itemId: toolCallId,
                   ok: u.status !== "failed",
                   detail: describeResult(u.content ?? u.rawOutput),
                   ...capturePreparedBoth(newInput, u.content ?? u.rawOutput),
@@ -1699,7 +1733,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   ...base(threadId, turnId),
                   type: "item.updated",
                   itemType: "tool",
-                  itemId: u.toolCallId,
+                  itemId: toolCallId,
                   ...capturePreparedInput(newInput),
                 });
               }

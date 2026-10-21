@@ -478,9 +478,21 @@ export type JsonRpcEnvelope = z.infer<typeof jsonRpcEnvelopeSchema>;
  *  on everything else:  content blocks are vendor-owned (ACP agents add
  *  fields as the protocol grows), so the schema passes unknown fields
  *  through instead of rejecting a newer agent. */
+// Content-block fields a newer agent adds are bounded JSON, not free-form:
+// every string, array and record value carries a cap.
+const boundedContentValue: z.ZodType<unknown> = z.lazy(() =>
+  z.union([
+    z.string().max(10_000_000),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(boundedContentValue).max(10_000),
+    z.record(z.string().max(256), boundedContentValue),
+  ]),
+);
 export const promptContentSchema = z
-  .object({ type: z.string().optional(), text: z.string().max(10_000_000) })
-  .passthrough();
+  .object({ type: z.string().max(64).optional(), text: z.string().max(10_000_000) })
+  .catchall(boundedContentValue);
 export type PromptContent = z.infer<typeof promptContentSchema>;
 
 /** A session/prompt call's params, bounded and strict at the method level:
@@ -500,7 +512,7 @@ process.stdin.on("data", (c) => {
     const line = buf.slice(0, nl);
     buf = buf.slice(nl + 1);
     if (!line.trim()) continue;
-    let msg: any;
+    let msg: unknown;
     try {
       msg = JSON.parse(line);
     } catch {
@@ -510,12 +522,22 @@ process.stdin.on("data", (c) => {
   }
 });
 
-function handle(rawMsg: any, resumed = false) {
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- type guard at the JSON parse boundary
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- parser for the untrusted JSON-RPC line, validated against the envelope schema before any field is read
+function handle(rawMsg: unknown, resumed = false) {
   // The whole envelope is validated before a field is read:  every reply
   // below echoes the PARSED id, never the raw one.
   const parsedEnvelope = jsonRpcEnvelopeSchema.safeParse(rawMsg);
   if (!parsedEnvelope.success) return;
-  const msg: any = parsedEnvelope.data;
+  const msg = parsedEnvelope.data;
+  // params is method-shaped and vendor-owned:  each case reads it through
+  // this record view and validates the fields it needs (session/prompt
+  // parses its own strict schema below).
+  const params = isRecord(msg.params) ? msg.params : {};
   // client's response to our permission request
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && msg.id === pendingPermissionId) {
     pendingPermissionId = null;
@@ -551,7 +573,7 @@ function handle(rawMsg: any, resumed = false) {
         });
         break;
       }
-      const servers: McpEntry[] = Array.isArray(msg.params?.mcpServers) ? msg.params.mcpServers : [];
+      const servers: McpEntry[] = Array.isArray(params.mcpServers) ? params.mcpServers : [];
       if (process.env.FAKE_ACP_DUMP) {
         dumpState.mcpServers = servers;
         writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify(dumpState, null, 2));
@@ -626,7 +648,7 @@ function handle(rawMsg: any, resumed = false) {
         });
       }
       const settingId = msg.method === "session/set_mode" ? "modeId" : "modelId";
-      if (typeof msg.params?.sessionId !== "string" || typeof msg.params?.[settingId] !== "string") {
+      if (typeof params.sessionId !== "string" || typeof params[settingId] !== "string") {
         out({
           jsonrpc: "2.0",
           id: msg.id,
@@ -642,7 +664,8 @@ function handle(rawMsg: any, resumed = false) {
       break;
     }
     case "session/set_config_option": {
-      const { configId, value } = msg.params ?? {};
+      const configId = params.configId;
+      const value = params.value;
       if (configId === reasoningConfigId && process.env.FAKE_ACP_REASONING_ERROR_CODE) {
         out({
           jsonrpc: "2.0",
@@ -660,9 +683,9 @@ function handle(rawMsg: any, resumed = false) {
         break;
       }
       const accepted = configId === "model"
-        ? models.includes(value)
+        ? typeof value === "string" && models.includes(value)
         : configId === reasoningConfigId
-          ? reasoningEfforts.includes(value)
+          ? typeof value === "string" && reasoningEfforts.includes(value)
           : false;
       if (!accepted) {
         out({
@@ -675,14 +698,14 @@ function handle(rawMsg: any, resumed = false) {
       // FAKE_ACP_MODEL_STICKS: answer OK and keep the old model anyway. Nothing
       // in the protocol forbids it, and it is the shape core.ts's confirmation
       // guard exists for — an error is loud, this is silent.
-      if (configId === "model" && !process.env.FAKE_ACP_MODEL_STICKS) {
+      if (configId === "model" && !process.env.FAKE_ACP_MODEL_STICKS && typeof value === "string") {
         currentModel = value;
         // mcode resets the session's effort to `default` on every model switch.
         if (reasoningModels.length > 0 && reasoningEfforts.includes("default")) {
           currentReasoningEffort = "default";
         }
       }
-      if (configId === reasoningConfigId && !process.env.FAKE_ACP_REASONING_STICKS) {
+      if (configId === reasoningConfigId && !process.env.FAKE_ACP_REASONING_STICKS && typeof value === "string") {
         currentReasoningEffort = value;
       }
       configCalls.push({ method: msg.method, params: msg.params });
