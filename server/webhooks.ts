@@ -159,7 +159,7 @@ export interface WebhookManagerOptions {
     runOn: RoutineRunOn;
     deliveryId: string;
     receivedAt: number;
-  }) => { id: string };
+  }) => { id: string; status?: string; error?: string };
   cancelQueued?: (webhookId: string, message: string) => void;
   pendingRuns?: (webhookId: string) => number;
 }
