@@ -85,10 +85,10 @@ pushes off.
 
 ## Review findings
 
-Nine review findings across two rounds, all in the same shape as the bug it was
-fixing:  a value that looked fine and silently removed the key, a change that
-looked safe and stopped the sidecar answering, or a mask that looked masked and
-printed the key.
+Thirteen review findings across four rounds, all in the same shape as the bug
+it was fixing:  a value that looked fine and silently removed the key, a
+change that looked safe and stopped the sidecar answering, or a mask that
+looked masked and printed the key.
 
 1.  **The failure cache was stamped when the read STARTED.**  `readVault`
     captured `now` before the subprocess ran and stored that in the cache
@@ -144,12 +144,15 @@ printed the key.
 
 7.  **The mask degenerated and printed the whole key for a short one.**
     `keyPreview()` takes the first eight and the last four characters of the
-    material, and those two slices overlap once the material is twelve
-    characters or shorter — so the "masked" preview of `ABCDEFGH` was
+    material, and a material of twelve characters or fewer is COVERED by
+    those two slices — they hand back every character of the key, just in
+    two halves — so the "masked" preview of `ABCDEFGH` was
     `ABCDEFGH…EFGH`, the whole key.  A preview that prints the secret it
     exists to hide is worse than no preview, so a material that short now
-    previews as `unavailable`.  The new test fails against the old mask with
-    the full key in the received value.
+    previews as `unavailable`.  The guard is written as the mask's own width
+    (`8 + 4`) rather than as a copied total, so a later edit cannot drift
+    away from it.  The new test fails against the old mask with the full key
+    in the received value.
 
 8.  **The live refusal named no key at all.**  The persisted-fault warning
     carries the masked preview, but the line printed the moment Apple refuses
@@ -163,6 +166,38 @@ printed the key.
     with the sidecar's warnings silenced.  The `finally` block now restores it,
     matching the sibling tests in the same file.
 
+10.  **The short-material test never exercised the warning path it claimed
+    to check.**  It asserted on `keyPreview()` alone, so a warning that
+    printed the key material directly would still have passed it, and its
+    last assertion re-checked a value already asserted on the line above.
+    The test now drives the refused-key warning with an eight-character key
+    and asserts the warning says `unavailable` and never carries the
+    material.
+
+11.  **The live refusal named a remedy that no longer exists.**  The warning
+    said pushes are off "until the key file changes", but the key lives in
+    the vault and the fault clears only when the vault secret changes:  an
+    operator was pointed at a local `.p8` that is no longer read, and
+    replacing it would not have turned pushes back on.  The warning now
+    names the source, the same way the persisted-fault message does.
+
+12.  **The guard's stated rationale misstated why twelve characters are
+    refused.**  The comment said the two slices overlap at twelve or fewer,
+    but at exactly twelve they are adjacent, not overlapping;  the reason the
+    key is refused is that the mask COVERS it.  A maintainer who "corrected"
+    the bound to `<` on the strength of the overlap story would have
+    re-opened the full-key echo the guard exists to close.  The rule is now
+    stated as coverage, and the bound is the mask's own width (`8 + 4`)
+    rather than a copied total.
+
+13.  **The whole file described the signing key as a file on disk.**  Finding
+    11 was one line, but the same stale framing ran through the status
+    reason, the persistence preamble, the fault-store doc, the refresh doc
+    and half a dozen comments — and one recovery log line told the operator
+    "the APNs key file changed" when what changed was the vault secret.
+    Every one of them now says "the signing key", so the next reader is not
+    sent to a file that is not read.
+
 ## Files
 
 -  `companion/src/apns.ts` — `APNS_VAULT_READ_BUDGET_MS`,
@@ -171,18 +206,20 @@ printed the key.
     `fleetSecretsGet()` with its in-flight guard, and the generation counter
     that keeps a cleared cache from being written back by a read already in
     flight.  `keyPreview()` masks a rejected key for both the persisted-fault
-    and the live refusal warning, and refuses to preview a material too short
-    to mask.
+    and the live refusal warning, refuses to preview a material too short to
+    mask, and expresses that bound as the mask's own width.  The live
+    refusal names the key's source as the remedy.
 -  `companion/src/apns.test.ts` — the ordering invariant, the override, the
     refusal of a non-positive or fractional override, the slow-failed-read
     regression, the event-loop regression, the concurrent-read guard, the
     slow-key-id-read regression, the masked-preview assertions for both
-    warnings, the short-material refusal, and the narrowed-ceiling test that no
-    longer depends on who is faster.
+    warnings, the short-material refusal, the test that drives the
+    refused-key warning with a short key, and the narrowed-ceiling test that
+    no longer depends on who is faster.
 
 ## Verification
 
--  `pnpm vitest run companion/src/apns.test.ts` — 142 passed (1 file).
+-  `pnpm vitest run companion/src/apns.test.ts` — 143 passed (1 file).
 -  `pnpm typecheck` — clean (exit 0).
 -  `pnpm lint` — baseline check passed;  4876 warnings against a baseline of
     4884, so eight fewer than the baseline allows.
@@ -199,6 +236,13 @@ printed the key.
     (`expected "companion: APNs refused the signing key (InvalidProviderToken);
     pushes are off until the key file changes" to contain "MIGHAgEA…BeVr"`), so
     it tests the defect and not the new code.
+-  The live-refusal test was run against the old remedy text and fails there
+    (`expected "companion: APNs refused the signing k…" to contain
+    "Infisical APNS_KEY_P8"`), so it tests the remedy and not the new code.
+-  The short-material warning test was run against a live-refusal line that
+    prints the material directly and fails there (`expected "companion: APNs
+    refused the signing k…" not to contain "ABCDEFGH"`), so it tests the
+    material leak and not the new code.
 -  Credential probe against the live Apple endpoint, using the lane's own
     `loadApnsConfig()`:  the sidecar resolved `keyId HSJ98QN95V` from
     `Infisical APNS_KEY_P8`, signed a provider token, and Apple answered

@@ -395,7 +395,7 @@ describe("sendApnsAlert", () => {
 
   it("does not re-sign for InvalidProviderToken — the key itself is refused", async () => {
     // Expiry is worth a fresh signature.  An invalid token means Apple
-    // refuses the KEY — wrong team, revoked, a .p8 that does not match its
+    // refuses the KEY — wrong team, revoked, a key that does not match its
     // key id — and every new signature earns the identical rejection.
     const config = testConfig();
     const { waits, sleep } = recordingSleep();
@@ -901,7 +901,7 @@ describe("watchHarnessNotifications", () => {
     expect(health.configured).toBe(false);
   });
 
-  it("picks up a rotated key file and forgets the one it replaced", async () => {
+  it("picks up a rotated signing key and forgets the one it replaced", async () => {
     let stamp = "key-v1";
     let loads = 0;
     const watch = watchHarnessNotifications({
@@ -1072,7 +1072,7 @@ describe("watchHarnessNotifications", () => {
 
   it("notices a rotated key while the stream stays open", async () => {
     // The re-check used to ride on the reconnect, so a sidecar whose harness
-    // stays up for days never looked at the key file again.
+    // stays up for days never looked at the signing key again.
     let stamp = "key-v1";
     let loads = 0;
     const watch = watchHarnessNotifications({
@@ -1145,8 +1145,8 @@ describe("watchHarnessNotifications", () => {
     // A rotation can land while a request signed with the old key is still
     // in flight.  Reading that request's answer as a verdict on the new key
     // disables the new key, and keeps it disabled: the fault clears only for
-    // a key file that differs from the recorded stamp, and the file on disk
-    // is already the new one.
+    // a key that differs from the recorded stamp, and the key in hand is
+    // already the new one.
     const keyA = testConfig({ keyId: "KEYAAA" });
     const keyB = testConfig({ keyId: "KEYBBB" });
     let stamp = "key-a";
@@ -1276,8 +1276,8 @@ describe("watchHarnessNotifications", () => {
   });
 
   it("treats a key rewritten with the same bytes as the same key, not a rotation", async () => {
-    // A secrets sync or a backup restore rewrites the .p8 with identical
-    // contents: the file stamp changes and so does the config object, but
+    // A secrets sync or a backup restore rewrites the key with identical
+    // contents: the stamp changes and so does the config object, but
     // the KEY does not.  Comparing objects rather than keys read Apple's
     // verdict on the key still in use as a verdict on a key already
     // replaced, waved it through, and went on signing with a key Apple
@@ -3137,7 +3137,7 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
     expect(store.current?.keyStamp).toBe("key-v1");
     expect(store.current?.errorTimestamp).toBe(1_700_000_000_000);
 
-    // A relaunch.  Nothing about the key file changed, so Apple's answer has
+    // A relaunch.  Nothing about the signing key changed, so Apple's answer has
     // not changed either — and the old build resumed full-rate sends here.
     let secondRun = 0;
     const restarted = faultingWatch(store, () => "key-v1", () => {
@@ -3244,21 +3244,70 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
     expect(line).toContain(`${material.slice(0, 8)}…${material.slice(-4)}`);
     expect(line).not.toContain(material);
     expect(line).not.toContain(p8);
+    // The remedy names the source the key actually lives in.  "Until the key
+    // file changes" points an operator at a local .p8 that is no longer
+    // read, and replacing it would not clear the verdict.
+    expect(line).toContain(apnsKeySource());
   });
 
-  it("refuses to preview a key too short to mask, rather than printing it whole", async () => {
-    // The first eight and the last four characters overlap once the material
-    // is twelve characters or shorter, so the "masked" preview would reproduce
-    // the whole key.  A preview that prints the secret it exists to hide is
-    // worse than no preview, so the short case previews as "unavailable".
+  it("refuses to preview a key too short to mask, rather than printing it whole", () => {
+    // The mask shows the first eight and the last four characters, so a
+    // material of twelve characters or fewer is COVERED by it:  the two
+    // pieces hand back every character of the key, just in two halves.  A
+    // preview that prints the secret it exists to hide is worse than no
+    // preview, so the short case previews as "unavailable".
     expect(keyPreview("ABCDEFGH")).toBe("unavailable");
     expect(keyPreview("ABCDEFGHIJKL")).toBe("unavailable");
+    // One character past the mask width is still maskable.
     expect(keyPreview("ABCDEFGHIJKLM")).not.toBe("unavailable");
-    // The refused-key warning takes the same short key and must not print it.
-    expect(keyPreview("ABCDEFGH")).not.toContain("ABCDEFGH");
   });
 
-  it("clears the verdict when the key file fingerprint changes", async () => {    const store = memoryKeyFaultStore({
+  it("never prints a key too short to mask, not even in the refused-key warning", async () => {
+    // The guard above only proves the helper refuses.  The regression it
+    // exists to prevent is a SHORT key reaching the log through the
+    // refused-key warning, so the warning path itself has to be driven:  a
+    // future change that prints the key material straight into the
+    // live-refusal line would leave the helper untouched and still pass a
+    // helper-only test.
+    const store = memoryKeyFaultStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const material = "ABCDEFGH";
+    const key = testConfig({ p8: material });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => key,
+      keyStamp: () => "key-v1",
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false as const,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault" as const,
+      }),
+    });
+    let line = "";
+    try {
+      await waitFor(() => {
+        line = warn.mock.calls.map((call) => String(call[0])).find((text) => text.includes("refused the signing key")) ?? "";
+        return line !== "";
+      });
+    } finally {
+      warn.mockRestore();
+      watch.stop();
+    }
+    // The warning says the key could not be previewed, and never the value.
+    expect(line).toContain("unavailable");
+    expect(line).not.toContain(material);
+  });
+
+  it("clears the verdict when the signing key fingerprint changes", async () => {
+    const store = memoryKeyFaultStore({
       reason: "InvalidProviderToken",
       at: 1_700_000_000_000,
       keyStamp: "key-v1",
@@ -3267,7 +3316,7 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
     const watch = faultingWatch(store, () => "key-v2", () => {
       sends += 1;
     });
-    // A different file: the verdict was about a key this process no longer
+    // A different key: the verdict was about a key this process no longer
     // holds, so it is forgotten and the replacement gets its chance.
     expect(await waitFor(() => sends > 0)).toBe(true);
     watch.stop();
@@ -3277,7 +3326,7 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
   it("drops the refused key's provider token and http2 sessions, so a rotation is not signed against them", async () => {
     // The fault used to null `discovered`, so the key-identity comparison in
     // refreshConfig saw no previous key, skipped invalidateProviderToken and
-    // dropHttp2Sessions, and signed the replacement .p8 against the cached
+    // dropHttp2Sessions, and signed the replacement key against the cached
     // token minted for the key Apple had just refused.
     dropHttp2Sessions();
     const key = testConfig({ keyId: "ROTATE1" });
@@ -3364,7 +3413,7 @@ describe("diskKeyFaultStore", () => {
     try {
       const store = diskKeyFaultStore(dir);
       store.save({ reason: "InvalidProviderToken", at: 1, keyStamp: null });
-      // A fault with no stamp can never match a key file, so it can never
+      // A fault with no stamp can never match a key, so it can never
       // hold pushes off — which is the safe direction for a torn file.
       expect(store.load()?.keyStamp).toBeNull();
     } finally {

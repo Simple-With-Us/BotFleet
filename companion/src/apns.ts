@@ -261,6 +261,13 @@ export async function apnsKeyStamp(): Promise<string | null> {
   return `${apnsKeySource()}:${digest}`;
 }
 
+/** The mask:  the first eight and the last four characters of the key
+ * material, and nothing else.  Kept as widths so the short-material guard
+ * below can be written in terms of the mask itself rather than as a
+ * hand-copied total that a later edit could drift away from. */
+const KEY_PREVIEW_HEAD = 8;
+const KEY_PREVIEW_TAIL = 4;
+
 /** A masked preview of a signing key:  the first eight and the last four
  * characters of the key material, and nothing else.
  *
@@ -270,16 +277,23 @@ export async function apnsKeyStamp(): Promise<string | null> {
  * key material and not the header.  An absent key previews as "unavailable"
  * rather than as an empty string, so the line still says something useful.
  *
- * A material too short to mask also previews as "unavailable":  the first
- * eight and the last four characters overlap once the material is twelve or
- * fewer characters long, so the "masked" preview would reproduce the whole
- * key.  A preview that prints the secret it exists to hide is worse than no
- * preview at all, so the short case is refused. */
+ * A material too short to mask also previews as "unavailable":  the mask
+ * shows the first eight and the last four characters, so a material of
+ * twelve characters or fewer is COVERED by it — the two pieces hand back
+ * every character of the key, just in two halves.  A preview that prints
+ * the secret it exists to hide is worse than no preview at all, so the
+ * short case is refused.
+ *
+ * The bound is the mask's own width, not a copy of it.  At exactly the mask
+ * width the two slices are ADJACENT rather than overlapping, and adjacency
+ * is not the reason the key is refused:  covering it is.  A maintainer who
+ * "corrects" the bound to `<` on the strength of an overlap story would
+ * re-open the full-key echo this guard exists to close. */
 export function keyPreview(p8: string | null | undefined): string {
   const material = (p8 ?? "").replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
   if (!material) return "unavailable";
-  if (material.length <= 12) return "unavailable";
-  return `${material.slice(0, 8)}…${material.slice(-4)}`;
+  if (material.length <= KEY_PREVIEW_HEAD + KEY_PREVIEW_TAIL) return "unavailable";
+  return `${material.slice(0, KEY_PREVIEW_HEAD)}…${material.slice(-KEY_PREVIEW_TAIL)}`;
 }
 
 export async function loadApnsConfig(): Promise<ApnsConfig | null> {
@@ -1763,7 +1777,7 @@ export function classifyHttpResponse(status: number, reason: string | undefined)
 
 /** Why this sidecar is not sending pushes at all.  A word rather than a
  * sentence, so the phone and the pairing page can each say it their own
- * way: `no-key` (no usable .p8 on disk), `key-rejected` (Apple refuses the
+ * way: `no-key` (no usable signing key), `key-rejected` (Apple refuses the
  * one we have), `unreachable` (every paired phone's circuit is open because
  * Apple's push service cannot be reached). */
 export type PushesOffReason = "no-key" | "key-rejected" | "unreachable";
@@ -1812,7 +1826,7 @@ export interface PushSenderHealth {
    * the owner can paste it straight into the Apple debug page. */
   lastError: string | null;
   /** Set when Apple refused the signing key itself.  Sending is off until
-   * the key file changes; a new signature from the same key cannot help. */
+   * the signing key changes; a new signature from the same key cannot help. */
   keyRejected: string | null;
   /** Notifications dropped because a device's queue was already full. */
   dropped: number;
@@ -2112,10 +2126,10 @@ function createHealthTracker(
 // days of them, one failure every forty seconds, with every surface still
 // reporting pushes as on.
 //
-// So the verdict goes on disk, beside the device registry, keyed to the key
-// FILE: replacing the file is what clears it, and nothing else does.  What
-// is written is a fingerprint — path, mtime, size — plus Apple's own words.
-// Never a byte of the key.
+// So the verdict goes on disk, beside the device registry, keyed to the
+// signing KEY: replacing the key is what clears it, and nothing else does.
+// What is written is a fingerprint — the key's source plus a one-way digest
+// of its bytes — plus Apple's own words.  Never a byte of the key.
 
 export interface PersistedKeyFault {
   /** Apple's reason string, e.g. `InvalidProviderToken`. */
@@ -2123,7 +2137,7 @@ export interface PersistedKeyFault {
   /** When the verdict was recorded, epoch ms. */
   at: number;
   /** `apnsKeyStamp()` at the moment of the fault.  A different value means a
-   * different file, which is the only thing that turns pushes back on. */
+   * different key, which is the only thing that turns pushes back on. */
   keyStamp: string | null;
   /** Apple's own `timestamp` field, for the debug page. */
   errorTimestamp?: number;
@@ -2223,7 +2237,7 @@ export function watchHarnessNotifications(options: {
    * keeps looking until it appears, then watches for it changing. */
   config?: ApnsConfig | null;
   loadConfig?: () => ApnsConfig | null | Promise<ApnsConfig | null>;
-  /** Fingerprint of the key file, so a rotated key is noticed. */
+  /** Fingerprint of the signing key, so a rotated key is noticed. */
   keyStamp?: () => string | null | Promise<string | null>;
   /** Retire a token Apple has rejected.  The token is named so a phone
    * that registered a replacement while this send was in flight keeps it. */
@@ -2317,7 +2331,7 @@ export function watchHarnessNotifications(options: {
   let discovered: ApnsConfig | null = fixed ?? null;
   let discoveredStamp: string | null = null;
   let warnedMissing = false;
-  /** Set when Apple refused the key itself.  Only a different key file
+  /** Set when Apple refused the key itself.  Only a different signing key
    * clears it — a fresh signature from the same one earns the same answer. */
   let keyFault = false;
   /** The newest SSE id seen, so a reconnect resumes rather than silently
@@ -2417,19 +2431,23 @@ export function watchHarnessNotifications(options: {
     sessionFingerprints.clear();
     const at = now();
     health.rejectKey(at, reason, errorTimestamp);
-    // Pin the verdict to the file that is on disk right now: only a
-    // DIFFERENT file clears it, here and across restarts.  The read is
-    // served from the four-minute cache the key check just refreshed, so
-    // this await is a microtask, not a vault round-trip.
+    // Pin the verdict to the key in hand right now: only a DIFFERENT key
+    // clears it, here and across restarts.  The read is served from the
+    // four-minute cache the key check just refreshed, so this await is a
+    // microtask, not a vault round-trip.
     const stamp = await keyStamp();
     if (stamp !== null) discoveredStamp = stamp;
     keyFaultStore?.save({ reason, at, keyStamp: discoveredStamp, errorTimestamp });
     // Rule 43:  name the refused key by its masked preview, so an operator
     // tailing the log can tell WHICH key Apple rejected.  The key itself is
-    // never printed.
+    // never printed.  The remedy names the real source:  the key lives in
+    // the vault, so "until the key file changes" points an operator at a
+    // local .p8 that is no longer read, and replacing it would not clear
+    // the verdict.  The persisted-fault message below names the source the
+    // same way.
     console.warn(
       `companion: APNs refused the signing key (${reason}; preview ${keyPreview(config.p8)}); ` +
-        `pushes are off until the key file changes`,
+        `pushes are off until ${apnsKeySource()} is replaced`,
     );
     // Leave the stream so the pump re-enters the key check rather than
     // sending the same doomed request for every notification that follows.
@@ -2477,7 +2495,7 @@ export function watchHarnessNotifications(options: {
    * a key Apple already refused. */
   let persistedFaultChecked = persistedFault === null;
 
-  /** Look at the key file and reload when it has changed.  Runs on a timer
+  /** Look at the signing key and reload when it has changed.  Runs on a timer
    * rather than only when the stream reconnects: a sidecar whose harness
    * stays up for days never reconnects, and a key dropped in or rotated
    * under it would otherwise go unnoticed for exactly as long. */
@@ -2501,22 +2519,22 @@ export function watchHarnessNotifications(options: {
               `Replace ${apnsKeySource()} to turn them back on.`,
           );
         } else {
-          // A different file, or no file at all: the verdict was about a key we
+          // A different key, or no key at all: the verdict was about a key we
           // no longer hold, so it has nothing left to say.
           keyFaultStore?.save(null);
         }
       }
     }
     if (keyFault) {
-      // Apple refuses what is on disk.  Only a different file can help.
+      // Apple refuses the key in hand.  Only a different key can help.
       if (stamp === null || stamp === discoveredStamp) return null;
       keyFault = false;
       keyFaultStore?.save(null);
-      console.log("companion: the APNs key file changed; closed-app phone wake is being tried again");
+      console.log("companion: the APNs signing key changed; closed-app phone wake is being tried again");
       if (fixed) {
-        // A pinned config cannot be reloaded, but the key file under it
-        // changed: the cached provider token and the TLS sessions that were
-        // built for the refused key must not be reused against the new one.
+        // A pinned config cannot be reloaded, but the key under it changed:
+        // the cached provider token and the TLS sessions that were built
+        // for the refused key must not be reused against the new one.
         health.setConfigured(fixed);
         invalidateProviderToken(fixed);
         dropHttp2Sessions();
@@ -2529,13 +2547,13 @@ export function watchHarnessNotifications(options: {
       return fixed;
     }
     if (discovered && stamp !== null && stamp === discoveredStamp) {
-      // The same file as last time: keep the config, and the provider token
+      // The same key as last time: keep the config, and the provider token
       // cached against it.
       return discovered;
     }
     const loaded = await loadConfig();
-    // Whatever is on disk now may not be what the cached token was signed
-    // with.  Compare key identity rather than the file stamp: a .p8 rewritten
+    // Whatever the key is now may not be what the cached token was signed
+    // with.  Compare key identity rather than the stamp: a key rewritten
     // with identical bytes — a secrets sync, a backup restore — is the same
     // key, and throwing away its cached provider token would spend one of
     // Apple's once-per-twenty-minutes re-signs for nothing.
@@ -2797,12 +2815,12 @@ export function watchHarnessNotifications(options: {
       // A rotation can land while a request signed with the old key is in
       // flight, and reading that request's rejection as a verdict on the
       // replacement would disable the replacement — then hold it disabled,
-      // because the fault only clears for a key file that differs from the
-      // recorded stamp and the file on disk is already the replacement.
+      // because the fault only clears for a key that differs from the
+      // recorded stamp and the key in hand is already the replacement.
       //
       // Key identity, not object identity: `refreshConfig` builds a fresh
-      // config object whenever the file's mtime or size changes, so an
-      // identity check would read a .p8 rewritten with the same bytes as a
+      // config object whenever the key's source or digest changes, so an
+      // identity check would read a key rewritten with the same bytes as a
       // rotation and wave through a rejection of the key still in use.
       const current = fixed ?? discovered;
       if (current !== null && providerTokenKey(config) === providerTokenKey(current)) {
