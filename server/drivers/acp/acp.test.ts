@@ -361,6 +361,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_MODE;
     delete process.env.FAKE_ACP_DUMP;
     delete process.env.FAKE_ACP_RPC_DUMP;
+    delete process.env.FAKE_ACP_RPC_APPEND_FILE;
     delete process.env.FAKE_ACP_EXIT_GATE;
     delete process.env.FAKE_ACP_DESCENDANT_PID;
     delete process.env.XAI_API_KEY;
@@ -622,6 +623,73 @@ describe("ACP turns (fake CLI)", () => {
     expect(methods).toContain("session/load");
     expect(methods).toContain("session/new");
     expect(methods).toContain("session/prompt");
+  });
+
+  it("a relaunch after a poisoned-session recovery resends the replayed context (BF-2447)", async () => {
+    // The dump file is per-launch (each child overwrites it), so the
+    // cross-launch method counts below come from the append file instead.
+    const appended = join(scratch, "resume-poisoned-retry-rpc.jsonl");
+    process.env.FAKE_ACP_RPC_APPEND_FILE = appended;
+    // One launch dies at session/prompt, after the recovery already rebuilt
+    // the prompt: the relaunch must skip the doomed session/load but still
+    // send the replay, not the bare turn text.
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_FAIL_AT_PROMPT = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches-poisoned");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "resume-poisoned");
+
+    let recovered = 0;
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned-retry",
+      text: "continue",
+      resumeCursor: "wedged-native-session",
+      recoveryText: "REPLAYED CONVERSATION SO FAR\n\ncontinue",
+      onReplayRecovered: () => {
+        recovered += 1;
+      },
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed", 25_000);
+
+    expect(done).toMatchObject({ ok: true });
+    // The replay reached the prompt on both attempts: once before the prompt
+    // died, once on the relaunch that skipped the doomed session/load.
+    expect(recovered).toBe(2);
+    expect(recorder.events.filter((event) => event.type === "turn.retrying")).toHaveLength(1);
+    // SAFETY: every line was written by the fake CLI's recordMethod as { pid, method, cwd }.
+    const methods: string[] = readFileSync(appended, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => (JSON.parse(line) as { method: string }).method);
+    expect(methods.filter((method) => method === "session/load")).toHaveLength(1);
+    expect(methods.filter((method) => method === "session/new")).toHaveLength(2);
+  }, 40_000);
+
+  it("a second poisoned session on the same thread still announces its own discard (BF-2447)", async () => {
+    await create(GrokAgentDriver, "resume-poisoned");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned-twice",
+      text: "continue",
+      resumeCursor: "wedged-native-session",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned-twice",
+      text: "and more",
+      resumeCursor: "wedged-again-session",
+    });
+    await vi.waitFor(
+      () => {
+        expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(2);
+      },
+      { timeout: 25_000 },
+    );
+
+    // One notice per discarded session: keyed by cursor, not by message
+    // text, so the second wedged session is not silenced by the first.
+    const notices = recorder.events.filter((event) => event.type === "runtime.notice");
+    expect(notices).toHaveLength(2);
   });
 
   it("classifies only the wedged-session rejection as poisoned (BF-2447)", () => {

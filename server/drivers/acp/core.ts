@@ -673,7 +673,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // `compressionAnnounced` outlives a relaunch (the entry is cleared only when the
       // logical turn settles), so a retried attempt that trims the same prompt
       // does not publish a second "Compressing Context" row.
-      const retryState = new Map<string, { attempt: number; cancelled: boolean; compressionAnnounced?: boolean; poisonedCursor?: string }>();
+      const retryState = new Map<string, { attempt: number; cancelled: boolean; compressionAnnounced?: boolean; poisonedCursor?: string; poisonedRebuild?: { text: string; replayed: boolean } }>();
       /** Substitution notices (model pinned to a session variant, etc.) once per thread. */
       const runtimeNoticesByThread = new Map<string, Set<string>>();
       // A relaunch waits real seconds; the fakes in acp.test.ts scale that
@@ -1768,17 +1768,22 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   `[acp] ${DRIVER_KIND} saved session ${cursor} is poisoned (unfinished turn or pending input); discarding its native history and starting a fresh session`,
                 );
                 retry.poisonedCursor = cursor;
-                // Once per thread: a relaunch must not republish the notice.
+                // Once per DISCARDED session, not once per thread: the
+                // poisoned-cursor guard above already stops a relaunch from
+                // republishing the notice, while a later wedged session on
+                // the same thread must still announce that its history was
+                // dropped.
                 {
                   const poisonedNotice =
                     "The saved session was left holding an unfinished turn, so its earlier native history was discarded and a fresh session was started.  Context from earlier in this thread may be missing.";
+                  const noticeKey = `poisoned-session:${cursor}`;
                   let heard = runtimeNoticesByThread.get(threadId);
                   if (!heard) {
                     heard = new Set();
                     runtimeNoticesByThread.set(threadId, heard);
                   }
-                  if (!heard.has(poisonedNotice)) {
-                    heard.add(poisonedNotice);
+                  if (!heard.has(noticeKey)) {
+                    heard.add(noticeKey);
                     emit({ ...base(threadId, turnId), type: "runtime.notice", message: poisonedNotice });
                   }
                 }
@@ -1796,8 +1801,30 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   currentText: turn.text,
                   failure,
                 });
+                // The relaunch below re-enters sendTurn with the same cursor
+                // and skips the doomed session/load, so the rebuilt prompt
+                // must survive the hop on the retry entry: without it the
+                // retried attempt sends the bare turn text into a second
+                // fresh session and silently drops the replayed conversation.
+                retry.poisonedRebuild = poisonedRebuild;
 
               }
+            } else if (cursor) {
+              // A relaunch after the recovery above: the cursor is known
+              // poisoned, so there is no session/load to rebuild from — carry
+              // the rebuilt prompt instead of sending the bare turn text.
+              // Recomputed when the entry has none (same pure inputs, same
+              // prompt) so the replay never depends on write ordering.
+              poisonedRebuild = retry.poisonedRebuild ?? recoveryPromptFor({
+                recoveryText: turn.recoveryText,
+                currentText: turn.text,
+                failure: classifyResumeFailure({
+                  attempted: true,
+                  rejected: true,
+                  promptSubmitted: false,
+                  producedOutput: false,
+                }),
+              });
             }
             if (!sessionId) {
               sessionResult = await request(
