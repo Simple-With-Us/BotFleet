@@ -49,6 +49,7 @@ import {
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  containerProbeContext,
   wakeContainerComputer,
   containerNetworkArgs,
   containerRuntimeStatus,
@@ -1869,4 +1870,107 @@ describe("PATH driver symlink repair", () => {
     expect(dockerfile).not.toContain("ping '-V'");
   });
 
+});
+
+describe("shared container probe context", () => {
+  const sharedTargets = [
+    SHARED_LOCAL_VM_TARGET,
+    perBotLocalVmTarget("bot-a"),
+    perBotLocalVmTarget("bot-b"),
+  ];
+
+  /** A container that exists but is not running: enough for the detail read,
+   *  and it never reaches the CUA probes. */
+  function stoppedInspect(): string {
+    return JSON.stringify([
+      {
+        Config: { Image: IMAGE, Labels: {}, Env: [] },
+        State: { Running: false, Status: "exited" },
+        Image: "sha256:managed-image-id",
+        HostConfig: {},
+        Mounts: [],
+        NetworkSettings: {},
+      },
+    ]);
+  }
+
+  function probeResponses(): Record<string, string | Error> {
+    const responses: Record<string, string | Error> = {
+      "/usr/bin/which docker": "/usr/bin/docker\n",
+      "/usr/bin/which podman": new Error("missing"),
+      [DOCKER_PROBE]: "29.0.0\n",
+      [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+    };
+    for (const target of sharedTargets) {
+      responses[`docker inspect ${target.containerName}`] = stoppedInspect();
+    }
+    return responses;
+  }
+
+  it("probes the runtime and the image once for a whole list of targets", async () => {
+    const fake = runner(probeResponses());
+    const context = await containerProbeContext(fake.run, "linux");
+    await Promise.all(sharedTargets.map((target) =>
+      containerComputerStatus(fake.run, "linux", target, context)));
+
+    expect(fake.calls.filter((call) => call === DOCKER_PROBE)).toHaveLength(1);
+    expect(fake.calls.filter((call) => call === `docker image inspect ${IMAGE}`)).toHaveLength(1);
+    // One inspect per target, not two: the detail read reuses the first.
+    for (const target of sharedTargets) {
+      expect(fake.calls.filter((call) => call === `docker inspect ${target.containerName}`)).toHaveLength(1);
+    }
+  });
+
+  it("probes the runtime and the image once per target without a shared context", async () => {
+    const fake = runner(probeResponses());
+    for (const target of sharedTargets) {
+      await containerComputerStatus(fake.run, "linux", target);
+    }
+
+    expect(fake.calls.filter((call) => call === DOCKER_PROBE)).toHaveLength(sharedTargets.length);
+    expect(fake.calls.filter((call) => call === `docker image inspect ${IMAGE}`)).toHaveLength(sharedTargets.length);
+  });
+
+  it("reports the same state with a shared context as without one", async () => {
+    const withContext = runner(probeResponses());
+    const context = await containerProbeContext(withContext.run, "linux");
+    const alone = runner(probeResponses());
+
+    for (const target of sharedTargets) {
+      const shared = await containerComputerStatus(withContext.run, "linux", target, context);
+      const single = await containerComputerStatus(alone.run, "linux", target);
+      expect(shared).toEqual(single);
+    }
+  });
+
+  it("does not inspect the image when no runtime is usable", async () => {
+    const fake = runner({
+      "/usr/bin/which docker": new Error("missing"),
+      "/usr/bin/which podman": new Error("missing"),
+    });
+    const context = await containerProbeContext(fake.run, "linux");
+
+    expect(context.runtimeStatus.runtime).toBeNull();
+    expect(context.image).toEqual({ present: false, image_id: null });
+    expect(fake.calls.some((call) => call.includes("image inspect"))).toBe(false);
+
+    const status = await containerComputerStatus(fake.run, "linux", SHARED_LOCAL_VM_TARGET, context);
+    expect(status.image).toBe(false);
+    expect(status.problem).toMatch(/runtime/i);
+  });
+
+  it("still reports a missing image when the shared context found none", async () => {
+    const fake = runner({
+      "/usr/bin/which docker": "/usr/bin/docker\n",
+      "/usr/bin/which podman": new Error("missing"),
+      [DOCKER_PROBE]: "29.0.0\n",
+      [`docker image inspect ${IMAGE}`]: new Error("no such image"),
+    });
+    const context = await containerProbeContext(fake.run, "linux");
+
+    expect(context.image).toEqual({ present: false, image_id: null });
+    const status = await containerComputerStatus(fake.run, "linux", SHARED_LOCAL_VM_TARGET, context);
+    expect(status.image).toBe(false);
+    expect(status.problem).toMatch(/Prepare the CUA desktop image/);
+  });
 });

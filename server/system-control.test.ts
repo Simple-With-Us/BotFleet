@@ -106,4 +106,47 @@ describe("system control", () => {
     expect(f.action).toHaveBeenCalledTimes(1);
     expect(f.states.get("bot:a")).toBe("running");
   });
+
+  it("reads every target in one shared pass when the caller can batch it", async () => {
+    const status = vi.fn(async (_target: (typeof targets)[number]) => ({ container: "running" }));
+    const statusAll = vi.fn(async (list: (typeof targets)[number][]) =>
+      new Map(list.map((target) => [target.key, { container: "running" }])));
+    const control = createSystemControl({
+      targets: () => targets,
+      status,
+      statusAll,
+      owner: () => undefined,
+      busy: () => false,
+      action: vi.fn(async () => {}),
+      afterStop: vi.fn(),
+    });
+
+    await expect(control.list()).resolves.toEqual([
+      { key: "shared", name: "Shared", running: true, state: "running" },
+      { key: "bot:a", name: "Bot A", running: true, state: "running" },
+    ]);
+    expect(statusAll).toHaveBeenCalledTimes(1);
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the per-target read for a target the shared pass did not answer", async () => {
+    const status = vi.fn(async (target: (typeof targets)[number]) =>
+      ({ container: target.key === "bot:a" ? "stopped" : "running" }));
+    const control = createSystemControl({
+      targets: () => targets,
+      status,
+      statusAll: async (list) => new Map([[list[0]!.key, { container: "running" }]]),
+      owner: () => undefined,
+      busy: () => false,
+      action: vi.fn(async () => {}),
+      afterStop: vi.fn(),
+    });
+
+    await expect(control.list()).resolves.toEqual([
+      { key: "shared", name: "Shared", running: true, state: "running" },
+      { key: "bot:a", name: "Bot A", running: false, state: "stopped" },
+    ]);
+    expect(status).toHaveBeenCalledTimes(1);
+    expect(status).toHaveBeenCalledWith(targets[1]);
+  });
 });
