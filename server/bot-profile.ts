@@ -248,6 +248,7 @@ export type BotProfilePatchResult =
  * patch carries the complete record to store, or `undefined` to drop it.
  */
 export function parseBotProfilePatch(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- validation boundary: the wire patch is untrusted and safeParse-checked before any field is read
   input: unknown,
   strict = false,
   current?: { voices?: BotVoices } | null,

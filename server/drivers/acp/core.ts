@@ -1590,6 +1590,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           const p = parsedNotification.data;
           // The named envelope fields are parsed and bounded above;  the
           // passthrough remainder stays vendor-shaped for the switch below.
+          // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- vendor-shaped ACP update remainder past the bounded envelope; every field is validated at the point of use
           const u = (p.update ?? {}) as Record<string, any>;
           // A history-summary session runs beside the turn's own session.
           // Its chunks collect into the summary note and must NEVER reach
