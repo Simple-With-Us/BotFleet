@@ -66,6 +66,15 @@ test("PR Autofix is not pinned to a reusable revision that deadlocks", () => {
   for (const bad of ["2e671004", "3fac4c3c"]) {
     assert.ok(!ref.startsWith(bad), `pr-autofix-reusable.yml is pinned to deadlocking ${bad}`);
   }
+  // Exact-SHA guard (Kody on #1289): the pr-autofix caller passes
+  // META_MODEL_API_TOKEN, which only the model-switch revision declares - a
+  // silent repin to anything else fails validation on every run.  a652e467 is
+  // that revision: closed host preset, fail-closed credential, request gate.
+  assert.equal(
+    ref,
+    "a652e46755412be2201a2f406e50a422c1376b4c",
+    "pr-autofix-reusable.yml pin must stay on the model-switch revision",
+  );
 });
 
 test("autofix callers keep their least-privilege and fork guards", () => {
