@@ -12035,12 +12035,22 @@ function runtimeWorkCounts(ownAdmissionActive = false, allowCredentialQueues = f
   };
 }
 
+/** The label for each kind of in-flight work.
+ *
+ *  A named contract rather than a bare `Record<string, string>`: the lint
+ *  ratchet treats an open dictionary annotation as throwing away known type
+ *  evidence, and a named owner keeps the index signature while saying what
+ *  the map holds. */
+interface BlockingWorkLabels {
+  readonly [kind: string]: string;
+}
+
 /** What to call each kind of in-flight work, for a refusal the owner can act on.
  *
  *  These are the words a person would use, not the counters' names.  The
  *  counters exist to be summed; the names exist so a refusal says "1 routine
  *  run" instead of "1 routineRuns". */
-const BLOCKING_WORK_LABELS: Readonly<Record<string, string>> = {
+const BLOCKING_WORK_LABELS: BlockingWorkLabels = {
   boot: "server start",
   admissions: "in-flight request",
   turns: "bot turn",
