@@ -7678,6 +7678,13 @@ async function startTurn(
       // A command takes nothing in front of it, so the notices wait for the next turn.
       const jobReminder = opts?.command ? { text: "", items: [] } : jobTurnReminder(bot.id, threadId, jobsMounted);
       jobNoticeItems = jobReminder.items;
+      // The replayed-history cap and the model-written summary toggle.
+      // Only a driver that budgets the prompt (ACP) honours them; the
+      // rest ignore what they do not know.
+      const historySettings: { maxHistoryTurns?: number; historySummaryModel?: true } = {};
+      const savedMaxHistoryTurns = z.number().safeParse(bot.maxHistoryTurns);
+      if (savedMaxHistoryTurns.success) historySettings.maxHistoryTurns = savedMaxHistoryTurns.data;
+      if (bot.historySummaryModel === true) historySettings.historySummaryModel = true;
       const turnInput = {
         threadId,
         text: jobReminder.text ? `${jobReminder.text}\n\n${turnText}` : turnText,
@@ -7706,11 +7713,7 @@ async function startTurn(
         resumeCursor: resume ? task.resumeCursors[instanceId] : undefined,
         recoveryText: recoveryText !== undefined && jobReminder.text ? `${jobReminder.text}\n\n${recoveryText}` : recoveryText,
         ...(recoveryText !== undefined && recoveryText !== turnText ? { recoveryIsReplay: true } : {}),
-        // The replayed-history cap and the model-written summary toggle.
-        // Only a driver that budgets the prompt (ACP) honours them; the
-        // rest ignore what they do not know.
-        ...(typeof bot.maxHistoryTurns === "number" ? { maxHistoryTurns: bot.maxHistoryTurns } : {}),
-        ...(bot.historySummaryModel === true ? { historySummaryModel: true } : {}),
+        ...historySettings,
         // A driver whose provider lost its session sends `recoveryText` in place
         // of the turn: the replay it adds in front of the message is a handoff
         // the person never typed, and only the driver knows it happened.
@@ -10069,6 +10072,12 @@ async function runGroupMemberTurn(
     Promise.resolve().then(() => {
       const finalWorkspaceError = taskWorkspaceExecutionError(contextTask?.workspaceContext, instance.driverKind, undefined, cwd);
       if (finalWorkspaceError) throw new Error(finalWorkspaceError);
+      // Same per-bot history settings as the 1:1 lane; only a driver
+      // that budgets the prompt (ACP) honours them.
+      const roomHistorySettings: { maxHistoryTurns?: number; historySummaryModel?: true } = {};
+      const roomMaxHistoryTurns = z.number().safeParse(bot.maxHistoryTurns);
+      if (roomMaxHistoryTurns.success) roomHistorySettings.maxHistoryTurns = roomMaxHistoryTurns.data;
+      if (bot.historySummaryModel === true) roomHistorySettings.historySummaryModel = true;
       return instance.adapter.sendTurn({
         threadId,
         text: roomJobReminder.text ? `${roomJobReminder.text}\n\n${text}` : text,
@@ -10086,10 +10095,7 @@ async function runGroupMemberTurn(
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
         launchIdentity: launchIdentityFor(bot, threadId),
-        // Same per-bot history settings as the 1:1 lane; only a driver
-        // that budgets the prompt (ACP) honours them.
-        ...(typeof bot.maxHistoryTurns === "number" ? { maxHistoryTurns: bot.maxHistoryTurns } : {}),
-        ...(bot.historySummaryModel === true ? { historySummaryModel: true } : {}),
+        ...roomHistorySettings,
         ...memberTurnSelection(selection),
         // the rest of the turn the card paused, held to that turn's allowlist
         toolPolicy,

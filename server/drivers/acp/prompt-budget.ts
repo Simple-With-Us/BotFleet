@@ -93,7 +93,7 @@ export const ACP_HISTORY_NOTE_MAX_CHARS = 4096;
 const maxHistoryTurnsSchema = z.number().int().min(0).max(MAX_ACP_HISTORY_TURNS);
 
 /** A non-negative integer turn cap, or undefined (ignored) for anything else. */
-export function decodeAcpMaxHistoryTurns(raw: unknown): number | undefined {
+export function decodeAcpMaxHistoryTurns(raw: Parameters<typeof maxHistoryTurnsSchema.safeParse>[0]): number | undefined {
   const parsed = maxHistoryTurnsSchema.safeParse(raw);
   return parsed.success ? parsed.data : undefined;
 }
@@ -480,17 +480,15 @@ export function applyAcpPromptBudget(input: {
   }
 
   if (!trimmed) return unchanged();
+  const dropped: AcpPromptDropped = { historyTurns: droppedTurns, sections: droppedSections };
+  if (collected.length > 0) dropped.historyTexts = collected;
+  if (summarizedTurns > 0) dropped.summarizedTurns = summarizedTurns;
   return {
     text: render(nextSystem, nextHistory, current, userStablePrefix),
     before,
     after: measure(nextSystem, nextHistory, userStablePrefix),
     trimmed: true,
-    dropped: {
-      historyTurns: droppedTurns,
-      sections: droppedSections,
-      ...(collected.length > 0 ? { historyTexts: collected } : {}),
-      ...(summarizedTurns > 0 ? { summarizedTurns } : {}),
-    },
+    dropped,
   };
 }
 

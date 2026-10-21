@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import { ensureDirs } from "../../config.ts";
 import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
@@ -599,12 +600,17 @@ describe("ACP turns (fake CLI)", () => {
   ];
   const replayText = (current: string, transcript: Array<{ role: "user" | "assistant"; text: string }> = SUMMARY_TRANSCRIPT) =>
     buildTurnContext({ text: current, transcript, rewound: false, fresh: true, replaysNatively: false }).turnText;
+  // SAFETY: recorder events are untyped; the lane's own compression emitter
+  // wrote the source and preview fields this suite reads.
   const compressionRows = () =>
     recorder.events.filter((e) => e.type === "context.injected" && (e as any).source === "compression") as any[];
+  // SAFETY: recorder events are untyped; the fake CLI emitted these fields.
   const echoedPrompts = () =>
     recorder.events
       .filter((e) => e.type === "item.completed" && (e as any).itemType === "assistant_text")
       .map((e) => String((e as any).text));
+  // SAFETY: the side dump is written by the fake CLI in this suite, one
+  // { sessionId, text } JSON object per line.
   const readSidePrompts = (path: string) =>
     readFileSync(path, "utf8")
       .trim()
@@ -630,8 +636,14 @@ describe("ACP turns (fake CLI)", () => {
     });
     // The gate holds the side session's prompt open: while the model is
     // still writing, the row must already be up, pending.
+    // SAFETY: recorder events are untyped; the pending row is the
+    // compression injection this suite just triggered.
     const pending = (await recorder.until(
-      (e) => e.type === "context.injected" && typeof (e as any).preview === "string" && (e as any).preview.includes("summarizing 4 earlier turns"),
+      (e) => {
+        // SAFETY: the compression emitter wrote preview; decode before reading.
+        const preview = z.string().safeParse((e as any).preview);
+        return e.type === "context.injected" && preview.success && preview.data.includes("summarizing 4 earlier turns");
+      },
     )) as any;
     expect(pending.io?.text?.text).toContain("The model is writing a summary");
     expect(echoedPrompts()).toHaveLength(0);
@@ -739,6 +751,7 @@ describe("ACP turns (fake CLI)", () => {
       maxHistoryTurns: 2,
       system: "SYS-PERSONA",
     });
+    // SAFETY: recorder events are untyped; turn.completed carries ok.
     const done = await recorder.until((e) => e.type === "turn.completed" && (e as any).ok === true, 30_000);
     expect(done).toMatchObject({ ok: true });
     expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);

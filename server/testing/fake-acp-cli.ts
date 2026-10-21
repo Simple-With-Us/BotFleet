@@ -646,7 +646,8 @@ function handle(msg: any, resumed = false) {
       break;
     }
     case "session/prompt": {
-      const promptSessionId = typeof msg.params?.sessionId === "string" ? msg.params.sessionId : null;
+      const parsedPromptSessionId = z.string().safeParse(msg.params?.sessionId);
+      const promptSessionId = parsedPromptSessionId.success ? parsedPromptSessionId.data : null;
       const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
       const isSidePrompt =
         process.env.FAKE_ACP_MULTI_SESSION === "1" &&

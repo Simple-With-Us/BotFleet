@@ -15,6 +15,8 @@ import { MAX_HISTORY_TURNS } from "../../shared/bot-profile";
 
 const selection = (instanceId: string): ModelSelection => ({ instanceId, model: "m" });
 
+// SAFETY: the card and the gate read only instanceId, driverKind, displayName
+// and capabilities; the fixture omits InstanceInfo fields they never touch.
 const ACP = {
   instanceId: "grok",
   driverKind: "grokAgent",
@@ -22,6 +24,7 @@ const ACP = {
   capabilities: { computerMcp: false, agentsMcp: true, localComputerMcp: false, toolLoop: false, historySummary: true },
 } as InstanceInfo;
 
+// SAFETY: same fixture shape as ACP above; only the gate's read fields are set.
 const MINIMAX = {
   instanceId: "minimax",
   driverKind: "openai-compat",

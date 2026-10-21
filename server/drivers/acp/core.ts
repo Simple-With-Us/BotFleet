@@ -1425,12 +1425,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // A history-summary session runs beside the turn's own session.
           // Its chunks collect into the summary note and must NEVER reach
           // the transcript: state.promptSent is already true when it runs.
-          const updateSessionId = typeof p.sessionId === "string" ? p.sessionId : null;
+          const parsedUpdateSessionId = z.string().safeParse(p.sessionId);
+          const updateSessionId = parsedUpdateSessionId.success ? parsedUpdateSessionId.data : null;
           if (updateSessionId && summarySessions.has(updateSessionId)) {
             const collector = summarySessions.get(updateSessionId)!;
             if (u.sessionUpdate === "agent_message_chunk") {
               const delta = u.content?.text;
-              if (typeof delta === "string") collector.text += delta;
+              const parsedDelta = z.string().safeParse(delta);
+              if (parsedDelta.success) collector.text += parsedDelta.data;
             }
             return;
           }
@@ -1906,7 +1908,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               let sideId: string | null = null;
               try {
                 const created = await request("session/new", { cwd, mcpServers: [] }, NEW_SESSION_TIMEOUT);
-                sideId = typeof created?.sessionId === "string" ? created.sessionId : null;
+                const parsedSideId = z.string().safeParse(created?.sessionId);
+                sideId = parsedSideId.success ? parsedSideId.data : null;
                 if (!sideId) return null;
                 const collector = { text: "" };
                 summarySessions.set(sideId, collector);

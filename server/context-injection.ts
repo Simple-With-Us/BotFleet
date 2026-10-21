@@ -155,6 +155,9 @@ export function addInjectionRef(
   if (byId >= 0) {
     const held = earlier![byId]!;
     if (held.source === ref.source && held.bytes === ref.bytes && held.preview === ref.preview) {
+      // SAFETY: byId came from earlier.findIndex, so earlier is defined and the
+      // array goes back unchanged; the cast only widens readonly to the declared
+      // return type.
       return earlier as ContextInjectionRef[];
     }
     const next = [...earlier!];

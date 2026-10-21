@@ -304,6 +304,8 @@ describe("parseBotProfilePatch (maxHistoryTurns and historySummaryModel)", () =>
 
   it("treats null, empty string, and invalid values as absent (clear)", () => {
     for (const bad of [null, "", -1, 501, 1.5, "25", true, {}, []]) {
+      // SAFETY: the test feeds deliberately invalid values to prove they are
+      // cleared; the patch input type excludes them, hence the cast.
       expect(parseBotProfilePatch({ maxHistoryTurns: bad } as never, true), String(bad)).toEqual({
         ok: true,
         patch: { maxHistoryTurns: undefined },
