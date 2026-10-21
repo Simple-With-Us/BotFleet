@@ -105,7 +105,7 @@ describe("OpenAICompatDriver", () => {
   });
 
   it("sends max_tokens on an OpenRouter endpoint and marks its catalog", async () => {
-    const bodies: Array<Record<string, any>> = [];
+    const bodies: Array<{ max_tokens?: number; max_completion_tokens?: number }> = [];
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
@@ -131,7 +131,7 @@ describe("OpenAICompatDriver", () => {
   });
 
   it("sends max_completion_tokens on a Groq endpoint", async () => {
-    const bodies: Array<Record<string, any>> = [];
+    const bodies: Array<{ max_tokens?: number; max_completion_tokens?: number }> = [];
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
@@ -157,7 +157,7 @@ describe("OpenAICompatDriver", () => {
   });
 
   it("sends no output-limit field and marks nothing on an unrecognized endpoint", async () => {
-    const bodies: Array<Record<string, any>> = [];
+    const bodies: Array<{ max_tokens?: number; max_completion_tokens?: number }> = [];
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
