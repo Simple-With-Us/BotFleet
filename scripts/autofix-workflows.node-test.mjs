@@ -81,7 +81,7 @@ test("PR Autofix is not pinned to a reusable revision that deadlocks", () => {
   // Validate Model Switch guard.
   assert.equal(
     ref,
-    "c97a2dae96762eb9ffc122c753f0dfb0a7840650",
+    "a4c48f013a2108be517ee933dccb1b37e9403920",
     "pr-autofix-reusable.yml pin must stay on the model-switch revision",
   );
 });
@@ -141,7 +141,7 @@ test("Claude Autofix keeps the Sentry-capable pin and same-repository bot gate",
   );
   assert.ok(
     claudeUses.includes(
-      "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650",
+      "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@a4c48f013a2108be517ee933dccb1b37e9403920",
     ),
     "claude-code-autofix-reusable.yml pin must stay on the model-switch revision",
   );
