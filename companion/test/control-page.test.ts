@@ -230,6 +230,13 @@ describe("the pairing page's refused-key remedy", () => {
 
     for (const state of states) {
       const written = renderPage(state);
+      // The sweep below only sees what the page wrote, so a page that rendered
+      // nothing would pass it for free.  Prove the page drew its panels
+      // first, or a broken page state would slip through as silence.
+      for (const id of ["where", "pair", "devices", "push"]) {
+        expect(written.get(id), `element ${id} was not rendered`).toBeDefined();
+      }
+      expect([...written.values()].join(" "), "the page rendered nothing").not.toBe("");
       for (const [id, html] of written) {
         expect(html, `element ${id}`).not.toContain("the key file");
         expect(html, `element ${id}`).not.toContain("Replace the key file");

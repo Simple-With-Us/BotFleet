@@ -227,6 +227,17 @@ it started in.
     and asserts on what lands in the DOM — and it fails against the old
     wording, so it tests the defect and not the new code.
 
+15.  **The new sweep could pass on a page that rendered nothing.**  Kody
+    reviewed the class sweep in `companion/test/control-page.test.ts` and
+    pointed out that it only inspected the elements the page had written, so
+    a page that stopped rendering would pass it for free and a broken page
+    state would escape as silence rather than as a failure.  The sweep now
+    proves the page drew its four panels before it sweeps them, and the proof
+    is itself asserted: with the render stubbed to write nothing, all five
+    tests in the file fail, and against the real page they pass.  The finding
+    was correct, and the hole was real: a sweep that cannot fail is not a
+    sweep.
+
 ## Files
 
 -  `companion/src/apns.ts` — `APNS_VAULT_READ_BUDGET_MS`,
@@ -252,7 +263,8 @@ it started in.
     served wording can be asserted on.
 -  `companion/test/control-page.test.ts` — drives the served page's own
     module script against a stub DOM and asserts on the copy that lands in
-    the DOM, across every state the page can be in.
+    the DOM, across every state the page can be in.  The sweep proves the page
+    rendered before it sweeps it, so it cannot pass on an empty page.
 -  `ios/Sources/CompanionCore/PushSenderHealth.swift` — the key-rejected
     row says the signing key needs replacing, not that a key file does.
 -  `ios/Tests/CompanionCoreTests/PushSenderHealthTests.swift` — the two
@@ -278,6 +290,9 @@ it started in.
 -  The short-material test was run against the old mask and fails there
     (`expected "ABCDEFGH…EFGH" to be "unavailable"`), so it tests the defect
     and not the new code.
+-  The served-page sweep was run against a stubbed render that writes nothing
+    and all five tests in the file fail, so the sweep cannot pass on a page
+    that rendered nothing.
 -  The live-refusal test was run against the old warning and fails there
     (`expected "companion: APNs refused the signing key (InvalidProviderToken);
     pushes are off until the key file changes" to contain "MIGHAgEA…BeVr"`), so
