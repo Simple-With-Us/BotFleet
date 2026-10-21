@@ -9,6 +9,10 @@ export const BOT_PROFILE_LIMITS = {
 /** Ceiling for per-bot HTTP tool-loop rounds (Designer 2026-09-25). */
 export const MAX_TOOL_ROUNDS = 200;
 
+/** Ceiling for a bot's replayed-history turn cap.  0 keeps none: every
+ *  replayed turn is dropped and summarized. */
+export const MAX_HISTORY_TURNS = 500;
+
 /** The round budget an HTTP tool-loop turn gets when a bot sets none.
  *
  *  Twelve is the floor that keeps a runaway loop from burning a subscription,
@@ -32,6 +36,12 @@ export const DEFAULT_MAX_TOOL_ROUNDS = 40;
  *  number a person reads is the number the loop enforces. */
 export function toolRoundsCaption(): string {
   return `Per turn.  Empty uses ${DEFAULT_MAX_TOOL_ROUNDS}.  Cap is ${MAX_TOOL_ROUNDS}.`;
+}
+
+/** The owner-facing sentence for the Maximum History Turns control, built
+ *  from the real cap. */
+export function historyTurnsCaption(): string {
+  return `Replayed turns kept per prompt.  Empty keeps them all.  Cap is ${MAX_HISTORY_TURNS}.`;
 }
 
 /** The budget a turn will actually run under, and whether the owner chose it.

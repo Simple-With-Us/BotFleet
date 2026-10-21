@@ -44,11 +44,13 @@ import {
   SLOW_INIT_LOG_MS,
 } from "./init-deadline.ts";
 import { estimateCatalogCost } from "../../gen-ai-cost.ts";
-import { boundText } from "../../../shared/item-io.ts";
+import { boundText, cutText } from "../../../shared/item-io.ts";
 import { annotatePromptBudget, captureTurnPrompt } from "../../sentry-ai.ts";
 import {
+  ACP_HISTORY_NOTE_MAX_CHARS,
   acpPromptCeilingRefusal,
   applyAcpPromptBudget,
+  buildExtractiveHistoryNote,
   decodeAcpContextCapTokens,
   decodeAcpPromptBudgetBytes,
   describeAcpPromptTrim,
@@ -351,6 +353,9 @@ const BOOT_MODEL_DISCOVERY_TIMEOUT_MS = 10_000;
 // cold starts with many servers configured.
 const NEW_SESSION_TIMEOUT = 120_000;
 const LOAD_SESSION_TIMEOUT = 120_000; // history replay on a long thread is slow
+/** A history summary is a convenience on the turn's critical path, not the
+ *  turn:  one minute, then the extractive note steps in. */
+const SUMMARY_SESSION_TIMEOUT = 60_000;
 // Hard backstop: fires regardless of streaming activity.  Kept as a floor
 // under the renewable idle deadline below — an agent that streams filler
 // forever without ever finishing must still die eventually.
@@ -642,8 +647,20 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // the same shape for the same reason.
       // `compressionAnnounced` outlives a relaunch (the entry is cleared only when the
       // logical turn settles), so a retried attempt that trims the same prompt
-      // does not publish a second "Compressing Context" row.
-      const retryState = new Map<string, { attempt: number; cancelled: boolean; compressionAnnounced?: boolean }>();
+      // does not publish a second "Compressing Context" row.  `compressionItemId`
+      // keeps the row's id stable across attempts and `compressionSettled` records
+      // that a final row landed, so an attempt that dies after a PENDING summary
+      // row still resolves that same row in place when the retry's summary lands.
+      const retryState = new Map<
+        string,
+        { attempt: number; cancelled: boolean; compressionAnnounced?: boolean; compressionSettled?: boolean; compressionItemId?: string }
+      >();
+      /** Model-written history summaries, per thread.  Rolled forward as more
+       *  turns drop (only the newly dropped turns go back to the model),
+       *  reused verbatim when the same turns drop again — including a
+       *  relaunch of the same logical turn — and reset when fewer drop
+       *  (a rewind, a bigger budget). */
+      const summaryCacheByThread = new Map<string, { summary: string; coveredTurns: number }>();
       /** Substitution notices (model pinned to a session variant, etc.) once per thread. */
       const runtimeNoticesByThread = new Map<string, Set<string>>();
       // A relaunch waits real seconds; the fakes in acp.test.ts scale that
@@ -1395,12 +1412,28 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           });
         };
 
+        /** Side sessions writing a history summary on this turn's child:
+         *  sessionId → collected reply text.  Entries stay after the summary
+         *  lands so a late chunk is swallowed rather than leaked. */
+        const summarySessions = new Map<string, { text: string }>();
         const handleNotification = (msg: any) => {
           // Vendor side-channels (e.g. grok's `_x.ai/*`) are teed to the
           // native log but never normalized: the prompt result is the settle.
           if (msg.method !== "session/update") return;
           const p = msg.params ?? {};
           const u = p.update ?? {};
+          // A history-summary session runs beside the turn's own session.
+          // Its chunks collect into the summary note and must NEVER reach
+          // the transcript: state.promptSent is already true when it runs.
+          const updateSessionId = typeof p.sessionId === "string" ? p.sessionId : null;
+          if (updateSessionId && summarySessions.has(updateSessionId)) {
+            const collector = summarySessions.get(updateSessionId)!;
+            if (u.sessionUpdate === "agent_message_chunk") {
+              const delta = u.content?.text;
+              if (typeof delta === "string") collector.text += delta;
+            }
+            return;
+          }
           // Agents announce their commands right after session/new or
           // session/load, before the prompt goes out and while a resumed
           // session is still replaying, so this reads ahead of the gate below.
@@ -1847,6 +1880,59 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             emitSessionStarted();
             state.promptSent = true;
+            /** Model-written summary of the turns the budget dropped, or null
+             *  on any failure (the caller falls back to the extractive note).
+             *  A side session on the same child does the writing;  its chunks
+             *  are routed by sessionId, never to the transcript.  The cache
+             *  rolls forward:  the same drops reuse the note, more drops send
+             *  only the newly dropped turns back, fewer drop everything and
+             *  start over. */
+            const summarizeDroppedHistory = async (
+              droppedTurns: number,
+              droppedTexts: readonly string[],
+            ): Promise<string | null> => {
+              const cached = summaryCacheByThread.get(threadId);
+              if (cached && cached.coveredTurns === droppedTurns) return cached.summary;
+              const truncated = droppedTexts.length < droppedTurns;
+              const instruction =
+                "You are compressing omitted conversation history for an agent whose prompt ran over its context budget.  " +
+                "Write a compact factual brief of the omitted turns: decisions made, facts and names stated, files and ids touched, commitments given.  " +
+                "Plain prose or short bullets, at most 200 words.  Do not continue the conversation; output only the brief.";
+              const elided = truncated ? "\n\n(Only the first part of the omitted text is shown.)" : "";
+              const promptText =
+                cached && droppedTurns > cached.coveredTurns
+                  ? `${instruction}\n\nSummary so far:\n${cached.summary}\n\nNewly omitted turns:\n${droppedTexts.slice(cached.coveredTurns).join("\n")}${elided}`
+                  : `${instruction}\n\nOmitted turns:\n${droppedTexts.join("\n")}${elided}`;
+              let sideId: string | null = null;
+              try {
+                const created = await request("session/new", { cwd, mcpServers: [] }, NEW_SESSION_TIMEOUT);
+                sideId = typeof created?.sessionId === "string" ? created.sessionId : null;
+                if (!sideId) return null;
+                const collector = { text: "" };
+                summarySessions.set(sideId, collector);
+                await request(
+                  "session/prompt",
+                  { sessionId: sideId, prompt: [{ type: "text", text: promptText }] },
+                  SUMMARY_SESSION_TIMEOUT,
+                );
+                const brief = collector.text.trim();
+                if (!brief) return null;
+                const wrapped = `[${droppedTurns} earlier ${droppedTurns === 1 ? "turn" : "turns"} summarized to fit the prompt budget.  ${brief}]`;
+                const note = wrapped.length > ACP_HISTORY_NOTE_MAX_CHARS ? cutText(wrapped, ACP_HISTORY_NOTE_MAX_CHARS) : wrapped;
+                summaryCacheByThread.set(threadId, { summary: note, coveredTurns: droppedTurns });
+                return note;
+              } catch {
+                return null;
+              } finally {
+                if (sideId) {
+                  // The map entry STAYS: a late chunk for this session is
+                  // swallowed by the routing above rather than leaked.
+                  try {
+                    send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: sideId } });
+                  } catch {}
+                }
+              }
+            };
             // Budget the prompt about to be sent.  This does not decide
             // whether the system prompt is inlined on resume.  Under the
             // ceiling the composed text is unchanged.
@@ -1871,49 +1957,108 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 model: resolvedModel ?? turn.model,
                 composed,
               }).bytes;
-              const budgeted = applyAcpPromptBudget({
+              const maxHistoryTurns = turn.maxHistoryTurns;
+              // The "Compressing Context" row.  Names and sizes only.  Once
+              // per logical turn: a relaunch trims the same prompt again.  A
+              // model-written summary can take seconds, so the row goes up
+              // BEFORE the model runs and resolves in place (same itemId)
+              // when the note lands — or when the extractive fallback steps in.
+              const compressionItemId = (retry.compressionItemId ??= `ctx-${randomUUID()}`);
+              let compressionPending = false;
+              const announceCompression = (preview: string, bytesSaved: number, body: string) => {
+                emit({
+                  ...base(threadId, turnId),
+                  type: "context.injected",
+                  itemId: compressionItemId,
+                  source: "compression",
+                  preview,
+                  bytes: bytesSaved,
+                  io: { text: boundText(body) },
+                });
+                try {
+                  // Only the harness knows which message this turn answers.
+                  turn.onContextCompressed?.({
+                    id: compressionItemId,
+                    source: "compression",
+                    preview,
+                    bytes: bytesSaved,
+                  });
+                } catch (error) {
+                  console.error("acp: onContextCompressed threw", error);
+                }
+              };
+              // Pass 1 learns what the trim drops;  the dropped turns' text
+              // is what the summary note is written from.
+              const planned = applyAcpPromptBudget({
                 composed,
                 sections: turn.systemSections,
                 userText: turn.text,
                 budgetBytes,
+                maxHistoryTurns,
+                collectDroppedText: true,
               });
+              let budgeted = planned;
+              let summaryKind: "extractive" | "model" | undefined;
+              if (planned.trimmed && planned.dropped.historyTurns > 0) {
+                const droppedTurns = planned.dropped.historyTurns;
+                const droppedTexts = planned.dropped.historyTexts ?? [];
+                let note: string | null = null;
+                if (turn.historySummaryModel === true) {
+                  if (!retry.compressionAnnounced) {
+                    retry.compressionAnnounced = true;
+                    compressionPending = true;
+                    announceCompression(
+                      `summarizing ${droppedTurns} earlier ${droppedTurns === 1 ? "turn" : "turns"}…`,
+                      0,
+                      "Older context is being cut before this turn is sent.  " +
+                        `The model is writing a summary of the ${droppedTurns} dropped ${droppedTurns === 1 ? "turn" : "turns"};  this row updates when it lands, and falls back to excerpts if that fails.`,
+                    );
+                  }
+                  note = await summarizeDroppedHistory(droppedTurns, droppedTexts);
+                  if (note !== null) summaryKind = "model";
+                }
+                note ??= buildExtractiveHistoryNote(droppedTexts);
+                summaryKind ??= "extractive";
+                // Pass 2 substitutes the note for the dropped turns it covers.
+                budgeted = applyAcpPromptBudget({
+                  composed,
+                  sections: turn.systemSections,
+                  userText: turn.text,
+                  budgetBytes,
+                  maxHistoryTurns,
+                  historySummary: { text: note, coversTurns: droppedTurns },
+                });
+              }
               annotatePromptBudget(threadId, turnId, budgeted);
               // The refusal comes first: a turn that is refused was not sent,
               // so it must not also say context was cut to fit it.
               const refusal = acpPromptCeilingRefusal(budgeted.text, budgetBytes);
               if (refusal) {
+                if (compressionPending || (retry.compressionAnnounced && !retry.compressionSettled)) {
+                  retry.compressionSettled = true;
+                  announceCompression("not sent: prompt too large", 0, refusal.message);
+                }
                 // Last resort: protected text alone is far past the budget.  Say
                 // so in the transcript instead of sending a prompt that size.
                 emit({ ...base(threadId, turnId), type: "runtime.error", message: refusal.message });
                 settle(false, "prompt_too_large");
                 return;
               }
-              const trim = describeAcpPromptTrim(budgeted, budgetBytes);
-              if (trim && !retry.compressionAnnounced) {
-                // The "Compressing Context" row.  Names and sizes only.  Once
-                // per logical turn: a relaunch trims the same prompt again.
+              const trim = describeAcpPromptTrim(
+                budgeted,
+                budgetBytes,
+                summaryKind ? { kind: summaryKind, turns: budgeted.dropped.summarizedTurns ?? 0 } : undefined,
+              );
+              // The summary path re-announces on every attempt: a retried
+              // attempt re-derives the note, and the attempt that died may
+              // have published only the pending row or the extractive
+              // fallback.  The stable itemId makes this an in-place replace.
+              // The plain trim announces once per logical turn — the prompt
+              // it describes is identical on every attempt.
+              if (trim && (compressionPending || summaryKind !== undefined || !retry.compressionAnnounced)) {
                 retry.compressionAnnounced = true;
-                const itemId = `ctx-${randomUUID()}`;
-                emit({
-                  ...base(threadId, turnId),
-                  type: "context.injected",
-                  itemId,
-                  source: "compression",
-                  preview: trim.preview,
-                  bytes: trim.bytesSaved,
-                  io: { text: boundText(trim.text) },
-                });
-                try {
-                  // Only the harness knows which message this turn answers.
-                  turn.onContextCompressed?.({
-                    id: itemId,
-                    source: "compression",
-                    preview: trim.preview,
-                    bytes: trim.bytesSaved,
-                  });
-                } catch (error) {
-                  console.error("acp: onContextCompressed threw", error);
-                }
+                retry.compressionSettled = true;
+                announceCompression(trim.preview, trim.bytesSaved, trim.text);
               }
               text = neutralizeLeadingSlash(budgeted.text);
               captureTurnPrompt(threadId, turnId, text);
@@ -2139,6 +2284,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             toolPolicy: Boolean(support.allowlist),
             // Explicit engine commands run directly, outside the ordinary prompt budget.
             engineCommands: true,
+            // The prompt budget drops replayed history under the ceiling and
+            // substitutes a summary note (extractive, or model-written when
+            // the bot opts in): the per-bot history settings apply here.
+            historySummary: true,
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),

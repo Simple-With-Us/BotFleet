@@ -44,6 +44,15 @@
 //                     session/new and session/load, before any prompt, and
 //                     marks the one after session/load as replayed history
 //                     when FAKE_ACP_COMMANDS_REPLAY is set.
+//   FAKE_ACP_MULTI_SESSION=1
+//                     session/new returns distinct ids (fake-acp-session-1, -2,
+//                     ...) and echo-gated prompt notifications carry their
+//                     session's id, so a test can drive a history-summary side
+//                     session beside the turn's own.  The FIRST session is the
+//                     turn's; for any later one FAKE_ACP_SIDE_FAIL=new|prompt
+//                     answers that call with a JSON-RPC error,
+//                     FAKE_ACP_SIDE_REPLY fixes the reply text, and
+//                     FAKE_ACP_SIDE_DUMP appends each side prompt as JSONL.
 //   FAKE_ACP_DUMP   path to write {argv, env} as JSON, so a test can assert
 //                   argv shape (agent/stdio flags) and env hygiene
 //   FAKE_ACP_MODELS      comma-separated model ids. Enables the opencode-shaped
@@ -100,6 +109,11 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { z } from "zod";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
+
+// FAKE_ACP_MULTI_SESSION bookkeeping: session/new hands out distinct ids and
+// the first one created is treated as the turn's own session.
+let sessionCounter = 0;
+let firstSessionId: string | null = null;
 
 /** The agent's catalog of slash commands, announced the way ACP agents do:
  *  a session/update notification, before any prompt. */
@@ -506,10 +520,17 @@ function handle(msg: any, resumed = false) {
       if (process.env.FAKE_ACP_DUMP) {
         writeFileSync(`${process.env.FAKE_ACP_DUMP}.mcp.json`, JSON.stringify(servers, null, 2));
       }
+      sessionCounter += 1;
+      const newSessionId = process.env.FAKE_ACP_MULTI_SESSION === "1" ? `fake-acp-session-${sessionCounter}` : "fake-acp-session";
+      if (firstSessionId === null) firstSessionId = newSessionId;
+      if (newSessionId !== firstSessionId && process.env.FAKE_ACP_SIDE_FAIL === "new") {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "side session/new failed" } });
+        break;
+      }
       const opts = configOptions();
       const mdls = sessionModels();
       result(msg.id, {
-        sessionId: "fake-acp-session",
+        sessionId: newSessionId,
         ...(opts ? { configOptions: opts } : {}),
         ...(mdls ? { models: mdls } : {}),
       });
@@ -625,6 +646,20 @@ function handle(msg: any, resumed = false) {
       break;
     }
     case "session/prompt": {
+      const promptSessionId = typeof msg.params?.sessionId === "string" ? msg.params.sessionId : null;
+      const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
+      const isSidePrompt =
+        process.env.FAKE_ACP_MULTI_SESSION === "1" &&
+        promptSessionId !== null &&
+        firstSessionId !== null &&
+        promptSessionId !== firstSessionId;
+      if (isSidePrompt && process.env.FAKE_ACP_SIDE_FAIL === "prompt") {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "side session/prompt failed" } });
+        break;
+      }
+      if (isSidePrompt && process.env.FAKE_ACP_SIDE_DUMP) {
+        appendFileSync(process.env.FAKE_ACP_SIDE_DUMP, JSON.stringify({ sessionId: promptSessionId, text: promptText }) + "\n");
+      }
       if (failAtPrompt) {
         process.stderr.write("fake-acp: HTTP 503 service temporarily unavailable\n");
         process.exit(5);
@@ -849,9 +884,14 @@ function handle(msg: any, resumed = false) {
         // echoing the WHOLE prompt (system + turn text) lets a test assert
         // both what a drained turn was sent and what it was NOT sent (e.g.
         // the webhook untrusted-data paragraph a steered turn must not get)
-        const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
+        const replyText = isSidePrompt ? (process.env.FAKE_ACP_SIDE_REPLY ?? `side echo: ${promptText}`) : `echo: ${promptText}`;
         const finish = () => {
-          out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `echo: ${promptText}` } } } });
+          const update = { sessionUpdate: "agent_message_chunk", content: { text: replyText } };
+          const params =
+            process.env.FAKE_ACP_MULTI_SESSION === "1" && promptSessionId !== null
+              ? { sessionId: promptSessionId, update }
+              : { update };
+          out({ jsonrpc: "2.0", method: "session/update", params });
           complete();
         };
         const gate = process.env.FAKE_ACP_GATE_FILE;

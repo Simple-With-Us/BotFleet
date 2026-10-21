@@ -141,12 +141,27 @@ export function mergeInjectionRefs(
  * message already holds it.  "Holds it" is the id, or the same source, size and
  * preview as `dropRecorded` reads it: a model fallback dispatches one message
  * again, and its second "Compressing Context" row would say what the first
- * already did. */
+ * already did.
+ *
+ * One exception: the same id with a NEW reading replaces the held row in
+ * place.  That is how a pending row resolves — a "Compressing Context" row
+ * posted while the model writes a summary updates to the finished numbers
+ * under the same id instead of stacking a second row. */
 export function addInjectionRef(
   earlier: readonly ContextInjectionRef[] | undefined,
   ref: ContextInjectionRef,
 ): ContextInjectionRef[] {
-  if (earlier?.some((held) => held.id === ref.id || (held.source === ref.source && held.bytes === ref.bytes && held.preview === ref.preview))) {
+  const byId = earlier?.findIndex((held) => held.id === ref.id) ?? -1;
+  if (byId >= 0) {
+    const held = earlier![byId]!;
+    if (held.source === ref.source && held.bytes === ref.bytes && held.preview === ref.preview) {
+      return earlier as ContextInjectionRef[];
+    }
+    const next = [...earlier!];
+    next[byId] = ref;
+    return next;
+  }
+  if (earlier?.some((held) => held.source === ref.source && held.bytes === ref.bytes && held.preview === ref.preview)) {
     return earlier as ContextInjectionRef[];
   }
   return mergeInjectionRefs(earlier, [ref]);

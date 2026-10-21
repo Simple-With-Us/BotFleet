@@ -14,6 +14,7 @@ import {
   DEFAULT_MAX_TOOL_ROUNDS,
   MAX_TOOL_ROUNDS,
   toolRoundsCaption,
+  MAX_HISTORY_TURNS,
 } from "../../shared/bot-profile";
 import {
   activeEngine,
@@ -22,6 +23,7 @@ import {
   configuredEngine,
   honorsToolRounds,
   reviewerOptions,
+  historySummaryGate,
   toolRoundsGate,
 } from "./bot-settings-gates";
 import type { Bot, InstanceInfo, ModelSelection } from "@/state/store";
@@ -53,6 +55,7 @@ function instance(
 
 const TOOL_LOOP = instance("minimax", { toolLoop: true, agentsMcp: true }, { displayName: "MiniMax" });
 const CLI = instance("claude", { toolLoop: false, agentsMcp: true }, { displayName: "Claude Code" });
+const ACP = instance("grok", { historySummary: true, agentsMcp: true }, { driverKind: "grokAgent", displayName: "Grok" });
 
 describe("the default is one number, said once", () => {
   it("the caption a person reads is built from the real constants", () => {
@@ -160,6 +163,69 @@ describe("toolRoundsGate", () => {
       });
       expect(gate.visible, String(saved)).toBe(false);
     }
+  });
+});
+
+describe("historySummaryGate", () => {
+  it("is visible and editable on an engine that budgets its prompt", () => {
+    const gate = historySummaryGate([ACP], {
+      modelSelection: selection("grok"),
+      maxHistoryTurns: null,
+      historySummaryModel: undefined,
+    });
+    expect(gate).toMatchObject({ visible: true, editable: true, note: null });
+    expect(gate.caption).toContain(`Cap is ${MAX_HISTORY_TURNS}`);
+  });
+
+  it("is hidden on an engine that keeps its own history when nothing is saved", () => {
+    const gate = historySummaryGate([TOOL_LOOP], {
+      modelSelection: selection("minimax"),
+      maxHistoryTurns: null,
+      historySummaryModel: undefined,
+    });
+    expect(gate).toMatchObject({ visible: false, editable: false, note: null });
+  });
+
+  it("STAYS VISIBLE but read-only when a saved cap outlives the engine that honored it", () => {
+    const gate = historySummaryGate([TOOL_LOOP], {
+      modelSelection: selection("minimax"),
+      maxHistoryTurns: 25,
+      historySummaryModel: undefined,
+    });
+    expect(gate.visible).toBe(true);
+    expect(gate.editable).toBe(false);
+    expect(gate.note).toContain("MiniMax keeps its own history");
+  });
+
+  it("stays visible for a saved model-summary toggle alone", () => {
+    const gate = historySummaryGate([CLI], {
+      modelSelection: selection("claude"),
+      maxHistoryTurns: null,
+      historySummaryModel: true,
+    });
+    expect(gate.visible).toBe(true);
+    expect(gate.editable).toBe(false);
+  });
+
+  it("treats a saved cap of 0 as a value to preserve, not as unset", () => {
+    const gate = historySummaryGate([CLI], {
+      modelSelection: selection("claude"),
+      maxHistoryTurns: 0,
+      historySummaryModel: undefined,
+    });
+    expect(gate.visible).toBe(true);
+    expect(gate.editable).toBe(false);
+  });
+
+  it("names the engine actually running when a fallback moved off the configured one", () => {
+    const gate = historySummaryGate([ACP, TOOL_LOOP], {
+      modelSelection: selection("grok"),
+      activeModelSelection: selection("minimax"),
+      maxHistoryTurns: 10,
+      historySummaryModel: undefined,
+    });
+    // Configured engine honors it: editable, no rollover copy needed.
+    expect(gate.editable).toBe(true);
   });
 });
 

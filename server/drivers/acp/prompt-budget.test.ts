@@ -12,6 +12,8 @@ import {
   resolveAcpPromptBudget,
   resolveAcpPromptBudgetBytes,
   decodeAcpContextCapTokens,
+  decodeAcpMaxHistoryTurns,
+  buildExtractiveHistoryNote,
   estimateTokens,
   type AcpPromptSection,
 } from "./prompt-budget.ts";
@@ -512,3 +514,207 @@ describe("token budget", () => {
     for (const bad of [0, -1, 1.5, "512k", null, 10_000_001]) expect(decodeAcpContextCapTokens(bad)).toBeUndefined();
   });
 });
+
+function threeTurnPrompt() {
+  const t1 = `User: ${"oldest ".repeat(30)}`;
+  const t2 = `Assistant: ${"middle ".repeat(30)}`;
+  const t3 = `User: ${"newest ".repeat(30)}`;
+  const user = `${t1}\n${t2}\n${t3}\n\n${TURN_REPLY_CUE}\n\n${current}`;
+  const listed = sections();
+  return {
+    composed: compose(listed.map((section) => section.text).join(""), user),
+    userText: user,
+    sections: listed,
+    t1,
+    t2,
+    t3,
+  };
+}
+
+describe("max history turns", () => {
+  it("drops replayed turns beyond the cap even when the bytes fit", () => {
+    const input = threeTurnPrompt();
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: bytes(input.composed), maxHistoryTurns: 1 });
+    expect(result.trimmed).toBe(true);
+    expect(result.dropped.historyTurns).toBe(2);
+    expect(result.text).not.toContain("oldest");
+    expect(result.text).not.toContain("middle");
+    expect(result.text).toContain("newest");
+    expect(result.text).toContain("VOLATILE-OLD");
+    expect(result.text).toContain("VOLATILE-NEW");
+  });
+
+  it("applies with the byte budget off", () => {
+    const input = threeTurnPrompt();
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: null, maxHistoryTurns: 2 });
+    expect(result.trimmed).toBe(true);
+    expect(result.dropped.historyTurns).toBe(1);
+    expect(result.text).not.toContain("oldest");
+    expect(result.text).toContain("middle");
+    expect(result.text).toContain("newest");
+  });
+
+  it("leaves a replay at the cap unchanged", () => {
+    const input = threeTurnPrompt();
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: bytes(input.composed), maxHistoryTurns: 3 });
+    expect(result.trimmed).toBe(false);
+    expect(result.text).toBe(input.composed);
+  });
+});
+
+describe("history summary substitution", () => {
+  const note = "[2 earlier turns summarized: the user set the project up.]";
+
+  it("replaces covered drops with the note instead of markers", () => {
+    const input = threeTurnPrompt();
+    const result = applyAcpPromptBudget({
+      ...input,
+      budgetBytes: null,
+      maxHistoryTurns: 1,
+      historySummary: { text: note, coversTurns: 2 },
+      collectDroppedText: true,
+    });
+    expect(result.text).toContain(note);
+    expect(result.text).not.toContain(ACP_PROMPT_SECTION_OMITTED);
+    expect(result.text).not.toContain("oldest");
+    expect(result.text).toContain("newest");
+    expect(result.text.indexOf(note)).toBeLessThan(result.text.indexOf("newest"));
+    expect(result.dropped.historyTurns).toBe(2);
+    expect(result.dropped.summarizedTurns).toBe(2);
+    expect(result.dropped.historyTexts).toEqual([input.t1, input.t2]);
+  });
+
+  it("keeps the per-turn marker past the covered count", () => {
+    const input = threeTurnPrompt();
+    const result = applyAcpPromptBudget({
+      ...input,
+      budgetBytes: null,
+      maxHistoryTurns: 1,
+      historySummary: { text: "[1 turn summarized.]", coversTurns: 1 },
+    });
+    expect(result.text).toContain("[1 turn summarized.]");
+    expect(result.text).toContain(ACP_PROMPT_SECTION_OMITTED);
+    expect(result.dropped.historyTurns).toBe(2);
+    expect(result.dropped.summarizedTurns).toBe(1);
+  });
+
+  it("never re-drops the note under byte pressure", () => {
+    const input = threeTurnPrompt();
+    const result = applyAcpPromptBudget({
+      ...input,
+      budgetBytes: 1,
+      historySummary: { text: note, coversTurns: 3 },
+    });
+    expect(result.text).toContain(note);
+    expect(result.text).not.toContain("oldest");
+    expect(result.text).not.toContain("newest");
+    expect(result.text.startsWith(stable)).toBe(true);
+    expect(result.text.endsWith(current)).toBe(true);
+    expect(result.dropped.summarizedTurns).toBe(3);
+  });
+});
+
+describe("collect dropped text", () => {
+  it("collects the dropped turns' text oldest first", () => {
+    const input = threeTurnPrompt();
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: 1, collectDroppedText: true });
+    expect(result.dropped.historyTurns).toBe(3);
+    expect(result.dropped.historyTexts).toEqual([input.t1, input.t2, input.t3]);
+  });
+
+  it("collects nothing when nothing is dropped", () => {
+    const input = threeTurnPrompt();
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: bytes(input.composed), collectDroppedText: true });
+    expect(result.trimmed).toBe(false);
+    expect(result.dropped.historyTexts).toBeUndefined();
+  });
+
+  it("bounds the collected text while the count stays exact", () => {
+    const big = (word: string) => `User: ${word} `.repeat(1) + "x".repeat(40 * 1024);
+    const t1 = big("first");
+    const t2 = big("second");
+    const t3 = big("third");
+    const user = `${t1}\n${t2}\n${t3}\n\n${TURN_REPLY_CUE}\n\n${current}`;
+    const input = { composed: compose("", user), userText: user, sections: [] };
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: null, maxHistoryTurns: 0, collectDroppedText: true });
+    expect(result.dropped.historyTurns).toBe(3);
+    expect(result.dropped.historyTexts?.length).toBe(2);
+    expect(result.dropped.historyTexts?.[0]).toBe(t1);
+  });
+});
+
+describe("buildExtractiveHistoryNote", () => {
+  it("writes one clipped line per turn", () => {
+    const note = buildExtractiveHistoryNote([
+      "User: first question here\nmore detail",
+      "Assistant: an answer here",
+    ]);
+    expect(note).toContain("[2 earlier turns omitted to fit the prompt budget.");
+    expect(note).toContain("User: first question here");
+    expect(note).toContain("Assistant: an answer here");
+    expect(note.endsWith("]")).toBe(true);
+    expect(note).not.toContain("more detail");
+  });
+
+  it("caps the excerpt list and counts the rest", () => {
+    const turns = Array.from({ length: 14 }, (_, i) => `User: turn ${i + 1} text`);
+    const note = buildExtractiveHistoryNote(turns);
+    expect(note).toContain("… and 2 more turns.]");
+    expect(note).toContain("turn 12 text");
+    expect(note).not.toContain("turn 13 text");
+  });
+
+  it("clips a long first line", () => {
+    const note = buildExtractiveHistoryNote([`User: ${"word ".repeat(80)}`, "Assistant: short"]);
+    const excerpt = note.split("\n")[1]!;
+    expect(excerpt.length).toBeLessThanOrEqual(160);
+    expect(excerpt.endsWith("…")).toBe(true);
+  });
+});
+
+describe("describeAcpPromptTrim with a summary", () => {
+  it("says how many turns the note covers, without blaming the byte budget", () => {
+    const input = threeTurnPrompt();
+    const note = "[2 earlier turns summarized.]";
+    const result = applyAcpPromptBudget({
+      ...input,
+      budgetBytes: null,
+      maxHistoryTurns: 1,
+      historySummary: { text: note, coversTurns: 2 },
+    });
+    const trim = describeAcpPromptTrim(result, null, { kind: "extractive", turns: 2 });
+    expect(trim).not.toBeNull();
+    expect(trim!.preview).toContain("2 summarized");
+    expect(trim!.text).toContain("Older context was cut before this turn was sent.");
+    expect(trim!.text).toContain("(2 replaced by one excerpt line each)");
+    expect(trim!.text).toContain("The summary sits where those turns were.");
+    expect(trim!.text).not.toContain("omission marker");
+  });
+
+  it("names a model-written summary", () => {
+    const input = threeTurnPrompt();
+    const note = "[2 earlier turns summarized by the model.]";
+    const result = applyAcpPromptBudget({
+      ...input,
+      budgetBytes: null,
+      maxHistoryTurns: 1,
+      historySummary: { text: note, coversTurns: 2 },
+    });
+    const trim = describeAcpPromptTrim(result, null, { kind: "model", turns: 2 });
+    expect(trim!.text).toContain("(2 replaced by a summary the model wrote)");
+  });
+});
+
+describe("decodeAcpMaxHistoryTurns", () => {
+  it("accepts a whole-number cap and rejects the rest", () => {
+    expect(decodeAcpMaxHistoryTurns(50)).toBe(50);
+    expect(decodeAcpMaxHistoryTurns(0)).toBe(0);
+    expect(decodeAcpMaxHistoryTurns(500)).toBe(500);
+    expect(decodeAcpMaxHistoryTurns(-1)).toBeUndefined();
+    expect(decodeAcpMaxHistoryTurns(501)).toBeUndefined();
+    expect(decodeAcpMaxHistoryTurns(2.5)).toBeUndefined();
+    expect(decodeAcpMaxHistoryTurns("50")).toBeUndefined();
+    expect(decodeAcpMaxHistoryTurns(undefined)).toBeUndefined();
+  });
+});
+

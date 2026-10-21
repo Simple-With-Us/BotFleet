@@ -7706,6 +7706,11 @@ async function startTurn(
         resumeCursor: resume ? task.resumeCursors[instanceId] : undefined,
         recoveryText: recoveryText !== undefined && jobReminder.text ? `${jobReminder.text}\n\n${recoveryText}` : recoveryText,
         ...(recoveryText !== undefined && recoveryText !== turnText ? { recoveryIsReplay: true } : {}),
+        // The replayed-history cap and the model-written summary toggle.
+        // Only a driver that budgets the prompt (ACP) honours them; the
+        // rest ignore what they do not know.
+        ...(typeof bot.maxHistoryTurns === "number" ? { maxHistoryTurns: bot.maxHistoryTurns } : {}),
+        ...(bot.historySummaryModel === true ? { historySummaryModel: true } : {}),
         // A driver whose provider lost its session sends `recoveryText` in place
         // of the turn: the replay it adds in front of the message is a handoff
         // the person never typed, and only the driver knows it happened.
@@ -10081,6 +10086,10 @@ async function runGroupMemberTurn(
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
         launchIdentity: launchIdentityFor(bot, threadId),
+        // Same per-bot history settings as the 1:1 lane; only a driver
+        // that budgets the prompt (ACP) honours them.
+        ...(typeof bot.maxHistoryTurns === "number" ? { maxHistoryTurns: bot.maxHistoryTurns } : {}),
+        ...(bot.historySummaryModel === true ? { historySummaryModel: true } : {}),
         ...memberTurnSelection(selection),
         // the rest of the turn the card paused, held to that turn's allowlist
         toolPolicy,

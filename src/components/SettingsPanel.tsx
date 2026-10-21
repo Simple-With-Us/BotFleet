@@ -38,8 +38,9 @@ import { bypassCoverageNote } from "../../shared/bypass-coverage";
 import { VoiceSettings } from "./VoiceSettings";
 import { AutoReviewCard } from "./AutoReviewCard";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
-import { botCapabilityGates, toolRoundsGate } from "@/lib/bot-settings-gates";
+import { botCapabilityGates, historySummaryGate, toolRoundsGate } from "@/lib/bot-settings-gates";
 import { MaxToolRoundsField } from "./MaxToolRoundsField";
+import { HistoryCompressionField } from "./HistoryCompressionField";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { effortLabel } from "@/lib/model-effort";
 import { selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
@@ -406,6 +407,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "composio"
         | "modelSelection"
         | "maxToolRounds"
+        | "maxHistoryTurns"
+        | "historySummaryModel"
         | "off"
       >
     > & { acknowledgeLocalAuto?: boolean; connectorTools?: Bot["connectorTools"] },
@@ -422,6 +425,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const engine = gates.engine;
   const { canCoordinate, canUseConnectedApps, canUseVps } = gates;
   const roundsGate = toolRoundsGate(state.instances, bot);
+  const historyGate = historySummaryGate(state.instances, bot);
   // Null when the engine asks and the broker answers, which is the common case.
   const bypassNote = bypassCoverageNote(engine?.capabilities?.bypassCoverage ?? "asks");
   const connectedAppsConfigured = state.config?.composio?.configured === true;
@@ -707,6 +711,16 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               value={bot.maxToolRounds}
               onChange={(maxToolRounds) => patch({ maxToolRounds })}
               gate={roundsGate}
+            />
+          )}
+
+          {historyGate.visible && (
+            <HistoryCompressionField
+              maxHistoryTurns={bot.maxHistoryTurns}
+              historySummaryModel={bot.historySummaryModel}
+              onMaxHistoryTurns={(maxHistoryTurns) => patch({ maxHistoryTurns })}
+              onHistorySummaryModel={(historySummaryModel) => patch({ historySummaryModel })}
+              gate={historyGate}
             />
           )}
 

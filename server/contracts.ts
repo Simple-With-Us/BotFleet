@@ -321,6 +321,16 @@ export interface SendTurnInput {
   contextCapTokens?: number;
   /** The bot's output limit in tokens, when its model supports one. */
   maxOutputTokens?: number;
+  /** The bot's cap on replayed history turns: older turns are dropped (and
+   *  summarized) even when the byte budget would fit them.  Absent keeps
+   *  every turn the byte budget fits.  Only a driver that budgets the
+   *  prompt honours it. */
+  maxHistoryTurns?: number;
+  /** When true, dropped history turns are summarized by the bot's model —
+   *  cached and rolled forward across turns — falling back to the
+   *  extractive note on any error.  Absent or false is the extractive
+   *  default.  Only a driver that can run a side session honours it. */
+  historySummaryModel?: boolean;
   resumeCursor?: unknown;
   /** The turn with the conversation so far replayed inline, attached only
    * alongside resumeCursor. A cursor-resuming driver sends it once, on a
@@ -340,12 +350,16 @@ export interface SendTurnInput {
    * that cannot rebuild does not call it, and a throw here must not fail the
    * turn. */
   onReplayRecovered?: () => void;
-  /** Called at most once per logical turn by a driver that cut older context
-   * to fit the prompt budget (the ACP driver), right after it publishes the
-   * `context.injected` event for the cut.  The ref is the row's own record:
-   * the harness hangs it under the message that started this turn, which only
-   * it knows.  A relaunch after a transient failure does not call it again.
-   * Never required, and a throw here must not fail the turn. */
+  /** Called by a driver that cut older context to fit the prompt budget
+   * (the ACP driver), right after it publishes the `context.injected`
+   * event for the cut.  The ref is the row's own record: the harness hangs
+   * it under the message that started this turn, which only it knows.
+   * A relaunch after a transient failure does not call it again.
+   * It may be called a second time with the SAME id and a new reading —
+   * a row posted while the model writes a history summary resolves to the
+   * finished numbers — and the harness replaces the row in place
+   * (server/context-injection.ts addInjectionRef).  Never required, and a
+   * throw here must not fail the turn. */
   onContextCompressed?: (ref: ContextInjectionRef) => void;
   /** Prior turns for transcript-replay providers (API-backed drivers).
    *  Each entry may carry tool call and result metadata so the executor
@@ -684,6 +698,11 @@ export interface ProviderAdapter {
      * `SendTurnInput.toolHost` only to such a driver, and dispatches it on
      * the same one-line path it uses for a CLI engine. */
     toolLoop?: boolean;
+    /** True when the driver trims an over-budget prompt itself and can
+     *  substitute a summary note for the replayed history it drops (the ACP
+     *  prompt budget), so the per-bot `maxHistoryTurns` and
+     *  `historySummaryModel` settings apply to it. */
+    historySummary?: boolean;
     /** True when the driver builds its own message history from
      * `SendTurnInput.transcript` every turn — every chat-completions driver
      * does this, the way a CLI driver replays its own native session.  A
