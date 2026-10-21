@@ -459,8 +459,10 @@ function playInterleaveTurn() {
 
 /** The JSON-RPC envelope every inbound message is parsed against before
  *  any field of it is read:  a bounded id, a bounded method name, and the
- *  rest passed through for each method's own bounded schema.  A message
- *  that does not fit is dropped unanswered — a reply echoes the id, and an
+ *  params, result or error left for each method's own bounded schema.  The
+ *  envelope is closed:  every message here comes from BotFleet's own ACP
+ *  driver, so an unknown top-level key is contract drift and the message is
+ *  dropped unanswered rather than accepted.  A reply echoes the id, and an
  *  unvalidated id is never echoed. */
 export const jsonRpcEnvelopeSchema = z.object({
   jsonrpc: z.literal("2.0").optional(),
@@ -469,7 +471,7 @@ export const jsonRpcEnvelopeSchema = z.object({
   params: z.unknown().optional(),
   result: z.unknown().optional(),
   error: z.unknown().optional(),
-}).passthrough();
+}).strict();
 export type JsonRpcEnvelope = z.infer<typeof jsonRpcEnvelopeSchema>;
 
 /** A session/prompt payload's content block.  Bounded on the text, lenient
@@ -479,6 +481,7 @@ export type JsonRpcEnvelope = z.infer<typeof jsonRpcEnvelopeSchema>;
 export const promptContentSchema = z
   .object({ type: z.string().optional(), text: z.string().max(10_000_000) })
   .passthrough();
+export type PromptContent = z.infer<typeof promptContentSchema>;
 
 /** A session/prompt call's params, bounded and strict at the method level:
  *  the one schema the handler parses, and the source of truth for the
