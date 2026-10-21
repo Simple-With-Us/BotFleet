@@ -222,6 +222,7 @@ import {
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  containerProbeContext,
   redactSecrets,
   refreshLocalVmGhCredentials,
   wakeContainerComputer,
@@ -14809,6 +14810,19 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const control = createSystemControl({
         targets: () => localVmModeSwitchTargets(store.bots.map((bot) => bot.id)),
         status: (target) => containerComputerStatus(undefined, undefined, target),
+        // One shared probe for the whole list: every target asks the same
+        // runtime and the same image, so asking once per target made this
+        // route cost N runtime probes and N image probes for N answers.
+        statusAll: async (targets) => {
+          const states = new Map<string, { container: string }>();
+          if (!targets.length) return states;
+          const context = await containerProbeContext();
+          await Promise.all(targets.map(async (target) => {
+            const state = await containerComputerStatus(undefined, undefined, target, context);
+            states.set(target.key, state);
+          }));
+          return states;
+        },
         owner: (target) => localVmLeaseFor(target).current(localVmOwnerBusy)?.botId
           ?? (target.key === SHARED_LOCAL_VM_TARGET.key
             ? store.bots.map((bot) => localVmLeaseFor(localVmTargetForBot(bot.id)).current(localVmOwnerBusy)?.botId).find(Boolean)

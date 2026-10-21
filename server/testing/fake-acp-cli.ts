@@ -522,6 +522,14 @@ function handle(msg: any, resumed = false) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32001, message: "saved session is gone" } });
         break;
       }
+      if (mode === "resume-poisoned") {
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32001, message: "The saved Muse session has an unfinished turn or pending input" },
+        });
+        break;
+      }
       if (mode === "resume-auth") {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "authentication required" } });
         break;
