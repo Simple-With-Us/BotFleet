@@ -11,11 +11,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import { ensureDirs } from "../../config.ts";
-import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
+import type { ModelCatalog, ProviderInstance, RuntimeEvent } from "../../contracts.ts";
 import type { ContextInjectionRef } from "../../../shared/context-injection.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
+import { buildTurnContext } from "../../turn-context.ts";
 import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../../testing/launch-identity.ts";
 import { MODEL_REJECTED_STOP_REASON } from "../../model-fallback.ts";
 import { classifyError } from "../retry.ts";
@@ -35,6 +37,17 @@ import { McodeAgentDriver } from "./mcode.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
+
+/** One side-session prompt the fake CLI recorded: the session it went to and
+ *  the summarizer text it carried.  Strict, so a malformed dump line fails
+ *  the suite instead of bypassing the assertions that read it. */
+export const SidePromptSchema = z
+  .object({
+    sessionId: z.string().min(1).max(256),
+    text: z.string(),
+  })
+  .strict();
+export type SidePrompt = z.infer<typeof SidePromptSchema>;
 
 /** A harness that exists only in tests: it exercises the opt-in session-config
  *  model hook so PR 1 can prove the core capability without shipping a visible
@@ -386,6 +399,11 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_INIT_DELAY_MS;
     delete process.env.FAKE_ACP_DRIP_MS;
     delete process.env.FAKE_ACP_DRIP_COUNT;
+    delete process.env.FAKE_ACP_MULTI_SESSION;
+    delete process.env.FAKE_ACP_SIDE_REPLY;
+    delete process.env.FAKE_ACP_SIDE_DUMP;
+    delete process.env.FAKE_ACP_SIDE_FAIL;
+    delete process.env.FAKE_ACP_GATE_FILE;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -576,6 +594,235 @@ describe("ACP turns (fake CLI)", () => {
     await recorder.until((event) => event.type === "turn.completed");
     expect(recorder.events.some((event) => event.type === "context.injected")).toBe(false);
   });
+
+  // --- Model-written rolling summary for dropped history (per-bot toggle) ---
+  // Six one-line pieces of replayed history;  maxHistoryTurns keeps the
+  // newest two, so four drop — no byte math involved, the count cap drives.
+  const SUMMARY_TRANSCRIPT: Array<{ role: "user" | "assistant"; text: string }> = [
+    { role: "user", text: "TURN1A my dog is named Biscuit" },
+    { role: "assistant", text: "TURN1B noted, Biscuit" },
+    { role: "user", text: "TURN2A my cat is named Mochi" },
+    { role: "assistant", text: "TURN2B noted, Mochi" },
+    { role: "user", text: "TURN3A my bird is named Kiwi" },
+    { role: "assistant", text: "TURN3B noted, Kiwi" },
+  ];
+  const TURN4_PAIR: Array<{ role: "user" | "assistant"; text: string }> = [
+    { role: "user", text: "TURN4A my fish is named Bubbles" },
+    { role: "assistant", text: "TURN4B noted, Bubbles" },
+  ];
+  const replayText = (current: string, transcript: Array<{ role: "user" | "assistant"; text: string }> = SUMMARY_TRANSCRIPT) =>
+    buildTurnContext({ text: current, transcript, rewound: false, fresh: true, replaysNatively: false }).turnText;
+  // SAFETY: recorder events are typed RuntimeEvents;  the predicate narrows
+  // to compression injections so itemId/preview/io stay checked.
+  const compressionRows = () =>
+    recorder.events.filter(
+      (e): e is Extract<RuntimeEvent, { type: "context.injected" }> =>
+        e.type === "context.injected" && "source" in e && e.source === "compression",
+    );
+  // SAFETY: same narrowing for transcript text the fake CLI echoed back.
+  const echoedPrompts = () =>
+    recorder.events
+      .filter(
+        (e): e is Extract<RuntimeEvent, { type: "item.completed"; itemType: "assistant_text" }> =>
+          e.type === "item.completed" && "itemType" in e && e.itemType === "assistant_text",
+      )
+      .map((e) => e.text);
+  // SAFETY: the side dump is written by the fake CLI in this suite, one
+  // { sessionId, text } JSON object per line — each line is parsed against
+  // the strict contract below, so a malformed record fails the test instead
+  // of slipping through an assertion.
+  const readSidePrompts = (path: string): SidePrompt[] =>
+    readFileSync(path, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => SidePromptSchema.parse(JSON.parse(line)));
+
+  it("runs the model-written summary behind a pending row that resolves in place", async () => {
+    const gate = join(scratch, "summary-gate");
+    const sideDump = join(scratch, "summary-side.jsonl");
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_REPLY = "SUMMARY-BRIEF: Biscuit the dog and Mochi the cat.";
+    process.env.FAKE_ACP_SIDE_DUMP = sideDump;
+    process.env.FAKE_ACP_GATE_FILE = gate;
+    await create(GrokAgentDriver, "echo-gated");
+    const compressed: ContextInjectionRef[] = [];
+    const sent = instance.adapter.sendTurn({
+      threadId: "t-summary",
+      text: replayText("what are my pets called?"),
+      historySummaryModel: true,
+      maxHistoryTurns: 2,
+      system: "SYS-PERSONA",
+      onContextCompressed: (ref) => void compressed.push(ref),
+    });
+    // The gate holds the side session's prompt open: while the model is
+    // still writing, the row must already be up, pending.  The whole event
+    // is parsed against the compression-row contract;  preview and io come
+    // only from the validated result, never from a cast.
+    const pendingRowSchema = z
+      .object({
+        type: z.literal("context.injected"),
+        preview: z.string(),
+        io: z.object({ text: z.object({ text: z.string() }).optional() }).optional(),
+      })
+      .catchall(z.unknown());
+    const pending = pendingRowSchema.parse(
+      await recorder.until((e) => {
+        const parsed = pendingRowSchema.safeParse(e);
+        return parsed.success && parsed.data.preview.includes("summarizing 4 earlier turns");
+      }),
+    );
+    expect(pending.io?.text?.text).toContain("The model is writing a summary");
+    expect(echoedPrompts()).toHaveLength(0);
+    writeFileSync(gate, "go");
+    await sent;
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const rows = compressionRows();
+    expect(rows).toHaveLength(2);
+    expect(rows[0].itemId).toBe(rows[1].itemId); // resolves in place
+    expect(rows[1].preview).toContain("4 earlier turns, 4 summarized");
+    expect(rows[1].io?.text?.text).toContain("a summary the model wrote");
+    expect(compressed).toHaveLength(2);
+    expect(compressed[0].id).toBe(compressed[1].id);
+
+    const text = echoedPrompts().at(-1)!;
+    expect(text).toContain("[4 earlier turns summarized to fit the prompt budget.  SUMMARY-BRIEF: Biscuit the dog and Mochi the cat.]");
+    for (const dropped of ["TURN1A", "TURN1B", "TURN2A", "TURN2B"]) expect(text).not.toContain(dropped);
+    for (const kept of ["TURN3A", "TURN3B", "what are my pets called?"]) expect(text).toContain(kept);
+
+    const side = readSidePrompts(sideDump);
+    expect(side).toHaveLength(1);
+    expect(side[0].sessionId).toBe("fake-acp-session-2");
+    expect(side[0].text).toContain("compressing omitted conversation history");
+    for (const dropped of ["TURN1A", "TURN1B", "TURN2A", "TURN2B"]) expect(side[0].text).toContain(dropped);
+    expect(side[0].text).not.toContain("TURN3A");
+    // the side session's reply never became a transcript item
+    expect(echoedPrompts()).toHaveLength(1);
+  });
+
+  it("falls back to an extractive note when the summary side session fails", async () => {
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_FAIL = "new";
+    await create(GrokAgentDriver, "echo-gated");
+    await instance.adapter.sendTurn({
+      threadId: "t-summary-fallback",
+      text: replayText("what are my pets called?"),
+      historySummaryModel: true,
+      maxHistoryTurns: 2,
+      system: "SYS-PERSONA",
+    });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    const rows = compressionRows();
+    expect(rows).toHaveLength(2); // pending, then the fallback's final
+    expect(rows[0].itemId).toBe(rows[1].itemId);
+    expect(rows[1].preview).toContain("4 earlier turns, 4 summarized");
+    expect(rows[1].io?.text?.text).toContain("one excerpt line each");
+    const text = echoedPrompts().at(-1)!;
+    expect(text).toContain("[4 earlier turns omitted to fit the prompt budget.");
+    expect(text).toContain("TURN1A"); // a dropped turn's excerpt line
+    expect(text).toContain("TURN3A"); // the kept newest turns
+    expect(text).not.toContain("SUMMARY-BRIEF");
+  });
+
+  it("rolls the cached summary forward as more turns drop, and reuses it when the same turns drop again", async () => {
+    const sideDump = join(scratch, "rolling-side.jsonl");
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_REPLY = "ROLLING-BRIEF";
+    process.env.FAKE_ACP_SIDE_DUMP = sideDump;
+    await create(GrokAgentDriver, "echo-gated");
+    const send = async (transcript: Array<{ role: "user" | "assistant"; text: string }>, current: string) => {
+      const { turnId } = await instance.adapter.sendTurn({
+        threadId: "t-rolling",
+        text: replayText(current, transcript),
+        historySummaryModel: true,
+        maxHistoryTurns: 2,
+        system: "SYS-PERSONA",
+      });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    };
+    await send(SUMMARY_TRANSCRIPT, "first question");
+    await send([...SUMMARY_TRANSCRIPT, ...TURN4_PAIR], "second question");
+    await send([...SUMMARY_TRANSCRIPT, ...TURN4_PAIR], "second question");
+
+    const side = readSidePrompts(sideDump);
+    // Two side prompts, not three: the identical third turn reuses the cache.
+    expect(side).toHaveLength(2);
+    expect(side[0].text).not.toContain("Summary so far");
+    expect(side[0].text).toContain("TURN1A");
+    // Turn two sends only the newly dropped turns, plus the summary so far.
+    expect(side[1].text).toContain("Summary so far");
+    expect(side[1].text).toContain("ROLLING-BRIEF");
+    expect(side[1].text).toContain("TURN3A");
+    expect(side[1].text).toContain("TURN3B");
+    expect(side[1].text).not.toContain("TURN1A");
+    expect(side[1].text).not.toContain("TURN2A");
+    // The note grows with the drops and the reused note ships verbatim.
+    expect(echoedPrompts()[1]).toContain("[6 earlier turns summarized to fit the prompt budget.  ROLLING-BRIEF]");
+    expect(echoedPrompts()[2]).toContain("[6 earlier turns summarized to fit the prompt budget.  ROLLING-BRIEF]");
+  });
+
+  it("resolves the pending row in place when a transient relaunch re-runs the summary", async () => {
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_REPLY = "BRIEF-AFTER-RETRY";
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_FAIL_AT_PROMPT = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-retry-state");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "echo-gated");
+    await instance.adapter.sendTurn({
+      threadId: "t-summary-retry",
+      text: replayText("what are my pets called?"),
+      historySummaryModel: true,
+      maxHistoryTurns: 2,
+      system: "SYS-PERSONA",
+    });
+    // SAFETY: turn.completed carries ok on the contract;  narrow to it.
+    const done = await recorder.until(
+      (e): e is Extract<RuntimeEvent, { type: "turn.completed" }> => e.type === "turn.completed" && "ok" in e && e.ok === true,
+      30_000,
+    );
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);
+    // Pending, the crashed attempt's extractive final, then the relaunch's
+    // model-written final: one row, updated in place each time.
+    const rows = compressionRows();
+    expect(rows).toHaveLength(3);
+    expect(new Set(rows.map((row) => row.itemId)).size).toBe(1);
+    expect(rows[0].preview).toContain("summarizing 4 earlier turns");
+    expect(rows[1].io?.text?.text).toContain("one excerpt line each");
+    expect(rows[2].io?.text?.text).toContain("a summary the model wrote");
+    expect(echoedPrompts().at(-1)).toContain("BRIEF-AFTER-RETRY");
+  }, 40_000);
+
+  it("does not re-announce an identical extractive row when a relaunch re-derives it", async () => {
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_FAIL = "new";
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_FAIL_AT_PROMPT = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-dedupe-state");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "echo-gated");
+    await instance.adapter.sendTurn({
+      threadId: "t-summary-dedupe",
+      text: replayText("what are my pets called?"),
+      historySummaryModel: true,
+      maxHistoryTurns: 2,
+      system: "SYS-PERSONA",
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId !== undefined);
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);
+    // Pending, then one extractive final: the relaunch derives the same
+    // deterministic note and must not publish the row a second time.  The
+    // stable itemId would make a real update an in-place replace;  an
+    // identical reading is not an update.
+    const rows = compressionRows();
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.itemId)).size).toBe(1);
+    expect(rows[0].preview).toContain("summarizing 4 earlier turns");
+    expect(rows[1].preview).toContain("4 earlier turns, 4 summarized");
+    expect(rows[1].io?.text?.text).toContain("one excerpt line each");
+  }, 40_000);
 
   it("fails closed when a saved ACP session cannot be resumed", async () => {
     const dump = join(scratch, "resume-rpc.json");

@@ -377,6 +377,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "history-compression") {
+  // Visual-spec harness (tests/e2e/history-compression.visual.spec.ts):
+  // History Compression controls, editable and read-only.
+  void import("./components/HistoryCompressionVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "bypass-local-computer") {
   // Visual-spec harness (tests/e2e/bypass-local-computer.visual.spec.ts):
   // Bypass Including This Mac, off, on, disabled, and its warning.

@@ -286,6 +286,63 @@ describe("parseBotProfilePatch (maxToolRounds)", () => {
   });
 });
 
+describe("parseBotProfilePatch (maxHistoryTurns and historySummaryModel)", () => {
+  it("keeps an integer in 0..500", () => {
+    expect(parseBotProfilePatch({ maxHistoryTurns: 0 }, true)).toEqual({
+      ok: true,
+      patch: { maxHistoryTurns: 0 },
+    });
+    expect(parseBotProfilePatch({ maxHistoryTurns: 25 }, true)).toEqual({
+      ok: true,
+      patch: { maxHistoryTurns: 25 },
+    });
+    expect(parseBotProfilePatch({ maxHistoryTurns: 500 }, false)).toEqual({
+      ok: true,
+      patch: { maxHistoryTurns: 500 },
+    });
+  });
+
+  it("treats null, empty string, and invalid values as absent (clear)", () => {
+    for (const bad of [null, "", -1, 501, 1.5, "25", true]) {
+      // SAFETY: the test feeds deliberately invalid values to prove they are
+      // cleared; the patch input type excludes them, hence the cast.
+      expect(parseBotProfilePatch({ maxHistoryTurns: bad } as never, true), String(bad)).toEqual({
+        ok: true,
+        patch: { maxHistoryTurns: undefined },
+      });
+    }
+  });
+
+  it("rejects arrays, objects, and oversized strings on the 4xx path", () => {
+    for (const bad of [{}, [], ["1"], "x".repeat(100)]) {
+      // SAFETY: shape-malformed values must fail validation itself (so the
+      // route answers 4xx) instead of being accepted and silently clearing
+      // the setting.
+      // The boundary takes unknown and the Zod parse inside rejects these;
+      // no cast means the test cannot drift from what the route will see.
+      expect(parseBotProfilePatch({ maxHistoryTurns: bad }, true).ok, String(bad)).toBe(false);
+    }
+  });
+
+  it("passes the model-written toggle through, strict included", () => {
+    expect(parseBotProfilePatch({ historySummaryModel: true }, true)).toEqual({
+      ok: true,
+      patch: { historySummaryModel: true },
+    });
+    expect(parseBotProfilePatch({ historySummaryModel: false }, true)).toEqual({
+      ok: true,
+      patch: { historySummaryModel: false },
+    });
+  });
+
+  it("omitting both fields leaves them out of the patch — existing values stay", () => {
+    const result = parseBotProfilePatch({ name: "Mira" }, true);
+    expect(result.ok).toBe(true);
+    expect(result.ok && "maxHistoryTurns" in result.patch).toBe(false);
+    expect(result.ok && "historySummaryModel" in result.patch).toBe(false);
+  });
+});
+
 describe("resolveMaxToolRounds", () => {
   it("accepts 1..200 integers and rejects everything else", () => {
     expect(resolveMaxToolRounds(2)).toBe(2);

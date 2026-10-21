@@ -152,7 +152,7 @@ import { ThreadWedgeGuard, type ThreadWedgeFailureInput } from "./thread-wedge-g
 import { effectiveFallbackTiers } from "./model-fallback.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
-import { effectiveToolRounds, toolBudgetPrompt, type DispatchHold } from "../shared/bot-profile.ts";
+import { effectiveToolRounds, toolBudgetPrompt, type DispatchHold, type MaxHistoryTurns, maxHistoryTurnsSchema } from "../shared/bot-profile.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
 import {
   activeTurnWorktreeLeases,
@@ -7679,6 +7679,17 @@ async function startTurn(
       // A command takes nothing in front of it, so the notices wait for the next turn.
       const jobReminder = opts?.command ? { text: "", items: [] } : jobTurnReminder(bot.id, threadId, jobsMounted);
       jobNoticeItems = jobReminder.items;
+      // The replayed-history cap and the model-written summary toggle.
+      // Only a driver that budgets the prompt (ACP) honours them; the
+      // rest ignore what they do not know.
+      interface HistoryTurnSettings {
+        maxHistoryTurns?: MaxHistoryTurns;
+        historySummaryModel?: true;
+      }
+      const historySettings: HistoryTurnSettings = {};
+      const savedMaxHistoryTurns = maxHistoryTurnsSchema.safeParse(bot.maxHistoryTurns);
+      if (savedMaxHistoryTurns.success) historySettings.maxHistoryTurns = savedMaxHistoryTurns.data;
+      if (bot.historySummaryModel === true) historySettings.historySummaryModel = true;
       const turnInput = {
         threadId,
         text: jobReminder.text ? `${jobReminder.text}\n\n${turnText}` : turnText,
@@ -7707,6 +7718,7 @@ async function startTurn(
         resumeCursor: resume ? task.resumeCursors[instanceId] : undefined,
         recoveryText: recoveryText !== undefined && jobReminder.text ? `${jobReminder.text}\n\n${recoveryText}` : recoveryText,
         ...(recoveryText !== undefined && recoveryText !== turnText ? { recoveryIsReplay: true } : {}),
+        ...historySettings,
         // A driver whose provider lost its session sends `recoveryText` in place
         // of the turn: the replay it adds in front of the message is a handoff
         // the person never typed, and only the driver knows it happened.
@@ -10065,6 +10077,16 @@ async function runGroupMemberTurn(
     Promise.resolve().then(() => {
       const finalWorkspaceError = taskWorkspaceExecutionError(contextTask?.workspaceContext, instance.driverKind, undefined, cwd);
       if (finalWorkspaceError) throw new Error(finalWorkspaceError);
+      // Same per-bot history settings as the 1:1 lane; only a driver
+      // that budgets the prompt (ACP) honours them.
+      interface HistoryTurnSettings {
+        maxHistoryTurns?: MaxHistoryTurns;
+        historySummaryModel?: true;
+      }
+      const roomHistorySettings: HistoryTurnSettings = {};
+      const roomMaxHistoryTurns = maxHistoryTurnsSchema.safeParse(bot.maxHistoryTurns);
+      if (roomMaxHistoryTurns.success) roomHistorySettings.maxHistoryTurns = roomMaxHistoryTurns.data;
+      if (bot.historySummaryModel === true) roomHistorySettings.historySummaryModel = true;
       return instance.adapter.sendTurn({
         threadId,
         text: roomJobReminder.text ? `${roomJobReminder.text}\n\n${text}` : text,
@@ -10082,6 +10104,7 @@ async function runGroupMemberTurn(
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
         launchIdentity: launchIdentityFor(bot, threadId),
+        ...roomHistorySettings,
         ...memberTurnSelection(selection),
         // the rest of the turn the card paused, held to that turn's allowlist
         toolPolicy,

@@ -395,6 +395,13 @@ export interface Bot {
    *  Unset or null uses DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts) — the
    *  same number the turn's prompt names and the loop stops at. */
   maxToolRounds?: number | null;
+  /** Cap on replayed history turns before older turns are dropped and
+   *  summarized (ACP engines).  Unset or null keeps every turn the byte
+   *  budget fits. */
+  maxHistoryTurns?: number | null;
+  /** Let the bot's model write the dropped-history summary (cached and
+   *  rolled forward), falling back to the extractive note on error. */
+  historySummaryModel?: boolean;
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
   speechDevices?: Array<"mac" | "iphone">;
@@ -870,6 +877,8 @@ export interface InstanceInfo {
     bypassCoverage?: "asks" | "native" | "none";
     /** The harness runs this engine's tool loop, so Maximum Tool Rounds applies. */
     toolLoop?: boolean;
+    /** ACP prompt budget: the per-bot history cap/summary settings apply. */
+    historySummary?: boolean;
   };
   /** Which computer destinations this engine can be given at all, derived
    *  server-side in `server/computer-capability.ts` and shipped whole.  The

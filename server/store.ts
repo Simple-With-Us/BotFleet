@@ -685,6 +685,15 @@ export interface BotRecord {
    * which DEFAULT_TURN_LOOP_BUDGET.maxRounds is derived from.
    * Integer 1..200; invalid values are treated as absent at dispatch. */
   maxToolRounds?: number;
+  /** Cap on replayed history turns in a budgeted prompt (ACP engines):
+   * older turns are dropped and summarized even when the byte budget would
+   * fit them.  Unset keeps every turn the byte budget fits.
+   * Integer 0..MAX_HISTORY_TURNS; invalid values are treated as absent. */
+  maxHistoryTurns?: number;
+  /** When true, dropped history turns are summarized by the bot's model
+   * (cached and rolled forward), falling back to the extractive note on
+   * error.  Absent or false is the extractive default. */
+  historySummaryModel?: boolean;
   /** Speak this bot's replies aloud as they settle, without being asked.
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */
