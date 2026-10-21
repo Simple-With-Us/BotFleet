@@ -12,7 +12,7 @@
 // never committed, and nothing reaches the network beyond a local server.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createPublicKey, createVerify, generateKeyPairSync } from "node:crypto";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -178,6 +178,48 @@ test("the staged file is written with mode 600 whatever the umask says", () => {
   assert.equal(written.pem.trim(), envKeyPem.trim());
 });
 
+test("the writer refuses a directory anyone but the owner may enter", () => {
+  //  A credential may never land in a shared or durable place:  the staged
+  //  copy lives in an owner-only staging directory, and the writer refuses
+  //  anything else.
+  const shared = mkdtempSync(join(tmpdir(), "asc-key-shared-"));
+  chmodSync(shared, 0o755);
+  const written = writePrivateKeyFile(join(shared, "key.p8"), envKeyPem);
+  assert.ok(written.error, `a shared directory was accepted: ${written.error}`);
+  assert.match(written.error, /not owner-only/);
+});
+
+test("the writer refuses a protected place", () => {
+  //  A credential directory is refused by the same rules the house policy
+  //  uses for a routine's own files.
+  mkdirSync(join(root, ".ssh"), { mode: 0o700 });
+  const written = writePrivateKeyFile(join(root, ".ssh", "key.p8"), envKeyPem);
+  assert.ok(written.error, `a protected place was accepted: ${written.error}`);
+  assert.match(written.error, /protected place/);
+});
+
+test("the writer refuses a link at the last component", () => {
+  //  A path that was swapped for a symlink must not redirect the key.
+  const link = join(root, "linked.p8");
+  symlinkSync(join(root, "real.p8"), link);
+  const written = writePrivateKeyFile(link, envKeyPem);
+  assert.ok(written.error, "a symlink was written through");
+  assert.match(written.error, /link/);
+});
+
+test("the writer keeps mode 600 on a file that already existed", () => {
+  //  writeFileSync would have applied the mode only on creation; the mode is
+  //  enforced on the handle, so a stale file cannot keep permissions that
+  //  let anyone else read the key.
+  const path = join(root, "existing.p8");
+  writeFileSync(path, "stale");
+  chmodSync(path, 0o644);
+  const written = writePrivateKeyFile(path, envKeyPem);
+  assert.ok(written.pem, `the write failed: ${written.error}`);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.equal(readFileSync(path, "utf8").trim(), envKeyPem.trim());
+});
+
 test("the child's environment is an allowlist, not a copy of the parent's", () => {
   //  A wholesale copy hands every credential on the operator's machine to the
   //  child, including the ones that have nothing to do with App Store Connect.
@@ -255,6 +297,33 @@ test("the client refuses a key in the environment that is not a PEM", async () =
   });
   assert.equal(result.code, 1, `expected the refusal exit, got ${result.code}: ${result.stderr}`);
   assert.match(result.stderr, /ASC_KEY_P8 is set but is not a PEM private key/);
+});
+
+test("the client falls through to the environment credential when APPLE_API_KEY_P8_BASE64 is broken", async () => {
+  //  A source that is present but unusable is skipped, not fatal:  the shell
+  //  layer ignores the same value and carries on, and the credential it
+  //  resolved is in the environment as ASC_KEY_P8.
+  const server = await localServer();
+  try {
+    const result = await spawnNode([client, "GET", `${server.base}/v1/apps`], {
+      PATH: safePath,
+      HOME: join(root, "home-broken"),
+      ASC_API_BASE: server.base,
+      ASC_KEY_ID: "SYNTHETICKEYID1",
+      ASC_ISSUER_ID: "synthetic-issuer",
+      ASC_KEY_P8: envKeyPem,
+      APPLE_API_KEY_ID: "BROKENKEY001",
+      APPLE_API_ISSUER_ID: "broken-issuer",
+      APPLE_API_KEY_P8_BASE64: "not a private key at all"
+    });
+    assert.equal(result.code, 0, `the client did not run: ${result.stderr}`);
+    assert.match(result.stderr, /asc-auth: using ASC_KEY_P8 environment/,
+      `the client did not fall through:\n${result.stderr}`);
+    const token = String(server.seen[0]?.authorization || "").replace(/^Bearer /, "");
+    assert.ok(signedWith(token, envKeyPem), "the request was not signed with the environment key");
+  } finally {
+    server.close();
+  }
 });
 
 test("the key never travels in the command arguments", async () => {

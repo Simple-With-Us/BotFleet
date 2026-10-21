@@ -149,9 +149,12 @@ grep -q '^ASC_KEY_P8 /asc$' "$FAKE_LOG" || fail "did not ask Infisical /asc for 
 : > "$FAKE_LOG"
 cp "${tmp}/asc.p8" "${tmp}/named-key.p8"
 chmod 600 "${tmp}/named-key.p8"
-env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
-  ASC_KEY_ID=ENVKEY0001 ASC_ISSUER_ID=env-issuer \
-  ASC_KEY_P8="$(<"${tmp}/other.p8")" ASC_KEY_PATH="${tmp}/named-key.p8" bash -c '
+#  The key is assigned in front of `env`, so it reaches the child through the
+#  environment and never through a process argument, where a listing would
+#  show it.
+ASC_KEY_P8="$(<"${tmp}/other.p8")" \
+  env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+  ASC_KEY_ID=ENVKEY0001 ASC_ISSUER_ID=env-issuer ASC_KEY_PATH="${tmp}/named-key.p8" bash -c '
   set -euo pipefail
   source "'"$funcs"'"
   load_secrets
@@ -296,8 +299,8 @@ env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
 # 2f. An ambient ASC_KEY_P8 without a key id is ignored:  the key id, the
 #     issuer and the key belong together.
 : > "$FAKE_LOG"
-env -u ASC_KEY_ID -u ASC_ISSUER_ID -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
-  ASC_KEY_P8="$(<"${tmp}/other.p8")" bash -c '
+ASC_KEY_P8="$(<"${tmp}/other.p8")" \
+  env -u ASC_KEY_ID -u ASC_ISSUER_ID -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 bash -c '
   set -euo pipefail
   source "'"$funcs"'"
   load_secrets
@@ -400,8 +403,9 @@ env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
 
 # 3. The credential never travels in a command argument.  The secret reaches
 #    the child through the environment, so its own argv must not carry it.
-argv="$(env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
-  ASC_KEY_ID=ENVKEY0005 ASC_ISSUER_ID=env-issuer ASC_KEY_P8="$(<"${tmp}/other.p8")" bash -c '
+argv="$(ASC_KEY_P8="$(<"${tmp}/other.p8")" \
+  env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+  ASC_KEY_ID=ENVKEY0005 ASC_ISSUER_ID=env-issuer bash -c '
   set -euo pipefail
   ps -o args= -p $$ 2>/dev/null || true
 ')"

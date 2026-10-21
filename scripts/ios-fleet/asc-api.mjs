@@ -109,6 +109,13 @@ function materializeP8(pem) {
   return p;
 }
 
+// Why a source could not be used.  A failed lookup is never swallowed:  it is
+// recorded here with the reason, and the notes are printed on every path, so
+// a broken secret read is diagnosable instead of reporting a bare "no
+// credential found" -- and a source that was skipped (a partial environment,
+// a value that is not a key) stays visible even when another source resolves.
+const RESOLUTION_NOTES = [];
+
 // Returns { keyId, issuerId, privateKeyPem, source } or { error } or { error: null }.
 //
 // The order is the rule:  the environment beats the network, and a file is not
@@ -123,6 +130,10 @@ function materializeP8(pem) {
 // raw stack trace instead of a credential error.  normalizePrivateKey lives in
 // asc-key.mjs, which the shell layer uses as well, so both sides of the
 // handoff accept exactly the same keys.
+//
+// A source that is present but unusable is skipped, not fatal:  the shell
+// layer ignores the same value and carries on, and the credential it resolved
+// is in the environment as ASC_KEY_P8.  The reason is kept for the message.
 function resolveCredential() {
   const envKeyId = String(process.env.ASC_KEY_ID || "").trim();
   const envIssuer = String(process.env.ASC_ISSUER_ID || "").trim();
@@ -134,9 +145,12 @@ function resolveCredential() {
   const issuerId = String(process.env.APPLE_API_ISSUER_ID || "").trim();
   if (keyId && issuerId && process.env.APPLE_API_KEY_P8_BASE64) {
     const pem = normalizePrivateKey(decodeP8(process.env.APPLE_API_KEY_P8_BASE64));
-    if (!pem) return { error: "APPLE_API_KEY_P8_BASE64 is set but did not decode to a PEM private key" };
-    materializeP8(pem);
-    return { keyId, issuerId, privateKeyPem: pem, source: "APPLE_API_* environment (base64 p8)" };
+    if (!pem) {
+      RESOLUTION_NOTES.push("APPLE_API_KEY_P8_BASE64 is set but did not decode to a PEM private key");
+    } else {
+      materializeP8(pem);
+      return { keyId, issuerId, privateKeyPem: pem, source: "APPLE_API_* environment (base64 p8)" };
+    }
   }
 
   // 2) The same secret as a plain environment variable.  This is the form
@@ -144,8 +158,11 @@ function resolveCredential() {
   //    hands a staged key to this client.
   if (envKeyId && envIssuer && envKeyPem) {
     const pem = normalizePrivateKey(envKeyPem);
-    if (!pem) return { error: "ASC_KEY_P8 is set but is not a PEM private key" };
-    return { keyId: envKeyId, issuerId: envIssuer, privateKeyPem: pem, source: "ASC_KEY_P8 environment" };
+    if (!pem) {
+      RESOLUTION_NOTES.push("ASC_KEY_P8 is set but is not a PEM private key");
+    } else {
+      return { keyId: envKeyId, issuerId: envIssuer, privateKeyPem: pem, source: "ASC_KEY_P8 environment" };
+    }
   }
 
   // 3) No file is read here (AFC-359, and AFC-459 / Kody rule 42):  a path on
@@ -677,7 +694,10 @@ async function main() {
       "  2) ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 in the environment\n" +
       "  3) Infisical /asc (fleet-secrets)\n" +
       "  A path in ASC_KEY_PATH is not a credential source:  the shell layer that owns the\n" +
-      "  credential hands the key over in ASC_KEY_P8."
+      "  credential hands the key over in ASC_KEY_P8." +
+      (RESOLUTION_NOTES.length
+        ? `\n  Skipped, with the reason:\n${RESOLUTION_NOTES.map((note) => `    - ${note}`).join("\n")}`
+        : "")
     );
     process.exit(1);
   }
