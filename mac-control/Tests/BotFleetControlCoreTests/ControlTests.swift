@@ -58,6 +58,46 @@ final class ControlTests: XCTestCase {
         catch { XCTAssertEqual(error as? ControlAPIError, .refused("Active bot turn")) }
     }
 
+    /// A server that answers the health check but is too slow for the status
+    /// route is running, not stopped.  Reporting it as unavailable would offer
+    /// to start a server that is already up, and would grey out Start Local
+    /// VM on a healthy machine.
+    func testSlowServerIsUnresponsiveRatherThanUnavailable() async {
+        MockURLProtocol.failure = { request in
+            request.url!.path == "/api/system/control" ? URLError(.timedOut) : nil
+        }
+        defer { MockURLProtocol.failure = nil }
+        MockURLProtocol.handler = { request in
+            (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8))
+        }
+        do { _ = try await ControlAPI(session: mockSession()).status(); XCTFail("Expected unresponsive") }
+        catch { XCTAssertEqual(error as? ControlAPIError, .unresponsive) }
+    }
+
+    /// A server that does not answer the health check at all really is gone.
+    func testUnreachableServerIsStillUnavailable() async {
+        MockURLProtocol.failure = { _ in URLError(.cannotConnectToHost) }
+        defer { MockURLProtocol.failure = nil }
+        do { _ = try await ControlAPI(session: mockSession()).status(); XCTFail("Expected unavailable") }
+        catch { XCTAssertEqual(error as? ControlAPIError, .unavailable) }
+    }
+
+    /// The status route waits longer than the identity check, because the
+    /// identity check is cheap and the status route is not.
+    func testStatusProbeWaitsLongerThanTheIdentityCheck() async {
+        MockURLProtocol.failure = nil
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
+            return (200, Data(#"{"activeBotCount":0,"persistOnExit":true,"localVms":[]}"#.utf8))
+        }
+        _ = try? await ControlAPI(session: mockSession()).status()
+        let health = MockURLProtocol.requests.first { $0.url!.path == "/api/health" }
+        let control = MockURLProtocol.requests.first { $0.url!.path == "/api/system/control" }
+        XCTAssertEqual(health?.timeoutInterval, 3)
+        XCTAssertEqual(control?.timeoutInterval, ControlAPI.statusTimeout)
+        XCTAssertEqual(ControlAPI.statusTimeout, 30)
+    }
+
     func testSuccessfulHTTPWithFailedActionIsRejected() async {
         MockURLProtocol.handler = { request in
             if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
@@ -277,10 +317,18 @@ private final class HelperCommands: CommandRunning {
 private final class MockURLProtocol: URLProtocol {
     static var requests: [URLRequest] = []
     static var handler: ((URLRequest) -> (Int, Data)) = { _ in (500, Data()) }
+    /// When this returns an error for a request, that request fails instead
+    /// of answering.  A server that is alive but too slow to answer looks
+    /// exactly like this to the client.
+    static var failure: ((URLRequest) -> Error?)? = nil
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.requests.append(request)
+        if let error = Self.failure?(request) {
+            client?.urlProtocol(self, didFailWithError: error)
+            return
+        }
         let (status, body) = Self.handler(request)
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: body)

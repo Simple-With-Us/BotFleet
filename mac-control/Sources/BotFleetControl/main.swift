@@ -130,7 +130,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 add("Local VMs (Docker): \(offlineVMs.runningCount) running of \(vms.count)")
                 if vms.isEmpty { add("  Managed Docker VMs: none found") }
                 for vm in vms { add("  \(vm.name): \(vm.running ? "running" : "stopped")") }
-            } else { add("Local VMs: unknown while server is offline") }
+            } else if apiUnavailable { add("Local VMs: unknown while server is offline") }
+            else { add("Local VMs: unknown while server is busy") }
         }
         if let problem { add("Error: \(problem)") }
         if let vmProblem { add("Local VM: \(vmProblem)") }
