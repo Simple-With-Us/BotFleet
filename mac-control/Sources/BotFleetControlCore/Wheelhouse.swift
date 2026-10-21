@@ -35,17 +35,24 @@ public struct WheelhouseEntry: Equatable {
     }
 
     /// A short description of the entry for the menu.
+    ///
+    /// The wanted state is optional, so the patterns spell out `.some` and
+    /// `.none` rather than leaning on a bare `true` or `nil`.  A literal
+    /// pattern matched against an `Optional` is only understood as exhaustive
+    /// by newer Swift compilers; the explicit form is understood by every one
+    /// of them, so the same source builds on the CI's toolchain and on a
+    /// developer's Mac.
     public var summary: String {
         switch (wanted, state) {
-        case (true, .running): return "running"
-        case (true, .stopped): return "stopped — wanted running"
-        case (true, .unknown): return "unknown — wanted running"
-        case (false, .running): return "running — not wanted"
-        case (false, .stopped): return "stopped"
-        case (false, .unknown): return "unknown"
-        case (nil, .running): return "running — wanted state unknown"
-        case (nil, .stopped): return "stopped — wanted state unknown"
-        case (nil, .unknown): return "unknown"
+        case (.some(true), .running): return "running"
+        case (.some(true), .stopped): return "stopped — wanted running"
+        case (.some(true), .unknown): return "unknown — wanted running"
+        case (.some(false), .running): return "running — not wanted"
+        case (.some(false), .stopped): return "stopped"
+        case (.some(false), .unknown): return "unknown"
+        case (.none, .running): return "running — wanted state unknown"
+        case (.none, .stopped): return "stopped — wanted state unknown"
+        case (.none, .unknown): return "unknown"
         }
     }
 }
@@ -121,8 +128,8 @@ public struct Wheelhouse: Equatable {
     /// it cannot see, and it does not start one it cannot prove is missing.
     public static func action(for entry: WheelhouseEntry) -> WheelhouseAction {
         switch (entry.wanted, entry.state) {
-        case (true, .stopped): return .start
-        case (false, .running): return .stop
+        case (.some(true), .stopped): return .start
+        case (.some(false), .running): return .stop
         default: return .none
         }
     }
