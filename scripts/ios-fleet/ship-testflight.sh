@@ -77,9 +77,10 @@
 # fleet runners).
 #
 # Secrets (never printed):
-#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_PATH  (env first, e.g. CI; else Infisical via
+#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8  (env first; else Infisical via
 #   `fleet-secrets get`: /asc ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8, written to a
-#   0600 temp file and deleted on exit)
+#   0600 temp file and deleted on exit).  A path in ASC_KEY_PATH is NOT a
+#   credential source:  it is ignored wherever it appears.
 #   or Xcode-signed-in session for destination=upload export
 #   SENTRY_AUTH_TOKEN  (dSYM + Size Analysis upload; env or `fleet-secrets get`)
 #   SENTRY_DSN         (injected into xcodebuild so Cocoa plist $(SENTRY_DSN) is set)
@@ -199,68 +200,128 @@ asc_tmp_dir() {
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
 # exported ASC_* vars are discarded with the subshell). Sets AUTH_MODE to
 # "api_key" or "none". Never prints secret values.
-# Order (AFC-359: the retired secrets folder is never read):
-#   1. ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH already in the environment
-#   2. CI: the APPLE_API_* names the ship workflow exports from Infisical
+#
+# WHY THE KEY IS HANDED OVER IN THE ENVIRONMENT (AFC-459, Kody rule 42 on the
+# CodeCaps PR #271 review):  the private key is a secret, and the approved
+# secret sources are the process environment, a captured `fleet-secrets get
+# NAME` and bootstrap-only Keychain credentials.  A caller-supplied file is not
+# one of them, so the node client never reads a key file.  This shell layer
+# owns the credential for altool and Xcode, so it hands the key to the client
+# in the environment, which is where the client looks for it.
+#
+# THE CREDENTIAL IS RESOLVED FROM THREE PLACES:
+#   1. CI: the APPLE_API_* names the ship workflow exports from Infisical
+#   2. ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 already in the environment
 #   3. Mac: Infisical Fleet-OPS through fleet-secrets, /asc ASC_KEY_ID,
-#      ASC_ISSUER_ID and ASC_KEY_P8, written to a 0600 temp file and removed
-#      on exit.
+#      ASC_ISSUER_ID and ASC_KEY_P8.
+# A disk credential is not a source at all:  a named ASC_KEY_PATH is ignored,
+# so a stale or foreign path in an operator's shell can never sign the upload
+# with the wrong key.  The key material never enters a command argument and
+# never reaches a log line.
 load_secrets() {
   AUTH_MODE="none"
-  if [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" ]]; then
-    if [[ -f "${ASC_KEY_PATH/#\~/$HOME}" ]]; then
-      AUTH_MODE="api_key"
-      return 0
-    fi
-    log "ASC_KEY_PATH set but file missing (not printing path contents)"
-  fi
-  # CI FALLBACK (2026-10-02). A GitHub-hosted macos-latest runner exports the
-  # APPLE_API_* names from Infisical. Decode the base64 p8 into a 0600 file in
-  # a private temp directory and export the ASC_* trio that altool (and
-  # asc-api.mjs) expect. Never prints a value.
+  #  A named ASC_KEY_PATH is not a credential source.  It is remembered only
+  #  so the run can say that it ignored it, and it is cleared here:  an
+  #  inherited path must never reach xcodebuild when the resolution below
+  #  fails, because then it would be a credential this run never resolved.
+  #  Only the staging copy written from the resolved credential is exported.
+  local named_path="${ASC_KEY_PATH:-}"
+  unset ASC_KEY_PATH
+  local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" key_pem="" rc=0
+  local key_path="" asc_kid=""
+
+  # 1. CI: the APPLE_API_* names the ship workflow exports from Infisical.
+  #    The p8 is base64 there, so it is decoded here, and it never travels in
+  #    an argument:  the here-string hands it to the decoder on stdin.
   if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
-    asc_tmp_dir
-    local ci_key="${ASC_TMP_DIR}/AuthKey_${APPLE_API_KEY_ID}.p8" decoded=1
     case "$APPLE_API_KEY_P8_BASE64" in
-      *BEGIN*) ( umask 077; printf '%s\n' "$APPLE_API_KEY_P8_BASE64" > "$ci_key" ) ;;
-      *) ( umask 077; printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$ci_key" ) 2>/dev/null || decoded=0 ;;
+      *BEGIN*) key_pem="$APPLE_API_KEY_P8_BASE64" ;;
+      *) key_pem="$(base64 --decode <<< "$APPLE_API_KEY_P8_BASE64" 2>/dev/null)" || key_pem="" ;;
     esac
-    if [[ "$decoded" -eq 1 ]] && grep -q "BEGIN " "$ci_key" 2>/dev/null; then
-      chmod 600 "$ci_key"
-      export ASC_KEY_ID="$APPLE_API_KEY_ID"
-      export ASC_ISSUER_ID="$APPLE_API_ISSUER_ID"
-      export ASC_KEY_PATH="$ci_key"
-      export API_PRIVATE_KEYS_DIR="$ASC_TMP_DIR"
-      AUTH_MODE="api_key"
+    if [[ -n "$key_pem" ]]; then
+      rc=0
+      node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$key_pem" || rc=$?
+      if [[ "$rc" -ne 0 ]]; then
+        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it"
+        key_pem=""
+      else
+        kid="$APPLE_API_KEY_ID"
+        iss="$APPLE_API_ISSUER_ID"
+      fi
+    else
+      logerr "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key"
+    fi
+    if [[ -z "$key_pem" ]]; then
+      #  An unusable source is removed from the environment.  The client looks
+      #  for these names first, so leaving them behind would have it resolve a
+      #  broken credential instead of the one this shell layer resolved.
+      unset APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+    fi
+  fi
+
+  # 2. An ambient ASC_KEY_P8.  It is only usable when it really is a PEM
+  #    private key and comes with the key id and issuer it belongs to.
+  if [[ -z "$key_pem" && -n "${ASC_KEY_P8:-}" ]]; then
+    if [[ -z "$kid" || -z "$iss" ]]; then
+      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it"
+      unset ASC_KEY_P8
+    else
+      rc=0
+      node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8" || rc=$?
+      if [[ "$rc" -ne 0 ]]; then
+        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it"
+        #  The client would refuse this value, so it is removed from the
+        #  environment:  the client has to see the credential this shell layer
+        #  resolved, not one that cannot be used.
+        unset ASC_KEY_P8
+      else
+        key_pem="$ASC_KEY_P8"
+      fi
+    fi
+  fi
+
+  # 3. The Mac: Infisical Fleet-OPS through fleet-secrets.  Nothing is read
+  #    from the old secrets folder (AFC-359) and nothing is read from a named
+  #    path (AFC-459).
+  if [[ -z "$key_pem" ]]; then
+    asc_kid="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
+    [[ -n "$kid" ]] || kid="$asc_kid"
+    [[ -n "$iss" ]] || iss="$(fs_get ASC_ISSUER_ID /asc)" || iss=""
+    if [[ -z "$kid" || -z "$iss" ]]; then
+      log "ASC credentials missing: set ASC_KEY_ID/ASC_ISSUER_ID/ASC_KEY_P8 in the environment, or add ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 to Infisical /asc"
       return 0
     fi
-    logerr "ASC_KEY_* unusable and APPLE_API_KEY_P8_BASE64 did not decode to a PEM"
+    # /asc holds one key.  A key id from the environment that differs from it
+    # has no Infisical copy:  fail with a clear message rather than guess.
+    if [[ "$kid" == "$asc_kid" ]]; then
+      key_pem="$(fs_get ASC_KEY_P8 /asc)" || key_pem=""
+    fi
+    if [[ -z "$key_pem" ]]; then
+      log "no .p8 for key ${kid}: Infisical /asc ASC_KEY_P8 holds a different key (or is unreadable);  export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this key"
+      return 0
+    fi
   fi
-  local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" p8 asc_kid
-  asc_kid="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
-  [[ -n "$kid" ]] || kid="$asc_kid"
-  [[ -n "$iss" ]] || iss="$(fs_get ASC_ISSUER_ID /asc)" || iss=""
-  if [[ -z "$kid" || -z "$iss" ]]; then
-    log "ASC credentials missing: set ASC_KEY_ID/ASC_ISSUER_ID/ASC_KEY_PATH or add ASC_KEY_ID and ASC_ISSUER_ID to Infisical /asc"
-    return 0
-  fi
-  # /asc holds one key.  A key id from the environment that differs from it
-  # has no Infisical copy:  fail with a clear message rather than guess.
-  p8=""
-  if [[ "$kid" == "$asc_kid" ]]; then
-    p8="$(fs_get ASC_KEY_P8 /asc)" || p8=""
-  fi
-  if [[ -z "$p8" ]]; then
-    log "no .p8 for key ${kid}: Infisical /asc ASC_KEY_P8 holds a different key (or is unreadable);  set ASC_KEY_PATH to a file for this key"
-    return 0
-  fi
+
+  # The key has to be in a mode-600 file for altool and Xcode, and in the
+  # environment for the node client, which never reads a file.  The file is
+  # written FROM the resolved credential, so it is never read back as one.
   asc_tmp_dir
-  ( umask 077; printf '%s\n' "$p8" > "${ASC_TMP_DIR}/AuthKey_${kid}.p8" )
-  chmod 600 "${ASC_TMP_DIR}/AuthKey_${kid}.p8"
-  p8=""
-  export ASC_KEY_ID="$kid" ASC_ISSUER_ID="$iss" ASC_KEY_PATH="${ASC_TMP_DIR}/AuthKey_${kid}.p8"
+  key_path="${ASC_TMP_DIR}/AuthKey_${kid}.p8"
+  if ! node "${FLEET_DIR}/asc-key.mjs" write "$key_path" <<< "$key_pem"; then
+    log "could not write the ASC key file; the credential is not usable"
+    key_pem=""
+    return 0
+  fi
   # altool searches API_PRIVATE_KEYS_DIR first, so no symlink into ~/.appstoreconnect is needed.
   export API_PRIVATE_KEYS_DIR="$ASC_TMP_DIR"
+  export ASC_KEY_ID="$kid" ASC_ISSUER_ID="$iss" ASC_KEY_P8="$key_pem"
+  # The staged path is a materialisation for the Apple tools, not a credential
+  # source:  the client takes the key from the environment.
+  export ASC_KEY_PATH="$key_path"
+  key_pem=""
+  if [[ -n "$named_path" && "$named_path" != "$key_path" ]]; then
+    log "ASC_KEY_PATH is not a credential source; the credential came from the environment or from Infisical"
+  fi
   AUTH_MODE="api_key"
   return 0
 }
@@ -269,8 +330,8 @@ load_secrets() {
 # resolve_seq_floor() calls asc_latest_seq(), so this cannot rely on the
 # exported ASC_* names -- it checks each source asc-api.mjs knows about.
 asc_credential_available() {
-  [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" && -f "${ASC_KEY_PATH:-/nonexistent}" ]] && return 0
   [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]] && return 0
+  [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]] && return 0
   [[ -x "$FLEET_SECRETS_BIN" ]] && return 0
   command -v fleet-secrets >/dev/null 2>&1 && return 0
   return 1
@@ -1093,7 +1154,7 @@ fi
 
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
   [[ -f "$UPLOAD_ONLY_IPA" ]] || die "package not found: $UPLOAD_ONLY_IPA"
-  [[ "$AUTH_MODE" == "api_key" ]] || die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
+  [[ "$AUTH_MODE" == "api_key" ]] || die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
   link_private_key "$ASC_KEY_PATH" "$ASC_KEY_ID"
   log "uploading existing package via altool (api key)"
   set +e
@@ -1465,7 +1526,7 @@ if [[ "$AUTH_MODE" != "api_key" ]]; then
   log "  1) Create ASC API key (App Manager+) in App Store Connect"
   log "  2) Store ASC_KEY_ID and ASC_ISSUER_ID in Infisical Fleet-OPS /asc"
   log "  3) Store the .p8 as ASC_KEY_P8 in Infisical /asc"
-  log "  4) Or export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH for this run"
+  log "  4) Or export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this run"
   log "  5) Re-run: bash $0 $APP_KEY --upload-only \"$PACKAGE\""
   log "Also ensure App Store Connect has an app record for ${BUNDLE_ID}."
   exit 3
