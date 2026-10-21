@@ -116,21 +116,38 @@ const acpSessionSetModelParams = z.object({ modelId: acpNonemptyString }).passth
 // JSON itself — the line was parsed before this schema runs.
 const ACP_JSON_STRING_MAX_CHARS = 64 * 1024;
 const ACP_JSON_ARRAY_MAX_ITEMS = 1_024;
-const acpBoundedJson: z.ZodType<JsonValue> = z.lazy(() =>
+const ACP_JSON_MAX_KEYS = 256;
+// Every level of a vendor payload is bounded:  strings, arrays, and each
+// record's key count all carry caps, so a notification's fan-out is capped
+// at every level.  Nesting depth follows the JSON line itself, which the
+// driver already had to read and parse before this schema runs.
+export const acpBoundedJson: z.ZodType<JsonValue> = z.lazy(() =>
   z.union([
     z.string().max(ACP_JSON_STRING_MAX_CHARS),
     z.number(),
     z.boolean(),
     z.null(),
     z.array(acpBoundedJson).max(ACP_JSON_ARRAY_MAX_ITEMS),
-    z.record(z.string().max(256), acpBoundedJson),
+    z
+      .record(z.string().max(256), acpBoundedJson)
+      .refine((record) => Object.keys(record).length <= ACP_JSON_MAX_KEYS, {
+        message: "too many keys",
+      }),
   ]),
 );
+export type AcpBoundedJson = z.infer<typeof acpBoundedJson>;
 // A chunk update's content block:  text is the field the transcript and the
-// summary collector read;  acpBoundedJson already caps its size.
-const acpChunkContent = z.object({ text: z.string().max(ACP_JSON_STRING_MAX_CHARS) }).passthrough();
+// summary collector read;  acpBoundedJson already caps its size.  ACP is
+// vendor-owned and grows content-block fields, so the schema passes unknown
+// fields through instead of rejecting a newer agent — they are accepted,
+// not consumed.
+export const acpChunkContent = z.object({ text: z.string().max(ACP_JSON_STRING_MAX_CHARS) }).passthrough();
+export type AcpChunkContent = z.infer<typeof acpChunkContent>;
 // A tool call's rawInput when it carries a shell-style command string.
-const acpRawInputCommand = z.object({ command: z.string() }).passthrough();
+// Same vendor leniency as acpChunkContent:  unknown rawInput fields pass
+// through unconsumed.
+export const acpRawInputCommand = z.object({ command: z.string().max(ACP_JSON_STRING_MAX_CHARS) }).passthrough();
+export type AcpRawInputCommand = z.infer<typeof acpRawInputCommand>;
 
 const acpSessionUpdateParams = z.object({
   sessionId: z.string().min(1).max(256).optional(),

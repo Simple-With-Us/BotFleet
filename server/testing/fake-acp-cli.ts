@@ -543,7 +543,7 @@ function handle(rawMsg: unknown, resumed = false) {
   // params is method-shaped and vendor-owned:  each case reads it through
   // this decoded record view and validates the fields it needs
   // (session/prompt parses its own strict schema below).
-  const parsedParams = z.record(z.string(), z.unknown()).safeParse(msg.params);
+  const parsedParams = z.record(z.string().max(256), boundedContentValue).safeParse(msg.params);
   const params = parsedParams.success ? parsedParams.data : {};
   // client's response to our permission request
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && msg.id === pendingPermissionId) {
