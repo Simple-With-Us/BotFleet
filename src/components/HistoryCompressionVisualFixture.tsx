@@ -26,7 +26,7 @@ const readonlyGate: HistorySummaryGate = {
   visible: true,
   editable: false,
   caption: historyTurnsCaption(),
-  note: "MiniMax keeps its own history, so these settings do not apply to it.  They apply again if a turn lands on an engine that budgets its prompt. Clear them to stop carrying them.",
+  note: "MiniMax keeps its own history, so these settings do not apply to it.\u00A0 They apply again if a turn lands on an engine that budgets its prompt.\u00A0 Clear them to stop carrying them.",
 };
 
 export default function HistoryCompressionVisualFixture() {

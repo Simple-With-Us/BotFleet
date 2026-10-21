@@ -195,6 +195,11 @@ describe("historySummaryGate", () => {
     expect(gate.visible).toBe(true);
     expect(gate.editable).toBe(false);
     expect(gate.note).toContain("MiniMax keeps its own history");
+    // Rendered copy:  every sentence gap is U+00A0 plus a space, which HTML
+    // does not collapse the way it collapses two typed spaces.
+    expect(gate.note).toContain("apply to it.\u00A0 They apply again");
+    expect(gate.note).toContain("its prompt.\u00A0 Clear them");
+    expect(gate.caption).toContain("per prompt.\u00A0 Empty keeps them all.\u00A0 Cap is");
   });
 
   it("stays visible for a saved model-summary toggle alone", () => {

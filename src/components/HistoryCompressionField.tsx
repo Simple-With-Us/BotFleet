@@ -88,7 +88,7 @@ export function HistoryCompressionField({
           <span className="text-[13px] font-medium text-ink">Model-Written Summary</span>
           <span className="mt-0.5 block text-[12.5px] text-ink-secondary">
             When older turns are dropped, the bot's model writes a short brief of them instead of one excerpt line
-            each.  The summary is cached and rolls forward as more turns drop, and falls back to excerpts if the
+            each.{"\u00A0 "}The summary is cached and rolls forward as more turns drop, and falls back to excerpts if the
             model cannot write one.
           </span>
         </span>

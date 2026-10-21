@@ -56,7 +56,9 @@ export function toolRoundsCaption(): string {
 /** The owner-facing sentence for the Maximum History Turns control, built
  *  from the real cap. */
 export function historyTurnsCaption(): string {
-  return `Replayed turns kept per prompt.  Empty keeps them all.  Cap is ${MAX_HISTORY_TURNS}.`;
+  // Rendered in HTML, where two typed spaces collapse:  the gap is U+00A0
+  // plus a space, written as an escape so the source stays ASCII.
+  return `Replayed turns kept per prompt.\u00A0 Empty keeps them all.\u00A0 Cap is ${MAX_HISTORY_TURNS}.`;
 }
 
 /** The budget a turn will actually run under, and whether the owner chose it.
