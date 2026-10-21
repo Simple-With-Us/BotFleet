@@ -14,6 +14,16 @@ const scratch = path.join(project, "mac-control/.build");
 async function bundleOfflineVmHelper(resources) {
   mkdirSync(resources, { recursive: true });
   writeFileSync(path.join(resources, "build-identity.json"), JSON.stringify(readSourceBuildIdentity(project, { requireGit: true })) + "\n");
+  // The helper reads the vm-cli manifest at runtime, and it resolves it
+  // against the directory it runs from.  scripts/bundle-server.mjs ships the
+  // same file for the server bundle; without it here the offline Local VM
+  // actions fail with ENOENT on a path that does not exist inside the app.
+  const vmCliManifestDir = path.join(resources, "computer-vm-cli");
+  mkdirSync(vmCliManifestDir, { recursive: true });
+  copyFileSync(
+    path.join(project, "scripts", "computer-vm-cli", "manifest.json"),
+    path.join(vmCliManifestDir, "manifest.json"),
+  );
   await build({
     entryPoints: [path.join(project, "server/local-vm-offline-cli.ts")],
     outfile: path.join(resources, "botfleet-vm-control.mjs"),
