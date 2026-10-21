@@ -1231,8 +1231,8 @@ export class RoutineManager {
           // record itself, with outcomeCode `bot_off`, is the
           // deliberate-pause signal.
           const skipped = this.newRun(routine, scheduledFor, false);
-          skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
           this.skipForOff(skipped);
+          skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
           if (skipped.sentryCheckInId) this.options.checkInFinish?.(skipped, skipped.sentryCheckInId, false);
         } else if (snoozed) {
           const skipped = this.newRun(routine, scheduledFor, false);

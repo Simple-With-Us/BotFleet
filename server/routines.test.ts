@@ -2797,8 +2797,10 @@ describe("bot on/off switch", () => {
     expect(h.manager.listRoutines()[0]!.nextRunAt).toBeGreaterThan(due);
     // BF-2476: a bot that is off never ran, so the check-in opens and
     // closes non-ok — never `ok`, and never missing (Sentry would
-    // synthesize `missed`).
+    // synthesize `missed`).  The start payload carries the populated
+    // `bot_off` outcome so the pause reads as deliberate in Sentry.
     expect(h.checkInStarts).toHaveLength(1);
+    expect(h.checkInStarts[0].run).toMatchObject({ outcomeCode: "bot_off" });
     expect(h.checkInFinishes).toHaveLength(1);
     expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
     expect(h.failed).toHaveLength(0);
