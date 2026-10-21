@@ -30,7 +30,7 @@ That is what lets the owner's `agent-sync mcp --default-seat MM` entry sign a la
 
 | Process | Seat agent-sync serves |
 | --- | --- |
-| Launched by BotFleet, seat assigned | The bot's role seat (`BF-MONITOR`), with the credential file `~/.secrets/Zulip/BF-Monitor-zuliprc`.  Posts are tagged `[BF-MONITOR·<session>]`. |
+| Launched by BotFleet, seat assigned | The bot's role seat (`BF-MONITOR`), with the credential `BF_MONITOR_ZULIP_KEY` from Infisical Fleet-OPS `/zulip`.  Posts are tagged `[BF-MONITOR·<session>]`. |
 | Launched by BotFleet, no seat (the switch below is off, or the name names no role) | None.  agent-sync exits 3 and the bot is offered no agent-sync tools. |
 | Not launched (the owner's own MiniMax Code) | `MM`, from `--default-seat MM`.  Posts are tagged `[MM]`. |
 

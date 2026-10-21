@@ -76,6 +76,24 @@ final class TestFlightUpdateCheckTests: XCTestCase {
         XCTAssertTrue(TestFlightUpdateCheck.isNewer(candidate, than: running))
     }
 
+    /// A commit-count build must outrank the 12-digit stamp it replaces, even
+    /// though the number is far smaller.  Without the scheme check the phone
+    /// reads "2058 < 202610080006" and never offers the update at all.
+    func testCommitCountBuildOutranksTheTimestampBuildItReplaces() {
+        let running = AppBuildInfo(marketingVersion: "1.0.30", build: "202610080006")
+        let candidate = AppBuildInfo(marketingVersion: "1.0.2058", build: "2058")
+        XCTAssertTrue(TestFlightUpdateCheck.isNewer(candidate, than: running))
+        XCTAssertFalse(TestFlightUpdateCheck.isNewer(running, than: candidate))
+    }
+
+    /// Within the commit-count scheme the number still decides.
+    func testCommitCountOrderingStaysNumeric() {
+        let running = AppBuildInfo(marketingVersion: "1.0.2058", build: "2058")
+        let newer = AppBuildInfo(marketingVersion: "1.0.2070", build: "2070")
+        XCTAssertTrue(TestFlightUpdateCheck.isNewer(newer, than: running))
+        XCTAssertFalse(TestFlightUpdateCheck.isNewer(running, than: newer))
+    }
+
     func testAvailableUpdateReturnsTheManifestsOfferWhenItIsNewer() throws {
         var manifest = VersionManifest()
         manifest.apps[TestFlightUpdateCheck.bundleId] = VersionManifestEntry(

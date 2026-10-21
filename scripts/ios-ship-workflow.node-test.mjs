@@ -199,15 +199,23 @@ test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   assert.equal(Object.keys(apps.apps).join(","), "botfleet");
 
   const ship = read("scripts/ios-fleet/ship-testflight.sh");
-  assert.match(ship, /MARKETING_VERSION\s+= 1\.0\.<seq>/);
-  assert.match(ship, /CURRENT_PROJECT_VERSION = <UTC YYYYMMDDHHMM>/);
+  // The fleet scheme (owner 2026-10-18): both values come from the repo
+  // commit count.  Assert the mechanism, not the retired seq-plus-timestamp
+  // shape this branch removes.
+  assert.match(ship, /MARKETING_VERSION\s+= 1\.0\.<commit_count>/);
+  assert.match(ship, /CURRENT_PROJECT_VERSION = <commit_count>/);
+  assert.match(ship, /rev-list --count HEAD/);
   assert.match(ship, /botfleet/);
   assert.match(ship, /DEFAULT_MIN_INTERVAL_SEC=3600/);
   assert.match(ship, /FORCE_SHIP=0/);
   assert.match(ship, /MANUAL_SIGN/);
   assert.match(ship, /ios-install-appstore-profiles\.sh/);
   assert.match(ship, /write_manual_export_plists/);
-  assert.match(ship, /date -u \+%Y%m%d%H%M/);
+  // The retired UTC stamp must not come back: no build number is minted from
+  // the clock, and there is no timestamp fallback for the case where the
+  // commit count cannot be read.
+  assert.doesNotMatch(ship, /date -u \+%Y%m%d%H%M/);
+  assert.doesNotMatch(ship, /utc_build_stamp/);
   assert.match(ship, /-allowProvisioningUpdates/);
 
   const profileMap = JSON.parse(read("ios/appstore-profiles.json"));
@@ -259,18 +267,19 @@ test("scheduled-ship-gate skips empty last-ship on schedule", () => {
   assert.match(run.stdout, /scheduled-ship-gate: all tests passed/);
 });
 
-// A GitHub-hosted macos-latest runner has no ~/.secrets directory. Before
-// 2026-10-02 asc-api.mjs read ONLY ~/.secrets/appstore-connect.env, so a
+// A GitHub-hosted macos-latest runner has no Infisical machine identity. Before
+// 2026-10-02 asc-api.mjs read ONLY the local credential file, so a
 // runner holding a perfectly good APPLE_API_* credential in the environment
 // still could not authenticate -- and ship-testflight.sh piped asc-api.mjs's
 // stderr to /dev/null, so the reason never reached the run log.
 test("asc-api.mjs resolves its credential from all three sources", () => {
   const asc = read("scripts/ios-fleet/asc-api.mjs");
   assert.match(asc, /function resolveCredential\(\)/);
-  // Source 1: ASC_* already exported.  Source 2: the local env file.
+  // Source 1: ASC_* already exported.  Source 2: Infisical through fleet-secrets (AFC-359).
   // Source 3: the APPLE_API_* names ios-ship.yml exports from Infisical.
   assert.match(asc, /process\.env\.ASC_KEY_ID/);
-  assert.match(asc, /appstore-connect\.env/);
+  assert.match(asc, /fleetSecretsGet\("ASC_KEY_ID", "\/asc"\)/);
+  assert.doesNotMatch(asc, /homedir\(\), "\.secrets"/);
   assert.match(asc, /APPLE_API_KEY_P8_BASE64/);
   // The base64 p8 is materialized privately and unlinked on exit.
   assert.match(asc, /Buffer\.from\(cleaned, "base64"\)/);
@@ -342,7 +351,7 @@ test("asc_latest_seq surfaces asc-api stderr and does not require the env file",
   assert.doesNotMatch(ship, /asc-api\.mjs" latest-build-seq[^\n]*2>\/dev\/null/);
   assert.match(ship, /2>"\$errf"/);
   assert.match(ship, /logerr "asc-seq: \$\{line\}"/);
-  // A missing ~/.secrets file is no longer an automatic UNVERIFIED.
+  // A missing local credential file is no longer an automatic UNVERIFIED.
   assert.match(ship, /asc_credential_available\(\)/);
   assert.doesNotMatch(ship, /if \[\[ ! -f "\$SECRETS_ENV" \]\]; then\n\s*logerr "asc-seq: no /);
   // Cleanup must not write to the captured-value stream: an `rm` wrapper that

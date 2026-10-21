@@ -153,7 +153,7 @@ export function unattendedModelDowngrade(
   // target's, and DSH refuses a level its settings do not declare.
   if (
     opts.automationSource === "webhook" &&
-    selection.model === "MiniMax-M3.1-Flash-Preview-thinking" &&
+    selection.model === "MiniMax-M3.1-Flash-thinking" &&
     opts.nonThinkingFlash?.instanceId &&
     opts.nonThinkingFlash.model &&
     !opts.isCooling?.(opts.nonThinkingFlash.instanceId, opts.nonThinkingFlash.model)
@@ -708,7 +708,7 @@ export function selectTurnFallback(input: {
     const next = chain[i];
     if (!next?.instanceId) continue;
     // Heal retired picker ids before same-engine / rejection checks so a
-    // saved MiniMax-M3 entry cannot loop against a live Flash Preview
+    // saved MiniMax-M3 entry cannot loop against a live Flash
     // primary or burn another unknown-model spawn.
     const model = rewriteRetiredModelId(next.model);
     if (input.current && sameEngine({ instanceId: next.instanceId, model }, input.current)) continue;

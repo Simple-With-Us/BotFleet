@@ -1,3 +1,4 @@
+import type { QuotaPlanMetadata } from "../../shared/quota-plan-metadata";
 // App settings → Usage: what every bot has spent, so "which of my bots is
 // costing me money" is answerable without a provider dashboard. Figures are
 // banked per settled turn on each task (server/store.ts addTaskUsage) and
@@ -346,6 +347,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
     modelId?: string | null;
     skipReason?: string | null;
     planName?: string | null;
+    planMetadata?: QuotaPlanMetadata;
     absoluteRemaining?: number | null;
     absoluteLimit?: number | null;
     quotaUnit?: string | null;

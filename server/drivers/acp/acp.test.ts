@@ -986,7 +986,7 @@ describe("ACP turns (fake CLI)", () => {
     await instance.adapter.sendTurn({
       threadId: "t-mcode-cost",
       text: "go",
-      model: "MiniMax-M3.1-Flash-Preview-thinking",
+      model: "MiniMax-M3.1-Flash-thinking",
     });
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({

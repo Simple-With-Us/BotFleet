@@ -24,7 +24,7 @@ jobs:
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.type == 'Bot' &&
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@31659885f58f08e129b6dc092f3493d7cdb74a11
+    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@269247f93d1eee20fe7cee83d1fb70833de83bea
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       # Pass only secrets the reusable declares (MINIMAX_API_KEY, and GH_PAT,
@@ -35,6 +35,11 @@ jobs:
       # acts as the owner's account).
       USAGE_INGEST_TOKEN: ${{ secrets.USAGE_INGEST_TOKEN }}
     with:
+      # The reusable's default drops claude/claude[bot] (restored here) and no
+      # default allows swu-echo, whose owner-directed dispatches were refused
+      # ("Workflow initiated by non-human actor: swu-echo").  All swu-* bots are
+      # trusted CI actors (owner 2026-10-20).
+      allowed_bots: "chatgpt-codex-connector,chatgpt-codex-connector[bot],kody-ai,kody-ai[bot],cursor,cursor[bot],claude,claude[bot],sentry,sentry[bot],swu-echo,swu-echo[bot]"
       prompt: |
         You are the fleet's autofix bot.  A review bot (Codex, Kody, or Cursor) just reviewed this pull request.
         1. Read every unresolved review comment from that review.  For each, decide against the current code whether it is a real defect.
@@ -44,3 +49,4 @@ jobs:
         5. Commit with a subject starting "autofix:" and push to the PR branch.  Stop after one round.
         6. If a comment is not a real defect or is unclear, change nothing for it.
         This repo's verify command: `pnpm typecheck && pnpm test`.
+

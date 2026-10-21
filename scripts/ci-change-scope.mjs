@@ -65,6 +65,7 @@ export function isPackagingPath(path) {
 export function isMacPackagingPath(path) {
   return (
     isPackagingPath(path) ||
+    path.startsWith("mac-control/") ||
     // The post-merge build this gate pre-empts.  Changing it changes what the
     // Mac updater consumes, so it deserves the same pre-merge proof.
     path === ".github/workflows/mac-commit-build.yml" ||

@@ -1141,6 +1141,45 @@ function DiagnosticsRow() {
   );
 }
 
+// Which build is running. Deliberately the quietest thing in General: it is
+// there to be read when something looks wrong and copied into a bug report,
+// not to be configured. Nothing here is editable, and a build that has not
+// answered yet simply renders nothing rather than a placeholder.
+function BuildInfoRow() {
+  const [info, setInfo] = useState<AppRuntimeInfo | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    const ogb = window.ogb;
+    if (!ogb?.appInfo) return;
+    ogb
+      .appInfo()
+      .then((value) => {
+        if (live) setInfo(value);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  if (!info) return null;
+
+  return (
+    <div className="flex items-center gap-2 px-1 pt-1 text-[12px] text-ink-secondary">
+      <span className="font-mono">{info.summary}</span>
+      <button
+        type="button"
+        onClick={() => void navigator.clipboard?.writeText(info.summary)}
+        aria-label="Copy build details"
+        className="rounded px-1.5 py-0.5 text-[11px] text-ink-secondary hover:bg-control hover:text-ink"
+      >
+        Copy
+      </button>
+    </div>
+  );
+}
+
 export function SettingsModal() {
   const { state, dispatch } = useStore();
   const bots = state.bots ?? [];
@@ -1476,6 +1515,9 @@ export function SettingsModal() {
                   </div>
                   <div id="setting-general-analytics" className={highlightClass("setting-general-analytics")}>
                     <AnalyticsRow />
+                  </div>
+                  <div id="setting-general-build" className={highlightClass("setting-general-build")}>
+                    <BuildInfoRow />
                   </div>
                 </>
               )}

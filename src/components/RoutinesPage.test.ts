@@ -51,3 +51,18 @@ describe("RoutinesPage header keeps its controls clickable", () => {
     }
   });
 });
+
+// `webhookResponse` is strict, so a field the server adds to a webhook but this
+// schema lacks fails the whole PATCH response parse (the Slack-to-Zulip
+// conversion) instead of being ignored.  The merged-only flag and the filtered
+// count (BF-2459) ride on every webhook the harness returns.
+describe("RoutinesPage webhook response schema", () => {
+  it("lists the webhook fields the harness added for merged-only filtering", () => {
+    const start = SRC.indexOf("const webhookResponse = z.object(");
+    const schema = SRC.slice(start, SRC.indexOf("const HOUR_HEIGHT", start));
+    expect(start).toBeGreaterThan(-1);
+    for (const field of ["mergedPullRequestsOnly", "ignoredCount", "lastIgnoredAt"]) {
+      expect(schema, `webhookResponse lacks ${field}`).toContain(`${field}: z.`);
+    }
+  });
+});

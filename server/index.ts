@@ -134,6 +134,7 @@ import {
   BOT_OFF_CODE,
   BOT_OFF_REFUSAL,
   botIsOff,
+  botOffPeersRefusal,
   botOffRoomNotice,
 } from "../shared/bot-power.ts";
 import { createUpdateControl, packagedInstalledAt } from "./update-control.ts";
@@ -200,7 +201,7 @@ import {
   type TurnFallbackPick,
 } from "./model-fallback.ts";
 import { enableModelRejectionPersist, modelRejections } from "./model-rejections.ts";
-import { rewriteModelSelection } from "./retired-model-ids.ts";
+import { rewriteModelSelection, rewriteRetiredModelId } from "./retired-model-ids.ts";
 import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
@@ -212,6 +213,8 @@ import {
   filterConnectorToolsList,
 } from "./connector-verdict.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
+import { requestHarnessShutdown } from "./harness-lifecycle.ts";
+import { ControlConflict, createSystemControl, reserveSystemShutdown } from "./system-control.ts";
 import { botFleetStatusSystemPrompt } from "./botfleet-status-capsule.ts";
 import {
   BOX_GATEWAY_PATH,
@@ -282,6 +285,7 @@ import {
   saveConfig,
   showToolCallsEnabled,
   summarizeToolCallsEnabled,
+  remoteDesktopLaunchAllowed,
   skillRecorderEnabled,
   syncCredentialEnv,
   patchInstanceConfig,
@@ -944,6 +948,9 @@ if (bootTranscriptSweep) console.log(bootTranscriptSweep);
 // never the reason the process stays alive.
 const stopTranscriptSweeps = startTranscriptRetentionSweeps(transcriptDirs);
 let runtimeQuiescing = false;
+// A native Stop Server request owns this fence until its graceful SIGTERM.
+// An updater must not release it through DELETE /api/runtime/quiesce.
+let controlShutdownPending = false;
 // A forced quiesce is still interrupting and saving work.  The fence is up
 // (`runtimeQuiescing`) but not yet settled: it can still roll back, and the
 // held messages are not on disk yet.  An updater whose forced request timed
@@ -4580,21 +4587,25 @@ bus.subscribe((event: RuntimeEvent) => {
 // mark at all (autoVerdict).
 type UnattendedSource = "job" | "outside";
 const unattendedBots = new Map<string, { at: number; source: UnattendedSource }>();
-const NON_THINKING_MINIMAX_FLASH = "MiniMax-M3.1-Flash-Preview";
+const NON_THINKING_MINIMAX_FLASH = "MiniMax-M3.1-Flash";
 
 /** A catalog row for non-thinking Flash, preferring the seat's own engine.
  *  mcode's picker does not offer this id, so a thinking mcode seat moves to
  *  dsh, then the MiniMax HTTP engine, and only when that engine is enabled
  *  and lists the id.  No such row means the caller leaves thinking in place. */
 function nonThinkingFlashSelection(currentInstanceId: string): { instanceId: string; model: string } | undefined {
+  // dsh and the MiniMax HTTP engine both spell this model
+  // `MiniMax-M3.1-Flash`, so one id serves every engine that offers it.
+  const flashFor = (): string => rewriteRetiredModelId(NON_THINKING_MINIMAX_FLASH);
   const offers = (instanceId: string): boolean => {
     const instance = registry.get(instanceId);
     if (!instance || instance.enabled === false) return false;
-    return instance.models.options.some((option) => option.id === NON_THINKING_MINIMAX_FLASH);
+    const model = flashFor();
+    return instance.models.options.some((option) => option.id === model);
   };
-  if (offers(currentInstanceId)) return { instanceId: currentInstanceId, model: NON_THINKING_MINIMAX_FLASH };
+  if (offers(currentInstanceId)) return { instanceId: currentInstanceId, model: flashFor() };
   for (const instanceId of ["dsh", "minimax"]) {
-    if (offers(instanceId)) return { instanceId, model: NON_THINKING_MINIMAX_FLASH };
+    if (offers(instanceId)) return { instanceId, model: flashFor() };
   }
   return undefined;
 }
@@ -8663,9 +8674,6 @@ export function executeListRoutinesRequest(input: {
   };
 }
 
-/** What coordinate_bots answers for a peer that is switched Off. */
-const BOT_OFF_PEER_REFUSAL = Object.freeze({ status: 403, body: Object.freeze({ error: "that bot is off" }) });
-
 /** The HTTP body for coordinate_bots.  Unknown keys are refused. */
 const coordinateBotsBodySchema = z.object({
   fromBotId: z.string().optional(),
@@ -8714,9 +8722,19 @@ export function executeCoordinateBotsRequest(input: {
   if (!jobHost) return { status: 503, body: { error: "the job runtime is not ready" } };
   const from = store.bot(input.fromBotId);
   if (!from) return { status: 404, body: { error: "no such bot" } };
+  // Every Off peer is named, once, so the asker can tell which of them said
+  // no.  The whole request is refused, before anything is recorded for any
+  // bot it named, so any other refusal (hidden, another section, no such
+  // bot) is listed by the job host when it is sent again without them.
+  const offPeers = new Map<string, string>();
+  let namedOthers = 0;
   for (const rawId of input.botIds) {
     const target = peerByToken(rawId);
-    if (target && botIsOff(target)) return BOT_OFF_PEER_REFUSAL;
+    if (target && botIsOff(target)) offPeers.set(target.id, target.name);
+    else namedOthers += 1;
+  }
+  if (offPeers.size > 0) {
+    return { status: 403, body: { error: botOffPeersRefusal([...offPeers.values()], namedOthers > 0) } };
   }
   const fromThreadId = String(input.fromThreadId ?? from.threadId);
   return jobHost.coordinate({
@@ -12653,6 +12671,9 @@ async function takeRuntimeFence(force: boolean) {
 }
 
 function endRuntimeQuiesce(): RuntimeQuiesceAnswer {
+  if (controlShutdownPending) {
+    return { safeToRestart: false, activeWorkCount: currentRuntimeReadiness().activeWorkCount, quiescing: true };
+  }
   if (runtimeFencing) {
     // A forced quiesce is still interrupting and saving work.  Releasing now
     // would land its snapshot and its held messages on an unfenced harness:
@@ -12813,6 +12834,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 403, { error: "forbidden: cross-site request" });
     }
     const mutatingApiRequest = isMutatingHarnessApiRequest(method, path);
+    if (controlShutdownPending && path === "/api/runtime/quiesce") {
+      return json(res, 503, { error: "server shutdown is in progress" });
+    }
     // The named Remote Access tunnel forwards with a loopback Host,
     // so the Host gate alone cannot distinguish a remote Access caller from the
     // owner.  Block mutating API traffic that carries Cloudflare edge markers
@@ -12822,7 +12846,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
     if (runtimeQuiescing && path.startsWith("/api/") && path !== "/api/runtime" && path !== "/api/runtime/quiesce" &&
         path !== "/api/health" && path !== "/api/update/status") {
-      return json(res, 503, { error: "BotFleet is quiescing for an update" });
+      return json(res, 503, { error: controlShutdownPending ? "server shutdown is in progress" : "BotFleet is quiescing for an update" });
     }
     if (mutatingApiRequest && !NON_JSON_BODY_ROUTES.has(path) && hasRequestBody(req) && !isJsonContentType(req)) {
       // the commands route names its code so a client can branch on it
@@ -14715,14 +14739,173 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, { message: patched });
     }
     if (method === "POST" && path === "/api/desktop/open") {
-      // Raising the desktop is a physical action on this computer, so only a
-      // connection from this computer may ask for it, whatever Host it sends.
+      // Raising the desktop is a physical action on this computer.  Two gates,
+      // and they are not alternatives to each other.
+      //
+      // The loopback check is the local-only defence: only a request that
+      // actually arrived from this machine may ask.  It is not, on its own, a
+      // defence against a phone.  The Companion sidecar replays a paired
+      // device's request to 127.0.0.1 — by design, since it strips Host and
+      // Origin so the device cannot spoof either — and that replay satisfies
+      // the check below by construction (companion/src/proxy.ts states this in
+      // its own header).  So for every phone caller this branch is reached
+      // with a loopback address that says nothing about where the person is.
+      //
+      // The policy check is therefore separate and in front, and it is the one
+      // that actually governs remote callers.  Keep both: if this one is ever
+      // dropped in a refactor the remote path silently re-opens, and if the
+      // loopback one is dropped the endpoint becomes reachable by anything that
+      // can speak to the port.
       if (!isLoopbackAddress(req.socket.remoteAddress)) {
         return json(res, 403, { error: "forbidden: the desktop can only be opened from this computer" });
+      }
+      if (!remoteDesktopLaunchAllowed(cfg)) {
+        // Deliberately distinct from the message above: this one is the owner
+        // saying no, and the phone surfaces it verbatim, so the person is
+        // told to go and change a setting rather than left guessing why a
+        // button does nothing.
+        return json(res, 403, { error: "Opening the desktop app from iOS is disabled in Mac settings" });
       }
       const result = await openBotFleetDesktop();
       if (!result.ok) return json(res, 503, { error: result.error ?? "could not open BotFleet" });
       return json(res, 200, { ok: true });
+    }
+    // One-click full shutdown.  Loopback-only like every route that stops
+    // something on this computer, and it is what writes the sentinel the
+    // launchd wrapper reads — without that marker the 5-minute StartInterval
+    // would treat the clean exit as a crash and resurrect the harness, which
+    // is exactly what makes a manual "shut it down" impossible today.
+    if (method === "POST" && path === "/api/system/shutdown") {
+      if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        return json(res, 403, { error: "forbidden: the harness can only be shut down from this computer" });
+      }
+      const stopping = await requestHarnessShutdown({
+        stopLocalVm: async () => {
+          // Same lease check the Computer panel's own stop route makes.  The
+          // harness is about to go away either way, but yanking a VM out from
+          // under a bot mid-turn destroys work the person did not ask to lose,
+          // so a leased VM is left running and reported instead.  It will be
+          // reclaimed by the runtime's own idle reaper.
+          const owner = localVmLeaseFor(SHARED_LOCAL_VM_TARGET).current(localVmOwnerBusy);
+          if (owner) {
+            return { stopped: false, note: `the Local VM is in use by ${owner}; left running` };
+          }
+          await containerComputerAction("stop", undefined, undefined, SHARED_LOCAL_VM_TARGET);
+          localVmIdleFor(SHARED_LOCAL_VM_TARGET).cancel();
+          return { stopped: true };
+        },
+      });
+      if (!stopping.ok) return json(res, 500, { error: stopping.error });
+      return json(res, 200, { ok: true, detail: stopping.detail });
+    }
+    if (path === "/api/system/control" || path.startsWith("/api/system/control/")) {
+      if (!isLoopbackAddress(req.socket.remoteAddress) || req.headers["x-botfleet-companion"] === "1") {
+        return json(res, 403, { error: "server controls require this Mac" });
+      }
+      if (method === "POST" && !String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
+      }
+      let ownControlLock = false;
+      const control = createSystemControl({
+        targets: () => localVmModeSwitchTargets(store.bots.map((bot) => bot.id)),
+        status: (target) => containerComputerStatus(undefined, undefined, target),
+        owner: (target) => localVmLeaseFor(target).current(localVmOwnerBusy)?.botId
+          ?? (target.key === SHARED_LOCAL_VM_TARGET.key
+            ? store.bots.map((bot) => localVmLeaseFor(localVmTargetForBot(bot.id)).current(localVmOwnerBusy)?.botId).find(Boolean)
+            : undefined),
+        busy: () => runtimeFencing || updateDrain.active || (runtimeQuiescing && !controlShutdownPending)
+          || store.bots.some((bot) => bot.busy) || localVmActiveThreads.size > 0
+          || localVmLifecycleBusy.size > 0 || localVmImageBusy || localVmProvisionBusy
+          || (localVmModeChangeBusy && !ownControlLock),
+        action: async (action, target) => {
+          localVmLifecycleBusy.add(target.key);
+          try {
+            await containerComputerAction(action, undefined, undefined, target);
+            if (action === "run" || action === "start") localVmIdleFor(target).touch();
+          } finally {
+            localVmLifecycleBusy.delete(target.key);
+          }
+        },
+        afterStop: (target) => localVmIdleFor(target).cancel(),
+      });
+      const reserveControl = () => {
+        control.guard();
+        // The existing VM routes and turn admission respect this fence.
+        // Set it before the first await, and retain it through status probes.
+        localVmModeChangeBusy = true;
+        ownControlLock = true;
+      };
+      try {
+        if (method === "GET" && path === "/api/system/control") {
+          return json(res, 200, {
+            activeBotCount: store.bots.filter((bot) => bot.busy).length,
+            localVms: await control.list(),
+            persistOnExit: cfg.server?.persistOnExit !== false,
+          });
+        }
+        if (method === "POST" && path === "/api/system/control/vms/stop") {
+          reserveControl();
+          try {
+            return json(res, 200, { ok: true, detail: await control.stopAll() });
+          } finally { localVmModeChangeBusy = false; }
+        }
+        if (method === "POST" && path === "/api/system/control/vms/start") {
+          if (cfg.localVm?.mode === "per-bot" || localVmProviderOff(cfg)) {
+            return json(res, 409, { error: "Enable shared Local VM in Computer settings first" });
+          }
+          reserveControl();
+          try {
+            return json(res, 200, { ok: true, vm: await control.startShared() });
+          } finally { localVmModeChangeBusy = false; }
+        }
+        if (method === "POST" && path === "/api/system/control/stop") {
+          // No marker or VM effect until all active work and leases are clear.
+          const reservation = reserveSystemShutdown({
+            guard: () => control.guard(),
+            activeWorkCount: () => currentRuntimeReadiness(ownAdmissionActive).activeWorkCount ?? 1,
+            fence: () => {
+              reserveControl();
+              cancelFenceLease();
+              controlShutdownPending = true;
+              runtimeQuiescing = true;
+            },
+            unfence: () => {
+              controlShutdownPending = false;
+              runtimeQuiescing = false;
+              localVmModeChangeBusy = false;
+            },
+          });
+          let stopping;
+          try {
+            stopping = await requestHarnessShutdown({
+              stopLocalVm: () => control.stopAll(),
+              // Go through the registered signal handler so queued event logs,
+              // children and stores receive the normal graceful drain.
+              exit: () => process.kill(process.pid, "SIGTERM"),
+            });
+          } catch (error) {
+            reservation.release();
+            throw error;
+          }
+          if (!stopping.ok) {
+            reservation.release();
+            return json(res, 500, { ok: false, error: stopping.error, detail: stopping.detail });
+          }
+          const partial = stopping.detail.localVmStop === "failed";
+          if (partial) {
+            return json(res, 500, {
+              ok: false,
+              error: "Server shutdown is proceeding, but one or more Local VMs could not be stopped.  Check Computer settings before assuming they are off.",
+              detail: stopping.detail,
+            });
+          }
+          return json(res, 200, { ok: true, detail: stopping.detail });
+        }
+      } catch (error) {
+        const failure = localComputerActionError(error);
+        return json(res, error instanceof ControlConflict ? 409 : failure.status, { error: failure.error });
+      }
+      return json(res, 404, { error: "unknown server control" });
     }
     if (method === "POST" && path === "/api/bots") {
       const body = await readBody(req);
@@ -16361,7 +16544,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       try {
         for (const target of affectedTargets) {
           const status = await containerComputerStatus(undefined, undefined, target).catch(() => null);
-          if (status?.container === "running" || status?.container === "stopped") {
+          if (status?.container === "running" || status?.container === "created" || status?.container === "stopped") {
             await containerComputerAction("remove", undefined, undefined, target);
           }
           // The idle backstop is keyed by target too; leaving it armed on a

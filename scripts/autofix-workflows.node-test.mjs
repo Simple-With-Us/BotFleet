@@ -29,9 +29,9 @@ function passedSecrets(yml) {
   return names;
 }
 
-test("claude-code-autofix.yml passes only secrets the codex reusable declares", () => {
+test("claude-code-autofix.yml passes only secrets the Claude reusable declares", () => {
   const yml = read(".github/workflows/claude-code-autofix.yml");
-  // codex-autofix-reusable.yml declares MINIMAX_API_KEY, an optional USAGE_INGEST_TOKEN (UM-1593 metering) and an ignored GH_PAT.  Passing
+  // claude-code-autofix-reusable.yml declares MINIMAX_API_KEY, an optional USAGE_INGEST_TOKEN (UM-1593 metering) and an ignored GH_PAT.  Passing
   // GH_ADMIN_PAT failed every run with "Invalid secret, GH_ADMIN_PAT is not defined in the
   // referenced workflow" (run 39054950004), and no fleet workflow may act as the owner.
   assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "USAGE_INGEST_TOKEN"]);
@@ -46,7 +46,7 @@ test("autofix.yml passes only secrets the pr-autofix reusable declares", () => {
 test("both autofix callers pin their reusable workflow to a full commit SHA", () => {
   const pins = [
     [".github/workflows/autofix.yml", "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml"],
-    [".github/workflows/claude-code-autofix.yml", "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml"],
+    [".github/workflows/claude-code-autofix.yml", "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml"],
   ];
   for (const [file, callee] of pins) {
     const uses = read(file).match(/^ {4}uses:\s*(\S+)\s*$/m);
@@ -104,4 +104,26 @@ test("autofix callers keep their least-privilege and fork guards", () => {
   const claude = read(".github/workflows/claude-code-autofix.yml");
   assert.match(claude, /github\.event\.review\.user\.type == 'Bot'/);
   assert.match(claude, /github\.event\.pull_request\.head\.repo\.full_name == github\.repository/);
+});
+
+test("Claude Autofix keeps the Sentry-capable pin and same-repository bot gate", () => {
+  const claude = read(".github/workflows/claude-code-autofix.yml");
+  // 2026-10-20: repinned to the AFC pin that retires MiniMax-M3.1-Flash-Preview,
+  // and the caller now passes allowed_bots explicitly - the reusable default
+  // drops claude/claude[bot] and refuses swu-echo dispatches, which blocked an
+  // owner-directed rerun (run 39531317324).
+  assert.match(
+    claude,
+    /claude-code-autofix-reusable\.yml@269247f93d1eee20fe7cee83d1fb70833de83bea/,
+  );
+  assert.match(claude, /^\s+allowed_bots: .*swu-echo/m);
+  const guard = claude.match(/^ {4}if: >-\n([\s\S]*?)^ {4}uses:/m)?.[1];
+  assert.ok(guard, "Claude Autofix has a job-level guard");
+  assert.equal(
+    guard.replace(/\s+/g, " ").trim(),
+    "github.event_name == 'workflow_dispatch' || " +
+      "(github.event_name == 'pull_request_review' && " +
+      "github.event.review.user.type == 'Bot' && " +
+      "github.event.pull_request.head.repo.full_name == github.repository)",
+  );
 });

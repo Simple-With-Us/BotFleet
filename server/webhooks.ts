@@ -11,6 +11,7 @@ import { parseJson, schemaIssue, type JsonValue } from "./schema.ts";
 import {
   asRecord,
   isGithubWebhookPayload,
+  isMergedPullRequestPayload,
   isSentryWebhookPayload,
   pickStr,
   serializeWebhookPayload,
@@ -35,6 +36,16 @@ export interface WebhookTrigger {
   verificationSample?: WebhookVerificationSample;
   /** Optional event-name allowlist. Empty means every event type. */
   eventTypes?: string[];
+  /** Run only when a GitHub pull request is merged: a `pull_request` delivery
+   *  whose action is `closed` and whose PR was merged.  Every other delivery,
+   *  including a PR closed without merging, is filtered at ingress before a
+   *  run exists, whatever `eventTypes` allows.  Absent or false adds no filter. */
+  mergedPullRequestsOnly?: boolean;
+  /** Deliveries this webhook filtered at ingress (event allowlist, built-in
+   *  pre-filters, merged-only) since the count began.  Counted in memory and
+   *  saved with the next write, so a filtered flood costs no extra disk work. */
+  ignoredCount?: number;
+  lastIgnoredAt?: number;
   /** Minimum minutes between activations of this trigger.  Deliveries that
    * arrive inside the gap wait and run together when it closes, rather than
    * waking the bot once each.  Absent or 0 runs every delivery. */
@@ -52,6 +63,7 @@ export interface WebhookTriggerInput {
   enabled?: boolean;
   verificationPending?: boolean;
   eventTypes?: string[];
+  mergedPullRequestsOnly?: boolean;
   minGapMinutes?: number;
   oneShotWake?: boolean;
 }
@@ -65,6 +77,8 @@ type CleanWebhookInput = Omit<
   | "lastReceivedAt"
   | "lastRunId"
   | "deliveryCount"
+  | "ignoredCount"
+  | "lastIgnoredAt"
   | "verifiedAt"
   | "verificationSample"
 >;
@@ -191,6 +205,7 @@ const triggerInputSchema = z.object({
   enabled: z.boolean().optional(),
   verificationPending: z.boolean().optional(),
   eventTypes: eventTypesSchema,
+  mergedPullRequestsOnly: z.boolean().optional(),
   minGapMinutes: minGapSchema,
   oneShotWake: z.boolean().optional(),
 });
@@ -218,6 +233,9 @@ const storedWebhookSchema = z.object({
   verifiedAt: z.number().finite().nonnegative().optional(),
   verificationSample: verificationSampleSchema.optional(),
   eventTypes: eventTypesSchema,
+  mergedPullRequestsOnly: z.boolean().optional(),
+  ignoredCount: z.number().int().nonnegative().optional(),
+  lastIgnoredAt: z.number().finite().nonnegative().optional(),
   minGapMinutes: minGapSchema,
   oneShotWake: z.boolean().optional(),
   secretHash: z.string().regex(/^[a-f0-9]{64}$/),
@@ -302,6 +320,7 @@ function cleanInput(input: WebhookTriggerInput): CleanWebhookInput {
   const minGapMinutes = Math.max(0, Math.min(1440, Math.round(input.minGapMinutes ?? 0)));
   if (minGapMinutes > 0) clean.minGapMinutes = minGapMinutes;
   if (input.oneShotWake === true) clean.oneShotWake = true;
+  if (input.mergedPullRequestsOnly === true) clean.mergedPullRequestsOnly = true;
   return clean;
 }
 
@@ -777,9 +796,7 @@ export function shouldIgnoreWebhookEvent(
         };
       }
     } else if (eventName === "pull_request") {
-      const pr = asRecord(root?.pull_request);
-      const isMerged = action === "closed" && (pr?.merged === true || pickStr(pr, "merged_at") !== undefined);
-      if (!isMerged) {
+      if (!isMergedPullRequestPayload(payload)) {
         const desc = action === "closed" ? "unmerged closed" : `action '${action ?? "unknown"}'`;
         return {
           ignore: true,
@@ -994,6 +1011,19 @@ function eventPrompt(
   ].join("\n");
 }
 
+/** Why a delivery is not a merged pull request, or undefined when it is one.
+ *  The reason lands in the delivery log, so it says what arrived. */
+function notMergedPullRequestReason(event: WebhookEvent): string | undefined {
+  const scope = "this webhook runs only when a pull request is merged";
+  if (event.eventName !== "pull_request") {
+    return `Event '${(event.eventName ?? "unknown").slice(0, 80)}' ignored: ${scope}`;
+  }
+  if (isMergedPullRequestPayload(event.payload)) return undefined;
+  const action = pickStr(asRecord(event.payload), "action");
+  const what = action === "closed" ? "closed without merging" : `action '${(action ?? "unknown").slice(0, 80)}'`;
+  return `GitHub pull_request ${what} ignored: ${scope}`;
+}
+
 export class WebhookManager {
   private readonly file: string;
   private readonly now: () => number;
@@ -1077,6 +1107,7 @@ export class WebhookManager {
       enabled: patch.enabled ?? trigger.enabled,
       verificationPending: patch.verificationPending ?? trigger.verificationPending,
       eventTypes: patch.eventTypes ?? trigger.eventTypes,
+      mergedPullRequestsOnly: patch.mergedPullRequestsOnly ?? trigger.mergedPullRequestsOnly,
       minGapMinutes: patch.minGapMinutes ?? trigger.minGapMinutes,
       oneShotWake: patch.oneShotWake ?? trigger.oneShotWake,
     });
@@ -1085,6 +1116,7 @@ export class WebhookManager {
     if (!clean.eventTypes?.length) delete trigger.eventTypes;
     if (!clean.minGapMinutes) delete trigger.minGapMinutes;
     if (!clean.oneShotWake) delete trigger.oneShotWake;
+    if (!clean.mergedPullRequestsOnly) delete trigger.mergedPullRequestsOnly;
     if (patch.enabled === false) {
       this.options.cancelQueued?.(trigger.id, "The webhook was paused before this delivery started");
     }
@@ -1211,6 +1243,15 @@ export class WebhookManager {
         event.eventName ? `Event type “${event.eventName}” is not enabled` : "Event type is missing",
       );
       return { deliveryId, duplicate: false, ignored: true };
+    }
+
+    if (trigger.mergedPullRequestsOnly) {
+      const reason = notMergedPullRequestReason(event);
+      if (reason) {
+        const deliveryId = requestedDeliveryId || randomUUID();
+        this.recordIgnoredAttempt(trigger, event, deliveryId, reason);
+        return { deliveryId, duplicate: false, ignored: true };
+      }
     }
 
     const route = resolveWebhookBotId(
@@ -1343,6 +1384,11 @@ export class WebhookManager {
     reason: string,
   ): void {
     const now = this.now();
+    // Counted before the log throttle below, so a flood that mostly never
+    // reaches the log still shows here.  No save(): the new value goes out
+    // with the next write, which keeps a filtered flood off the disk.
+    trigger.ignoredCount = (trigger.ignoredCount ?? 0) + 1;
+    trigger.lastIgnoredAt = now;
     const recent = (this.recentIgnored.get(trigger.id) ?? []).filter(
       (at) => now - at < IGNORED_ATTEMPTS_WINDOW_MS,
     );

@@ -123,6 +123,16 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
     domId: "setting-general-analytics",
     badge: "Privacy",
   },
+  {
+    id: "general:build",
+    sectionId: "general",
+    sectionLabel: "General",
+    title: "Build",
+    subtitle: "The version and build number of the running app.",
+    keywords: ["build", "build number", "version", "which version", "commit", "app version", "running version"],
+    domId: "setting-general-build",
+    badge: "System",
+  },
 
   // --- Connections ---
   {

@@ -18,6 +18,8 @@
 // A turn that is already running is never interrupted by switching Off.  The
 // gate is on STARTING work; it finishes what it began and nothing new follows.
 
+import { joinRefusals } from "./peer-refusals.ts";
+
 /** Real U+00A0 plus a space: the repo's sentence gap for copy that a renderer
  *  would otherwise collapse (see src/lib/remote-access.ts `sentenceGapHtml`). */
 const GAP = "  ";
@@ -37,6 +39,24 @@ export const BOT_OFF_REFUSAL = `This bot is off.${GAP}Turn it on to chat.`;
 /** The composer's disabled-state headline and its button. */
 export const BOT_OFF_COMPOSER_NOTICE = BOT_OFF_REFUSAL;
 export const BOT_OFF_TURN_ON_LABEL = "Turn On";
+
+/** Why a handoff to an Off bot was turned away, in the words the bot that
+ *  asked reads.  It names the bot, because one handoff can name several and
+ *  the asker has to tell which of them said no.  It is not `BOT_OFF_REFUSAL`:
+ *  that tells a person to turn the bot on to chat, which a bot cannot do. */
+export function botOffPeerRefusal(name: string): string {
+  return `${name} is switched off`;
+}
+
+/** What coordinate_bots answers when a handoff names Off bots: each of them,
+ *  once.  The refusal covers the whole request and nothing is recorded, so
+ *  when the handoff named other bots too it says none of them was handed the
+ *  work either (`alsoNamedOthers`), and the asker does not read a refusal of
+ *  one bot as a handoff to the rest. */
+export function botOffPeersRefusal(names: readonly string[], alsoNamedOthers: boolean): string {
+  const reasons = joinRefusals(names.map((name) => botOffPeerRefusal(name)));
+  return alsoNamedOthers ? `${reasons}.${GAP}Nothing was handed off.` : reasons;
+}
 
 // ── switching Off a bot that is working ────────────────────────────────
 //

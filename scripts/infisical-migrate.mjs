@@ -19,7 +19,7 @@
 // client the running server uses.
 //
 // Guarantees this file exists to keep:
-//   - Never reads `~/.secrets/*` or any fleet handoff file.  The identity is
+//   - Never reads the retired secrets folder or any fleet handoff file.  The identity is
 //     config-file-or-env only, exactly as the server resolves it.
 //   - Never accepts a credential on the command line -- there is no flag for
 //     one.

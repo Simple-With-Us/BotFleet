@@ -189,11 +189,10 @@ the field leaves the stored value untouched).
    fails the build.
 5. **Local desktop packaging.**  `scripts/with-sentry-dsn.sh` wraps a local
    `pnpm package:mac:local` (or any other `package:*` script) with the same
-   three-tier resolution — already-exported environment, Infisical (only if
-   already logged in; this script never calls `infisical login`), then the
-   handoff file `~/.secrets/botfleet-sentry.env` via
-   an `awk` read that produces only the value after the first `NAME=`, never
-   the whole `NAME=value` row — and exports both `SENTRY_DSN` and
+   three-tier resolution — already-exported environment, then
+   `fleet-secrets get NAME --path /botfleet-sentry` (Infisical Fleet-OPS),
+   then the `infisical` CLI (only if already logged in; this script never
+   calls `infisical login`) — and exports both `SENTRY_DSN` and
    `VITE_SENTRY_DSN` before executing the wrapped command.  It turns xtrace
    off before it reads anything, so neither `bash -x` nor an inherited
    `SHELLOPTS` can echo a resolved value, and it never prints one in any

@@ -1,6 +1,8 @@
 import { app, BrowserWindow, WebContentsView, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, screen, session, shell, systemPreferences, Tray, utilityProcess } from "electron";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { openServerControls, shutdownAttachedServer } from "./server-controls.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -31,6 +33,7 @@ import {
 import { openBlankTerminal } from "./terminal-launch.mjs";
 import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
 import { readConfigFile, updateConfigFile } from "./config-file-lock.mjs";
+import { readPersistOnExitPolicy } from "./persist-on-exit-policy.mjs";
 import { buildDiagnosticsReport, decodeLogTail, diagnosticsFileName } from "./diagnostics.mjs";
 import {
   assertExternalWorkspaceCredentialMarkers,
@@ -84,8 +87,10 @@ import {
   resolveCompanionControlPlaneURL,
 } from "./companion-account-service.mjs";
 import capabilitiesModule from "./capabilities.cjs";
+import appInfoModule from "./app-info.cjs";
 
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
+const { appRuntimeInfo, appRuntimeSummary } = appInfoModule;
 let updateCredentialPreparationPath;
 try {
   updateCredentialPreparationPath = updateCredentialReceiptPath(process.argv);
@@ -2002,6 +2007,18 @@ ipcMain.handle("desktop:capabilities", async () =>
   }),
 );
 
+// Which build is running, for the settings panel. Answered from the live
+// process, so it always describes the app the user is actually looking at
+// rather than whatever was last installed.
+ipcMain.handle("desktop:app-info", () => {
+  const info = appRuntimeInfo({
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    harness: app.isPackaged ? `${serverMode}:${SERVER_PORT}` : "dev",
+  });
+  return { ...info, summary: appRuntimeSummary(info) };
+});
+
 ipcMain.handle("assemblyai:status", () => ({
   configured: Boolean(assemblyAICredential(secureCredentials)),
 }));
@@ -2318,6 +2335,14 @@ function setupApplicationMenu() {
           label: "Open Data Folder",
           click: () => shell.openPath(DATA_DIR),
         },
+        ...(isMac ? [{
+          label: "Server Controls…",
+          click: () => openServerControls({
+            source: app.isPackaged ? path.join(process.resourcesPath, "BotFleet Control.app") : fileURLToPath(new URL("./resources/BotFleet Control.app", import.meta.url)),
+            shell,
+            dialog,
+          }),
+        }] : []),
         { type: "separator" },
         isMac ? { role: "close" } : { role: "quit" },
       ],
@@ -2407,6 +2432,14 @@ function setupApplicationMenu() {
 }
 
 app.whenReady().then(async () => {
+  // A deliberate shutdown writes a sentinel so launchd's periodic tick leaves
+  // the harness alone.  Launching the app is the documented way back, so clear
+  // it first — before anything here tries to reach a server, so the request
+  // below is never made against a marker that says "stay down".
+  if (!wantsSafeStorageExport(process.argv) && !updateCredentialPreparationPath) {
+    recordExplicitStartupSession();
+    clearHarnessShutdownMarker();
+  }
   if (wantsSafeStorageExport(process.argv)) {
     try {
       const result = await readSecureCredentials({
@@ -2461,6 +2494,11 @@ app.whenReady().then(async () => {
   tray = new Tray(trayIcon);
   tray.setToolTip("BotFleet");
   tray.setContextMenu(Menu.buildFromTemplate([
+    ...(process.platform === "darwin" ? [{ label: "Server Controls…", click: () => openServerControls({
+      source: app.isPackaged ? path.join(process.resourcesPath, "BotFleet Control.app") : fileURLToPath(new URL("./resources/BotFleet Control.app", import.meta.url)),
+      shell,
+      dialog,
+    }) }] : []),
     { label: "Show BotFleet", click: () => {
         if (app.dock) app.dock.show();
         if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -2622,10 +2660,8 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform === "darwin" && app.dock) {
-    app.dock.hide();
-    return;
-  }
+  // Background controls live in the independent native app.  Closing the
+  // desktop must release Electron, its helpers and its sleep blocker.
   app.quit();
 });
 
@@ -2650,6 +2686,94 @@ const requestSignalQuit = () => {
 process.once("SIGINT", requestSignalQuit);
 process.once("SIGTERM", requestSignalQuit);
 
+// Whether the always-on harness should outlive this window.
+//
+// This reads the config file directly rather than importing the server's
+// config module: main.mjs is plain ESM and server/config.ts is TypeScript, and
+// pulling a transpile step into the Electron entry point to read one boolean
+// is not a trade worth making.  The field is a plain boolean with one
+// documented default, so reading it is safe; a malformed or missing file
+// falls back to the same answer as an absent field.
+//
+// Absent means TRUE on purpose.  The harness is launchd-supervised and is
+// documented as always-on, and every paired phone depends on it still
+// answering after the window closes, so "not configured" must never be read
+// as "shut it all down".  Turning it off is always a deliberate act.
+function serverPersistsOnExit() {
+  try {
+    const dir = process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet");
+    const policy = readPersistOnExitPolicy(dir);
+    if (policy !== null) return policy;
+    const parsed = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
+    return parsed?.server?.persistOnExit !== false;
+  } catch {
+    return true;
+  }
+}
+
+// Ask the harness we are attached to stop cleanly, so it writes the sentinel
+// the launchd wrapper reads.  Without that marker the five-minute tick treats
+// the exit as a crash and brings the harness straight back, which is what
+// makes a quiet "shut it down" impossible today.
+//
+// Fire and forget by design: this runs during quit, the app is going away
+// regardless, and the harness's own reply is not something anyone is left to
+// read.  A refused connection means it was already gone.
+//
+// SERVER_PORT, not process.env.OMB_PORT: OMB_PORT is what this process hands
+// a harness it forks itself, and it is unset whenever we attached to one that
+// launchd started.  SERVER_PORT is the port we actually talked to, and it is
+// already a number — reading it also removes the NaN case a non-numeric OMB_PORT
+// would produce here.
+function requestAttachedHarnessShutdown() {
+  return shutdownAttachedServer(SERVER_PORT).catch((error) => {
+    dialog.showErrorBox(
+      "Could Not Confirm Server Shutdown",
+      `The server or a Local VM may still be running.\u00a0 ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+}
+
+// Clear the "stopped on purpose" sentinel when the app starts, which is the
+// other half of what POST /api/system/shutdown promises: the marker text and
+// the docs both say "launch the BotFleet app to let it come back", and without
+// this the app would launch into a permanently blocked harness.
+//
+// Safe to do unconditionally on launch, and the ordering is the reason.  The
+// launchd wrapper reads this marker itself and exits 0 while it exists, so a
+// periodic tick never reaches the harness and never runs this code.  This only
+// runs when a person actually opened the app -- BotFleet is not a login item,
+// and even if it became one, the wrapper would still be the thing refusing to
+// start a server, which is the decision we want to honour only on a real
+// launch.  A manual run of the wrapper clears it too, so there are two ways
+// back and neither depends on the other.
+function clearHarnessShutdownMarker() {
+  const marker = path.join(process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet"), "stopped.marker");
+  try {
+    fs.rmSync(marker, { force: true });
+  } catch {
+    // Already gone, or a path we cannot touch.  Either way the app launching
+    // is the intent, and the wrapper treats a missing marker as "start".
+  }
+}
+
+function recordExplicitStartupSession() {
+  if (process.platform !== "darwin") return;
+  // BF_CONTROL_STARTUP_POLICY_V1: a direct app launch allows this boot even
+  // when login startup is disabled.  Marker absence keeps default behavior.
+  const dir = process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet");
+  try {
+    const current = process.env.BOTFLEET_BOOT_SESSION_OVERRIDE
+      || execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8" }).trim();
+    if (!current) throw new Error("boot session is empty");
+    const sessionPath = process.env.BOTFLEET_STARTUP_SESSION ?? path.join(dir, "startup-session");
+    fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+    fs.writeFileSync(sessionPath, `${current}\n`, { mode: 0o600 });
+  } catch (error) {
+    console.error("Could not record explicit server start for this boot:", error);
+  }
+}
+
 app.on("before-quit", (e) => {
   credentialRestoreStopped = true;
   clearTimeout(credentialRestoreTimer);
@@ -2659,6 +2783,12 @@ app.on("before-quit", (e) => {
     // serverProc is null when attached — the always-on harness outlives us.
     serverProc?.kill();
   } catch {}
+  // …unless the owner asked for the harness to go down with the window.  Only
+  // meaningful when we did not spawn it ourselves: a child we own is already
+  // killed above, and asking the harness to shut down would be asking a process
+  // that is already dead.  See serverPersistsOnExit() for why absent means yes.
+  const stopAttachedHarness =
+    serverProc || serverPersistsOnExit() ? Promise.resolve() : requestAttachedHarnessShutdown();
   try {
     uiShim?.close();
   } catch {}
@@ -2678,6 +2808,10 @@ app.on("before-quit", (e) => {
       // Shut the connector down first, then the sidecar, without changing the
       // remembered toggle the next launch will restore.
       stopDesktopCompanion({ remember: false }).catch(() => {}),
+      // Asked for, not forced, and it does not outrank the app exiting: a
+      // harness that is already gone answers with a refused connection, which
+      // is a perfectly good outcome for something we are shutting down anyway.
+      stopAttachedHarness.catch(() => {}),
     ]),
     new Promise((resolve) => setTimeout(resolve, CUA_STOP_TIMEOUT_MS).unref()),
   ]);
