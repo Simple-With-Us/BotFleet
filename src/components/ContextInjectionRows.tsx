@@ -64,7 +64,7 @@ const EXPLANATION: Record<ContextSource, string> = {
   rewind: "The surviving conversation, replayed after an edit or a version switch.",
   reply: "The earlier message your reply quotes.",
   continuation: "The note BotFleet sent so the bot could carry on once you finished a card.",
-  compression: "The prompt was over its budget, so older context was cut before it was sent.  Sizes and names only.",
+  compression: "The prompt was over its budget, so older context was cut before it was sent.\u00A0 Sizes and names only.",
 };
 
 export function ContextInjectionRow({

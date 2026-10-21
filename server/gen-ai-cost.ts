@@ -23,8 +23,8 @@ export type CatalogUsage = {
 /** Same published MiniMax pay-as-you-go rates as the HTTP driver.  The
  *  retired MiniMax-M2.7 row stays so a saved picker id still prices. */
 export const CATALOG_MINIMAX_PRICES: ChatCompletionsPriceTable = {
-  "MiniMax-M3.1-Flash-Preview": [{ input: 0.3, output: 1.2, cachedInput: 0.06 }],
-  "MiniMax-M3.1-Flash-Preview-1M": [
+  "MiniMax-M3.1-Flash": [{ input: 0.3, output: 1.2, cachedInput: 0.06 }],
+  "MiniMax-M3.1-Flash-1M": [
     { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
     { input: 0.6, output: 2.4, cachedInput: 0.12 },
   ],
@@ -61,11 +61,11 @@ export function catalogMinimaxPriceKey(model: string | null | undefined): string
   if (!lower.includes("minimax") && !lower.includes("m3.1") && !lower.includes("m2.7")) {
     return null;
   }
-  if (lower.includes("1m")) return "MiniMax-M3.1-Flash-Preview-1M";
-  if (lower.includes("m3.1") || lower.includes("m3-1")) return "MiniMax-M3.1-Flash-Preview";
+  if (lower.includes("1m")) return "MiniMax-M3.1-Flash-1M";
+  if (lower.includes("m3.1") || lower.includes("m3-1")) return "MiniMax-M3.1-Flash";
   if (lower.includes("highspeed")) return "MiniMax-M2.7-highspeed";
   if (lower.includes("m2.7")) return "MiniMax-M2.7";
-  if (lower.includes("minimax")) return "MiniMax-M3.1-Flash-Preview";
+  if (lower.includes("minimax")) return "MiniMax-M3.1-Flash";
   return null;
 }
 

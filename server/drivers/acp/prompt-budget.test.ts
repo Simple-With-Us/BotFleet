@@ -499,7 +499,7 @@ describe("token budget", () => {
   it("clamps the cap to a model's published window and never clamps an unknown model", () => {
     const known = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 5_000_000, model: "MiniMax-M2.7", composed: prose });
     expect(known.tokens).toBe(Math.floor(204_800 * 0.8));
-    const m3 = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 524_288, model: "MiniMax-M3.1-Flash-Preview", composed: prose });
+    const m3 = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 524_288, model: "MiniMax-M3.1-Flash", composed: prose });
     expect(m3.tokens).toBe(Math.floor(524_288 * 0.8));
     const thinking = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 5_000_000, model: "MiniMax-M2.7-highspeed-thinking", composed: prose });
     expect(thinking.tokens).toBe(Math.floor(204_800 * 0.8));

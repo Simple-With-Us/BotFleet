@@ -1,3 +1,4 @@
+import type { QuotaPlanMetadata } from "../../shared/quota-plan-metadata";
 // App settings → Usage: what every bot has spent, so "which of my bots is
 // costing me money" is answerable without a provider dashboard. Figures are
 // banked per settled turn on each task (server/store.ts addTaskUsage) and
@@ -346,6 +347,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
     modelId?: string | null;
     skipReason?: string | null;
     planName?: string | null;
+    planMetadata?: QuotaPlanMetadata;
     absoluteRemaining?: number | null;
     absoluteLimit?: number | null;
     quotaUnit?: string | null;
@@ -1301,7 +1303,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                 <div className="flex min-w-0 flex-col">
                   <span className="truncate font-medium text-ink" title={entry.displayName}>{entry.displayName}</span>
                   <span className="truncate text-[11px] text-ink-secondary/90" title={entry.pricing.notes ?? sub?.notes ?? api?.notes ?? ""}>
-                    {entry.pricing.kind === "api" ? "API pay-as-you-go" : entry.pricing.kind === "free" ? "Free engine" : "Subscription engine"}
+                    {entry.pricing.kind === "api" ? "API pay-as-you-go" : entry.pricing.kind === "free" ? "Free engine" : entry.pricing.kind === "unknown" ? "Pricing unknown" : "Subscription engine"}
                   </span>
                 </div>
                 <div className="flex flex-col gap-1">

@@ -79,3 +79,8 @@ playwright-report/
 # "the always-on checkout has uncommitted changes" on a directory that was
 # simply the engine doing its job.
 .agents/
+
+# Generated native server controller and Swift package products.
+electron/resources/BotFleet Control.app/
+mac-control/.build/
+mac-control/.swiftpm/

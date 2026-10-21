@@ -34,11 +34,14 @@ const FILES = sourceFiles(SRC).map((path) => ({
 }));
 
 /** JSX text nodes plus the three attributes that reach a person: a tooltip,
- * a screen-reader name, and the grey text inside an empty field. */
+ * a screen-reader name, and the grey text inside an empty field.  String
+ * literals inside a JSX expression ({"..."}) reach a person the same way,
+ * so they are scanned too. */
 function userFacingStrings(text: string): string[] {
   const found: string[] = [];
   for (const match of text.matchAll(/(?:title|aria-label|placeholder)="([^"]+)"/g)) found.push(match[1]!);
   for (const match of text.matchAll(/>\s*([A-Za-z][^<>{}\n]{1,120}?)\s*</g)) found.push(match[1]!);
+  for (const match of text.matchAll(/\{"([^"{}]{2,200})"\}/g)) found.push(match[1]!);
   return found;
 }
 

@@ -31,16 +31,25 @@ function passedSecrets(yml) {
 
 test("claude-code-autofix.yml passes only secrets the Claude reusable declares", () => {
   const yml = read(".github/workflows/claude-code-autofix.yml");
-  // claude-code-autofix-reusable.yml declares MINIMAX_API_KEY, an optional USAGE_INGEST_TOKEN (UM-1593 metering) and an ignored GH_PAT.  Passing
+  // claude-code-autofix-reusable.yml declares MINIMAX_API_KEY, an optional USAGE_INGEST_TOKEN (UM-1593 metering),  the optional
+  // org META_MODEL_API_TOKEN for the model switch (2026-10-21),  and an ignored GH_PAT.  Passing
   // GH_ADMIN_PAT failed every run with "Invalid secret, GH_ADMIN_PAT is not defined in the
   // referenced workflow" (run 39054950004), and no fleet workflow may act as the owner.
-  assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "USAGE_INGEST_TOKEN"]);
+  assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "META_MODEL_API_TOKEN", "USAGE_INGEST_TOKEN"]);
   assert.doesNotMatch(yml, /secrets\.GH_ADMIN_PAT/);
 });
 
 test("autofix.yml passes only secrets the pr-autofix reusable declares", () => {
   const yml = read(".github/workflows/autofix.yml");
-  assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "AUTOFIX_GITHUB_APP_PRIVATE_KEY", "USAGE_INGEST_TOKEN"]);
+  assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "META_MODEL_API_TOKEN", "AUTOFIX_GITHUB_APP_PRIVATE_KEY", "USAGE_INGEST_TOKEN"]);
+});
+
+test("the trusted policy pins no model while the org-switch revision is pinned", () => {
+  // Kody on #1289:  with the switch revision pinned,  a model id in the
+  // trusted file is one more place that must move when the fleet switches,
+  // and it never wins -  the org variable outranks any file pin.  Keep it out.
+  const trusted = read(".github/pr-autofix-trusted.yml");
+  assert.doesNotMatch(trusted, /^model:/m, "the trusted policy must not pin a model id");
 });
 
 test("both autofix callers pin their reusable workflow to a full commit SHA", () => {
@@ -65,6 +74,16 @@ test("PR Autofix is not pinned to a reusable revision that deadlocks", () => {
   for (const bad of ["2e671004", "3fac4c3c"]) {
     assert.ok(!ref.startsWith(bad), `pr-autofix-reusable.yml is pinned to deadlocking ${bad}`);
   }
+  // Exact-SHA guard (Kody on #1289): the pr-autofix caller passes
+  // META_MODEL_API_TOKEN, which only the model-switch revision declares - a
+  // silent repin to anything else fails validation on every run.  c97a2dae is
+  // that revision now: closed host preset, fail-closed credential, request gate,
+  // Validate Model Switch guard.
+  assert.equal(
+    ref,
+    "c97a2dae96762eb9ffc122c753f0dfb0a7840650",
+    "pr-autofix-reusable.yml pin must stay on the model-switch revision",
+  );
 });
 
 test("autofix callers keep their least-privilege and fork guards", () => {
@@ -108,13 +127,25 @@ test("autofix callers keep their least-privilege and fork guards", () => {
 
 test("Claude Autofix keeps the Sentry-capable pin and same-repository bot gate", () => {
   const claude = read(".github/workflows/claude-code-autofix.yml");
-  // AFC #657 was inspected: only sentry and sentry[bot] were added to the
-  // prior bot list.  Do not override that reviewed policy or restore the old pin.
-  assert.match(
-    claude,
-    /claude-code-autofix-reusable\.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34/,
+  // 2026-10-20: repinned to the AFC pin that retires MiniMax-M3.1-Flash-Preview,
+  // and the caller now passes allowed_bots explicitly - the reusable default
+  // drops claude/claude[bot] and refuses swu-echo dispatches, which blocked an
+  // owner-directed rerun (run 39531317324).
+  // 2026-10-21: repinned again for the org model switch (c97a2dae carries the
+  // closed host preset,  the fail-closed credential,  the request gate,  and the
+  // Validate Model Switch guard).
+  // Compare the job-level uses: ref itself (as the PR Autofix guard does),  not a
+  // whole-file text match that a comment quoting the SHA would also satisfy.
+  const claudeUses = [...claude.matchAll(/^ {4}uses:\s*(\S+)\s*$/gm)].map(
+    (m) => m[1],
   );
-  assert.doesNotMatch(claude, /^\s+allowed_bots:/m);
+  assert.ok(
+    claudeUses.includes(
+      "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650",
+    ),
+    "claude-code-autofix-reusable.yml pin must stay on the model-switch revision",
+  );
+  assert.match(claude, /^\s+allowed_bots: .*swu-echo/m);
   const guard = claude.match(/^ {4}if: >-\n([\s\S]*?)^ {4}uses:/m)?.[1];
   assert.ok(guard, "Claude Autofix has a job-level guard");
   assert.equal(
