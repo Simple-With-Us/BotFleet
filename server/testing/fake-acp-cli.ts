@@ -386,8 +386,29 @@ if (process.env.FAKE_ACP_DUMP) {
 let pendingPermissionId: number | null = null;
 let onPermissionAnswered: (() => void) | null = null;
 
-// ask-peer mode: the "agents" MCP server entry from session/new's mcpServers
-type McpEntry = { command: string; args?: string[]; env?: Array<{ name: string; value: string }> };
+// Inbound payloads are JSON:  every string, array and record value carries
+// a cap, so one oversized message cannot pin unbounded memory or CPU.
+const boundedContentValue: z.ZodType<unknown> = z.lazy(() =>
+  z.union([
+    z.string().max(10_000_000),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(boundedContentValue).max(10_000),
+    z.record(z.string().max(256), boundedContentValue),
+  ]),
+);
+
+// ask-peer mode: the "agents" MCP server entry from session/new's mcpServers.
+// The schema bounds the array and every string inside each entry, and the
+// entry type is derived from it — no any-widening at the boundary.
+const mcpEntrySchema = z.object({
+  name: z.string().max(256),
+  command: z.string().max(4_096),
+  args: z.array(z.string().max(4_096)).max(256).optional(),
+  env: z.array(z.object({ name: z.string().max(256), value: z.string().max(65_536) }).strict()).max(256).optional(),
+}).catchall(boundedContentValue);
+type McpEntry = z.infer<typeof mcpEntrySchema>;
 let agentsMcp: McpEntry | null = null;
 
 /** Minimal one-shot MCP stdio client: initialize, call each tool in
@@ -480,16 +501,6 @@ export type JsonRpcEnvelope = z.infer<typeof jsonRpcEnvelopeSchema>;
  *  through instead of rejecting a newer agent. */
 // Content-block fields a newer agent adds are bounded JSON, not free-form:
 // every string, array and record value carries a cap.
-const boundedContentValue: z.ZodType<unknown> = z.lazy(() =>
-  z.union([
-    z.string().max(10_000_000),
-    z.number(),
-    z.boolean(),
-    z.null(),
-    z.array(boundedContentValue).max(10_000),
-    z.record(z.string().max(256), boundedContentValue),
-  ]),
-);
 export const promptContentSchema = z
   .object({ type: z.string().max(64).optional(), text: z.string().max(10_000_000) })
   .catchall(boundedContentValue);
@@ -569,12 +580,17 @@ function handle(rawMsg: unknown, resumed = false) {
         });
         break;
       }
-      const servers: McpEntry[] = Array.isArray(params.mcpServers) ? params.mcpServers : [];
+      const parsedMcpServers = z.array(mcpEntrySchema).max(100).safeParse(params.mcpServers);
+      if (params.mcpServers !== undefined && !parsedMcpServers.success) {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Invalid params" } });
+        break;
+      }
+      const servers: McpEntry[] = parsedMcpServers.success ? parsedMcpServers.data : [];
       if (process.env.FAKE_ACP_DUMP) {
         dumpState.mcpServers = servers;
         writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify(dumpState, null, 2));
       }
-      agentsMcp = servers.find((s: any) => s?.name === "agents") ?? null;
+      agentsMcp = servers.find((s) => s.name === "agents") ?? null;
       if (process.env.FAKE_ACP_DUMP) {
         writeFileSync(`${process.env.FAKE_ACP_DUMP}.mcp.json`, JSON.stringify(servers, null, 2));
       }
@@ -644,7 +660,9 @@ function handle(rawMsg: unknown, resumed = false) {
         });
       }
       const settingId = msg.method === "session/set_mode" ? "modeId" : "modelId";
-      if (typeof params.sessionId !== "string" || typeof params[settingId] !== "string") {
+      const parsedSettingSession = z.string().max(256).safeParse(params.sessionId);
+      const parsedSettingValue = z.string().max(256).safeParse(params[settingId]);
+      if (!parsedSettingSession.success || !parsedSettingValue.success) {
         out({
           jsonrpc: "2.0",
           id: msg.id,
@@ -660,7 +678,8 @@ function handle(rawMsg: unknown, resumed = false) {
       break;
     }
     case "session/set_config_option": {
-      const configId = params.configId;
+      const parsedConfigId = z.string().max(256).safeParse(params.configId);
+      const configId = parsedConfigId.success ? parsedConfigId.data : undefined;
       const value = params.value;
       const parsedValue = z.string().max(256).safeParse(value);
       if (configId === reasoningConfigId && process.env.FAKE_ACP_REASONING_ERROR_CODE) {
