@@ -256,31 +256,44 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         const unsupportedField =
           /unsupported|not supported|does not support|doesn't support|do not support|cannot support|can't support|not permitted|unrecognized|unknown|unexpected|extra_forbidden/i;
         let rejection = await res.text().catch(() => "");
+        // One recovery per optional field, in either order: whichever field
+        // the endpoint names first, the retry can surface the other one, so
+        // each recovery re-reads the rejection for the next check.
+        const dropUnsupportedField = async (field: RegExp, strip: () => void): Promise<boolean> => {
+          if (!field.test(rejection) || !unsupportedField.test(rejection)) return false;
+          strip();
+          res = await request();
+          rejection = !res.ok && (res.status === 400 || res.status === 422) ? await res.text().catch(() => "") : "";
+          return true;
+        };
         // Providers phrase the same 400 differently, so the wording check has to
         // cover active voice ("does not support") as well as the adjective and
         // passive forms ("unsupported", "not supported").  Matching only the
         // latter left a plain "This endpoint does not support stream_options"
         // rejection with no retry at all.
-        if (/stream_options/i.test(rejection) && unsupportedField.test(rejection)) {
+        await dropUnsupportedField(/stream_options/i, () => {
           delete bodyPayload.stream_options;
-          res = await request();
-          // The retry can itself hit the second recovery below, so only
-          // re-read the body when the status still asks for one.
-          rejection = !res.ok && (res.status === 400 || res.status === 422) ? await res.text().catch(() => "") : "";
-        }
+        });
         // The output-limit field this driver sends is optional too: an
         // endpoint that rejects max_tokens/max_completion_tokens gets the
-        // same one-shot recovery instead of failing the whole turn.
-        if (
-          !res.ok &&
-          (res.status === 400 || res.status === 422) &&
-          maxOutputParam !== null &&
-          bodyPayload[maxOutputParam] !== undefined &&
-          /max_(completion_)?tokens/i.test(rejection) &&
-          unsupportedField.test(rejection)
-        ) {
-          delete bodyPayload[maxOutputParam];
-          res = await request();
+        // same recovery instead of failing the whole turn.
+        if (maxOutputParam !== null && bodyPayload[maxOutputParam] !== undefined) {
+          // The stream_options pass below runs only after a max-output
+          // retry actually fired, so a persistent single-field rejection
+          // still costs exactly one retry.
+          if (
+            await dropUnsupportedField(/max_(completion_)?tokens/i, () => {
+              delete bodyPayload[maxOutputParam];
+            })
+          ) {
+            // The max-output retry can surface a stream_options rejection
+            // the first pass never saw, when the endpoint names the fields
+            // one at a time.  The recovery order must not depend on which
+            // field it reports first.
+            await dropUnsupportedField(/stream_options/i, () => {
+              delete bodyPayload.stream_options;
+            });
+          }
         }
       }
       if (!res.ok) {

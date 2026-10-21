@@ -217,6 +217,43 @@ describe("OpenAICompatDriver", () => {
     await inst.dispose();
   });
 
+  it("recovers when the endpoint names the rejected fields one at a time", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      if (bodies.length === 1) {
+        return new Response('{"error":"max_completion_tokens is not supported by this endpoint"}', { status: 400 });
+      }
+      if (bodies.length === 2) {
+        return new Response('{"error":"This endpoint does not support stream_options"}', { status: 400 });
+      }
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "maxout-order",
+      displayName: "Maxout Order",
+      enabled: true,
+      config: { url: "https://api.groq.com/openai/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "gsk-fake" },
+      environment: {},
+    });
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-maxout-order", text: "hi", maxOutputTokens: 512 });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    // The recovery order must not depend on which field the endpoint names
+    // first: max dropped on the first retry, stream_options on the second.
+    expect(done).toMatchObject({ ok: true });
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0].max_completion_tokens).toBe(512);
+    expect(bodies[0]).toHaveProperty("stream_options");
+    expect(bodies[2]).not.toHaveProperty("max_completion_tokens");
+    expect(bodies[2]).not.toHaveProperty("stream_options");
+    recorder.stop();
+    await inst.dispose();
+  });
+
   it("sends no output-limit field and marks nothing on an unrecognized endpoint", async () => {
     const bodies: Array<{ max_tokens?: number; max_completion_tokens?: number }> = [];
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
