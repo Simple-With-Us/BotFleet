@@ -1105,7 +1105,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       thisComputer: "no",
       connectedApps: "no",
       crossBotCoordination: "no",
-      computerUse: "yes",
+      computerUse: "limited",
       imageAttachments: "no",
       roomCoordination: "no",
       webAccess: "yes",
