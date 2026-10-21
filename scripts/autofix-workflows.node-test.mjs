@@ -126,9 +126,13 @@ test("Claude Autofix keeps the Sentry-capable pin and same-repository bot gate",
   // 2026-10-21: repinned again for the org model switch (c97a2dae carries the
   // closed host preset,  the fail-closed credential,  the request gate,  and the
   // Validate Model Switch guard).
-  assert.match(
-    claude,
-    /claude-code-autofix-reusable\.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650/,
+  // Compare the job-level uses: ref itself (as the PR Autofix guard does),  not a
+  // whole-file text match that a comment quoting the SHA would also satisfy.
+  const claudeUses = claude.match(/^ {4}uses:\s*(\S+)\s*$/m)?.[1] ?? "";
+  assert.equal(
+    claudeUses.split("@")[1] ?? "",
+    "c97a2dae96762eb9ffc122c753f0dfb0a7840650",
+    "claude-code-autofix-reusable.yml pin must stay on the model-switch revision",
   );
   assert.match(claude, /^\s+allowed_bots: .*swu-echo/m);
   const guard = claude.match(/^ {4}if: >-\n([\s\S]*?)^ {4}uses:/m)?.[1];
