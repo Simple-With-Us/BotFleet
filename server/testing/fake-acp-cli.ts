@@ -388,7 +388,7 @@ let onPermissionAnswered: (() => void) | null = null;
 
 // Inbound payloads are JSON:  every string, array and record value carries
 // a cap, so one oversized message cannot pin unbounded memory or CPU.
-const boundedContentValue: z.ZodType<unknown> = z.lazy(() =>
+export const boundedContentValue: z.ZodType<unknown> = z.lazy(() =>
   z.union([
     z.string().max(10_000_000),
     z.number(),
@@ -398,6 +398,7 @@ const boundedContentValue: z.ZodType<unknown> = z.lazy(() =>
     z.record(z.string().max(256), boundedContentValue),
   ]),
 );
+export type BoundedContentValue = z.infer<typeof boundedContentValue>;
 
 // ask-peer mode: the "agents" MCP server entry from session/new's mcpServers.
 // The schema bounds the array and every string inside each entry, and the
@@ -407,6 +408,9 @@ const mcpEntrySchema = z.object({
   command: z.string().max(4_096),
   args: z.array(z.string().max(4_096)).max(256).optional(),
   env: z.array(z.object({ name: z.string().max(256), value: z.string().max(65_536) }).strict()).max(256).optional(),
+  // Lenient on everything else:  MCP server entries are vendor-owned
+  // (ACP clients add fields as the protocol grows), so unknown keys are
+  // bounded JSON and ignored, never rejected.
 }).catchall(boundedContentValue);
 type McpEntry = z.infer<typeof mcpEntrySchema>;
 let agentsMcp: McpEntry | null = null;
