@@ -44,6 +44,14 @@ test("autofix.yml passes only secrets the pr-autofix reusable declares", () => {
   assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "META_MODEL_API_TOKEN", "AUTOFIX_GITHUB_APP_PRIVATE_KEY", "USAGE_INGEST_TOKEN"]);
 });
 
+test("the trusted policy pins no model while the org-switch revision is pinned", () => {
+  // Kody on #1289:  with the switch revision pinned,  a model id in the
+  // trusted file is one more place that must move when the fleet switches,
+  // and it never wins -  the org variable outranks any file pin.  Keep it out.
+  const trusted = read(".github/pr-autofix-trusted.yml");
+  assert.doesNotMatch(trusted, /^model:/m, "the trusted policy must not pin a model id");
+});
+
 test("both autofix callers pin their reusable workflow to a full commit SHA", () => {
   const pins = [
     [".github/workflows/autofix.yml", "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml"],
