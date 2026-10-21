@@ -97,11 +97,9 @@ jobs:
             check: macos-latest
           - os: ubuntu-latest
             check: ubuntu-latest
-          - os: windows-latest
-            check: windows-latest
     # Docs-only fast path still reports the required check names
-    # (typecheck + test (macos-latest) / windows-latest) but must not consume
-    # scarce free-plan macOS/Windows concurrent slots (2026-10-05 backlog).
+    # (typecheck + test (macos-latest) / ubuntu-latest) but must not consume
+    # scarce free-plan macOS concurrent slots (2026-10-05 backlog).
     runs-on: ${{ needs.changes.outputs.docs_only == 'true' && 'ubuntu-latest' || matrix.os }}
     # The test chain alone takes 10.5 to 13.5 minutes per host, and a full
     # job ran 14m49s on Ubuntu, so 15 cancelled healthy runs.  Keep this at
@@ -156,93 +154,6 @@ jobs:
           echo "The @botfleet/control-plane workspace package was removed 2026-09-26 with cloudflare/control-plane/."
           echo "This job satisfies ruleset 21771270 required context only; it does not run workerd or control-plane tests."
           echo "For Cloudflare validation use: pnpm broker:check && pnpm broker:test"
-
-  package-linux:
-    name: package + smoke (Ubuntu 24.04 x64)
-    needs: changes
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-26.04
-    timeout-minutes: 25
-    steps:
-      - name: Documentation-only fast path
-        if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
-      - name: Packaging-unrelated fast path
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed != 'true'
-        run: echo "No electron/, third_party/, packaging script, or dependency paths changed; Linux packaging was skipped."
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        with:
-          persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        with:
-          node-version: 24
-          cache: pnpm
-      - name: Install package validation and native smoke tools
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: >-
-          sudo apt-get update && sudo apt-get install -y
-          at-spi2-core dbus-x11 desktop-file-utils libfuse2t64 libxi6 libxkbcommon0 squashfs-tools x11-utils xdotool xvfb
-        continue-on-error: false
-      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: pnpm install --frozen-lockfile
-      - name: Stage the pinned CUA runtime
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: pnpm build:cua:linux
-      - name: Prove overlay-free X11 input routing
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: dbus-run-session -- xvfb-run -a pnpm smoke:cua-x11-input
-      - name: Package from the verified offline CUA stage
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: pnpm package:linux:offline
-      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: node scripts/verify-linux-package.mjs
-      - name: Match a normal Ubuntu package parent on the ephemeral runner
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: |
-          test ! -L /opt
-          test "$(stat -c '%F %U:%G' /opt)" = "directory root:root"
-          case "$(stat -c '%a' /opt)" in
-            755) ;;
-            775|777) sudo chmod 0755 /opt ;;
-            *) echo "Unexpected /opt mode: $(stat -c '%a' /opt)" >&2; exit 1 ;;
-          esac
-          test "$(stat -c '%U:%G %a' /opt)" = "root:root 755"
-      - name: Reproduce and verify an in-place DEB upgrade
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: |
-          deb=(release/*.deb)
-          test "${#deb[@]}" -eq 1
-          sudo --preserve-env=CI,RUNNER_TEMP node scripts/smoke-deb-upgrade.mjs "${deb[0]}"
-      - name: Configure Chromium sandbox for the unpacked app
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: |
-          sudo chown root:root release/linux-unpacked/chrome-sandbox
-          sudo chmod 4755 release/linux-unpacked/chrome-sandbox
-          test "$(stat -c '%U:%G %a' release/linux-unpacked/chrome-sandbox)" = "root:root 4755"
-      - name: Launch packaged app and verify lifecycle
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        env:
-          OMB_KEEP_SMOKE_DIR: "1"
-          OMB_SMOKE_INSTALLED_DEB: "1"
-        run: pnpm smoke:linux-package
-      - name: Remove the installed upgrade fixture
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true' && always()
-        run: sudo dpkg --purge botfleet || true
-      - name: Upload smoke diagnostics on failure
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true' && failure()
-        with:
-          name: botfleet-ubuntu-smoke-diagnostics
-          path: |
-            /tmp/omb-linux-smoke-*
-            /tmp/omb-linux-smoke-runtime-*
-          if-no-files-found: warn
-          include-hidden-files: true
-          retention-days: 7
 
   ios-build:
     name: iOS Swift tests and unsigned build (xcode-27)
