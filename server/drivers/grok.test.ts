@@ -87,6 +87,25 @@ describe("GrokDriver turns (fake fetch)", () => {
     expect(requestBodies[0].model).toBe("grok-4.7");
   });
 
+  it("sends the bot's output limit as max_completion_tokens, and every catalog row carries supportsMaxOutput", async () => {
+    script = [];
+    await create();
+    expect(instance.models.options.every((model) => model.supportsMaxOutput === true)).toBe(true);
+    await instance.adapter.sendTurn({ threadId: "t-max-out", text: "hi", maxOutputTokens: 4096 });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(requestBodies[0].max_completion_tokens).toBe(4096);
+    expect(requestBodies[0]).not.toHaveProperty("max_tokens");
+  });
+
+  it("sends no output-limit field when the bot sets none", async () => {
+    script = [];
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-max-out-unset", text: "hi" });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(requestBodies[0]).not.toHaveProperty("max_completion_tokens");
+    expect(requestBodies[0]).not.toHaveProperty("max_tokens");
+  });
+
   it("normalizes a full turn into the canonical event sequence", async () => {
     script = [];
     await create();
@@ -572,7 +591,7 @@ describe("GrokDriver live model catalog", () => {
     const instance = await create();
     await instance.refreshModels?.();
     const rows = instance.models.options.filter((option) => option.id === "grok-build-0.1");
-    expect(rows).toEqual([{ id: "grok-build-0.1", label: "Grok Build 0.1" }]);
+    expect(rows).toEqual([{ id: "grok-build-0.1", label: "Grok Build 0.1", supportsMaxOutput: true }]);
     expect(instance.models.options.map((option) => option.id)).toEqual(["grok-build-0.1", "grok-4.7"]);
   });
 

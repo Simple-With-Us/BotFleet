@@ -104,6 +104,84 @@ describe("OpenAICompatDriver", () => {
     expect(fetchMock).toHaveBeenCalled();
   });
 
+  it("sends max_tokens on an OpenRouter endpoint and marks its catalog", async () => {
+    const bodies: Array<Record<string, any>> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-openrouter",
+      displayName: "OpenRouter",
+      enabled: true,
+      config: { url: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "sk-or-fake" },
+      environment: {},
+    });
+    expect(inst.models.options.every((model) => model.supportsMaxOutput === true)).toBe(true);
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-or", text: "hi", maxOutputTokens: 2048 });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(bodies[0].max_tokens).toBe(2048);
+    expect(bodies[0]).not.toHaveProperty("max_completion_tokens");
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("sends max_completion_tokens on a Groq endpoint", async () => {
+    const bodies: Array<Record<string, any>> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-groq",
+      displayName: "Groq",
+      enabled: true,
+      config: { url: "https://api.groq.com/openai/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "gsk-fake" },
+      environment: {},
+    });
+    expect(inst.models.options.every((model) => model.supportsMaxOutput === true)).toBe(true);
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-groq", text: "hi", maxOutputTokens: 512 });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(bodies[0].max_completion_tokens).toBe(512);
+    expect(bodies[0]).not.toHaveProperty("max_tokens");
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("sends no output-limit field and marks nothing on an unrecognized endpoint", async () => {
+    const bodies: Array<Record<string, any>> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-ollama-maxout",
+      displayName: "Ollama Local",
+      enabled: true,
+      config: { url: "http://localhost:11434/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY" },
+      environment: {},
+    });
+    expect(inst.models.options.some((model) => model.supportsMaxOutput === true)).toBe(false);
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-ollama", text: "hi", maxOutputTokens: 999 });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(bodies[0]).not.toHaveProperty("max_tokens");
+    expect(bodies[0]).not.toHaveProperty("max_completion_tokens");
+    recorder.stop();
+    await inst.dispose();
+  });
+
   it("never sends the workspace-shared process.env credential to a custom instance", async () => {
     // syncCredentialEnv copies a saved openaiCompat.key into
     // process.env.OPENAI_COMPAT_API_KEY as soon as it's saved — that env var

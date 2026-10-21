@@ -78,6 +78,25 @@ export function sentryProviderForUrl(url: string): string {
   return "openai-compat";
 }
 
+/** The output-limit field a KNOWN endpoint documents, or null when the
+ *  endpoint is unrecognized and no field may be sent (a generic
+ *  OpenAI-compatible server is under no obligation to accept either name).
+ *
+ *  Sources (fetched 2026-10-21):
+ *   - OpenAI: `max_completion_tokens`; `max_tokens` deprecated
+ *     (openai-node completions.ts, mirroring platform.openai.com docs).
+ *   - Groq: `max_completion_tokens`; `max_tokens` deprecated
+ *     (https://console.groq.com/docs/api-reference#chat-create).
+ *   - OpenRouter: `max_tokens`
+ *     (https://openrouter.ai/docs/api-reference/chat-completion).
+ */
+export function maxOutputParamForUrl(url: string): "max_tokens" | "max_completion_tokens" | null {
+  const provider = sentryProviderForUrl(url);
+  if (provider === "openai" || provider === "groq") return "max_completion_tokens";
+  if (provider === "openrouter") return "max_tokens";
+  return null;
+}
+
 function decodeConfig(raw: unknown): OpenAICompatConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
   const envUrl = process.env.OPENAI_COMPAT_URL;
@@ -161,14 +180,21 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       "";
     const listeners = new Set<RuntimeEventListener>();
     const active = new Map<string, { abort: AbortController; turnId: string; startedAt: number }>();
-    let catalog = DEFAULT_MODELS;
+    // The output-limit field is endpoint-level for the providers above, so
+    // every option of a recognized endpoint carries supportsMaxOutput; an
+    // unrecognized endpoint's catalog stays unmarked and the picker hides
+    // the control.
+    const maxOutputParam = maxOutputParamForUrl(config.url);
+    const stampMaxOutput = (c: ModelCatalog): ModelCatalog =>
+      maxOutputParam === null ? c : { ...c, options: c.options.map((option) => ({ ...option, supportsMaxOutput: true })) };
+    let catalog = stampMaxOutput(DEFAULT_MODELS);
     if (config.models && config.models.length > 0) {
       const options: ModelCatalog["options"] = config.models.map((m) => {
         const id = typeof m === "string" ? m : m.id;
         const label = typeof m === "object" && m.label ? m.label : id;
         return { id, label, custom: true };
       });
-      catalog = { default: options[0].id, options };
+      catalog = stampMaxOutput({ default: options[0].id, options });
     }
 
     const emit = (event: RuntimeEvent) => {
@@ -192,6 +218,9 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         onChunk?: () => void;
         onDelta?: (d: string, streamKind?: "assistant_text" | "reasoning_text") => void;
         onUsage?: (usage: TurnUsage) => void;
+        /** The bot's optional output limit, sent under the field this
+         *  endpoint documents (maxOutputParamForUrl).  Absent sends nothing. */
+        maxOutputTokens?: number;
       },
     ): Promise<{
       text: string;
@@ -202,6 +231,9 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       const bodyPayload: any = { model, messages, stream: opts.stream, ...(opts.stream ? { stream_options: { include_usage: true } } : {}) };
       if (opts.tools && opts.tools.length > 0) {
         bodyPayload.tools = opts.tools;
+      }
+      if (maxOutputParam !== null && opts.maxOutputTokens !== undefined) {
+        bodyPayload[maxOutputParam] = opts.maxOutputTokens;
       }
       const headers: Record<string, string> = {
         "content-type": "application/json",
@@ -369,7 +401,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           options.push({ id, label });
         }
         if (options.length) {
-          catalog = { default: options[0].id, options };
+          catalog = stampMaxOutput({ default: options[0].id, options });
         }
       } catch {
         // keep DEFAULT_MODELS — never fail the instance on a catalog miss
@@ -477,6 +509,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
               stream: true,
               signal: opts.signal,
               tools: openAiTools,
+              maxOutputTokens: turn.maxOutputTokens,
               onChunk: opts.onChunk,
               // `onPublished` before the emit: from here this round can
               // never be retried, because a replay would show the person
