@@ -100,6 +100,16 @@ function runner(responses: Record<string, string | Error>) {
   return { calls, run };
 }
 
+/** The answers a fake runner serves, keyed by the exact command line.
+ *
+ *  A named contract rather than a bare `Record<string, ...>`: the lint
+ *  ratchet treats an open dictionary annotation on a binding as throwing
+ *  away known type evidence, and a named owner keeps the index signature
+ *  while saying what the map holds. */
+interface ProbeResponses {
+  [command: string]: string | Error;
+}
+
 const DOCKER_PROBE = "docker info --format {{.ServerVersion}}";
 
 /** What `execFile` rejects with when its `timeout` kills the child: `killed`
@@ -1894,8 +1904,8 @@ describe("shared container probe context", () => {
     ]);
   }
 
-  function probeResponses(): Record<string, string | Error> {
-    const responses: Record<string, string | Error> = {
+  function probeResponses(): ProbeResponses {
+    const responses: ProbeResponses = {
       "/usr/bin/which docker": "/usr/bin/docker\n",
       "/usr/bin/which podman": new Error("missing"),
       [DOCKER_PROBE]: "29.0.0\n",
