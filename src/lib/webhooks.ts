@@ -1,4 +1,6 @@
 import type { RoutineRunOn } from "@/lib/routines";
+import { niceCalendarDate, niceCalendarTime } from "./routine-calendar";
+import { CENTRAL_TIME_ZONE, startOfDayInTimeZone } from "../../shared/time-zone";
 
 export interface WebhookTrigger {
   id: string;
@@ -86,4 +88,82 @@ export function webhookActivationDefaults(
     enabled: webhook?.enabled ?? true,
     verificationPending: webhook?.verificationPending ?? false,
   };
+}
+
+/** GitHub events people most often point a bot at.  The editor lists these as
+ * checkboxes; an event type the sender names that is not here is added by hand. */
+export const COMMON_WEBHOOK_EVENT_TYPES: readonly string[] = [
+  "pull_request",
+  "push",
+  "check_run",
+  "check_suite",
+  "workflow_run",
+  "issues",
+  "issue_comment",
+  "release",
+];
+
+/** The harness keeps at most this many event types per webhook and refuses a
+ * longer list, so the editor stops adding at the same number. */
+export const MAX_WEBHOOK_EVENT_TYPES = 20;
+/** The harness cuts a longer event type down to this many characters. */
+const MAX_EVENT_TYPE_LENGTH = 200;
+
+/** The two settings that decide which deliveries run, as one webhook holds
+ * them.  A webhook that never had the flag reads as off. */
+export interface WebhookFilterValues {
+  mergedPullRequestsOnly: boolean;
+  eventTypes: string[];
+}
+
+/** What a change sends: only the setting that changed. */
+export type WebhookFilterPatch = Partial<WebhookFilterValues>;
+
+export function webhookFilterValues(
+  webhook: Pick<WebhookTrigger, "mergedPullRequestsOnly" | "eventTypes">,
+): WebhookFilterValues {
+  return {
+    mergedPullRequestsOnly: webhook.mergedPullRequestsOnly === true,
+    eventTypes: webhook.eventTypes ?? [],
+  };
+}
+
+/** Event types typed into the add box.  Split on commas and never on spaces,
+ * because a sender's event name can hold them: GitLab sends "Merge Request Hook". */
+export function parseEventTypes(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((value) => value.trim().slice(0, MAX_EVENT_TYPE_LENGTH))
+    .filter(Boolean);
+}
+
+/** `current` plus the new names, in order, without repeats and never past the
+ * limit.  Returns a new list; the argument is left alone. */
+export function addEventTypes(current: readonly string[], added: readonly string[]): string[] {
+  const next = [...current];
+  for (const name of added) {
+    if (next.length >= MAX_WEBHOOK_EVENT_TYPES) break;
+    if (!next.includes(name)) next.push(name);
+  }
+  return next;
+}
+
+export function setEventTypeChecked(current: readonly string[], name: string, checked: boolean): string[] {
+  return checked ? addEventTypes(current, [name]) : current.filter((value) => value !== name);
+}
+
+/** "Filtered 12 deliveries, last at 3:15 PM", or null while nothing has been
+ * filtered.  Times are Central like the rest of Routines, and a delivery from
+ * an earlier day also names its date. */
+export function filteredDeliveriesLabel(
+  webhook: Pick<WebhookTrigger, "ignoredCount" | "lastIgnoredAt">,
+  now = Date.now(),
+): string | null {
+  const count = webhook.ignoredCount ?? 0;
+  if (!(count > 0)) return null;
+  const head = `Filtered ${count.toLocaleString()} ${count === 1 ? "delivery" : "deliveries"}`;
+  const at = webhook.lastIgnoredAt;
+  if (at === undefined) return head;
+  const today = startOfDayInTimeZone(at, CENTRAL_TIME_ZONE) === startOfDayInTimeZone(now, CENTRAL_TIME_ZONE);
+  return `${head}, last at ${today ? "" : `${niceCalendarDate(at, false)}, `}${niceCalendarTime(at)}`;
 }
