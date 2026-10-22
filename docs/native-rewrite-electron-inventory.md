@@ -198,21 +198,22 @@ real product surface.
 1. **Native diagnostics bundle and bug-report export.** `diagnostics.mjs`
    (redaction, the `CREDENTIAL_ENV_NAMES` mirror of the server list, log
    tail), `main.mjs:975-997` (`gatherDiagnostics`), `:1729-1761`
-   (`desktop:export-diagnostics`). Not in the BF-2502 inventory.
+   (`desktop:export-diagnostics`). Not in the BF-2502 inventory. — **BF-2538**
 2. **Native embedded remote-desktop viewer with session isolation.**
    `desktop-viewer.cjs`, `desktop-workspace.cjs`. A `WKWebView` with the
-   same origin and permission rules, or a native VNC/RDP client.
+   same origin and permission rules, or a native VNC/RDP client. — **BF-2539**
 3. **Native skill recorder** — capture to skill definition, plus the
-   `app.botfleet.recorder.macos` helper's signing story.
+   `app.botfleet.recorder.macos` helper's signing story. — **BF-2540**
 4. **Sentry Cocoa for the native app** — release SHA stamping and request
    scrubbing. The BF-2502 inventory marks this "Phase 3, no covering issue".
-5. **Desktop capability and version surface** — fold into BF-2501, but name
-   it so the parity harness can assert it.
+   — **BF-2541**
+5. **Desktop capability and version surface** — fold into **BF-2501**, but
+   name it so the parity harness can assert it.
 6. **The `botfleet://install` allowlist** — the native URL handler must
-   reproduce `package-link.mjs` exactly; that belongs in BF-2495's
+   reproduce `package-link.mjs` exactly; that belongs in **BF-2495**'s
    acceptance criteria.
-7. **Native version probe** — fold into BF-2486 and BF-2510 rather than
-   leaving it unowned.
+7. **Native version probe** — fold into **BF-2486** and **BF-2510** rather
+   than leaving it unowned.
 
 ## 10. Install and cutover (BF-2498's other half)
 
