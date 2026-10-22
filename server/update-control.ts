@@ -208,10 +208,6 @@ export interface LaunchPlan {
    * `exec node` would not resolve without it. */
   nodeDirectory: string;
   force?: boolean;
-  /** Harness owner bearer credential for the ubf runtime shortcut probe only. */
-  harnessOwnerNonce?: string;
-  /** Mode-0600 env file sourced by the launchd job (avoids secret export lines in `-c`). */
-  launchEnvFilePath?: string;
 }
 
 export interface LaunchResult {
@@ -243,8 +239,6 @@ export interface UpdateControlDeps {
    * busy because of the question.  This one answers `GET /api/update/status`,
    * which holds no admission. */
   readiness: () => RuntimeReadiness;
-  /** Live harness-owner nonce for updater child env (BOTFLEET_OWNER_NONCE). */
-  harnessOwnerNonce?: () => string | null;
   /** How a state file reaches disk.  A seam rather than a detail: the
    * behaviour that matters here is what happens when it THROWS, and a test
    * that arranged that with directory permissions would only be testing them
@@ -669,9 +663,6 @@ export function launchPlanCommand(plan: LaunchPlan): { command: string; args: st
   const forceArg = plan.force ? " --force" : "";
   const script = [
     `export PATH=${quote(plan.nodeDirectory)}:"$PATH"`,
-    ...(plan.launchEnvFilePath
-      ? [`set -a && . ${quote(plan.launchEnvFilePath)} && set +a`]
-      : []),
     `exec /bin/bash ${quote(plan.scriptPath)} --progress ${quote(plan.progressPath)} --run-id ${quote(plan.runId)}${forceArg}`,
   ].join("\n");
   return {
@@ -748,37 +739,22 @@ async function defaultLaunch(plan: LaunchPlan): Promise<LaunchResult> {
   // A finished label stays registered and makes the next `submit` fail
   // outright, so it is cleared — but only now that it is known to be dead.
   await execCommand("/bin/launchctl", ["remove", plan.label]);
-  const harnessOwnerNonce = plan.harnessOwnerNonce?.trim();
-  const launchPlan: LaunchPlan = { ...plan };
-  let launchEnvFilePath = plan.launchEnvFilePath;
-  if (harnessOwnerNonce && !launchEnvFilePath) {
-    launchEnvFilePath = join(dirname(plan.progressPath), `${plan.runId}.launch.env`);
-    mkdirSync(dirname(launchEnvFilePath), { recursive: true, mode: 0o700 });
-    writeFileSync(launchEnvFilePath, `BOTFLEET_OWNER_NONCE=${harnessOwnerNonce}\n`, { mode: 0o600 });
-    launchPlan.launchEnvFilePath = launchEnvFilePath;
-  }
-  const { command, args } = launchPlanCommand(launchPlan);
+  // No credential rides along.  The updater reads the harness's current one
+  // from the owner record itself, because the harness mints a new one every
+  // time it boots and an update restarts it on purpose.
+  const { command, args } = launchPlanCommand(plan);
   const submitted = await execCommand(command, args);
   if (submitted.code === 0) return { launcher: "launchd" };
-  if (launchEnvFilePath) {
-    try {
-      rmSync(launchEnvFilePath, { force: true });
-    } catch {
-      /* a leftover env file is swept with the run artifacts */
-    }
-  }
   // launchd refused (an old label still settling, a sandboxed domain).  A
   // detached, session-leading child is still better than not updating: it
   // outlives the desktop app, and the harness restart it performs is a
   // launchd kickstart, not a signal to this process group.
   const log = openSync(plan.logPath, "a");
   try {
-    const harnessOwnerNonce = plan.harnessOwnerNonce?.trim();
     const childEnv: NodeJS.ProcessEnv = {
       ...process.env,
       PATH: `${plan.nodeDirectory}:${process.env.PATH ?? ""}`,
     };
-    if (harnessOwnerNonce) childEnv.BOTFLEET_OWNER_NONCE = harnessOwnerNonce;
     const child = spawn(
       "/bin/bash",
       [plan.scriptPath, "--progress", plan.progressPath, "--run-id", plan.runId, ...(plan.force ? ["--force"] : [])],
@@ -1482,7 +1458,6 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
         label: deps.label,
         nodeDirectory: deps.nodeDirectory,
         force,
-        harnessOwnerNonce: deps.harnessOwnerNonce?.() ?? undefined,
       });
     } catch (error) {
       // Nothing started, so the record must not outlive the attempt.

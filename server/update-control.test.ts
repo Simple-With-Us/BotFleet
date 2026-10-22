@@ -627,7 +627,7 @@ describe("the launcher", () => {
     expect(args[10]).toContain("--run-id 'run_one'");
   });
 
-  it("sources harness bearer credentials from a launch env file, not the -c string", () => {
+  it("hands the detached job no credential at all: the updater reads the current one from the owner record", () => {
     const { args } = launchPlanCommand({
       runId: "run_nonce",
       progressPath: "/tmp/state/runs/run_nonce.progress.json",
@@ -635,11 +635,13 @@ describe("the launcher", () => {
       scriptPath: "/Users/jay/apps/update-botfleet.sh",
       label: "com.jay.botfleet-update",
       nodeDirectory: "/opt/homebrew/bin",
-      launchEnvFilePath: "/tmp/state/runs/run_nonce.launch.env",
     });
     const script = args[10];
-    expect(script).toContain(". '/tmp/state/runs/run_nonce.launch.env'");
-    expect(script).not.toContain("BOTFLEET_OWNER_NONCE=");
+    // The harness mints a new credential on every boot and an update restarts
+    // it on purpose, so one captured at launch is stale by the time it is used.
+    expect(script).not.toContain("BOTFLEET_OWNER_NONCE");
+    expect(script).not.toContain("launch.env");
+    expect(script).not.toMatch(/set -a/);
   });
 
   it("records the run before launching it, and launches nothing it cannot record", async () => {

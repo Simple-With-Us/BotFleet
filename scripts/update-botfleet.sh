@@ -202,24 +202,31 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
       if [[ "$IS_UP_TO_DATE" == "1" ]]; then
         OWNER_FILE="${BOTFLEET_DATA_DIR:-$HOME/.botfleet}/harness-owner.json"
         if [[ -f "$OWNER_FILE" ]]; then
-          # The bearer credential is never read from harness-owner.json in this
-          # wrapper: it must arrive via BOTFLEET_OWNER_NONCE.  A live owner
-          # record means the harness was adopted, so a missing or rejected
-          # credential must fail fast instead of pretending the runtime check
-          # passed.  The helper reads only the port from the owner file and
-          # writes just a commit SHA to stdout.
-          : "${BOTFLEET_OWNER_NONCE:?BotFleet updater: BOTFLEET_OWNER_NONCE is required when a harness owner record exists.}"
+          # The harness mints a NEW credential every time it boots, so the only
+          # current one is in harness-owner.json, and nothing exported into
+          # this process earlier can be trusted to match it.  The helper reads
+          # the file and makes the authenticated request inside one process, so
+          # the credential never crosses a process boundary, and it writes just
+          # a commit SHA to stdout.  This used to insist on a
+          # BOTFLEET_OWNER_NONCE variable and exit 1 without one, which made
+          # even "already current" a failure for anyone running it from a
+          # terminal.  Exit 1 from the helper means it could not learn the
+          # commit (no harness listening, an odd answer): that is "nothing to
+          # compare", not "out of date".  Exit 3 means the harness refused the
+          # credential in its own record, which is NOT evidence that it is
+          # current, so the updater itself is left to diagnose it.
           RUNTIME_PROBE_ERR="$(mktemp "${TMPDIR:-/tmp}/botfleet-runtime-probe.XXXXXX")"
-          if ! RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" BOTFLEET_OWNER_NONCE="$BOTFLEET_OWNER_NONCE" "$NODE_BIN" "$SCRIPT_DIR/update-botfleet-runtime-commit.mjs" 2>"$RUNTIME_PROBE_ERR"); then
+          RUNTIME_COMMIT=""
+          RUNTIME_PROBE_STATUS=0
+          RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" "$NODE_BIN" "$SCRIPT_DIR/update-botfleet-runtime-commit.mjs" 2>"$RUNTIME_PROBE_ERR") || RUNTIME_PROBE_STATUS=$?
+          if [[ "$RUNTIME_PROBE_STATUS" == "3" ]]; then
             if [[ -s "$RUNTIME_PROBE_ERR" ]]; then
               cat "$RUNTIME_PROBE_ERR" >&2
             fi
-            rm -f "$RUNTIME_PROBE_ERR"
-            echo "BotFleet updater: could not verify the running harness commit (credential BOTFLEET_OWNER_NONCE)." >&2
-            exit 1
+            IS_UP_TO_DATE=0
           fi
           rm -f "$RUNTIME_PROBE_ERR"
-          if [[ "$RUNTIME_COMMIT" =~ ^[0-9a-f]{40}$ && "$RUNTIME_COMMIT" != "$LOCAL_HEAD" ]]; then
+          if [[ "$RUNTIME_PROBE_STATUS" == "0" && "$RUNTIME_COMMIT" =~ ^[0-9a-f]{40}$ && "$RUNTIME_COMMIT" != "$LOCAL_HEAD" ]]; then
             IS_UP_TO_DATE=0
           fi
         fi

@@ -834,27 +834,30 @@ test("the stable wrapper does not test for a .git directory to find the checkout
   assert.match(source, /git -C "\$BOTFLEET_CHECKOUT" rev-parse --git-dir/);
 });
 
-test("the up-to-date runtime probe reads the bearer credential from BOTFLEET_OWNER_NONCE only", async () => {
+test("the up-to-date runtime probe reads the current credential from the owner record, in one process", async () => {
   const wrapper = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
   const helper = await readFile(join(scripts, "update-botfleet-runtime-commit.mjs"), "utf8");
   assert.match(wrapper, /update-botfleet-runtime-commit\.mjs/);
-  assert.match(wrapper, /BOTFLEET_OWNER_NONCE/);
-  assert.match(wrapper, /BOTFLEET_OWNER_NONCE is required when a harness owner record exists/);
-  assert.doesNotMatch(wrapper, /\|\| RUNTIME_COMMIT=""/);
+  // No environment variable is required or forwarded: the harness mints a new
+  // credential on every boot, so only the file is current.
+  assert.doesNotMatch(wrapper, /\$\{BOTFLEET_OWNER_NONCE|BOTFLEET_OWNER_NONCE=/);
+  assert.doesNotMatch(helper, /process\.env\.BOTFLEET_OWNER_NONCE/);
+  // The credential never leaves the helper process.
   assert.doesNotMatch(wrapper, /owner\.nonce/);
   assert.doesNotMatch(wrapper, /console\.log\(.*nonce/);
-  assert.match(helper, /process\.env\.BOTFLEET_OWNER_NONCE/);
-  assert.doesNotMatch(helper, /owner\.nonce/);
-  assert.match(helper, /BOTFLEET_OWNER_NONCE is required/);
+  assert.match(helper, /owner\.nonce/);
+  assert.doesNotMatch(helper, /(?:stdout|console)[^\n]*credential/);
   assert.match(helper, /res\.statusCode === 401 \|\| res\.statusCode === 403/);
-  assert.match(helper, /maskedCredentialEnvRef/);
+  assert.doesNotMatch(wrapper, /\|\| RUNTIME_COMMIT=""/);
 });
 
-test("the mac updater authenticates runtime calls with BOTFLEET_OWNER_NONCE only", async () => {
+test("the mac updater authenticates each runtime call with the owner record it just read", async () => {
   const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
-  assert.match(source, /requireHarnessBearerCredential/);
-  assert.match(source, /process\.env\.BOTFLEET_OWNER_NONCE/);
-  assert.doesNotMatch(source, /Authorization: `Bearer \$\{owner\.nonce\}`/);
+  assert.doesNotMatch(source, /process\.env\.BOTFLEET_OWNER_NONCE/);
+  assert.doesNotMatch(source, /requireHarnessBearerCredential/);
+  // Every call site hands the header builder the record in scope.
+  assert.doesNotMatch(source, /harnessAuthorizationHeader\(\)/);
+  assert.ok((source.match(/harnessAuthorizationHeader\(owner\)/g) ?? []).length >= 6);
 });
 
 test("apply bootstraps the updater recorded in the stage manifest, not a newer origin/main", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
@@ -1576,15 +1579,9 @@ test("unused foreign fallback ports do not hide one valid BotFleet owner", () =>
   assert.match(healthTopologyResult([owner, { kind: "unavailable" }]).reason, /unavailable or ambiguous/);
 });
 
-test("a post-fence ownership exception releases runtime admission", async (t) => {
+test("a post-fence ownership exception releases runtime admission", async () => {
   const releases = [];
   const owner = { version: 1, pid: 42, port: 8799, nonce: "a".repeat(64) };
-  const previousNonce = process.env.BOTFLEET_OWNER_NONCE;
-  process.env.BOTFLEET_OWNER_NONCE = owner.nonce;
-  t.after(() => {
-    if (previousNonce === undefined) delete process.env.BOTFLEET_OWNER_NONCE;
-    else process.env.BOTFLEET_OWNER_NONCE = previousNonce;
-  });
   const result = await fenceRuntimeAdmission(
     { dataDirectory: "/private/data", ports: [8799] },
     {
