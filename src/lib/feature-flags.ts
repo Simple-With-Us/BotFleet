@@ -1,5 +1,12 @@
+export type BusySendMode = "steer" | "queue";
+
 export interface FeatureFlagConfig {
-  features?: { skillRecorder?: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
+  features?: {
+    skillRecorder?: boolean;
+    showToolCalls?: boolean;
+    summarizeToolCalls?: boolean;
+    busySend?: BusySendMode;
+  };
 }
 
 /** Experimental features are available only after an explicit opt-in. */
@@ -23,4 +30,9 @@ export function showToolCallsEnabled(config: FeatureFlagConfig | null | undefine
  * On by default when tool calls are shown. Set to false to show detailed stream. */
 export function summarizeToolCallsEnabled(config: FeatureFlagConfig | null | undefined): boolean {
   return config?.features?.summarizeToolCalls !== false;
+}
+
+/** What Send does while a bot is in a turn.  Queue only when that word is saved. */
+export function busySendMode(config: FeatureFlagConfig | null | undefined): BusySendMode {
+  return config?.features?.busySend === "queue" ? "queue" : "steer";
 }

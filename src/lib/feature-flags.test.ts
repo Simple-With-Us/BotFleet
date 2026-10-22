@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { showToolCallsEnabled, skillRecorderEnabled, summarizeToolCallsEnabled } from "./feature-flags";
+import { busySendMode, showToolCallsEnabled, skillRecorderEnabled, summarizeToolCallsEnabled } from "./feature-flags";
 
 describe("experimental feature flags", () => {
   it("keeps Teach a skill hidden by default", () => {
@@ -30,5 +30,12 @@ describe("experimental feature flags", () => {
     expect(summarizeToolCallsEnabled({})).toBe(true);
     expect(summarizeToolCallsEnabled({ features: { summarizeToolCalls: true } })).toBe(true);
     expect(summarizeToolCallsEnabled({ features: { summarizeToolCalls: false } })).toBe(false);
+  });
+
+  it("steers a busy send unless queue is saved", () => {
+    expect(busySendMode(null)).toBe("steer");
+    expect(busySendMode({})).toBe("steer");
+    expect(busySendMode({ features: { busySend: "steer" } })).toBe("steer");
+    expect(busySendMode({ features: { busySend: "queue" } })).toBe("queue");
   });
 });

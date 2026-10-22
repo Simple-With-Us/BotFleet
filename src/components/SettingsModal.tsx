@@ -24,7 +24,7 @@ import {
   type ConversationMode,
 } from "../../shared/conversation-mode";
 import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
-import { showToolCallsEnabled, skillRecorderEnabled, summarizeToolCallsEnabled } from "@/lib/feature-flags";
+import { busySendMode, showToolCallsEnabled, skillRecorderEnabled, summarizeToolCallsEnabled, type BusySendMode } from "@/lib/feature-flags";
 import { ApiKeyRow, EngineKeyRow, VpsConnection } from "./ApiKeys";
 import { LinqSettings } from "./LinqSettings";
 import { useUpdaterState } from "@/lib/updater";
@@ -887,6 +887,59 @@ function AnalyticsRow() {
   );
 }
 
+function BusySendRow() {
+  const { state, dispatch } = useStore();
+  const mode = busySendMode(state.config);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const save = async (next: BusySendMode) => {
+    if (saving || next === mode) return;
+    setSaving(true);
+    setError("");
+    try {
+      const config: ConfigStatus = await api("/api/config", {
+        method: "PATCH",
+        body: JSON.stringify({ features: { busySend: next } }),
+      });
+      dispatch({ type: "configStatus", config });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save setting.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card
+      title="While a Bot Is Working"
+      subtitle={"Send uses this choice.\u00a0 The other action stays available on that message."}
+    >
+      <div className="flex flex-wrap gap-1 rounded-lg border border-hairline/40 bg-inset p-0.5">
+        {(["steer", "queue"] as const).map((option) => (
+          <button
+            key={option}
+            type="button"
+            disabled={saving}
+            onClick={() => void save(option)}
+            aria-pressed={mode === option}
+            className={cn(
+              "flex-1 rounded-md px-3 py-1.5 text-[13px] font-medium transition-colors disabled:cursor-wait disabled:opacity-50",
+              mode === option ? "bg-raised text-ink shadow-sm" : "text-ink-secondary hover:text-ink",
+            )}
+          >
+            {option === "steer" ? "Steer" : "Queue"}
+          </button>
+        ))}
+      </div>
+      <p className="mt-2 text-[12px] leading-relaxed text-ink-secondary">
+        Steer sends the typed text into the running turn.{"\u00a0 "}Queue holds it until the turn finishes.
+      </p>
+      {error ? <p role="alert" className="mt-2 text-[12px] text-danger">{error}</p> : null}
+    </Card>
+  );
+}
+
 function ToolCallsRow() {
   const { state, dispatch } = useStore();
   const showCalls = showToolCallsEnabled(state.config);
@@ -1379,6 +1432,9 @@ export function SettingsModal() {
                   >
                     <RoomTurnTimeoutSettings />
                   </Card>
+                  <div id="setting-general-busy-send" className={highlightClass("setting-general-busy-send")}>
+                    <BusySendRow />
+                  </div>
                   <div id="setting-general-tool-calls" className={highlightClass("setting-general-tool-calls")}>
                     <ToolCallsRow />
                   </div>

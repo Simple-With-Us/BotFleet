@@ -767,21 +767,25 @@ public struct CompanionClient: Sendable {
     /// carries API keys.
     public func updateFeatures(
         showToolCalls: Bool? = nil,
-        summarizeToolCalls: Bool? = nil
+        summarizeToolCalls: Bool? = nil,
+        busySend: String? = nil
     ) async throws -> ConfigStatus {
         struct FeaturesBody: Encodable {
             let showToolCalls: Bool?
             let summarizeToolCalls: Bool?
+            let busySend: String?
 
             func encode(to encoder: Encoder) throws {
                 var container = encoder.container(keyedBy: CodingKeys.self)
                 if let showToolCalls { try container.encode(showToolCalls, forKey: .showToolCalls) }
                 if let summarizeToolCalls { try container.encode(summarizeToolCalls, forKey: .summarizeToolCalls) }
+                if let busySend { try container.encode(busySend, forKey: .busySend) }
             }
 
             enum CodingKeys: String, CodingKey {
                 case showToolCalls
                 case summarizeToolCalls
+                case busySend
             }
         }
         return try await send(
@@ -790,7 +794,8 @@ public struct CompanionClient: Sendable {
                 "/api/features",
                 encodedBody: FeaturesBody(
                     showToolCalls: showToolCalls,
-                    summarizeToolCalls: summarizeToolCalls
+                    summarizeToolCalls: summarizeToolCalls,
+                    busySend: busySend
                 )
             ),
             as: ConfigStatus.self
@@ -1128,9 +1133,11 @@ public struct CompanionClient: Sendable {
         toBot botId: String,
         threadId: String,
         idempotencyKey: String,
-        recording: IncomingRecording? = nil
+        recording: IncomingRecording? = nil,
+        delivery: String? = nil
     ) async throws -> SendMessageResult {
         var body: [String: Any] = ["text": text, "threadId": threadId, "idempotencyKey": idempotencyKey]
+        if let delivery { body["delivery"] = delivery }
         if let recording {
             body["recording"] = ["path": recording.path, "mime": recording.mime,
                                  "transcript": recording.transcript, "engine": recording.engine]

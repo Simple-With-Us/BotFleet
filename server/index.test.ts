@@ -3631,20 +3631,35 @@ describe("harness HTTP API", () => {
   it("keeps Teach a skill off by default and persists an explicit opt-in", async () => {
     const before = await api("GET", "/api/config");
     expect(before.status).toBe(200);
-    expect(before.body.features).toEqual({ skillRecorder: false, showToolCalls: true, summarizeToolCalls: true });
+    expect(before.body.features).toEqual({ skillRecorder: false, showToolCalls: true, summarizeToolCalls: true, busySend: "steer" });
 
     const saved = await api("PATCH", "/api/config", {
       features: { skillRecorder: true },
     });
     expect(saved.status).toBe(200);
-    expect(saved.body.features).toEqual({ skillRecorder: true, showToolCalls: true, summarizeToolCalls: true });
+    expect(saved.body.features).toEqual({ skillRecorder: true, showToolCalls: true, summarizeToolCalls: true, busySend: "steer" });
 
     const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
     expect(disk.features).toEqual({ skillRecorder: true });
 
     const tools = await api("PATCH", "/api/config", { features: { showToolCalls: true } });
     expect(tools.status).toBe(200);
-    expect(tools.body.features).toEqual({ skillRecorder: true, showToolCalls: true, summarizeToolCalls: true });
+    expect(tools.body.features).toEqual({ skillRecorder: true, showToolCalls: true, summarizeToolCalls: true, busySend: "steer" });
+
+    const queuedSend = await api("PATCH", "/api/config", { features: { busySend: "queue" } });
+    expect(queuedSend.status).toBe(200);
+    expect(queuedSend.body.features.busySend).toBe("queue");
+    expect(queuedSend.body.features.skillRecorder).toBe(true);
+    const queuedDisk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
+    expect(queuedDisk.features.busySend).toBe("queue");
+
+    const phone = await api("PATCH", "/api/features", { busySend: "steer" });
+    expect(phone.status).toBe(200);
+    expect(phone.body.features.busySend).toBe("steer");
+    expect(phone.body.features.skillRecorder).toBe(true);
+
+    const invalidSend = await api("PATCH", "/api/features", { busySend: "hold" });
+    expect(invalidSend.status).toBe(400);
 
     await api("PATCH", "/api/config", { features: { skillRecorder: false, showToolCalls: false, summarizeToolCalls: true } });
   });

@@ -185,6 +185,8 @@ describe("sentence gap outside chat", () => {
     ["components/GroupView.tsx", "attached.{\"\\u00a0 \"}Add more"],
     ["components/RoutinesPage.tsx", "answer.{\"\\u00a0 \"}Open its"],
     ["components/RoutinesPage.tsx", "work.{\"\\u00a0 \"}Every run"],
+    ["components/SettingsModal.tsx", "choice.\\u00a0 The other"],
+    ["components/SettingsModal.tsx", "turn.{\"\\u00a0 \"}Queue holds"],
     ["components/SettingsModal.tsx", "subtitle={\"Anonymous product events — app opened, which features get used.\\u00a0 Never"],
     ["components/SettingsModal.tsx", "output.\\u00a0 Your email is only attached if you shared it during setup.\"}"],
     ["components/SettingsModal.tsx", "tools.{\"\\u00a0 \"}Errors"],
@@ -201,6 +203,7 @@ describe("sentence gap outside chat", () => {
     ["components/WebhooksPanel.tsx", "now.{\"\\u00a0 \"}Keep BotFleet"],
     ["components/WebhooksPanel.tsx", "yet.{\"\\u00a0 \"}Use the"],
     // Search results render the same sentences from this table, not from the modal.
+    ["lib/settings-search.ts", "choice.\\u00a0 The other"],
     ["lib/settings-search.ts", "used.\\u00a0 Never"],
     ["lib/settings-search.ts", "them.\\u00a0 They stay"],
     ["lib/settings-search.ts", "tail.\\u00a0 Review"],

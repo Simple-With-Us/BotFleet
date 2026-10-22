@@ -579,8 +579,13 @@ export interface ConfigStatus {
     projects: Array<{ slug: string; match: string[] }>;
     enginePlans?: Record<string, { planName?: string; costPerMonth?: number | null }>;
   };
-  /** Opt-in flags. Absent means off. */
-  features?: { skillRecorder: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
+  /** Resolved product flags.  `busySend` is steer unless the saved value is queue. */
+  features?: {
+    skillRecorder: boolean;
+    showToolCalls?: boolean;
+    summarizeToolCalls?: boolean;
+    busySend?: "steer" | "queue";
+  };
   /** Sentry diagnostics.  `configured` mirrors `hasDsn` — a key is on file,
    * whether or not `enabled` is currently true.  The DSN itself never
    * appears here; it travels only over `GET /api/observability`. */
@@ -1025,6 +1030,8 @@ export type Action =
       botId: string;
       text: string;
       replyToId?: string;
+      /** Set only while the bot is busy.  Idle sends omit it. */
+      delivery?: "steer" | "queue";
       /** The server refused the send or could not be reached.  Called with the
        * reason, after the error banner is set, so a caller that cleared its
        * input can put it back. */
@@ -2537,6 +2544,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 text: action.text,
                 replyToId: action.replyToId,
                 ...(threadId ? { threadId } : {}),
+                ...(action.delivery ? { delivery: action.delivery } : {}),
               }),
             })
               .then((body: unknown) => {

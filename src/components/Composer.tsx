@@ -4,6 +4,7 @@ import { acceptComposerTranscript } from "@/lib/composer-dictation";
 import { pickSTTProvider } from "@/lib/transcription-provider";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { track } from "@/lib/analytics";
+import { busySendMode, type BusySendMode } from "@/lib/feature-flags";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { currentCall, useOnCall } from "@/lib/call";
 import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
@@ -175,6 +176,10 @@ export function Composer({
   // for those the composer never locks — the server steers instead of 409
   const canSteer =
     !group && Boolean(bot) && state.instances.find((i) => i.instanceId === bot!.modelSelection.instanceId)?.capabilities?.queueing === true;
+  // Steer is the default while a turn is running.  Queue is the saved choice.
+  // The other mode stays available on this one message.
+  const busyPrimary: BusySendMode = busy ? busySendMode(state.config) : "steer";
+  const busyAlternate: BusySendMode = busyPrimary === "steer" ? "queue" : "steer";
   // a pending approval blocks the prompt until it is answered
   const threadId = group?.threadId ?? bot?.threadId ?? "";
   // the VISIBLE branch only — an approval left on a branch you edited away
@@ -343,7 +348,7 @@ export function Composer({
   };
 
   const hasContent = Boolean(text.trim()) || attachments.length > 0;
-  const send = (opts?: { steerNow?: boolean }) => {
+  const send = (opts?: { delivery?: BusySendMode }) => {
     if (locked) return;
     if (attachments.some((attachment) => attachment.kind === "image")) {
       if (!imageTargetsSupport(text)) {
@@ -358,8 +363,11 @@ export function Composer({
     if (!t) return;
     const sent: SentDraft<Message> = { draftId, threadId, text, attachments, reply: replyTo ?? undefined };
     const onError = () => restoreFailedSend(sent);
+    // Idle sends omit delivery.  A busy send uses the setting unless this
+    // keystroke or click named the other mode.
+    const delivery: BusySendMode | undefined = busy ? (opts?.delivery ?? busyPrimary) : undefined;
     if (busy && group) {
-      if (opts?.steerNow) {
+      if (delivery === "steer") {
         dispatch({ type: "interruptGroup", groupId: group.id });
         dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       } else {
@@ -378,11 +386,25 @@ export function Composer({
       dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       track("message_sent", { room: true });
     } else if (bot) {
-      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, onError });
-      if (busy && opts?.steerNow) {
+      dispatch({
+        type: "send",
+        botId: bot.id,
+        text: t,
+        replyToId: replyTo?.id,
+        ...(delivery ? { delivery } : {}),
+        onError,
+      });
+      // A live steer engine folds the text in.  Interrupting after that
+      // would stop the turn that just received it.  An engine that only
+      // queues still needs the interrupt so the held line goes out now.
+      if (delivery === "steer" && !canSteer) {
         dispatch({ type: "interrupt", botId: bot.id });
       }
-      track("message_sent", { driver: bot.modelSelection?.instanceId, queued: busy && !canSteer, steerNow: opts?.steerNow });
+      track("message_sent", {
+        driver: bot.modelSelection?.instanceId,
+        queued: delivery === "queue",
+        steerNow: delivery === "steer",
+      });
     }
     setText("");
     setAttachments([]);
@@ -838,11 +860,12 @@ export function Composer({
               onEditLast();
               return;
             }
-            // Shift+Enter inserts a newline; plain Enter sends; Alt/Cmd+Enter steers immediately when busy
+            // Shift+Enter inserts a newline.  Enter uses the busy-send
+            // setting.  Alt or Cmd+Enter uses the other mode for this message.
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
-              if (busy && !canSteer && (e.altKey || e.metaKey)) {
-                send({ steerNow: true });
+              if (busy && (e.altKey || e.metaKey)) {
+                send({ delivery: busyAlternate });
               } else {
                 send();
               }
@@ -857,12 +880,10 @@ export function Composer({
               ? "Answer the approval above to continue"
               : recording
               ? "Listening…"
-              : busy && canSteer
-                ? `${busyName} is working — Enter sends this into the running turn`
+              : busy && busyPrimary === "steer"
+                ? `${busyName} is working — Enter steers this turn`
               : busy
-                ? group
-                  ? `${busyName} is working — Enter queues your message`
-                  : `${busyName} is working — sends when this turn finishes`
+                ? `${busyName} is working — Enter queues this message`
                 : group
                   ? `Message ${group.name} — ${groupComposerHint(group, members ?? [])}`
                   : `Message ${bot?.name ?? ""}`
@@ -899,36 +920,42 @@ export function Composer({
             <Mic size={18} />
           </button>
         )}
-        {hasContent && !locked && busy && !canSteer && (
+        {hasContent && !locked && busy && (
           <button
             type="button"
-            onClick={() => send({ steerNow: true })}
-            aria-label="Steer Now (send and interrupt current turn)"
-            title="Steer Now — send message and interrupt current turn immediately (Alt+Enter)"
+            onClick={() => send({ delivery: busyAlternate })}
+            aria-label={busyAlternate === "steer" ? "Steer this message" : "Queue this message"}
+            title={busyAlternate === "steer" ? "Steer this message (Alt+Enter)" : "Queue this message (Alt+Enter)"}
             className="flex h-8 items-center gap-1 rounded-full bg-accent px-2.5 text-[12px] font-medium text-white shadow-sm hover:brightness-110"
           >
-            <Zap size={13} className="fill-current" />
-            <span>Steer Now</span>
+            {busyAlternate === "steer" ? <Zap size={13} className="fill-current" /> : <Clock size={13} />}
+            <span>{busyAlternate === "steer" ? "Steer" : "Queue"}</span>
           </button>
         )}
         {hasContent && !locked && (
           <button
             type="button"
             onClick={(e) => {
-              if (busy && !canSteer && e.altKey) {
-                send({ steerNow: true });
+              if (busy && e.altKey) {
+                send({ delivery: busyAlternate });
               } else {
                 send();
               }
             }}
-            aria-label={busy && canSteer ? "Send into the running turn" : busy ? "Queue Message (Alt+Click to Steer Now)" : "Send Message"}
-            title={busy && canSteer ? "Send into the running turn" : busy ? "Sends when the current turn finishes (Alt+Click to Steer Now)" : "Send"}
+            aria-label={busy && busyPrimary === "steer" ? "Steer" : busy ? "Queue message" : "Send Message"}
+            title={
+              busy && busyPrimary === "steer"
+                ? "Steer this turn (Alt+Click to queue)"
+                : busy
+                  ? "Queue until this turn finishes (Alt+Click to steer)"
+                  : "Send"
+            }
             className={cn(
               "flex size-8 shrink-0 items-center justify-center rounded-full text-white",
-              busy && !canSteer ? "bg-raised text-ink-secondary hover:bg-raised-hover" : "bg-accent hover:brightness-110",
+              busy && busyPrimary === "queue" ? "bg-raised text-ink-secondary hover:bg-raised-hover" : "bg-accent hover:brightness-110",
             )}
           >
-            {busy && !canSteer ? <Clock size={15} /> : <ArrowUp size={17} />}
+            {busy && busyPrimary === "queue" ? <Clock size={15} /> : <ArrowUp size={17} />}
           </button>
         )}
           </div>

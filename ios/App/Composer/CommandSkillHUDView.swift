@@ -63,10 +63,10 @@ public struct CommandSkillHUDView: View {
         CommandSkillItem(
             id: "steer",
             title: "/steer",
-            description: "Steer and redirect active execution",
+            description: "Send the message you typed into the running turn",
             iconName: "steeringwheel",
             brandColor: Color(hex: "#F97316"),
-            command: "Pause and explain your current plan"
+            command: ""
         )
     ]
     

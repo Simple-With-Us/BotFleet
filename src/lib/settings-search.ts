@@ -64,6 +64,16 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
     badge: "Execution",
   },
   {
+    id: "general:busySend",
+    sectionId: "general",
+    sectionLabel: "General",
+    title: "While a Bot Is Working",
+    subtitle: "Send uses this choice.\u00a0 The other action stays available on that message.",
+    keywords: ["steer", "queue", "busy", "while a bot is working", "send", "interrupt", "running turn"],
+    domId: "setting-general-busy-send",
+    badge: "Chat",
+  },
+  {
     id: "general:toolCalls",
     sectionId: "general",
     sectionLabel: "General",

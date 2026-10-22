@@ -787,6 +787,8 @@ public struct ConfigFeatures: Codable, Hashable, Sendable {
     public var skillRecorder: Bool?
     public var showToolCalls: Bool?
     public var summarizeToolCalls: Bool?
+    /// `steer` or `queue`.  Absent means steer, matching the harness.
+    public var busySend: String?
 
     /// Matches `showToolCallsEnabled` on the Mac: on unless explicitly off.
     public var showsToolCalls: Bool { showToolCalls != false }

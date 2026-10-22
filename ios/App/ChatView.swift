@@ -765,7 +765,10 @@ struct ChatView: View {
         let run: () -> Void
     }
 
-    private static let steerPrompt = "Pause and explain your current plan"
+    /// What the arrow does while this bot is in a turn.  Queue only when saved.
+    private var busyDefaultIsQueue: Bool {
+        session.config?.features?.busySend == "queue"
+    }
 
     private var plusActions: [PlusAction] {
         var out: [PlusAction] = []
@@ -796,12 +799,16 @@ struct ChatView: View {
             composerFocusAfterPlusDismiss = true
         })
         if current.busy, case .bot = current {
+            let queueInstead = !busyDefaultIsQueue
             out.append(PlusAction(
-                id: "steer", systemImage: "steeringwheel", title: "Steer",
+                id: "busy-send",
+                systemImage: queueInstead ? "clock" : "steeringwheel",
+                title: queueInstead ? "Queue" : "Steer",
                 subtitle: canSend
-                    ? "Send this into the running turn"
-                    : "Redirect what this bot is doing now"
-            ) { steer() })
+                    ? (queueInstead ? "Hold this until the turn finishes" : "Send this into the running turn")
+                    : "Type a message first",
+                disabled: !canSend
+            ) { submit(delivery: queueInstead ? .queue : .steer) })
         }
         if clipboardHasAttachment {
             out.append(PlusAction(
@@ -884,6 +891,17 @@ struct ChatView: View {
         return (!text.isEmpty || !pendingAttachments.isEmpty) && !sending && !(dictation.recordedWAV != nil && current.busy)
     }
 
+    /// The arrow queues only for a busy bot whose saved choice is queue.
+    private var sendUsesQueue: Bool {
+        if case .bot = current, current.busy { return busyDefaultIsQueue }
+        return false
+    }
+
+    private var sendButtonLabel: String {
+        guard current.busy, case .bot = current else { return "Send" }
+        return busyDefaultIsQueue ? "Queue message" : "Steer"
+    }
+
     private var hasPendingApproval: Bool {
         messages.contains { $0.card?.isPending == true }
     }
@@ -900,12 +918,12 @@ struct ChatView: View {
         ])
     }
 
-    private func steer() {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        submit(text.isEmpty ? Self.steerPrompt : nil)
+    private enum BusyDelivery {
+        case steer
+        case queue
     }
 
-    private func submit(_ explicitText: String? = nil) {
+    private func submit(_ explicitText: String? = nil, delivery: BusyDelivery? = nil) {
         // This also cancels an in-flight permission prompt before it can
         // open the microphone after the message has already been sent.
         dictation.stop()
@@ -915,6 +933,13 @@ struct ChatView: View {
             dictation.recordedTranscript.map { (data: data, transcript: $0) }
         }
         guard !text.isEmpty || !outgoing.isEmpty, !sending else { return }
+        let busyBot: Bot? = {
+            if case let .bot(bot) = current, current.busy { return bot }
+            return nil
+        }()
+        // Rooms keep today's send.  A busy bot uses the setting unless this
+        // tap named the other mode.  An empty draft never reaches here.
+        let chosen: BusyDelivery? = busyBot == nil ? nil : (delivery ?? (busyDefaultIsQueue ? .queue : .steer))
         // The server intentionally refuses recorded sends while a bot is
         // steering; keep the capture locally rather than upload an orphan.
         guard recording == nil || !current.busy else { return }
@@ -938,7 +963,19 @@ struct ChatView: View {
         let sentText = text
         sending = true
         Task {
-            let outcome = await session.send(sentText, to: current, attachments: outgoing, recording: recording)
+            let outcome = await session.send(
+                sentText,
+                to: current,
+                attachments: outgoing,
+                recording: recording,
+                delivery: chosen == .queue ? "queue" : (chosen == .steer ? "steer" : nil)
+            )
+            // The server already folded a live steer into the turn.  Stopping
+            // that turn would throw the text away.  A queue response means
+            // this engine held the line, so an interrupt lets it go out now.
+            if outcome.ok, chosen == .steer, outcome.queued, !outcome.steered, let busyBot {
+                await session.interrupt(bot: busyBot)
+            }
             sending = false
             let transcript = session.state.transcript(forThread: threadId)
             guard ComposerSendRecovery.shouldRestoreClearedDraft(
@@ -993,6 +1030,15 @@ struct ChatView: View {
                     case "tasks":
                         draft = ""
                         showingTasks = true
+                    case "steer":
+                        let remainder = draft.replacingOccurrences(
+                            of: #"^/steer\b\s*"#,
+                            with: "",
+                            options: .regularExpression
+                        )
+                        draft = remainder
+                        showCommandHUD = false
+                        submit(delivery: .steer)
                     default: submit(command.command)
                     }
                 }
@@ -1010,13 +1056,16 @@ struct ChatView: View {
                     draft = "\(prefix)\(mention.trigger)\(selected.name) "
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
-            } else if current.busy, case .bot = current {
+            } else if canSend, current.busy, case .bot = current {
+                let queueInstead = !busyDefaultIsQueue
                 HStack(spacing: 8) {
-                    Button(action: steer) {
+                    Button {
+                        submit(delivery: queueInstead ? .queue : .steer)
+                    } label: {
                         HStack(spacing: 5) {
-                            Image(systemName: "steeringwheel")
+                            Image(systemName: queueInstead ? "clock" : "steeringwheel")
                                 .font(.system(size: 12, weight: .semibold))
-                            Text("Steer")
+                            Text(queueInstead ? "Queue" : "Steer")
                                 .font(.caption.weight(.semibold))
                         }
                         .padding(.horizontal, 12)
@@ -1024,7 +1073,7 @@ struct ChatView: View {
                         .background(Capsule().fill(Color.secondary.opacity(0.14)))
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Steer the running turn")
+                    .accessibilityLabel(queueInstead ? "Queue this message" : "Steer this message")
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 4)
@@ -1129,7 +1178,7 @@ struct ChatView: View {
                         }
 
                         Button { submit() } label: {
-                            Image(systemName: "arrow.up")
+                            Image(systemName: sendUsesQueue ? "clock" : "arrow.up")
                                 .font(.system(size: 15, weight: .bold))
                                 .foregroundStyle(canSend ? Color.white : Color.secondary)
                                 .frame(width: 32, height: 32)
@@ -1139,6 +1188,7 @@ struct ChatView: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(!canSend)
+                        .accessibilityLabel(sendButtonLabel)
                         .padding(.trailing, 6)
                         .padding(.bottom, 6)
                         .animation(.easeOut(duration: 0.15), value: canSend)

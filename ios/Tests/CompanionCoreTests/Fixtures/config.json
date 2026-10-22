@@ -38,6 +38,7 @@
   "features": {
     "skillRecorder": false,
     "showToolCalls": true,
-    "summarizeToolCalls": true
+    "summarizeToolCalls": true,
+    "busySend": "steer"
   }
 }

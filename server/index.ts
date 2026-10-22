@@ -178,6 +178,7 @@ import {
   revokedTurnProviders,
 } from "./config-reload-keys.ts";
 import { computerReach } from "./computer-capability.ts";
+import { parseBusyDelivery, wantsLiveSteer } from "./busy-send.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
 import {
   ensureDirs,
@@ -194,6 +195,7 @@ import {
   showToolCallsEnabled,
   summarizeToolCallsEnabled,
   skillRecorderEnabled,
+  busySendMode,
   syncCredentialEnv,
   patchInstanceConfig,
   deleteInstanceConfig,
@@ -8658,6 +8660,7 @@ function configStatus() {
       skillRecorder: skillRecorderEnabled(cfg),
       showToolCalls: showToolCallsEnabled(cfg),
       summarizeToolCalls: summarizeToolCallsEnabled(cfg),
+      busySend: busySendMode(cfg),
     },
   };
 }
@@ -12387,6 +12390,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const rawText = String(body.text ?? "").trim();
       if (!rawText) return json(res, 400, { error: "text required" });
+      // Invalid delivery is refused even when the bot is idle.  A valid
+      // word is ignored until the bot is actually in a turn.
+      let delivery: ReturnType<typeof parseBusyDelivery>;
+      try {
+        delivery = parseBusyDelivery(body.delivery);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "delivery must be steer or queue";
+        return json(res, 400, { error: message });
+      }
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       if (body.threadId !== undefined && (typeof body.threadId !== "string" || !/^[\w-]+$/.test(body.threadId))) {
@@ -12466,7 +12478,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // A reload can dispose the live adapter after steer accepts this
           // message.  Hold it in the server queue until the replacement
           // fleet is attached, then dispatch it as a fresh turn.
-          if (!providerReloadInProgress && instance?.adapter.capabilities.queueing && instance.adapter.steer) {
+          const engineCanSteer = Boolean(
+            !providerReloadInProgress && instance?.adapter.capabilities.queueing && instance.adapter.steer,
+          );
+          if (wantsLiveSteer(delivery, engineCanSteer) && instance?.adapter.steer) {
             const steered = await instance.adapter
               .steer(bot.threadId, promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"))
               .catch(() => false);
@@ -14262,9 +14277,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // rather than write access to /api/config (which carries API keys).
     if (method === "PATCH" && path === "/api/features") {
       const body = await readBody(req);
+      if (body.busySend !== undefined && body.busySend !== "steer" && body.busySend !== "queue") {
+        return json(res, 400, { error: "features.busySend must be steer or queue" });
+      }
       const featurePatch = {
         ...(typeof body.showToolCalls === "boolean" ? { showToolCalls: body.showToolCalls } : {}),
         ...(typeof body.summarizeToolCalls === "boolean" ? { summarizeToolCalls: body.summarizeToolCalls } : {}),
+        ...(body.busySend === "steer" || body.busySend === "queue" ? { busySend: body.busySend } : {}),
       };
       if (Object.keys(featurePatch).length === 0) {
         return json(res, 400, { error: "nothing to save" });

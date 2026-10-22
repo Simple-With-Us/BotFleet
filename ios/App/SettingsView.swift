@@ -192,6 +192,18 @@ struct SettingsView: View {
                         }
                     }
                     .disabled(!settingsLoaded)
+
+                    Picker(selection: busySendBinding) {
+                        Text("Steer").tag("steer")
+                        Text("Queue").tag("queue")
+                    } label: {
+                        Label {
+                            Text("While a Bot Is Working")
+                        } icon: {
+                            SettingsIcon(symbol: "steeringwheel", color: .orange)
+                        }
+                    }
+                    .disabled(!settingsLoaded)
                 } header: {
                     Text("Workspace")
                 } footer: {
@@ -422,6 +434,15 @@ struct SettingsView: View {
         )
     }
 
+    private var busySendBinding: Binding<String> {
+        Binding(
+            get: { session.config?.features?.busySend == "queue" ? "queue" : "steer" },
+            set: { next in
+                Task { _ = await session.updateBusySend(next) }
+            }
+        )
+    }
+
     private func loadSettingsExtras() async {
         // Do not flip settingsLoaded false on every reload — that would re-open
         // the placeholder-save hole while a refresh is in flight.  First open
@@ -548,9 +569,10 @@ struct SettingsView: View {
         guard settingsLoaded else {
             return "Workspace layout, terminology, and tool toggles unlock after settings load from your computer."
         }
-        return session.config?.isProjectsMode == true
+        let layout = session.config?.isProjectsMode == true
             ? "Projects hides named bots.  That word is a category that any number of threads can sit under."
             : "Simple is one conversation per bot.  That word is a group thread invited bots and you can all write in."
+        return layout + "  While a bot is working, Send follows While a Bot Is Working.\u{00A0} Steer folds the typed message into the turn.\u{00A0} Queue holds it until the turn finishes."
     }
 
     private var notificationsAreEnabled: Bool {

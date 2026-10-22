@@ -240,6 +240,8 @@ const featureConfigSchema = z.object({
   summarizeToolCalls: z.boolean().optional(),
   /** Per-turn Git worktree isolation for bots working in a shared repository. */
   gitWorktreeLeases: z.boolean().optional(),
+  /** What Send does while a bot is already in a turn.  Absent means steer. */
+  busySend: z.enum(["steer", "queue"]).optional(),
 });
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
@@ -631,12 +633,13 @@ export interface AppConfig {
     credentialStorage?: "external";
     refreshMinutes?: number;
   };
-  /** Opt-in product experiments. Every flag defaults to disabled. */
+  /** Product flags.  Most stay off until turned on.  `busySend` is steer unless saved as queue. */
   features?: {
     skillRecorder?: boolean;
     showToolCalls?: boolean;
     summarizeToolCalls?: boolean;
     gitWorktreeLeases?: boolean;
+    busySend?: "steer" | "queue";
   };
   /** How the roster and threads are laid out.  Absent means simple. */
   conversationMode?: ConversationMode;
@@ -1012,6 +1015,11 @@ export function showToolCallsEnabled(cfg: AppConfig): boolean {
 
 export function summarizeToolCallsEnabled(cfg: AppConfig): boolean {
   return cfg.features?.summarizeToolCalls !== false;
+}
+
+/** What Send does while a bot is in a turn.  Queue only when that word is saved. */
+export function busySendMode(cfg: AppConfig): "steer" | "queue" {
+  return cfg.features?.busySend === "queue" ? "queue" : "steer";
 }
 
 // OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.

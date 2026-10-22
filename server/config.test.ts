@@ -20,6 +20,7 @@ import {
   showToolCallsEnabled,
   summarizeToolCallsEnabled,
   skillRecorderEnabled,
+  busySendMode,
   stripWorkspaceCredentialEnv,
   syncCredentialEnv,
   vpsSshAlias,
@@ -156,6 +157,17 @@ describe("configuration boundaries", () => {
     expect(summarizeToolCallsEnabled({})).toBe(true);
     expect(summarizeToolCallsEnabled({ features: { summarizeToolCalls: false } })).toBe(false);
     expect(summarizeToolCallsEnabled({ features: { summarizeToolCalls: true } })).toBe(true);
+  });
+
+  it("steers a busy send unless queue is saved", () => {
+    expect(busySendMode({})).toBe("steer");
+    expect(busySendMode({ features: {} })).toBe("steer");
+    expect(busySendMode({ features: { busySend: "steer" } })).toBe("steer");
+    expect(busySendMode({ features: { busySend: "queue" } })).toBe("queue");
+    expect(parseConfigPatch({ features: { busySend: "queue" } })).toEqual({
+      features: { busySend: "queue" },
+    });
+    expect(() => parseConfigPatch({ features: { busySend: "hold" } })).toThrow("features.busySend");
   });
 
   it.each([0, 1.5, 5, "2", null])("rejects an invalid per-bot VM limit: %j", (maxInstances) => {

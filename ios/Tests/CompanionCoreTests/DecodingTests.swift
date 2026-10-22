@@ -575,6 +575,7 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(config.rooms?.turnTimeoutMinutes, 5)
         XCTAssertEqual(config.features?.showToolCalls, true)
         XCTAssertEqual(config.features?.summarizeToolCalls, true)
+        XCTAssertEqual(config.features?.busySend, "steer")
         XCTAssertTrue(config.features?.showsToolCalls ?? false)
         XCTAssertTrue(config.features?.summarizesToolCalls ?? false)
         XCTAssertEqual(config.box?.configured, false)

@@ -1006,10 +1006,12 @@ final class Session: ObservableObject {
     struct MessageSendOutcome: Sendable {
         let ok: Bool
         let clientNonce: String
+        var queued: Bool = false
+        var steered: Bool = false
     }
 
     @discardableResult
-    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> MessageSendOutcome {
+    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil, delivery: String? = nil) async -> MessageSendOutcome {
         guard let client else { return MessageSendOutcome(ok: false, clientNonce: "") }
         var clientNonce = ""
         do {
@@ -1043,6 +1045,8 @@ final class Session: ObservableObject {
             let localId = UUID().uuidString
             clientNonce = localId
             state.rememberPendingSend(threadId: threadId, id: localId, text: prompt, queued: false)
+            var queued = false
+            var steered = false
             do {
                 switch chat {
                 case let .bot(bot):
@@ -1051,8 +1055,11 @@ final class Session: ObservableObject {
                         toBot: bot.id,
                         threadId: threadId,
                         idempotencyKey: localId,
-                        recording: savedRecording
+                        recording: savedRecording,
+                        delivery: delivery
                     )
+                    queued = result.queued == true
+                    steered = result.steered == true
                     if result.queued == true, let queueId = result.queueId, !queueId.isEmpty {
                         let dest = result.threadId ?? bot.threadId
                         if dest != threadId {
@@ -1071,7 +1078,7 @@ final class Session: ObservableObject {
                         recording: savedRecording
                     )
                 }
-                return MessageSendOutcome(ok: true, clientNonce: localId)
+                return MessageSendOutcome(ok: true, clientNonce: localId, queued: queued, steered: steered)
             } catch {
                 state.cancelPendingQueued(threadId: threadId, queueId: localId)
                 if let apiError = error as? APIError, apiError.isConflict {
@@ -2296,6 +2303,24 @@ final class Session: ObservableObject {
         let outcome = await enqueueSettingsUpdate()
         guard let outcome, outcome.terminologyOK == true else { return nil }
         return outcome.status
+    }
+
+    /// Writes only `busySend`.  Kept off the settings flush so a partial
+    /// phone save cannot clobber the other feature flags mid-coalesce.
+    @MainActor
+    func updateBusySend(_ mode: String) async -> ConfigStatus? {
+        guard mode == "steer" || mode == "queue", let client else { return nil }
+        do {
+            let status = try await client.updateFeatures(busySend: mode)
+            config = status
+            return status
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+            return nil
+        } catch {
+            recordActionError(error)
+            return nil
+        }
     }
 
     @MainActor

@@ -255,14 +255,15 @@ async function openRoom(page: Page) {
   return box;
 }
 
-test('Steer Now in a busy room gives the message back when the server refuses it', async ({ page }) => {
+test('Enter in a busy room steers and gives the message back when the server refuses it', async ({ page }) => {
   const sends = await mockServer(page, refuse);
   roomState.busy = true;
   await openApp(page);
   const box = await openRoom(page);
 
   await box.fill('interrupt with this instead');
-  await box.press('Alt+Enter');
+  // Steer is the default.  Enter sends now.  Alt+Enter queues instead.
+  await box.press('Enter');
 
   await expect.poll(() => sends.length).toBe(1);
   await expect(box).toHaveValue('interrupt with this instead');
@@ -275,7 +276,7 @@ test('a room message held for a busy member is given back if the server refuses 
   const box = await openRoom(page);
 
   await box.fill('queued behind the member who is talking');
-  await box.press('Enter');
+  await box.press('Alt+Enter');
   // held in the composer's queue: nothing has gone to the server yet
   await expect(box).toHaveValue('');
   expect(sends).toHaveLength(0);
@@ -292,10 +293,10 @@ test('a second room message held for a busy member joins the first and goes out 
   const box = await openRoom(page);
 
   await box.fill('first thought');
-  await box.press('Enter');
+  await box.press('Alt+Enter');
   await expect(box).toHaveValue('');
   await box.fill('second thought');
-  await box.press('Enter');
+  await box.press('Alt+Enter');
 
   // both are held and nothing has gone out: the second did not replace the first
   await expect(box).toHaveValue('');
@@ -320,9 +321,9 @@ test('two room messages held for a busy member come back together when the serve
   const box = await openRoom(page);
 
   await box.fill('first thought');
-  await box.press('Enter');
+  await box.press('Alt+Enter');
   await box.fill('second thought');
-  await box.press('Enter');
+  await box.press('Alt+Enter');
   await expect(box).toHaveValue('');
   expect(sends).toHaveLength(0);
 
