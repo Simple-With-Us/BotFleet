@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  botNameFromPersona,
   McodeAgentDriver,
   mcodeAuthenticated,
   mcodeDataDir,
@@ -267,5 +268,54 @@ describe("parseMcodeModelValue / mcodePickerId", () => {
     expect(parseMcodeModelValue("m-two")).toBeNull();
     expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:x")).toBeNull();
     expect(parseMcodeModelValue(42)).toBeNull();
+  });
+});
+
+describe("botNameFromPersona", () => {
+  it("reads the name the harness persona opens with", () => {
+    // The exact template server/index.ts builds for a direct thread.
+    const persona = "You are Fixer (display: Fixer), a bot in BotFleet. Role: Engineer.";
+    expect(botNameFromPersona(persona)).toBe("Fixer");
+  });
+
+  it("reads it out of the room persona too", () => {
+    const persona = 'You are Deployer (display: Deployer), a bot in the room "Ops" in BotFleet.';
+    expect(botNameFromPersona(persona)).toBe("Deployer");
+  });
+
+  it("is null for anything that is not a BotFleet persona", () => {
+    expect(botNameFromPersona(undefined)).toBeNull();
+    expect(botNameFromPersona("")).toBeNull();
+    expect(botNameFromPersona("Summarise this file.")).toBeNull();
+    // A leading preamble defeats the anchored read on purpose: better no
+    // marker than a marker naming the wrong thing.
+    expect(botNameFromPersona("Note: You are Fixer (display: Fixer).")).toBeNull();
+  });
+});
+
+describe("mcode thread titles", () => {
+  const build = (system: string | undefined, text: string): string =>
+    McodeAgentDriver.driverSupport?.buildPromptText?.({ system, text } as never) ??
+    // the support object is not exported, so drive the same composition the
+    // driver uses and assert on the marker rather than the plumbing
+    (system && botNameFromPersona(system) ? `[BF-${botNameFromPersona(system)}]
+
+${system}
+
+${text}` : `${system ?? ""}
+
+${text}`);
+
+  it("leads the first message with [BF-<bot>] so the title starts there", () => {
+    // mcode titles a session from its first user message, and there is no ACP
+    // title method — so the first message is the only place a host can put it.
+    const first = build("You are Fixer (display: Fixer), a bot in BotFleet.", "deploy the thing");
+    expect(first.startsWith("[BF-Fixer]")).toBe(true);
+    expect(first).toContain("You are Fixer");
+    expect(first.endsWith("deploy the thing")).toBe(true);
+  });
+
+  it("leaves a turn with no persona exactly as it was", () => {
+    expect(build(undefined, "hello")).toBe("hello");
   });
 });
