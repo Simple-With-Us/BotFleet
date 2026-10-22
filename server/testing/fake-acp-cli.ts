@@ -29,6 +29,16 @@
 //                     file exists — a deterministic busy window for the
 //                     steer-queue e2e, with the echo pinning exactly what a
 //                     drained turn was sent)
+//                   | tool-hang (open a tool_call with status in_progress and
+//                     then go silent — a long build.  With
+//                     FAKE_ACP_TOOL_CLOSES_MS set, close the tool after that
+//                     many ms and THEN go silent, so the idle guard has to
+//                     drop back from the tool window to the plain one.
+//                     Reacts to session/cancel by exiting, like cancel-exits.)
+//                   | session-new-hangs (write a line to stderr on session/new
+//                     and never answer it — an MCP server that will not
+//                     connect — so the driver's session/new timeout
+//                     diagnostics have something to name)
 //   FAKE_ACP_DUMP   path to write {argv, env} as JSON, so a test can assert
 //                   argv shape (agent/stdio flags) and env hygiene
 //   FAKE_ACP_MODELS      comma-separated model ids. Enables the opencode-shaped
@@ -50,6 +60,15 @@
 //                        sessionUpdate:"usage_update" notification with that
 //                        `used` value before the (usage-free) prompt result —
 //                        what @deepseek-ai/dsh-acp actually does.
+//   FAKE_ACP_USAGE_COST  a USD amount.  Puts `cost: { amount, currency }` on
+//                        the usage_update notification (currency from
+//                        FAKE_ACP_USAGE_CURRENCY, default USD) — the session's
+//                        cumulative spend, as ACP defines it.  Leaves the prompt
+//                        result's own usage alone.
+//   FAKE_ACP_USAGE_CACHE  add cachedReadTokens:7, cachedWriteTokens:2,
+//                        thoughtTokens:3 and totalTokens:27 to the prompt
+//                        result's usage, the full ACP Usage shape.
+//   FAKE_ACP_STOP_REASON  the prompt result's stopReason (default end_turn).
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
@@ -377,6 +396,13 @@ function handle(msg: any) {
         break;
       }
       const servers: McpEntry[] = Array.isArray(msg.params?.mcpServers) ? msg.params.mcpServers : [];
+      if (mode === "session-new-hangs") {
+        // an MCP server that never finishes its handshake: say so on
+        // stderr the way a real agent would, and never answer
+        process.stderr.write(`fake-acp: waiting for mcp server ${servers[0]?.name ?? "none"} to connect\n`);
+        setInterval(() => {}, 1_000);
+        return;
+      }
       if (process.env.FAKE_ACP_DUMP) {
         dumpState.mcpServers = servers;
         writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify(dumpState, null, 2));
@@ -497,25 +523,61 @@ function handle(msg: any) {
         // ever replies { stopReason }) — the only usage signal is this
         // notification, a combined context-occupancy figure with no
         // input/output split (see acp/core.ts's usage_update case).
-        if (process.env.FAKE_ACP_USAGE_UPDATE) {
+        if (process.env.FAKE_ACP_USAGE_UPDATE || process.env.FAKE_ACP_USAGE_COST) {
           out({
             jsonrpc: "2.0",
             method: "session/update",
-            params: { update: { sessionUpdate: "usage_update", used: Number(process.env.FAKE_ACP_USAGE_UPDATE), size: 128_000 } },
+            params: {
+              update: {
+                sessionUpdate: "usage_update",
+                used: process.env.FAKE_ACP_USAGE_UPDATE ? Number(process.env.FAKE_ACP_USAGE_UPDATE) : 100,
+                size: 128_000,
+                ...(process.env.FAKE_ACP_USAGE_COST
+                  ? {
+                      cost: {
+                        amount: Number(process.env.FAKE_ACP_USAGE_COST),
+                        currency: process.env.FAKE_ACP_USAGE_CURRENCY ?? "USD",
+                      },
+                    }
+                  : {}),
+              },
+            },
           });
         }
         recordMethod("session/prompt.result");
+        const stopReason = process.env.FAKE_ACP_STOP_REASON ?? "end_turn";
+        const usage = {
+          inputTokens: 10,
+          outputTokens: 5,
+          ...(process.env.FAKE_ACP_USAGE_CACHE
+            ? { cachedReadTokens: 7, cachedWriteTokens: 2, thoughtTokens: 3, totalTokens: 27 }
+            : {}),
+        };
         result(
           msg.id,
           // FAKE_ACP_USAGE_ROOT reproduces opencode 1.18.18's shape: usage at
           // the result root with an empty _meta, instead of usage under _meta.
           process.env.FAKE_ACP_USAGE_UPDATE
-            ? { stopReason: "end_turn" }
+            ? { stopReason }
             : process.env.FAKE_ACP_USAGE_ROOT
-              ? { stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 5 }, _meta: {} }
-              : { stopReason: "end_turn", _meta: { inputTokens: 10, outputTokens: 5 } },
+              ? { stopReason, usage, _meta: {} }
+              : { stopReason, _meta: usage },
         );
       };
+      if (mode === "tool-hang") {
+        // A tool the agent is waiting on: open it, optionally close it
+        // after a while, and say nothing else — the driver's tool-aware
+        // idle window is what decides when this becomes a stall.
+        out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call", toolCallId: "tc-slow", title: "build", status: "in_progress" } } });
+        const closesMs = Number(process.env.FAKE_ACP_TOOL_CLOSES_MS ?? "0");
+        if (closesMs > 0) {
+          setTimeout(() => {
+            out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-slow", status: "completed" } } });
+          }, closesMs);
+        }
+        setInterval(() => {}, 1_000);
+        return;
+      }
       if (mode === "drip") {
         // Periodic output for the prompt idle guard's "still alive" side:
         // each chunk is inbound traffic that must renew core.ts's idle
@@ -669,7 +731,9 @@ function handle(msg: any) {
     }
     case "session/cancel":
       // the interrupted prompt resolves as cancelled
-      if (mode === "cancel-exits" || mode === "cancel-exits-with-child" || mode === "drip") process.exit(0);
+      if (mode === "cancel-exits" || mode === "cancel-exits-with-child" || mode === "drip" || mode === "tool-hang") {
+        process.exit(0);
+      }
       break;
     default:
       if (msg.id !== undefined) out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });

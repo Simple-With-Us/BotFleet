@@ -524,6 +524,7 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       if (event.cachedInput != null) {
         turn.span.setAttribute("gen_ai.usage.input_tokens.cached", event.cachedInput);
       }
+      if (event.contextWindow != null) turn.span.setAttribute("gen_ai.request.context_window", event.contextWindow);
       break;
     }
     case "runtime.error": {

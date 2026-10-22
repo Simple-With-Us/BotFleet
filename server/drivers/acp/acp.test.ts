@@ -15,7 +15,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureDirs } from "../../config.ts";
 import type { ProviderInstance } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
-import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
+import {
+  createAcpDriver,
+  readAcpUsage,
+  skipSubscriptionAuthForLocalInject,
+  type AcpConfig,
+  type AcpSupport,
+} from "./core.ts";
 import { GrokAgentDriver } from "./grok.ts";
 import { DshAgentDriver } from "./dsh.ts";
 import { KimiAgentDriver } from "./kimi.ts";
@@ -98,6 +104,34 @@ const ClassifiedErrorDriver = createAcpDriver({
     error && typeof error === "object" && (error as { code?: unknown }).code === -32000
       ? "invalid_credentials"
       : undefined,
+});
+
+describe("readAcpUsage", () => {
+  const full = { inputTokens: 10, outputTokens: 5, cachedReadTokens: 7, cachedWriteTokens: 2, thoughtTokens: 3, totalTokens: 27 };
+
+  it("reports input and output only until a harness declares its cache convention", () => {
+    // The contract promises cachedInput is a subset of input.  Nobody has
+    // said which way this agent counts, so guessing would under-bill.
+    expect(readAcpUsage(full)).toEqual({ input: 10, output: 5 });
+  });
+
+  it("passes input through when the agent already counts cache reads in it", () => {
+    expect(readAcpUsage(full, true)).toEqual({ input: 10, output: 5, cachedInput: 7 });
+  });
+
+  it("folds cache reads and writes into input when the agent reports them apart", () => {
+    expect(readAcpUsage(full, false)).toEqual({ input: 19, output: 5, cachedInput: 7 });
+  });
+
+  it("omits cachedInput when the agent sent no cache figure, whatever the convention", () => {
+    expect(readAcpUsage({ inputTokens: 10, outputTokens: 5 }, true)).toEqual({ input: 10, output: 5 });
+  });
+
+  it("is undefined for a result with no usage at all", () => {
+    expect(readAcpUsage(undefined)).toBeUndefined();
+    expect(readAcpUsage({})).toBeUndefined();
+    expect(readAcpUsage({ cachedReadTokens: 7 })).toBeUndefined();
+  });
 });
 
 describe("skipSubscriptionAuthForLocalInject", () => {
@@ -207,6 +241,14 @@ describe("ACP decodeConfig", () => {
     expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 20 * 60_000 + 1 }).promptIdleMs).toBeUndefined();
   });
 
+  it("accepts only bounded tool idle deadlines", () => {
+    expect(GrokAgentDriver.decodeConfig({ promptToolIdleMs: 1_000 }).promptToolIdleMs).toBe(1_000);
+    expect(GrokAgentDriver.decodeConfig({ promptToolIdleMs: 20 * 60_000 }).promptToolIdleMs).toBe(20 * 60_000);
+    expect(GrokAgentDriver.decodeConfig({ promptToolIdleMs: 999 }).promptToolIdleMs).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ promptToolIdleMs: "600000" }).promptToolIdleMs).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({}).promptToolIdleMs).toBeUndefined();
+  });
+
   it("advertises local CUA and qdrant in full-auto mode, because a host turn runs brokered", async () => {
     const fullAuto = await GrokAgentDriver.create({
       instanceId: "grok-full-auto",
@@ -267,6 +309,12 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_INIT_DELAY_MS;
     delete process.env.FAKE_ACP_DRIP_MS;
     delete process.env.FAKE_ACP_DRIP_COUNT;
+    delete process.env.FAKE_ACP_TOOL_CLOSES_MS;
+    delete process.env.FAKE_ACP_SESSION_TIMEOUT_MS;
+    delete process.env.FAKE_ACP_STOP_REASON;
+    delete process.env.FAKE_ACP_USAGE_COST;
+    delete process.env.FAKE_ACP_USAGE_CURRENCY;
+    delete process.env.FAKE_ACP_USAGE_CACHE;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -468,6 +516,127 @@ describe("ACP turns (fake CLI)", () => {
     // on some stale deadline left over from before the ask was resolved
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
+  });
+
+  it("waits the tool window, not the plain one, while a tool call is open", async () => {
+    // A build that says nothing for a while is an OPEN TOOL, not a wedged
+    // agent: the plain 150 ms window must not fire while tc-slow is open,
+    // and the wider tool window must.
+    await create(GrokAgentDriver, "tool-hang", { promptIdleMs: 150, promptToolIdleMs: 900 });
+    await instance.adapter.sendTurn({ threadId: "t-tool-idle", text: "build it" });
+
+    await recorder.until((event) => event.type === "item.started");
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    expect(recorder.events.some((event) => event.type === "turn.completed")).toBe(false);
+
+    const done = await recorder.until((event) => event.type === "turn.completed", 4_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_stall" });
+    expect(recorder.events.find((event) => event.type === "runtime.error")?.message).toMatch(
+      /no output for .* with 1 tool call still open/,
+    );
+    expect(instance.adapter.hasSession("t-tool-idle")).toBe(false);
+  });
+
+  it("drops back to the plain idle window once the tool closes", async () => {
+    process.env.FAKE_ACP_TOOL_CLOSES_MS = "100";
+    // the tool window is 5 s; if the guard stayed on it after tc-slow
+    // completed, the 2 s wait below would run out first
+    await create(GrokAgentDriver, "tool-hang", { promptIdleMs: 200, promptToolIdleMs: 5_000 });
+    await instance.adapter.sendTurn({ threadId: "t-tool-closed", text: "build it" });
+
+    await recorder.until((event) => event.type === "item.completed" && (event as any).itemType === "tool");
+    const done = await recorder.until((event) => event.type === "turn.completed", 2_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_stall" });
+    expect(recorder.events.find((event) => event.type === "runtime.error")?.message).not.toMatch(/tool call/);
+  });
+
+  it("names the MCP servers and the stderr tail when session/new times out, and relaunches once", async () => {
+    process.env.FAKE_ACP_SESSION_TIMEOUT_MS = "300";
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "session-new-hangs");
+    await instance.adapter.sendTurn({
+      threadId: "t-session-new-timeout",
+      text: "go",
+      integrations: {
+        agents: { command: process.execPath, args: ["/tmp/agents-proxy.js"], env: {} },
+      },
+    });
+
+    await recorder.until((event) => event.type === "turn.completed", 25_000);
+    // one relaunch, like an initialize timeout — every MCP connect is
+    // repeated under the same load, so the full budget is not spent
+    const retries = recorder.events.filter((event) => event.type === "turn.retrying");
+    expect(retries.map((event) => event.attempt)).toEqual([1]);
+    expect(retries[0]).toMatchObject({ reason: "timeout" });
+    const error = recorder.events.find((event) => event.type === "runtime.error");
+    expect(error?.message).toMatch(
+      /^session\/new timed out after \d+\.\d s with 1 MCP server \(agents\); stderr: .*waiting for mcp server agents to connect$/,
+    );
+    expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: false, stopReason: "rpc_error" });
+    expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+  }, 40_000);
+
+  it("settles a truncated answer as ok with max_tokens named", async () => {
+    process.env.FAKE_ACP_STOP_REASON = "maxTokens";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-max-tokens", text: "write a book" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true, stopReason: "max_tokens" });
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
+  });
+
+  it("books the agent's USD cost as this turn's share of the session total", async () => {
+    process.env.FAKE_ACP_USAGE_COST = "0.12";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cost", text: "one" });
+    const first = await recorder.until((event) => event.type === "turn.completed");
+    expect(first).toMatchObject({ ok: true, cost: 0.12, billingMode: "estimated" });
+    // the same notification's `size` is the context window
+    expect(recorder.events.find((event) => event.type === "thread.token-usage.updated")).toMatchObject({
+      input: 100,
+      contextWindow: 128_000,
+    });
+
+    // The resumed session reports its running total; only the movement
+    // since the last turn is this turn's cost.
+    const cursor = (recorder.events.find((event) => event.type === "session.started") as any).sessionId;
+    process.env.FAKE_ACP_USAGE_COST = "0.30";
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-cost", text: "two", resumeCursor: cursor });
+    const second = await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+    expect(second).toMatchObject({ ok: true, billingMode: "estimated" });
+    expect((second as any).cost).toBeCloseTo(0.18, 10);
+  });
+
+  it("ignores a cost the agent reports in a currency other than USD", async () => {
+    process.env.FAKE_ACP_USAGE_COST = "0.5";
+    process.env.FAKE_ACP_USAGE_CURRENCY = "EUR";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cost-eur", text: "go" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true, cost: null });
+    expect(done).not.toHaveProperty("billingMode");
+  });
+
+  it("emits cache dimensions once a harness has declared how its agent counts them", async () => {
+    process.env.FAKE_ACP_USAGE_CACHE = "1";
+    const CacheAwareDriver = createAcpDriver({
+      ...SELECT_MODEL_SUPPORT,
+      driverKind: "cacheAwareTest",
+      selectModel: undefined,
+      usageInputIncludesCache: true,
+    });
+    await create(CacheAwareDriver);
+    await instance.adapter.sendTurn({ threadId: "t-cache", text: "go" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true, usage: { input: 10, output: 5, cachedInput: 7 } });
+    expect(recorder.events.find((event) => event.type === "thread.token-usage.updated")).toMatchObject({
+      input: 10,
+      output: 5,
+      cachedInput: 7,
+    });
   });
 
   it("emits each assistant text block before the tool that follows it", async () => {

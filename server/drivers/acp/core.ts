@@ -20,6 +20,7 @@ import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { toolFields } from "../../tool-fields.ts";
 import { describeResult } from "../../../shared/tool-activity.ts";
+import { redactSecretsInText } from "../../../shared/redact.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
 import {
@@ -159,6 +160,13 @@ export interface AcpConfig {
    * never cut off; only a fully wedged one is.  `promptTimeoutMs` still
    * applies underneath this as the absolute backstop. */
   promptIdleMs?: number;
+  /** Idle deadline used INSTEAD of `promptIdleMs` while the agent has a tool
+   * call open (`tool_call` seen, no completed/failed `tool_call_update`
+   * yet).  A build, a test run, or a long shell command is legitimately
+   * silent for far longer than a wedged model is, and the 3-minute default
+   * above was stopping those turns as stalls.  Never wider than the hard
+   * `promptTimeoutMs` backstop. */
+  promptToolIdleMs?: number;
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -202,6 +210,15 @@ export interface AcpSupport {
    * Default true, because every sibling honours it; opt out when a harness
    * demonstrably does not. */
   mcpServers?: boolean;
+  /** Whether this agent's `session/prompt` usage `inputTokens` ALREADY
+   * counts its `cachedReadTokens` / `cachedWriteTokens`.  The contract for
+   * `turn.completed.usage` requires `cachedInput` to be a subset of `input`,
+   * and the ACP spec does not say which way an agent reports it, so the
+   * cache dimensions are only emitted once a harness has confirmed its own
+   * agent's convention here: `true` passes `inputTokens` through, `false`
+   * folds the cache figures in first.  Unset (unknown) keeps today's
+   * input/output-only report rather than guessing at billing. */
+  usageInputIncludesCache?: boolean;
   /** Message shown when the CLI is present but not signed in. */
   loginNote: string;
   /** How a user installs this harness's CLI; surfaced by the setup UI. */
@@ -310,8 +327,19 @@ const MAX_PROMPT_TIMEOUT_MS = 20 * 60_000;
 const DEFAULT_PROMPT_IDLE_MS = 180_000;
 const MIN_PROMPT_IDLE_MS = 1_000;
 const MAX_PROMPT_IDLE_MS = 20 * 60_000;
+// Idle window while a tool call is open (see `AcpConfig.promptToolIdleMs`).
+// A running build or test suite says nothing for minutes at a time, and the
+// agent cannot speak until the tool returns; that is not the silence the
+// idle guard exists to catch.  Capped by the hard prompt ceiling at use.
+const DEFAULT_PROMPT_TOOL_IDLE_MS = 10 * 60_000;
 const CANCEL_FLUSH_GRACE_MS = 50;
 const FORCE_EXIT_AFTER_MS = 2_000;
+
+/** "1.5 s" under ten seconds, "120 s" above — an elapsed figure for the
+ *  session/new timeout detail, where a scaled test window is sub-second. */
+function describeElapsed(ms: number): string {
+  return ms < 10_000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms / 1000)} s`;
+}
 
 /** "3 minutes" at the real default, "N s" for anything not a whole number
  *  of minutes (short test windows included) — used only in the idle-stall
@@ -339,8 +367,12 @@ class AcpRpcTimeoutError extends Error {
 class AcpPromptIdleError extends Error {
   readonly method: string;
 
-  constructor(method: string, idleMs: number) {
-    super(`${method} produced no output for ${describeIdleWindow(idleMs)} and was stopped as a stall.`);
+  constructor(method: string, idleMs: number, openTools = 0) {
+    super(
+      openTools > 0
+        ? `${method} produced no output for ${describeIdleWindow(idleMs)} with ${openTools} tool call${openTools === 1 ? "" : "s"} still open and was stopped as a stall.`
+        : `${method} produced no output for ${describeIdleWindow(idleMs)} and was stopped as a stall.`,
+    );
     this.name = "AcpPromptIdleError";
     this.method = method;
   }
@@ -374,6 +406,58 @@ export function normalizeStopReason(raw: unknown): string | undefined {
     .toLowerCase();
 }
 
+/** How a normalized `session/prompt` stop reason settles the turn.
+ *
+ * `end_turn` is the plain success and keeps its `null` stop reason.
+ * `max_tokens` is ALSO a success — the agent answered, the answer was cut
+ * short — but it used to be folded into the same `null`, so a truncated
+ * reply was indistinguishable from a whole one downstream (a routine that
+ * needed the rest never learned it was missing).  It now settles `ok` with
+ * its own name.  `cancelled` is the person's own stop.  Anything else is
+ * the agent reporting a failure, kept verbatim so the reason is visible. */
+export function settleForStopReason(reason: string | undefined): { ok: boolean; stopReason: string | null } {
+  if (reason === "end_turn") return { ok: true, stopReason: null };
+  if (reason === "max_tokens") return { ok: true, stopReason: "max_tokens" };
+  if (reason === "cancelled") return { ok: true, stopReason: "cancelled" };
+  return { ok: false, stopReason: reason ?? "failed" };
+}
+
+/** Per-turn usage as `turn.completed` carries it. */
+export type AcpTurnUsage = { input: number; output?: number; cachedInput?: number };
+
+/** Read a `session/prompt` result's usage block into the turn's figure.
+ *
+ * The ACP `Usage` shape is `inputTokens`, `outputTokens`, and optionally
+ * `cachedReadTokens`, `cachedWriteTokens`, `thoughtTokens`, `totalTokens`.
+ * Only the first two were read; the cache dimensions were dropped on the
+ * floor, so an ACP engine's cache reads were billed at the full input rate.
+ *
+ * `inputIncludesCache` is the harness's `usageInputIncludesCache`: `true`
+ * means `inputTokens` already counts the cache reads and writes, `false`
+ * means they must be folded in (the claude.ts shape), and `undefined` means
+ * nobody has checked — in which case the cache figures are NOT emitted,
+ * because `turn.completed.usage` promises `cachedInput` is a subset of
+ * `input` and reporting it the wrong way round under-bills every turn.
+ * `thoughtTokens` and `totalTokens` are read but have no home on the
+ * contract yet; the raw result is already on the native log. */
+export function readAcpUsage(raw: unknown, inputIncludesCache?: boolean): AcpTurnUsage | undefined {
+  const usage = (raw ?? {}) as Record<string, unknown>;
+  const count = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : undefined;
+  const inputTokens = count(usage.inputTokens);
+  const outputTokens = count(usage.outputTokens);
+  if (inputTokens === undefined && outputTokens === undefined) return undefined;
+  const cachedRead = count(usage.cachedReadTokens);
+  const cachedWrite = count(usage.cachedWriteTokens);
+  let input = inputTokens ?? 0;
+  if (inputIncludesCache === false) input += (cachedRead ?? 0) + (cachedWrite ?? 0);
+  return {
+    input,
+    output: outputTokens ?? 0,
+    ...(inputIncludesCache !== undefined && cachedRead !== undefined ? { cachedInput: cachedRead } : {}),
+  };
+}
+
 function decodeAcpConfig(defaultCli: string) {
   return (raw: unknown): AcpConfig => {
     const o = (raw ?? {}) as Record<string, unknown>;
@@ -386,14 +470,16 @@ function decodeAcpConfig(defaultCli: string) {
         ? o.promptTimeoutMs
         : undefined;
     const initTimeoutMs = decodeInitTimeoutMs(o.initTimeoutMs);
-    const promptIdleMs =
-      typeof o.promptIdleMs === "number" &&
-      Number.isFinite(o.promptIdleMs) &&
-      Number.isInteger(o.promptIdleMs) &&
-      o.promptIdleMs >= MIN_PROMPT_IDLE_MS &&
-      o.promptIdleMs <= MAX_PROMPT_IDLE_MS
-        ? o.promptIdleMs
+    const boundedIdle = (value: unknown) =>
+      typeof value === "number" &&
+      Number.isFinite(value) &&
+      Number.isInteger(value) &&
+      value >= MIN_PROMPT_IDLE_MS &&
+      value <= MAX_PROMPT_IDLE_MS
+        ? value
         : undefined;
+    const promptIdleMs = boundedIdle(o.promptIdleMs);
+    const promptToolIdleMs = boundedIdle(o.promptToolIdleMs);
     return {
       cli: typeof o.cli === "string" ? o.cli : defaultCli,
       fullAuto: o.fullAuto === true,
@@ -401,6 +487,7 @@ function decodeAcpConfig(defaultCli: string) {
       ...(initTimeoutMs === undefined ? {} : { initTimeoutMs }),
       ...(promptTimeoutMs === undefined ? {} : { promptTimeoutMs }),
       ...(promptIdleMs === undefined ? {} : { promptIdleMs }),
+      ...(promptToolIdleMs === undefined ? {} : { promptToolIdleMs }),
     };
   };
 }
@@ -481,6 +568,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // down so a scripted transient failure does not cost the suite its
       // backoff.  The `turn.retrying` event still reports the REAL delay.
       const retryScale = Number(process.env.FAKE_ACP_RETRY_SCALE ?? "1");
+      // session/new's deadline is a constant on purpose (see the comment on
+      // NEW_SESSION_TIMEOUT); the fakes shrink it the same way they shrink
+      // the backoff, so a test can prove the timeout's diagnostics without
+      // waiting two real minutes for them.
+      const newSessionTimeoutMs = Number(process.env.FAKE_ACP_SESSION_TIMEOUT_MS) || NEW_SESSION_TIMEOUT;
+      // Cumulative USD an agent has reported for a thread's native session
+      // (`usage_update.cost` is the session's running total, like `used`).
+      // Kept per thread across turns so a resumed session's next report can
+      // be turned into THIS turn's delta; a fresh `session/new` resets it.
+      const sessionCostUsd = new Map<string, number>();
 
       const emit = (event: RuntimeEvent) => {
         for (const l of [...listeners]) l(event);
@@ -539,6 +636,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         });
         emit({ ...base(threadId, turnId), type: "turn.started" });
 
+        /** USD this turn has cost so far, from the agent's own report — or
+         *  null while nothing has been reported, which is every settle
+         *  before the prompt and every agent that never sends a cost. */
+        let turnCostUsd: number | null = null;
+        /** The `cost` half of every `turn.completed` this turn emits.  One
+         *  reading of the session field for all six settle paths, so none
+         *  of them can go back to a hardcoded `cost: null`.  The agent's
+         *  figure is its own estimate, not a bill, hence `estimated`. */
+        const costFields = () =>
+          turnCostUsd === null ? { cost: null } : { cost: turnCostUsd, billingMode: "estimated" as const };
+
         const finishBeforeDispatch = (
           ok: boolean,
           stopReason: string,
@@ -547,7 +655,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           if (active.get(threadId)?.turnId === turnId) active.delete(threadId);
           retryState.delete(threadId);
           if (error) emit({ ...base(threadId, turnId), type: "runtime.error", ...error });
-          emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost: null });
+          emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, ...costFields() });
           return { turnId, dispatched: false as const };
         };
         const cancelledBeforeDispatch = () =>
@@ -645,6 +753,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           text: "",
         };
         const asks = new Map<string, (behavior: string, source?: "user" | "timeout" | "system") => void>();
+        // Tool calls the agent has opened and not yet closed.  While one is
+        // open the idle guard waits `promptToolIdleMs` instead of
+        // `promptIdleMs`: the agent is not wedged, it is waiting on a tool.
+        const openTools = new Set<string>();
         let nextId = 1;
         let sessionId: string | null = null;
         let interruptTimer: ReturnType<typeof setTimeout> | null = null;
@@ -686,22 +798,32 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             appendNative(threadId, { dir: "out", source: SOURCE, msg: obj });
           });
-        const request = (method: string, params: unknown, timeoutMs?: number, idleMs?: number) =>
+        const request = (
+          method: string,
+          params: unknown,
+          timeoutMs?: number,
+          idle?: { idleMs: number; toolIdleMs: number },
+        ) =>
           new Promise<any>((resolve, reject) => {
             const id = nextId++;
             // Idle watchdog — unlike `timer` below, this restarts on every
             // inbound line (see the stdout handler), so a long-lived
             // streaming turn is never cut off; only one that has gone
             // completely silent trips it.  Only armed when the caller
-            // passes idleMs (currently just session/prompt).
+            // passes `idle` (currently just session/prompt).
             let idleTimer: ReturnType<typeof setTimeout> | null = null;
             const clearIdle = () => {
               if (idleTimer) clearTimeout(idleTimer);
               idleTimer = null;
             };
             const armIdle = () => {
-              if (!(idleMs && idleMs > 0)) return;
+              if (!idle || !(idle.idleMs > 0)) return;
               clearIdle();
+              // The window is chosen at arm time, so a tool closing (its
+              // tool_call_update is inbound traffic, which re-arms) drops
+              // the guard straight back to the plain window.
+              const openToolCount = openTools.size;
+              const idleMs = openToolCount > 0 ? Math.max(idle.idleMs, idle.toolIdleMs) : idle.idleMs;
               idleTimer = setTimeout(() => {
                 // A permission ask blocks on a PERSON, not the agent —
                 // waiting on one is not the silence this guard exists to
@@ -712,7 +834,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 }
                 rpcPending.delete(id);
                 if (timer) clearTimeout(timer);
-                reject(new AcpPromptIdleError(method, idleMs));
+                reject(new AcpPromptIdleError(method, idleMs, openToolCount));
               }, idleMs);
               idleTimer.unref?.();
             };
@@ -777,7 +899,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
          * signal is a `session/update` `usage_update` notification carrying
          * a combined context-occupancy figure (see the `usage_update` case
          * in `handleNotification` below), with no input/output split. */
-        let turnUsage: { input: number; output?: number } | undefined;
+        let turnUsage: AcpTurnUsage | undefined;
 
         const settle = (ok: boolean, stopReason: string | null) => {
           if (state.settled || state.retrying) return;
@@ -791,6 +913,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             p.reject(new Error("turn settled"));
           }
           rpcPending.clear();
+          openTools.clear();
           active.delete(threadId);
           flushAssistantText();
           emit({
@@ -798,7 +921,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             type: "turn.completed",
             ok,
             stopReason,
-            cost: null,
+            ...costFields(),
             ...(turnUsage ? { usage: turnUsage } : {}),
           });
           stop(); // the agent process does not exit on its own
@@ -846,6 +969,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             p.reject(new Error("turn retrying"));
           }
           rpcPending.clear();
+          openTools.clear();
           stop();
           // The thread STAYS claimed through the backoff — that entry is what
           // makes a stop during the wait reach this turn instead of racing a
@@ -866,7 +990,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 type: "turn.completed",
                 ok: false,
                 stopReason: retry.cancelled ? "interrupted" : "disposed",
-                cost: null,
+                ...costFields(),
               });
               return;
             }
@@ -889,7 +1013,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 type: "turn.completed",
                 ok: false,
                 stopReason: "exit_before_result",
-                cost: null,
+                ...costFields(),
               });
             }
           })();
@@ -998,6 +1122,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             case "tool_call": {
               state.sawOutput = true;
               flushAssistantText();
+              // ACP's initial status defaults to pending; only a call that
+              // arrives already finished stays out of the open set.
+              if (typeof u.toolCallId === "string" && u.status !== "completed" && u.status !== "failed") {
+                openTools.add(u.toolCallId);
+              }
               // ACP hands us `kind`, `locations` and `rawInput` alongside the
               // title.  Folding all of it into one 80-char title was what left
               // the transcript showing `read_file` seven times with no paths;
@@ -1017,6 +1146,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               break;
             }
             case "tool_call_update": {
+              if (typeof u.toolCallId === "string") {
+                if (u.status === "completed" || u.status === "failed") openTools.delete(u.toolCallId);
+                else if (u.status === "in_progress" || u.status === "pending") openTools.add(u.toolCallId);
+              }
               if (u.status === "completed" || u.status === "failed") {
                 emit({
                   ...base(threadId, turnId),
@@ -1044,8 +1177,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // there is no reported output figure, so that attribute stays
             // unset instead of a fabricated 0 — see the `output?:` comment
             // on `turnUsage` above.
+            //
+            // The same notification carries two more figures that were
+            // dropped: `size`, the model's context window (so `used / size`
+            // is the occupancy), and `cost`, the session's running spend
+            // as `{ amount, currency }`.  Both are read below.
             case "usage_update": {
               const used = u.used;
+              const size = u.size;
+              const contextWindow =
+                typeof size === "number" && Number.isFinite(size) && size > 0 ? Math.trunc(size) : undefined;
               if (typeof used === "number" && Number.isFinite(used)) {
                 // Spread, not a literal `output: turnUsage?.output` — that
                 // would always create the key (value undefined when
@@ -1062,7 +1203,28 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   type: "thread.token-usage.updated",
                   input: turnUsage.input,
                   ...(turnUsage.output != null ? { output: turnUsage.output } : {}),
+                  ...(contextWindow !== undefined ? { contextWindow } : {}),
                 });
+              }
+              // Only a USD figure is a cost this harness can book; another
+              // currency would be summed into dollar spend as if it were
+              // dollars.  The amount is the SESSION's cumulative total, so
+              // this turn's share is the movement since the last report —
+              // and a total smaller than the last one is a fresh session
+              // counting from zero, not a refund.
+              const cost = u.cost;
+              const amount = cost?.amount;
+              if (
+                cost &&
+                typeof amount === "number" &&
+                Number.isFinite(amount) &&
+                amount >= 0 &&
+                cost.currency === "USD"
+              ) {
+                const previous = sessionCostUsd.get(threadId) ?? 0;
+                const delta = amount >= previous ? amount - previous : amount;
+                sessionCostUsd.set(threadId, amount);
+                turnCostUsd = (turnCostUsd ?? 0) + delta;
               }
               break;
             }
@@ -1228,9 +1390,35 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               }
             }
             if (!sessionId) {
-              sessionResult = await request("session/new", { cwd, mcpServers }, NEW_SESSION_TIMEOUT);
+              const sessionNewStartedAt = Date.now();
+              try {
+                sessionResult = await request("session/new", { cwd, mcpServers }, newSessionTimeoutMs);
+              } catch (error) {
+                // A bare "session/new timed out" said nothing about WHY.
+                // session/new is where the agent connects every MCP server
+                // it was handed, so the count and names of those, plus
+                // whatever the agent wrote to stderr while it hung, are
+                // the diagnosis — in the message, because the message is
+                // what reaches the log line and the Sentry breadcrumb.
+                if (error instanceof AcpRpcTimeoutError) {
+                  const elapsed = describeElapsed(Date.now() - sessionNewStartedAt);
+                  const count = mcpServers.length;
+                  const names = mcpServers.map((server) => server.name).join(", ");
+                  const tail = redactSecretsInText(stderr.trim().slice(-300)).replace(/\s+/g, " ").trim();
+                  throw new AcpRpcTimeoutError(
+                    "session/new",
+                    `after ${elapsed} with ${count} MCP server${count === 1 ? "" : "s"}` +
+                      `${names ? ` (${names})` : ""}${tail ? `; stderr: ${tail}` : ""}`,
+                  );
+                }
+                throw error;
+              }
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
+              // A fresh native session counts its spend from zero; a stale
+              // cumulative from an earlier session would swallow this
+              // turn's whole cost as "already reported".
+              sessionCostUsd.delete(threadId);
             }
             let selectedModel: string | null = null;
             let sessionStarted = false;
@@ -1324,23 +1512,28 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 prompt: [{ type: "text", text }],
               },
               turnConfig.promptTimeoutMs ?? DEFAULT_PROMPT_MAX_MS,
-              turnConfig.promptIdleMs ?? DEFAULT_PROMPT_IDLE_MS,
+              {
+                idleMs: turnConfig.promptIdleMs ?? DEFAULT_PROMPT_IDLE_MS,
+                // never wider than the hard ceiling it sits under
+                toolIdleMs: Math.min(
+                  turnConfig.promptToolIdleMs ?? DEFAULT_PROMPT_TOOL_IDLE_MS,
+                  turnConfig.promptTimeoutMs ?? DEFAULT_PROMPT_MAX_MS,
+                ),
+              },
             );
             // opencode 1.18.18 reports usage at the result root; grok and
             // gemini put it under _meta. Read both rather than lose the count.
-            const usage = result?.usage ?? result?._meta ?? {};
-            if (typeof usage.inputTokens === "number" || typeof usage.outputTokens === "number") {
-              turnUsage = { input: usage.inputTokens ?? 0, output: usage.outputTokens ?? 0 };
+            const usage = readAcpUsage(result?.usage ?? result?._meta, support.usageInputIncludesCache);
+            if (usage) {
+              turnUsage = usage;
               emit({
                 ...base(threadId, turnId),
                 type: "thread.token-usage.updated",
                 ...turnUsage,
               });
             }
-            const reason = normalizeStopReason(result?.stopReason);
-            if (reason === "end_turn" || reason === "max_tokens") settle(true, null);
-            else if (reason === "cancelled") settle(true, "cancelled");
-            else settle(false, reason ?? "failed");
+            const outcome = settleForStopReason(normalizeStopReason(result?.stopReason));
+            settle(outcome.ok, outcome.stopReason);
           } catch (e) {
             if (!state.settled && !state.retrying) {
               const resumeFailure = e instanceof AcpResumeError;
@@ -1351,6 +1544,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               const code = support.classifyError?.(classifiedFailure);
               const promptTimedOut = e instanceof AcpRpcTimeoutError && e.method === "session/prompt";
               const initTimedOut = e instanceof AcpRpcTimeoutError && e.method === "initialize";
+              const sessionNewTimedOut = e instanceof AcpRpcTimeoutError && e.method === "session/new";
               // Same shape as a hard timeout — an unresponsive child on the
               // other end of a wedged RPC — just detected by total silence
               // instead of elapsed wall clock, so the cleanup is identical.
@@ -1392,10 +1586,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // maybeRetry refuses — a wedged child must not be relaunched
               // into the same hang.
               //
-              // An initialize deadline earns ONE relaunch, not the whole
-              // transient budget: the relaunch repeats the entire cold boot
-              // under the same host load, and a second one mostly adds load.
-              const initRelaunchSpent = initTimedOut && retry.attempt >= MAX_INIT_TIMEOUT_RELAUNCHES;
+              // An initialize or session/new deadline earns ONE relaunch, not
+              // the whole transient budget: the relaunch repeats the entire
+              // cold boot — and every MCP server connect — under the same
+              // host load, and a second one mostly adds load.
+              const initRelaunchSpent =
+                (initTimedOut || sessionNewTimedOut) && retry.attempt >= MAX_INIT_TIMEOUT_RELAUNCHES;
               if (
                 !needsAuth &&
                 !initRelaunchSpent &&
