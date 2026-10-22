@@ -120,9 +120,6 @@ export default function ModelRowsVisualFixture() {
             2026.09.26-dd393fe
           </span>
         </div>
-        <div className="mt-0.5 text-[11.5px] text-ink-secondary">
-          Choose a model for this bot.
-        </div>
         <EngineQuotasPanel engines={[ENGINE]} activeInstanceId="minimax" />
       </div>
     </div>

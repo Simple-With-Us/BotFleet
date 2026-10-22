@@ -248,14 +248,19 @@ const RESERVED_INSTANCE_ID = new Map<string, string>([
   ["piAgent", "pi"],
   ["mcodeAgent", "mcode"],
   ["museAgent", "muse"],
+  ["opencodeGo", "opencode"],
 ]);
+
+const RESERVED_OPENCODE_IDS = new Set(["opencode", "opencodeGo"]);
 
 export function isCustomEngineInstance(instance: {
   driverKind: string;
   instanceId: string;
   isCustom?: boolean;
 }): boolean {
-  if (instance.isCustom) return true;
+  if (instance.isCustom === true) return true;
+  if (instance.isCustom === false) return false;
+  if (instance.driverKind === "opencodeGo") return !RESERVED_OPENCODE_IDS.has(instance.instanceId);
   return instance.instanceId !== (RESERVED_INSTANCE_ID.get(instance.driverKind) ?? instance.driverKind);
 }
 

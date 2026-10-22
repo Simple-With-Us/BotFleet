@@ -326,6 +326,12 @@ interface T2AResponse {
  */
 export function sanitizeForTTS(text: string): string {
   if (!text) return "";
+  return sanitizeForTTSLine(text);
+}
+
+/** Acoustic dash/ellipsis cleanup on one line (no newline folding). */
+function sanitizeForTTSLine(text: string): string {
+  if (!text) return "";
   return text
     // Collapse whitespace runs first to prevent regex backtracking on long runs
     .replace(/\s+/g, " ")
@@ -348,6 +354,17 @@ export function sanitizeForTTS(text: string): string {
     // Clean up multiple spaces
     .replace(/[ \t]+/g, " ")
     .trim();
+}
+
+/** Like {@link sanitizeForTTS}, but keeps `\n` so `speakable()` / `toUtterances()`
+ * can still turn headings and lists into separate sentences before clip split. */
+export function sanitizeForTTSByLine(text: string): string {
+  if (!text) return "";
+  if (!text.includes("\n")) return sanitizeForTTS(text);
+  return text
+    .split("\n")
+    .map((line) => sanitizeForTTSLine(line))
+    .join("\n");
 }
 
 /** Synthesize one utterance to mp3 bytes.  Throws if MiniMax returns a

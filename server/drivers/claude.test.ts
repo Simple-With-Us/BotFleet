@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ensureDirs } from "../config.ts";
-import type { ProviderInstance } from "../contracts.ts";
+import type { ProviderInstance, RuntimeEvent } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import {
@@ -23,6 +23,7 @@ import {
   CLAUDE_CONTAINMENT_SETTINGS,
   ClaudeDriver,
   claudeDisallowedTools,
+  helperUsageDelta,
   claudeUnsolicitedFrameStats,
   permissionSocketPath,
   withVolatileNote,
@@ -92,6 +93,25 @@ function answerQueue(conn: ReturnType<typeof connect>) {
   });
   return () => new Promise<any>((resolve) => waiters.push(resolve));
 }
+
+describe("helper usage", () => {
+  it("counts one assistant message once, and a later increase only as the difference", () => {
+    const seen = new Map<string, number>();
+    expect(helperUsageDelta(seen, "msg-1", 1098)).toBe(1098);
+    expect(helperUsageDelta(seen, "msg-1", 1098)).toBe(0);
+    expect(helperUsageDelta(seen, "msg-1", 1108)).toBe(10);
+    expect(helperUsageDelta(seen, "msg-2", 4)).toBe(4);
+    expect(helperUsageDelta(seen, undefined, 7)).toBe(7);
+    expect(helperUsageDelta(undefined, "msg-3", 3)).toBe(3);
+  });
+
+  it("accepts an engine reset floor before counting the next increase", () => {
+    const seen = new Map<string, number>();
+    expect(helperUsageDelta(seen, "msg-1", 500)).toBe(500);
+    expect(helperUsageDelta(seen, "msg-1", 100)).toBe(0);
+    expect(helperUsageDelta(seen, "msg-1", 150)).toBe(50);
+  });
+});
 
 describe("ClaudeDriver.decodeConfig", () => {
   it("defaults to the claude binary with acceptEdits", () => {
@@ -2240,10 +2260,14 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       await instance.adapter.sendTurn({ threadId: "t-helpers", text: "survey" });
       await recorder.until((e) => e.type === "turn.completed");
 
-      const started = recorder.events.filter((e) => e.type === "item.started" && e.itemType === "tool");
-      expect(started.map((e) => (e as { itemId?: string }).itemId)).toEqual(["task-1", "helper-read-1"]);
-      expect((started[0] as { parentItemId?: string }).parentItemId).toBeUndefined();
-      expect(started[1]).toMatchObject({ title: "Read", parentItemId: "task-1" });
+      const started = recorder.events.filter(
+        (e): e is Extract<RuntimeEvent, { type: "item.started" }> =>
+          e.type === "item.started" && e.itemType === "tool",
+      );
+      expect(started.map((e) => e.itemId)).toEqual(["task-1", "helper-read-1"]);
+      expect(started[0]?.parentItemId).toBeUndefined();
+      expect(started[0]?.subagentId).toBeUndefined();
+      expect(started[1]).toMatchObject({ title: "Read", parentItemId: "task-1", subagentId: "task-1" });
       // the helper's step still completes like any other
       expect(recorder.events.some((e) => e.type === "item.completed" && e.itemType === "tool" && e.itemId === "helper-read-1")).toBe(true);
       // the helper talking to its parent is not the bot talking to anyone
@@ -2253,6 +2277,15 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       // nor is the helper's context the bot's: no usage report carries it
       const usage = recorder.events.filter((e) => e.type === "thread.token-usage.updated");
       expect(usage.some((e) => (e as { input: number }).input === 999)).toBe(false);
+      // the helper's own bill lands on its card, not on the bot's meter.
+      // the fake repeats the assistant frame, and both carry message id
+      // msg-helper-1, so the card is billed once
+      const billed = recorder.events.filter((e) => e.type === "item.updated" && e.itemId === "task-1");
+      expect(billed).toHaveLength(1);
+      expect(billed[0]).toMatchObject({
+        subagentId: "task-1",
+        tokens: 1098,
+      });
     });
   });
 });

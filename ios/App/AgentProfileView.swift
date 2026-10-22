@@ -40,6 +40,11 @@ struct AgentProfileView: View {
     @State private var confirmingDuplicate = false
     @State private var player: AVAudioPlayer?
     @State private var isOff: Bool
+    /// The On/Off switch was flipped while the bot was working, and the
+    /// person has not yet said what should happen to the turn in flight.
+    @State private var powerOffWhileRunning = false
+    /// They said stop it: the switch saves first, then the turn is stopped.
+    @State private var stopRunningTurnOnSave = false
     @State private var computers: Set<String>
     @State private var cwd: String
     /// The execution policy, saved with the rest of the sheet.  Bypass is
@@ -172,8 +177,7 @@ struct AgentProfileView: View {
                 Section {
                     HStack {
                         Spacer()
-                        BotAvatarView(bot: current, size: 112, state: .happy, animated: true)
-                            .providerBadge(for: current, avatarSize: 112)
+                        BotAvatarWithProviderBadge(bot: current, size: 112, state: .happy, animated: true)
                         Spacer()
                     }
                     .listRowBackground(Color.clear)
@@ -218,7 +222,21 @@ struct AgentProfileView: View {
                 }
 
                 Section {
-                    Toggle("On", isOn: Binding(get: { !isOff }, set: { isOff = !$0 }))
+                    Toggle("On", isOn: Binding(get: { !isOff }, set: { turnedOn in
+                    // Switching a working bot off is really two decisions —
+                    // stop the turn now, or stop it starting from now — and a
+                    // switch cannot tell which one was meant.  Hold the flip
+                    // until they answer, and only ask when there is a turn to
+                    // decide about.  The decision lives in CompanionCore so it
+                    // is tested rather than eyeballed: `get` reads `!isOff`,
+                    // so `set` must apply the inverse of what the switch says.
+                    switch botPowerToggleAction(turnedOn: turnedOn, isOff: isOff, isBusy: current.busy == true) {
+                    case .askAboutRunningTurn:
+                        powerOffWhileRunning = true
+                    case .setOff(let next):
+                        isOff = next
+                    }
+                }))
                 } header: {
                     Text("Power")
                 } footer: {
@@ -417,6 +435,24 @@ struct AgentProfileView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text(BotDuplicate.summary)
+            }
+            .confirmationDialog(
+                "\(current.name) Is Working",
+                isPresented: $powerOffWhileRunning,
+                titleVisibility: .visible
+            ) {
+                Button("Stop It And Power Off", role: .destructive) {
+                    isOff = true
+                    stopRunningTurnOnSave = true
+                }
+                Button("Power Off After This Turn") {
+                    isOff = true
+                    stopRunningTurnOnSave = false
+                }
+                Button("Keep It On", role: .cancel) {}
+            } message: {
+                // Two spaces between sentences, held with a non-breaking space.
+                Text("Turning \(current.name) off stops new work, but the turn running now will keep going.\u{00A0} Stop it now, or let it finish first.")
             }
             .task {
                 if !session.cachedInstances.isEmpty {
@@ -1132,7 +1168,7 @@ struct AgentProfileView: View {
     private func save() async -> Bool {
         busy = true
         defer { busy = false }
-        return await ProfileSaveGate.run(
+        let saved = await ProfileSaveGate.run(
             save: {
                 await session.updateProfile(
                     profilePatch(),
@@ -1143,6 +1179,16 @@ struct AgentProfileView: View {
             accept: synchronizeForm(with:),
             rejected: revertRefusableFields
         )
+        // Stopping is a second act, after the switch has saved: the Off flag
+        // is what keeps the bot from starting anything new in the gap, and an
+        // interrupt still works on a bot that is already Off because it acts
+        // on the turn in flight rather than on the bot being on.  A save the
+        // computer refused has switched nothing off, so nothing is stopped.
+        if saved, stopRunningTurnOnSave {
+            stopRunningTurnOnSave = false
+            await session.interrupt(bot: current)
+        }
+        return saved
     }
 
     /// A refused save puts the fields the computer can say no to back to what

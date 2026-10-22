@@ -7,6 +7,7 @@ import type { RuntimeEvent } from "./contracts.ts";
 import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
+import { wantsEphemeralDispatch } from "./ephemeral-dispatch.ts";
 import { BUSY_DEFER_NOTE, DEFAULT_WEBHOOK_HOT_DEFER_MS, nextOccurrence, RoutineManager, type RoutineManagerOptions, type RoutineRunOn, type RoutineSchedule } from "./routines.ts";
 
 type TurnCompletedEvent = Extract<RuntimeEvent, { type: "turn.completed" }>;
@@ -1169,6 +1170,41 @@ describe("RoutineManager", () => {
     }
     expect(h.started.map((row) => row.threadId)).toEqual(["thread-2", "thread-2"]);
     expect(h.taskActivations.filter(Boolean)).toHaveLength(1);
+  });
+
+  it("classifies a UI-pass webhook as one-shot and leaves a payload mention on another webhook alone", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.oneShotWakeForRun = (run) => wantsEphemeralDispatch({
+      triggerSource: run.triggerSource,
+      name: run.routineName,
+      id: run.webhookId,
+    });
+    h.manager.enqueueWebhook({
+      webhookId: "ui-pass",
+      webhookName: "GitHub UI Pass",
+      prompt: "Review PR #4",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "ui-1",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent(turnCompletedFixture(h.started.at(-1)!.threadId));
+
+    h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "check failed on a commit titled UI pass",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "cg-1",
+      receivedAt: new Date(2026, 7, 17, 8, 3).getTime(),
+    });
+    await h.manager.tick();
+
+    expect(h.ephemeralFlags).toEqual([true, false]);
+    expect(h.started[0]?.threadId).not.toBe(h.started[1]?.threadId);
   });
 
   it("keeps every delivery of ONE webhook on that webhook's own thread", async () => {

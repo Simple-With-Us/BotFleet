@@ -11,6 +11,7 @@ import {
   compareRank,
   hasLineage,
   lineageClasses,
+  newestInClass,
   presentCatalog,
   reconcileChain,
   reconcileEntry,
@@ -88,14 +89,15 @@ export function lineageContextFor(
 }
 
 // ── Claude CLI version gate ──────────────────────────────────────────────
-// The Claude CLI's own model catalog lists Opus 5.5 only from Claude Code
-// 2.1.280 (its `min_claude_code_version`); Sonnet 5.5 declares no minimum.
-// On an older CLI the Opus 5.5 row is not offered and no saved selection is
-// moved onto it: a move there would also hide Opus 5, the model the bot ran
-// on before, with no way back in the picker.  Fable 5.1 (listed from 2.1.251)
-// was offered to every CLI before lineage existed and is left as it was.
+// Claude Code's changelog added Opus 5.5 in 2.1.280 (2026-09-22) and Sonnet
+// 5.5 in 2.1.284 (2026-09-28).  On an older CLI those rows are not offered
+// and no saved selection is moved onto them: a move there would also hide
+// the model the bot ran on before, with no way back in the picker.  Fable
+// 5.1 (listed from 2.1.251) was offered to every CLI before lineage existed
+// and is left as it was.
 const CLAUDE_CLI_MINIMUM = {
   "claude-opus-5-5": [2, 1, 280],
+  "claude-sonnet-5-5": [2, 1, 284],
 } as const satisfies Readonly<Record<string, readonly number[]>>;
 
 /** `2.1.284 (Claude Code)` -> [2, 1, 284]; undefined when no version is known. */
@@ -142,7 +144,13 @@ export function withoutModelsTooNewForCli<C extends CatalogLike>(
   if (!tooNew.size) return models;
   const options = models.options.filter((option) => Boolean(option.custom) || !tooNew.has(option.id));
   if (options.length === models.options.length) return models;
-  const fallbackDefault = options.find((option) => !option.custom)?.id ?? models.default;
+  // The static default is Sonnet 5.5.  The first remaining official row is
+  // Fable, which would hand every new bot a different class.  Stay on the
+  // newest member of the default's own class that this CLI can run.
+  const official = options.filter((option) => !option.custom).map((option) => option.id);
+  const classKey = classifyModel(driverKind, models.default)?.classKey;
+  const sameClass = classKey ? newestInClass(driverKind, classKey, official) : undefined;
+  const fallbackDefault = sameClass ?? official[0] ?? models.default;
   return { ...models, options, default: tooNew.has(models.default) ? fallbackDefault : models.default };
 }
 

@@ -205,6 +205,8 @@ contextBridge.exposeInMainWorld("ogb", {
   openFile: (filePath) => ipcRenderer.invoke("desktop:open-file", filePath),
   /** Reveal a file in Finder with the file selected. */
   showInFolder: (filePath) => ipcRenderer.invoke("desktop:show-in-folder", filePath),
+  /** Reveal a user-chosen file or folder (e.g. a plugin install source). */
+  revealLocalPath: (filePath) => ipcRenderer.invoke("desktop:reveal-local-path", filePath),
   /** Open a web URL in the default browser. */
   openExternal: (url) => ipcRenderer.invoke("desktop:open-external", url),
   /** Ask where to save a bot-created file (inside ~/.botfleet), copy it

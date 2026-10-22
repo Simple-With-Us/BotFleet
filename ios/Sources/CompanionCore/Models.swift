@@ -962,6 +962,8 @@ public struct ConfigStatus: Codable, Sendable {
     /// `simple` or `projects`.  Absent means simple.  A leftover `fleet`
     /// value is treated as projects.
     public var conversationMode: String?
+    /// `queue` or `steer`.  Absent means steer-first (legacy harness behavior).
+    public var busySendDefault: String?
     public var sidebarSectionOrder: [String]?
     /// Enable Automatic Update Checks.  Absent on a harness that predates
     /// the desktop updater, which is not the same as off.

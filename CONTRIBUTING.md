@@ -10,6 +10,8 @@ BotFleet uses [Kody](https://kodus.io) for automated pull-request review.  **Fle
 
 This repo's root **`kodus-config.yml`** only overrides review behavior for BotFleet (for example severity filters and request-changes settings).  Leave it in place unless you are intentionally changing how Kody behaves on BotFleet PRs.
 
+Kody re-reviews the **entire diff** on each push, so an open PR can accumulate new threads even after you fix earlier ones.  Treat findings as **advisory**: verify against current HEAD, and use human judgment on security, billing, and release-path comments.  Maintainers and fleet agents follow the **per-PR stop rule** documented in [`docs/decisions/2026-10-15-kody-review-stop-rule.md`](docs/decisions/2026-10-15-kody-review-stop-rule.md) — fix real issues in one or two triage rounds, then document accepted risk for anything left instead of chasing zero-unresolved forever.
+
 ## Ground rules
 
 - **Small, focused PRs.** One concern per PR. A PR that ports a platform *and* adds a feature *and*

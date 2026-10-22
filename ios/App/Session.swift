@@ -1044,7 +1044,13 @@ final class Session: ObservableObject {
     }
 
     @discardableResult
-    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> MessageSendOutcome {
+    func send(
+        _ text: String,
+        to chat: Chat,
+        attachments: [PendingChatAttachment] = [],
+        recording: (data: Data, transcript: String)? = nil,
+        busyDelivery: String? = nil
+    ) async -> MessageSendOutcome {
         guard let client else { return MessageSendOutcome(ok: false, clientNonce: "") }
         var clientNonce = ""
         do {
@@ -1093,7 +1099,8 @@ final class Session: ObservableObject {
                         toBot: bot.id,
                         threadId: threadId,
                         idempotencyKey: localId,
-                        recording: savedRecording
+                        recording: savedRecording,
+                        busyDelivery: busyDelivery
                     )
                     if result.queued == true, let queueId = result.queueId, !queueId.isEmpty {
                         let dest = result.threadId ?? bot.threadId
@@ -2653,6 +2660,21 @@ final class Session: ObservableObject {
     }
 
     @MainActor
+    func updateBusySendDefault(_ busySendDefault: String) async -> ConfigStatus? {
+        guard let client else { return nil }
+        do {
+            let status = try await client.updateBusySendDefault(busySendDefault)
+            config = status
+            return status
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+            return nil
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+    }
+
     func updateConversationMode(_ conversationMode: String, mergeThreads: Bool = false) async -> ConfigStatus? {
         pendingConversationMode = conversationMode
         pendingConversationMergeThreads = mergeThreads

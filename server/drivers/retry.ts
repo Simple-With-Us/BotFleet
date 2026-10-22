@@ -86,6 +86,8 @@ const TRANSIENT_PATTERNS: Array<{ pattern: RegExp; reason: TransientReason }> = 
       /\b(?:econnreset|econnrefused|epipe|etimedout|eai_again|connection reset|connection refused|socket hang up|network error|fetch failed)\b/i,
     reason: "connection_reset",
   },
+  // MiniMax Code runtime turn lock left behind by an aborted predecessor (BOTFLEET-2K).
+  { pattern: /\block file\b.*\balready being held\b/i, reason: "connection_reset" },
   { pattern: /\btimeout(ed)?\b|\btimed? out\b/i, reason: "timeout" },
 ];
 

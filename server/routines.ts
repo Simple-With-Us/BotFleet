@@ -288,6 +288,9 @@ export interface RoutineManagerOptions {
   webhookHotDeferMaxMs?: () => number;
   /** One-line operational log.  Absent writes with `console.log`. */
   log?: (line: string) => void;
+  /** When a queued run can never succeed on the bot's engine for this prompt
+   *  (capability gate `refuse`), settle it as skipped instead of holding forever. */
+  incapableRun?: (run: RoutineRun) => { reason: string } | undefined;
   /** Per-run readiness gate.  False leaves the durable run queued; callers
    * invoke tick() again when the missing runtime prerequisite arrives. */
   canStart?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => boolean;
@@ -1434,6 +1437,11 @@ export class RoutineManager {
             }
           }
         }
+        const incapable = this.options.incapableRun?.(run);
+        if (incapable) {
+          this.skipIncapable(run, incapable.reason);
+          continue;
+        }
         // Gate before creating, activating, or stamping a task.  A missing
         // runtime credential may take many scheduler ticks to arrive; those
         // retries must not mint duplicate empty tasks as a side effect.
@@ -1814,6 +1822,17 @@ export class RoutineManager {
     run.failurePhase = "lifecycle";
     run.finishedAt = this.now();
     if (emit) this.emitRun(run);
+  }
+
+  /** Engine can never run this queued prompt — record and drop, do not hold. */
+  private skipIncapable(run: RoutineRun, reason: string, emit = true): void {
+    this.leaveQueued(run, "failed");
+    run.error = reason.slice(0, 500);
+    run.outcomeCode = "skipped_incapable";
+    run.failurePhase = "dispatch";
+    run.finishedAt = this.now();
+    if (emit) this.emitRun(run);
+    this.save();
   }
 
   /** Whether the bot this run targets is switched Off. */

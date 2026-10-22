@@ -370,6 +370,37 @@ describe("windowsLabelFromHeadlines", () => {
   it("returns undefined for an empty window list", () => {
     expect(windowsLabelFromHeadlines([])).toBeUndefined();
   });
+
+  // These assert the RENDERED window names rather than the intermediate bucket.
+  // A bucket can classify correctly while the label the panel resolves from it
+  // is wrong, which is how a 5-hour session window came to read "Hourly" --
+  // and why a guard on the bucket alone would not have caught it.
+  /** What the panel paints for these raw window names.  `secondaryPercent`
+   *  stays null unless the case under test is genuinely a two-window engine,
+   *  so an unlabelled second window never shows up as the "Longer" fallback. */
+  function renderedLabels(windows: string[], secondaryPercent: number | null = null): string[] {
+    const label = windowsLabelFromHeadlines(
+      windowHeadlines(windows.map((window) => ({ label: "Token Plan", window, remainingPercent: 100, skip: false }))),
+    );
+    return quotaWindows(40, secondaryPercent, { windowsLabel: label }).map((w) => w.label);
+  }
+
+  it("resolves the compact '5hr' spelling to 5-Hour, not Hourly", () => {
+    expect(renderedLabels(["5hr", "Week"], 90)).toEqual(["5-Hour", "Weekly"]);
+  });
+
+  it("resolves every spelling of the 5-hour window the same way", () => {
+    for (const window of ["5h", "5hr", "5hrs", "5 hour", "5-hour"]) {
+      expect(renderedLabels([window])).toEqual(["5-Hour"]);
+    }
+  });
+
+  it("classifies bare durations into real periods instead of leaving them unlabelled", () => {
+    expect(renderedLabels(["7d"])).toEqual(["Weekly"]);
+    expect(renderedLabels(["2w"])).toEqual(["Weekly"]);
+    expect(renderedLabels(["30d"])).toEqual(["Monthly"]);
+    expect(renderedLabels(["24h"])).toEqual(["Daily"]);
+  });
 });
 
 describe("minimaxQuotaLine", () => {

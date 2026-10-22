@@ -406,7 +406,10 @@ describe("WebhookManager", () => {
     expect(() => h.manager.receive(webhook.endpointId, secret, { payload: { overflow: true }, eventName: "push" })).toThrow("rate limit");
   });
 
-  it("pre-filters out-of-scope Sentry warnings and pending GitHub compile runs at ingress", () => {
+  // One matrix over ingress filters: dozens of triggers and receives, each
+  // compiling scope regexes and persisting attempt rows.  Windows CI runners
+  // can exceed the default 20s budget under full-suite load.
+  it("pre-filters out-of-scope Sentry warnings and pending GitHub compile runs at ingress", { timeout: 120_000 }, () => {
     const h = harness();
     const { webhook: sentryHook, secret: sentrySecret } = h.manager.create({
       name: "Sentry Incident Webhook → Fixer",

@@ -194,9 +194,11 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
     expect(done).toMatchObject({ turnId, ok: true, usage: { input: 7, output: 3, cachedInput: 4 } });
     const text = JSON.stringify(recorder.events);
-    for (const marker of ["HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED", "9999"]) {
+    for (const marker of ["HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED"]) {
       expect(text).not.toContain(marker);
     }
+    // Helper fixture uses inputTokens 9999; a random main-thread turnId must not trip this.
+    expect(text).not.toContain('"inputTokens":9999');
     // the main thread's own turn is intact, in order, with the helper's one
     // host step nested under the spawn_agent row
     expect(recorder.events.map((e) => e.type)).toEqual([
@@ -231,21 +233,21 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(spawn).toMatchObject({ title: "spawn_agent", toolKind: "task" });
     expect((spawn as { parentItemId?: string }).parentItemId).toBeUndefined();
     const helperStep = recorder.events.find((e) => e.type === "item.started" && e.itemId === "h1");
-    expect(helperStep).toMatchObject({ title: "HELPER COMMAND", parentItemId: "spawn-1" });
+    expect(helperStep).toMatchObject({ title: "HELPER COMMAND", parentItemId: "spawn-1", subagentId: "spawn-1" });
     expect(recorder.events.some((e) => e.type === "item.completed" && e.itemId === "h1")).toBe(true);
     // the main thread's own steps stay at the margin
     const own = recorder.events.find((e) => e.type === "item.started" && e.itemId === "i1");
     expect((own as { parentItemId?: string }).parentItemId).toBeUndefined();
   });
 
-  it("reports emulated background jobs and no helpers", async () => {
+  it("reports emulated background jobs and typed helpers", async () => {
     await create();
     // jobs P2: the job tools ride the MCP server Codex already mounts.  The
     // job process is spawned by the harness, not by Codex, so it is NOT inside
     // the codex sandbox — the approval card is what stands between a Codex bot
     // and a job, and a full-auto Codex bot is under ruling (c) instead.
     expect(instance.adapter.capabilities.backgroundJobs).toBe("emulated");
-    expect(instance.adapter.capabilities.helpers).toBe("none");
+    expect(instance.adapter.capabilities.helpers).toBe("typed");
   });
 
   it("files a step's own input (not its outcome fields) for the side store", async () => {

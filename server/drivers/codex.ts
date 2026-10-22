@@ -579,7 +579,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           itemType: "tool",
           itemId: item.id,
           title,
-          ...(parentItemId === undefined ? {} : { parentItemId }),
+          ...(parentItemId === undefined ? {} : { parentItemId, subagentId: parentItemId }),
           ...toolFields(title, item, { cwd: turn.cwd }),
           ...captureInput(codexItemInput(item)),
         });
@@ -1064,7 +1064,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // owner's full-auto ruling (b) instead — which is exactly the trade
         // the decision doc records for Codex.
         backgroundJobs: "emulated",
-        helpers: "none",
+        // Typed: a helper's steps name the spawn_agent call that started
+        // them, and the chat draws that call as a helper card (jobs P3).
+        helpers: "typed",
         // on-request approvals arrive as request.opened; a full-auto
         // instance (approvalPolicy "never") asks nothing unless held
         reviewHook: config.fullAuto ? "after" : "before",

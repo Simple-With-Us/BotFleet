@@ -646,17 +646,21 @@ describe("ACP turns (fake CLI)", () => {
   });
 
   it("keeps a turn alive past the idle window as long as it keeps streaming", async () => {
-    process.env.FAKE_ACP_DRIP_MS = "30";
-    process.env.FAKE_ACP_DRIP_COUNT = "8";
-    // each gap (30 ms) is well under the idle window (150 ms), but the
-    // whole turn (8 * 30 ms = 240 ms) runs well past it — proving renewal,
-    // not just a generous deadline
-    await create(GrokAgentDriver, "drip", { promptIdleMs: 150 });
+    // macOS CI runners can coalesce short timers; keep the same proof on every
+    // OS with wider margins on darwin only.
+    const promptIdleMs = process.platform === "darwin" ? 450 : 150;
+    const dripMs = process.platform === "darwin" ? 50 : 30;
+    const dripCount = process.platform === "darwin" ? 12 : 8;
+    process.env.FAKE_ACP_DRIP_MS = String(dripMs);
+    process.env.FAKE_ACP_DRIP_COUNT = String(dripCount);
+    // each gap is well under the idle window, but the whole turn runs well
+    // past it — proving renewal, not just a generous deadline
+    await create(GrokAgentDriver, "drip", { promptIdleMs });
     await instance.adapter.sendTurn({ threadId: "t-idle-drip", text: "keep talking" });
 
     const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
     expect(done).toMatchObject({ ok: true });
-    expect(recorder.events.filter((event) => event.type === "content.delta")).toHaveLength(8);
+    expect(recorder.events.filter((event) => event.type === "content.delta")).toHaveLength(dripCount);
     expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
   });
 

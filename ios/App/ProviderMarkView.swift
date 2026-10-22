@@ -16,24 +16,7 @@ struct ProviderMarkView: View {
     var size: CGFloat = 20
 
     static func resolvedDriverKind(for driverKind: String, model: String?) -> String {
-        // Antigravity runs Gemini-family and Claude-family models, but the
-        // provider is still Antigravity. Keep the driver identity for both
-        // its mark and VoiceOver label instead of renaming it from model text.
-        if driverKind == "antigravity" || driverKind == "antigravityAgent" { return driverKind }
-        // DeepSeek Harness and MiniMax Code also keep their distinct driver identities
-        // so that model keywords (e.g. "minimax" or "deepseek") do not clobber them.
-        if driverKind == "dsh" || driverKind == "dshAgent" { return driverKind }
-        if driverKind == "mcode" || driverKind == "mcodeAgent" { return driverKind }
-        guard let model = model?.lowercased() else { return driverKind }
-        if model.contains("minimax") { return "minimax" }
-        if model.contains("qwen") { return "qwenAgent" }
-        if model.contains("hermes") { return "hermesAgent" }
-        if model.contains("claude") { return "claude" }
-        if model.contains("deepseek") { return "deepseek" }
-        if model.contains("gpt") || model.contains("o1") || model.contains("o3") || model.contains("o4") { return "openai" }
-        if model.contains("antigravity") { return "antigravity" }
-        if model.contains("gemini") { return "gemini" }
-        return driverKind
+        ProviderMarkRouting.resolvedDriverKind(for: driverKind, model: model)
     }
 
     private var effectiveDriverKind: String {
@@ -177,14 +160,14 @@ extension View {
     /// chat header and message rows use, for a bot answering in its own
     /// thread.  Draws nothing when the engine is unknown (a cold roster), so
     /// the avatar is left as it was.  Apply it to every bot avatar.
-    func providerBadge(for bot: Bot, avatarSize: CGFloat) -> some View {
-        modifier(ProviderBadge(bot: bot, avatarSize: avatarSize))
+    func providerBadge(for bot: Bot, inThread threadId: String? = nil, avatarSize: CGFloat) -> some View {
+        modifier(ProviderBadge(bot: bot, threadId: threadId ?? bot.threadId, avatarSize: avatarSize))
     }
 
     /// A chat's avatar: a bot gets the mark, a room (many bots, no single
     /// model) gets nothing.
     func providerBadge(for chat: Chat?, avatarSize: CGFloat) -> some View {
-        modifier(ProviderBadge(bot: chat?.bot, avatarSize: avatarSize))
+        modifier(ProviderBadge(bot: chat?.bot, threadId: chat?.threadId, avatarSize: avatarSize))
     }
 }
 
@@ -197,6 +180,9 @@ private extension Chat {
 
 private struct ProviderBadge: ViewModifier {
     let bot: Bot?
+    /// The conversation thread whose task override applies, not always
+    /// `bot.threadId` when navigation holds a task thread open.
+    let threadId: String?
     let avatarSize: CGFloat
     @EnvironmentObject private var session: Session
 
@@ -208,7 +194,8 @@ private struct ProviderBadge: ViewModifier {
     func body(content: Content) -> some View {
         content.overlay(alignment: .bottomTrailing) {
             if let bot,
-               let selection = MessageRow.modelSelection(of: bot, inThread: bot.threadId),
+               let threadId,
+               let selection = MessageRow.modelSelection(of: bot, inThread: threadId),
                let driverKind = session.instanceDriverKinds[selection.instanceId] {
                 ProviderMarkView(driverKind: driverKind, model: selection.model, size: diameter)
                     .offset(x: 3, y: 3)

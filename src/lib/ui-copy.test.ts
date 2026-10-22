@@ -119,7 +119,15 @@ describe("Settings Models layout", () => {
     expect(models!.text).toContain("flex-[1_1_16rem]");
     expect(models!.text).not.toContain("grid-cols-[minmax(0,1.1fr)");
     expect(models!.text).not.toContain("&nbsp;");
-    expect(picker!.text).toContain('contained && !label && "w-full min-w-0 justify-between"');
+    // Settings stacks the picker: label on its own line, trigger full width
+    // beneath it. The row layout this replaced squeezed the label and its
+    // subtitle into a narrow column beside the trigger, so "Primary Model"
+    // wrapped to two lines and the subtitle broke into a five-word ribbon at
+    // every desktop width. Assert the STACK, not the old className string, so
+    // the guard survives a restyle of either half.
+    expect(picker!.text).toContain("flex flex-col gap-3");
+    expect(picker!.text).toContain('contained ? "w-full min-w-0 justify-between');
+    expect(picker!.text).not.toContain('flex items-center justify-between gap-4');
     // picking a new primary keeps the bot's fallback chain: the picker commits
     // pickedSelection, which builds on selectionForPick and copies the
     // fallbacks across. The behavior itself is covered in model-pick.test.ts

@@ -61,7 +61,10 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.match(shipScript, /organization not found\|embedded in token/);
   assert.match(shipScript, /mint an org token for/);
   const ci = read(".github/workflows/ci.yml");
-  assert.match(ci, /\|\| 'xcode-27' \}\}/);
+  // The unsigned build is a literal xcode-27 job.  The old runner ternary
+  // (`ubuntu-latest` or `xcode-27`) was the echo fast path.
+  assert.match(ci, /^ {4}runs-on: xcode-27$/m);
+  assert.doesNotMatch(ci, /\|\| 'xcode-27' \}\}/);
   assert.match(ci, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
   assert.match(yml, /fetch-depth:\s*0/);
   assert.match(yml, /cancel-in-progress:\s*false/);

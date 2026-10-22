@@ -1309,20 +1309,27 @@ export const ENGINE_DISPLAY_ORDER: string[] = [
 
 /** Access surface shown in the matrix.  Billing stays in `pricing`; it cannot
  *  be inferred from access because MiniMax API uses a subscription-backed API
- *  key while Muse Code is a CLI with the same kind of account billing. */
+ *  key while Muse Code is a CLI with the same kind of account billing.
+ *
+ *  This column answers "how does BotFleet reach this engine", so it names the
+ *  driver BotFleet actually ships — not every surface the vendor sells.  Two
+ *  labels used to advertise the vendor instead: Grok read "CLI + API" when
+ *  the only Grok driver in the tree is `drivers/acp/grok.ts`, and Clutch
+ *  (`deepseek-harness`) read "API" because DeepSeek meters over an API.  DeepSeek
+ *  being billed per token says what the money is, not how the turn is run —
+ *  Clutch runs its harness CLI, the same as every other CLI engine here. */
 export function engineAccessLabel(entry: EngineCapabilityEntry): string {
   switch (entry.id) {
-    case "grok":
-      return "CLI + API";
-    case "deepseek-harness":
     case "minimax":
     case "openai-compat":
     case "box":
       return "API";
+    case "grok":
     case "cursor":
     case "claude":
     case "codex":
     case "antigravity":
+    case "deepseek-harness":
     case "mcode":
     case "muse":
     case "kimi":

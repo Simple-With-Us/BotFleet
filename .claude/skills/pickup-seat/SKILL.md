@@ -50,7 +50,7 @@ state: WIP
 do-not: double-work these lanes"
 ```
 
-Put the same claim on THE BOARD (`board claim` or `board comment`) **and** on the live effort board + `docs/EFFORT-LOG.md`.  Live-only rows have been lost before.
+Put the same claim on Linear (`board claim` or `board comment`) **and** a Zulip post in the work topic.  Effort logs are archived — do not edit them.
 
 If they used `FLEET` incorrectly, do not echo it.  Directed `<SEAT>` is enough.
 
@@ -91,7 +91,7 @@ Answer disambiguation pings fast.  Cede lanes the returning seat re-claims, espe
 
 ## CLOSE OUT
 
-`closeout` skill: both effort boards, THE BOARD resolution, `docs/rollouts/YYYY-MM-DD-pickup-<seat>-cap.md`, Apple Note `[APP, Monet] pickup <seat> cap`, Slack summary.  Correct premature claims in place.  Never delete their row.
+`closeout` skill: Linear resolution, `docs/rollouts/YYYY-MM-DD-pickup-<seat>-cap.md`, Apple Note `[APP, Monet] pickup <seat> cap`, Slack summary.  Correct premature claims in place on Linear.
 
 ## Canon
 

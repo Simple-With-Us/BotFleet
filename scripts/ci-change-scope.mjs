@@ -26,7 +26,16 @@ export function isIosPath(path) {
   // ci.yml is the only place the `ios` job is defined -- there is no
   // separate ios-ci.yml the way packaging has package-linux.yml -- so a
   // workflow edit here can change the job itself, not just build scripts.
-  return path === ".github/workflows/ci.yml" || path.startsWith("ios/") || path.startsWith("scripts/ios-");
+  // The required check replays this classifier and scripts/ci-ios-gate.mjs.
+  // Those two files are iOS paths so a change to the proof cannot take the
+  // skip path and approve itself.
+  return (
+    path === ".github/workflows/ci.yml" ||
+    path === "scripts/ci-change-scope.mjs" ||
+    path === "scripts/ci-ios-gate.mjs" ||
+    path.startsWith("ios/") ||
+    path.startsWith("scripts/ios-")
+  );
 }
 
 export function isPackagingPath(path) {
@@ -39,10 +48,6 @@ export function isPackagingPath(path) {
     path.startsWith("scripts/prepare-") ||
     path.startsWith("scripts/package-")
   );
-}
-
-export function isControlPlanePath(path) {
-  return path.startsWith("cloudflare/");
 }
 
 /** The Mac pre-merge packaging gate (scripts/mac-package-gate.mjs) reuses
@@ -80,7 +85,6 @@ export function classifyCIPaths(paths) {
     docsOnly: hasChanges && changedPaths.every(isDocumentationPath),
     iosChanged: !hasChanges || changedPaths.some(isIosPath),
     packagingChanged: !hasChanges || changedPaths.some(isPackagingPath),
-    controlPlaneChanged: !hasChanges || changedPaths.some(isControlPlanePath),
   };
 }
 
@@ -97,8 +101,7 @@ function main() {
     `docs_only=${result.docsOnly}\n` +
       `changed_count=${result.changedCount}\n` +
       `ios_changed=${result.iosChanged}\n` +
-      `packaging_changed=${result.packagingChanged}\n` +
-      `control_plane_changed=${result.controlPlaneChanged}\n`,
+      `packaging_changed=${result.packagingChanged}\n`,
   );
 }
 

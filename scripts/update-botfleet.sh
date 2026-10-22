@@ -478,6 +478,7 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
           scripts/update-progress.mjs \
           scripts/ci-build-resolver.mjs \
           scripts/stage-entries.mjs \
+          scripts/failed-install-retention.mjs \
           electron/update-credential-preparation.mjs | tar -x -C "$BOOTSTRAP_DIR"; then
         PINNED_ARGS=()
         if [[ "${1:-update}" != "apply" && "${1:-update}" != "unquiesce" ]]; then

@@ -125,7 +125,10 @@ describe("EngineCapabilitiesMatrix orientation", () => {
   });
 
   it("renders an access pill for every engine without conflating billing", () => {
-    expect(html).toContain("CLI + API");
+    // Every engine reads CLI or API. "CLI + API" is gone: no engine in the
+    // registry has two drivers, so the compound label described a vendor
+    // surface BotFleet cannot reach rather than one it runs.
+    expect(html).not.toContain("CLI + API");
     expect(html).toContain("CLI");
     expect(html).toContain("API");
     expect(html).not.toContain("Subscription");

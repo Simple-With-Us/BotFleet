@@ -527,7 +527,10 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
       ],
     });
     expect(entry.providerKinds).toEqual(["deepseekAgent", "muse", "minimax"]);
-    expect(engineAccessLabel(entry)).toBe("API");
+    // Clutch reaches DeepSeek, Muse and MiniMax over its own harness CLI, so
+    // access reads CLI.  The API rates asserted below are what the turn is
+    // BILLED at — a separate column, and the reason this test exists.
+    expect(engineAccessLabel(entry)).toBe("CLI");
     expect(entry.capabilities.imageAttachments).toBe("yes");
     const copy = [
       entry.pricing.notes ?? "",
@@ -551,7 +554,9 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
   });
 
   it("keeps access separate from billing", () => {
-    expect(engineAccessLabel(ENGINE_CAPABILITIES.grok)).toBe("CLI + API");
+    // Access names the driver BotFleet ships, so an engine whose only driver
+    // is a harness CLI reads "CLI" even when the vendor also sells an API.
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.grok)).toBe("CLI");
     expect(engineAccessLabel(ENGINE_CAPABILITIES.minimax)).toBe("API");
     expect(engineAccessLabel(ENGINE_CAPABILITIES.mcode)).toBe("CLI");
     expect(engineAccessLabel(ENGINE_CAPABILITIES.muse)).toBe("CLI");

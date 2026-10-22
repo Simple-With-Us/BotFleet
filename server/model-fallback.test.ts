@@ -32,6 +32,8 @@ import {
   type FallbackScanMessage,
   unattendedModelDowngrade,
 } from "./model-fallback.ts";
+import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
+import { withoutModelsTooNewForCli } from "./model-lineage.ts";
 import { eligibleAutoFallbackChain, type AutoFallbackCandidate } from "./turn-safety.ts";
 import { doomedDispatches } from "./doomed-dispatch.ts";
 import { MODEL_REJECTION_TTL_MS, ModelRejectionRegistry, modelRejections } from "./model-rejections.ts";
@@ -564,6 +566,28 @@ describe("AUTO_FALLBACK_PRIORITY — #90 auto-failover ordering", () => {
   it("still prefers codex over minimax — the ladder is codex, then minimax, then openaiCompat", () => {
     expect(pick(["openaiCompat", "minimax", "codex"])).toBe("codex");
     expect(pick(["openaiCompat", "minimax"])).toBe("minimax");
+  });
+
+  it("trims Claude defaults the detected CLI is too old to run before picking failover", () => {
+    const cliVersion = "2.1.279";
+    const described: AutoFallbackCandidate = {
+      instanceId: "claude",
+      driverKind: "claudeAgent",
+      snapshot: { state: "available", authenticated: true },
+      models: STATIC_CLAUDE_MODELS,
+    };
+    const runnable = {
+      ...described,
+      models: withoutModelsTooNewForCli(described.driverKind!, STATIC_CLAUDE_MODELS, cliVersion),
+    };
+    const chain = eligibleAutoFallbackChain([runnable], {
+      botId: "bot-1",
+      currentInstanceId: "codex",
+      isCooling: () => false,
+      priority: AUTO_FALLBACK_PRIORITY,
+    });
+    expect(chain[0]?.model).toBe("claude-sonnet-5");
+    expect(chain[0]?.model).not.toBe("claude-sonnet-5-5");
   });
 
   it("leaves every existing CLI ordering unchanged: claude, antigravity, gemini, codex, openaiCompat, grok", () => {

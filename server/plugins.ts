@@ -72,6 +72,9 @@ export interface PluginRuntimeInputs {
   /** Receives allow-listed structured events only.  No event carries
    *  plugin-supplied text; see PluginLogEvent. */
   logger(event: PluginLogEvent): void;
+  /** Configured Zulip realm origin.  Used only to allow the shipped
+   *  Zulip plugin to reach that host.  Absent when Zulip is not configured. */
+  zulipRealm?(): string | undefined;
 }
 
 let runtimeInputs: PluginRuntimeInputs | null = null;
@@ -101,6 +104,11 @@ export function matchPluginActionRoute(path: string): { name: string; action: Pl
  *  server boot from server/index.ts. */
 export function initPluginRuntime(inputs: PluginRuntimeInputs): void {
   runtimeInputs = inputs;
+}
+
+function zulipRealmOption(): { zulipRealm?: string } {
+  const realm = runtimeInputs?.zulipRealm?.();
+  return realm ? { zulipRealm: realm } : {};
 }
 
 function inputsOrThrow(): PluginHostInputs {
@@ -135,7 +143,7 @@ async function liveSandbox(listing: PluginListing, baseDir: string): Promise<Loa
   if (inflight) return inflight;
   const attempt = (async () => {
     await dropLoaded(listing.name);
-    const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
+    const result = await loadPlugin(listing, inputsOrThrow(), baseDir, zulipRealmOption());
     if ("error" in result) return result;
     loaded.set(listing.name, result);
     return result;
@@ -347,7 +355,7 @@ export async function enablePlugin(
   }
 
   if (!loaded.has(name)) {
-    const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir);
+    const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir, zulipRealmOption());
     if ("error" in loaded_) return { error: loaded_.error };
     loaded.set(name, loaded_);
   }
@@ -476,7 +484,7 @@ export async function updatePlugin(
   if (wasEnabled) {
     const refreshed = listingOrError(name, baseDir);
     if (!("error" in refreshed)) {
-      const loaded_ = await loadPlugin(refreshed, inputsOrThrow(), baseDir);
+      const loaded_ = await loadPlugin(refreshed, inputsOrThrow(), baseDir, zulipRealmOption());
       if ("error" in loaded_) {
         warnPluginEvent("plugins.update.disabled", name, "reload_failed");
         const current = readRegistry(baseDir).plugins[name];
@@ -524,7 +532,7 @@ export async function reloadPlugin(
   await dropLoaded(name);
   const registry = readRegistry(baseDir);
   if (registry.plugins[name]?.enabled) {
-    const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir);
+    const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir, zulipRealmOption());
     if ("error" in loaded_) return { error: loaded_.error };
     loaded.set(name, loaded_);
   }
@@ -641,7 +649,7 @@ export async function bootPluginRuntime(baseDir: string = PLUGINS_DIR): Promise<
       trySetPluginEntry({ ...entry, enabled: false }, baseDir);
       continue;
     }
-    const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
+    const result = await loadPlugin(listing, inputsOrThrow(), baseDir, zulipRealmOption());
     if ("error" in result) {
       // loadPlugin already logged the sandbox's stable reason code.
       warnPluginEvent("plugins.boot.disabled", name, "load_failed");

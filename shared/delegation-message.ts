@@ -72,3 +72,47 @@ export function delegationMessageView(
 
   return null;
 }
+
+/** A row the live line can read without taking the whole transcript type. */
+export interface DelegationProgressRow {
+  role: "user" | "system" | "bot";
+  kind?: string;
+  tool?: { name?: string; target?: string };
+  job?: unknown;
+}
+
+/** What the delegation card says while the bot does the work, and once it
+ * has answered.  The scan stops at the next thing a person sent. */
+export function delegationLiveLine(
+  rows: readonly DelegationProgressRow[],
+  index: number,
+  busy: boolean,
+): string | undefined {
+  if (index < 0 || index >= rows.length) return undefined;
+  let tools = 0;
+  let last = "";
+  let replied = false;
+  for (let i = index + 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.role === "user") break;
+    if (row.role === "system" && row.kind !== "activity") break;
+    if (row.kind === "text" && row.role === "bot") {
+      replied = true;
+      continue;
+    }
+    if (row.kind !== "activity" || !row.tool || row.job) continue;
+    const name = row.tool.name ?? "";
+    if (name.startsWith("error:") || name.startsWith("notice:") || name.startsWith("retrying")) continue;
+    tools += 1;
+    const step = row.tool.target?.trim() || name.trim();
+    if (step) last = step;
+  }
+  if (busy) {
+    if (!last && tools === 0) return "Working";
+    const count = `${tools} ${tools === 1 ? "tool" : "tools"}`;
+    return last ? `Working · ${last} · ${count}` : `Working · ${count}`;
+  }
+  if (!replied && tools === 0) return undefined;
+  if (tools === 0) return "Done";
+  return `Done · ${tools} ${tools === 1 ? "tool" : "tools"}`;
+}

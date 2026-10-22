@@ -64,12 +64,31 @@ git merge-base --is-ancestor <fix-sha> origin/main && echo "on main" || echo "NO
 
 If NOT on main, open a follow-up PR from the same branch.  Expect squash-merge conflicts — merge main in; this branch's newer rounds win in its own files.
 
-## 6. Stop at round 2–3
+## 6. Per-PR stop rule (rounds 1–2, then accepted risk)
 
-Later rounds on a merged PR are mostly noise.  Triage genuine hazards; surface the rest to the owner (Notes + board comment).  the agent's job on these is the security/contract read, not infinite bot ping-pong.
+Kody and similar bots **re-review the whole diff on every push**.  Zero-unresolved threads is not a
+terminating merge bar — each fix push can open a fresh batch (BF-1997).
+
+**Round 1:** classify all unresolved threads against HEAD; batch-fix **real** items; reply + resolve
+addressed and false positives.  **Push before resolving** (section 5).
+
+**Round 2:** only for threads opened on the round-1 head (group by
+`comments.nodes[0].commit.oid`).  Same batch-fix discipline.
+
+**Stop:** after round 2, do not chase convergence.  For each remaining thread, either merge with an
+explicit **accepted risk** note (why the finding is deferred, already mitigated elsewhere, or
+out of scope) or escalate money-path / release-path items to the owner.  Post accepted-risk
+summaries on the PR and, for fleet work, THE BOARD or Linear (BF-1997 canon).
+
+Kody findings are **advisory** — verify against HEAD; adversarially check critical paths before
+changing behavior (section 2).  Later rounds on an already-merged PR are mostly noise: triage
+genuine hazards; surface the rest via Apple Notes + board comment.
+
+Full decision: `docs/decisions/2026-10-15-kody-review-stop-rule.md`.
 
 ## Canon
 
 - `/Users/jay/apps/AGENT-SYNC.md` — Merge requirements
-- App `AGENTS.md` Pre-Commit / Handoff
+- App `AGENTS.md` — Kody Review Rules; Pre-Commit / Handoff
+- `docs/decisions/2026-10-15-kody-review-stop-rule.md` — stop rule evidence
 - Skills: `unstick-pr`, `land-lane`

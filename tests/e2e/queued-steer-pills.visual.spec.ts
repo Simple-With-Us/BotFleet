@@ -10,6 +10,7 @@ export const QueuedSendBodySchema = z
     text: z.string().optional(),
     replyToId: z.string().nullish(),
     threadId: z.string().optional(),
+    busyDelivery: z.enum(["queue", "steer"]).optional(),
   })
   .strict();
 // Inferred from the schema so the runtime check and the static type cannot
@@ -135,7 +136,25 @@ async function mockServer(page: Page) {
         json({ ok: true, queued: true, queueId: `q-${sends.length}`, threadId: QUEUE }, 202),
       );
     }
-    if (pathname === '/api/instances') return route.fulfill(json({ instances: [], describedAt: Date.now() }));
+    if (pathname === '/api/config' && method === 'GET') {
+      return route.fulfill(json({ busySendDefault: 'queue', terminology: 'channels' }));
+    }
+    if (pathname === '/api/instances') {
+      return route.fulfill(
+        json({
+          instances: [
+            {
+              instanceId: 'codex',
+              driverKind: 'codex',
+              snapshot: { state: 'available' },
+              models: { default: 'gpt', options: [] },
+              capabilities: { queueing: true },
+            },
+          ],
+          describedAt: Date.now(),
+        }),
+      );
+    }
     if (pathname === '/api/routines') return route.fulfill(json({ routines: [], runs: [] }));
     if (pathname === '/api/webhooks') return route.fulfill(json({ webhooks: [], attempts: [], ingress: {} }));
     if (pathname === '/api/resource-triggers') return route.fulfill(json({ triggers: [] }));
@@ -201,7 +220,25 @@ async function mockServerWithRoom(page: Page) {
         json({ ok: true, queued: true, queueId: `q-${sends.length}`, threadId: QUEUE }, 202),
       );
     }
-    if (pathname === '/api/instances') return route.fulfill(json({ instances: [], describedAt: Date.now() }));
+    if (pathname === '/api/config' && method === 'GET') {
+      return route.fulfill(json({ busySendDefault: 'queue', terminology: 'channels' }));
+    }
+    if (pathname === '/api/instances') {
+      return route.fulfill(
+        json({
+          instances: [
+            {
+              instanceId: 'codex',
+              driverKind: 'codex',
+              snapshot: { state: 'available' },
+              models: { default: 'gpt', options: [] },
+              capabilities: { queueing: true },
+            },
+          ],
+          describedAt: Date.now(),
+        }),
+      );
+    }
     if (pathname === '/api/routines') return route.fulfill(json({ routines: [], runs: [] }));
     if (pathname === '/api/webhooks') return route.fulfill(json({ webhooks: [], attempts: [], ingress: {} }));
     if (pathname === '/api/resource-triggers') return route.fulfill(json({ triggers: [] }));
@@ -288,6 +325,21 @@ test('visual: several queued pills stack without crowding out the composer', asy
     maxDiffPixelRatio: 0.02,
     threshold: 0.2,
     mask: queuedMask(page),
+  });
+});
+
+test('visual: busy send button shows queue affordance when default is queue', async ({ page }) => {
+  await mockServer(page);
+  const box = await openBusyBot(page);
+  await pinFonts(page);
+
+  await box.fill('hold this until the turn finishes');
+  const send = page.getByRole('button', { name: 'Queue Message (Alt+Click to Steer Now)' });
+  await expect(send).toBeVisible();
+  await expect(send).toHaveScreenshot('composer-busy-send-queue-default.png', {
+    ...stableShot,
+    maxDiffPixelRatio: 0.02,
+    threshold: 0.2,
   });
 });
 

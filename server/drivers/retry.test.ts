@@ -115,6 +115,13 @@ describe("classifyError", () => {
     });
   });
 
+  it("treats MiniMax Code lock-file contention as a transient connection collision", () => {
+    const msg = "MiniMax Code Runtime failed: Lock file is already being held";
+    expect(classifyError(new Error(msg))).toEqual({ transient: true, reason: "connection_reset" });
+    expect(classifyError({ text: msg })).toEqual({ transient: true, reason: "connection_reset" });
+    expect(classifyError({ exitCode: 1, stderr: msg })).toEqual({ transient: true, reason: "connection_reset" });
+  });
+
   it("keeps a per-minute TPM 429 transient and retryable, not quota", () => {
     // OpenAI's token-per-minute throttle opens with "Rate limit reached" but
     // clears in seconds ("Please try again in 6s").  Only a monthly, billing

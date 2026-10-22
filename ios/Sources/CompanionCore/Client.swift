@@ -744,6 +744,14 @@ public struct CompanionClient: Sendable {
         )
     }
 
+    public func updateBusySendDefault(_ busySendDefault: String) async throws -> ConfigStatus {
+        struct Body: Encodable { let busySendDefault: String }
+        return try await send(
+            try makeRequest("PATCH", "/api/busy-send-default", encodedBody: Body(busySendDefault: busySendDefault)),
+            as: ConfigStatus.self
+        )
+    }
+
     public func updateTerminology(
         _ terminology: String,
         custom: RoomLabels? = nil
@@ -1332,9 +1340,11 @@ public struct CompanionClient: Sendable {
         toBot botId: String,
         threadId: String,
         idempotencyKey: String,
-        recording: IncomingRecording? = nil
+        recording: IncomingRecording? = nil,
+        busyDelivery: String? = nil
     ) async throws -> SendMessageResult {
         var body: [String: Any] = ["text": text, "threadId": threadId, "idempotencyKey": idempotencyKey]
+        if let busyDelivery { body["busyDelivery"] = busyDelivery }
         if let recording {
             body["recording"] = ["path": recording.path, "mime": recording.mime,
                                  "transcript": recording.transcript, "engine": recording.engine]
