@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { botAvatarCropSchema, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
-import { BOT_PROFILE_LIMITS } from "../shared/bot-profile.ts";
+import { BOT_PROFILE_LIMITS, MAX_TOOL_ROUNDS } from "../shared/bot-profile.ts";
 import {
   CONNECTOR_SLUGS_MAX,
   CONNECTOR_SLUG_PATTERN,
@@ -34,6 +34,7 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "userNotes",
   "effort",
   "computers",
+  "maxToolRounds",
 ] as const;
 
 /** One service's grant, `{ tools: "*" }` for every tool Composio offers on
@@ -69,6 +70,14 @@ const connectorToolsSchema = z
   .refine((value) => Object.keys(value).length <= CONNECTOR_SLUGS_MAX, {
     error: `connectorTools may name at most ${CONNECTOR_SLUGS_MAX} services`,
   });
+
+
+/** Integer 1..MAX_TOOL_ROUNDS, else absent. Empty/null/invalid all mean unset. */
+export function resolveMaxToolRounds(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
+  if (value < 1 || value > MAX_TOOL_ROUNDS) return undefined;
+  return value;
+}
 
 const profilePatchSchema = z.object({
   name: z
@@ -110,6 +119,8 @@ const profilePatchSchema = z.object({
   userNotes: z.string().max(20000).optional(),
   effort: z.string().max(50).optional(),
   computers: z.array(z.enum(["cloud", "vm", "local"])).optional(),
+  // Integer 1..MAX_TOOL_ROUNDS kept; null/"" /invalid → undefined (absent).
+  maxToolRounds: z.any().optional(),
 });
 
 export type BotProfilePatchInput = z.input<typeof profilePatchSchema>;
@@ -139,6 +150,7 @@ export type BotProfilePatch = Partial<
     | "extraCwds"
     | "userNotes"
     | "computers"
+    | "maxToolRounds"
   >
 > & { effort?: string };
 
@@ -169,7 +181,7 @@ export function parseBotProfilePatch(input: BotProfilePatchInput, strict = false
     return { ok: false, error: issue?.message ?? "invalid profile patch" };
   }
 
-  const { avatarUrl, cwd, connectorTools, ...fields } = parsed.data;
+  const { avatarUrl, cwd, connectorTools, maxToolRounds: _maxToolRounds, ...fields } = parsed.data;
   const patch: BotProfilePatch = fields;
   if (avatarUrl !== undefined) patch.avatarUrl = avatarUrl || undefined;
   if (cwd !== undefined) patch.cwd = cwd || undefined;
@@ -178,5 +190,10 @@ export function parseBotProfilePatch(input: BotProfilePatchInput, strict = false
   // the request) leaves any existing grants alone — patchBot only touches
   // keys actually present on the patch object.
   if (connectorTools !== undefined) patch.connectorTools = connectorTools === null ? undefined : connectorTools;
+  // maxToolRounds: key present → resolve (null/"" /invalid become undefined
+  // clear); key absent → leave existing value alone.
+  if (Object.prototype.hasOwnProperty.call(parsed.data, "maxToolRounds")) {
+    patch.maxToolRounds = resolveMaxToolRounds(parsed.data.maxToolRounds);
+  }
   return { ok: true, patch };
 }

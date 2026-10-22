@@ -243,8 +243,31 @@ export interface SendTurnInput {
       result: string;
     }>;
   }>;
-  /** Bot persona (name/title/description) as a system prompt. */
+  /** Bot persona (name/title/description) as a system prompt.  Always the
+   *  whole prompt, every section in order, so a driver that has not adopted
+   *  the split below keeps sending exactly what it sent before. */
   system?: string;
+  /** `system` split at the sections that legitimately change
+   *  mid-conversation (memory, mentions; upstream also outstanding teammate
+   *  work and recent work): `systemStable` is everything else, `systemVolatile`
+   *  is those sections' text.  A driver that keeps one CLI process per thread
+   *  keys that process on the stable half, so a memory edit no longer
+   *  respawns the session and makes the provider re-cache the entire prompt;
+   *  the changed half is delivered inside the next turn instead.  Drivers
+   *  that rebuild their request every turn keep only the stable half in
+   *  their system message and carry the volatile half inside the newest user
+   *  message, so the resent prefix stays byte-identical.  Both are present
+   *  or neither is (see drivers/prompt-split.ts promptHalves). */
+  systemStable?: string;
+  systemVolatile?: string;
+  /** sha256 hex of `systemVolatile`, computed once by the server so a driver
+   *  comparing halves against a receipt need not hash the text itself. */
+  volatileDigest?: string;
+  /** True when this turn's user message tags teammates: the mentions part
+   *  of systemVolatile describes this turn even when its text is unchanged
+   *  from the previous turn, so digest-based delivery must not suppress the
+   *  note. */
+  mentionTurn?: boolean;
   /** Tool definitions the agent may call this turn, in OpenAI function-calling
    * shape.  An HTTP driver (MiniMax, OpenAI-compatible) hands these to the
    * model verbatim; a CLI driver that mounts MCP servers is free to ignore

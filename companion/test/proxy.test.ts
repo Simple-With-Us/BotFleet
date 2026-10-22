@@ -16,6 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createProxyHandler } from "../src/proxy.ts";
 import { createConnectedDeviceTracker } from "../src/connected-devices.ts";
 import type { CompanionEndpoint } from "../src/endpoints.ts";
+import { harnessReady } from "../../server/testing/harness-ready.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
@@ -158,7 +159,7 @@ beforeAll(async () => {
       // accepts but never answers hangs forever, and the loop below never
       // gets to notice its own deadline — which is how a boot failure ends up
       // reported as "hook timed out" with nothing else to go on.
-      if ((await fetch(`${HARNESS}/api/health`, { signal: AbortSignal.timeout(2_000) })).ok) break;
+      if (await harnessReady(HARNESS, 2_000)) break;
     } catch {
       /* not up yet */
     }
@@ -290,7 +291,9 @@ describe("the sidecar in front of an unmodified harness", () => {
   it("serves a minimal, non-cacheable companion health identity", async () => {
     const health = await device("GET", "/api/health", { token: null });
     expect(health.status).toBe(200);
-    expect(health.body).toEqual({ app: "botfleet" });
+    // Readiness crosses the tunnel because the harness answers health before
+    // it finishes booting; nothing else about the computer does.
+    expect(health.body).toEqual({ app: "botfleet", ready: true });
     expect(health.headers.get("cache-control")).toBe("private, no-store");
     expect(health.headers.get("cdn-cache-control")).toBe("no-store");
     expect(JSON.stringify(health.body)).not.toContain("pid");

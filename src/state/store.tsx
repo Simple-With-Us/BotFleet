@@ -306,6 +306,8 @@ export interface Bot {
   autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */
   alwaysAllow?: string[];
+  /** Ceiling on HTTP toolLoop rounds (MiniMax / Grok HTTP / openai-compat). Unset = 12. */
+  maxToolRounds?: number;
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
   /** this bot's own voice id (falls back to the app-wide one) */

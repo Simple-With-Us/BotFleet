@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { GrokDriver } from "./grok.ts";
+import { VOLATILE_CONTEXT_NOTE_PREFIX } from "./prompt-split.ts";
 
 const SSE_BODY = (text: string) =>
   [
@@ -229,6 +230,47 @@ describe("GrokDriver turns (fake fetch)", () => {
       tools: [{ type: "function", function: { name: "search", description: "Search files" } }],
     });
     expect(requestBodies[0].messages).toHaveLength(5);
+  });
+
+  it("heads the request with the stable half and carries the volatile half on the newest user message", async () => {
+    // Upstream PR #1758, HTTP half.  The system message is the head of the
+    // resent prefix, so a memory write must not move it; the volatile half
+    // rides the newest user message, every request, because the stored
+    // transcript never contains a delivered note.
+    script = [];
+    await create();
+    await instance.adapter.sendTurn({
+      threadId: "t-split",
+      system: "You are a test bot. Memory: likes tea.",
+      systemStable: "You are a test bot.",
+      systemVolatile: " Memory: likes tea.",
+      transcript: [
+        { role: "user", text: "earlier" },
+        { role: "assistant", text: "noted" },
+      ],
+      text: "Summarize it.",
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    expect(requestBodies).toHaveLength(1);
+    expect(requestBodies[0].messages).toEqual([
+      { role: "system", content: "You are a test bot." },
+      { role: "user", content: "earlier" },
+      { role: "assistant", content: "noted" },
+      { role: "user", content: `${VOLATILE_CONTEXT_NOTE_PREFIX}\n\nMemory: likes tea.\n\nSummarize it.` },
+    ]);
+    expect(JSON.stringify(requestBodies[0].messages[0])).not.toContain("likes tea");
+  });
+
+  it("keeps a legacy unsplit turn's whole prompt in the system message", async () => {
+    script = [];
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-unsplit", system: "You are a test bot. Memory: likes tea.", text: "hi" });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(requestBodies[0].messages).toEqual([
+      { role: "system", content: "You are a test bot. Memory: likes tea." },
+      { role: "user", content: "hi" },
+    ]);
   });
 
   it("keeps a final unterminated data line from the SSE stream", async () => {

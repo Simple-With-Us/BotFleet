@@ -529,6 +529,10 @@ export interface BotRecord {
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
+  /** Ceiling on model→tool rounds for HTTP toolLoop engines (MiniMax / Grok
+   * HTTP / openai-compat). Unset = DEFAULT_TURN_LOOP_BUDGET.maxRounds (12).
+   * Integer 1..200; invalid values are treated as absent at dispatch. */
+  maxToolRounds?: number;
   /** Speak this bot's replies aloud as they settle, without being asked.
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */

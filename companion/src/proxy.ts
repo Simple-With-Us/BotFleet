@@ -408,7 +408,14 @@ export function createProxyHandler(options: ProxyOptions) {
               return;
             }
             finished = true;
-            sendJson(res, 200, { app: "botfleet" });
+            // The harness opens its port before it finishes booting and
+            // answers health at 200 with `ready: false` until it has, while
+            // 503-ing every other route.  A phone told only "app: botfleet"
+            // would read that as a working Mac and fail on its first real
+            // request, so this one boolean crosses with it.  Still nothing
+            // identifying: no pid, no static.
+            const ready = (identity as { ready?: unknown } | null)?.ready !== false;
+            sendJson(res, 200, { app: "botfleet", ready });
           });
           return;
         }

@@ -5,7 +5,7 @@
 //
 // The fake CLI is a shebang script Windows cannot exec directly; spawnCli
 // resolves it to `node <script>`, so these run everywhere.
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,8 +22,10 @@ import {
   fetchPiModels,
   parsePiCatalog,
   PiDriver,
+  piStopReason,
   preferPiInjectRows,
   splitPiModel,
+  summarizeStderr,
 } from "./pi.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-pi-cli.ts");
@@ -193,6 +195,20 @@ describe("PiDriver catalog (fake CLI)", () => {
   });
 });
 
+/** True once `pid` is gone (signal 0 fails), false if it outlives the wait. */
+async function waitForExit(pid: number, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
 describe("PiDriver turns (fake CLI)", () => {
   let instance: ProviderInstance;
   let recorder: EventRecorder;
@@ -276,8 +292,97 @@ describe("PiDriver turns (fake CLI)", () => {
     await create("exit-early");
     const { turnId } = await instance.adapter.sendTurn({ threadId: "t-exit", text: "hi" });
     const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
-    expect(done).toMatchObject({ ok: false, stopReason: "failed" });
+    expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
+    expect(recorder.events.find((e) => e.type === "runtime.error")).toMatchObject({
+      message: expect.stringMatching(/^pi exited 1 before agent_end/),
+    });
     expect(instance.adapter.hasSession("t-exit")).toBe(false);
+  });
+
+  it("settles a refused model as model_refused, cleans up, and frees the thread", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-refused-"));
+    const dump = join(dir, "dump.jsonl");
+    await create("model-refused", { FAKE_PI_DUMP: dump });
+    // sendTurn resolves: a throw here used to leave the thread's active entry
+    // behind, so every later turn answered "a turn is already running"
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-refused",
+      text: "hi",
+      model: "openai/gpt-nope",
+      integrations: { composio: { command: "node", args: ["connector-proxy.js"], env: { COMPOSIO_KEY: "ck" } } },
+    });
+    const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId, 30_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "model_refused" });
+    expect(recorder.events.filter((e) => e.type === "turn.completed" && e.turnId === turnId)).toHaveLength(1);
+    expect(recorder.events.find((e) => e.type === "runtime.error" && e.turnId === turnId)).toMatchObject({
+      message: expect.stringContaining("pi refused the model openai/gpt-nope: pi set_model failed: Model not found"),
+    });
+    expect(instance.adapter.hasSession("t-refused")).toBe(false);
+
+    const rows = readFileSync(dump, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { pid?: number; mcpConfigPath?: string | null; prompt?: string });
+    // the prompt never went out on the wrong model
+    expect(rows.some((row) => row.prompt !== undefined)).toBe(false);
+    // the 0600 MCP config (credentials) is gone with the turn
+    const spawnRow = rows.find((row) => row.mcpConfigPath);
+    expect(spawnRow?.mcpConfigPath).toBeTruthy();
+    expect(existsSync(dirname(spawnRow!.mcpConfigPath!))).toBe(false);
+    // and the child is dead, not left running beside the thread
+    expect(await waitForExit(spawnRow!.pid!)).toBe(true);
+
+    // the thread takes a new turn
+    const second = await instance.adapter.sendTurn({ threadId: "t-refused", text: "again" });
+    const secondDone = await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId, 30_000);
+    expect(secondDone).toMatchObject({ ok: true, stopReason: "end_turn" });
+  });
+
+  it("drains a flooded stderr and settles exit_before_result with an excerpt, not a hang", async () => {
+    await create("stderr-flood");
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-flood", text: "hi" });
+    // 100 KB is past a pipe buffer: an undrained stderr blocks the child's
+    // write forever and only the 20-minute stall watchdog ends the turn
+    const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId, 30_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
+    const error = recorder.events.find((e) => e.type === "runtime.error" && e.turnId === turnId) as
+      | { message: string }
+      | undefined;
+    expect(error?.message).toMatch(/^pi exited 1 before agent_end: FATAL: provider stream exploded/);
+    expect(error?.message).toContain("characters omitted");
+    expect(error?.message).toContain("last words: giving up");
+    expect(error!.message.length).toBeLessThanOrEqual(2_000);
+    expect(instance.adapter.hasSession("t-flood")).toBe(false);
+  });
+
+  it("fails a lost session as resume_failed instead of prompting an empty context", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-resume-fail-"));
+    const dump = join(dir, "dump.jsonl");
+    await create("resume-fail", { FAKE_PI_DUMP: dump });
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-lost",
+      text: "remember what we said?",
+      resumeCursor: "/fake/pi-session-gone.json",
+    });
+    const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId, 30_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "resume_failed" });
+    expect(recorder.events.find((e) => e.type === "runtime.error" && e.turnId === turnId)).toMatchObject({
+      message: expect.stringContaining("The saved pi session could not be resumed"),
+    });
+    expect(recorder.events.some((e) => e.type === "session.started" && e.turnId === turnId)).toBe(false);
+    expect(instance.adapter.hasSession("t-lost")).toBe(false);
+    const rows = readFileSync(dump, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { prompt?: string });
+    expect(rows.some((row) => row.prompt !== undefined)).toBe(false);
+  });
+
+  it("reports a reply cut off at the token limit as max_tokens", async () => {
+    await create("length");
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-length", text: "hi" });
+    const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    expect(done).toMatchObject({ ok: true, stopReason: "max_tokens", usage: { input: 12, output: 4096 } });
   });
 
   it("surfaces a pi turn error instead of reporting an empty success", async () => {
@@ -535,6 +640,33 @@ describe("PiDriver turns (fake CLI)", () => {
     };
     expect(written.providers.omlx.baseUrl).toBe("http://127.0.0.1:8080/v1");
     expect(written.providers.omlx.models.some((m) => m.id === "MiniMax-M3-4bit")).toBe(true);
+  });
+});
+
+describe("piStopReason", () => {
+  it("maps pi-ai's length to max_tokens and keeps cancel and end_turn", () => {
+    expect(piStopReason("length")).toBe("max_tokens");
+    expect(piStopReason("cancelled")).toBe("cancelled");
+    expect(piStopReason("aborted")).toBe("cancelled");
+    expect(piStopReason("stop")).toBe("end_turn");
+    expect(piStopReason(undefined)).toBe("end_turn");
+  });
+});
+
+describe("summarizeStderr", () => {
+  it("returns short stderr whole", () => {
+    expect(summarizeStderr("boom\n", "", 5)).toBe("boom");
+  });
+
+  it("keeps the head and tail and counts what the bounded buffer dropped", () => {
+    const head = `ERROR first line\n${"a".repeat(4_000)}`;
+    const tail = `${"b".repeat(4_000)}\nfinal line`;
+    const total = head.length + 90_000 + tail.length;
+    const excerpt = summarizeStderr(head, tail, total);
+    expect(excerpt.startsWith("ERROR first line")).toBe(true);
+    expect(excerpt.endsWith("final line")).toBe(true);
+    const omitted = Number(/… (\d+) characters omitted …/.exec(excerpt)?.[1]);
+    expect(omitted).toBe(total - 400 - 200);
   });
 });
 

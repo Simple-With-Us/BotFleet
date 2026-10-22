@@ -3,6 +3,7 @@ import * as sentryAi from "../sentry-ai.ts";
 import { recordEvents } from "../testing/events.ts";
 import { startFakeOpenAiServer, type FakeOpenAiServer } from "../testing/fake-openai-server.ts";
 import { OpenAICompatDriver, sentryProviderForUrl } from "./openai-compat.ts";
+import { VOLATILE_CONTEXT_NOTE_PREFIX } from "./prompt-split.ts";
 
 describe("OpenAICompatDriver", () => {
   const savedUrl = process.env.OPENAI_COMPAT_URL;
@@ -716,6 +717,62 @@ describe("OpenAICompatDriver driver-owned tool loop", () => {
       );
       expect(total).toBeLessThan(80 * 5_000);
     } finally {
+      await instance.dispose();
+    }
+  });
+
+  it("heads the request with the stable half and carries the volatile half on the newest user message", async () => {
+    // Upstream PR #1758, HTTP half: the system message is the head of the
+    // resent prefix, so only the stable half belongs there, and the volatile
+    // half (memory, mentions) rides the newest user message every request.
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      }
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }));
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "openai-compat-split",
+      displayName: "Split Test",
+      enabled: true,
+      config: { url: "https://example.com/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "test-key" },
+      environment: {},
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-split",
+        system: "You are a test bot. Memory: likes tea.",
+        systemStable: "You are a test bot.",
+        systemVolatile: " Memory: likes tea.",
+        transcript: [{ role: "user", text: "earlier" }, { role: "assistant", text: "noted" }],
+        text: "Summarize it.",
+      });
+      await recorder.until((event) => event.type === "turn.completed");
+      const body = bodies.find((b: any) => Array.isArray(b.messages));
+      expect(body.messages).toEqual([
+        { role: "system", content: "You are a test bot." },
+        { role: "user", content: "earlier" },
+        { role: "assistant", content: "noted" },
+        { role: "user", content: `${VOLATILE_CONTEXT_NOTE_PREFIX}\n\nMemory: likes tea.\n\nSummarize it.` },
+      ]);
+
+      // a legacy unsplit turn keeps its whole prompt in the system message
+      await instance.adapter.sendTurn({ threadId: "t-unsplit", system: "You are a test bot. Memory: likes tea.", text: "hi" });
+      await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-unsplit");
+      const legacy = bodies.filter((b: any) => Array.isArray(b.messages)).at(-1);
+      expect(legacy.messages).toEqual([
+        { role: "system", content: "You are a test bot. Memory: likes tea." },
+        { role: "user", content: "hi" },
+      ]);
+    } finally {
+      recorder.stop();
       await instance.dispose();
     }
   });

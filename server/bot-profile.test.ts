@@ -4,7 +4,7 @@
 // so a future field cannot silently become remotely writable.
 import { describe, expect, it } from "vitest";
 
-import { parseBotProfilePatch } from "./bot-profile.ts";
+import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
 
 describe("parseBotProfilePatch (strict — the paired boundary)", () => {
   it("refuses unknown keys — strict means the allowlist IS the contract", () => {
@@ -142,5 +142,48 @@ describe("parseBotProfilePatch (connectorTools)", () => {
       ok: true,
       patch: { connectorTools: { gmail: { tools: "*" } } },
     });
+  });
+});
+
+describe("parseBotProfilePatch (maxToolRounds)", () => {
+  it("keeps an integer in 1..200", () => {
+    expect(parseBotProfilePatch({ maxToolRounds: 2 }, true)).toEqual({
+      ok: true,
+      patch: { maxToolRounds: 2 },
+    });
+    expect(parseBotProfilePatch({ maxToolRounds: 200 }, true)).toEqual({
+      ok: true,
+      patch: { maxToolRounds: 200 },
+    });
+    expect(parseBotProfilePatch({ maxToolRounds: 1 }, false)).toEqual({
+      ok: true,
+      patch: { maxToolRounds: 1 },
+    });
+  });
+
+  it("treats null, empty string, and invalid values as absent (clear)", () => {
+    for (const bad of [null, "", 0, -1, 201, 1.5, "12", true, {}, []]) {
+      expect(parseBotProfilePatch({ maxToolRounds: bad } as never, true), String(bad)).toEqual({
+        ok: true,
+        patch: { maxToolRounds: undefined },
+      });
+    }
+  });
+
+  it("omitting the field leaves it out of the patch — existing values stay", () => {
+    const result = parseBotProfilePatch({ name: "Mira" }, true);
+    expect(result.ok).toBe(true);
+    expect(result.ok && "maxToolRounds" in result.patch).toBe(false);
+  });
+});
+
+describe("resolveMaxToolRounds", () => {
+  it("accepts 1..200 integers and rejects everything else", () => {
+    expect(resolveMaxToolRounds(2)).toBe(2);
+    expect(resolveMaxToolRounds(12)).toBe(12);
+    expect(resolveMaxToolRounds(200)).toBe(200);
+    for (const bad of [undefined, null, "", 0, -3, 201, 2.5, "2", NaN, Infinity]) {
+      expect(resolveMaxToolRounds(bad), String(bad)).toBeUndefined();
+    }
   });
 });

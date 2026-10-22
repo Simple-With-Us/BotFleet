@@ -14,6 +14,7 @@ import type {
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+import { splitChatPrompt } from "./prompt-split.ts";
 import { toolFields } from "../tool-fields.ts";
 
 import { runTurnLoop, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
@@ -199,8 +200,13 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       const retryScale = Number(process.env.FAKE_GROK_RETRY_SCALE ?? "1");
       active.set(threadId, { abort, turnId });
 
+      // Only the stable half of the prompt heads the request; the volatile
+      // half rides the newest user message, every request, so the resent
+      // prefix stays byte-identical across a memory write (see
+      // prompt-split.ts splitChatPrompt).
+      const chat = splitChatPrompt(turn);
       const messages: any[] = [
-        ...(turn.system ? [{ role: "system", content: turn.system }] : []),
+        ...(chat.system ? [{ role: "system", content: chat.system }] : []),
         // Byte-cap and entry-cap the transcript before folding it in so a
         // long thread cannot ship its full history on every round — see
         // chat-completions/replay-cap.ts.
@@ -227,7 +233,7 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
           }
           return res;
         }),
-        { role: "user", content: turn.text },
+        { role: "user", content: chat.text },
       ];
       appendNative(threadId, { dir: "out", source: "xai.chat.completions", msg: { model: turn.model, messageCount: messages.length } });
 

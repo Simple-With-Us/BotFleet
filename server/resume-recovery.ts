@@ -15,6 +15,10 @@
 //
 // Lifted from #759 (aivsomkar), where the rebuild came from a context plan;
 // here it is the recovery text the harness attaches to a resuming turn.
+//
+// server/boot-recovery.ts is the second caller: a restart interrupts a turn
+// the same way a rejected resume does, so it asks the same question of the
+// thread's persisted event log instead of live protocol state.
 
 export type ResumeFailureClass =
   /** the session was rejected before the provider saw the prompt. The turn

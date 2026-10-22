@@ -19,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { DecisionRow } from "./decision-log.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
@@ -143,7 +144,7 @@ posixOnly("authorization decisions are logged", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${BASE}/api/health`)).ok) break;
+        if (await harnessReady(BASE)) break;
       } catch {
         /* not up yet */
       }

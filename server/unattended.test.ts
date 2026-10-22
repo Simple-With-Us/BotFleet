@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
@@ -138,7 +139,7 @@ posixOnly("unattended turns keep asking", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${BASE}/api/health`)).ok) break;
+        if (await harnessReady(BASE)) break;
       } catch {
         /* not up yet */
       }

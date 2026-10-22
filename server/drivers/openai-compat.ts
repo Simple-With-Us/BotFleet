@@ -19,6 +19,7 @@ import type {
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+import { splitChatPrompt } from "./prompt-split.ts";
 import { withChatSpan } from "../sentry-ai.ts";
 import { runTurnLoop, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
 
@@ -398,8 +399,13 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       // model's prompt window or the provider's per-request size — see
       // chat-completions/replay-cap.ts.
       const cappedTranscript = capReplayedTranscript(turn.transcript);
+      // Only the stable half of the prompt heads the request; the volatile
+      // half rides the newest user message, every request, so the resent
+      // prefix stays byte-identical across a memory write (see
+      // prompt-split.ts splitChatPrompt).
+      const chat = splitChatPrompt(turn);
       const messages: ChatMessage[] = [
-        ...(turn.system ? [{ role: "system" as const, content: turn.system }] : []),
+        ...(chat.system ? [{ role: "system" as const, content: chat.system }] : []),
         ...cappedTranscript.flatMap((m): ChatMessage[] => {
           const res: ChatMessage[] = [];
           if (m.role === "assistant") {
@@ -423,7 +429,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           }
           return res;
         }),
-        ...(turn.text ? [{ role: "user" as const, content: turn.text }] : []),
+        ...(chat.text ? [{ role: "user" as const, content: chat.text }] : []),
       ];
 
       emit({ ...base(threadId, turnId), type: "turn.started" });

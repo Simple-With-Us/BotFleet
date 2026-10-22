@@ -17,6 +17,7 @@ import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts"
 import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB } from "./config.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SERVER_DIR, "..");
@@ -401,8 +402,7 @@ beforeAll(async () => {
   const deadline = Date.now() + 45_000;
   for (;;) {
     try {
-      const res = await fetch(`${BASE}/api/health`);
-      if (res.ok) break;
+      if (await harnessReady(BASE)) break;
     } catch {
       /* not up yet */
     }

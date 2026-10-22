@@ -68,7 +68,10 @@ while (Date.now() < deadline) {
   if (child.exitCode !== null) break;
   try {
     const res = await fetch(`http://127.0.0.1:${port}/api/health`);
-    if (res.ok) {
+    // Health answers from the moment the port binds, which is before the boot
+    // work is done — the checks below all hit routes that 503 until it is, so
+    // wait for `ready` rather than for the first answer.
+    if (res.ok && (await res.json().catch(() => null))?.ready !== false) {
       listening = true;
       break;
     }

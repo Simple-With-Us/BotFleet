@@ -38,6 +38,13 @@ export interface TelemetryTurnParams {
    * Preferred over the instance-id heuristics when it is known, because an
    * instance id is operator-chosen and an engine id is not. */
   driverKind?: string;
+  /** UTF-8 bytes of the system prompt the driver was handed, split at the
+   * volatile boundary (server/system-prompt.ts): stable bytes ride the
+   * cacheable prefix, volatile bytes are re-delivered in the turn that
+   * changed them.  Present only when the server assembled a split prompt
+   * for the turn; read against `cachedInputTokens` to see whether the
+   * prefix is actually being cached. */
+  promptBytes?: { stable: number; volatile: number };
 }
 
 export interface TelemetryStatus {
@@ -294,8 +301,10 @@ type TokenType = "input" | "cacheRead" | "output" | "unknown";
 
 /** Exactly the metadata one turn stamps on every event it emits.  Named
  * rather than the open `TelemetryMetadata` bag so the keys are a contract:
- * the nine that have always ridden along, the four this split adds, and the
- * two room fields a room turn adds on top. */
+ * the nine that have always ridden along, the four this split adds, the two
+ * room fields a room turn adds on top, and the two prompt-byte figures a
+ * split system prompt adds (flat numbers, because the v2 bag accepts only
+ * primitives). */
 type TurnMetadata = {
   botName: string;
   botId: string;
@@ -313,6 +322,8 @@ type TurnMetadata = {
   estimatedCostUsd?: number;
   roomId?: string;
   roomName?: string;
+  promptStableBytes?: number;
+  promptVolatileBytes?: number;
 };
 
 /** Turn one completed turn into the events that go on the wire.
@@ -371,6 +382,12 @@ export function buildTurnEvents(
     params.costUsd != null && Number.isFinite(params.costUsd) && params.costUsd >= 0 ? params.costUsd : null;
   const estimatedCost = params.billingMode === "estimated" ? reportedCost : null;
   const cost = params.billingMode === "estimated" ? null : reportedCost;
+  // The prompt halves' byte counts are a size, never a spend: two flat
+  // non-negative integers, or nothing when the turn's prompt was not split.
+  const promptBytes = params.promptBytes
+    && Number.isFinite(params.promptBytes.stable) && Number.isFinite(params.promptBytes.volatile)
+    ? { stable: Math.max(0, Math.round(params.promptBytes.stable)), volatile: Math.max(0, Math.round(params.promptBytes.volatile)) }
+    : null;
 
   const allSlices: Array<{ suffix: string; tokenType: TokenType; quantity: number }> = [
     { suffix: "in", tokenType: "input", quantity: inputBillable },
@@ -417,6 +434,10 @@ export function buildTurnEvents(
       if (roomName) metadata.roomName = roomName;
     }
     if (estimatedCost != null) metadata.estimatedCostUsd = index === 0 ? estimatedCost : 0;
+    if (promptBytes) {
+      metadata.promptStableBytes = promptBytes.stable;
+      metadata.promptVolatileBytes = promptBytes.volatile;
+    }
 
     const event: TelemetryV2Event = {
       eventId: `${prefix}:${slice.suffix}`,

@@ -602,6 +602,9 @@ public struct CompanionClient: Sendable {
 
     private struct HealthIdentity: Decodable {
         let app: String
+        // Older sidecars did not include readiness; their 2xx identity was
+        // already the complete health signal.
+        let ready: Bool?
     }
 
     private static func healthy(_ connection: Connection, session: URLSession) async -> Bool {
@@ -616,7 +619,7 @@ public struct CompanionClient: Sendable {
             else { return false }
             let identity = try JSONDecoder().decode(HealthIdentity.self, from: data)
             let app = identity.app.lowercased()
-            guard app == "botfleet" || app == "botfleet" else { return false }
+            guard app == "botfleet", identity.ready != false else { return false }
             return true
         } catch {
             return false

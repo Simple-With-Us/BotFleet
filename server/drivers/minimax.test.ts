@@ -9,6 +9,7 @@ import { recordEvents } from "../testing/events.ts";
 import { startFakeOpenAiServer } from "../testing/fake-openai-server.ts";
 import { observeRuntimeEvent, resetSentryAiForTests, type SentryAiSink } from "../sentry-ai.ts";
 import { costUsd } from "./chat-completions/pricing.ts";
+import { VOLATILE_CONTEXT_NOTE_PREFIX } from "./prompt-split.ts";
 import {
   decodeMinimaxConfig,
   isPricedMinimaxEndpoint,
@@ -1750,6 +1751,56 @@ describe("MinimaxDriver", () => {
       );
       expect(total).toBeLessThan(80 * 5_000);
     } finally {
+      await instance.dispose();
+    }
+  });
+
+  it("heads the request with the stable half and carries the volatile half on the newest user message", async () => {
+    // Upstream PR #1758, HTTP half: the system message is the head of the
+    // resent prefix, so only the stable half belongs there, and the volatile
+    // half (memory, mentions) rides the newest user message every request.
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return sse(
+        '{"choices":[{"delta":{"content":"ok"}}]}',
+        '{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+      );
+    }));
+    const instance = await MinimaxDriver.create({
+      instanceId: "minimax",
+      displayName: "MiniMax",
+      enabled: true,
+      config: MinimaxDriver.defaultConfig(),
+      environment: { MINIMAX_API_KEY: "test-key" },
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-split",
+        system: "You are a test bot. Memory: likes tea.",
+        systemStable: "You are a test bot.",
+        systemVolatile: " Memory: likes tea.",
+        transcript: [{ role: "user", text: "earlier" }, { role: "assistant", text: "noted" }],
+        text: "Summarize it.",
+      });
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(bodies[0].messages).toEqual([
+        { role: "system", content: "You are a test bot." },
+        { role: "user", content: "earlier" },
+        { role: "assistant", content: "noted" },
+        { role: "user", content: `${VOLATILE_CONTEXT_NOTE_PREFIX}\n\nMemory: likes tea.\n\nSummarize it.` },
+      ]);
+
+      // a legacy unsplit turn keeps its whole prompt in the system message
+      await instance.adapter.sendTurn({ threadId: "t-unsplit", system: "You are a test bot. Memory: likes tea.", text: "hi" });
+      await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-unsplit");
+      expect(bodies[1].messages).toEqual([
+        { role: "system", content: "You are a test bot. Memory: likes tea." },
+        { role: "user", content: "hi" },
+      ]);
+    } finally {
+      recorder.stop();
       await instance.dispose();
     }
   });

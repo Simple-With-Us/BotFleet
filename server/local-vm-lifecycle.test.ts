@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 // Real HTTP admission and state changes, with every container executable
 // shadowed by a fixture.  A file gate holds cleanup before any container I/O.
@@ -79,7 +80,7 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     const deadline = Date.now() + 30000;
     for (;;) {
       if (child.exitCode !== null) throw new Error(`fixture exited ${child.exitCode}: ${stderr.slice(-1000)}`);
-      try { if ((await fetch(`${base}/api/health`)).ok) break; } catch {}
+      if (await harnessReady(base)) break;
       if (Date.now() > deadline) throw new Error(`fixture did not start: ${stderr.slice(-1000)}`);
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
