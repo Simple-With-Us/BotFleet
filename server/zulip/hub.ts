@@ -639,8 +639,8 @@ class ZulipSession {
       // routeMessage owns expected failures internally; the catch is a
       // backstop so an unexpected throw cannot surface as an unhandled
       // rejection from this fire-and-forget loop.
-      void this.hub.routeMessage(this, found.get(id)!).catch((error: unknown) => {
-        this.hub.log(`[zulip] ${this.role}: backfill route failed: ${error instanceof Error ? error.message : String(error)}`);
+      void this.hub.routeMessage(this, found.get(id)!).catch((error) => {
+        this.hub.log(`[zulip] ${this.role}: backfill route failed: ${describe(error)}`);
       });
     }
     this.save();
@@ -692,8 +692,8 @@ class ZulipSession {
           // as an unhandled rejection out of the poll loop.
           void this.hub
             .routeMessage(this, { ...event.message, flags: event.flags ?? event.message.flags ?? [] })
-            .catch((error: unknown) => {
-              this.hub.log(`[zulip] ${this.role}: poll route failed: ${error instanceof Error ? error.message : String(error)}`);
+            .catch((error) => {
+              this.hub.log(`[zulip] ${this.role}: poll route failed: ${describe(error)}`);
             });
         } else if (event.type === "realm_user") {
           this.applyRealmUser(event.op, event.person);
