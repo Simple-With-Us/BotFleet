@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { openServerControls, shutdownAttachedServer } from "./server-controls.mjs";
+import { botfleetDataDir } from "./app-paths.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -619,7 +620,7 @@ function writeUpdateCredentialReceipt(receiptPath, receipt) {
 }
 
 function desktopConfigPath() {
-  const dataDir = process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet");
+  const dataDir = botfleetDataDir();
   return path.join(dataDir, "config.json");
 }
 
@@ -651,6 +652,11 @@ let managedComposioSetup = { status: "unconfigured" };
 // why stdio is piped, not inherited — under a Finder/Explorer launch the
 // parent's stdio leads nowhere and a failed boot is otherwise undiagnosable.
 const LOG_DIR = app.getPath("logs");
+// The app's own data directory: ~/.botfleet unless OMB_DATA_DIR says
+// otherwise.  The application menu opens this, so it has to resolve to the
+// same place the harness writes to — see app-paths.mjs for why this is one
+// function rather than a literal in three places.
+const DATA_DIR = botfleetDataDir();
 let logStream = null;
 import {
   companionAdvertisedHostedUrl,
@@ -1082,7 +1088,7 @@ let credentialRestoreStopped = false;
 let credentialRestoreLastOutcome = null;
 async function replayAttachedWorkspaceCredentials(port, expectedBuild) {
   if (credentialRestoreStopped) return;
-  const owner = readHarnessOwner(process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet"));
+  const owner = readHarnessOwner(botfleetDataDir());
   let outcome = "unavailable";
   try {
     // Hold the existing credential transaction through the network restore.
@@ -1126,7 +1132,7 @@ async function startServerPackaged() {
   // during teardown — one settle-and-retry covers it.
   const result = await resolvePackagedServer({
     ports: [8799, 18799, 28799],
-    owner: () => readHarnessOwner(process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet")),
+    owner: () => readHarnessOwner(botfleetDataDir()),
     probe: (port, owner) => probeHarness({ port, owner, expectedBuild }),
     spawn: startServerOn,
     log: slog,
@@ -2421,8 +2427,8 @@ function setupApplicationMenu() {
           click: () => shell.openExternal("https://github.com/Simple-With-Us/BotFleet"),
         },
         {
-          label: "Open Logs & Data Folder",
-          click: () => shell.openPath(DATA_DIR),
+          label: "Open Logs Folder",
+          click: () => shell.openPath(LOG_DIR),
         },
       ],
     },
@@ -2701,7 +2707,7 @@ process.once("SIGTERM", requestSignalQuit);
 // as "shut it all down".  Turning it off is always a deliberate act.
 function serverPersistsOnExit() {
   try {
-    const dir = process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet");
+    const dir = botfleetDataDir();
     const policy = readPersistOnExitPolicy(dir);
     if (policy !== null) return policy;
     const parsed = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
@@ -2748,7 +2754,7 @@ function requestAttachedHarnessShutdown() {
 // launch.  A manual run of the wrapper clears it too, so there are two ways
 // back and neither depends on the other.
 function clearHarnessShutdownMarker() {
-  const marker = path.join(process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet"), "stopped.marker");
+  const marker = path.join(botfleetDataDir(), "stopped.marker");
   try {
     fs.rmSync(marker, { force: true });
   } catch {
@@ -2761,7 +2767,7 @@ function recordExplicitStartupSession() {
   if (process.platform !== "darwin") return;
   // BF_CONTROL_STARTUP_POLICY_V1: a direct app launch allows this boot even
   // when login startup is disabled.  Marker absence keeps default behavior.
-  const dir = process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet");
+  const dir = botfleetDataDir();
   try {
     const current = process.env.BOTFLEET_BOOT_SESSION_OVERRIDE
       || execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8" }).trim();
