@@ -526,6 +526,26 @@ export function credentialSyncExcludePatterns(): string[] {
   return [...GENERIC_EXCLUDE_PATTERNS, ...CREDENTIAL_EXCLUDE_PATTERNS].sort();
 }
 
+/**
+ * Every member tar actually packed, in archive-relative form.  Derived from the
+ * archive itself rather than re-derived from the plan, so the verify step can
+ * never probe a path the excludes removed, and can never miss one it kept.
+ */
+export async function listArchiveRelPaths(archive: Buffer): Promise<string[]> {
+  const listed = await new Promise<string>((resolve, reject) => {
+    const tar = spawn("tar", ["-tf", "-"], { env: { ...process.env, COPYFILE_DISABLE: "1" } });
+    const chunks: Buffer[] = [];
+    tar.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    tar.on("error", reject);
+    tar.on("close", (code) => (code === 0 ? resolve(Buffer.concat(chunks).toString("utf8")) : reject(new Error(`tar list failed with code ${code}`))));
+  });
+  const members = listed
+    .split("\n")
+    .map((line) => line.trim().replace(/\/+$/, ""))
+    .filter((line) => line && line !== "." && line !== "..");
+  return [...new Set(members)].sort();
+}
+
 export async function packageCredentialArchive(
   homeDir: string,
   plan: CredentialSyncPlan,
