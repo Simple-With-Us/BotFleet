@@ -66,12 +66,12 @@ serves the contract, or a slim Node companion host survives).
 | `powerSaveBlocker` while the companion is on and keep-awake is set | `main.mjs:672-682`, `:2796` | **BF-2484** (native `IOPMAssertion`) |
 | Private per-launch Unix-socket origin, cleanup, health proof | `companion-origin-gateway.mjs:39-179` | **BF-2510** |
 | Loopback guardian gateway on 8812, parent-death pipe, fail-closed forwarding | `companion-origin-gateway.mjs:217-312`, `managed-companion-guardian.mjs` | **BF-2510** — exists only because the sidecar is a separate process |
-| Cloudflared connector lifecycle, 0600 token file, hosted-endpoint verification, stale-token reaping | `managed-companion-tunnel.mjs` | **BF-2510** / **BF-2511** |
+| Hosted-connector lifecycle: provider session token in an owner-only file, hosted-endpoint verification, stale-token reaping | `managed-companion-tunnel.mjs` | **BF-2510** / **BF-2511** |
 | Publish the hosted URL only after public health verification | `main.mjs:787-809` | **BF-2510** |
 | Adopt a launchd-supervised sidecar via the runtime claim file | `managed-companion-runtime.mjs:202-218`, `companion.mjs:215-235` | **BF-2514** |
 | Companion account service (email code sign-in, control-plane calls, install credential, sign-out) | `companion-account-service.mjs`, `control-plane-client.mjs` | **BF-2511** |
 | Pairing open/close, device revoke, per-device cloud-desktop grant | `companion.mjs:469-511` | **BF-2510** / **BF-2511** (Keychain-backed pairing service) |
-| TryCloudflare quick tunnel | `main.mjs:721-741`, `:1959` | **BF-2510** (keep only if a hosted route survives) |
+| Ephemeral quick-tunnel fallback | `main.mjs:721-741`, `:1959` | **BF-2510** (keep only if a hosted route survives) |
 | Strip inherited `OMB_COMPANION_HOSTED_URL` / `OMB_COMPANION_INTERNAL_ORIGIN` from the child env | `companion.mjs:274-282` | **BF-2510** |
 | Quit order: connector, then sidecar | `main.mjs:2804-2817` | **BF-2514** |
 
@@ -183,7 +183,7 @@ and need no new work:
   (`scripts/launchd/app.botfleet.server.plist`).
 
 So the daily path is already decoupled from Electron. The remaining coupling
-is the *hosted* route: the cloudflared connector, the account service, and
+is the *hosted* route: the hosted connector, the account service, and
 the origin gateway all live in the Electron main process today. Moving the
 hosted route under launchd — so a paired phone reaches the Mac with the
 desktop app closed — is the one piece of BF-2498's "move it now" clause that

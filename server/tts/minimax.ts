@@ -20,11 +20,11 @@
 // An error response surfaces base_resp.status_msg verbatim.
 
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { Audio, VerifyResult, Voice } from "./types.ts";
 import { recordSpeechUsage } from "./usage.ts";
+import { dataDir } from "../data-dir.ts";
 
 // ── Re-export shared types ────────────────────────────────────────────────────
 export type { Audio, VerifyResult, Voice };
@@ -33,7 +33,7 @@ const API = process.env.MINIMAX_API_URL || "https://api.minimax.io";
 const MODEL = process.env.MINIMAX_SPEECH_MODEL || "speech-2.8-turbo";
 const MAX_CHARS = 10_000;
 
-const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet");
+const DATA_DIR = dataDir();
 const CLONED_VOICES_FILE = join(DATA_DIR, "tts-cloned-voices.json");
 
 // ── Documented starter voices ────────────────────────────────────────────────

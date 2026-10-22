@@ -9,6 +9,7 @@ import { z } from "zod";
 import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
 import { readPersistOnExitPolicy, writePersistOnExitPolicy } from "../electron/persist-on-exit-policy.mjs";
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
+import { dataDir } from "./data-dir.ts";
 import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
@@ -1367,8 +1368,10 @@ export function summarizeToolCallsEnabled(cfg: AppConfig): boolean {
   return cfg.features?.summarizeToolCalls !== false;
 }
 
-// OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
-export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet");
+// OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.  dataDir() applies the
+// same trim-and-blank rule the desktop app does (electron/app-paths.mjs), so both processes
+// resolve one directory.
+export const DATA_DIR = dataDir();
 const LEGACY_HOME_DATA_DIRS = [".openmausbot", ".opengrokbot"] as const;
 export const EVENTS_DIR = join(DATA_DIR, "events");
 export const NATIVE_DIR = join(DATA_DIR, "native");

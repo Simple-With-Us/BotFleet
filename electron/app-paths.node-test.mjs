@@ -17,7 +17,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MAIN = readFileSync(join(ROOT, "electron/main.mjs"), "utf8");
 
 test("the data directory is ~/.botfleet unless OMB_DATA_DIR overrides it", () => {
-  assert.equal(botfleetDataDir({}, "/Users/jay"), "/Users/jay/.botfleet");
+  assert.equal(botfleetDataDir({}, "/Users/jay"), join("/Users/jay", ".botfleet"));
   assert.equal(
     botfleetDataDir({ OMB_DATA_DIR: "/Volumes/External/botfleet" }, "/Users/jay"),
     "/Volumes/External/botfleet",
@@ -28,9 +28,9 @@ test("an empty or whitespace override is unset, not the current directory", () =
   // `OMB_DATA_DIR=""` used to reach a `??` expression and produce a relative
   // path, which then resolved against whatever directory the process
   // happened to be in.
-  assert.equal(botfleetDataDir({ OMB_DATA_DIR: "" }, "/Users/jay"), "/Users/jay/.botfleet");
-  assert.equal(botfleetDataDir({ OMB_DATA_DIR: "   " }, "/Users/jay"), "/Users/jay/.botfleet");
-  assert.equal(botfleetDataDir({ OMB_DATA_DIR: undefined }, "/Users/jay"), "/Users/jay/.botfleet");
+  assert.equal(botfleetDataDir({ OMB_DATA_DIR: "" }, "/Users/jay"), join("/Users/jay", ".botfleet"));
+  assert.equal(botfleetDataDir({ OMB_DATA_DIR: "   " }, "/Users/jay"), join("/Users/jay", ".botfleet"));
+  assert.equal(botfleetDataDir({ OMB_DATA_DIR: undefined }, "/Users/jay"), join("/Users/jay", ".botfleet"));
 });
 
 test("the application menu opens folders that exist as constants", () => {
