@@ -1140,11 +1140,21 @@ export class ZulipHub {
     const now = this.now();
     const budgetPerSession = Math.max(1, this.deps.timings?.drainBatchSize ?? 16);
     const groups = new Map<string, typeof rows>();
+    // outgoingBotWanted reads live settings, a regex, and botExists per
+    // call: resolve once per bot per batch, not once per row.
+    const wantedCache = new Map<string, boolean>();
+    const botWanted = (botId: string): boolean => {
+      const cached = wantedCache.get(botId);
+      if (cached !== undefined) return cached;
+      const wanted = this.outgoingBotWanted(botId);
+      wantedCache.set(botId, wanted);
+      return wanted;
+    };
     for (const row of rows) {
       const key = `${row.botId}:${row.messageId}`;
       const session = this.sessions.get(row.botId);
       if (!session) {
-        if (!this.outgoingBotWanted(row.botId)) {
+        if (!botWanted(row.botId)) {
           // The bot is gone from settings for good; its row can never route.
           try { this.outgoingSpool.remove(row); } catch { /* already gone */ }
           this.outgoingRetry.delete(key);
