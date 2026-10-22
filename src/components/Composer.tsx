@@ -305,6 +305,13 @@ function ComposerInner({
       group,
       members,
       terminologySingular: terminology.singular,
+      activeBotIds: group
+        ? new Set(
+            (members ?? [])
+              .filter((member) => member.activity === "working" || group.busyBotId === member.id)
+              .map((member) => member.id),
+          )
+        : undefined,
     });
   }, [triggerInfo, dismissedAt, state.bots, state.groups, state.routines, state.config?.terminology, bot?.id, group, members]);
   const pickerOpen = candidates.length > 0;
@@ -818,6 +825,12 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
               {triggerInfo?.trigger === "@" ? "Bots" : "Apps & Channels"}
             </div>
             {candidates.map((item, i) => (
+              <>
+              {item.section === "other" && candidates[i - 1]?.section !== "other" && (
+                <div key="other-bots" className="border-t border-hairline/20 px-3 pb-1 pt-2 text-[11px] italic text-ink-secondary">
+                  (or any other bot)
+                </div>
+              )}
               <button
                 key={item.id}
                 role="option"

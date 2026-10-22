@@ -18,6 +18,10 @@ export interface AutocompleteChoice {
   description?: string;
   bot?: Bot;
   connected?: boolean;
+  /** Picker grouping for `@`: bots already working in this channel first,
+   * then other members, then the rest of the fleet.  The composer renders
+   * "(or any other bot)" above the first `other` row. */
+  section?: "active" | "members" | "other";
 }
 
 function findLastValidTrigger(upto: string, char: "@" | "#"): number {
@@ -63,6 +67,9 @@ export interface AutocompleteContext {
   group?: Group;
   members?: Bot[];
   terminologySingular?: string;
+  /** Bots with a turn in flight in this channel (the room's busy bot plus
+   * any member whose activity is working).  They lead the `@` picker. */
+  activeBotIds?: ReadonlySet<string>;
 }
 
 /**
@@ -85,19 +92,22 @@ export function getAutocompleteCandidates(
         kind: "bot",
         badge: "All",
         description: "All room members",
+        section: "members",
       });
 
       const memberIds = new Set<string>();
       for (const member of ctx.members ?? []) {
         if (!member.hidden) {
           memberIds.add(member.id);
+          const active = ctx.activeBotIds?.has(member.id) === true;
           pool.push({
             id: member.id,
             name: member.name,
             kind: "bot",
-            badge: "Member",
+            badge: active ? "Working Here" : "Member",
             description: member.title || member.description || "Room Member",
             bot: member,
+            section: active ? "active" : "members",
           });
         }
       }
@@ -111,9 +121,14 @@ export function getAutocompleteCandidates(
             badge: "Bot",
             description: bot.title || bot.description || "Fleet Bot",
             bot,
+            section: "other",
           });
         }
       }
+      // Working in this channel first, then members, then everyone else —
+      // stable within a section so the fleet order above is preserved.
+      const rank = { active: 0, members: 1, other: 2 } as const;
+      pool.sort((a, b) => rank[a.section ?? "other"] - rank[b.section ?? "other"]);
     } else {
       // Direct chat: prioritize the current bot, followed by the rest of the fleet
       const sortedBots = [...ctx.bots.filter((b) => !b.hidden)].sort((a, b) => {
@@ -139,7 +154,23 @@ export function getAutocompleteCandidates(
       return [];
     }
 
-    return pool.filter((b) => !q || b.name.toLowerCase().includes(q)).slice(0, 8);
+    // Narrow as you type: prefix matches first, then substring matches.
+    // Once a space follows a partial name the tag is finished, so narrow on
+    // the first word only — otherwise "@Bui lder" would empty the picker.
+    const needle = q.includes(" ") && !pool.some((b) => b.name.toLowerCase().startsWith(q))
+      ? q.split(/\s+/)[0]!
+      : q;
+    return pool
+      .filter((b) => !needle || b.name.toLowerCase().includes(needle))
+      .sort((a, b) => {
+        if (!needle) return 0;
+        const aPref = a.name.toLowerCase().startsWith(needle);
+        const bPref = b.name.toLowerCase().startsWith(needle);
+        if (aPref && !bPref) return -1;
+        if (!aPref && bPref) return 1;
+        return 0;
+      })
+      .slice(0, 8);
   }
 
   if (trigger === "#") {

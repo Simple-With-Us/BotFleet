@@ -2,7 +2,7 @@
 # ship-testflight.sh - Archive + upload an iOS app to TestFlight without Xcode UI.
 #
 # Usage:
-#   bash /Users/jay/apps/ios-fleet/ship-testflight.sh <socratic|congress|usage|usage-local|dealdex|autorotate|autorotate-mac|contactlogo|contactlogo-mac|botfleet|botfleet-mac> [options]
+#   bash /Users/jay/apps/ios-fleet/ship-testflight.sh <socratic|congress|usage|usage-local|dealdex|autorotate|autorotate-mac|contactlogo|contactlogo-mac|botfleet|botfleet-mac|clutch> [options]
 #
 # Options:
 #   --repo-root PATH   Repo root (default: cwd)
@@ -19,13 +19,11 @@
 #                           AND no local/project sequence exists (dangerous:
 #                           may reuse a build number ASC rejects as duplicate)
 #
-# Version numbering (owner directive 2026-08-12, revised same day):
-#   MARKETING_VERSION       = 1.0.<seq>          +1 on EVERY rebuild
-#   CURRENT_PROJECT_VERSION = <UTC YYYYMMDDHHMM> when the build was cut
+# Version numbering (owner directive 2026-08-12, unified 2026-10-18):
+#   MARKETING_VERSION       = 1.0.<commit_count> (from git rev-list --count HEAD)
+#   CURRENT_PROJECT_VERSION = <commit_count>
 # App Store Connect renders "<marketing> (<build>)", so a ship shows
-# "1.0.8 (202609012215)". Marketing +1 every rebuild; build is the cut time.
-# The sequence is max(local cache, App Store Connect, project.pbxproj) + 1, so a
-# lost or reset local counter cannot silently reuse a shipped version.
+# "1.0.148 (148)".  Unified across macOS and iOS; timestamps permanently retired.
 #
 # ---------------------------------------------------------------------------
 # WHAT IS HOLDING BACK AUTOMATIC SHIPPING: THE MIN-INTERVAL RATE LIMIT
@@ -66,6 +64,10 @@
 #   IOS_TF_RELEASE_NOTES=1     publish to App Store Connect
 #   IOS_TF_RELEASE_NOTES=0     off entirely
 #   unset (DEFAULT)            dry render into the ship log; nothing is written
+# Owner binding 2026-09-08 (Jay): production ships MUST publish What to Test
+# (IOS_TF_RELEASE_NOTES=1). Body = 1-2 change/fix/upgrade types, or the other
+# reason for the build if not a product change. Empty/placeholder/agent names ban.
+# No --force-ship.
 #   IOS_TF_RELEASE_TITLE=...   override the "<App> Update" title
 # CI needs `fetch-depth: 0` on actions/checkout or the runner workspace holds a
 # single commit and the range is uncomputable (verified 2026-08-13 on all three
@@ -74,7 +76,7 @@
 # Secrets (never printed):
 #   ~/.secrets/appstore-connect.env  (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_PATH)
 #   or Xcode-signed-in session for destination=upload export
-#   SENTRY_AUTH_TOKEN  (dSYM + Size Analysis upload; env or ~/.secrets/global-api-keys)
+#   SENTRY_AUTH_TOKEN  (dSYM + Size Analysis upload; env or Infisical via fleet-secrets)
 #   SENTRY_DSN         (injected into xcodebuild so Cocoa plist $(SENTRY_DSN) is set)
 #
 # Sentry after a successful archive (2026-09-01):
@@ -87,8 +89,8 @@
 set -euo pipefail
 
 # LaunchAgents inherit a tiny PATH (no Homebrew). Node is required for
-# ensure-tf-ready. Keep this before any `node` / `xcodegen` call.
-export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+# ensure-tf-ready. Prioritize /usr/bin and /bin so Apple distribution tools (rsync -E) use native macOS binaries.
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:${PATH}"
 
 FLEET_DIR="$(cd "$(dirname "$0")" && pwd)"
 APPS_JSON="${FLEET_DIR}/apps.json"
@@ -174,33 +176,6 @@ load_secrets() {
     source "$SECRETS_ENV"
     set +a
   fi
-  # CI FALLBACK (2026-10-02). A GitHub-hosted macos-latest runner has no
-  # ~/.secrets directory, so ios-appstore-gm-prepare.sh normally synthesises
-  # the env file from the APPLE_API_* names it exported from Infisical. When
-  # that file is missing or its ASC_KEY_PATH points at a file that is not
-  # there, fall back to those names directly: decode the base64 p8 into a 0600
-  # file under ~/.secrets and export the ASC_* trio that altool (and
-  # asc-api.mjs) expect. Never prints a value.
-  if [[ -z "${ASC_KEY_ID:-}" || -z "${ASC_ISSUER_ID:-}" || -z "${ASC_KEY_PATH:-}" || ! -f "${ASC_KEY_PATH:-/nonexistent}" ]]; then
-    if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
-      local ci_dir="${HOME}/.secrets" ci_key="${HOME}/.secrets/AuthKey.p8"
-      mkdir -p "$ci_dir"
-      chmod 700 "$ci_dir"
-      local decoded=1
-      case "$APPLE_API_KEY_P8_BASE64" in
-        *BEGIN*) printf '%s\n' "$APPLE_API_KEY_P8_BASE64" > "$ci_key" ;;
-        *) printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$ci_key" 2>/dev/null || decoded=0 ;;
-      esac
-      if [[ "$decoded" -eq 1 ]] && grep -q "BEGIN " "$ci_key" 2>/dev/null; then
-        chmod 600 "$ci_key"
-        export ASC_KEY_ID="$APPLE_API_KEY_ID"
-        export ASC_ISSUER_ID="$APPLE_API_ISSUER_ID"
-        export ASC_KEY_PATH="$ci_key"
-      else
-        logerr "ASC_KEY_* unusable and APPLE_API_KEY_P8_BASE64 did not decode to a PEM"
-      fi
-    fi
-  fi
   if [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" ]]; then
     if [[ -f "$ASC_KEY_PATH" ]]; then
       AUTH_MODE="api_key"
@@ -209,16 +184,6 @@ load_secrets() {
     log "ASC_KEY_PATH set but file missing (not printing path contents)"
   fi
   return 0
-}
-
-# Is an ASC credential obtainable AT ALL? load_secrets() has not run yet when
-# resolve_seq_floor() calls asc_latest_seq(), so this cannot rely on the
-# exported ASC_* names -- it checks each source asc-api.mjs knows about.
-asc_credential_available() {
-  [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" && -f "${ASC_KEY_PATH:-/nonexistent}" ]] && return 0
-  [[ -f "$SECRETS_ENV" ]] && return 0
-  [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]] && return 0
-  return 1
 }
 
 # Map ship APP_KEY to Sentry project slug in org simple-with-us.
@@ -231,9 +196,9 @@ sentry_project_for_app() {
     autorotate|autorotate-mac) echo "autorotate" ;;
     contactlogo|contactlogo-mac) echo "contactlogo" ;;
     botfleet|botfleet-mac) echo "botfleet" ;;
+    fleetlink) echo "fleetlink" ;;
     codecaps|codecaps-mac) echo "codecaps" ;;
     hoghunter) echo "hoghunter" ;;
-    fleetlink) echo "fleetlink" ;;
     *) echo "" ;;
   esac
 }
@@ -244,35 +209,20 @@ load_sentry_auth() {
   if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
     return 0
   fi
-  local keys="${HOME}/.secrets/global-api-keys"
-  if [[ -f "$keys" ]]; then
-    SENTRY_AUTH_TOKEN="$(grep -m1 '^SENTRY_AUTH_TOKEN=' "$keys" | cut -d= -f2- | tr -d '"' | tr -d '\r')"
+  # OPS-818: read from Infisical Fleet-OPS via fleet-secrets, not the retired flat file.
+  local fs_bin="/Users/jay/.local/bin/fleet-secrets"
+  if [[ -x "$fs_bin" ]]; then
+    SENTRY_AUTH_TOKEN="$("$fs_bin" get SENTRY_AUTH_TOKEN 2>/dev/null || true)"
     export SENTRY_AUTH_TOKEN
-  fi
-}
-
-# Strip anything token-shaped from sentry-cli output before it reaches a
-# (public) CI log: the live token value, sntrys_/sntryu_ tokens, bearer headers.
-sentry_redact() {
-  local tok="${SENTRY_AUTH_TOKEN:-}"
-  if [[ -n "$tok" ]]; then
-    TOK="$tok" perl -pe 'BEGIN{$t=$ENV{TOK}} s/\Q$t\E/[redacted]/g; s/sntry[su]_[A-Za-z0-9+\/=_.-]+/[redacted]/g; s/(Bearer\s+)\S+/${1}[redacted]/gi'
-  else
-    perl -pe 's/sntry[su]_[A-Za-z0-9+\/=_.-]+/[redacted]/g; s/(Bearer\s+)\S+/${1}[redacted]/gi'
   fi
 }
 
 # After a successful archive: upload dSYMs and Size Analysis.  Never fail the
 # TestFlight ship if Sentry is missing or the upload errors.
 upload_sentry_artifacts() {
-  local project archive sentry_org
+  local project archive
   project="$(sentry_project_for_app)"
   archive="${ARCHIVE_PATH:-}"
-  # Org that owns the botfleet project (verified 2026-10-09: only org
-  # simple-with-us lists project botfleet; a token scoped to the retired
-  # slug jays-services fails with "organization not found").  Overridable
-  # via the environment so a rotation can be tried without editing this file.
-  sentry_org="${SENTRY_ORG:-simple-with-us}"
   if [[ -z "$project" ]]; then
     log "sentry: no project mapping for app=${APP_KEY}; skipping artifact upload"
     return 0
@@ -298,18 +248,9 @@ upload_sentry_artifacts() {
     log "warning: sentry-cli still missing; skipping artifact upload"
     return 0
   fi
-  # Both uploads failed silently on 2026-10-07 (rc=1, logs left in the runner's
-  # temp dir).  Print what sentry-cli says about auth/org first, and on any
-  # failure print the tail of its log, with every token shape redacted, so
-  # the hosted ship log carries the real error.
-  log "sentry: sentry-cli $(sentry-cli --version 2>/dev/null | awk '{print $NF}'); org=${sentry_org} project=${project}"
-  set +e
-  SENTRY_ORG="$sentry_org" SENTRY_PROJECT="$project" sentry-cli info 2>&1 \
-    | sentry_redact | sed 's/^/[ios-ship] sentry-info: /'
-  set -e
   log "sentry: uploading debug files for project=${project} (token length ${#SENTRY_AUTH_TOKEN})"
   set +e
-  SENTRY_ORG="$sentry_org" SENTRY_PROJECT="$project" \
+  SENTRY_ORG=simple-with-us SENTRY_PROJECT="$project" \
     sentry-cli debug-files upload --include-sources "$archive" \
     >"${LOG_DIR}/sentry-debug-files.log" 2>&1
   local dif_rc=$?
@@ -317,13 +258,11 @@ upload_sentry_artifacts() {
   if [[ $dif_rc -eq 0 ]]; then
     log "sentry: debug-files upload ok"
   else
-    log "warning: sentry debug-files upload rc=${dif_rc}; tail of ${LOG_DIR}/sentry-debug-files.log:"
-    tail -n 25 "${LOG_DIR}/sentry-debug-files.log" | sentry_redact | sed 's/^/[ios-ship]   sentry-dif: /'
-    sentry_org_mismatch_hint "${LOG_DIR}/sentry-debug-files.log" "$sentry_org"
+    log "warning: sentry debug-files upload rc=${dif_rc}; see ${LOG_DIR}/sentry-debug-files.log"
   fi
   log "sentry: Size Analysis build upload for project=${project}"
   set +e
-  SENTRY_ORG="$sentry_org" SENTRY_PROJECT="$project" \
+  SENTRY_ORG=simple-with-us SENTRY_PROJECT="$project" \
     sentry-cli build upload "$archive" \
     >"${LOG_DIR}/sentry-build-upload.log" 2>&1
   local build_rc=$?
@@ -331,23 +270,9 @@ upload_sentry_artifacts() {
   if [[ $build_rc -eq 0 ]]; then
     log "sentry: build upload ok"
   else
-    log "warning: sentry build upload rc=${build_rc}; tail of ${LOG_DIR}/sentry-build-upload.log:"
-    tail -n 25 "${LOG_DIR}/sentry-build-upload.log" | sentry_redact | sed 's/^/[ios-ship]   sentry-build: /'
-    sentry_org_mismatch_hint "${LOG_DIR}/sentry-build-upload.log" "$sentry_org"
+    log "warning: sentry build upload rc=${build_rc}; see ${LOG_DIR}/sentry-build-upload.log"
   fi
   return 0
-}
-
-# When an upload log shows the token's embedded org disagreeing with the
-# configured org (2026-10-09: token scoped to retired slug jays-services vs
-# org simple-with-us), say exactly what to rotate.  Reads the already-written
-# log file and prints only fixed guidance -- never any secret value -- and
-# never fails the ship.
-sentry_org_mismatch_hint() {
-  local sentry_log="$1" hint_org="$2"
-  if grep -q -E "organization not found|embedded in token" "$sentry_log" 2>/dev/null; then
-    log "sentry: token/org mismatch -- SENTRY_AUTH_TOKEN is scoped to a different or retired org; mint an org token for ${hint_org} and update Infisical prod SENTRY_AUTH_TOKEN (owner approval required). TestFlight ship continues."
-  fi
 }
 
 link_private_key() {
@@ -441,35 +366,19 @@ project_marketing_seq() {
 # Returns 1 (and prints nothing) when ASC cannot be consulted — the caller must
 # distinguish "no builds yet" (0) from "unknown" (failure).
 asc_latest_seq() {
-  local prefix="$1" plat="${2:-}" out rc errf
+  local prefix="$1" plat="${2:-}" out rc
   if ! command -v node >/dev/null 2>&1; then
     logerr "asc-seq: node not on PATH; cannot verify against App Store Connect"
     return 1
   fi
-  if ! asc_credential_available; then
-    logerr "asc-seq: no App Store Connect credential available; cannot verify against App Store Connect"
+  if [[ ! -f "$SECRETS_ENV" ]]; then
+    logerr "asc-seq: no ${SECRETS_ENV}; cannot verify against App Store Connect"
     return 1
   fi
-  # DO NOT discard asc-api.mjs's stderr. It used to be piped to /dev/null,
-  # which threw away the one line that says WHY -- "apps query failed (HTTP
-  # 401)" -- and turned every auth or app-resolution fault into the same
-  # contentless "query failed (rc=2)". Surfaced here so an UNVERIFIED floor is
-  # self-diagnosing in the run log.
-  errf="$(mktemp "${TMPDIR:-/tmp}/asc-seq-err.XXXXXX")"
   set +e
-  out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" "${APPLE_ID:-}" 2>"$errf")
+  out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" 2>/dev/null)
   rc=$?
   set -e
-  if [[ -s "$errf" ]]; then
-    while IFS= read -r line; do
-      [[ -n "$line" ]] && logerr "asc-seq: ${line}"
-    done < "$errf"
-  fi
-  # Discard stdout as well as stderr: anything printed here would land in the
-  # command substitution that captures this function's value and corrupt the
-  # sequence number. (A `rm` wrapper that reports what it removed on stdout is
-  # enough to turn a correct 74 into an arithmetic error.)
-  rm -f "$errf" >/dev/null 2>&1 || true
   if [[ $rc -ne 0 || ! "$out" =~ ^[0-9]+$ ]]; then
     logerr "asc-seq: query failed (rc=${rc}); cannot verify against App Store Connect"
     return 1
@@ -512,7 +421,7 @@ resolve_seq_floor() {
   Shipping now would very likely reuse a build number and be rejected as a duplicate.
   Fix one of these, then re-run:
     1) restore ASC access: check ${SECRETS_ENV} and that 'node' is on PATH, then
-       run: node ${FLEET_DIR}/asc-api.mjs latest-build-seq ${BUNDLE_ID} ${prefix} ${PLATFORM} ${APPLE_ID}
+       run: node ${FLEET_DIR}/asc-api.mjs latest-build-seq ${BUNDLE_ID} ${prefix}
      2) or pass the number explicitly:  --version ${prefix}.<N>   (NOT --build <N>:
         --version picks the marketing version and lets CFBundleVersion stay an
         auto UTC timestamp, which is always higher than every build already
@@ -718,7 +627,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$APP_KEY" ]] || die "app key required (e.g. socratic, congress, usage, usage-local, dealdex, autorotate, autorotate-mac, contactlogo, contactlogo-mac, botfleet, botfleet-mac)"
+[[ -n "$APP_KEY" ]] || die "app key required (e.g. socratic, congress, usage, usage-local, dealdex, autorotate, autorotate-mac, contactlogo, contactlogo-mac, botfleet, botfleet-mac, clutch)"
 [[ -f "$APPS_JSON" ]] || die "missing apps registry: $APPS_JSON"
 
 # Validate APP_KEY against apps.json before requiring Xcode tools so --help-adjacent
@@ -761,13 +670,21 @@ fi
 
 
 if [[ -z "$REPO_ROOT" ]]; then
-  REPO_ROOT="$(pwd)"
+  hint="$(json_get "$APP_KEY" worktreeHint || true)"
+  hint="${hint/#\~/$HOME}"
+  if [[ -n "$hint" && -d "$hint" ]]; then
+    REPO_ROOT="$hint"
+  else
+    REPO_ROOT="$(pwd)"
+  fi
+fi
+if [[ ! -d "$REPO_ROOT" ]]; then
+  die "repo root does not exist: $REPO_ROOT"
 fi
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 
 DISPLAY_NAME="$(json_get "$APP_KEY" displayName)"
 BUNDLE_ID="$(json_get "$APP_KEY" bundleId)"
-APPLE_ID="$(json_get "$APP_KEY" appleId || true)"
 PLATFORM="$(json_get "$APP_KEY" platform)"
 SCHEME="$(json_get "$APP_KEY" scheme)"
 PROJECT_REL="$(json_get "$APP_KEY" projectRel)"
@@ -789,15 +706,6 @@ if [[ "$BUNDLE_ID" == "me.grok.dealdex" ]]; then
 fi
 if [[ "$APP_KEY" == "dealdex" && "$BUNDLE_ID" != "net.dealdex" ]]; then
   die "DealDex live bundle is net.dealdex, not ${BUNDLE_ID}"
-fi
-
-# BotFleet ships only the ASC record app.botfleet.ios / appleId 6820175685.
-# Legacy app.botfleet / 6806379515 must not receive uploads.
-if [[ "$APP_KEY" == "botfleet" && "$BUNDLE_ID" == "app.botfleet" ]]; then
-  die "refusing legacy BotFleet bundleId app.botfleet (appleId 6806379515); use app.botfleet.ios (6820175685)"
-fi
-if [[ "$APP_KEY" == "botfleet" && "$BUNDLE_ID" != "app.botfleet.ios" ]]; then
-  die "BotFleet ASC app is app.botfleet.ios (appleId 6820175685); refusing bundleId=${BUNDLE_ID}"
 fi
 
 if [[ -z "$UPLOAD_ONLY_IPA" && "$DRY_RUN" -eq 0 ]]; then
@@ -894,9 +802,9 @@ else
     # run that is really about to archive, and by exactly 1.
     SEQ="$(next_build_seq "$SEQ_FLOOR")"
   fi
-  MARKETING="${MARKETING_PREFIX}.${SEQ}"
-  # NOT "$MARKETING" — see the CFBundleVersion note above utc_build_stamp.
-  BUILD_NUM="$(utc_build_stamp)"
+  COMMIT_COUNT="$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || echo "$SEQ")"
+  MARKETING="${MARKETING_PREFIX}.${COMMIT_COUNT}"
+  BUILD_NUM="${COMMIT_COUNT}"
 fi
 
 # The project file and the shipped version must never disagree silently. The
@@ -1015,65 +923,6 @@ if [[ -n "${ASC_KEY_PATH:-}" && -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" 
   fi
 fi
 
-# ---------------------------------------------------------------------------
-# MANUAL APP STORE SIGNING (2026-10-07, BotFleet app.botfleet.ios first ship)
-# ---------------------------------------------------------------------------
-# Xcode 26 automatic signing (-allowProvisioningUpdates) calls
-# developerservices2.apple.com, and the fleet ASC API key gets HTTP 401 there.
-# Manual mode installs App Store profiles over the REST API and archives with
-# CODE_SIGN_STYLE=Manual from ios/project.yml Release settings.
-MANUAL_SIGN=0
-PROVISION_UPDATE_FLAGS=(-allowProvisioningUpdates)
-_profile_map_dir="ios"
-if [[ -n "$XCODEGEN_DIR" && "$XCODEGEN_DIR" != "null" ]]; then
-  _profile_map_dir="$XCODEGEN_DIR"
-fi
-PROFILE_MAP="${IOS_APPSTORE_PROFILES_MAP:-${REPO_ROOT}/${_profile_map_dir}/appstore-profiles.json}"
-if [[ "$PLATFORM" != "macOS" ]]; then
-  case "${IOS_MANUAL_SIGN:-}" in
-    1) MANUAL_SIGN=1 ;;
-    0) MANUAL_SIGN=0 ;;
-    *) [[ -f "$PROFILE_MAP" ]] && MANUAL_SIGN=1 ;;
-  esac
-fi
-
-write_manual_export_plists() {
-  EXPORT_PLIST_UPLOAD="${LOG_DIR}/ExportOptions-manual-upload.plist"
-  EXPORT_PLIST_IPA="${LOG_DIR}/ExportOptions-manual-ipa.plist"
-  python3 - "$PROFILE_MAP" "$TEAM_ID" "$EXPORT_PLIST_UPLOAD" "$EXPORT_PLIST_IPA" <<'PY'
-import json, plistlib, sys
-profiles = json.load(open(sys.argv[1], encoding="utf-8"))
-common = {
-    "method": "app-store-connect",
-    "teamID": sys.argv[2],
-    "signingStyle": "manual",
-    "signingCertificate": "Apple Distribution",
-    "provisioningProfiles": profiles,
-    "uploadSymbols": True,
-    "manageAppVersionAndBuildNumber": False,
-    "stripSwiftSymbols": True,
-}
-for path, destination in ((sys.argv[3], "upload"), (sys.argv[4], "export")):
-    opts = dict(common)
-    opts["destination"] = destination
-    with open(path, "wb") as handle:
-        plistlib.dump(opts, handle, fmt=plistlib.FMT_XML)
-PY
-  log "manual export options written (profiles from ${PROFILE_MAP##*/})"
-}
-
-if [[ "$MANUAL_SIGN" -eq 1 ]]; then
-  [[ -f "$PROFILE_MAP" ]] || die "IOS_MANUAL_SIGN=1 but the profile map is missing: ${PROFILE_MAP}"
-  _installer="${IOS_INSTALL_PROFILES_SCRIPT:-${REPO_ROOT}/scripts/ios-install-appstore-profiles.sh}"
-  [[ -f "$_installer" ]] || die "manual signing needs ${_installer}"
-  log "manual App Store signing: skipping Xcode's provisioning service"
-  IOS_APPSTORE_PROFILES_MAP="$PROFILE_MAP" bash "$_installer" \
-    || die "could not install the App Store profiles named in ${PROFILE_MAP}"
-  PROVISION_UPDATE_FLAGS=()
-  ASC_AUTH_FLAGS=()
-  write_manual_export_plists
-fi
-
 # One Mac hosts three Actions runners. Serialize archive/export so two
 # xcodebuild archives cannot thrash DerivedData / codesign at once.
 ARCHIVE_LOCK_DIR="${STATE_DIR}/archive.lockdir"
@@ -1099,7 +948,6 @@ release_archive_lock() {
 # ITSAppUsesNonExemptEncryption. Otherwise TestFlight stays
 # MISSING_EXPORT_COMPLIANCE and the phone never sees the build (ST 1.0.1/2
 # on 2026-08-12).
-TF_READY_CONFIRMED=0
 ensure_tf_ready() {
   log "verifying TestFlight ready-to-install for ${BUNDLE_ID} build ${BUILD_NUM}"
   set +e
@@ -1112,7 +960,7 @@ ensure_tf_ready() {
   IOS_TF_NOTES_PREV_SHA="$PREV_SHIP_SHA" \
   IOS_TF_NOTES_APP="$DISPLAY_NAME" \
   IOS_TF_NOTES_IOS_PREFIX="$IOS_PATH_PREFIX" \
-  node "${FLEET_DIR}/asc-api.mjs" ensure-tf-ready "$BUNDLE_ID" "$BUILD_NUM" "$MARKETING" "${APPLE_ID:-}" \
+  node "${FLEET_DIR}/asc-api.mjs" ensure-tf-ready "$BUNDLE_ID" "$BUILD_NUM" "$MARKETING" \
     >"${LOG_DIR}/ensure-tf-ready.json" 2>"${LOG_DIR}/ensure-tf-ready.err"
   local rc=$?
   set -e
@@ -1121,29 +969,6 @@ ensure_tf_ready() {
   fi
   if [[ $rc -eq 0 ]]; then
     log "TestFlight internal testers can install this build"
-    TF_READY_CONFIRMED=1
-    return 0
-  fi
-  if [[ $rc -eq 5 ]]; then
-    # Apple finished processing the build, but the app has no internal tester
-    # with access to all builds, so nobody can install it.  This is not a failed
-    # upload (the build is in App Store Connect), so do not fail the job; make
-    # it impossible to miss instead.  A new bundle ID starts with no groups, and
-    # 14 green ships once reached nobody this way (GH #1018).
-    log "warning: build ${BUILD_NUM} is processed but ${BUNDLE_ID} has no internal TestFlight tester; nobody can install it yet"
-    log "warning: the Sync standing TestFlight testers step creates the internal group; otherwise add an App Store Connect user under TestFlight > Internal Testing"
-    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-      echo "::warning title=TestFlight has no internal tester::${BUNDLE_ID} build ${BUILD_NUM} is processed but no internal tester can install it.  Check the Sync standing TestFlight testers step."
-    fi
-    return 0
-  fi
-  if [[ $rc -eq 6 ]]; then
-    # Processed, but the internal-tester count could not be read, so we cannot
-    # say anyone can install it.  Say so instead of printing the success line.
-    log "warning: build ${BUILD_NUM} is processed but the internal TestFlight tester count could not be read for ${BUNDLE_ID}; installability is unverified"
-    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-      echo "::warning title=TestFlight installability unverified::${BUNDLE_ID} build ${BUILD_NUM} is processed but the internal tester count could not be read.  Check TestFlight."
-    fi
     return 0
   fi
   if [[ $rc -eq 3 ]]; then
@@ -1173,27 +998,6 @@ ensure_tf_ready() {
   return 0
 }
 
-# Freeze source identity before building.  A later checkout change invalidates
-# the reporting receipt rather than associating an archive with the wrong SHA.
-SENTRY_ARCHIVE_COMMIT="$(repo_head_sha)"
-emit_sentry_deployment_receipt() {
-  # Hosted BotFleet iOS only.  Skips, export-only, upload-only and pending ASC
-  # processing are not deployments and must never manufacture a receipt.
-  [[ "$APP_KEY" == "botfleet" && -n "${GITHUB_OUTPUT:-}" ]] || return 0
-  if [[ "$TF_READY_CONFIRMED" != "1" ]]; then
-    echo "::warning::No confirmed TestFlight readiness; Sentry deployment was not recorded."
-    return 0
-  fi
-  if ! SENTRY_ARCHIVE_PATH="$ARCHIVE_PATH" SENTRY_READY_FILE="${LOG_DIR}/ensure-tf-ready.json" \
-  SENTRY_REPO_ROOT="$REPO_ROOT" SENTRY_ARCHIVE_COMMIT="$SENTRY_ARCHIVE_COMMIT" \
-  SENTRY_BUNDLE_ID="$BUNDLE_ID" SENTRY_MARKETING_VERSION="$MARKETING" SENTRY_BUILD_NUMBER="$BUILD_NUM" \
-    node "${REPO_ROOT}/scripts/sentry-testflight-receipt.mjs"; then
-    # Preserve the successful ship result.  The separate reporting job fails
-    # visibly on this output before it loads any Sentry credential.
-    echo "sentry_receipt_error=true" >> "$GITHUB_OUTPUT"
-  fi
-}
-
 acquire_archive_lock
 log "archiving..."
 set +e
@@ -1208,58 +1012,31 @@ if [[ -n "${SENTRY_DSN:-}" ]]; then
   SENTRY_DSN_FLAGS+=(SENTRY_DSN="$SENTRY_DSN")
   log "SENTRY_DSN present for archive (length ${#SENTRY_DSN})"
 else
-  log "warning: SENTRY_DSN unset; Cocoa no-ops when the plist value is empty"
-  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-    echo "::warning::SENTRY_DSN unset; this TestFlight build ships with Sentry Cocoa inert."
-  fi
+  log "SENTRY_DSN unset; Cocoa no-ops when the plist value is empty"
 fi
 
-if [[ "$MANUAL_SIGN" -eq 1 ]]; then
-  xcodebuild archive \
-    -project "$PROJECT_PATH" \
-    -scheme "$SCHEME" \
-    -configuration Release \
-    "${ARCHIVE_PLATFORM_FLAGS[@]}" \
-    -archivePath "$ARCHIVE_PATH" \
-    DEVELOPMENT_TEAM="$TEAM_ID" \
-    MARKETING_VERSION="$MARKETING" \
-    CURRENT_PROJECT_VERSION="$BUILD_NUM" \
-    ${SENTRY_DSN_FLAGS[@]:+"${SENTRY_DSN_FLAGS[@]}"} \
-    2>&1 | tee "${LOG_DIR}/archive.log"
-  ARCHIVE_RC="${PIPESTATUS[0]:-$?}"
-else
-  xcodebuild archive \
-    -project "$PROJECT_PATH" \
-    -scheme "$SCHEME" \
-    -configuration Release \
-    "${ARCHIVE_PLATFORM_FLAGS[@]}" \
-    -archivePath "$ARCHIVE_PATH" \
-    -allowProvisioningUpdates \
-    -allowProvisioningDeviceRegistration \
-    ${ASC_AUTH_FLAGS[@]:+"${ASC_AUTH_FLAGS[@]}"} \
-    DEVELOPMENT_TEAM="$TEAM_ID" \
-    CODE_SIGN_STYLE=Automatic \
-    MARKETING_VERSION="$MARKETING" \
-    CURRENT_PROJECT_VERSION="$BUILD_NUM" \
-    ${SENTRY_DSN_FLAGS[@]:+"${SENTRY_DSN_FLAGS[@]}"} \
-    2>&1 | tee "${LOG_DIR}/archive.log"
-  ARCHIVE_RC="${PIPESTATUS[0]:-$?}"
-fi
+xcodebuild archive \
+  -project "$PROJECT_PATH" \
+  -scheme "$SCHEME" \
+  -configuration Release \
+  "${ARCHIVE_PLATFORM_FLAGS[@]}" \
+  -archivePath "$ARCHIVE_PATH" \
+  -allowProvisioningUpdates \
+  -allowProvisioningDeviceRegistration \
+  ${ASC_AUTH_FLAGS[@]:+"${ASC_AUTH_FLAGS[@]}"} \
+  DEVELOPMENT_TEAM="$TEAM_ID" \
+  CODE_SIGN_STYLE=Automatic \
+  MARKETING_VERSION="$MARKETING" \
+  CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+  ${SENTRY_DSN_FLAGS[@]:+"${SENTRY_DSN_FLAGS[@]}"} \
+  2>&1 | tee "${LOG_DIR}/archive.log"
+ARCHIVE_RC="${PIPESTATUS[0]:-$?}"
 set -e
 [[ $ARCHIVE_RC -eq 0 ]] || die "archive failed (rc=$ARCHIVE_RC); see ${LOG_DIR}/archive.log"
-if [[ "$MANUAL_SIGN" -eq 1 ]]; then
-  _archived_app="$(ls -d "${ARCHIVE_PATH}/Products/Applications/"*.app 2>/dev/null | head -1 || true)"
-  if [[ -n "$_archived_app" ]]; then
-    _authority="$(codesign -dvv "$_archived_app" 2>&1 | sed -n 's/^Authority=//p' | head -1 || true)"
-    log "archived app signed by: ${_authority:-unknown}"
-  fi
-fi
 upload_sentry_artifacts
 
-if [[ "$MANUAL_SIGN" -eq 0 ]]; then
-  EXPORT_PLIST_UPLOAD="${FLEET_DIR}/ExportOptions-appstore.plist"
-  EXPORT_PLIST_IPA="${FLEET_DIR}/ExportOptions-export-ipa.plist"
-fi
+EXPORT_PLIST_UPLOAD="${FLEET_DIR}/ExportOptions-appstore.plist"
+EXPORT_PLIST_IPA="${FLEET_DIR}/ExportOptions-export-ipa.plist"
 
 if [[ "$EXPORT_ONLY" -eq 1 ]]; then
   log "exporting package only..."
@@ -1269,7 +1046,7 @@ if [[ "$EXPORT_ONLY" -eq 1 ]]; then
     -archivePath "$ARCHIVE_PATH" \
     -exportPath "$EXPORT_DIR" \
     -exportOptionsPlist "$EXPORT_PLIST_IPA" \
-    ${PROVISION_UPDATE_FLAGS[@]:+"${PROVISION_UPDATE_FLAGS[@]}"} \
+    -allowProvisioningUpdates \
     ${ASC_AUTH_FLAGS[@]:+"${ASC_AUTH_FLAGS[@]}"} \
     2>&1 | tee "${LOG_DIR}/export.log"
   EXPORT_RC=${PIPESTATUS[0]}
@@ -1282,10 +1059,6 @@ if [[ "$EXPORT_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-if [[ "$MANUAL_SIGN" -eq 1 ]]; then
-  log "manual signing: exporting the IPA locally, then uploading with altool (api key)"
-  : >"${LOG_DIR}/export-upload.log"
-else
 # Prefer: export with destination=upload (uses Xcode session OR ASC if configured in Xcode)
 log "exporting + uploading to App Store Connect..."
 mkdir -p "$EXPORT_DIR"
@@ -1306,13 +1079,11 @@ if [[ $EXPORT_RC -eq 0 ]]; then
   release_archive_lock
   ensure_tf_ready
   record_successful_ship
-  emit_sentry_deployment_receipt
   log "logs: ${LOG_DIR}"
   exit 0
 fi
 
 log "xcodebuild upload export failed (rc=$EXPORT_RC); trying local export + altool"
-fi
 
 mkdir -p "$EXPORT_DIR"
 set +e
@@ -1320,7 +1091,7 @@ xcodebuild -exportArchive \
   -archivePath "$ARCHIVE_PATH" \
   -exportPath "$EXPORT_DIR" \
   -exportOptionsPlist "$EXPORT_PLIST_IPA" \
-  ${PROVISION_UPDATE_FLAGS[@]:+"${PROVISION_UPDATE_FLAGS[@]}"} \
+  -allowProvisioningUpdates \
   ${ASC_AUTH_FLAGS[@]:+"${ASC_AUTH_FLAGS[@]}"} \
   2>&1 | tee "${LOG_DIR}/export-ipa.log"
 EXPORT_RC=${PIPESTATUS[0]}
@@ -1365,7 +1136,6 @@ fi
 release_archive_lock
 ensure_tf_ready
 record_successful_ship
-emit_sentry_deployment_receipt
 log "upload submitted; watch TestFlight processing for ${BUNDLE_ID} build ${BUILD_NUM}"
 log "logs: ${LOG_DIR}"
 exit 0
