@@ -16,6 +16,7 @@ describe("computeRoomAttentionIndex", () => {
         dm: true,
         memberIds: ["bot-1", "bot-2"],
         unread: true,
+        threadId: "thread-dm-1",
       },
       {
         id: "group-bf",
@@ -24,6 +25,7 @@ describe("computeRoomAttentionIndex", () => {
         memberIds: ["bot-1", "bot-2"],
         unread: false,
         cwd: "/Users/jay/Code/BotFleet",
+        threadId: "thread-bf",
       },
       {
         id: "group-st",
@@ -32,6 +34,7 @@ describe("computeRoomAttentionIndex", () => {
         memberIds: ["bot-3"],
         unread: true,
         cwd: "/Users/jay/Code/Socratic.Trade",
+        threadId: "thread-st",
       },
     ];
 
@@ -41,12 +44,16 @@ describe("computeRoomAttentionIndex", () => {
         name: "Architect",
         activity: "working",
         unread: false,
+        // Turn runs on the BotFleet room thread.
+        inflightThreadId: "thread-bf",
       },
       {
         id: "bot-2",
         name: "Fixer",
         activity: "waiting-on-you",
         unread: true,
+        // Open card sits on the BotFleet room thread.
+        waitingThreadId: "thread-bf",
       },
       {
         id: "bot-3",
@@ -68,15 +75,17 @@ describe("computeRoomAttentionIndex", () => {
     expect(result).toHaveLength(2);
     expect(result.map((r) => r.roomId)).toEqual(["group-bf", "group-st"]);
 
-    // BotFleet group has bot-1 (working) and bot-2 (waiting-on-you, unread)
+    // BotFleet group has bot-1 (working its room thread) and bot-2 (waiting
+    // on its room thread). bot-2's unread 1:1 thread is not room content.
     const bf = result.find((r) => r.roomId === "group-bf")!;
     expect(bf.errors.count).toBe(0);
     expect(bf.working.count).toBe(1);
     expect(bf.working.bots[0].botName).toBe("Architect");
     expect(bf.needsAction.count).toBe(1);
     expect(bf.needsAction.bots[0].botName).toBe("Fixer");
-    expect(bf.unread.count).toBe(1); // bot-2 has unread
-    expect(bf.unread.hasUnread).toBe(true);
+    expect(bf.unread.count).toBe(0);
+    expect(bf.unread.hasUnread).toBe(false);
+    expect(bf.unread.bots.map((b) => b.botName)).toEqual(["Fixer"]);
     expect(bf.cwd).toBe("/Users/jay/Code/BotFleet");
 
     // Socratic.Trade group has bot-3 (dead), room unread is true
@@ -98,6 +107,7 @@ describe("computeRoomAttentionIndex", () => {
         section: "Finance",
         memberIds: [], // Explicitly empty
         unread: false,
+        threadId: "thread-ct",
       },
     ];
 
@@ -135,6 +145,7 @@ describe("computeRoomAttentionIndex", () => {
         name: "Dev",
         memberIds: ["bot-speaker"],
         unread: true, // Room chat itself is unread
+        threadId: "thread-dev",
       },
     ];
 
@@ -149,8 +160,10 @@ describe("computeRoomAttentionIndex", () => {
 
     const result = computeRoomAttentionIndex(groups, bots);
     expect(result[0].unread.hasUnread).toBe(true);
-    // Unread count reflects total unread conversation surfaces (room chat + member bot thread)
-    expect(result[0].unread.count).toBe(2);
+    // Room count is the room chat only; the member's 1:1 unread is listed
+    // for the fleet rollup, not counted here.
+    expect(result[0].unread.count).toBe(1);
+    expect(result[0].unread.bots.map((b) => b.botId)).toEqual(["bot-speaker"]);
   });
 
   it("summarizes fleet attention accurately", () => {
@@ -199,6 +212,7 @@ describe("computeRoomAttentionIndex", () => {
         name: "BotFleet",
         memberIds: ["bot-err"],
         unread: false,
+        threadId: "thread-bf",
       },
     ];
 
@@ -228,6 +242,7 @@ describe("computeRoomAttentionIndex", () => {
         name: "BotFleet",
         memberIds: ["bot-fork", "bot-stale"],
         unread: false,
+        threadId: "thread-bf",
       },
     ];
 
@@ -278,8 +293,8 @@ describe("computeRoomAttentionIndex", () => {
       messages,
     };
     const groups: MinimalGroup[] = [
-      { id: "room-a", name: "A", memberIds: ["bot-shared"], unread: false },
-      { id: "room-b", name: "B", memberIds: ["bot-shared"], unread: false },
+      { id: "room-a", name: "A", memberIds: ["bot-shared"], unread: false, threadId: "thread-a" },
+      { id: "room-b", name: "B", memberIds: ["bot-shared"], unread: false, threadId: "thread-b" },
     ];
 
     const result = computeRoomAttentionIndex(groups, [bot]);
@@ -373,6 +388,7 @@ describe("computeRoomAttentionIndex", () => {
         name: "BotFleet",
         memberIds: ["bot-deep", "bot-cycle", "bot-missing", "bot-ancestor"],
         unread: false,
+        threadId: "thread-room",
       },
     ];
     const result = computeRoomAttentionIndex(groups, [deepBot, cycle, missingLeaf, ancestorOnly]);
@@ -389,24 +405,30 @@ describe("summarizeFleetAttention", () => {
     id: string,
     memberIds: string[],
     extra: Partial<MinimalGroup> = {},
-  ): MinimalGroup => ({ id, name: id, memberIds, unread: false, ...extra });
+  ): MinimalGroup => ({ id, name: id, memberIds, unread: false, threadId: `${id}-thread`, ...extra });
 
-  it("counts a bot once however many rooms it belongs to", () => {
+  it("attributes a working turn to its own room, not every room the bot is in", () => {
     // One working bot and one dead bot, each a member of all three rooms.
+    // The worker's turn runs on room-a's thread.
     const groups = [
       room("room-a", ["bot-worker", "bot-crashed"]),
       room("room-b", ["bot-worker", "bot-crashed"]),
       room("room-c", ["bot-worker", "bot-crashed"]),
     ];
     const bots: MinimalBot[] = [
-      { id: "bot-worker", name: "Worker", activity: "working" },
+      { id: "bot-worker", name: "Worker", activity: "working", inflightThreadId: "room-a-thread" },
       { id: "bot-crashed", name: "Crashed", activity: "dead" },
     ];
 
     const rooms = computeRoomAttentionIndex(groups, bots);
-    // Every room still shows the bot's one global state, so the per-room chips
-    // and matrix rows are unchanged.
-    expect(rooms.map((r) => r.working.count)).toEqual([1, 1, 1]);
+    // Only the room that owns the turn thread shows working. Errors stay
+    // global: a dead bot is dead in every room it belongs to.
+    expect(rooms.map((r) => r.working.count)).toEqual([1, 0, 0]);
+    expect(rooms.map((r) => r.working.bots.map((b) => b.botId))).toEqual([
+      ["bot-worker"],
+      [],
+      [],
+    ]);
     expect(rooms.map((r) => r.errors.count)).toEqual([1, 1, 1]);
 
     const summary = summarizeFleetAttention(rooms);
@@ -414,31 +436,136 @@ describe("summarizeFleetAttention", () => {
     expect(summary.totalErrors).toBe(1);
     expect(summary.totalNeedsAction).toBe(0);
     expect(summary.totalUnread).toBe(0);
-    // How many rooms are affected is a different question, and it stays per room.
-    expect(summary.roomsWorking).toBe(3);
+    expect(summary.roomsWorking).toBe(1);
     expect(summary.roomsWithErrors).toBe(3);
   });
 
+  it("shows an unattributed working state nowhere", () => {
+    // A working bot with no live-thread attribution (and no room claiming
+    // it through busyBotId) is real work, but no room can honestly claim
+    // it, so no room chip does.
+    const groups = [
+      room("room-a", ["bot-worker"]),
+      room("room-b", ["bot-worker"]),
+    ];
+    const bots: MinimalBot[] = [
+      { id: "bot-worker", name: "Worker", activity: "working" },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    expect(rooms.map((r) => r.working.count)).toEqual([0, 0]);
+
+    const summary = summarizeFleetAttention(rooms);
+    expect(summary.totalWorking).toBe(0);
+    expect(summary.roomsWorking).toBe(0);
+  });
+
   it("still counts different bots separately when their rooms overlap", () => {
+    // Each wait and turn is attributed to the room that owns its thread,
+    // even when membership overlaps.
     const groups = [
       room("room-a", ["bot-a", "bot-c"]),
       room("room-b", ["bot-a", "bot-b", "bot-c", "bot-d"]),
       room("room-c", ["bot-b", "bot-d"]),
     ];
     const bots: MinimalBot[] = [
-      { id: "bot-a", name: "A", activity: "working" },
-      { id: "bot-b", name: "B", activity: "working" },
-      { id: "bot-c", name: "C", activity: "waiting-on-you" },
-      { id: "bot-d", name: "D", activity: "waiting-on-you" },
+      { id: "bot-a", name: "A", activity: "working", inflightThreadId: "room-a-thread" },
+      { id: "bot-b", name: "B", activity: "working", inflightThreadId: "room-c-thread" },
+      { id: "bot-c", name: "C", activity: "waiting-on-you", waitingThreadId: "room-b-thread" },
+      { id: "bot-d", name: "D", activity: "waiting-on-you", waitingThreadId: "room-b-thread" },
     ];
 
     const rooms = computeRoomAttentionIndex(groups, bots);
-    expect(rooms.map((r) => r.working.count)).toEqual([1, 2, 1]);
-    expect(rooms.map((r) => r.needsAction.count)).toEqual([1, 2, 1]);
+    expect(rooms.map((r) => r.working.count)).toEqual([1, 0, 1]);
+    expect(rooms.map((r) => r.needsAction.count)).toEqual([0, 2, 0]);
 
     const summary = summarizeFleetAttention(rooms);
     expect(summary.totalWorking).toBe(2);
     expect(summary.totalNeedsAction).toBe(2);
+  });
+
+  it("shows a wait only in the room that owns the waiting thread", () => {
+    // The reported case: one bot waits on a card in AFC+OPS while belonging
+    // to every room. Only AFC+OPS may show it.
+    const groups = [
+      room("room-codecaps", ["bot-plumber"]),
+      room("room-afcops", ["bot-plumber"]),
+    ];
+    const bots: MinimalBot[] = [
+      {
+        id: "bot-plumber",
+        name: "Plumber",
+        activity: "waiting-on-you",
+        waitingThreadId: "room-afcops-thread",
+      },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    expect(rooms.map((r) => r.needsAction.count)).toEqual([0, 1]);
+    expect(rooms[1].needsAction.bots.map((b) => b.botName)).toEqual(["Plumber"]);
+
+    const summary = summarizeFleetAttention(rooms);
+    expect(summary.totalNeedsAction).toBe(1);
+    expect(summary.roomsNeedingAction).toBe(1);
+  });
+
+  it("shows a 1:1 wait or turn in no room", () => {
+    // A wait on the bot's own thread (or a wait the server never attributed)
+    // belongs to no room, so no room chip claims it.
+    const groups = [
+      room("room-a", ["bot-solo"]),
+      room("room-b", ["bot-solo"]),
+    ];
+    const waitingNowhere: MinimalBot[] = [
+      {
+        id: "bot-solo",
+        name: "Solo",
+        activity: "waiting-on-you",
+        threadId: "bot-solo-thread",
+        waitingThreadId: "bot-solo-thread",
+      },
+    ];
+    const waitingUnattributed: MinimalBot[] = [
+      { id: "bot-solo", name: "Solo", activity: "waiting-on-you" },
+    ];
+
+    for (const bots of [waitingNowhere, waitingUnattributed]) {
+      const rooms = computeRoomAttentionIndex(groups, bots);
+      expect(rooms.map((r) => r.needsAction.count)).toEqual([0, 0]);
+    }
+
+    const turningNowhere: MinimalBot[] = [
+      {
+        id: "bot-solo",
+        name: "Solo",
+        activity: "working",
+        threadId: "bot-solo-thread",
+        inflightThreadId: "bot-solo-thread",
+      },
+    ];
+    const rooms = computeRoomAttentionIndex(groups, turningNowhere);
+    expect(rooms.map((r) => r.working.count)).toEqual([0, 0]);
+  });
+
+  it("attributes a wait on a room task thread to that room", () => {
+    const groups = [
+      room("room-a", ["bot-tasked"], {
+        threadId: "room-a-thread",
+        tasks: [{ threadId: "room-a-task-9" }],
+      }),
+      room("room-b", ["bot-tasked"]),
+    ];
+    const bots: MinimalBot[] = [
+      {
+        id: "bot-tasked",
+        name: "Tasked",
+        activity: "waiting-on-you",
+        waitingThreadId: "room-a-task-9",
+      },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    expect(rooms.map((r) => r.needsAction.count)).toEqual([1, 0]);
   });
 
   it("counts a working bot once whether its activity or its room's busy marker says so", () => {
@@ -452,11 +579,12 @@ describe("summarizeFleetAttention", () => {
     ];
 
     const rooms = computeRoomAttentionIndex(groups, bots);
-    // room-a lists bot-global once although two signals mark it working, and
-    // room-b adds a bot that is busy only in that room.
+    // room-a lists bot-global once although two signals mark it working.
+    // room-b lists only its own busy speaker: bot-global's process belongs
+    // to room-a, so room-b may not claim it through the global activity.
     expect(rooms.map((r) => r.working.bots.map((b) => b.botId))).toEqual([
       ["bot-global"],
-      ["bot-global", "bot-room-only"],
+      ["bot-room-only"],
     ]);
 
     const summary = summarizeFleetAttention(rooms);
@@ -475,8 +603,9 @@ describe("summarizeFleetAttention", () => {
     ];
 
     const rooms = computeRoomAttentionIndex(groups, bots);
-    // Per room: the bot's thread, plus the room chat where it is unread.
-    expect(rooms.map((r) => r.unread.count)).toEqual([1, 2, 1]);
+    // Per room: the room chat only. The bot's 1:1 unread is still listed
+    // for the fleet rollup, but only room-b's own chat counts at room level.
+    expect(rooms.map((r) => r.unread.count)).toEqual([0, 1, 0]);
     expect(rooms.map((r) => r.unread.roomUnread)).toEqual([false, true, false]);
     expect(rooms.map((r) => r.unread.bots.map((b) => b.botId))).toEqual([
       ["bot-reader"],
@@ -486,6 +615,6 @@ describe("summarizeFleetAttention", () => {
 
     const summary = summarizeFleetAttention(rooms);
     expect(summary.totalUnread).toBe(2); // the bot once, plus room-b's chat
-    expect(summary.roomsWithUnread).toBe(3);
+    expect(summary.roomsWithUnread).toBe(1);
   });
 });

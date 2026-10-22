@@ -738,6 +738,12 @@ export interface BotRecord {
    * could not tell working from waiting-on-you from a stalled engine.
    * Transient like busy: reset to idle on load. */
   activity?: BotActivity;
+  /** The thread holding the bot's open approval or question while activity
+   * is waiting-on-you. Lets readers attribute the wait to the room that
+   * owns the thread instead of fanning one global state out to every room.
+   * Transient like activity: cleared whenever activity leaves
+   * waiting-on-you, stripped on save, reset on load. */
+  waitingThreadId?: string | null;
   /** Durable crash marker: the thread a turn was dispatched on. Cleared
    * when that turn settles. Unlike activity/busy, this survives restart. */
   inflightThreadId?: string;
@@ -1060,6 +1066,10 @@ export class Store {
       if (b.busy || (b.activity !== undefined && b.activity !== "idle")) botsMigrated = true;
       b.busy = false;
       b.activity = "idle";
+      if (b.waitingThreadId !== undefined && b.waitingThreadId !== null) {
+        b.waitingThreadId = null;
+        botsMigrated = true;
+      }
       if (b.cloudBackend !== undefined && b.cloudBackend !== "box" && b.cloudBackend !== "vps") {
         delete b.cloudBackend;
         botsMigrated = true;
@@ -1287,7 +1297,7 @@ export class Store {
     // busy/activity never survive a restart (reset on load above) and
     // change on every turn transition, so they are excluded here rather
     // than debounced — nothing to coalesce for state nobody reads back.
-    writeFileAtomic(BOTS_FILE, JSON.stringify(this.bots.map(({ busy, activity, ...bot }) => bot), null, 2));
+    writeFileAtomic(BOTS_FILE, JSON.stringify(this.bots.map(({ busy, activity, waitingThreadId, ...bot }) => bot), null, 2));
     this.botsDirty = false;
   }
 
@@ -2170,6 +2180,25 @@ export class Store {
     if (bot.activity === activity && Boolean(bot.busy) === busy) return bot;
     bot.activity = activity;
     bot.busy = busy;
+    // A wait belongs to the thread that opened it. Any other transition
+    // drops the attribution, so a stale thread can never pin a badge to
+    // the wrong room after the wait is gone.
+    if (activity !== "waiting-on-you") bot.waitingThreadId = null;
+    bot.activityStartedAt = Date.now();
+    this.emit({ type: "bot", botId });
+    return bot;
+  }
+
+  /** Mark a bot waiting on a human for the approval or question on one
+   * thread. The thread is what ties the wait to its room; without it the
+   * global activity fans out to every room the bot belongs to. */
+  setWaiting(botId: string, threadId: string): BotRecord | null {
+    const bot = this.bot(botId);
+    if (!bot) return null;
+    const busy = ACTIVITY_BUSY.has("waiting-on-you");
+    bot.activity = "waiting-on-you";
+    bot.busy = busy;
+    bot.waitingThreadId = threadId;
     bot.activityStartedAt = Date.now();
     this.emit({ type: "bot", botId });
     return bot;
