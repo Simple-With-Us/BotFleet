@@ -833,33 +833,51 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                 >
                   {queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
                 </span>
-                <div className="flex shrink-0 items-center gap-1">
+                {/* Labeled actions, not bare glyphs: three 24px icons in a row were
+                    easy to mis-tap, and "Steer" beside "Cancel" says which one
+                    ends the wait.  The order is Steer, Edit, Cancel — Edit sits in
+                    the middle so neither neighbour reads as its default.  The
+                    accessible names stay the ones the screen readers and the
+                    tests already use. */}
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSteerQueued}
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-accent/30 bg-accent/10 text-accent hover:bg-accent/15",
+                    )}
+                    title="Stops the current turn and sends this now."
+                    aria-label="Steer Now"
+                  >
+                    <ArrowUp size={12} strokeWidth={2.5} aria-hidden="true" />
+                    Steer
+                  </button>
                   <button
                     type="button"
                     onClick={() => handleEditQueued(entry)}
-                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink transition-colors"
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-hairline/40 bg-inset/30 text-ink-secondary hover:bg-raised hover:text-ink",
+                    )}
                     title="Puts the message back in the composer to edit."
                     aria-label="Edit Queued Message"
                   >
-                    <Pencil size={12} strokeWidth={2} />
+                    <Pencil size={12} strokeWidth={2} aria-hidden="true" />
+                    Edit
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCancelQueued(entry.queueId)}
-                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-danger transition-colors"
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-hairline/40 bg-inset/30 text-ink-secondary hover:bg-raised hover:text-danger",
+                    )}
                     title="Cancel Queued Message"
                     aria-label="Cancel Queued Message"
                   >
-                    <Trash2 size={12} strokeWidth={2} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleSteerQueued}
-                    className="flex size-6 items-center justify-center rounded-md text-accent hover:bg-accent/15 transition-colors"
-                    title="Stops the current turn and sends this now."
-                    aria-label="Steer Now"
-                  >
-                    <ArrowUp size={13} strokeWidth={2.5} />
+                    <Trash2 size={12} strokeWidth={2} aria-hidden="true" />
+                    Cancel
                   </button>
                 </div>
               </div>
