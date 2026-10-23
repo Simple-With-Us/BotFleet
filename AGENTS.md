@@ -88,12 +88,12 @@ Two spaces between sentences in every paragraph a human reads: product UI, App S
 
 **HOW to emit it (owner ruling 2026-10-23, the same on every surface):**  between sentences, write a real U+00A0 (no-break space) followed by a normal space.  This covers chat replies, Zulip, GitHub PR and issue text, Linear, Slack, commit messages, repo docs, UI copy, skills and agent instructions.
 
-- Never write the `&nbsp;` entity.  It shows up as literal text in squash-merge commits, plain-text email and many APIs.
+- Never write the `&nbsp;` entity in prose.  It shows up as literal text in squash-merge commits, plain-text email and many APIs.
 - Two plain ASCII spaces are not enough.  Rendered surfaces (Zulip, GitHub, Linear, HTML, Markdown chat panes) collapse them to one.
-- Generate the U+00A0 in the shell (`printf 'One.\302\240 Two.'`, or the converter in the `sentence-gap` skill) rather than typing it, because a model-typed U+00A0 can be normalized to a plain space.  Check the bytes before you post.
-- HTML, JSX and SwiftUI product copy: `\u00A0 ` in source, or a shared `SENTENCE_GAP` constant.
-- Code, identifiers and machine-readable config never get a U+00A0.  If a surface strips U+00A0, leave the text as it is rather than switching to the entity.
-- This replaces the earlier per-surface rules (the entity in chat panes or on GitHub, and two ASCII spaces in files, commits and terminals).
+- Generate the U+00A0 in the shell (`printf 'One.\302\240 Two.'`, or the converter in the canonical `sentence-gap` skill (`AI-Fleet-Coordinator/docs/fleet-skills/sentence-gap/SKILL.md`, https://github.com/Simple-With-Us/AI-Fleet-Coordinator/blob/main/docs/fleet-skills/sentence-gap/SKILL.md)) rather than typing it, because a model-typed U+00A0 can be normalized to a plain space.  Check the bytes before you post.
+- Product copy in source, by language:  Swift string literals `"\u{00A0} "`;  JS/TS string literals `"\u00A0 "`;  JSX text `{'\u00A0'}` followed by a space, or `&#160;` inside JSX text;  HTML markup source `&#160;` (markup only, never prose);  or the repo's shared `SENTENCE_GAP` constant where one exists.
+- Code, identifiers and machine-readable config never get a U+00A0.  If a surface strips U+00A0, leave the text as it is rather than switching to the entity, and report that surface in #Work-In-Progress (formerly #agent-sync) so it can be given a working mechanism.
+- This replaces the earlier per-surface rules (the entity in chat panes or on GitHub, and two plain ASCII spaces in files, commits and terminals).
 
 ## App Icon And Logo Policy: Full-Bleed Square Only, Never Squircle
 

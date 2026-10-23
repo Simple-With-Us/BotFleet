@@ -41,7 +41,7 @@ Slack, commit messages, repo docs and Markdown, skills, agent instructions, and 
 - **Generate the U+00A0 in the shell** (the converter below, or `printf '\302\240'`) rather
   than typing it, because a model-typed U+00A0 can be normalized to a plain space.  Check the
   bytes before you post.
-- In HTML, JSX and Swift source, write it as `\u00A0 ` or use a shared `SENTENCE_GAP` constant.
+- In product-copy source, spell it per language:  Swift `"\u{00A0} "`, JS/TS strings `"\u00A0 "`, JSX text `{'\u00A0'}` plus a space or `&#160;`, HTML markup source `&#160;`, or a shared `SENTENCE_GAP` constant.  Never `&nbsp;` in prose.
 - Code, identifiers and machine-readable config never get a U+00A0.
 - If a surface strips U+00A0, leave the text as it is rather than switching to the entity, and
   report the surface in #Work-In-Progress.
@@ -63,7 +63,7 @@ depends on the surface, so pick by destination:
 | Destination | Use | Why |
 |---|---|---|
 | **Every surface** — chat replies in any pane, Zulip, GitHub PR and issue titles, bodies and comments, review comments, Linear, Slack, commit messages, repo docs and Markdown, skills and agent instructions, rendered product copy | a real U+00A0 plus a normal space | Owner ruling 2026-10-23:  one rule everywhere.  Two ASCII spaces collapse on rendered surfaces, and the `&nbsp;` entity shows as literal text in squash commits, plain-text email and many APIs.  This replaces every earlier per-surface row. |
-| **HTML / JSX / Swift source for product copy** | `\u00A0 ` in source, or a shared `SENTENCE_GAP` constant | The rendered result is the same U+00A0 plus a space.  Never `&nbsp; `. |
+| **HTML / JSX / Swift source for product copy** | Swift `"\u{00A0} "`, JS/TS strings `"\u00A0 "`, JSX text `{'\u00A0'}` plus a space or `&#160;`, HTML markup source `&#160;`, or a shared `SENTENCE_GAP` constant | The rendered result is the same U+00A0 plus a space.  Never `&nbsp; `. |
 | **Code, identifiers and machine-readable config** | no gap character | Never put U+00A0 into code, identifiers or config. |
 | **A surface that strips U+00A0** | leave the text as it is | Do not switch to the `&nbsp;` entity.  Report the surface in #Work-In-Progress. |
 | **Markdown source** | the same U+00A0 plus a space *between* sentences | ⚠️ Two spaces at the **end of a line** is the unrelated hard-line-break syntax — don't confuse the two |
