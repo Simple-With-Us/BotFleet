@@ -10,6 +10,7 @@ import {
   DSH_MINIMUM_ACP_VERSION,
   DSH_PROVIDER_ID,
   DSH_MINIMAX_PROVIDER_ID,
+  dshCanonicalWireModelId,
   classifyDshError,
   dshCredentialCandidates,
   dshInstalledEffortLevels,
@@ -401,6 +402,8 @@ export function dshSpawnArgs(config: AcpConfig, turn: Pick<SendTurnInput, "integ
   return clutchDshSpawnArgs(config, turn);
 }
 
+const dshSelectModel = clutchDshSupport.selectModel;
+
 /**
  * The Clutch package's error codes include "unknown"; BotFleet's
  * ProviderErrorCode does not — an unrecognized Clutch code is the same as
@@ -432,6 +435,17 @@ export const dshSupport = {
   images: true,
   models: STATIC_DSH_MODELS,
   resolveModels: (environment) => readDshModelCatalog(environment),
+  // The installed settings can advertise `deepseek-v4.1-flash`, but DeepSeek's
+  // API accepts the stock `deepseek-flash` id.  Keep Clutch's advertised-value
+  // resolution for every other model, while canonicalizing this settings-only
+  // alias before BotFleet sends the model option over ACP.
+  selectModel: dshSelectModel && {
+    ...dshSelectModel,
+    valueForModel: (model, advertised) =>
+      model.toLowerCase() === "deepseek-v4.1-flash"
+        ? dshSelectModel.valueForModel?.(dshCanonicalWireModelId(model))
+        : dshSelectModel.valueForModel?.(model, advertised),
+  },
   loginNote: clutchDshSupport.loginNote ?? "DSH CLI auth missing — add ~/.dsh/.credentials.yaml",
   resumeMethod: "session/resume" as const,
   spawnArgs: dshSpawnArgs,
