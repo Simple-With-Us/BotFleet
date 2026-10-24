@@ -52,9 +52,21 @@ export FAKE_LOG="${tmp}/fake.log"
 export FAKE_ASC_PEM="${tmp}/asc.p8"
 : > "$FAKE_LOG"
 
+# A vault that is always closed.  fs_get falls back to whatever
+# fleet-secrets is on the PATH when the configured binary is not executable,
+# so a case that wants NO credential points FLEET_SECRETS_BIN at this
+# executable stub and not at a path that does not exist:  a path that does
+# not exist lets the real fleet-secrets answer, and a test has no business
+# reading the owner's vault.
+cat > "${tmp}/no-vault" <<'VAULT'
+#!/usr/bin/env bash
+exit 2
+VAULT
+chmod 700 "${tmp}/no-vault"
+
 extract() {
   awk '
-    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
+    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_preview\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
     grab { print }
     grab && /^\}/ { grab = 0 }
   ' "$script"
@@ -484,6 +496,17 @@ root_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
 case "$root_log" in
   *"no App Store Connect API key"*) fail "a root TMPDIR was reported as a missing key: ${root_log}" ;;
 esac
+# The refusal has to hold for a user who CAN write to the root of the
+# filesystem, so it is asserted on the helper itself and not on whether
+# mktemp happened to fail.  A root TMPDIR strips down to nothing, and
+# nothing is not a directory:  the root of the filesystem is refused
+# instead of being turned into a path a key could be staged in.
+root_rc="$(TMPDIR=/ bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  if asc_temp_root >/dev/null 2>&1; then echo "rc=0"; else echo "rc=$?"; fi
+')"
+[[ "$root_rc" == "rc=1" ]] || fail "a root TMPDIR was not refused by asc_temp_root (${root_rc})"
 # A doubled trailing slash is not the root, so it strips down to the real
 # directory and the key stages there.
 stage_from_tmpdir "double-slash TMPDIR" TMPDIR="${tmp}//"
@@ -544,29 +567,43 @@ cred_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
   [[ "$ASC_AUTH_FAILURE" == credential ]]
   [[ "$(asc_upload_block)" == credential ]]
 ')" || fail "a broken credential was classified as a path refusal"
+# The captured log is never echoed into a failure message:  it can hold the
+# key itself, and a failure message is a sink like any other.
 case "$cred_log" in
   *"the credential was resolved but it is not a usable PEM private key"*) ;;
-  *) fail "a broken credential did not say so: ${cred_log}" ;;
+  *) fail "a broken credential did not say so" ;;
 esac
 case "$cred_log" in
-  *"the staging path was refused"*) fail "a broken credential was reported as a path refusal: ${cred_log}" ;;
+  *"the staging path was refused"*) fail "a broken credential was reported as a path refusal" ;;
 esac
 case "$cred_log" in
-  *"no App Store Connect API key"*) fail "a broken credential was reported as a missing key: ${cred_log}" ;;
+  *"no App Store Connect API key"*) fail "a broken credential was reported as a missing key" ;;
 esac
-# The rejected credential is identified by its public labels, the key id and
-# the issuer, and by nothing that came out of the key itself.  A preview of
-# the PEM would be a slice of the private key's own encoding.
+# The rejected credential is identified by its public label, the key id, and
+# by a MASKED PREVIEW of the key:  the first eight and the last four
+# characters with the middle elided.  That is the fleet's canonical mask,
+# and it is what lets an owner tell one rejected key from another without
+# the key ever being printed.
 case "$cred_log" in
   *"key id ABCDE12345"*) ;;
-  *) fail "a broken credential did not name the key id: ${cred_log}" ;;
+  *) fail "a broken credential did not name the key id" ;;
 esac
-if grep -q "BEGIN PRIVATE KEY" <<< "$cred_log"; then
-  fail "a broken credential printed the key itself: ${cred_log}"
+case "$cred_log" in
+  *"preview "*) ;;
+  *) fail "a broken credential did not carry a masked preview" ;;
+esac
+# The preview is a mask and not the key:  neither the PEM armor nor any
+# slice of the key body may appear in the log.  The slice is matched with
+# bash pattern matching, so no byte of the key ever reaches the argument
+# list of a process, where another user could read it through ps.
+if [[ "$cred_log" == *"BEGIN PRIVATE KEY"* ]]; then
+  fail "a broken credential printed the key itself"
 fi
-if grep -q "$(sed -n '2p' "${tmp}/asc.p8" | cut -c1-12)" <<< "$cred_log"; then
-  fail "a broken credential printed a slice of the key body: ${cred_log}"
+key_slice="$(sed -n '2p' "${tmp}/asc.p8" | cut -c1-12)"
+if [[ "$cred_log" == *"$key_slice"* ]]; then
+  fail "a broken credential printed a slice of the key body"
 fi
+unset key_slice
 
 # 8c. The two failures are told apart by the writer's exit code, not by the
 #     text of its message.  A staging failure is 2 and a credential failure
@@ -628,7 +665,7 @@ validate_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8
   # The sourced file points at the fake fleet-secrets.  Point it at nothing
   # after that, so the rejected ambient value is the only credential there
   # is and no other source can rescue the run.
-  FLEET_SECRETS_BIN="'"${tmp}"'/no-such-fleet-secrets"
+  FLEET_SECRETS_BIN="'"${tmp}"'/no-vault"
   load_secrets
   [[ "$AUTH_MODE" == none ]]
   [[ "$ASC_AUTH_FAILURE" == credential ]]
@@ -636,6 +673,47 @@ validate_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8
 ')" || fail "a credential rejected by validate was classified as a missing key"
 case "$validate_log" in
   *"no App Store Connect API key"*) fail "a rejected credential was reported as a missing key: ${validate_log}" ;;
+esac
+
+# 8f. A validator that fails without classifying anything is not a broken
+#     credential.  asc-key.mjs exits 3 for a value that is not a PEM and
+#     1 for its own crash, and node uses 1 for an uncaught exception, so a
+#     crash must not be reported as a bad key:  that would send the owner
+#     to re-export a key that is perfectly fine.
+mkdir -p "${tmp}/bin-validator"
+cat > "${tmp}/bin-validator/node" <<WRAP
+#!/usr/bin/env bash
+if [[ "\${1:-}" == *asc-key.mjs && "\${2:-}" == validate ]]; then
+  echo "asc-key: internal error" >&2
+  exit 1
+fi
+exec "$real_node" "\$@"
+WRAP
+chmod 700 "${tmp}/bin-validator/node"
+validator_log="$(env -u ASC_KEY_PATH -u ASC_KEY_P8 \
+  -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+  ASC_KEY_ID=ABCDE12345 ASC_ISSUER_ID=issuer-synthetic \
+  PATH="${tmp}/bin-validator:${PATH}" ASC_TEST_PEM="${tmp}/asc.p8" bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  # The sourced file points at the fake fleet-secrets.  Point it at nothing
+  # after that, so the only credential in the run is the one the ambient
+  # ASC_KEY_P8 carries.
+  FLEET_SECRETS_BIN="'"${tmp}"'/no-vault"
+  # The credential reaches the run through the environment it belongs in, so
+  # no byte of the key is ever an argument of a process.
+  ASC_KEY_P8="$(cat "$ASC_TEST_PEM")"
+  load_secrets
+  [[ "$AUTH_MODE" == none ]]
+  [[ "$ASC_AUTH_FAILURE" == writer ]]
+  [[ "$(asc_upload_block)" == writer ]]
+')" || fail "a validator crash was classified as a credential failure"
+case "$validator_log" in
+  *"the key validator failed with status"*) ;;
+  *) fail "a validator crash did not say the validator failed" ;;
+esac
+case "$validator_log" in
+  *"is not a usable PEM private key"*) fail "a validator crash was reported as a broken key" ;;
 esac
 
 # 9. No credential at all still classifies as missing, so the owner handoff
@@ -646,7 +724,7 @@ env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
   source "'"$funcs"'"
   # The sourced file points at the fake fleet-secrets.  Point it at nothing
   # after that, so this case really has no credential.
-  FLEET_SECRETS_BIN="'"${tmp}"'/no-such-fleet-secrets"
+  FLEET_SECRETS_BIN="'"${tmp}"'/no-vault"
   load_secrets
   [[ "$AUTH_MODE" == none ]]
   [[ -z "${ASC_AUTH_FAILURE:-}" ]]

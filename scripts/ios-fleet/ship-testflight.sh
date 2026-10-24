@@ -197,24 +197,29 @@ fs_get() {
 # A directory mktemp may use.  macOS TMPDIR ends in a slash, and joining
 # another slash onto it produces a doubled slash.  resolveStagingTarget
 # refuses a path that is not normal, so every trailing slash is stripped
-# here, including the root.  TMPDIR=/ would otherwise stay "/" and the join
-# would build "//asc-key.XXXXXX".  An empty root makes that join add exactly
-# one slash.
+# here.  A TMPDIR of "/" strips down to nothing, and nothing is not a
+# directory:  the root of the filesystem is refused rather than turned into
+# a path that can be written, because a key staged there would land in "/".
 asc_temp_root() {
   local root="${TMPDIR:-/tmp}"
   while [[ "$root" == */ ]]; do
     root="${root%/}"
   done
+  #  An empty root is the filesystem root:  a key staged there would land in
+  #  "/", so it is refused instead of being turned into a writable path.
+  [[ -n "$root" ]] || return 1
   printf '%s' "$root"
 }
 
 # Make the temp directory that holds a materialised .p8 (0700), once.
 # A directory that cannot be created is a path failure and not a crash:  the
-# caller classifies it.  A root TMPDIR is the case that reaches it, because
-# the root of the filesystem is not writable for a normal user.
+# caller classifies it.  A root TMPDIR reaches it, because asc_temp_root
+# refuses the root of the filesystem before mktemp is ever called.
 asc_tmp_dir() {
   if [[ -z "$ASC_TMP_DIR" ]]; then
-    ASC_TMP_DIR="$(umask 077; mktemp -d "$(asc_temp_root)/asc-key.XXXXXX")" || {
+    local root
+    root="$(asc_temp_root)" || { ASC_TMP_DIR=""; return 1; }
+    ASC_TMP_DIR="$(umask 077; mktemp -d "${root}/asc-key.XXXXXX")" || {
       ASC_TMP_DIR=""
       return 1
     }
@@ -235,6 +240,40 @@ asc_upload_block() {
     writer) printf '%s\n' "writer" ;;
     *) printf '%s\n' "missing" ;;
   esac
+}
+
+# A MASKED PREVIEW of a rejected credential:  the first eight and the last
+# four characters, with the middle elided.  That is the fleet's canonical
+# mask, and the same helper the other fleet repos carry:  it answers "which
+# key is this?" without printing a value anyone could authenticate with.  A
+# value too short to mask safely is withheld whole, so the preview can never
+# become the secret.
+#
+# The value never reaches an external command:  it arrives as a function
+# argument, which bash keeps in the shell's own memory and never puts into a
+# process argument list, and the preview itself is built with parameter
+# expansion.
+key_preview() {
+  local v="${1:-}" n
+  #  Whitespace is removed first:  a PEM is wrapped, and a preview that
+  #  carried a newline would break the log line it is written into.
+  v="${v//[[:space:]]/}"
+  n=${#v}
+  if [[ "$n" -eq 0 ]]; then
+    printf '%s' "(empty)"
+    return 0
+  fi
+  if [[ "$n" -le 24 ]]; then
+    #  Withheld unless the value is comfortably longer than the twelve
+    #  characters a preview discloses:  a 13-character rejected credential
+    #  would otherwise be logged as 12 of its 13 characters, which is the
+    #  mask becoming the secret.
+    printf '[%d chars, withheld]' "$n"
+    return 0
+  fi
+  #  The offset is computed arithmetically:  ${v: -4} needs bash 4.2 and this
+  #  script targets Apple bash 3.2, where it is a bad substitution.
+  printf '%s...%s' "${v:0:8}" "${v:$((${#v}-4))}"
 }
 
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
@@ -282,13 +321,26 @@ load_secrets() {
     if [[ -n "$key_pem" ]]; then
       rc=0
       node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$key_pem" || rc=$?
-      if [[ "$rc" -ne 0 ]]; then
-        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it"
-        key_pem=""
+      if [[ "$rc" -eq 3 ]]; then
         #  The credential was resolved and then rejected.  That is a
         #  credential failure, not a missing key:  the owner has to fix the
         #  value that is there, not create a key that already exists.
+        #  The rejected value is named by a masked preview and never by
+        #  itself.
+        local preview
+        preview="$(key_preview "$key_pem")" || preview=""
+        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it; preview: ${preview:-withheld}"
+        unset preview
+        key_pem=""
         ASC_AUTH_FAILURE="credential"
+      elif [[ "$rc" -ne 0 ]]; then
+        #  The validator itself failed (a crash, a missing node):  it never
+        #  classified the credential, so this run must not classify it
+        #  either.  Calling it a bad credential would send the owner to
+        #  re-export a key that is perfectly fine.
+        log "could not check APPLE_API_KEY_P8_BASE64; the key validator failed with status ${rc}"
+        key_pem=""
+        ASC_AUTH_FAILURE="writer"
       else
         kid="$APPLE_API_KEY_ID"
         iss="$APPLE_API_ISSUER_ID"
@@ -311,13 +363,19 @@ load_secrets() {
   #    private key and comes with the key id and issuer it belongs to.
   if [[ -z "$key_pem" && -n "${ASC_KEY_P8:-}" ]]; then
     if [[ -z "$kid" || -z "$iss" ]]; then
-      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it"
+      local preview
+      preview="$(key_preview "$ASC_KEY_P8")" || preview=""
+      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it; preview: ${preview:-withheld}"
+      unset preview
       unset ASC_KEY_P8
     else
       rc=0
       node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8" || rc=$?
-      if [[ "$rc" -ne 0 ]]; then
-        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it"
+      if [[ "$rc" -eq 3 ]]; then
+        local preview
+        preview="$(key_preview "$ASC_KEY_P8")" || preview=""
+        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it; preview: ${preview:-withheld}"
+        unset preview
         #  The client would refuse this value, so it is removed from the
         #  environment:  the client has to see the credential this shell layer
         #  resolved, not one that cannot be used.
@@ -325,6 +383,14 @@ load_secrets() {
         #  Resolved and then rejected, so it is a credential failure and not a
         #  missing key.
         ASC_AUTH_FAILURE="credential"
+      elif [[ "$rc" -ne 0 ]]; then
+        #  The validator itself failed (a crash, a missing node):  it never
+        #  classified the credential, so this run must not classify it
+        #  either.  Calling it a bad credential would send the owner to
+        #  re-export a key that is perfectly fine.
+        log "could not check ASC_KEY_P8; the key validator failed with status ${rc}"
+        unset ASC_KEY_P8
+        ASC_AUTH_FAILURE="writer"
       else
         key_pem="$ASC_KEY_P8"
         #  A usable credential was found, so an earlier rejection of another
@@ -387,11 +453,16 @@ load_secrets() {
     # them a missing key is not.
     if [[ "$rc" -eq 3 ]]; then
       # The credential was resolved and it is not a usable PEM private key.
-      # The credential is identified by its key id and issuer, which are
-      # public labels and not part of the key.  Nothing from the key itself
-      # is printed:  a preview of the PEM would be a slice of the private
-      # key's own encoding, so it would put key material in the log.
-      log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key (key id ${kid:-unknown})"
+      # It is named by its key id, which is a public label that travels in
+      # every request header and is not part of the key, and by a MASKED
+      # PREVIEW of the key:  the first eight and the last four characters,
+      # with the middle elided.  The preview answers "which key is this?"
+      # without printing a value anyone could authenticate with, and it is
+      # cleared as soon as it has been logged.
+      local preview
+      preview="$(key_preview "$key_pem")" || preview=""
+      log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key (key id ${kid:-unknown}, preview ${preview:-withheld})"
+      unset preview
       ASC_AUTH_FAILURE="credential"
     elif [[ "$rc" -eq 2 ]]; then
       # The credential was resolved.  The staging path was refused.
@@ -1644,9 +1715,9 @@ if [[ "$AUTH_MODE" != "api_key" ]]; then
     exit 3
   fi
   if [[ "$(asc_upload_block)" == "writer" ]]; then
-    log "Upload blocked: the key writer itself failed."
+    log "Upload blocked: the key tool itself failed."
     log "It classified neither the credential nor the path, so this is not a missing key and not a path failure."
-    log "The credential was resolved; the writer that stages it for the Apple tools did not finish."
+    log "The credential was resolved; the tool that checks or stages it for the Apple tools did not finish."
     exit 3
   fi
   log "Upload blocked: no App Store Connect API key."
