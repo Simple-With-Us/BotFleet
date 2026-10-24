@@ -47,13 +47,13 @@ test('visual: the merge picker offers every conversation and names what will be 
   const fixture = page.getByTestId('merge-all-threads-fixture');
   await expect(fixture).toBeVisible();
 
-  const dialog = page.getByRole('dialog');
+  const dialog = page.getByTestId('merge-all-threads-dialog');
   await expect(dialog.getByText('Merge All Threads')).toBeVisible();
 
   // Every conversation is listed with how much it holds.
-  await expect(dialog.getByText('Fleet coordination')).toBeVisible();
-  await expect(dialog.getByText('Release pipeline')).toBeVisible();
-  await expect(dialog.getByText('Usage Monitor heartbeat')).toBeVisible();
+  await expect(dialog.getByRole('radio', { name: /Fleet coordination/ })).toBeVisible();
+  await expect(dialog.getByRole('radio', { name: /Release pipeline/ })).toBeVisible();
+  await expect(dialog.getByRole('radio', { name: /Usage Monitor heartbeat/ })).toBeVisible();
   await expect(dialog.getByText('4,211')).toBeVisible();
   await expect(dialog.getByText('312')).toBeVisible();
 
@@ -63,8 +63,10 @@ test('visual: the merge picker offers every conversation and names what will be 
   await expect(dialog.getByRole('radio', { name: /Release pipeline/ })).not.toBeChecked();
 
   // The summary says how many will move and where they will go.
-  await expect(dialog.getByText(/2 conversations will be folded into/)).toBeVisible();
-  await expect(dialog.getByText(/cannot be undone/)).toBeVisible();
+  const summary = dialog.getByTestId('merge-all-threads-summary');
+  await expect(summary).toContainText('2 conversations will be folded into');
+  await expect(dialog.getByTestId('merge-all-threads-destination')).toHaveText('Fleet coordination');
+  await expect(summary).toContainText('cannot be undone');
 
   await expect(dialog).toHaveScreenshot(
     'merge-all-threads-picker.png',
@@ -76,12 +78,14 @@ test('visual: choosing another destination moves the summary with it', async ({ 
   await page.goto('/?fixture=merge-all-threads');
   await pinFonts(page);
 
-  const dialog = page.getByRole('dialog');
+  const dialog = page.getByTestId('merge-all-threads-dialog');
   await dialog.getByRole('radio', { name: /Usage Monitor heartbeat/ }).click();
 
   await expect(dialog.getByRole('radio', { name: /Usage Monitor heartbeat/ })).toBeChecked();
-  await expect(dialog.getByText(/2 conversations will be folded into/)).toBeVisible();
-  await expect(dialog.getByText('Usage Monitor heartbeat')).toBeVisible();
+  await expect(dialog.getByTestId('merge-all-threads-summary')).toContainText(
+    '2 conversations will be folded into',
+  );
+  await expect(dialog.getByTestId('merge-all-threads-destination')).toHaveText('Usage Monitor heartbeat');
 
   await expect(dialog).toHaveScreenshot(
     'merge-all-threads-picker-chosen.png',

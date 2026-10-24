@@ -71,7 +71,7 @@ export function MergeAllThreadsDialog({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4" role="dialog" aria-labelledby="merge-all-threads-title">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4" role="dialog" aria-labelledby="merge-all-threads-title" data-testid="merge-all-threads-dialog">
       <div className="w-full max-w-md rounded-2xl bg-card p-4 shadow-2xl">
         <div className="flex items-center gap-2 text-[15px] font-semibold text-ink">
           <GitMerge size={16} className="text-ink-secondary" />
@@ -146,9 +146,9 @@ export function MergeAllThreadsDialog({
               })}
             </div>
 
-            <p className="mt-3 text-[12.5px] leading-relaxed text-ink-secondary">
+            <p className="mt-3 text-[12.5px] leading-relaxed text-ink-secondary" data-testid="merge-all-threads-summary">
               {folding.length} {folding.length === 1 ? "conversation" : "conversations"} will be folded into{" "}
-              <span className="text-ink">{destination?.title || "the chosen thread"}</span>.{"\u00A0 "}This cannot be undone from here.
+              <span className="text-ink" data-testid="merge-all-threads-destination">{destination?.title || "the chosen thread"}</span>.{"\u00A0 "}This cannot be undone from here.
             </p>
 
             {error && <p className="mt-2 text-[12.5px] text-danger">{error}</p>}
