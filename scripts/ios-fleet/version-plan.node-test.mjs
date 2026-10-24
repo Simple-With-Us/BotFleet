@@ -266,3 +266,36 @@ test("planVersion refuses a forced build that recreates 1.0.N (N) (Kody, AFC-517
     { marketing: "1.0.237", build: "999" }
   );
 });
+
+test("planVersion skips a patch a drift train holds, like production (Kody, AFC-517)", () => {
+  // Train 1.0.236 holds build "236":  production (nextMarketingPatch via
+  // latest-marketing-patch) ships 1.0.237, so the reference must too.
+  const appStoreVersions = ["1.0.235"];
+  const trains = [
+    { version: "1.0.235", builds: ["202610110355"] },
+    { version: "1.0.236", builds: ["236"] }
+  ];
+  const plan = planVersion({ prefix: "1.0", appStoreVersions, trains, commitCount: 2360, floor: 0 });
+  assert.equal(plan.marketing, "1.0.237");
+  assert.equal(plan.build, "2360");
+  // Two held patches in a row are both skipped.
+  const both = [...trains, { version: "1.0.237", builds: ["237", "2400"] }];
+  assert.equal(planVersion({ prefix: "1.0", appStoreVersions, trains: both, commitCount: 2360 }).marketing, "1.0.238");
+  // Same answer as feeding the client's printed number back in as ascPatch.
+  const printed = nextMarketingPatch({ prefix: "1.0", appStoreVersions, trains: both }) - 1;
+  assert.deepEqual(
+    planVersion({ prefix: "1.0", ascPatch: printed, commitCount: 2360 }),
+    planVersion({ prefix: "1.0", appStoreVersions, trains: both, commitCount: 2360 })
+  );
+});
+
+test("planVersion from state: drift trains above the release do not lift it (Congress.Trade)", () => {
+  const plan = planVersion({
+    prefix: "1.0",
+    appStoreVersions: CONGRESS_APP_STORE_VERSIONS,
+    trains: CONGRESS_TRAINS,
+    commitCount: 2360,
+    floor: 0
+  });
+  assert.equal(plan.marketing, "1.0.237");
+});

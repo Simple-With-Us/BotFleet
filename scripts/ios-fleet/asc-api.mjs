@@ -46,7 +46,9 @@ import { normalizePrivateKey } from "./asc-key.mjs";
 import {
   buildFloor,
   isDriftTrain,
-  nextMarketingPatch
+  latestMarketingPatch,
+  nextMarketingPatch,
+  parsePatch
 } from "./version-plan.mjs";
 
 // Reads one value from Infisical Fleet-OPS through fleet-secrets.  Returns ""
@@ -971,7 +973,10 @@ async function main() {
   // Every build of one train, page by page.  Used when the train's inline
   // build list is truncated, so a drift train is never mistaken for an
   // empty one.
-  async function trainBuildVersions(trainId) {
+  // `stopAt` (optional) is the build string that settles the question being
+  // asked:  once a build equal to it is seen the train is known to be a
+  // drift train, so the remaining pages are not read.
+  async function trainBuildVersions(trainId, stopAt) {
     const out = [];
     let url = `/v1/preReleaseVersions/${encodeURIComponent(trainId)}/builds?limit=200`;
     for (let page = 0; page < 50 && url; page++) {
@@ -982,13 +987,20 @@ async function main() {
         if (!validVersion(bv)) return { ok: false, status: `malformed build ${b?.id || "?"}`, builds: out };
         out.push(bv);
       }
+      if (stopAt !== undefined && out.includes(stopAt)) return { ok: true, status: 200, builds: out };
       url = res.parsed.links?.next || "";
     }
     if (url) return { ok: false, status: "build list longer than 50 pages", builds: out };
     return { ok: true, status: 200, builds: out };
   }
-  async function fetchTrains(appId, platform) {
+  // `prefix` and `appStoreVersions` let fetchTrains skip work that cannot
+  // change the answer:  a train's full build list is read only when its
+  // drift status can still move latestMarketingPatch (see resolveIncomplete
+  // below).  The "taken" set in nextMarketingPatch needs only the version
+  // string, so a train that cannot raise the maximum never costs a request.
+  async function fetchTrains(appId, platform, prefix, appStoreVersions) {
     const trains = [];
+    const incomplete = [];
     const buildVersionById = new Map();
     let url =
       `/v1/preReleaseVersions?filter[app]=${appId}` +
@@ -1013,18 +1025,44 @@ async function main() {
         const ids = (rel?.data || []).map((b) => b && b.id).filter(Boolean);
         let builds = ids.map((id) => buildVersionById.get(id)).filter((x) => x !== undefined);
         // The inline list stops at limit[builds]; when it is cut short (or a
-        // build record is missing from `included`), read the whole train.
+        // build record is missing from `included`), the train is noted and
+        // settled after every page is read.
         const total = rel?.meta?.paging?.total;
+        const train = { version: v.attributes.version, builds };
         if (builds.length < ids.length || (Number.isInteger(total) && total > ids.length)) {
-          const full = await trainBuildVersions(v.id);
-          if (!full.ok) return { ok: false, status: full.status, trains };
-          builds = full.builds;
+          incomplete.push({ id: v.id, train });
         }
-        trains.push({ version: v.attributes.version, builds });
+        trains.push(train);
       }
       url = res.parsed.links?.next || "";
     }
     if (url) return { ok: false, status: "more than 10 pages of trains", trains };
+
+    // Settle the incomplete trains, highest patch first.  A train's drift
+    // status only matters when its patch is above the maximum the complete
+    // data already gives:  at or below it, drift or not, the maximum is the
+    // same.  A partial list that already holds build "N" is conclusively a
+    // drift train.  The first incomplete train confirmed NOT drift becomes
+    // the maximum, so every lower one is settled too and the loop stops.
+    // The result is the same latestMarketingPatch / nextMarketingPatch the
+    // full read would give, at one request per train that can still raise it.
+    const pending = incomplete
+      .map((entry) => ({ ...entry, patch: parsePatch(entry.train.version, prefix) }))
+      .filter((entry) => entry.patch !== null && !isDriftTrain(entry.train.version, entry.train.builds, prefix))
+      .sort((a, b) => b.patch - a.patch);
+    const pendingSet = new Set(pending.map((entry) => entry.train));
+    let best = latestMarketingPatch({
+      prefix,
+      appStoreVersions,
+      trains: trains.filter((t) => !pendingSet.has(t))
+    });
+    for (const entry of pending) {
+      if (entry.patch <= best) break;
+      const full = await trainBuildVersions(entry.id, String(entry.patch));
+      if (!full.ok) return { ok: false, status: full.status, trains };
+      entry.train.builds = full.builds;
+      if (!isDriftTrain(entry.train.version, entry.train.builds, prefix)) best = entry.patch;
+    }
     return { ok: true, status: 200, trains };
   }
 
@@ -1083,7 +1121,7 @@ async function main() {
     }
 
     // 2) The TestFlight trains and their builds.
-    const trainRes = await fetchTrains(appId, platform);
+    const trainRes = await fetchTrains(appId, platform, prefix, appStoreVersions);
     if (!trainRes.ok) {
       console.error(`latest-marketing-patch: preReleaseVersions query failed (HTTP ${trainRes.status})`);
       failExit(trainRes.status);

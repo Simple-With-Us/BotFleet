@@ -209,17 +209,27 @@ export function buildFloor({ trainBuilds = [], appBuilds = [], platform = "" } =
 /**
  * The marketing version and the build number for one ship.
  *
- *   prefix        the default train, e.g. "1.0"
- *   ascPatch      the highest patch already used on that train (0 if none)
- *   forcedVersion an exact --version override, or ""
- *   forcedBuild   an exact --build override, or ""
- *   commitCount   the repo commit count
- *   floor         the build floor (see buildFloor)
+ *   prefix           the default train, e.g. "1.0"
+ *   appStoreVersions the App Store versions (see latestMarketingPatch)
+ *   trains           the TestFlight trains (see latestMarketingPatch)
+ *   ascPatch         used only when neither appStoreVersions nor trains is
+ *                    given:  the number `asc-api.mjs latest-marketing-patch`
+ *                    prints, i.e. one less than the next FREE patch (0 if none)
+ *   forcedVersion    an exact --version override, or ""
+ *   forcedBuild      an exact --build override, or ""
+ *   commitCount      the repo commit count
+ *   floor            the build floor (see buildFloor)
+ *
+ * With appStoreVersions / trains the target patch is nextMarketingPatch, the
+ * same number production ships:  a patch a drift train already holds is
+ * skipped, never reused.
  *
  * Returns { marketing, build } as strings.
  */
 export function planVersion({
   prefix = "1.0",
+  appStoreVersions,
+  trains,
   ascPatch = 0,
   forcedVersion = "",
   forcedBuild = "",
@@ -227,7 +237,10 @@ export function planVersion({
   floor = 0
 } = {}) {
   const train = String(prefix || "1.0");
-  const patch = Number.isFinite(ascPatch) ? Math.max(0, Math.trunc(ascPatch)) : 0;
+  const fromState = Array.isArray(appStoreVersions) || Array.isArray(trains);
+  const patch = fromState
+    ? nextMarketingPatch({ prefix: train, appStoreVersions: appStoreVersions || [], trains: trains || [] }) - 1
+    : Number.isFinite(ascPatch) ? Math.max(0, Math.trunc(ascPatch)) : 0;
 
   let marketing;
   let targetPatch;
