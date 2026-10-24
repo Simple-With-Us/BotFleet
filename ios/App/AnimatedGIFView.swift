@@ -11,8 +11,9 @@ struct AnimatedGIFView: UIViewRepresentable {
     var maxPixelSize: Int = 0
     let contentMode: UIView.ContentMode
 
-    init(data: Data?, contentMode: UIView.ContentMode = .scaleAspectFit) {
+    init(data: Data?, maxPixelSize: Int = 0, contentMode: UIView.ContentMode = .scaleAspectFit) {
         self.data = data
+        self.maxPixelSize = maxPixelSize
         self.contentMode = contentMode
     }
 
