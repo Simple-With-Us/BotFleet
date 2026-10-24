@@ -41,3 +41,22 @@ Legacy WebhookManager attempts are rate/cap limited (ignored and rejected receip
 Authenticated malformed JSON and oversized bodies currently return 400/413 before recording metadata. A delivery detail with null/malformed payload stays pending in reconciliation; it is never called recovered without a usable payload. Exact live detail availability for those cases remains unverified, so no completeness guarantee is made yet.
 
 The server formatter now strips newlines, control characters and parentheses from every interpolated field so payload metadata cannot forge another delivery marker. It logs before broadcasting, emits an attempt copy rather than the manager's stored object, and uses stable webhook IDs instead of a closure over the later-created manager.
+
+## Review and test evidence
+
+Independent source review: 74add33cb5c0147784400c22d48b83abbea97138, followed by delta review at 43caf41cfa22b4dff7e52e1f432c5103a0f0607c. Reviewer did not execute tests. Delta review accepted log-before-broadcast, copied attempts, removal of the later-manager closure, and all-field marker sanitization. F1 (legacy attempt suppression versus dedicated-hook completeness), F4 (bad_json/413 recovery), and operational proof remain open.
+
+Executor tests at the 43caf41 delta: 44/44 server Vitest tests on Mac. Prior reconciliation tests: 8/8; runner status tests: 2/2. These results are scoped tests, not installed runtime proof.
+
+## Conservative lock recovery checklist
+
+A held mkdir lock is not proof a writer is dead. Do not remove or rename it based solely on age, an absent remembered PID, or a completed report. Before any recovery:
+1. Stop new admissions to both actual installed writer entry points using their supported service controls, under existing deployment authority. Inventory launchd labels, executable paths and all writer processes. If either entry point cannot be identified or stopped, hold recovery.
+2. Verify no server flush or reconcile process can still own the lock, including child processes. Repeat the liveness check after the stop acknowledgement. Do not rely on PID reuse alone.
+3. Preserve a private copy of the spool, cursor/checkpoint and log. Never truncate or discard malformed data. Inspect only metadata, never HMAC credentials or webhook payload prose.
+4. Only with exclusive ownership established, move the stale lock aside atomically, run recovery once, verify retained records and dedupe, then remove only the empty stale directory if deletion is authorized.
+5. Restart only the approved writer configuration, prove one normal cycle and one simulated failure is reported by the independent monitor, and document what was replayed or remains unrecovered.
+
+This checklist is preparation, not permission to stop the live BotFleet server. Recovery remains blocked until installed writer controls and authority are verified.
+
+The plist under request-log-templates is intentionally non-installable with explicit placeholders. Resolve actual paths and hook IDs, verify an authenticated dry run and failure notification, and obtain any required runtime authority before substituting values or loading it. No credential goes in the plist or config.
