@@ -283,6 +283,9 @@ export interface Task {
   createdAt: number;
   /** Last message in this task's thread; falls back to createdAt. */
   lastActivity?: number;
+  /** How many messages this task's thread holds.  Absent on frames from
+   * before the harness counted them. */
+  messageCount?: number;
   /** what this task has spent, banked once per settled turn */
   usage?: TaskUsage;
   /** Timing aggregate banked with `usage`; absent on tasks from before it
@@ -1110,6 +1113,17 @@ export type Action =
   | { type: "moveTaskToBot"; botId: string; threadId: string; toBotId: string }
   | { type: "moveTaskToGroup"; botId: string; threadId: string; toGroupId: string }
   | { type: "mergeTasks"; botId: string; threadId: string; intoThreadId: string }
+  | {
+      type: "mergeAllBotTasks";
+      botId: string;
+      intoThreadId: string;
+      /** What the server did, so a caller can say what was folded in and what
+       * was left behind.  `error` is set instead when the merge failed. */
+      onSettled?: (
+        result: { merged: string[]; skipped: Array<{ title: string; reason: string }> } | null,
+        error: string | null,
+      ) => void;
+    }
   | { type: "deleteGroupTask"; groupId: string; threadId: string }
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
@@ -2136,6 +2150,30 @@ export function reducer(state: AppState, action: Action): AppState {
         ),
       };
     }
+    case "mergeAllBotTasks": {
+      const source = state.bots.find((bot) => bot.id === action.botId);
+      if (!source) return state;
+      const into = (source.tasks ?? []).find((task) => task.threadId === action.intoThreadId);
+      if (!into) return state;
+      // A conversation bound to a different App cannot merge, so it stays:
+      // the server skips it and names it, and the roster agrees with that
+      // instead of briefly hiding a conversation that is still there.
+      const remaining = (source.tasks ?? []).filter(
+        (task) => task.threadId === action.intoThreadId
+          || !taskWorkspaceContextsMatch(task.workspaceContext, into.workspaceContext),
+      );
+      if (remaining.length === (source.tasks ?? []).length) return state;
+      // The bot keeps one conversation after the merge, and it is the one the
+      // person chose, so the roster and the open chat agree immediately.
+      return {
+        ...state,
+        bots: state.bots.map((bot) =>
+          bot.id === action.botId
+            ? { ...bot, tasks: remaining, threadId: action.intoThreadId }
+            : bot,
+        ),
+      };
+    }
     case "moveTaskToBot": {
       const source = state.bots.find((bot) => bot.id === action.botId);
       const moving = (source?.tasks ?? []).find((task) => task.threadId === action.threadId);
@@ -2616,6 +2654,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Apply their local projection only after the server accepts the change.
       const confirmTaskMutation = action.type === "moveGroupTask"
         || action.type === "moveGroupTaskToBot" || action.type === "mergeTasks"
+        || action.type === "mergeAllBotTasks"
         || action.type === "moveTaskToBot" || action.type === "moveTaskToGroup";
       if (action.type !== "cancelQueued" && !confirmTaskMutation) rawDispatch(action);
       switch (action.type) {
@@ -3067,6 +3106,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             method: "PATCH",
             body: JSON.stringify({ mergeInto: action.intoThreadId }),
           }).then(() => rawDispatch(action)).catch(showError);
+          break;
+        case "mergeAllBotTasks":
+          api(`/api/bots/${action.botId}/merge-threads`, {
+            method: "POST",
+            body: JSON.stringify({ intoThreadId: action.intoThreadId }),
+          })
+            .then((r: any) => {
+              rawDispatch(action);
+              // The server's frame carries the merged conversation's messages
+              // and the bot's one remaining thread, so the chat opens on what
+              // was merged without a second round trip.
+              if (r?.bot) dispatch({ type: "botPatched", bot: r.bot });
+              action.onSettled?.({ merged: r?.merged ?? [], skipped: r?.skipped ?? [] }, null);
+            })
+            .catch((e: unknown) => {
+              showError(e);
+              action.onSettled?.(null, e instanceof Error ? e.message : String(e));
+            });
           break;
         case "moveTaskToBot":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {

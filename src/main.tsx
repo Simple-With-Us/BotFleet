@@ -49,6 +49,18 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "merge-all-threads") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/MergeAllThreadsVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "engine-callout") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
   // for in the real app boot path. The App render below is unchanged for any
