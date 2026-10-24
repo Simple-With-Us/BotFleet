@@ -23,13 +23,25 @@ fi
 brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
 xcodegen generate
 
-# The CI runner image ships no "iPhone 17 Pro" device, so a named destination
-# fails before the build starts. Create the device when it is absent; the
-# device type ships with Xcode and the latest installed iOS runtime is used.
+# The CI runner image ships no "iPhone 17 Pro" device instance, so a named
+# destination fails before the build starts. Create it when absent, pinned to
+# the explicit device type identifier; a name passed as the type is not a
+# verified model. Fail clearly when the Xcode catalog lacks the type or a
+# caller override names a different device - never substitute another model,
+# whose different geometry would make the screenshot meaningless.
+DEVICE_TYPE="com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro"
 if ! xcrun simctl list devices available | grep -F "${DEVICE} (" >/dev/null; then
+  if [[ "${DEVICE}" != "iPhone 17 Pro" ]]; then
+    echo "ios-tvface-screenshot: simulator '${DEVICE}' not present; auto-create is pinned to iPhone 17 Pro" >&2
+    exit 1
+  fi
+  if ! xcrun simctl list devicetypes | grep -F "${DEVICE_TYPE}" >/dev/null; then
+    echo "ios-tvface-screenshot: device type ${DEVICE_TYPE} not in this Xcode catalog" >&2
+    exit 1
+  fi
   RUNTIME_ID="$(xcrun simctl list runtimes | awk '/^iOS /{print $NF}' | sort -V | tail -1)"
-  echo "ios-tvface-screenshot: simulator '${DEVICE}' not present; creating it on ${RUNTIME_ID}"
-  xcrun simctl create "${DEVICE}" "${DEVICE}" "${RUNTIME_ID}"
+  echo "ios-tvface-screenshot: simulator '${DEVICE}' not present; creating ${DEVICE_TYPE} on ${RUNTIME_ID}"
+  xcrun simctl create "${DEVICE}" "${DEVICE_TYPE}" "${RUNTIME_ID}"
 fi
 
 xcodebuild \
