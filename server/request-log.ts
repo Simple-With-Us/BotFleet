@@ -28,9 +28,13 @@ export interface WebhookRequestMetadata {
   ref?: string;
 }
 
+export function logAtom(value: unknown, limit = 200): string {
+  return String(value ?? "").replace(/[\r\n\x00-\x1f\x7f]/g, " ").replace(/[()]/g, "").slice(0, limit);
+}
+
 function stringField(source: Record<string, unknown>, key: string, limit: number): string | undefined {
   const value = source[key];
-  return typeof value === "string" && value.length > 0 ? value.slice(0, limit) : undefined;
+  return typeof value === "string" && value.length > 0 ? logAtom(value, limit) : undefined;
 }
 
 /** Pull log-safe metadata out of a webhook event.  Never body or title text. */
@@ -81,14 +85,14 @@ export function formatRequestLogLine(
   webhookName: string,
 ): string {
   const ts = new Date(entry.receivedAt).toISOString().replace(/\.\d{3}Z$/, "Z");
-  const action = metadata.action ? `${entry.eventName}.${metadata.action}` : entry.eventName;
+  const action = metadata.action ? `${logAtom(entry.eventName, 64)}.${logAtom(metadata.action, 64)}` : logAtom(entry.eventName, 64);
   const target =
-    (metadata.repository ?? "") +
-    (typeof metadata.number === "number" ? `#${metadata.number}` : "") +
-    (metadata.ref ? ` ${metadata.ref}` : "");
-  const actor = metadata.actor ? ` by ${metadata.actor}` : "";
-  const reason = entry.reason ? ` (${entry.reason.slice(0, 160)})` : "";
-  return `- ${ts} ${action}${target ? ` ${target}` : ""}${actor} [${entry.outcome}] via ${webhookName}${reason} (delivery ${entry.deliveryId})`;
+    logAtom(metadata.repository) +
+    (Number.isSafeInteger(metadata.number) ? `#${metadata.number}` : "") +
+    (metadata.ref ? ` ${logAtom(metadata.ref)}` : "");
+  const actor = metadata.actor ? ` by ${logAtom(metadata.actor, 100)}` : "";
+  const reason = entry.reason ? ` (${logAtom(entry.reason, 160)})` : "";
+  return `- ${ts} ${action}${target ? ` ${target}` : ""}${actor} [${logAtom(entry.outcome, 64)}] via ${logAtom(webhookName)}${reason} (delivery ${logAtom(entry.deliveryId, 100)})`;
 }
 
 export interface RequestLogOptions {
@@ -208,7 +212,7 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
       const lock = options.filePath + ".lock";
       mkdirSync(lock, { mode: 0o700 });
       try {
-        appendFsync(options.spoolPath, JSON.stringify({ line, delivery: entry.deliveryId }) + "\n");
+        appendFsync(options.spoolPath, JSON.stringify({ line, delivery: logAtom(entry.deliveryId, 100) }) + "\n");
         flush();
       } finally {
         rmdirSync(lock);

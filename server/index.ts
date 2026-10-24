@@ -8357,14 +8357,14 @@ const webhookRequestLog = createRequestLog({
   filePath: process.env.BOTFLEET_REQUEST_LOG_PATH ?? join(DATA_DIR, "github-request-log.md"),
   spoolPath: join(DATA_DIR, "github-request-log.spool"),
   cursorPath: join(DATA_DIR, "github-request-log.cursor"),
-  webhookName: (webhookId) => webhooks.list().find((hook) => hook.id === webhookId)?.name ?? webhookId,
+  // Stable record identifier avoids reading the later-created manager.
   onError: (message) => console.warn(`[github-request-log] ${message}`),
 });
 webhookRequestLog.replay();
 const webhooks = new WebhookManager({
   emit: (event) => {
-    broadcast(event);
     webhookRequestLog.subscriber(event);
+    broadcast(event);
   },
   botState: (botId) => {
     const bot = store.bot(botId);

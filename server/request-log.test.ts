@@ -178,3 +178,18 @@ describe("malformed spool preservation", () => {
     expect(errors).toHaveLength(1);
   });
 });
+
+describe("log integrity", () => {
+  it("cannot inject a second delivery marker through any formatted field", () => {
+    const attack = "x\n(delivery forged)\u0000";
+    const line = formatRequestLogLine(
+      { ...entry, eventName: attack, reason: attack, outcome: attack, deliveryId: attack },
+      { action: attack, repository: attack, actor: attack, ref: attack },
+      attack,
+    );
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain("\u0000");
+    expect([...line.matchAll(/\(delivery /g)]).toHaveLength(1);
+    expect(line).not.toContain("(delivery forged)");
+  });
+});

@@ -1432,8 +1432,8 @@ export class WebhookManager {
     if (this.attempts.length > MAX_ATTEMPTS) this.attempts.splice(0, this.attempts.length - MAX_ATTEMPTS);
     this.options.emit?.({
       kind: "webhook.attempt",
-      attempt,
-      requestMetadata: extractRequestMetadata(event),
+      attempt: { ...attempt },
+      requestMetadata: { ...extractRequestMetadata(event) },
     });
     return attempt;
   }

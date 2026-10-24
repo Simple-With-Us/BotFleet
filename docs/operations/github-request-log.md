@@ -33,3 +33,11 @@ Config shape (identifiers and paths only, never credentials):
 Use `node scripts/github-request-log-runner.mjs /absolute/path/config.json --check-status` from the independent health monitor. It fails when the last run failed, no successful run exists, or success is older than 30 minutes. A nonzero exit alone is not an alert: deployment must connect this check to an existing verified notification path and prove a simulated failure is reported before claiming monitoring active.
 
 Proposed launchd settings: RunAtLoad=true and StartInterval=600 for the runner; independent health check every 15 minutes. Do not load either job until real IDs, scoped gh authentication, dry-run evidence and the approved runtime change are verified. This source change does not install or enable them.
+
+## Review qualification at the corrective head
+
+Legacy WebhookManager attempts are rate/cap limited (ignored and rejected receipts), so its subscriber does not promise every non-GitHub attempt. The new dedicated GitHub route must receive the approved org/personal subscriptions and reconcile directly from retained deliveries; existing limited receipt history is not a substitute. This guarantee is still pending real hook proof.
+
+Authenticated malformed JSON and oversized bodies currently return 400/413 before recording metadata. A delivery detail with null/malformed payload stays pending in reconciliation; it is never called recovered without a usable payload. Exact live detail availability for those cases remains unverified, so no completeness guarantee is made yet.
+
+The server formatter now strips newlines, control characters and parentheses from every interpolated field so payload metadata cannot forge another delivery marker. It logs before broadcasting, emits an attempt copy rather than the manager's stored object, and uses stable webhook IDs instead of a closure over the later-created manager.
