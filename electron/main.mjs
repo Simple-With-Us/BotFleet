@@ -101,12 +101,17 @@ import appInfoModule from "./app-info.cjs";
 if (process.env.OMB_SMOKE_SERVER_MENU === "1" && process.env.OMB_SMOKE_USER_DATA_DIR) {
   const smokeUserData = path.resolve(process.env.OMB_SMOKE_USER_DATA_DIR);
   const smokeLogs = path.join(smokeUserData, "logs");
-  // Electron refuses to point a path at a directory that does not exist.
+  // Electron refuses to point a path at a directory that does not exist, and
+  // a smoke that cannot isolate its user data must never fall through to the
+  // owner's real directory.  Say why and stop.
   try {
     fs.mkdirSync(smokeUserData, { recursive: true });
     fs.mkdirSync(smokeLogs, { recursive: true });
-  } catch {
-    /* the smoke reports the missing directory itself */
+  } catch (error) {
+    console.error(
+      `[smoke] server-menu could not create its user-data directory ${smokeUserData}: ${error?.code ?? error?.message ?? error}`,
+    );
+    process.exit(2);
   }
   app.setPath("userData", smokeUserData);
   // The log folder travels with the user data for the smoke, so a run
