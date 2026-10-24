@@ -1,15 +1,13 @@
 /** Mac-local GitHub request log: a durable, metadata-only, non-executing
  * consumer subscribed to WebhookManager attempt events.
  *
- * Durability: each attempt's metadata record is appended to a JSONL spool
- * (mode 600) with fsync inside appendAttempt - synchronously before the
- * ingress answers GitHub, so an ACKed delivery is always on disk.  A flusher
- * converts unflushed spool records into one Markdown line each and advances
- * an offset cursor (mode 600) only after a confirmed write; replay at startup
- * and per event drains whatever a crash left behind.  A crash between the
- * Markdown write and the cursor write can re-emit a line, so flush skips
- * delivery ids already present in the log's tail.  A fully drained spool is
- * truncated back to empty.
+ * Durability: metadata is fsynced to a spool before the normal response when
+ * the write succeeds. Failed writes need GET-only source reconciliation.
+ * Replay reads the whole spool and deduplicates against the full durable log,
+ * then truncates only after all valid records have landed. Malformed records
+ * preserve the spool and report an error. Server and reconciler share a mkdir
+ * lock at filePath + ".lock". A crash-held lock fails visibly, never reclaimed
+ * automatically; recovery must verify writer liveness before removing it.
  *
  * Lines carry event metadata only - event name, action, repository, number,
  * actor, delivery id, outcome - never payload bodies, titles, or message
@@ -17,7 +15,7 @@
  * dispatch, but is reported through onError so the gap is visible.
  */
 
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, rmdirSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
 import type { WebhookAttempt, WebhookManagerEvent } from "./webhooks.ts";
@@ -98,7 +96,7 @@ export interface RequestLogOptions {
   filePath: string;
   /** Append-only JSONL crash spool (mode 600). */
   spoolPath: string;
-  /** Flush offset cursor (mode 600). */
+  /** Flush recovery marker (mode 600). */
   cursorPath: string;
   /** Resolve a friendly name for the webhook record; falls back to its id. */
   webhookName?: (webhookId: string) => string;
@@ -109,7 +107,13 @@ export interface RequestLogOptions {
 function appendFsync(path: string, text: string): void {
   const fd = openSync(path, "a", 0o600);
   try {
-    writeSync(fd, text);
+    const bytes = Buffer.from(text);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = writeSync(fd, bytes, offset, bytes.length - offset);
+      if (count <= 0) throw new Error("request-log short write");
+      offset += count;
+    }
     fsyncSync(fd);
   } finally {
     closeSync(fd);
@@ -119,25 +123,32 @@ function appendFsync(path: string, text: string): void {
 function writeFsync(path: string, text: string): void {
   const fd = openSync(path, "w", 0o600);
   try {
-    writeSync(fd, text);
+    const bytes = Buffer.from(text);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = writeSync(fd, bytes, offset, bytes.length - offset);
+      if (count <= 0) throw new Error("request-log short write");
+      offset += count;
+    }
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
 }
 
-const DELIVERY_TAIL_BYTES = 65536;
 
-/** Delivery ids already in the Markdown log's tail (crash-window dedupe). */
+
+/** Delivery ids already in the Markdown full log (crash-window dedupe). */
 function loggedDeliveries(filePath: string): Set<string> {
   try {
     const text = readFileSync(filePath, "utf8");
-    const tail = text.slice(-DELIVERY_TAIL_BYTES);
+    const tail = text;
     const ids = new Set<string>();
     for (const match of tail.matchAll(/\(delivery ([^)]+)\)/g)) ids.add(match[1]!);
     return ids;
-  } catch {
-    return new Set();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+    throw error;
   }
 }
 
@@ -151,21 +162,13 @@ export interface RequestLog {
 
 export function createRequestLog(options: RequestLogOptions): RequestLog {
   const flush = (): void => {
-    let offset = 0;
-    try {
-      offset = Number(readFileSync(options.cursorPath, "utf8")) || 0;
-    } catch {
-      // No cursor yet.
-    }
     let spool: string;
     try {
       spool = readFileSync(options.spoolPath, "utf8");
     } catch {
       return; // Nothing spooled.
     }
-    if (offset > spool.length) offset = 0; // Spool was truncated underneath us.
     const pending = spool
-      .slice(offset)
       .split("\n")
       .filter((line) => line.length > 0);
     if (pending.length > 0) {
@@ -177,6 +180,7 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
           if (typeof parsed.line !== "string") throw new Error("invalid spool record");
           if (parsed.delivery && seen.has(parsed.delivery)) continue;
           lines.push(parsed.line);
+          if (parsed.delivery) seen.add(parsed.delivery);
         } catch {
           // Preserve the entire spool and cursor for recovery. Never silently
           // discard malformed or partially-written records.
@@ -187,8 +191,8 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
         mkdirSync(dirname(options.filePath), { recursive: true });
         appendFsync(options.filePath, lines.map((line) => line + "\n").join(""));
       }
-      // Cursor advances only after the Markdown write confirmed.
-      writeFsync(options.cursorPath, String(spool.length));
+      // Full-spool replay plus durable log dedupe avoids a truncate/cursor
+      // crash letting an old byte offset skip new records.
     }
     // Fully drained: the spool's crash-recovery job is done; start it empty.
     writeFsync(options.spoolPath, "");
@@ -200,9 +204,15 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
       const name = options.webhookName?.(entry.webhookId) ?? entry.webhookId;
       const line = formatRequestLogLine(entry, metadata, name);
       mkdirSync(dirname(options.spoolPath), { recursive: true });
-      // Spool-first: the record is durable before dispatch answers GitHub.
-      appendFsync(options.spoolPath, JSON.stringify({ line, delivery: entry.deliveryId }) + "\n");
-      flush();
+      mkdirSync(dirname(options.filePath), { recursive: true });
+      const lock = options.filePath + ".lock";
+      mkdirSync(lock, { mode: 0o700 });
+      try {
+        appendFsync(options.spoolPath, JSON.stringify({ line, delivery: entry.deliveryId }) + "\n");
+        flush();
+      } finally {
+        rmdirSync(lock);
+      }
     } catch (error) {
       options.onError?.(error instanceof Error ? error.message : String(error));
     }
@@ -227,7 +237,10 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
     record,
     replay: () => {
       try {
-        flush();
+        mkdirSync(dirname(options.filePath), { recursive: true });
+        const lock = options.filePath + ".lock";
+        mkdirSync(lock, { mode: 0o700 });
+        try { flush(); } finally { rmdirSync(lock); }
       } catch (error) {
         options.onError?.(error instanceof Error ? error.message : String(error));
       }

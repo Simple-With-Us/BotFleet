@@ -13,7 +13,7 @@ Reconciliation now follows Link cursor pagination, scans the complete retained w
 Operational requirements still open:
 - Live org/repo delivery-list and payload-read permission tests with the eventual hook IDs.
 - Installed Mac launchd cadence, startup catch-up and a separate durable failure/staleness monitor. Proposed cadence is 10 minutes; not installed or enabled here.
-- One shared log-writer/lock contract between server spool replay and reconciliation. Current separate appends do not yet prove cross-process deduplication.
+- Both writers now use the same mkdir lock (log path + .lock), full-log dedupe, and fsynced writes. A crash-held lock fails visibly and is never stolen automatically. Stale-lock recovery still needs a verified writer-liveness procedure.
 - Spool malformed-record recovery/quarantine. The current fix preserves the entire spool and cursor on malformed data, reports an error, and refuses silent truncation. Operator recovery is still needed.
 - Independent current-head review and full CI, plus real org and personal event proofs.
 - Internal bot runs initiated by schedules/UI are not observable through GitHub webhooks and are not claimed covered.

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Recover metadata by GET only. Never redeliver a dispatching webhook.
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmdirSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -53,7 +53,12 @@ function ghGet(path) {
   const link=headers.match(/^link:\s*(.*)$/im)?.[1];const next=link?.split(',').find(x=>/rel="next"/.test(x))?.match(/<([^>]+)>/)?.[1];
   return {data,next};
 }
-export function reconcile({org,repo,hook,log,cursor,get=ghGet,now=()=>new Date(),maxPages=100}) {
+export function reconcile(options) {
+  mkdirSync(dirname(options.log), {recursive:true});
+  const lock=options.log+'.lock';mkdirSync(lock,{mode:0o700});
+  try {return reconcileLocked(options);} finally {rmdirSync(lock);}
+}
+function reconcileLocked({org,repo,hook,log,cursor,get=ghGet,now=()=>new Date(),maxPages=100}) {
   const base=org?`orgs/${org}`:`repos/${repo}`;const prefix=`${base}/hooks/${hook}/deliveries`;
   let state={version:1,through:null,pending:{},gaps:{}};
   try { state=JSON.parse(readFileSync(cursor,'utf8')); if(state.version!==1||!state.pending||!state.gaps) throw Error('invalid reconcile checkpoint'); }

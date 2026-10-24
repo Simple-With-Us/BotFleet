@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -122,15 +122,15 @@ describe("createRequestLog", () => {
     const dir = tmp();
     const p = paths(dir);
     const blocker = join(dir, "blocked");
-    writeFileSync(blocker, "not a directory");
+    mkdirSync(blocker);
     const errors: string[] = [];
-    const log = createRequestLog({ ...p, filePath: join(blocker, "log.md"), onError: (m) => errors.push(m) });
+    const log = createRequestLog({ ...p, filePath: blocker, onError: (m) => errors.push(m) });
     log.record(entry, { repository: "o/r", number: 7, actor: "kody-ai[bot]", action: "submitted" });
     expect(errors.length).toBeGreaterThan(0);
     // The spool holds the record even though the Markdown write failed.
     expect(readFileSync(p.spoolPath, "utf8")).toContain("deliv-1");
 
-    rmSync(blocker);
+    rmSync(blocker, { recursive: true });
     const recovered = createRequestLog({ ...p, onError: (m) => errors.push(m) });
     recovered.replay();
     const lines = readFileSync(p.filePath, "utf8").trim().split("\n");

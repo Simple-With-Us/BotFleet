@@ -1,4 +1,4 @@
-import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
+import {mkdirSync,statSync,mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';import {join} from 'node:path';import {test} from 'node:test';import assert from 'node:assert/strict';
 import {reconcile,loggedDeliveryIds} from './github-request-log-reconcile.mjs';
 function fixture(fn) {const dir=mkdtempSync(join(tmpdir(),'reconcile-'));try{return fn({org:'Org',hook:'9',log:join(dir,'log'),cursor:join(dir,'cursor')});}finally{rmSync(dir,{recursive:true,force:true});}}
@@ -30,4 +30,7 @@ test('retention gap marker states unknown count instead of invented loss',()=>fi
 }));
 test('repeated recovery is idempotent with persisted log',()=>fixture(p=>{
  const get=path=>({data:path.includes('?')?[d(1)]:detail});reconcile({...p,get,now:stamp});const before=readFileSync(p.log,'utf8');reconcile({...p,get,now:stamp});assert.equal(readFileSync(p.log,'utf8'),before);
+}));
+test('shared lock prevents a second writer and is never stolen',()=>fixture(p=>{
+ const lock=p.log+'.lock';mkdirSync(lock);assert.throws(()=>reconcile({...p,get:()=>({data:[]}),now:stamp}),/EEXIST/);assert.ok(statSync(lock).isDirectory());
 }));
