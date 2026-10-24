@@ -20,8 +20,9 @@ BF_CODE="${BF_CODE:-$BF_VOLUME/Code/BotFleet-server}"
 BF_REPO="${BF_REPO:-https://github.com/Simple-With-Us/BotFleet.git}"
 BF_REF="${BF_REF:-main}"
 
-# A local clone the checkout borrows objects from, to save bandwidth.
-BF_REFERENCE_REPO="${BF_REFERENCE_REPO:-$BF_VOLUME/Code/BotFleet}"
+# An optional local clone the checkout borrows objects from.  Off by default:
+# a partial (blob:none) clone cannot serve as a reference and fails the clone.
+BF_REFERENCE_REPO="${BF_REFERENCE_REPO:-}"
 
 # Node, the pnpm store, and the ports.
 NODE_VERSION="${NODE_VERSION:-24.18.0}"

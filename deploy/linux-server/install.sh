@@ -140,7 +140,11 @@ if [ -d "$BF_CODE/.git" ]; then
   run as_user git -C "$BF_CODE" fetch origin
 else
   say "cloning $BF_REPO into $BF_CODE"
-  run as_user git clone --reference-if-able "$BF_REFERENCE_REPO" --dissociate "$BF_REPO" "$BF_CODE"
+  if [ -n "$BF_REFERENCE_REPO" ]; then
+    run as_user git clone --reference-if-able "$BF_REFERENCE_REPO" --dissociate "$BF_REPO" "$BF_CODE"
+  else
+    run as_user git clone "$BF_REPO" "$BF_CODE"
+  fi
 fi
 
 if [ -d "$BF_CODE/.git" ]; then
@@ -264,6 +268,10 @@ run tailscale serve --bg "--https=${TS_HTTPS_PORT}" "http://127.0.0.1:${GATE_POR
 # --------------------------------------------------------------------------
 
 say "waiting for the harness to answer"
+if [ "$DRY_RUN" -eq 1 ]; then
+  note "would wait for http://127.0.0.1:${HARNESS_PORT}/api/health"
+  exit 0
+fi
 if wait_for_health "$HARNESS_PORT"; then
   note "the harness is healthy on 127.0.0.1:${HARNESS_PORT}"
 else
