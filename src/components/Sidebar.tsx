@@ -33,6 +33,7 @@ import {
   Crown,
   FolderMinus,
   FolderPlus,
+  GitMerge,
   Library,
   Loader2,
   Moon,
@@ -67,6 +68,7 @@ import {
 
 import { BotAvatar, InitialsAvatar } from "./Avatar";
 import { BotOffBadge } from "./BotOffBadge";
+import { MergeAllThreadsDialog } from "./MergeAllThreadsDialog";
 import { ProviderMark } from "./ProviderIcons";
 import { stateForBot } from "@/lib/mascot";
 import { botActivityLocation, botStatusText, botWaitReason } from "@/lib/sidebar-activity";
@@ -1668,11 +1670,13 @@ function BotContextMenu({
   onClose,
   onArchive,
   onMoveToSection,
+  onMergeAll,
 }: {
   menu: MenuState;
   onClose: () => void;
   onArchive: (bot: Bot) => void;
   onMoveToSection: (botId: string) => void;
+  onMergeAll: (botId: string) => void;
 }) {
   const { state, dispatch } = useStore();
   const bot = state.bots.find((b) => b.id === menu.botId);
@@ -1696,6 +1700,7 @@ function BotContextMenu({
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
   const canCoordinate = engine?.capabilities?.agentsMcp === true;
   const visibleBotCount = state.bots.filter((candidate) => !candidate.hidden).length;
+  const threadCount = bot.tasks?.length ?? 0;
   const archiveBlocked = Boolean(bot.chiefOfStaff) || visibleBotCount <= 1;
   const archiveHint = bot.chiefOfStaff
     ? "Choose another Chief of Staff first"
@@ -1759,6 +1764,18 @@ function BotContextMenu({
         }),
         item(<BellDot size={16} className="text-ink-secondary" />, "Mark as Unread", () =>
           dispatch({ type: "markUnread", botId: bot.id }),
+        ),
+        item(
+          <GitMerge size={16} className="text-ink-secondary" />,
+          "Merge All Threads…",
+          () => {
+            onClose();
+            onMergeAll(bot.id);
+          },
+          {
+            disabled: threadCount < 2,
+            hint: threadCount < 2 ? "This bot has one conversation" : undefined,
+          },
         ),
         divider("d1"),
         item(<Pencil size={16} className="text-ink-secondary" />, "Edit Profile", () => {
@@ -2275,6 +2292,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const importReturnRef = useRef<HTMLButtonElement>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [sectionPicker, setSectionPicker] = useState<MenuState | null>(null);
+  const [mergeAll, setMergeAll] = useState<MenuState | null>(null);
   const [roomMenu, setRoomMenu] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [roomSectionPicker, setRoomSectionPicker] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [plusOpen, setPlusOpen] = useState(false);
@@ -3218,6 +3236,13 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           onClose={() => setMenu(null)}
           onArchive={(bot) => void archiveBot(bot)}
           onMoveToSection={(botId) => setSectionPicker({ botId, x: menu.x, y: menu.y })}
+          onMergeAll={(botId) => setMergeAll({ botId, x: menu.x, y: menu.y })}
+        />
+      )}
+      {mergeAll && state.bots.find((candidate) => candidate.id === mergeAll.botId) && (
+        <MergeAllThreadsDialog
+          bot={state.bots.find((candidate) => candidate.id === mergeAll.botId)!}
+          onClose={() => setMergeAll(null)}
         />
       )}
       {sectionPicker && (

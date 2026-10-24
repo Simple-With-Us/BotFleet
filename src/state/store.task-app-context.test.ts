@@ -20,6 +20,7 @@ function fixture(): AppState {
     tasks: [
       { threadId: "bound-task", title: "Build", createdAt: 1, cwd: context.cwd, workspaceContext: context },
       { threadId: "legacy-task", title: "Unassigned", createdAt: 2 },
+      { threadId: "plain-task", title: "Also unassigned", createdAt: 3 },
     ],
   };
   const group: Group = {
@@ -70,6 +71,22 @@ describe("App task creation and local continuity", () => {
     const state = fixture();
     expect(reducer(state, { type: "mergeTasks", botId: "bot-a", threadId: "bound-task", intoThreadId: "legacy-task" })).toBe(state);
     expect(reducer(state, { type: "moveTaskToGroup", botId: "bot-a", threadId: "bound-task", toGroupId: "app-b" })).toBe(state);
+  });
+
+  it("folds the mergeable conversations into the chosen one and keeps the App-bound one", () => {
+    const state = fixture();
+    const merged = reducer(state, { type: "mergeAllBotTasks", botId: "bot-a", intoThreadId: "legacy-task" });
+    const bot = merged.bots.find((candidate) => candidate.id === "bot-a")!;
+    // the plain conversation folds in; the App-bound one cannot, so it stays
+    // and the roster agrees with what the server will report.
+    expect(bot.tasks!.map((task) => task.threadId)).toEqual(["bound-task", "legacy-task"]);
+    expect(bot.threadId).toBe("legacy-task");
+  });
+
+  it("refuses a merge-all whose destination is not one of the bot's conversations", () => {
+    const state = fixture();
+    expect(reducer(state, { type: "mergeAllBotTasks", botId: "bot-a", intoThreadId: "no-such-thread" })).toBe(state);
+    expect(reducer(state, { type: "mergeAllBotTasks", botId: "bot-b", intoThreadId: "legacy-task" })).toBe(state);
   });
 
   it("preserves saved context through a room round-trip and refuses another App", () => {

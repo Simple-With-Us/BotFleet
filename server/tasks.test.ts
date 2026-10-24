@@ -254,6 +254,80 @@ describe("tasks", () => {
     expect(store.messagesFor(bound.threadId)).toEqual(beforeBound);
   });
 
+  it("folds every extra conversation of one bot into the chosen destination, oldest first", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const inbox = bot.threadId;
+    const second = store.createTask(bot.id, "Second")!;
+    const third = store.createTask(bot.id, "Third")!;
+    const base = Date.now();
+    store.appendMessage(inbox, { role: "user", kind: "text", text: "Inbox", at: base });
+    store.appendMessage(second.threadId, { role: "user", kind: "text", text: "Second", at: base + 1_000 });
+    store.appendMessage(third.threadId, { role: "user", kind: "text", text: "Third", at: base + 2_000 });
+
+    const result = store.mergeAllBotTasks(bot.id, inbox);
+    expect(result).not.toBeNull();
+    expect(result!.merged).toHaveLength(2);
+    expect(result!.skipped).toEqual([]);
+    expect(store.tasks(bot.id)).toHaveLength(1);
+    // the destination is the one left, and it is the one the bot opens
+    expect(store.bot(bot.id)!.threadId).toBe(inbox);
+    const texts = store.messagesFor(inbox).map((message) => message.text);
+    expect(texts).toContain("Inbox");
+    expect(texts).toContain("Second");
+    expect(texts).toContain("Third");
+    // the destination's own transcript stays at the front
+    expect(texts.indexOf("Inbox")).toBeLessThan(texts.indexOf("Second"));
+    // and the merged conversations follow in the order they happened
+    expect(texts.indexOf("Second")).toBeLessThan(texts.indexOf("Third"));
+    // each fold says which conversation it brought in
+    expect(texts.filter((text) => text?.includes("Merged"))).toHaveLength(2);
+  });
+
+  it("leaves an App-bound conversation alone and names it, instead of refusing the whole merge", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const app = store.createGroup("Project App", [bot.id]);
+    const plain = bot.threadId;
+    const bound = store.createTask(bot.id, "Bound extra", false, undefined, context(app.id, join(home, "checkout")))!;
+    store.appendMessage(plain, { role: "user", kind: "text", text: "Plain" });
+    store.appendMessage(bound.threadId, { role: "user", kind: "text", text: "Bound" });
+
+    const result = store.mergeAllBotTasks(bot.id, plain);
+    expect(result).not.toBeNull();
+    expect(result!.skipped).toHaveLength(1);
+    expect(result!.skipped[0]).toMatchObject({ threadId: bound.threadId, title: "Bound extra" });
+    expect(result!.skipped[0]!.reason).toContain("App");
+    // the bound conversation is untouched, and the plain one still merged
+    expect(store.tasks(bot.id).map((task) => task.threadId)).toContain(bound.threadId);
+    expect(store.messagesFor(bound.threadId).map((message) => message.text)).toContain("Bound");
+    expect(store.messagesFor(plain).map((message) => message.text)).toContain("Plain");
+  });
+
+  it("refuses a merge-all whose destination is not one of the bot's conversations", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const other = store.createBot();
+    store.createTask(bot.id, "Side work")!;
+
+    expect(store.mergeAllBotTasks(bot.id, other.threadId)).toBeNull();
+    expect(store.mergeAllBotTasks(bot.id, "no-such-thread")).toBeNull();
+    expect(store.tasks(bot.id)).toHaveLength(2);
+  });
+
+  it("gathers one bot's conversations without touching another bot's", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const neighbour = store.createBot();
+    store.createTask(bot.id, "Mine")!;
+    store.createTask(neighbour.id, "Theirs")!;
+
+    const result = store.mergeAllBotTasks(bot.id, bot.threadId);
+    expect(result!.merged).toHaveLength(1);
+    expect(store.tasks(bot.id)).toHaveLength(1);
+    expect(store.tasks(neighbour.id)).toHaveLength(2);
+  });
+
   it("keeps the App workspace on automation rollover after the bot folder changes", async () => {
     const { store } = await freshStore();
     const bot = store.createBot();

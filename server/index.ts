@@ -3034,7 +3034,8 @@ setInterval(() => {
  * than the desktop window did. Stripped here rather than at each call site
  * so a new broadcast cannot forget. */
 const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: TaskRecord) => {
-  const last = store.messagesFor(task.threadId).at(-1);
+  const messages = store.messagesFor(task.threadId);
+  const last = messages.at(-1);
   // Time-based snoozes heal on read against the HARNESS clock, so a phone
   // whose clock is minutes off still agrees with the desktop about whether
   // a thread is asleep.  The 0 sentinel is not a time and survives every
@@ -3044,6 +3045,9 @@ const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: Task
     ...(isThreadSnoozed(snoozedUntil) ? { snoozedUntil } : {}),
     lastActivity: last?.at ?? task.createdAt,
     lastMessage: last,
+    // How much conversation a thread holds, so a person can tell a long
+    // history from a recent one before choosing what to merge into what.
+    messageCount: messages.length,
   };
 };
 const wireGroupTask = (task: GroupTaskRecord) => {
@@ -16520,6 +16524,35 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const fresh = botWithThread(updated);
       broadcast({ kind: "bot", bot: fresh });
       return json(res, 200, { bot: fresh });
+    }
+
+    // Fold every other conversation of ONE bot into the one the person picks.
+    // The workspace switch has a merge of its own, but that one moves every
+    // bot and room at once and only as a side effect of changing the
+    // arrangement, so a single bot's threads cannot be gathered on demand.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/merge-threads$/);
+    if (m && method === "POST") {
+      const body = await readBody(req);
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      if (bot.busy) {
+        return json(res, 409, { error: "this bot is working — let it finish before merging its threads" });
+      }
+      const into = typeof body.intoThreadId === "string" ? body.intoThreadId : "";
+      if (!into) return json(res, 400, { error: "choose the conversation to merge into" });
+      if (!(bot.tasks ?? []).some((task) => task.threadId === into)) {
+        return json(res, 400, { error: "that is not one of this bot's conversations" });
+      }
+      const result = store.mergeAllBotTasks(bot.id, into);
+      if (!result || !result.bot) return json(res, 400, { error: "this bot has nothing to merge" });
+      // A merge COPIES the source's messages into the target and then deletes
+      // the source task, so — unlike a move, which keeps its thread id — the
+      // source thread ids name nothing afterwards and their logs would sit on
+      // disk forever.
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, result.merged);
+      const fresh = botWithThread(result.bot);
+      broadcast({ kind: "bot", bot: fresh });
+      return json(res, 200, { bot: fresh, merged: result.merged, skipped: result.skipped });
     }
 
     // what the user's machine can host: which runtime is installed, whether

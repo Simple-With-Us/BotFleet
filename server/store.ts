@@ -1722,6 +1722,65 @@ export class Store {
     return { bots, groups, threads };
   }
 
+  /** Fold every other conversation of ONE bot into the chosen destination.
+   *
+   * Scoped to a single bot, and unlike the workspace-wide
+   * `mergeAllExtraThreads`, a source that cannot merge does not abort the
+   * rest: a thread bound to a different App is left alone and reported, so
+   * a person sees exactly what stayed behind instead of a refusal that
+   * merged nothing.  The workspace switch has to refuse outright, because
+   * it would otherwise hide a task whose binding prevented the merge.
+   *
+   * Sources fold oldest first, so the destination's own transcript stays at
+   * the front and the merged text reads in chronological order. */
+  mergeAllBotTasks(botId: string, intoThreadId: string): {
+    bot: BotRecord | null;
+    merged: string[];
+    skipped: Array<{ threadId: string; title: string; reason: string }>;
+  } | null {
+    const bot = this.bot(botId);
+    if (!bot || !bot.tasks || bot.tasks.length < 2) return null;
+    const into = bot.tasks.find((entry) => entry.threadId === intoThreadId);
+    if (!into) return null;
+
+    const merged: string[] = [];
+    const skipped: Array<{ threadId: string; title: string; reason: string }> = [];
+    const sources = [...bot.tasks]
+      .filter((task) => task.threadId !== intoThreadId)
+      .sort((a, b) => this.threadStart(a) - this.threadStart(b) || a.createdAt - b.createdAt);
+    for (const source of sources) {
+      if (!taskWorkspaceContextsMatch(source.workspaceContext, into.workspaceContext)) {
+        skipped.push({
+          threadId: source.threadId,
+          title: source.title || UNTITLED_TASK,
+          reason: "belongs to another App",
+        });
+        continue;
+      }
+      if (this.mergeBotTasks(botId, source.threadId, intoThreadId)) merged.push(source.threadId);
+    }
+
+    // Deleting a task can move the bot's active thread, so the destination
+    // is set explicitly: the merged conversation is the one to read next.
+    const fresh = this.bot(botId);
+    if (fresh && fresh.tasks?.some((task) => task.threadId === intoThreadId)) {
+      const destination = fresh.tasks.find((task) => task.threadId === intoThreadId)!;
+      fresh.threadId = intoThreadId;
+      fresh.resumeCursors = { ...destination.resumeCursors };
+      this.saveBots();
+      this.emit({ type: "bot", botId: fresh.id });
+    }
+    return { bot: fresh ?? null, merged, skipped };
+  }
+
+  /** When a conversation started, for ordering a merge.  The first message is
+   * the honest start; the task's own creation time stands in for a thread
+   * that has not spoken yet, and breaks a tie between two that did. */
+  private threadStart(task: TaskRecord): number {
+    const first = this.messagesFor(task.threadId)[0];
+    return first?.at ?? task.createdAt;
+  }
+
   /** Move one of a bot's conversations into a channel, where the channel's
    * members answer it from then on. */
   moveTaskToGroup(fromBotId: string, threadId: string, groupId: string): {
