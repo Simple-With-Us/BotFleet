@@ -156,16 +156,38 @@ test("the command line refuses a value that is not a key", async () => {
 
 test("the write command says which failure it was through its exit code", async () => {
   //  The shell layer reads the exit code, so the two failures cannot share
-  //  one:  a value the Apple tools cannot use is a credential failure (1),
+  //  one:  a value the Apple tools cannot use is a credential failure (3),
   //  and a path or a file that could not be used is a staging failure (2).
   //  One code for both would send the owner to the wrong place.
+  //
+  //  The credential status is 3 and not 1 because 1 is what this process
+  //  uses for a usage error and what node uses for an uncaught exception.
+  //  A crash would then read as a broken key, which is the same class of
+  //  misdiagnosis this separation exists to prevent.
   const value = await run(["write", join(root, "bad-value.p8")], "not a private key");
-  assert.equal(value.code, 1, `a broken credential did not exit 1: ${value.stderr}`);
+  assert.equal(value.code, 3, `a broken credential did not exit 3: ${value.stderr}`);
 
   const shared = mkdtempSync(join(tmpdir(), "asc-key-shared-"));
   chmodSync(shared, 0o755);
   const staging = await run(["write", join(shared, "key.p8")], envKeyPem);
   assert.equal(staging.code, 2, `a refused staging path did not exit 2: ${staging.stderr}`);
+});
+
+test("a refused path outranks a broken value, on the command line and in the module", async () => {
+  //  A value that is both a broken PEM and a path that cannot be used is
+  //  classified the same way by both entry points.  When the two disagreed,
+  //  the command line called it a path failure while the exported function
+  //  called it a credential failure, and the caller was sent to two
+  //  different owners for one run.
+  const shared = mkdtempSync(join(tmpdir(), "asc-key-both-"));
+  chmodSync(shared, 0o755);
+  const refused = join(shared, "key.p8");
+
+  const cli = await run(["write", refused], "not a private key");
+  assert.equal(cli.code, 2, `a refused path did not outrank a broken value: ${cli.stderr}`);
+
+  const written = writePrivateKeyFile(refused, "not a private key");
+  assert.equal(written.reason, "staging", "the module and the command line disagree about which failure wins");
 });
 
 test("the module has no read and no exec subcommand", async () => {

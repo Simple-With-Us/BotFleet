@@ -41,13 +41,16 @@ import { posix } from "node:path";
 // A private key is a few kilobytes.  Anything larger is not one.
 const MAX_KEY_BYTES = 64 * 1024;
 
-//  The exit codes the shell layer reads.  1 is a credential the Apple tools
-//  cannot use, 2 is a staging failure where the credential was fine but the
-//  path or the file could not be used.  The caller has to tell them apart:  a
-//  broken key and a refused path are different problems and they lead to
-//  different owners, so one exit code for both would send the owner to the
-//  wrong place.
-const EXIT_CREDENTIAL = 1;
+//  The exit codes the shell layer reads.  3 is a credential the Apple tools
+//  cannot use.  2 is a staging failure where the credential was fine but the
+//  path or the file could not be used.  1 is the status this process uses for
+//  usage and for a crash, and it is also the status node uses for an uncaught
+//  exception.  A missing node is 127, and a killed process is 128 plus the
+//  signal.  None of those are a credential, so the credential status is a
+//  code node does not use for them.  One code for a broken key and a refused
+//  path, or for a broken key and a crash, would send the owner to the wrong
+//  place.
+const EXIT_CREDENTIAL = 3;
 const EXIT_STAGING = 2;
 
 // Normalizes a PEM private key and refuses anything that is not one.
@@ -190,15 +193,17 @@ export function resolveStagingTarget(keyPath) {
  *  Returns { pem } when the key was written, and { error, reason } for every
  *  other outcome.  The reason says which of the two failures it was:  a
  *  credential the Apple tools cannot use, or a staging target that could not
- *  be used.  The key is never printed. */
+ *  be used.  The target is classified first, matching the command line, so a
+ *  value that is both a broken PEM and a refused path is a staging failure.
+ *  The key is never printed. */
 export function writePrivateKeyFile(keyPath, value) {
-  const pem = normalizePrivateKey(value);
-  if (!pem) {
-    return { error: "the value is not a PEM private key", reason: "credential" };
-  }
   const target = resolveStagingTarget(keyPath);
   if (target.error) {
     return { error: target.error, reason: "staging" };
+  }
+  const pem = normalizePrivateKey(value);
+  if (!pem) {
+    return { error: "the value is not a PEM private key", reason: "credential" };
   }
   let fd;
   try {
@@ -295,7 +300,7 @@ async function main() {
     const pem = normalizePrivateKey(await readStdin());
     if (!pem) {
       console.error("asc-key: the value is not a PEM private key");
-      return 1;
+      return EXIT_CREDENTIAL;
     }
     //  The key is not printed here either:  see the module header.
     console.log("asc-key: the value is a PEM private key");

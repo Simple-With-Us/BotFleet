@@ -466,6 +466,27 @@ mkdir -p "${tmp}/slash-tmp"
 stage_from_tmpdir "trailing-slash TMPDIR" TMPDIR="${tmp}/slash-tmp/"
 stage_from_tmpdir "TMPDIR without a trailing slash" TMPDIR="${tmp}/tmp"
 stage_from_tmpdir "unset TMPDIR" -u TMPDIR
+# A root-level TMPDIR is "/" and nothing else.  Every trailing slash is
+# stripped, so the root becomes empty and the join adds exactly one slash:
+# "//asc-key.XXXXXX" is the doubled slash the staging check refuses.  The
+# directory that lands on is the root of the filesystem, which a normal user
+# cannot write, so the run must report a path failure and not crash.
+root_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
+  -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+  TMPDIR="/" bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  load_secrets
+  [[ "$AUTH_MODE" == none ]]
+  [[ "$ASC_AUTH_FAILURE" == staging ]]
+  [[ "$(asc_upload_block)" == staging ]]
+')" || fail "a root TMPDIR was not classified as a path failure"
+case "$root_log" in
+  *"no App Store Connect API key"*) fail "a root TMPDIR was reported as a missing key: ${root_log}" ;;
+esac
+# A doubled trailing slash is not the root, so it strips down to the real
+# directory and the key stages there.
+stage_from_tmpdir "double-slash TMPDIR" TMPDIR="${tmp}//"
 
 # 8. A staging refusal is not a missing credential.  The key resolves, the
 #    writer refuses the path, and the upload block says staging.  The writer
@@ -500,15 +521,15 @@ case "$stage_log" in
 esac
 
 # 8b. A credential the writer refuses is not a path refusal either.  The
-#     writer exits 1 for a value that is not a usable PEM private key, and the
-#     run has to say THAT rather than pointing at the staging path or at a key
-#     that has to be created:  the key exists, the value is broken.
+#     writer exits 3 for a value that is not a usable PEM private key, and
+#     the run has to say THAT rather than pointing at the staging path or at
+#     a key that has to be created:  the key exists, the value is broken.
 mkdir -p "${tmp}/bin-cred"
 cat > "${tmp}/bin-cred/node" <<WRAP
 #!/usr/bin/env bash
 if [[ "\${1:-}" == *asc-key.mjs && "\${2:-}" == write ]]; then
   echo "asc-key: the value is not a PEM private key" >&2
-  exit 1
+  exit 3
 fi
 exec "$real_node" "\$@"
 WRAP
@@ -533,16 +554,89 @@ esac
 case "$cred_log" in
   *"no App Store Connect API key"*) fail "a broken credential was reported as a missing key: ${cred_log}" ;;
 esac
+# The rejected credential is identified by its public labels, the key id and
+# the issuer, and by nothing that came out of the key itself.  A preview of
+# the PEM would be a slice of the private key's own encoding.
+case "$cred_log" in
+  *"key id ABCDE12345"*) ;;
+  *) fail "a broken credential did not name the key id: ${cred_log}" ;;
+esac
+if grep -q "BEGIN PRIVATE KEY" <<< "$cred_log"; then
+  fail "a broken credential printed the key itself: ${cred_log}"
+fi
+if grep -q "$(sed -n '2p' "${tmp}/asc.p8" | cut -c1-12)" <<< "$cred_log"; then
+  fail "a broken credential printed a slice of the key body: ${cred_log}"
+fi
 
 # 8c. The two failures are told apart by the writer's exit code, not by the
 #     text of its message.  A staging failure is 2 and a credential failure
-#     is 1, so the writer itself has to keep them apart.
+#     is 3, so the writer itself has to keep them apart.
 cred_rc=0
 printf 'not a private key' | node "${here}/asc-key.mjs" write "${tmp}/not-a-key.p8" >/dev/null 2>&1 || cred_rc=$?
-[[ "$cred_rc" -eq 1 ]] || fail "a value that is not a key did not exit 1 (got ${cred_rc})"
+[[ "$cred_rc" -eq 3 ]] || fail "a value that is not a key did not exit 3 (got ${cred_rc})"
 stage_rc=0
 node "${here}/asc-key.mjs" write "${tmp}/not-normal//key.p8" <<< "$(cat "${tmp}/asc.p8")" >/dev/null 2>&1 || stage_rc=$?
 [[ "$stage_rc" -eq 2 ]] || fail "a refused staging path did not exit 2 (got ${stage_rc})"
+
+# 8d. A writer that fails without classifying anything is neither a broken
+#     credential nor a refused path.  The writer exits 1 for its own usage
+#     error and node uses 1 for an uncaught exception, so a crash must not
+#     be reported as a broken key:  that would send the owner to re-export a
+#     key that is fine.
+mkdir -p "${tmp}/bin-writer"
+cat > "${tmp}/bin-writer/node" <<WRAP
+#!/usr/bin/env bash
+if [[ "\${1:-}" == *asc-key.mjs && "\${2:-}" == write ]]; then
+  echo "asc-key: internal error" >&2
+  exit 1
+fi
+exec "$real_node" "\$@"
+WRAP
+chmod 700 "${tmp}/bin-writer/node"
+writer_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
+  -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+  PATH="${tmp}/bin-writer:${PATH}" bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  load_secrets
+  [[ "$AUTH_MODE" == none ]]
+  [[ "$ASC_AUTH_FAILURE" == writer ]]
+  [[ "$(asc_upload_block)" == writer ]]
+')" || fail "a writer crash was classified as a credential or a path failure"
+case "$writer_log" in
+  *"the key writer failed with status"*) ;;
+  *) fail "a writer crash did not say the writer failed: ${writer_log}" ;;
+esac
+case "$writer_log" in
+  *"is not a usable PEM private key"*) fail "a writer crash was reported as a broken key: ${writer_log}" ;;
+esac
+case "$writer_log" in
+  *"the staging path was refused"*) fail "a writer crash was reported as a path refusal: ${writer_log}" ;;
+esac
+case "$writer_log" in
+  *"no App Store Connect API key"*) fail "a writer crash was reported as a missing key: ${writer_log}" ;;
+esac
+
+# 8e. A credential that is resolved and then rejected by the earlier validate
+#     check is a credential failure, not a missing key.  The key exists; the
+#     value that came back cannot be used.
+validate_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
+  ASC_KEY_ID=ABCDE12345 ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="not a private key" \
+  bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  # The sourced file points at the fake fleet-secrets.  Point it at nothing
+  # after that, so the rejected ambient value is the only credential there
+  # is and no other source can rescue the run.
+  FLEET_SECRETS_BIN="'"${tmp}"'/no-such-fleet-secrets"
+  load_secrets
+  [[ "$AUTH_MODE" == none ]]
+  [[ "$ASC_AUTH_FAILURE" == credential ]]
+  [[ "$(asc_upload_block)" == credential ]]
+')" || fail "a credential rejected by validate was classified as a missing key"
+case "$validate_log" in
+  *"no App Store Connect API key"*) fail "a rejected credential was reported as a missing key: ${validate_log}" ;;
+esac
 
 # 9. No credential at all still classifies as missing, so the owner handoff
 #    for a missing key stays on that path.
