@@ -53,6 +53,13 @@ import { pollServerIdentity, probeHarness, resolvePackagedServer } from "./serve
 import { readPackagedBuildIdentity } from "./runtime-identity.mjs";
 import { readHarnessOwner } from "./harness-ownership.mjs";
 import { startUiShim } from "./attached-ui-shim.mjs";
+import {
+  readSavedRemoteUrl,
+  readServerTarget,
+  writeServerTarget,
+  writeServerTargetTemplate,
+  SERVER_TARGET_FILE,
+} from "./server-target.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
@@ -348,6 +355,10 @@ let serverReady = true;
 // dev harness) and the app joined it instead of forking a second server
 // against the same data dir. An attached harness is never killed on quit.
 let serverMode = "spawned";
+// Which BotFleet server this launch talks to: the harness on this Mac
+// ("local") or a remote server the owner pointed the app at ("remote").
+// Read once at boot from the user-data target file; see server-target.mjs.
+let serverTarget = { mode: "local" };
 // Serves the bundled UI (and streams /api through) when the attached harness
 // runs headless — see attached-ui-shim.mjs.
 let uiShim = null;
@@ -979,11 +990,15 @@ function readLogTail(logPath) {
 // file is safe to paste into a public issue even if a future log line ever
 // carried a secret.
 async function gatherDiagnostics() {
-  const serverStatus = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config`, {
-    signal: AbortSignal.timeout(3_000),
-  })
-    .then((res) => (res.ok ? res.json() : null))
-    .catch(() => null);
+  // A remote server is not this machine's business: there is no local harness
+  // to read a config summary from, so the report simply carries none.
+  const serverStatus = serverMode === "remote"
+    ? null
+    : await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config`, {
+        signal: AbortSignal.timeout(3_000),
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .catch(() => null);
   const logPath = path.join(LOG_DIR, "server.log");
   const log = readLogTail(logPath);
   return buildDiagnosticsReport({
@@ -994,7 +1009,7 @@ async function gatherDiagnostics() {
       electron: process.versions.electron,
       node: process.versions.node,
       packaged: app.isPackaged,
-      harness: app.isPackaged ? `${serverMode}:${SERVER_PORT}` : "dev",
+      harness: app.isPackaged ? harnessLabel() : "dev",
       uptimeSeconds: Math.round(process.uptime()),
     },
     configSummary: serverStatus ?? {},
@@ -1088,6 +1103,8 @@ let credentialRestoreStopped = false;
 let credentialRestoreLastOutcome = null;
 async function replayAttachedWorkspaceCredentials(port, expectedBuild) {
   if (credentialRestoreStopped) return;
+  // Local Keychain secrets are never copied to a remote server.
+  if (serverMode === "remote") return;
   const owner = readHarnessOwner(botfleetDataDir());
   let outcome = "unavailable";
   try {
@@ -1186,6 +1203,42 @@ async function startServerPackaged() {
   return false;
 }
 
+// Which server this launch should use.  A broken preference is not a broken
+// app: an unreadable target file falls back to the server on this Mac and
+// says why in the log.
+function readDesktopServerTarget() {
+  try {
+    return readServerTarget({ userDataDir: app.getPath("userData") });
+  } catch (error) {
+    return { mode: "local", error: `Could not read the server target: ${error?.message ?? error}` };
+  }
+}
+
+// A remote server replaces the local harness entirely: no child is forked and
+// no local harness is joined.  The bundled UI is still served from this
+// machine, so the renderer stays on a loopback origin and every trust check
+// in the app keeps working; only the far end of the /api pipe moves.
+async function startRemoteServer(remoteOrigin, remoteToken = "") {
+  serverMode = "remote";
+  serverProc = null;
+  try {
+    uiShim = await startUiShim({
+      uiDir: path.join(process.resourcesPath, "ui"),
+      remoteOrigin,
+      remoteToken,
+      listenPorts: [18799, 28799, 8799],
+      log: slog,
+    });
+    rendererBase = `http://127.0.0.1:${uiShim.port}`;
+    slog(`using the remote BotFleet server at ${remoteOrigin}`);
+    return true;
+  } catch (error) {
+    slog(`could not serve the bundled UI for the remote server at ${remoteOrigin}: ${error?.message ?? error}`);
+    serverStartConflictOnly = false;
+    return false;
+  }
+}
+
 function syncManagedComposioCredentials() {
   if (!serverProc) return;
   try {
@@ -1221,10 +1274,12 @@ const ERROR_PAGE_STYLE =
 // harness probe runs again.  Never opened externally (it is not http).
 const SERVER_RETRY_URL = "botfleet://retry-server";
 
-function buildErrorPage({ allPortsOccupied, unresponsiveOwner = null }) {
+function buildErrorPage({ allPortsOccupied, unresponsiveOwner = null, remoteOrigin = null }) {
   const serverLogPath = path.join(LOG_DIR, "server.log");
   const serverLogHref = pathToFileURL(serverLogPath).href;
-  const reason = unresponsiveOwner
+  const reason = remoteOrigin
+    ? `BotFleet could not reach the server at ${remoteOrigin}.\u00a0 Check that the address is right and that this Mac can reach it, then try again.`
+    : unresponsiveOwner
     ? `A BotFleet server that owns this Mac's fleet data (process ${unresponsiveOwner.pid} on port ${unresponsiveOwner.port}) is running but not answering.\u00a0 BotFleet will not start a second server on the same data.\u00a0 Wait a minute and try again, or quit that process first.`
     : allPortsOccupied
       ? "Every BotFleet port answered health checks from another program on ports 8799–28799.\u00a0 Quit that program, then try again."
@@ -1252,6 +1307,14 @@ let displayMediaRequestCount = 0;
 function rendererBaseUrl() {
   if (!app.isPackaged) return DEV_URL;
   return rendererBase ?? `http://127.0.0.1:${SERVER_PORT}`;
+}
+
+// Which server the app is talking to, in one word for the diagnostics and the
+// settings panel.  A remote server has no local port to name, so it is named
+// by its origin instead.
+function harnessLabel() {
+  if (serverMode === "remote") return `remote:${serverTarget.origin}`;
+  return `${serverMode}:${SERVER_PORT}`;
 }
 
 function rendererOrigin() {
@@ -1664,7 +1727,11 @@ function createWindow() {
     win.loadURL(
       serverReady
         ? rendererBaseUrl()
-        : buildErrorPage({ allPortsOccupied: serverStartConflictOnly, unresponsiveOwner: serverStartUnresponsiveOwner }),
+        : buildErrorPage({
+            allPortsOccupied: serverStartConflictOnly,
+            unresponsiveOwner: serverStartUnresponsiveOwner,
+            remoteOrigin: serverMode === "remote" ? serverTarget.origin : null,
+          }),
     );
   } else {
     win.loadURL(DEV_URL);
@@ -2020,7 +2087,7 @@ ipcMain.handle("desktop:app-info", () => {
   const info = appRuntimeInfo({
     version: app.getVersion(),
     packaged: app.isPackaged,
-    harness: app.isPackaged ? `${serverMode}:${SERVER_PORT}` : "dev",
+    harness: app.isPackaged ? harnessLabel() : "dev",
   });
   return { ...info, summary: appRuntimeSummary(info) };
 });
@@ -2061,7 +2128,10 @@ ipcMain.handle("sts:status", () => ({
 // The harness holds the Usage Monitor connection, so it is told, and the call
 // never waits on it or fails because of it.
 function reportStsSession(provider) {
-  void fetch(`http://127.0.0.1:${SERVER_PORT}/api/sts/session-started`, {
+  // A remote server is told through the shim; there is no local harness to
+  // report the session to.
+  const base = serverMode === "remote" ? rendererBaseUrl() : `http://127.0.0.1:${SERVER_PORT}`;
+  void fetch(`${base}/api/sts/session-started`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ provider }),
@@ -2120,6 +2190,8 @@ ipcMain.handle("credential:set", async (_event, name, value, provider) => {
   }
   const secret = value.trim();
   const applyToHarness = async () => {
+    // Local Keychain secrets are never copied to a remote server.
+    if (serverMode === "remote") return null;
     // In development the server is a separately launched process, so it
     // cannot receive credentials from Electron at boot. Keep its established
     // local config path there; production always uses the encrypted store.
@@ -2165,6 +2237,8 @@ ipcMain.handle("credential:set-instance", async (_event, instanceId, value) => {
   }
   const secret = value.trim();
   const applyToHarness = async () => {
+    // Local Keychain secrets are never copied to a remote server.
+    if (serverMode === "remote") return null;
     // Dev/browser fallback: no desktop shell to replay this from at the next
     // spawn, so the server's own PATCH persists the key in config.json —
     // the same plaintext shape the create-time flow already falls back to.
@@ -2255,6 +2329,86 @@ function setupApplicationMenu() {
     }
   };
 
+  // Which BotFleet server this app talks to.  The radio shows where the app
+  // is pointed right now; "Set Remote Server…" opens the target file so the
+  // owner can type in the address of a server on another machine.
+  const serverSubmenu = () => {
+    const saved = readSavedRemoteUrl(app.getPath("userData"));
+    return [
+      {
+        label: "This Mac",
+        type: "radio",
+        checked: serverMode !== "remote",
+        click: () => chooseServerTarget({ mode: "local" }),
+      },
+      ...(saved
+        ? [
+            {
+              label: `Remote: ${saved}`,
+              type: "radio",
+              checked: serverMode === "remote",
+              click: () => chooseServerTarget({ mode: "remote", url: saved }),
+            },
+          ]
+        : []),
+      { type: "separator" },
+      {
+        label: "Set Remote Server…",
+        click: () => openServerTargetFile(),
+      },
+    ];
+  };
+
+  // Point the app at a server and offer to restart into it.  The server the
+  // app talks to cannot change under a running window: the renderer origin,
+  // the trust checks and the event stream are all built on it.
+  const chooseServerTarget = async (target) => {
+    try {
+      writeServerTarget(app.getPath("userData"), target);
+    } catch (error) {
+      dialog.showErrorBox(
+        "Could Not Save The Server",
+        `BotFleet could not save the server it should use.\u00a0 ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return;
+    }
+    setupApplicationMenu();
+    const { response } = await dialog.showMessageBox({
+      type: "info",
+      buttons: ["Restart Now", "Later"],
+      defaultId: 0,
+      cancelId: 1,
+      message: "Restart BotFleet To Use The Other Server?",
+      detail: "BotFleet restarts before it talks to the other server.\u00a0 Your conversations and settings stay where they are.",
+    });
+    if (response !== 0) return;
+    app.relaunch();
+    app.quit();
+  };
+
+  // Open the target file for the owner to edit: the address of a server on
+  // another machine is theirs to type, not ours to guess.
+  const openServerTargetFile = () => {
+    const userDataDir = app.getPath("userData");
+    const file = path.join(userDataDir, SERVER_TARGET_FILE);
+    try {
+      // The template is written only when there is no file yet, and its url
+      // is empty on purpose: the address is the owner's to type.
+      writeServerTargetTemplate(userDataDir);
+    } catch (error) {
+      slog(`could not write the server target file: ${error?.message ?? error}`);
+    }
+    void shell.openPath(file);
+    void dialog.showMessageBox({
+      type: "info",
+      buttons: ["OK"],
+      message: "Edit The Server Target File",
+      detail:
+        `Set "url" to the server's address, paste the gate token from the server into "token", ` +
+        `set "mode" to "remote", then restart BotFleet.\u00a0 The file is ${file}`,
+    });
+  };
+
   const template = [
     ...(isMac
       ? [
@@ -2290,6 +2444,7 @@ function setupApplicationMenu() {
                 label: "Usage  (Token Spend...)",
                 click: () => sendToRenderer("open-settings", { section: "usage" }),
               },
+              { label: "Server", submenu: serverSubmenu() },
               { type: "separator" },
               { role: "services" },
               { type: "separator" },
@@ -2349,6 +2504,10 @@ function setupApplicationMenu() {
             dialog,
           }),
         }] : []),
+        // On macOS the Server submenu lives in the app-name menu, so it is
+        // not repeated here; every other platform has no app-name menu and
+        // gets it under File instead.
+        ...(!isMac ? [{ label: "Server", submenu: serverSubmenu() }] : []),
         { type: "separator" },
         isMac ? { role: "close" } : { role: "quit" },
       ],
@@ -2613,13 +2772,35 @@ app.whenReady().then(async () => {
           return { mode: "unavailable", reason: String(e) };
         })
       : Promise.resolve({ mode: "unavailable", reason: "unsupported-platform" });
-  if (app.isPackaged) serverReady = await startServerPackaged();
+  if (app.isPackaged) {
+    // The target file (or BOTFLEET_SERVER_URL) decides which BotFleet server
+    // this launch talks to: the one on this Mac, or a remote one.
+    const target = readDesktopServerTarget();
+    serverTarget = target;
+    // A remote target with an ignored problem (an invalid gate token, say)
+    // still points at the remote server, so the message must not claim the
+    // app fell back to this Mac.
+    if (target.error) {
+      slog(
+        target.mode === "remote"
+          ? `server target: ${target.error}`
+          : `server target: ${target.error}; using the server on this Mac`,
+      );
+    }
+    serverReady = target.mode === "remote"
+      ? await startRemoteServer(target.origin, target.token ?? "")
+      : await startServerPackaged();
+    // The Server menu shows where the app is pointed, so it is built again
+    // once the server it talks to is settled.
+    setupApplicationMenu();
+  }
   // The companion the user left on comes back without anyone finding the
   // toggle again — one attempt, after the harness port is settled, with the
   // exact options the IPC handler uses. A failure surfaces in companionState
   // (the panel shows the error) rather than retrying; and it never delays
-  // the window.
-  if (serverReady && companionEnabledAtRest()) {
+  // the window.  A remote server has its own phone pairing, so the local
+  // sidecar stays off.
+  if (serverReady && serverMode !== "remote" && companionEnabledAtRest()) {
     void startDesktopCompanion({ waitForHosted: false, remember: false });
   }
   const win = createWindow();
@@ -2636,7 +2817,9 @@ app.whenReady().then(async () => {
   if (credentialStoreUnavailable) {
     slog("skipping connected-apps registration: the credential store was unreadable this launch");
   }
-  if (app.isPackaged && composioBrokerUrl() && !credentialStoreUnavailable) {
+  // Connected Apps live on the server this app talks to; a remote server
+  // registers its own, so nothing is pushed into a local harness here.
+  if (app.isPackaged && serverMode !== "remote" && composioBrokerUrl() && !credentialStoreUnavailable) {
     void updateSecureCredentialDocument(async (credentials) => {
       await ensureManagedComposioCredentials({
         brokerUrl: composioBrokerUrl(),
@@ -2793,8 +2976,12 @@ app.on("before-quit", (e) => {
   // meaningful when we did not spawn it ourselves: a child we own is already
   // killed above, and asking the harness to shut down would be asking a process
   // that is already dead.  See serverPersistsOnExit() for why absent means yes.
+  // A remote server is never stopped by the desktop app: it is not ours to
+  // stop, and it may well be serving another machine.
   const stopAttachedHarness =
-    serverProc || serverPersistsOnExit() ? Promise.resolve() : requestAttachedHarnessShutdown();
+    serverMode === "remote" || serverProc || serverPersistsOnExit()
+      ? Promise.resolve()
+      : requestAttachedHarnessShutdown();
   try {
     uiShim?.close();
   } catch {}

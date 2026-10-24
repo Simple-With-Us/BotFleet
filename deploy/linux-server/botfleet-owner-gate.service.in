@@ -1,0 +1,50 @@
+[Unit]
+Description=BotFleet owner gate (Tailscale identity reverse proxy in front of the harness)
+Documentation=https://github.com/Simple-With-Us/BotFleet
+After=botfleet-server.service
+
+[Service]
+Type=simple
+User=@BF_USER@
+Group=@BF_GROUP@
+UMask=0007
+WorkingDirectory=@BF_ROOT@/workdir
+EnvironmentFile=@BF_ROOT@/config/gate.env
+Environment="HOME=@BF_ROOT@/home"
+Environment="TMPDIR=@BF_ROOT@/tmp"
+Environment="XDG_CONFIG_HOME=@BF_ROOT@/home/.config"
+Environment="XDG_CACHE_HOME=@BF_ROOT@/home/.cache"
+Environment="XDG_DATA_HOME=@BF_ROOT@/home/.local/share"
+Environment="XDG_STATE_HOME=@BF_ROOT@/home/.local/state"
+Environment="npm_config_cache=@BF_ROOT@/home/.npm"
+Environment="PATH=@BF_ROOT@/node/bin:@BF_ROOT@/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=@NODE_BIN@ @BF_CODE@/deploy/linux-server/owner-gate.mjs
+StandardOutput=append:@BF_ROOT@/logs/owner-gate.log
+StandardError=append:@BF_ROOT@/logs/owner-gate.log
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=60
+
+# The sandbox below makes every path read-only except the fleet volume.
+# No privilege gain through setuid binaries.
+NoNewPrivileges=yes
+# The whole filesystem is read-only.
+ProtectSystem=strict
+# /home and /root stay read-only.
+ProtectHome=read-only
+# The fleet volume is the only writable path.
+ReadWritePaths=/mnt/fleet-extra
+# A private /tmp for this unit.
+PrivateTmp=yes
+# Kernel tunables stay read-only.
+ProtectKernelTunables=yes
+# The cgroup file system stays read-only.
+ProtectControlGroups=yes
+# No new suid or sgid files.
+RestrictSUIDSGID=yes
+# The memory layout cannot be changed.
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

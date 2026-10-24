@@ -6,7 +6,15 @@ import path from "node:path";
 import test from "node:test";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 
-import { isApiPath, parseHostAuthority, resolveStaticFile, shimOriginGuard, startUiShim } from "./attached-ui-shim.mjs";
+import {
+  GATE_TOKEN_HEADER,
+  isApiPath,
+  parseHostAuthority,
+  remoteForwardedHeaders,
+  resolveStaticFile,
+  shimOriginGuard,
+  startUiShim,
+} from "./attached-ui-shim.mjs";
 
 function makeUiDir() {
   const dir = mkdtempSync(path.join(os.tmpdir(), "bf-ui-shim-"));
@@ -244,15 +252,16 @@ test("prefers the first free port from the list and falls back past busy ones", 
 // A rebound page keeps the attacker's hostname in `Host` and sends its own
 // `Origin`, so both must be refused before anything reaches the harness.
 
-function rawRequest({ port, path: requestPath, method = "GET", headers = {} }) {
+function rawRequest({ port, path: requestPath, method = "GET", headers = {}, body = null }) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers }, (res) => {
-      let body = "";
-      res.on("data", (chunk) => (body += chunk));
-      res.on("end", () => resolve({ status: res.statusCode, body, headers: res.headers }));
+      let text = "";
+      res.on("data", (chunk) => (text += chunk));
+      res.on("end", () => resolve({ status: res.statusCode, body: text, headers: res.headers }));
     });
     req.on("error", reject);
-    req.end();
+    if (body === null) req.end();
+    else req.end(body);
   });
 }
 
@@ -430,5 +439,421 @@ test("a rebound WebSocket handshake never reaches the harness", async () => {
   } finally {
     await shim.close();
     await harness.close();
+  }
+});
+
+// ── A REMOTE server instead of the harness on this Mac ─────────────────────
+// The renderer still loads from a loopback port, so the app's own trust
+// checks are unchanged; only the far end of the /api pipe moves.  The remote
+// server must not see the browser's view of the request (its origin, its
+// referer, its fetch metadata) — it is being asked to trust the shim, not the
+// browser.
+
+test("remoteForwardedHeaders sets the remote Host and drops the browser's headers", () => {
+  const headers = remoteForwardedHeaders(
+    {
+      headers: {
+        host: "127.0.0.1:18799",
+        origin: "http://127.0.0.1:18799",
+        referer: "http://127.0.0.1:18799/settings",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-dest": "empty",
+        connection: "keep-alive",
+        "keep-alive": "timeout=5",
+        "transfer-encoding": "chunked",
+        "content-type": "application/json",
+        "x-requested-with": "botfleet",
+      },
+    },
+    "https://jay-server.boa-roygbiv.ts.net:8799",
+  );
+
+  assert.equal(headers.host, "jay-server.boa-roygbiv.ts.net:8799");
+  assert.equal(headers.origin, undefined);
+  assert.equal(headers.referer, undefined);
+  assert.equal(headers["sec-fetch-mode"], undefined);
+  assert.equal(headers["sec-fetch-site"], undefined);
+  assert.equal(headers["sec-fetch-dest"], undefined);
+  assert.equal(headers.connection, undefined);
+  assert.equal(headers["keep-alive"], undefined);
+  assert.equal(headers["transfer-encoding"], undefined);
+  // …while the headers that describe the request itself survive.
+  assert.equal(headers["content-type"], "application/json");
+  assert.equal(headers["x-requested-with"], "botfleet");
+});
+
+test("remoteForwardedHeaders keeps connection and upgrade on a websocket upgrade", () => {
+  const headers = remoteForwardedHeaders(
+    {
+      headers: {
+        host: "127.0.0.1:18799",
+        origin: "http://127.0.0.1:18799",
+        connection: "Upgrade",
+        upgrade: "websocket",
+        "sec-websocket-key": "abc",
+        "sec-websocket-version": "13",
+        "keep-alive": "timeout=5",
+      },
+    },
+    "https://jay-server.boa-roygbiv.ts.net:8799",
+  );
+  assert.equal(headers.connection, "Upgrade");
+  assert.equal(headers.upgrade, "websocket");
+  assert.equal(headers["sec-websocket-key"], "abc");
+  assert.equal(headers.origin, undefined);
+  assert.equal(headers["keep-alive"], undefined);
+});
+
+// A stand-in remote server: records every header it was given.
+function startRecordingUpstream() {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      seen.push({ method: req.method, url: req.url, headers: { ...req.headers }, body });
+      res.writeHead(200, { "content-type": "application/json", "x-upstream": "remote" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () =>
+      resolve({
+        port: server.address().port,
+        seen,
+        close: () =>
+          new Promise((r) => {
+            server.closeAllConnections();
+            server.close(() => r());
+          }),
+      }),
+    );
+  });
+}
+
+test("a remote origin proxies /api to the remote server and serves the UI locally", async () => {
+  const upstream = await startRecordingUpstream();
+  const uiDir = makeUiDir();
+  // The remote origin is an http loopback address, which is what an
+  // `ssh -L` tunnel looks like from this side.
+  const remoteOrigin = `http://127.0.0.1:${upstream.port}`;
+  const shim = await startUiShim({ uiDir, remoteOrigin });
+  try {
+    const base = `http://127.0.0.1:${shim.port}`;
+
+    // The bundled UI is still served from this machine.
+    const index = await fetch(`${base}/`);
+    assert.equal(index.status, 200);
+    assert.match(await index.text(), /BotFleet/);
+    const asset = await fetch(`${base}/assets/app.js`);
+    assert.equal(asset.status, 200);
+    assert.equal(asset.headers.get("content-type"), "text/javascript");
+
+    // A GET reaches the remote server with the remote authority as Host and
+    // without the browser's origin.
+    const get = await rawRequest({
+      port: shim.port,
+      path: "/api/health",
+      headers: {
+        host: `127.0.0.1:${shim.port}`,
+        origin: `http://127.0.0.1:${shim.port}`,
+        referer: `http://127.0.0.1:${shim.port}/`,
+        "sec-fetch-mode": "cors",
+      },
+    });
+    assert.equal(get.status, 200);
+    assert.equal(get.headers["x-upstream"], "remote");
+    assert.equal(upstream.seen.length, 1);
+    assert.equal(upstream.seen[0].method, "GET");
+    assert.equal(upstream.seen[0].url, "/api/health");
+    assert.equal(upstream.seen[0].headers.host, `127.0.0.1:${upstream.port}`);
+    assert.equal(upstream.seen[0].headers.origin, undefined);
+    assert.equal(upstream.seen[0].headers.referer, undefined);
+    assert.equal(upstream.seen[0].headers["sec-fetch-mode"], undefined);
+
+    // A POST keeps its method, path and body.
+    const post = await rawRequest({
+      port: shim.port,
+      method: "POST",
+      path: "/api/rooms?x=1",
+      headers: {
+        host: `127.0.0.1:${shim.port}`,
+        origin: `http://127.0.0.1:${shim.port}`,
+        "content-type": "application/json",
+      },
+      body: '{"hi":1}',
+    });
+    assert.equal(post.status, 200);
+    assert.equal(upstream.seen.length, 2);
+    assert.equal(upstream.seen[1].method, "POST");
+    assert.equal(upstream.seen[1].url, "/api/rooms?x=1");
+    assert.equal(upstream.seen[1].body, '{"hi":1}');
+    assert.equal(upstream.seen[1].headers.host, `127.0.0.1:${upstream.port}`);
+    assert.equal(upstream.seen[1].headers.origin, undefined);
+  } finally {
+    await shim.close();
+    await upstream.close();
+  }
+});
+
+test("a remote server that is gone yields 502, not a hang", async () => {
+  const upstream = await startRecordingUpstream();
+  const deadPort = upstream.port;
+  await upstream.close();
+  const shim = await startUiShim({ uiDir: makeUiDir(), remoteOrigin: `http://127.0.0.1:${deadPort}` });
+  try {
+    const res = await fetch(`http://127.0.0.1:${shim.port}/api/health`, { signal: AbortSignal.timeout(5_000) });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.match(body.error, /not reachable/);
+    // The failure names the remote server, not a local port.
+    assert.match(body.error, new RegExp(`127\\.0\\.0\\.1:${deadPort}`));
+    // The UI itself still serves — the renderer can show its own error state.
+    const index = await fetch(`http://127.0.0.1:${shim.port}/`);
+    assert.equal(index.status, 200);
+  } finally {
+    await shim.close();
+  }
+});
+
+test("a websocket upgrade reaches the remote server without the browser's origin", async () => {
+  const seen = [];
+  const sockets = new Set();
+  const upstream = http.createServer();
+  upstream.on("upgrade", (req, socket) => {
+    seen.push({ url: req.url, headers: { ...req.headers } });
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+    socket.on("data", (chunk) => socket.write(`echo:${chunk}`));
+    socket.on("end", () => socket.end());
+  });
+  await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+  const upstreamPort = upstream.address().port;
+  const shim = await startUiShim({ uiDir: makeUiDir(), remoteOrigin: `http://127.0.0.1:${upstreamPort}` });
+  try {
+    const echoed = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: "127.0.0.1",
+        port: shim.port,
+        path: "/api/ws",
+        headers: {
+          host: `127.0.0.1:${shim.port}`,
+          origin: `http://127.0.0.1:${shim.port}`,
+          connection: "Upgrade",
+          upgrade: "websocket",
+        },
+      });
+      req.on("upgrade", (res, socket) => {
+        assert.equal(res.statusCode, 101);
+        socket.once("data", (chunk) => {
+          socket.destroy();
+          resolve(String(chunk));
+        });
+        socket.write("ping");
+      });
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(echoed, "echo:ping");
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].url, "/api/ws");
+    // The remote server is addressed by its own authority, with no origin.
+    assert.equal(seen[0].headers.host, `127.0.0.1:${upstreamPort}`);
+    assert.equal(seen[0].headers.origin, undefined);
+    // …and the upgrade headers survive, because they ARE the request.
+    assert.equal(seen[0].headers.upgrade, "websocket");
+  } finally {
+    await shim.close();
+    for (const socket of sockets) socket.destroy();
+    upstream.closeAllConnections?.();
+    await new Promise((r) => upstream.close(r));
+  }
+});
+
+// ── The gate token for a remote server ─────────────────────────────────────
+// A remote server behind the BotFleet owner gate wants the desktop app's
+// gate token on every request.  The renderer must never be able to choose it:
+// an incoming header of the same name is dropped and replaced with the real
+// one, so a page in the renderer cannot borrow or forge it.
+
+const GATE_TOKEN = "0123456789abcdef0123456789abcdef";
+
+test("a remote server receives the gate token on every proxied request", async () => {
+  const upstream = await startRecordingUpstream();
+  const shim = await startUiShim({
+    uiDir: makeUiDir(),
+    remoteOrigin: `http://127.0.0.1:${upstream.port}`,
+    remoteToken: GATE_TOKEN,
+  });
+  try {
+    const get = await rawRequest({
+      port: shim.port,
+      path: "/api/health",
+      headers: { host: `127.0.0.1:${shim.port}` },
+    });
+    assert.equal(get.status, 200);
+    assert.equal(upstream.seen.length, 1);
+    assert.equal(upstream.seen[0].headers[GATE_TOKEN_HEADER], GATE_TOKEN);
+
+    const post = await rawRequest({
+      port: shim.port,
+      method: "POST",
+      path: "/api/rooms",
+      headers: {
+        host: `127.0.0.1:${shim.port}`,
+        "content-type": "application/json",
+      },
+      body: '{"hi":1}',
+    });
+    assert.equal(post.status, 200);
+    assert.equal(upstream.seen.length, 2);
+    assert.equal(upstream.seen[1].headers[GATE_TOKEN_HEADER], GATE_TOKEN);
+  } finally {
+    await shim.close();
+    await upstream.close();
+  }
+});
+
+test("a spoofed gate token from the client is replaced, never forwarded", async () => {
+  const upstream = await startRecordingUpstream();
+  const shim = await startUiShim({
+    uiDir: makeUiDir(),
+    remoteOrigin: `http://127.0.0.1:${upstream.port}`,
+    remoteToken: GATE_TOKEN,
+  });
+  try {
+    const res = await rawRequest({
+      port: shim.port,
+      path: "/api/health",
+      headers: {
+        host: `127.0.0.1:${shim.port}`,
+        [GATE_TOKEN_HEADER]: "a-token-the-renderer-invented",
+      },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(upstream.seen.length, 1);
+    assert.equal(upstream.seen[0].headers[GATE_TOKEN_HEADER], GATE_TOKEN);
+  } finally {
+    await shim.close();
+    await upstream.close();
+  }
+});
+
+test("a remote server without a token gets no token header", async () => {
+  const upstream = await startRecordingUpstream();
+  const shim = await startUiShim({
+    uiDir: makeUiDir(),
+    remoteOrigin: `http://127.0.0.1:${upstream.port}`,
+  });
+  try {
+    const res = await rawRequest({
+      port: shim.port,
+      path: "/api/health",
+      headers: { host: `127.0.0.1:${shim.port}` },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(upstream.seen.length, 1);
+    assert.equal(upstream.seen[0].headers[GATE_TOKEN_HEADER], undefined);
+  } finally {
+    await shim.close();
+    await upstream.close();
+  }
+});
+
+test("the gate token is never written to the log", async () => {
+  const upstream = await startRecordingUpstream();
+  const lines = [];
+  const shim = await startUiShim({
+    uiDir: makeUiDir(),
+    remoteOrigin: `http://127.0.0.1:${upstream.port}`,
+    remoteToken: GATE_TOKEN,
+    log: (line) => lines.push(line),
+  });
+  try {
+    await rawRequest({
+      port: shim.port,
+      path: "/api/health",
+      headers: { host: `127.0.0.1:${shim.port}` },
+    });
+    assert.equal(lines.join("\n").includes(GATE_TOKEN), false);
+  } finally {
+    await shim.close();
+    await upstream.close();
+  }
+});
+
+test("remoteForwardedHeaders replaces an incoming gate token header", () => {
+  const headers = remoteForwardedHeaders(
+    {
+      headers: {
+        host: "127.0.0.1:18799",
+        [GATE_TOKEN_HEADER]: "a-token-the-renderer-invented",
+      },
+    },
+    "https://jay-server.boa-roygbiv.ts.net:8799",
+    GATE_TOKEN,
+  );
+  assert.equal(headers[GATE_TOKEN_HEADER], GATE_TOKEN);
+
+  // Without a configured token, the renderer's header is dropped entirely.
+  const dropped = remoteForwardedHeaders(
+    { headers: { host: "127.0.0.1:18799", [GATE_TOKEN_HEADER]: "invented" } },
+    "https://jay-server.boa-roygbiv.ts.net:8799",
+  );
+  assert.equal(dropped[GATE_TOKEN_HEADER], undefined);
+});
+
+test("a websocket upgrade to a remote server carries the gate token", async () => {
+  const seen = [];
+  const sockets = new Set();
+  const upstream = http.createServer();
+  upstream.on("upgrade", (req, socket) => {
+    seen.push({ url: req.url, headers: { ...req.headers } });
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+    socket.on("data", (chunk) => socket.write(`echo:${chunk}`));
+    socket.on("end", () => socket.end());
+  });
+  await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+  const upstreamPort = upstream.address().port;
+  const shim = await startUiShim({
+    uiDir: makeUiDir(),
+    remoteOrigin: `http://127.0.0.1:${upstreamPort}`,
+    remoteToken: GATE_TOKEN,
+  });
+  try {
+    const echoed = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: "127.0.0.1",
+        port: shim.port,
+        path: "/api/ws",
+        headers: {
+          host: `127.0.0.1:${shim.port}`,
+          connection: "Upgrade",
+          upgrade: "websocket",
+          [GATE_TOKEN_HEADER]: "a-token-the-renderer-invented",
+        },
+      });
+      req.on("upgrade", (res, socket) => {
+        assert.equal(res.statusCode, 101);
+        socket.once("data", (chunk) => {
+          socket.destroy();
+          resolve(String(chunk));
+        });
+        socket.write("ping");
+      });
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(echoed, "echo:ping");
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].headers[GATE_TOKEN_HEADER], GATE_TOKEN);
+  } finally {
+    await shim.close();
+    for (const socket of sockets) socket.destroy();
+    await new Promise((r) => upstream.close(r));
   }
 });
