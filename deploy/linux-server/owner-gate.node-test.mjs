@@ -5,14 +5,17 @@
 // fake upstream on an ephemeral port and points the gate at it.
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
 import crypto from "node:crypto";
 import net from "node:net";
 
 import {
   createOwnerGate,
+  gateConfigFromSecrets,
   gateDecision,
   isLoopbackAddress,
+  parseArgs,
   parseOwnerLogins,
   parseTokenSha256,
   upstreamHeaders,
@@ -22,6 +25,9 @@ const OWNER = "owner@example.com";
 const PUBLIC_ORIGIN = "https://botfleet-host.tailnet.ts.net:8799";
 
 const ownerSet = () => parseOwnerLogins(OWNER);
+
+const readSource = (name) =>
+  fs.readFileSync(new URL(name, import.meta.url), "utf8");
 
 // A websocket handshake key, built at runtime: a literal one looks like a
 // secret to the scanner and is not one.
@@ -214,6 +220,76 @@ test("gateDecision checks the owner before the origin", () => {
     publicOrigin: PUBLIC_ORIGIN,
   });
   assert.equal(decision.reason, "owner identity required");
+});
+
+// ---------------------------------------------------------------------------
+// The configuration comes from Infisical, never from the environment
+// ---------------------------------------------------------------------------
+
+test("the gate reads no environment variable", () => {
+  const source = readSource("./owner-gate.mjs");
+  assert.equal(source.includes("process.env"), false);
+  for (const name of [
+    "BOTFLEET_GATE_HOST",
+    "BOTFLEET_GATE_PORT",
+    "BOTFLEET_HARNESS_PORT",
+    "BOTFLEET_OWNER_LOGINS",
+    "BOTFLEET_PUBLIC_ORIGIN",
+    "BOTFLEET_GATE_TOKEN_SHA256",
+  ]) {
+    const read = new RegExp(`process\\.env\\.${name}`);
+    assert.equal(read.test(source), false, `${name} must not be read from the environment`);
+  }
+});
+
+test("the systemd unit hands the gate the bootstrap token file and no env file", () => {
+  const unit = readSource("./botfleet-owner-gate.service.in");
+  assert.equal(unit.includes("EnvironmentFile"), false);
+  assert.match(unit, /--bootstrap-token-file @BF_ROOT@\/config\/infisical-read-token/);
+});
+
+test("parseArgs takes the bootstrap token file and refuses anything else", () => {
+  const parsed = parseArgs(["--bootstrap-token-file", "/srv/botfleet/infisical-read-token"]);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.bootstrapTokenFile, "/srv/botfleet/infisical-read-token");
+
+  const inline = parseArgs(["--bootstrap-token-file=/srv/botfleet/infisical-read-token"]);
+  assert.equal(inline.ok, true);
+  assert.equal(inline.bootstrapTokenFile, "/srv/botfleet/infisical-read-token");
+
+  const missing = parseArgs([]);
+  assert.equal(missing.ok, false);
+  assert.match(String(missing.error), /--bootstrap-token-file/);
+
+  const unknown = parseArgs(["--gate-port", "9000"]);
+  assert.equal(unknown.ok, false);
+  assert.match(String(unknown.error), /unknown argument/);
+});
+
+test("gateConfigFromSecrets maps the Infisical values onto the gate", () => {
+  const config = gateConfigFromSecrets({
+    BOTFLEET_OWNER_LOGINS: "Owner@Example.com, second@example.com",
+    BOTFLEET_PUBLIC_ORIGIN: "https://botfleet-host.tailnet.ts.net:8799",
+    BOTFLEET_SERVER_GATE_TOKEN: DESKTOP_TOKEN,
+  });
+
+  assert.deepEqual([...config.owners].sort(), ["owner@example.com", "second@example.com"]);
+  assert.equal(config.publicOrigin, PUBLIC_ORIGIN);
+  // The token is hashed in memory; the gate never holds the token itself.
+  assert.equal(config.tokenSha256, tokenSha256);
+  assert.equal(JSON.stringify(config).includes(DESKTOP_TOKEN), false);
+});
+
+test("gateConfigFromSecrets leaves a name the vault does not hold empty", () => {
+  const config = gateConfigFromSecrets({ BOTFLEET_OWNER_LOGINS: OWNER });
+  assert.equal(config.owners.size, 1);
+  assert.equal(config.publicOrigin, "");
+  assert.equal(config.tokenSha256, null);
+
+  const empty = gateConfigFromSecrets({});
+  assert.equal(empty.owners.size, 0);
+  assert.equal(empty.publicOrigin, "");
+  assert.equal(empty.tokenSha256, null);
 });
 
 // ---------------------------------------------------------------------------

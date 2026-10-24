@@ -52,7 +52,7 @@
     "test:package-link": "pnpm build:shared && node --test electron/package-link.node-test.mjs electron/sts-packaging.node-test.mjs",
     "test:save-file": "node --test electron/save-file.node-test.mjs electron/open-file.node-test.mjs",
     "test:app-paths": "node --test electron/app-paths.node-test.mjs",
-    "test:server-boot-probe": "node --test electron/server-boot-probe.node-test.mjs electron/attached-ui-shim.node-test.mjs electron/server-target.node-test.mjs electron/harness-ownership.node-test.mjs electron/runtime-identity.node-test.mjs server/sts-launch.node-test.mjs",
+    "test:server-boot-probe": "node --test electron/server-boot-probe.node-test.mjs electron/attached-ui-shim.node-test.mjs electron/server-target.node-test.mjs electron/infisical-read.node-test.mjs electron/harness-ownership.node-test.mjs electron/runtime-identity.node-test.mjs server/sts-launch.node-test.mjs",
     "bench:observation": "node --experimental-strip-types scripts/bench-observation.ts",
     "test:watch": "vitest",
     "test:cua": "pnpm build:cua && node scripts/smoke-cua.mjs",

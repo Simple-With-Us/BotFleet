@@ -9,7 +9,6 @@ User=@BF_USER@
 Group=@BF_GROUP@
 UMask=0007
 WorkingDirectory=@BF_ROOT@/workdir
-EnvironmentFile=@BF_ROOT@/config/gate.env
 Environment="HOME=@BF_ROOT@/home"
 Environment="TMPDIR=@BF_ROOT@/tmp"
 Environment="XDG_CONFIG_HOME=@BF_ROOT@/home/.config"
@@ -18,7 +17,10 @@ Environment="XDG_DATA_HOME=@BF_ROOT@/home/.local/share"
 Environment="XDG_STATE_HOME=@BF_ROOT@/home/.local/state"
 Environment="npm_config_cache=@BF_ROOT@/home/.npm"
 Environment="PATH=@BF_ROOT@/node/bin:@BF_ROOT@/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=@NODE_BIN@ @BF_CODE@/deploy/linux-server/owner-gate.mjs
+# The gate reads its configuration from Infisical.  The only local item is
+# this read-only Infisical service token: a regular file owned by the service
+# user, mode 0600.
+ExecStart=@NODE_BIN@ @BF_CODE@/deploy/linux-server/owner-gate.mjs --bootstrap-token-file @BF_ROOT@/config/infisical-read-token
 StandardOutput=append:@BF_ROOT@/logs/owner-gate.log
 StandardError=append:@BF_ROOT@/logs/owner-gate.log
 Restart=on-failure

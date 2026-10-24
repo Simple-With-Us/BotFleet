@@ -28,19 +28,19 @@ BF_REFERENCE_REPO="${BF_REFERENCE_REPO:-}"
 NODE_VERSION="${NODE_VERSION:-24.18.0}"
 PNPM_STORE_DIR="${PNPM_STORE_DIR:-$BF_VOLUME/.pnpm-store}"
 HARNESS_PORT="${HARNESS_PORT:-8799}"
-GATE_PORT="${GATE_PORT:-8798}"
 TS_HTTPS_PORT="${TS_HTTPS_PORT:-8799}"
 
-# The Tailscale logins allowed to reach the harness, comma separated.
-# May be empty: the desktop gate token is a second owner credential, and the
-# token alone is enough.
-OWNER_LOGINS="${OWNER_LOGINS:-}"
+# The owner gate's port is fixed in code (deploy/linux-server/owner-gate.mjs):
+# the gate is a loopback listener in front of a loopback harness, and there is
+# nothing about it to configure.  `tailscale serve` has to point at exactly
+# that port.
+GATE_PORT="8798"
 
-# The desktop gate token.  A tagged Tailscale device (a tag:prod Mac) gets
-# no Tailscale-User-Login header, so the desktop app presents this token
-# instead.  The token lives in this file, owner-only; only its sha256 goes
-# into gate.env.
-DESKTOP_TOKEN_FILE="${BF_ROOT}/config/desktop-token"
+# The Infisical service token the owner gate bootstraps with.  This is the ONE
+# local item: a read-only Infisical service token, scoped to the BotFleet
+# project, the prod environment and the /botfleet-server path.  The gate reads
+# its whole configuration from the vault; the token is only the key to it.
+INFISICAL_READ_TOKEN_FILE="${BF_ROOT}/config/infisical-read-token"
 
 # The systemd units.
 SERVER_UNIT="botfleet-server.service"
@@ -87,110 +87,56 @@ as_user() {
   runuser -u "$BF_USER" -- env "HOME=$BF_ROOT/home" "PATH=$BF_ROOT/node/bin:$PATH" "$@"
 }
 
-# The sha256 of a file, as 64 lowercase hex characters.
-sha256_of_file() {
-  local path="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$path" | cut -d' ' -f1
-    return 0
-  fi
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$path" | cut -d' ' -f1
-    return 0
-  fi
-  if command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$path" | sed 's/.*= *//'
-    return 0
-  fi
-  if [ -x "$BF_ROOT/node/bin/node" ]; then
-    "$BF_ROOT/node/bin/node" -e '
-      const crypto = require("node:crypto");
-      const fs = require("node:fs");
-      const digest = crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex");
-      process.stdout.write(digest);
-    ' "$path"
-    return 0
-  fi
-  return 1
-}
-
-# A random hex token.  openssl is the usual source; node's crypto is the
-# fallback for a host without openssl.
-generate_random_token() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 32
-    return 0
-  fi
-  if [ -x "$BF_ROOT/node/bin/node" ]; then
-    "$BF_ROOT/node/bin/node" -e '
-      process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"));
-    '
-    return 0
-  fi
-  if command -v node >/dev/null 2>&1; then
-    node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))'
-    return 0
-  fi
-  return 1
-}
-
-# The desktop gate token: the second owner credential.  A tagged Tailscale
-# device (a tag:prod Mac) gets no Tailscale-User-Login header, so the
-# desktop app presents this token instead.
+# Refuse to install without the Infisical read token, and say exactly how to
+# create it.  The token never touches argv and never reaches the shell
+# history: it is read from the terminal without echo and written straight
+# into the file by the service user.
 #
-# The token is written owner-only and is never echoed to the terminal, into a
-# log line or into a dry-run preview.  The file holds the token and nothing
-# else, with no trailing newline, so the sha256 of the file is the sha256 of
-# the token the client sends.
-ensure_desktop_token() {
+# The file has to be a regular file (a symlink is refused), mode 0600 and
+# owned by the service user: it is the key to the vault, and the gate refuses
+# anything else.
+require_infisical_read_token() {
   local path="$1"
-  if [ -s "$path" ]; then
-    return 0
-  fi
-  local token
-  if ! token="$(generate_random_token)" || [ -z "$token" ]; then
-    die "could not generate a desktop gate token: install openssl or node on this host"
-  fi
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    note "would generate a desktop gate token in ${path} (mode 0600)"
-    unset token
+    note "would check $path (a regular file, mode 0600, owned by $BF_USER)"
     return 0
   fi
-  # The token goes straight from the generator to the file.  It is never
-  # printed, so it cannot end up in a transcript or a log.
-  local tmp="${path}.tmp"
-  (umask 077 && printf '%s' "$token" >"$tmp")
-  chmod 0600 "$tmp"
-  chown "$BF_USER:$BF_GROUP" "$tmp"
-  mv -f "$tmp" "$path"
-  unset token
-}
 
-# Set one KEY=VALUE line in an env file, leaving every other line as it is.
-# The file is rewritten through a temporary file and renamed over the
-# original, so the mode (0640) and the owner survive the edit and a crash
-# cannot leave a truncated env file behind.
-set_env_value() {
-  local path="$1" key="$2" value="$3"
-  if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    note "would set ${key} in ${path}"
+  local problem=""
+  local mode=""
+  local owner=""
+
+  if [ -L "$path" ]; then
+    problem="it is a symlink"
+  elif [ ! -e "$path" ]; then
+    problem="it does not exist"
+  elif [ ! -f "$path" ]; then
+    problem="it is not a regular file"
+  else
+    mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || echo "")"
+    owner="$(stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null || echo "")"
+    if [ "$mode" != "600" ]; then
+      problem="its mode is ${mode:-unknown}, not 600"
+    elif [ -n "$owner" ] && [ "$owner" != "$(id -u "$BF_USER" 2>/dev/null || echo "")" ]; then
+      problem="it is not owned by $BF_USER"
+    fi
+  fi
+
+  if [ -z "$problem" ]; then
+    say "the Infisical read token is in place"
     return 0
   fi
-  local tmp="${path}.tmp"
-  if [ -f "$path" ]; then
-    awk -v k="$key" -v v="$value" '
-      index($0, k "=") == 1 { if (!done) { print k "=" v; done = 1 } ; next }
-      { print }
-    ' "$path" >"$tmp"
-  else
-    : >"$tmp"
-  fi
-  if ! grep -q "^${key}=" "$tmp" 2>/dev/null; then
-    printf '%s=%s\n' "$key" "$value" >>"$tmp"
-  fi
-  chmod 0640 "$tmp"
-  chown "$BF_USER:$BF_GROUP" "$tmp"
-  mv -f "$tmp" "$path"
+
+  local message
+  message="$(cat <<EOF
+the Infisical read token $path cannot be used: $problem
+
+Create it with a read-only Infisical service token scoped to the BotFleet project, the prod environment and the /botfleet-server path.  The token is read from the terminal without echo, so it never reaches argv or the shell history:
+
+  sudo install -m 600 -o $BF_USER -g $BF_GROUP /dev/null $BF_ROOT/config/infisical-read-token && sudo -u $BF_USER bash -c 'IFS= read -rs t && printf %s "\$t" > '"$BF_ROOT"'/config/infisical-read-token'
+EOF
+)"
+  die "$message"
 }
 
 # Refuse to run unless we are root, re-executing with sudo when that is possible.

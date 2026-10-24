@@ -7,6 +7,10 @@
 # the desktop gate token for tagged ones.  See README.md for the security
 # model.
 #
+# The owner gate reads its whole configuration from Infisical, so this script
+# never writes a gate configuration file: the only local item it insists on is
+# the read-only Infisical service token the gate bootstraps with.
+#
 # The script is idempotent: run it again to repair or re-point an install.
 set -euo pipefail
 
@@ -24,7 +28,7 @@ Usage: $(basename "$0") [--dry-run]
   --dry-run  Print every action instead of running it.
 
 Environment overrides: BF_USER, BF_GROUP, BF_ROOT, BF_CODE, BF_REPO, BF_REF,
-NODE_VERSION, TS_HTTPS_PORT, GATE_PORT, OWNER_LOGINS.
+NODE_VERSION, TS_HTTPS_PORT.
 EOF
 }
 
@@ -165,14 +169,16 @@ run as_user sh -c "cd '$BF_CODE' && pnpm install --frozen-lockfile --store-dir '
 run as_user sh -c "cd '$BF_CODE' && pnpm exec vite build"
 
 # --------------------------------------------------------------------------
-# (f) The environment files.  No secrets live here.
+# (f) The configuration files.  No secrets live here.
 # --------------------------------------------------------------------------
 
+# The harness launch parameters still live in a local env file.  Moving them
+# into Infisical is tracked as a follow-up; the gate is already there.
 if [ ! -f "$BF_ROOT/config/server.env" ]; then
   say "writing $BF_ROOT/config/server.env"
   write_file "$BF_ROOT/config/server.env" 0640 <<EOF
 # BotFleet harness environment for the Linux server.
-# No secrets live in this file.  Secrets come from Infisical (INFISICAL.md)
+# No secrets live in this file.  Secrets come from Infisical (INFISICAL.md)
 # and from the engine CLIs' own login files under the service user's home.
 # OMB_DATA_DIR, OMB_STATIC_DIR and OMB_PORT are set by the systemd unit.
 EOF
@@ -180,52 +186,21 @@ else
   say "keeping the existing $BF_ROOT/config/server.env"
 fi
 
-# The desktop gate token is the second owner credential.  A tagged Tailscale
-# device (a tag:prod Mac) gets no Tailscale-User-Login header, so the desktop
-# app presents this token instead.  It is generated once and then kept: a
-# re-run of the installer never rotates it behind the app's back.
-say "checking the desktop gate token"
-ensure_desktop_token "$DESKTOP_TOKEN_FILE"
+# The owner gate reads its configuration from Infisical: the BotFleet project,
+# the prod environment, the /botfleet-server path.  The only local item is the
+# bootstrap, a read-only Infisical service token.
+say "checking the Infisical read token"
+require_infisical_read_token "$INFISICAL_READ_TOKEN_FILE"
 
-token_sha256="$(sha256_of_file "$DESKTOP_TOKEN_FILE" || true)"
-if [ -z "$token_sha256" ]; then
-  if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    # A dry run does not create the token, so there is nothing to hash yet.
-    token_sha256="<the sha256 of the token generated at install time>"
-  else
-    die "could not compute the sha256 of $DESKTOP_TOKEN_FILE"
+# The gate used to read a local env file and a local desktop token.  Neither
+# is read any more.  The files are left exactly as they are: deleting them is
+# the owner's call, once the values are in Infisical.
+for old_file in "$BF_ROOT/config/gate.env" "$BF_ROOT/config/desktop-token"; do
+  if [ -e "$old_file" ]; then
+    note "migration: $old_file is no longer read by the gate."
+    note "  after BOTFLEET_SERVER_GATE_TOKEN, BOTFLEET_OWNER_LOGINS and BOTFLEET_PUBLIC_ORIGIN are in Infisical (BotFleet, prod, /botfleet-server), delete it."
   fi
-fi
-
-# At least one owner credential has to exist.  The desktop token counts on its
-# own, so OWNER_LOGINS may be empty.
-if [ -z "$OWNER_LOGINS" ] && [ ! -s "$DESKTOP_TOKEN_FILE" ] && [ "${DRY_RUN:-0}" -eq 0 ]; then
-  die "no owner credential: set OWNER_LOGINS to the comma-separated list of Tailscale logins allowed to reach the harness, or keep the desktop gate token in $DESKTOP_TOKEN_FILE"
-fi
-
-if [ -n "$OWNER_LOGINS" ] || [ ! -f "$BF_ROOT/config/gate.env" ]; then
-  dns_name="$(tailscale_dns_name || true)"
-  if [ -z "$dns_name" ]; then
-    dns_name="$(hostname -f 2>/dev/null || hostname)"
-    note "could not read the tailnet DNS name; using $dns_name for the public origin"
-  fi
-  say "writing $BF_ROOT/config/gate.env"
-  write_file "$BF_ROOT/config/gate.env" 0640 <<EOF
-# BotFleet owner gate.  Only the listed Tailscale logins and the holder of
-# the desktop gate token may reach the harness.
-BOTFLEET_GATE_HOST=127.0.0.1
-BOTFLEET_GATE_PORT=${GATE_PORT}
-BOTFLEET_HARNESS_PORT=${HARNESS_PORT}
-BOTFLEET_OWNER_LOGINS=${OWNER_LOGINS}
-BOTFLEET_GATE_TOKEN_SHA256=${token_sha256}
-BOTFLEET_PUBLIC_ORIGIN=https://${dns_name}:${TS_HTTPS_PORT}
-EOF
-else
-  say "keeping the existing $BF_ROOT/config/gate.env"
-  # The gate keeps only the hash of the token, so the hash line has to keep
-  # matching the token file even when the rest of the file is left alone.
-  set_env_value "$BF_ROOT/config/gate.env" "BOTFLEET_GATE_TOKEN_SHA256" "$token_sha256"
-fi
+done
 
 # --------------------------------------------------------------------------
 # (g) The systemd units.
@@ -286,7 +261,7 @@ else
 fi
 note "$SERVER_UNIT: $(systemctl is-active "$SERVER_UNIT" || true)"
 note "$GATE_UNIT: $(systemctl is-active "$GATE_UNIT" || true)"
-say "the desktop gate token is ready"
-note "read it with: sudo cat $DESKTOP_TOKEN_FILE"
-note "paste it into the desktop app's server target file as \"token\", then set \"mode\" to \"remote\" and restart the app"
+say "the owner gate reads its configuration from Infisical"
+note "BotFleet, prod, /botfleet-server: BOTFLEET_OWNER_LOGINS, BOTFLEET_PUBLIC_ORIGIN, BOTFLEET_SERVER_GATE_TOKEN"
+note "the desktop app's server target file needs the BOTFLEET_SERVER_GATE_TOKEN value as \"token\", with \"mode\" set to \"remote\""
 say "done"

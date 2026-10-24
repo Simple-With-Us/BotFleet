@@ -18,8 +18,8 @@
  * `tailscale serve` only adds it for devices owned by a user.  A desktop app
  * on such a device (a `tag:prod` Mac) therefore presents a second owner
  * credential instead — a shared token in the `x-botfleet-gate-token` header.
- * The gate stores only the sha256 of that token, so a leaked gate.env does
- * not hand over the token itself.  Either credential opens the gate; the
+ * The gate stores only the sha256 of that token, so a leaked configuration
+ * does not hand over the token itself.  Either credential opens the gate; the
  * token header is dropped before the request reaches the harness.
  *
  * The gate also rewrites the upstream request head: the Host becomes the
@@ -27,23 +27,44 @@
  * hop-by-hop header is dropped so the harness only ever sees a plain loopback
  * caller.
  *
- * Configuration comes from the environment:
+ * Configuration comes from Infisical, and from nowhere else: Infisical is the
+ * sole source of truth for every secret, setting and on/off switch, so the
+ * gate reads no environment variable and has no fallback chain.  It reads the
+ * BotFleet project (environment `prod`, path `/botfleet-server`) once at
+ * start:
  *
- *   BOTFLEET_GATE_HOST           bind address, default 127.0.0.1 (loopback only)
- *   BOTFLEET_GATE_PORT           bind port, default 8798
- *   BOTFLEET_HARNESS_PORT        harness port, default 8799
  *   BOTFLEET_OWNER_LOGINS        comma-separated Tailscale logins, optional
- *   BOTFLEET_GATE_TOKEN_SHA256   sha256 of the desktop gate token, optional
  *   BOTFLEET_PUBLIC_ORIGIN       the only browser Origin accepted, optional
+ *   BOTFLEET_SERVER_GATE_TOKEN   the desktop gate token, optional
  *
- * At least one of BOTFLEET_OWNER_LOGINS and BOTFLEET_GATE_TOKEN_SHA256 must be
- * set; the gate refuses to start without an owner credential.
+ * At least one of BOTFLEET_OWNER_LOGINS and BOTFLEET_SERVER_GATE_TOKEN must
+ * be there; the gate refuses to start without an owner credential.  If the
+ * vault cannot be read the gate fails loudly and exits: systemd restarts it,
+ * and it never falls back to a local copy of the configuration.
+ *
+ * The one local item is the bootstrap: a read-only Infisical service token,
+ * scoped to that project, environment and path, in the file the
+ * `--bootstrap-token-file` flag points at.  The file must be a regular file,
+ * owned by the service user, mode 0600.
+ *
+ * The configuration is read once at start, so a value changed in Infisical
+ * takes effect on the next `systemctl restart botfleet-owner-gate`.
+ *
+ * The gate host, the gate port and the harness port are fixed in code: the
+ * gate is a loopback listener in front of a loopback harness, and there is
+ * nothing about them to configure.
  */
 
 import crypto from 'node:crypto';
 import http from 'node:http';
 import net from 'node:net';
 import { pathToFileURL } from 'node:url';
+
+import {
+  InfisicalReadError,
+  readBootstrapTokenFile,
+  readInfisicalSecrets,
+} from '../../electron/infisical-read.mjs';
 
 /**
  * True when the value is a string.
@@ -83,11 +104,24 @@ function isCallable(value) {
   return Object.prototype.toString.call(value).endsWith('Function]');
 }
 
+// The gate is a loopback listener in front of a loopback harness.  These are
+// fixed in code: there is no environment variable and no flag that moves
+// them.
 const DEFAULT_GATE_HOST = '127.0.0.1';
 const DEFAULT_GATE_PORT = 8798;
 const DEFAULT_HARNESS_PORT = 8799;
 const HEALTH_PATH = '/__gate/health';
 const GATE_NAME = 'botfleet-owner-gate';
+
+/** The Infisical names the gate reads. */
+const GATE_SECRET_NAMES = [
+  'BOTFLEET_OWNER_LOGINS',
+  'BOTFLEET_PUBLIC_ORIGIN',
+  'BOTFLEET_SERVER_GATE_TOKEN',
+];
+
+/** How the vault is named in a message.  Names and metadata only. */
+const INFISICAL_LABEL = 'BotFleet prod /botfleet-server';
 
 /** RFC 7230 hop-by-hop headers.  These never cross the gate. */
 const HOP_BY_HOP_HEADERS = new Set([
@@ -171,7 +205,7 @@ export function presentedLogin(headers) {
  * Parse and validate the desktop gate token's sha256.
  *
  * The gate never stores the token itself, only its digest, so a leaked
- * gate.env cannot be replayed as a credential.  The digest is 64 lowercase
+ * configuration cannot be replayed as a credential.  The digest is 64 lowercase
  * hex characters — the sha256 of the token — and anything else is a
  * configuration error rather than a silently ignored value: a mistyped hash
  * would lock the owner out of a server that looks configured but is not.
@@ -556,54 +590,150 @@ export function createOwnerGate({
 }
 
 /**
- * Read the environment, refuse an unsafe configuration, and listen.
+ * Read the command line.  The gate takes exactly one flag: the file that
+ * holds the read-only Infisical service token.
+ *
+ * @param {string[]} argv
+ * @returns {{ok: true, bootstrapTokenFile: string} | {ok: false, error: string}}
  */
-function main() {
-  const gateHost = (process.env.BOTFLEET_GATE_HOST || DEFAULT_GATE_HOST).trim();
-  const gatePort = Number(process.env.BOTFLEET_GATE_PORT || DEFAULT_GATE_PORT);
-  const harnessPort = Number(process.env.BOTFLEET_HARNESS_PORT || DEFAULT_HARNESS_PORT);
-  const owners = parseOwnerLogins(process.env.BOTFLEET_OWNER_LOGINS || '');
-  const publicOrigin = (process.env.BOTFLEET_PUBLIC_ORIGIN || '').trim();
+export function parseArgs(argv) {
+  const args = Array.isArray(argv) ? argv : [];
+  let bootstrapTokenFile = '';
 
-  if (!isLoopbackAddress(gateHost)) {
-    process.stderr.write(
-      `${new Date().toISOString()} [owner-gate] refusing to start: ` +
-        `BOTFLEET_GATE_HOST=${gateHost} is not a loopback address.\n`,
-    );
-    process.exit(1);
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = String(args[i]);
+    if (arg === '--bootstrap-token-file') {
+      const value = args[i + 1];
+      if (!value || String(value).startsWith('--')) {
+        return { ok: false, error: '--bootstrap-token-file needs a path' };
+      }
+      bootstrapTokenFile = String(value);
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--bootstrap-token-file=')) {
+      bootstrapTokenFile = arg.slice('--bootstrap-token-file='.length);
+      continue;
+    }
+    return { ok: false, error: `unknown argument: ${arg}` };
   }
 
-  //  A malformed token hash is a configuration error, not a missing token:
-  //  silently ignoring it would leave a server that looks configured and
-  //  refuses every desktop request.  The hash itself is never logged.
-  const parsedToken = parseTokenSha256(process.env.BOTFLEET_GATE_TOKEN_SHA256 || '');
+  if (!bootstrapTokenFile) {
+    return {
+      ok: false,
+      error:
+        '--bootstrap-token-file <path> is required: the gate reads its ' +
+        'configuration from Infisical, and the only local item is a read-only ' +
+        'Infisical service token file',
+    };
+  }
+
+  return { ok: true, bootstrapTokenFile };
+}
+
+/**
+ * Turn the values read from Infisical into the gate's configuration.
+ *
+ * The desktop gate token is hashed in memory: only its sha256 is ever held
+ * by the gate, so a leaked configuration cannot be replayed as a credential.
+ * No value is logged here.
+ *
+ * @param {Record<string, string>|undefined} secrets
+ * @returns {{owners: Set<string>, publicOrigin: string, tokenSha256: string|null}}
+ */
+export function gateConfigFromSecrets(secrets) {
+  const ownerLogins = isText(secrets?.BOTFLEET_OWNER_LOGINS) ? secrets.BOTFLEET_OWNER_LOGINS : '';
+  const publicOrigin = isText(secrets?.BOTFLEET_PUBLIC_ORIGIN)
+    ? secrets.BOTFLEET_PUBLIC_ORIGIN.trim()
+    : '';
+  const gateToken = isText(secrets?.BOTFLEET_SERVER_GATE_TOKEN)
+    ? secrets.BOTFLEET_SERVER_GATE_TOKEN
+    : '';
+
+  const tokenSha256 = gateToken
+    ? crypto.createHash('sha256').update(gateToken, 'utf8').digest('hex')
+    : null;
+
+  return {
+    owners: parseOwnerLogins(ownerLogins),
+    publicOrigin,
+    tokenSha256,
+  };
+}
+
+/**
+ * Write a fatal line and stop.  The message never carries a value.
+ *
+ * @param {string} message
+ */
+function fail(message) {
+  process.stderr.write(`${new Date().toISOString()} ${message}\n`);
+  process.exit(1);
+}
+
+/**
+ * Read the configuration from Infisical, refuse an unsafe configuration, and
+ * listen.
+ */
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  if (!args.ok) {
+    fail(`owner gate: ${args.error}`);
+    return;
+  }
+
+  //  The bootstrap: the one local file, a read-only Infisical service token.
+  let serviceToken;
+  try {
+    serviceToken = readBootstrapTokenFile(args.bootstrapTokenFile);
+  } catch (err) {
+    fail(`owner gate: cannot read the Infisical read token: ${err?.message ?? 'unknown error'}`);
+    return;
+  }
+
+  //  The configuration itself.  There is no fallback: a vault that cannot be
+  //  read stops the gate, and systemd restarts it.
+  let secrets;
+  try {
+    secrets = await readInfisicalSecrets({
+      serviceToken,
+      names: GATE_SECRET_NAMES,
+    });
+  } catch (err) {
+    const reason = err instanceof InfisicalReadError ? err.reason : 'unreachable';
+    fail(`owner gate: cannot read its config from Infisical (${INFISICAL_LABEL}): ${reason}`);
+    return;
+  }
+
+  const { owners, publicOrigin, tokenSha256 } = gateConfigFromSecrets(secrets);
+
+  //  The digest goes through the gate's own hash check, so a malformed hash
+  //  is a configuration error rather than a silently ignored value.  The hash
+  //  itself is never logged.
+  const parsedToken = parseTokenSha256(tokenSha256 ?? '');
   if (!parsedToken.ok) {
-    process.stderr.write(
-      `${new Date().toISOString()} [owner-gate] refusing to start: ${parsedToken.error}.\n`,
-    );
-    process.exit(1);
+    fail(`owner gate: refusing to start: ${parsedToken.error}.`);
+    return;
   }
-  const tokenSha256 = parsedToken.sha256;
+  const gateTokenSha256 = parsedToken.sha256;
 
   //  At least one owner credential must exist, or the gate would wave every
   //  request through to the harness.
-  if (owners.size === 0 && !tokenSha256) {
-    process.stderr.write(
-      `${new Date().toISOString()} [owner-gate] refusing to start: ` +
-        'no owner credential is configured.  Set BOTFLEET_OWNER_LOGINS to a ' +
-        'comma-separated list of Tailscale logins, for example ' +
-        'BOTFLEET_OWNER_LOGINS=owner@example.com, or set ' +
-        'BOTFLEET_GATE_TOKEN_SHA256 to the sha256 of the desktop gate token.\n',
+  if (owners.size === 0 && !gateTokenSha256) {
+    fail(
+      'owner gate: refusing to start: no owner credential in Infisical ' +
+        `(${INFISICAL_LABEL}): set BOTFLEET_OWNER_LOGINS or ` +
+        'BOTFLEET_SERVER_GATE_TOKEN there.',
     );
-    process.exit(1);
+    return;
   }
 
   const server = createOwnerGate({
     owners,
     publicOrigin,
-    tokenSha256,
-    harnessPort,
-    harnessHost: '127.0.0.1',
+    tokenSha256: gateTokenSha256,
+    harnessPort: DEFAULT_HARNESS_PORT,
+    harnessHost: DEFAULT_GATE_HOST,
   });
 
   server.on('error', (err) => {
@@ -611,14 +741,15 @@ function main() {
     process.exit(1);
   });
 
-  server.listen(gatePort, gateHost, () => {
+  server.listen(DEFAULT_GATE_PORT, DEFAULT_GATE_HOST, () => {
     const address = server.address();
-    const boundPort = address && isObject(address) ? address.port : gatePort;
+    const boundPort = address && isObject(address) ? address.port : DEFAULT_GATE_PORT;
     //  Whether a token is configured is not a secret; the token and its hash
     //  never appear in a log line.
     defaultLog(
-      `[owner-gate] listening on ${gateHost}:${boundPort} -> harness 127.0.0.1:${harnessPort} ` +
-        `(owners: ${owners.size}, token: ${tokenSha256 ? 'yes' : 'no'})`,
+      `[owner-gate] listening on ${DEFAULT_GATE_HOST}:${boundPort} -> harness ` +
+        `${DEFAULT_GATE_HOST}:${DEFAULT_HARNESS_PORT} ` +
+        `(owners: ${owners.size}, token: ${gateTokenSha256 ? 'yes' : 'no'})`,
     );
   });
 }
@@ -631,5 +762,9 @@ if (entry) {
   } catch {
     isDirectRun = false;
   }
-  if (isDirectRun) main();
+  if (isDirectRun) {
+    main().catch((err) => {
+      fail(`owner gate: ${err?.message ?? 'unknown error'}`);
+    });
+  }
 }
