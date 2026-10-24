@@ -105,6 +105,10 @@ TEAM_ID="CC8UTF7ATG"
 # Infisical Fleet-OPS via fleet-secrets.  Nothing is read from the old secrets folder.
 FLEET_SECRETS_BIN="${FLEET_SECRETS:-${HOME}/.local/bin/fleet-secrets}"
 ASC_TMP_DIR=""
+# "staging" means a credential was resolved and the staging path was refused.
+# Anything else, including empty, means no credential was resolved.  The upload
+# step has to say which one it is.  A path refusal is not a missing key.
+ASC_AUTH_FAILURE=""
 cleanup_asc_tmp() {
   if [[ -n "${ASC_TMP_DIR:-}" ]]; then
     rm -rf "$ASC_TMP_DIR" 2>/dev/null || true
@@ -190,10 +194,33 @@ fs_get() {
   printf '%s' "$v"
 }
 
+# A directory mktemp may use.  macOS TMPDIR ends in a slash, and joining
+# another slash onto it produces a doubled slash.  resolveStagingTarget
+# refuses a path that is not normal, so trailing slashes are stripped here.
+# The root itself is kept.
+asc_temp_root() {
+  local root="${TMPDIR:-/tmp}"
+  while [[ "$root" == */ && "$root" != "/" ]]; do
+    root="${root%/}"
+  done
+  printf '%s' "$root"
+}
+
 # Make the temp directory that holds a materialised .p8 (0700), once.
 asc_tmp_dir() {
   if [[ -z "$ASC_TMP_DIR" ]]; then
-    ASC_TMP_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/asc-key.XXXXXX")"
+    ASC_TMP_DIR="$(umask 077; mktemp -d "$(asc_temp_root)/asc-key.XXXXXX")"
+  fi
+}
+
+# Why an upload has no usable staged key.  "staging" is a path refusal after
+# a credential was resolved.  "missing" is no credential.  The owner handoff
+# for a missing key does not apply to a path refusal.
+asc_upload_block() {
+  if [[ "${ASC_AUTH_FAILURE:-}" == "staging" ]]; then
+    printf '%s\n' "staging"
+  else
+    printf '%s\n' "missing"
   fi
 }
 
@@ -220,6 +247,7 @@ asc_tmp_dir() {
 # never reaches a log line.
 load_secrets() {
   AUTH_MODE="none"
+  ASC_AUTH_FAILURE=""
   #  A named ASC_KEY_PATH is not a credential source.  It is remembered only
   #  so the run can say that it ignored it, and it is cleared here:  an
   #  inherited path must never reach xcodebuild when the resolution below
@@ -308,7 +336,10 @@ load_secrets() {
   asc_tmp_dir
   key_path="${ASC_TMP_DIR}/AuthKey_${kid}.p8"
   if ! node "${FLEET_DIR}/asc-key.mjs" write "$key_path" <<< "$key_pem"; then
-    log "could not write the ASC key file; the credential is not usable"
+    # The credential was resolved.  The staging path was refused.  Leaving
+    # AUTH_MODE as none is correct, and calling that a missing key is not.
+    log "could not stage the ASC key; the credential was resolved and the staging path was refused"
+    ASC_AUTH_FAILURE="staging"
     key_pem=""
     return 0
   fi
@@ -571,7 +602,7 @@ asc_latest_seq() {
   # 401)" -- and turned every auth or app-resolution fault into the same
   # contentless "query failed (rc=2)". Surfaced here so an UNVERIFIED floor is
   # self-diagnosing in the run log.
-  errf="$(mktemp "${TMPDIR:-/tmp}/asc-seq-err.XXXXXX")"
+  errf="$(mktemp "$(asc_temp_root)/asc-seq-err.XXXXXX")"
   set +e
   out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" "${APPLE_ID:-}" 2>"$errf")
   rc=$?
@@ -1125,7 +1156,7 @@ AUTH_MODE="none"
 load_secrets
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-OUT_ROOT="${TMPDIR:-/tmp}/ios-ship-${APP_KEY}-${STAMP}"
+OUT_ROOT="$(asc_temp_root)/ios-ship-${APP_KEY}-${STAMP}"
 ARCHIVE_PATH="${OUT_ROOT}/${SCHEME}.xcarchive"
 EXPORT_DIR="${OUT_ROOT}/export"
 LOG_DIR="${OUT_ROOT}/logs"
@@ -1154,7 +1185,12 @@ fi
 
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
   [[ -f "$UPLOAD_ONLY_IPA" ]] || die "package not found: $UPLOAD_ONLY_IPA"
-  [[ "$AUTH_MODE" == "api_key" ]] || die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
+  if [[ "$AUTH_MODE" != "api_key" ]]; then
+    if [[ "$(asc_upload_block)" == "staging" ]]; then
+      die "upload-only: the App Store Connect credential was resolved, and the staging path was refused. This is a path failure, not a missing key."
+    fi
+    die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
+  fi
   link_private_key "$ASC_KEY_PATH" "$ASC_KEY_ID"
   log "uploading existing package via altool (api key)"
   set +e
@@ -1521,6 +1557,11 @@ PACKAGE="$(ls -1 "$EXPORT_DIR"/*.ipa "$EXPORT_DIR"/*.pkg 2>/dev/null | head -1 |
 load_secrets
 if [[ "$AUTH_MODE" != "api_key" ]]; then
   log "Package ready at: $PACKAGE"
+  if [[ "$(asc_upload_block)" == "staging" ]]; then
+    log "Upload blocked: the App Store Connect credential was resolved, and the staging path was refused."
+    log "This is a path failure, not a missing key."
+    exit 3
+  fi
   log "Upload blocked: no App Store Connect API key."
   log "Owner handoff:"
   log "  1) Create ASC API key (App Manager+) in App Store Connect"

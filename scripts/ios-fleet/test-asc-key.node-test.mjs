@@ -198,6 +198,14 @@ test("the writer refuses a protected place", () => {
   assert.match(written.error, /protected place/);
 });
 
+test("the writer refuses a path that is not normal", () => {
+  //  A doubled slash is what a trailing-slash TMPDIR produces.  The caller
+  //  has to strip it.  This check stays, and it refuses before any write.
+  const written = writePrivateKeyFile(`${root}//key.p8`, envKeyPem);
+  assert.ok(written.error, "a doubled slash was accepted");
+  assert.match(written.error, /not a normal path/);
+});
+
 test("the writer refuses a link at the last component", () => {
   //  A path that was swapped for a symlink must not redirect the key.
   const link = join(root, "linked.p8");
