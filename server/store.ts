@@ -28,7 +28,7 @@ import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import { interruptedHelper, type HelperTranscript } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextInjectionRef } from "../shared/context-injection.ts";
-import { taskWorkspaceContextsMatch, type TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
+import { taskWorkspaceContextsMatch, taskWorkspaceMergeSkipReason, type TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
 import {
   applyOwnerDirective,
   classifyModel,
@@ -604,6 +604,7 @@ export const ACTIVITY_BUSY: ReadonlySet<BotActivity> = new Set(["working", "wait
 
 export type StoreChange =
   | { type: "message"; threadId: string; message: Message }
+  | { type: "messages"; threadId: string; messages: Message[] }
   | { type: "message.patch"; threadId: string; message: Message }
   | { type: "thread"; threadId: string; activeLeafId: string }
   | { type: "thread.deleted"; threadId: string }
@@ -1618,15 +1619,17 @@ export class Store {
     const incoming = this.messagesFor(fromThreadId);
     if (incoming.length > 0) {
       const label = from.title?.trim() || "Merged thread";
-      this.appendMessage(intoThreadId, {
-        role: "user",
-        kind: "text",
-        text: `Merged “${label}” into this thread.`,
-      });
-      for (const message of incoming) {
-        const { id: _id, parentId: _parent, ...rest } = message;
-        this.appendMessage(intoThreadId, rest);
-      }
+      // The divider and the copied messages land as one write and one
+      // frame.  A conversation that holds thousands of messages would
+      // otherwise mean thousands of commits and thousands of redraws on
+      // every client watching it.
+      this.appendMessages(intoThreadId, [
+        { role: "user", kind: "text", text: `Merged “${label}” into this thread.` },
+        ...incoming.map((message) => {
+          const { id: _id, parentId: _parent, ...rest } = message;
+          return rest;
+        }),
+      ]);
     }
 
     // The source task's automation key (and any it already collected from
@@ -1665,15 +1668,17 @@ export class Store {
     const incoming = this.messagesFor(fromThreadId);
     if (incoming.length > 0) {
       const label = from.title?.trim() || "Merged thread";
-      this.appendMessage(intoThreadId, {
-        role: "user",
-        kind: "text",
-        text: `Merged “${label}” into this thread.`,
-      });
-      for (const message of incoming) {
-        const { id: _id, parentId: _parent, ...rest } = message;
-        this.appendMessage(intoThreadId, rest);
-      }
+      // The divider and the copied messages land as one write and one
+      // frame.  A conversation that holds thousands of messages would
+      // otherwise mean thousands of commits and thousands of redraws on
+      // every client watching it.
+      this.appendMessages(intoThreadId, [
+        { role: "user", kind: "text", text: `Merged “${label}” into this thread.` },
+        ...incoming.map((message) => {
+          const { id: _id, parentId: _parent, ...rest } = message;
+          return rest;
+        }),
+      ]);
     }
 
     return this.deleteGroupTask(groupId, fromThreadId);
@@ -1745,19 +1750,35 @@ export class Store {
 
     const merged: string[] = [];
     const skipped: Array<{ threadId: string; title: string; reason: string }> = [];
-    const sources = [...bot.tasks]
+    // Each source's start is read ONCE, before the sort: a comparator that
+    // reads it hydrates the whole transcript — base64 captures included —
+    // again and again, and a long conversation is the case that hurts most.
+    const sources = bot.tasks
       .filter((task) => task.threadId !== intoThreadId)
-      .sort((a, b) => this.threadStart(a) - this.threadStart(b) || a.createdAt - b.createdAt);
+      .map((task) => ({ task, start: this.threadStart(task) }))
+      .sort((a, b) => a.start - b.start || a.task.createdAt - b.task.createdAt)
+      .map((entry) => entry.task);
+
+    // The bot's live conversation must not move while the fold runs:
+    // `deleteTask` hands the active thread to whatever is left first, so
+    // without this the bot would briefly point at another conversation and
+    // every frame the client receives mid-merge would name the wrong one.
+    bot.threadId = intoThreadId;
+
     for (const source of sources) {
       if (!taskWorkspaceContextsMatch(source.workspaceContext, into.workspaceContext)) {
         skipped.push({
           threadId: source.threadId,
           title: source.title || UNTITLED_TASK,
-          reason: "belongs to another App",
+          reason: taskWorkspaceMergeSkipReason(source.workspaceContext, into.workspaceContext),
         });
         continue;
       }
       if (this.mergeBotTasks(botId, source.threadId, intoThreadId)) merged.push(source.threadId);
+      // The merge deletes the source, and a deletion can hand the active
+      // thread to another conversation; the destination is the one that
+      // has to stay live.
+      bot.threadId = intoThreadId;
     }
 
     // Deleting a task can move the bot's active thread, so the destination
@@ -1775,10 +1796,14 @@ export class Store {
 
   /** When a conversation started, for ordering a merge.  The first message is
    * the honest start; the task's own creation time stands in for a thread
-   * that has not spoken yet, and breaks a tie between two that did. */
+   * that has not spoken yet, and breaks a tie between two that did.
+   *
+   * The timestamp is read at the SQL boundary, not through the transcript:
+   * a long conversation would otherwise be pulled into memory — with every
+   * base64 capture in it — just to learn when it began. */
   private threadStart(task: TaskRecord): number {
-    const first = this.messagesFor(task.threadId)[0];
-    return first?.at ?? task.createdAt;
+    const first = mdb.firstMessageAt(task.threadId, messagesFile(task.threadId));
+    return first ?? task.createdAt;
   }
 
   /** Move one of a bot's conversations into a channel, where the channel's
@@ -2023,6 +2048,50 @@ export class Store {
     // bubble for them) — a thread that opens with one of those should not
     // leave the onboarding card stuck forever either.
     if ((full.role === "user" || full.role === "system") && full.kind === "text") this.dismissOnboardingCard(threadId);
+    return full;
+  }
+
+  /** Append a WHOLE transcript to a thread in one write and one frame.
+   *
+   * Folding a long conversation into another copies every message it holds.
+   * One transaction per message meant thousands of commits, and one frame
+   * per message meant a client redrawing the conversation thousands of
+   * times; both are the wrong shape for a bulk copy.  The rows land
+   * together, the branch head moves to the last one, and the client gets
+   * the batch in a single piece. */
+  appendMessages(
+    threadId: string,
+    messages: Array<Omit<Message, "id" | "at" | "parentId"> & { id?: string; at?: number; parentId?: string }>,
+  ): Message[] {
+    const t = this.thread(threadId);
+    const full: Message[] = [];
+    let parentId = t.activeLeafId;
+    for (const message of messages) {
+      const { id, at, parentId: wanted, ...rest } = message;
+      const entry: Message = {
+        id: id ?? newId(),
+        at: at ?? Date.now(),
+        parentId: wanted ?? parentId,
+        ...redactBotAuthored(rest),
+      };
+      parentId = entry.id;
+      full.push(entry);
+    }
+    if (full.length === 0) return full;
+    mdb.appendMessages(threadId, full);
+    t.messages.push(...full);
+    this.threads.recordAppend(threadId);
+    t.activeLeafId = full[full.length - 1]!.id;
+    if (full.some((message) => message.kind === "screen")) {
+      for (const pruned of this.pruneScreenFrames(t)) {
+        mdb.updateMessage(threadId, pruned);
+        this.emit({ type: "message.patch", threadId, message: pruned });
+      }
+    }
+    this.emit({ type: "messages", threadId, messages: full });
+    // A bulk copy is activity on the thread, same as a message that arrived
+    // on its own, so an until-activity snooze waits on it too.
+    if (this.threadsAwaitingActivity.has(threadId)) this.wakeThreadOnActivity(threadId);
     return full;
   }
 

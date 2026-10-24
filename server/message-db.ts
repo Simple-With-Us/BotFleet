@@ -283,6 +283,57 @@ export function appendMessage(threadId: string, message: Message): void {
   }
 }
 
+/** Persist a WHOLE transcript in one transaction.
+ *
+ * Folding a long conversation into another copies every message it holds,
+ * and one transaction per message turned that into thousands of commits
+ * that each blocked the event loop.  The rows land together and the branch
+ * head moves to the last one, so the transcript reads exactly as it would
+ * have if the messages had arrived one at a time. */
+export function appendMessages(threadId: string, messages: Message[]): void {
+  if (messages.length === 0) return;
+  const database = db();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    for (const message of messages) insertMessage(threadId, message);
+    setActiveLeaf(threadId, messages[messages.length - 1]!.id);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+/** When a thread first spoke, without hydrating the transcript.
+ *
+ * The first row by insertion order is the thread's start, which is what the
+ * merge order reads; a comparator that asked for it through the full
+ * transcript instead pulled every message — base64 captures included —
+ * into memory, once per comparison.  A thread whose rows still live only in
+ * its legacy JSON file is read from that file, not imported: this is a
+ * question about a timestamp, not a reason to write. */
+export function firstMessageAt(threadId: string, legacyFile: string): number | null {
+  // SAFETY: the query selects the single column `at` from at most one row, so
+  // the row is `{ at: number }` and `.get()` returns undefined when the thread
+  // has no rows yet.
+  const row = db()
+    .prepare("SELECT at FROM messages WHERE thread_id = ? ORDER BY rowid LIMIT 1")
+    .get(threadId) as { at: number } | undefined;
+  if (row) return row.at;
+  try {
+    const raw = JSON.parse(readFileSync(legacyFile, "utf8"));
+    // SAFETY: a legacy transcript file holds either the message array itself
+    // or an object with a `messages` array.  Both shapes are read here, and
+    // any other shape yields an empty list rather than a wrong answer.
+    const messages = Array.isArray(raw)
+      ? (raw as Message[])
+      : (((raw as { messages?: Message[] }).messages ?? []) as Message[]);
+    return messages[0]?.at ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Rows whose stored helper is still running.  The LIKE pass is a candidate
  * filter; the helper status is what decides.  A restart has no live tracker,
  * so these are the cards that would otherwise tick forever. */

@@ -339,7 +339,7 @@ function activityPreview(tool: NonNullable<Message["tool"]>): string {
   return target ? `${verb} · ${target}` : verb;
 }
 
-interface MenuState {
+export interface MenuState {
   botId: string;
   x: number;
   y: number;
@@ -1665,7 +1665,7 @@ function SectionPicker({
   );
 }
 
-function BotContextMenu({
+export function BotContextMenu({
   menu,
   onClose,
   onArchive,

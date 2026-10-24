@@ -31,6 +31,7 @@ import type { ReviewHook } from "../../shared/auto-review";
 import type { BusySendDefault } from "../../shared/busy-send-default.ts";
 import type { ContextInjectionRef } from "../../shared/context-injection";
 import { taskWorkspaceContextsMatch, type TaskAppRef, type TaskWorkspaceContext } from "../../shared/task-workspace-context";
+import { MergeAllBotTasksResponseSchema } from "../../shared/merge-threads";
 import { eligibleTaskApps } from "@/lib/task-app-context";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
@@ -286,6 +287,10 @@ export interface Task {
   /** How many messages this task's thread holds.  Absent on frames from
    * before the harness counted them. */
   messageCount?: number;
+  /** When the conversation first spoke.  Absent on frames from before the
+   * harness stamped it.  A merge folds transcripts in the order they
+   * began, which is not always the order the tasks were created. */
+  startedAt?: number;
   /** what this task has spent, banked once per settled turn */
   usage?: TaskUsage;
   /** Timing aggregate banked with `usage`; absent on tasks from before it
@@ -1120,7 +1125,10 @@ export type Action =
       /** What the server did, so a caller can say what was folded in and what
        * was left behind.  `error` is set instead when the merge failed. */
       onSettled?: (
-        result: { merged: string[]; skipped: Array<{ title: string; reason: string }> } | null,
+        result: {
+          merged: string[];
+          skipped: Array<{ threadId: string; title: string; reason: string }>;
+        } | null,
         error: string | null,
       ) => void;
     }
@@ -1204,6 +1212,8 @@ export type Action =
   | { type: "markUnread"; botId: string }
   | { type: "botPatched"; bot: BotAnnouncement }
   | { type: "messageAdded"; threadId: string; message: Message }
+  | { type: "messagesAdded"; threadId: string; messages: Message[] }
+  | { type: "mergeApplied"; botId: string; threadId: string; tasks: Task[] }
   | { type: "messagePatched"; threadId: string; message: Message }
   | { type: "screenFrame"; botId: string; png: string; mime: string }
   | { type: "provisioning"; botId: string; on: boolean }
@@ -1747,6 +1757,41 @@ export function reducer(state: AppState, action: Action): AppState {
       const animated = motion ? withMascotMotion(next, bot.id, motion) : next;
       return animated;
     }
+    case "messagesAdded": {
+      // A bulk copy — a merge folding one conversation into another — writes
+      // a whole transcript at once, so it arrives in one piece instead of
+      // thousands of single-message frames.
+      const bot = state.bots.find((b) => b.threadId === action.threadId);
+      if (!bot) {
+        const group = state.groups.find((g) => g.threadId === action.threadId);
+        if (!group) return state;
+        const known = new Set(group.messages.map((m) => m.id));
+        const fresh = action.messages.filter((m) => !known.has(m.id));
+        if (fresh.length === 0) return state;
+        return {
+          ...state,
+          groups: state.groups.map((g) =>
+            g.id === group.id ? { ...g, messages: [...g.messages, ...fresh] } : g,
+          ),
+        };
+      }
+      const known = new Set(bot.messages.map((m) => m.id));
+      const fresh = action.messages.filter((m) => !known.has(m.id));
+      if (fresh.length === 0) return state;
+      return updateBot(state, bot.id, (b) => {
+        let messages = [...b.messages, ...fresh];
+        // base64 screen frames are big; a long computer-use session would
+        // grow memory without bound. Keep the newest few frames' pixels and
+        // strip the rest (the message row survives as a placeholder).
+        const withPng = messages.filter((m) => m.kind === "screen" && m.png);
+        const excess = withPng.length - MAX_KEPT_SCREEN_FRAMES;
+        if (excess > 0) {
+          const dropIds = new Set(withPng.slice(0, excess).map((m) => m.id));
+          messages = messages.map((m) => (dropIds.has(m.id) ? { ...m, png: undefined } : m));
+        }
+        return { ...b, messages, activeLeafId: messages.at(-1)?.id ?? b.activeLeafId };
+      });
+    }
     case "messagePatched": {
       const bot = state.bots.find((b) => b.threadId === action.threadId);
       if (!bot) {
@@ -2170,6 +2215,18 @@ export function reducer(state: AppState, action: Action): AppState {
         bots: state.bots.map((bot) =>
           bot.id === action.botId
             ? { ...bot, tasks: remaining, threadId: action.intoThreadId }
+            : bot,
+        ),
+      };
+    }
+    case "mergeApplied": {
+      // The server's own answer about what is left: the conversations that
+      // stayed behind, and the one that is now live.
+      return {
+        ...state,
+        bots: state.bots.map((bot) =>
+          bot.id === action.botId
+            ? { ...bot, tasks: action.tasks, threadId: action.threadId }
             : bot,
         ),
       };
@@ -3112,13 +3169,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             method: "POST",
             body: JSON.stringify({ intoThreadId: action.intoThreadId }),
           })
-            .then((r: any) => {
+            .then((body) => {
+              // The answer crosses the HTTP boundary through a deliberately
+              // generic helper, so it is narrowed before anything in it is
+              // believed.
+              const parsed = MergeAllBotTasksResponseSchema.safeParse(body);
+              if (!parsed.success) throw new Error("The merge answer was not in the expected shape.");
+              const { bot, merged, skipped } = parsed.data;
               rawDispatch(action);
-              // The server's frame carries the merged conversation's messages
-              // and the bot's one remaining thread, so the chat opens on what
-              // was merged without a second round trip.
-              if (r?.bot) dispatch({ type: "botPatched", bot: r.bot });
-              action.onSettled?.({ merged: r?.merged ?? [], skipped: r?.skipped ?? [] }, null);
+              // The server's own list of conversations is the truth about
+              // what stayed behind, so the roster takes it rather than the
+              // guess the optimistic paint made.
+              dispatch({
+                type: "mergeApplied",
+                botId: bot.id,
+                threadId: bot.threadId,
+                tasks: bot.tasks ?? [],
+              });
+              action.onSettled?.({ merged, skipped }, null);
             })
             .catch((error) => {
               showError(error);
@@ -3355,6 +3423,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
         case "message.patch":
           rawDispatch({ type: "messagePatched", threadId: frame.threadId, message: frame.message });
+          break;
+        case "messages":
+          rawDispatch({ type: "messagesAdded", threadId: frame.threadId, messages: frame.messages });
           break;
         // An update runs detached and takes minutes; the harness pushes a
         // new status on every step so the Updates card and the floating

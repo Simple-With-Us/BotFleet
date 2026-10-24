@@ -25,6 +25,7 @@ import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from
 import { DEFAULT_ROOM_TERMINOLOGY, lowerRoomLabels, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
+import { MergeThreadsBodySchema } from "../shared/merge-threads.ts";
 import {
   applyFallbackSlots,
   KEEP_FALLBACK_SLOT,
@@ -3048,6 +3049,10 @@ const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: Task
     // How much conversation a thread holds, so a person can tell a long
     // history from a recent one before choosing what to merge into what.
     messageCount: messages.length,
+    // When the conversation first spoke.  A merge folds transcripts in the
+    // order they began, and the task's own creation time can disagree with
+    // that, so the client orders by this one.
+    startedAt: messages[0]?.at ?? task.createdAt,
   };
 };
 const wireGroupTask = (task: GroupTaskRecord) => {
@@ -3166,6 +3171,11 @@ store.onChange((change) => {
   switch (change.type) {
     case "message":
       broadcast({ kind: "message", threadId: change.threadId, message: change.message });
+      break;
+    case "messages":
+      // A bulk copy (a merge) writes a whole transcript at once, so it
+      // arrives as one frame instead of thousands of single-message ones.
+      broadcast({ kind: "messages", threadId: change.threadId, messages: change.messages });
       break;
     case "message.patch":
       broadcast({ kind: "message.patch", threadId: change.threadId, message: change.message });
@@ -16532,27 +16542,36 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // arrangement, so a single bot's threads cannot be gathered on demand.
     m = path.match(/^\/api\/bots\/([\w-]+)\/merge-threads$/);
     if (m && method === "POST") {
-      const body = await readBody(req);
+      const parsed = MergeThreadsBodySchema.safeParse(await readBody(req));
+      if (!parsed.success) return json(res, 400, { error: "choose the conversation to merge into" });
+      const { intoThreadId } = parsed.data;
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       if (bot.busy) {
         return json(res, 409, { error: "this bot is working — let it finish before merging its threads" });
       }
-      const into = typeof body.intoThreadId === "string" ? body.intoThreadId : "";
-      if (!into) return json(res, 400, { error: "choose the conversation to merge into" });
-      if (!(bot.tasks ?? []).some((task) => task.threadId === into)) {
+      if (!(bot.tasks ?? []).some((task) => task.threadId === intoThreadId)) {
         return json(res, 400, { error: "that is not one of this bot's conversations" });
       }
-      const result = store.mergeAllBotTasks(bot.id, into);
+      const result = store.mergeAllBotTasks(bot.id, intoThreadId);
       if (!result || !result.bot) return json(res, 400, { error: "this bot has nothing to merge" });
       // A merge COPIES the source's messages into the target and then deletes
       // the source task, so — unlike a move, which keeps its thread id — the
       // source thread ids name nothing afterwards and their logs would sit on
       // disk forever.
       for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, result.merged);
-      const fresh = botWithThread(result.bot);
-      broadcast({ kind: "bot", bot: fresh });
-      return json(res, 200, { bot: fresh, merged: result.merged, skipped: result.skipped });
+      // The source conversations are gone, so anything still scheduled against
+      // them — a routine, a webhook — would keep writing into a thread that
+      // no longer exists.
+      stopJobsForDeleted(result.merged, "its conversation was merged away");
+      // The merged conversation can hold far more than one event frame
+      // carries (the companion's limit is 1 MB), so the bot frame goes out
+      // WITHOUT the transcript.  The messages themselves arrive on their own
+      // frames as the fold writes them, and the roster is all this frame
+      // has to carry.
+      const light = wireBot(result.bot);
+      broadcast({ kind: "bot", bot: light });
+      return json(res, 200, { bot: light, merged: result.merged, skipped: result.skipped });
     }
 
     // what the user's machine can host: which runtime is installed, whether

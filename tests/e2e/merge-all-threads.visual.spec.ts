@@ -70,7 +70,18 @@ test('visual: the merge picker offers every conversation and names what will be 
 
   await expect(dialog).toHaveScreenshot(
     'merge-all-threads-picker.png',
-    { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 },
+    {
+      ...stableShot,
+      maxDiffPixelRatio: 0.02,
+      threshold: 0.2,
+      // The counts and the times come from the data, so they are masked:
+      // the shape of the picker is what this screenshot pins.
+      mask: [
+        page.locator('[data-testid="merge-all-threads-count"]'),
+        page.locator('[data-testid="merge-all-threads-time"]'),
+        page.locator('[data-testid="merge-all-threads-summary"]'),
+      ],
+    },
   );
 });
 
@@ -89,6 +100,34 @@ test('visual: choosing another destination moves the summary with it', async ({ 
 
   await expect(dialog).toHaveScreenshot(
     'merge-all-threads-picker-chosen.png',
+    {
+      ...stableShot,
+      maxDiffPixelRatio: 0.02,
+      threshold: 0.2,
+      mask: [
+        page.locator('[data-testid="merge-all-threads-count"]'),
+        page.locator('[data-testid="merge-all-threads-time"]'),
+        page.locator('[data-testid="merge-all-threads-summary"]'),
+      ],
+    },
+  );
+});
+
+test('visual: the bot context menu offers the merge action', async ({ page }) => {
+  await page.goto('/?fixture=merge-all-threads-menu');
+  await pinFonts(page);
+
+  const fixture = page.getByTestId('merge-all-threads-menu-fixture');
+  await expect(fixture).toBeVisible();
+
+  // The action is the only way into the picker, so the entry itself is
+  // pinned: a label that moved or lost its icon would ship unnoticed.
+  const menu = page.locator('[data-bot-menu]');
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole('button', { name: 'Merge All Threads…' })).toBeVisible();
+
+  await expect(menu).toHaveScreenshot(
+    'merge-all-threads-menu.png',
     { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 },
   );
 });

@@ -7,9 +7,24 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import { StoreProvider, type Bot } from "@/state/store";
+import type { TaskWorkspaceContext } from "../../shared/task-workspace-context";
 import { MergeAllThreadsDialog } from "./MergeAllThreadsDialog";
 
-const bot = (tasks: Array<{ threadId: string; title: string; createdAt: number; messageCount?: number }>): Bot => ({
+const context: TaskWorkspaceContext = {
+  kind: "local",
+  appRef: { kind: "group", id: "app-a" },
+  cwd: "/repo-a",
+  capturedAt: 1,
+};
+
+const bot = (tasks: Array<{
+  threadId: string;
+  title: string;
+  createdAt: number;
+  startedAt?: number;
+  messageCount?: number;
+  workspaceContext?: TaskWorkspaceContext;
+}>): Bot => ({
   id: "bot-1",
   threadId: tasks[0]!.threadId,
   name: "Juniper",
@@ -87,5 +102,37 @@ describe("MergeAllThreadsDialog", () => {
     );
 
     expect(html).toContain("1 conversation will be folded into");
+  });
+
+  it("counts only the conversations that will actually move, and names the ones that stay", () => {
+    const html = render(
+      bot([
+        { threadId: "old", title: "The long history", createdAt: 1_000, messageCount: 10 },
+        { threadId: "new", title: "Recent work", createdAt: 9_000, messageCount: 2 },
+        { threadId: "bound", title: "App work", createdAt: 10_000, messageCount: 3, workspaceContext: context },
+      ]),
+    );
+
+    // The App-bound conversation cannot fold into an unbound destination,
+    // so the preview must not promise it: it says what will move and names
+    // what stays where it is.
+    expect(html).toContain("1 conversation will be folded into");
+    expect(html).toContain("Staying where they are");
+    expect(html).toContain("App work");
+  });
+
+  it("orders the conversations by when they first spoke, not by when the task was created", () => {
+    const html = render(
+      bot([
+        { threadId: "created-first", title: "Created first", createdAt: 1_000, startedAt: 9_000, messageCount: 1 },
+        { threadId: "spoke-first", title: "Spoke first", createdAt: 5_000, startedAt: 2_000, messageCount: 1 },
+      ]),
+    );
+
+    // "Spoke first" began earlier, so it is the default destination even
+    // though its task was created later — the server folds transcripts in
+    // the order they began.
+    const spokeFirst = html.match(/<input[^>]*value="spoke-first"[^>]*>/)?.[0] ?? "";
+    expect(spokeFirst).toContain("checked");
   });
 });

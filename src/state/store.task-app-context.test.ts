@@ -83,6 +83,36 @@ describe("App task creation and local continuity", () => {
     expect(bot.threadId).toBe("legacy-task");
   });
 
+  it("takes the server's own list of what is left after a merge", () => {
+    const state = fixture();
+    // the server is the one that knows what stayed behind, so the roster
+    // takes its answer rather than the optimistic guess
+    const applied = reducer(state, {
+      type: "mergeApplied",
+      botId: "bot-a",
+      threadId: "legacy-task",
+      tasks: [{ threadId: "legacy-task", title: "Unassigned", createdAt: 2 }],
+    });
+    const bot = applied.bots.find((candidate) => candidate.id === "bot-a")!;
+    expect(bot.tasks!.map((task) => task.threadId)).toEqual(["legacy-task"]);
+    expect(bot.threadId).toBe("legacy-task");
+  });
+
+  it("takes a folded transcript in one piece", () => {
+    const state = fixture();
+    const messages = [
+      { id: "m-1", at: 10, role: "user" as const, kind: "text" as const, text: "first" },
+      { id: "m-2", at: 11, role: "user" as const, kind: "text" as const, text: "second" },
+    ];
+    const added = reducer(state, { type: "messagesAdded", threadId: "bound-task", messages });
+    const bot = added.bots.find((candidate) => candidate.id === "bot-a")!;
+    // the whole batch lands at once, and the branch head is its last message
+    expect(bot.messages.map((message) => message.id)).toEqual(["m-1", "m-2"]);
+    expect(bot.activeLeafId).toBe("m-2");
+    // a second copy of the same batch changes nothing
+    expect(reducer(added, { type: "messagesAdded", threadId: "bound-task", messages })).toBe(added);
+  });
+
   it("refuses a merge-all whose destination is not one of the bot's conversations", () => {
     const state = fixture();
     expect(reducer(state, { type: "mergeAllBotTasks", botId: "bot-a", intoThreadId: "no-such-thread" })).toBe(state);

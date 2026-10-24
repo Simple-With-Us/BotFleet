@@ -328,6 +328,66 @@ describe("tasks", () => {
     expect(store.tasks(neighbour.id)).toHaveLength(2);
   });
 
+  it("keeps the chosen conversation as the live one the whole way through the fold", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const inbox = bot.threadId;
+    store.createTask(bot.id, "Second")!;
+    const third = store.createTask(bot.id, "Third")!;
+    // The bot is LOOKING at one of the conversations that is about to be
+    // folded away.  Deleting a conversation hands the live thread to
+    // whatever is left first, so without a pinned destination the bot
+    // would point at another conversation while the fold is still running
+    // — and every frame the clients saw would name the wrong one.
+    store.switchTask(bot.id, third.threadId);
+    const seen: string[] = [];
+    const stop = store.onChange((change) => {
+      if (change.type === "bot") seen.push(store.bot(bot.id)!.threadId);
+    });
+    const result = store.mergeAllBotTasks(bot.id, inbox);
+    stop();
+    expect(result!.merged).toHaveLength(2);
+    expect(store.bot(bot.id)!.threadId).toBe(inbox);
+    expect(seen.length).toBeGreaterThan(0);
+    expect([...new Set(seen)]).toEqual([inbox]);
+  });
+
+  it("names the real difference when a conversation cannot merge", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const app = store.createGroup("Project App", [bot.id]);
+    const other = store.createGroup("Other App", [bot.id]);
+    const destination = store.createTask(bot.id, "Destination", false, undefined, context(app.id, join(home, "checkout")))!;
+    const folder = store.createTask(bot.id, "Other folder", false, undefined, context(app.id, join(home, "elsewhere")))!;
+    const elsewhere = store.createTask(bot.id, "Other app", false, undefined, context(other.id, join(home, "elsewhere")))!;
+
+    const result = store.mergeAllBotTasks(bot.id, destination.threadId);
+    const reasons = new Map(result!.skipped.map((entry) => [entry.threadId, entry.reason]));
+    // the same App in a different folder is not "another App"
+    expect(reasons.get(folder.threadId)).toBe("runs in a different folder");
+    expect(reasons.get(elsewhere.threadId)).toBe("belongs to another App");
+  });
+
+  it("folds a conversation in one write and one frame, not one per message", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const inbox = bot.threadId;
+    const second = store.createTask(bot.id, "Second")!;
+    for (const text of ["one", "two", "three", "four"]) {
+      store.appendMessage(second.threadId, { role: "user", kind: "text", text });
+    }
+    const changes: string[] = [];
+    const stop = store.onChange((change) => {
+      if (change.type === "message") changes.push("message");
+      if (change.type === "messages") changes.push("messages");
+    });
+    store.mergeAllBotTasks(bot.id, inbox);
+    stop();
+    // the whole transcript arrived as one batch, so a client redraws the
+    // conversation once instead of once per message
+    expect(changes).toEqual(["messages"]);
+  });
+
   it("keeps the App workspace on automation rollover after the bot folder changes", async () => {
     const { store } = await freshStore();
     const bot = store.createBot();

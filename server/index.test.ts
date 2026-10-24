@@ -584,6 +584,43 @@ beforeAll(async () => {
     expect(fresh.tasks.length).toBeGreaterThan(1);
   });
 
+  it("validates the merge request before it reaches the store", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+
+    // an unknown key is a typo, not a field to carry along
+    const unknown = await api("POST", `/api/bots/${bot.id}/merge-threads`, {
+      intoThreadId: bot.threadId,
+      also: "x",
+    });
+    expect(unknown.status).toBe(400);
+    // a thread id that is not a string, and one far longer than any id
+    const wrongType = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: 42 });
+    expect(wrongType.status).toBe(400);
+    const tooLong = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: "x".repeat(200) });
+    expect(tooLong.status).toBe(400);
+
+    // and none of those refusals moved anything
+    const after = await api("GET", "/api/bots");
+    const fresh = after.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    expect(fresh.tasks).toHaveLength(1);
+  });
+
+  it("answers a merge with the roster, not the whole transcript", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Second" });
+
+    const merged = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: bot.threadId });
+    expect(merged.status).toBe(200);
+    expect(merged.body.merged).toHaveLength(1);
+    // A merged conversation can hold far more than one event frame
+    // carries, so the answer carries the roster and leaves the transcript
+    // to the paged endpoint.
+    expect(merged.body.bot.messages).toBeUndefined();
+    expect(merged.body.bot.tasks).toHaveLength(1);
+  });
+
   it("tells a person how much conversation each thread holds", async () => {
     const created = await api("POST", "/api/bots");
     const bot = created.body.bot;
