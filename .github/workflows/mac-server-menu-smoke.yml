@@ -8,7 +8,7 @@
 # it checks that an app with no Infisical read token in its keychain runs
 # against the server on this Mac, that the old server-target.json is ignored
 # rather than read, that the Server menu offers "This Mac", the Infisical
-# status line and "Reload from Infisical", and that reloading from Infisical
+# status line and "Reload From Infisical", and that reloading from Infisical
 # leaves a working app behind.
 #
 # What it never does: it never contacts a real server, never reaches the

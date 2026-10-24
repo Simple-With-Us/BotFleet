@@ -10,13 +10,13 @@
 //
 // What it proves:
 //   - the app reads its server target from Infisical and nowhere else;
-//   - a runner with no Infisical read token in the Keychain runs against
+//   - an app with no Infisical read token in its keychain runs against
 //     the server on this Mac, and the menu says so;
 //   - the old server-target.json is ignored: it is flagged, never read, and
 //     never rewritten;
 //   - the Server menu offers "This Mac", the Infisical status line and
-//     "Reload from Infisical", and no longer offers "Set Remote Server…";
-//   - "Reload from Infisical" is safe to click: the app keeps running.
+//     "Reload From Infisical", and no longer offers "Set Remote Server…";
+//   - "Reload From Infisical" is safe to click: the app keeps running.
 //
 // What it never does: it never contacts a real server and it never reaches
 // the owner's Keychain, its user data or its server target.  The app reads
@@ -102,21 +102,38 @@ function removeSmokeKeychain() {
     /* the temporary home is removed below either way */
   }
 }
+
+// Cleanup runs on every way out, a failed assertion, an early exit or an
+// exception, so the throwaway keychain never stays in the search list and the
+// temporary home never stays on disk.
+function cleanUp() {
+  removeSmokeKeychain();
+  try {
+    rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch {
+    /* the OS will reap it; the assertions are what matter */
+  }
+}
+process.on("exit", cleanUp);
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, () => process.exit(1));
+}
 try {
   const keychainPassword = randomBytes(24).toString("hex");
+  // Marked before the create, so a create that half-worked is still deleted.
+  keychainCreated = true;
   execFileSync("/usr/bin/security", ["create-keychain", "-p", keychainPassword, smokeKeychain], {
     stdio: "ignore",
   });
-  keychainCreated = true;
   // No auto-lock: a locked keychain would make the read a prompt.
   execFileSync("/usr/bin/security", ["set-keychain-settings", smokeKeychain], { stdio: "ignore" });
   execFileSync("/usr/bin/security", ["unlock-keychain", "-p", keychainPassword, smokeKeychain], {
     stdio: "ignore",
   });
-} catch (error) {
-  removeSmokeKeychain();
-  console.error(`could not create the throwaway keychain: ${error instanceof Error ? error.message : String(error)}`);
-  rmSync(home, { recursive: true, force: true });
+} catch {
+  // A constant message: the failed command line carries the keychain
+  // password, and Node puts the command line in the error.
+  console.error("could not create the throwaway keychain for the smoke");
   process.exit(1);
 }
 
@@ -242,12 +259,12 @@ if (spawnError !== null) {
   const labels = report.serverMenu?.labels ?? [];
   check(labels.includes("This Mac"), `the Server menu must offer "This Mac", got ${JSON.stringify(labels)}`);
   check(
-    labels.includes("No Infisical read token in the Keychain"),
+    labels.includes("No Infisical Token In The Keychain"),
     `the Server menu must say it has no Infisical read token, got ${JSON.stringify(labels)}`,
   );
   check(
-    labels.includes("Reload from Infisical"),
-    `the Server menu must offer "Reload from Infisical", got ${JSON.stringify(labels)}`,
+    labels.includes("Reload From Infisical"),
+    `the Server menu must offer "Reload From Infisical", got ${JSON.stringify(labels)}`,
   );
   check(
     !labels.some((label) => label.includes("Set Remote Server")),
@@ -258,8 +275,8 @@ if (spawnError !== null) {
   // exactly where it was.
   const reloadLabels = report.reload?.labels ?? [];
   check(
-    reloadLabels.includes("Reload from Infisical"),
-    `the Server menu must still offer "Reload from Infisical" after the reload, got ${JSON.stringify(reloadLabels)}`,
+    reloadLabels.includes("Reload From Infisical"),
+    `the Server menu must still offer "Reload From Infisical" after the reload, got ${JSON.stringify(reloadLabels)}`,
   );
   check(
     report.reload?.mode === "local",
@@ -285,12 +302,7 @@ if (exitedEarly) {
   );
 }
 
-removeSmokeKeychain();
-try {
-  rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-} catch {
-  /* the OS will reap it; the assertions above are what matter */
-}
+cleanUp();
 
 if (failures.length > 0) {
   console.error("FAIL: the packaged Server menu smoke did not pass:");

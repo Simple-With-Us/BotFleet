@@ -125,7 +125,7 @@ if (process.env.OMB_SMOKE_SERVER_MENU === "1" && process.env.OMB_SMOKE_USER_DATA
 // keychain of its own (a test-only launch hook, like the user-data one), and
 // a smoke launched without one stops instead of searching the real Keychain.
 let smokeKeychainPath = null;
-if (process.env.OMB_SMOKE_SERVER_MENU === "1") {
+if (app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU === "1") {
   const keychain = process.env.OMB_SMOKE_KEYCHAIN ?? "";
   if (!path.isAbsolute(keychain) || !fs.existsSync(keychain)) {
     console.error("[smoke] server-menu needs OMB_SMOKE_KEYCHAIN, an absolute path to a throwaway keychain that exists");
@@ -1290,6 +1290,15 @@ function readServerTargetFromInfisical() {
   return resolveServerTarget({ userDataDir });
 }
 
+// The host of a validated remote origin, for the Server menu.
+function serverMenuHost(origin) {
+  try {
+    return new URL(origin).hostname || origin;
+  } catch {
+    return origin;
+  }
+}
+
 // One step of the packaged Server-menu smoke, in the app log.  A smoke that
 // never prints its line then says how far the app got.
 function smokeStep(step) {
@@ -1410,10 +1419,10 @@ async function runServerMenuSmoke() {
     smokeStep(`health ${report.health.status}`);
     report.serverMenu = { labels: serverMenuLabels() };
 
-    // "Reload from Infisical" reads the vault again.  On a runner with no
+    // "Reload From Infisical" reads the vault again.  On a runner with no
     // enrollment the reload changes nothing, and the app has to survive that.
     const reload = (findServerMenuItem()?.submenu?.items ?? []).find(
-      (entry) => entry.label === "Reload from Infisical",
+      (entry) => entry.label === "Reload From Infisical",
     );
     await reload?.click?.();
     smokeStep("reload finished");
@@ -1481,13 +1490,16 @@ async function offerRestartForServerTarget(target) {
     slog(`smoke: would offer a restart into ${target?.mode ?? "unknown"}`);
     return false;
   }
+  // The dialog names the server the same way the Server menu does, with the
+  // address in the detail line.
+  const remote = target?.mode === "remote";
   const { response } = await dialog.showMessageBox({
     type: "info",
-    buttons: ["Restart Now", "Later"],
+    buttons: ["Restart", "Not Now"],
     defaultId: 0,
     cancelId: 1,
-    message: "Restart BotFleet To Use The Other Server?",
-    detail: "BotFleet restarts before it talks to the other server.\u00a0 Your conversations and settings stay where they are.",
+    message: `Restart BotFleet To Use ${remote ? "The Remote Server" : "The Server On This Mac"}?`,
+    detail: `BotFleet restarts before it connects to ${remote ? `the remote server at ${target.origin}` : "the server on this Mac"}.\u00a0 Your conversations and settings stay where they are.`,
   });
   if (response !== 0) return false;
   app.relaunch();
@@ -1545,7 +1557,7 @@ function buildErrorPage({ allPortsOccupied, unresponsiveOwner = null, remoteOrig
   return (
     "data:text/html;charset=utf-8," +
     encodeURIComponent(
-      `<style>${ERROR_PAGE_STYLE}</style><body><div style="text-align:center;max-width:360px"><h2>Couldn't Start the Bot Server</h2><p>${escapeHtml(reason)}&#160; If it keeps happening, check <a target="_blank" rel="noopener" href="${serverLogHref}">${escapeHtml(serverLogPath)}</a>.</p><a class="retry" target="_blank" rel="noopener" href="${SERVER_RETRY_URL}">Try Again</a></div></body>`,
+      `<style>${ERROR_PAGE_STYLE}</style><body><div style="text-align:center;max-width:360px"><h2>${remoteOrigin ? "Couldn't Reach The Bot Server" : "Couldn't Start The Bot Server"}</h2><p>${escapeHtml(reason)}&#160; If it keeps happening, check <a target="_blank" rel="noopener" href="${serverLogHref}">${escapeHtml(serverLogPath)}</a>.</p><a class="retry" target="_blank" rel="noopener" href="${SERVER_RETRY_URL}">Try Again</a></div></body>`,
     )
   );
 }
@@ -2636,7 +2648,8 @@ function setupApplicationMenu() {
       ...(mode === "remote" && origin
         ? [
             {
-              label: `Remote: ${origin}`,
+              // The host alone names the server; a full URL gets cut off.
+              label: `Remote: ${serverMenuHost(origin)}`,
               type: "radio",
               checked: true,
               enabled: false,
@@ -2646,12 +2659,12 @@ function setupApplicationMenu() {
       { type: "separator" },
       {
         label: enrolled
-          ? "From Infisical (BotFleet prod /botfleet-server)"
-          : "No Infisical read token in the Keychain",
+          ? "From Infisical"
+          : "No Infisical Token In The Keychain",
         enabled: false,
       },
       {
-        label: "Reload from Infisical",
+        label: "Reload From Infisical",
         // The promise is returned so the smoke can wait for it; the catch is
         // the backstop for a menu click nobody awaits, and it logs only the
         // message, never a target or a token.

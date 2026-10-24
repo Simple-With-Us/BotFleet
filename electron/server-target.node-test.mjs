@@ -536,6 +536,9 @@ test("main.mjs stages a reloaded target until the restart is accepted", () => {
 test("main.mjs gives the Server-menu smoke its own keychain and a reload backstop", () => {
   const main = fs.readFileSync(new URL("./main.mjs", import.meta.url), "utf8");
   assert.match(main, /process\.env\.OMB_SMOKE_KEYCHAIN/);
+  // Only a packaged smoke needs the keychain; an unpackaged run that merely
+  // inherits the smoke variable is left alone.
+  assert.match(main, /if \(app\.isPackaged && process\.env\.OMB_SMOKE_SERVER_MENU === "1"\) \{\s*const keychain = process\.env\.OMB_SMOKE_KEYCHAIN/);
   assert.match(main, /readKeychainServiceToken\(\{ keychain: smokeKeychainPath \}\)/);
   assert.match(main, /reloadServerTargetFromInfisical\(\)\.catch\(\(error\) => \{/);
 });
