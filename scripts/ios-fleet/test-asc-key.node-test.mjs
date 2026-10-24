@@ -154,6 +154,20 @@ test("the command line refuses a value that is not a key", async () => {
   assert.match(result.stderr, /not a PEM private key/);
 });
 
+test("the write command says which failure it was through its exit code", async () => {
+  //  The shell layer reads the exit code, so the two failures cannot share
+  //  one:  a value the Apple tools cannot use is a credential failure (1),
+  //  and a path or a file that could not be used is a staging failure (2).
+  //  One code for both would send the owner to the wrong place.
+  const value = await run(["write", join(root, "bad-value.p8")], "not a private key");
+  assert.equal(value.code, 1, `a broken credential did not exit 1: ${value.stderr}`);
+
+  const shared = mkdtempSync(join(tmpdir(), "asc-key-shared-"));
+  chmodSync(shared, 0o755);
+  const staging = await run(["write", join(shared, "key.p8")], envKeyPem);
+  assert.equal(staging.code, 2, `a refused staging path did not exit 2: ${staging.stderr}`);
+});
+
 test("the module has no read and no exec subcommand", async () => {
   //  A path on disk is not an approved credential source, so the module never
   //  reads a key file and never runs a command with the key in hand.

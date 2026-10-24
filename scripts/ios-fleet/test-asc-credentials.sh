@@ -468,14 +468,15 @@ stage_from_tmpdir "TMPDIR without a trailing slash" TMPDIR="${tmp}/tmp"
 stage_from_tmpdir "unset TMPDIR" -u TMPDIR
 
 # 8. A staging refusal is not a missing credential.  The key resolves, the
-#    writer refuses the path, and the upload block says staging.
+#    writer refuses the path, and the upload block says staging.  The writer
+#    exits 2 for that:  a path that could not be used.
 real_node="$(command -v node)"
 mkdir -p "${tmp}/bin"
 cat > "${tmp}/bin/node" <<WRAP
 #!/usr/bin/env bash
 if [[ "\${1:-}" == *asc-key.mjs && "\${2:-}" == write ]]; then
   echo "asc-key: the staged key path is not a normal path" >&2
-  exit 1
+  exit 2
 fi
 exec "$real_node" "\$@"
 WRAP
@@ -497,6 +498,51 @@ esac
 case "$stage_log" in
   *"no App Store Connect API key"*) fail "a path refusal was reported as a missing key" ;;
 esac
+
+# 8b. A credential the writer refuses is not a path refusal either.  The
+#     writer exits 1 for a value that is not a usable PEM private key, and the
+#     run has to say THAT rather than pointing at the staging path or at a key
+#     that has to be created:  the key exists, the value is broken.
+mkdir -p "${tmp}/bin-cred"
+cat > "${tmp}/bin-cred/node" <<WRAP
+#!/usr/bin/env bash
+if [[ "\${1:-}" == *asc-key.mjs && "\${2:-}" == write ]]; then
+  echo "asc-key: the value is not a PEM private key" >&2
+  exit 1
+fi
+exec "$real_node" "\$@"
+WRAP
+chmod 700 "${tmp}/bin-cred/node"
+cred_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
+  -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+  PATH="${tmp}/bin-cred:${PATH}" bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  load_secrets
+  [[ "$AUTH_MODE" == none ]]
+  [[ "$ASC_AUTH_FAILURE" == credential ]]
+  [[ "$(asc_upload_block)" == credential ]]
+')" || fail "a broken credential was classified as a path refusal"
+case "$cred_log" in
+  *"the credential was resolved but it is not a usable PEM private key"*) ;;
+  *) fail "a broken credential did not say so: ${cred_log}" ;;
+esac
+case "$cred_log" in
+  *"the staging path was refused"*) fail "a broken credential was reported as a path refusal: ${cred_log}" ;;
+esac
+case "$cred_log" in
+  *"no App Store Connect API key"*) fail "a broken credential was reported as a missing key: ${cred_log}" ;;
+esac
+
+# 8c. The two failures are told apart by the writer's exit code, not by the
+#     text of its message.  A staging failure is 2 and a credential failure
+#     is 1, so the writer itself has to keep them apart.
+cred_rc=0
+printf 'not a private key' | node "${here}/asc-key.mjs" write "${tmp}/not-a-key.p8" >/dev/null 2>&1 || cred_rc=$?
+[[ "$cred_rc" -eq 1 ]] || fail "a value that is not a key did not exit 1 (got ${cred_rc})"
+stage_rc=0
+node "${here}/asc-key.mjs" write "${tmp}/not-normal//key.p8" <<< "$(cat "${tmp}/asc.p8")" >/dev/null 2>&1 || stage_rc=$?
+[[ "$stage_rc" -eq 2 ]] || fail "a refused staging path did not exit 2 (got ${stage_rc})"
 
 # 9. No credential at all still classifies as missing, so the owner handoff
 #    for a missing key stays on that path.

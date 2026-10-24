@@ -213,15 +213,18 @@ asc_tmp_dir() {
   fi
 }
 
-# Why an upload has no usable staged key.  "staging" is a path refusal after
-# a credential was resolved.  "missing" is no credential.  The owner handoff
-# for a missing key does not apply to a path refusal.
+# Why an upload has no usable staged key.  "staging" is a path or file refusal
+# after a credential was resolved.  "credential" is a resolved credential that
+# is not a usable PEM private key.  "missing" is no credential.  The owner
+# handoff for a missing key applies to neither of the other two:  a key that
+# exists and is broken is not a key that has to be created, and a refused path
+# is not a credential problem at all.
 asc_upload_block() {
-  if [[ "${ASC_AUTH_FAILURE:-}" == "staging" ]]; then
-    printf '%s\n' "staging"
-  else
-    printf '%s\n' "missing"
-  fi
+  case "${ASC_AUTH_FAILURE:-}" in
+    staging) printf '%s\n' "staging" ;;
+    credential) printf '%s\n' "credential" ;;
+    *) printf '%s\n' "missing" ;;
+  esac
 }
 
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
@@ -335,11 +338,24 @@ load_secrets() {
   # written FROM the resolved credential, so it is never read back as one.
   asc_tmp_dir
   key_path="${ASC_TMP_DIR}/AuthKey_${kid}.p8"
-  if ! node "${FLEET_DIR}/asc-key.mjs" write "$key_path" <<< "$key_pem"; then
-    # The credential was resolved.  The staging path was refused.  Leaving
-    # AUTH_MODE as none is correct, and calling that a missing key is not.
-    log "could not stage the ASC key; the credential was resolved and the staging path was refused"
-    ASC_AUTH_FAILURE="staging"
+  #  The writer says WHICH failure it was through its exit code:  1 is a value
+  #  the Apple tools cannot use, 2 is a path or a file that could not be used.
+  #  The two are reported differently, so the code is kept rather than folded
+  #  into "something went wrong".
+  rc=0
+  node "${FLEET_DIR}/asc-key.mjs" write "$key_path" <<< "$key_pem" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    # Leaving AUTH_MODE as none is correct in both cases, and calling either
+    # one a missing key is not.
+    if [[ "$rc" -eq 1 ]]; then
+      # The credential was resolved and it is not a usable PEM private key.
+      log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key"
+      ASC_AUTH_FAILURE="credential"
+    else
+      # The credential was resolved.  The staging path was refused.
+      log "could not stage the ASC key; the credential was resolved and the staging path was refused"
+      ASC_AUTH_FAILURE="staging"
+    fi
     key_pem=""
     return 0
   fi
@@ -1189,6 +1205,9 @@ if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
     if [[ "$(asc_upload_block)" == "staging" ]]; then
       die "upload-only: the App Store Connect credential was resolved, and the staging path was refused. This is a path failure, not a missing key."
     fi
+    if [[ "$(asc_upload_block)" == "credential" ]]; then
+      die "upload-only: the App Store Connect credential was resolved, but it is not a usable PEM private key. This is a credential failure, not a missing key and not a path failure."
+    fi
     die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
   fi
   link_private_key "$ASC_KEY_PATH" "$ASC_KEY_ID"
@@ -1560,6 +1579,17 @@ if [[ "$AUTH_MODE" != "api_key" ]]; then
   if [[ "$(asc_upload_block)" == "staging" ]]; then
     log "Upload blocked: the App Store Connect credential was resolved, and the staging path was refused."
     log "This is a path failure, not a missing key."
+    exit 3
+  fi
+  if [[ "$(asc_upload_block)" == "credential" ]]; then
+    log "Upload blocked: the App Store Connect credential was resolved, but it is not a usable PEM private key."
+    log "This is a credential failure, not a missing key and not a path failure."
+    log "The key exists; the value that came back from the vault cannot be used to sign an upload."
+    log "Owner handoff:"
+    log "  1) Export the .p8 again in App Store Connect (App Manager+)"
+    log "  2) Store that file as ASC_KEY_P8 in Infisical Fleet-OPS /asc"
+    log "  3) Or export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this run"
+    log "  4) Re-run: bash $0 $APP_KEY --upload-only \"$PACKAGE\""
     exit 3
   fi
   log "Upload blocked: no App Store Connect API key."
