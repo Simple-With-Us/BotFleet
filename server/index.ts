@@ -308,6 +308,8 @@ import {
   ITEM_IO_DIR,
   NATIVE_DIR,
 } from "./config.ts";
+import { createRequestLog } from "./request-log.ts";
+import { readGitHubRequestLog } from "./routes/github-request-log.ts";
 import {
   appendBounded,
   describeSweep,
@@ -8351,8 +8353,19 @@ function resolveAndSendRoutine(
 // Webhook definitions are independent from calendar schedules, but every
 // delivery joins the same RoutineManager queue. That keeps unattended work
 // ordered behind a busy bot and gives webhook runs the same durable receipts.
+const webhookRequestLog = createRequestLog({
+  filePath: process.env.BOTFLEET_REQUEST_LOG_PATH ?? join(DATA_DIR, "github-request-log.md"),
+  spoolPath: join(DATA_DIR, "github-request-log.spool"),
+  cursorPath: join(DATA_DIR, "github-request-log.cursor"),
+  // Stable record identifier avoids reading the later-created manager.
+  onError: (message) => console.warn(`[github-request-log] ${message}`),
+});
+webhookRequestLog.replay();
 const webhooks = new WebhookManager({
-  emit: broadcast,
+  emit: (event) => {
+    webhookRequestLog.subscriber(event);
+    broadcast(event);
+  },
   botState: (botId) => {
     const bot = store.bot(botId);
     return !bot ? "missing" : botIsOff(bot) ? "off" : bot.busy ? "busy" : "ready";
@@ -8389,6 +8402,18 @@ try {
         handler: (req, res) =>
           readLinqWebhook(req, res, {
             getBots: () => store.bots.slice(),
+            beginAdmission: beginUpdateAdmission,
+          }),
+        deferAdmission: true,
+      },
+      "/hooks/github-request-log": {
+        // Stable non-secret endpoint: X-Hub-Signature-256 HMAC verified
+        // before admission, fail-closed when unconfigured.  Records only -
+        // deliveries here never dispatch and never reach a bot prompt.
+        handler: (req, res) =>
+          readGitHubRequestLog(req, res, {
+            requestLog: webhookRequestLog,
+            secretProvider: () => loadConfig().githubRequestLog?.webhookSecret?.trim() || undefined,
             beginAdmission: beginUpdateAdmission,
           }),
         deferAdmission: true,

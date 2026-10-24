@@ -1,0 +1,62 @@
+# GitHub request-log operations (draft, not installed)
+
+The log is not ready for deployment. New org/personal hooks wait for the owner's Infisical exception. Secret provisioning is Infisical-only. Use a stable non-secret endpoint and X-Hub-Signature-256; never use a secret-bearing URL.
+
+GitHub does not automatically redeliver failed deliveries. Its recent delivery history covers three days. Reconciliation uses GET-only delivery detail payloads and must never request redelivery of existing dispatching hooks.
+
+Sources:
+- https://docs.github.com/en/rest/orgs/webhooks
+- https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/redelivering-webhooks
+
+Reconciliation now follows Link cursor pagination, scans the complete retained window (bounded by maxPages), persists retryable detail failures, fsyncs appends and atomic checkpoints, and deduplicates against the full log rather than a 64KB tail. Pagination failure leaves the checkpoint unchanged. A corrupt checkpoint fails visibly and is not replaced. History outside three days is a potential gap with unknown count, not an invented count of proven lost events.
+
+Operational requirements still open:
+- Live org/repo delivery-list and payload-read permission tests with the eventual hook IDs.
+- Installed Mac launchd cadence, startup catch-up and a separate durable failure/staleness monitor. Proposed cadence is 10 minutes; not installed or enabled here.
+- Both writers now use the same mkdir lock (log path + .lock), full-log dedupe, and fsynced writes. A crash-held lock fails visibly and is never stolen automatically. Stale-lock recovery still needs a verified writer-liveness procedure.
+- Spool malformed-record recovery/quarantine. The current fix preserves the entire spool and cursor on malformed data, reports an error, and refuses silent truncation. Operator recovery is still needed.
+- Independent current-head review and full CI, plus real org and personal event proofs.
+- Internal bot runs initiated by schedules/UI are not observable through GitHub webhooks and are not claimed covered.
+
+Do not call the log lossless or operational while these requirements remain open.
+
+## Prepared runner and monitor (not installed)
+
+`node scripts/github-request-log-runner.mjs /absolute/path/config.json` runs configured org/personal hook reconciliation and saves a mode-600, fsynced atomic status file containing checkedAt, lastSuccess, consecutiveFailures and per-hook outcomes. It exits nonzero on any failed hook. Error text is fixed, not provider/credential output.
+
+Config shape (identifiers and paths only, never credentials):
+
+```
+{"statusPath":"/absolute/path/reconcile-status.json","hooks":[{"org":"Simple-With-Us","hook":"ACTUAL_HOOK_ID","log":"/absolute/path/github-request-log.md","cursor":"/absolute/path/org-reconcile.json"}]}
+```
+
+Use `node scripts/github-request-log-runner.mjs /absolute/path/config.json --check-status` from the independent health monitor. It fails when the last run failed, no successful run exists, or success is older than 30 minutes. A nonzero exit alone is not an alert: deployment must connect this check to an existing verified notification path and prove a simulated failure is reported before claiming monitoring active.
+
+Proposed launchd settings: RunAtLoad=true and StartInterval=600 for the runner; independent health check every 15 minutes. Do not load either job until real IDs, scoped gh authentication, dry-run evidence and the approved runtime change are verified. This source change does not install or enable them.
+
+## Review qualification at the corrective head
+
+Legacy WebhookManager attempts are rate/cap limited (ignored and rejected receipts), so its subscriber does not promise every non-GitHub attempt. The new dedicated GitHub route must receive the approved org/personal subscriptions and reconcile directly from retained deliveries; existing limited receipt history is not a substitute. This guarantee is still pending real hook proof.
+
+Authenticated malformed JSON and oversized bodies currently return 400/413 before recording metadata. A delivery detail with null/malformed payload stays pending in reconciliation; it is never called recovered without a usable payload. Exact live detail availability for those cases remains unverified, so no completeness guarantee is made yet.
+
+The server formatter now strips newlines, control characters and parentheses from every interpolated field so payload metadata cannot forge another delivery marker. It logs before broadcasting, emits an attempt copy rather than the manager's stored object, and uses stable webhook IDs instead of a closure over the later-created manager.
+
+## Review and test evidence
+
+Independent source review: 74add33cb5c0147784400c22d48b83abbea97138, followed by delta review at 43caf41cfa22b4dff7e52e1f432c5103a0f0607c. Reviewer did not execute tests. Delta review accepted log-before-broadcast, copied attempts, removal of the later-manager closure, and all-field marker sanitization. F1 (legacy attempt suppression versus dedicated-hook completeness), F4 (bad_json/413 recovery), and operational proof remain open.
+
+Executor tests at the 43caf41 delta: 44/44 server Vitest tests on Mac. Prior reconciliation tests: 8/8; runner status tests: 2/2. These results are scoped tests, not installed runtime proof.
+
+## Conservative lock recovery checklist
+
+A held mkdir lock is not proof a writer is dead. Do not remove or rename it based solely on age, an absent remembered PID, or a completed report. Before any recovery:
+1. Stop new admissions to both actual installed writer entry points using their supported service controls, under existing deployment authority. Inventory launchd labels, executable paths and all writer processes. If either entry point cannot be identified or stopped, hold recovery.
+2. Verify no server flush or reconcile process can still own the lock, including child processes. Repeat the liveness check after the stop acknowledgement. Do not rely on PID reuse alone.
+3. Preserve a private copy of the spool, cursor/checkpoint and log. Never truncate or discard malformed data. Inspect only metadata, never HMAC credentials or webhook payload prose.
+4. Only with exclusive ownership established, move the stale lock aside atomically, run recovery once, verify retained records and dedupe, then remove only the empty stale directory if deletion is authorized.
+5. Restart only the approved writer configuration, prove one normal cycle and one simulated failure is reported by the independent monitor, and document what was replayed or remains unrecovered.
+
+This checklist is preparation, not permission to stop the live BotFleet server. Recovery remains blocked until installed writer controls and authority are verified.
+
+The plist under request-log-templates is intentionally non-installable with explicit placeholders. Resolve actual paths and hook IDs, verify an authenticated dry run and failure notification, and obtain any required runtime authority before substituting values or loading it. No credential goes in the plist or config.
