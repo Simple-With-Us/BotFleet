@@ -29,15 +29,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 
-// The budget covers the app's own worst case before it prints the line.  A
-// runner with no Infisical read token runs against the server on this Mac,
-// so the app boots its local harness before the window exists, and that boot
-// may take two passes over three ports with a 60s health wait each (6 min)
-// before the app gives up and shows its error page.  Then the window load
-// (20s at most), the health probe (15s) and the Keychain read on reload
-// (10s).  The old 120s budget was set when the smoke ran in remote mode and
-// never booted the harness; it timed out before the window was ever made.
-const SMOKE_TIMEOUT_MS = 480_000;
+// The local harness answers within seconds on a runner, so a longer budget
+// only makes a stuck launch slower to report.  When the line never comes,
+// the app's own server.log printed below says where the launch stopped.
+const SMOKE_TIMEOUT_MS = 120_000;
 
 const appPath = process.argv[2];
 if (!appPath) {
