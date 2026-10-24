@@ -52,7 +52,7 @@ export default function MergeAllThreadsVisualFixture() {
   }, []);
   return (
     <StoreContext.Provider value={value}>
-      <div data-testid="merge-all-threads-fixture" className="bg-app">
+      <div data-testid="merge-all-threads-fixture" className="bg-app min-h-[600px]">
         <MergeAllThreadsDialog bot={BOT} onClose={() => {}} />
       </div>
     </StoreContext.Provider>
