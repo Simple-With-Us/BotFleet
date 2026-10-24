@@ -8,7 +8,7 @@ cd "$ROOT/ios"
 
 BASELINE="$ROOT/ios/AppStore/screenshots/tv-face-preview.png"
 OUT="$ROOT/artifacts/ios-tvface-preview.png"
-DEVICE="${IOS_SIM_DEVICE:-iPhone 17 Pro}"
+DEVICE="${IOS_SIM_DEVICE:-iPhone 17}"
 BUNDLE_ID="app.botfleet.ios"
 DERIVED="$ROOT/ios/build/DerivedData-tvface"
 APP_PATH="$DERIVED/Build/Products/Debug-iphonesimulator/BotFleet.app"
@@ -23,16 +23,27 @@ fi
 brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
 xcodegen generate
 
-# The CI runner image ships no "iPhone 17 Pro" device instance, so a named
+# The CI runner image ships no "iPhone 17" device instance, so a named
 # destination fails before the build starts. Create it when absent, pinned to
 # the explicit device type identifier; a name passed as the type is not a
 # verified model. Fail clearly when the Xcode catalog lacks the type or a
 # caller override names a different device - never substitute another model,
 # whose different geometry would make the screenshot meaningless.
-DEVICE_TYPE="com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro"
+#
+# Capture target history: this was "iPhone 17 Pro" from the step's first
+# version (a 2026-10-06 agent default, not an owner requirement). iOS 27
+# simulator runtimes no longer offer iPhone 17 Pro - the xcode-27 image's
+# iOS 27.0 catalog lists iPhone 17 / 17e / 18 Pro / 18 Pro Max / Air - while
+# every runtime that still offers 17 Pro is iOS 26.x, below this app's 27.0
+# deployment floor. iPhone 17 is the closest current device the floor allows;
+# the picker's supported-device check below still validates the pairing
+# against the runner's own catalog at run time. Visual clearance never comes
+# from this choice: a capture is reviewed on its actual pixels, not on any
+# assumed geometry equivalence.
+DEVICE_TYPE="com.apple.CoreSimulator.SimDeviceType.iPhone-17"
 if ! xcrun simctl list devices available | grep -F "${DEVICE} (" >/dev/null; then
-  if [[ "${DEVICE}" != "iPhone 17 Pro" ]]; then
-    echo "ios-tvface-screenshot: simulator '${DEVICE}' not present; auto-create is pinned to iPhone 17 Pro" >&2
+  if [[ "${DEVICE}" != "iPhone 17" ]]; then
+    echo "ios-tvface-screenshot: simulator '${DEVICE}' not present; auto-create is pinned to iPhone 17" >&2
     exit 1
   fi
   if ! xcrun simctl list devicetypes | grep -F "${DEVICE_TYPE}" >/dev/null; then
