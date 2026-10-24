@@ -362,7 +362,12 @@ jobs:
         run: |
           v="${{ needs.prepare.outputs.version }}"
           if [ -f "release/BotFleet-$v-arm64.dmg" ] && [ -f "release/BotFleet-$v-x64.dmg" ]; then
-            node scripts/regenerate-mac-feed.mjs release/latest-mac.yml
+            # Pass the pinned version explicitly.  The script's fallback is
+            # package.json's version, which is the FLOOR of the stamp scheme
+            # (1.0.31) and the version already installed on the owner's Mac:
+            # the first unified release died looking for a 1.0.31 artifact that
+            # the 1.0.2193 build had never made.
+            node scripts/regenerate-mac-feed.mjs release/latest-mac.yml "$v"
           else
             echo "::warning::skipping latest-mac.yml — not every mac architecture built"
           fi
