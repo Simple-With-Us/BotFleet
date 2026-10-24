@@ -2082,6 +2082,13 @@ export class Store {
     t.messages.push(...full);
     this.threads.recordAppend(threadId);
     t.activeLeafId = full[full.length - 1]!.id;
+    // The first-run quiz is not a live ask, and talking past it hides it.
+    // A bulk copy carries the same user or system text a single message
+    // would, so it talks past it too — otherwise a merged conversation that
+    // starts with the greeting leaves the quiz on screen forever.
+    if (full.some((message) => (message.role === "user" || message.role === "system") && message.kind === "text")) {
+      this.dismissOnboardingCard(threadId);
+    }
     if (full.some((message) => message.kind === "screen")) {
       for (const pruned of this.pruneScreenFrames(t)) {
         mdb.updateMessage(threadId, pruned);

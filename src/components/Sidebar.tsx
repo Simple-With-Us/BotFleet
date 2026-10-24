@@ -1715,7 +1715,7 @@ export function BotContextMenu({
     icon: React.ReactNode,
     label: string,
     onClick?: () => void,
-    opts?: { danger?: boolean; disabled?: boolean; hint?: string },
+    opts?: { danger?: boolean; disabled?: boolean; hint?: string; testId?: string },
   ) => (
     <button
       key={label}
@@ -1725,6 +1725,7 @@ export function BotContextMenu({
         onClose();
       }}
       title={opts?.hint}
+      data-testid={opts?.testId}
       className={cn(
         "flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px]",
         opts?.danger ? "text-danger" : "text-ink",
@@ -1748,6 +1749,7 @@ export function BotContextMenu({
           bot.pinned ? <PinOff size={16} className="text-ink-secondary" /> : <Pin size={16} className="text-ink-secondary" />,
           bot.pinned ? "Unpin" : "Pin",
           () => dispatch({ type: "updateBot", botId: bot.id, patch: { pinned: !bot.pinned } }),
+          { testId: "bot-menu-item-pin" },
         ),
         item(
           <Crown size={16} className={bot.chiefOfStaff ? "text-accent" : "text-ink-secondary"} />,
@@ -1756,6 +1758,7 @@ export function BotContextMenu({
           {
             disabled: !bot.chiefOfStaff && !canCoordinate,
             hint: !bot.chiefOfStaff && !canCoordinate ? "Choose an engine with coordination first" : undefined,
+            testId: "bot-menu-item-chief",
           },
         ),
         item(<FolderPlus size={16} className="text-ink-secondary" />, "Move to Section", () => {
@@ -1775,6 +1778,7 @@ export function BotContextMenu({
           {
             disabled: threadCount < 2,
             hint: threadCount < 2 ? "This bot has one conversation" : undefined,
+            testId: "bot-menu-item-merge",
           },
         ),
         divider("d1"),
@@ -1797,6 +1801,7 @@ export function BotContextMenu({
           {
             disabled: archiveBlocked,
             hint: archiveHint,
+            testId: "bot-menu-item-archive",
           },
         ),
         item(<Trash2 size={16} />, "Delete", () => dispatch({ type: "deleteBot", botId: bot.id }), {

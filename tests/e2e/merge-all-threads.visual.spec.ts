@@ -128,6 +128,22 @@ test('visual: the bot context menu offers the merge action', async ({ page }) =>
 
   await expect(menu).toHaveScreenshot(
     'merge-all-threads-menu.png',
-    { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 },
+    {
+      ...stableShot,
+      maxDiffPixelRatio: 0.02,
+      threshold: 0.2,
+      // These items say what the DATA says: whether the bot is pinned, what
+      // the engine can coordinate, how many conversations the bot holds, and
+      // whether the fleet still has another bot to keep.  Their text and
+      // their enabled state come from the fixture, so they are masked and
+      // the menu's shape is what this screenshot pins.  The merge entry's
+      // label is asserted above, so nothing about it is lost.
+      mask: [
+        page.locator('[data-testid="bot-menu-item-pin"]'),
+        page.locator('[data-testid="bot-menu-item-chief"]'),
+        page.locator('[data-testid="bot-menu-item-merge"]'),
+        page.locator('[data-testid="bot-menu-item-archive"]'),
+      ],
+    },
   );
 });

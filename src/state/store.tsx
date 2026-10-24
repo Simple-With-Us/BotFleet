@@ -1761,7 +1761,15 @@ export function reducer(state: AppState, action: Action): AppState {
       // A bulk copy — a merge folding one conversation into another — writes
       // a whole transcript at once, so it arrives in one piece instead of
       // thousands of single-message frames.
-      const bot = state.bots.find((b) => b.threadId === action.threadId);
+      //
+      // The frame belongs to a CONVERSATION, and the bot that owns one is
+      // the one showing it or the one holding it in its roster.  A merge
+      // moves the bot to another conversation, so the active thread alone
+      // does not name the owner — and the frame was dropped, leaving the
+      // merged conversation invisible until the next hydrate.
+      const bot =
+        state.bots.find((b) => b.threadId === action.threadId)
+        ?? state.bots.find((b) => (b.tasks ?? []).some((task) => task.threadId === action.threadId));
       if (!bot) {
         const group = state.groups.find((g) => g.threadId === action.threadId);
         if (!group) return state;
@@ -1775,11 +1783,17 @@ export function reducer(state: AppState, action: Action): AppState {
           ),
         };
       }
+      // Two conversations never share a transcript.  A frame for a
+      // conversation the bot is not showing IS that conversation's
+      // transcript, so it replaces the one on screen instead of being
+      // appended to it — the merge moved the bot, and the old
+      // conversation's words are not the new one's.
+      const showing = bot.threadId === action.threadId;
       const known = new Set(bot.messages.map((m) => m.id));
       const fresh = action.messages.filter((m) => !known.has(m.id));
-      if (fresh.length === 0) return state;
+      if (showing && fresh.length === 0) return state;
       return updateBot(state, bot.id, (b) => {
-        let messages = [...b.messages, ...fresh];
+        let messages = showing ? [...b.messages, ...fresh] : action.messages;
         // base64 screen frames are big; a long computer-use session would
         // grow memory without bound. Keep the newest few frames' pixels and
         // strip the rest (the message row survives as a placeholder).
@@ -2212,23 +2226,41 @@ export function reducer(state: AppState, action: Action): AppState {
       // person chose, so the roster and the open chat agree immediately.
       return {
         ...state,
-        bots: state.bots.map((bot) =>
-          bot.id === action.botId
-            ? { ...bot, tasks: remaining, threadId: action.intoThreadId }
-            : bot,
-        ),
+        bots: state.bots.map((bot) => {
+          if (bot.id !== action.botId) return bot;
+          const next: Bot = { ...bot, tasks: remaining, threadId: action.intoThreadId };
+          // The transcript on screen belongs to the conversation the bot was
+          // showing.  A merge moves the bot to another conversation, so the
+          // old transcript is dropped here rather than left on screen under
+          // the new conversation's name; the merged one arrives on its own
+          // frame.
+          if (bot.threadId !== action.intoThreadId) {
+            next.messages = [];
+            next.activeLeafId = undefined;
+          }
+          return next;
+        }),
       };
     }
     case "mergeApplied": {
       // The server's own answer about what is left: the conversations that
       // stayed behind, and the one that is now live.
+      //
+      // The answer names the conversations, not their full records: the
+      // roster needs more than that — how much a conversation cost, whether
+      // it is asleep, which folder it runs in, which engine it uses — and a
+      // narrow record would leave all of it out until the next hydrate.  So
+      // each conversation the server kept is paired with the full record the
+      // client already holds, and only a conversation the client never saw
+      // falls back to the narrow one.
       return {
         ...state,
-        bots: state.bots.map((bot) =>
-          bot.id === action.botId
-            ? { ...bot, tasks: action.tasks, threadId: action.threadId }
-            : bot,
-        ),
+        bots: state.bots.map((bot) => {
+          if (bot.id !== action.botId) return bot;
+          const held = new Map((bot.tasks ?? []).map((task) => [task.threadId, task]));
+          const tasks = action.tasks.map((task) => held.get(task.threadId) ?? task);
+          return { ...bot, tasks, threadId: action.threadId };
+        }),
       };
     }
     case "moveTaskToBot": {
@@ -3191,6 +3223,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             .catch((error) => {
               showError(error);
               action.onSettled?.(null, error instanceof Error ? error.message : String(error));
+              // The optimistic paint moved the bot to the chosen conversation
+              // and dropped the transcript it was showing, so a merge that
+              // failed has to put the server's own state back rather than
+              // leave an empty chat under a conversation that never changed.
+              api("/api/bots")
+                .then((body: { bots?: Bot[] }) => {
+                  const restored = body?.bots?.find((candidate) => candidate.id === action.botId);
+                  if (restored) rawDispatch({ type: "botPatched", bot: restored });
+                })
+                .catch(() => {});
             });
           break;
         case "moveTaskToBot":
@@ -3446,6 +3488,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (bot.unread && bot.id === stateRef.current.selectedId) {
             bot.unread = false;
             botPatchQueue.enqueue(bot.id, { unread: false }, bot);
+          }
+          // A bot frame that moves the bot to another conversation without
+          // carrying the transcript leaves the old conversation's words on
+          // screen under the new one.  A merge does exactly this — the
+          // transcript it builds can be larger than an event frame carries,
+          // so the frame is deliberately light — and the conversation it
+          // names is fetched instead.
+          const before = stateRef.current.bots.find((candidate) => candidate.id === bot.id);
+          if (before && before.threadId !== bot.threadId && !bot.messages?.length) {
+            void api(`/api/threads/${bot.threadId}/messages?limit=${PAGE_SIZE}`)
+              .then((page: { messages?: Message[] }) => {
+                rawDispatch({ type: "botPatched", bot: { ...bot, messages: page?.messages ?? [] } });
+              })
+              .catch(() => {});
           }
           rawDispatch({
             type: "botPatched",

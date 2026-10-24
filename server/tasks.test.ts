@@ -54,6 +54,18 @@ describe("tasks", () => {
     expect(store.activeTask(bot.id)).toMatchObject({ threadId: bot.threadId, title: UNTITLED_TASK });
   });
 
+  it("talks past the first-run quiz when a folded transcript arrives", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const card = store.messagesFor(bot.threadId).find((message) => message.kind === "options");
+    expect(card?.card?.dismissed).toBeFalsy();
+    // a merge copies a whole conversation in one write, and the copy
+    // carries the same user text a single message would
+    store.appendMessages(bot.threadId, [{ role: "user", kind: "text", text: "Hello" }]);
+    const dismissed = store.messagesFor(bot.threadId).find((message) => message.kind === "options");
+    expect(dismissed?.card?.dismissed).toBe(true);
+  });
+
   it("starts a new task on a fresh thread and makes it active", async () => {
     const { store } = await freshStore();
     const bot = store.createBot();
