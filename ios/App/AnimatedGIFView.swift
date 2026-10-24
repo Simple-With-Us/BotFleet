@@ -22,7 +22,18 @@ struct AnimatedGIFView: UIViewRepresentable {
         view.contentMode = contentMode
         view.clipsToBounds = true
         view.backgroundColor = .clear
+        // SwiftUI owns avatar geometry, not the decoded image's native size.
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.defaultLow, for: .vertical)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         return view
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UIImageView, context: Context) -> CGSize? {
+        guard let width = proposal.width, let height = proposal.height,
+              width.isFinite, height.isFinite else { return nil }
+        return CGSize(width: max(0, width), height: max(0, height))
     }
 
     func updateUIView(_ view: UIImageView, context: Context) {
@@ -71,7 +82,18 @@ extension UIImage {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         let count = CGImageSourceGetCount(source)
         guard count > 1 else {
-            guard let cg = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+            let cg: CGImage?
+            if maxPixelSize > 0 {
+                let options: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+                ]
+                cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+            } else {
+                cg = CGImageSourceCreateImageAtIndex(source, 0, nil)
+            }
+            guard let cg else { return nil }
             return UIImage(cgImage: cg)
         }
         var frames: [(UIImage, Double)] = []
