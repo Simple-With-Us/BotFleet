@@ -390,6 +390,10 @@ const appConfigSchema = z.object({
   /** Linq transport credentials live in `process.env` — never on disk — so
    *  a stolen config.json does not hand an attacker a phone number.  Only
    *  the workspace phone + per-bot toggle + sender policy live on disk. */
+  githubRequestLog: z.object({
+    /** Org request-log hook HMAC secret.  Prefer env/Infisical; kept optional on disk for sync only. */
+    webhookSecret: optionalText,
+  }).optional(),
   imessageLinq: z.object({
     /** Linq phone number that receives iMessage on this workspace's behalf
      *  — typically the Director bot's number.  Formatted E.164.  Stored
@@ -700,6 +704,7 @@ export interface AppConfig {
    *
    *  Tokens never live here: `LINQ_API_TOKEN` and `LINQ_WEBHOOK_SECRET`
    *  come from `process.env` (the runtime secret layer). */
+  githubRequestLog?: { webhookSecret?: string };
   imessageLinq?: {
     botNumber?: string;
     apiToken?: string;
@@ -2021,7 +2026,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
+  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "githubRequestLog", "zulip", "autoReview", "sts"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
