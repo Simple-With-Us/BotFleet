@@ -59,6 +59,10 @@ private enum TVFaceFetchResult: Sendable {
 final class TVFacePlayer: ObservableObject {
     @Published var imageData: Data?
     @Published var expressionLabel: String = "resting"
+    /// True when every asset in the fallback chain failed (offline, CDN
+    /// unreachable): the view renders the deterministic mascot instead of
+    /// an endless spinner.  Cleared on the next play().
+    @Published private(set) var failed = false
 
     private var previous: TVFaceExpression = .resting
     private var color: String
@@ -94,14 +98,17 @@ final class TVFacePlayer: ObservableObject {
 
     func play(expression next: TVFaceExpression, animated: Bool) {
         task?.cancel()
+        failed = false
         if !animated {
-            previous = next
             expressionLabel = next.rawValue
             task = Task { await show(expression: next, kind: .still) }
             return
         }
+        // `previous` is the last expression actually RENDERED (advanced in
+        // show() on success), not merely planned: recording a face whose
+        // fetch never completed would plan the next transition from a state
+        // the user never saw.
         let steps = TVFacePlanner.plan(from: previous, to: next)
-        previous = next
         task = Task { [weak self] in
             guard let self else { return }
             for step in steps {
@@ -155,6 +162,7 @@ final class TVFacePlayer: ObservableObject {
             case .hit(let data):
                 storeCache(url: url, data: data)
                 imageData = data
+                previous = expression
                 return
             case .missing:
                 markMissed(url)
@@ -165,6 +173,7 @@ final class TVFacePlayer: ObservableObject {
         let still = source.url(color: color, expression: expression, kind: .still)
         if let cached = cachedData(for: still) {
             imageData = cached
+            previous = expression
             return
         }
         var stillFailed = false
@@ -173,6 +182,7 @@ final class TVFacePlayer: ObservableObject {
             case .hit(let data):
                 storeCache(url: still, data: data)
                 imageData = data
+                previous = expression
                 return
             case .missing:
                 markMissed(still)
@@ -182,16 +192,25 @@ final class TVFacePlayer: ObservableObject {
         }
         // Both fetches failing means we are offline or the CDN is down;
         // trying the resting still would just burn another timeout.
-        if primaryFailed && stillFailed { return }
+        if primaryFailed && stillFailed {
+            failed = true
+            return
+        }
         let rest = source.url(color: color, expression: .resting, kind: .still)
         if let cached = cachedData(for: rest) {
             imageData = cached
+            previous = .resting
             return
         }
         if !recentlyMissed(rest), case .hit(let data) = await fetch(rest) {
             storeCache(url: rest, data: data)
             imageData = data
+            previous = .resting
+            return
         }
+        // Every fallback exhausted: surface the failure so the view can
+        // render the deterministic mascot instead of spinning forever.
+        failed = true
     }
 
     private func fetch(_ url: URL) async -> TVFaceFetchResult {
@@ -243,7 +262,12 @@ struct TVFaceAvatar: View {
     var body: some View {
         ZStack {
             Color.black.opacity(0.001) // hit target
-            if let data = player.imageData {
+            if player.failed {
+                // The deterministic mascot is the documented fallback for
+                // undeliverable identity art (offline, CDN unreachable):
+                // "identity never becomes an empty placeholder".
+                BotMascot(color: color, size: size, state: state, animated: animated)
+            } else if let data = player.imageData {
                 // Avatars render well under 200pt; decode thumbnails at the
                 // actual display size (@3x) instead of every 480x480 frame.
                 AnimatedGIFView(data: data, maxPixelSize: max(1, Int(size * 3)))
