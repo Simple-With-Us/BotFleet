@@ -39,7 +39,33 @@ if ! xcrun simctl list devices available | grep -F "${DEVICE} (" >/dev/null; the
     echo "ios-tvface-screenshot: device type ${DEVICE_TYPE} not in this Xcode catalog" >&2
     exit 1
   fi
-  RUNTIME_ID="$(xcrun simctl list runtimes | awk '/^iOS /{print $NF}' | sort -V | tail -1)"
+  # Pick the newest available iOS runtime whose own supported-device list
+  # includes the pinned type; the newest runtime alone is not a contract -
+  # e.g. a beta runtime can reject a shipping device type ("Incompatible
+  # device", SimError 403). Fail clearly when no runtime supports the type.
+  RUNTIMES_JSON="$ROOT/artifacts/simctl-runtimes.json"
+  xcrun simctl list -j runtimes > "$RUNTIMES_JSON"
+  RUNTIME_ID="$(python3 - "${DEVICE_TYPE}" "$RUNTIMES_JSON" <<'PY'
+import json, sys
+want = sys.argv[1]
+runtimes = json.load(open(sys.argv[2]))["runtimes"]
+def ver(r):
+    return [int(x) for x in r.get("version", "0").split(".")]
+cands = [
+    r for r in runtimes
+    if r.get("platform") == "iOS"
+    and r.get("isAvailable", True)
+    and any(t.get("identifier") == want for t in r.get("supportedDeviceTypes", []))
+]
+if not cands:
+    sys.exit(1)
+cands.sort(key=ver)
+print(cands[-1]["identifier"])
+PY
+)" || {
+    echo "ios-tvface-screenshot: no available iOS runtime supports ${DEVICE_TYPE} on this runner" >&2
+    exit 1
+  }
   echo "ios-tvface-screenshot: simulator '${DEVICE}' not present; creating ${DEVICE_TYPE} on ${RUNTIME_ID}"
   xcrun simctl create "${DEVICE}" "${DEVICE_TYPE}" "${RUNTIME_ID}"
 fi
