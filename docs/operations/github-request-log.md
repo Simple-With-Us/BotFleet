@@ -19,3 +19,17 @@ Operational requirements still open:
 - Internal bot runs initiated by schedules/UI are not observable through GitHub webhooks and are not claimed covered.
 
 Do not call the log lossless or operational while these requirements remain open.
+
+## Prepared runner and monitor (not installed)
+
+`node scripts/github-request-log-runner.mjs /absolute/path/config.json` runs configured org/personal hook reconciliation and saves a mode-600, fsynced atomic status file containing checkedAt, lastSuccess, consecutiveFailures and per-hook outcomes. It exits nonzero on any failed hook. Error text is fixed, not provider/credential output.
+
+Config shape (identifiers and paths only, never credentials):
+
+```
+{"statusPath":"/absolute/path/reconcile-status.json","hooks":[{"org":"Simple-With-Us","hook":"ACTUAL_HOOK_ID","log":"/absolute/path/github-request-log.md","cursor":"/absolute/path/org-reconcile.json"}]}
+```
+
+Use `node scripts/github-request-log-runner.mjs /absolute/path/config.json --check-status` from the independent health monitor. It fails when the last run failed, no successful run exists, or success is older than 30 minutes. A nonzero exit alone is not an alert: deployment must connect this check to an existing verified notification path and prove a simulated failure is reported before claiming monitoring active.
+
+Proposed launchd settings: RunAtLoad=true and StartInterval=600 for the runner; independent health check every 15 minutes. Do not load either job until real IDs, scoped gh authentication, dry-run evidence and the approved runtime change are verified. This source change does not install or enable them.
