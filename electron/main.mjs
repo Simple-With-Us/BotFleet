@@ -3011,9 +3011,8 @@ app.whenReady().then(async () => {
       if (target.error) {
         slog(`server target: ${target.error}; using the server on this Mac`);
       }
-      serverReady = target.mode === "remote"
-        ? await startRemoteServer(target.origin, target.token ?? "")
-        : await startServerPackaged();
+      if (target.mode === "remote") serverReady = await startRemoteServer(target.origin, target.token ?? "");
+      else serverReady = await startServerPackaged();
     }
     // The Server menu shows where the app is pointed, so it is built again
     // once the server it talks to is settled.
