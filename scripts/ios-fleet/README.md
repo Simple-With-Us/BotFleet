@@ -3,8 +3,26 @@
 Vendored from `/Users/jay/apps/ios-fleet` (same family as Congress.Trade
 `scripts/ios-fleet`) so a GitHub-hosted `macos-latest` runner can ship
 without that Mac path.  `apps.json` here is BotFleet-only: bundle
-`app.botfleet.ios` (appleId `6820175685`), team `CC8UTF7ATG`, SKU `botfleet`, marketing `1.0.<commit_count>`,
-build `<commit_count>`.
+`app.botfleet.ios` (appleId `6820175685`), team `CC8UTF7ATG`, SKU `botfleet`,
+marketing train `1.0`.
+
+## Versioning
+
+Owner directive 2026-10-24 (AFC-517):  the marketing version and the build
+number are independent.
+
+- `MARKETING_VERSION` is the next patch on the app's train:  `1.0.<P+1>`, where
+  `P` is the highest patch App Store Connect already holds on that train
+  (App Store versions AND TestFlight trains, drift trains ignored).
+- `CURRENT_PROJECT_VERSION` is the repo commit count, raised above the App
+  Store Connect floor (every build already in the target train, plus the app's
+  own plain-integer builds) when it has to be.
+- `--version` and `--build` are exact overrides; `--build` no longer moves the
+  marketing version.
+
+The rules live in `scripts/ios-fleet/version-plan.mjs` (pure, unit-tested by
+`version-plan.node-test.mjs`); `ship-testflight.sh` applies them and prints a
+`version plan:` line naming the patch and the floors it used.
 
 `scripts/ios-ship-testflight.sh` prefers this directory, then falls back
 to `/Users/jay/apps/ios-fleet` on Jay's Mac.

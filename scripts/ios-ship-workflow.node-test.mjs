@@ -199,11 +199,13 @@ test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   assert.equal(Object.keys(apps.apps).join(","), "botfleet");
 
   const ship = read("scripts/ios-fleet/ship-testflight.sh");
-  // The fleet scheme (owner 2026-10-18): both values come from the repo
-  // commit count.  Assert the mechanism, not the retired seq-plus-timestamp
-  // shape this branch removes.
-  assert.match(ship, /MARKETING_VERSION\s+= 1\.0\.<commit_count>/);
-  assert.match(ship, /CURRENT_PROJECT_VERSION = <commit_count>/);
+  // The scheme (owner directive 2026-10-24, AFC-517):  the marketing version
+  // is the next patch on the App Store Connect train, and the build number is
+  // the repo commit count raised above the App Store Connect floor.  The two
+  // numbers are independent, so assert the mechanism, not the retired
+  // 1.0.<commit_count> shape.
+  assert.match(ship, /MARKETING_VERSION\s+= <prefix>\.<P\+1>/);
+  assert.match(ship, /CURRENT_PROJECT_VERSION = the repo commit count/);
   assert.match(ship, /rev-list --count HEAD/);
   assert.match(ship, /botfleet/);
   assert.match(ship, /DEFAULT_MIN_INTERVAL_SEC=3600/);
@@ -351,10 +353,11 @@ test("asc-api.mjs stays dependency-free: it runs from a bare directory with no n
   try {
     const copy = join(tmp, "asc-api.mjs");
     writeFileSync(copy, src);
-    // The client imports asc-key.mjs, so the bare copy needs it too:  a
-    // missing sibling is ERR_MODULE_NOT_FOUND, which is the same failure this
-    // test exists to catch.
+    // The client imports asc-key.mjs and version-plan.mjs, so the bare copy
+    // needs them too:  a missing sibling is ERR_MODULE_NOT_FOUND, which is
+    // the same failure this test exists to catch.
     writeFileSync(join(tmp, "asc-key.mjs"), read("scripts/ios-fleet/asc-key.mjs"));
+    writeFileSync(join(tmp, "version-plan.mjs"), read("scripts/ios-fleet/version-plan.mjs"));
     const run = spawnSync(process.execPath, [copy, "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: { PATH: process.env.PATH || "", HOME: tmp },
@@ -366,18 +369,49 @@ test("asc-api.mjs stays dependency-free: it runs from a bare directory with no n
   }
 });
 
-test("asc_latest_seq surfaces asc-api stderr and does not require the env file", () => {
+test("the ASC version queries surface asc-api stderr and do not require the env file", () => {
   const ship = read("scripts/ios-fleet/ship-testflight.sh");
   // The old line threw away the only diagnostic that says WHY (HTTP 401).
   assert.doesNotMatch(ship, /asc-api\.mjs" latest-build-seq[^\n]*2>\/dev\/null/);
   assert.match(ship, /2>"\$errf"/);
-  assert.match(ship, /logerr "asc-seq: \$\{line\}"/);
+  assert.match(ship, /logerr "asc-patch: \$\{line\}"/);
+  assert.match(ship, /logerr "asc-floor: \$\{line\}"/);
   // A missing local credential file is no longer an automatic UNVERIFIED.
   assert.match(ship, /asc_credential_available\(\)/);
   assert.doesNotMatch(ship, /if \[\[ ! -f "\$SECRETS_ENV" \]\]; then\n\s*logerr "asc-seq: no /);
   // Cleanup must not write to the captured-value stream: an `rm` wrapper that
   // reports on stdout once turned a correct sequence into an arithmetic error.
   assert.match(ship, /rm -f "\$errf" >\/dev\/null 2>&1 \|\| true/);
+});
+
+test("the version plan is independent:  the marketing version is the next patch, the build is the commit count", () => {
+  const ship = read("scripts/ios-fleet/ship-testflight.sh");
+  // The three log lines the owner asked for, verbatim.
+  assert.match(
+    ship,
+    /log "version plan: asc_patch=\$\{PLAN_ASC_PATCH\} -> marketing=\$\{MARKETING\}; build floors: train=\$\{PLAN_TRAIN_FLOOR\} app=\$\{PLAN_APP_FLOOR\} commit_count=\$\{PLAN_COMMIT_COUNT\} -> build=\$\{BUILD_NUM\}"/
+  );
+  assert.match(ship, /log "marketing=\$\{MARKETING\} build=\$\{BUILD_NUM\}"/);
+  assert.match(ship, /log "App Store Connect will show this as: \$\{MARKETING\} \(\$\{BUILD_NUM\}\)"/);
+  // --build no longer moves the marketing version:  the two numbers are
+  // independent, so the build can never be derived from the version.
+  assert.doesNotMatch(ship, /MARKETING="\$\{MARKETING_PREFIX\}\.\$\{BUILD_NUM\}"/);
+  // The retired floor paths are gone:  App Store Connect is the only record
+  // that shipping advances.
+  assert.doesNotMatch(ship, /resolve_seq_floor/);
+  assert.doesNotMatch(ship, /next_build_seq/);
+  assert.doesNotMatch(ship, /local_seq/);
+  assert.doesNotMatch(ship, /asc_latest_seq/);
+  // The two new App Store Connect queries, and the node seam they run under.
+  assert.match(ship, /asc_client latest-marketing-patch/);
+  assert.match(ship, /asc_client build-floor/);
+  assert.match(ship, /ASC_NODE="\$\{IOS_FLEET_NODE:-node\}"/);
+  assert.match(ship, /ASC_PLATFORM="IOS"/);
+  // An unreachable App Store Connect is fatal unless the operator opts out.
+  assert.match(ship, /die "cannot determine the next marketing version\./);
+  assert.match(ship, /die "cannot determine the build floor for \$\{MARKETING\}\./);
+  assert.match(ship, /--allow-unverified-seq set; the marketing version is planned from an UNVERIFIED patch \(P=0\)/);
+  assert.match(ship, /--allow-unverified-seq set; the build floor is UNVERIFIED \(0\)/);
 });
 
 // ---------------------------------------------------------------------------

@@ -45,7 +45,7 @@ function initRepo(root, { shallow = false, version = "1.0.0" } = {}) {
 }
 
 describe("version planning", () => {
-  it("resolves 1.0.<commit_count>, the scheme the iOS client already ships", () => {
+  it("resolves 1.0.<commit_count>, the desktop release scheme", () => {
     assert.equal(planVersion({ commitCount: 2127 }).version, "1.0.2127");
     assert.equal(planVersion({ commitCount: 2127 }).floored, false);
   });
