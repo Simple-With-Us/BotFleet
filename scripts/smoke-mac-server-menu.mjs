@@ -93,6 +93,13 @@ const child = spawn(executable, [], {
   stdio: ["ignore", "pipe", "pipe"],
 });
 
+// A spawn-level failure (EACCES, ENOEXEC) arrives as an 'error' event.  Record
+// it so the smoke reports FAIL instead of crashing on an unhandled event.
+let spawnError = null;
+child.on("error", (error) => {
+  spawnError = error instanceof Error ? error.message : String(error);
+});
+
 for (const stream of [child.stdout, child.stderr]) {
   stream.setEncoding("utf8");
   stream.on("data", (chunk) => {
@@ -103,7 +110,7 @@ for (const stream of [child.stdout, child.stderr]) {
 }
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const running = () => child.exitCode === null && child.signalCode === null;
+const running = () => spawnError === null && child.exitCode === null && child.signalCode === null;
 
 // The whole process group goes down together: the app spawns children.
 async function stopProcess() {
@@ -143,7 +150,9 @@ const check = (condition, message) => {
   if (!condition) failures.push(message);
 };
 
-if (!report) {
+if (spawnError !== null) {
+  failures.push(`the app could not be started: ${spawnError}`);
+} else if (!report) {
   failures.push(
     exitedEarly
       ? `the app exited (code ${child.exitCode ?? child.signalCode}) before printing the smoke line`
