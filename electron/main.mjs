@@ -1232,7 +1232,7 @@ function buildErrorPage({ allPortsOccupied, unresponsiveOwner = null }) {
   return (
     "data:text/html;charset=utf-8," +
     encodeURIComponent(
-      `<style>${ERROR_PAGE_STYLE}</style><body><div style="text-align:center;max-width:360px"><h2>Couldn't Start the Bot Server</h2><p>${escapeHtml(reason)}&nbsp; If it keeps happening, check <a target="_blank" rel="noopener" href="${serverLogHref}">${escapeHtml(serverLogPath)}</a>.</p><a class="retry" target="_blank" rel="noopener" href="${SERVER_RETRY_URL}">Try Again</a></div></body>`,
+      `<style>${ERROR_PAGE_STYLE}</style><body><div style="text-align:center;max-width:360px"><h2>Couldn't Start the Bot Server</h2><p>${escapeHtml(reason)}&#160; If it keeps happening, check <a target="_blank" rel="noopener" href="${serverLogHref}">${escapeHtml(serverLogPath)}</a>.</p><a class="retry" target="_blank" rel="noopener" href="${SERVER_RETRY_URL}">Try Again</a></div></body>`,
     )
   );
 }
