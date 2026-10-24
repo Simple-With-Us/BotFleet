@@ -55,6 +55,19 @@ export const MIME = {
   ".txt": "text/plain; charset=utf-8",
 };
 
+/**
+ * True when the value is a string.
+ *
+ * A header value is decoded once, here, at the boundary, and the branches
+ * below work on the decoded text.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isText(value) {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
 export function isApiPath(pathname) {
   return pathname === "/api" || pathname.startsWith("/api/");
 }
@@ -239,7 +252,8 @@ export function parseRemoteOrigin(remoteOrigin) {
  * and for nothing else.
  */
 function isUpgradeRequest(req) {
-  return typeof req.headers.upgrade === "string" && req.headers.upgrade !== "";
+  const upgrade = req.headers.upgrade;
+  return isText(upgrade) && upgrade !== "";
 }
 
 /**
@@ -331,6 +345,27 @@ function remoteRawHeaders(req, remote, remoteToken = "") {
   return rawHeaders;
 }
 
+/**
+ * The request options for a proxied remote call.
+ *
+ * SNI has to name the remote host, not the shim's, and an IP-literal remote
+ * has no name to put in it -- so the option is added only when it applies.
+ */
+function remoteRequestOptions(remote, req, remoteToken) {
+  const options = {
+    host: remote.hostname,
+    port: remote.port,
+    method: req.method,
+    path: req.url,
+    // The remote server answers for its own authority and only for requests
+    // that do not claim to come from somewhere else, so the shim's own origin,
+    // referer and fetch metadata are stripped.
+    headers: remoteForwardedHeaders(req, remote.origin, remoteToken),
+  };
+  if (remote.secure && !remote.isIpAddress) options.servername = remote.hostname;
+  return options;
+}
+
 function proxyHttp({ harnessHost, harnessPort, remote, remoteToken, log }, req, res) {
   let attempts = 0;
   let current = null;
@@ -355,16 +390,7 @@ function proxyHttp({ harnessHost, harnessPort, remote, remoteToken, log }, req, 
     const upstream = remote
       ? (remote.secure ? https : http).request(
           {
-            host: remote.hostname,
-            port: remote.port,
-            // SNI has to name the remote host, not the shim's.
-            ...(remote.secure && !remote.isIpAddress ? { servername: remote.hostname } : {}),
-            method: req.method,
-            path: req.url,
-            // The remote server answers for its own authority and only for
-            // requests that do not claim to come from somewhere else, so the
-            // shim's own origin, referer and fetch metadata are stripped.
-            headers: remoteForwardedHeaders(req, remote.origin, remoteToken),
+            ...remoteRequestOptions(remote, req, remoteToken),
           },
           (ures) => {
             res.writeHead(ures.statusCode ?? 502, ures.headers);

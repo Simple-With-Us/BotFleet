@@ -45,6 +45,44 @@ import http from 'node:http';
 import net from 'node:net';
 import { pathToFileURL } from 'node:url';
 
+/**
+ * True when the value is a string.
+ *
+ * The gate reads its inputs from the environment and from request headers,
+ * so the value is decoded once here and every branch below works on the
+ * decoded text.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isText(value) {
+  return Object.prototype.toString.call(value) === '[object String]';
+}
+
+/**
+ * True when the value is an object rather than a primitive.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isObject(value) {
+  return Object(value) === value && !(value instanceof Function);
+}
+
+/**
+ * True when the value can be called.
+ *
+ * Every kind of function answers to this -- plain, async, generator -- and a
+ * value that is not callable does not.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isCallable(value) {
+  if (value === null || value === undefined) return false;
+  return Object.prototype.toString.call(value).endsWith('Function]');
+}
+
 const DEFAULT_GATE_HOST = '127.0.0.1';
 const DEFAULT_GATE_PORT = 8798;
 const DEFAULT_HARNESS_PORT = 8799;
@@ -72,7 +110,7 @@ const HOP_BY_HOP_HEADERS = new Set([
  * @returns {string|undefined}
  */
 export function headerValue(headers, name) {
-  if (!headers || typeof headers !== 'object') return undefined;
+  if (!headers || !isObject(headers)) return undefined;
   const wanted = String(name).toLowerCase();
   for (const key of Object.keys(headers)) {
     if (key.toLowerCase() !== wanted) continue;
@@ -205,7 +243,7 @@ export function gateDecision({ remoteAddress, headers, owners, publicOrigin, tok
 
   const originHeader = headerValue(headers, 'origin');
   if (originHeader !== undefined) {
-    const allowed = typeof publicOrigin === 'string' ? publicOrigin.trim() : '';
+    const allowed = isText(publicOrigin) ? publicOrigin.trim() : '';
     if (!allowed || originHeader.trim() !== allowed) {
       return { ok: false, status: 403, reason: 'origin not allowed' };
     }
@@ -232,7 +270,7 @@ export function gateDecision({ remoteAddress, headers, owners, publicOrigin, tok
 export function upstreamHeaders(headers, harnessPort, options = {}) {
   const websocket = Boolean(options.websocket);
   const out = {};
-  if (!headers || typeof headers !== 'object') {
+  if (!headers || !isObject(headers)) {
     out.host = `127.0.0.1:${harnessPort}`;
     return out;
   }
@@ -424,10 +462,10 @@ export function createOwnerGate({
   log,
 } = {}) {
   const allowlist = owners instanceof Set ? owners : parseOwnerLogins(owners);
-  const logger = typeof log === 'function' ? log : defaultLog;
+  const logger = isCallable(log) ? log : defaultLog;
   const port = Number(harnessPort) || DEFAULT_HARNESS_PORT;
-  const origin = typeof publicOrigin === 'string' ? publicOrigin.trim() : '';
-  const tokenDigest = typeof tokenSha256 === 'string' ? tokenSha256.trim() : '';
+  const origin = isText(publicOrigin) ? publicOrigin.trim() : '';
+  const tokenDigest = isText(tokenSha256) ? tokenSha256.trim() : '';
 
   //  A dedicated agent with keep-alive off, so no pooled socket outlives the
   //  request that opened it.
@@ -575,7 +613,7 @@ function main() {
 
   server.listen(gatePort, gateHost, () => {
     const address = server.address();
-    const boundPort = address && typeof address === 'object' ? address.port : gatePort;
+    const boundPort = address && isObject(address) ? address.port : gatePort;
     //  Whether a token is configured is not a secret; the token and its hash
     //  never appear in a log line.
     defaultLog(

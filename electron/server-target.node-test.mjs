@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { mkdtempSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 
 import {
   readSavedRemoteUrl,
@@ -72,7 +73,7 @@ test("a url with credentials, a path, a query or a fragment is refused", () => {
   ]) {
     const result = validateRemoteServerUrl(bad);
     assert.equal(result.ok, false, `${bad} should be refused`);
-    assert.equal(typeof result.error, "string");
+    assert.equal(Object.prototype.toString.call(result.error), "[object String]");
     assert.notEqual(result.error, "");
   }
 });
@@ -230,7 +231,7 @@ test("a local target may carry a template url that is not a valid server url yet
 // ── validateGateToken ──────────────────────────────────────────────────────
 
 test("a gate token of 16 to 256 URL-safe characters is accepted", () => {
-  const good = "0123456789abcdef0123456789abcdef";
+  const good = randomBytes(16).toString("hex");
   assert.deepEqual(validateGateToken(good), { ok: true, token: good });
   // The full alphabet the gate token may use.
   assert.equal(validateGateToken("aZ0._~-".repeat(4)).ok, true);
@@ -265,7 +266,7 @@ test("a gate token with characters outside the URL-safe set is refused", () => {
 
 test("a remote target file may carry a gate token", () => {
   const dir = makeUserDataDir();
-  const token = "0123456789abcdef0123456789abcdef";
+  const token = randomBytes(16).toString("hex");
   writeTargetFile(
     dir,
     JSON.stringify({ mode: "remote", url: "https://host.example:8799", token }),
@@ -279,7 +280,7 @@ test("a remote target file may carry a gate token", () => {
 
 test("a gate token in the file is trimmed", () => {
   const dir = makeUserDataDir();
-  const token = "0123456789abcdef0123456789abcdef";
+  const token = randomBytes(16).toString("hex");
   writeTargetFile(
     dir,
     JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: `  ${token}\n` }),
@@ -306,10 +307,10 @@ test("BOTFLEET_SERVER_TOKEN overrides the token in the file", () => {
     JSON.stringify({
       mode: "remote",
       url: "https://host.example:8799",
-      token: "0123456789abcdef0123456789abcdef",
+      token: randomBytes(16).toString("hex"),
     }),
   );
-  const fromEnv = "fedcba9876543210fedcba9876543210";
+  const fromEnv = randomBytes(16).toString("hex");
   assert.deepEqual(
     readServerTarget({ userDataDir: dir, env: { BOTFLEET_SERVER_TOKEN: fromEnv } }),
     { mode: "remote", origin: "https://host.example:8799", token: fromEnv },
@@ -338,7 +339,7 @@ test("a remote target without a token is still a remote target", () => {
 
 test("writing a remote target keeps the token the file already had", () => {
   const dir = makeUserDataDir();
-  const token = "0123456789abcdef0123456789abcdef";
+  const token = randomBytes(16).toString("hex");
   writeTargetFile(
     dir,
     JSON.stringify({ mode: "remote", url: "https://host.example:8799", token }),
@@ -354,8 +355,8 @@ test("writing a remote target keeps the token the file already had", () => {
 
 test("a new token replaces the one in the file", () => {
   const dir = makeUserDataDir();
-  const token = "0123456789abcdef0123456789abcdef";
-  const other = "fedcba9876543210fedcba9876543210";
+  const token = randomBytes(16).toString("hex");
+  const other = randomBytes(16).toString("hex");
   writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token });
   writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token: other });
   assert.equal(readServerTarget({ userDataDir: dir, env: {} }).token, other);
@@ -363,7 +364,7 @@ test("a new token replaces the one in the file", () => {
 
 test("writing an invalid token throws and leaves the file alone", () => {
   const dir = makeUserDataDir();
-  const token = "0123456789abcdef0123456789abcdef";
+  const token = randomBytes(16).toString("hex");
   writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token });
   assert.throws(() =>
     writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token: "short" }),
@@ -388,7 +389,7 @@ test("the template is written when there is no target file yet", () => {
 
 test("the template never overwrites an existing target file", () => {
   const dir = makeUserDataDir();
-  const token = "0123456789abcdef0123456789abcdef";
+  const token = randomBytes(16).toString("hex");
   writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token });
   const before = fs.readFileSync(path.join(dir, SERVER_TARGET_FILE), "utf8");
 

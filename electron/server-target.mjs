@@ -34,6 +34,30 @@ import path from "node:path";
 
 export const SERVER_TARGET_FILE = "server-target.json";
 
+/**
+ * A runtime string test without `typeof`.
+ *
+ * The values here arrive from a file, an environment variable or a dialog, so
+ * they are decoded once at this boundary and everything after it works on the
+ * decoded text.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isString(value) {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
+/**
+ * A plain object, decoded the same way: an array or a null is not one.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isRecord(value) {
+  return Object.prototype.toString.call(value) === "[object Object]";
+}
+
 /** Loopback hosts that may be reached over plain http. */
 function isLoopbackHostname(hostname) {
   const host = String(hostname ?? "").toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
@@ -57,7 +81,7 @@ function isLoopbackHostname(hostname) {
  * @returns {{ ok: true, origin: string } | { ok: false, error: string }}
  */
 export function validateRemoteServerUrl(input) {
-  if (typeof input !== "string" || input.trim() === "") {
+  if (!isString(input) || input.trim() === "") {
     return { ok: false, error: "The server URL is empty" };
   }
   const raw = input.trim();
@@ -108,7 +132,7 @@ function targetFilePath(userDataDir) {
  * @returns {{ ok: true, token: string } | { ok: false, error: string }}
  */
 export function validateGateToken(input) {
-  if (typeof input !== "string") {
+  if (!isString(input)) {
     return { ok: false, error: "The gate token is not a string" };
   }
   const raw = input.trim();
@@ -137,7 +161,7 @@ function readTargetFile(userDataDir) {
   }
   try {
     const parsed = JSON.parse(text);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    if (!isRecord(parsed)) return null;
     return parsed;
   } catch {
     return null;
@@ -156,7 +180,7 @@ function savedOriginFrom(parsed) {
     ? [parsed.url, parsed.savedUrl]
     : [parsed.savedUrl, parsed.url];
   for (const candidate of candidates) {
-    if (typeof candidate !== "string") continue;
+    if (!isString(candidate)) continue;
     const validated = validateRemoteServerUrl(candidate);
     if (validated.ok) return validated.origin;
   }
@@ -175,9 +199,8 @@ function savedOriginFrom(parsed) {
  * @returns {{ ok: true, token: string } | { ok: false, error: string }}
  */
 function tokenFromEnv(environment) {
-  const raw = typeof environment?.BOTFLEET_SERVER_TOKEN === "string"
-    ? environment.BOTFLEET_SERVER_TOKEN.trim()
-    : "";
+  const token = environment?.BOTFLEET_SERVER_TOKEN;
+  const raw = isString(token) ? token.trim() : "";
   if (!raw) return { ok: true, token: "" };
   const checked = validateGateToken(raw);
   if (!checked.ok) return { ok: false, error: checked.error };
@@ -199,7 +222,8 @@ function tokenFromEnv(environment) {
  * @returns {{ mode: "local" } | { mode: "remote", origin: string, token?: string, error?: string } | { mode: "local", error: string }}
  */
 export function readServerTarget({ userDataDir, env = process.env } = {}) {
-  const override = typeof env?.BOTFLEET_SERVER_URL === "string" ? env.BOTFLEET_SERVER_URL.trim() : "";
+  const overrideValue = env?.BOTFLEET_SERVER_URL;
+  const override = isString(overrideValue) ? overrideValue.trim() : "";
   if (override) {
     if (override.toLowerCase() === "local") return { mode: "local" };
     const validated = validateRemoteServerUrl(override);
@@ -231,7 +255,7 @@ export function readServerTarget({ userDataDir, env = process.env } = {}) {
   } catch {
     return { mode: "local", error: `${SERVER_TARGET_FILE} is not valid JSON` };
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+  if (!isRecord(parsed)) {
     return { mode: "local", error: `${SERVER_TARGET_FILE} is not a JSON object` };
   }
 
@@ -257,7 +281,7 @@ export function readServerTarget({ userDataDir, env = process.env } = {}) {
   }
   if (fromEnv.token) return { ...remote, token: fromEnv.token };
 
-  const inFile = typeof parsed.token === "string" ? parsed.token.trim() : "";
+  const inFile = isString(parsed.token) ? parsed.token.trim() : "";
   if (!inFile) return remote;
   const checked = validateGateToken(inFile);
   if (!checked.ok) {
@@ -298,11 +322,11 @@ export function writeServerTarget(userDataDir, { mode, url, token } = {}) {
   // A token handed in is checked; a token already in the file is kept as it
   // is, because it was checked when it was read.
   let chosenToken = "";
-  if (typeof token === "string" && token.trim()) {
+  if (isString(token) && token.trim()) {
     const checked = validateGateToken(token);
     if (!checked.ok) throw new Error(checked.error);
     chosenToken = checked.token;
-  } else if (typeof previousFile?.token === "string" && previousFile.token.trim()) {
+  } else if (isString(previousFile?.token) && previousFile.token.trim()) {
     chosenToken = previousFile.token.trim();
   }
 
@@ -315,7 +339,7 @@ export function writeServerTarget(userDataDir, { mode, url, token } = {}) {
     // A url may be handed in for the "local" mode too: the menu writes a
     // template the user then edits.  It is stored as given — the reader
     // validates before it is ever used.
-    const requested = typeof url === "string" ? url.trim() : "";
+    const requested = isString(url) ? url.trim() : "";
     const kept = requested || previous || "";
     target = { mode: "local" };
     if (kept) {

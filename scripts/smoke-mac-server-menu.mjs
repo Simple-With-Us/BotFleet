@@ -1,0 +1,210 @@
+#!/usr/bin/env node
+// Packaged-app smoke for the Server menu.
+//
+// The Server menu is the only way an owner points the desktop app at another
+// BotFleet server, and it cannot be reached by a unit test: it needs a
+// packaged app, a real application menu and a real window.  This script
+// launches the packaged app with a throwaway HOME, drives the menu handlers
+// through the app's own smoke hook, and asserts what came back.
+//
+// What it proves:
+//   - the app starts in remote mode and points at the configured server;
+//   - a server that cannot be reached answers with a clean 502 JSON, so a
+//     wrong address is a message and not a crash;
+//   - the Server menu offers "This Mac" and "Set Remote Server…";
+//   - the target file is written, and switching to a remote server and back
+//     to this Mac leaves it in the state the menu claims.
+//
+// What it never does: it never contacts a real server.  The remote address is
+// under the reserved .invalid TLD, so nothing can resolve it.
+//
+// Usage: node scripts/smoke-mac-server-menu.mjs <path to BotFleet.app>
+
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir, userInfo } from "node:os";
+import { join } from "node:path";
+
+const REMOTE_URL = "https://botfleet-smoke.invalid:8799";
+const SMOKE_TIMEOUT_MS = 120_000;
+const EXPECTED_REMOTE_LABEL = `Remote: ${REMOTE_URL}`;
+
+const appPath = process.argv[2];
+if (!appPath) {
+  console.error("usage: node scripts/smoke-mac-server-menu.mjs <path to BotFleet.app>");
+  process.exit(2);
+}
+
+const executable = join(appPath, "Contents", "MacOS", "BotFleet");
+if (!existsSync(executable)) {
+  console.error(`no executable at ${executable}`);
+  process.exit(1);
+}
+
+// A throwaway HOME: the app writes its user-data (and the target file) there,
+// so a run never touches the real one.
+const home = mkdtempSync(join(tmpdir(), "bf-server-menu-smoke-"));
+const runnerTemp = process.env.RUNNER_TEMP;
+const logPath = runnerTemp ? join(runnerTemp, "server-menu-smoke.log") : null;
+
+let output = "";
+let report = null;
+
+const child = spawn(executable, [], {
+  cwd: home,
+  detached: true,
+  env: {
+    ...process.env,
+    HOME: home,
+    // The smoke hook itself.
+    OMB_SMOKE_SERVER_MENU: "1",
+    // The server this launch talks to: unreachable on purpose.
+    BOTFLEET_SERVER_URL: REMOTE_URL,
+    // The server the menu should switch to.
+    OMB_SMOKE_SERVER_URL: REMOTE_URL,
+    // No signing identity is needed for an unsigned local build.
+    CSC_IDENTITY_AUTO_DISCOVERY: "false",
+  },
+  stdio: ["ignore", "pipe", "pipe"],
+});
+
+for (const stream of [child.stdout, child.stderr]) {
+  stream.setEncoding("utf8");
+  stream.on("data", (chunk) => {
+    output += chunk;
+    const match = output.match(/\[smoke\] server-menu (\{.*\})\r?\n/);
+    if (match && !report) report = JSON.parse(match[1]);
+  });
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const running = () => child.exitCode === null && child.signalCode === null;
+
+// The whole process group goes down together: the app spawns children.
+async function stopProcess() {
+  if (!running()) return;
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {}
+  const deadline = Date.now() + 5_000;
+  while (running() && Date.now() < deadline) await delay(50);
+  if (running()) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {}
+  }
+}
+
+const deadline = Date.now() + SMOKE_TIMEOUT_MS;
+while (!report && Date.now() < deadline) {
+  if (!running()) break;
+  await delay(100);
+}
+
+const exitedEarly = !running();
+await stopProcess();
+
+if (logPath) {
+  try {
+    mkdirSync(runnerTemp, { recursive: true });
+    writeFileSync(logPath, output);
+  } catch {
+    /* the log is a convenience, never the assertion */
+  }
+}
+
+const failures = [];
+const check = (condition, message) => {
+  if (!condition) failures.push(message);
+};
+
+if (!report) {
+  failures.push(
+    exitedEarly
+      ? `the app exited (code ${child.exitCode ?? child.signalCode}) before printing the smoke line`
+      : `the app printed no "[smoke] server-menu" line within ${SMOKE_TIMEOUT_MS / 1000}s`,
+  );
+} else {
+  check(report.serverMode === "remote", `serverMode must be "remote", got ${JSON.stringify(report.serverMode)}`);
+  check(
+    report.health?.status === 502 || report.health?.status === 503,
+    `the unreachable server must answer 502 or 503, got ${JSON.stringify(report.health)}`,
+  );
+  check(report.health?.json === true, `the health body must be JSON, got ${JSON.stringify(report.health)}`);
+  check(report.error === null || report.error === undefined, `the smoke reported an error: ${report.error}`);
+
+  const labels = report.serverMenu?.labels ?? [];
+  check(labels.includes("This Mac"), `the Server menu must offer "This Mac", got ${JSON.stringify(labels)}`);
+  check(
+    labels.includes("Set Remote Server…"),
+    `the Server menu must offer "Set Remote Server…", got ${JSON.stringify(labels)}`,
+  );
+
+  check(
+    report.targetFile?.exists === true,
+    "the target file must exist after \"Set Remote Server…\" was clicked",
+  );
+
+  const remoteLabels = report.remote?.labels ?? [];
+  check(
+    remoteLabels.includes(EXPECTED_REMOTE_LABEL),
+    `the Server menu must list "${EXPECTED_REMOTE_LABEL}", got ${JSON.stringify(remoteLabels)}`,
+  );
+  check(report.remote?.mode === "remote", `the target file must say "remote", got ${JSON.stringify(report.remote?.mode)}`);
+
+  const localLabels = report.local?.labels ?? [];
+  check(report.local?.mode === "local", `the target file must say "local", got ${JSON.stringify(report.local?.mode)}`);
+  check(
+    localLabels.includes(EXPECTED_REMOTE_LABEL),
+    `the Server menu must still list "${EXPECTED_REMOTE_LABEL}" after switching back, got ${JSON.stringify(localLabels)}`,
+  );
+
+  // The target file on disk, where Electron put the user-data directory.
+  // macOS resolves the home directory from the password database, not from
+  // $HOME, so the file may land in either place; the app's own report above
+  // is what proves it was written, and this checks what it says.
+  const roots = [join(home, "Library", "Application Support"), join(userInfo().homedir, "Library", "Application Support")];
+  const found = roots.flatMap((root) =>
+    existsSync(root)
+      ? readdirSync(root).flatMap((name) => {
+          const candidate = join(root, name, "server-target.json");
+          return existsSync(candidate) ? [candidate] : [];
+        })
+      : [],
+  );
+  for (const file of found) {
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    check(parsed.mode === "local", `the target file must end in "local", got ${JSON.stringify(parsed.mode)}`);
+    check(!parsed.token, "the target file must not carry a token");
+  }
+}
+
+// The app must not have crashed.  It printed the line and was still running
+// when the smoke killed it, or it quit by itself with a clean exit code; a
+// nonzero exit on its own is a crash.
+if (exitedEarly) {
+  check(
+    child.exitCode === 0,
+    `the app exited with code ${child.exitCode ?? child.signalCode} before the smoke finished`,
+  );
+}
+
+try {
+  rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+} catch {
+  /* the OS will reap it; the assertions above are what matter */
+}
+
+if (failures.length > 0) {
+  console.error("FAIL: the packaged Server menu smoke did not pass:");
+  for (const failure of failures) console.error(`  - ${failure}`);
+  console.error("--- app output ---");
+  console.error(output);
+  process.exit(1);
+}
+
+console.log(
+  `PASS: server mode ${report.serverMode}, health ${report.health.status} JSON, ` +
+    `menu [${report.serverMenu.labels.join(", ")}], ` +
+    `remote mode ${report.remote.mode}, back to ${report.local.mode}.`,
+);

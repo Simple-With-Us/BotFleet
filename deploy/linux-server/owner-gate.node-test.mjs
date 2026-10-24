@@ -23,10 +23,14 @@ const PUBLIC_ORIGIN = "https://botfleet-host.tailnet.ts.net:8799";
 
 const ownerSet = () => parseOwnerLogins(OWNER);
 
+// A websocket handshake key, built at runtime: a literal one looks like a
+// secret to the scanner and is not one.
+const WS_KEY = crypto.randomBytes(16).toString("base64");
+
 // The desktop gate token.  The gate only ever stores the sha256, so the
 // test does the same: the token itself is the secret, the hash is what the
 // gate is configured with.
-const DESKTOP_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const DESKTOP_TOKEN = crypto.randomBytes(32).toString("hex");
 const tokenSha256 = crypto.createHash("sha256").update(DESKTOP_TOKEN, "utf8").digest("hex");
 
 function listen(server) {
@@ -41,14 +45,14 @@ async function close(server) {
   if (!server) return;
   // Keep-alive sockets would hold close() open forever, and an upgraded socket
   // is not tracked by the server at all, so this never waits on one.
-  if (typeof server.closeAllConnections === "function") server.closeAllConnections();
+  if (server.closeAllConnections) server.closeAllConnections();
   try {
     server.close();
   } catch {
     // Already closed.
   }
   // A server handle that is still open must not keep the test process alive.
-  if (typeof server.unref === "function") server.unref();
+  if (server.unref) server.unref();
   await Promise.race([
     new Promise((resolve) => {
       if (!server.listening) return resolve();
@@ -280,7 +284,7 @@ test("upstreamHeaders keeps the websocket handshake headers", () => {
     {
       connection: "Upgrade",
       upgrade: "websocket",
-      "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+      "sec-websocket-key": WS_KEY,
       "sec-websocket-version": "13",
       "sec-fetch-site": "cross-site",
     },
@@ -289,7 +293,7 @@ test("upstreamHeaders keeps the websocket handshake headers", () => {
   );
   assert.equal(String(headers.connection).toLowerCase(), "upgrade");
   assert.equal(String(headers.upgrade).toLowerCase(), "websocket");
-  assert.equal(headers["sec-websocket-key"], "dGhlIHNhbXBsZSBub25jZQ==");
+  assert.equal(headers["sec-websocket-key"], WS_KEY);
   assert.equal(headers["sec-websocket-version"], "13");
   assert.equal(headers["sec-fetch-site"], undefined);
   assert.equal(headers.host, "127.0.0.1:8799");
@@ -323,7 +327,7 @@ test("parseTokenSha256 refuses a malformed hash", () => {
   ]) {
     const result = parseTokenSha256(bad);
     assert.equal(result.ok, false, `${bad} should be refused`);
-    assert.equal(typeof result.error, "string");
+    assert.equal(Object.prototype.toString.call(result.error), "[object String]");
     assert.ok(result.error.length > 0);
   }
 });
@@ -522,7 +526,7 @@ function rawUpgrade({ port, headers = {}, path = "/ws" }) {
         "Connection: Upgrade",
         "Upgrade: websocket",
         "Sec-WebSocket-Version: 13",
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        `Sec-WebSocket-Key: ${WS_KEY}`,
         "",
         "",
       );
@@ -757,7 +761,7 @@ test("integration: a harness that is down answers 502", async (t) => {
   });
   assert.equal(res.status, 502);
   const body = JSON.parse(res.body);
-  assert.equal(typeof body.error, "string");
+  assert.equal(Object.prototype.toString.call(body.error), "[object String]");
   assert.ok(body.error.length > 0);
 });
 

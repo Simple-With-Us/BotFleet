@@ -1239,6 +1239,177 @@ async function startRemoteServer(remoteOrigin, remoteToken = "") {
   }
 }
 
+// The packaged Server-menu smoke.  It is active only in a packaged app that
+// was launched with OMB_SMOKE_SERVER_MENU=1, and it drives the real menu
+// handlers with nobody in front of the screen: the dialogs, the file opener
+// and the relaunch are skipped and logged instead.
+function serverMenuSmokeEnabled() {
+  return app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU === "1";
+}
+
+// The "Server" menu item, wherever the platform put it: on macOS it lives in
+// the app-name menu, everywhere else under File.
+function findServerMenuItem() {
+  const menu = Menu.getApplicationMenu();
+  if (!menu) return null;
+  for (const top of menu.items) {
+    if (top.label === "Server") return top;
+    for (const item of top.submenu?.items ?? []) {
+      if (item.label === "Server") return item;
+    }
+  }
+  return null;
+}
+
+// The labels of the Server submenu, with the separators dropped.
+function serverMenuLabels() {
+  const item = findServerMenuItem();
+  return (item?.submenu?.items ?? [])
+    .map((entry) => entry.label ?? "")
+    .filter((label) => label !== "");
+}
+
+// The mode the target file names, or "" when there is no readable file.
+function serverTargetFileMode() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(app.getPath("userData"), SERVER_TARGET_FILE), "utf8"));
+    return parsed?.mode ?? "";
+  } catch {
+    return "";
+  }
+}
+
+// The target file's parsed keys, never its values: a key name is harmless,
+// a token is not.
+function serverTargetFileKeys() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(app.getPath("userData"), SERVER_TARGET_FILE), "utf8"));
+    return Object.keys(parsed);
+  } catch {
+    return [];
+  }
+}
+
+// Drive the Server menu the way an owner would and report what happened.
+// The report never carries a token: only the mode, the labels and the key
+// names of the target file.
+async function runServerMenuSmoke() {
+  const report = {
+    serverMode,
+    harness: harnessLabel(),
+    rendererBaseUrl: rendererBaseUrl(),
+    health: { status: 0, json: false },
+    serverMenu: { labels: [] },
+    targetFile: { exists: false, keys: [] },
+    remote: { labels: [], mode: "" },
+    local: { labels: [], mode: "" },
+    error: null,
+  };
+  try {
+    // The health of the server this app talks to.  A remote that cannot be
+    // reached must answer with a clean error, not a hang and not a crash.
+    try {
+      const response = await fetch(`${rendererBaseUrl()}/api/health`, {
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body = await response.text();
+      try {
+        JSON.parse(body);
+        report.health = { status: response.status, json: true };
+      } catch {
+        report.health = { status: response.status, json: false };
+      }
+    } catch (error) {
+      report.health = { status: 0, json: false, error: String(error?.message ?? error) };
+    }
+
+    report.serverMenu = { labels: serverMenuLabels() };
+
+    // The "Set Remote Server…" item opens the target file for the owner to
+    // edit.  In the smoke it writes the file and stops there.
+    const setRemote = (findServerMenuItem()?.submenu?.items ?? []).find(
+      (entry) => entry.label === "Set Remote Server\u2026",
+    );
+    setRemote?.click?.();
+    const targetFile = path.join(app.getPath("userData"), SERVER_TARGET_FILE);
+    report.targetFile = { exists: fs.existsSync(targetFile), keys: serverTargetFileKeys() };
+
+    // The radio items: point the app at a remote server, then back at this
+    // Mac, and report the menu each time.
+    await chooseServerTarget({ mode: "remote", url: process.env.OMB_SMOKE_SERVER_URL });
+    report.remote = { labels: serverMenuLabels(), mode: serverTargetFileMode() };
+
+    await chooseServerTarget({ mode: "local" });
+    report.local = { labels: serverMenuLabels(), mode: serverTargetFileMode() };
+  } catch (error) {
+    report.error = String(error?.message ?? error);
+  }
+  console.log(`[smoke] server-menu ${JSON.stringify(report)}`);
+  app.quit();
+}
+
+// Point the app at a server and offer to restart into it.  The server the
+// app talks to cannot change under a running window: the renderer origin,
+// the trust checks and the event stream are all built on it.
+async function chooseServerTarget(target) {
+  try {
+    writeServerTarget(app.getPath("userData"), target);
+  } catch (error) {
+    if (serverMenuSmokeEnabled()) {
+      slog(`could not save the server target: ${error?.message ?? error}`);
+      return;
+    }
+    dialog.showErrorBox(
+      "Could Not Save The Server",
+      `BotFleet could not save the server it should use.\u00a0 ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return;
+  }
+  setupApplicationMenu();
+  if (serverMenuSmokeEnabled()) {
+    slog(`smoke: server target set to ${target?.mode ?? "unknown"}`);
+    return;
+  }
+  const { response } = await dialog.showMessageBox({
+    type: "info",
+    buttons: ["Restart Now", "Later"],
+    defaultId: 0,
+    cancelId: 1,
+    message: "Restart BotFleet To Use The Other Server?",
+    detail: "BotFleet restarts before it talks to the other server.\u00a0 Your conversations and settings stay where they are.",
+  });
+  if (response !== 0) return;
+  app.relaunch();
+  app.quit();
+}
+
+// Open the target file for the owner to edit: the address of a server on
+// another machine is theirs to type, not ours to guess.
+function openServerTargetFile() {
+  const userDataDir = app.getPath("userData");
+  const file = path.join(userDataDir, SERVER_TARGET_FILE);
+  try {
+    // The template is written only when there is no file yet, and its url
+    // is empty on purpose: the address is the owner's to type.
+    writeServerTargetTemplate(userDataDir);
+  } catch (error) {
+    slog(`could not write the server target file: ${error?.message ?? error}`);
+  }
+  if (serverMenuSmokeEnabled()) {
+    slog(`smoke: would open the server target file at ${file}`);
+    return;
+  }
+  void shell.openPath(file);
+  void dialog.showMessageBox({
+    type: "info",
+    buttons: ["OK"],
+    message: "Edit The Server Target File",
+    detail:
+      `Set "url" to the server's address, paste the gate token from the server into "token", ` +
+      `set "mode" to "remote", then restart BotFleet.\u00a0 The file is ${file}`,
+  });
+}
+
 function syncManagedComposioCredentials() {
   if (!serverProc) return;
   try {
@@ -1721,6 +1892,21 @@ function createWindow() {
         if (process.env.OMB_SMOKE_KEEP_OPEN !== "1") win.close();
       }
     });
+  }
+
+  // The packaged Server-menu smoke: it drives the real Server menu handlers
+  // with nobody in front of the screen and prints one line of JSON.  It is
+  // active only in a packaged app launched with OMB_SMOKE_SERVER_MENU=1.
+  if (app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU === "1") {
+    let smokeStarted = false;
+    const startServerMenuSmoke = () => {
+      if (smokeStarted) return;
+      smokeStarted = true;
+      void runServerMenuSmoke();
+    };
+    win.webContents.once("did-finish-load", startServerMenuSmoke);
+    // A window that never finishes loading must not hang the smoke.
+    setTimeout(startServerMenuSmoke, 20_000);
   }
 
   if (app.isPackaged) {
@@ -2357,56 +2543,6 @@ function setupApplicationMenu() {
         click: () => openServerTargetFile(),
       },
     ];
-  };
-
-  // Point the app at a server and offer to restart into it.  The server the
-  // app talks to cannot change under a running window: the renderer origin,
-  // the trust checks and the event stream are all built on it.
-  const chooseServerTarget = async (target) => {
-    try {
-      writeServerTarget(app.getPath("userData"), target);
-    } catch (error) {
-      dialog.showErrorBox(
-        "Could Not Save The Server",
-        `BotFleet could not save the server it should use.\u00a0 ${error instanceof Error ? error.message : String(error)}`,
-      );
-      return;
-    }
-    setupApplicationMenu();
-    const { response } = await dialog.showMessageBox({
-      type: "info",
-      buttons: ["Restart Now", "Later"],
-      defaultId: 0,
-      cancelId: 1,
-      message: "Restart BotFleet To Use The Other Server?",
-      detail: "BotFleet restarts before it talks to the other server.\u00a0 Your conversations and settings stay where they are.",
-    });
-    if (response !== 0) return;
-    app.relaunch();
-    app.quit();
-  };
-
-  // Open the target file for the owner to edit: the address of a server on
-  // another machine is theirs to type, not ours to guess.
-  const openServerTargetFile = () => {
-    const userDataDir = app.getPath("userData");
-    const file = path.join(userDataDir, SERVER_TARGET_FILE);
-    try {
-      // The template is written only when there is no file yet, and its url
-      // is empty on purpose: the address is the owner's to type.
-      writeServerTargetTemplate(userDataDir);
-    } catch (error) {
-      slog(`could not write the server target file: ${error?.message ?? error}`);
-    }
-    void shell.openPath(file);
-    void dialog.showMessageBox({
-      type: "info",
-      buttons: ["OK"],
-      message: "Edit The Server Target File",
-      detail:
-        `Set "url" to the server's address, paste the gate token from the server into "token", ` +
-        `set "mode" to "remote", then restart BotFleet.\u00a0 The file is ${file}`,
-    });
   };
 
   const template = [
