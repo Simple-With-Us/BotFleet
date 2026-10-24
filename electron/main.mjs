@@ -53,13 +53,7 @@ import { pollServerIdentity, probeHarness, resolvePackagedServer } from "./serve
 import { readPackagedBuildIdentity } from "./runtime-identity.mjs";
 import { readHarnessOwner } from "./harness-ownership.mjs";
 import { startUiShim } from "./attached-ui-shim.mjs";
-import {
-  readSavedRemoteUrl,
-  readServerTarget,
-  writeServerTarget,
-  writeServerTargetTemplate,
-  SERVER_TARGET_FILE,
-} from "./server-target.mjs";
+import { resolveServerTarget } from "./server-target.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
@@ -379,9 +373,9 @@ let serverReady = true;
 // against the same data dir. An attached harness is never killed on quit.
 let serverMode = "spawned";
 // Which BotFleet server this launch talks to: the harness on this Mac
-// ("local") or a remote server the owner pointed the app at ("remote").
-// Read once at boot from the user-data target file; see server-target.mjs.
-let serverTarget = { mode: "local" };
+// ("local") or a remote server Infisical points the app at ("remote").
+// Read once at boot from Infisical; see server-target.mjs.
+let serverTarget = { mode: "local", source: "", legacyFile: false };
 // Why the remote server could not be used (an invalid gate token, say).  The
 // error page shows it instead of the generic "could not reach it" line.
 let serverRemoteError = null;
@@ -1241,15 +1235,17 @@ async function startServerPackaged() {
   return false;
 }
 
-// Which server this launch should use.  A broken preference is not a broken
-// app: an unreadable target file falls back to the server on this Mac and
-// says why in the log.
-function readDesktopServerTarget() {
-  try {
-    return readServerTarget({ userDataDir: app.getPath("userData") });
-  } catch (error) {
-    return { mode: "local", error: `Could not read the server target: ${error?.message ?? error}` };
-  }
+// Which server this launch should use.  Infisical is the sole source of
+// truth, so this is a vault read and nothing else: no file, no environment
+// variable, no fallback.  An unreadable vault is an error the owner has to
+// see, not a reason to talk to a different server.
+function serverTargetFailure(error) {
+  return {
+    mode: "error",
+    source: "infisical",
+    legacyFile: false,
+    message: `BotFleet could not read its server settings from Infisical: ${error?.message ?? error}`,
+  };
 }
 
 // A remote server replaces the local harness entirely: no child is forked and
@@ -1278,6 +1274,7 @@ async function startRemoteServer(remoteOrigin, remoteToken = "") {
     return true;
   } catch (error) {
     slog(`could not serve the bundled UI for the remote server at ${remoteOrigin}: ${error?.message ?? error}`);
+    serverRemoteError = String(error?.message ?? error);
     serverStartConflictOnly = false;
     return false;
   }
@@ -1313,44 +1310,39 @@ function serverMenuLabels() {
     .filter((label) => label !== "");
 }
 
-// The mode the target file names, or "" when there is no readable file.
-function serverTargetFileMode() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(app.getPath("userData"), SERVER_TARGET_FILE), "utf8"));
-    return parsed?.mode ?? "";
-  } catch {
-    return "";
-  }
-}
-
-// The target file's parsed keys, never its values: a key name is harmless,
-// a token is not.
-function serverTargetFileKeys() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(app.getPath("userData"), SERVER_TARGET_FILE), "utf8"));
-    return Object.keys(parsed);
-  } catch {
-    return [];
-  }
-}
-
-// Drive the Server menu the way an owner would and report what happened.
-// The report never carries a token: only the mode, the labels and the key
-// names of the target file.
-async function runServerMenuSmoke() {
-  const report = {
-    serverMode,
+// The report the packaged Server-menu smoke prints.  It never carries a
+// token: only the mode, where the target came from, the menu labels and the
+// error.
+function serverMenuSmokeReport() {
+  return {
+    serverMode: serverTarget?.mode ?? "local",
+    source: serverTarget?.source ?? "",
+    legacyFile: serverTarget?.legacyFile === true,
     harness: harnessLabel(),
     rendererBaseUrl: rendererBaseUrl(),
     health: { status: 0, json: false },
     serverMenu: { labels: [] },
-    targetFile: { exists: false, keys: [] },
-    remote: { labels: [], mode: "" },
-    local: { labels: [], mode: "" },
+    reload: { labels: [], mode: "" },
     error: null,
   };
+}
+
+// The report goes out through the write callback, not through a bare
+// console.log: a pipe write is asynchronous on macOS, and quitting on the
+// next line would drop the queued line before the parent ever saw it.
+async function writeServerMenuSmokeReport(report) {
+  await new Promise((resolve) => {
+    process.stdout.write(`[smoke] server-menu ${JSON.stringify(report)}\n`, resolve);
+  });
+}
+
+// Drive the Server menu the way an owner would and report what happened.
+// The report never carries a token: only the mode, where the target came
+// from, the menu labels and the error.
+async function runServerMenuSmoke() {
+  const report = serverMenuSmokeReport();
   try {
-    // The health of the server this app talks to.  A remote that cannot be
+    // The health of the server this app talks to.  A server that cannot be
     // reached must answer with a clean error, not a hang and not a crash.
     try {
       const response = await fetch(`${rendererBaseUrl()}/api/health`, {
@@ -1369,51 +1361,55 @@ async function runServerMenuSmoke() {
 
     report.serverMenu = { labels: serverMenuLabels() };
 
-    // The "Set Remote Server…" item opens the target file for the owner to
-    // edit.  In the smoke it writes the file and stops there.
-    const setRemote = (findServerMenuItem()?.submenu?.items ?? []).find(
-      (entry) => entry.label === "Set Remote Server\u2026",
+    // "Reload from Infisical" reads the vault again.  On a runner with no
+    // enrollment the reload changes nothing, and the app has to survive that.
+    const reload = (findServerMenuItem()?.submenu?.items ?? []).find(
+      (entry) => entry.label === "Reload from Infisical",
     );
-    setRemote?.click?.();
-    const targetFile = path.join(app.getPath("userData"), SERVER_TARGET_FILE);
-    report.targetFile = { exists: fs.existsSync(targetFile), keys: serverTargetFileKeys() };
-
-    // The radio items: point the app at a remote server, then back at this
-    // Mac, and report the menu each time.
-    await chooseServerTarget({ mode: "remote", url: process.env.OMB_SMOKE_SERVER_URL });
-    report.remote = { labels: serverMenuLabels(), mode: serverTargetFileMode() };
-
-    await chooseServerTarget({ mode: "local" });
-    report.local = { labels: serverMenuLabels(), mode: serverTargetFileMode() };
+    await reload?.click?.();
+    report.reload = { labels: serverMenuLabels(), mode: serverTarget?.mode ?? "" };
   } catch (error) {
     report.error = String(error?.message ?? error);
   }
-  // The report goes out through the write callback, not through a bare
-  // console.log: a pipe write is asynchronous on macOS, and quitting on the
-  // next line would drop the queued line before the parent ever saw it.
-  await new Promise((resolve) => {
-    process.stdout.write(`[smoke] server-menu ${JSON.stringify(report)}\n`, resolve);
-  });
+  await writeServerMenuSmokeReport(report);
   app.quit();
+}
+
+// Read the server target from Infisical again.  A failed read changes
+// nothing: the app keeps talking to the server it is on, and the owner is
+// told why the reload did nothing.
+async function reloadServerTargetFromInfisical() {
+  let target;
+  try {
+    target = await resolveServerTarget({ userDataDir: app.getPath("userData") });
+  } catch (error) {
+    target = serverTargetFailure(error);
+  }
+  if (target.mode === "error") {
+    if (serverMenuSmokeEnabled()) {
+      slog(`smoke: the reload from Infisical failed: ${target.message}`);
+    } else {
+      dialog.showErrorBox("BotFleet cannot read its server settings from Infisical", target.message);
+    }
+    return target;
+  }
+  const changed =
+    target.mode !== serverTarget?.mode ||
+    (target.mode === "remote" && target.origin !== serverTarget?.origin);
+  serverTarget = target;
+  setupApplicationMenu();
+  if (!changed) {
+    slog("the server target from Infisical has not changed");
+    return target;
+  }
+  await offerRestartForServerTarget(target);
+  return target;
 }
 
 // Point the app at a server and offer to restart into it.  The server the
 // app talks to cannot change under a running window: the renderer origin,
 // the trust checks and the event stream are all built on it.
-async function chooseServerTarget(target) {
-  try {
-    writeServerTarget(app.getPath("userData"), target);
-  } catch (error) {
-    if (serverMenuSmokeEnabled()) {
-      slog(`could not save the server target: ${error?.message ?? error}`);
-      return;
-    }
-    dialog.showErrorBox(
-      "Could Not Save The Server",
-      `BotFleet could not save the server it should use.\u00a0 ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return;
-  }
+async function offerRestartForServerTarget(target) {
   setupApplicationMenu();
   if (serverMenuSmokeEnabled()) {
     slog(`smoke: server target set to ${target?.mode ?? "unknown"}`);
@@ -1430,39 +1426,6 @@ async function chooseServerTarget(target) {
   if (response !== 0) return;
   app.relaunch();
   app.quit();
-}
-
-// Open the target file for the owner to edit: the address of a server on
-// another machine is theirs to type, not ours to guess.
-function openServerTargetFile() {
-  const userDataDir = app.getPath("userData");
-  const file = path.join(userDataDir, SERVER_TARGET_FILE);
-  try {
-    // The template is written only when there is no file yet, and its url
-    // is empty on purpose: the address is the owner's to type.
-    writeServerTargetTemplate(userDataDir);
-  } catch (error) {
-    slog(`could not write the server target file: ${error?.message ?? error}`);
-  }
-  if (serverMenuSmokeEnabled()) {
-    slog(`smoke: would open the server target file at ${file}`);
-    return;
-  }
-  void shell.openPath(file).catch((error) => {
-    slog(`could not open the server target file: ${error instanceof Error ? error.message : String(error)}`);
-  });
-  void dialog
-    .showMessageBox({
-      type: "info",
-      buttons: ["OK"],
-      message: "Edit The Server Target File",
-      detail:
-        `Set "url" to the server's address, paste the gate token from the server into "token", ` +
-        `set "mode" to "remote", then restart BotFleet.\u00a0 The file is ${file}`,
-    })
-    .catch((error) => {
-      slog(`could not show the server target instructions: ${error instanceof Error ? error.message : String(error)}`);
-    });
 }
 
 function syncManagedComposioCredentials() {
@@ -2587,32 +2550,40 @@ function setupApplicationMenu() {
     }
   };
 
-  // Which BotFleet server this app talks to.  The radio shows where the app
-  // is pointed right now; "Set Remote Server…" opens the target file so the
-  // owner can type in the address of a server on another machine.
+  // Which BotFleet server this app talks to.  The target comes from
+  // Infisical, so the menu only shows where the app is pointed and offers to
+  // read the vault again.
   const serverSubmenu = () => {
-    const saved = readSavedRemoteUrl(app.getPath("userData"));
+    const mode = serverTarget?.mode ?? "local";
+    const origin = serverTarget?.origin ?? "";
+    const enrolled = serverTarget?.source !== "not-enrolled";
     return [
       {
         label: "This Mac",
         type: "radio",
-        checked: serverMode !== "remote",
-        click: () => chooseServerTarget({ mode: "local" }),
+        checked: mode !== "remote",
+        enabled: false,
       },
-      ...(saved
+      ...(mode === "remote" && origin
         ? [
             {
-              label: `Remote: ${saved}`,
+              label: `Remote: ${origin}`,
               type: "radio",
-              checked: serverMode === "remote",
-              click: () => chooseServerTarget({ mode: "remote", url: saved }),
+              checked: true,
+              enabled: false,
             },
           ]
         : []),
       { type: "separator" },
       {
-        label: "Set Remote Server…",
-        click: () => openServerTargetFile(),
+        label: enrolled
+          ? "From Infisical (BotFleet prod /botfleet-server)"
+          : "No Infisical read token in the Keychain",
+        enabled: false,
+      },
+      {
+        label: "Reload from Infisical",
+        click: () => reloadServerTargetFromInfisical(),
       },
     ];
   };
@@ -2981,31 +2952,29 @@ app.whenReady().then(async () => {
         })
       : Promise.resolve({ mode: "unavailable", reason: "unsupported-platform" });
   if (app.isPackaged) {
-    // The target file (or BOTFLEET_SERVER_URL) decides which BotFleet server
-    // this launch talks to: the one on this Mac, or a remote one.
-    const target = readDesktopServerTarget();
+    // Infisical decides which BotFleet server this launch talks to: the one
+    // on this Mac, or a remote one.  There is no file and no environment
+    // variable to fall back on.
+    const target = await resolveServerTarget({ userDataDir: app.getPath("userData") });
     serverTarget = target;
-    if (target.mode === "remote" && target.error && !target.tokenDropped) {
-      // The remote target is unusable.  Falling back to the server on this
-      // Mac would talk to a different server than the owner configured, so
-      // the remote error page says what is wrong instead.  A dropped gate
-      // token is not this case:  the token is optional (a tailnet-signed-in
-      // device reaches the server without one), and the reader has already
-      // left the bad token out, so the launch below goes on without it.
-      slog(`server target: ${target.error}`);
-      serverMode = "remote";
-      serverRemoteError = target.error;
-      serverStartConflictOnly = false;
-      serverReady = false;
-    } else {
-      if (target.error && target.tokenDropped) {
-        slog(`server target: ${target.error}; connecting to the remote server without a gate token`);
-      } else if (target.error) {
-        slog(`server target: ${target.error}; using the server on this Mac`);
-      }
-      if (target.mode === "remote") serverReady = await startRemoteServer(target.origin, target.token ?? "");
-      else serverReady = await startServerPackaged();
+    if (target.legacyFile) {
+      slog("server-target.json is no longer read; the server target and gate token come from Infisical (BotFleet prod /botfleet-server).\u00a0 Delete the file.");
     }
+    if (target.mode === "error") {
+      // The vault could not be read, or what it says is unusable.  Falling
+      // back to the server on this Mac would talk to a different server than
+      // the owner configured, so the launch stops with the reason instead.
+      slog(`server target: ${target.message}`);
+      if (serverMenuSmokeEnabled()) {
+        await writeServerMenuSmokeReport({ ...serverMenuSmokeReport(), error: target.message });
+      } else {
+        dialog.showErrorBox("BotFleet cannot read its server settings from Infisical", target.message);
+      }
+      app.quit();
+      return;
+    }
+    if (target.mode === "remote") serverReady = await startRemoteServer(target.origin, target.token ?? "");
+    else serverReady = await startServerPackaged();
     // The Server menu shows where the app is pointed, so it is built again
     // once the server it talks to is settled.
     setupApplicationMenu();

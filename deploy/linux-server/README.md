@@ -83,8 +83,8 @@ Either one opens the gate.  Both still have to pass the Origin and `sec-fetch-si
 ### Rotating The Token
 
 1. Change `BOTFLEET_SERVER_GATE_TOKEN` in Infisical (BotFleet, prod, `/botfleet-server`).
-2. Restart the gate: `sudo systemctl restart botfleet-owner-gate`.  The configuration is read once at start, so this is the step that makes the new value live.
-3. Copy the new value into the desktop app's server target file and restart the app.
+2. Restart the gate: `sudo systemctl restart botfleet-owner-gate`.  The configuration is read once at start, so this is the step that makes the new value live.
+3. Reload it on the Mac: **BotFleet menu > Server > Reload from Infisical**, and let the app restart into the new token.
 
 Rotating the token does not touch `BOTFLEET_OWNER_LOGINS`, so a phone signed in as the owner keeps working while the desktop app is updated.
 
@@ -132,21 +132,31 @@ The logins land under `BF_ROOT/home`, so they survive a restart and are visible 
 
 ## Connecting The Desktop App
 
-In the app: **BotFleet menu > Server > Set Remote Server…** opens the server target file.  Fill in three fields:
+The Mac app reads its server target from Infisical, from the **BotFleet** project, environment **`prod`**, path **`/botfleet-server`**:
 
-```json
-{
-  "mode": "remote",
-  "url": "https://<host>.<tailnet>.ts.net:8799",
-  "token": "<the value of BOTFLEET_SERVER_GATE_TOKEN in Infisical>"
-}
+| Infisical name | What the app does with it |
+|---|---|
+| `BOTFLEET_SERVER_MODE` | `local` or `remote`: which server this launch talks to. |
+| `BOTFLEET_SERVER_URL` | The server, when the mode is `remote`: the tailnet URL of the gate, `https://<host>.<tailnet>.ts.net:8799`. |
+| `BOTFLEET_SERVER_GATE_TOKEN` | The `x-botfleet-gate-token` the app presents to the gate: the same value the gate hashes. |
+
+Set `BOTFLEET_SERVER_MODE` to `remote`, fill in the other two, then pick **BotFleet menu > Server > Reload from Infisical**.  The app reads the vault again and offers to restart into the new server.
+
+There is no local copy and no environment variable to set: Infisical is the only source, so a value that is not in the vault is not a value the app has.
+
+### The One Local Item: the Keychain token
+
+Reading the vault needs a key, so the Mac keeps exactly one local item: a **read-only Infisical service token** (`st.…`), scoped to the BotFleet project, the `prod` environment and the `/botfleet-server` path.  It lives in the login Keychain as a generic password.  Add it with:
+
+```sh
+security add-generic-password -U -s "BotFleet Infisical read token" -a botfleet -w
 ```
 
-The `url` is the tailnet URL, the `token` is the value of `BOTFLEET_SERVER_GATE_TOKEN` in Infisical (BotFleet, prod, `/botfleet-server`), and the `mode` is `remote`.  Then restart BotFleet from the Server menu.
+The command prompts for the value, so the token never reaches argv or the shell history.  Without that item the app has no Infisical bootstrap at all: it runs against the server on this Mac, and the Server menu says "No Infisical read token in the Keychain".
 
-The Mac side of this lands in a following commit, which moves the same two settings into Infisical for the desktop app as well: `BOTFLEET_SERVER_MODE` (`local` or `remote`) and `BOTFLEET_SERVER_URL`.  The server target file stays as it is until then.
+The old `server-target.json` in the app's user-data directory is no longer read.  When it is still there the app says so once at launch and keeps going; delete it.
 
-The app reaches the gate, the gate checks the credential the app presented, and the request continues to the harness on loopback.  The token is never written to a log and never leaves this Mac.
+The app reaches the gate, the gate checks the credential the app presented, and the request continues to the harness on loopback.  The token is never written to a log and never leaves this Mac.
 
 ## Health Checks
 

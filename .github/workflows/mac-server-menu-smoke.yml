@@ -1,18 +1,19 @@
 # Mac Server Menu Smoke
 #
-# What this proves: the packaged Mac app really can be pointed at another
-# BotFleet server from its Server menu.  The menu lives in the Electron main
+# What this proves: the packaged Mac app really does read its server target
+# from Infisical and nowhere else.  The menu lives in the Electron main
 # process, so no unit test can reach it -- a packaged app, a real application
 # menu and a real window are needed.  This job packages the app unsigned
 # (exactly like Mac Package Gate does) and then drives the menu headlessly:
-# it checks that the app starts in remote mode, that an unreachable server
-# answers with a clean 502 JSON instead of a hang or a crash, that the Server
-# menu offers "This Mac" and "Set Remote Server…", and that switching to a
-# remote server and back writes the target file the menu claims.
+# it checks that a runner with no Infisical read token in its Keychain runs
+# against the server on this Mac, that the old server-target.json is ignored
+# rather than read, that the Server menu offers "This Mac", the Infisical
+# status line and "Reload from Infisical", and that reloading from Infisical
+# leaves a working app behind.
 #
-# What it never does: it never contacts a real server.  The remote address is
-# under the reserved .invalid TLD, so nothing can resolve it, and the app
-# runs with a throwaway HOME.
+# What it never does: it never contacts a real server, never reaches the
+# owner's Keychain and never touches the owner's user data -- the app runs
+# with a throwaway HOME.
 #
 # On required-ness: this is deliberately NOT a required check.  A path-filtered
 # required check is a trap -- when the filter skips the workflow the check
@@ -26,6 +27,7 @@ on:
     paths:
       - electron/main.mjs
       - electron/server-target.mjs
+      - electron/infisical-read.mjs
       - electron/attached-ui-shim.mjs
       - scripts/smoke-mac-server-menu.mjs
       - .github/workflows/mac-server-menu-smoke.yml

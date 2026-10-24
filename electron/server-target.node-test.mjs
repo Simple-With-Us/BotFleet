@@ -7,14 +7,12 @@ import { mkdtempSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 
 import {
-  readSavedRemoteUrl,
-  readServerTarget,
-  readServerTargetFile,
+  KEYCHAIN_ACCOUNT,
+  KEYCHAIN_SERVICE,
+  resolveServerTarget,
+  readKeychainServiceToken,
   validateGateToken,
   validateRemoteServerUrl,
-  validateTargetFile,
-  writeServerTarget,
-  writeServerTargetTemplate,
   SERVER_TARGET_FILE,
 } from "./server-target.mjs";
 
@@ -22,8 +20,25 @@ function makeUserDataDir() {
   return mkdtempSync(path.join(os.tmpdir(), "bf-server-target-"));
 }
 
-function writeTargetFile(dir, contents) {
-  fs.writeFileSync(path.join(dir, SERVER_TARGET_FILE), contents);
+// Every secret in this file is generated at run time: a literal that looks
+// like a token would be a secret in the repository.
+function serviceToken() {
+  return `st.${randomBytes(24).toString("hex")}`;
+}
+
+function gateToken() {
+  return randomBytes(16).toString("hex");
+}
+
+// The vault read, with nothing behind it: no network, no keychain, no env.
+function fakeVault(secrets) {
+  return async ({ names }) => {
+    const out = {};
+    for (const name of names) {
+      if (Object.prototype.toString.call(secrets?.[name]) === "[object String]") out[name] = secrets[name];
+    }
+    return out;
+  };
 }
 
 // ── validateRemoteServerUrl ────────────────────────────────────────────────
@@ -93,147 +108,10 @@ test("a non-http scheme is refused", () => {
   }
 });
 
-// ── readServerTarget ───────────────────────────────────────────────────────
-
-test("a missing target file means the server on this Mac", () => {
-  const dir = makeUserDataDir();
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), { mode: "local" });
-});
-
-test("BOTFLEET_SERVER_URL overrides the file", () => {
-  const dir = makeUserDataDir();
-  writeTargetFile(dir, JSON.stringify({ mode: "remote", url: "https://file.example:8799" }));
-
-  assert.deepEqual(
-    readServerTarget({ userDataDir: dir, env: { BOTFLEET_SERVER_URL: "local" } }),
-    { mode: "local" },
-  );
-  assert.deepEqual(
-    readServerTarget({ userDataDir: dir, env: { BOTFLEET_SERVER_URL: "https://env.example:8799" } }),
-    { mode: "remote", origin: "https://env.example:8799" },
-  );
-});
-
-test("an invalid BOTFLEET_SERVER_URL falls back to this Mac with an error", () => {
-  const dir = makeUserDataDir();
-  const result = readServerTarget({ userDataDir: dir, env: { BOTFLEET_SERVER_URL: "http://host.example" } });
-  assert.equal(result.mode, "local");
-  assert.match(result.error, /BOTFLEET_SERVER_URL/);
-});
-
-test("a target file naming a remote server is used", () => {
-  const dir = makeUserDataDir();
-  writeTargetFile(
-    dir,
-    JSON.stringify({ mode: "remote", url: "https://jay-server.boa-roygbiv.ts.net:8799" }),
-  );
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), {
-    mode: "remote",
-    origin: "https://jay-server.boa-roygbiv.ts.net:8799",
-  });
-});
-
-test("a target file naming the local server is used", () => {
-  const dir = makeUserDataDir();
-  writeTargetFile(dir, JSON.stringify({ mode: "local", savedUrl: "https://host.example:8799" }));
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), { mode: "local" });
-});
-
-test("a malformed target file falls back to this Mac with an error, never a throw", () => {
-  const dir = makeUserDataDir();
-  writeTargetFile(dir, "{ this is not json");
-  const result = readServerTarget({ userDataDir: dir, env: {} });
-  assert.equal(result.mode, "local");
-  assert.match(result.error, /JSON/);
-
-  writeTargetFile(dir, JSON.stringify(["not", "an", "object"]));
-  const array = readServerTarget({ userDataDir: dir, env: {} });
-  assert.equal(array.mode, "local");
-  assert.ok(array.error);
-
-  writeTargetFile(dir, JSON.stringify({ mode: "sideways" }));
-  const sideways = readServerTarget({ userDataDir: dir, env: {} });
-  assert.equal(sideways.mode, "local");
-  assert.match(sideways.error, /mode/);
-});
-
-test("a remote target file with an invalid url falls back to this Mac with an error", () => {
-  const dir = makeUserDataDir();
-  writeTargetFile(dir, JSON.stringify({ mode: "remote", url: "http://host.example:8799" }));
-  const result = readServerTarget({ userDataDir: dir, env: {} });
-  assert.equal(result.mode, "local");
-  assert.match(result.error, /not valid/i);
-
-  writeTargetFile(dir, JSON.stringify({ mode: "remote" }));
-  const missing = readServerTarget({ userDataDir: dir, env: {} });
-  assert.equal(missing.mode, "local");
-  assert.ok(missing.error);
-});
-
-// ── writeServerTarget ──────────────────────────────────────────────────────
-
-test("a written target file is owner-only", () => {
-  const dir = makeUserDataDir();
-  writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799" });
-  const file = path.join(dir, SERVER_TARGET_FILE);
-  const mode = fs.statSync(file).mode & 0o777;
-  assert.equal(mode, 0o600);
-});
-
-test("writing a remote target stores the normalized origin", () => {
-  const dir = makeUserDataDir();
-  const written = writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799/" });
-  assert.equal(written.mode, "remote");
-  assert.equal(written.url, "https://host.example:8799");
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), {
-    mode: "remote",
-    origin: "https://host.example:8799",
-  });
-});
-
-test("switching back to this Mac keeps the last remote url so the menu can switch back", () => {
-  const dir = makeUserDataDir();
-  writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799" });
-  writeServerTarget(dir, { mode: "local" });
-
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), { mode: "local" });
-  assert.equal(readSavedRemoteUrl(dir), "https://host.example:8799");
-
-  // …and the kept url is still usable as a remote target.
-  writeServerTarget(dir, { mode: "remote", url: readSavedRemoteUrl(dir) });
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), {
-    mode: "remote",
-    origin: "https://host.example:8799",
-  });
-});
-
-test("writing an invalid remote url throws and leaves the file alone", () => {
-  const dir = makeUserDataDir();
-  writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799" });
-  assert.throws(() => writeServerTarget(dir, { mode: "remote", url: "http://host.example:8799" }));
-  assert.throws(() => writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799/api" }));
-  assert.throws(() => writeServerTarget(dir, { mode: "remote", url: "https://user:pw@host.example:8799" }));
-  assert.throws(() => writeServerTarget(dir, { mode: "sideways" }));
-  // The good target is still in place.
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), {
-    mode: "remote",
-    origin: "https://host.example:8799",
-  });
-});
-
-test("a local target may carry a template url that is not a valid server url yet", () => {
-  const dir = makeUserDataDir();
-  writeServerTarget(dir, { mode: "local", url: "https://<host>.<tailnet>.ts.net:8799" });
-  // The app still runs against this Mac…
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), { mode: "local" });
-  // …and the template is not offered as a switch-back target until it is real.
-  assert.equal(readSavedRemoteUrl(dir), null);
-});
-
 // ── validateGateToken ──────────────────────────────────────────────────────
 
 test("a gate token of 16 to 256 URL-safe characters is accepted", () => {
-  const good = randomBytes(16).toString("hex");
+  const good = gateToken();
   assert.deepEqual(validateGateToken(good), { ok: true, token: good });
   // The full alphabet the gate token may use.
   assert.equal(validateGateToken("aZ0._~-".repeat(4)).ok, true);
@@ -264,275 +142,337 @@ test("a gate token with characters outside the URL-safe set is refused", () => {
   }
 });
 
-// ── readServerTarget: the token ───────────────────────────────────────────
+// ── readKeychainServiceToken ──────────────────────────────────────────────
 
-test("a remote target file may carry a gate token", () => {
-  const dir = makeUserDataDir();
-  const token = randomBytes(16).toString("hex");
-  writeTargetFile(
-    dir,
-    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token }),
+// The keychain read only happens on macOS.  The platform is swapped for the
+// duration of the test so the module can be exercised anywhere.
+async function withPlatform(platform, run) {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: platform, configurable: true });
+  try {
+    return await run();
+  } finally {
+    if (descriptor) Object.defineProperty(process, "platform", descriptor);
+  }
+}
+
+test("the keychain token is read with the security tool, service and account", async () => {
+  const token = serviceToken();
+  const calls = [];
+  const execFileImpl = async (file, args, options) => {
+    calls.push({ file, args, options });
+    return { stdout: `${token}\n` };
+  };
+
+  const result = await withPlatform("darwin", () => readKeychainServiceToken({ execFileImpl }));
+  assert.equal(result, token);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, "/usr/bin/security");
+  assert.deepEqual(calls[0].args, [
+    "find-generic-password",
+    "-s",
+    KEYCHAIN_SERVICE,
+    "-a",
+    KEYCHAIN_ACCOUNT,
+    "-w",
+  ]);
+  assert.equal(calls[0].options.timeout, 10_000);
+});
+
+test("a keychain without the item is not enrolled, not an error", async () => {
+  const execFileImpl = async () => {
+    const error = new Error("could not find the item");
+    error.code = 44;
+    throw error;
+  };
+  const result = await withPlatform("darwin", () => readKeychainServiceToken({ execFileImpl }));
+  assert.equal(result, null);
+});
+
+test("a keychain that cannot be read is an error", async () => {
+  const execFileImpl = async () => {
+    const error = new Error("User interaction is not allowed");
+    error.code = 36;
+    throw error;
+  };
+  await assert.rejects(
+    () => withPlatform("darwin", () => readKeychainServiceToken({ execFileImpl })),
+    /could not read the Infisical read token from the Keychain/,
   );
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), {
-    mode: "remote",
-    origin: "https://host.example:8799",
-    token,
-  });
 });
 
-test("a gate token in the file is trimmed", () => {
-  const dir = makeUserDataDir();
-  const token = randomBytes(16).toString("hex");
-  writeTargetFile(
-    dir,
-    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: `  ${token}\n` }),
-  );
-  assert.equal(readServerTarget({ userDataDir: dir, env: {} }).token, token);
-});
-
-test("an invalid gate token in the file is ignored and reported", () => {
-  const dir = makeUserDataDir();
-  writeTargetFile(
-    dir,
-    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: "short" }),
-  );
-  const result = readServerTarget({ userDataDir: dir, env: {} });
-  assert.equal(result.mode, "remote");
-  assert.equal(result.token, undefined);
-  assert.match(result.error, /token/i);
-});
-
-test("BOTFLEET_SERVER_TOKEN overrides the token in the file", () => {
-  const dir = makeUserDataDir();
-  writeTargetFile(
-    dir,
-    JSON.stringify({
-      mode: "remote",
-      url: "https://host.example:8799",
-      token: randomBytes(16).toString("hex"),
-    }),
-  );
-  const fromEnv = randomBytes(16).toString("hex");
-  assert.deepEqual(
-    readServerTarget({ userDataDir: dir, env: { BOTFLEET_SERVER_TOKEN: fromEnv } }),
-    { mode: "remote", origin: "https://host.example:8799", token: fromEnv },
+test("a keychain value that is not a service token is refused", async () => {
+  const execFileImpl = async () => ({ stdout: "not-a-service-token" });
+  await assert.rejects(
+    () => withPlatform("darwin", () => readKeychainServiceToken({ execFileImpl })),
+    /could not read the Infisical read token from the Keychain/,
   );
 });
 
-test("an invalid BOTFLEET_SERVER_TOKEN is reported, not used", () => {
-  const dir = makeUserDataDir();
-  writeTargetFile(dir, JSON.stringify({ mode: "remote", url: "https://host.example:8799" }));
-  const result = readServerTarget({ userDataDir: dir, env: { BOTFLEET_SERVER_TOKEN: "nope" } });
-  assert.equal(result.mode, "remote");
-  assert.equal(result.token, undefined);
-  assert.match(result.error, /BOTFLEET_SERVER_TOKEN/);
+test("a machine that is not macOS has no keychain to read", async () => {
+  let called = false;
+  const execFileImpl = async () => {
+    called = true;
+    return { stdout: serviceToken() };
+  };
+  const result = await withPlatform("linux", () => readKeychainServiceToken({ execFileImpl }));
+  assert.equal(result, null);
+  assert.equal(called, false);
 });
 
-test("a remote target without a token is still a remote target", () => {
+// ── resolveServerTarget ───────────────────────────────────────────────────
+
+test("no keychain token means this Mac, and the app says it is not enrolled", async () => {
   const dir = makeUserDataDir();
-  writeTargetFile(dir, JSON.stringify({ mode: "remote", url: "https://host.example:8799" }));
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), {
-    mode: "remote",
-    origin: "https://host.example:8799",
-  });
-});
-
-// ── writeServerTarget: the token ───────────────────────────────────────────
-
-test("writing a remote target keeps the token the file already had", () => {
-  const dir = makeUserDataDir();
-  const token = randomBytes(16).toString("hex");
-  writeTargetFile(
-    dir,
-    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token }),
-  );
-  writeServerTarget(dir, { mode: "local" });
-  // The file is read through the app's own validated reader, so a malformed
-  // target can never reach the assertions unnoticed.
-  const after = readServerTargetFile(dir);
-  assert.equal(after.token, token);
-
-  // …and switching back to remote keeps it too.
-  writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799" });
-  assert.equal(readServerTarget({ userDataDir: dir, env: {} }).token, token);
-});
-
-test("an invalid token in the file is dropped, not written back", () => {
-  const dir = makeUserDataDir();
-  // The file is hand-editable by design, so a token typed by hand can be
-  // wrong.  Carrying it over would write it back verbatim, and the reader
-  // would then reject it — locking the owner out of the server they had
-  // configured.
-  writeTargetFile(
-    dir,
-    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: "short" }),
-  );
-  writeServerTarget(dir, { mode: "local" });
-
-  const after = readServerTargetFile(dir);
-  assert.equal(after.token, undefined);
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), { mode: "local" });
-
-  // A new token still replaces whatever was there.
-  const token = randomBytes(16).toString("hex");
-  writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token });
-  assert.equal(readServerTargetFile(dir).token, token);
-});
-
-test("a new token replaces the one in the file", () => {
-  const dir = makeUserDataDir();
-  const token = randomBytes(16).toString("hex");
-  const other = randomBytes(16).toString("hex");
-  writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token });
-  writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token: other });
-  assert.equal(readServerTarget({ userDataDir: dir, env: {} }).token, other);
-});
-
-test("writing an invalid token throws and leaves the file alone", () => {
-  const dir = makeUserDataDir();
-  const token = randomBytes(16).toString("hex");
-  writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token });
-  assert.throws(() =>
-    writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token: "short" }),
-  );
-  assert.equal(readServerTarget({ userDataDir: dir, env: {} }).token, token);
-});
-
-test("the reader validates the file before anything uses it", () => {
-  const dir = makeUserDataDir();
-
-  // A file that is not an object at all.
-  writeTargetFile(dir, JSON.stringify(["not", "an", "object"]));
-  assert.equal(readServerTargetFile(dir), null);
-
-  // An unknown mode.
-  writeTargetFile(dir, JSON.stringify({ mode: "sideways" }));
-  assert.equal(readServerTargetFile(dir), null);
-
-  // A remote file comes back validated, with its token trimmed.
-  const token = randomBytes(16).toString("hex");
-  writeTargetFile(
-    dir,
-    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: `  ${token}\n` }),
-  );
-  assert.deepEqual(readServerTargetFile(dir), {
-    mode: "remote",
-    url: "https://host.example:8799",
-    token,
-  });
-
-  // An invalid token is dropped by the reader, and the reader says so.
-  writeTargetFile(
-    dir,
-    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: "short" }),
-  );
-  assert.deepEqual(readServerTargetFile(dir), {
-    mode: "remote",
-    url: "https://host.example:8799",
-  });
-  const result = readServerTarget({ userDataDir: dir, env: {} });
-  assert.equal(result.mode, "remote");
-  assert.equal(result.token, undefined);
-  assert.match(result.error, /token/i);
-});
-
-test("validateTargetFile refuses a shape the app would never use", () => {
-  assert.equal(validateTargetFile(null).value, null);
-  assert.equal(validateTargetFile("remote").value, null);
-  assert.equal(validateTargetFile({}).value, null);
-  assert.equal(validateTargetFile({ mode: "sideways" }).value, null);
-
-  const checked = validateTargetFile({ mode: "remote", url: "https://host.example:8799" });
-  assert.deepEqual(checked.value, { mode: "remote", url: "https://host.example:8799" });
-  assert.equal(checked.error, null);
-});
-
-test("a dropped gate token is marked, so the launch goes on without it", () => {
-  const dir = makeUserDataDir();
-  writeTargetFile(
-    dir,
-    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: "short" }),
-  );
-  const fromFile = readServerTarget({ userDataDir: dir, env: {} });
-  assert.equal(fromFile.mode, "remote");
-  assert.equal(fromFile.origin, "https://host.example:8799");
-  assert.equal(fromFile.tokenDropped, true);
-
-  const fromEnv = readServerTarget({ userDataDir: dir, env: { BOTFLEET_SERVER_TOKEN: "nope" } });
-  assert.equal(fromEnv.tokenDropped, true);
-  assert.equal(fromEnv.token, undefined);
-
-  const override = readServerTarget({
+  const result = await resolveServerTarget({
     userDataDir: dir,
-    env: { BOTFLEET_SERVER_URL: "https://other.example:8799", BOTFLEET_SERVER_TOKEN: "nope" },
+    readToken: async () => null,
+    readSecrets: async () => {
+      throw new Error("the vault must not be read without a bootstrap token");
+    },
   });
-  assert.equal(override.tokenDropped, true);
-  assert.equal(override.origin, "https://other.example:8799");
+  assert.equal(result.mode, "local");
+  assert.equal(result.source, "not-enrolled");
+  assert.equal(result.legacyFile, false);
 });
 
-test("main.mjs aborts the launch only for a remote error that is not a dropped token", () => {
+test("Infisical can say local too", async () => {
+  const dir = makeUserDataDir();
+  const result = await resolveServerTarget({
+    userDataDir: dir,
+    readToken: async () => serviceToken(),
+    readSecrets: fakeVault({ BOTFLEET_SERVER_MODE: "local" }),
+  });
+  assert.equal(result.mode, "local");
+  assert.equal(result.source, "infisical");
+  assert.equal(result.legacyFile, false);
+});
+
+test("a remote target carries the origin and the gate token", async () => {
+  const dir = makeUserDataDir();
+  const token = gateToken();
+  const result = await resolveServerTarget({
+    userDataDir: dir,
+    readToken: async () => serviceToken(),
+    readSecrets: fakeVault({
+      BOTFLEET_SERVER_MODE: "remote",
+      BOTFLEET_SERVER_URL: "https://jay-server.boa-roygbiv.ts.net:8799/",
+      BOTFLEET_SERVER_GATE_TOKEN: token,
+    }),
+  });
+  assert.equal(result.mode, "remote");
+  assert.equal(result.source, "infisical");
+  assert.equal(result.origin, "https://jay-server.boa-roygbiv.ts.net:8799");
+  assert.equal(result.token, token);
+  assert.equal(result.legacyFile, false);
+});
+
+test("a remote target with an unusable url is an error, not a fallback to this Mac", async () => {
+  const dir = makeUserDataDir();
+  const result = await resolveServerTarget({
+    userDataDir: dir,
+    readToken: async () => serviceToken(),
+    readSecrets: fakeVault({
+      BOTFLEET_SERVER_MODE: "remote",
+      BOTFLEET_SERVER_URL: "http://host.example:8799",
+      BOTFLEET_SERVER_GATE_TOKEN: gateToken(),
+    }),
+  });
+  assert.equal(result.mode, "error");
+  assert.equal(result.source, "infisical");
+  assert.match(result.message, /BOTFLEET_SERVER_URL/);
+  assert.match(result.message, /Infisical/);
+});
+
+test("a remote target without a url is an error", async () => {
+  const dir = makeUserDataDir();
+  const result = await resolveServerTarget({
+    userDataDir: dir,
+    readToken: async () => serviceToken(),
+    readSecrets: fakeVault({
+      BOTFLEET_SERVER_MODE: "remote",
+      BOTFLEET_SERVER_GATE_TOKEN: gateToken(),
+    }),
+  });
+  assert.equal(result.mode, "error");
+  assert.match(result.message, /BOTFLEET_SERVER_URL/);
+});
+
+test("a remote target without a gate token is an error", async () => {
+  const dir = makeUserDataDir();
+  const result = await resolveServerTarget({
+    userDataDir: dir,
+    readToken: async () => serviceToken(),
+    readSecrets: fakeVault({
+      BOTFLEET_SERVER_MODE: "remote",
+      BOTFLEET_SERVER_URL: "https://host.example:8799",
+    }),
+  });
+  assert.equal(result.mode, "error");
+  assert.match(result.message, /BOTFLEET_SERVER_GATE_TOKEN/);
+});
+
+test("a remote target with an unusable gate token is an error", async () => {
+  const dir = makeUserDataDir();
+  const result = await resolveServerTarget({
+    userDataDir: dir,
+    readToken: async () => serviceToken(),
+    readSecrets: fakeVault({
+      BOTFLEET_SERVER_MODE: "remote",
+      BOTFLEET_SERVER_URL: "https://host.example:8799",
+      BOTFLEET_SERVER_GATE_TOKEN: "short",
+    }),
+  });
+  assert.equal(result.mode, "error");
+  assert.match(result.message, /BOTFLEET_SERVER_GATE_TOKEN/);
+});
+
+test("a vault that cannot be reached is an error, never a quiet fallback", async () => {
+  const dir = makeUserDataDir();
+  const result = await resolveServerTarget({
+    userDataDir: dir,
+    readToken: async () => serviceToken(),
+    readSecrets: async () => {
+      const error = new Error("Infisical could not be reached");
+      error.reason = "unreachable";
+      throw error;
+    },
+  });
+  assert.equal(result.mode, "error");
+  assert.notEqual(result.mode, "local");
+  assert.equal(result.source, "infisical");
+  assert.match(result.message, /Infisical/);
+  assert.match(result.message, /prod/);
+  assert.match(result.message, /\/botfleet-server/);
+});
+
+test("a vault that answers with an HTTP error is an error", async () => {
+  const dir = makeUserDataDir();
+  const result = await resolveServerTarget({
+    userDataDir: dir,
+    readToken: async () => serviceToken(),
+    readSecrets: async () => {
+      const error = new Error("answered HTTP 403");
+      error.reason = "http-403";
+      throw error;
+    },
+  });
+  assert.equal(result.mode, "error");
+  assert.match(result.message, /403/);
+});
+
+test("a mode that is missing or unknown is an error", async () => {
+  const dir = makeUserDataDir();
+  for (const mode of [undefined, "", "sideways", "LOCAL SERVER"]) {
+    const result = await resolveServerTarget({
+      userDataDir: dir,
+      readToken: async () => serviceToken(),
+      readSecrets: fakeVault(
+        mode === undefined ? {} : { BOTFLEET_SERVER_MODE: mode },
+      ),
+    });
+    assert.equal(result.mode, "error", `${String(mode)} should be refused`);
+    assert.match(result.message, /BOTFLEET_SERVER_MODE/);
+  }
+});
+
+test("a keychain that cannot be read is an error, not a silent local mode", async () => {
+  const dir = makeUserDataDir();
+  const result = await resolveServerTarget({
+    userDataDir: dir,
+    readToken: async () => {
+      throw new Error("could not read the Infisical read token from the Keychain");
+    },
+    readSecrets: async () => ({}),
+  });
+  assert.equal(result.mode, "error");
+  assert.match(result.message, /Keychain/);
+});
+
+test("the old target file is flagged and never read", async () => {
+  const dir = makeUserDataDir();
+  const token = gateToken();
+  fs.writeFileSync(
+    path.join(dir, SERVER_TARGET_FILE),
+    JSON.stringify({ mode: "remote", url: "http://127.0.0.1:9", token }),
+  );
+
+  const result = await resolveServerTarget({
+    userDataDir: dir,
+    readToken: async () => null,
+    readSecrets: async () => {
+      throw new Error("the vault must not be read without a bootstrap token");
+    },
+  });
+  // The file exists, so it is flagged…
+  assert.equal(result.legacyFile, true);
+  // …and it is ignored: the app is on this Mac, not on the remote address in
+  // the file, and the token in it is nowhere in sight.
+  assert.equal(result.mode, "local");
+  assert.equal(result.source, "not-enrolled");
+  assert.equal(result.token, undefined);
+  assert.equal(result.origin, undefined);
+  assert.equal(JSON.stringify(result).includes(token), false);
+});
+
+test("no message ever carries a token or a url value", async () => {
+  const dir = makeUserDataDir();
+  const token = gateToken();
+  const secret = serviceToken();
+  const url = "https://host.example:8799";
+
+  const cases = [
+    {
+      readToken: async () => secret,
+      readSecrets: async () => {
+        const error = new Error("boom");
+        error.reason = "unreachable";
+        throw error;
+      },
+    },
+    {
+      readToken: async () => secret,
+      readSecrets: fakeVault({ BOTFLEET_SERVER_MODE: "sideways" }),
+    },
+    {
+      readToken: async () => secret,
+      readSecrets: fakeVault({
+        BOTFLEET_SERVER_MODE: "remote",
+        BOTFLEET_SERVER_URL: "not a url",
+        BOTFLEET_SERVER_GATE_TOKEN: token,
+      }),
+    },
+    {
+      readToken: async () => secret,
+      readSecrets: fakeVault({
+        BOTFLEET_SERVER_MODE: "remote",
+        BOTFLEET_SERVER_URL: url,
+        BOTFLEET_SERVER_GATE_TOKEN: "short",
+      }),
+    },
+  ];
+
+  for (const injected of cases) {
+    const result = await resolveServerTarget({ userDataDir: dir, ...injected });
+    assert.equal(result.mode, "error");
+    const message = String(result.message);
+    assert.equal(message.includes(token), false, `the message carried the token: ${message}`);
+    assert.equal(message.includes(secret), false, `the message carried the service token: ${message}`);
+    assert.equal(message.includes(url), false, `the message carried the url: ${message}`);
+  }
+});
+
+// ── main.mjs: the shape of the startup ────────────────────────────────────
+
+test("main.mjs resolves the target from Infisical and keeps the source order", () => {
   const main = fs.readFileSync(new URL("./main.mjs", import.meta.url), "utf8");
-  assert.match(main, /if \(target\.mode === "remote" && target\.error && !target\.tokenDropped\) \{/);
+  assert.match(
+    main,
+    /const target = await resolveServerTarget\(\{ userDataDir: app\.getPath\("userData"\) \}\);/,
+  );
+  assert.match(main, /if \(target\.mode === "remote"\) serverReady = await startRemoteServer\(/);
+  assert.match(main, /else serverReady = await startServerPackaged\(\);/);
+  // The remote error page still exists, so the remote path keeps its own
+  // failure handling.
   assert.match(main, /startRemoteServer\(target\.origin, target\.token \?\? ""\)/);
-});
-
-test("validateTargetFile validates a remote url and never returns an unchecked one", () => {
-  const bad = validateTargetFile({ mode: "remote", url: "ftp://host.example", token: "a".repeat(32) });
-  assert.match(bad.error, /remote server URL/);
-  assert.match(bad.urlError, /remote server URL/);
-  assert.equal(bad.value.url, undefined);
-  // The rest of the file is still read, so the token can be carried over.
-  assert.equal(bad.value.token, "a".repeat(32));
-
-  const good = validateTargetFile({ mode: "remote", url: " https://host.example:8799/ " });
-  assert.equal(good.value.url, "https://host.example:8799");
-
-  // A local file keeps its template url as typed.
-  assert.equal(validateTargetFile({ mode: "local", url: "not yet" }).value.url, "not yet");
-});
-
-test("a remote file with a bad url still hands its token to the next write", () => {
-  const dir = makeUserDataDir();
-  const token = randomBytes(16).toString("hex");
-  writeTargetFile(dir, JSON.stringify({ mode: "remote", url: "ftp://host.example", token }));
-  assert.equal(readServerTarget({ userDataDir: dir, env: {} }).mode, "local");
-  const written = writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799" });
-  assert.equal(written.token, token);
-});
-
-// ── writeServerTargetTemplate ──────────────────────────────────────────────
-
-test("the template is written when there is no target file yet", () => {
-  const dir = makeUserDataDir();
-  const result = writeServerTargetTemplate(dir);
-  assert.equal(result.written, true);
-
-  const file = path.join(dir, SERVER_TARGET_FILE);
-  const mode = fs.statSync(file).mode & 0o777;
-  assert.equal(mode, 0o600);
-
-  const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-  assert.deepEqual(parsed, { mode: "local", url: "", token: "" });
-  // …and the same file read through the app's own validated reader.
-  assert.deepEqual(readServerTargetFile(dir), { mode: "local", url: "" });
-});
-
-test("the template never overwrites an existing target file", () => {
-  const dir = makeUserDataDir();
-  const token = randomBytes(16).toString("hex");
-  writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token });
-  const before = fs.readFileSync(path.join(dir, SERVER_TARGET_FILE), "utf8");
-
-  const result = writeServerTargetTemplate(dir);
-  assert.equal(result.written, false);
-  assert.equal(fs.readFileSync(path.join(dir, SERVER_TARGET_FILE), "utf8"), before);
-});
-
-test("the template's empty url does not make the app fall over", () => {
-  const dir = makeUserDataDir();
-  writeServerTargetTemplate(dir);
-  // The app still runs against this Mac…
-  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), { mode: "local" });
-  // …and the empty url is not offered as a switch-back target.
-  assert.equal(readSavedRemoteUrl(dir), null);
 });

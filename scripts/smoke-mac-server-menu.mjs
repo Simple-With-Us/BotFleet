@@ -1,33 +1,35 @@
 #!/usr/bin/env node
 // Packaged-app smoke for the Server menu.
 //
-// The Server menu is the only way an owner points the desktop app at another
-// BotFleet server, and it cannot be reached by a unit test: it needs a
-// packaged app, a real application menu and a real window.  This script
-// launches the packaged app with a throwaway HOME, drives the menu handlers
-// through the app's own smoke hook, and asserts what came back.
+// The Server menu is the only way an owner sees where the desktop app points
+// and the only way the app reads that point again, and it cannot be reached
+// by a unit test: it needs a packaged app, a real application menu and a real
+// window.  This script launches the packaged app with a throwaway HOME,
+// drives the menu handlers through the app's own smoke hook, and asserts
+// what came back.
 //
 // What it proves:
-//   - the app starts in remote mode and points at the configured server;
-//   - a server that cannot be reached answers with a clean 502 JSON, so a
-//     wrong address is a message and not a crash;
-//   - the Server menu offers "This Mac" and "Set Remote Server…";
-//   - the target file is written, and switching to a remote server and back
-//     to this Mac leaves it in the state the menu claims.
+//   - the app reads its server target from Infisical and nowhere else;
+//   - a runner with no Infisical read token in the Keychain runs against
+//     the server on this Mac, and the menu says so;
+//   - the old server-target.json is ignored: it is flagged, never read, and
+//     never rewritten;
+//   - the Server menu offers "This Mac", the Infisical status line and
+//     "Reload from Infisical", and no longer offers "Set Remote Server…";
+//   - "Reload from Infisical" is safe to click: the app keeps running.
 //
-// What it never does: it never contacts a real server.  The remote address is
-// under the reserved .invalid TLD, so nothing can resolve it.
+// What it never does: it never contacts a real server and it never reaches
+// the owner's Keychain, its user data or its server target.
 //
 // Usage: node scripts/smoke-mac-server-menu.mjs <path to BotFleet.app>
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 
-const REMOTE_URL = "https://botfleet-smoke.invalid:8799";
 const SMOKE_TIMEOUT_MS = 120_000;
-const EXPECTED_REMOTE_LABEL = `Remote: ${REMOTE_URL}`;
 
 const appPath = process.argv[2];
 if (!appPath) {
@@ -42,8 +44,8 @@ if (!existsSync(executable)) {
   process.exit(1);
 }
 
-// A throwaway HOME: the app writes its user-data (and the target file) there,
-// so a run never touches the real one.
+// A throwaway HOME: the app writes its user-data there, so a run never
+// touches the real one.
 const home = mkdtempSync(join(tmpdir(), "bf-server-menu-smoke-"));
 // macOS resolves the home directory from the password database, not from
 // $HOME, so overriding HOME alone would leave `app.getPath("userData")`
@@ -65,6 +67,20 @@ if (!resolve(userDataDir).startsWith(`${resolve(home)}${sep}`)) {
   );
   process.exit(2);
 }
+
+// The old target file, written before the launch.  The app must ignore it:
+// it is flagged, it is never read, and it is never rewritten.  The token in
+// it is generated at run time — a literal that looks like a secret would be
+// a secret in the repository.
+const legacyTargetFile = join(userDataDir, "server-target.json");
+const legacyTarget = {
+  mode: "remote",
+  url: "http://127.0.0.1:9",
+  token: randomBytes(16).toString("hex"),
+};
+const legacyTargetText = `${JSON.stringify(legacyTarget, null, 2)}\n`;
+writeFileSync(legacyTargetFile, legacyTargetText);
+
 const runnerTemp = process.env.RUNNER_TEMP;
 const logPath = runnerTemp ? join(runnerTemp, "server-menu-smoke.log") : null;
 
@@ -79,14 +95,10 @@ const child = spawn(executable, [], {
     HOME: home,
     // The smoke hook itself.
     OMB_SMOKE_SERVER_MENU: "1",
-    // Where the app must keep its user data (and the target file it writes).
+    // Where the app must keep its user data.
     OMB_SMOKE_USER_DATA_DIR: userDataDir,
     // Where the app and the harness keep their own data.
     OMB_DATA_DIR: dataDir,
-    // The server this launch talks to: unreachable on purpose.
-    BOTFLEET_SERVER_URL: REMOTE_URL,
-    // The server the menu should switch to.
-    OMB_SMOKE_SERVER_URL: REMOTE_URL,
     // No signing identity is needed for an unsigned local build.
     CSC_IDENTITY_AUTO_DISCOVERY: "false",
   },
@@ -161,62 +173,52 @@ if (spawnError !== null) {
       : `the app printed no "[smoke] server-menu" line within ${SMOKE_TIMEOUT_MS / 1000}s`,
   );
 } else {
-  check(report.serverMode === "remote", `serverMode must be "remote", got ${JSON.stringify(report.serverMode)}`);
+  // The runner has no Infisical read token in its Keychain, so the app runs
+  // against the server on this Mac and says where that came from.
   check(
-    report.health?.status === 502 || report.health?.status === 503,
-    `the unreachable server must answer 502 or 503, got ${JSON.stringify(report.health)}`,
+    report.serverMode === "local",
+    `serverMode must be "local", got ${JSON.stringify(report.serverMode)}`,
   );
-  check(report.health?.json === true, `the health body must be JSON, got ${JSON.stringify(report.health)}`);
+  check(
+    report.source === "not-enrolled",
+    `source must be "not-enrolled", got ${JSON.stringify(report.source)}`,
+  );
+  check(report.legacyFile === true, `legacyFile must be true, got ${JSON.stringify(report.legacyFile)}`);
   check(report.error === null || report.error === undefined, `the smoke reported an error: ${report.error}`);
 
   const labels = report.serverMenu?.labels ?? [];
   check(labels.includes("This Mac"), `the Server menu must offer "This Mac", got ${JSON.stringify(labels)}`);
   check(
-    labels.includes("Set Remote Server…"),
-    `the Server menu must offer "Set Remote Server…", got ${JSON.stringify(labels)}`,
+    labels.includes("No Infisical read token in the Keychain"),
+    `the Server menu must say it has no Infisical read token, got ${JSON.stringify(labels)}`,
   );
-
   check(
-    report.targetFile?.exists === true,
-    "the target file must exist after \"Set Remote Server…\" was clicked",
+    labels.includes("Reload from Infisical"),
+    `the Server menu must offer "Reload from Infisical", got ${JSON.stringify(labels)}`,
   );
-
-  const remoteLabels = report.remote?.labels ?? [];
   check(
-    remoteLabels.includes(EXPECTED_REMOTE_LABEL),
-    `the Server menu must list "${EXPECTED_REMOTE_LABEL}", got ${JSON.stringify(remoteLabels)}`,
+    !labels.some((label) => label.includes("Set Remote Server")),
+    `the Server menu must no longer offer "Set Remote Server…", got ${JSON.stringify(labels)}`,
   );
-  check(report.remote?.mode === "remote", `the target file must say "remote", got ${JSON.stringify(report.remote?.mode)}`);
 
-  const localLabels = report.local?.labels ?? [];
-  check(report.local?.mode === "local", `the target file must say "local", got ${JSON.stringify(report.local?.mode)}`);
+  // The reload reads Infisical again.  Nothing changed, so the app has to be
+  // exactly where it was.
+  const reloadLabels = report.reload?.labels ?? [];
   check(
-    localLabels.includes(EXPECTED_REMOTE_LABEL),
-    `the Server menu must still list "${EXPECTED_REMOTE_LABEL}" after switching back, got ${JSON.stringify(localLabels)}`,
+    reloadLabels.includes("Reload from Infisical"),
+    `the Server menu must still offer "Reload from Infisical" after the reload, got ${JSON.stringify(reloadLabels)}`,
+  );
+  check(
+    report.reload?.mode === "local",
+    `the server mode after the reload must be "local", got ${JSON.stringify(report.reload?.mode)}`,
   );
 
-  // The target file on disk, in the throwaway user-data directory the app
-  // was pointed at.  It is checked with explicit assertions instead of a
-  // schema: this script is deliberately dependency-free so it can run
-  // before the app's dependencies exist, and it asserts on every field it
-  // reads.
-  const targetFile = join(userDataDir, "server-target.json");
-  check(existsSync(targetFile), `the target file must exist at ${targetFile}`);
-  if (existsSync(targetFile)) {
-    let parsed;
-    try {
-      parsed = JSON.parse(readFileSync(targetFile, "utf8"));
-    } catch (error) {
-      check(false, `the target file must be valid JSON: ${String(error?.message ?? error)}`);
-    }
-    if (parsed !== undefined) {
-      check(
-        Object.prototype.toString.call(parsed) === "[object Object]",
-        `the target file must be a JSON object, got ${JSON.stringify(parsed)}`,
-      );
-      check(parsed.mode === "local", `the target file must end in "local", got ${JSON.stringify(parsed.mode)}`);
-      check(!parsed.token, "the target file must not carry a token");
-    }
+  // The old target file is ignored: the app flagged it, read nothing from it
+  // and wrote nothing back to it.
+  check(existsSync(legacyTargetFile), `the legacy target file must still be there at ${legacyTargetFile}`);
+  if (existsSync(legacyTargetFile)) {
+    const after = readFileSync(legacyTargetFile, "utf8");
+    check(after === legacyTargetText, "the app must not rewrite the legacy target file");
   }
 }
 
@@ -245,7 +247,7 @@ if (failures.length > 0) {
 }
 
 console.log(
-  `PASS: server mode ${report.serverMode}, health ${report.health.status} JSON, ` +
+  `PASS: server mode ${report.serverMode} (${report.source}), legacy file ${report.legacyFile}, ` +
     `menu [${report.serverMenu.labels.join(", ")}], ` +
-    `remote mode ${report.remote.mode}, back to ${report.local.mode}.`,
+    `reload mode ${report.reload.mode}.`,
 );
