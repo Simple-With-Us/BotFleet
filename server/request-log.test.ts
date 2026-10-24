@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { WebhookAttempt } from "./webhooks.ts";
 
 import {
   createRequestLog,
@@ -116,6 +117,15 @@ describe("createRequestLog", () => {
     expect(lines[0]).toContain("o/r#1");
     expect(lines[1]).toContain("[ignored]");
     expect(lines[1]).toContain("Event type not enabled");
+  });
+
+  it("records attempts without an event name as unknown", () => {
+    const log = createRequestLog(paths(tmp()));
+    const attempt: WebhookAttempt = { ...entry, outcome: "accepted", id: "attempt-missing-name", statusCode: 200, eventName: undefined };
+    log.subscriber({ ...attemptEvent, attempt });
+    const text = readFileSync(join(dirs.at(-1)!, "github-request-log.md"), "utf8");
+    expect(text).toContain(" unknown.opened ");
+    expect(text).toContain("(delivery deliv-1)");
   });
 
   it("spool survives an unwritable Markdown path and replay drains it after recovery", () => {

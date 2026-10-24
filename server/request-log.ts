@@ -229,7 +229,7 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
       record(
         {
           deliveryId: attempt.deliveryId ?? attempt.id,
-          eventName: attempt.eventName,
+          eventName: attempt.eventName ?? "unknown",
           receivedAt: attempt.receivedAt,
           outcome: attempt.outcome,
           reason: attempt.reason,
