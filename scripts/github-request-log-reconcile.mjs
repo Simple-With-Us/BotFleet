@@ -32,8 +32,10 @@ export function loggedDeliveryIds(path) {
   try { return new Set([...readFileSync(path,'utf8').matchAll(/\(delivery ([^)\r\n]+)\)/g)].map(m=>m[1])); }
   catch(e) { if(e.code==='ENOENT') return new Set();throw e; }
 }
-function clean(s,max=200) { return String(s??'').replace(/[\r\n\x00-\x1f\x7f]/g,' ').replace(/[()]/g,'').slice(0,max); }
+function clean(s,max=200) { return Array.from(String(s??''),c=>c.charCodeAt(0)<=31||c.charCodeAt(0)===127?' ':c).join('').replace(/[()]/g,'').slice(0,max); }
 export function extractMetadata(p) {
+  // External JSON boundary: reject primitive payloads before metadata field reads.
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- JSON payloads are untyped in this dependency-free CLI.
   const x=p&&typeof p==='object'?p:{};const m={};
   if(x.action) m.action=clean(x.action,64);
   if(x.repository?.full_name) m.repository=clean(x.repository.full_name);
@@ -81,6 +83,7 @@ function reconcileLocked({org,repo,hook,log,cursor,get=ghGet,now=()=>new Date(),
   for(const [id,d] of Object.entries(state.pending)) {
     try {
       const detail=get(prefix+'/'+encodeURIComponent(id)).data;
+      // oxlint-disable-next-line anti-slop/no-runtime-typeof -- provider detail must have an object payload before recovery can be claimed.
       if(!detail.request?.payload||typeof detail.request.payload!=='object') throw Error('payload unavailable');
       const line=formatRecoveredLine({ts:new Date(d.delivered_at),eventName:detail.event??d.event,meta:extractMetadata(detail.request.payload),deliveryId:d.guid});
       append(log,line+'\n');seen.add(String(d.guid));delete state.pending[id];recovered++;

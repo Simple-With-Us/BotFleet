@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { JsonValue } from "./schema.ts";
-import { WebhookManager, type WebhookManagerOptions } from "./webhooks.ts";
+import { WebhookManager, type WebhookManagerOptions, type WebhookManagerEvent } from "./webhooks.ts";
 
 const dirs: string[] = [];
 
@@ -18,7 +18,7 @@ function harness() {
   let pending = 0;
   const queued: Array<Record<string, unknown>> = [];
   const cancelled: Array<{ id: string; message: string }> = [];
-  const emitted: unknown[] = [];
+  const emitted: WebhookManagerEvent[] = [];
   const options: WebhookManagerOptions = {
     file,
     now: () => now,
@@ -1881,10 +1881,10 @@ describe("request metadata on attempt events", () => {
     const input = { payload, contentType: "application/json", eventName: "pull_request", deliveryId: "d-1" };
     h.manager.receive(webhook.endpointId, secret, input);
     h.manager.receive(webhook.endpointId, secret, input);
-    const attempts = (h.emitted as Array<Record<string, unknown>>).filter((e) => e.kind === "webhook.attempt");
+    const attempts = h.emitted.filter((e) => e.kind === "webhook.attempt");
     expect(attempts).toHaveLength(2);
     for (const e of attempts) {
-      const meta = e.requestMetadata as Record<string, unknown>;
+      const meta = e.requestMetadata;
       expect(meta).toMatchObject({
         repository: "Simple-With-Us/BotFleet",
         number: 901,
@@ -1893,7 +1893,7 @@ describe("request metadata on attempt events", () => {
       });
       expect(JSON.stringify(meta)).not.toContain("titles never leak");
     }
-    expect((attempts[0]?.attempt as Record<string, unknown>).outcome).toBe("accepted");
-    expect((attempts[1]?.attempt as Record<string, unknown>).outcome).toBe("duplicate");
+    expect(attempts[0]?.attempt.outcome).toBe("accepted");
+    expect(attempts[1]?.attempt.outcome).toBe("duplicate");
   });
 });

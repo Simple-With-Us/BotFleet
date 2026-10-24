@@ -39,6 +39,7 @@ const entry = {
 
 const attemptEvent = {
   kind: "webhook.attempt" as const,
+  // SAFETY: this test double implements only the fields consumed by the subject; unrelated members are never read.
   attempt: { ...entry, id: "attempt-1", statusCode: 200, preview: "" } as never,
   requestMetadata: { repository: "o/r", number: 1, actor: "bot", action: "opened" },
 };
@@ -89,6 +90,15 @@ describe("extractRequestMetadata", () => {
   });
 });
 
+describe("metadata field validation", () => {
+  it("drops malformed fields while preserving independently valid metadata", () => {
+    expect(extractRequestMetadata({ eventName: "pull_request", payload: {
+      action: ["opened"], repository: { full_name: 3 }, sender: { login: "safe-bot" },
+      pull_request: { number: "9" }, issue: { number: 7 },
+    } })).toEqual({ actor: "safe-bot", number: 7 });
+  });
+});
+
 describe("formatRequestLogLine", () => {
   it("renders one metadata-only Markdown line", () => {
     const line = formatRequestLogLine(
@@ -108,8 +118,10 @@ describe("createRequestLog", () => {
     log.subscriber(attemptEvent);
     log.subscriber({
       kind: "webhook.attempt",
+      // SAFETY: this test double implements only the fields consumed by the subject; unrelated members are never read.
       attempt: { ...entry, id: "attempt-2", deliveryId: "deliv-2", outcome: "ignored", reason: "Event type not enabled", statusCode: 200, preview: "" } as never,
     });
+    // SAFETY: this test double implements only the fields consumed by the subject; unrelated members are never read.
     log.subscriber({ kind: "webhook", webhook: {} as never });
     const lines = readFileSync(join(dirs.at(-1)!, "github-request-log.md"), "utf8").trim().split("\n");
     expect(lines).toHaveLength(2);

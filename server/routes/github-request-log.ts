@@ -7,6 +7,7 @@
 
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { z } from "zod";
 
 import { extractRequestMetadata, type RequestLog } from "../request-log.ts";
 
@@ -22,8 +23,9 @@ export interface GitHubRequestLogRouteOptions {
 }
 
 const MAX_BODY_BYTES = 1024 * 1024;
+class BodyTooLargeError extends Error {}
 
-function json(res: ServerResponse, status: number, body: Record<string, unknown>): void {
+function json(res: ServerResponse, status: number, body: { ok: boolean; reason?: string }): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
 }
@@ -32,12 +34,10 @@ async function readRawBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
-    const buf = chunk as Buffer;
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buf.length;
     if (size > MAX_BODY_BYTES) {
-      const error = new Error("body too large") as Error & { status?: number };
-      error.status = 413;
-      throw error;
+      throw new BodyTooLargeError("body too large");
     }
     chunks.push(buf);
   }
@@ -60,7 +60,7 @@ export async function readGitHubRequestLog(
   try {
     rawBody = await readRawBody(req);
   } catch (err) {
-    const status = (err as { status?: number }).status ?? 400;
+    const status = err instanceof BodyTooLargeError ? 413 : 400;
     json(res, status, { ok: false, reason: "bad_body" });
     return;
   }
@@ -70,7 +70,7 @@ export async function readGitHubRequestLog(
     json(res, 503, { ok: false, reason: "webhook_secret_not_configured" });
     return;
   }
-  const header = (req.headers["x-hub-signature-256"] as string | undefined) ?? undefined;
+  const header = z.string().optional().catch(undefined).parse(req.headers["x-hub-signature-256"]);
   if (!verifyGitHubSignature(rawBody, header, secret)) {
     json(res, 401, { ok: false, reason: "bad_signature" });
     return;
@@ -88,8 +88,8 @@ export async function readGitHubRequestLog(
     return;
   }
   try {
-    const eventName = ((req.headers["x-github-event"] as string | undefined) ?? "unknown").slice(0, 64);
-    const deliveryId = ((req.headers["x-github-delivery"] as string | undefined) ?? randomUUID()).slice(0, 100);
+    const eventName = z.string().catch("unknown").parse(req.headers["x-github-event"]).slice(0, 64);
+    const deliveryId = z.string().catch(() => randomUUID()).parse(req.headers["x-github-delivery"]).slice(0, 100);
     options.requestLog.record(
       {
         deliveryId,

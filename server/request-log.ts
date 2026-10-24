@@ -17,6 +17,7 @@
 
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, rmdirSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
+import { z } from "zod";
 
 import type { WebhookAttempt, WebhookManagerEvent } from "./webhooks.ts";
 
@@ -28,41 +29,38 @@ export interface WebhookRequestMetadata {
   ref?: string;
 }
 
-export function logAtom(value: unknown, limit = 200): string {
-  return String(value ?? "").replace(/[\r\n\x00-\x1f\x7f]/g, " ").replace(/[()]/g, "").slice(0, limit);
+type LogAtomValue = string | number | null | undefined;
+export function logAtom(value: LogAtomValue, limit = 200): string {
+  return Array.from(String(value ?? ""), (char) => {
+    const code = char.charCodeAt(0);
+    return code <= 31 || code === 127 ? " " : char;
+  }).join("").replace(/[()]/g, "").slice(0, limit);
 }
 
-function stringField(source: Record<string, unknown>, key: string, limit: number): string | undefined {
-  const value = source[key];
-  return typeof value === "string" && value.length > 0 ? logAtom(value, limit) : undefined;
-}
+const optionalText = z.string().optional().catch(undefined);
+const numberRecord = z.object({ number: z.number().optional().catch(undefined) }).optional().catch(undefined);
+const metadataPayload = z.object({
+  action: optionalText,
+  repository: z.object({ full_name: optionalText }).optional().catch(undefined),
+  sender: z.object({ login: optionalText }).optional().catch(undefined),
+  pull_request: numberRecord, issue: numberRecord, discussion: numberRecord,
+  release: numberRecord, check_run: numberRecord,
+  ref: optionalText,
+}).catch({});
 
-/** Pull log-safe metadata out of a webhook event.  Never body or title text. */
+/** Decode untrusted webhook fields before reading metadata; never body/title text. */
 export function extractRequestMetadata(event: { eventName?: string; payload?: unknown }): WebhookRequestMetadata {
-  const payload = (event.payload && typeof event.payload === "object" ? event.payload : {}) as Record<string, unknown>;
+  const payload = metadataPayload.parse(event.payload);
   const meta: WebhookRequestMetadata = {};
-  meta.action = stringField(payload, "action", 64);
-  const repository = payload.repository;
-  if (repository && typeof repository === "object") {
-    meta.repository = stringField(repository as Record<string, unknown>, "full_name", 200);
-  }
-  const sender = payload.sender;
-  if (sender && typeof sender === "object") {
-    meta.actor = stringField(sender as Record<string, unknown>, "login", 100);
-  }
+  if (payload.action) meta.action = logAtom(payload.action, 64);
+  if (payload.repository?.full_name) meta.repository = logAtom(payload.repository.full_name, 200);
+  if (payload.sender?.login) meta.actor = logAtom(payload.sender.login, 100);
   for (const key of ["pull_request", "issue", "discussion", "release", "check_run"] as const) {
-    const entry = payload[key];
-    if (entry && typeof entry === "object") {
-      const number = (entry as Record<string, unknown>).number;
-      if (typeof number === "number") {
-        meta.number = number;
-        break;
-      }
-    }
+    const number = payload[key]?.number;
+    if (number !== undefined) { meta.number = number; break; }
   }
-  if (event.eventName === "push") {
-    const ref = stringField(payload, "ref", 200);
-    if (ref) meta.ref = ref.replace(/^refs\/heads\//, "").slice(0, 100);
+  if (event.eventName === "push" && payload.ref) {
+    meta.ref = logAtom(payload.ref, 200).replace(/^refs\/heads\//, "").slice(0, 100);
   }
   return meta;
 }
@@ -151,7 +149,8 @@ function loggedDeliveries(filePath: string): Set<string> {
     for (const match of tail.matchAll(/\(delivery ([^)]+)\)/g)) ids.add(match[1]!);
     return ids;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+    const parsedError = z.object({ code: z.string() }).safeParse(error);
+    if (parsedError.success && parsedError.data.code === "ENOENT") return new Set();
     throw error;
   }
 }
@@ -180,8 +179,7 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
       const lines: string[] = [];
       for (const record of pending) {
         try {
-          const parsed = JSON.parse(record) as { line?: string; delivery?: string };
-          if (typeof parsed.line !== "string") throw new Error("invalid spool record");
+          const parsed = z.object({ line: z.string(), delivery: z.string().optional() }).parse(JSON.parse(record));
           if (parsed.delivery && seen.has(parsed.delivery)) continue;
           lines.push(parsed.line);
           if (parsed.delivery) seen.add(parsed.delivery);

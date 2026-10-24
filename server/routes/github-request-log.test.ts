@@ -21,6 +21,7 @@ afterEach(() => {
 const SECRET = "test-hook-secret";
 
 function fixture(body: string, headers: Record<string, string>) {
+  // SAFETY: this test double implements only the fields consumed by the subject; unrelated members are never read.
   const req = Readable.from([Buffer.from(body)]) as Readable & { headers: Record<string, string> };
   req.headers = headers;
   let status = 0;
@@ -76,6 +77,7 @@ describe("readGitHubRequestLog", () => {
     const dir = tmp();
     const { options } = setup(dir);
     const { req, res, result } = fixture(PAYLOAD, signed(PAYLOAD));
+    // SAFETY: this test double implements only the fields consumed by the subject; unrelated members are never read.
     await readGitHubRequestLog(req as never, res as never, options);
     expect(result().status).toBe(200);
     const line = readFileSync(join(dir, "github-request-log.md"), "utf8").trim();
@@ -91,6 +93,7 @@ describe("readGitHubRequestLog", () => {
     const dir = tmp();
     const { options } = setup(dir);
     const { req, res, result } = fixture(PAYLOAD, signed(PAYLOAD, { "x-hub-signature-256": "sha256=deadbeef" }));
+    // SAFETY: this test double implements only the fields consumed by the subject; unrelated members are never read.
     await readGitHubRequestLog(req as never, res as never, options);
     expect(result().status).toBe(401);
     expect(() => readFileSync(join(dir, "github-request-log.md"), "utf8")).toThrow();
@@ -100,6 +103,7 @@ describe("readGitHubRequestLog", () => {
     const dir = tmp();
     const { options } = setup(dir);
     const { req, res, result } = fixture(PAYLOAD, signed(PAYLOAD));
+    // SAFETY: this test double implements only the fields consumed by the subject; unrelated members are never read.
     await readGitHubRequestLog(req as never, res as never, { ...options, secretProvider: () => undefined });
     expect(result().status).toBe(503);
   });
@@ -109,6 +113,7 @@ describe("readGitHubRequestLog", () => {
     const { options } = setup(dir);
     const body = "not json";
     const { req, res, result } = fixture(body, signed(body));
+    // SAFETY: this test double implements only the fields consumed by the subject; unrelated members are never read.
     await readGitHubRequestLog(req as never, res as never, options);
     expect(result().status).toBe(400);
   });
