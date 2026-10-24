@@ -105,10 +105,20 @@ function rawSecretsUrl() {
     workspaceId: BOTFLEET_INFISICAL_PROJECT_ID,
     environment: BOTFLEET_INFISICAL_ENVIRONMENT,
     secretPath: BOTFLEET_SERVER_SECRET_PATH,
+    // The values are what this reader is for, so they are asked for
+    // explicitly instead of relying on the API's default.
+    viewSecretValue: "true",
+    // A stored value that is a reference such as ${prod.folder.NAME} comes
+    // back as the referenced value, the same way scripts/infisical-fetch.mjs
+    // reads it.  A reference the vault could not expand is refused below.
+    expandSecretReferences: "true",
     include_imports: "false",
   });
   return `${INFISICAL_SITE}/api/v3/secrets/raw?${query.toString()}`;
 }
+
+/** A `${...}` reference anywhere in a value: one the vault did not expand. */
+const UNRESOLVED_REFERENCE = /\$\{[^}]*\}/;
 
 /**
  * Read a set of secrets from the vault.
@@ -117,8 +127,10 @@ function rawSecretsUrl() {
  * back, and only when the vault holds them.  A name that is absent is simply
  * absent from the result: the caller decides what an absent name means.
  *
- * A value that still holds a `${...}` reference did not resolve, so it is
- * refused rather than used as if it were a secret.
+ * References are expanded by the vault (`expandSecretReferences`), so a value
+ * that still holds a `${...}` reference did not resolve: the target is
+ * missing or this token cannot read the referenced folder.  It is refused
+ * rather than used as if it were the secret.
  *
  * @param {{serviceToken: string, names: string[], fetchImpl?: typeof fetch, timeoutMs?: number}} options
  * @returns {Promise<Record<string, string>>}
@@ -190,7 +202,7 @@ export async function readInfisicalSecrets({
     if (!isString(key) || !wanted.has(key)) continue;
     const value = row.secretValue;
     if (!isString(value)) continue;
-    if (value.includes("${")) {
+    if (UNRESOLVED_REFERENCE.test(value)) {
       throw new InfisicalReadError(
         "bad-output",
         `the secret ${key} in Infisical (${BOTFLEET_INFISICAL_ENVIRONMENT} ${BOTFLEET_SERVER_SECRET_PATH}) is an unresolved reference`,
@@ -204,9 +216,19 @@ export async function readInfisicalSecrets({
 /**
  * Read the bootstrap service token from its file.
  *
- * The file is opened without following symlinks and is then checked: it has
- * to be a regular file, owned by the user the process runs as, and mode 0600.
- * Anything else is a configuration error, not something to work around.
+ * The file is opened without following symlinks and is then checked on the
+ * open descriptor: it has to be a regular file with exactly one link, owned
+ * by the user the process runs as, and mode 0600.  The path is then looked
+ * at again with lstat, and its device and inode must be the ones of the open
+ * descriptor, so the bytes read are the bytes of the file at that path and
+ * not of something swapped in between.  A hard link to another file is
+ * refused because its owner and mode say nothing about who else can reach
+ * the same bytes.  Anything else is a configuration error, not something to
+ * work around.
+ *
+ * The directories above the file are not walked: the path is the fixed one
+ * install.sh creates inside the service user's own config directory, and the
+ * open never follows a symlink at the last step.
  *
  * @param {string} path
  * @returns {string} the validated service token
@@ -232,6 +254,20 @@ export function readBootstrapTokenFile(path) {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) {
       throw new Error(`the Infisical read token file ${file} is not a regular file`);
+    }
+    if (stat.nlink !== 1) {
+      throw new Error(`the Infisical read token file ${file} has more than one hard link; it must have exactly one`);
+    }
+    let pathStat;
+    try {
+      pathStat = fs.lstatSync(file);
+    } catch (err) {
+      throw new Error(
+        `the Infisical read token file ${file} changed while it was read: ${err?.code ?? "unknown error"}`,
+      );
+    }
+    if (pathStat.dev !== stat.dev || pathStat.ino !== stat.ino) {
+      throw new Error(`the Infisical read token file ${file} changed while it was read`);
     }
     const geteuid = process.geteuid;
     const euid = Object.prototype.toString.call(geteuid) === "[object Function]" ? geteuid() : null;
