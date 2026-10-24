@@ -435,7 +435,7 @@ const pushDropLines = (push) => {
  * the fallback then says what is true in every case: the SIGNING KEY is what
  * has to change, because a fresh signature from the same key cannot help. */
 const pushRejectedKeyLine = (push, keySource) => {
-  return "<p>Apple refused the signing key (<code>" + esc(push.keyRejected) + "</code>).&nbsp; " +
+  return "<p>Apple refused the signing key (<code>" + esc(push.keyRejected) + "</code>).&#160; " +
     "Replace " + esc(keySource || "the signing key") + " to turn pushes back on.</p>" +
     (push.lastError
       ? "<p class=dim>Last error: <code>" + esc(String(push.lastError)) + "</code></p>"
@@ -513,30 +513,30 @@ function render(s) {
       : s.push.keyRejected
         ? pushRejectedKeyLine(s.push, s.keySource)
         : !s.push.configured
-          ? "<p class=dim>No signing key found, so a phone that is not open will not be woken.&nbsp; " +
+          ? "<p class=dim>No signing key found, so a phone that is not open will not be woken.&#160; " +
             "The key is looked for again every few minutes.</p>"
           : "<p>On, for " + s.push.tokensRegistered + " " +
             (s.push.tokensRegistered === 1 ? "phone" : "phones") + "." +
-            (s.push.lastSentAt ? "&nbsp; Last sent " + ago(s.push.lastSentAt) + "." : "&nbsp; Nothing sent yet.") +
+            (s.push.lastSentAt ? "&#160; Last sent " + ago(s.push.lastSentAt) + "." : "&#160; Nothing sent yet.") +
             "</p>" +
             (s.push.lastError
               ? "<p class=dim>Last error: <code>" + esc(String(s.push.lastError)) + "</code> " +
                 ago(s.push.lastErrorAt) + "." +
                 (s.push.lastErrorCode
-                  ? "&nbsp; Code: <code>" + esc(s.push.lastErrorCode) + "</code>."
+                  ? "&#160; Code: <code>" + esc(s.push.lastErrorCode) + "</code>."
                   : "") +
                 "</p>"
               : "") +
             (s.push.failureKind && s.push.failureKind !== "none"
-              ? "<p class=dim>Last failure kind: <code>" + esc(s.push.failureKind) + "</code>" +
+              ? "<p class=dim>Last failure kind: <code>" + esc(s.push.failureKind) + "</code>." +
                 (s.push.consecutiveTransportFailures > 0
-                  ? "&nbsp; in a row: <code>" + s.push.consecutiveTransportFailures + "</code>."
-                  : ".") +
+                  ? "&#160; Failures in a row: <code>" + s.push.consecutiveTransportFailures + "</code>."
+                  : "") +
                 "</p>"
               : "") +
             (s.push.pushesOff && s.push.pushesOffReason === "unreachable"
               ? "<p>Apple's push service cannot be reached from this computer, so closed-app " +
-                "notifications are waiting rather than going out.&nbsp; They are sent when it " +
+                "notifications are waiting rather than going out.&#160; They are sent when it " +
                 "comes back.</p>"
               : "") +
             (s.push.circuitOpenUntil && s.push.circuitOpenUntil > Date.now()
