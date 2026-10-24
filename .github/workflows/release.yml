@@ -82,7 +82,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          v="v${{ needs.prepare.outputs.version }}"
+          # steps.pin.outputs.version, NOT needs.prepare.outputs.version.  This
+          # step runs INSIDE the prepare job, and the needs context there holds
+          # the jobs prepare depends on -- which is none of them, because
+          # prepare is the first job.  The needs expression rendered as an empty
+          # string, so the guard compared the literal tag "v", which matches no
+          # release, so the gate never fired: a release already published under
+          # this version would have been overwritten instead of stopping the run.
+          v="v${{ steps.pin.outputs.version }}"
           if gh release view "$v" --repo "$RELEASES_REPO" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
             echo "::error::$v is already published on $RELEASES_REPO — bump the version first"
             exit 1

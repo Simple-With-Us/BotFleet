@@ -131,6 +131,32 @@ test("release workflow defaults to artifacts and requires explicit release mutat
   assert.match(workflow, /node scripts\/verify-release-assets\.mjs uploaded "\$VERSION"/);
 });
 
+test("the publish guard compares the stamped version, not an empty needs context", () => {
+  const workflow = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8").replace(/\r\n/g, "\n");
+  const prepare = workflow.slice(workflow.indexOf("\n  prepare:"), workflow.indexOf("\n  mac:"));
+  assert.ok(prepare.length > 0, "the workflow has a prepare job");
+
+  // The release version is stamped from history, not read from package.json:
+  // package.json says 1.0.31, which is the version already installed on the
+  // owner's Mac, so a feed carrying it can never offer an update.
+  assert.match(prepare, /version=\$\(node scripts\/stamp-commit-version\.mjs \.\)/);
+  // The stamp is `git rev-list --count`, which answers 1 on a shallow clone,
+  // so the checkout has to be full depth or every release would number 1.0.1.
+  assert.match(prepare, /fetch-depth: 0/);
+  // Inside the prepare job the needs context is empty -- prepare is the first
+  // job and depends on nothing -- so needs.prepare.outputs.version rendered
+  // empty and the guard compared the literal tag "v".  That matched no
+  // release, so the gate never fired and a published release could be
+  // overwritten instead of stopping the run.  Comments may name the mistake;
+  // the code must not use it.
+  const prepareCode = prepare
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n");
+  assert.match(prepareCode, /v="v\$\{\{ steps\.pin\.outputs\.version \}\}"/);
+  assert.doesNotMatch(prepareCode, /needs\.prepare\.outputs\.version/);
+});
+
 test("release tags must resolve to the pinned build, including nested annotated tags", async () => {
   const sha = "a".repeat(40);
   const annotation = "b".repeat(40);
