@@ -110,21 +110,21 @@ See the [OpenMausBot repository](https://github.com/milind-soni/OpenMausBot) for
 
 ## Quick start
 
-**Released builds ([latest](https://github.com/Simple-With-Us/BotFleet/releases/latest)):** the harness server is embedded, so no separate server setup is required.  Desktop numbering matches iOS (`1.0.x`).  This page always points at the latest packaged assets rather than a frozen tag, so it tracks whatever is actually published.
+**Released builds ([latest](https://github.com/Simple-With-Us/BotFleet/releases/latest)):** the harness server is embedded, so no separate server setup is required.  This page always points at the latest packaged assets rather than a frozen tag, so it tracks whatever is actually published.  The exact versions are in the table below — desktop and iOS are numbered independently.
 
 | | Download | Install |
 |---|---|---|
 | **macOS** (Apple silicon) | [BotFleet.dmg](https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet.dmg) | Drag it to Applications, open it.  Signed with the BotFleet Developer ID. |
 | **macOS** (Intel) | [BotFleet-intel.dmg](https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet-intel.dmg) | Same app, built for Intel Macs. |
-| **Windows** (x64) | Not published yet | The Windows installer is built by the release workflow but no Windows build has shipped.  Watch the [releases page](https://github.com/Simple-With-Us/BotFleet/releases) or build from source below. |
-| **Ubuntu 24.04** (x64) | Not published yet | Ubuntu packages are built by the release workflow but no Ubuntu build has shipped.  See the [Ubuntu Desktop guide](docs/linux-desktop.md) to build one from source. |
+| **Windows** (x64) | Not published | CI and the release workflow no longer build a Windows installer (BF-2500).  Build from source below. |
+| **Ubuntu 24.04** (x64) | Not published | CI and the release workflow no longer build Ubuntu packages (BF-2500).  See the [Ubuntu Desktop guide](docs/linux-desktop.md) to build one from source. |
 
 In-app **Check for updates** reads `latest-mac.yml` from the GitHub release.
 
 | | Value |
 |---|---|
 | Published release / tag | **v0.1.38** (the only tag) |
-| Update feed | **shipped** — that release carries `latest-mac.yml` alongside four DMGs.  The feed lists the two versioned ones (`BotFleet-0.1.38-arm64.dmg`, `BotFleet-0.1.38-x64.dmg`); the stable `BotFleet.dmg` and `BotFleet-intel.dmg` the download links above point at are there too.  No zip payload is published, so in-app updates install the DMG. |
+| Update feed | **shipped** — that release carries `latest-mac.yml` alongside four DMGs.  The feed lists the two versioned ones (`BotFleet-0.1.38-arm64.dmg`, `BotFleet-0.1.38-x64.dmg`); the stable `BotFleet.dmg` and `BotFleet-intel.dmg` the download links above point at are there too.  No ZIP payload is published, and the macOS updater needs one, so **Check for updates** cannot install from this feed ([`docs/releasing.md`](docs/releasing.md)).  Until a release ships both macOS zips, update by downloading the DMG. |
 | `package.json` version on `main` | `1.0.31` |
 | iOS companion `MARKETING_VERSION` | `1.0.30` |
 
@@ -219,6 +219,8 @@ Early but real — the loop works end to end: message → bot → streamed reply
 Every BotFleet-layer add-on listed above is in testing.
 
 Contributions welcome — the driver SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately small; adding a provider is one file in [`server/drivers/`](server/drivers/) plus a one-line registration.
+
+Fleet Kody review rules are maintained in [`Simple-With-Us/Kodus-Config`](https://github.com/Simple-With-Us/Kodus-Config), not in this tree.  See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how that relates to the repo-local `kodus-config.yml`.
 
 ## License
 

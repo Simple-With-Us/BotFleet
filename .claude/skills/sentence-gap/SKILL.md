@@ -1,7 +1,7 @@
 ---
 name: sentence-gap
 description: >-
-  Always put a visibly wider gap between sentences in every human-readable reply and file. Applies on every turn — Cursor desktop, Cursor cloud, CLI, Grok, chat, commits, PRs, and docs. Follows Monet's portable protocol: literal &nbsp; plus a space in Markdown chat UIs; two ASCII spaces in files. Never type a raw U+00A0 in chat. Use whenever writing any prose a human will read.
+  Always put a visibly wider gap between sentences in every human-readable reply and file. Applies on every turn — Cursor desktop, Cursor cloud, CLI, Grok, chat, commits, PRs, and docs. Follows Monet's portable protocol. Mechanism (owner ruling 2026-10-23, the same on every surface): a real U+00A0 plus a normal space between sentences; never the &nbsp; entity, and never two plain ASCII spaces, which collapse on rendered surfaces. Use whenever writing any prose a human will read.
 ---
 
 # Sentence gap (portable — always on)
@@ -13,7 +13,7 @@ description: >-
 > Cursor, Grok, Grok Bot, Codex, AG, DeepSeek, Kimi, and Fx have their own skill dirs and must not take identity from here.
 
 
-Source of truth: `/Users/jay/Code/ai-fleet-coordinator/docs/SENTENCE-GAP-PORTABLE-SKILL.md`
+Source of truth: `/Users/jay/Code/AI-Fleet-Coordinator/docs/SENTENCE-GAP-PORTABLE-SKILL.md`
 
 The block below is Monet's protocol, pasted verbatim. Follow it exactly. Do not weaken it. Cloud agents without the Mac filesystem still have the full protocol in this file.
 
@@ -21,11 +21,34 @@ The block below is Monet's protocol, pasted verbatim. Follow it exactly. Do not 
 
 Put a **visibly wider gap** between sentences — after `.` `!` `?` when a new sentence
 follows — in every piece of prose a human reads.  Not just product copy: chat replies,
-commit messages, PR titles and bodies, code comments, docs, tickets, Slack posts, release
+commit messages, PR titles and bodies, code comments, docs, tickets, Zulip posts, release
 notes, design docs.
 
 Do **not** add a gap after a non-terminal abbreviation (`e.g.`, `i.e.`, `Dr.`, `v1.2.3`),
 inside a URL, email, filename, or a brand name containing a period.
+
+### Current rule (owner ruling 2026-10-23) — one mechanism on every surface
+
+Jay, Fri, Oct 23:  update the rule everywhere, so it is the same on every surface.  Between
+sentences, write a **real U+00A0 (no-break space) followed by a normal space**.  That covers
+chat replies in every pane, Zulip, GitHub PR and issue text and review comments, Linear,
+Slack, commit messages, repo docs and Markdown, skills, agent instructions, and UI copy.
+
+- **Never write the `&nbsp;` entity.**  It shows up as literal text in squash-merge commits,
+  plain-text email and many APIs.
+- **Two plain ASCII spaces are not enough.**  Rendered surfaces (Zulip, GitHub, Linear, HTML,
+  Markdown chat panes) collapse them to one.
+- **Generate the U+00A0 in the shell** (the converter below, or `printf '\302\240'`) rather
+  than typing it, because a model-typed U+00A0 can be normalized to a plain space.  Check the
+  bytes before you post.
+- In product-copy source, spell it per language:  Swift `"\u{00A0} "`, JS/TS strings `"\u00A0 "`, JSX text `{'\u00A0'}` plus a space or `&#160;`, HTML markup source `&#160;`, or a shared `SENTENCE_GAP` constant.  Never `&nbsp;` in prose.
+- Code, identifiers and machine-readable config never get a U+00A0.
+- If a surface strips U+00A0, leave the text as it is rather than switching to the entity, and
+  report the surface in #Work-In-Progress.
+
+This replaces every earlier per-surface rule:  the entity in chat panes (2026-10-08, 2026-10-18)
+and on GitHub (2026-10-22), and two ASCII spaces in files, commits, terminals and untested
+surfaces (2026-10-20).  Where older text below disagrees, this section wins.
 
 ### The catch that wastes everyone's time
 
@@ -39,30 +62,50 @@ depends on the surface, so pick by destination:
 
 | Destination | Use | Why |
 |---|---|---|
-| **Chat / transcript UI that renders Markdown** | the literal entity text `&nbsp;` then a normal space → `End.&nbsp; Next.` | The renderer expands the entity into a real non-breaking space, so the gap is visible |
-| **Plain-text chat (no Markdown rendering)** | two literal ASCII spaces | Nothing collapses them; an entity would show as the ugly text `&nbsp;` |
-| **Files read as source** — repo docs, commit messages, code comments, config, diffs | two literal ASCII spaces | Read in an editor/terminal/`git diff`, which preserve them verbatim; an entity would appear literally |
-| **HTML / JSX / SwiftUI / any rendered product copy** | `&nbsp;&#32;`, `{"  "}`, `  `, or a shared `SENTENCE_GAP` constant | Raw double spaces collapse in HTML |
-| **Markdown source** | two literal spaces *between* sentences | ⚠️ Two spaces at the **end of a line** is the unrelated hard-line-break syntax — don't confuse the two |
+| **Every surface** — chat replies in any pane, Zulip, GitHub PR and issue titles, bodies and comments, review comments, Linear, Slack, commit messages, repo docs and Markdown, skills and agent instructions, rendered product copy | a real U+00A0 plus a normal space | Owner ruling 2026-10-23:  one rule everywhere.  Two ASCII spaces collapse on rendered surfaces, and the `&nbsp;` entity shows as literal text in squash commits, plain-text email and many APIs.  This replaces every earlier per-surface row. |
+| **HTML / JSX / Swift source for product copy** | Swift `"\u{00A0} "`, JS/TS strings `"\u00A0 "`, JSX text `{'\u00A0'}` plus a space or `&#160;`, HTML markup source `&#160;`, or a shared `SENTENCE_GAP` constant | The rendered result is the same U+00A0 plus a space.  Never `&nbsp; `. |
+| **Code, identifiers and machine-readable config** | no gap character | Never put U+00A0 into code, identifiers or config. |
+| **A surface that strips U+00A0** | leave the text as it is | Do not switch to the `&nbsp;` entity.  Report the surface in #Work-In-Progress. |
+| **Markdown source** | the same U+00A0 plus a space *between* sentences | ⚠️ Two spaces at the **end of a line** is the unrelated hard-line-break syntax — don't confuse the two |
 
-### Verify, don't assume — run this self-test once per platform
+**Producing U+00A0 through a tool.**  You cannot type a raw U+00A0 into your own chat reply,
+but a shell step can produce one.  Write the text with two ASCII spaces after each sentence,
+then convert it before it leaves your hands:
+`perl -CSDA -pe 's/([.!?])  (?=\S)/$1\x{a0} /g' body.txt > body.nbsp.txt`.  Check that the
+output holds at least one U+00A0 (`grep -c $'\xc2\xa0' body.nbsp.txt`) before passing it to
+`gh pr create --body-file`, `gh pr comment --body-file`, or the text you hand to `agent-sync post`.
 
-The table above is a starting point, not gospel: renderers differ and change.  **On your
-first run in a new tool, test it and ask the human what they actually see.**
+### Verify, don't assume — run this self-test only on a NEW, unlisted surface
 
-> Output these two lines verbatim, then ask which shows a wider gap:
->
-> A. `Sentence one.&nbsp; Sentence two.`
-> B. `Sentence one.  Sentence two.`
->
-> If A looks wider → use the `&nbsp;` entity on this surface.
-> If B looks wider, or they look identical → use two literal spaces.
-> If neither shows a gap → say so plainly and ask how they want it handled.
-> Then keep using whichever won, for that surface, for the rest of the session.
+Since 2026-10-23 every surface takes a real U+00A0 plus a normal space, so there is nothing to
+choose.  On a surface nobody has checked yet, post one test line with the gap generated in the
+shell and ask the human whether they see a wider gap.  If the surface strips the U+00A0, leave
+the text as it is, never switch to the `&nbsp;` entity, and report the surface in
+#Work-In-Progress.
 
-### Already tested — do NOT burn time re-trying these
+### History — 2026-08-19/20 findings on Claude Code (terminal + desktop), do NOT re-run these tests
 
-Verified on Claude Code (terminal + desktop), 2026-08-19/20:
+**2026-10-23 update — one mechanism everywhere.**  The owner replaced every per-surface rule
+with one:  a real U+00A0 plus a normal space on every surface, never the `&nbsp;` entity, and
+never two plain ASCII spaces.  The entity rows (chat panes 2026-10-08 and 2026-10-18, GitHub
+2026-10-22) and the two-ASCII-space rows (files, commits, terminals, untested surfaces) below
+are history only.
+
+**2026-09-04 update — desktop app superseded.**  The entity finding below for the desktop
+app (Code tab) was superseded by an owner-verified ruling on 2026-09-04: use **two literal
+ASCII spaces** there.  The 2026-08-19 entity advice for the desktop app was withdrawn.
+
+**2026-10-08 update — desktop app superseded again.**  On the Code tab, type the `&nbsp;`
+entity plus a space after each sentence (outside code spans); the renderer decodes it.  A raw
+U+00A0 from the model arrives as a plain space (0 NBSPs in the verified reply), and two
+ASCII spaces collapse.  Owner-verified 2026-10-08 with a screenshot.  The 2026-09-04 ASCII
+ruling is withdrawn.
+
+**Terminal CLI — no newer ruling.**  Last checked 2026-08-19/20; not re-verified since.
+Default to two literal ASCII spaces there, and do not use the `&nbsp;` entity on a terminal
+TUI, which would print it literally.
+
+What was found 2026-08-19/20:
 
 - ❌ **Two literal ASCII spaces in chat** — collapsed by the Markdown renderer.  Invisible.
 - ❌ **A raw U+00A0 character typed directly into chat** — normalized away in the
@@ -74,8 +117,9 @@ Verified on Claude Code (terminal + desktop), 2026-08-19/20:
   screen-reader modes only drop borders.
 - ❌ **Patching the client** — compiled and signed; breaks code signing and is wiped by
   auto-update.  Never attempt.
-- ✅ **The literal entity text `&nbsp;` + a space in chat** — renders as a visibly wider
-  gap.  This is the one that worked.
+- ✅ The literal entity text `&nbsp;` + a space rendered as a visibly wider gap, and does
+  again on the desktop app (re-verified 2026-10-08, see above).  Not re-verified on the
+  terminal CLI since, so use two ASCII spaces there.
 - ✅ **Two literal ASCII spaces in files** — correct and simplest; leave file content alone.
 
 ### The transferable lesson

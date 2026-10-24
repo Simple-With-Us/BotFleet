@@ -19,6 +19,8 @@ import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { spawn, spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 
+import { containerRuntimeLockdownEnv } from "../container-runtime-guard.ts";
+
 /** How `waitForExit` should end the child, and how long to allow. */
 export interface WaitForExitOptions {
   /** Sent immediately. Omit for a child the caller has already signalled. */
@@ -143,6 +145,13 @@ export function spawnDetached(command: string, args: readonly string[], options:
     ...(process.platform === "win32" ? {} : { detached: true }),
     env: {
       ...options.env,
+      // A harness child gets a throwaway HOME but shares the machine's ONE
+      // container daemon, and the Local VM container name derives from the OS
+      // username, not HOME.  Without this a test turned the Local VM on and
+      // created (then orphaned) the owner's real container.  Set last so a
+      // suite's env cannot drop it; a suite that shadows `docker` with a
+      // script names the directory in BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR.
+      ...containerRuntimeLockdownEnv(),
       BOTFLEET_TEST_CHILD: "1",
       BOTFLEET_TEST_PARENT_PID: String(process.pid),
     },

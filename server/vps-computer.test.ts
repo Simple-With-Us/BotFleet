@@ -13,6 +13,7 @@ import {
   DISPLAY,
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
+  MANAGED_IMAGE_BUILD_TIMEOUT_MS,
   MANAGED_LABEL,
   healCuaShimsScript,
   resetCuaShimHealGate,
@@ -36,9 +37,15 @@ import {
   vpsDriverError,
   vpsSshTunnelArgs,
   perBotVpsTarget,
+  runnerFailureDetail,
   vpsSyncCliCredentials,
   resetVpsCliSyncThrottle,
   reuseVps,
+  inspectVpsForAuto,
+  resetVpsImageBuildState,
+  vpsImageBuildState,
+  vpsPrepareImageAhead,
+  vpsSwitchToPreparedImage,
   type VpsCommandRunner,
 } from "./vps-computer.ts";
 import { computerReach, type ComputerCapabilityFlags } from "./computer-capability.ts";
@@ -157,7 +164,7 @@ function fixture({
             },
           },
            Id: containerId,
-          Image: state.image ? state.containerImageId : "old-image-id",
+          Image: state.containerImageId,
           HostConfig: {
             Binds: mounts ? ["/host:/container"] : [],
             VolumesFrom: [],
@@ -435,6 +442,16 @@ describe("VPS computer", () => {
     expect(provision.calls.some(({ args }) => args[2] === "build")).toBe(true);
   });
 
+  // The CLI layer makes a cold build take 20 minutes or more, and the VPS path
+  // used to cap it at 10, so every VPS rebuild would have timed out.
+  it("gives the image build the same generous timeout as the Local VM", async () => {
+    const provision = fixture({ image: false, container: false });
+    await vpsComputerAction("provision", CONFIG, BOT_ID, provision.runner);
+    const build = provision.calls.find(({ args }) => args[2] === "build");
+    expect(build?.options?.timeoutMs).toBe(MANAGED_IMAGE_BUILD_TIMEOUT_MS);
+    expect(MANAGED_IMAGE_BUILD_TIMEOUT_MS).toBeGreaterThanOrEqual(30 * 60_000);
+  });
+
   it("uses the image id produced by a rebuild", async () => {
     const staleImageId = `sha256:${"b".repeat(64)}`;
     const provision = fixture({
@@ -541,6 +558,34 @@ describe("VPS computer", () => {
     await expect(vpsComputerAction("provision", {}, BOT_ID, fixture().runner)).rejects.toThrow(/not configured/);
   });
 
+  it("shares one Auto inspection among turns that ask while it runs, never jumping a stop queued behind it", async () => {
+    const fake = fixture();
+    let release!: () => void;
+    let gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const runner: VpsCommandRunner = async (args, options) => {
+      if (args[2] === "image") await gate;
+      return fake.runner(args, options);
+    };
+    const inspections = () => fake.calls.filter(({ args }) => args[2] === "image").length;
+    const burst = [1, 2, 3].map(() => inspectVpsForAuto(CONFIG, BOT_ID, runner));
+    release();
+    expect((await Promise.all(burst)).map((status) => status.ready)).toEqual([true, true, true]);
+    expect(inspections()).toBe(1);
+
+    gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const running = inspectVpsForAuto(CONFIG, BOT_ID, runner);
+    const stop = vpsComputerAction("stop", CONFIG, BOT_ID, runner);
+    const after = inspectVpsForAuto(CONFIG, BOT_ID, runner);
+    release();
+    expect((await running).ready).toBe(true);
+    expect((await stop).container).toBe("stopped");
+    expect(await after).toMatchObject({ ready: false, container: "stopped" });
+  });
+
   it("attributes a transport failure to the link, never to a missing container", async () => {
     const fake = fixture();
     const flaky: VpsCommandRunner = async (args, options) => {
@@ -598,6 +643,105 @@ describe("VPS computer", () => {
     expect(status.desktop_error).toContain("did not become ready");
     expect(status.problem).toContain("desktop failed to start");
     expect(fake.calls.some(({ args }) => args[2] === "exec" && args.includes("tail"))).toBe(true);
+  });
+
+  describe("a failed desktop probe never blames the Driver's normal startup output", () => {
+    const ESC = "\u001b";
+    // The owner's card on 2026-10-08: the update notice, a coloured WARN, and
+    // the readiness line, shown as "The VPS CUA desktop failed to start".
+    const healthyLog = [
+      "cua-driver v0.34.0 is available (you have v0.20.0)",
+      "   Update with: cua-driver update",
+      "   Release notes: https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.34.0",
+      `${ESC}[2m2026-10-07T13:54:42.869037Z${ESC}[0m ${ESC}[33m WARN${ESC}[0m ${ESC}[2mplatform_linux::overlay${ESC}[0m${ESC}[2m:${ESC}[0m X11 overlay: root reads cannot see this window's own pixels`,
+      "Cua Driver daemon listening on /opt/ogb/run/cua.sock",
+    ].join("\n");
+
+    /** A runner whose Driver probe throws `probeError` and whose supervisor log
+     * reads as `log` (or fails to read, when `log` is an Error). */
+    function failingProbe(probeError: Error, log: string | Error) {
+      const fake = fixture();
+      const runner: VpsCommandRunner = async (args, options) => {
+        if (args[2] === "exec" && args.at(-1) === "--version") throw probeError;
+        if (args[2] === "exec" && args.includes("tail")) {
+          if (log instanceof Error) throw log;
+          return { stdout: log, stderr: "" };
+        }
+        return fake.runner(args, options);
+      };
+      return { runner, calls: fake.calls };
+    }
+
+    it("shows no banner, no WARN and no escape codes when the log is only startup noise", async () => {
+      const { runner } = failingProbe(new Error("CUA health report is failed"), healthyLog);
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.desktopReady).toBe(false);
+      expect(status.container).toBe("running");
+      expect(status.problem).toBe("The VPS CUA desktop failed to start: CUA health report is failed");
+      for (const noise of ["Release notes", "WARN", "overlay", "listening", "[2m", "[0m", ESC]) {
+        expect(status.problem).not.toContain(noise);
+      }
+    });
+
+    it("falls back to the generic not-ready copy when nothing real can be said", async () => {
+      const { runner } = failingProbe(new Error(healthyLog), healthyLog);
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.desktop_error).toBeNull();
+      expect(status.desktopUnreachable).toBe(false);
+      expect(status.problem).toBe("The VPS container started, but CUA Driver is not ready yet");
+    });
+
+    it("reports one timed-out probe as a transient check failure beside a running container", async () => {
+      const timedOut = new Error("Docker-over-SSH command timed out");
+      const { runner } = failingProbe(timedOut, timedOut);
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.container).toBe("running");
+      expect(status.desktopReady).toBe(false);
+      expect(status.desktop_error).toBeNull();
+      expect(status.desktopUnreachable).toBe(true);
+      expect(status.ready).toBe(false);
+      expect(status.problem).toBe("Couldn't reach the VPS desktop just now; retrying");
+      expect(status.problem).not.toMatch(/failed to start|agent/i);
+    });
+
+    it("still reports a real supervisor fault when the probe also timed out", async () => {
+      const timedOut = new Error("Docker-over-SSH command timed out");
+      const { runner } = failingProbe(
+        timedOut,
+        `${healthyLog.split("\n")[0]}\n${ESC}[31m2026-10-07T13:56:00Z ERROR${ESC}[0m cua_driver: worker panicked`,
+      );
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.desktopUnreachable).toBe(false);
+      expect(status.problem).toBe(
+        "The VPS CUA desktop failed to start: 2026-10-07T13:56:00Z ERROR cua_driver: worker panicked",
+      );
+    });
+
+    it("names the Driver version that answered when it is not the pinned one", async () => {
+      const fake = fixture();
+      const runner: VpsCommandRunner = async (args, options) => {
+        if (args[2] === "exec" && args.at(-1) === "--version") return { stdout: "cua-driver 0.34.0\n", stderr: "" };
+        if (args[2] === "exec" && args.includes("tail")) return { stdout: healthyLog, stderr: "" };
+        return fake.runner(args, options);
+      };
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.problem).toBe(
+        `The VPS CUA desktop failed to start: unexpected CUA Driver version "cua-driver 0.34.0" (expected ${CUA_DRIVER_VERSION})`,
+      );
+    });
+
+    it("strips escape codes from a transport failure", async () => {
+      const fake = fixture();
+      const runner: VpsCommandRunner = async (args, options) => {
+        if (args[2] === "image") throw new Error(`${ESC}[31mssh: connect to host vps port 22: Operation timed out${ESC}[0m`);
+        return fake.runner(args, options);
+      };
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.daemonUp).toBe(false);
+      expect(status.problem).toBe(
+        "Docker over SSH failed while checking the VPS: ssh: connect to host vps port 22: Operation timed out",
+      );
+    });
   });
 
   it("waits for readiness with a cheap driver probe and backoff, not full re-inspections", async () => {
@@ -793,6 +937,139 @@ describe("VPS computer", () => {
       expect(tarCalls(replaced.calls)).toHaveLength(1);
     });
 
+    it("keeps the sync successful when tar errors but every credential destination landed", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-partial-"));
+      try {
+        mkdirSync(join(tempDir, ".ssh"), { recursive: true });
+        writeFileSync(join(tempDir, ".ssh", "config"), "Host *\n");
+
+        const fake = fixture({ container: true, running: true });
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        try {
+          // tar exits non-zero because one member could not be written, and the
+          // probe confirms nothing is actually missing (the gcloud case).
+          const partial: VpsCommandRunner = async (args, options) => {
+            if (args.includes("tar") && args.includes("-xf")) {
+              fake.calls.push({ args, options });
+              throw new Error("tar: .config/gcloud/logs: Cannot mkdir: Permission denied");
+            }
+            if (args.includes("sh") && args.includes("-c")) {
+              fake.calls.push({ args, options });
+              return { stdout: "", stderr: "" }; // probe: nothing is missing
+            }
+            return fake.runner(args, options);
+          };
+
+          const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, partial, tempDir);
+          expect(result.ok).toBe(true);
+          expect(result.syncedTools.some((entry) => entry.name === "ssh")).toBe(true);
+        } finally {
+          warn.mockRestore();
+        }
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("repairs a root-owned guest destination and re-extracts instead of failing the sync", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-repair-"));
+      try {
+        mkdirSync(join(tempDir, ".ssh"), { recursive: true });
+        writeFileSync(join(tempDir, ".ssh", "config"), "Host *\n");
+
+        const fake = fixture({ container: true, running: true });
+        let extractAttempts = 0;
+        const repairing: VpsCommandRunner = async (args, options) => {
+          // tar: refuses to write while a root-owned path sits in the way.
+          if (args.includes("tar") && args.includes("-xf")) {
+            extractAttempts += 1;
+            fake.calls.push({ args, options });
+            if (extractAttempts === 1) throw new Error("tar: /home/cua/.ssh: Cannot open: Permission denied");
+            return { stdout: "", stderr: "" };
+          }
+          if (args.includes("sh") && args.includes("-c")) {
+            fake.calls.push({ args, options });
+            // The probe reports .ssh absent until the repair has run.
+            if (String(args[args.length - 1]).includes("rm -rf")) return { stdout: "", stderr: "" };
+            return extractAttempts > 1 ? { stdout: "", stderr: "" } : { stdout: "/home/cua/.ssh\n", stderr: "" };
+          }
+          return fake.runner(args, options);
+        };
+
+        const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, repairing, tempDir);
+        expect(result.ok).toBe(true);
+        expect(extractAttempts).toBe(2);
+        // The repair only works as root: a `--cap-drop ALL` container gives
+        // cua no way to remove a path it does not own.
+        const repair = fake.calls.find((call) => String(call.args[call.args.length - 1]).includes("rm -rf"));
+        expect(repair?.args).toContain("-u");
+        expect(repair?.args).toContain("0");
+        expect(String(repair?.args[repair?.args.length - 1] ?? "")).toContain("/home/cua/.ssh");
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    // Kody's high finding on #936: a directory can exist on the guest while the
+    // credential file inside it was refused.  Probing only the top-level
+    // destination reports that as a complete sync.
+    it("fails when the destination directory exists but the packed file inside it is missing", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-member-"));
+      try {
+        mkdirSync(join(tempDir, ".ssh"), { recursive: true });
+        writeFileSync(join(tempDir, ".ssh", "config"), "Host *\n");
+
+        const fake = fixture({ container: true, running: true });
+        const member: VpsCommandRunner = async (args, options) => {
+          if (args.includes("tar") && args.includes("-xf")) {
+            fake.calls.push({ args, options });
+            throw new Error("tar: .ssh/config: Cannot open: Permission denied");
+          }
+          if (args.includes("sh") && args.includes("-c")) {
+            fake.calls.push({ args, options });
+            // Every top-level directory is present; only the file is not.
+            const probe = String(args[args.length - 1] ?? "");
+            if (probe.includes("rm -rf")) return { stdout: "", stderr: "" };
+            return { stdout: probe.includes(".ssh/config") ? "/home/cua/.ssh/config\n" : "", stderr: "" };
+          }
+          return fake.runner(args, options);
+        };
+
+        await expect(vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, member, tempDir)).rejects.toThrow(
+          /are missing/,
+        );
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("still fails the sync when a credential destination is genuinely missing", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-missing-"));
+      try {
+        mkdirSync(join(tempDir, ".ssh"), { recursive: true });
+        writeFileSync(join(tempDir, ".ssh", "config"), "Host *\n");
+
+        const fake = fixture({ container: true, running: true });
+        const missing: VpsCommandRunner = async (args, options) => {
+          if (args.includes("tar") && args.includes("-xf")) {
+            fake.calls.push({ args, options });
+            throw new Error("tar extract failed");
+          }
+          if (args.includes("sh") && args.includes("-c")) {
+            fake.calls.push({ args, options });
+            return { stdout: "/home/cua/.ssh\n", stderr: "" };
+          }
+          return fake.runner(args, options);
+        };
+
+        await expect(vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, missing, tempDir)).rejects.toThrow(
+          /are missing/,
+        );
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
     it("backs off after a failed automatic sync instead of retrying on every turn", async () => {
       const base = fixture({ containerName: SHARED_VPS_TARGET.containerName });
       const failing: VpsCommandRunner = async (args, options) => {
@@ -822,5 +1099,241 @@ describe("VPS computer", () => {
       const heals = fake.calls.filter(({ args }) => args.includes("root") && args.includes(healCuaShimsScript()));
       expect(heals).toHaveLength(1);
     });
+  });
+});
+
+describe("runnerFailureDetail", () => {
+  it("keeps every line of a long stderr, because the first line is the diagnosis", () => {
+    // What the shared VPS produced: one refused member per line.  A 1000-char
+    // tail cut mid-word, so the log opened with "kdir: Permission denied"
+    // instead of "Cannot mkdir: Permission denied" and lost the rest.
+    const lines = ["tar: .config/gcloud/logs/2026.10.02/x.log: Cannot open: No such file or directory"];
+    for (let day = 1; day <= 40; day += 1) {
+      lines.push(`tar: .config/gcloud/logs/2026.10.${String(day).padStart(2, "0")}: Cannot mkdir: Permission denied`);
+    }
+    const stderr = `${lines.join("\n")}\ntar: Exiting with failure status due to previous errors\n`;
+    expect(stderr.length).toBeGreaterThan(1_000);
+    const detail = runnerFailureDetail(stderr, 2);
+    expect(detail).toBe(stderr.trim());
+    expect(detail).toContain("Cannot open: No such file or directory");
+    expect(detail).toContain("Cannot mkdir: Permission denied");
+    expect(detail).toContain("Exiting with failure status due to previous errors");
+  });
+
+  it("says how much stderr was dropped instead of clipping silently", () => {
+    const detail = runnerFailureDetail(`${"x".repeat(20_000)}`, 1);
+    expect(detail).toContain("earlier characters omitted");
+    expect(detail.length).toBeLessThan(9_000);
+  });
+
+  it("reports the exit status when there was no stderr to report", () => {
+    expect(runnerFailureDetail("   \n", 7)).toBe("Docker-over-SSH exited 7");
+    expect(runnerFailureDetail("", null)).toBe("Docker-over-SSH exited without a status");
+  });
+
+  it("still scrubs a secret out of the command's own stderr", () => {
+    expect(runnerFailureDetail("docker: failed with VNC_PW=hunter2 in the command line", 1)).toContain(
+      "VNC_PW=<redacted>",
+    );
+  });
+});
+
+describe("VPS image build-ahead and switch", () => {
+  const SHARED: AppConfig = { vps: { sshAlias: "production-vps" }, botDefaults: { vpsMode: "shared" } };
+  const STALE_IMAGE_ID = `sha256:${"c".repeat(64)}`;
+  // A shared container still running on the previous IMAGE_LAYER_VERSION:
+  // the new pinned tag is absent until the build, and once it exists the
+  // container is still on the old image id.
+  const staleShared = () =>
+    fixture({ image: false, containerImageId: STALE_IMAGE_ID, containerName: SHARED_VPS_TARGET.containerName });
+  const gated = (runner: VpsCommandRunner) => {
+    let release!: () => void;
+    let fail: ((error: Error) => void) | undefined;
+    const gate = new Promise<void>((resolve, reject) => {
+      release = resolve;
+      fail = reject;
+    });
+    const wrapped: VpsCommandRunner = async (args, options) => {
+      if (args[2] === "build") await gate;
+      return runner(args, options);
+    };
+    return { runner: wrapped, release: () => release(), fail: (error: Error) => fail?.(error) };
+  };
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const builds = (calls: Array<{ args: string[] }>) => calls.filter(({ args }) => args[2] === "build").length;
+
+  beforeEach(() => resetVpsImageBuildState());
+  afterEach(() => resetVpsImageBuildState());
+
+  it("reports a running container on a stale image as outdated, never as clean and ready", async () => {
+    const fake = staleShared();
+    const status = await vpsComputerStatus(SHARED, "workspace", fake.runner);
+    expect(status.container).toBe("running");
+    expect(status.image).toBe(false);
+    expect(status.imageOutdated).toBe(true);
+    expect(status.ready).toBe(false);
+    expect(status.imageBuild.phase).toBe("idle");
+    expect(status.problem).toMatch(/Prepare the pinned BotFleet CUA image/);
+  });
+
+  it("builds once for concurrent presses while the old container keeps running", async () => {
+    const fake = staleShared();
+    const gate = gated(fake.runner);
+    const first = await vpsPrepareImageAhead(SHARED, gate.runner);
+    const second = await vpsPrepareImageAhead(SHARED, gate.runner);
+    expect(first.phase).toBe("building");
+    expect(second.phase).toBe("building");
+    expect(second.startedAt).toBe(first.startedAt);
+    await settle();
+
+    const during = await vpsComputerStatus(SHARED, "workspace", gate.runner);
+    expect(during.imageBuild.phase).toBe("building");
+    expect(during.imageBuild.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(during.container).toBe("running");
+
+    gate.release();
+    await settle();
+    await settle();
+    expect(builds(fake.calls)).toBe(1);
+    // nothing touched the running container while the image built
+    expect(fake.calls.some(({ args }) => ["rm", "stop", "run"].includes(args[2]!))).toBe(false);
+
+    const after = await vpsComputerStatus(SHARED, "workspace", fake.runner);
+    expect(after.image).toBe(true);
+    expect(after.imageBuild.phase).toBe("ready");
+    expect(after.imageOutdated).toBe(true);
+    expect(after.ready).toBe(false);
+  });
+
+  it("lets a provision that needs the image join the build already running", async () => {
+    const fake = fixture({ image: false, container: false });
+    const gate = gated(fake.runner);
+    await vpsPrepareImageAhead(CONFIG, gate.runner);
+    await settle();
+    const provision = vpsComputerAction("provision", CONFIG, BOT_ID, gate.runner);
+    await settle();
+    gate.release();
+    const status = await provision;
+    expect(status.ready).toBe(true);
+    expect(builds(fake.calls)).toBe(1);
+  });
+
+  it("skips the build when the pinned image is already on the VPS", async () => {
+    const fake = fixture();
+    await vpsPrepareImageAhead(CONFIG, fake.runner);
+    await settle();
+    await settle();
+    expect(builds(fake.calls)).toBe(0);
+    expect(vpsImageBuildState("production-vps", true).phase).toBe("ready");
+  });
+
+  it("records a failed build for the panel without an unhandled rejection, and a retry can succeed", async () => {
+    const fake = staleShared();
+    const gate = gated(fake.runner);
+    await vpsPrepareImageAhead(SHARED, gate.runner);
+    await settle();
+    gate.fail(new Error("docker build exited 1: \u001b[31mno space left on device\u001b[0m"));
+    await settle();
+    await settle();
+    const failed = await vpsComputerStatus(SHARED, "workspace", fake.runner);
+    expect(failed.imageBuild.phase).toBe("failed");
+    expect(failed.imageBuild.error).toContain("no space left on device");
+    expect(failed.imageBuild.error).not.toContain("\u001b");
+
+    await vpsPrepareImageAhead(SHARED, fake.runner);
+    await settle();
+    await settle();
+    const retried = await vpsComputerStatus(SHARED, "workspace", fake.runner);
+    expect(retried.imageBuild.phase).toBe("ready");
+    expect(retried.image).toBe(true);
+  });
+
+  it("refuses to switch before the new image is ready", async () => {
+    const fake = staleShared();
+    await expect(vpsSwitchToPreparedImage(SHARED, fake.runner)).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringMatching(/isn't ready yet/),
+    });
+    expect(fake.calls.some(({ args }) => ["rm", "run"].includes(args[2]!))).toBe(false);
+  });
+
+  it("refuses to switch while the image is still building", async () => {
+    const fake = staleShared();
+    const gate = gated(fake.runner);
+    await vpsPrepareImageAhead(SHARED, gate.runner);
+    await settle();
+    await expect(vpsSwitchToPreparedImage(SHARED, gate.runner)).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringMatching(/still building/),
+    });
+    expect(fake.calls.some(({ args }) => ["rm", "run"].includes(args[2]!))).toBe(false);
+    gate.release();
+    await settle();
+  });
+
+  it("refuses outside shared mode, with no container, or when already current", async () => {
+    await expect(vpsSwitchToPreparedImage(CONFIG, fixture().runner)).rejects.toMatchObject({ status: 409 });
+    const missing = fixture({ container: false, containerName: SHARED_VPS_TARGET.containerName });
+    await expect(vpsSwitchToPreparedImage(SHARED, missing.runner)).rejects.toThrow(/No shared VPS container/);
+    const current = fixture({ containerName: SHARED_VPS_TARGET.containerName });
+    await expect(vpsSwitchToPreparedImage(SHARED, current.runner)).rejects.toThrow(/already runs the current image/);
+    expect(current.calls.some(({ args }) => args[2] === "rm")).toBe(false);
+  });
+
+  it("switches a stale container onto the prepared image without rebuilding it", async () => {
+    const fake = staleShared();
+    await vpsPrepareImageAhead(SHARED, fake.runner);
+    await settle();
+    await settle();
+    const buildsBefore = builds(fake.calls);
+    expect(buildsBefore).toBe(1);
+
+    const status = await vpsSwitchToPreparedImage(SHARED, fake.runner);
+    expect(status.ready).toBe(true);
+    expect(status.imageOutdated).toBe(false);
+    expect(builds(fake.calls)).toBe(buildsBefore);
+    const rm = fake.calls.findIndex(({ args }) => args[2] === "rm" && args[3] === "-f" && args[4] === CONTAINER_ID);
+    const run = fake.calls.findIndex(({ args }) => args[2] === "run");
+    expect(rm).toBeGreaterThanOrEqual(0);
+    expect(run).toBeGreaterThan(rm);
+    expect(fake.calls[run]!.args.at(-1)).toBe(IMAGE_ID);
+  });
+
+  it("does not offer a swap for label drift on the pinned image, and still refuses to call it ready", async () => {
+    // A container on the pinned image id whose own labels drifted: bots
+    // refuse it, but replacing it would not be an image switch, so it is not
+    // "outdated" and the destructive swap is not offered.
+    const drifted = fixture({ containerName: SHARED_VPS_TARGET.containerName });
+    const runner: VpsCommandRunner = async (args, options) => {
+      const out = await drifted.runner(args, options);
+      if (args[2] !== "inspect") return out;
+      const parsed = JSON.parse(out.stdout) as Array<{ Config: { Labels: Record<string, string> } }>;
+      parsed[0]!.Config.Labels[VPS_VIEWER_LABEL] = "0";
+      return { ...out, stdout: JSON.stringify(parsed) };
+    };
+    const status = await vpsComputerStatus(SHARED, "workspace", runner);
+    expect(status.imageMatches).toBe(false);
+    expect(status.imageOutdated).toBe(false);
+    expect(status.ready).toBe(false);
+    await expect(vpsSwitchToPreparedImage(SHARED, runner)).rejects.toThrow(/already runs the current image/);
+  });
+
+  it("reads an image with null labels as not the pinned image rather than a transport failure", async () => {
+    const fake = fixture();
+    const runner: VpsCommandRunner = async (args, options) => {
+      if (args[2] === "image") {
+        return { stdout: JSON.stringify([{ Id: IMAGE_ID, Config: { Labels: null } }]), stderr: "" };
+      }
+      return fake.runner(args, options);
+    };
+    const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+    expect(status.daemonUp).toBe(true);
+    expect(status.image).toBe(false);
+  });
+
+  it("refuses a container BotFleet did not create", async () => {
+    const fake = fixture({ managed: false, containerImageId: STALE_IMAGE_ID, containerName: SHARED_VPS_TARGET.containerName });
+    await expect(vpsSwitchToPreparedImage(SHARED, fake.runner)).rejects.toThrow(/did not create/);
+    expect(fake.calls.some(({ args }) => args[2] === "rm")).toBe(false);
   });
 });

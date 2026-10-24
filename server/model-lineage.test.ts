@@ -148,9 +148,12 @@ describe("Claude CLI version gate", () => {
   });
 
   it("names the models an older CLI's own catalog does not list yet", () => {
-    expect([...claudeModelsTooNewFor("2.1.232 (Claude Code)")]).toEqual(["claude-opus-5-5"]);
-    expect([...claudeModelsTooNewFor("2.1.279")]).toEqual(["claude-opus-5-5"]);
-    expect(claudeModelsTooNewFor("2.1.280").size).toBe(0);
+    expect([...claudeModelsTooNewFor("2.1.232 (Claude Code)")].sort()).toEqual(["claude-opus-5-5", "claude-sonnet-5-5"]);
+    expect([...claudeModelsTooNewFor("2.1.279")].sort()).toEqual(["claude-opus-5-5", "claude-sonnet-5-5"]);
+    // Opus 5.5 landed in 2.1.280; Sonnet 5.5 landed in 2.1.284.
+    expect([...claudeModelsTooNewFor("2.1.280")]).toEqual(["claude-sonnet-5-5"]);
+    expect([...claudeModelsTooNewFor("2.1.283")]).toEqual(["claude-sonnet-5-5"]);
+    expect(claudeModelsTooNewFor("2.1.284").size).toBe(0);
     expect(claudeModelsTooNewFor("3.0.0").size).toBe(0);
     expect(claudeModelsTooNewFor(undefined).size).toBe(0);
   });
@@ -163,13 +166,25 @@ describe("Claude CLI version gate", () => {
 
   it("keeps a pinned Opus 5 on Opus 5 for a CLI too old for Opus 5.5, and moves it on a new one", () => {
     const pinned = { instanceId: "claude", model: "claude-opus-5" };
+    const pinnedSonnet = { instanceId: "claude", model: "claude-sonnet-5" };
     const old = gateLineageByCliVersion(claude, "2.1.232 (Claude Code)")!;
     expect(old.offeredIds).not.toContain("claude-opus-5-5");
-    expect(old.offeredIds).toContain("claude-sonnet-5-5");
+    expect(old.offeredIds).not.toContain("claude-sonnet-5-5");
+    expect(old.offeredIds).toContain("claude-sonnet-5");
     expect(reconcileEntry(pinned, old).entry).toBe(pinned);
-    // Latest Opus resolves to what that CLI can run.
+    expect(reconcileEntry(pinnedSonnet, old).entry).toBe(pinnedSonnet);
+    // Latest resolves to what that CLI can run.
     expect(reconcileEntry({ ...pinned, latest: "opus" }, old).entry.model).toBe("claude-opus-5");
-    expect(reconcileEntry(pinned, gateLineageByCliVersion(claude, "2.1.284 (Claude Code)")).entry.model).toBe("claude-opus-5-5");
+    expect(reconcileEntry({ ...pinnedSonnet, latest: "sonnet" }, old).entry.model).toBe("claude-sonnet-5");
+    // 2.1.280 can run Opus 5.5 and still cannot run Sonnet 5.5.
+    const mid = gateLineageByCliVersion(claude, "2.1.280 (Claude Code)")!;
+    expect(mid.offeredIds).toContain("claude-opus-5-5");
+    expect(mid.offeredIds).not.toContain("claude-sonnet-5-5");
+    expect(reconcileEntry(pinned, mid).entry.model).toBe("claude-opus-5-5");
+    expect(reconcileEntry({ ...pinnedSonnet, latest: "sonnet" }, mid).entry.model).toBe("claude-sonnet-5");
+    const current = gateLineageByCliVersion(claude, "2.1.284 (Claude Code)")!;
+    expect(reconcileEntry(pinned, current).entry.model).toBe("claude-opus-5-5");
+    expect(reconcileEntry(pinnedSonnet, current).entry.model).toBe("claude-sonnet-5-5");
   });
 
   it("leaves other engines alone", () => {
@@ -179,12 +194,22 @@ describe("Claude CLI version gate", () => {
 
   it("offers Opus 5 instead of Opus 5.5 in the picker for an older CLI", () => {
     const [old] = presentDescribedInstances([{ ...instances.claude, snapshot: { version: "2.1.232 (Claude Code)" } }]);
-    expect(optionIds(old!.models)).toEqual(expect.arrayContaining(["claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1"]));
+    expect(optionIds(old!.models)).toEqual(expect.arrayContaining(["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"]));
     expect(optionIds(old!.models)).not.toContain("claude-opus-5-5");
-    expect(old!.models.default).toBe("claude-sonnet-5-5");
+    expect(optionIds(old!.models)).not.toContain("claude-sonnet-5-5");
+    expect(old!.models.default).toBe("claude-sonnet-5");
+    const [mid] = presentDescribedInstances([{ ...instances.claude, snapshot: { version: "2.1.280 (Claude Code)" } }]);
+    expect(optionIds(mid!.models)).toContain("claude-opus-5-5");
+    expect(optionIds(mid!.models)).toContain("claude-sonnet-5");
+    expect(optionIds(mid!.models)).not.toContain("claude-sonnet-5-5");
+    expect(optionIds(mid!.models)).not.toContain("claude-opus-5");
+    expect(mid!.models.default).toBe("claude-sonnet-5");
     const [current] = presentDescribedInstances([{ ...instances.claude, snapshot: { version: "2.1.284 (Claude Code)" } }]);
     expect(optionIds(current!.models)).toContain("claude-opus-5-5");
+    expect(optionIds(current!.models)).toContain("claude-sonnet-5-5");
     expect(optionIds(current!.models)).not.toContain("claude-opus-5");
+    expect(optionIds(current!.models)).not.toContain("claude-sonnet-5");
+    expect(current!.models.default).toBe("claude-sonnet-5-5");
   });
 });
 
@@ -264,6 +289,88 @@ describe("checkLineageWrite", () => {
     expect(write({ ...custom, fallbacks: [{ instanceId: "grok", model: "grok-3-mini" }] })).toEqual({
       ok: false,
       error: 'retired model "grok-3-mini" in fallback 1 — choose another model',
+    });
+  });
+
+  describe("context cap and output limit", () => {
+    const saved: ModelSelection = {
+      instanceId: "claude",
+      model: "claude-sonnet-5-5",
+      contextCap: 524_288,
+      maxOutputTokens: 8192,
+      fallbacks: [
+        { instanceId: "codex", model: "gpt-5.5", maxOutputTokens: 4096 },
+        { instanceId: "grok", model: "grok-4.7", contextCap: 131_072 },
+      ],
+    };
+    const ask = (raw: ModelSelection) => {
+      const result = write(raw, saved, raw);
+      if (!result.ok) throw new Error(result.error);
+      return result.selection;
+    };
+
+    it("keeps the saved limits when an older client re-sends the selection without them", () => {
+      // The shipped iOS app decodes instanceId, model, effort and fallbacks only.
+      const resent = ask({
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        effort: "high",
+        fallbacks: [
+          { instanceId: "codex", model: "gpt-5.5" },
+          { instanceId: "grok", model: "grok-4.7" },
+        ],
+      });
+      expect(resent).toMatchObject({
+        effort: "high",
+        contextCap: 524_288,
+        maxOutputTokens: 8192,
+        fallbacks: [
+          { instanceId: "codex", model: "gpt-5.5", maxOutputTokens: 4096 },
+          { instanceId: "grok", model: "grok-4.7", contextCap: 131_072 },
+        ],
+      });
+      expect(resent.fallbacks?.[0]?.contextCap).toBeUndefined();
+    });
+
+    it("follows a reordered fallback to its own limits", () => {
+      const resent = ask({
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        fallbacks: [
+          { instanceId: "grok", model: "grok-4.7" },
+          { instanceId: "codex", model: "gpt-5.5" },
+        ],
+      });
+      expect(resent.fallbacks).toEqual([
+        { instanceId: "grok", model: "grok-4.7", contextCap: 131_072 },
+        { instanceId: "codex", model: "gpt-5.5", maxOutputTokens: 4096 },
+      ]);
+    });
+
+    it("clears a limit only on an explicit null, and keeps the other one", () => {
+      const raw = { instanceId: "claude", model: "claude-sonnet-5-5", contextCap: null };
+      const result = write({ instanceId: "claude", model: "claude-sonnet-5-5" }, saved, raw);
+      expect(result.ok && result.selection.contextCap).toBeUndefined();
+      expect(result.ok && result.selection.maxOutputTokens).toBe(8192);
+    });
+
+    it("never hands a limit to a different model", () => {
+      const moved = ask({ instanceId: "claude", model: "claude-opus-5" });
+      expect(moved.contextCap).toBeUndefined();
+      expect(moved.maxOutputTokens).toBeUndefined();
+      const otherEngine = ask({ instanceId: "claude2", model: "claude-sonnet-5-5" });
+      expect(otherEngine.contextCap).toBeUndefined();
+    });
+
+    it("lets a value the client sends win over the saved one", () => {
+      const resent = ask({ instanceId: "claude", model: "claude-sonnet-5-5", contextCap: 262_144 });
+      expect(resent.contextCap).toBe(262_144);
+      expect(resent.maxOutputTokens).toBe(8192);
+    });
+
+    it("carries nothing when there is no saved selection", () => {
+      const result = write({ instanceId: "claude", model: "claude-sonnet-5-5" }, undefined);
+      expect(result.ok && result.selection.contextCap).toBeUndefined();
     });
   });
 

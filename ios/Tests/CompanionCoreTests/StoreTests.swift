@@ -373,6 +373,66 @@ final class StoreTests: XCTestCase {
         XCTAssertNil(state.pendingQueued[threadId])
     }
 
+    func testQueuedSendKeepsRawTextAndAttachmentsForEditRestore() throws {
+        var state = CompanionState()
+        let threadId = "t-queued-edit"
+        let attachment = PendingChatAttachment(name: "shot.png", mime: "image/png", data: Data("x".utf8))
+        let composed = ChatAttachments.composeMessage(
+            text: "check this",
+            attachments: [ChatPromptAttachment(kind: .image, path: "/tmp/shot.png")]
+        )
+        state.rememberPendingSend(
+            threadId: threadId,
+            id: "q-edit",
+            text: composed,
+            queued: true,
+            rawText: "check this",
+            attachments: [attachment]
+        )
+        let entry = try XCTUnwrap(state.pendingQueued[threadId]?.first)
+        XCTAssertEqual(entry.rawText, "check this")
+        XCTAssertEqual(entry.text, composed)
+        XCTAssertEqual(entry.attachments.count, 1)
+        XCTAssertEqual(entry.attachments.first?.name, "shot.png")
+        let restored = entry.rawText ?? entry.text
+        let resent = ChatAttachments.composeMessage(
+            text: restored,
+            attachments: [ChatPromptAttachment(kind: .image, path: "/tmp/shot.png")]
+        )
+        XCTAssertEqual(resent.components(separatedBy: "<attached-image").count - 1, 1)
+    }
+
+    func testLegacyQueuedSendWithoutRawTextRestoresComposedTextWithoutAttachments() {
+        let attachment = PendingChatAttachment(name: "shot.png", mime: "image/png", data: Data("x".utf8))
+        let composed = ChatAttachments.composeMessage(
+            text: "check this",
+            attachments: [ChatPromptAttachment(kind: .image, path: "/tmp/shot.png")]
+        )
+        let entry = QueuedSend(
+            queueId: "q-legacy",
+            text: composed,
+            rawText: nil,
+            attachments: [attachment],
+            queued: true
+        )
+        let draft: String
+        let restoredAttachments: [PendingChatAttachment]
+        if let rawText = entry.rawText {
+            draft = rawText
+            restoredAttachments = entry.attachments
+        } else {
+            draft = entry.text
+            restoredAttachments = []
+        }
+        XCTAssertEqual(draft, composed)
+        XCTAssertTrue(restoredAttachments.isEmpty)
+        let resent = ChatAttachments.composeMessage(
+            text: draft,
+            attachments: restoredAttachments.map { ChatPromptAttachment(kind: $0.kind, path: "/tmp/shot.png") }
+        )
+        XCTAssertEqual(resent.components(separatedBy: "<attached-image").count - 1, 1)
+    }
+
 
     // MARK: - Bots
 
@@ -424,6 +484,36 @@ final class StoreTests: XCTestCase {
 
         state.apply(.thread(threadId: bot.threadId, activeLeafId: tail.id))
         XCTAssertEqual(state.visibleTranscript(forThread: bot.threadId).map(\.id), ["root", "fork", "tail"])
+    }
+
+    /// The chat list resolves the leaf from the bot it already holds
+    /// (BOTFLEET-3R); that must match the roster-scanning reader.
+    func testLeafAwareVisibleTranscriptMatchesTheRosterLookup() throws {
+        var state = try hydrated()
+        let bot = try XCTUnwrap(state.bots.first)
+        let root = message("root")
+        var first = message("first", at: 2)
+        first.parentId = root.id
+        var fork = message("fork", at: 3)
+        fork.parentId = root.id
+        state.messages[bot.threadId] = [root, first, fork]
+        state.apply(.thread(threadId: bot.threadId, activeLeafId: fork.id))
+        let live = try XCTUnwrap(state.bot(bot.id))
+
+        XCTAssertEqual(
+            state.visibleTranscript(forThread: bot.threadId, activeLeafId: live.activeLeafId).map(\.id),
+            state.visibleTranscript(forThread: bot.threadId).map(\.id)
+        )
+        XCTAssertEqual(
+            state.visibleTranscript(forThread: bot.threadId, activeLeafId: live.activeLeafId).map(\.id),
+            ["root", "fork"]
+        )
+
+        state.messages["room-thread"] = [message("r1"), message("r2", at: 2)]
+        XCTAssertEqual(
+            state.visibleTranscript(forThread: "room-thread", activeLeafId: nil).map(\.id),
+            state.visibleTranscript(forThread: "room-thread").map(\.id)
+        )
     }
 
     func testVersionsAreUserMessagesWithTheSameParent() {
@@ -499,6 +589,32 @@ final class StoreTests: XCTestCase {
         let pending = state.pendingApprovals
         XCTAssertEqual(pending.map(\.message.id), ["new", "old"])
         XCTAssertEqual(pending.first?.threadId, secondThread)
+    }
+
+    /// BOTFLEET-30: `pendingApprovals` resolves each bot's leaf directly
+    /// rather than via `bot(forThread:)`, and must still honor the branch.
+    func testPendingApprovalsOnlyCountTheActiveBranch() throws {
+        var state = try hydrated()
+        let bot = try XCTUnwrap(state.bots.first)
+        func pendingCard(_ id: String, at: Double, parent: String) -> Message {
+            var message = Message(id: id, role: .bot, kind: .options, at: at)
+            message.parentId = parent
+            message.card = OptionCard(
+                title: "Approval needed", subtitle: "rm -rf ./build", options: ["Allow", "Deny"],
+                answered: nil, dismissed: nil, requestId: "r-\(id)", tool: "Bash",
+                held: nil, allowKey: "Bash:rm"
+            )
+            return message
+        }
+        let root = message("root")
+        let offBranch = pendingCard("off-branch", at: 2, parent: root.id)
+        let onBranch = pendingCard("on-branch", at: 3, parent: root.id)
+        for threadId in Array(state.messages.keys) { state.messages[threadId] = [] }
+        state.messages[bot.threadId] = [root, offBranch, onBranch]
+
+        state.apply(.thread(threadId: bot.threadId, activeLeafId: onBranch.id))
+        XCTAssertEqual(state.pendingApprovals.map(\.message.id), ["on-branch"])
+        XCTAssertEqual(state.pendingApprovals.first?.threadId, bot.threadId)
     }
 
     // MARK: - Cursor

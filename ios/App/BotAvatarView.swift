@@ -5,6 +5,25 @@ import CompanionCore
 /// An agent identity image fetched from the paired computer with the device
 /// bearer token. The mascot is deterministic fallback for missing, stale, or
 /// undecodable attachments, so identity never becomes an empty placeholder.
+/// Bot identity image with the model-provider mark at the lower-right corner.
+/// Use this anywhere a lone `BotAvatarView` would need `.providerBadge` so
+/// position, scale, and the unknown-engine empty state stay consistent.
+struct BotAvatarWithProviderBadge: View {
+    let bot: Bot
+    /// When the avatar sits in a task (or other) thread, pass that thread id
+    /// so the mark follows the task override instead of the bot's primary id.
+    var conversationThreadId: String? = nil
+    let size: CGFloat
+    var state: BotState = .idle
+    var animated = false
+    var comets = false
+
+    var body: some View {
+        BotAvatarView(bot: bot, size: size, state: state, animated: animated, comets: comets)
+            .providerBadge(for: bot, inThread: conversationThreadId, avatarSize: size)
+    }
+}
+
 struct BotAvatarView: View {
     let bot: Bot
     let size: CGFloat
@@ -44,13 +63,26 @@ struct BotAvatarView: View {
             guard crop != .mascot, crop != .tvface, bot.avatarUrl != nil else { return }
             let data = await session.avatarData(forPath: bot.avatarUrl)
             guard !Task.isCancelled else { return }
-            guard let data, let decoded = UIImage(data: data) else {
+            guard let data, let decoded = BotAvatarView.cachedImage(for: data) else {
                 failed = true
                 return
             }
             guard !Task.isCancelled else { return }
             image = decoded
         }
+    }
+
+    private static let avatarImageCache = NSCache<NSData, UIImage>()
+
+    /// Cached decoded UIImage lookup to prevent synchronous PNG re-decoding on @MainActor.  Avoids repeated main-thread decompression across SwiftUI view body updates.
+    static func cachedImage(for data: Data) -> UIImage? {
+        let key = data as NSData
+        if let cached = avatarImageCache.object(forKey: key) {
+            return cached
+        }
+        guard let decoded = UIImage(data: data) else { return nil }
+        avatarImageCache.setObject(decoded, forKey: key)
+        return decoded
     }
 
     private var mask: AnyShape {
@@ -104,7 +136,7 @@ struct RoomAvatarView: View {
             guard room.avatarUrl != nil else { return }
             let data = await session.avatarData(forPath: room.avatarUrl)
             guard !Task.isCancelled else { return }
-            guard let data, let decoded = UIImage(data: data) else {
+            guard let data, let decoded = BotAvatarView.cachedImage(for: data) else {
                 failed = true
                 return
             }

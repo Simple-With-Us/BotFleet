@@ -14,15 +14,19 @@ import {
   DEFAULT_MAX_TOOL_ROUNDS,
   MAX_TOOL_ROUNDS,
   toolRoundsCaption,
+  MAX_HISTORY_TURNS,
 } from "../../shared/bot-profile";
 import {
   activeEngine,
+  autoReviewGate,
   botCapabilityGates,
   configuredEngine,
   honorsToolRounds,
+  reviewerOptions,
+  historySummaryGate,
   toolRoundsGate,
 } from "./bot-settings-gates";
-import type { InstanceInfo, ModelSelection } from "@/state/store";
+import type { Bot, InstanceInfo, ModelSelection } from "@/state/store";
 
 const selection = (instanceId: string, model = "m"): ModelSelection => ({ instanceId, model });
 
@@ -31,12 +35,14 @@ const selection = (instanceId: string, model = "m"): ModelSelection => ({ instan
 function instance(
   instanceId: string,
   capabilities: Partial<NonNullable<InstanceInfo["capabilities"]>> = {},
-  extra: { driverKind?: string; displayName?: string } = {},
+  extra: { driverKind?: string; displayName?: string; state?: "available" | "unavailable" } = {},
 ): InstanceInfo {
+  // SAFETY: a fixture that carries only the fields the gates read; the real InstanceInfo has many more.
   return {
     instanceId,
     driverKind: extra.driverKind ?? "openai-compat",
     displayName: extra.displayName ?? instanceId,
+    snapshot: { state: extra.state ?? "available" },
     capabilities: {
       computerMcp: false,
       agentsMcp: false,
@@ -49,6 +55,7 @@ function instance(
 
 const TOOL_LOOP = instance("minimax", { toolLoop: true, agentsMcp: true }, { displayName: "MiniMax" });
 const CLI = instance("claude", { toolLoop: false, agentsMcp: true }, { displayName: "Claude Code" });
+const ACP = instance("grok", { historySummary: true, agentsMcp: true }, { driverKind: "grokAgent", displayName: "Grok" });
 
 describe("the default is one number, said once", () => {
   it("the caption a person reads is built from the real constants", () => {
@@ -159,6 +166,74 @@ describe("toolRoundsGate", () => {
   });
 });
 
+describe("historySummaryGate", () => {
+  it("is visible and editable on an engine that budgets its prompt", () => {
+    const gate = historySummaryGate([ACP], {
+      modelSelection: selection("grok"),
+      maxHistoryTurns: null,
+      historySummaryModel: undefined,
+    });
+    expect(gate).toMatchObject({ visible: true, editable: true, note: null });
+    expect(gate.caption).toContain(`Cap is ${MAX_HISTORY_TURNS}`);
+  });
+
+  it("is hidden on an engine that keeps its own history when nothing is saved", () => {
+    const gate = historySummaryGate([TOOL_LOOP], {
+      modelSelection: selection("minimax"),
+      maxHistoryTurns: null,
+      historySummaryModel: undefined,
+    });
+    expect(gate).toMatchObject({ visible: false, editable: false, note: null });
+  });
+
+  it("STAYS VISIBLE but read-only when a saved cap outlives the engine that honored it", () => {
+    const gate = historySummaryGate([TOOL_LOOP], {
+      modelSelection: selection("minimax"),
+      maxHistoryTurns: 25,
+      historySummaryModel: undefined,
+    });
+    expect(gate.visible).toBe(true);
+    expect(gate.editable).toBe(false);
+    expect(gate.note).toContain("MiniMax keeps its own history");
+    // Rendered copy:  every sentence gap is U+00A0 plus a space, which HTML
+    // does not collapse the way it collapses two typed spaces.
+    expect(gate.note).toContain("apply to it.\u00A0 They apply again");
+    expect(gate.note).toContain("its prompt.\u00A0 Clear them");
+    expect(gate.caption).toContain("per prompt.\u00A0 Empty keeps them all.\u00A0 Cap is");
+  });
+
+  it("stays visible for a saved model-summary toggle alone", () => {
+    const gate = historySummaryGate([CLI], {
+      modelSelection: selection("claude"),
+      maxHistoryTurns: null,
+      historySummaryModel: true,
+    });
+    expect(gate.visible).toBe(true);
+    expect(gate.editable).toBe(false);
+  });
+
+  it("treats a saved cap of 0 as a value to preserve, not as unset", () => {
+    const gate = historySummaryGate([CLI], {
+      modelSelection: selection("claude"),
+      maxHistoryTurns: 0,
+      historySummaryModel: undefined,
+    });
+    expect(gate.visible).toBe(true);
+    expect(gate.editable).toBe(false);
+  });
+
+  it("names the engine actually running when a fallback moved off the configured one", () => {
+    const gate = historySummaryGate([ACP, TOOL_LOOP], {
+      modelSelection: selection("grok"),
+      activeModelSelection: selection("minimax"),
+      maxHistoryTurns: 10,
+      historySummaryModel: undefined,
+    });
+    // Configured engine honors it: editable, no rollover copy needed.
+    expect(gate.editable).toBe(true);
+  });
+});
+
 describe("botCapabilityGates reads the engine once for the whole panel", () => {
   it("maps each capability off the same engine", () => {
     const rich = instance("grok", {
@@ -192,5 +267,173 @@ describe("botCapabilityGates reads the engine once for the whole panel", () => {
     expect(gates.canUseConnectedApps).toBe(false);
     expect(gates.canUseVps).toBe(false);
     expect(gates.toolLoop).toBe(false);
+  });
+});
+
+// Auto-review used to be greyed out with "This engine cannot run an isolated
+// review safely" on every engine but Claude.  The owner asked for it to work
+// everywhere; these pin what each kind of engine is offered and what it is
+// told.
+describe("autoReviewGate: auto-review on every engine", () => {
+  const CLAUDE = instance("claude", { approvalReview: true, reviewHook: "before", asksWhenHeld: true }, { displayName: "Claude Code", driverKind: "claudeAgent" });
+  const CODEX = instance("codex", { reviewHook: "before", asksWhenHeld: true }, { displayName: "Codex", driverKind: "codex" });
+  const CODEX_AUTO = instance("codex-auto", { reviewHook: "after", asksWhenHeld: true }, { displayName: "Codex Full Auto", driverKind: "codex" });
+  const AGY = instance("agy", { reviewHook: "after" }, { displayName: "Antigravity", driverKind: "antigravityAgent" });
+  const WRAPPER = instance("wrap", { reviewHook: "none" }, { displayName: "CLI Wrapper", driverKind: "cliWrapper" });
+  const COMPAT = instance("compat", { approvalReview: true, reviewHook: "before" }, { displayName: "OpenRouter" });
+  const bot = (instanceId: string, patch: Partial<Pick<Bot, "autoReview" | "bypassPermissions" | "autoApprove">> = {}) => ({
+    modelSelection: selection(instanceId),
+    ...patch,
+  });
+  const all = [CLAUDE, CODEX, CODEX_AUTO, AGY, WRAPPER, COMPAT];
+  const NBSP_GAP = /\.  [A-Z]/;
+
+  it("an engine that reviews itself is reviewed before each ask, by itself", () => {
+    const gate = autoReviewGate(all, bot("claude"), null);
+    expect(gate).toMatchObject({ hook: "before", canWatch: true, canEnforce: true, needsFallback: false });
+    expect(gate.reviewer).toEqual({ instanceId: "claude", name: "Claude Code", role: "own" });
+    expect(gate.summary).toContain("reviewed before it runs");
+  });
+
+  it("an engine that cannot review itself gets the automatic fallback reviewer without anyone picking one", () => {
+    const automatic = autoReviewGate(all, bot("codex"), null);
+    expect(automatic).toMatchObject({ canWatch: true, canEnforce: true, needsFallback: true, fallbackMode: "auto", disabledReason: null });
+    // Claude's separate review process ranks first among healthy engines
+    expect(automatic.automatic).toEqual({ instanceId: "claude", name: "Claude Code" });
+    expect(automatic.reviewer).toEqual({ instanceId: "claude", name: "Claude Code", role: "fallback" });
+    expect(automatic.summary).toContain("Claude Code reviews for it");
+    expect(automatic.summary).toMatch(NBSP_GAP);
+    expect(automatic.fallbackOptions.map((option) => option.instanceId)).toEqual(["claude", "compat"]);
+
+    const chosen = autoReviewGate(all, bot("codex"), "compat");
+    expect(chosen).toMatchObject({ fallbackMode: "chosen", canEnforce: true });
+    expect(chosen.reviewer).toEqual({ instanceId: "compat", name: "OpenRouter", role: "fallback" });
+
+    // only the owner turning the fallback off greys it out again
+    const off = autoReviewGate(all, bot("codex"), "none");
+    expect(off).toMatchObject({ canWatch: false, canEnforce: false, reviewer: null, fallbackMode: "none" });
+    expect(off.disabledReason).toContain("the fallback reviewer is off");
+  });
+
+  it("Automatic skips an engine that is down and takes the next one that is working", () => {
+    const claudeDown = { ...CLAUDE, snapshot: { state: "unavailable" as const } };
+    const gate = autoReviewGate([claudeDown, CODEX, COMPAT], bot("codex"), null);
+    expect(gate.automatic?.instanceId).toBe("compat");
+    expect(gate.reviewer?.name).toBe("OpenRouter");
+  });
+
+  it("an API engine's own action is reviewed first by a different engine, with itself standing in", () => {
+    const gate = autoReviewGate(all, bot("compat"), null);
+    expect(gate.reviewer).toEqual({ instanceId: "claude", name: "Claude Code", role: "fallback" });
+    expect(gate.standIn).toEqual({ instanceId: "compat", name: "OpenRouter", role: "own" });
+    expect(gate.summary).toContain("OpenRouter is not the first judge of its own work");
+    // with nobody else to ask, it reviews itself
+    expect(autoReviewGate([COMPAT], bot("compat"), null).reviewer).toEqual({ instanceId: "compat", name: "OpenRouter", role: "own" });
+  });
+
+  it("a full-auto instance that can ask is held under On, and says which steps are still only watched", () => {
+    const gate = autoReviewGate(all, bot("codex-auto"), "claude");
+    expect(gate.hook).toBe("before");
+    expect(gate.watchHook).toBe("after");
+    expect(gate.summary).toContain("asking mode");
+    // it no longer claims every action is reviewed before it runs
+    expect(gate.summary).toContain("Steps it still takes without asking");
+    expect(gate.summary).toContain("The stop is not instant");
+    // the held summary makes the same promise as the can-only-watch one: a
+    // stop undoes nothing that already started
+    expect(gate.summary).toContain("nothing already started is undone");
+    // and says an always-allow is reviewed there too
+    expect(gate.summary).toContain("including anything you set to always allow");
+    expect(gate.hints.enforce).toBe("Answer only reviews that return a strict approval.");
+  });
+
+  it("an engine with no hook can only watch, and On says the stop is late and undoes nothing", () => {
+    const gate = autoReviewGate(all, bot("agy"), "claude");
+    expect(gate).toMatchObject({ hook: "after", watchHook: "after", canWatch: true, canEnforce: true });
+    expect(gate.summary).toContain("can only watch");
+    expect(gate.summary).toContain("cannot undo a step that already started");
+    expect(gate.summary).toContain("a few more steps can run first");
+    expect(gate.hints.enforce).toBe("Stop the turn when the reviewer refuses a step or cannot check it.");
+  });
+
+  it("an engine that asks says that steps it takes without asking are not reviewed", () => {
+    expect(autoReviewGate(all, bot("claude"), null).summary).toContain("Steps it takes without asking are not reviewed.");
+  });
+
+  it("an engine that reports no actions says so, whoever could review", () => {
+    const gate = autoReviewGate(all, bot("wrap"), "claude");
+    expect(gate).toMatchObject({ hook: "none", canWatch: false, canEnforce: false });
+    expect(gate.disabledReason).toBe("CLI Wrapper reports no actions, so there is nothing to review.");
+  });
+
+  it("names the gap when nothing in the fleet can review", () => {
+    const gate = autoReviewGate([CODEX], bot("codex"), null);
+    expect(gate.disabledReason).toContain("no engine that can review is set up");
+    expect(gate.fallbackOptions).toEqual([]);
+    expect(gate.automatic).toBeNull();
+  });
+
+  it("ignores a chosen fallback reviewer that is disabled, cannot review, or cannot run", () => {
+    const disabled: InstanceInfo = { ...COMPAT, enabled: false };
+    expect(autoReviewGate([CODEX, disabled], bot("codex"), "compat").reviewer).toBeNull();
+    expect(autoReviewGate([CODEX, AGY], bot("codex"), "agy").reviewer).toBeNull();
+    // a keyless API engine reports approvalReview but would fail every review
+    const keyless = instance("minimax", { approvalReview: true, reviewHook: "before" }, { displayName: "MiniMax", state: "unavailable", driverKind: "minimax" });
+    expect(reviewerOptions([CODEX, keyless])).toEqual([]);
+    expect(autoReviewGate([CODEX, keyless], bot("codex"), "minimax").reviewer).toBeNull();
+    expect(autoReviewGate([CODEX, keyless], bot("codex"), null).reviewer).toBeNull();
+  });
+
+  it("says when the fallback reviewer stands in for an engine that reviews itself", () => {
+    const gate = autoReviewGate(all, bot("claude"), "compat");
+    expect(gate.reviewer?.role).toBe("own");
+    expect(gate.summary).toContain("OpenRouter stands in if that review fails");
+  });
+
+  it("an engine that has not reported yet keeps every mode open instead of reading as 'no'", () => {
+    const gate = autoReviewGate([], bot("ghost", { autoReview: "enforce" }), null);
+    expect(gate).toMatchObject({ hook: "unknown", canWatch: true, canEnforce: true, disabledReason: null });
+    expect(gate.summary).toContain("has not reported");
+  });
+
+  it("states the per-turn review limit and what happens past it", () => {
+    const gate = autoReviewGate(all, bot("claude"), null, 25);
+    expect(gate.capNote).toBe(
+      "Up to 25 reviews per turn.  Past that, On hands each approval to you or stops the turn, and Watch stops recording.",
+    );
+    expect(autoReviewGate(all, bot("claude"), null).capNote).toContain("Up to 50 reviews per turn.");
+  });
+
+  it("states the Auto and Bypass Permissions rule for each mode, and claims only approvals are checked first", () => {
+    expect(autoReviewGate(all, bot("claude"), null).bypassNote).toBeNull();
+    expect(autoReviewGate(all, bot("claude", { bypassPermissions: true }), null).bypassNote).toContain("without approval cards or review");
+    const screened = autoReviewGate(all, bot("claude", { bypassPermissions: true, autoReview: "enforce" }), null).bypassNote;
+    expect(screened).toContain("the reviewer still checks each approval first");
+    expect(screened).not.toContain("each action");
+    expect(screened).toContain("comes back to you as a card");
+    const held = autoReviewGate(all, bot("codex-auto", { bypassPermissions: true, autoReview: "enforce" }), "claude").bypassNote;
+    expect(held).toContain("Steps taken without asking are checked as they start.");
+    expect(held).toMatch(NBSP_GAP);
+    expect(autoReviewGate(all, bot("claude", { bypassPermissions: true, autoReview: "shadow" }), null).bypassNote).toContain(
+      "Watch only records",
+    );
+    expect(autoReviewGate(all, bot("agy", { bypassPermissions: true, autoReview: "enforce" }), "claude").bypassNote).toContain(
+      "stops the turn",
+    );
+    // an Auto bot's own grants are screened too now
+    expect(autoReviewGate(all, bot("claude", { autoApprove: true, autoReview: "enforce" }), null).bypassNote).toBe(
+      "Auto is on, but the reviewer still checks each approval first, and anything it refuses or cannot check comes back to you as a card.",
+    );
+  });
+
+  it("never calls a bot an agent", () => {
+    for (const engine of all) {
+      for (const fallback of [null, "claude", "none"]) {
+        const gate = autoReviewGate(all, bot(engine.instanceId, { bypassPermissions: true, autoReview: "enforce" }), fallback);
+        for (const text of [gate.summary, gate.disabledReason ?? "", gate.bypassNote ?? "", gate.capNote, ...Object.values(gate.hints)]) {
+          expect(text).not.toMatch(/\bagents?\b/i);
+        }
+      }
+    }
   });
 });

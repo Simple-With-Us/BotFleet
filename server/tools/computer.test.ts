@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { TurnToolCall, TurnToolRuntime } from "../contracts.ts";
+import { launchEnvironment } from "../launch-identity.ts";
 import type { AgentToolCallContext } from "./agents.ts";
 import { createComputerTools, READ_FILE_DEFAULT_LINE_LIMIT, READ_FILE_MAX_BYTES } from "./computer.ts";
 
@@ -53,6 +54,37 @@ describe("computer tools", () => {
       const result = await tools.bash(call, dummyIdentity, dummyRuntime);
       expect(result.kind).toBe("error");
       expect(result.content).toContain("42");
+    });
+
+    // cmd.exe (the Windows shell) does not expand $NAME
+    it.skipIf(process.platform === "win32")("gives the shell the launch variables, and none of the harness's identity", async () => {
+      const saved = { seat: process.env.AGENT_SEAT, site: process.env.ZULIP_SITE };
+      process.env.AGENT_SEAT = "CLAUDE";
+      process.env.ZULIP_SITE = "https://harness.example.invalid";
+      try {
+        const run = async (launchEnv: Record<string, string> | undefined) => {
+          const tools = createComputerTools({ cwd: scratchDir, launchEnv });
+          const result = await tools.bash(
+            { id: "call-env", name: "bash", arguments: { command: 'echo "seat=$AGENT_SEAT launcher=$AGENT_LAUNCHER site=$ZULIP_SITE"' } },
+            dummyIdentity,
+            dummyRuntime,
+          );
+          expect(result.kind).toBe("result");
+          return result.content;
+        };
+        // The shell's environment is an allowlist, so the harness's seat never reaches it.
+        expect(await run(undefined)).toBe("seat= launcher= site=");
+        // The turn's launch variables do, for the bot that owns the turn.
+        expect(await run(launchEnvironment({ seat: "BF-PLUMBER", session: "thread-1" }))).toBe(
+          "seat=BF-PLUMBER launcher=botfleet site=",
+        );
+        expect(await run(launchEnvironment({ seat: null, session: "thread-1" }))).toBe("seat= launcher=botfleet site=");
+      } finally {
+        if (saved.seat === undefined) delete process.env.AGENT_SEAT;
+        else process.env.AGENT_SEAT = saved.seat;
+        if (saved.site === undefined) delete process.env.ZULIP_SITE;
+        else process.env.ZULIP_SITE = saved.site;
+      }
     });
 
     it("rejects empty or missing command", async () => {

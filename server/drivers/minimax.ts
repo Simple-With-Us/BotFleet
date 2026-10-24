@@ -22,14 +22,25 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { boundText } from "../../shared/item-io.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
-import { splitChatPrompt } from "./prompt-split.ts";
+import { contextWindowFor } from "../model-context-windows.ts";
+import { joinedSystemPrompt, splitChatPrompt } from "./prompt-split.ts";
+import {
+  acpPromptCeilingRefusal,
+  applyAcpPromptBudget,
+  decodeAcpContextCapTokens,
+  decodeAcpPromptBudgetBytes,
+  describeAcpPromptTrim,
+  resolveAcpPromptBudget,
+} from "./acp/prompt-budget.ts";
 import { toolFields } from "../tool-fields.ts";
 import { classifyHttpError, httpErrorFor, type HttpErrorClassification } from "./chat-completions/errors.ts";
 import { runTurnLoop, DEFAULT_TURN_LOOP_BUDGET, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
 import { costUsd, type ChatCompletionsPriceTable } from "./chat-completions/pricing.ts";
 import { capReplayedTranscript } from "./chat-completions/replay-cap.ts";
-import { genAiProvider, withChatSpan } from "../sentry-ai.ts";
+import { formatGenAiMessages, genAiProvider, withChatSpan } from "../sentry-ai.ts";
 
 const DRIVER_KIND = "minimax";
 const API_KEY_ENV = "MINIMAX_API_KEY";
@@ -78,12 +89,17 @@ const MINIMAX_RETIRED_MODEL_IDS: readonly string[] = [
   // Dropped as dominated: same $0.30/$1.20 as M3.1's <=512K tier for a
   // fifth of the context.
   "MiniMax-M2.7",
-  // Superseded by MiniMax-M3.1-Flash-Preview.
+  // Superseded by MiniMax-M3.1-Flash.
   "MiniMax-M3",
+  // The former spellings of the two M3.1 Flash rows.  MiniMax renamed them
+  // and the API keeps serving the retired ids, so a live list would
+  // otherwise re-inflate a dead row next to its live replacement.
+  "MiniMax-M3.1-Flash-Preview",
+  "MiniMax-M3.1-Flash-Preview-1M",
 ];
 
 /** The `reasoning_effort` values MiniMax accepts on /v1/chat/completions, for
- *  MiniMax-M3.1-Flash-Preview only.  Source:
+ *  MiniMax-M3.1-Flash only.  Source:
  *  https://platform.minimax.io/docs/api-reference/text-openai-api.  The field
  *  is sent top-level and never paired with a `thinking` object:
  *   - omitting it means `max`, which is what Default sends;
@@ -95,19 +111,43 @@ const MINIMAX_RETIRED_MODEL_IDS: readonly string[] = [
 const M31_EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 
 const MODELS: ModelCatalog = {
-  default: "MiniMax-M3.1-Flash-Preview",
+  default: "MiniMax-M3.1-Flash",
   options: [
     {
-      id: "MiniMax-M3.1-Flash-Preview",
-      label: "MiniMax M3.1 Flash Preview",
+      id: "MiniMax-M3.1-Flash",
+      label: "MiniMax M3.1 Flash (512K)",
+      contextWindow: 524_288,
+      effortLevels: [...M31_EFFORT_LEVELS],
+      defaultEffort: "max",
+      supportsMaxOutput: true,
+    },
+    {
+      id: "MiniMax-M3.1-Flash-1M",
+      label: "MiniMax M3.1 Flash (1M)",
       contextWindow: 1_000_000,
       effortLevels: [...M31_EFFORT_LEVELS],
+      defaultEffort: "max",
+      supportsMaxOutput: true,
     },
     // Explicit `[]`: src/lib/model-effort.ts gives a row with no list the
     // engine-wide one, which is M3.1's.
-    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [] },
+    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [], supportsMaxOutput: true },
   ],
 };
+
+/** The prompt-budget window for a MiniMax model: the catalog row's own cap
+ *  when the id is one the catalog carries - the 512K Flash row is a deliberate
+ *  client-side billing-tier cap, and budgeting it at the shared table's
+ *  published 1M would push those turns into the higher input tier (Kody
+ *  review, PR #1283) - else the shared published table, else undefined. */
+export function minimaxWindowTokens(
+  model: string | undefined,
+  options: ModelCatalog["options"],
+): number | undefined {
+  if (!model) return undefined;
+  const row = options.find((option) => option.id === model);
+  return row?.contextWindow ?? contextWindowFor(model);
+}
 
 /** Published MiniMax API rates, USD per million tokens, STANDARD service
  *  tier — this driver never sends `service_tier: "priority"`.  Source:
@@ -129,7 +169,8 @@ const MODELS: ModelCatalog = {
  *  against the pricing page above as the maintenance cost of having a
  *  cost column at all. */
 export const MINIMAX_PRICE_PER_MILLION: ChatCompletionsPriceTable = {
-  "MiniMax-M3.1-Flash-Preview": [
+  "MiniMax-M3.1-Flash": [{ input: 0.3, output: 1.2, cachedInput: 0.06 }],
+  "MiniMax-M3.1-Flash-1M": [
     { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
     { input: 0.6, output: 2.4, cachedInput: 0.12 },
   ],
@@ -236,6 +277,11 @@ export type MinimaxUrlSource = "instance" | "workspace" | "environment" | "defau
 export interface MinimaxConfig {
   url: string;
   urlSource: MinimaxUrlSource;
+  /** Prompt budget override in bytes (0 turns it off).  Same meaning as the
+   *  ACP engines' `promptBudgetBytes`. */
+  promptBudgetBytes?: number;
+  /** Working-context cap in tokens; see `resolveAcpPromptBudget`. */
+  contextCapTokens?: number;
 }
 
 interface LocalMiniMaxConfig {
@@ -258,6 +304,8 @@ const driverConfigSchema = z.object({
   // a workspace-wide endpoint apart from one this instance carries WITHOUT
   // comparing the two values.
   urlSource: z.string().optional(),
+  promptBudgetBytes: z.unknown().optional(),
+  contextCapTokens: z.unknown().optional(),
 });
 
 /** server/config.ts's `WORKSPACE_URL_SOURCE`: the marker instanceConfigs()
@@ -320,6 +368,8 @@ export function loadLocalMiniMaxConfig(home = homedir()): LocalMiniMaxConfig {
 export function decodeMinimaxConfig(raw: unknown): MinimaxConfig {
   const parsed = driverConfigSchema.safeParse(raw ?? {});
   const config = parsed.success ? parsed.data : {};
+  const promptBudgetBytes = decodeAcpPromptBudgetBytes(config.promptBudgetBytes);
+  const contextCapTokens = decodeAcpContextCapTokens(config.contextCapTokens);
   const ownUrl = config.url?.trim();
   const envUrl = process.env.MINIMAX_BASE_URL?.trim();
   // Provenance, decided here once, where all three inputs are still
@@ -334,6 +384,8 @@ export function decodeMinimaxConfig(raw: unknown): MinimaxConfig {
   return {
     url: normalizedApiUrl(ownUrl || envUrl || DEFAULT_URL),
     urlSource,
+    ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }),
+    ...(contextCapTokens === undefined ? {} : { contextCapTokens }),
   };
 }
 
@@ -346,11 +398,9 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
   metadata: {
     displayName: "MiniMax",
     supportsMultipleInstances: true,
-    // Mirrors the `capabilities` block in `create` below, including what it
-    // does NOT declare: this driver mounts agents + local-computer tools and
-    // no Composio bridge, no screen channel, and no image input.  That
-    // absence is the reason the matrix shows connected apps as unavailable
-    // here while MiniMax Code shows them as available.
+    // Mirrors the `capabilities` block in `create` below: this driver mounts
+    // agents and local-computer tools, with no Composio, no screen channel,
+    // and no image input.
     channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
   },
   models: MODELS,
@@ -462,6 +512,10 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         /** M3.1's `reasoning_effort`.  Set only for a user turn's own rounds;
          *  the utility path (titles, summaries) never passes it. */
         reasoningEffort?: EffortLevel;
+        /** The bot's optional output limit, sent as `max_completion_tokens`
+         *  (MiniMax: "use this field for new integrations").  Absent sends
+         *  nothing, so the model keeps its own limit. */
+        maxOutputTokens?: number;
       },
     ): Promise<{ text: string; reasoning: string; tool_calls?: any[]; usage: TurnUsage | null }> => {
       // When the caller supplies a signal it already carries the request
@@ -471,8 +525,9 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       // with no signal — generateText for titles and summaries — keep the
       // driver's own 180s ceiling.
       const signal = opts.signal ?? AbortSignal.timeout(180_000);
+      const upstreamModel = model.replace(/-1M$/i, "");
       const body = {
-        model,
+        model: upstreamModel,
         messages,
         stream: opts.stream,
         reasoning_split: true,
@@ -485,6 +540,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // https://platform.minimax.io/docs/api-reference/text-openai-api
         // (An undefined value is dropped by JSON.stringify, so Default adds no key.)
         reasoning_effort: opts.reasoningEffort,
+        max_completion_tokens: opts.maxOutputTokens,
       };
       const res = await fetch(`${apiUrl}/chat/completions`, {
         method: "POST",
@@ -658,7 +714,57 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       // half rides the newest user message, every request, so the resent
       // prefix stays byte-identical across a memory write (see
       // prompt-split.ts splitChatPrompt).
-      const chat = splitChatPrompt(turn);
+      let chat = splitChatPrompt(turn);
+      // The same prompt budget the ACP engines apply: trim the volatile
+      // system sections (oldest first by priority) when the system prompt plus
+      // this message is past the budget.  The transcript has its own cap above.
+      // A trimmed prompt is sent as one system block, so that turn gives up the
+      // stable/volatile cache split; an untrimmed turn is unchanged.
+      const system = joinedSystemPrompt(turn);
+      let trim: ReturnType<typeof describeAcpPromptTrim> = null;
+      if (system) {
+        // A refusal throws out of sendTurn before the loop exists, so nothing
+        // would ever settle this turn: release the thread's slot first, or the
+        // next turn on it is refused as "already running".
+        try {
+          const composed = `${system}\n\n${turn.text}`;
+          // No config at all must not inherit the ACP 128 KiB default: a MiniMax
+          // bot has a 1M window.  Without an override or a cap the budget is the
+          // model's own window (80% of it), and off for a model with no known one.
+          const windowTokens = minimaxWindowTokens(model, models.options);
+          const unconfigured =
+            config.promptBudgetBytes === undefined && config.contextCapTokens === undefined && turn.contextCapTokens === undefined;
+          const budgetBytes = unconfigured && windowTokens === undefined
+            ? null
+            : resolveAcpPromptBudget({
+                configuredBytes: config.promptBudgetBytes,
+                capTokens: turn.contextCapTokens ?? config.contextCapTokens ?? windowTokens,
+                model,
+                composed,
+              }).bytes;
+          // An untrimmed request carries the volatile half as a framed context
+          // note on the user message (splitChatPrompt), about a hundred bytes the
+          // composed prompt does not have.  Leave room for them when deciding
+          // whether to trim, and judge the hard ceiling on what is really sent.
+          const untrimmedSent = `${chat.system ?? ""}\n\n${chat.text}`;
+          const framingBytes = Math.max(0, Buffer.byteLength(untrimmedSent) - Buffer.byteLength(composed));
+          const budgeted = applyAcpPromptBudget({
+            composed,
+            sections: turn.systemSections,
+            userText: turn.text,
+            budgetBytes: budgetBytes === null ? null : Math.max(1, budgetBytes - framingBytes),
+          });
+          const refusal = acpPromptCeilingRefusal(budgeted.trimmed ? budgeted.text : untrimmedSent, budgetBytes);
+          if (refusal) throw new Error(refusal.message);
+          trim = describeAcpPromptTrim(budgeted, budgetBytes);
+          if (budgeted.trimmed) {
+            chat = { system: budgeted.text.slice(0, budgeted.text.length - turn.text.length - 2) || undefined, text: turn.text };
+          }
+        } catch (error) {
+          active.delete(threadId);
+          throw error;
+        }
+      }
       const messages: ChatMessage[] = [
         ...(chat.system ? [{ role: "system" as const, content: chat.system }] : []),
         ...cappedTranscript.flatMap((m): ChatMessage[] => {
@@ -689,6 +795,30 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
       emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model });
+      if (trim) {
+        const itemId = `ctx-${newId()}`;
+        emit({
+          ...base(threadId, turnId),
+          type: "context.injected",
+          itemId,
+          source: "compression",
+          preview: trim.preview,
+          bytes: trim.bytesSaved,
+          io: { text: boundText(trim.text) },
+        });
+        try {
+          // Only the harness knows which message this turn answers, so it
+          // hangs the row there (the ACP driver does the same).
+          turn.onContextCompressed?.({
+            id: itemId,
+            source: "compression",
+            preview: trim.preview,
+            bytes: trim.bytesSaved,
+          });
+        } catch (error) {
+          console.error("minimax: onContextCompressed threw", error);
+        }
+      }
 
       // Tool ids this turn has already opened a step for.  The stream
       // announces a call once and then keeps sending argument fragments for
@@ -721,7 +851,13 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // item.started at all; calling it here would double every tool
         // span.
         const { text, reasoning, usage, tool_calls } = await withChatSpan(
-          { model, conversationId: threadId, taskId: turnId, provider: genAiProvider(DRIVER_KIND) },
+          {
+            model,
+            conversationId: threadId,
+            taskId: turnId,
+            provider: genAiProvider(DRIVER_KIND),
+            input: formatGenAiMessages(roundMessages),
+          },
           ({ recordUsage }) =>
             complete(roundMessages, model, {
               stream: true,
@@ -733,6 +869,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
               // the `budget` comment on this turn's runTurnLoop call.
               idleTimeoutMs: turn.unattended ? STREAM_IDLE_TIMEOUT_MS : undefined,
               reasoningEffort,
+              maxOutputTokens: turn.maxOutputTokens,
               // Every raw chunk feeds the loop's idle clock, which is what
               // bounds silence on the interactive path now that its hard
               // ceiling is the loop's default rather than 180s.
@@ -929,7 +1066,23 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           label: known?.label ?? id,
           contextWindow: known?.contextWindow,
           effortLevels: known?.effortLevels ?? [],
+          defaultEffort: known?.defaultEffort,
+          supportsMaxOutput: known?.supportsMaxOutput,
         });
+        if (id === "MiniMax-M3.1-Flash") {
+          const m1 = MODELS.options.find((m) => m.id === "MiniMax-M3.1-Flash-1M");
+          if (m1 && !seen.has(m1.id)) {
+            seen.add(m1.id);
+            options.push({
+              id: m1.id,
+              label: m1.label,
+              contextWindow: m1.contextWindow,
+              effortLevels: m1.effortLevels ?? [],
+              defaultEffort: m1.defaultEffort,
+              supportsMaxOutput: m1.supportsMaxOutput,
+            });
+          }
+        }
       }
       if (options.length === 0) return; // an empty or malformed list keeps the current catalog
       const keptDefault = options.find((o) => o.id === models.default)?.id;
@@ -1005,6 +1158,9 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           // server/tools/jobs.ts); helpers stay `delegate_bot`.
           backgroundJobs: "emulated",
           helpers: "none",
+          // Every tool with an `ask` policy opens a card on the in-process
+          // permission broker (server/tools/approvals.ts) before it runs.
+          reviewHook: "before",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
@@ -1038,6 +1194,21 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           stream: false,
         });
         return text.trim() ? text : reasoning;
+      },
+      // Auto-review on this same account: the utility model, no `tools`, the
+      // brief as the system message and the action as the user message,
+      // cancelled by the reviewer's deadline.
+      // Only the answer text counts as a verdict, never the reasoning.
+      reviewPermission: async (prompt: ReviewPrompt, signal?: AbortSignal) => {
+        const { text } = await complete(
+          [
+            { role: "system", content: prompt.system },
+            { role: "user", content: prompt.data },
+          ],
+          UTILITY_MODEL,
+          { stream: false, signal },
+        );
+        return text;
       },
       dispose: async () => {
         for (const { abort } of active.values()) abort.abort();

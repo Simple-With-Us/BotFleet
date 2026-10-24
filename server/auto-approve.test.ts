@@ -199,6 +199,15 @@ describe("autoDecision", () => {
     expect(autoDecision(bot, "Bash", "ls")).toBeNull();
   });
 
+  it("honours a saved configured MCP tool grant without auto mode", () => {
+    const key = "provider-tool:claude:linear:list_issues:abc123";
+    const bot = { alwaysAllow: [key] };
+    expect(autoVerdict(bot, "mcp__linear__list_issues", "list KAT issues", { mcpToolAllowKey: key }).approve).toBe(
+      "auto-approved mcp__linear__list_issues (always allowed)",
+    );
+    expect(autoVerdict(bot, "mcp__linear__create_issue", "create KAT issue", { mcpToolAllowKey: null }).approve).toBeNull();
+  });
+
   it("never lets always-allow override the destructive guard", () => {
     expect(autoDecision({ alwaysAllow: ["Bash"] }, "Bash", "sudo rm -rf /var")).toBeNull();
   });
@@ -399,6 +408,60 @@ describe("job_start approvals", () => {
     expect(verdict.rule).toBe("local-computer:job:pnpm");
     // off the host computer the key carries no scope prefix
     expect(autoVerdict({ autoApprove: true }, "job_start", "job: pnpm test", { ownJobStart: true }).approve).toBe("auto-approved job:pnpm");
+  });
+
+  it("starts a Bypass Permissions bot's job without a card too, on the host computer as anywhere", () => {
+    // The MCP lane tags every job start local-computer (a job runs on this
+    // computer), and bypass skips local-computer requests, so a bot the person
+    // put in bypass was carded on every job it started.
+    const verdict = autoVerdict({ bypassPermissions: true }, "job_start", "job: pnpm test", own);
+    expect(verdict.approve).toBe("auto-approved local-computer:job:pnpm");
+    expect(verdict.source).toBe("auto-mode");
+    expect(autoVerdict({ bypassPermissions: true }, "job_start", "job: pnpm test", { ownJobStart: true }).approve)
+      .toMatch(/^auto-approved /);
+    // The ruling is about the harness's own job_start, by origin: a mounted
+    // MCP server's tool of the same name is not it, and still cards.
+    expect(autoVerdict({ bypassPermissions: true }, "job_start", "job: pnpm test", host).approve).toBeNull();
+    // Bypass alone does not make the host-control exclusion go away.
+    expect(autoVerdict({ bypassPermissions: true }, "mouse_click", "click at 1, 2", own).approve).toBeNull();
+  });
+
+  // Owner ruling 2026-10-14.  Bypass used to answer FEWER requests than Auto
+  // Mode, because it refused anything local-computer while Auto answered it.
+  // That inversion read as a broken switch, so the extra reach is a second,
+  // named switch rather than a quieter removal of the boundary.
+  describe("Bypass Including This Mac", () => {
+    it("answers a local-computer request once both switches are on", () => {
+      const verdict = autoVerdict(
+        { bypassPermissions: true, bypassLocalComputer: true },
+        "mouse_click",
+        "click at 1, 2",
+        own,
+      );
+      expect(verdict.approve).toBe("auto-approved local-computer:mouse_click (permission bypass)");
+      expect(verdict.source).toBe("auto-mode");
+    });
+
+    it("does nothing at all on its own, without Bypass", () => {
+      // Otherwise this field would be a way to switch off the asking while
+      // the switch that is supposed to mean it stays off.
+      expect(autoVerdict({ bypassLocalComputer: true }, "mouse_click", "click at 1, 2", own).approve).toBeNull();
+      expect(autoVerdict({ bypassLocalComputer: true }, "Bash", "rm -rf ./build", own).approve).toBeNull();
+    });
+
+    it("leaves the default exactly as it was", () => {
+      // The switch is opt-in: a bot in bypass and nothing else still asks for
+      // anything that controls the real desktop.
+      expect(autoVerdict({ bypassPermissions: true }, "mouse_click", "click at 1, 2", own).approve).toBeNull();
+      expect(autoVerdict({ bypassPermissions: true, bypassLocalComputer: false }, "mouse_click", "click", own).approve)
+        .toBeNull();
+    });
+
+    it("does not change what a bot without bypass does", () => {
+      expect(autoVerdict({ autoApprove: true }, "mouse_click", "click at 1, 2", own).approve).toBeTruthy();
+      expect(autoVerdict({ bypassLocalComputer: true, autoApprove: false }, "mouse_click", "click", own).approve)
+        .toBeNull();
+    });
   });
 
   it("asks a bot that is not full-auto for every job start, whatever it always-allows", () => {

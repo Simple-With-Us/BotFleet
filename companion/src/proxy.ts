@@ -20,12 +20,7 @@ import {
   MAX_COMPANION_ENDPOINTS,
   type CompanionEndpoint,
 } from "./endpoints.ts";
-import {
-  companionProfilePatchDenial,
-  denyReason,
-  isCloudDesktopJoin,
-  isCompanionProfilePatch,
-} from "./routes.ts";
+import { companionBodyCheck, companionLiveActivityTokenDenial, denyReason, isCloudDesktopJoin } from "./routes.ts";
 import { cleanDeviceName, parsePairRequestId } from "./devices.ts";
 import { isJsonObject, type JsonObject, type JsonValue } from "./json.ts";
 import { createSseScrubber, isJson, scrub } from "./wire.ts";
@@ -60,6 +55,10 @@ export interface ProxyOptions {
   connected?: (deviceId: string, disconnect: () => void) => () => void;
   /** Store an APNs device token for closed-app wake. */
   setPushToken?: (deviceId: string, token: string) => boolean;
+  /** Store the push-to-start Live Activity token.  Separate from the one
+   * above because the phone registers them separately and either can be
+   * reissued without the other. */
+  setLiveActivityToken?: (deviceId: string, token: string) => boolean;
   /** How the closed-app wake sender is doing.  Counts, timestamps, and the
    * last status Apple returned — nothing derived from the signing key. */
   pushHealth?: () => PushSenderHealth;
@@ -339,8 +338,36 @@ export function createProxyHandler(options: ProxyOptions) {
       return;
     }
 
+    if (method === "POST" && path === "/api/companion/live-activity-token") {
+      const device = options.authenticate(token);
+      const deviceId = device?.id;
+      if (!deviceId) {
+        return sendJson(res, 401, { error: "pair this device from Phone settings in BotFleet on your computer" });
+      }
+      readJson(req).then(
+        (body) => {
+          // Validated before the field is read: this is a body off the
+          // network, and `String(body.token)` would coerce a number or an
+          // object into something the registry has to reject.
+          const denial = companionLiveActivityTokenDenial(body);
+          if (denial) return sendJson(res, denial.status, { error: denial.error });
+          if (!options.setLiveActivityToken?.(deviceId, String(body.token))) {
+            return sendJson(res, 400, { error: "that Live Activity token is not usable" });
+          }
+          return sendJson(res, 200, { ok: true });
+        },
+        (error: Error) => sendJson(res, 400, { error: error.message }),
+      );
+      return;
+    }
+
+    // Routes that reach a broader harness handler (the bot profile and the
+    // bot organize PATCHes) have their body checked against a field
+    // allowlist first.  What is forwarded is the re-serialized, validated
+    // object, never the bytes the phone sent.
     let forwardedBody: Buffer | undefined;
-    if (isCompanionProfilePatch(method, path)) {
+    const bodyCheck = companionBodyCheck(method, path);
+    if (bodyCheck) {
       let body: JsonObject;
       try {
         body = await readJson(req);
@@ -348,9 +375,9 @@ export function createProxyHandler(options: ProxyOptions) {
         sendJson(res, 400, { error: error instanceof Error ? error.message : "invalid JSON body" });
         return;
       }
-      const profileDenial = companionProfilePatchDenial(body);
-      if (profileDenial) {
-        sendJson(res, profileDenial.status, { error: profileDenial.error });
+      const bodyDenial = bodyCheck(body);
+      if (bodyDenial) {
+        sendJson(res, bodyDenial.status, { error: bodyDenial.error });
         return;
       }
       forwardedBody = Buffer.from(JSON.stringify(body));

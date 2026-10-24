@@ -97,6 +97,23 @@ export const TVFACE_HAS_ENTER_RETURN: Set<TVFaceExpression> = new Set([
 ]);
 
 /**
+ * Expressions that ship a looping hold GIF (`gifs/<expression>_hold.gif`) in
+ * every pack under public/tv-face/skins.
+ *
+ * Fifteen reachable expressions ship a still only — `scared`, `sad`, `waking`,
+ * `proud`, and eleven others.  The player used to ask for their hold GIF
+ * anyway, 404, and fall back to that same still through `onError`, burning a
+ * request on every cue.  It now asks for the still directly.  Whether an
+ * expression belongs here is asserted against the on-disk packs in
+ * tvFaceSkins.test.ts, so the two cannot drift.
+ */
+export const TVFACE_HAS_HOLD: ReadonlySet<TVFaceExpression> = new Set([
+  "alerting", "angry", "computer", "crash", "excited", "fleet", "git",
+  "happy", "laughing", "listening", "loading", "memory", "notifying",
+  "resting", "routine", "screen", "searching", "sleeping", "speaking",
+  "surprised", "thinking", "tools", "typing", "webhook", "working",
+]);
+/**
  * Every expression name that appears on the TV-Face sheet and that the player
  * can select. Used by demos and tests so the sheet cannot silently shrink.
  */
@@ -110,3 +127,4 @@ export const TVFACE_SHEET_EXPRESSIONS: readonly TVFaceExpression[] = [
   "speaking", "suspicious", "surprised", "thinking", "tools", "typing",
   "uploading", "waking", "webhook", "working",
 ] as const;
+

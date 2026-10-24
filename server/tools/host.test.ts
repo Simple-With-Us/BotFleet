@@ -30,21 +30,24 @@ function deps(over: Partial<TurnToolHostDeps> = {}): TurnToolHostDeps {
     // The real endpoint bodies, bound to a fixture roster — the same
     // functions `index.ts` exports and binds to the live store.
     executeListAgentsRequest: ({ selfId }) => listAgentsResponse(selfId, bots),
-    executeAskBotRequest: vi.fn(
-      async (): Promise<AgentRequestResult> => ({ status: 200, body: {} }),
+    executeCoordinateBotsRequest: vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 200, body: { message: "Handed off." } }),
     ),
     executeListRoutinesRequest: () => ({
       status: 200,
       body: { now: "2026-09-12T10:00:00.000Z", timeZone: "UTC", routines: [] },
     }),
-    executeDelegateBotRequest: vi.fn(
-      async (): Promise<AgentRequestResult> => ({ status: 200, body: { queued: true, message: "Delegation queued." } }),
+    executeAssignmentStatusRequest: vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 200, body: { assignments: [] } }),
     ),
     executeCreateBotRequest: vi.fn(
       async (): Promise<AgentRequestResult> => ({ status: 201, body: { id: "bot-new", name: "Pixel", section: "Work" } }),
     ),
     executeRequestCredentialRequest: vi.fn(
       async (): Promise<AgentRequestResult> => ({ status: 201, body: { messageId: "msg-1", label: "OpenCode API key" } }),
+    ),
+    executeRequestSignInRequest: vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 201, body: { messageId: "msg-sign", site: "example.com" } }),
     ),
     executeRoutineRequestRequest: vi.fn(
       async (): Promise<AgentRequestResult> => ({ status: 201, body: { summary: "Weekdays at 09:00" } }),
@@ -55,7 +58,14 @@ function deps(over: Partial<TurnToolHostDeps> = {}): TurnToolHostDeps {
 
 const hostFor = (
   over: Partial<TurnToolHostDeps> = {},
-  ctx: { commsDepth?: number; chiefOfStaff?: boolean; localComputer?: boolean; workspace?: boolean; cwd?: string } = {},
+  ctx: {
+    commsDepth?: number;
+    chiefOfStaff?: boolean;
+    localComputer?: boolean;
+    workspace?: boolean;
+    cwd?: string;
+    launchIdentity?: { seat: string | null; session: string };
+  } = {},
 ) =>
   createTurnToolHost({
     botId: "bot-self",
@@ -65,6 +75,7 @@ const hostFor = (
     localComputer: ctx.localComputer,
     workspace: ctx.workspace,
     cwd: ctx.cwd,
+    launchIdentity: ctx.launchIdentity,
     deps: deps(over),
   });
 
@@ -91,7 +102,7 @@ function askingRuntime(verdict: RequestOutcome) {
 describe("the host runs what the catalog advertised", () => {
   it("serves the registry's three agents tools", async () => {
     const host = hostFor();
-    for (const name of ["list_bots", "ask_bot", "list_routines"]) {
+    for (const name of ["list_bots", "coordinate_bots", "list_routines"]) {
       const outcome = await host.execute({ id: "1", name, arguments: { bot_id: "bot-peer", task: "x" } }, runtime);
       expect(outcome.content, name).not.toContain("is not available to this bot");
     }
@@ -140,31 +151,32 @@ describe("the host runs what the catalog advertised", () => {
 });
 
 describe("caller identity is the turn's, never the model's", () => {
-  it("bakes botId, threadId and depth into ask_bot at dispatch", async () => {
-    const executeAskBotRequest = vi.fn(
+  it("bakes botId, threadId and depth into coordinate_bots at dispatch", async () => {
+    const executeCoordinateBotsRequest = vi.fn(
       async (): Promise<AgentRequestResult> => ({
         status: 200,
-        body: { botName: "peer", text: "here you go" },
+        body: { message: "Handed to @peer." },
       }),
     );
     const host = createTurnToolHost({
       botId: "bot-self",
       threadId: "thread-1",
       commsDepth: 1,
-      deps: deps({ executeAskBotRequest }),
+      deps: deps({ executeCoordinateBotsRequest }),
     });
     const outcome = await host.execute(
-      { id: "1", name: "ask_bot", arguments: { bot_id: "@peer", task: "summarize", fromBotId: "bot-other" } },
+      { id: "1", name: "coordinate_bots", arguments: { bot_ids: ["@peer"], message: "summarize", fromBotId: "bot-other" } },
       runtime,
     );
-    expect(executeAskBotRequest).toHaveBeenCalledWith({
+    expect(executeCoordinateBotsRequest).toHaveBeenCalledWith({
       fromBotId: "bot-self",
-      toBotId: "bot-peer",
+      botIds: ["bot-peer"],
       message: "summarize",
       depth: 1,
       fromThreadId: "thread-1",
     });
-    expect(outcome).toMatchObject({ kind: "result", content: "peer replied:\nhere you go" });
+    expect(outcome.kind).toBe("result");
+    expect(outcome.content).toContain("Handed to @peer.");
   });
 
   it("ignores a thread the model names for list_routines", async () => {
@@ -183,10 +195,10 @@ describe("caller identity is the turn's, never the model's", () => {
 describe("the host's contract", () => {
   it("never throws — a thrown dependency comes back as an error outcome", async () => {
     const outcome = await hostFor({
-      executeAskBotRequest: async () => {
+      executeCoordinateBotsRequest: async () => {
         throw new Error("comms bus is down");
       },
-    }).execute({ id: "1", name: "ask_bot", arguments: { bot_id: "@peer", task: "x" } }, runtime);
+    }).execute({ id: "1", name: "coordinate_bots", arguments: { bot_ids: ["@peer"], message: "x" } }, runtime);
     expect(outcome.kind).toBe("error");
     expect(JSON.parse(outcome.content).error).toBe("comms bus is down");
   });
@@ -265,32 +277,32 @@ describe("the six tools PR 7 added", () => {
     expect(fresh.kind).toBe("result");
   });
 
-  it("delegate_bot asks before it runs, carrying the target and the first 120 chars", async () => {
-    const executeDelegateBotRequest = vi.fn(
-      async (): Promise<AgentRequestResult> => ({ status: 200, body: { queued: true, message: "Delegation queued." } }),
+  it("coordinate_bots asks before it runs, carrying the target and the first 120 chars", async () => {
+    const executeCoordinateBotsRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 200, body: { message: "Handed off." } }),
     );
     const asking = askingRuntime("allowed-once");
     const longTask = "x".repeat(200);
-    const outcome = await hostFor({ executeDelegateBotRequest }).execute(
-      { id: "1", name: "delegate_bot", arguments: { bot_id: "bot-peer", message: longTask } },
+    const outcome = await hostFor({ executeCoordinateBotsRequest }).execute(
+      { id: "1", name: "coordinate_bots", arguments: { bot_ids: ["bot-peer"], message: longTask } },
       asking.runtime,
     );
     expect(asking.asks).toHaveLength(1);
-    expect(asking.asks[0].tool).toBe("delegate_bot");
+    expect(asking.asks[0].tool).toBe("coordinate_bots");
     expect(asking.asks[0].summary).toContain("bot-peer");
     expect(asking.asks[0].summary.length).toBeLessThan(longTask.length);
     expect(outcome.kind).toBe("result");
-    expect(executeDelegateBotRequest).toHaveBeenCalledTimes(1);
+    expect(executeCoordinateBotsRequest).toHaveBeenCalledTimes(1);
   });
 
-  it("a denied delegate_bot never reaches the endpoint — nothing is queued", async () => {
-    const executeDelegateBotRequest = vi.fn(async (): Promise<AgentRequestResult> => ({ status: 200, body: {} }));
+  it("a denied coordinate_bots never reaches the endpoint — nothing is recorded", async () => {
+    const executeCoordinateBotsRequest = vi.fn(async (): Promise<AgentRequestResult> => ({ status: 200, body: {} }));
     const asking = askingRuntime("rejected");
-    const outcome = await hostFor({ executeDelegateBotRequest }).execute(
-      { id: "1", name: "delegate_bot", arguments: { bot_id: "bot-peer", message: "do it" } },
+    const outcome = await hostFor({ executeCoordinateBotsRequest }).execute(
+      { id: "1", name: "coordinate_bots", arguments: { bot_ids: ["bot-peer"], message: "do it" } },
       asking.runtime,
     );
-    expect(executeDelegateBotRequest).not.toHaveBeenCalled();
+    expect(executeCoordinateBotsRequest).not.toHaveBeenCalled();
     expect(outcome).toMatchObject({ kind: "error", detail: "denied" });
   });
 
@@ -321,42 +333,42 @@ describe("the six tools PR 7 added", () => {
 // cannot start carding by accident and a write tool cannot stop.
 describe("the host asks before a write tool runs", () => {
   it("opens an ask carrying the registry's own summary, and only then runs the tool", async () => {
-    const executeAskBotRequest = vi.fn(async () => ({ status: 200, body: { botName: "peer", text: "ok" } }));
+    const executeCoordinateBotsRequest = vi.fn(async () => ({ status: 200, body: { message: "Handed off." } }));
     const asking = askingRuntime("allowed-once");
-    const outcome = await hostFor({ executeAskBotRequest }).execute(
-      { id: "1", name: "ask_bot", arguments: { bot_id: "@peer", task: "summarise  the   log" } },
+    const outcome = await hostFor({ executeCoordinateBotsRequest }).execute(
+      { id: "1", name: "coordinate_bots", arguments: { bot_ids: ["@peer"], message: "summarise  the   log" } },
       asking.runtime,
     );
 
-    expect(asking.asks).toEqual([{ tool: "ask_bot", summary: "ask @peer: summarise the log" }]);
-    expect(executeAskBotRequest).toHaveBeenCalledTimes(1);
+    expect(asking.asks).toEqual([{ tool: "coordinate_bots", summary: "hand to @peer: summarise the log" }]);
+    expect(executeCoordinateBotsRequest).toHaveBeenCalledTimes(1);
     expect(outcome.kind).toBe("result");
   });
 
   it("a deny never reaches the executor, and the model is told why", async () => {
-    const executeAskBotRequest = vi.fn(async () => ({ status: 200, body: {} }));
+    const executeCoordinateBotsRequest = vi.fn(async () => ({ status: 200, body: {} }));
     const asking = askingRuntime("rejected");
-    const outcome = await hostFor({ executeAskBotRequest }).execute(
-      { id: "1", name: "ask_bot", arguments: { bot_id: "@peer", task: "spend the budget" } },
+    const outcome = await hostFor({ executeCoordinateBotsRequest }).execute(
+      { id: "1", name: "coordinate_bots", arguments: { bot_ids: ["@peer"], message: "spend the budget" } },
       asking.runtime,
     );
 
     // the side effect never happened — an approval that arrives after the
     // fact is a receipt, not a decision
-    expect(executeAskBotRequest).not.toHaveBeenCalled();
+    expect(executeCoordinateBotsRequest).not.toHaveBeenCalled();
     expect(outcome).toMatchObject({ kind: "error", detail: "denied" });
     expect(outcome.content).toContain("was not approved");
   });
 
   it("no broker mounted is fail-closed — nobody asked is not nobody objected", async () => {
-    const executeAskBotRequest = vi.fn(async () => ({ status: 200, body: {} }));
+    const executeCoordinateBotsRequest = vi.fn(async () => ({ status: 200, body: {} }));
     const asking = askingRuntime("unavailable");
-    const outcome = await hostFor({ executeAskBotRequest }).execute(
-      { id: "1", name: "ask_bot", arguments: { bot_id: "@peer", task: "x" } },
+    const outcome = await hostFor({ executeCoordinateBotsRequest }).execute(
+      { id: "1", name: "coordinate_bots", arguments: { bot_ids: ["@peer"], message: "x" } },
       asking.runtime,
     );
 
-    expect(executeAskBotRequest).not.toHaveBeenCalled();
+    expect(executeCoordinateBotsRequest).not.toHaveBeenCalled();
     expect(outcome).toMatchObject({ kind: "error", detail: "approval unavailable" });
   });
 
@@ -373,14 +385,14 @@ describe("the host asks before a write tool runs", () => {
 
   it("asks even when the summary cannot be built", async () => {
     // A card nobody can read is bad; running a write tool unasked is worse.
-    const executeAskBotRequest = vi.fn(async () => ({ status: 200, body: {} }));
+    const executeCoordinateBotsRequest = vi.fn(async () => ({ status: 200, body: {} }));
     const asking = askingRuntime("rejected");
-    await hostFor({ executeAskBotRequest }).execute(
-      { id: "1", name: "ask_bot", arguments: { bot_id: { nested: "object" }, task: 42 } },
+    await hostFor({ executeCoordinateBotsRequest }).execute(
+      { id: "1", name: "coordinate_bots", arguments: { bot_ids: [{ nested: "object" }], message: 42 } },
       asking.runtime,
     );
     expect(asking.asks).toHaveLength(1);
-    expect(executeAskBotRequest).not.toHaveBeenCalled();
+    expect(executeCoordinateBotsRequest).not.toHaveBeenCalled();
   });
 });
 
@@ -438,6 +450,24 @@ describe("host computer tools on HTTP lane", () => {
     expect(asking.asks[0]).toMatchObject({ tool: "bash", summary: "bash: echo 'hello host'", approvalScope: "local-computer" });
     expect(outcome.kind).toBe("result");
     expect(outcome.content).toContain("hello host");
+  });
+
+  // cmd.exe (the Windows shell) does not expand $NAME
+  it.skipIf(process.platform === "win32")("runs bash marked as launched, as the bot that owns the turn, or with no seat", async () => {
+    const echo = { id: "1", name: "bash", arguments: { command: 'echo "$AGENT_LAUNCHER/$AGENT_LAUNCH_SEAT/$AGENT_SESSION"' } };
+    const seated = await hostFor({}, { localComputer: true, launchIdentity: { seat: "BF-FIXER", session: "thread-1" } }).execute(
+      echo,
+      runtime,
+    );
+    expect(seated.content).toBe("botfleet/BF-FIXER/thread-1");
+    const roleless = await hostFor({}, { localComputer: true, launchIdentity: { seat: null, session: "thread-1" } }).execute(
+      echo,
+      runtime,
+    );
+    expect(roleless.content).toBe("botfleet//thread-1");
+    // A host built with no identity still marks the shell as launched, with no seat.
+    const bare = await hostFor({}, { localComputer: true }).execute(echo, runtime);
+    expect(bare.content).toBe("botfleet//");
   });
 
   it("asks for approval before running bash, fails on deny", async () => {

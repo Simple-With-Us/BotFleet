@@ -2,12 +2,19 @@ import { describe, expect, it } from "vitest";
 
 import { attachmentLabel, filesFromClipboard, intakeFiles, isImageFile, type Attachment, type ClipboardFileSource } from "./composer-attachments";
 
-type Fake = { name: string; size: number; type: string; text: () => Promise<string> };
+type Fake = {
+  name: string;
+  size: number;
+  type: string;
+  text: () => Promise<string>;
+  arrayBuffer?: () => Promise<ArrayBuffer>;
+};
 const file = (name: string, type: string, size = 10): Fake => ({
   name,
   size,
   type,
   text: async () => "contents",
+  arrayBuffer: async () => new ArrayBuffer(size),
 });
 const upload = async (f: Fake): Promise<Attachment> => ({
   kind: "image",
@@ -88,5 +95,63 @@ describe("intakeFiles", () => {
     });
     expect(out.attachments).toHaveLength(1);
     expect(out.notice).toMatch(/bad\.png: too large/);
+  });
+
+  it("surfaces the underlying error when a pathless image upload to a non-image engine fails", async () => {
+    const originalFetch = globalThis.fetch;
+    // SAFETY: intakeFiles is the only caller under test and it only needs a
+    // fetch that returns a JSON error body for the attachment upload route.
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "content-type must be a supported file type" }), {
+        status: 400,
+        statusText: "Bad Request",
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    try {
+      const out = await intakeFiles([file("", "image/png", 3)], {
+        allowImages: false,
+        getPath: () => "",
+        uploadImage: async () => null,
+      });
+      expect(out.attachments).toHaveLength(0);
+      expect(out.notice).toMatch(/Pasted Screenshot\.png could not be attached/);
+      expect(out.notice).toMatch(/Pasted Screenshot\.png: content-type must be a supported file type/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("attaches a pathless screenshot as a file when the engine cannot read images", async () => {
+    const originalFetch = globalThis.fetch;
+    // SAFETY: intakeFiles is the only caller under test and it only needs a
+    // fetch that returns the saved attachment JSON for the upload route.
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ path: "/api/attachments/abc.png", mime: "image/png", bytes: 3 }), {
+        status: 201,
+        statusText: "Created",
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    try {
+      const out = await intakeFiles([file("", "image/png", 3)], {
+        allowImages: false,
+        getPath: () => "",
+        uploadImage: async () => null,
+      });
+      expect(out.attachments).toHaveLength(1);
+      expect(out.attachments[0].kind).toBe("file");
+      expect(out.notice).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("reports when an image uploader returns null instead of failing silently", async () => {
+    const out = await intakeFiles([file("shot.png", "image/png")], {
+      allowImages: true,
+      getPath: () => "",
+      uploadImage: async () => null,
+    });
+    expect(out.attachments).toHaveLength(0);
+    expect(out.notice).toMatch(/shot\.png: could not be uploaded/);
   });
 });

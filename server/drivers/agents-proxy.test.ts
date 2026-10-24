@@ -9,6 +9,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { selectPeerBots, type AgentBot } from "../tools/agents.ts";
+
 const PROXY = join(dirname(fileURLToPath(import.meta.url)), "agents-proxy.ts");
 const TOKEN = "test-comms-token";
 
@@ -16,12 +18,15 @@ const TOKEN = "test-comms-token";
 let stub: Server;
 let stubPort = 0;
 let lastAuth: string | undefined;
+let agentsResponse: unknown = { bots: [{ id: "bot-helper", name: "Helper", model: "fake-model", busy: false }] };
 let lastAskBody: any = null;
+let askStatus = 200;
 let askResponse: unknown = { botName: "Helper", text: "hi from helper" };
 let lastDelegateBody: any = null;
 let delegateResponse: unknown = { queued: true, message: "Delegation queued." };
 let lastCreateBody: any = null;
 let lastCredentialBody: any = null;
+let lastSignInBody: any = null;
 let lastRoutineQuery = "";
 let routinesResponse: unknown = {
   now: "2026-08-28T10:30:00.000Z",
@@ -63,23 +68,19 @@ beforeAll(async () => {
     }
     if (req.method === "GET" && req.url?.startsWith("/api/internal/agents")) {
       res.writeHead(200, { "content-type": "application/json" });
-      return res.end(
-        JSON.stringify({
-          bots: [{ id: "bot-helper", name: "Helper", model: "fake-model", busy: false }],
-        }),
-      );
+      return res.end(JSON.stringify(agentsResponse));
     }
-    if (req.method === "POST" && req.url === "/api/internal/ask-bot") {
+    if (req.method === "POST" && req.url === "/api/internal/coordinate-bots") {
       let data = "";
       req.on("data", (c) => (data += c));
       req.on("end", () => {
         lastAskBody = JSON.parse(data);
-        res.writeHead(200, { "content-type": "application/json" });
+        res.writeHead(askStatus, { "content-type": "application/json" });
         res.end(JSON.stringify(askResponse));
       });
       return;
     }
-    if (req.method === "POST" && req.url === "/api/internal/delegate-bot") {
+    if (req.method === "POST" && req.url === "/api/internal/assignment-status") {
       let data = "";
       req.on("data", (c) => (data += c));
       req.on("end", () => {
@@ -96,6 +97,16 @@ beforeAll(async () => {
         lastCreateBody = JSON.parse(data);
         res.writeHead(201, { "content-type": "application/json" });
         res.end(JSON.stringify({ id: "bot-designer", name: "Pixel", section: "Work" }));
+      });
+      return;
+    }
+    if (req.method === "POST" && req.url === "/api/internal/request-sign-in") {
+      let data = "";
+      req.on("data", (c) => (data += c));
+      req.on("end", () => {
+        lastSignInBody = JSON.parse(data);
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ messageId: "msg-sign", site: "example.com" }));
       });
       return;
     }
@@ -162,16 +173,17 @@ afterAll(async () => {
 });
 
 describe("agents-proxy MCP surface", () => {
-  it("answers the MCP handshake and lists all eight tools", async () => {
+  it("answers the MCP handshake and lists all nine tools", async () => {
     const init = await rpc("initialize", { protocolVersion: "2024-11-05" });
     expect(init.result.serverInfo.name).toContain("agents");
     const list = await rpc("tools/list");
     expect(list.result.tools.map((t: { name: string }) => t.name)).toEqual([
       "list_bots",
-      "ask_bot",
-      "delegate_bot",
+      "coordinate_bots",
+      "assignment_status",
       "create_bot",
       "request_credential",
+      "request_sign_in",
       "list_routines",
       "propose_routine",
       "propose_routine_action",
@@ -212,46 +224,116 @@ describe("agents-proxy MCP surface", () => {
     expect(lastAuth).toBe(`Bearer ${TOKEN}`);
   });
 
-  it("ask_bot forwards sender + depth and returns the reply", async () => {
-    askResponse = { botName: "Helper", text: "hi from helper" };
-    const res = await callTool("ask_bot", { bot_id: "bot-helper", message: "ping" });
-    expect(res.result.content[0].text).toContain("Helper replied:");
-    expect(res.result.content[0].text).toContain("hi from helper");
+  it("list_bots says which peers are switched off, from the rows the harness really serves", async () => {
+    // The rows come out of the same filter the HTTP lane serves
+    // (`selectPeerBots`), so this renders what a live harness sends the proxy,
+    // and not a hand-written guess at it.
+    const peer = (id: string, name: string, extra: Partial<AgentBot> = {}): AgentBot => ({
+      id,
+      name,
+      section: "",
+      modelSelection: { model: "fake-model" },
+      ...extra,
+    });
+    const rows = selectPeerBots("bot-asker", [
+      peer("bot-asker", "Asker"),
+      peer("bot-awake", "Awake"),
+      peer("bot-sleepy", "Sleepy", { off: true }),
+      peer("bot-busy-off", "Tired", { off: true, busy: true }),
+      peer("bot-busy", "Busy", { busy: true }),
+    ])!;
+    agentsResponse = JSON.parse(JSON.stringify({ section: "", bots: rows }));
+    try {
+      const res = await callTool("list_bots", {});
+      const lines: string[] = res.result.content[0].text.split("\n");
+      expect(lines).toContain("- Awake [id: bot-awake, model: fake-model]");
+      expect(lines).toContain("- Sleepy [id: bot-sleepy, model: fake-model, off]");
+      expect(lines).toContain("- Tired [id: bot-busy-off, model: fake-model, busy, off]");
+      expect(lines).toContain("- Busy [id: bot-busy, model: fake-model, busy]");
+      // an On bot carries nothing about Off
+      expect(lines.filter((line) => /\boff\b/.test(line)).map((line) => line.split(" ")[1])).toEqual(["Sleepy", "Tired"]);
+    } finally {
+      agentsResponse = { bots: [{ id: "bot-helper", name: "Helper", model: "fake-model", busy: false }] };
+    }
+  });
+
+  it("coordinate_bots forwards sender, depth and bot ids", async () => {
+    askResponse = { message: "Handed to @Helper.  The result comes back on this conversation when the work finishes.", assignments: [{ id: "asg-1" }] };
+    const res = await callTool("coordinate_bots", { bot_ids: ["bot-helper"], message: "ping" });
+    expect(res.result.content[0].text).toContain("Handed to @Helper");
     expect(lastAskBody).toMatchObject({
       fromBotId: "bot-asker",
       fromThreadId: "thread-asker-routine",
-      toBotId: "bot-helper",
+      botIds: ["bot-helper"],
       message: "ping",
       depth: 0,
     });
   });
 
-  it("renders a busy peer as a clean answer, not an error", async () => {
-    askResponse = { busy: true };
-    const res = await callTool("ask_bot", { bot_id: "bot-helper", message: "ping" });
-    expect(res.result.content[0].text).toContain("busy");
+  it("assignment_status reads without changing work", async () => {
+    delegateResponse = { assignments: [] };
+    const res = await callTool("assignment_status", {});
     expect(res.result.isError).toBeFalsy();
+    expect(res.result.content[0].text).toContain("assignments");
+    expect(lastDelegateBody).toMatchObject({ fromBotId: "bot-asker", fromThreadId: "thread-asker-routine" });
   });
 
   it("surfaces the harness's depth refusal as a tool error", async () => {
-    askResponse = { error: "message chains are limited to one hop" };
-    const res = await callTool("ask_bot", { bot_id: "bot-helper", message: "ping" });
+    askResponse = { error: "delegation chains are limited to one hop — do this one yourself" };
+    const res = await callTool("coordinate_bots", { bot_ids: ["bot-helper"], message: "ping" });
     expect(res.result.isError).toBe(true);
     expect(res.result.content[0].text).toContain("one hop");
   });
 
-  it("forwards the source thread when queueing a delegation", async () => {
-    delegateResponse = { queued: true, message: "Delegation queued." };
-    const res = await callTool("delegate_bot", {
-      bot_id: "bot-helper",
+  it("names every bot that refused when none of them took the work", async () => {
+    askResponse = { error: "Sleepy is switched off; Archived is hidden; no such bot: Ghost" };
+    const res = await callTool("coordinate_bots", { bot_ids: ["bot-sleepy", "Archived", "Ghost"], message: "ping" });
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toBe(
+      "Couldn't hand that off: Sleepy is switched off; Archived is hidden; no such bot: Ghost",
+    );
+  });
+
+  it("shows which bots were not handed the work when only some took it", async () => {
+    // The harness puts the refusals in the message, because this is all the
+    // model is shown.  The proxy must hand it over whole.
+    askResponse = {
+      message:
+        "Handed to @Helper.  The result comes back on this conversation when the work finishes.  Not handed off: Sleepy is switched off; no such bot: Ghost.",
+      assignments: [{ id: "asg-3" }],
+      errors: ["Sleepy is switched off", "no such bot: Ghost"],
+    };
+    const res = await callTool("coordinate_bots", { bot_ids: ["bot-helper", "bot-sleepy", "Ghost"], message: "split it" });
+    expect(res.result.isError).toBeFalsy();
+    expect(res.result.content[0].text).toContain("Handed to @Helper.");
+    expect(res.result.content[0].text).toContain("Not handed off: Sleepy is switched off; no such bot: Ghost.");
+  });
+
+  it("passes the harness's refusal of an Off bot through, naming the bot", async () => {
+    // The harness answers 403 for a request that names an Off bot, before it
+    // records anything.  The proxy turns that into a tool error with its text.
+    askStatus = 403;
+    askResponse = { error: "Sleepy is switched off" };
+    try {
+      const res = await callTool("coordinate_bots", { bot_ids: ["bot-sleepy"], message: "wake up" });
+      expect(res.result.isError).toBe(true);
+      expect(res.result.content[0].text).toBe("Sleepy is switched off");
+    } finally {
+      askStatus = 200;
+    }
+  });
+
+  it("forwards the reason when recording a handoff", async () => {
+    askResponse = { message: "Handed to @Helper.", assignments: [{ id: "asg-2" }] };
+    const res = await callTool("coordinate_bots", {
+      bot_ids: ["bot-helper"],
       message: "take this",
       reason: "follow-up",
     });
-    expect(res.result.content[0].text).toContain("Delegation queued");
-    expect(lastDelegateBody).toMatchObject({
+    expect(res.result.content[0].text).toContain("Handed to @Helper");
+    expect(lastAskBody).toMatchObject({
       fromBotId: "bot-asker",
-      fromThreadId: "thread-asker-routine",
-      toBotId: "bot-helper",
+      botIds: ["bot-helper"],
       message: "take this",
       reason: "follow-up",
       depth: 0,
@@ -259,8 +341,8 @@ describe("agents-proxy MCP surface", () => {
   });
 
   it("returns queue refusal guidance to the agent as a tool error", async () => {
-    delegateResponse = { error: "delegation chains are limited to one hop — do this one yourself" };
-    const res = await callTool("delegate_bot", { bot_id: "bot-helper", message: "take this" });
+    askResponse = { error: "delegation chains are limited to one hop — do this one yourself" };
+    const res = await callTool("coordinate_bots", { bot_ids: ["bot-helper"], message: "take this" });
     expect(res.result.isError).toBe(true);
     expect(res.result.content[0].text).toContain("do this one yourself");
   });
@@ -295,6 +377,25 @@ describe("agents-proxy MCP surface", () => {
       reason: "The selected model needs it.",
     });
     expect(JSON.stringify(lastCredentialBody)).not.toContain("secret");
+  });
+
+  it("asks for a site sign-in without sending a password", async () => {
+    lastSignInBody = null;
+    const res = await callTool("request_sign_in", {
+      site: "example.com",
+      reason: "the inbox",
+      password: "hunter2",
+    });
+    expect(res.result.isError).toBe(false);
+    expect(res.result.content[0].text).toContain("Sign in needed");
+    expect(res.result.content[0].text).toContain("Never ask them to paste a password");
+    expect(lastSignInBody).toEqual({
+      fromBotId: "bot-asker",
+      fromThreadId: "thread-asker-routine",
+      site: "example.com",
+      reason: "the inbox",
+    });
+    expect(JSON.stringify(lastSignInBody)).not.toContain("hunter2");
   });
 
   it("rejects credential ids outside the fixed allowlist locally", async () => {
@@ -498,7 +599,7 @@ describe("agents-proxy MCP surface", () => {
   });
 
   it("requires bot_id and message", async () => {
-    const res = await callTool("ask_bot", { bot_id: "", message: "" });
+    const res = await callTool("coordinate_bots", { bot_ids: [], message: "" });
     expect(res.result.isError).toBe(true);
   });
 });

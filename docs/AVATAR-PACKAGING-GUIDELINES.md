@@ -54,7 +54,7 @@ AvatarName/
 ```
 
 ### The `manifest.json`
-Every pack must include a `manifest.json` that maps BotFleet's internal states to the filenames in your `gifs/` and `stills/` folders.  Only list skins whose art actually ships: `SHIPPED_SKINS` (`src/components/tv-face/TVFaceAvatar.tsx`) currently includes **every BotColor** (orange/default, blue, green, purple, pink, red, cyan, yellow, teal, coral, white, black).  `orange` IS the default skin (`public/tv-face/skins/default`).  Green uses red face glyphs.
+Every pack must include a `manifest.json` that maps BotFleet's internal states to the filenames in your `gifs/` and `stills/` folders.  Only list skins whose art actually ships: `SHIPPED_SKINS` (`src/components/tv-face/TVFaceAvatar.tsx`) currently includes **every BotColor** (orange/default, blue, green, purple, pink, red, cyan, yellow, teal, coral, white, black).  `orange` IS the default skin (`public/tv-face/skins/default`).  Any color without shipped art renders the default skin rather than 404ing.  Green uses red face glyphs.
 
 ```json
 {

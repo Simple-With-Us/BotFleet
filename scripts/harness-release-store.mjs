@@ -272,6 +272,93 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
 }
 
 /**
+ * Stage a commit into `staging/<commit>`: the tree, then its dependencies.
+ *
+ * The tree is exported with `git archive`, which reads an object and writes
+ * bytes.  It never checks a branch out, never touches a worktree, and never
+ * mutates the repository it reads from — so preparing a release cannot
+ * disturb the tree that is currently running, which is the whole point of
+ * having a store instead of a checkout.
+ *
+ * The dependency install runs inside the staging tree, so the promoted
+ * release carries the exact tree it was verified with.  `--frozen-lockfile`
+ * is not optional here: a release that resolved different versions than
+ * the lockfile names is not the commit it claims to be.
+ */
+export async function stageRelease({
+  commit,
+  repo,
+  env = process.env,
+  install = true,
+  pnpm = "pnpm",
+  log = () => {},
+} = {}) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    throw new ResolutionError(
+      `Refusing to stage a non-commit value: ${commit}.  A release is named by the commit it holds.`,
+      "not-a-commit",
+    );
+  }
+  // A commit that is already a release is not staged again.  Promoting it
+  // would fail with `already-released` AFTER a full dependency install, so
+  // the check has to come first: the install is the expensive part, and the
+  // staging tree it leaves behind is a leftover nobody asked for.
+  if (await isReleaseDirectory(releasePath(commit, env))) {
+    throw new ResolutionError(
+      `Commit ${commit.slice(0, 12)} is already a release at ${releasePath(commit, env)}; nothing to stage.  ` +
+        "Point the pointer at it with `swap`, or pick a different commit.",
+      "already-released",
+      { releasePath: releasePath(commit, env) },
+    );
+  }
+  const source = repo || env.BOTFLEET_RELEASE_SOURCE_REPO || "";
+  if (!source) {
+    throw new ResolutionError(
+      "No source repository to stage from.  Pass --repo <path> or set BOTFLEET_RELEASE_SOURCE_REPO.",
+      "no-source-repo",
+    );
+  }
+  const staging = stagingPath(commit, env);
+  await rm(staging, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  await mkdir(staging, { recursive: true, mode: 0o755 });
+
+  const archive = join(staging, ".botfleet-release-source.tar");
+  try {
+    await run("git", ["-C", source, "archive", "--format=tar", "--output", archive, commit], { timeout: 300_000 });
+    await run("tar", ["-xf", archive, "-C", staging], { timeout: 300_000 });
+  } catch (error) {
+    await rm(archive, { force: true });
+    throw new ResolutionError(
+      `Could not export ${commit.slice(0, 12)} from ${source}: ${error?.message || error}.  ` +
+        "The commit must exist in that repository (fetch it first if it is new).",
+      "stage-export-failed",
+      { stagingPath: staging },
+    );
+  }
+  await rm(archive, { force: true });
+
+  if (install) {
+    log(`installing dependencies in ${staging}`);
+    try {
+      await run(pnpm, ["install", "--frozen-lockfile"], {
+        cwd: staging,
+        timeout: 30 * 60_000,
+        maxBuffer: 32 * 1024 * 1024,
+        env: { ...env },
+      });
+    } catch (error) {
+      throw new ResolutionError(
+        `Dependency install failed for ${commit.slice(0, 12)}: ${error?.message || error}.  ` +
+          "The staging tree is left in place for inspection.",
+        "stage-install-failed",
+        { stagingPath: staging },
+      );
+    }
+  }
+  return staging;
+}
+
+/**
  * Drop write permission from a promoted release, and say so if it did not take.
  *
  * Read-only is the invariant, so a failure here is a failure to promote, not a

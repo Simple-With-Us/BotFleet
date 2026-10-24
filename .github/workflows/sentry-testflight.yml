@@ -1,0 +1,73 @@
+name: Sentry TestFlight
+
+# Called only with an archive-verified, exact-build TestFlight readiness receipt.
+# Green CI, an uploaded archive, and a skipped ship are NOT deployment evidence.
+# Reporting failure is a separate red job; it must not cause another app upload.
+# Main's sentry-deploy.yml stays the CI workflow_run deploy recorder.
+on:
+  workflow_call:
+    inputs:
+      receipt:
+        description: Verified TestFlight distribution receipt from ios-ship
+        required: false
+        default: ""
+        type: string
+      receipt_error:
+        description: The ship succeeded but its deployment receipt could not be verified
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sentry-testflight-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  record-testflight-availability:
+    if: github.repository == 'Simple-With-Us/BotFleet' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: pnpm
+      # --ignore-scripts is load-bearing.  The root `postinstall` compiles the
+      # clutch dependency with esbuild, and esbuild is a devDependency that
+      # `--prod` leaves out, so the script exits 1 and this job went red after
+      # every successful upload.  The reporter imports only zod, the receipt
+      # module and node builtins, so it needs no install script.
+      - name: Install reporter dependencies
+        run: pnpm install --frozen-lockfile --prod --ignore-scripts
+      - name: Validate the distribution receipt before loading credentials
+        env:
+          SENTRY_DEPLOY_RECEIPT: ${{ inputs.receipt }}
+          SENTRY_RECEIPT_ERROR: ${{ inputs.receipt_error }}
+        run: |
+          node --input-type=module -e '
+            import { validateReceipt } from "./scripts/sentry-testflight-receipt.mjs";
+            if (process.env.SENTRY_RECEIPT_ERROR === "true") throw new Error("The upload succeeded but receipt verification failed; deployment reporting is blocked");
+            const receipt = validateReceipt(JSON.parse(process.env.SENTRY_DEPLOY_RECEIPT));
+            if (receipt.sourceCommit !== process.env.GITHUB_SHA) throw new Error("Receipt source does not match the ship workflow");
+          '
+      - name: Load the required Sentry auth token
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: SENTRY_AUTH_TOKEN
+          required: SENTRY_AUTH_TOKEN
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+        env:
+          GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      - name: Record the Cocoa release and confirmed TestFlight availability
+        env:
+          SENTRY_DEPLOY_RECEIPT: ${{ inputs.receipt }}
+        run: node scripts/sentry-report-testflight.mjs

@@ -64,12 +64,12 @@ Every agent session must start with systematic orientation before touching code:
    ```
    Skim for your agent tag or repositories you plan to touch.  Grok Bot seats also full-read `[SENDER->FLEET]` (every GB seat must spend time).  Coordinator self-id is `AFL`, not `FLEET`.
 
-3. **Check Live Effort Boards & Work Items:**
+3. **Check Linear & Work Items:**
    ```bash
    board stats
    board list --status open,in_progress --limit 25
    ```
-   Or inspect live board files directly: `rg -n "In Progress" /Users/jay/apps/*EFFORT-LOG.md`.
+   Effort logs are archived — use Linear (`board` or agent-sync `linear_list` when mounted), not `~/apps/*EFFORT-LOG.md` or `docs/EFFORT-LOG.md`, for open work.
 
 ---
 
@@ -84,14 +84,14 @@ git -C /Users/jay/Code/<Repo> worktree add -b <seat>/<feature-slug> ~/apps/<app>
 
 ---
 
-## 3. Triple-Claim & Task Lifecycle
+## 3. Claim & Task Lifecycle
 
-Before starting substantial work, reserve your lane across three durable surfaces:
+Before starting substantial work, reserve your lane on Linear and Zulip:
 
-1. **Live Effort Board (`/Users/jay/apps/<APP>-EFFORT-LOG.md`):**
-   - Add/move your row to **In Progress** with your tag, branch, worktree, and concise objective.
-   - Live boards are branch-neutral and canonical.  Mirror your update to `docs/EFFORT-LOG.md` in the repo before committing.
-2. **GitHub Issue:**
+1. **Linear (`board claim` / `board file`):**
+   - Claim or file the issue In Progress with your tag, branch, worktree, and concise objective.
+   - Do not edit archived effort logs (`~/apps/*-EFFORT-LOG.md` or repo `docs/EFFORT-LOG.md`).
+2. **GitHub Issue (when applicable):**
    - Link your branch to the corresponding GitHub Issue or create one.
 3. **Slack Channel `#agent-sync`:**
    Post a standardized claim header:
@@ -107,22 +107,23 @@ Before starting substantial work, reserve your lane across three durable surface
 
 ---
 
-## 4. Secret Safety & The Handoff-File Grep Trap
+## 4. Secret Safety & The Grep Trap
 
-**Handoff File:** `/Users/jay/.secrets/global-api-keys` (no `.env` extension).  
+**Mac reader:** `fleet-secrets` (`get NAME`, `run`, `names`), which reads Infisical Fleet-OPS.  Nothing may read the flat file `~/.secrets/global-api-keys` any more (OPS-818).  
 **Sole Runtime Truth:** **Infisical** is the source of truth for all deployed app runtime secrets.
 
 ### Strict Grep Trap Ban (2026-08-14):
-NEVER print, `cat`, `grep`, `rg`, or `view_file` lines matching `KEY=value` from `~/.secrets/global-api-keys`.  Doing so dumps raw secrets into transcript logs.
+NEVER print a secret value, and never `cat`, `grep`, `rg`, or `view_file` anything under `~/.secrets/`.  Doing so dumps raw secrets into transcript logs.
 
 - **Inspection (Names only):**
   ```bash
-  grep -oE '^[A-Z][A-Z0-9_]*' ~/.secrets/global-api-keys | sort -u
+  fleet-secrets names
   ```
   *(Or via cloud API: `GET https://mac.jays.services/files/key-names` with Bearer auth).*
 - **Extraction into single variable (Never echo):**
   ```bash
-  SECRET_VAL="$(grep -m1 '^TARGET_KEY=' ~/.secrets/global-api-keys | cut -d= -f2- | tr -d '"')"
+  SECRET_VAL="$(fleet-secrets get TARGET_KEY)" || exit $?
+  # or hand a command only the keys it needs:  fleet-secrets run --only KEY_A,KEY_B -- CMD
   # Use $SECRET_VAL directly without echoing or printing
   ```
 - **Infisical CLI:** Never run bare `infisical secrets` or `--output json`.  Use `bash scripts/infisical-secrets-safe.sh {set|has|names}`.
@@ -135,8 +136,9 @@ Visibly wider gap (two visible spaces) after terminal punctuation (`.`, `!`, `?`
 
 | Surface | Syntax | Why |
 | :--- | :--- | :--- |
-| **Markdown Chat UIs / HTML** | `&nbsp;` plus normal space (`Sentence one.&nbsp; Sentence two.`) | Survives HTML/Markdown whitespace collapse |
-| **Source Files** (docs, commit messages, PRs, comments) | Two literal ASCII spaces | Read in raw text editors / terminals |
+| **Every surface** (owner ruling 2026-10-23):  chat replies in any pane, Zulip, GitHub PR and issue text, review comments, Linear, Slack, commit messages, repo docs, skills, agent instructions, rendered UI copy | A real U+00A0 plus a normal space, generated in the shell | One rule everywhere.  Two ASCII spaces collapse on rendered surfaces, and the `&nbsp;` entity shows literally in squash commits and plain text. |
+| **HTML / JSX / Swift source for product copy** | Swift `"\u{00A0} "`, JS/TS strings `"\u00A0 "`, JSX text `{'\u00A0'}` plus a space or `&#160;`, HTML markup source `&#160;`, or a shared `SENTENCE_GAP` constant | Same rendered gap; never `&nbsp; ` |
+| **Code, identifiers, machine-readable config** | No gap character | Never put U+00A0 into code |
 
 *Do not apply after abbreviations (`e.g.`, `v1.2.3`) or in URLs/identifiers.*
 

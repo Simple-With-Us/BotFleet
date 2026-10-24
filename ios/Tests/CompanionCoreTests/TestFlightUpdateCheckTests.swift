@@ -10,17 +10,17 @@ final class TestFlightUpdateCheckTests: XCTestCase {
     // MARK: - Manifest decoding
 
     /// The real published manifest, verbatim, minus unrelated apps. Proves
-    /// this app's bundle id (`app.botfleet`) round-trips through the shape
+    /// this app's bundle id (`app.botfleet.ios`) round-trips through the shape
     /// the fleet actually serves, not a shape invented for this test.
     private let realManifestJSON = Data(#"""
     {
       "schemaVersion": 1,
       "updatedAt": "2026-09-04T03:58:13Z",
       "apps": {
-        "app.botfleet": {
+        "app.botfleet.ios": {
           "marketingVersion": "1.0.29",
           "build": "202609032050",
-          "appleId": 6806379515,
+          "appleId": 6820175685,
           "displayName": "BotFleet"
         },
         "trade.socratic.app": {
@@ -38,7 +38,7 @@ final class TestFlightUpdateCheckTests: XCTestCase {
         let entry = try XCTUnwrap(manifest.apps[TestFlightUpdateCheck.bundleId])
         XCTAssertEqual(entry.marketingVersion, "1.0.29")
         XCTAssertEqual(entry.build, "202609032050")
-        XCTAssertEqual(entry.appleId, 6_806_379_515)
+        XCTAssertEqual(entry.appleId, 6_820_175_685)
     }
 
     func testAnUnlistedBundleIdOffersNoUpdateRatherThanThrowing() throws {
@@ -74,6 +74,24 @@ final class TestFlightUpdateCheckTests: XCTestCase {
         let running = AppBuildInfo(marketingVersion: "1.0.9", build: "202609010000")
         let candidate = AppBuildInfo(marketingVersion: "1.0.30", build: "202609130000")
         XCTAssertTrue(TestFlightUpdateCheck.isNewer(candidate, than: running))
+    }
+
+    /// A commit-count build must outrank the 12-digit stamp it replaces, even
+    /// though the number is far smaller.  Without the scheme check the phone
+    /// reads "2058 < 202610080006" and never offers the update at all.
+    func testCommitCountBuildOutranksTheTimestampBuildItReplaces() {
+        let running = AppBuildInfo(marketingVersion: "1.0.30", build: "202610080006")
+        let candidate = AppBuildInfo(marketingVersion: "1.0.2058", build: "2058")
+        XCTAssertTrue(TestFlightUpdateCheck.isNewer(candidate, than: running))
+        XCTAssertFalse(TestFlightUpdateCheck.isNewer(running, than: candidate))
+    }
+
+    /// Within the commit-count scheme the number still decides.
+    func testCommitCountOrderingStaysNumeric() {
+        let running = AppBuildInfo(marketingVersion: "1.0.2058", build: "2058")
+        let newer = AppBuildInfo(marketingVersion: "1.0.2070", build: "2070")
+        XCTAssertTrue(TestFlightUpdateCheck.isNewer(newer, than: running))
+        XCTAssertFalse(TestFlightUpdateCheck.isNewer(running, than: newer))
     }
 
     func testAvailableUpdateReturnsTheManifestsOfferWhenItIsNewer() throws {

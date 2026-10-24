@@ -12,10 +12,12 @@ import { track } from "@/lib/analytics";
 import { normalizeState } from "@/lib/mascot";
 import { speaker } from "@/lib/tts";
 import { spokenReply } from "../../shared/voice-summary";
+import { voiceForDevice } from "../../shared/bot-voice";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
 import { sessionKeyterms } from "@/lib/stt-keyterms";
+import { mergeCloudSttCapabilities } from "@/lib/cloud-stt-capabilities";
 import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { useStore, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
@@ -35,8 +37,8 @@ export function GroupCallButton({ group, members }: { group: Group; members: Bot
     <CallTargetButton
       targetId={group.id}
       targetName={group.name}
-      voices={members.map((member) => member.voice)}
-      setupBotId={members.find((member) => !member.voice)?.id ?? members[0]?.id}
+      voices={members.map((member) => voiceForDevice(member, "mac"))}
+      setupBotId={members.find((member) => !voiceForDevice(member, "mac"))?.id ?? members[0]?.id}
       requireExplicitVoices
       onStart={() => track("group_call_started", { memberCount: members.length })}
     />
@@ -161,7 +163,8 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       move("speaking");
       setSpeakingMemberId(member?.id ?? null);
       hush();
-      await speaker.speak(text, { botId: member?.id, voiceId: member?.voice, ...(messageId ? { messageId, threadId: group.threadId } : {}) });
+      // Each member speaks with its voice for this Mac.
+      await speaker.speak(text, { botId: member?.id, voiceId: member ? voiceForDevice(member, "mac") : undefined, ...(messageId ? { messageId, threadId: group.threadId } : {}) });
       return alive.current && currentCall() === group.id && sayGeneration.current === mine;
     },
     [group.id, group.threadId, hush, move],
@@ -335,7 +338,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       if (!alive.current || currentCall() !== group.id) return;
       if (code === 2) {
         setNote(
-          "Calls need a working dictation provider.\u00A0 Add an AssemblyAI key in Settings, or use BotFleet for macOS.",
+          "Calls need a working dictation provider.\u00A0 Add an AssemblyAI key in Settings, or install the desktop app for macOS.",
         );
         return;
       }
@@ -358,10 +361,11 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       const status = await bridge.transcription?.status?.().catch(() => undefined);
       const hostPlatform = bridge.platform ?? "unknown";
       const choice: ProviderChoice = pickSTTProvider({
-        cloudSttConfigured: Boolean(status?.configured),
+        cloudStt: mergeCloudSttCapabilities(state.config?.callStt?.cloud, Boolean(status?.configured)),
         appleSpeechAvailable: hostPlatform === "darwin",
         platform: hostPlatform,
         explicitPreference: state.config?.callStt?.provider ?? undefined,
+        ladder: state.config?.callStt?.ladder,
       });
       if (choice.provider === null) {
         if (alive.current && currentCall() === group.id) {

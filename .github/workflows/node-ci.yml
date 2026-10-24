@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so the ratchet can read the base branch baseline.
           # The default pull_request checkout is the merge commit
@@ -23,7 +23,7 @@ jobs:
           # A branch that is only behind the base must be linted as merged,
           # or the ratchet false-fails and seats regenerate the baseline.
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
       - name: Enable pnpm

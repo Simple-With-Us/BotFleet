@@ -43,6 +43,15 @@
   --color-hairline: #d0d7de;
   --color-ink: #111418;
   --color-ink-secondary: #57606a;
+  /* Platform and engine marks get their own tone instead of following `--color-ink`.
+     A Custom Palette may put main text on the accent colour, and a logo that
+     inherits ink then paints itself in the accent: the engine rail stops
+     reading as ten engines and starts reading as ten accent chips (owner
+     2026-10-10).  Each skin restates `--color-mark`; `applyCustomTheme` sets it
+     from the ground's lightness and never from the palette's accent or ink, so
+     no palette can recolor a logo.  The marks are silhouettes of brands, not
+     brand paint: the shapes stay, the colours do not. */
+  --color-mark: #111418;
   --color-accent: #0969da;
   --color-accent-border: #218bff;
   /* the ring a keyboard user follows; sits on the accent so focus reads as
@@ -90,6 +99,7 @@
   --color-control: #2f2f2f;       /* = raised: Midnight is unchanged */
   --color-hairline: #333333;
   --color-ink: #fcfcfc;
+  --color-mark: #fcfcfc;
   --color-ink-secondary: #fcfcfc99;
   --color-accent: #1084fe;
   --color-accent-border: #459ffe;
@@ -131,6 +141,7 @@
   --color-hairline: #c8bda8;      /* #ece7dd was 1.11:1 on the rail → 1.65:1 */
 
   --color-ink: #1a1a18;           /* 17.4:1 on white */
+  --color-mark: #1a1a18;
   --color-ink-secondary: #6b6559; /* #8b8578 was 3.67:1 → 5.78:1 */
 
   /* Two accent tones: the fill carries white, the text stands on white. */
@@ -182,7 +193,8 @@
   --color-control: #262019;       /* = raised: Foundry is unchanged */
   --color-hairline: #3d3529;      /* visible on purpose — this UI has edges */
 
-  --color-ink: #f4efe4;           /* warm off-white, never pure #fff */
+  --color-ink: #f4efe4;
+  --color-mark: #f4efe4;           /* warm off-white, never pure #fff */
   --color-ink-secondary: #b0a696; /* 6.7:1 on raised, 5.9:1 on hover */
 
   /* Brass. Bright fill, dark lettering — the inversion described above. */
@@ -242,6 +254,7 @@
 
   --color-ink: #14201f;           /* dark petrol; a neutral black would read
                                      as a foreign object on a tinted ground */
+  --color-mark: #14201f;
   --color-ink-secondary: #4d5c5b; /* 7.0:1 on white, 5.8:1 on the ground */
 
   --color-accent: #11736d;        /* deep teal, carries white at 5.68:1 */
@@ -279,6 +292,7 @@
   --color-hairline: #d0d7de;
 
   --color-ink: #111418;
+  --color-mark: #111418;
   --color-ink-secondary: #57606a;
 
   --color-accent: #0969da;
@@ -316,6 +330,7 @@
   --color-hairline: #94a3b8;
 
   --color-ink: #0f172a;
+  --color-mark: #0f172a;
   --color-ink-secondary: #475569;
 
   --color-accent: #4f46e5;
@@ -352,6 +367,7 @@
   --color-hairline: #e2e8f0;
 
   --color-ink: #020617;
+  --color-mark: #020617;
   --color-ink-secondary: #64748b;
 
   --color-accent: #0284c7;
@@ -387,6 +403,7 @@
   --color-hairline: #a8bfd8;
 
   --color-ink: #0f1c2e;
+  --color-mark: #0f1c2e;
   --color-ink-secondary: #475d78;
 
   --color-accent: #0077cc;
@@ -422,6 +439,7 @@
   --color-hairline: #bfb297;
 
   --color-ink: #2b251c;
+  --color-mark: #2b251c;
   --color-ink-secondary: #786d5c;
 
   --color-accent: #c05621;
@@ -457,6 +475,7 @@
   --color-hairline: #93a1a1;
 
   --color-ink: #073642;
+  --color-mark: #073642;
   --color-ink-secondary: #586e75;
 
   --color-accent: #268bd2;

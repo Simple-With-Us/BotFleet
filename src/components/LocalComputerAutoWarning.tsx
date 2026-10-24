@@ -17,12 +17,19 @@ export function LocalComputerAutoWarning({
   onConfirm,
   bots,
   busy = false,
+  title = "Allow Auto Mode on This Computer?",
+  body = LOCAL_COMPUTER_AUTO_WARNING,
 }: {
   open: boolean;
   onCancel: () => void;
   onConfirm: () => void;
   bots?: { id: string; name: string }[];
   busy?: boolean;
+  /** The second switch stands behind the same warning, but saying "Auto Mode"
+   *  there would name the wrong thing, so the caller supplies its wording.
+   *  Defaults keep every existing caller's copy exactly as it was. */
+  title?: string;
+  body?: string;
 }) {
   const confirmRef = useRef<HTMLButtonElement>(null);
 
@@ -57,12 +64,12 @@ export function LocalComputerAutoWarning({
           <AlertTriangle size={18} className="mt-0.5 shrink-0 text-warning" />
           <div>
             <h2 id="local-auto-warning-title" className="text-[15px] font-semibold text-ink">
-              Allow Auto Mode on This Computer?
+              {title}
             </h2>
             <p id="local-auto-warning-body" className="mt-1.5 text-[13px] leading-relaxed text-ink-secondary">
               {bots
                 ? `Auto mode will let ${bots.length === 1 ? "this bot" : `these ${bots.length} bots`} click, type, and run tools on this computer without asking first.\u00a0 Destructive and sensitive actions still stop.\u00a0 Continue only if you are watching.`
-                : LOCAL_COMPUTER_AUTO_WARNING}
+                : body}
             </p>
             {bots && (
               <ul aria-label="Bots Gaining Auto Access" className="mt-3 max-h-48 overflow-y-auto space-y-1 text-[13px] text-ink">

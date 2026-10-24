@@ -13,6 +13,7 @@ import {
   ROOM_LABEL_MAX_LENGTH,
   ROOM_TERMINOLOGY_OPTIONS,
   ROOM_TERMINOLOGY_PRESETS,
+  lowerRoomLabels,
   suggestPlural,
   type RoomLabels,
   type RoomTerminology,
@@ -23,21 +24,30 @@ import {
   parseConversationMode,
   type ConversationMode,
 } from "../../shared/conversation-mode";
+import {
+  BUSY_SEND_DEFAULTS,
+  parseBusySendDefault,
+  type BusySendDefault,
+} from "../../shared/busy-send-default.ts";
 import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
 import { showToolCallsEnabled, skillRecorderEnabled, summarizeToolCallsEnabled } from "@/lib/feature-flags";
 import { ApiKeyRow, EngineKeyRow, VpsConnection } from "./ApiKeys";
 import { LinqSettings } from "./LinqSettings";
 import { useUpdaterState } from "@/lib/updater";
 import {
+  activeDrain,
   availableLabel,
+  drainLabel,
   idleLabel,
-  installBlockedBusy,
+  installPausesWork,
+  PAUSES_WORK_COPY,
   installBlockedReason,
   installedLabel,
   lastRunDetail,
   lastRunLabel,
   runningLabel,
   updateSource,
+  useNow,
   useUpdateControl,
 } from "@/lib/update-control";
 import { EnginesSettings } from "./EnginesSettings";
@@ -56,6 +66,7 @@ import { SecretsSection } from "./SecretsSection";
 import { SkinPicker } from "./SkinPicker";
 import { RoomTurnTimeoutSettings } from "./RoomTurnTimeoutSettings";
 import { TranscriptionSettings } from "./TranscriptionSettings";
+import { StsSettings } from "./StsSettings";
 import { QdrantRagConnection } from "./QdrantRagConnection";
 import { cn } from "@/lib/cn";
 import { putAutomaticUpdateSetting } from "@/lib/automatic-update-setting";
@@ -461,6 +472,9 @@ function UpdatesRow() {
   // only path that works there — and on a Mac that has both, it is the one
   // that can actually install without waiting for a published build.
   const local = useUpdateControl();
+  // A countdown while an update holds new work, so it ticks; a hook, so it
+  // comes before the early return below.
+  const holdNow = useNow(local.status?.drain ? 1_000 : null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const hasBridge = Boolean(window.ogb?.updater);
@@ -489,12 +503,13 @@ function UpdatesRow() {
   // Why Install Update is down.  The harness ships a reason with every
   // refusal it can see coming, and no surface rendered one — so a card with an
   const blockedReason = source === "harness" ? installBlockedReason(status) : null;
-  const isBusyBlocked = installBlockedBusy(status);
-  const isBlocked = blockedReason !== null && !isBusyBlocked;
-  const subtitleReason = isBusyBlocked ? "Work will pause and resume after update" : blockedReason;
+  const isBlocked = blockedReason !== null;
+  const subtitleReason = blockedReason ?? (source === "harness" && installPausesWork(status) ? PAUSES_WORK_COPY : null);
+  // How many messages are saved for after the restart, and when it begins.
+  const holdLine = source === "harness" ? drainLabel(activeDrain(status, holdNow), holdNow) : null;
   const subtitle =
     source === "harness" && status
-      ? `Installed ${installedLabel(status)}.${"\u00A0 "}${harnessLine}${subtitleReason ? `.${"\u00A0 "}${subtitleReason}` : ""}`
+      ? `Installed ${installedLabel(status)}.${"\u00A0 "}${harnessLine}${subtitleReason ? `.${"\u00A0 "}${subtitleReason}` : ""}${holdLine ? `${"\u00A0 "}${holdLine}` : ""}`
       : `${feedLabel}${"\u00A0 "}Auto-checks at most once per 6 hours;${"\u00A0 "}you can manually check any time if an update is available.`;
   const lastRun = source === "harness" ? lastRunLabel(status?.lastRun ?? null) : null;
   // The updater's own message for that run — a hover only, never inline.
@@ -567,7 +582,7 @@ function UpdatesRow() {
             </button>
             {hasUpdate && (
               <button
-                onClick={() => void local.install({ force: true })}
+                onClick={() => void local.install()}
                 disabled={local.busy !== null || isBlocked}
                 className="rounded-lg bg-accent px-3 py-1.5 text-[13px] font-medium text-white disabled:bg-control disabled:text-ink-secondary"
               >
@@ -630,6 +645,8 @@ export function ConversationModeRow() {
   const { state, dispatch } = useStore();
   const current = parseConversationMode(state.config?.conversationMode);
   const labels = state.config?.roomLabels ?? { singular: "Channel", plural: "Channels" };
+  // Mid-sentence form:  keeps the capitals of a custom proper noun such as HUB.
+  const lower = lowerRoomLabels(labels);
   const [saving, setSaving] = useState(false);
   const [pendingSimple, setPendingSimple] = useState(false);
   const save = async (conversationMode: ConversationMode, mergeThreads = false) => {
@@ -663,14 +680,14 @@ export function ConversationModeRow() {
   return (
     <Card
       title="Workspace Arrangement"
-      subtitle={`Choose how your bots and ${labels.plural.toLowerCase()} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${labels.plural.toLowerCase()} mode treats each ${labels.singular.toLowerCase()} as a category for threads.`}
+      subtitle={`Choose how your bots and ${lower.plural} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${lower.plural} mode treats each ${lower.singular} as a category for threads.`}
     >
       <div className="flex flex-col gap-2">
         {CONVERSATION_MODES.map((mode) => {
           const copy = CONVERSATION_MODE_COPY[mode];
           const selected = current === mode;
           const displayTitle = mode === "projects" ? labels.plural : copy.title;
-          const displaySubtitle = copy.subtitle;
+          const displaySubtitle = copy.subtitle(lower.singular);
           return (
             <button
               key={mode}
@@ -692,7 +709,7 @@ export function ConversationModeRow() {
           <div className="rounded-lg border border-hairline/40 bg-raised/40 px-3 py-2.5">
             <div className="text-[14px] font-medium text-ink">Merge Extra Threads?</div>
             <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved but hidden.
+              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved and out of the sidebar.
             </div>
             <div className="mt-2 flex flex-wrap gap-2">
               <button
@@ -709,7 +726,7 @@ export function ConversationModeRow() {
                 onClick={() => void save("simple")}
                 className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-raised/60"
               >
-                Keep Extra Threads Hidden
+                Keep Them Out of the Sidebar
               </button>
               <button
                 type="button"
@@ -722,6 +739,66 @@ export function ConversationModeRow() {
             </div>
           </div>
         )}
+      </div>
+    </Card>
+  );
+}
+
+const BUSY_SEND_COPY = {
+  queue: {
+    title: "Queue",
+    subtitle: "While a bot is working, Enter holds your message until the turn finishes.  Use Steer Now when you need to interrupt.",
+  },
+  steer: {
+    title: "Steer",
+    subtitle: "While a bot is working, Enter sends into the running turn when the engine supports it, or stops the turn and sends when it does not.",
+  },
+} satisfies Record<BusySendDefault, { title: string; subtitle: string }>;
+
+export function BusySendDefaultRow() {
+  const { state, dispatch } = useStore();
+  const current = parseBusySendDefault(state.config?.busySendDefault);
+  const [saving, setSaving] = useState(false);
+  const save = async (busySendDefault: BusySendDefault) => {
+    if (saving || busySendDefault === current) return;
+    setSaving(true);
+    try {
+      const config: ConfigStatus = await api("/api/busy-send-default", {
+        method: "PATCH",
+        body: JSON.stringify({ busySendDefault }),
+      });
+      dispatch({ type: "configStatus", config });
+    } catch {
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Card
+      title="Busy Sends"
+      subtitle="Choose what happens when you send while a bot is already working.  Each send can still override this from the composer."
+    >
+      <div className="flex flex-col gap-2">
+        {BUSY_SEND_DEFAULTS.map((mode) => {
+          const copy = BUSY_SEND_COPY[mode];
+          const selected = current === mode;
+          return (
+            <button
+              key={mode}
+              type="button"
+              disabled={saving}
+              aria-pressed={selected}
+              onClick={() => void save(mode)}
+              className={cn(
+                "rounded-lg border px-3 py-2.5 text-left",
+                selected ? "border-accent bg-accent/10" : "border-hairline/40 hover:bg-raised/60",
+              )}
+            >
+              <div className="text-[14px] font-medium text-ink">{copy.title}</div>
+              <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{copy.subtitle}</div>
+            </button>
+          );
+        })}
       </div>
     </Card>
   );
@@ -1064,6 +1141,45 @@ function DiagnosticsRow() {
   );
 }
 
+// Which build is running. Deliberately the quietest thing in General: it is
+// there to be read when something looks wrong and copied into a bug report,
+// not to be configured. Nothing here is editable, and a build that has not
+// answered yet simply renders nothing rather than a placeholder.
+function BuildInfoRow() {
+  const [info, setInfo] = useState<AppRuntimeInfo | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    const ogb = window.ogb;
+    if (!ogb?.appInfo) return;
+    ogb
+      .appInfo()
+      .then((value) => {
+        if (live) setInfo(value);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  if (!info) return null;
+
+  return (
+    <div className="flex items-center gap-2 px-1 pt-1 text-[12px] text-ink-secondary">
+      <span className="font-mono">{info.summary}</span>
+      <button
+        type="button"
+        onClick={() => void navigator.clipboard?.writeText(info.summary)}
+        aria-label="Copy build details"
+        className="rounded px-1.5 py-0.5 text-[11px] text-ink-secondary hover:bg-control hover:text-ink"
+      >
+        Copy
+      </button>
+    </div>
+  );
+}
+
 export function SettingsModal() {
   const { state, dispatch } = useStore();
   const bots = state.bots ?? [];
@@ -1371,6 +1487,9 @@ export function SettingsModal() {
                   <div id="setting-general-conversation-mode" className={highlightClass("setting-general-conversation-mode")}>
                     <ConversationModeRow />
                   </div>
+                  <div id="setting-general-busy-send" className={highlightClass("setting-general-busy-send")}>
+                    <BusySendDefaultRow />
+                  </div>
                   <Card
                     id="setting-general-room-turn-timeout"
                     className={highlightClass("setting-general-room-turn-timeout")}
@@ -1397,6 +1516,9 @@ export function SettingsModal() {
                   <div id="setting-general-analytics" className={highlightClass("setting-general-analytics")}>
                     <AnalyticsRow />
                   </div>
+                  <div id="setting-general-build" className={highlightClass("setting-general-build")}>
+                    <BuildInfoRow />
+                  </div>
                 </>
               )}
 
@@ -1419,6 +1541,9 @@ export function SettingsModal() {
                     ) : null}
                     <div id="setting-connections-transcription" className={highlightClass("setting-connections-transcription")}>
                       <TranscriptionSettings />
+                    </div>
+                    <div id="setting-connections-sts" className={highlightClass("setting-connections-sts")}>
+                      <StsSettings />
                     </div>
                     <div id="setting-connections-api-keys" className={cn("flex flex-col gap-4", highlightClass("setting-connections-api-keys"))}>
                       <ApiKeyRow section="box" />

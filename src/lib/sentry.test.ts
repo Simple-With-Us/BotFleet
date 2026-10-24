@@ -101,15 +101,18 @@ describe("browser Sentry", () => {
     expect(src).toMatch(/blockAllMedia:\s*true/);
     expect(src).toMatch(/feedbackIntegration\(/);
     expect(src).toMatch(/autoInject:\s*false/);
-    expect(src).toMatch(/enableLogs:\s*true/);
-    expect(src).toMatch(/sendDefaultPii:\s*false/);
+    expect(src).toMatch(/urlQueryParams:\s*false/);
+    expect(src).not.toMatch(/sendDefaultPii/);
     expect(src).toMatch(/genAI:\s*\{\s*inputs:\s*false,\s*outputs:\s*false/);
+    expect(src).toMatch(/VITE_SENTRY_RELEASE/);
+    expect(src).toMatch(/release:\s*options\.release/);
   });
 
   it("iOS Cocoa reads SENTRY_DSN from Info.plist only", () => {
     const swift = readFileSync(join(ROOT, "ios/App/SentryTelemetry.swift"), "utf8");
     expect(swift).toMatch(/forInfoDictionaryKey: "SENTRY_DSN"/);
-    expect(swift).toMatch(/profilesSampleRate = 0\.1/);
+    // sentry-cocoa 9 replaced profilesSampleRate with configureProfiling.
+    expect(swift).toMatch(/configureProfiling = \{[^}]*sessionSampleRate = 0\.1/);
     expect(swift).toMatch(/sessionReplay\.onErrorSampleRate = 0\.1/);
     expect(swift).not.toMatch(/ingest\.sentry\.io/);
     expect(swift).not.toMatch(/\?\? "https:\/\//);

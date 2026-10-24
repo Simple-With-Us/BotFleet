@@ -8,18 +8,34 @@
 import type { ModelSelection } from "./contracts.ts";
 
 /** Exact retired picker ids → the live catalog id that replaced them.
- *  Applies across dsh and the native minimax driver: both dropped the
- *  same M3 / plain M2.7 rows for the same product reason.  DeepSeek's
+ *  Applies across dsh, the native minimax driver and mcode: all three
+ *  dropped the same rows for the same product reasons.  DeepSeek's
  *  retired wire/display id folds onto the V4.1 Flash picker id (wire
- *  translation to deepseek-flash lives in Clutch / dshModelOptionValue). */
+ *  translation to deepseek-flash lives in Clutch / dshModelOptionValue).
+ *  `DeepSeek-V4.1-Pro` is a different retirement: DeepSeek never published a
+ *  4.1 Pro (its catalog is `DeepSeek-V4.1-Flash` plus `DeepSeek-V4-Pro-0813`),
+ *  so the picker row was simply misnamed and every bot saved against it needs
+ *  the rewrite or it would send an id no engine accepts.
+ *
+ *  The MiniMax M3.1 Flash rows were renamed, not retired: MiniMax dropped
+ *  the `-Preview` suffix, and every engine that serves M3.1 now answers to
+ *  `MiniMax-M3.1-Flash`.  Both former spellings are listed so a bot saved
+ *  against one is migrated onto the live id instead of sending a spelling no
+ *  engine accepts.  The mcode thinking rows carry the same suffix, so they
+ *  get their own entries: an exact-match index cannot fold one into another. */
 const RETIRED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
-  "MiniMax-M3": "MiniMax-M3.1-Flash-Preview",
+  "MiniMax-M3": "MiniMax-M3.1-Flash",
+  "MiniMax-M3.1-Flash-Preview": "MiniMax-M3.1-Flash",
+  "MiniMax-M3.1-Flash-Preview-1M": "MiniMax-M3.1-Flash-1M",
+  "MiniMax-M3.1-Flash-Preview-thinking": "MiniMax-M3.1-Flash-thinking",
+  "MiniMax-M3.1-Flash-Preview-thinking-1M": "MiniMax-M3.1-Flash-thinking-1M",
   "MiniMax-M2.7": "MiniMax-M2.7-highspeed",
   "deepseek-v4-flash": "DeepSeek-V4.1-Flash",
+  "DeepSeek-V4.1-Pro": "DeepSeek-V4-Pro",
 };
 
 /** Live replacement for a retired model id, or the input when it is still
- *  current.  Exact match only — MiniMax-M3.1-Flash-Preview and
+ *  current.  Exact match only — MiniMax-M3.1-Flash and
  *  MiniMax-M2.7-highspeed must not match the retired stems. */
 export function rewriteRetiredModelId(model: string): string {
   return RETIRED_MODEL_REPLACEMENTS[model] ?? model;

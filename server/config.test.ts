@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -47,6 +47,10 @@ import {
   infisicalConfigured,
   infisicalEnabled,
   infisicalSettings,
+  agentProxyEnabled,
+  agentProxySettings,
+  applyAgentProxyEnv,
+  DEFAULT_AGENT_PROXY_ADDRESS,
   isHttpsUrl,
   type AppConfig,
 } from "./config.ts";
@@ -57,6 +61,31 @@ import { isSentryDsn as isBrowserSentryDsn } from "../src/lib/observability-conf
 const SENTINEL_DSN = "https://abc123@o0.ingest.sentry.io/1";
 
 describe("configuration boundaries", () => {
+  it("accepts voice provider fields and rejects unknown keys in those schemas", () => {
+    expect(parseConfigPatch({
+      tts: { provider: "xai" },
+      callStt: { provider: "meta" },
+      azureSpeech: { region: "westus" },
+      metaSpeech: {},
+      groq: {},
+      assemblyai: {},
+    })).toEqual({
+      tts: { provider: "xai" },
+      callStt: { provider: "meta" },
+      azureSpeech: { region: "westus" },
+      metaSpeech: {},
+      groq: {},
+      assemblyai: {},
+    });
+
+    expect(() => parseConfigPatch({ tts: { provider: "xai", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ callStt: { provider: "meta", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ azureSpeech: { region: "westus", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ metaSpeech: { typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ groq: { typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ assemblyai: { typo: true } })).toThrow(/Unrecognized key/);
+  });
+
   it("keeps supported stored settings and drops unrelated top-level data", () => {
     expect(
       parseStoredConfig({
@@ -84,6 +113,32 @@ describe("configuration boundaries", () => {
       usage: { ingestUrl: "https://usage.example.com", ingestToken: "tok" },
     });
     expect(parseConfigPatch({ usage: { ingestUrl: "" } })).toEqual({ usage: { ingestUrl: "" } });
+  });
+
+  it("accepts another Infisical project and environment for the Zulip keys, and refuses a malformed one", () => {
+    expect(
+      parseConfigPatch({
+        zulip: {
+          credentialSource: "infisical",
+          infisicalProjectId: " 9bf7417a-fbbb-42ca-870c-2b45207233f5 ",
+          infisicalEnv: "prod",
+          infisicalPath: "/zulip",
+        },
+      }),
+    ).toEqual({
+      zulip: {
+        credentialSource: "infisical",
+        infisicalProjectId: "9bf7417a-fbbb-42ca-870c-2b45207233f5",
+        infisicalEnv: "prod",
+        infisicalPath: "/zulip",
+      },
+    });
+    // empty clears it back to the harness's own project and environment
+    expect(parseConfigPatch({ zulip: { infisicalProjectId: "", infisicalEnv: "" } })).toEqual({
+      zulip: { infisicalProjectId: "", infisicalEnv: "" },
+    });
+    expect(() => parseConfigPatch({ zulip: { infisicalProjectId: "../other" } })).toThrow("zulip.infisicalProjectId");
+    expect(() => parseConfigPatch({ zulip: { infisicalEnv: "prod/zulip" } })).toThrow("zulip.infisicalEnv");
   });
 
   it("accepts only a simple VPS SSH config alias and exposes no credentials", () => {
@@ -139,6 +194,11 @@ describe("configuration boundaries", () => {
     expect(() => parseConfigPatch({ features: { skillRecorder: "yes" } })).toThrow(
       "features.skillRecorder",
     );
+  });
+
+  it("accepts busySendDefault queue or steer", () => {
+    expect(parseConfigPatch({ busySendDefault: "queue" })).toEqual({ busySendDefault: "queue" });
+    expect(() => parseConfigPatch({ busySendDefault: "hold" })).toThrow("busySendDefault");
   });
 
   it("shows tool steps by default and accepts an explicit opt-out", () => {
@@ -796,9 +856,33 @@ describe("saveConfig section merge", () => {
   beforeEach(() => {
     mkdirSync(DATA_DIR, { recursive: true });
     rmSync(join(DATA_DIR, "config.json"), { force: true });
+    rmSync(join(DATA_DIR, "persist-on-exit.policy"), { force: true });
   });
   afterEach(() => {
     rmSync(join(DATA_DIR, "config.json"), { force: true });
+    rmSync(join(DATA_DIR, "persist-on-exit.policy"), { force: true });
+  });
+
+  it("persists server quit policy and retains it through another server setting", () => {
+    saveConfig({ server: { persistOnExit: false } });
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+    expect(readFileSync(join(DATA_DIR, "persist-on-exit.policy"), "utf8")).toBe("false\n");
+
+    saveConfig({ server: { allowRemoteDesktopLaunch: true } });
+    expect(loadConfig().server).toMatchObject({ persistOnExit: false, allowRemoteDesktopLaunch: true });
+  });
+
+  it("uses the strict offline policy and replaces it on an online save", () => {
+    saveConfig({ server: { persistOnExit: true } });
+    writeFileSync(join(DATA_DIR, "persist-on-exit.policy"), "false\n");
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+
+    saveConfig({ server: { persistOnExit: true } });
+    expect(readFileSync(join(DATA_DIR, "persist-on-exit.policy"), "utf8")).toBe("true\n");
+    expect(loadConfig().server?.persistOnExit).toBe(true);
+
+    writeFileSync(join(DATA_DIR, "persist-on-exit.policy"), "true\ntrailing");
+    expect(loadConfig().server?.persistOnExit).toBe(true);
   });
 
   it("persists usage URL and token, and a later URL-only patch keeps the token", () => {
@@ -1159,6 +1243,9 @@ describe("observability settings", () => {
     expect(parseConfigPatch({ observability: { sentryDsn: "" } })).toEqual({
       observability: { sentryDsn: "" },
     });
+    expect(() => parseConfigPatch({ observability: { sentryFleetDsn: "http://abc123@o0.ingest.sentry.io/1" } })).toThrow(
+      "observability.sentryFleetDsn must be a Sentry https:// DSN",
+    );
     expect(
       parseConfigPatch({
         observability: { sentryDsn: SENTINEL_DSN, enabled: false, tracesSampleRate: 0, logsEnabled: false },
@@ -1200,6 +1287,7 @@ describe("observability settings", () => {
   it("defaults the environment, sample rate, and log forwarding", () => {
     expect(observabilitySettings({})).toEqual({
       dsn: null,
+      fleetDsn: null,
       enabled: true,
       environment: "production",
       tracesSampleRate: DEFAULT_SENTRY_TRACES_SAMPLE_RATE,
@@ -1307,6 +1395,44 @@ describe("the secret-store section", () => {
       writeThrough: true,
     });
     expect(infisicalEnabled(loadConfig())).toBe(false);
+  });
+
+  it("persists the pronunciation list beside the voice, the way the STT vocabulary is kept", () => {
+    saveConfig({ tts: { key: "sentinel-tts-key", voice: "jay-wedgeworth-001" } });
+    const list = [{ term: "SQL", say: "sequel" }, { term: "C#", say: "C sharp" }];
+    saveConfig(parseConfigPatch({ tts: { pronunciations: list } }));
+    // A section merge: the list never drops the key or the default voice.
+    expect(loadConfig().tts).toMatchObject({ key: "sentinel-tts-key", voice: "jay-wedgeworth-001", pronunciations: list });
+    saveConfig(parseConfigPatch({ tts: { voice: "English_Graceful_Lady" } }));
+    expect(loadConfig().tts).toMatchObject({ voice: "English_Graceful_Lady", pronunciations: list });
+    // A saved empty list stays empty, so the defaults do not come back.
+    saveConfig(parseConfigPatch({ tts: { pronunciations: [] } }));
+    expect(loadConfig().tts?.pronunciations).toEqual([]);
+  });
+
+  it("validates the pronunciation list with the shared rules, and canonicalizes it", () => {
+    expect(parseConfigPatch({ tts: { pronunciations: [{ term: " SQL ", say: " se   quel " }] } }).tts?.pronunciations).toEqual([
+      { term: "SQL", say: "se quel" },
+    ]);
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "SQL", say: "a" }, { term: "sql", say: "b" }] } }))
+      .toThrow("sql is on the list twice.");
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "two words", say: "x" }] } })).toThrow();
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "SQL", say: "my SQL" }] } })).toThrow();
+    expect(() => parseConfigPatch({ tts: { pronunciations: "SQL=sequel" } })).toThrow();
+  });
+
+  it("keeps every other setting when a hand-edited pronunciation list is bad", () => {
+    const stored = parseStoredConfig({
+      profile: { name: "Jay" },
+      tts: {
+        voice: "jay-wedgeworth-001",
+        pronunciations: [{ term: "SQL", say: "sequel" }, { term: "sql", say: "dup" }, { term: "", say: "x" }, 7],
+      },
+    });
+    expect(stored.profile?.name).toBe("Jay");
+    expect(stored.tts).toEqual({ voice: "jay-wedgeworth-001", pronunciations: [{ term: "SQL", say: "sequel" }] });
+    // Not a list at all reads as never saved, which means the defaults.
+    expect(parseStoredConfig({ tts: { voice: "v", pronunciations: "nope" } }).tts).toEqual({ voice: "v" });
   });
 
   it("persists call STT vocabulary and clears an explicit provider on Auto", () => {
@@ -1703,3 +1829,180 @@ describe("legacy voice provider migration", () => {
     }
   });
 });
+
+describe("agentProxy settings and environment", () => {
+  it("defaults to disabled", () => {
+    expect(agentProxyEnabled({})).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: {} })).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: { enabled: false } })).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: { enabled: true } })).toBe(true);
+  });
+
+  it("resolves defaults and falls back to infisical project settings when unconfigured", () => {
+    const defaultSettings = agentProxySettings({});
+    expect(defaultSettings).toEqual({
+      enabled: false,
+      address: DEFAULT_AGENT_PROXY_ADDRESS,
+      projectId: "",
+      environment: "prod",
+      secretPath: "/",
+      caCertPath: undefined,
+    });
+
+    const withInfisical = agentProxySettings({
+      infisical: { projectId: "proj-inf-99", environment: "staging", secretPath: "/backend" },
+    });
+    expect(withInfisical.projectId).toBe("proj-inf-99");
+    expect(withInfisical.environment).toBe("staging");
+    expect(withInfisical.secretPath).toBe("/backend");
+
+    const explicit = agentProxySettings({
+      infisical: { projectId: "proj-inf-99" },
+      agentProxy: {
+        enabled: true,
+        address: "proxy.local:18000",
+        projectId: "custom-proj",
+        environment: "dev",
+        secretPath: "/agents",
+        caCertPath: "/tmp/proxy-ca.crt",
+      },
+    });
+    expect(explicit).toEqual({
+      enabled: true,
+      address: "proxy.local:18000",
+      projectId: "custom-proj",
+      environment: "dev",
+      secretPath: "/agents",
+      caCertPath: "/tmp/proxy-ca.crt",
+    });
+  });
+
+  it("returns base environment untouched when agent proxy is disabled", () => {
+    const baseEnv = { FOO: "bar" };
+    expect(applyAgentProxyEnv({}, baseEnv)).toBe(baseEnv);
+    expect(applyAgentProxyEnv({ agentProxy: { enabled: false } }, baseEnv)).toBe(baseEnv);
+    expect(applyAgentProxyEnv({}, undefined)).toBeUndefined();
+  });
+
+  it("injects proxy environment variables when enabled", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+        projectId: "proj-xyz",
+        environment: "prod",
+        secretPath: "/app",
+        caCertPath: "/certs/proxy.pem",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, { EXISTING: "true" });
+    expect(env).toMatchObject({
+      EXISTING: "true",
+      HTTP_PROXY: "http://127.0.0.1:17322",
+      HTTPS_PROXY: "http://127.0.0.1:17322",
+      http_proxy: "http://127.0.0.1:17322",
+      https_proxy: "http://127.0.0.1:17322",
+      ALL_PROXY: "http://127.0.0.1:17322",
+      all_proxy: "http://127.0.0.1:17322",
+      NO_PROXY: "localhost,127.0.0.1",
+      no_proxy: "localhost,127.0.0.1",
+      INFISICAL_AGENT_PROXY_ADDRESS: "127.0.0.1:17322",
+      INFISICAL_PROJECT_ID: "proj-xyz",
+      INFISICAL_ENVIRONMENT: "prod",
+      INFISICAL_SECRET_PATH: "/app",
+      SSL_CERT_FILE: "/certs/proxy.pem",
+      NODE_EXTRA_CA_CERTS: "/certs/proxy.pem",
+    });
+  });
+
+  it("preserves explicitly set proxy variables when injecting", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, {
+      HTTP_PROXY: "http://corp-proxy:8080",
+      NO_PROXY: "intranet.example.com",
+    });
+    expect(env?.HTTP_PROXY).toBe("http://corp-proxy:8080");
+    expect(env?.NO_PROXY).toBe("intranet.example.com");
+    expect(env?.HTTPS_PROXY).toBe("http://127.0.0.1:17322");
+  });
+
+  it("lets explicitly configured routing and CA settings win over inherited INFISICAL_* and TLS variables", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "proxy.local:18000",
+        projectId: "explicit-proj",
+        environment: "dev",
+        secretPath: "/agents",
+        caCertPath: "/certs/proxy.pem",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, {
+      INFISICAL_AGENT_PROXY_ADDRESS: "stale.local:1",
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+      SSL_CERT_FILE: "/etc/ssl/ambient.pem",
+      NODE_EXTRA_CA_CERTS: "/etc/ssl/ambient-extra.pem",
+    });
+    expect(env).toMatchObject({
+      HTTPS_PROXY: "http://proxy.local:18000",
+      INFISICAL_AGENT_PROXY_ADDRESS: "proxy.local:18000",
+      INFISICAL_PROJECT_ID: "explicit-proj",
+      INFISICAL_ENVIRONMENT: "dev",
+      INFISICAL_SECRET_PATH: "/agents",
+      SSL_CERT_FILE: "/certs/proxy.pem",
+      NODE_EXTRA_CA_CERTS: "/certs/proxy.pem",
+    });
+  });
+
+  it("keeps an inherited routing id when the proxy only fell back to BotFleet's own Infisical settings", () => {
+    const cfg: AppConfig = {
+      infisical: { projectId: "fallback-proj", environment: "staging", secretPath: "/backend" },
+      agentProxy: { enabled: true },
+    };
+    const inherited = applyAgentProxyEnv(cfg, {
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+    });
+    expect(inherited).toMatchObject({
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+    });
+    const bare = applyAgentProxyEnv(cfg, {});
+    expect(bare).toMatchObject({
+      INFISICAL_PROJECT_ID: "fallback-proj",
+      INFISICAL_ENVIRONMENT: "staging",
+      INFISICAL_SECRET_PATH: "/backend",
+    });
+  });
+
+  it("rejects unknown agentProxy keys at the config boundary", () => {
+    expect(() => parseConfigPatch({ agentProxy: { enabled: true, typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ agentProxy: { allowReadableBrokeredSecrets: true } })).toThrow(/Unrecognized key/);
+  });
+
+  it("persists agentProxy in saveConfig and merges correctly", () => {
+    saveConfig({
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+        projectId: "saved-project",
+      },
+    });
+    const loaded = loadConfig();
+    expect(loaded.agentProxy).toMatchObject({
+      enabled: true,
+      address: "127.0.0.1:17322",
+      projectId: "saved-project",
+    });
+  });
+});
+

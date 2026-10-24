@@ -48,6 +48,28 @@ export interface KnobFieldSpec {
  * deliberately-out-of-scope list. */
 export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
   {
+    // How long a voice call waits for the bot's own engine before the model
+    // answers that turn alone.  A coding engine regularly takes 10-30s, and the
+    // vendor preamble only covers the first couple of seconds, so this is the
+    // knob that decides when a call degrades instead of going quiet.
+    id: "sts.engineTimeoutMs",
+    label: "Voice call engine timeout",
+    section: "sts",
+    path: ["engineTimeoutMs"],
+    infisicalName: "BOTFLEET_STS_ENGINE_TIMEOUT_MS",
+    kind: "int",
+    min: 1000,
+    max: 120000,
+  },
+  {
+    id: "sts.frontEngine",
+    label: "Voice calls use the bot's engine",
+    section: "sts",
+    path: ["frontEngine"],
+    infisicalName: "BOTFLEET_STS_FRONT_ENGINE",
+    kind: "bool",
+  },
+  {
     id: "jobs.defaultMinutes",
     label: "Default job run limit",
     section: "jobs",
@@ -166,6 +188,28 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: 1,
   },
   {
+    // Reviewer calls one turn may spend on auto-review (server/auto-review.ts
+    // `ReviewBudget`).  Bounds mirror shared/auto-review.ts.
+    id: "autoReview.maxReviewsPerTurn",
+    label: "Auto-review limit per turn",
+    section: "autoReview",
+    path: ["maxReviewsPerTurn"],
+    infisicalName: "BOTFLEET_AUTO_REVIEW_MAX_PER_TURN",
+    kind: "int",
+    min: 1,
+    max: 500,
+  },
+  {
+    id: "tts.audioRetentionDays",
+    label: "TTS audio clip retention days",
+    section: "tts",
+    path: ["audioRetentionDays"],
+    infisicalName: "BOTFLEET_TTS_AUDIO_RETENTION_DAYS",
+    kind: "int",
+    min: 0,
+    max: 365,
+  },
+  {
     id: "infisical.refreshMinutes",
     label: "Infisical refresh cadence",
     section: "infisical",
@@ -174,6 +218,75 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     kind: "int",
     min: 5,
     max: 1440,
+  },
+  {
+    id: "agentProxy.enabled",
+    label: "Agent proxy enabled",
+    section: "agentProxy",
+    path: ["enabled"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_ENABLED",
+    kind: "bool",
+  },
+  {
+    // Off unless the owner says otherwise.  The phone's Open-on-Mac button
+    // and nothing else in the fleet depends on this, so it is the knob most
+    // worth being able to flip without a deploy.
+    //
+    // `server.persistOnExit` is deliberately NOT a row, and the reason is the
+    // difference between where this table's values end up and where that one
+    // is read.  A knob here is resolved by the harness into in-memory `cfg`,
+    // and `writeThroughKnobs` tombstones the field so `saveConfig` leaves it
+    // out of config.json — the vault owns it.  `persistOnExit` has exactly one
+    // consumer, `serverPersistsOnExit()` in electron/main.mjs, and that reads
+    // config.json off disk before the harness has been consulted; Electron
+    // cannot import this TypeScript module.  A row here would therefore look
+    // settable and do nothing: set it in the vault and the harness resolves
+    // `false` in memory, while Electron still sees an absent field, reads
+    // `undefined !== false`, and keeps the harness alive on quit.
+    //
+    // It is also the wrong shape for a knob.  This table is fleet-wide, and
+    // "quit should tear the harness down" is a per-Mac decision that would
+    // then apply to every machine sharing the project.  As a plain field in
+    // ~/.botfleet/config.json it is per-Mac, survives saves, and is read by
+    // the one process that acts on it.
+    id: "server.allowRemoteDesktopLaunch",
+    label: "Allow remote desktop launch",
+    section: "server",
+    path: ["allowRemoteDesktopLaunch"],
+    infisicalName: "BOTFLEET_SERVER_ALLOW_REMOTE_DESKTOP_LAUNCH",
+    kind: "bool",
+  },
+  {
+    id: "agentProxy.address",
+    label: "Agent proxy address",
+    section: "agentProxy",
+    path: ["address"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_ADDRESS",
+    kind: "string",
+  },
+  {
+    id: "agentProxy.projectId",
+    label: "Agent proxy project ID",
+    section: "agentProxy",
+    path: ["projectId"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_PROJECT_ID",
+    kind: "string",
+  },
+  {
+    id: "agentProxy.environment",
+    label: "Agent proxy environment",
+    section: "agentProxy",
+    path: ["environment"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_ENV",
+    kind: "string",
+  },
+  {
+    id: "agentProxy.secretPath",
+    label: "Agent proxy secret path",
+    section: "agentProxy",
+    path: ["secretPath"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_PATH",
+    kind: "string",
   },
 ] as const;
 

@@ -14,6 +14,7 @@ import {
   ENGINE_DISPLAY_ORDER,
   capabilityCellGlyph,
   capabilityCellLabel,
+  engineAccessLabel,
   capabilityNoteFor,
   engineIdFromDriverKind,
   pricingModeLabel,
@@ -288,19 +289,14 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // (server/drivers/claude.ts, codex.ts, antigravity.ts, and the DSH
     // ACP adapter).  A missing key renders as "-", which reads as
     // "engine cannot do this" — the exact underclaim Codex flagged.
-    for (const id of ["claude", "codex", "antigravity", "deepseek-harness"]) {
+    for (const id of ["claude", "codex", "antigravity", "deepseek-harness", "grok", "cursor", "mcode"]) {
       expect(ENGINE_CAPABILITIES[id].capabilities.connectedApps, id).toBe("yes");
     }
   });
 
-  it("marks MiniMax connectedApps as 'no' — the driver has no composioMcp", () => {
-    // Connected Apps is the Composio bridge, and MiniMax's direct
-    // driver declares no composioMcp in server/drivers/minimax.ts
-    // (Claude, Codex, Antigravity, pi, and the DSH ACP adapter all
-    // declare it).  'limited' still implied a partial channel that does
-    // not exist; driving this Mac is the thisComputer row
-    // (localComputerMcp), a different thing.  Pin 'no' so a future edit
-    // cannot silently regress the matrix to overclaim.
+  it("marks MiniMax API connectedApps as 'no' — the direct HTTP driver does not mount composioMcp", () => {
+    // Connected Apps is the Composio bridge, which the ACP/CLI drivers mount
+    // (including MiniMax Code) while the direct HTTP MiniMax driver does not.
     expect(ENGINE_CAPABILITIES.minimax.capabilities.connectedApps).toBe("no");
   });
 
@@ -330,16 +326,20 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // The matrix lists the ids a live mcode session actually advertises, so
     // the engine's declared models and the picker's rows agree.
     expect(mcode.defaultModels.map((m) => m.id)).toEqual([
-      "MiniMax-M3.1-Flash-Preview-thinking",
+      "MiniMax-M3.1-Flash-thinking",
+      "MiniMax-M3.1-Flash-thinking-1M",
       "MiniMax-M2.7-highspeed-thinking",
     ]);
     // The flash preview tier is the one a current mcode install defaults to,
     // so it must be reachable in the matrix too.  It is deliberately not the
     // first row: a preview id is never what a fresh install hands someone who
     // has not asked for it.
-    expect(mcode.defaultModels[0].id).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+    expect(mcode.defaultModels[0].id).toBe("MiniMax-M3.1-Flash-thinking");
     expect(
-      mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-Preview-thinking")?.ctxTokens,
+      mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-thinking")?.ctxTokens,
+    ).toBe(524_288);
+    expect(
+      mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-thinking-1M")?.ctxTokens,
     ).toBe(1_000_000);
   });
 
@@ -365,7 +365,7 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(capabilityCellLabel("yes")).toBe("Available");
     expect(capabilityCellLabel("no")).toBe("Not available");
     expect(capabilityCellLabel("limited")).toBe("Limited");
-    expect(capabilityCellLabel("yes-pro-only")).toBe("Pro plan only");
+    expect(CAPABILITY_STATES).not.toContain("yes-pro-only");
     // A missing key and an explicit "unknown" say the same thing, and
     // neither of them says "not available".
     expect(capabilityCellLabel("unknown")).toBe("Not audited");
@@ -519,13 +519,24 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
       "Clutch runs models over the Clutch ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.",
     );
     expect(entry.whyThisEngine).toEqual({
-      headline: "DeepSeek models over the Clutch ACP bridge, billed pay-as-you-go.",
+      headline: "DeepSeek, Muse, and MiniMax models through the Clutch bridge.",
       prose: [
-        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, and cross-bot coordination are available.  Image attachments are per model:  DeepSeek-V4.1-Flash accepts images, while DeepSeek-V4.1-Pro carries a No Vision badge.",
-        "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
+        "Clutch runs DeepSeek, Meta Muse, and MiniMax models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, and cross-bot coordination are available.  Image attachments remain per model:  DeepSeek-V4.1-Flash accepts images, while DeepSeek-V4-Pro carries a No Vision badge.",
+        "Muse and MiniMax use subscription-backed API-key access.  DeepSeek remains pay-as-you-go; the rates below are its public API catalog, not a subscription invoice.",
       ],
     });
+    expect(entry.providerKinds).toEqual(["deepseekAgent", "muse", "minimax"]);
+    // Clutch reaches DeepSeek, Muse and MiniMax over its own harness CLI, so
+    // access reads CLI.  The API rates asserted below are what the turn is
+    // BILLED at — a separate column, and the reason this test exists.
+    expect(engineAccessLabel(entry)).toBe("CLI");
     expect(entry.capabilities.imageAttachments).toBe("yes");
+    expect(entry.capabilities.longContext).toBe("yes");
+    expect(entry.defaultModels[0]).toEqual({
+      id: "DeepSeek-V4.1-Flash",
+      display: "DeepSeek-V4.1-Flash",
+      ctxTokens: 1_000_000,
+    });
     const copy = [
       entry.pricing.notes ?? "",
       entry.pricing.api.notes ?? "",
@@ -546,4 +557,29 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
     expect(pricingModeLabel(entry.pricing)).toBe("API · $0.00027/1k in");
     expect(pricingModeLabel(entry.pricing).toLowerCase()).not.toContain("bundled");
   });
+
+  it("leads Antigravity with Gemini 3.8 Flash and 3.1 Pro and marks longContext on OpenCode, Muse, and Clutch", () => {
+    const ag = ENGINE_CAPABILITIES.antigravity;
+    expect(ag.defaultModels[0]).toEqual({
+      id: "gemini-3.8-flash-high",
+      display: "Gemini 3.8 Flash (High)",
+      ctxTokens: 1_000_000,
+    });
+    expect(ag.defaultModels.map((m) => m.id)).toContain("gemini-3.1-pro-high");
+    expect(ENGINE_CAPABILITIES["deepseek-harness"].capabilities.longContext).toBe("yes");
+    expect(ENGINE_CAPABILITIES.opencode.capabilities.longContext).toBe("yes");
+    expect(ENGINE_CAPABILITIES.muse.capabilities.longContext).toBe("yes");
+    expect(ENGINE_CAPABILITIES.mcode.capabilities.roomCoordination).toBe("yes");
+  });
+
+  it("keeps access separate from billing", () => {
+    // Access names the driver BotFleet ships, so an engine whose only driver
+    // is a harness CLI reads "CLI" even when the vendor also sells an API.
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.grok)).toBe("CLI");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.minimax)).toBe("API");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.mcode)).toBe("CLI");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.muse)).toBe("CLI");
+    expect(pricingModeLabel(ENGINE_CAPABILITIES.minimax.pricing)).toContain("Subscription + API");
+  });
 });
+

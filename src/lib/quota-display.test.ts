@@ -4,6 +4,7 @@ import {
   absoluteQuotaLabel,
   antigravityGroupSummary,
   antigravityQuotaLines,
+  bindingQuotaWindow,
   formatDualQuotaBadge,
   formatResetCountdown,
   headlinesExhausted,
@@ -15,6 +16,7 @@ import {
   providerIssueLine,
   quotaLinesSummary,
   quotaProducerLabel,
+  quotaWindows,
   remainingPercentLabel,
   windowHeadlines,
   windowsLabelFromHeadlines,
@@ -368,6 +370,37 @@ describe("windowsLabelFromHeadlines", () => {
   it("returns undefined for an empty window list", () => {
     expect(windowsLabelFromHeadlines([])).toBeUndefined();
   });
+
+  // These assert the RENDERED window names rather than the intermediate bucket.
+  // A bucket can classify correctly while the label the panel resolves from it
+  // is wrong, which is how a 5-hour session window came to read "Hourly" --
+  // and why a guard on the bucket alone would not have caught it.
+  /** What the panel paints for these raw window names.  `secondaryPercent`
+   *  stays null unless the case under test is genuinely a two-window engine,
+   *  so an unlabelled second window never shows up as the "Longer" fallback. */
+  function renderedLabels(windows: string[], secondaryPercent: number | null = null): string[] {
+    const label = windowsLabelFromHeadlines(
+      windowHeadlines(windows.map((window) => ({ label: "Token Plan", window, remainingPercent: 100, skip: false }))),
+    );
+    return quotaWindows(40, secondaryPercent, { windowsLabel: label }).map((w) => w.label);
+  }
+
+  it("resolves the compact '5hr' spelling to 5-Hour, not Hourly", () => {
+    expect(renderedLabels(["5hr", "Week"], 90)).toEqual(["5-Hour", "Weekly"]);
+  });
+
+  it("resolves every spelling of the 5-hour window the same way", () => {
+    for (const window of ["5h", "5hr", "5hrs", "5 hour", "5-hour"]) {
+      expect(renderedLabels([window])).toEqual(["5-Hour"]);
+    }
+  });
+
+  it("classifies bare durations into real periods instead of leaving them unlabelled", () => {
+    expect(renderedLabels(["7d"])).toEqual(["Weekly"]);
+    expect(renderedLabels(["2w"])).toEqual(["Weekly"]);
+    expect(renderedLabels(["30d"])).toEqual(["Monthly"]);
+    expect(renderedLabels(["24h"])).toEqual(["Daily"]);
+  });
 });
 
 describe("minimaxQuotaLine", () => {
@@ -573,5 +606,49 @@ describe("absolute allowances and handoff health", () => {
     // resolves to the same rendered string.
     expect(providerIssueLine("Claude", "Sign in again to refresh quota", "agent-bar"))
       .toBe("Claude: Sign in again to refresh quota (from CodeCaps)");
+  });
+});
+
+describe("quotaWindows", () => {
+  it("names each window instead of emitting one packed abbreviation", () => {
+    // The chip this replaces read "(93% / 3% for 5h / w)":  two numbers, two
+    // unexplained abbreviations, and no way to tell which window was the one
+    // about to stop a turn.
+    const windows = quotaWindows(93, 3, { windowsLabel: "5hr/week" });
+    expect(windows.map((w) => w.label)).toEqual(["5-Hour", "Weekly"]);
+    expect(windows.map((w) => w.remainingPercent)).toEqual([93, 3]);
+    expect(windows.map((w) => w.kind)).toEqual(["primary", "secondary"]);
+  });
+
+  it("names a single window, and handles an unlabelled reading", () => {
+    expect(quotaWindows(42, null, { windowsLabel: "hour" })[0]?.label).toBe("Hourly");
+    expect(quotaWindows(80, null)[0]?.label).toBe("Quota");
+    expect(quotaWindows(null, 10, { windowsLabel: "5hr/month" })[0]?.label).toBe("Monthly");
+  });
+
+  it("returns nothing when there is no reading at all", () => {
+    // Distinct from "everything spent": an absent reading must not render as
+    // a 0% window, which would read as an exhausted engine.
+    expect(quotaWindows(null, null, { windowsLabel: "5hr/week" })).toEqual([]);
+  });
+});
+
+describe("bindingQuotaWindow", () => {
+  it("picks the lowest window, which is the one that stops a turn first", () => {
+    // 93% beside 3% is an engine that is effectively spent, and the weekly
+    // number is the one to say so — not the flattering 93%.
+    const binding = bindingQuotaWindow(quotaWindows(93, 3, { windowsLabel: "5hr/week" }));
+    expect(binding?.label).toBe("Weekly");
+    expect(binding?.remainingPercent).toBe(3);
+  });
+
+  it("is not fooled by ordering", () => {
+    expect(bindingQuotaWindow(quotaWindows(5, 90, { windowsLabel: "5hr/week" }))?.label).toBe("5-Hour");
+    expect(bindingQuotaWindow(quotaWindows(50, 50, { windowsLabel: "5hr/week" }))?.label).toBe("5-Hour");
+  });
+
+  it("handles a single window and an empty list", () => {
+    expect(bindingQuotaWindow(quotaWindows(12, null, { windowsLabel: "week" }))?.remainingPercent).toBe(12);
+    expect(bindingQuotaWindow([])).toBeNull();
   });
 });

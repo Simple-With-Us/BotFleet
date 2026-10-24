@@ -65,8 +65,55 @@ function open(): DatabaseSync {
       thread_id TEXT PRIMARY KEY,
       active_leaf_id TEXT
     );
+    CREATE TABLE IF NOT EXISTS running_helpers (
+      thread_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      PRIMARY KEY (thread_id, message_id)
+    );
   `);
+  backfillRunningHelpers(db);
   return db;
+}
+
+/** One-time import for databases that predated the side table. */
+function backfillRunningHelpers(database: DatabaseSync): void {
+  // SAFETY: `COUNT(*)` on `running_helpers` always returns one numeric row.
+  const count = database.prepare("SELECT COUNT(*) AS n FROM running_helpers").get() as { n: number };
+  if (count.n > 0) return;
+  // SAFETY: the query selects `thread_id`, `id`, and `json`, all TEXT columns on `messages`.
+  const rows = database
+    .prepare("SELECT thread_id, id, json FROM messages WHERE json LIKE ?")
+    .all('%"status":"running"%') as Array<{ thread_id: string; id: string; json: string }>;
+  const insert = database.prepare(
+    "INSERT OR IGNORE INTO running_helpers (thread_id, message_id, started_at) VALUES (?, ?, ?)",
+  );
+  for (const row of rows) {
+    let message: Message;
+    try {
+      // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
+      message = JSON.parse(row.json) as Message;
+    } catch {
+      continue;
+    }
+    if (message.helper?.status !== "running") continue;
+    insert.run(row.thread_id, row.id, message.helper.startedAt ?? message.at ?? 0);
+  }
+}
+
+function syncRunningHelper(threadId: string, message: Message): void {
+  const database = db();
+  if (message.helper?.status === "running") {
+    database
+      .prepare(
+        "INSERT OR REPLACE INTO running_helpers (thread_id, message_id, started_at) VALUES (?, ?, ?)",
+      )
+      .run(threadId, message.id, message.helper.startedAt ?? message.at ?? 0);
+    return;
+  }
+  database
+    .prepare("DELETE FROM running_helpers WHERE thread_id = ? AND message_id = ?")
+    .run(threadId, message.id);
 }
 
 /** The live handle — reopened when the file was removed out from under us
@@ -133,6 +180,38 @@ export function readThreadTail(threadId: string, legacyFile: string, limit: numb
   return importLegacy(threadId, legacyFile);
 }
 
+/** Read the newest `limit` messages for multiple threads in one batched query.
+ * Uses a window function to partition by thread_id and order by rowid so
+ * only the tail rows are returned in chronological order. */
+export function readThreadsTail(threadIds: readonly string[], limit: number): Map<string, Message[]> {
+  const result = new Map<string, Message[]>();
+  for (const id of threadIds) {
+    result.set(id, []);
+  }
+  const uniqueIds = Array.from(new Set(threadIds));
+  if (uniqueIds.length === 0 || limit <= 0) return result;
+
+  const placeholders = uniqueIds.map(() => "?").join(", ");
+  const statement = db().prepare(
+    "SELECT thread_id, json FROM (" +
+      "SELECT thread_id, rowid AS seq, json, ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY rowid DESC) AS rn " +
+      `FROM messages WHERE thread_id IN (${placeholders})` +
+    ") WHERE rn <= ? ORDER BY thread_id, seq ASC",
+  );
+  // SAFETY: query returns `thread_id` and `json`, both TEXT columns on `messages`.
+  const rows = statement.all(...uniqueIds, limit) as Array<{ thread_id: string; json: string }>;
+  for (const row of rows) {
+    const list = result.get(row.thread_id);
+    const msg = rowToMessage(row);
+    if (list) {
+      list.push(msg);
+    } else {
+      result.set(row.thread_id, [msg]);
+    }
+  }
+  return result;
+}
+
 function importLegacy(threadId: string, legacyFile: string): ThreadRows {
   let messages: Message[] = [];
   let activeLeafId: string | null = null;
@@ -187,6 +266,7 @@ export function insertMessage(threadId: string, message: Message): void {
   db()
     .prepare("INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)")
     .run(threadId, message.id, message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message));
+  syncRunningHelper(threadId, message);
 }
 
 /** Persist a new message and the branch head as one crash-safe mutation. */
@@ -203,10 +283,40 @@ export function appendMessage(threadId: string, message: Message): void {
   }
 }
 
+/** Rows whose stored helper is still running.  The LIKE pass is a candidate
+ * filter; the helper status is what decides.  A restart has no live tracker,
+ * so these are the cards that would otherwise tick forever. */
+export function runningHelperRows(): Array<{ threadId: string; message: Message }> {
+  // SAFETY: the join selects `thread_id` and `json`, both TEXT columns on their tables.
+  const rows = db()
+    .prepare(
+      "SELECT rh.thread_id, m.json FROM running_helpers rh " +
+        "INNER JOIN messages m ON m.thread_id = rh.thread_id AND m.id = rh.message_id",
+    )
+    .all() as Array<{ thread_id: string; json: string }>;
+  const found: Array<{ threadId: string; message: Message }> = [];
+  for (const { thread_id, json } of rows) {
+    let message: Message;
+    try {
+      // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
+      message = JSON.parse(json) as Message;
+    } catch {
+      continue;
+    }
+    if (message.helper?.status !== "running") {
+      syncRunningHelper(thread_id, message);
+      continue;
+    }
+    found.push({ threadId: thread_id, message });
+  }
+  return found;
+}
+
 export function updateMessage(threadId: string, message: Message): void {
   db()
     .prepare("UPDATE messages SET at = ?, role = ?, kind = ?, text = ?, json = ? WHERE thread_id = ? AND id = ?")
     .run(message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message), threadId, message.id);
+  syncRunningHelper(threadId, message);
 }
 
 export function setActiveLeaf(threadId: string, leafId: string | null): void {
@@ -221,6 +331,7 @@ export function setActiveLeaf(threadId: string, leafId: string | null): void {
 export function deleteThread(threadId: string): void {
   db().prepare("DELETE FROM messages WHERE thread_id = ?").run(threadId);
   db().prepare("DELETE FROM thread_state WHERE thread_id = ?").run(threadId);
+  db().prepare("DELETE FROM running_helpers WHERE thread_id = ?").run(threadId);
 }
 
 /** Freelist bytes above which `pruneDeadThreads` runs a full `VACUUM`
@@ -387,16 +498,18 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
   if (!needle) return [];
   // escape LIKE wildcards so a literal % or _ in the query stays literal
   const pattern = `%${needle.replace(/([\\%_])/g, "\\$1")}%`;
-  // text messages by their text; activity chips by the tool name — "which
+  // text messages by their text/content; activity chips by the tool name — "which
   // bot ran that migration" is a tool-name question. The chip's name lives
   // in the row's json; a JSON1 extract keeps this one query.
   const scope = threadId ? "thread_id = ? AND " : "";
   const statement = db().prepare(
-    "SELECT thread_id, id, at, role, kind, text, json_extract(json, '$.tool.name') AS tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
-      `WHERE ${scope}((kind = 'text' AND text IS NOT NULL AND lower(text) LIKE ? ESCAPE '\\') ` +
+    "SELECT thread_id, id, at, role, kind, text, json_extract(json, '$.content') AS content, json_extract(json, '$.tool.name') AS tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
+      `WHERE ${scope}json_extract(json, '$.role') IN ('user', 'bot') ` +
+      "  AND ((lower(COALESCE(text, json_extract(json, '$.content'), '')) LIKE ? ESCAPE '\\') " +
       "   OR (kind = 'activity' AND tool_name IS NOT NULL AND lower(tool_name) LIKE ? ESCAPE '\\')) " +
       "ORDER BY at DESC LIMIT ?",
   );
+  // SAFETY: query returns columns from `messages` and JSON1 extractions.
   const rows = (threadId
     ? statement.all(threadId, pattern, pattern, limit)
     : statement.all(pattern, pattern, limit)) as Array<{
@@ -406,11 +519,12 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
     role: string;
     kind: string;
     text: string | null;
+    content: string | null;
     tool_name: string | null;
     from_name: string | null;
   }>;
   return rows.map((row) => {
-    const haystack = row.kind === "activity" ? (row.tool_name ?? "") : (row.text ?? "");
+    const haystack = row.kind === "activity" ? (row.tool_name ?? "") : (row.text ?? row.content ?? "");
     const hitAt = Math.max(0, haystack.toLowerCase().indexOf(needle));
     const start = Math.max(0, hitAt - 60);
     const end = Math.min(haystack.length, hitAt + needle.length + 90);

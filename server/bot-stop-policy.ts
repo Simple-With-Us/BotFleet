@@ -22,7 +22,15 @@
 // a person ask for THIS turn".  A resume is the system replaying work on its
 // own initiative, so it must never both clear the stop and start the turn.
 //
+// An Off bot (shared/bot-power.ts) is the stronger sibling of a stop: it
+// refuses a person's turn too, and only an explicit Turn On lifts it.  It is
+// refused in `startTurn` BEFORE this policy runs, with its own `bot_off` code.
+// Every caller that treats a stop as "a decision, not a fault" must treat Off
+// the same way, so `isBotStoppedError` answers true for both.
+//
 // Pure and clock-free so the policy is testable without booting a harness.
+import { BOT_OFF_CODE, BOT_OFF_REFUSAL } from "../shared/bot-power.ts";
+
 export type BotStopDecision =
   /** The stop stands.  Do not dispatch, and do not clear the stop. */
   | { action: "refuse"; reason: "bot-stopped" }
@@ -77,7 +85,17 @@ export function botAutomationsPausedMessage(): string {
  * Callers that retry on failure (a card continuation, a boot resume) must be
  * able to tell "the provider is unhappy" from "you stopped this bot on
  * purpose" — only the first is worth retrying or reporting as a failure.
+ * A bot switched Off is the same kind of decision, so it counts here too.
  */
 export function isBotStoppedError(error: unknown): boolean {
-  return Boolean(error && typeof error === "object" && (error as { code?: unknown }).code === "bot_stopped");
+  const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  // The error's own message already says which: an Off refusal tells the person
+  // to turn the bot on, a stop tells them to start it again.
+  return code === "bot_stopped" || code === BOT_OFF_CODE;
+}
+
+/** The error `startTurn` throws for an Off bot: 409 like a stop, with a
+ *  distinct code so a caller or client can tell the two apart. */
+export function botOffError(): Error & { status: number; code: string } {
+  return Object.assign(new Error(BOT_OFF_REFUSAL), { status: 409, code: BOT_OFF_CODE });
 }

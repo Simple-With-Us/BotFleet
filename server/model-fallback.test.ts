@@ -9,6 +9,7 @@ import {
   AUTO_FALLBACK_PRIORITY,
   DEFAULT_QUOTA_COOLDOWN_TTL_MS,
   bootRecoveryTurnOpts,
+  continuedTurnToolPolicy,
   isModelRejectionText,
   isQuotaOrCapText,
   isShortProviderErrorText,
@@ -31,6 +32,8 @@ import {
   type FallbackScanMessage,
   unattendedModelDowngrade,
 } from "./model-fallback.ts";
+import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
+import { withoutModelsTooNewForCli } from "./model-lineage.ts";
 import { eligibleAutoFallbackChain, type AutoFallbackCandidate } from "./turn-safety.ts";
 import { doomedDispatches } from "./doomed-dispatch.ts";
 import { MODEL_REJECTION_TTL_MS, ModelRejectionRegistry, modelRejections } from "./model-rejections.ts";
@@ -66,23 +69,36 @@ function decide(messagesAfterUser: FallbackScanMessage[], opts: {
 describe("DSH vision route migration", () => {
   it("updates the Pro primary and matching fallback without changing unrelated routes", () => {
     const original: ModelSelection = {
-      instanceId: "dsh", model: "DeepSeek-V4.1-Pro", effort: "high",
+      instanceId: "dsh", model: "DeepSeek-V4-Pro", effort: "high",
       fallbacks: [
-        { instanceId: "claude", model: "DeepSeek-V4.1-Pro" },
-        { instanceId: "dsh", model: "DeepSeek-V4.1-Pro", effort: "none" },
-        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "claude", model: "DeepSeek-V4-Pro" },
+        { instanceId: "dsh", model: "DeepSeek-V4-Pro", effort: "none" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
       ],
     };
     expect(dshVisionSelection(original)).toEqual({
       instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "high",
       fallbacks: [
-        { instanceId: "claude", model: "DeepSeek-V4.1-Pro" },
+        { instanceId: "claude", model: "DeepSeek-V4-Pro" },
         { instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "none" },
-        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
       ],
     });
-    expect(original.model).toBe("DeepSeek-V4.1-Pro");
-    expect(original.fallbacks?.[1]?.model).toBe("DeepSeek-V4.1-Pro");
+    expect(original.model).toBe("DeepSeek-V4-Pro");
+    expect(original.fallbacks?.[1]?.model).toBe("DeepSeek-V4-Pro");
+  });
+
+  it("still routes the retired DeepSeek-V4.1-Pro spelling off Pro", () => {
+    // A send path can carry the old id before the store rewrite reaches it, and
+    // a Pro turn that stayed on Pro would fail on the image instead of routing.
+    expect(
+      dshVisionSelection({ instanceId: "dsh", model: "DeepSeek-V4.1-Pro" }),
+    ).toEqual({ instanceId: "dsh", model: "DeepSeek-V4.1-Flash" });
+  });
+
+  it("leaves a non-dsh entry named DeepSeek-V4-Pro alone", () => {
+    const chain: ModelSelection = { instanceId: "claude", model: "DeepSeek-V4-Pro" };
+    expect(dshVisionSelection(chain)).toEqual(chain);
   });
 });
 
@@ -389,6 +405,13 @@ describe("selectTurnFallback", () => {
     });
   });
 
+  it("carries a fallback's own context cap and output limit, and adds neither when unset", () => {
+    expect(
+      selectionForFallbackPick({ instanceId: "minimax", model: "m", effort: "high", contextCap: 524_288, maxOutputTokens: 8192 }),
+    ).toEqual({ instanceId: "minimax", model: "m", effort: "high", contextCap: 524_288, maxOutputTokens: 8192 });
+    expect("contextCap" in selectionForFallbackPick({ instanceId: "minimax", model: "m" })).toBe(false);
+  });
+
   it("cancelled or interrupted does not fail over", () => {
     const afterUser: FallbackScanMessage[] = [{ role: "bot", kind: "activity", tool: { name: "Bash" } }];
     expect(decide(afterUser, { ok: false, stopReason: "cancelled" })).toBeUndefined();
@@ -460,7 +483,7 @@ describe("structured provider-error code feeds selectTurnFallback exactly as ind
   // "error" are kept off the auto-failover path, not inside
   // selectTurnFallback's own produced/quotaOrCap gate (that gate only
   // matters once a chain has already been handed to it).
-  const compose = (stopReason: string, current = { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" }) => {
+  const compose = (stopReason: string, current = { instanceId: "minimax", model: "MiniMax-M3.1-Flash" }) => {
     const code = providerErrorCodeFromStopReason(stopReason);
     const quotaOrCap = quotaOrCapFromErrorCode(code) ?? false;
     const chain = quotaOrCap ? [{ instanceId: "claude", model: "claude-sonnet-5" }] : undefined;
@@ -552,6 +575,28 @@ describe("AUTO_FALLBACK_PRIORITY — #90 auto-failover ordering", () => {
     expect(pick(["openaiCompat", "minimax"])).toBe("minimax");
   });
 
+  it("trims Claude defaults the detected CLI is too old to run before picking failover", () => {
+    const cliVersion = "2.1.279";
+    const described: AutoFallbackCandidate = {
+      instanceId: "claude",
+      driverKind: "claudeAgent",
+      snapshot: { state: "available", authenticated: true },
+      models: STATIC_CLAUDE_MODELS,
+    };
+    const runnable = {
+      ...described,
+      models: withoutModelsTooNewForCli(described.driverKind!, STATIC_CLAUDE_MODELS, cliVersion),
+    };
+    const chain = eligibleAutoFallbackChain([runnable], {
+      botId: "bot-1",
+      currentInstanceId: "codex",
+      isCooling: () => false,
+      priority: AUTO_FALLBACK_PRIORITY,
+    });
+    expect(chain[0]?.model).toBe("claude-sonnet-5");
+    expect(chain[0]?.model).not.toBe("claude-sonnet-5-5");
+  });
+
   it("leaves every existing CLI ordering unchanged: claude, antigravity, gemini, codex, openaiCompat, grok", () => {
     expect(pick(["grok", "codex", "openaiCompat", "claude", "gemini", "antigravity"])).toBe("claude");
     expect(pick(["grok", "codex", "openaiCompat", "gemini", "antigravity"])).toBe("antigravity");
@@ -573,6 +618,34 @@ describe("AUTO_FALLBACK_PRIORITY — #90 auto-failover ordering", () => {
     expect(codexIdx).toBeGreaterThanOrEqual(0);
     expect(codexIdx).toBeLessThan(minimaxIdx);
     expect(minimaxIdx).toBeLessThan(openaiCompatIdx);
+  });
+});
+
+describe("continuedTurnToolPolicy", () => {
+  const toolPolicy = { mode: "allowlist" as const, commands: [], writePaths: [], readPaths: [] };
+
+  it("returns the allowlist on the turn starter a card continuation resumes", () => {
+    expect(
+      continuedTurnToolPolicy([
+        { role: "user", kind: "text", text: "earlier chat" },
+        { role: "bot", kind: "text", text: "reply" },
+        { role: "system", kind: "text", text: "run the routine", toolPolicy },
+        { role: "bot", kind: "activity", tool: { name: "connector" } },
+        { role: "bot", kind: "options" },
+      ]),
+    ).toEqual(toolPolicy);
+  });
+
+  it("returns none when the turn being continued is an ordinary one", () => {
+    expect(
+      continuedTurnToolPolicy([
+        { role: "system", kind: "text", text: "run the routine", toolPolicy },
+        { role: "bot", kind: "text", text: "done" },
+        { role: "user", kind: "text", text: "now a chat turn" },
+        { role: "bot", kind: "options" },
+      ]),
+    ).toBeUndefined();
+    expect(continuedTurnToolPolicy([])).toBeUndefined();
   });
 });
 
@@ -636,6 +709,15 @@ describe("shouldReplayPersistedStarter", () => {
 });
 
 describe("bootRecoveryTurnOpts", () => {
+  it("carries a routine's command allowlist on the continuation path as well as on replay", () => {
+    const toolPolicy = { mode: "allowlist" as const, commands: [], writePaths: [], readPaths: [] };
+    const resume = { role: "system", automationSource: "manual" as const, toolPolicy };
+    // false is the BOOT_RECOVERY_NOTICE continuation, which never reuses the starter as userMessage
+    expect(bootRecoveryTurnOpts(resume, false)).toEqual({ automationSource: "manual", unattended: true, toolPolicy });
+    expect(bootRecoveryTurnOpts(resume, true)).toEqual({ automationSource: "manual", unattended: true, toolPolicy });
+    expect(bootRecoveryTurnOpts({ role: "user" }, false)).not.toHaveProperty("toolPolicy");
+  });
+
   it("forwards webhook automationSource and marks unattended on both replay and BOOT_RECOVERY_NOTICE paths", () => {
     const resume = { role: "system", automationSource: "webhook" as const };
     const notice = bootRecoveryTurnOpts(resume, false);
@@ -971,6 +1053,35 @@ describe("QuotaCooldownRegistry", () => {
     expect(cd?.resetsAt).toBe(now + DEFAULT_QUOTA_COOLDOWN_TTL_MS);
     expect(registry.get("bot1", "antigravity", "gemini-3.8-flash-high", now + DEFAULT_QUOTA_COOLDOWN_TTL_MS + 1)).toBeUndefined();
   });
+
+  it("skips redundant disk writes when recordInstanceCap or clear makes no state change", () => {
+    const file = `${tmpdir()}/quota-cooldowns-dedup-${Date.now()}.json`;
+    const registry = new QuotaCooldownRegistry();
+    const writes: string[] = [];
+    registry.enablePersist(file, (_path, json) => {
+      writes.push(json);
+    });
+    const resetsAt = Date.now() + 60_000;
+    registry.recordInstanceCap("antigravity", "gemini-3.8-pro-high", {
+      resetsAt,
+      error: "exhausted",
+      source: "antigravity-usage",
+    });
+    expect(writes).toHaveLength(1);
+
+    // Repeated poll with identical resetsAt/error/source should not re-write the file
+    registry.recordInstanceCap("antigravity", "gemini-3.8-pro-high", {
+      resetsAt,
+      error: "exhausted",
+      source: "antigravity-usage",
+    });
+    expect(writes).toHaveLength(1);
+
+    // Clearing a non-existent bot cooldown should not write to disk either
+    registry.clear("non-existent-bot");
+    registry.clear("non-existent-bot", "antigravity", "gemini-3.8-pro-high");
+    expect(writes).toHaveLength(1);
+  });
 });
 
 describe("inheritedUnattended", () => {
@@ -993,9 +1104,9 @@ describe("inheritedUnattended", () => {
 
 describe("non-thinking Flash catalog", () => {
   it("is a DSH row and not an mcode picker row", () => {
-    expect(STATIC_DSH_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash-Preview")).toBe(true);
-    expect(STATIC_MCODE_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash-Preview")).toBe(false);
-    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+    expect(STATIC_DSH_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash")).toBe(true);
+    expect(STATIC_MCODE_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash")).toBe(false);
+    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3.1-Flash-thinking");
   });
 });
 
@@ -1060,7 +1171,7 @@ describe("unattendedModelDowngrade", () => {
     // declares no levels, so it is left alone.
     const levelsFor = (model: string) =>
       STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
-    const m31: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" };
+    const m31: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking" };
     expect(
       unattendedModelDowngrade(m31, { unattended: true, driverKind: "mcodeAgent", effortLevels: levelsFor }),
     ).toEqual({ ...m31, effort: "low" });
@@ -1085,7 +1196,7 @@ describe("unattendedModelDowngrade", () => {
   });
 
   it("moves a webhook classify seat off thinking Flash onto a live non-thinking row", () => {
-    // mcode's shipped catalog does not offer MiniMax-M3.1-Flash-Preview
+    // mcode's shipped catalog does not offer MiniMax-M3.1-Flash
     // (0.5.5 advertises the no-variant wire value and then fails the turn).
     // DSH's static catalog does.  The caller passes that row.  A cross-engine
     // move drops effort so DSH is not handed mcode's "low".
@@ -1093,10 +1204,10 @@ describe("unattendedModelDowngrade", () => {
       STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
     const thinking: ModelSelection = {
       instanceId: "mcode",
-      model: "MiniMax-M3.1-Flash-Preview-thinking",
+      model: "MiniMax-M3.1-Flash-thinking",
       effort: "max",
     };
-    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" };
+    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash" };
     expect(
       unattendedModelDowngrade(thinking, {
         automationSource: "webhook",
@@ -1114,22 +1225,22 @@ describe("unattendedModelDowngrade", () => {
       }),
     ).toEqual({ ...thinking, effort: "low" });
     // Same engine already offers the id: stay there and still stamp low.
-    const onMinimax: ModelSelection = { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview-thinking" };
+    const onMinimax: ModelSelection = { instanceId: "minimax", model: "MiniMax-M3.1-Flash-thinking" };
     expect(
       unattendedModelDowngrade(onMinimax, {
         automationSource: "webhook",
         driverKind: "minimax",
-        effortLevels: (model) => (model === "MiniMax-M3.1-Flash-Preview" ? ["low", "max"] : []),
-        nonThinkingFlash: { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" },
+        effortLevels: (model) => (model === "MiniMax-M3.1-Flash" ? ["low", "max"] : []),
+        nonThinkingFlash: { instanceId: "minimax", model: "MiniMax-M3.1-Flash" },
       }),
-    ).toEqual({ instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview", effort: "low" });
+    ).toEqual({ instanceId: "minimax", model: "MiniMax-M3.1-Flash", effort: "low" });
   });
 
   it("does not move human, job, or resource turns, or a cooling non-thinking row", () => {
     const levelsFor = (model: string) =>
       STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
-    const thinking: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" };
-    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" };
+    const thinking: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking" };
+    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash" };
     const base = { driverKind: "mcodeAgent" as const, effortLevels: levelsFor, nonThinkingFlash: live };
     expect(unattendedModelDowngrade(thinking, base)).toEqual(thinking);
     expect(
@@ -1142,7 +1253,7 @@ describe("unattendedModelDowngrade", () => {
       unattendedModelDowngrade(thinking, {
         ...base,
         automationSource: "webhook",
-        isCooling: (instanceId, model) => instanceId === "dsh" && model === "MiniMax-M3.1-Flash-Preview",
+        isCooling: (instanceId, model) => instanceId === "dsh" && model === "MiniMax-M3.1-Flash",
       }),
     ).toEqual({ ...thinking, effort: "low" });
   });
@@ -1152,7 +1263,7 @@ describe("unattendedModelDowngrade", () => {
     // Max still runs automated turns at Low, and there is no per-bot opt-out.
     const levelsFor = (model: string) =>
       STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
-    const saved: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "max" };
+    const saved: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking", effort: "max" };
     expect(
       unattendedModelDowngrade(saved, { unattended: true, driverKind: "mcodeAgent", effortLevels: levelsFor }),
     ).toEqual({ ...saved, effort: "low" });
@@ -1369,7 +1480,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
   const T0 = 1_780_000_000_000;
   const CHAIN: ModelSelection[] = [
     { instanceId: "grok", model: "grok-4.7" },
-    { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+    { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
     { instanceId: "claude", model: "claude-sonnet-5" },
   ];
   const doomed = (...instances: string[]) => (botId: string, instanceId: string) =>
@@ -1437,7 +1548,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
       isDoomed: doomed("grok"),
       now: T0,
     });
-    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview", nextUsed: 2 });
+    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 2 });
     // nextUsed still points past the entry that was chosen, so the second
     // failure of the same turn walks on to the third rather than re-offering
     // the dead first entry.
@@ -1500,7 +1611,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
           botId: "bot2",
           now: T0,
         }),
-      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview", nextUsed: 2 });
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 2 });
     } finally {
       doomedDispatches.clear();
     }
@@ -1513,7 +1624,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
       model: "gemini-3.8-pro-high",
       fallbacks: [
         { instanceId: "grok", model: "grok-4.7" },
-        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
         { instanceId: "claude", model: "claude-sonnet-5" },
       ],
     };
@@ -1538,7 +1649,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
 
     // Nothing dead: the first usable entry, untouched.
     expect(registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: () => false }).selection)
-      .toMatchObject({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" });
+      .toMatchObject({ instanceId: "dsh", model: "MiniMax-M3.1-Flash" });
 
     // dsh cannot start for this bot, so the next saved engine is the third.
     const skipped = registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: doomed("dsh") });
@@ -1570,7 +1681,7 @@ describe("the default doomed gate is live, not a stub", () => {
   const T0 = 1_780_000_000_000;
   const CHAIN: ModelSelection[] = [
     { instanceId: "grok", model: "grok-4.7" },
-    { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+    { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
     { instanceId: "claude", model: "claude-sonnet-5" },
   ];
 
@@ -1612,7 +1723,7 @@ describe("the default doomed gate is live, not a stub", () => {
           botId: "bot-default-gate-clean",
           now: T0,
         }),
-      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview", nextUsed: 2 });
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 2 });
     } finally {
       doomedDispatches.clear();
     }
@@ -1623,7 +1734,7 @@ describe("the default doomed gate is live, not a stub", () => {
     const primary: ModelSelection = {
       instanceId: "antigravity",
       model: "gemini-3.8-pro-high",
-      fallbacks: [{ instanceId: "grok", model: "grok-4.7" }, { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" }],
+      fallbacks: [{ instanceId: "grok", model: "grok-4.7" }, { instanceId: "dsh", model: "MiniMax-M3.1-Flash" }],
     };
     registry.record({
       botId: "bot-default-gate",
@@ -1654,7 +1765,7 @@ describe("a rejected model id does not end the fallback walk", () => {
   const CHAIN: ModelSelection[] = [
     { instanceId: "claude", model: "claude-3-7-sonnet" },
     { instanceId: "codex", model: "gpt-5.6-luna" },
-    { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" },
+    { instanceId: "minimax", model: "MiniMax-M3.1-Flash" },
   ];
   const DEAD_TEXT =
     "There's an issue with the selected model (claude-3-7-sonnet). It may not exist or you may not have access to it.";
@@ -1993,7 +2104,9 @@ describe("launchFallbackTurn and a stopped turn", () => {
 });
 
 describe("retired MiniMax-M3 ids are rewritten before failover", () => {
-  it("selectTurnFallback returns the live Flash Preview id for a MiniMax-M3 entry", () => {
+  it("selectTurnFallback returns dsh's live M3.1 Flash id for a MiniMax-M3 entry", () => {
+    // The Preview suffix is retired, so a MiniMax-M3 entry lands on the
+    // MiniMax-M3.1-Flash id every engine now serves.
     const next = selectTurnFallback({
       ok: false,
       produced: false,
@@ -2002,13 +2115,24 @@ describe("retired MiniMax-M3 ids are rewritten before failover", () => {
         { instanceId: "grok", model: "grok-4.7" },
       ],
       used: 0,
-      current: { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" },
+      current: { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking" },
     });
     expect(next).toEqual({
       instanceId: "dsh",
-      model: "MiniMax-M3.1-Flash-Preview",
+      model: "MiniMax-M3.1-Flash",
       nextUsed: 1,
     });
+  });
+
+  it("selectTurnFallback heals a saved dsh Flash Preview entry onto MiniMax-M3.1-Flash (BOTFLEET-4E)", () => {
+    const next = selectTurnFallback({
+      ok: false,
+      produced: false,
+      fallbacks: [{ instanceId: "dsh", model: "MiniMax-M3.1-Flash" }],
+      used: 0,
+      current: { instanceId: "grok", model: "grok-4.7" },
+    });
+    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 1 });
   });
 
   it("resolveModel heals a Director-shaped MiniMax-M3 primary without waiting for rejection", () => {
@@ -2019,10 +2143,12 @@ describe("retired MiniMax-M3 ids are rewritten before failover", () => {
       fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3" }],
     });
     expect(resolved.isFallback).toBe(false);
+    // Each engine gets its own live spelling: dsh dropped the Preview suffix,
+    // the native MiniMax driver still serves it.
     expect(resolved.selection).toEqual({
       instanceId: "dsh",
-      model: "MiniMax-M3.1-Flash-Preview",
-      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" }],
+      model: "MiniMax-M3.1-Flash",
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash" }],
     });
   });
 });

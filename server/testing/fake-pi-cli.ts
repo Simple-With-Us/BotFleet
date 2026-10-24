@@ -8,7 +8,8 @@
 //   FAKE_PI_MODE   happy (default) | tooluse | permission | interleave | turn-error | no-models | exit-early
 //                  | model-refused (set_model answers success:false) | resume-fail (switch_session answers
 //                  success:false) | stderr-flood (on prompt: 100 KB to stderr, then exit 1) | length (the
-//                  reply is cut off by the output-token limit)
+//                  reply is cut off by the output-token limit) | slow-tool (a bash step that runs
+//                  FAKE_PI_TOOL_MS, default 30000, before the reply; `abort` ends it early)
 //   FAKE_PI_MODELS comma-separated provider/model pairs (default "ollama-cloud/glm-5.2,openai/gpt-4o")
 //   FAKE_PI_DUMP   path to append {argv, env} JSON, so a test can assert argv shape
 //                  and env hygiene (no leaked secrets into the pi child).  Also records
@@ -55,6 +56,10 @@ if (process.env.FAKE_PI_DUMP) {
         mcpConfigPath: process.env.OMB_MCP_CONFIG ?? null,
         envConfigured: ["PATH", "HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "BOX_TOKEN"].filter(
           (k) => process.env[k] !== undefined,
+        ),
+        // the launcher contract's variables, with values (see server/launch-identity.ts)
+        identityEnv: Object.fromEntries(
+          Object.entries(process.env).filter(([k]) => /^(AGENT_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(k)),
         ),
         mcpConfig,
       }) + "\n",
@@ -123,6 +128,22 @@ const streamToolTurn = () => {
   send({ type: "message_update", usage: { input: 0, output: 0 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "done" } });
   send({ type: "turn_end", message: { stopReason: "end_turn", usage: { input: 12, output: 2 } }, usage: { input: 12, output: 2 } });
   send({ type: "agent_end" });
+};
+
+// slow-tool: pi starts one of its own bash steps (no card, like the real
+// CLI) and keeps it running, so a test can act on the step while the turn is
+// still open.  An `abort` settles the turn cancelled.
+let slowToolTimer: ReturnType<typeof setTimeout> | undefined;
+const streamSlowToolTurn = () => {
+  send({ type: "agent_start" });
+  send({ type: "turn_start" });
+  send({ type: "tool_execution_start", toolCallId: "call_slow", toolName: "bash", args: { command: "make deploy" } });
+  slowToolTimer = setTimeout(() => {
+    send({ type: "tool_execution_end", toolCallId: "call_slow", toolName: "bash", isError: false });
+    send({ type: "message_update", usage: { input: 0, output: 0 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "deployed" } });
+    send({ type: "turn_end", message: { stopReason: "end_turn", usage: { input: 5, output: 1 } }, usage: { input: 5, output: 1 } });
+    send({ type: "agent_end" });
+  }, Number(process.env.FAKE_PI_TOOL_MS) || 30_000);
 };
 
 // permission: open a select ask, hold the turn until extension_ui_response
@@ -248,12 +269,14 @@ function handle(cmd: any) {
       else if (mode === "interleave") streamInterleaveTurn();
       else if (mode === "turn-error") streamErrorTurn();
       else if (mode === "length") streamLengthTurn();
+      else if (mode === "slow-tool") streamSlowToolTurn();
       else streamTurn();
       return;
     case "extension_ui_response":
       if (cmd.id === "ask-1") finishPermissionTurn();
       return;
     case "abort":
+      if (slowToolTimer) clearTimeout(slowToolTimer);
       send({ type: "turn_end", message: { stopReason: "cancelled", usage: { input: 0, output: 0 } }, usage: { input: 0, output: 0 } });
       return;
     default:

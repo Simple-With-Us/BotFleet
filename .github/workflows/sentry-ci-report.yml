@@ -36,10 +36,12 @@ name: Sentry CI Report
 # pipeline):
 #   CI,
 #   iOS TestFlight ship (GitHub-hosted macOS),
-#   Package Ubuntu,
-#   Validate Desktop Packages,
 #   Release,
 #   Sentry Deploy
+#
+# `Package Ubuntu` (`package-linux.yml`) and `Validate Desktop Packages`
+# (`package-win.yml`) were entries here until BF-2500 deleted both workflows;
+# the list now names only workflows that exist on `main`.
 #
 # `iOS TestFlight Release` (`ios-testflight.yml`) was the entry here through
 # 2026-09-04; that workflow was deleted the same day and replaced by
@@ -71,12 +73,11 @@ name: Sentry CI Report
 on:
   workflow_run:
     workflows:
+      - Vercel production catch-up
       # Names must match the `name:` field of workflow files exactly —
       # a stale entry here silently disables alerting for that pipeline.
       - CI
       - iOS TestFlight ship (GitHub-hosted macOS)
-      - Package Ubuntu
-      - Validate Desktop Packages
       - Release
       - Sentry Deploy
     types: [completed]
@@ -111,7 +112,7 @@ jobs:
         # script rather than whatever version lives on an arbitrary (possibly fork/PR) branch that
         # triggered the observed workflow.  Do not add `ref: ${{ github.event.workflow_run.head_sha }}`
         # without re-reviewing the security implications.
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # SENTRY_FLEET_DSN is a non-identity name behind Infisical, with the
       # synced GitHub secret as a GH_FALLBACK_ during the cutover.  Not

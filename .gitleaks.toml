@@ -5,9 +5,9 @@ minVersion = "v8.25.0"
 [extend]
 useDefault = true
 
-# Kody review-rule YAMLs contain intentional test examples. Scope this exception
-# to the two default rules that false-positive here, and only these file paths.
+# MCP strict-handshake tests mount disposable x-api-key header literals.  Scope
+# this to generic-api-key only so real secrets in that file still fail other rules.
 [[allowlists]]
-description = "Kody review rules contain intentional fake-secret examples"
-targetRules = ["stripe-access-token", "generic-api-key"]
-paths = ['''^\.kody-rules/''']
+description = "MCP strict handshake tests use disposable API-key header literals"
+targetRules = ["generic-api-key"]
+paths = ['''^server/mcp-strict-handshake\.test\.ts$''']

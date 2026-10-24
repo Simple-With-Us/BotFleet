@@ -1,6 +1,6 @@
 ---
 name: owner-copy
-description: Fleet human-facing prose — two spaces between sentences, light theme default, Title Case headings, no agent names in App Store/TestFlight notes, Central Time labels. Use when writing UI strings, ASC listing fields, PR/commit/Slack/Notes prose, release notes, or any paragraph a human will read. Also when changing theme defaults or taking screenshots.
+description: Fleet human-facing prose — two spaces between sentences (a real U+00A0 plus a space on every surface), light theme default, Title Case headings, no agent names in App Store/TestFlight notes, Central Time labels. Use when writing UI strings, ASC listing fields, PR/commit/Slack/Notes prose, release notes, or any paragraph a human will read. Also when changing theme defaults or taking screenshots.
 ---
 
 # Owner-facing copy (MONET)
@@ -19,24 +19,14 @@ Canonical detail: `/Users/jay/apps/FLEET-UI-COPY.md`.  Policy: `/Users/jay/apps/
 Full protocol (always follow, do not weaken): skill `sentence-gap`
 (`~/Desktop/fleet-skills/sentence-gap/SKILL.md` — Monet portable paste).
 
-Binding for every paragraph a human reads — in-app UI, ASC description / promotional text / What’s New / review notes, push, email, help, Apple Notes, effort boards, **chat replies**, PR titles/bodies, commit messages, Slack.
+Binding for every paragraph a human reads — in-app UI, ASC description / promotional text / What’s New / review notes, push, email, help, Apple Notes, Linear issues and comments, **chat replies**, PR titles/bodies, commit messages, Zulip.
 
-- **Files** (repo docs, commit/PR/Slack/Notes source): two literal ASCII spaces after `.` / `!` / `?` before the next sentence.  Do not write `&nbsp;` into files.
-- **Chat replies** (Claude/Monet transcript): type the HTML entity `&nbsp;` right after the period, then a normal space — `Sentence one.&nbsp; Sentence two.`  Two literal spaces collapse in the renderer.  A raw U+00A0 also disappears.  Verified ST PR #2893.
+- **Every surface** (owner ruling 2026-10-23):  chat replies in any pane, Zulip, GitHub PR and issue text and review comments, Linear, Slack, commit messages, repo docs, skills, agent instructions and UI copy all take a real U+00A0 plus a normal space after each sentence.  Generate it in the shell rather than typing it.
+- **Never the `&nbsp;` entity.**  It shows up as literal text in squash-merge commits, plain-text email and many APIs.
+- **Never two plain ASCII spaces.**  Rendered surfaces collapse them to one.
+- Code, identifiers and machine-readable config never get a U+00A0.  If a surface strips it, leave the text as it is and report the surface;  do not switch to the entity.
 
-Single space stays correct after non-terminal abbreviations (`e.g.`, `v1.2.3`).  Two trailing spaces at the **end** of a Markdown line are a hard break — a different rule.
-
-HTML/JSX/SwiftUI that collapse spaces: NBSP+space or `SENTENCE_GAP`.  Do not "fix" `Congress.Trade`, `Socratic.Trade`, URLs, emails, or `U.S.`.
-
-Does not apply: identifiers, log lines, API enums, commit **subjects** that are fragments with no terminator.
-
-## Theme default = light
-
-First visit / no stored preference = **light**.  Do not boot dark from `prefers-color-scheme` unless the user chose System or Dark.  Dark is optional.  Screenshots, ASC, marketing: light unless the owner asked for dark.
-
-## Headings vs values
-
-- Headings / titles / buttons: **Title Case**.
+Headings / titles / buttons: **Title Case**.
 - Values / secondary status: sentence case or lowercase (`not reported`, `ask-first`).
 - Congress and Congressional take a capital C.  Brand **Congress.Trade**, **DealDex**, **Socratic.Trade**.
 - Compact money suffixes lowercase (`$99.8k`).  Do not say “Live” on account rows; paper is `Alpaca (paper)`.

@@ -61,11 +61,26 @@ struct ComputerView: View {
             }
         }
         .safeAreaInset(edge: .bottom) {
-            // A bot whose `computers` include "cloud" can open a desktop, but
-            // a VPS-backed one is "cloud" too and the server refuses to mint
-            // an interactive desktop for it — no button beats a dead one. An
-            // older harness never sends cloudBackend, so nil keeps the button.
-            if current.computers?.contains("cloud") == true && current.cloudBackend != "vps" {
+            // A bot whose `computers` include "cloud" can open a desktop only
+            // when its effective backend is the hosted Box.  A VPS-backed one
+            // is "cloud" too and the server refuses to mint an interactive
+            // desktop for it, and a bot with no backend of its own inherits
+            // the workspace default — so this reads the backend the harness
+            // resolved, not the raw stored value.  No button beats a dead
+            // one; the reason takes its place so the screen is not silent.
+            switch current.cloudDesktopAvailability {
+            case .notCloud:
+                EmptyView()
+            case let .unavailable(reason):
+                Text(reason.message)
+                    .font(.footnote)
+                    .foregroundStyle(Color.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .background(.ultraThinMaterial)
+            case .available:
                 VStack(spacing: 8) {
                     if let desktopError {
                         Text(desktopError)

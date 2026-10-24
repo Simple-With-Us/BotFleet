@@ -118,3 +118,32 @@ describe("ChatView step payloads and injected context", () => {
     expect(SRC).toContain("{showToolCalls && m.contextInjections?.length ? (");
   });
 });
+
+describe("ChatView karaoke on the reply itself", () => {
+  it("has no Spoken Summary card under the message any more", () => {
+    expect(SRC).not.toContain("SpokenSummaryCard");
+    expect(SRC).not.toContain("Spoken Summary");
+    expect(SRC).not.toContain("speech.wordIndex");
+  });
+
+  it("follows the voice over the rendered markdown, keyed by the message and its written text", () => {
+    // The workspace pronunciation list rides along, so "sequel" lights up "SQL".
+    expect(SRC).toContain("useMessageKaraoke(spokenRef, message.id, writtenSource, speakable, state.config?.tts?.pronunciations);");
+    expect(SRC).toContain("writtenReply(message.text ?? \"\")");
+    const wrapper = SRC.indexOf("<div ref={spokenRef}>");
+    const markdown = SRC.indexOf("<ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />");
+    expect(wrapper).toBeGreaterThan(-1);
+    expect(markdown).toBeGreaterThan(wrapper);
+    // The wrapper holds only the markdown, so only the reply's own words are read.
+    expect(SRC.slice(wrapper + "<div ref={spokenRef}>".length, markdown).trim()).toBe("");
+    const close = SRC.indexOf("</div>", markdown);
+    expect(SRC.slice(markdown + "<ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />".length, close).trim()).toBe("");
+  });
+
+  it("calls the hook before any early return, so the hook order never changes", () => {
+    const hook = SRC.indexOf("useMessageKaraoke(spokenRef");
+    const firstReturn = SRC.indexOf("if (humanTyped && editing) {");
+    expect(hook).toBeGreaterThan(-1);
+    expect(hook).toBeLessThan(firstReturn);
+  });
+});

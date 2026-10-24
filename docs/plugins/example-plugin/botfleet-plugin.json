@@ -1,0 +1,28 @@
+{
+  "name": "your-plugin-name",
+  "version": "1.0.0",
+  "description": "One-sentence description of what your plugin does.  Shown in the manager and review screen.",
+  "author": "Your Name",
+  "license": "Apache-2.0",
+  "botfleet": ">=1",
+  "entry": "plugin.mjs",
+  "capabilities": ["read.bots"],
+  "contributes": {
+    "cards": [
+      {
+        "id": "example",
+        "title": "Example Card",
+        "description": "A short description shown in the UI.",
+        "layout": "stat-grid",
+        "fields": ["a", "b"]
+      }
+    ],
+    "commands": [
+      {
+        "name": "hello",
+        "description": "Say hello from your plugin.",
+        "args": []
+      }
+    ]
+  }
+}

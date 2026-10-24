@@ -1,8 +1,8 @@
 # Releasing
 
 One workflow builds everything: **Actions → Release → Run workflow**.  It
-builds macOS (arm64 + x64, signed, notarized, stapled), Windows, and Ubuntu
-from a single pinned commit, verifies every artifact the way a user would
+builds macOS (arm64 + x64, signed, notarized, stapled) from a single pinned
+commit, verifies every artifact the way a user would
 receive it, and preserves one complete artifact set in Actions.  That default
 mode does not create or change a GitHub Release.  Tick **draft** to upload the
 verified set to a draft on this repository's own
@@ -21,9 +21,23 @@ owner's rule (2026-09-02) is one repository per app, so the separate
 `botfleet-releases` repo is retired.  Nothing under `milind-soni/*` is ours to
 publish to.
 
-The workflow refuses to overwrite an already-published version, so the only
-prerequisite per release is that `package.json`'s version is bumped on the
-ref you run it against.
+## The Version of a Release
+
+The workflow refuses to overwrite an already-published version, and the version
+it compares is the one stamped from the released commit, not `package.json`'s.
+
+Every release version is `1.0.<commit_count>` of the commit being released,
+computed by `scripts/stamp-commit-version.mjs` from a full-history checkout. 
+`package.json`'s version is a floor rather than the release number: it only
+keeps a build from being numbered below what the tree already claims, and it is
+never edited to cut a release.  Because the commit count only grows, two
+releases cannot collide and a release cannot go backwards.
+
+So the prerequisite per release is a commit, not a version bump.  Run the
+workflow against a ref whose commit count is above the last published release,
+and the stamp, the `v<version>` tag, the version inside the app bundle, and the
+`version` field of `latest-mac.yml` are all one string, computed once in the
+`prepare` job and handed to every later job.
 
 ## What Auto-Update Needs on the Release
 
@@ -32,17 +46,14 @@ electron-updater reads a feed file, not the DMG:
 - **macOS:** `latest-mac.yml` plus the `BotFleet-<version>-arm64.zip` and
   `BotFleet-<version>-x64.zip` it lists (and their `.blockmap` files).
   The DMGs are for humans; the updater downloads the zips.
-- **Windows:** `latest.yml` plus `BotFleet-<version>-setup.exe` and its
-  `.blockmap`.
-- **Ubuntu:** `latest-linux.yml` plus the AppImage.
 
 A release that carries only DMGs, as
 [`v0.1.38`](https://github.com/Simple-With-Us/BotFleet/releases/tag/v0.1.38)
-did, cannot be found by any installed app: **Check for updates** fails
-on every platform.  `1.0.31` is the first desktop version prepared to ship
-with `latest-mac.yml` and both macOS zips from `release.yml`.  Never
-hand-edit or carry forward a feed file; it pins sha512 hashes of the exact
-bytes on the release.
+did, cannot be found by any installed app: **Check for updates** fails on every
+platform.  Every release cut from `release.yml` carries `latest-mac.yml` and
+both macOS zips, and the assemble gate fails the run when any of them is
+missing.  Never hand-edit or carry forward a feed file; it pins sha512 hashes of
+the exact bytes on the release.
 
 ## Why the Gates Exist
 

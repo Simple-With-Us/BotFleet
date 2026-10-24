@@ -6,9 +6,13 @@
 // readable.
 
 import type { ComputerMount } from "./computer-grants.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
+import type { SubagentSnapshot } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
-import type { ContextSource } from "../shared/context-injection.ts";
+import type { ContextInjectionRef, ContextSource } from "../shared/context-injection.ts";
 import type { ItemIoCapture } from "../shared/item-io.ts";
+import type { ReviewHook, ReviewPrompt } from "../shared/auto-review.ts";
+import type { ToolScope } from "../shared/tool-scope.ts";
 
 export type DriverKind = string;
 export type InstanceId = string;
@@ -41,7 +45,7 @@ export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 
 /** Narrow untrusted API/config input before it becomes a model selection. */
 export function isEffortLevel(value: unknown): value is EffortLevel {
-  return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
+  return (EFFORT_LEVELS as readonly unknown[]).includes(value);
 }
 
 // ── model selection ────────────────────────────────────────────────────
@@ -52,6 +56,14 @@ export interface ModelSelection {
   model: string;
   /** Optional: no effort means no flag, and the CLI keeps its own default. */
   effort?: EffortLevel;
+  /** Optional working-context cap in tokens (for example 524288 for 512K).
+   *  Absent means the model's full window.  Only honored for a model whose
+   *  catalog row lists it in `contextCaps`. */
+  contextCap?: number;
+  /** Optional output limit in tokens, sent to the provider only when set and
+   *  only for a model whose row has `supportsMaxOutput`.  Absent means the
+   *  model's own limit. */
+  maxOutputTokens?: number;
   /** Optional: a model class this entry floats on ("Latest Sonnet" is
    *  `latest: "sonnet"`).  `model` is still the real slug that runs — the
    *  harness keeps it pointed at the newest member of the class the
@@ -152,7 +164,24 @@ export type RuntimeEvent = RuntimeEventBase &
          * context-occupancy figure (session/update `usage_update`), never a
          * real input/output split, so a driver that only knows one side
          * omits the other rather than reporting a fabricated 0. */
-        usage?: { input: number; output?: number; cachedInput?: number };
+        usage?: {
+          input: number;
+          output?: number;
+          cachedInput?: number;
+          /** Cache writes, 5 minute TTL (or a TTL the engine did not break
+           * down).  Like `cachedInput`, a SUBSET of `input`: a driver that
+           * names them keeps `input` the whole context sent, and telemetry
+           * subtracts them back out to price them at the cache-write rate. */
+          cacheWrite5m?: number;
+          /** Cache writes to the 1 hour cache; a subset of `input` as well. */
+          cacheWrite1h?: number;
+          /** The reasoning share of `output` (already inside it, never added
+           * again), for the engines that report it. */
+          reasoning?: number;
+        };
+        /** The model the provider says served the turn, when it says (an
+         * alias or a fallback can differ from the one requested). */
+        servedModel?: string;
       }
     | {
         type: "item.started";
@@ -180,12 +209,17 @@ export type RuntimeEvent = RuntimeEventBase &
          * steps.  The transcript nests the row under its parent instead of
          * interleaving parallel helpers' steps with the bot's. */
         parentItemId?: string;
+        /** Set when this step belongs to a helper.  The same id as
+         * `parentItemId` for a typed engine.  A named engine has none. */
+        subagentId?: string;
       }
-    | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null }
+    | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null; subagentId?: string }
     | {
         type: "item.completed";
         itemType: "tool";
         ok: boolean;
+        /** The helper this step ran inside, when the engine named one. */
+        subagentId?: string;
         /** One line of what came back — rows read, the failure's message.
          * A failure's detail is the whole reason the row is worth reading. */
         detail?: string;
@@ -194,7 +228,7 @@ export type RuntimeEvent = RuntimeEventBase &
         arguments?: string;
       }
     | { type: "item.completed"; itemType: "assistant_text"; text: string }
-    | { type: "content.delta"; streamKind: "assistant_text" | "reasoning_text"; delta: string }
+    | { type: "content.delta"; streamKind: "assistant_text" | "reasoning_text"; delta: string; subagentId?: string }
     | {
         type: "request.opened";
         requestType: "permission" | "question";
@@ -228,10 +262,18 @@ export type RuntimeEvent = RuntimeEventBase &
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }
+    | { type: "runtime.notice"; message: string }
     /** The harness put content in front of the model that the person did not
      * type (`shared/context-injection.ts`).  `itemId` keys the full text in the
      * side store; `preview` is one redacted, clipped line. */
     | { type: "context.injected"; source: ContextSource; preview: string; bytes: number }
+    /** A helper's card changed.  At most once a second while it runs, and
+     * again the moment it finishes.  Output stays off this frame. */
+    | { type: "subagent.updated"; subagent: SubagentSnapshot }
+    /** The slash commands the engine says it has, as it announced them: names
+     *  only, lowercase, no slash, deduped.  The bus hands it to the command
+     *  cache and nowhere else, so it never reaches a transcript or a client. */
+    | { type: "engine.commands"; names: string[]; origin: "claude-init" | "acp-available-commands" }
   );
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;
@@ -242,16 +284,53 @@ export type RuntimeEventListener = (event: RuntimeEvent) => void;
  * no action. */
 export type RequestOutcome = "allowed-once" | "rejected" | "answered" | "unavailable";
 
+/** Who BotFleet, as the launcher, says an engine child is for one turn of one
+ *  bot (server/launch-identity.ts).  Per turn and per bot, never per engine
+ *  instance: two bots can share one instance and must not share a seat. */
+export interface LaunchIdentity {
+  /** The fleet seat BotFleet assigned this bot, or null when it has none.  A
+   *  child with no seat is still marked as launched, so fleet tools refuse
+   *  instead of falling back to a platform default. */
+  seat: string | null;
+  /** BotFleet's id for the thread this turn runs on. */
+  session: string;
+}
+
 // ── adapter contract (upstream ProviderAdapterShape, promise-flavored) ──
 // The conversation runtime every provider is flattened into. streamEvents
 // becomes onEvent(listener) → unsubscribe; sessions start implicitly on
 // the first turn (the agentcal per-turn-process model) with resumeCursor
 // carrying the provider-native continuation (e.g. a claude session id).
+/** A slash command of the engine's own that BotFleet runs as a turn: `/compact`,
+ *  `/context`.  The name is lowercase, has no slash, and is already
+ *  allowlisted (server/drivers/engine-commands.ts).  `args` is one line of at
+ *  most 500 characters and never starts with a slash. */
+export interface TurnCommand {
+  name: string;
+  args?: string;
+}
+
 export interface SendTurnInput {
   threadId: ThreadId;
   text: string;
   model?: string;
   effort?: EffortLevel;
+  /** The bot's chosen context cap in tokens, when its model offers one.  A
+   *  driver that budgets the prompt sizes it from this (see `contextCapTokens`
+   *  in the driver config, which this overrides for the turn). */
+  contextCapTokens?: number;
+  /** The bot's output limit in tokens, when its model supports one. */
+  maxOutputTokens?: number;
+  /** The bot's cap on replayed history turns: older turns are dropped (and
+   *  summarized) even when the byte budget would fit them.  Absent keeps
+   *  every turn the byte budget fits.  Only a driver that budgets the
+   *  prompt honours it. */
+  maxHistoryTurns?: number;
+  /** When true, dropped history turns are summarized by the bot's model —
+   *  cached and rolled forward across turns — falling back to the
+   *  extractive note on any error.  Absent or false is the extractive
+   *  default.  Only a driver that can run a side session honours it. */
+  historySummaryModel?: boolean;
   resumeCursor?: unknown;
   /** The turn with the conversation so far replayed inline, attached only
    * alongside resumeCursor. A cursor-resuming driver sends it once, on a
@@ -271,6 +350,17 @@ export interface SendTurnInput {
    * that cannot rebuild does not call it, and a throw here must not fail the
    * turn. */
   onReplayRecovered?: () => void;
+  /** Called by a driver that cut older context to fit the prompt budget
+   * (the ACP driver), right after it publishes the `context.injected`
+   * event for the cut.  The ref is the row's own record: the harness hangs
+   * it under the message that started this turn, which only it knows.
+   * A relaunch after a transient failure does not call it again.
+   * It may be called a second time with the SAME id and a new reading —
+   * a row posted while the model writes a history summary resolves to the
+   * finished numbers — and the harness replaces the row in place
+   * (server/context-injection.ts addInjectionRef).  Never required, and a
+   * throw here must not fail the turn. */
+  onContextCompressed?: (ref: ContextInjectionRef) => void;
   /** Prior turns for transcript-replay providers (API-backed drivers).
    *  Each entry may carry tool call and result metadata so the executor
    *  can replay a multi-step turn that has already been settled: the
@@ -309,6 +399,12 @@ export interface SendTurnInput {
    *  or neither is (see drivers/prompt-split.ts promptHalves). */
   systemStable?: string;
   systemVolatile?: string;
+  /** Ordered non-empty system-prompt sections, the same list joined into
+   *  `system`.  ACP uses it to drop the oldest volatile sections under a
+   *  byte budget.  The stable sections are interleaved with them, so the
+   *  two joined halves are not enough to put a section back.  Optional: a
+   *  driver that does not budget the prompt ignores it. */
+  systemSections?: Array<{ id: string; text: string; volatile: boolean }>;
   /** sha256 hex of `systemVolatile`, computed once by the server so a driver
    *  comparing halves against a receipt need not hash the text itself. */
   volatileDigest?: string;
@@ -317,6 +413,12 @@ export interface SendTurnInput {
    *  from the previous turn, so digest-based delivery must not suppress the
    *  note. */
   mentionTurn?: boolean;
+  /** Set only for a turn that runs one of the engine's own slash commands.
+   *  The driver writes exactly `/name args` and nothing else: no persona, no
+   *  volatile note, no replayed conversation.  Every other turn leaves it
+   *  unset, and its text is shielded so a leading slash cannot become a
+   *  command (`neutralizeLeadingSlash`). */
+  command?: TurnCommand;
   /** Tool definitions the agent may call this turn, in OpenAI function-calling
    * shape.  An HTTP driver (MiniMax, OpenAI-compatible) hands these to the
    * model verbatim; a CLI driver that mounts MCP servers is free to ignore
@@ -376,6 +478,9 @@ export interface SendTurnInput {
     dweb?: { url: string };
     /** Shared Qdrant Agent RAG vector memory integration. */
     qdrant?: { command: string; args: string[]; env: Record<string, string> };
+    /** User-configured MCP servers (config.json `mcpServers`), each narrowed by
+     * `parseStoredMcpServer()` and mounted in `turnStdioMcpServers()`. */
+    custom?: Record<string, McpServerSpec>;
     /** Every computer this bot was granted for this turn, in the order the
      * person granted them. A grant is a capability, not a preference: each
      * entry is mounted as its own MCP server so the agent chooses per task.
@@ -394,12 +499,39 @@ export interface SendTurnInput {
   cwd?: string;
   /** True when the bot has autoApprove enabled by the user. */
   autoApprove?: boolean;
+  /** Fresh owner tool selection for this turn, independent of execution approval. */
+  toolScope?: ToolScope;
+  /** True when the bot has Bypass Permissions enabled by the user.  The
+   *  broker path reads the bot record itself (`autoVerdict`), so this exists
+   *  only for a driver that has a native skip-approvals mode and NO broker
+   *  path to carry the bot's choice (Antigravity's print mode).  It never
+   *  applies to a turn that controls This Mac, exactly as the broker's bypass
+   *  never answers a `local-computer` request, and unlike `autoApprove` it
+   *  applies to unattended turns too, as the broker's bypass does. */
+  bypassPermissions?: boolean;
   /** True when this turn began from an outside event (webhook, resource
    *  threshold) or was inherited from an already-unattended bot.  Auto Mode
    *  is something a person switched on for turns they are present for, so a
    *  driver that converts autoApprove into a permission bypass must treat an
    *  unattended turn as a hard stop (see auto-approve.ts). */
   unattended?: boolean;
+  /** True when the bot's auto-review is On, a reviewer is available, and a
+   *  person is present for this turn (server/auto-review.ts
+   *  `shouldHoldForReview`).  A driver that declares `asksWhenHeld` runs a
+   *  full-auto instance in its asking mode for this one turn, so each ask
+   *  reaches the reviewer before it runs.  Never set on an unattended turn:
+   *  an ask the reviewer turns down would wait on a card nobody is there to
+   *  answer. */
+  holdForReview?: boolean;
+  /** The identity an engine child is launched with (`LaunchIdentity`).  A
+   *  driver that spawns a child for the turn applies it to that child's
+   *  environment; absent means a launched child with no seat. */
+  launchIdentity?: LaunchIdentity;
+  /** A routine's command allowlist (server/tool-policy.ts).  Present only on
+   *  a routine turn whose routine set one, and on every re-dispatch of that
+   *  turn.  A driver whose capabilities say `toolPolicy: true` holds the turn
+   *  to it;  the harness refuses to send such a turn to any other driver. */
+  toolPolicy?: ToolPolicy;
 }
 
 /** The decoded `arguments` object of one tool call.
@@ -491,6 +623,22 @@ export interface TurnToolHost {
   drainNotices?(): string[];
 }
 
+/** An MCP server this machine starts and talks to over stdio. */
+export interface StdioMcpSpec {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
+/** An MCP server reached over HTTP (streamable HTTP or SSE). */
+export interface RemoteMcpSpec {
+  type: "http" | "sse";
+  url: string;
+  headers: Record<string, string>;
+}
+
+export type McpServerSpec = StdioMcpSpec | RemoteMcpSpec;
+
 export interface TurnStartResult {
   turnId: TurnId;
   /** False when the driver emitted a terminal event before provider launch.
@@ -550,6 +698,11 @@ export interface ProviderAdapter {
      * `SendTurnInput.toolHost` only to such a driver, and dispatches it on
      * the same one-line path it uses for a CLI engine. */
     toolLoop?: boolean;
+    /** True when the driver trims an over-budget prompt itself and can
+     *  substitute a summary note for the replayed history it drops (the ACP
+     *  prompt budget), so the per-bot `maxHistoryTurns` and
+     *  `historySummaryModel` settings apply to it. */
+    historySummary?: boolean;
     /** True when the driver builds its own message history from
      * `SendTurnInput.transcript` every turn — every chat-completions driver
      * does this, the way a CLI driver replays its own native session.  A
@@ -573,6 +726,27 @@ export interface ProviderAdapter {
      * every helper event names the call that started it, so its steps nest
      * under that row.  Absent reads as `"none"`. */
     helpers?: HelperSupport;
+    /** Where auto-review can see this instance's tool calls
+     * (shared/auto-review.ts).  Decided from the instance's own config, so a
+     * full-auto instance that never asks says `"after"`.  Absent reads as
+     * `"none"`: an engine that does not say where its actions surface is never
+     * promised a review. */
+    reviewHook?: ReviewHook;
+    /** True when the driver honours `SendTurnInput.holdForReview`: a full-auto
+     * instance then runs that one turn in its asking mode, the same downgrade
+     * a host-control turn already gets, so every ask reaches the reviewer
+     * before it runs.  Meaningful only beside `reviewHook: "after"`. */
+    asksWhenHeld?: boolean;
+    /** True when the driver holds a turn to `SendTurnInput.toolPolicy` (or
+     *  refuses it when the engine instance cannot be held).  Absent: the
+     *  harness never sends this driver an allowlist turn. */
+    toolPolicy?: boolean;
+    /** True when the engine announces its own slash commands (the Claude init
+     *  frame's `slash_commands`, ACP's `available_commands_update`) and runs
+     *  an allowlisted one when a turn carries `command`.  Absent reads as
+     *  false, and such an engine never gets an engine group in the command
+     *  menu. */
+    engineCommands?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
@@ -698,8 +872,9 @@ export interface ModelCatalog {
     /** Short tag rendered next to the label in the model picker (e.g. a
      * price/speed tradeoff the user should see before picking).  Drivers
      * set it on static catalog rows; the picker renders it as a chip with
-     * `badgeTitle` (full sentence) on hover.  Keep the chip under ~10 chars
-     * so it does not push the label to a second line on narrow chat heads. */
+     * `badgeTitle` (full sentence) on hover.  Keep the chip short: in a
+     * narrow picker the row's tags wrap onto their own line rather than
+     * squeezing the name, so a long chip costs the list a row of height. */
     badge?: string;
     /** Hover explanation for `badge`.  Without this the chip renders
      * without a tooltip and a screen-reader hint. */
@@ -711,7 +886,15 @@ export interface ModelCatalog {
     /** Effort levels this specific model supports, if any.
      * When defined, only models with non-empty effortLevels support effort. */
     effortLevels?: readonly EffortLevel[];
+    /** The default effort level for this model when none is explicitly selected. */
+    defaultEffort?: EffortLevel;
     supportsEffort?: boolean;
+    /** Working-context caps (tokens) the picker offers besides the full
+     * window, for a model that is useful below it.  Absent means no choice. */
+    contextCaps?: readonly number[];
+    /** The driver sends a per-bot output limit for this model
+     * (`maxOutputTokens`).  Absent means it does not, and the picker hides it. */
+    supportsMaxOutput?: boolean;
     /** Whether this model can interpret an attached image. Absent inherits the engine gate. */
     images?: boolean;
   }>;
@@ -740,8 +923,14 @@ export interface ProviderInstance {
   generateText?(prompt: string): Promise<string>;
   /** Isolated, tool-free permission review on this same provider. Kept
    * separate from generateText so the UI never infers a security capability
-   * from a generic helper that may expose prompts in argv or lack approvals. */
-  reviewPermission?(prompt: string, signal?: AbortSignal): Promise<string>;
+   * from a generic helper that may expose prompts in argv or lack approvals.
+   * Implemented by Claude (a tool-free one-shot CLI, the brief as its
+   * system prompt and the action on stdin) and by the HTTP lanes (a
+   * chat-completions call with no `tools`, the brief as the system message
+   * and the action as the user message).  An engine without one is reviewed
+   * by the fleet's fallback reviewer, never by an arbitrary sibling
+   * (server/auto-review.ts `reviewersFor`). */
+  reviewPermission?(prompt: ReviewPrompt, signal?: AbortSignal): Promise<string>;
   dispose(): Promise<void>;
 }
 
@@ -787,6 +976,12 @@ export interface ProviderDriver<Config = unknown> {
   /** How to get this engine installed. Omit for engines that need no local
    * binary (API-key drivers), which is what makes it optional. */
   readonly install?: EngineInstall;
+  /** Other command names that run THIS engine, beyond the default binary name.
+   * The Engines picker searches these alongside the default so a correctly
+   * installed engine is never reported missing because it ships under a
+   * different command — Clutch's driver default is `dsh` while the Clutch build
+   * is installed as `clutch`.  Bare names only; a path here is ignored. */
+  readonly cliAliases?: string[];
   /** Decode the opaque config envelope; throw on invalid (→ shadow). */
   decodeConfig(raw: unknown): Config;
   defaultConfig(): Config;

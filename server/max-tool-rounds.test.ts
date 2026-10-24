@@ -39,19 +39,22 @@ const wantsTools = (id: string): TurnRoundResult => ({
 function stubDeps(): TurnToolHostDeps {
   return {
     executeListAgentsRequest: () => ({ status: 200, body: { bots: [] } }),
-    executeAskBotRequest: vi.fn(async () => ({ status: 200, body: {} })),
+    executeCoordinateBotsRequest: vi.fn(async () => ({ status: 200, body: { message: "Handed off." } })),
     executeListRoutinesRequest: () => ({
       status: 200,
       body: { now: "2026-09-12T10:00:00.000Z", timeZone: "UTC", routines: [] },
     }),
-    executeDelegateBotRequest: vi.fn(
-      async () => ({ status: 200, body: { queued: true, message: "Delegation queued." } }),
+    executeAssignmentStatusRequest: vi.fn(
+      async () => ({ status: 200, body: { assignments: [] } }),
     ),
     executeCreateBotRequest: vi.fn(
       async () => ({ status: 201, body: { id: "bot-new", name: "Pixel", section: "Work" } }),
     ),
     executeRequestCredentialRequest: vi.fn(
       async () => ({ status: 201, body: { messageId: "msg-1", label: "key" } }),
+    ),
+    executeRequestSignInRequest: vi.fn(
+      async () => ({ status: 201, body: { messageId: "msg-sign", site: "example.com" } }),
     ),
     executeRoutineRequestRequest: vi.fn(
       async () => ({ status: 201, body: { summary: "Weekdays at 09:00" } }),

@@ -134,7 +134,9 @@ export function countByRule(diagnostics) {
   for (const diagnostic of diagnostics ?? []) {
     const rule = ruleIdFromCode(diagnostic.code);
     if (diagnostic.severity === "error") {
-      errors.push(`${rule} in ${diagnostic.filename}`);
+      const location = diagnostic.filename ?? diagnostic.labels?.[0]?.span?.file?.name;
+      const message = diagnostic.message ?? diagnostic.rendered ?? "unclassified lint error";
+      errors.push(`${rule} in ${location ?? "unknown file"}: ${message}`);
     } else if (diagnostic.severity === "warning") {
       warnings.set(rule, (warnings.get(rule) ?? 0) + 1);
     }

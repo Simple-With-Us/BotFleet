@@ -213,9 +213,12 @@ export function validateAddEngine(input: {
   // operator added, so one without a key of its own could only fail every
   // turn.  The server refuses it too; this is the same rule said earlier.
   if (option.requiresKey && !input.key.trim()) return "An API key is required";
-  if (option.requiresModels && input.models.length === 0) {
-    return "At least one model ID is required (e.g. meta-llama/llama-3.3-70b-instruct)";
-  }
+  // A connection's own endpoint is the only honest catalog for an
+  // OpenAI-compatible vendor, and the driver already asks it (`{url}/models`).
+  // Requiring the operator to retype what the endpoint publishes made that
+  // probe unreachable — a non-empty list is exactly what suppresses it — so an
+  // empty list is allowed here and resolved by discovery instead.  The
+  // "Fetch Models" action on the form fills this in from the same call.
   if (input.models.length > 15) return "At most 15 model IDs can be configured";
   return null;
 }
@@ -245,14 +248,19 @@ const RESERVED_INSTANCE_ID = new Map<string, string>([
   ["piAgent", "pi"],
   ["mcodeAgent", "mcode"],
   ["museAgent", "muse"],
+  ["opencodeGo", "opencode"],
 ]);
+
+const RESERVED_OPENCODE_IDS = new Set(["opencode", "opencodeGo"]);
 
 export function isCustomEngineInstance(instance: {
   driverKind: string;
   instanceId: string;
   isCustom?: boolean;
 }): boolean {
-  if (instance.isCustom) return true;
+  if (instance.isCustom === true) return true;
+  if (instance.isCustom === false) return false;
+  if (instance.driverKind === "opencodeGo") return !RESERVED_OPENCODE_IDS.has(instance.instanceId);
   return instance.instanceId !== (RESERVED_INSTANCE_ID.get(instance.driverKind) ?? instance.driverKind);
 }
 

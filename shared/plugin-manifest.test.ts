@@ -1,0 +1,379 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  HOST_API_VERSION,
+  PLUGIN_CAPABILITIES,
+  parsePluginManifest,
+  parsePluginManifestJson,
+  satisfiesBotfleetVersion,
+} from "./plugin-manifest.ts";
+
+describe("parsePluginManifest", () => {
+  const valid = {
+    name: "fleet-overview",
+    version: "1.0.0",
+    description: "Bot counts by status.",
+    botfleet: ">=1",
+    entry: "plugin.mjs",
+  };
+
+  it("accepts a minimal valid manifest", () => {
+    const result = parsePluginManifest(valid);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.manifest.name).toBe("fleet-overview");
+      expect(result.manifest.version).toBe("1.0.0");
+      expect(result.manifest.botfleet).toBe(">=1");
+      expect(result.manifest.entry).toBe("plugin.mjs");
+      expect(result.manifest.capabilities).toEqual([]);
+      expect(result.manifest.needs.network).toEqual([]);
+    }
+  });
+
+  it("accepts a fully populated manifest", () => {
+    const full = {
+      ...valid,
+      author: "Jay Wedgeworth",
+      license: "Apache-2.0",
+      capabilities: ["read.bots", "read.status"],
+      contributes: {
+        cards: [
+          {
+            id: "fleet-overview",
+            title: "Fleet Overview",
+            description: "Counts.",
+            layout: "stat-grid",
+            fields: ["total", "running"],
+          },
+        ],
+        commands: [
+          { name: "fleet", description: "Summarize the fleet.", args: ["scope"] },
+        ],
+      },
+    };
+    const result = parsePluginManifest(full);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.manifest.capabilities.length).toBe(2);
+      expect(result.manifest.contributes?.cards?.length).toBe(1);
+      expect(result.manifest.contributes?.commands?.length).toBe(1);
+    }
+  });
+
+  it("rejects names with uppercase letters", () => {
+    const bad = { ...valid, name: "FleetOverview" };
+    const result = parsePluginManifest(bad);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some((i) => i.field === "name")).toBeTruthy();
+    }
+  });
+
+  it("rejects names that try to escape the slug gate", () => {
+    for (const name of ["../escape", ".", "..", "with spaces", "with_underscore"]) {
+      const result = parsePluginManifest({ ...valid, name });
+      expect(result.ok).toBe(false);
+    }
+  });
+
+  it("rejects non-semver versions with a useful message", () => {
+    const result = parsePluginManifest({ ...valid, version: "1.0" });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      const issue = result.issues.find((i) => i.field === "version");
+      expect(issue).toBeTruthy();
+      expect(issue!.message).toMatch(/semver/);
+    }
+  });
+
+  it("accepts an explicit network allowlist and rejects everything else", () => {
+    const allowed = parsePluginManifest({
+      ...valid,
+      capabilities: ["net.hosts"],
+      needs: { network: ["API.Example.com:443", "[::1]:9"] },
+    });
+    expect(allowed.ok).toBe(true);
+    if (allowed.ok) {
+      expect(allowed.manifest.capabilities).toEqual(["net.hosts"]);
+      expect(allowed.manifest.needs.network).toEqual(["API.Example.com:443", "[::1]:9"]);
+    }
+    for (const entry of ["*", "https://example.com/a", "example.com", "127.0.0.1:0", "127.0.0.1:99999", "::1:443"]) {
+      const result = parsePluginManifest({ ...valid, needs: { network: [entry] } });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.issues.some((issue) => issue.field.startsWith("needs.network"))).toBe(true);
+      }
+    }
+    const duplicate = parsePluginManifest({
+      ...valid,
+      needs: { network: ["example.com:443", "Example.com:443"] },
+    });
+    expect(duplicate.ok).toBe(false);
+    if (!duplicate.ok) {
+      expect(duplicate.issues.some((issue) => issue.field === "needs.network")).toBe(true);
+    }
+    const extra = parsePluginManifest({ ...valid, needs: { network: [], shell: true } });
+    expect(extra.ok).toBe(false);
+  });
+
+  it("rejects unknown capabilities", () => {
+    const result = parsePluginManifest({ ...valid, capabilities: ["read.bots", "nuke.everything"] });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      const issue = result.issues.find((i) => i.message.includes("nuke.everything"));
+      expect(issue).toBeTruthy();
+      expect(issue!.message).toMatch(new RegExp(PLUGIN_CAPABILITIES.join("|")));
+    }
+  });
+
+  it("rejects card id duplicates with a per-field message", () => {
+    const bad = {
+      ...valid,
+      contributes: {
+        cards: [
+          { id: "fleet", title: "A", layout: "stat-grid" },
+          { id: "fleet", title: "B", layout: "stat-grid" },
+        ],
+      },
+    };
+    const result = parsePluginManifest(bad);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some((i) => i.field === "contributes.cards")).toBeTruthy();
+    }
+  });
+
+  it("rejects duplicate command names", () => {
+    const bad = {
+      ...valid,
+      contributes: {
+        commands: [
+          { name: "fleet", description: "A" },
+          { name: "fleet", description: "B" },
+        ],
+      },
+    };
+    const result = parsePluginManifest(bad);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some((i) => i.field === "contributes.commands")).toBeTruthy();
+    }
+  });
+
+  it("rejects entry that points outside the plugin directory", () => {
+    const result = parsePluginManifest({ ...valid, entry: "../escape.mjs" });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some((i) => i.field === "entry")).toBeTruthy();
+    }
+  });
+
+  it("rejects entry with non-js extension", () => {
+    const result = parsePluginManifest({ ...valid, entry: "plugin.cjs" });
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects botfleet constraint that is not a semver range", () => {
+    const result = parsePluginManifest({ ...valid, botfleet: "soon" });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some((i) => i.field === "botfleet")).toBeTruthy();
+    }
+  });
+
+  it("rejects botfleet ranges the gate cannot evaluate (e.g. >=1.0.0)", () => {
+    const result = parsePluginManifest({ ...valid, botfleet: ">=1.0.0" });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some((i) => i.field === "botfleet")).toBeTruthy();
+    }
+  });
+
+  it("includes a (root) field when input is not an object", () => {
+    const result = parsePluginManifest("not an object");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      // zod returns the root path as "" or similar; we treat both as the root.
+      expect(result.issues.some((i) => i.field === "(root)")).toBeTruthy();
+    }
+  });
+});
+
+describe("parsePluginManifestJson", () => {
+  it("surfaces JSON syntax errors as a single (root) issue", () => {
+    const result = parsePluginManifestJson("{ not valid json");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.length).toBe(1);
+      expect(result.issues[0]!.field).toBe("(root)");
+      expect(result.issues[0]!.message).toMatch(/not valid JSON/);
+    }
+  });
+
+  it("passes through to schema when JSON parses", () => {
+    const result = parsePluginManifestJson(JSON.stringify({
+      name: "ok",
+      version: "0.0.1",
+      description: ".",
+      botfleet: ">=1",
+      entry: "x.mjs",
+    }));
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe("satisfiesBotfleetVersion", () => {
+  it("honors >=", () => {
+    expect(satisfiesBotfleetVersion(">=1", 1)).toBe(true);
+    expect(satisfiesBotfleetVersion(">=1", 2)).toBe(true);
+    expect(satisfiesBotfleetVersion(">=2", 1)).toBe(false);
+  });
+
+  it("honors <=", () => {
+    expect(satisfiesBotfleetVersion("<=1", 1)).toBe(true);
+    // Host 2 retains the v1 surface, so a "<=1" plugin still loads.
+    expect(satisfiesBotfleetVersion("<=1", 2)).toBe(true);
+    expect(satisfiesBotfleetVersion(">=3", 2)).toBe(false);
+  });
+
+  it("honors caret", () => {
+    expect(satisfiesBotfleetVersion("^1.2.0", 1)).toBe(true);
+    // Same v1-surface retention as above.
+    expect(satisfiesBotfleetVersion("^1.2.0", 2)).toBe(true);
+    expect(satisfiesBotfleetVersion("^2.0.0", 1)).toBe(false);
+  });
+
+  it("honors tilde", () => {
+    expect(satisfiesBotfleetVersion("~1.2.0", 1)).toBe(true);
+  });
+
+  it("honors bare version", () => {
+    expect(satisfiesBotfleetVersion("1", 1)).toBe(true);
+    // Host 2 retains the v1 surface: a "1" plugin loads on host 2.
+    expect(satisfiesBotfleetVersion("1", 2)).toBe(true);
+    expect(satisfiesBotfleetVersion("2", 1)).toBe(false);
+    expect(satisfiesBotfleetVersion("2", 2)).toBe(true);
+    expect(satisfiesBotfleetVersion("1", HOST_API_VERSION)).toBe(true);
+  });
+
+  it("fails closed on garbage", () => {
+    expect(satisfiesBotfleetVersion("anything", 1)).toBe(false);
+  });
+});
+describe("v2 event subscriptions and settings", () => {
+  const base = {
+    name: "zulip-bridge",
+    version: "1.0.0",
+    description: "Zulip wake routing.",
+    botfleet: ">=1",
+    entry: "plugin.mjs",
+  };
+
+  it("accepts the new event capabilities", () => {
+    const result = parsePluginManifest({
+      ...base,
+      capabilities: ["events.subscribe", "chat.read", "dispatch.wake", "connector.reply"],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("accepts event subscriptions with the matching capability", () => {
+    const result = parsePluginManifest({
+      ...base,
+      capabilities: ["events.subscribe"],
+      contributes: {
+        eventSubscriptions: [{ id: "zulip-inbox", source: "zulip", kinds: ["message"] }],
+      },
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.manifest.contributes?.eventSubscriptions?.length).toBe(1);
+    }
+  });
+
+  it("rejects subscriptions without the events.subscribe capability", () => {
+    const result = parsePluginManifest({
+      ...base,
+      contributes: {
+        eventSubscriptions: [{ id: "zulip-inbox", source: "zulip", kinds: ["message"] }],
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some((i) => i.field === "capabilities")).toBe(true);
+    }
+  });
+
+  it("rejects includeChats without chat.read", () => {
+    const result = parsePluginManifest({
+      ...base,
+      capabilities: ["events.subscribe"],
+      contributes: {
+        eventSubscriptions: [{ id: "s", source: "zulip", kinds: ["message"], includeChats: true }],
+      },
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects duplicate subscription ids", () => {
+    const result = parsePluginManifest({
+      ...base,
+      capabilities: ["events.subscribe"],
+      contributes: {
+        eventSubscriptions: [
+          { id: "dup", source: "zulip", kinds: ["message"] },
+          { id: "dup", source: "zulip", kinds: ["message"] },
+        ],
+      },
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("accepts plain and secret settings", () => {
+    const result = parsePluginManifest({
+      ...base,
+      settings: [
+        { key: "dispatcherBotId", label: "Dispatcher bot", type: "string", required: true },
+        { key: "bridgeSecret", label: "Bridge secret", type: "secret" },
+      ],
+      settingsVersion: 2,
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects credential-looking keys on non-secret settings", () => {
+    const result = parsePluginManifest({
+      ...base,
+      settings: [{ key: "apiToken", label: "Token", type: "string" }],
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects defaults on secret settings", () => {
+    const result = parsePluginManifest({
+      ...base,
+      settings: [{ key: "hookSecret", label: "Secret", type: "secret", default: "x" }],
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects duplicate setting keys", () => {
+    const result = parsePluginManifest({
+      ...base,
+      settings: [
+        { key: "same", label: "A", type: "string" },
+        { key: "same", label: "B", type: "string" },
+      ],
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("v1 manifests parse unchanged with empty settings", () => {
+    const result = parsePluginManifest(base);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.manifest.settings).toEqual([]);
+      expect(result.manifest.settingsVersion).toBe(1);
+    }
+  });
+});

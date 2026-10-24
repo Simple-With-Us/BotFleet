@@ -28,7 +28,7 @@ vi.mock("@/state/store", () => ({
 }));
 
 // Imported after the mock is registered (vitest hoists vi.mock above imports).
-import { EffortSection, LocalModelsPanel, ModelPicker } from "./ModelPicker";
+import { ContextSection, EffortSection, MaxOutputSection, LocalModelsPanel, ModelPicker, ModelRow } from "./ModelPicker";
 
 type Option = InstanceInfo["models"]["options"][number];
 
@@ -71,6 +71,7 @@ function render(
     initialRailId?: string | null;
     selection?: Bot["modelSelection"];
     contained?: boolean;
+    widePopover?: boolean;
     bot?: Bot;
   } = {},
 ): string {
@@ -190,8 +191,12 @@ describe("Local Models panel", () => {
   });
 
   it("opens on the engine itself for a bot on a cloud model, even with local models configured", () => {
+    // The pane header was the discriminator before: the hosted pane said
+    // "Choose a model for this bot" and the local pane said "Runs On <engine>".
+    // That line is gone — it only restated the list underneath it — so the
+    // engine's own name in the heading is what separates the two panes now.
     const text = words(menu(render([claude([QWEN])])));
-    expect(text).toContain("Choose a model for this bot");
+    expect(text).toContain("Claude");
     expect(text).not.toContain("Runs On Claude");
   });
 
@@ -258,6 +263,173 @@ describe("Local Models panel", () => {
     );
     expect(text).toContain("Nothing matches");
     expect(text).not.toContain("qwen3:8b");
+  });
+});
+
+describe("usage reads once at the top, naming the real window", () => {
+  // The quota chip that sat on every model row packed an engine's whole state
+  // into one string and squeezed the slug it sat beside, so the numbers moved
+  // to a block under the header — the same place a capped engine shows its
+  // "Usage cap in effect" card.  These cases keep the window NAMING honest:
+  // `quota.models[id].windowsLabel` is optional in the contract
+  // (server/contracts.ts), so an entry can arrive without one and the block
+  // used to fall through to the generic "Current"/"Longer" names while the row
+  // beneath it said something else — two names for one window in one menu.
+  type ModelQuota = {
+    capped: boolean;
+    remainingPercent?: number;
+    secondaryRemainingPercent?: number;
+    windowsLabel?: string;
+  };
+  const withQuota = (models: Record<string, ModelQuota>, windowsLabel?: string) =>
+    engine("antigravity", "antigravity", "Antigravity", [{ id: "gemini", label: "Gemini 3" }], {
+      snapshot: {
+        state: "available",
+        version: "1",
+        quota: { capped: false, windowsLabel, models },
+      },
+    } as Partial<InstanceInfo>);
+
+  /** The one model row the picker rendered for this engine, taken from the
+   *  menu markup by the row's own class so a rail button cannot be mistaken
+   *  for it. */
+  const modelRow = (html: string): string =>
+    html.match(
+      /<button type="button" class="flex w-full items-center justify-between gap-2 rounded-lg px-2\.5 py-2[^]*?<\/button>/u,
+    )?.[0] ?? "";
+
+  it("uses the engine-level label when the model entry has none", () => {
+    const html = menu(
+      render(
+        [withQuota({ gemini: { capped: false, remainingPercent: 93, secondaryRemainingPercent: 3 } }, "5hr/Week")],
+        { selection: { instanceId: "antigravity", model: "gemini" } },
+      ),
+    );
+    const text = words(html);
+    expect(text).toContain("Weekly");
+    expect(text).not.toContain("Longer");
+  });
+
+  it("prefers the model entry's own label when it carries one", () => {
+    const html = menu(
+      render(
+        [
+          withQuota(
+            { gemini: { capped: false, remainingPercent: 93, secondaryRemainingPercent: 3, windowsLabel: "5hr/Week" } },
+            "ignored",
+          ),
+        ],
+        { selection: { instanceId: "antigravity", model: "gemini" } },
+      ),
+    );
+    expect(words(html)).toContain("Weekly");
+  });
+
+  it("names the window that will run out first, not merely a low number", () => {
+    const html = menu(
+      render(
+        [withQuota({ gemini: { capped: false, remainingPercent: 93, secondaryRemainingPercent: 3 } }, "5hr/Week")],
+        { selection: { instanceId: "antigravity", model: "gemini" } },
+      ),
+    );
+    const text = words(html);
+    expect(text).toContain("93% left");
+    expect(text).toContain("3% left");
+    expect(text).toContain("Weekly is nearly spent");
+  });
+
+  it("keeps the percentages off the model rows themselves", () => {
+    const html = menu(
+      render(
+        [withQuota({ gemini: { capped: false, remainingPercent: 93, secondaryRemainingPercent: 3 } }, "5hr/Week")],
+        { selection: { instanceId: "antigravity", model: "gemini" } },
+      ),
+    );
+    // The packed chip was the reason the row could not hold a slug: it printed
+    // "(93% / 3% for 5h / w)" beside every model name.  The numbers now live
+    // in the usage block, so the row that names the model must not carry them.
+    const row = modelRow(html);
+    expect(row).toContain("Gemini 3");
+    expect(row).not.toContain("93%");
+    expect(row).not.toContain("3%");
+    expect(words(html)).not.toContain("for 5h / w");
+  });
+
+  it("stays silent about a window being nearly spent above the threshold", () => {
+    const html = menu(
+      render(
+        [withQuota({ gemini: { capped: false, remainingPercent: 80, secondaryRemainingPercent: 90 } }, "5hr/Week")],
+        { selection: { instanceId: "antigravity", model: "gemini" } },
+      ),
+    );
+    expect(words(html)).not.toContain("nearly spent");
+  });
+});
+
+describe("fleet-wide model menus", () => {
+  it("opens wider than its trigger while the sidebar remains in flow", () => {
+    const wide = render([claude()], { widePopover: true });
+    expect(wide).toContain("w-[480px]");
+    expect(wide).toContain("max-w-[calc(100vw-24px)]");
+    expect(wide).toContain("fixed z-50");
+    const sidebar = render([claude()]);
+    expect(sidebar).toContain("relative mt-3 w-full");
+    expect(sidebar).not.toContain("w-[480px]");
+  });
+});
+
+describe("a model row keeps its name readable beside its tags", () => {
+  // The owner's screenshots: "Highspeed" and "DeepSeek-V" rendered as a
+  // vertical column of single characters because the label was `flex-1`
+  // (basis 0) beside `shrink-0` tags, so width pressure shrank the name to
+  // nothing before the tags gave up any space.
+  it("wraps the tags onto their own line instead of squeezing the slug", () => {
+    const html = renderToStaticMarkup(
+      <ModelRow
+        option={{ id: "deepseek-v4", label: "DeepSeek-V4 Default", contextWindow: 1_000_000, badge: "Preview" }}
+        current={false}
+        defaultId="deepseek-v4"
+        onPick={() => {}}
+      />,
+    );
+    // A wrapping group with its own hook: when the tags cannot fit beside the
+    // name, this element is what moves below it.
+    expect(html).toContain('data-testid="model-row-tags"');
+    // The floor that stops the name collapsing.  Capped at 100% so it can
+    // never force the row wider than the pane holding it.
+    expect(html).toContain("min-w-[min(9rem,100%)]");
+    expect(html).toContain("flex-wrap");
+  });
+
+  it("shows a context size only once without a redundant Context word", () => {
+    const html = renderToStaticMarkup(
+      <ModelRow option={{ id: "muse-spark-1.3", label: "Muse Spark 1.3", contextWindow: 1_048_576, badge: "1M Context" }}
+        current={false} defaultId="" onPick={() => {}} />,
+    );
+    expect(html.match(/>1M</g)).toHaveLength(1);
+    expect(html).not.toContain("1M Context");
+  });
+
+  it("keeps a badge-only context size compact", () => {
+    const html = renderToStaticMarkup(
+      <ModelRow option={{ id: "custom", label: "Custom", badge: "1M Context" }}
+        current={false} defaultId="" onPick={() => {}} />,
+    );
+    expect(html).toContain(">1M<");
+    expect(html).not.toContain("1M Context");
+  });
+
+  it("renders the full slug in the title when the visible name is clipped", () => {
+    const html = renderToStaticMarkup(
+      <ModelRow
+        option={{ id: "m3.1", label: "MiniMax M3.1 Flash · thinking" }}
+        current={false}
+        defaultId=""
+        onPick={() => {}}
+      />,
+    );
+    expect(html).toContain('title="MiniMax M3.1 Flash · thinking"');
+    expect(html).toContain("truncate");
   });
 });
 
@@ -459,8 +631,61 @@ describe("Effort section in the chat model menu", () => {
     const tree = EffortSection({ levels: ["low", "high"], current: "low", onPick });
     const choices = findElements(tree, (element) => element.type === "button");
     expect(choices).toHaveLength(3);
-    for (const choice of choices) (choice.props as { onClick: () => void }).onClick();
+    for (const choice of choices) {
+      // SAFETY: This section creates each button with its own onClick callback.
+      (choice.props as { onClick: () => void }).onClick();
+    }
     expect(onPick.mock.calls).toEqual([[undefined], ["low"], ["high"]]);
+  });
+
+  it("renders (default: max) in the header and omits the Default button when defaultEffort is provided", () => {
+    const onPick = vi.fn();
+    const props = {
+      // SAFETY: literal effort levels for test fixture.
+      levels: ["low", "medium", "high", "xhigh", "max"] as const,
+      // SAFETY: literal effort level for test fixture.
+      defaultEffort: "max" as const,
+      current: undefined,
+      onPick,
+    };
+    const element = createElement(EffortSection, props);
+    const html = renderToStaticMarkup(element);
+    expect(html).toContain("Effort");
+    expect(html).toContain("(default: max)");
+    const tree = EffortSection(props);
+    const choices = findElements(tree, (el) => el.type === "button");
+    expect(choices).toHaveLength(5);
+    // SAFETY: EffortSection renders buttons with aria-pressed boolean props.
+    const maxButton = choices.find((c) => (c.props as { "aria-pressed"?: boolean })["aria-pressed"] === true);
+    expect(maxButton).toBeDefined();
+    // SAFETY: EffortSection renders each button with an onClick callback.
+    (choices[0].props as { onClick: () => void }).onClick();
+    expect(onPick).toHaveBeenCalledWith("low");
+  });
+
+  it("Max Input Tokens: presets plus a custom field, No Limit first, hidden with no caps", () => {
+    const html = renderToStaticMarkup(
+      createElement(ContextSection, { caps: [524_288], windowTokens: 1_000_000, current: undefined, onPick: () => {} }),
+    );
+    expect(html).toContain("Max Input Tokens");
+    expect(html).toContain("No Limit (1M)");
+    expect(html).toContain(">512K<");
+    expect(html).toContain('placeholder="No limit"');
+    expect(html).toContain('aria-label="Max Input Tokens"');
+    expect(html).toContain("Empty is no limit.");
+    // A saved value that is not a preset shows in the custom field.
+    const custom = renderToStaticMarkup(
+      createElement(ContextSection, { caps: [524_288], windowTokens: 1_000_000, current: 300_000, onPick: () => {} }),
+    );
+    expect(custom).toContain('value="300000"');
+    expect(renderToStaticMarkup(createElement(ContextSection, { caps: [], current: undefined, onPick: () => {} }))).toBe("");
+  });
+
+  it("Max Output Tokens renders a group with an empty Default field", () => {
+    const html = renderToStaticMarkup(createElement(MaxOutputSection, { current: undefined, windowTokens: 1_000_000, onPick: () => {} }));
+    expect(html).toContain("Max Output Tokens");
+    expect(html).toContain('placeholder="Default"');
+    expect(html).toContain("Empty uses the model default.");
   });
 
   it("renders nothing for a model with no levels", () => {

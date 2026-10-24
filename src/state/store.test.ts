@@ -567,6 +567,56 @@ describe("cross-client bot creation", () => {
   });
 });
 
+// BF-2424: the optimistic-patch reconcile re-reads a bot after a rejected
+// PATCH. It asks for `?messages=0`, which answers with `messages: []`, and an
+// incoming transcript sharing no ids with what is on screen is read as a full
+// snapshot and replaces — vacuously true for an empty array. So the visible
+// conversation would blank on every rejected save. The reconcile therefore
+// carries the transcript already on screen instead of the empty one.
+describe("reconcile frames must not blank the transcript", () => {
+  const seedBot = {
+    id: "bot-1",
+    threadId: "t1",
+    name: "Ada",
+    title: "",
+    description: "",
+    notifications: false,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "acp", model: "fake" },
+  } satisfies Omit<Bot, "messages">;
+
+  const seeded = reducer(initialState, {
+    type: "botPatched",
+    bot: { ...seedBot, messages: [] },
+  });
+  const withTranscript = reducer(seeded, {
+    type: "messageAdded",
+    threadId: "t1",
+    message: { id: "m1", role: "user", kind: "text", text: "still here", at: 1 },
+  });
+
+  it("documents the hazard: a bare empty transcript from the same thread DOES replace", () => {
+    // This is the existing, intended behaviour for a task-switch snapshot that
+    // arrives empty (see "task switch transcript" below). It is exactly why the
+    // reconcile must not hand an empty array back: the reducer cannot tell the
+    // two apart, so the caller has to carry the real transcript.
+    const blanked = reducer(withTranscript, {
+      type: "botPatched",
+      bot: { ...seedBot, messages: [] },
+    });
+    expect(blanked.bots[0]?.messages).toEqual([]);
+  });
+
+  it("keeps the transcript when the reconcile carries the messages already on screen", () => {
+    const reconciled = reducer(withTranscript, {
+      type: "botPatched",
+      bot: { ...seedBot, messages: withTranscript.bots[0]!.messages },
+    });
+    expect(reconciled.bots[0]?.messages.map((m) => m.id)).toEqual(["m1"]);
+  });
+});
+
 describe("section Chiefs", () => {
   const bot = (id: string, section: string, chiefOfStaff = false) => ({
     id,
@@ -1251,5 +1301,109 @@ describe("task switch transcript", () => {
     });
     expect(next.bots[0]?.threadId).toBe("thread");
     expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["fresh"]);
+  });
+});
+
+// The Fleet Matrix overview closes when the person picks a chat, and only then.
+// `selectedId` cannot say that: a click on the open chat leaves it unchanged,
+// and the store rewrites it by itself when a hydrate loses the selection or a
+// delete falls back.  `selectionNonce` is the signal, so this pins which
+// actions move it.
+describe("selectionNonce", () => {
+  const botNamed = (id: string) =>
+    ({
+      id,
+      threadId: `${id}-thread`,
+      name: id,
+      title: "",
+      description: "",
+      notifications: true,
+      color: "blue",
+      unread: false,
+      modelSelection: { instanceId: "x", model: "y" },
+      messages: [],
+    }) satisfies Bot;
+  const roomNamed = (id: string) =>
+    ({
+      id,
+      threadId: `${id}-thread`,
+      name: id,
+      memberIds: ["a"],
+      defaultResponder: { kind: "everyone" },
+      bulletin: "",
+      unread: false,
+      createdAt: 1,
+      messages: [],
+    }) satisfies Group;
+  const open = {
+    ...initialState,
+    bots: [botNamed("a"), botNamed("b")],
+    groups: [roomNamed("room")],
+    selectedId: "a",
+  };
+
+  it("counts picking another bot or a room", () => {
+    const toBot = reducer(open, { type: "select", id: "b" });
+    expect(toBot.selectionNonce).toBe(open.selectionNonce + 1);
+    const toRoom = reducer(toBot, { type: "select", id: "room" });
+    expect(toRoom.selectionNonce).toBe(open.selectionNonce + 2);
+  });
+
+  it("counts a click on the chat that is already open, which selectedId cannot show", () => {
+    const sameBot = reducer(open, { type: "select", id: "a" });
+    expect(sameBot.selectedId).toBe(open.selectedId);
+    expect(sameBot.selectionNonce).toBe(open.selectionNonce + 1);
+
+    const inRoom = { ...open, selectedId: "room" };
+    const sameRoom = reducer(inRoom, { type: "select", id: "room" });
+    expect(sameRoom.selectedId).toBe("room");
+    expect(sameRoom.selectionNonce).toBe(inRoom.selectionNonce + 1);
+  });
+
+  it("counts a new bot taking the selection, not a second fold of the bot already on screen", () => {
+    const added = reducer(open, { type: "botAdded", bot: botNamed("c") });
+    expect(added.selectedId).toBe("c");
+    expect(added.selectionNonce).toBe(open.selectionNonce + 1);
+    const refolded = reducer(added, { type: "botAdded", bot: botNamed("c") });
+    expect(refolded.selectedId).toBe("c");
+    expect(refolded.selectionNonce).toBe(added.selectionNonce);
+  });
+
+  it("does not move for a bot or room update streamed in the background", () => {
+    const busy = reducer(open, { type: "botPatched", bot: { ...botNamed("a"), busy: true } });
+    const arrived = reducer(busy, { type: "botPatched", bot: botNamed("elsewhere") });
+    const room = reducer(arrived, { type: "groupPatched", group: { id: "room", unread: true } });
+    const thread = reducer(room, { type: "taskSwitched", bot: { id: "a", threadId: "a-other" } });
+    expect(thread.selectionNonce).toBe(open.selectionNonce);
+  });
+
+  it("does not move when hydrate picks the first bot at launch or after the selection vanished", () => {
+    const launch = reducer(initialState, {
+      type: "hydrate",
+      bots: [botNamed("a"), botNamed("b")],
+      groups: [roomNamed("room")],
+      computerControl: {},
+    });
+    expect(launch.selectedId).toBe("a");
+    expect(launch.selectionNonce).toBe(initialState.selectionNonce);
+
+    const lost = reducer({ ...open, selectedId: "gone" }, {
+      type: "hydrate",
+      bots: [botNamed("b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(lost.selectedId).toBe("b");
+    expect(lost.selectionNonce).toBe(open.selectionNonce);
+  });
+
+  it("does not move when a delete makes the store fall back to another chat", () => {
+    const roomGone = reducer({ ...open, selectedId: "room" }, { type: "groupDeleted", groupId: "room" });
+    expect(roomGone.selectedId).toBe("a");
+    expect(roomGone.selectionNonce).toBe(open.selectionNonce);
+
+    const botGone = reducer(open, { type: "deleteBot", botId: "a" });
+    expect(botGone.selectedId).toBe("b");
+    expect(botGone.selectionNonce).toBe(open.selectionNonce);
   });
 });

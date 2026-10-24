@@ -76,6 +76,11 @@ const SENSITIVE = [
   // The desktop's OS-encrypted credential document (safeStorage), which is
   // where every packaged-app key actually lands.
   /\bcredentials\.bin\b/i,
+  // The fleet's secrets folder and every Zulip key file in it.  Each BF role
+  // bot's `<Role>-zuliprc` is a live bot key (docs/zulip.md): a bot that can
+  // read another role's file can post as that role, so a read is carded too.
+  /(^|[\s/"'=:~])\.secrets([/\\]|$|["'\s])/i,
+  /zuliprc\b/i,
   ...(process.env.OMB_DATA_DIR
     ? [new RegExp(`(^|[\\s/"'])${process.env.OMB_DATA_DIR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([/\\\\]|$|["'\\s])`, "i")]
     : []),
@@ -362,9 +367,18 @@ export function offerableApprovalKey(
   return key;
 }
 
+/** The rule a permission-bypass grant carries.  Auto-review keys on it:
+ *  On screens a bypass approval before it is delivered, and Watch audits it
+ *  afterwards (server/auto-review.ts `reviewsBypass`). */
+export const PERMISSION_BYPASS_RULE = "permission-bypass";
+
 export interface AutoApprover {
   autoApprove?: boolean;
   bypassPermissions?: boolean;
+  /** The second switch, 2026-10-14: let Bypass answer the requests that
+   * control the person's real desktop too.  Ignored without `bypassPermissions`,
+   * so it can never approve anything on its own. */
+  bypassLocalComputer?: boolean;
   alwaysAllow?: string[];
 }
 
@@ -416,15 +430,27 @@ export function autoVerdict(
      *  path its driver carried (server/path-containment.ts).  Absent for
      *  every tool whose driver carries no path; nothing is guessed then. */
     fileWrite?: FileWriteCheck;
+    /** Exact configured MCP tool grant key when this ask is eligible. */
+    mcpToolAllowKey?: string | null;
   },
 ): AutoVerdict {
   // Permission bypass is still an auto-approval grant, so the local-computer
   // consent boundary still applies: `localAutoAcknowledgementError` treats
   // bypassPermissions as an auto-approve request and demands
   // acknowledgeLocalAuto before this combination is created.
-  if (bot.bypassPermissions && context?.scope !== "local-computer") {
+  //
+  // Owner ruling 2026-10-14: Bypass on its own stops at the edge of the real
+  // desktop, which made it *weaker* than Auto Mode — Auto already answers
+  // those requests, so "bypass" answering fewer of them than "auto" read as a
+  // broken switch rather than as caution.  `bypassLocalComputer` is the second,
+  // named switch that buys the rest, so the default boundary still stands and
+  // the grant is something the owner asked for by name.
+  if (
+    bot.bypassPermissions &&
+    (context?.scope !== "local-computer" || bot.bypassLocalComputer)
+  ) {
     const key = approvalKey(tool, summary, context?.scope);
-    return { approve: `auto-approved ${key} (permission bypass)`, source: "auto-mode", rule: "permission-bypass" };
+    return { approve: `auto-approved ${key} (permission bypass)`, source: "auto-mode", rule: PERMISSION_BYPASS_RULE };
   }
   // Owner ruling, 2026-10-01 and applied literally 2026-10-02: a bot in full
   // auto never gets an approval card for the harness's own `job_start`.  It
@@ -439,7 +465,12 @@ export function autoVerdict(
   // guard.  Bash and every other tool keep all of theirs, and a bot that is
   // not in full auto falls through to the checks below, where a job start is
   // never granted and a card is the only way in.
-  if (bot.autoApprove && context?.ownJobStart === true && isOwnJobStart(tool)) {
+  // A bot in Bypass Permissions has asked for strictly more than full auto, so
+  // it gets the same treatment here.  The bypass branch above skips any
+  // `local-computer` request, and the MCP lane tags every job start that way
+  // because a job runs on this computer, so without this a bypass-only bot was
+  // carded on every job it started.
+  if ((bot.autoApprove || bot.bypassPermissions) && context?.ownJobStart === true && isOwnJobStart(tool)) {
     const key = approvalKey(tool, summary, context.scope);
     return { approve: `auto-approved ${key}`, source: "auto-mode", rule: key };
   }
@@ -469,14 +500,20 @@ export function autoVerdict(
   // too long for the card before any card is shown, so this is what keeps a
   // lookalike tool's cut summary from riding an Auto grant.)
   const unsafeCommand = jobTool ? truncatedJobSummary(summary) : unsafeCommandSummary(tool, summary);
+  const mcpKey = context?.mcpToolAllowKey ?? null;
+  const mcpGrant =
+    !destructive && !sensitive && !systemChange && !unsafeCommand && !jobTool && mcpKey && bot.alwaysAllow?.includes(mcpKey)
+      ? { approve: `auto-approved ${tool} (always allowed)`, source: "always-allow" as const, rule: mcpKey }
+      : null;
   const grant =
     destructive || sensitive || systemChange || unsafeCommand
       ? null
-      : !jobTool && bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
-        ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
-        : bot.autoApprove
-          ? { approve: `auto-approved ${jobTool ? key : tool}`, source: "auto-mode" as const, rule: jobTool ? key : undefined }
-          : null;
+      : mcpGrant
+        ?? (!jobTool && bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
+          ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
+          : bot.autoApprove
+            ? { approve: `auto-approved ${jobTool ? key : tool}`, source: "auto-mode" as const, rule: jobTool ? key : undefined }
+            : null);
   if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
   if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
   if (systemChange) return { approve: null, source: "system-guard", rule: systemChange };

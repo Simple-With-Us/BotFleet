@@ -2,12 +2,15 @@ import { boundStalePromptSnapshots, retainRoutineRuns } from "../shared/routine-
 import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { z } from "zod";
 
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
+import type { JsonValue } from "./schema.ts";
+import { loadGuarded, logRefusedSave, type Interpreted } from "./store-guard.ts";
 import type { RoutineRequestOperation } from "../shared/routine-request.ts";
 import {
   allowsMultipleBotThreads,
@@ -18,8 +21,10 @@ import {
 import { foldPrompts, gapEndsAt, withinGap } from "./trigger-gap.ts";
 import { routineFailureCode, routineFailurePhase, type RoutineOutcomeCode, type RoutineFailurePhase } from "../shared/routine-outcomes.ts";
 import { botAutomationsPausedMessage } from "./bot-stop-policy.ts";
+import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { canonicalTimeZone, nextZonedOccurrence } from "../shared/time-zone.ts";
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
+import { sanitizeToolPolicy, type ToolPolicy } from "./tool-policy.ts";
 
 export type RoutineSchedule =
   | { type: "once"; at: number }
@@ -112,6 +117,9 @@ export interface Routine {
   /** When true, each wake runs on a fresh thread with no transcript replay;
    *  the owner automation thread receives one summary message. */
   oneShotWake?: boolean;
+  /** The commands and files this routine's turns may touch
+   *  (server/tool-policy.ts).  Absent: an ordinary routine turn. */
+  toolPolicy?: ToolPolicy;
   nextRunAt: number | null;
   createdAt: number;
   updatedAt: number;
@@ -128,6 +136,10 @@ export interface RoutineRun {
    * routines.json. */
   prompt?: string;
   durationMinutes?: number;
+  /** Snapshot of the routine's command allowlist as queued, kept beside the
+   *  prompt snapshot so a run whose routine was deleted or edited meanwhile
+   *  can never dispatch its prompt without the allowlist it was queued with. */
+  toolPolicy?: ToolPolicy;
   botId: string;
   runOn: RoutineRunOn;
   scheduledFor: number;
@@ -212,6 +224,8 @@ export interface RoutineInput {
   scheduleTimeZoneSource?: "stored" | "host";
   durationMinutes?: number;
   oneShotWake?: boolean;
+  /** A command allowlist, or null to remove one (update only). */
+  toolPolicy?: JsonValue | ToolPolicy | null;
 }
 
 interface RoutineFile {
@@ -223,6 +237,27 @@ interface RoutineFile {
   /** Manual bot snoozes, keyed by bot id.  `null` is an indefinite snooze
    * (Infinity is not valid JSON); a number is the epoch-ms expiry. */
   botSnoozes?: Record<string, number | null>;
+}
+
+/** The least routines.json must be before the manager can read it: an object whose routines and runs,
+ * when present, are lists of objects that have an id.  Receipts and snoozes keep their own lenient
+ * handling below, as they always had; a stricter test here would set aside a file an older build wrote. */
+const routineFileSchema = z.looseObject({ routines: z.array(z.unknown()).optional(), runs: z.array(z.unknown()).optional() });
+const routineEntrySchema = z.looseObject({ id: z.string().min(1) });
+const isRoutineFile = (candidate: JsonValue): candidate is JsonValue & Partial<RoutineFile> =>
+  routineFileSchema.safeParse(candidate).success;
+
+function interpretRoutineFile(parsed: JsonValue): Interpreted<Partial<RoutineFile>> {
+  if (!isRoutineFile(parsed)) return { ok: false, reason: "it does not hold a routines file" };
+  const routines = (parsed.routines ?? []).filter((entry) => routineEntrySchema.safeParse(entry).success);
+  const runs = (parsed.runs ?? []).filter((entry) => routineEntrySchema.safeParse(entry).success);
+  const found = (parsed.routines?.length ?? 0) + (parsed.runs?.length ?? 0);
+  const usable = routines.length + runs.length;
+  if (found > 0 && usable === 0) return { ok: false, reason: `none of its ${found} entries is a usable routine or run` };
+  // Everything else in the file is carried through untouched: when entries are left out, this value
+  // is what store-guard writes back over routines.json, and it must lose only those entries.
+  const whole: Partial<RoutineFile> = parsed;
+  return { ok: true, value: { ...whole, routines, runs }, omitted: found - usable };
 }
 
 export type RoutineRequestOwner = Pick<RoutineRequestReceipt, "requestId" | "messageId" | "botId" | "threadId">;
@@ -253,6 +288,9 @@ export interface RoutineManagerOptions {
   webhookHotDeferMaxMs?: () => number;
   /** One-line operational log.  Absent writes with `console.log`. */
   log?: (line: string) => void;
+  /** When a queued run can never succeed on the bot's engine for this prompt
+   *  (capability gate `refuse`), settle it as skipped instead of holding forever. */
+  incapableRun?: (run: RoutineRun) => { reason: string } | undefined;
   /** Per-run readiness gate.  False leaves the durable run queued; callers
    * invoke tick() again when the missing runtime prerequisite arrives. */
   canStart?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => boolean;
@@ -322,7 +360,7 @@ export interface RoutineManagerOptions {
     runOn: RoutineRunOn,
     triggerSource: RoutineRunTrigger,
     onDispatchError: (message: string) => void,
-    turnOpts?: { ephemeralDispatch?: boolean },
+    turnOpts?: { ephemeralDispatch?: boolean; toolPolicy?: ToolPolicy },
   ) => Promise<void>;
   interruptTurn?: (botId: string, threadId: string, runOn: RoutineRunOn) => Promise<void>;
   onRunFailed?: (run: RoutineRun) => void;
@@ -436,6 +474,10 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
   const schedule = input.schedule.type === "daily" && input.scheduleTimeZoneSource === "host"
     ? { type: "daily" as const, time: input.schedule.time, weekdays: input.schedule.weekdays }
     : input.schedule;
+  const toolPolicy = sanitizeToolPolicy(input.toolPolicy);
+  // Only a run on the bot's own engine can be held to an allowlist:  a cloud
+  // or Maus run executes somewhere BotFleet does not answer the engine's asks.
+  if (toolPolicy && runOn !== "bot") throw new Error("A routine with a command allowlist must run on the bot");
   return {
     name,
     prompt,
@@ -445,6 +487,8 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
     schedule: cleanSchedule(schedule),
     durationMinutes: Math.min(240, Math.max(15, Math.round(Number(input.durationMinutes) || 30))),
     ...(input.oneShotWake === true ? { oneShotWake: true } : {}),
+    // undefined when there is none:  update() deletes the key then
+    toolPolicy,
   };
 }
 
@@ -464,6 +508,9 @@ export class RoutineManager {
    * so sustained activity still flushes on a bounded cadence. */
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
+  /** True when routines.json could not be read or moved aside, so saving would destroy the only
+   * copy of it.  Logged and shown; the one case in which this manager stops saving. */
+  private writesRefused = false;
   /** When each trigger last STARTED, keyed by `automationThreadKey`.
    *
    * In memory only: a gap is a rate limit on waking a bot, and after a
@@ -479,55 +526,107 @@ export class RoutineManager {
   private readonly botSnoozeUntil = new Map<string, number>();
   /** Coarse hold-reason signatures already persisted and broadcast. */
   private readonly publishedHoldBuckets = new Map<string, string>();
+  /** Deliveries dropped because the bot was snoozed/off (BF-2462). In-memory
+   * only: counting them must not rewrite routines.json. */
+  private skippedDeliveryTotal = 0;
+  private readonly skippedDeliveriesByTrigger = new Map<string, number>();
+
+  /** BF-2462: a webhook/resource delivery for a snoozed/off bot will never
+   * run, so do not persist a run (or its prompt copy) for it. Persisting
+   * ~1,970 instant cancelled rows rewrote all of routines.json with fsync
+   * per delivery and evicted real history. Return a transient receipt so
+   * callers still get 202 + status/outcomeCode, bump a counter, and store
+   * no prompt copy. */
+  private skippedDelivery(input: {
+    routineId: string;
+    routineName: string;
+    botId: string;
+    runOn: RoutineRunOn;
+    receivedAt: number;
+    off: boolean;
+    triggerSource: "webhook" | "resource";
+    webhookId: string;
+    deliveryId: string;
+  }): RoutineRun {
+    this.skippedDeliveryTotal += 1;
+    const key = `${input.triggerSource}:${input.webhookId}`;
+    this.skippedDeliveriesByTrigger.set(key, (this.skippedDeliveriesByTrigger.get(key) ?? 0) + 1);
+    return {
+      id: randomUUID(),
+      routineId: input.routineId,
+      routineName: input.routineName,
+      prompt: "",
+      botId: input.botId,
+      runOn: input.runOn,
+      scheduledFor: input.receivedAt,
+      status: "cancelled",
+      outcomeCode: input.off ? "bot_off" : "cancelled",
+      failurePhase: "lifecycle",
+      error: input.off ? BOT_OFF_SKIPPED : undefined,
+      finishedAt: this.now(),
+      manual: false,
+      triggerSource: input.triggerSource,
+      webhookId: input.webhookId,
+      deliveryId: input.deliveryId,
+      createdAt: this.now(),
+    };
+  }
+
+  skippedDeliveryCount(triggerId?: string, triggerSource?: "webhook" | "resource"): number {
+    if (!triggerId) return this.skippedDeliveryTotal;
+    if (triggerSource) return this.skippedDeliveriesByTrigger.get(`${triggerSource}:${triggerId}`) ?? 0;
+    return (
+      (this.skippedDeliveriesByTrigger.get(`webhook:${triggerId}`) ?? 0) +
+      (this.skippedDeliveriesByTrigger.get(`resource:${triggerId}`) ?? 0)
+    );
+  }
 
   constructor(options: RoutineManagerOptions) {
     this.options = options;
     this.file = options.file ?? join(DATA_DIR, "routines.json");
     this.now = options.now ?? Date.now;
     let runOnMigrated = false;
-    try {
-      const disk = JSON.parse(readFileSync(this.file, "utf8")) as Partial<RoutineFile>;
-      const rawRoutines = Array.isArray(disk.routines) ? disk.routines : [];
-      const rawRuns = Array.isArray(disk.runs) ? disk.runs : [];
-      this.routines = rawRoutines.map((routine) => {
-        const runOn = normalizeRunOn(routine.runOn);
-        if ((routine as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
-        return { ...routine, runOn };
-      });
-      this.runs = rawRuns.map((run) => {
-        const runOn = normalizeRunOn(run.runOn);
-        if ((run as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
-        return { ...run, runOn };
-      });
-      this.routineRequestReceipts = Array.isArray(disk.routineRequestReceipts)
-        ? disk.routineRequestReceipts.filter((receipt): receipt is RoutineRequestReceipt =>
-            typeof receipt?.requestId === "string" &&
-            typeof receipt?.messageId === "string" &&
-            typeof receipt?.botId === "string" &&
-            typeof receipt?.threadId === "string" &&
-            isRoutineRequestAction(receipt?.action) &&
-            receipt?.fingerprintVersion === 1 &&
-            typeof receipt?.fingerprint === "string" && /^[a-f0-9]{64}$/.test(receipt.fingerprint) &&
-            typeof receipt?.resultId === "string" &&
-            Number.isFinite(receipt?.appliedAt)
-          )
-        : [];
-      // Manual snoozes survive restarts: a crash or relaunch must not clear
-      // a user's explicit stop and let the next schedule or webhook restart
-      // the bot.  Expired finite snoozes are dropped, not revived.
-      if (disk.botSnoozes) {
-        for (const [botId, until] of Object.entries(disk.botSnoozes)) {
-          if (until === null) {
-            this.botSnoozeUntil.set(botId, Infinity);
-          } else if (typeof until === "number" && Number.isFinite(until) && until > this.now()) {
-            this.botSnoozeUntil.set(botId, until);
-          }
+    // A routines.json that cannot be used is moved aside, never deleted, and reported (store-guard.ts).
+    // It used to read as "no routines", and the next save replaced it.
+    const loaded = loadGuarded(this.file, interpretRoutineFile);
+    this.writesRefused = loaded.writesRefused;
+    const disk = loaded.value ?? {};
+    const rawRoutines = Array.isArray(disk.routines) ? disk.routines : [];
+    const rawRuns = Array.isArray(disk.runs) ? disk.runs : [];
+    this.routines = rawRoutines.map((routine) => {
+      const runOn = normalizeRunOn(routine.runOn);
+      if ((routine as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
+      return { ...routine, runOn };
+    });
+    this.runs = rawRuns.map((run) => {
+      const runOn = normalizeRunOn(run.runOn);
+      if ((run as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
+      return { ...run, runOn };
+    });
+    this.routineRequestReceipts = Array.isArray(disk.routineRequestReceipts)
+      ? disk.routineRequestReceipts.filter((receipt): receipt is RoutineRequestReceipt =>
+          typeof receipt?.requestId === "string" &&
+          typeof receipt?.messageId === "string" &&
+          typeof receipt?.botId === "string" &&
+          typeof receipt?.threadId === "string" &&
+          isRoutineRequestAction(receipt?.action) &&
+          receipt?.fingerprintVersion === 1 &&
+          typeof receipt?.fingerprint === "string" && /^[a-f0-9]{64}$/.test(receipt.fingerprint) &&
+          typeof receipt?.resultId === "string" &&
+          Number.isFinite(receipt?.appliedAt)
+        )
+      : [];
+    // Manual snoozes survive restarts: a crash or relaunch must not clear
+    // a user's explicit stop and let the next schedule or webhook restart
+    // the bot.  Expired finite snoozes are dropped, not revived.
+    if (disk.botSnoozes) {
+      for (const [botId, until] of Object.entries(disk.botSnoozes)) {
+        if (until === null) {
+          this.botSnoozeUntil.set(botId, Infinity);
+        } else if (typeof until === "number" && Number.isFinite(until) && until > this.now()) {
+          this.botSnoozeUntil.set(botId, until);
         }
       }
-    } catch {
-      this.routines = [];
-      this.runs = [];
-      this.routineRequestReceipts = [];
     }
     if (runOnMigrated) this.save();
     // A local process cannot still own these turns after a full restart.
@@ -616,9 +715,13 @@ export class RoutineManager {
     return true;
   }
 
+  /** Put a run an update cancelled back in the queue.  Only a `cancelled`
+   *  run: one that is running or waiting has already been restarted by
+   *  something else (a release that resumed it first), and queueing it again
+   *  would run the same automation twice. */
   requeueRun(runId: string): boolean {
     const run = this.runs.find((candidate) => candidate.id === runId);
-    if (run && ["cancelled", "running", "waiting"].includes(run.status)) {
+    if (run && run.status === "cancelled") {
       run.status = "queued";
       run.outcomeCode = undefined;
       run.failurePhase = undefined;
@@ -775,6 +878,8 @@ export class RoutineManager {
       schedule: nextSchedule,
       durationMinutes: patch.durationMinutes ?? routine.durationMinutes,
       oneShotWake: patch.oneShotWake ?? routine.oneShotWake,
+      // Omitted keeps the stored allowlist;  an explicit null removes it.
+      toolPolicy: patch.toolPolicy === undefined ? routine.toolPolicy : patch.toolPolicy,
     });
     if (this.options.botState(clean.botId) === "missing") throw new Error("That Bot no longer exists");
     const cancelledRuns: RoutineRun[] = [];
@@ -786,6 +891,7 @@ export class RoutineManager {
         updatedAt: Math.max(now, routine.updatedAt + 1),
       });
       if (patch.oneShotWake === false) delete routine.oneShotWake;
+      if (!clean.toolPolicy) delete routine.toolPolicy;
       if (patch.enabled === false) {
         for (const run of this.runs) {
           if (run.routineId !== routine.id || run.status !== "queued") continue;
@@ -859,14 +965,19 @@ export class RoutineManager {
     }
     const routine = this.routines.find((r) => r.id === id);
     if (!routine) return null;
-    this.clearBotSnooze(routine.botId);
+    // Off outranks "Run now": a person pressing it is asking, but the bot is
+    // off, so the run is recorded as skipped and nothing is dispatched.  The
+    // stop is left in place — only Turn On lifts Off.
+    const off = this.botIsOff(routine.botId);
+    if (!off) this.clearBotSnooze(routine.botId);
     let run!: RoutineRun;
     this.commitMutation(() => {
       run = this.newRun(routine, this.now(), true);
+      if (off) this.skipForOff(run, false);
       if (request) this.rememberRoutineRequest(request, run.id, this.now());
     });
     this.emitRun(run);
-    queueMicrotask(() => void this.tick());
+    if (!off) queueMicrotask(() => void this.tick());
     return { ...run };
   }
 
@@ -921,7 +1032,11 @@ export class RoutineManager {
     if (this.options.botState(input.botId) === "missing") {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
-    const snoozed = this.isBotSnoozed(input.botId);
+    // Off is checked before the busy-coalesce below, not after: coalescing
+    // folds the delivery into a receipt that runs when the current turn ends,
+    // which would start new work on a bot that is switched Off.
+    const off = this.botIsOff(input.botId);
+    const snoozed = off || this.isBotSnoozed(input.botId);
     if (!snoozed) {
       const deferred = this.coalesceIntoBusyDefer({
         botId: input.botId,
@@ -936,6 +1051,19 @@ export class RoutineManager {
       });
       if (deferred) return deferred;
     }
+    if (snoozed) {
+      return this.skippedDelivery({
+        routineId: input.webhookId,
+        routineName: input.webhookName,
+        botId: input.botId,
+        runOn: input.runOn,
+        receivedAt: input.receivedAt,
+        off,
+        triggerSource: "webhook",
+        webhookId: input.webhookId,
+        deliveryId: input.deliveryId,
+      });
+    }
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: input.webhookId,
@@ -944,10 +1072,7 @@ export class RoutineManager {
       botId: input.botId,
       runOn: input.runOn,
       scheduledFor: input.receivedAt,
-      status: snoozed ? "cancelled" : "queued",
-      outcomeCode: snoozed ? "cancelled" : undefined,
-      failurePhase: snoozed ? "lifecycle" : undefined,
-      finishedAt: snoozed ? this.now() : undefined,
+      status: "queued",
       manual: false,
       triggerSource: "webhook",
       webhookId: input.webhookId,
@@ -957,9 +1082,7 @@ export class RoutineManager {
     this.runs.push(run);
     this.save();
     this.emitRun(run);
-    if (!snoozed) {
-      queueMicrotask(() => void this.tick());
-    }
+    queueMicrotask(() => void this.tick());
     return { ...run };
   }
 
@@ -977,7 +1100,11 @@ export class RoutineManager {
     if (this.options.botState(input.botId) === "missing") {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
-    const snoozed = this.isBotSnoozed(input.botId);
+    // Off is checked before the busy-coalesce below, not after: coalescing
+    // folds the delivery into a receipt that runs when the current turn ends,
+    // which would start new work on a bot that is switched Off.
+    const off = this.botIsOff(input.botId);
+    const snoozed = off || this.isBotSnoozed(input.botId);
     if (!snoozed) {
       const deferred = this.coalesceIntoBusyDefer({
         botId: input.botId,
@@ -992,6 +1119,19 @@ export class RoutineManager {
       });
       if (deferred) return deferred;
     }
+    if (snoozed) {
+      return this.skippedDelivery({
+        routineId: input.triggerId,
+        routineName: input.triggerName,
+        botId: input.botId,
+        runOn: input.runOn,
+        receivedAt: input.receivedAt,
+        off,
+        triggerSource: "resource",
+        webhookId: input.triggerId,
+        deliveryId: input.deliveryId,
+      });
+    }
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: input.triggerId,
@@ -1000,10 +1140,7 @@ export class RoutineManager {
       botId: input.botId,
       runOn: input.runOn,
       scheduledFor: input.receivedAt,
-      status: snoozed ? "cancelled" : "queued",
-      outcomeCode: snoozed ? "cancelled" : undefined,
-      failurePhase: snoozed ? "lifecycle" : undefined,
-      finishedAt: snoozed ? this.now() : undefined,
+      status: "queued",
       manual: false,
       triggerSource: "resource",
       webhookId: input.triggerId,
@@ -1013,9 +1150,7 @@ export class RoutineManager {
     this.runs.push(run);
     this.save();
     this.emitRun(run);
-    if (!snoozed) {
-      queueMicrotask(() => void this.tick());
-    }
+    queueMicrotask(() => void this.tick());
     return { ...run };
   }
 
@@ -1150,19 +1285,37 @@ export class RoutineManager {
         if (!routine.enabled || routine.nextRunAt == null || routine.nextRunAt > now) continue;
         const scheduledFor = routine.nextRunAt;
         const late = now - scheduledFor;
+        const off = this.botIsOff(routine.botId);
         const snoozed = this.isBotSnoozed(routine.botId);
-        if (snoozed) {
+        if (off) {
+          // The schedule still advances (below), so turning the bot back on
+          // resumes at the next occurrence instead of replaying the backlog.
+          // The run is recorded as skipped with its reason; it is not
+          // `missed`, which would count as needing attention.  Sentry has no
+          // skipped status, so the pause is reported explicitly: the check-in
+          // opens and closes non-ok (never `ok` for work that never ran, per
+          // BF-2476), because emitting nothing would let Sentry synthesize a
+          // `missed` check-in at the deadline with no context.  The run
+          // record itself, with outcomeCode `bot_off`, is the
+          // deliberate-pause signal.
+          const skipped = this.newRun(routine, scheduledFor, false);
+          this.skipForOff(skipped);
+          skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
+          if (skipped.sentryCheckInId) this.options.checkInFinish?.(skipped, skipped.sentryCheckInId, false);
+        } else if (snoozed) {
           const skipped = this.newRun(routine, scheduledFor, false);
           skipped.status = "missed";
           skipped.finishedAt = now;
           skipped.error = botAutomationsPausedMessage();
           skipped.outcomeCode = "bot_stopped";
           skipped.failurePhase = "lifecycle";
+          skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
           this.emitRun(skipped);
-          if (routine.schedule.type === "daily") {
-            const checkInId = this.options.checkInStart?.(skipped, routine);
-            if (checkInId) this.options.checkInFinish?.(skipped, checkInId, true);
-          }
+          // Same explicit-pause reporting as above (BF-2476): a stopped bot
+          // is a deliberate pause, not a success — the check-in opens and
+          // closes non-ok, because the only statuses Sentry offers are `ok`
+          // and `error` and emitting nothing would synthesize `missed`.
+          if (skipped.sentryCheckInId) this.options.checkInFinish?.(skipped, skipped.sentryCheckInId, false);
         } else if (late > CATCH_UP_MS) {
           const missed = this.newRun(routine, scheduledFor, false);
           missed.status = "missed";
@@ -1198,6 +1351,14 @@ export class RoutineManager {
       };
       for (const run of [...this.runs].reverse()) {
         if (run.status !== "queued") continue;
+        // An Off bot's queued receipt is settled as skipped, never parked: it
+        // would otherwise wait for a Turn On and then run hours-old work, and
+        // meanwhile count as pending work that blocks an update.
+        if (this.botIsOff(run.botId)) {
+          this.skipForOff(run);
+          this.save();
+          continue;
+        }
         // `holdReason` is a cached verdict from the last time canStart ran, and
         // the gates below can `continue` without ever re-deriving it. A manual
         // snooze can outlast the engine coming back, leaving a receipt that
@@ -1350,6 +1511,11 @@ export class RoutineManager {
             }
           }
         }
+        const incapable = this.options.incapableRun?.(run);
+        if (incapable) {
+          this.skipIncapable(run, incapable.reason);
+          continue;
+        }
         // Gate before creating, activating, or stamping a task.  A missing
         // runtime credential may take many scheduler ticks to arrive; those
         // retries must not mint duplicate empty tasks as a side effect.
@@ -1426,6 +1592,7 @@ export class RoutineManager {
         ) {
           this.options.activateTask?.(run.botId, ownerThreadId);
         }
+        const hotSince = run.hotDeferredAt ?? run.createdAt;
         run.threadId = threadId;
         run.startedAt = this.now();
         run.status = "running";
@@ -1433,7 +1600,6 @@ export class RoutineManager {
         run.hotDeferredAt = undefined;
         this.publishedHoldBuckets.delete(run.id);
         if (hotDeferExpiredReason) {
-          const hotSince = run.hotDeferredAt ?? run.createdAt;
           const waitedMin = Math.max(0, Math.round((this.now() - hotSince) / 60_000));
           this.writeLog(
             `[routines] webhook "${run.routineName}" (${run.id}) waited ${waitedMin} min for a busy host and is dispatching anyway.  ${hotDeferExpiredReason}`,
@@ -1453,12 +1619,24 @@ export class RoutineManager {
         }
         // Combined deliveries stay pending until this owning turn settles.
         // A dispatch is not evidence that any delivery completed successfully.
+        //
+        // Only runs held to the same allowlist fold together:  a delivery
+        // queued after the owner narrowed a routine's allowlist must never
+        // ride on an older, broader one.  The rest stay queued and dispatch
+        // on a later tick under their own.
+        const routinePolicy = this.routines.find((r) => r.id === run.routineId)?.toolPolicy;
+        const policyKey = (candidate: RoutineRun) => {
+          const policy = candidate.toolPolicy ?? routinePolicy;
+          return policy ? JSON.stringify(policy) : "";
+        };
+        const ownPolicyKey = policyKey(run);
         const waiting = this.runs.filter(
           (candidate) =>
             candidate.status === "queued" &&
             candidate.id !== run.id &&
             candidate.botId === run.botId &&
-            automationThreadKey(candidate) === key,
+            automationThreadKey(candidate) === key &&
+            policyKey(candidate) === ownPolicyKey,
         );
         for (const folded of waiting) {
           folded.status = "running";
@@ -1495,6 +1673,13 @@ export class RoutineManager {
                 })),
               })
             : own;
+          // The allowlist the run was queued with, else the routine's own.  A
+          // webhook or resource run has no routine and never carries one.
+          // Re-checked here:  routines.json is a file, and a hand-edited
+          // allowlist must fail the run, never reach the driver half-formed.
+          const toolPolicy = run.triggerSource === "webhook" || run.triggerSource === "resource"
+            ? undefined
+            : sanitizeToolPolicy(run.toolPolicy ?? routinePolicy);
           await this.options.startTurn(
             run.botId,
             threadId,
@@ -1502,7 +1687,7 @@ export class RoutineManager {
             normalizeRunOn(run.runOn),
             scheduledTriggerSource,
             (message) => this.failThread(threadId, message, "dispatch_failed"),
-            { ephemeralDispatch: Boolean(run.ownerThreadId) },
+            { ephemeralDispatch: Boolean(run.ownerThreadId), toolPolicy },
           );
         } catch (error) {
           this.failThread(threadId, error instanceof Error ? error.message : String(error), "dispatch_failed");
@@ -1514,7 +1699,20 @@ export class RoutineManager {
   }
 
   handleRuntimeEvent(event: RuntimeEvent, opts?: { fallingOver?: boolean }): RoutineRun | null {
-    const run = this.runs.find((r) => !r.coalescedInto && r.threadId === event.threadId && ["running", "waiting"].includes(r.status));
+    if (
+      event.type !== "session.started" &&
+      event.type !== "request.opened" &&
+      event.type !== "request.resolved" &&
+      event.type !== "runtime.error" &&
+      event.type !== "turn.retrying" &&
+      event.type !== "turn.completed" &&
+      !(event.type === "item.completed" && event.itemType === "assistant_text")
+    ) {
+      return null;
+    }
+    const run = this.runs.find(
+      (r) => !r.coalescedInto && r.threadId === event.threadId && (r.status === "running" || r.status === "waiting"),
+    );
     if (!run) return null;
     run.engineId = event.providerInstanceId ?? event.provider;
     run.driver = event.provider;
@@ -1602,7 +1800,9 @@ export class RoutineManager {
   }
 
   failThread(threadId: string, message: string, code = routineFailureCode(message)) {
-    const run = this.runs.find((r) => !r.coalescedInto && r.threadId === threadId && ["running", "waiting"].includes(r.status));
+    const run = this.runs.find(
+      (r) => !r.coalescedInto && r.threadId === threadId && (r.status === "running" || r.status === "waiting"),
+    );
     if (!run) return;
     this.failRun(run, message, code);
     this.deliverEphemeralFailure(run, message);
@@ -1696,6 +1896,53 @@ export class RoutineManager {
     this.publishedHoldBuckets.delete(run.id);
   }
 
+  /** Settle a receipt for a bot that is switched Off: skipped, never retried.
+   *
+   *  `cancelled`, not `missed` or `failed`: both of those are in
+   *  ROUTINE_ATTENTION_STATUSES, so an Off bot would light the attention badge
+   *  for every Sentry webhook it politely ignored.  The run stays in history
+   *  with the reason, which is the whole requirement — a trigger that fires
+   *  while the bot is Off is recorded and dropped, not held for later.
+   *  Caller saves. */
+  private skipForOff(run: RoutineRun, emit = true): void {
+    this.leaveQueued(run, "cancelled");
+    run.error = BOT_OFF_SKIPPED;
+    run.outcomeCode = "bot_off";
+    run.failurePhase = "lifecycle";
+    run.finishedAt = this.now();
+    if (emit) this.emitRun(run);
+  }
+
+  /** Engine can never run this queued prompt — record and drop, do not hold. */
+  private skipIncapable(run: RoutineRun, reason: string, emit = true): void {
+    this.leaveQueued(run, "failed");
+    run.error = reason.slice(0, 500);
+    run.outcomeCode = "skipped_incapable";
+    run.failurePhase = "dispatch";
+    run.finishedAt = this.now();
+    if (emit) this.emitRun(run);
+    this.save();
+  }
+
+  /** Whether the bot this run targets is switched Off. */
+  private botIsOff(botId: string): boolean {
+    return this.options.botState(botId) === "off";
+  }
+
+  /** Settle every queued receipt a bot has, because it was just switched Off.
+   *  Running and waiting receipts are left alone: a turn that has started
+   *  finishes.  Returns the receipts it settled. */
+  skipQueuedRunsForBot(botId: string): RoutineRun[] {
+    const skipped: RoutineRun[] = [];
+    for (const run of this.runs) {
+      if (run.botId !== botId || run.status !== "queued") continue;
+      this.skipForOff(run);
+      skipped.push({ ...run });
+    }
+    if (skipped.length > 0) this.save();
+    return skipped;
+  }
+
   private failRun(run: RoutineRun, message: string, code = routineFailureCode(message)) {
     this.leaveQueued(run, "failed");
     run.error = message.slice(0, 500);
@@ -1731,6 +1978,7 @@ export class RoutineManager {
       routineName: routine.name,
       prompt: routine.prompt,
       durationMinutes: routine.durationMinutes,
+      toolPolicy: routine.toolPolicy,
       botId: routine.botId,
       runOn: normalizeRunOn(routine.runOn),
       scheduledFor,
@@ -1888,6 +2136,14 @@ export class RoutineManager {
       this.saveTimer = null;
     }
     if (!this.dirty) return;
+    if (this.writesRefused) {
+      // `dirty` stays set on purpose.  It is cleared only after a write lands, so a refused write
+      // leaves the pending state marked exactly as a failed write would — a later flush, once the
+      // owner has fixed the file, still tries to persist it.  Clearing it here would report a save
+      // that never happened as done, and the refusal is logged once per file either way.
+      logRefusedSave(this.file);
+      return;
+    }
     mkdirSync(dirname(this.file), { recursive: true });
     const now = this.now();
     const botSnoozes: Record<string, number | null> = {};

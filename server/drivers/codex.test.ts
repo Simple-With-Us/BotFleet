@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import { CodexDriver, codexLoginAnswer } from "./codex.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 
@@ -81,6 +82,42 @@ describe("CodexDriver turns (fake app-server)", () => {
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
+  });
+
+  it("launches each bot's turn with its own seat and none of the harness's identity", async () => {
+    const restore = inheritHarnessIdentity();
+    try {
+      // an instance-level identity must not survive either
+      await create({ environment: { AGENT_SEAT: "CLAUDE", ZULIP_API_KEY: "instance-api-key" } });
+      const dump = join(scratch, "launch-dump.json");
+      process.env.FAKE_CODEX_DUMP = dump;
+      const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+        const started = await instance.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+        await recorder.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+        return readEngineDump(dump);
+      };
+
+      const plumber = await seenFor("t-cx-plumber", { seat: "BF-PLUMBER", session: "t-cx-plumber" });
+      const fixer = await seenFor("t-cx-fixer", { seat: "BF-FIXER", session: "t-cx-fixer" });
+      const none = await seenFor("t-cx-none", { seat: null, session: "t-cx-none" });
+      expectLaunchedAs(plumber.env, { seat: "BF-PLUMBER", session: "t-cx-plumber" });
+      expectLaunchedAs(fixer.env, { seat: "BF-FIXER", session: "t-cx-fixer" });
+      expectLaunchedAs(none.env, { seat: null, session: "t-cx-none" });
+      expect(JSON.stringify([plumber.env, fixer.env, none.env])).not.toContain("instance-api-key");
+
+      // The model's shell runs under Codex's own environment policy, so the
+      // same values ride as `-c` overrides, quoted, for the right bot only.
+      expect(plumber.argv).toContain('shell_environment_policy.set.AGENT_LAUNCH_SEAT="BF-PLUMBER"');
+      expect(plumber.argv).toContain('shell_environment_policy.set.AGENT_SESSION="t-cx-plumber"');
+      expect(plumber.argv).toContain('shell_environment_policy.set.AGENT_LAUNCHER="botfleet"');
+      expect(fixer.argv).toContain('shell_environment_policy.set.AGENT_SEAT="BF-FIXER"');
+      expect(fixer.argv.join(" ")).not.toContain("BF-PLUMBER");
+      expect(none.argv).toContain('shell_environment_policy.set.AGENT_LAUNCHER="botfleet"');
+      expect(none.argv.join(" ")).not.toContain("AGENT_LAUNCH_SEAT");
+      expect(none.argv.join(" ")).not.toContain("ZULIP");
+    } finally {
+      restore();
+    }
   });
 
   it("runs the handshake and normalizes a full turn", async () => {
@@ -157,9 +194,11 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
     expect(done).toMatchObject({ turnId, ok: true, usage: { input: 7, output: 3, cachedInput: 4 } });
     const text = JSON.stringify(recorder.events);
-    for (const marker of ["HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED", "9999"]) {
+    for (const marker of ["HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED"]) {
       expect(text).not.toContain(marker);
     }
+    // Helper fixture uses inputTokens 9999; a random main-thread turnId must not trip this.
+    expect(text).not.toContain('"inputTokens":9999');
     // the main thread's own turn is intact, in order, with the helper's one
     // host step nested under the spawn_agent row
     expect(recorder.events.map((e) => e.type)).toEqual([
@@ -194,21 +233,21 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(spawn).toMatchObject({ title: "spawn_agent", toolKind: "task" });
     expect((spawn as { parentItemId?: string }).parentItemId).toBeUndefined();
     const helperStep = recorder.events.find((e) => e.type === "item.started" && e.itemId === "h1");
-    expect(helperStep).toMatchObject({ title: "HELPER COMMAND", parentItemId: "spawn-1" });
+    expect(helperStep).toMatchObject({ title: "HELPER COMMAND", parentItemId: "spawn-1", subagentId: "spawn-1" });
     expect(recorder.events.some((e) => e.type === "item.completed" && e.itemId === "h1")).toBe(true);
     // the main thread's own steps stay at the margin
     const own = recorder.events.find((e) => e.type === "item.started" && e.itemId === "i1");
     expect((own as { parentItemId?: string }).parentItemId).toBeUndefined();
   });
 
-  it("reports emulated background jobs and no helpers", async () => {
+  it("reports emulated background jobs and typed helpers", async () => {
     await create();
     // jobs P2: the job tools ride the MCP server Codex already mounts.  The
     // job process is spawned by the harness, not by Codex, so it is NOT inside
     // the codex sandbox — the approval card is what stands between a Codex bot
     // and a job, and a full-auto Codex bot is under ruling (c) instead.
     expect(instance.adapter.capabilities.backgroundJobs).toBe("emulated");
-    expect(instance.adapter.capabilities.helpers).toBe("none");
+    expect(instance.adapter.capabilities.helpers).toBe("typed");
   });
 
   it("files a step's own input (not its outcome fields) for the side store", async () => {
@@ -724,6 +763,9 @@ describe("CodexDriver turns (fake app-server)", () => {
     await instance.adapter.sendTurn({ threadId: "t-approve", text: "clean up" });
     const opened = await recorder.until((e) => e.type === "request.opened");
     expect(opened).toMatchObject({ requestType: "permission", tool: "shell", summary: "rm -rf scratch" });
+    // the step the ask is about (legacy `callId`, v2 `itemId`), so the
+    // auto-review step watch leaves this step to the card
+    expect(opened).toHaveProperty("itemId", "call-approve");
 
     await instance.adapter.respondToRequest("t-approve", opened.requestId!, { behavior: "allow" });
     const resolved = await recorder.until((e) => e.type === "request.resolved");
@@ -876,6 +918,63 @@ describe("CodexDriver turns (fake app-server)", () => {
       sandbox: "workspace-write",
       approvalPolicy: "on-request",
     });
+  });
+
+  it("brokers a full-auto turn held for auto-review, so the reviewer sees the ask before it runs", async () => {
+    // Auto-review On for a bot on a full-auto Codex instance: the harness
+    // sets `holdForReview` on an attended turn, and the turn is brokered
+    // exactly like a host-control turn, inside workspace-write on-request.
+    await create({ mode: "approval", fullAuto: true });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
+    const dump = join(scratch, "held-dump.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-held", text: "clean up", holdForReview: true });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    // an ordinary ask, which auto-review may answer: no host scope on it
+    expect(opened.type === "request.opened" && opened.approvalScope).toBeUndefined();
+    await instance.adapter.respondToRequest("t-held", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed");
+    // SAFETY: FAKE_CODEX_DUMP is written by server/testing/fake-codex-app-server.ts in the FakeDump shape.
+    expect(startParams(JSON.parse(readFileSync(dump, "utf8")) as FakeDump)).toMatchObject({
+      sandbox: "workspace-write",
+      approvalPolicy: "on-request",
+    });
+  });
+
+  it("never resumes a held thread on an unattended turn, which would ask with nobody there", async () => {
+    // A thread started brokered keeps on-request when resumed.  A webhook
+    // turn on a full-auto bot is never held, so it must start fresh in the
+    // instance's own full-auto mode instead of inheriting the held thread's
+    // asks and waiting on a card nobody can answer.
+    await create({ mode: "approval", fullAuto: true });
+    process.env.FAKE_CODEX_DUMP = join(scratch, "held-first.json");
+    await instance.adapter.sendTurn({ threadId: "t-held-then-webhook", text: "first", holdForReview: true });
+    const started = await recorder.until((e) => e.type === "session.started" && e.threadId === "t-held-then-webhook");
+    const heldThread = started.type === "session.started" ? started.sessionId : null;
+    expect(heldThread).toBeTruthy();
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    await instance.adapter.respondToRequest("t-held-then-webhook", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-held-then-webhook");
+
+    const dump = join(scratch, "webhook-after-held.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-held-then-webhook",
+      text: "webhook",
+      resumeCursor: heldThread,
+      unattended: true,
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-held-then-webhook" && e.turnId !== opened.turnId);
+    // SAFETY: FAKE_CODEX_DUMP is written by server/testing/fake-codex-app-server.ts in the FakeDump shape.
+    const written = JSON.parse(readFileSync(dump, "utf8")) as FakeDump;
+    expect(written.calls.some((c) => c.method === "thread/resume")).toBe(false);
+    expect(startParams(written)).toMatchObject({ sandbox: "danger-full-access", approvalPolicy: "never" });
+  });
+
+  it("asks before every approval when not full-auto, which is where review holds it", async () => {
+    await create({ mode: "approval" });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "before", asksWhenHeld: true });
   });
 
   it("does not broker an isolated computer, which carries no host scope", async () => {

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+import type { JsonValue } from "./schema.ts";
 import { WebhookManager, type WebhookManagerOptions } from "./webhooks.ts";
 
 const dirs: string[] = [];
@@ -124,6 +125,36 @@ describe("WebhookManager", () => {
     expect(h.queued[0]?.prompt).toContain("[UNTRUSTED WEBHOOK EVENT DATA]");
     expect(h.queued[0]?.prompt).toMatch(/"lead"\s*:\s*"Ada"/);
     expect(h.manager.list()[0]).toMatchObject({ lastRunId: "run-1", deliveryCount: 1 });
+  });
+
+  it("logs a delivery the routine manager skipped as ignored with its reason, and a queued one as accepted (BF-2462)", () => {
+    const h = harness();
+    // A skipped delivery comes back as an unpersisted `cancelled` receipt:  an
+    // Off bot also carries its reason in `error` (its outcome code is `bot_off`,
+    // never a status), a snoozed bot carries none.
+    const receipts: Array<{ id: string; status?: string; error?: string }> = [
+      { id: "skip-off", status: "cancelled", error: "Skipped: this bot is off" },
+      { id: "skip-snoozed", status: "cancelled" },
+      { id: "run-queued", status: "queued" },
+    ];
+    const manager = new WebhookManager({ ...h.options, enqueue: () => receipts.shift()! });
+    const { webhook, secret } = create(manager);
+    for (const deliveryId of ["d-off", "d-snoozed", "d-queued"]) {
+      manager.receive(webhook.endpointId, secret, { payload: { lead: "Ada" }, contentType: "application/json", deliveryId });
+    }
+
+    const attempts = manager.listAttempts();
+    expect(attempts.find((attempt) => attempt.runId === "skip-off")).toMatchObject({
+      outcome: "ignored",
+      statusCode: 202,
+      reason: "Skipped: this bot is off",
+    });
+    const snoozed = attempts.find((attempt) => attempt.runId === "skip-snoozed");
+    expect(snoozed).toMatchObject({ outcome: "ignored", statusCode: 202 });
+    expect(snoozed).not.toHaveProperty("reason");
+    const queued = attempts.find((attempt) => attempt.runId === "run-queued");
+    expect(queued).toMatchObject({ outcome: "accepted", statusCode: 202 });
+    expect(queued).not.toHaveProperty("reason");
   });
 
   it("uses an authenticated task from the payload when default instructions are empty", () => {
@@ -406,7 +437,10 @@ describe("WebhookManager", () => {
     expect(() => h.manager.receive(webhook.endpointId, secret, { payload: { overflow: true }, eventName: "push" })).toThrow("rate limit");
   });
 
-  it("pre-filters out-of-scope Sentry warnings and pending GitHub compile runs at ingress", () => {
+  // One matrix over ingress filters: dozens of triggers and receives, each
+  // compiling scope regexes and persisting attempt rows.  Windows CI runners
+  // can exceed the default 20s budget under full-suite load.
+  it("pre-filters out-of-scope Sentry warnings and pending GitHub compile runs at ingress", { timeout: 120_000 }, () => {
     const h = harness();
     const { webhook: sentryHook, secret: sentrySecret } = h.manager.create({
       name: "Sentry Incident Webhook → Fixer",
@@ -473,7 +507,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "requested",
         workflow_run: { id: 12345, status: "queued" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const requestedResult = h.manager.receive(compileHook.endpointId, compileSecret, requestedEvent);
@@ -592,7 +626,7 @@ describe("WebhookManager", () => {
           status: "completed",
           conclusion: "failure",
         },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const completedCheckResult = h.manager.receive(compileHook.endpointId, compileSecret, completedCheckEvent);
@@ -608,7 +642,7 @@ describe("WebhookManager", () => {
           id: 54322,
           status: "in_progress",
         },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const activeCheckResult = h.manager.receive(compileHook.endpointId, compileSecret, activeCheckEvent);
@@ -624,7 +658,7 @@ describe("WebhookManager", () => {
           status: "completed",
           conclusion: "success",
         },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const successfulCheckResult = h.manager.receive(compileHook.endpointId, compileSecret, successfulCheckEvent);
@@ -797,7 +831,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "opened",
         pull_request: { id: 111, merged: false },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const prOpenResult = h.manager.receive(compileHook.endpointId, compileSecret, prOpenEvent);
@@ -808,7 +842,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "closed",
         pull_request: { id: 112, merged: false },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const prUnmergedClosedResult = h.manager.receive(compileHook.endpointId, compileSecret, prUnmergedClosedEvent);
@@ -819,7 +853,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "closed",
         pull_request: { id: 113, merged: true, merged_at: "2026-09-24T09:00:00Z" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const prMergedClosedResult = h.manager.receive(compileHook.endpointId, compileSecret, prMergedClosedEvent);
@@ -862,7 +896,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "completed",
         check_suite: { id: 701, status: "completed", conclusion: "success" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     expect(h.manager.receive(compileHook.endpointId, compileSecret, successfulSuiteEvent)).toMatchObject({ ignored: true });
@@ -872,7 +906,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "completed",
         check_suite: { id: 702, status: "completed", conclusion: "failure" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const failedSuiteResult = h.manager.receive(compileHook.endpointId, compileSecret, failedSuiteEvent);
@@ -884,7 +918,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "in_progress",
         workflow_job: { id: 801, status: "in_progress" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     expect(h.manager.receive(compileHook.endpointId, compileSecret, inProgressJobEvent)).toMatchObject({ ignored: true });
@@ -894,7 +928,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "completed",
         workflow_job: { id: 802, status: "completed", conclusion: "failure" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const failedJobResult = h.manager.receive(compileHook.endpointId, compileSecret, failedJobEvent);
@@ -929,7 +963,7 @@ describe("WebhookManager", () => {
       payload: {
         state: "pending",
         sha: "abc1234",
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const pendingStatusResult = h.manager.receive(compileHook.endpointId, compileSecret, pendingStatusEvent);
@@ -940,7 +974,7 @@ describe("WebhookManager", () => {
       payload: {
         state: "success",
         sha: "abc1234",
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const successStatusResult = h.manager.receive(compileHook.endpointId, compileSecret, successStatusEvent);
@@ -951,7 +985,7 @@ describe("WebhookManager", () => {
       payload: {
         state: "failure",
         sha: "abc1234",
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const failureStatusResult = h.manager.receive(compileHook.endpointId, compileSecret, failureStatusEvent);
@@ -1096,7 +1130,7 @@ describe("WebhookManager", () => {
       deliveryId: "push-1",
       payload: {
         ref: "refs/heads/main",
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     const pushResult = h.manager.receive(compileHook.endpointId, compileSecret, pushEvent);
@@ -1578,7 +1612,7 @@ describe("WebhookManager", () => {
         action: "edited",
         sender: { login: "github-actions[bot]" },
         issue: { number: 171, title: "Align analytics endpoint schemas", state: "closed" },
-        repository: { full_name: "jaywedgeworth22/congress-trading-shared" },
+        repository: { full_name: "Simple-With-Us/congress-trading-shared" },
       },
     };
     const botIssueResult = h.manager.receive(deployerHook.endpointId, deployerSecret, botIssueEdit);
@@ -1610,7 +1644,7 @@ describe("WebhookManager", () => {
         sender: { login: "jaywedgeworth22" },
         assignee: { login: "BF-Deployer" },
         issue: { number: 172, title: "Please help deploy this", state: "open" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade" },
       },
     };
     const deployerAssignResult = h.manager.receive(deployerHook.endpointId, deployerSecret, humanIssueAssign);
@@ -1624,7 +1658,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "opened",
         pull_request: { number: 10, draft: true, state: "open" },
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     expect(h.manager.receive(deployerHook.endpointId, deployerSecret, draftPr)).toMatchObject({ ignored: true });
@@ -1635,7 +1669,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "closed",
         pull_request: { number: 11, draft: false, state: "closed", merged: false },
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     expect(h.manager.receive(deployerHook.endpointId, deployerSecret, unmergedClosedPr)).toMatchObject({ ignored: true });
@@ -1646,7 +1680,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "closed",
         pull_request: { number: 12, draft: false, state: "closed", merged: true, merged_at: "2026-09-28T07:00:00Z" },
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     const mergedResult = h.manager.receive(deployerHook.endpointId, deployerSecret, mergedClosedPr);
@@ -1670,7 +1704,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "created",
         check_run: { id: 100, status: "in_progress", conclusion: null },
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     expect(h.manager.receive(deployerHook.endpointId, deployerSecret, inProgressCheck)).toMatchObject({ ignored: true });
@@ -1681,7 +1715,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "completed",
         check_run: { id: 101, status: "completed", conclusion: "success" },
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     const deployerCompletedCheckResult = h.manager.receive(deployerHook.endpointId, deployerSecret, completedCheck);
@@ -1690,6 +1724,146 @@ describe("WebhookManager", () => {
   });
 });
 
+// BF-2459: the Compiler webhook fires when a pull request merges, and for
+// nothing else.  The flag states that on the trigger itself, so the rule holds
+// whatever the trigger is called and whatever event types it lists.
+describe("WebhookManager merged pull requests only", () => {
+  const startedAt = Date.parse("2026-08-16T10:00:00.000Z");
+  const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet" };
+  const pullRequest = (action: string, details: Record<string, JsonValue>, deliveryId: string) => ({
+    eventName: "pull_request",
+    deliveryId,
+    payload: { action, number: 7, repository, pull_request: { number: 7, ...details } },
+  });
+  const merged = pullRequest("closed", { merged: true, merged_at: "2026-10-18T21:00:00Z" }, "pr-merged");
+  const closedUnmerged = pullRequest("closed", { merged: false, merged_at: null }, "pr-closed-unmerged");
+  const opened = pullRequest("opened", { merged: false }, "pr-opened");
+  const failedCheckRun = {
+    eventName: "check_run",
+    deliveryId: "check-run-failed",
+    payload: {
+      action: "completed",
+      repository,
+      check_run: { id: 1, status: "completed", conclusion: "failure" },
+    },
+  };
+  // The name says nothing about compile gates, so only the flag can filter.
+  const compiler = { name: "Compiler", prompt: "Verify the merge.", botId: "maus-1" };
 
+  it("runs for a merged pull request and filters everything else before a run exists", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...compiler, mergedPullRequestsOnly: true });
+    expect(webhook.mergedPullRequestsOnly).toBe(true);
 
+    for (const event of [closedUnmerged, opened, failedCheckRun]) {
+      expect(h.manager.receive(webhook.endpointId, secret, event)).toMatchObject({ duplicate: false, ignored: true });
+    }
+    expect(h.queued).toHaveLength(0);
 
+    const result = h.manager.receive(webhook.endpointId, secret, merged);
+    expect(result).toMatchObject({ duplicate: false, runId: "run-1" });
+    expect(result.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(1);
+    expect(h.queued[0]?.prompt).toContain("Event: pull_request");
+
+    expect(h.manager.list()[0]).toMatchObject({ deliveryCount: 1, ignoredCount: 3 });
+    expect(h.manager.listAttempts().map((attempt) => [attempt.outcome, attempt.reason])).toEqual([
+      ["ignored", expect.stringContaining("pull_request closed without merging ignored")],
+      ["ignored", expect.stringContaining("pull_request action 'opened' ignored")],
+      ["ignored", expect.stringContaining("Event 'check_run' ignored")],
+      ["accepted", undefined],
+    ]);
+  });
+
+  it("treats a merge timestamp as a merge and ignores a delivery that is not a pull request at all", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...compiler, mergedPullRequestsOnly: true });
+
+    const mergedByTimestamp = pullRequest("closed", { merged_at: "2026-10-18T21:05:00Z" }, "pr-merged-at");
+    expect(h.manager.receive(webhook.endpointId, secret, mergedByTimestamp).runId).toBe("run-1");
+
+    expect(h.manager.receive(webhook.endpointId, secret, { payload: { message: "hello" } })).toMatchObject({ ignored: true });
+    expect(h.manager.receive(webhook.endpointId, secret, { payload: "closed", eventName: "pull_request" })).toMatchObject({ ignored: true });
+    expect(h.queued).toHaveLength(1);
+    expect(h.manager.listAttempts().at(-1)?.reason).toContain("GitHub pull_request action 'unknown' ignored");
+  });
+
+  it("filters whatever the event type list allows, and leaves a webhook without the flag unchanged", () => {
+    const h = harness();
+    const broad = h.manager.create({ ...compiler, eventTypes: ["pull_request", "check_run"], mergedPullRequestsOnly: true });
+    expect(h.manager.receive(broad.webhook.endpointId, broad.secret, failedCheckRun)).toMatchObject({ ignored: true });
+    expect(h.manager.receive(broad.webhook.endpointId, broad.secret, closedUnmerged)).toMatchObject({ ignored: true });
+    expect(h.queued).toHaveLength(0);
+
+    const unfiltered = h.manager.create({ name: "Release watcher", prompt: "Summarize it.", botId: "maus-1" });
+    expect(unfiltered.webhook.mergedPullRequestsOnly).toBeUndefined();
+    for (const event of [closedUnmerged, opened, failedCheckRun, merged]) {
+      const result = h.manager.receive(unfiltered.webhook.endpointId, unfiltered.secret, event);
+      expect(result).toMatchObject({ duplicate: false });
+      expect(result.runId).toBeDefined();
+    }
+    expect(h.queued).toHaveLength(4);
+    const untouched = h.manager.list().find((candidate) => candidate.id === unfiltered.webhook.id);
+    expect(untouched?.ignoredCount).toBeUndefined();
+    expect(untouched?.lastIgnoredAt).toBeUndefined();
+  });
+
+  it("is set and cleared by update, survives a rename and a restart, and stays out of the file when off", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create(compiler);
+    expect(h.manager.receive(webhook.endpointId, secret, closedUnmerged).runId).toBe("run-1");
+
+    expect(h.manager.update(webhook.id, { mergedPullRequestsOnly: true })?.mergedPullRequestsOnly).toBe(true);
+    expect(h.manager.receive(webhook.endpointId, secret, opened)).toMatchObject({ ignored: true });
+
+    // A rename, or an edit from the settings panel that never sends the flag, keeps it.
+    expect(h.manager.update(webhook.id, { name: "Compiler (merges)" })?.mergedPullRequestsOnly).toBe(true);
+    h.manager.flushNow();
+    const reloaded = new WebhookManager(h.options);
+    expect(reloaded.list()[0]).toMatchObject({ name: "Compiler (merges)", mergedPullRequestsOnly: true });
+    expect(reloaded.receive(webhook.endpointId, secret, failedCheckRun)).toMatchObject({ ignored: true });
+
+    expect(reloaded.update(webhook.id, { mergedPullRequestsOnly: false })?.mergedPullRequestsOnly).toBeUndefined();
+    reloaded.flushNow();
+    expect(readFileSync(h.file, "utf8")).not.toContain("mergedPullRequestsOnly");
+    expect(reloaded.receive(webhook.endpointId, secret, { ...failedCheckRun, deliveryId: "check-run-again" }).runId).toBe("run-2");
+  });
+
+  it("counts every filtered delivery, past the log throttle and across a restart, without a run or an extra write", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...compiler, eventTypes: ["pull_request"], mergedPullRequestsOnly: true });
+
+    // The event-name allowlist and the merged-only rule both count.  Three
+    // log rows per ten seconds is the existing cap, and this fills it.
+    for (const event of [
+      { ...failedCheckRun, deliveryId: "f-1" },
+      { ...closedUnmerged, deliveryId: "f-2" },
+      { ...opened, deliveryId: "f-3" },
+    ]) h.manager.receive(webhook.endpointId, secret, event);
+    h.manager.flushNow();
+    const written = statSync(h.file).mtimeMs;
+
+    // Over the cap: counted, not logged, and nothing is marked for saving.
+    h.manager.receive(webhook.endpointId, secret, { ...opened, deliveryId: "f-4" });
+    h.manager.receive(webhook.endpointId, secret, { ...failedCheckRun, deliveryId: "f-5" });
+    h.manager.flushNow();
+    expect(statSync(h.file).mtimeMs).toBe(written);
+    expect(h.queued).toHaveLength(0);
+    expect(h.manager.listAttempts().filter((attempt) => attempt.outcome === "ignored")).toHaveLength(3);
+    expect(h.manager.list()[0]).toMatchObject({ ignoredCount: 5, lastIgnoredAt: startedAt, deliveryCount: 0 });
+    // The disk is behind by the two uncounted rows until the next write.
+    expect(JSON.parse(readFileSync(h.file, "utf8")).webhooks[0].ignoredCount).toBe(3);
+
+    h.setNow(startedAt + 60_000);
+    h.manager.receive(webhook.endpointId, secret, { ...opened, deliveryId: "f-6" });
+    h.manager.flushNow();
+    expect(new WebhookManager(h.options).list()[0]).toMatchObject({ ignoredCount: 6, lastIgnoredAt: startedAt + 60_000 });
+  });
+
+  it("keeps the counters out of management input", () => {
+    const h = harness();
+    const { webhook } = h.manager.create({ ...compiler, ignoredCount: 99 });
+    expect(webhook.ignoredCount).toBeUndefined();
+    expect(h.manager.update(webhook.id, { ignoredCount: 99, lastIgnoredAt: 1 })?.ignoredCount).toBeUndefined();
+  });
+});

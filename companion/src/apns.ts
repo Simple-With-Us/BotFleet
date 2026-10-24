@@ -3,10 +3,13 @@
 // leaves this process; tests inject sendImpl.
 import { connect as http2Connect, constants as http2Constants, type ClientHttp2Session, type ClientHttp2Stream } from "node:http2";
 import { createHash, createPrivateKey, sign as cryptoSign } from "node:crypto";
+import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
+import { isFiniteJsonNumber, isJsonObject, isJsonString, type JsonObject, type JsonValue } from "./json.ts";
 import { DATA_DIR, writeFileAtomic } from "./state.ts";
 
 export interface ApnsConfig {
@@ -17,39 +20,288 @@ export interface ApnsConfig {
   production: boolean;
 }
 
-/** Where the signing key lives.  The path, never the contents. */
-export function apnsKeyPath(): string {
-  const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
-  return process.env.APNS_P8_PATH?.trim() || join(homedir(), ".secrets", `AuthKey_${keyId}.p8`);
+/** The fleet's shared APNs key (Simple With Us team CC8UTF7ATG), used when
+ * neither the environment nor Infisical names another one (AFC-359). */
+export const SHARED_APNS_KEY_ID = "HSJ98QN95V";
+/** Fleet-OPS root names of the shared key:  references into `/apns`, so a
+ * rotation there reaches the sidecar without a code change. */
+export const SHARED_APNS_KEY_ID_NAME = "APNS_KEY_ID";
+export const SHARED_APNS_P8_NAME = "APNS_KEY_P8";
+
+/** The Infisical name of an APNs signing key.  With no key id it is the
+ * shared key (`APNS_KEY_P8`);  a key pinned by `APNS_KEY_ID` in the
+ * environment is read as `AUTHKEY_<KEY_ID>`, one per Apple key (AFC-359: the
+ * retired secrets folder is never read). */
+export function apnsVaultName(keyId?: string): string {
+  return keyId ? `AUTHKEY_${keyId}` : SHARED_APNS_P8_NAME;
 }
 
-/** A fingerprint of the key FILE — its path, modification time and size,
- * never a byte of the key itself.  Cheap enough to take every few minutes,
- * and enough to notice a rotated .p8 that kept its path.  The path is part
- * of it because `APNS_P8_PATH` can move the key: pointing the sidecar at a
- * different file is a key change, and a fault recorded against the old one
- * must not survive it. */
-export function apnsKeyStamp(path = apnsKeyPath()): string | null {
+/** The key id pinned in the environment, if any. */
+function pinnedKeyId(): string | undefined {
+  return process.env.APNS_KEY_ID?.trim() || undefined;
+}
+
+/** The `fleet-secrets` binary.  `FLEET_SECRETS_BIN` is the test seam. */
+function fleetSecretsBin(): string {
+  return process.env.FLEET_SECRETS_BIN?.trim() || join(homedir(), ".local", "bin", "fleet-secrets");
+}
+
+/** How long a key read from Infisical is trusted before it is read again.
+ * The sidecar re-checks the key every few minutes; one `fleet-secrets` call
+ * per window is enough to notice a rotation without a process per tick. */
+export const APNS_VAULT_CACHE_MS = 4 * 60 * 1000;
+/** A failed read is retried sooner: a Mac that was still booting should not
+ *  keep pushes off for a whole window.  The window is measured from the moment
+ *  the read FINISHED, so a read that runs longer than the window cannot expire
+ *  its own failure entry and trigger an immediate second blocking read. */
+export const APNS_VAULT_RETRY_MS = 30_000;
+
+/** The slowest `fleet-secrets` read measured on the fleet Mac (2026-10-19):
+ *  3.6-5.3 s warm, 16.6 s with a cold cache.  The ceiling below is derived
+ *  from this number rather than picked by feel, so re-measuring retunes the
+ *  guard instead of leaving a magic constant behind. */
+export const APNS_VAULT_READ_BUDGET_MS = 16_600;
+
+/** How long one `fleet-secrets` read may take before it counts as failed.
+ *
+ * The read is an Infisical round-trip, not a local file read.  A ceiling below
+ * the vault's own latency does not slow the sidecar down — it removes the
+ * key:  the read is killed, the failure looks like "no key", and the sidecar
+ * turns APNs pushes OFF.  That is exactly what the old 10 s ceiling did to a
+ * cold-cache read.  Three times the measured worst case leaves room for a
+ * slower network without letting a wedged read hang the key path. */
+export const APNS_VAULT_READ_TIMEOUT_MS = 3 * APNS_VAULT_READ_BUDGET_MS;
+
+/** A finite, positive integer from the environment, or the fallback.
+ *
+ * Both failure modes here are the same one:  the value stops being a sensible
+ * timeout and the read stops working, which the sidecar reads as "no key" and
+ * turns APNs pushes off.  `Number("-1")` is a number, so a negative value
+ * sails through a `|| fallback` and becomes a timeout that fires instantly.
+ * `Number("0.5")` is a number too, and Node's `execFile` rejects a
+ * fractional timeout with ERR_OUT_OF_RANGE — so the read throws, the catch
+ * swallows it, and the key silently disappears. */
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const configured = Number(process.env[name]);
+  return Number.isInteger(configured) && configured > 0 ? configured : fallback;
+}
+
+/** The read ceiling actually used, overridable for a slower vault. */
+function vaultReadTimeoutMs(): number {
+  return positiveIntegerEnv("APNS_VAULT_READ_TIMEOUT_MS", APNS_VAULT_READ_TIMEOUT_MS);
+}
+
+/** The retry window actually used, overridable for a slower vault. */
+function vaultRetryMs(): number {
+  return positiveIntegerEnv("APNS_VAULT_RETRY_MS", APNS_VAULT_RETRY_MS);
+}
+
+interface VaultKey {
+  /** The pinned key id this read was for, or "" for the shared key. */
+  pin: string;
+  keyId: string;
+  p8: string | null;
+  at: number;
+}
+
+let vaultKey: VaultKey | null = null;
+
+/** The read in flight, so two callers that miss the cache together cause ONE
+ * vault read rather than two.  A synchronous read could not be interleaved;
+ * an async one can, and two concurrent reads would double the wall time of
+ * exactly the slow case this module exists to survive. */
+let vaultReadInFlight: Promise<VaultKey> | null = null;
+
+/** Bumped by `resetApnsKeyCache`.  A read that started before the bump must
+ * not write its answer into the cache the caller just cleared. */
+let vaultGeneration = 0;
+
+/** Test seam: forget the cached Infisical read. */
+export function resetApnsKeyCache(): void {
+  vaultKey = null;
+  vaultReadInFlight = null;
+  vaultGeneration++;
+}
+
+const execFileAsync = promisify(execFile);
+
+/** One `fleet-secrets` read, off the event loop.
+ *
+ * The read is an Infisical round-trip:  3.6-5.3 s warm, 16.6 s cold on the
+ * fleet Mac, and the ceiling above allows up to 49.8 s for a slower vault.
+ * Run synchronously, that window is time the sidecar cannot answer a request,
+ * fire a timer, or drain a push queue for — and the two reads a cold start
+ * needs are sequential, so the worst case froze the event loop for ~100 s.
+ * The read is async and the caller awaits it, and the same `timeout` still
+ * bounds it:  the child is killed at the ceiling, and a killed read is still
+ * a failed read, which is what turns APNs pushes off. */
+async function fleetSecretsGet(name: string): Promise<string | null> {
   try {
-    const info = statSync(path);
-    return `${path}:${info.mtimeMs}:${info.size}`;
+    const { stdout } = await execFileAsync(fleetSecretsBin(), ["get", name], {
+      encoding: "utf8",
+      timeout: vaultReadTimeoutMs(),
+    });
+    return stdout.replace(/\n$/, "");
   } catch {
     return null;
   }
 }
 
-export function loadApnsConfig(): ApnsConfig | null {
-  const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
+/** The key id Infisical names for the shared key, or null when the read
+ * fails or does not look like an Apple key id. */
+async function sharedKeyId(): Promise<string | null> {
+  const id = (await fleetSecretsGet(SHARED_APNS_KEY_ID_NAME))?.trim();
+  return id && /^[A-Z0-9]{10}$/.test(id) ? id : null;
+}
+
+/** The read itself, away from the cache check. */
+async function readVaultFromVault(pin: string, retryMs: number, generation: number): Promise<VaultKey> {
+  const p8 = await fleetSecretsGet(apnsVaultName(pin || undefined));
+  // The entry is stamped when the read FINISHED, not when it started.  A read
+  // that runs longer than the retry window would otherwise leave an
+  // already-expired entry behind, and the very next caller — `refreshConfig`
+  // asks for the stamp and then the config — would run another full read
+  // instead of the cached answer.
+  let completedAt = Date.now();
+  const store = (next: VaultKey): VaultKey => {
+    if (generation === vaultGeneration) vaultKey = next;
+    return next;
+  };
+  if (p8 === null && vaultKey && vaultKey.pin === pin && vaultKey.p8) {
+    // A transient failure keeps the last good key (pushes keep flowing) and
+    // is retried after the short window rather than the long one.
+    return store({ ...vaultKey, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) });
+  }
+  if (pin || p8 === null) {
+    return store({ pin, keyId: pin || SHARED_APNS_KEY_ID, p8, at: completedAt });
+  }
+  const id = await sharedKeyId();
+  // The read is not finished until the id read returns.  Stamping before it
+  // left an entry that was already expired by the time it was stored, when the
+  // id read took longer than the retry window — and the raised ceiling allows
+  // exactly that — so the next caller ran a second full vault round trip
+  // instead of taking the cached answer.
+  completedAt = Date.now();
+  if (id) {
+    return store({ pin, keyId: id, p8, at: completedAt });
+  }
+  // The PEM read but its id did not:  keep the last good id for the same
+  // key, otherwise use the built-in id, and retry after the short window
+  // either way.  The id is part of the stamp, so a fault Apple records
+  // against a wrong fallback id clears once the real id is read.
+  const keyId = vaultKey && vaultKey.pin === pin && vaultKey.p8 === p8 ? vaultKey.keyId : SHARED_APNS_KEY_ID;
+  return store({ pin, keyId, p8, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) });
+}
+
+async function readVault(now = Date.now()): Promise<VaultKey> {
+  const pin = pinnedKeyId() ?? "";
+  const retryMs = vaultRetryMs();
+  if (vaultKey && vaultKey.pin === pin && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : retryMs)) {
+    return vaultKey;
+  }
+  if (!vaultReadInFlight) {
+    const read = readVaultFromVault(pin, retryMs, vaultGeneration);
+    vaultReadInFlight = read;
+    const clear = () => {
+      if (vaultReadInFlight === read) vaultReadInFlight = null;
+    };
+    void read.then(clear, clear);
+  }
+  return vaultReadInFlight;
+}
+
+/** Where the signing key comes from, as text for status lines.  Never the
+ * contents.  Order: `APNS_P8` (the PEM itself, for a host that injects it),
+ * then `APNS_P8_PATH` (an explicit file), then Infisical:  `AUTHKEY_<KEY_ID>`
+ * when `APNS_KEY_ID` pins a key, otherwise the shared `APNS_KEY_P8`. */
+export function apnsKeySource(): string {
+  if (process.env.APNS_P8?.trim()) return "APNS_P8 environment";
+  const explicit = process.env.APNS_P8_PATH?.trim();
+  if (explicit) return explicit;
+  return `Infisical ${apnsVaultName(pinnedKeyId())}`;
+}
+
+async function resolveP8(): Promise<{ p8: string; origin: string; keyId: string } | null> {
+  const pinned = pinnedKeyId();
+  const inline = process.env.APNS_P8?.trim();
+  if (inline) return { p8: inline, origin: "env", keyId: pinned ?? SHARED_APNS_KEY_ID };
+  const explicit = process.env.APNS_P8_PATH?.trim();
+  if (explicit) {
+    try {
+      if (!existsSync(explicit)) return null;
+      return {
+        p8: readFileSync(explicit, "utf8"),
+        origin: `${explicit}:${statSync(explicit).mtimeMs}`,
+        keyId: pinned ?? SHARED_APNS_KEY_ID,
+      };
+    } catch {
+      return null;
+    }
+  }
+  const got = await readVault();
+  return got.p8 ? { p8: got.p8, origin: "vault", keyId: got.keyId } : null;
+}
+
+/** A fingerprint of the key — where it came from plus a one-way digest of
+ * the PEM, never a byte of the key itself.  Cheap enough to take every few
+ * minutes, and enough to notice a rotated .p8 that kept its name.  The
+ * source is part of it because `APNS_P8_PATH` or `APNS_P8` can move the
+ * key: pointing the sidecar at a different key is a key change, and a fault
+ * recorded against the old one must not survive it. */
+// The stamp format changed from `<path>:<mtime>:<size>` in AFC-359.  A key
+// fault persisted before the upgrade therefore never matches and is cleared
+// once on load:  the safe direction, since a key that is still bad is simply
+// re-recorded by the next push Apple refuses.
+export async function apnsKeyStamp(): Promise<string | null> {
+  const got = await resolveP8();
+  if (!got) return null;
+  // The key id is hashed with the PEM:  the same PEM under a different id is
+  // a different signing identity to Apple.
+  const digest = createHash("sha256").update(`${got.keyId}\n${got.p8}`).digest("hex").slice(0, 16);
+  return `${apnsKeySource()}:${digest}`;
+}
+
+/** The mask:  the first eight and the last four characters of the key
+ * material, and nothing else.  Kept as widths so the short-material guard
+ * below can be written in terms of the mask itself rather than as a
+ * hand-copied total that a later edit could drift away from. */
+const KEY_PREVIEW_HEAD = 8;
+const KEY_PREVIEW_TAIL = 4;
+
+/** A masked preview of a signing key:  the first eight and the last four
+ * characters of the key material, and nothing else.
+ *
+ * Rule 43:  a rejected provider key is identified by its masked preview, so
+ * the operator can tell WHICH key Apple refused without the key ever being
+ * printed.  The PEM armour is stripped first, so the preview describes the
+ * key material and not the header.  An absent key previews as "unavailable"
+ * rather than as an empty string, so the line still says something useful.
+ *
+ * A material too short to mask also previews as "unavailable":  the mask
+ * shows the first eight and the last four characters, so a material of
+ * twelve characters or fewer is COVERED by it — the two pieces hand back
+ * every character of the key, just in two halves.  A preview that prints
+ * the secret it exists to hide is worse than no preview at all, so the
+ * short case is refused.
+ *
+ * The bound is the mask's own width, not a copy of it.  At exactly the mask
+ * width the two slices are ADJACENT rather than overlapping, and adjacency
+ * is not the reason the key is refused:  covering it is.  A maintainer who
+ * "corrects" the bound to `<` on the strength of an overlap story would
+ * re-open the full-key echo this guard exists to close. */
+export function keyPreview(p8: string | null | undefined): string {
+  const material = (p8 ?? "").replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+  if (!material) return "unavailable";
+  if (material.length <= KEY_PREVIEW_HEAD + KEY_PREVIEW_TAIL) return "unavailable";
+  return `${material.slice(0, KEY_PREVIEW_HEAD)}…${material.slice(-KEY_PREVIEW_TAIL)}`;
+}
+
+export async function loadApnsConfig(): Promise<ApnsConfig | null> {
   const teamId = process.env.APNS_TEAM_ID?.trim() || "CC8UTF7ATG";
-  const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet";
-  const p8Path = apnsKeyPath();
-  if (!existsSync(p8Path)) return null;
-  let p8: string;
-  try {
-    p8 = readFileSync(p8Path, "utf8");
-  } catch {
-    return null;
-  }
+  const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet.ios";
+  const got = await resolveP8();
+  if (!got) return null;
+  const { p8, keyId } = got;
   if (!p8.includes("BEGIN PRIVATE KEY")) return null;
   return {
     keyId,
@@ -240,6 +492,353 @@ export function apnsPayload(alert: ApnsAlert): ApnsPayload {
     // from Apple, and again when the wake reconnects and the harness replays
     // the very frame the push was built from.
     seq: alert.seq,
+  };
+}
+
+// --- Live Activities ------------------------------------------------------
+//
+// A Live Activity has its own APNs channel: a different push type, a
+// different topic, and a body that is decoded by the synthesized `Codable` on
+// `BotActivityAttributes` in ios/Shared/BotActivity.swift rather than by our
+// own app.  Every key below is that struct's field name, and the type name
+// travels as a string, so nothing here may be "cleaned up" — a renamed key is
+// a widget that silently stops updating.
+
+/** The literal Swift type name `attributes-type` must carry.  Change this and
+ * the system has no type to decode the attributes against. */
+export const LIVE_ACTIVITY_ATTRIBUTES_TYPE = "BotActivityAttributes";
+
+/** Seconds between the Unix epoch and Apple's reference date
+ * (2001-01-01T00:00:00Z).  A synthesized `Codable` reads a Swift `Date` from a
+ * NUMBER of seconds since that date; an ISO-8601 string here decodes as a
+ * crash on the phone, not a wrong-looking timer. */
+export const APPLE_REFERENCE_DATE_OFFSET = 978_307_200;
+
+/** A `BotState` raw value — the face the island wears. */
+export type LiveActivityFace = string;
+
+/** The static, immutable half of the activity: what the widget was started
+ * for.  Sent once, on `start`, and never again — ActivityKit refuses to
+ * change it. */
+export interface LiveActivityAttributes {
+  botId: string;
+  threadId: string;
+  name: string;
+  /** A `BotPalette` name.  An unknown name falls back to neutral grey in the
+   * widget rather than failing the decode. */
+  color: string;
+}
+
+/** `BotActivityAttributes.ContentState` — the half that changes. */
+export interface LiveActivityContentState {
+  face: LiveActivityFace;
+  /** "needsYou" | "working" | "toReview" */
+  kind: string;
+  headline: string;
+  line: string;
+  requestId?: string;
+  options: string[];
+  isPermission: boolean;
+  /** Seconds since Apple's reference date.  See
+   * `APPLE_REFERENCE_DATE_OFFSET` for why this is a number. */
+  since: number;
+}
+
+export interface LiveActivityAlertBody {
+  title: string;
+  body: string;
+}
+
+export type LiveActivityEvent = "start" | "update" | "end";
+
+export interface LiveActivityPayload {
+  aps: {
+    /** Unix seconds. */
+    timestamp: number;
+    event: LiveActivityEvent;
+    "content-state": LiveActivityContentState;
+    /** Start only. */
+    "attributes-type"?: string;
+    /** Start only. */
+    attributes?: LiveActivityAttributes;
+    /** Start only — and the system rejects a start without one. */
+    alert?: LiveActivityAlertBody;
+    /** End only: when the activity should leave the island. */
+    "dismissal-date"?: number;
+  };
+}
+
+/** The topic a Live Activity push is addressed to.  Derived from the
+ * configured bundle id rather than spelled out, so moving a build between
+ * sandbox and production moves both channels together and the two can never
+ * disagree about which app it is talking to. */
+export function liveActivityTopic(bundleId: string): string {
+  return `${bundleId}.push-type.liveactivity`;
+}
+
+/** The palette name used when the frame did not say.  `BotPalette.color`
+ * resolves anything it does not know to the same neutral grey, so a missing
+ * field costs the island its colour and nothing else. */
+export const DEFAULT_LIVE_ACTIVITY_COLOR = "gray";
+
+/** What one Live Activity push says.  Attributes travel on every event here
+ * because they are the same value throughout the activity's life — the start
+ * carries them and the updates below do not resend them. */
+export interface LiveActivityPush {
+  event: LiveActivityEvent;
+  attributes: LiveActivityAttributes;
+  state: LiveActivityContentState;
+  /** Defaults to the state's own headline and line, because a start without
+   * an alert is rejected outright. */
+  alert?: LiveActivityAlertBody;
+  /** Unix seconds; defaults to now. */
+  timestamp?: number;
+  /** Unix seconds; `end` only. */
+  dismissalDate?: number;
+}
+
+/** The JSON body for one Live Activity event.  Exported so a test can read
+ * the shape without standing up a fetch. */
+export function liveActivityPayload(
+  event: LiveActivityEvent,
+  attributes: LiveActivityAttributes,
+  state: LiveActivityContentState,
+  alert?: LiveActivityAlertBody,
+  options: { timestamp?: number; dismissalDate?: number } = {},
+): LiveActivityPayload {
+  const timestamp = options.timestamp ?? Math.floor(Date.now() / 1000);
+  // `requestId` is `String?` in Swift, and a synthesized decoder reads an
+  // absent optional as nil.  Both halves are built explicitly rather than
+  // spread over an empty object, so the two shapes stay visible.
+  const { requestId, ...stateWithoutRequest } = state;
+  const contentState: LiveActivityContentState =
+    requestId === undefined ? { ...stateWithoutRequest } : { ...stateWithoutRequest, requestId };
+  const aps: LiveActivityPayload["aps"] = {
+    timestamp,
+    event,
+    "content-state": contentState,
+  };
+  if (event === "start") {
+    aps["attributes-type"] = LIVE_ACTIVITY_ATTRIBUTES_TYPE;
+    aps.attributes = attributes;
+    aps.alert = alert ?? { title: state.headline, body: state.line };
+  }
+  if (event === "end" && options.dismissalDate !== undefined) {
+    aps["dismissal-date"] = options.dismissalDate;
+  }
+  return { aps };
+}
+
+/** One string out of a raw JSON frame.
+ *
+ * The frame is whatever `JSON.parse` returned, so a `title` that arrived as
+ * a number is not a string and must not become one here — the alert path
+ * falls back exactly as it would for an absent field rather than putting a
+ * number in a banner title. */
+const frameString = (frame: JsonObject, field: string): string | undefined => {
+  const value = frame[field];
+  return isJsonString(value) ? String(value) : undefined;
+};
+
+/** What the harness notify frame carries, once it has been parsed.
+ *
+ * The fields are optional because the frame is: a harness that predates the
+ * Live Activity work sends no `color`, no `options` and no `isPermission`,
+ * and that must cost the island a caption rather than the push.  They are
+ * optional in the type but NOT in the parsing — `parseLiveActivitySource`
+ * is what decides whether a value that IS there is the right shape, and
+ * this interface is only ever handed what that function returned. */
+export interface LiveActivitySource {
+  title?: string;
+  body?: string;
+  kind?: string;
+  threadId?: string;
+  botId?: string;
+  requestId?: string;
+  tool?: string;
+  /** Newer harness frames carry the bot's own name and palette colour. */
+  botName?: string;
+  color?: string;
+  options?: string[];
+  isPermission?: boolean;
+  /** Epoch ms — when this kind began.  Defaults to now. */
+  since?: number;
+}
+
+/** Every field the Live Activity reads, with the type it must have when it is
+ * there at all.  An absent field is fine — that is the degraded path — and a
+ * field of the wrong type is not: it would be indexed as if it were a string
+ * and reach a widget that decodes it strictly. */
+const LIVE_ACTIVITY_SOURCE_FIELDS = {
+  title: "string",
+  body: "string",
+  kind: "string",
+  threadId: "string",
+  botId: "string",
+  requestId: "string",
+  tool: "string",
+  botName: "string",
+  color: "string",
+  options: "string[]",
+  isPermission: "boolean",
+  since: "number",
+} as const satisfies Record<string, string>;
+
+/** What `parseLiveActivitySource` concluded about one inbound frame. */
+export type LiveActivitySourceParse =
+  | { ok: true; source: LiveActivitySource }
+  | { ok: false; error: string };
+
+/** True when `value` is what `expected` says, for the shapes above. */
+const conforms = (value: JsonValue, expected: string): boolean => {
+  if (expected === "string") return isJsonString(value);
+  if (expected === "boolean") return value === true || value === false;
+  if (expected === "number") return isFiniteJsonNumber(value);
+  if (expected === "string[]") return Array.isArray(value) && value.every((entry) => isJsonString(entry));
+  return false;
+};
+
+/** The strings out of an array `conforms` has already cleared.  Read entry by
+ * entry rather than asserted, so a value that slipped through is dropped
+ * rather than carried into the payload. */
+const jsonStrings = (value: JsonValue[]): string[] => {
+  const out: string[] = [];
+  for (const entry of value) {
+    if (isJsonString(entry)) out.push(String(entry));
+  }
+  return out;
+};
+
+/** Name the shape a rejected value actually had, so the log line says what
+ * arrived rather than only what was wanted. */
+const describeJson = (value: JsonValue): string => {
+  if (Array.isArray(value)) return "an array";
+  if (isJsonObject(value)) return "an object";
+  if (value === null) return "null";
+  return Object.prototype.toString.call(value).slice(8, -1).toLowerCase();
+};
+
+/** Put one already-checked value on the parsed source.  A switch rather than
+ * an index cast, so the field the value lands on is spelled out. */
+const assignSource = (source: LiveActivitySource, field: string, value: JsonValue): void => {
+  switch (field) {
+    case "title":
+      source.title = String(value);
+      return;
+    case "body":
+      source.body = String(value);
+      return;
+    case "kind":
+      source.kind = String(value);
+      return;
+    case "threadId":
+      source.threadId = String(value);
+      return;
+    case "botId":
+      source.botId = String(value);
+      return;
+    case "requestId":
+      source.requestId = String(value);
+      return;
+    case "tool":
+      source.tool = String(value);
+      return;
+    case "botName":
+      source.botName = String(value);
+      return;
+    case "color":
+      source.color = String(value);
+      return;
+    case "options":
+      source.options = jsonStrings(Array.isArray(value) ? value : []);
+      return;
+    case "isPermission":
+      source.isPermission = value === true;
+      return;
+    case "since":
+      source.since = Number(value);
+      return;
+    default:
+      return;
+  }
+};
+
+/** Parse one notify frame's notification before anything indexes off it.
+ *
+ * The frame arrives as raw JSON off the harness's loopback stream, and an
+ * interface alone is a promise about a value nobody checked: `??` catches a
+ * field that is ABSENT and nothing else.  A `title` that arrived as a
+ * number, or `options` that arrived as an object, would be copied straight
+ * into a payload the widget decodes strictly.  This is the boundary that
+ * says no.
+ *
+ * Unknown keys are ignored rather than refused, and that is deliberate.  The
+ * harness frame is a contract this sidecar neither owns nor versions against
+ * — `server/notify.ts` already sends `avatarUrl`, which nothing here reads,
+ * and refusing on an unrecognised key would drop every push from every bot
+ * that has a profile picture.  The fields the builder actually reads are the
+ * ones held to their types; a sparse frame still parses, and keeps its
+ * fallbacks. */
+export function parseLiveActivitySource(raw: JsonValue): LiveActivitySourceParse {
+  if (!isJsonObject(raw)) return { ok: false, error: "notification is not a JSON object" };
+  const source: LiveActivitySource = {};
+  for (const [field, expected] of Object.entries(LIVE_ACTIVITY_SOURCE_FIELDS)) {
+    const value = raw[field];
+    if (value === undefined || value === null) continue;
+    if (!conforms(value, expected)) {
+      return { ok: false, error: `${field} must be ${expected}, got ${describeJson(value)}` };
+    }
+    assignSource(source, field, value);
+  }
+  return { ok: true, source };
+}
+
+/** One notify frame, as the Live Activity sees it. */
+export interface LiveActivityContent {
+  attributes: LiveActivityAttributes;
+  state: LiveActivityContentState;
+  alert: LiveActivityAlertBody;
+}
+
+/** Map a harness notify frame onto the widget's contract, degrading field by
+ * field rather than refusing to build: a frame from an older harness has no
+ * bot name, no palette and no option list, and the island should still start
+ * with a caption and a timer instead of nothing at all. */
+export function liveActivityContent(
+  notification: LiveActivitySource,
+  now: number = Date.now(),
+): LiveActivityContent {
+  const kind = notification.kind;
+  const blocking = alertIsBlocking(kind);
+  // The title is the frame's own headline ("Forge needs you") when no name
+  // came with it — one word too long on the island, and never absent.
+  const name = notification.botName ?? notification.title ?? "BotFleet";
+  // A permission card answers allow/deny; a question wants an answer typed,
+  // so a frame that says nothing offers the verdict only when the kind says
+  // it is a permission.
+  const isPermission = notification.isPermission ?? kind === "approval";
+  const headline = blocking ? `${name} needs you` : `${name} is working`;
+  const state: LiveActivityContentState = {
+    face: blocking ? "thinking" : "idle",
+    kind: blocking ? "needsYou" : kind === "done" ? "toReview" : "working",
+    headline,
+    line: notification.body ?? "",
+    options: notification.options ?? (isPermission ? ["Allow", "Deny"] : []),
+    isPermission,
+    since: (notification.since ?? now) / 1000 - APPLE_REFERENCE_DATE_OFFSET,
+  };
+  // Absent rather than null: a synthesized decoder reads a missing optional as
+  // nil, and a literal null in the body is what a hand-written encoder sends.
+  if (notification.requestId !== undefined) state.requestId = notification.requestId;
+  return {
+    attributes: {
+      botId: notification.botId ?? "",
+      threadId: notification.threadId ?? "",
+      name,
+      color: notification.color ?? DEFAULT_LIVE_ACTIVITY_COLOR,
+    },
+    state,
+    alert: { title: headline, body: notification.body ?? "" },
   };
 }
 
@@ -985,11 +1584,19 @@ function sendOver(
   req.end(init?.body ?? "");
 }
 
-export async function sendApnsAlert(
+/** One APNs request: the shared transport, retry ladder and failure
+ * classification behind both push channels.
+ *
+ * Everything push-type specific — topic, priority, body — arrives as an
+ * argument, so a Live Activity goes through the same HTTP/2 session cache, the
+ * same 20-minute provider-token cache and the same key-fault handling as an
+ * alert.  A refused key is the key's verdict, not a channel's, and splitting
+ * the ladder would have meant teaching the watcher a second one. */
+async function sendApnsPush(
   config: ApnsConfig,
   deviceToken: string,
-  alert: ApnsAlert,
-  options: ApnsSendOptions = {},
+  request: { topic: string; pushType: string; priority: string; body: string },
+  options: ApnsSendOptions,
 ): Promise<ApnsSendResult> {
   // The default transport is the http2 path, keyed by the SIGNING KEY and
   // opened through the injected session factory when one is given; tests
@@ -1010,7 +1617,7 @@ export async function sendApnsAlert(
   if (!/^[0-9a-f]{64,}$/.test(token)) {
     return { ok: false, status: 400, reason: "BadDeviceToken", attempts: 0, failureKind: "bad_token" };
   }
-  const body = JSON.stringify(apnsPayload(alert));
+  const body = request.body;
 
   let attempts = 0;
   let resigned = false;
@@ -1028,9 +1635,9 @@ export async function sendApnsAlert(
         method: "POST",
         headers: {
           authorization: `bearer ${providerToken(config, now())}`,
-          "apns-topic": config.bundleId,
-          "apns-push-type": "alert",
-          "apns-priority": "10",
+          "apns-topic": request.topic,
+          "apns-push-type": request.pushType,
+          "apns-priority": request.priority,
           "content-type": "application/json",
         },
         body,
@@ -1101,6 +1708,57 @@ export async function sendApnsAlert(
   };
 }
 
+/** Post one banner alert on the ordinary push channel. */
+export async function sendApnsAlert(
+  config: ApnsConfig,
+  deviceToken: string,
+  alert: ApnsAlert,
+  options: ApnsSendOptions = {},
+): Promise<ApnsSendResult> {
+  return sendApnsPush(
+    config,
+    deviceToken,
+    {
+      topic: config.bundleId,
+      pushType: "alert",
+      priority: "10",
+      body: JSON.stringify(apnsPayload(alert)),
+    },
+    options,
+  );
+}
+
+/** Start, update or end one Live Activity.
+ *
+ * `start` carries priority 10 because it is the push that puts the island on
+ * the screen; `update` and `end` carry 5, which Apple treats as
+ * power-friendly and is all a content change or a dismissal needs.  The
+ * attributes go on the start alone — ActivityKit treats them as immutable,
+ * and resending them is at best wasted bytes. */
+export async function sendApnsLiveActivity(
+  config: ApnsConfig,
+  deviceToken: string,
+  push: LiveActivityPush,
+  options: ApnsSendOptions = {},
+): Promise<ApnsSendResult> {
+  return sendApnsPush(
+    config,
+    deviceToken,
+    {
+      topic: liveActivityTopic(config.bundleId),
+      pushType: "liveactivity",
+      priority: push.event === "start" ? "10" : "5",
+      body: JSON.stringify(
+        liveActivityPayload(push.event, push.attributes, push.state, push.alert, {
+          timestamp: push.timestamp,
+          dismissalDate: push.dismissalDate,
+        }),
+      ),
+    },
+    options,
+  );
+}
+
 /** Bucketed shape of why a HTTP-layer call did not land.  Decision table:
  * every status Apple commonly returns plus the matching reason string. */
 export function classifyHttpResponse(status: number, reason: string | undefined): Exclude<ApnsFailureKind, "none"> {
@@ -1119,7 +1777,7 @@ export function classifyHttpResponse(status: number, reason: string | undefined)
 
 /** Why this sidecar is not sending pushes at all.  A word rather than a
  * sentence, so the phone and the pairing page can each say it their own
- * way: `no-key` (no usable .p8 on disk), `key-rejected` (Apple refuses the
+ * way: `no-key` (no usable signing key), `key-rejected` (Apple refuses the
  * one we have), `unreachable` (every paired phone's circuit is open because
  * Apple's push service cannot be reached). */
 export type PushesOffReason = "no-key" | "key-rejected" | "unreachable";
@@ -1168,7 +1826,7 @@ export interface PushSenderHealth {
    * the owner can paste it straight into the Apple debug page. */
   lastError: string | null;
   /** Set when Apple refused the signing key itself.  Sending is off until
-   * the key file changes; a new signature from the same key cannot help. */
+   * the signing key changes; a new signature from the same key cannot help. */
   keyRejected: string | null;
   /** Notifications dropped because a device's queue was already full. */
   dropped: number;
@@ -1468,10 +2126,10 @@ function createHealthTracker(
 // days of them, one failure every forty seconds, with every surface still
 // reporting pushes as on.
 //
-// So the verdict goes on disk, beside the device registry, keyed to the key
-// FILE: replacing the file is what clears it, and nothing else does.  What
-// is written is a fingerprint — path, mtime, size — plus Apple's own words.
-// Never a byte of the key.
+// So the verdict goes on disk, beside the device registry, keyed to the
+// signing KEY: replacing the key is what clears it, and nothing else does.
+// What is written is a fingerprint — the key's source plus a one-way digest
+// of its bytes — plus Apple's own words.  Never a byte of the key.
 
 export interface PersistedKeyFault {
   /** Apple's reason string, e.g. `InvalidProviderToken`. */
@@ -1479,7 +2137,7 @@ export interface PersistedKeyFault {
   /** When the verdict was recorded, epoch ms. */
   at: number;
   /** `apnsKeyStamp()` at the moment of the fault.  A different value means a
-   * different file, which is the only thing that turns pushes back on. */
+   * different key, which is the only thing that turns pushes back on. */
   keyStamp: string | null;
   /** Apple's own `timestamp` field, for the debug page. */
   errorTimestamp?: number;
@@ -1550,6 +2208,11 @@ export const APNS_KEY_RECHECK_MS = 5 * 60 * 1000;
  * backlog does form the newest alerts are the ones worth keeping. */
 export const APNS_MAX_QUEUED_PER_DEVICE = 8;
 
+/** The same cap for Live Activity starts, on their own lanes.  Small on
+ * purpose: a phone that has been asleep through five approvals wants the
+ * newest one on its island, not a queue replayed at it on wake. */
+export const APNS_MAX_QUEUED_LIVE_ACTIVITIES = 2;
+
 /** How often a link that keeps failing is allowed to say so.  A broken
  * transport produced 6,003 identical log lines over two days — one per
  * attempt cycle, forever — because transport failures were the one outcome
@@ -1573,16 +2236,29 @@ export function watchHarnessNotifications(options: {
   /** Explicit config pins the sender; `undefined` discovers it from disk and
    * keeps looking until it appears, then watches for it changing. */
   config?: ApnsConfig | null;
-  loadConfig?: () => ApnsConfig | null;
-  /** Fingerprint of the key file, so a rotated key is noticed. */
-  keyStamp?: () => string | null;
+  loadConfig?: () => ApnsConfig | null | Promise<ApnsConfig | null>;
+  /** Fingerprint of the signing key, so a rotated key is noticed. */
+  keyStamp?: () => string | null | Promise<string | null>;
   /** Retire a token Apple has rejected.  The token is named so a phone
    * that registered a replacement while this send was in flight keeps it. */
   forgetToken?: (deviceId: string, token: string) => void;
+  /** Phones holding a push-to-start Live Activity token.  Its own list, never
+   * appended to `tokensForDisconnected`: health counts the phones on that one
+   * to decide whether pushes are off, and counting a phone twice there would
+   * have every phone counted against itself. */
+  liveActivityTokensForDisconnected?: () => { deviceId: string; token: string }[];
+  /** Test seam, the Live Activity twin of `send`. */
+  sendLiveActivity?: typeof sendApnsLiveActivity;
+  /** Retire a Live Activity token Apple has rejected.  Separate from
+   * `forgetToken` because the registry holds two independent tokens and
+   * clearing one against the other would silently do nothing. */
+  forgetLiveActivityToken?: (deviceId: string, token: string) => void;
   fetchImpl?: typeof fetch;
   now?: () => number;
   keyRecheckMs?: number;
   maxQueuedPerDevice?: number;
+  /** How many Live Activity starts one phone may have waiting. */
+  maxQueuedLiveActivities?: number;
   /** Where a key fault is remembered across restarts.  The sidecar hands in
    * `diskKeyFaultStore()`; a watcher without one keeps the fault in memory
    * for this process only, which is what a test wants. */
@@ -1615,6 +2291,19 @@ export function watchHarnessNotifications(options: {
   const queues = new Map<string, DeviceQueue>();
   const queueDepth = (queue: DeviceQueue): number => queue.blocking.length + queue.normal.length;
 
+  // Live Activity pushes get their own lanes, keyed the same way but never
+  // sharing a queue with the alerts above.  `queues` drops the oldest entry
+  // when a phone's lane is full, and it is specified to drop a report before
+  // an approval — a rule that says nothing about islands, and one that would
+  // silently discard a start.  Depth is deliberately NOT reported to health:
+  // `tokensRegistered` counts the phones on `tokensForDisconnected`, and a
+  // second token type counted there would count every phone twice against the
+  // unreachable/off thresholds.
+  const liveQueues = new Map<string, LiveDeviceQueue>();
+  /** How many starts one phone may have waiting.  An island is a summary, not
+   * a transcript: past this the newest one says everything the backlog did. */
+  const maxLiveQueued = Math.max(1, options.maxQueuedLiveActivities ?? APNS_MAX_QUEUED_LIVE_ACTIVITIES);
+
   const health = createHealthTracker(
     () => options.tokensForDisconnected().length,
     () => new Map([...queues].map(([deviceId, queue]) => [deviceId, queueDepth(queue)])),
@@ -1629,6 +2318,7 @@ export function watchHarnessNotifications(options: {
   }
 
   const send = options.send ?? sendApnsAlert;
+  const sendLiveActivity = options.sendLiveActivity ?? sendApnsLiveActivity;
   // The harness SSE stream is HTTP/1.1 loopback; native `fetch` is the
   // right choice for it.  APNs pushes go through the http2 path inside
   // `sendApnsAlert`, not here — the watcher never calls `fetch` against
@@ -1641,7 +2331,7 @@ export function watchHarnessNotifications(options: {
   let discovered: ApnsConfig | null = fixed ?? null;
   let discoveredStamp: string | null = null;
   let warnedMissing = false;
-  /** Set when Apple refused the key itself.  Only a different key file
+  /** Set when Apple refused the key itself.  Only a different signing key
    * clears it — a fresh signature from the same one earns the same answer. */
   let keyFault = false;
   /** The newest SSE id seen, so a reconnect resumes rather than silently
@@ -1726,26 +2416,39 @@ export function watchHarnessNotifications(options: {
     loggedQueueFull.delete(deviceId);
   };
 
-  const onKeyFault = (config: ApnsConfig, reason: string, errorTimestamp?: number) => {
+  const onKeyFault = async (config: ApnsConfig, reason: string, errorTimestamp?: number) => {
     if (keyFault) return;
     keyFault = true;
-    // Pin the verdict to the file that is on disk right now: only a
-    // DIFFERENT file clears it, here and across restarts.
-    const stamp = keyStamp();
-    if (stamp !== null) discoveredStamp = stamp;
     // `discovered` is deliberately kept.  Nulling it here is what used to
     // make a later rotation skip the key-identity comparison in
     // `refreshConfig`, so the replacement .p8 was signed against the
     // provider token cached for the key Apple had just refused — and was
     // refused in turn, permanently.  The refused key's token and its TLS
-    // sessions are worthless either way, so drop them now.
+    // sessions are worthless either way, so drop them now, before the await
+    // below, so nothing can reuse them in the meantime.
     invalidateProviderToken(config);
     dropHttp2Sessions();
     sessionFingerprints.clear();
     const at = now();
     health.rejectKey(at, reason, errorTimestamp);
+    // Pin the verdict to the key in hand right now: only a DIFFERENT key
+    // clears it, here and across restarts.  The read is served from the
+    // four-minute cache the key check just refreshed, so this await is a
+    // microtask, not a vault round-trip.
+    const stamp = await keyStamp();
+    if (stamp !== null) discoveredStamp = stamp;
     keyFaultStore?.save({ reason, at, keyStamp: discoveredStamp, errorTimestamp });
-    console.warn(`companion: APNs refused the signing key (${reason}); pushes are off until the key file changes`);
+    // Rule 43:  name the refused key by its masked preview, so an operator
+    // tailing the log can tell WHICH key Apple rejected.  The key itself is
+    // never printed.  The remedy names the real source:  the key lives in
+    // the vault, so "until the key file changes" points an operator at a
+    // local .p8 that is no longer read, and replacing it would not clear
+    // the verdict.  The persisted-fault message below names the source the
+    // same way.
+    console.warn(
+      `companion: APNs refused the signing key (${reason}; preview ${keyPreview(config.p8)}); ` +
+        `pushes are off until ${apnsKeySource()} is replaced`,
+    );
     // Leave the stream so the pump re-enters the key check rather than
     // sending the same doomed request for every notification that follows.
     abort?.abort();
@@ -1779,22 +2482,59 @@ export function watchHarnessNotifications(options: {
     circuitRetries.set(deviceId, cancel);
   };
 
-  /** Look at the key file and reload when it has changed.  Runs on a timer
+  // A key fault Apple has already delivered survives this process.  Without
+  // this, every Electron relaunch resumed full-rate sends against a key
+  // Apple had refused days earlier — and every surface, including the
+  // phone's own settings row, went on reporting pushes as on.
+  const persistedFault = keyFaultStore?.load() ?? null;
+  /** Whether the persisted fault has already been weighed against the key on
+   * disk.  The weighing needs a stamp, and the stamp needs the vault, so it
+   * happens inside the first `refreshConfig` — which the pump awaits before
+   * it sends anything.  Checking it at construction would have meant either a
+   * blocking read on the event loop or a window where a push goes out against
+   * a key Apple already refused. */
+  let persistedFaultChecked = persistedFault === null;
+
+  /** Look at the signing key and reload when it has changed.  Runs on a timer
    * rather than only when the stream reconnects: a sidecar whose harness
    * stays up for days never reconnects, and a key dropped in or rotated
    * under it would otherwise go unnoticed for exactly as long. */
-  const refreshConfig = (): ApnsConfig | null => {
-    const stamp = keyStamp();
+  const refreshConfig = async (): Promise<ApnsConfig | null> => {
+    const stamp = await keyStamp();
+    if (!persistedFaultChecked) {
+      persistedFaultChecked = true;
+      if (persistedFault) {
+        if (stamp !== null && stamp === persistedFault.keyStamp) {
+          keyFault = true;
+          discoveredStamp = stamp;
+          health.rejectKey(persistedFault.at, persistedFault.reason, persistedFault.errorTimestamp);
+          // Rule 43:  a rejected provider key is identified by a masked
+          // first-8/last-4 preview, never by its value.  The key in hand is
+          // the one Apple refused — the stamp above matched it — and it is
+          // already in the vault cache, so this is not a second round trip.
+          const rejected = await loadConfig();
+          console.warn(
+            `companion: APNs pushes stay off — Apple refused this signing key (${persistedFault.reason}; ` +
+              `preview ${keyPreview(rejected?.p8)}) and the key has not changed since.  ` +
+              `Replace ${apnsKeySource()} to turn them back on.`,
+          );
+        } else {
+          // A different key, or no key at all: the verdict was about a key we
+          // no longer hold, so it has nothing left to say.
+          keyFaultStore?.save(null);
+        }
+      }
+    }
     if (keyFault) {
-      // Apple refuses what is on disk.  Only a different file can help.
+      // Apple refuses the key in hand.  Only a different key can help.
       if (stamp === null || stamp === discoveredStamp) return null;
       keyFault = false;
       keyFaultStore?.save(null);
-      console.log("companion: the APNs key file changed; closed-app phone wake is being tried again");
+      console.log("companion: the APNs signing key changed; closed-app phone wake is being tried again");
       if (fixed) {
-        // A pinned config cannot be reloaded, but the key file under it
-        // changed: the cached provider token and the TLS sessions that were
-        // built for the refused key must not be reused against the new one.
+        // A pinned config cannot be reloaded, but the key under it changed:
+        // the cached provider token and the TLS sessions that were built
+        // for the refused key must not be reused against the new one.
         health.setConfigured(fixed);
         invalidateProviderToken(fixed);
         dropHttp2Sessions();
@@ -1807,13 +2547,13 @@ export function watchHarnessNotifications(options: {
       return fixed;
     }
     if (discovered && stamp !== null && stamp === discoveredStamp) {
-      // The same file as last time: keep the config, and the provider token
+      // The same key as last time: keep the config, and the provider token
       // cached against it.
       return discovered;
     }
-    const loaded = loadConfig();
-    // Whatever is on disk now may not be what the cached token was signed
-    // with.  Compare key identity rather than the file stamp: a .p8 rewritten
+    const loaded = await loadConfig();
+    // Whatever the key is now may not be what the cached token was signed
+    // with.  Compare key identity rather than the stamp: a key rewritten
     // with identical bytes — a secrets sync, a backup restore — is the same
     // key, and throwing away its cached provider token would spend one of
     // Apple's once-per-twenty-minutes re-signs for nothing.
@@ -1850,30 +2590,8 @@ export function watchHarnessNotifications(options: {
     return fixed ?? discovered;
   };
 
-  // A key fault Apple has already delivered survives this process.  Without
-  // this, every Electron relaunch resumed full-rate sends against a key
-  // Apple had refused days earlier — and every surface, including the
-  // phone's own settings row, went on reporting pushes as on.
-  const persistedFault = keyFaultStore?.load() ?? null;
-  if (persistedFault) {
-    const stamp = keyStamp();
-    if (stamp !== null && stamp === persistedFault.keyStamp) {
-      keyFault = true;
-      discoveredStamp = stamp;
-      health.rejectKey(persistedFault.at, persistedFault.reason, persistedFault.errorTimestamp);
-      console.warn(
-        `companion: APNs pushes stay off — Apple refused this signing key (${persistedFault.reason}) ` +
-          `and the key file has not changed since.  Replace ${apnsKeyPath()} to turn them back on.`,
-      );
-    } else {
-      // A different file, or no file at all: the verdict was about a key we
-      // no longer hold, so it has nothing left to say.
-      keyFaultStore?.save(null);
-    }
-  }
-
   const keyTimer = setInterval(() => {
-    refreshConfig();
+    void refreshConfig();
   }, recheckMs);
   keyTimer.unref?.();
 
@@ -1899,6 +2617,129 @@ export function watchHarnessNotifications(options: {
     normal: QueuedAlert[];
     running: boolean;
   }
+
+  interface QueuedLiveActivity {
+    token: string;
+    push: LiveActivityPush;
+  }
+
+  /** One phone's island lane.  Separate from `DeviceQueue` so a full alert
+   * backlog can never decide whether an island starts, and so nothing here is
+   * read by the health snapshot. */
+  interface LiveDeviceQueue {
+    pending: QueuedLiveActivity[];
+    running: boolean;
+  }
+
+  /** Send one island push and do the bookkeeping that is safe for it.
+   *
+   * Deliberately narrower than `recordOutcome`: no sent/failed counter, no
+   * circuit run, no per-device health row.  This is a second surface for the
+   * same phones, and counting it there would double every phone on the health
+   * page and let an island's failures trip a breaker the alert queue is
+   * already using.  What it does share is the two verdicts that are about the
+   * sender rather than the phone: a refused key is the same key fault, and a
+   * dead token is still a dead token. */
+  const sendLiveOne = async (config: ApnsConfig, deviceId: string, token: string, push: LiveActivityPush) => {
+    let result: ApnsSendResult;
+    try {
+      result = await sendLiveActivity(config, token, push);
+    } catch (err) {
+      const info = inspectTransportError(err);
+      console.warn(
+        `companion: Live Activity push failed (${classifyTransportError(info)}` +
+          `${info.code ? ` ${info.code}` : ""}); the banner for that phone is unaffected`,
+      );
+      return;
+    }
+    try {
+      recordLiveOutcome(config, deviceId, token, result);
+    } catch {
+      console.warn("companion: Live Activity bookkeeping after a send failed");
+    }
+  };
+
+  const recordLiveOutcome = (
+    config: ApnsConfig,
+    deviceId: string,
+    token: string,
+    result: ApnsSendResult,
+  ) => {
+    if (result.ok) return;
+    // The key, not the phone — exactly the alert path's reading, down to the
+    // rotation guard, because it IS the same key.
+    if (result.reason === INVALID_PROVIDER_TOKEN) {
+      const current = fixed ?? discovered;
+      if (current !== null && providerTokenKey(config) === providerTokenKey(current)) {
+        void onKeyFault(config, result.reason, result.errorTimestamp);
+      }
+      return;
+    }
+    // The registry holds this token separately, so it needs its own forget:
+    // `clearPushToken` compares against the alert token and would no-op.
+    if (tokenIsDead(result.status, result.reason)) {
+      options.forgetLiveActivityToken?.(deviceId, token);
+      if (firstTime(`${deviceId}:dead-live:${result.reason ?? result.status}`)) {
+        console.warn(
+          `companion: APNs ${result.status}${result.reason ? ` ${result.reason}` : ""} — dropped that phone's ` +
+            "Live Activity token; it will register a new one",
+        );
+      }
+      return;
+    }
+    if (isTransportFailure(result.failureKind ?? "transport") || result.status === 0) return;
+    if (firstTime(`${deviceId}:live:${result.status}:${result.reason ?? ""}`)) {
+      console.warn(
+        `companion: Live Activity push ${result.status}${result.reason ? ` ${result.reason}` : ""} — ` +
+          "the banner for that phone is unaffected",
+      );
+    }
+  };
+
+  const drainLive = async (deviceId: string, queue: LiveDeviceQueue) => {
+    queue.running = true;
+    try {
+      while (!stopped) {
+        const config = activeConfig();
+        if (!config) break;
+        if (queue.pending.length === 0) break;
+        // An open circuit means Apple is unreachable.  An island is a summary
+        // of right now, so this one is dropped rather than held: an approval
+        // that starts its activity three hours late is worse than no island.
+        if (health.circuitIsOpen(deviceId, now())) {
+          if (firstTime(`${deviceId}:live-defer`)) {
+            console.warn(
+              `companion: APNs is unreachable — skipping ${queue.pending.length} Live Activity start(s) for a phone`,
+            );
+          }
+          queue.pending.length = 0;
+          break;
+        }
+        const next = queue.pending.shift();
+        if (!next) break;
+        await sendLiveOne(config, deviceId, next.token, next.push);
+      }
+    } catch {
+      console.warn("companion: Live Activity queue drain failed");
+    } finally {
+      queue.running = false;
+      if (queue.pending.length === 0) liveQueues.delete(deviceId);
+    }
+  };
+
+  /** Put one island push on that phone's lane and start draining it. */
+  const enqueueLiveActivity = (deviceId: string, token: string, push: LiveActivityPush) => {
+    let queue = liveQueues.get(deviceId);
+    if (!queue) {
+      queue = { pending: [], running: false };
+      liveQueues.set(deviceId, queue);
+    }
+    queue.pending.push({ token, push });
+    // Newest wins: an island that starts with an hour-old approval says
+    // something untrue about what is waiting now.
+    while (queue.pending.length > maxLiveQueued) queue.pending.shift();
+    if (!queue.running) void drainLive(deviceId, queue);
+  };
 
   // The circuit is checked by `drain` BEFORE it takes an alert off a lane,
   // not here: this function is only reached for an alert that is already
@@ -1974,16 +2815,16 @@ export function watchHarnessNotifications(options: {
       // A rotation can land while a request signed with the old key is in
       // flight, and reading that request's rejection as a verdict on the
       // replacement would disable the replacement — then hold it disabled,
-      // because the fault only clears for a key file that differs from the
-      // recorded stamp and the file on disk is already the replacement.
+      // because the fault only clears for a key that differs from the
+      // recorded stamp and the key in hand is already the replacement.
       //
       // Key identity, not object identity: `refreshConfig` builds a fresh
-      // config object whenever the file's mtime or size changes, so an
-      // identity check would read a .p8 rewritten with the same bytes as a
+      // config object whenever the key's source or digest changes, so an
+      // identity check would read a key rewritten with the same bytes as a
       // rotation and wave through a rejection of the key still in use.
       const current = fixed ?? discovered;
       if (current !== null && providerTokenKey(config) === providerTokenKey(current)) {
-        onKeyFault(config, result.reason, result.errorTimestamp);
+        void onKeyFault(config, result.reason, result.errorTimestamp);
       } else if (!keyFault) {
         console.warn("companion: APNs refused a signing key that has since been replaced; the replacement stands");
       }
@@ -2088,26 +2929,23 @@ export function watchHarnessNotifications(options: {
   };
 
   const deliver = (
-    notification: {
-      title?: string;
-      body?: string;
-      kind?: string;
-      threadId?: string;
-      botId?: string;
-      requestId?: string;
-      tool?: string;
-    },
+    // Raw JSON, honestly typed: the frame is whatever `JSON.parse` handed
+    // back, and a field in it is a `JsonValue` until something says
+    // otherwise.  Both consumers below decode their own — the alert reads
+    // strings through `frameString`, the island through
+    // `parseLiveActivitySource`.
+    notification: JsonObject,
     seq?: number,
   ) => {
     const connected = new Set(options.connectedIds());
     const alert: ApnsAlert = {
-      title: notification.title ?? "BotFleet",
-      body: notification.body ?? "",
-      kind: notification.kind,
-      threadId: notification.threadId,
-      botId: notification.botId,
-      requestId: notification.requestId,
-      tool: notification.tool,
+      title: frameString(notification, "title") ?? "BotFleet",
+      body: frameString(notification, "body") ?? "",
+      kind: frameString(notification, "kind"),
+      threadId: frameString(notification, "threadId"),
+      botId: frameString(notification, "botId"),
+      requestId: frameString(notification, "requestId"),
+      tool: frameString(notification, "tool"),
       seq,
     };
     const blocking = alertIsBlocking(alert.kind);
@@ -2137,11 +2975,42 @@ export function watchHarnessNotifications(options: {
       }
       if (!queue.running) void drain(row.deviceId, queue);
     }
+
+    // The island, for the same phones and only for the kinds a person is
+    // actually blocked on.  A phone that is streaming gets the banner over
+    // the socket already, so it is skipped by the same filter as the alerts
+    // above — and it gets BOTH surfaces when it is not, which is the point:
+    // the banner is history, the island is the thing you answer from.
+    //
+    // The frame is parsed first, and only here: the alert above is unchanged
+    // and still lands, because a banner built from the same frame is worth
+    // more than a rejected island and costs nothing to send.  A malformed
+    // frame is dropped here rather than indexed.
+    if (blocking && options.liveActivityTokensForDisconnected) {
+      const parsed = parseLiveActivitySource(notification);
+      if (!parsed.ok) {
+        if (firstTime(`liveactivity-frame:${parsed.error}`)) {
+          console.warn(`companion: notify frame not used for Live Activities — ${parsed.error}`);
+        }
+        return;
+      }
+      const content = liveActivityContent(parsed.source, now());
+      for (const row of options.liveActivityTokensForDisconnected()) {
+        if (connected.has(row.deviceId)) continue;
+        enqueueLiveActivity(row.deviceId, row.token, {
+          event: "start",
+          attributes: content.attributes,
+          state: content.state,
+          alert: content.alert,
+          timestamp: Math.floor(now() / 1000),
+        });
+      }
+    }
   };
 
   const pump = async () => {
     while (!stopped) {
-      const config = refreshConfig();
+      const config = await refreshConfig();
       if (!config) {
         await pause(recheckMs);
         continue;
@@ -2180,15 +3049,10 @@ export function watchHarnessNotifications(options: {
               resumed?: boolean;
               /** The stream position of this frame, stamped by `broadcast`. */
               seq?: number;
-              notification?: {
-                title?: string;
-                body?: string;
-                kind?: string;
-                threadId?: string;
-                botId?: string;
-                requestId?: string;
-                tool?: string;
-              };
+              /** A notify frame, still raw: whatever `JSON.parse` returned.
+               *  `deliver` decodes it — the banner reads strings, the Live
+               * Activity builder parses the whole frame. */
+              notification?: JsonObject;
             };
             try {
               // SAFETY: the frame came off the harness's own loopback stream
@@ -2247,6 +3111,8 @@ export function watchHarnessNotifications(options: {
         queue.normal.length = 0;
       }
       queues.clear();
+      for (const queue of liveQueues.values()) queue.pending.length = 0;
+      liveQueues.clear();
       // Close the persistent http2 session on the way out.  Tests do not
       // expect open sockets across runs.
       dropHttp2Sessions();

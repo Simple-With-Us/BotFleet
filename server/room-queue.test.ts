@@ -6,6 +6,9 @@ import {
   drainRoomRounds,
   hasQueuedRoomRound,
   queueRoomRound,
+  refreshRoomRounds,
+  restoreRoomRounds,
+  takeRoomRounds,
   ROOM_QUEUE_MAX,
   ROOM_QUEUE_TTL_MS,
   _queuedRoomCount,
@@ -32,6 +35,32 @@ const round = (overrides: Partial<Parameters<typeof queueRoomRound>[0]> = {}) =>
 
 describe("room round queue", () => {
   beforeEach(() => _resetRoomQueue());
+
+  it("lets an update carry every waiting round and put them back, dated afresh", () => {
+    queueRoomRound(round(), NOW);
+    queueRoomRound(round({ botId: "scout", hop: 1, cardContinuation: "go on" }), NOW);
+    const taken = takeRoomRounds();
+    expect(taken.map((r) => [r.botId, r.hop, r.cardContinuation])).toEqual([["director", 0, undefined], ["scout", 1, "go on"]]);
+    expect(_queuedRoomCount()).toBe(0);
+
+    // Back after the restart, long after the TTL would have dropped them.
+    const later = NOW + ROOM_QUEUE_TTL_MS * 4;
+    expect(restoreRoomRounds(taken.map(({ at: _at, ...rest }) => rest), later)).toBe(2);
+    // One already waiting for the same bot keeps its place.
+    expect(restoreRoomRounds([round()], later)).toBe(0);
+    const ran: string[] = [];
+    drainRoomRounds(storeWith({ director: {}, scout: {} }), later + 1, (r) => { ran.push(r.botId); });
+    expect(ran.sort()).toEqual(["director", "scout"]);
+  });
+
+  it("does not count a hold against a waiting round", () => {
+    queueRoomRound(round(), NOW);
+    const afterHold = NOW + ROOM_QUEUE_TTL_MS + 60_000;
+    refreshRoomRounds(afterHold);
+    const ran: string[] = [];
+    drainRoomRounds(storeWith({ director: {} }), afterHold + 1, (r) => { ran.push(r.botId); });
+    expect(ran).toEqual(["director"]);
+  });
 
   it("holds a round for a busy bot and runs it once the bot settles", () => {
     expect(queueRoomRound(round(), NOW)).toBe(true);

@@ -106,6 +106,11 @@ running fleet.
 | `box.token` | `BOX_TOKEN` | `BOX_TOKEN` | yes | yes |
 | `opencodeGo.apiKey` | `OPENCODE_API_KEY` | `OPENCODE_API_KEY` | yes | yes |
 | `tts.key` | `OMB_TTS_KEY` | `OMB_TTS_KEY` | yes | no |
+| `azureSpeech.key` | `AZURE_SPEECH_KEY` | `AZURE_SPEECH_KEY` | yes | no |
+| `azureSpeech.region` | `AZURE_SPEECH_REGION` | `AZURE_SPEECH_REGION` | no | no |
+| `metaSpeech.key` | `META_SPEECH_API_KEY` | `META_SPEECH_API_KEY` | yes | no |
+| `groq.key` | `GROQ_API_KEY` | `GROQ_API_KEY` | yes | no |
+| `assemblyai.key` | `ASSEMBLYAI_API_KEY` | `ASSEMBLYAI_API_KEY` | yes | no |
 | `imageGen.key` | `OMB_OPENAI_IMAGE_KEY` | `OMB_OPENAI_IMAGE_KEY` | yes | no |
 | `deepseek.key` | `DEEPSEEK_API_KEY` | `DEEPSEEK_API_KEY` | yes | no |
 | `usage.ingestUrl` | `USAGE_MONITOR_INGEST_URL` | `USAGE_MONITOR_INGEST_URL` | no | no |
@@ -117,6 +122,7 @@ running fleet.
 | `qdrant.accessClientId` | `OMB_RECALL_ACCESS_CLIENT_ID` | `OMB_RECALL_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_ID` | no | yes |
 | `qdrant.accessClientSecret` | `OMB_RECALL_ACCESS_CLIENT_SECRET` | `OMB_RECALL_ACCESS_CLIENT_SECRET`, `CF_ACCESS_CLIENT_SECRET` | yes | yes |
 | `observability.sentryDsn` | `SENTRY_DSN` | `SENTRY_DSN`, `BOTFLEET_SENTRY_DSN` | yes | no |
+| `observability.sentryFleetDsn` | `SENTRY_FLEET_DSN` | `SENTRY_FLEET_DSN` | yes | no |
 
 This table lives once, in code, at `server/secret-map.ts`'s `SECRET_FIELDS` —
 this list is kept in step with it by hand, so treat the source as
@@ -275,6 +281,18 @@ The product server **never** reads a fleet secrets-handoff file itself —
 only these two paths feed it an identity — and `server/secret-map.ts` has
 no `infisical.*` row for exactly the reason above: the vault's own
 credentials cannot be one of the things the vault resolves.
+
+The environment path has exactly one sanctioned injector:
+`scripts/botfleet-server-start.sh`, the launchd entry point, which may
+extract `INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET` (canonical names
+first, `INFISICAL_AUTOMATION_*` aliases only as fallback) from the
+`chmod 600` handoff file at process start, and only for values the
+environment does not already set.  It reads the two names line by line and
+never sources the file, so the Node server still receives its identity
+through the environment alone — the handoff file is never opened by
+product code, and the pair is never moved into a LaunchAgent plist, where
+the client secret would sit same-user-readable in a new location for no
+reduction in exposure.
 
 ## The Migration Script
 

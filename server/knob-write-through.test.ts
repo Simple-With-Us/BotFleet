@@ -153,6 +153,8 @@ describe("writeThroughKnobs", () => {
       observability: { tracesSampleRate: 0.5 },
       usage: { spendCeilingUsd: 25.5 },
       infisical: { refreshMinutes: 10 },
+      autoReview: { maxReviewsPerTurn: 80 },
+      agentProxy: { enabled: true, address: "127.0.0.1:17322", projectId: "proj-1", environment: "prod", secretPath: "/agents" },
     };
     const result = await writeThroughKnobs(
       patch,
@@ -168,6 +170,16 @@ describe("writeThroughKnobs", () => {
     expect(calls.get("BOTFLEET_TRACES_SAMPLE_RATE")).toBe("0.5");
     expect(calls.get("BOTFLEET_SPEND_CEILING_USD")).toBe("25.5");
     expect(calls.get("BOTFLEET_INFISICAL_REFRESH_MINUTES")).toBe("10");
-    expect(KNOB_FIELDS.length).toBe(13);
+    expect(calls.get("BOTFLEET_AUTO_REVIEW_MAX_PER_TURN")).toBe("80");
+    expect(calls.get("BOTFLEET_AGENT_PROXY_ENABLED")).toBe("true");
+    expect(calls.get("BOTFLEET_AGENT_PROXY_ADDRESS")).toBe("127.0.0.1:17322");
+    expect(calls.get("BOTFLEET_AGENT_PROXY_PROJECT_ID")).toBe("proj-1");
+    expect(calls.get("BOTFLEET_AGENT_PROXY_ENV")).toBe("prod");
+    expect(calls.get("BOTFLEET_AGENT_PROXY_PATH")).toBe("/agents");
+    // 22 + server.allowRemoteDesktopLaunch (BF-2489).  Bump this deliberately:
+    // the count is here so that adding or dropping a knob is a decision
+    // someone reads rather than an edit that slips through -- it is what
+    // caught nineteen rows disappearing at once.
+    expect(KNOB_FIELDS.length).toBe(23);
   });
 });

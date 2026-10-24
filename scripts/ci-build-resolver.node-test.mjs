@@ -1,23 +1,34 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
 import {
   artifactNameFor,
+  assertExtractedBundleContained,
   assertSafeArchiveEntries,
+  authHeaders,
+  BUNDLE_ROOT,
   classifyResolutionFailure,
   downloadBuiltBundle,
   findCommitArtifact,
+  inspectArchive,
+  listUpdateCandidates,
   manifestArtifactName,
+  readInstalledSourceCommit,
+  readSymlinkTargets,
   maskedKeyPreview,
   materializeBuild,
+  resetGhAuthCacheForTests,
   ResolutionError,
   selectCommitRun,
+  selectNewestGreenCommit,
+  selectUpdateTarget,
+  SELECTION_WINDOW,
   updateSourcePolicy,
   verifyManifest,
 } from "./ci-build-resolver.mjs";
@@ -145,6 +156,97 @@ test("a commit with no hosted build says so, and says how to make one", async (t
       assert.match(error.message, new RegExp(COMMIT));
       return true;
     },
+  );
+});
+
+test("a JSON response without the list is a bad response, not a missing build", async (t) => {
+  // `no-build` is recoverable, so `auto` would quietly package locally and hide an
+  // API change or a proxy fault.  These bodies are valid JSON that is not the
+  // envelope the endpoint promises.
+  for (const body of [{}, null, 42, { workflow_runs: "nope" }, { workflow_runs: null }, { workflows: [] }]) {
+    await assert.rejects(
+      downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl: json(body) }),
+      (error) => {
+        assert.ok(error instanceof ResolutionError, JSON.stringify(body));
+        assert.equal(error.cause, "bad-response", JSON.stringify(body));
+        assert.match(error.message, /without a "workflow_runs" list/);
+        return true;
+      },
+      JSON.stringify(body),
+    );
+  }
+});
+
+test("a run whose artifact list is malformed is a bad response, not a missing build", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) return json({ artifacts: null })();
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "bad-response");
+      assert.match(error.message, /without an "artifacts" list/);
+      return true;
+    },
+  );
+});
+
+test("a run entry missing a required field is a bad response at the boundary, not a silent skip", async (t) => {
+  // The old shape only checked the envelope, so a partial entry was passed through
+  // and silently dropped by `selectCommitRun`.  The boundary now rejects it: a
+  // proxy or a 200-with-truncated-body would otherwise look like an empty build
+  // and `auto` would quietly package locally.
+  for (const partial of [
+    { head_sha: COMMIT, status: "completed", conclusion: "success", event: "push" }, // no id
+    { id: 1, status: "completed", conclusion: "success", event: "push" }, // no head_sha
+    { id: 1, head_sha: COMMIT, conclusion: "success", event: "push" }, // no status
+    { id: 1, head_sha: COMMIT, status: "completed", event: "push" }, // no conclusion (must be string|null)
+  ]) {
+    await assert.rejects(
+      downloadBuiltBundle({
+        commit: COMMIT,
+        destination: await fixture(t),
+        fetchImpl: json({ workflow_runs: [partial] }),
+      }),
+      (error) => {
+        assert.ok(error instanceof ResolutionError, JSON.stringify(partial));
+        assert.equal(error.cause, "bad-response", JSON.stringify(partial));
+        assert.match(error.message, /malformed workflow run entry/);
+        return true;
+      },
+      JSON.stringify(partial),
+    );
+  }
+});
+
+test("an artifact entry missing a required field is a bad response at the boundary, not a silent skip", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) {
+      return json({ artifacts: [{ name: artifactNameFor(COMMIT), expired: false, archive_download_url: "https://example.test/a.zip" }] })();
+    }
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "bad-response");
+      assert.match(error.message, /malformed artifact entry/);
+      return true;
+    },
+  );
+});
+
+test("an empty artifact list is still a missing build", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) return json({ artifacts: [] })();
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => error instanceof ResolutionError && error.cause === "no-build",
   );
 });
 
@@ -412,6 +514,87 @@ function escapeForRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+test("authHeaders falls back to gh auth token when env tokens are absent", () => {
+  resetGhAuthCacheForTests();
+  const GH_PREFIX = "ghp";
+  const cliToken = [GH_PREFIX, "cli_fallback_token_0123456789abcd"].join("_");
+  let ghCalls = 0;
+  const execFileSyncImpl = (command, args) => {
+    ghCalls += 1;
+    assert.equal(command, "gh");
+    assert.deepEqual(args, ["auth", "token"]);
+    return `${cliToken}\n`;
+  };
+  assert.deepEqual(authHeaders({}, { execFileSyncImpl }), { authorization: `Bearer ${cliToken}` });
+  assert.equal(ghCalls, 1, "gh is consulted once and then cached");
+  assert.deepEqual(authHeaders({}, { execFileSyncImpl }), { authorization: `Bearer ${cliToken}` });
+  assert.equal(ghCalls, 1, "the cached token is reused");
+});
+
+test("authHeaders skips gh when an env token is present", () => {
+  resetGhAuthCacheForTests();
+  const execFileSyncImpl = () => {
+    throw new Error("gh must not run when GITHUB_TOKEN is set");
+  };
+  assert.deepEqual(
+    authHeaders({ GITHUB_TOKEN: "env-only-token" }, { execFileSyncImpl }),
+    { authorization: "Bearer env-only-token" },
+  );
+  assert.deepEqual(
+    authHeaders({ GH_TOKEN: "gh-env-token" }, { execFileSyncImpl }),
+    { authorization: "Bearer gh-env-token" },
+  );
+});
+
+test("authHeaders swallows gh failures and leaves authorization unset", () => {
+  resetGhAuthCacheForTests();
+  const execFileSyncImpl = (command) => {
+    throw new Error(`${command} unavailable`);
+  };
+  assert.deepEqual(authHeaders({}, { execFileSyncImpl }), {});
+});
+
+test("an artifact download 401 names the commit and explains token setup", async (t) => {
+  resetGhAuthCacheForTests();
+  const execFileSyncImpl = () => {
+    throw new Error("no gh in this fixture");
+  };
+  let calls = 0;
+  const fetchImpl = async (url) => {
+    calls += 1;
+    if (calls === 1) {
+      return { ok: true, status: 200, json: async () => successfulRuns };
+    }
+    if (calls === 2) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ artifacts: [anArtifact({})] }),
+      };
+    }
+    return { ok: false, status: 401, arrayBuffer: async () => new ArrayBuffer(0) };
+  };
+  await assert.rejects(
+    downloadBuiltBundle({
+      commit: COMMIT,
+      destination: await fixture(t),
+      fetchImpl,
+      env: {},
+      execFileSyncImpl,
+    }),
+    (error) => {
+      assert.equal(error.cause, "unauthorized");
+      assert.match(error.message, new RegExp(COMMIT));
+      assert.match(error.message, /gh auth login/);
+      assert.match(error.message, /GITHUB_TOKEN/);
+      assert.doesNotMatch(error.message, /public repo/);
+      assert.doesNotMatch(error.message, /not a full commit/);
+      return true;
+    },
+  );
+  assert.equal(calls, 3, "two lookups plus one download attempt");
+});
+
 test("a rejected key is named by a masked preview, never printed", async () => {
   // A 401 that cannot say WHICH key was rejected is not a diagnosis, and the
   // answer must never be the key itself.
@@ -440,4 +623,807 @@ test("a rejected key is named by a masked preview, never printed", async () => {
       return true;
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// In-bundle framework symlinks.
+//
+// On 2026-10-08 the safe updater refused the green hosted build of main
+// 8ccf02725, because the guard treated every symlink as a Zip Slip.  A real
+// Electron bundle always carries framework links, so the hosted path could
+// never install a real build.  These tests pin the replacement rule: links
+// strictly inside BotFleet.app/ with relative, non-climbing targets are
+// accepted.  Every way a link could carry a write or a resolution out of the
+// bundle is still refused.
+
+const FW = `${BUNDLE_ROOT}/Contents/Frameworks`;
+const fileEntry = (name) => ({ name, mode: "-rw-r--r--" });
+const dirEntry = (name) => ({ name, mode: "drwxr-xr-x" });
+const linkEntry = (name, target) => ({ name, mode: "lrwxr-xr-x", target });
+
+/** The entry list ditto produces for one framework, sidecars included. */
+function frameworkEntries(framework = "Squirrel", binary = framework) {
+  const root = `${FW}/${framework}.framework`;
+  return [
+    dirEntry(`${BUNDLE_ROOT}/`),
+    dirEntry(`${BUNDLE_ROOT}/Contents/`),
+    dirEntry(`${FW}/`),
+    dirEntry(`${root}/`),
+    dirEntry(`${root}/Versions/`),
+    dirEntry(`${root}/Versions/A/`),
+    dirEntry(`${root}/Versions/A/Resources/`),
+    fileEntry(`${root}/Versions/A/${binary}`),
+    fileEntry(`${root}/Versions/A/Resources/Info.plist`),
+    linkEntry(`${root}/Versions/Current`, "A"),
+    linkEntry(`${root}/Resources`, "Versions/Current/Resources"),
+    linkEntry(`${root}/${binary}`, `Versions/Current/${binary}`),
+    // ditto writes a sidecar for a link too.  It is an ordinary file under
+    // __MACOSX/, not an entry under the link.
+    fileEntry(`__MACOSX/${root}/Versions/._Current`),
+  ];
+}
+
+function assertRefused(entries, why, message) {
+  assert.throws(
+    () => assertSafeArchiveEntries(entries, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }),
+    (error) => {
+      assert.equal(error.cause, "unsafe-archive", message);
+      assert.match(error.message, why, message);
+      return true;
+    },
+    message,
+  );
+}
+
+test("in-bundle framework links are accepted, and only inside the bundle", () => {
+  // The shape of the real 8ccf02725 bundle, including a framework whose name
+  // has a space in it.
+  const real = [...frameworkEntries("Squirrel"), ...frameworkEntries("Electron Framework").slice(3)];
+  assert.doesNotThrow(() => assertSafeArchiveEntries(real, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }));
+
+  // GitHub's wrapper is checked with no symlinkRoot, and there even a
+  // well-formed link is refused, exactly as before.
+  assert.throws(
+    () => assertSafeArchiveEntries(real, { label: "artifact" }),
+    (error) => error.cause === "unsafe-archive" && /symlink entry/.test(error.message),
+  );
+});
+
+test("a link whose target is absolute, climbs, or cannot be read is refused", () => {
+  const base = frameworkEntries();
+  for (const [target, why] of [
+    ["/etc", /absolute target/],
+    ["/Users/someone/.ssh", /absolute target/],
+    ["../../../../../../outside", /climbs with \.\./],
+    // A sibling of the bundle: `<destination>/Sibling.app`.
+    ["../../../Sibling.app/Contents", /climbs with \.\./],
+    // The lexical trap.  `b -> ..` looks contained, and `c -> b/../x` looks
+    // contained, but the kernel applies `..` after following `b`, so `c`
+    // lands outside the bundle.  Refusing every `..` refuses both halves.
+    ["..", /climbs with \.\./],
+    ["b/../x", /climbs with \.\./],
+    ["", /empty target/],
+    ["A\0/x", /contains NUL/],
+    [undefined, /could not be read/],
+  ]) {
+    assertRefused(
+      [...base, linkEntry(`${BUNDLE_ROOT}/Contents/escape`, target)],
+      why,
+      `a link to ${JSON.stringify(target)} must be refused`,
+    );
+  }
+});
+
+test("a link outside BotFleet.app is refused, wherever it sits", () => {
+  const base = frameworkEntries();
+  for (const name of ["Sibling", "__MACOSX/BotFleet.app/Contents/link"]) {
+    assertRefused([...base, linkEntry(name, "A")], /outside BotFleet\.app\//, `${name} must be refused`);
+  }
+  // The bundle itself as a link would make every other entry a write through
+  // it, to wherever it points.
+  assertRefused([linkEntry(BUNDLE_ROOT, "Contents")], /outside BotFleet\.app\//, "the bundle itself as a link");
+  assertRefused([...base, linkEntry("botfleet.APP", "Contents")], /duplicate entry/, "a case-variant bundle link collides with the bundle");
+});
+
+test("nothing may be written through a link, however the name is spelled", () => {
+  const base = frameworkEntries();
+  const current = `${FW}/Squirrel.framework/Versions/Current`;
+  for (const name of [
+    `${current}/payload`,
+    `${current}/nested/dir/`,
+    // APFS is case-insensitive, so this lands inside `Versions/Current`.
+    `${BUNDLE_ROOT.toLowerCase()}/contents/frameworks/squirrel.framework/VERSIONS/current/payload`,
+  ]) {
+    assertRefused([...base, fileEntry(name)], /written through the symlink entry/, `${name} must be refused`);
+  }
+
+  // APFS is normalization-insensitive too.  A link spelled with a composed é
+  // and a payload spelled with a decomposed one are the same directory.
+  assertRefused(
+    [...base, linkEntry(`${BUNDLE_ROOT}/Contents/café`, "Frameworks"), fileEntry(`${BUNDLE_ROOT}/Contents/café/payload`)],
+    /written through the symlink entry/,
+    "a normalization-variant spelling must still be caught",
+  );
+});
+
+test("duplicates, climbing directories, and special files are refused", () => {
+  const base = frameworkEntries();
+  assertRefused(
+    [...base, fileEntry(`${BUNDLE_ROOT}/contents/frameworks/SQUIRREL.framework/Versions/A/Squirrel`)],
+    /duplicate entry/,
+    "a case-folded duplicate would replace the first copy",
+  );
+  // Directory entries used to be skipped outright, so a climbing directory was
+  // never looked at.
+  assertRefused([...base, dirEntry(`${BUNDLE_ROOT}/../../escape/`)], /traverses out of the destination/, "a climbing directory");
+  assertRefused([...base, dirEntry("/abs/dir/")], /absolute path/, "an absolute directory");
+  assertRefused([...base, { name: `${BUNDLE_ROOT}/Contents/fifo`, mode: "prw-r--r--" }], /FIFO/, "a FIFO entry");
+});
+
+// Reading targets.  A per-read timeout alone let 256 links read one after
+// another hold the updater lock for over two hours, so the reads share one
+// wall-clock budget and run a few at a time.
+
+const manyLinks = (count) => Array.from({ length: count }, (_, index) => linkEntry(`${FW}/L${index}.framework/Versions/Current`, undefined));
+
+/** A stand-in reader that records how many reads are in flight at once. */
+function trackingReader(settle) {
+  const seen = { calls: 0, inFlight: 0, maxInFlight: 0, timeouts: [] };
+  const read = (_archive, name, timeoutMs) => {
+    seen.calls += 1;
+    seen.inFlight += 1;
+    seen.maxInFlight = Math.max(seen.maxInFlight, seen.inFlight);
+    seen.timeouts.push(timeoutMs);
+    return settle(name, timeoutMs).finally(() => {
+      seen.inFlight -= 1;
+    });
+  };
+  return { read, seen };
+}
+
+test("a read that hangs forever still hits the overall budget, and the archive is refused", async () => {
+  // This reader ignores its timeout entirely and never settles.  Only the
+  // shared deadline can end the wait.
+  const { read, seen } = trackingReader(() => new Promise(() => {}));
+  const started = Date.now();
+  await assert.rejects(
+    readSymlinkTargets("unused.zip", manyLinks(256), { budgetMs: 150, readTarget: read }),
+    (error) => {
+      assert.equal(error.cause, "unsafe-archive");
+      assert.match(error.message, /256 symlink targets took longer than 150ms/);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 5_000, "the budget, not 256 per-read timeouts, bounds the wait");
+  assert.equal(seen.maxInFlight, 8, "no more than eight reads run at once");
+  assert.equal(seen.calls, 8, "no new read starts once the budget is spent");
+});
+
+test("slow reads that honour their timeouts cannot stretch the budget either", async () => {
+  // This reader behaves like runBoundedText: it gives up when its timeout
+  // passes.  Every timeout it is handed must fit inside what is left of the
+  // budget, so the last read cannot run past the deadline.
+  const { read, seen } = trackingReader((_name, timeoutMs) => new Promise((_resolve, reject) => {
+    setTimeout(() => reject(new Error("killed at its timeout")), timeoutMs);
+  }));
+  const started = Date.now();
+  await assert.rejects(
+    readSymlinkTargets("unused.zip", manyLinks(256), { budgetMs: 200, readTarget: read }),
+    (error) => error.cause === "unsafe-archive" && /took longer than 200ms/.test(error.message),
+  );
+  assert.ok(Date.now() - started < 5_000);
+  assert.ok(seen.maxInFlight <= 8);
+  assert.ok(seen.timeouts.every((ms) => ms > 0 && ms <= 200), `every read fits inside the budget: ${seen.timeouts}`);
+});
+
+test("link targets are read in parallel, and a pattern-shaped name is never handed to unzip", async () => {
+  const { read, seen } = trackingReader(async (name) => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return `target-of-${name.split("/").at(-3)}`;
+  });
+  const entries = [...manyLinks(20), linkEntry(`${FW}/W[1].framework/Versions/Current`, undefined), fileEntry(`${FW}/plain`)];
+  await readSymlinkTargets("unused.zip", entries, { readTarget: read });
+  assert.equal(seen.calls, 20, "the wildcard-named link is not read, and plain files never are");
+  assert.equal(seen.maxInFlight, 8);
+  assert.equal(entries[0].target, "target-of-L0.framework");
+  assert.equal(entries[19].target, "target-of-L19.framework");
+  assert.equal(entries[20].target, undefined, "an unread link stays unread, which the checker refuses");
+
+  // Over the cap, nothing is read at all.
+  const capped = trackingReader(async () => "A");
+  await assert.rejects(
+    readSymlinkTargets("unused.zip", manyLinks(257), { readTarget: capped.read }),
+    (error) => error.cause === "unsafe-archive" && /257 symlink entries, more than the 256/.test(error.message),
+  );
+  assert.equal(capped.seen.calls, 0);
+});
+
+const posixOnly = process.platform === "win32" ? "symlinks need privileges on Windows" : false;
+const macOnly = process.platform === "darwin" ? false : "needs ditto, which is macOS only";
+
+/** A real BotFleet.app tree on disk, with frameworks shaped like Electron's. */
+async function stageBundle(root) {
+  const app = join(root, BUNDLE_ROOT);
+  for (const [framework, binary] of [["Squirrel", "Squirrel"], ["Electron Framework", "Electron Framework"]]) {
+    const fw = join(app, "Contents", "Frameworks", `${framework}.framework`);
+    await mkdir(join(fw, "Versions", "A", "Resources"), { recursive: true });
+    await writeFile(join(fw, "Versions", "A", binary), `${framework} binary\n`);
+    await writeFile(join(fw, "Versions", "A", "Resources", "Info.plist"), `${framework} plist\n`);
+    await symlink("A", join(fw, "Versions", "Current"));
+    await symlink("Versions/Current/Resources", join(fw, "Resources"));
+    await symlink(`Versions/Current/${binary}`, join(fw, binary));
+  }
+  await mkdir(join(app, "Contents", "Resources"), { recursive: true });
+  await writeFile(join(app, "Contents", "Resources", "marker.txt"), "staged\n");
+  return app;
+}
+
+/** Pack an app the way the hosted workflow does. */
+async function packBundle(app, zipPath) {
+  await run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", app, zipPath]);
+  return zipPath;
+}
+
+/** Wrap a bundle zip the way GitHub does, with a manifest that matches it. */
+async function wrapBundle(scratch, innerZip) {
+  const innerBytes = await readFile(innerZip);
+  const manifest = {
+    schemaVersion: 1,
+    commit: COMMIT,
+    artifact: "BotFleet-mac-arm64.zip",
+    sha256: createHash("sha256").update(innerBytes).digest("hex"),
+  };
+  const wrapperDir = await mkdtemp(join(scratch, "wrapper-"));
+  await writeFile(join(wrapperDir, "BotFleet-mac-arm64.zip"), innerBytes);
+  await writeFile(join(wrapperDir, "build-manifest.json"), JSON.stringify(manifest));
+  const wrapperZip = join(wrapperDir, "artifact.zip");
+  await run("zip", ["-q", wrapperZip, "BotFleet-mac-arm64.zip", "build-manifest.json"], { cwd: wrapperDir });
+  return { artifactBytes: await readFile(wrapperZip), manifest };
+}
+
+test("a framework-shaped bundle packed by ditto is accepted and unpacks with its links intact", { skip: macOnly }, async (t) => {
+  const scratch = await fixture(t);
+  const app = await stageBundle(join(scratch, "src"));
+  const innerZip = await packBundle(app, join(scratch, "BotFleet-mac-arm64.zip"));
+
+  const entries = await inspectArchive(innerZip, { label: "app bundle", symlinkRoot: BUNDLE_ROOT });
+  // The old listing typed a link with a space in its name as a regular file.
+  // It must come back as a link, with its real target read from the archive.
+  const spaced = entries.find(({ name }) => name === `${FW}/Electron Framework.framework/Electron Framework`);
+  assert.ok(spaced, "the spaced framework binary link is listed");
+  assert.equal(spaced.mode.charAt(0), "l", "a link with a space in its name is typed as a link");
+  assert.equal(spaced.target, "Versions/Current/Electron Framework");
+  assert.equal(entries.filter(({ mode }) => mode.startsWith("l")).length, 6);
+
+  const destination = join(scratch, "staging", "hosted");
+  const built = await materializeBuild({ ...(await wrapBundle(scratch, innerZip)), commit: COMMIT, destination });
+  assert.equal(built.appPath, join(destination, BUNDLE_ROOT));
+  const current = join(built.appPath, "Contents/Frameworks/Squirrel.framework/Versions/Current");
+  assert.ok((await lstat(current)).isSymbolicLink(), "Versions/Current is still a link after unpacking");
+  assert.equal(await readlink(current), "A");
+  assert.equal(
+    await readFile(join(built.appPath, "Contents/Frameworks/Electron Framework.framework/Resources/Info.plist"), "utf8"),
+    "Electron Framework plist\n",
+    "a file reads through the framework links",
+  );
+  // The private extraction directory is gone, and only the app is left.
+  assert.deepEqual(await readdir(destination), [BUNDLE_ROOT]);
+});
+
+test("real archives with escaping links are refused before anything is written", { skip: macOnly }, async (t) => {
+  const scratch = await fixture(t);
+  for (const [label, linkPath, target, why] of [
+    ["an absolute target", "Contents/abs", "/etc", /absolute target/],
+    ["an escape via ../..", "Contents/Frameworks/esc", "../../../outside", /climbs with \.\./],
+    ["a sibling outside the bundle", "Contents/sib", "../../Sibling.app/Contents", /climbs with \.\./],
+  ]) {
+    const root = await mkdtemp(join(scratch, "case-"));
+    const app = await stageBundle(join(root, "src"));
+    await symlink(target, join(app, linkPath));
+    const innerZip = await packBundle(app, join(root, "BotFleet-mac-arm64.zip"));
+    await assert.rejects(
+      inspectArchive(innerZip, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }),
+      (error) => {
+        assert.equal(error.cause, "unsafe-archive", label);
+        assert.match(error.message, why, label);
+        assert.match(error.message, new RegExp(escapeForRegExp(`${BUNDLE_ROOT}/${linkPath}`)), `${label} names the link`);
+        return true;
+      },
+    );
+  }
+});
+
+test("an entry written through a link in a real archive is refused, and nothing lands outside", { skip: macOnly }, async (t) => {
+  const scratch = await fixture(t);
+  const outside = join(scratch, "outside");
+  await mkdir(outside);
+
+  // Stage 1: a bundle whose link points out of it, packed by ditto.
+  const first = await stageBundle(join(scratch, "stage1"));
+  await symlink("../../outside", join(first, "Contents", "evil"));
+  const innerZip = await packBundle(first, join(scratch, "BotFleet-mac-arm64.zip"));
+  // Stage 2: append an innocent-looking file whose path runs through that link.
+  // `zip` cannot hold both on one disk at once, so it comes from a second tree.
+  const second = join(scratch, "stage2");
+  await mkdir(join(second, BUNDLE_ROOT, "Contents", "evil"), { recursive: true });
+  await writeFile(join(second, BUNDLE_ROOT, "Contents", "evil", "pwned"), "pwned\n");
+  await run("zip", ["-q", "-y", innerZip, `${BUNDLE_ROOT}/Contents/evil/pwned`], { cwd: second });
+
+  await assert.rejects(
+    inspectArchive(innerZip, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }),
+    (error) => {
+      assert.equal(error.cause, "unsafe-archive");
+      assert.match(error.message, /BotFleet\.app\/Contents\/evil\/pwned \(written through the symlink entry BotFleet\.app\/Contents\/evil\)/);
+      return true;
+    },
+  );
+
+  // The full materialise path refuses it too, and writes nothing anywhere.
+  const destination = join(scratch, "staging", "hosted");
+  await assert.rejects(
+    materializeBuild({ ...(await wrapBundle(scratch, innerZip)), commit: COMMIT, destination }),
+    (error) => error.cause === "unsafe-archive",
+  );
+  assert.deepEqual(await readdir(outside), [], "nothing was written through the link");
+  assert.deepEqual(await readdir(destination), [], "nothing was unpacked");
+});
+
+test("the unpacked tree is checked again on disk", { skip: posixOnly }, async (t) => {
+  const scratch = await fixture(t);
+  const app = await stageBundle(join(scratch, "good"));
+  await assert.doesNotReject(assertExtractedBundleContained(app));
+
+  // Whatever the archive listing said, a link that really resolves outside the
+  // bundle, or nowhere, is refused before the bundle is moved.
+  for (const [label, linkPath, target, why] of [
+    ["an absolute target", "Contents/abs", scratch, /resolves outside the bundle/],
+    ["a climbing target", "Contents/Frameworks/up", "../../..", /resolves outside the bundle/],
+    ["a dangling target", "Contents/gone", "Nowhere/at/all", /dangling/],
+  ]) {
+    const bad = await stageBundle(await mkdtemp(join(scratch, "bad-")));
+    await mkdir(dirname(join(bad, linkPath)), { recursive: true });
+    await symlink(target, join(bad, linkPath));
+    await assert.rejects(
+      assertExtractedBundleContained(bad),
+      (error) => {
+        assert.equal(error.cause, "unsafe-archive", label);
+        assert.match(error.message, why, label);
+        return true;
+      },
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Choosing the newest commit with a green hosted build when no target is named
+// ---------------------------------------------------------------------------
+
+// Oldest to newest.  C0 is "installed" in most cases below; C4 is main's tip.
+const C = ["1", "2", "3", "4", "5"].map((digit) => digit.repeat(40));
+const SELECT_ENV = { GITHUB_TOKEN: "fixture-token" };
+
+/**
+ * A fetch that answers the three Actions endpoints the selection reads, and
+ * records every URL it was asked for.  `green` is the commits that have a
+ * successful run (newest-first as GitHub lists them); `tipRun` is what the
+ * per-commit lookup of main's tip returns.
+ */
+function actionsFetch({ green = [], tipRun = null, expired = [], urls = [], fail = null } = {}) {
+  const body = (value) => ({ ok: true, status: 200, json: async () => value });
+  return async (url) => {
+    const text = String(url);
+    urls.push(text);
+    if (fail) return fail(text);
+    if (text.includes("status=success")) {
+      return body({ workflow_runs: green.map((commit, index) => aRun({ id: 100 + index, head_sha: commit })) });
+    }
+    if (text.includes("head_sha=")) {
+      return body({ workflow_runs: tipRun ? [aRun({ id: 7, ...tipRun })] : [] });
+    }
+    const match = /runs\/(\d+)\/artifacts/.exec(text);
+    if (match) {
+      const commit = green[Number(match[1]) - 100];
+      return body({ artifacts: [anArtifact({ name: artifactNameFor(commit), expired: expired.includes(commit) })] });
+    }
+    throw new Error(`unexpected request ${text}`);
+  };
+}
+
+const select = (candidates, options = {}) =>
+  selectNewestGreenCommit({ candidates, tip: candidates[0], env: SELECT_ENV, ...options });
+
+test("main's tip is chosen when its build is green", async () => {
+  const urls = [];
+  const found = await select([C[4], C[3], C[2]], { fetchImpl: actionsFetch({ green: [C[4], C[3]], urls }) });
+  assert.equal(found.commit, C[4]);
+  assert.equal(found.behind, 0);
+  assert.equal(found.tipBuild, "succeeded");
+  // The listing is one request for all of main's successful runs, then the
+  // artifact of the commit chosen.  The tip's own state is not looked up
+  // because nothing needs describing.
+  assert.equal(urls.length, 2, urls.join("\n"));
+  assert.match(urls[0], /\/actions\/workflows\/mac-commit-build\.yml\/runs\?branch=main&status=success&per_page=100$/);
+  assert.match(urls[1], /\/actions\/runs\/100\/artifacts/);
+});
+
+test("a cancelled tip falls back to the newest earlier commit that is green", async () => {
+  // Exactly the 2026-10-09 failure: the tip's build was cancelled by the next
+  // push, and the commit before it had a green build.
+  const found = await select([C[4], C[3], C[2]], {
+    fetchImpl: actionsFetch({ green: [C[3], C[2]], tipRun: { head_sha: C[4], status: "completed", conclusion: "cancelled" } }),
+  });
+  assert.equal(found.commit, C[3]);
+  assert.equal(found.behind, 1);
+  assert.equal(found.tipBuild, "was cancelled");
+});
+
+test("the newest GREEN COMMIT wins, whatever order the runs finished in", async () => {
+  // A re-run of an old commit can finish after a newer one, so GitHub lists the
+  // older commit's run first.  Git order decides.
+  const found = await select([C[4], C[3], C[2]], {
+    fetchImpl: actionsFetch({ green: [C[2], C[3]], tipRun: { head_sha: C[4], status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(found.commit, C[3]);
+  assert.equal(found.behind, 1);
+  assert.equal(found.tipBuild, "is still running");
+});
+
+test("a tip that is still queued, failed or has no build at all is described as such", async () => {
+  for (const [tipRun, expected] of [
+    [{ head_sha: C[4], status: "queued", conclusion: null }, "is still running"],
+    [{ head_sha: C[4], status: "completed", conclusion: "failure" }, "failed"],
+    [{ head_sha: C[4], status: "completed", conclusion: "timed_out" }, "timed out"],
+    [null, "has no hosted build yet"],
+  ]) {
+    const found = await select([C[4], C[3]], { fetchImpl: actionsFetch({ green: [C[3]], tipRun }) });
+    assert.equal(found.commit, C[3]);
+    assert.equal(found.tipBuild, expected);
+  }
+});
+
+test("a green run whose artifact has expired is skipped for the next candidate", async () => {
+  const logs = [];
+  const found = await select([C[4], C[3], C[2]], {
+    fetchImpl: actionsFetch({ green: [C[4], C[3], C[2]], expired: [C[4]], tipRun: { head_sha: C[4], status: "completed", conclusion: "success" } }),
+    log: (line) => logs.push(line),
+  });
+  assert.equal(found.commit, C[3]);
+  assert.equal(found.behind, 1);
+  assert.match(logs.join("\n"), /artifact is missing or expired/);
+});
+
+test("only runs the install path itself would accept count as green", async () => {
+  const fetchImpl = async (url) => ({
+    ok: true,
+    status: 200,
+    json: async () => String(url).includes("status=success")
+      ? { workflow_runs: [aRun({ id: 1, head_sha: C[4], event: "pull_request" }), aRun({ id: 2, head_sha: C[3], event: "workflow_dispatch" })] }
+      : String(url).includes("head_sha=")
+        ? { workflow_runs: [] }
+        : { artifacts: [anArtifact({ name: artifactNameFor(C[3]) })] },
+  });
+  const found = await select([C[4], C[3]], { fetchImpl });
+  assert.equal(found.commit, C[3], "a pull_request run is not a build of main; a workflow_dispatch run is");
+});
+
+test("a malformed Actions response is no usable build, never a guess", async () => {
+  // Hand-checked (no zod: the updater is bootstrapped without node_modules), so
+  // the checks have to hold on their own: an array, then every item's shape.
+  const respond = ({ runs, artifacts }) => async (url) => {
+    const text = String(url);
+    const body = text.includes("/artifacts")
+      ? artifacts
+      : text.includes("head_sha=") ? { workflow_runs: [] } : runs;
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const goodRuns = { workflow_runs: [aRun({ id: 100, head_sha: C[4] })] };
+  const goodArtifact = anArtifact({ name: artifactNameFor(C[4]) });
+  // Control: the well-formed pair selects the commit.
+  assert.equal((await select([C[4]], { fetchImpl: respond({ runs: goodRuns, artifacts: { artifacts: [goodArtifact] } }) })).commit, C[4]);
+
+  for (const [label, artifacts] of [
+    ["a body that is not an object", "oops"],
+    ["a null body", null],
+    ["no artifacts key", {}],
+    ["artifacts that is not an array", { artifacts: { 0: goodArtifact } }],
+    ["artifacts that is null", { artifacts: null }],
+    ["an item that is not an object", { artifacts: ["x", 7, null] }],
+    ["an item without expired", { artifacts: [{ ...goodArtifact, expired: undefined }] }],
+    ["an item with a string expired", { artifacts: [{ ...goodArtifact, expired: "false" }] }],
+    ["an item with a string id", { artifacts: [{ ...goodArtifact, id: "1" }] }],
+    ["an item without a download url", { artifacts: [{ ...goodArtifact, archive_download_url: undefined }] }],
+    ["an item with a numeric name", { artifacts: [{ ...goodArtifact, name: 5 }] }],
+    ["an expired item", { artifacts: [{ ...goodArtifact, expired: true }] }],
+    ["an artifact for another commit", { artifacts: [{ ...goodArtifact, name: artifactNameFor(C[3]) }] }],
+  ]) {
+    const found = await select([C[4]], { fetchImpl: respond({ runs: goodRuns, artifacts }) });
+    assert.equal(found.commit, null, label);
+  }
+
+  for (const [label, runs] of [
+    ["a body that is not an object", "oops"],
+    ["workflow_runs that is not an array", { workflow_runs: { 0: aRun({ head_sha: C[4] }) } }],
+    ["a run without an id", { workflow_runs: [aRun({ id: undefined, head_sha: C[4] })] }],
+    ["a run with a numeric head_sha", { workflow_runs: [aRun({ head_sha: 4 })] }],
+    ["a run with a missing status", { workflow_runs: [aRun({ head_sha: C[4], status: undefined })] }],
+    ["a run that did not conclude success", { workflow_runs: [aRun({ head_sha: C[4], conclusion: "failure" })] }],
+    ["a run with no conclusion", { workflow_runs: [aRun({ id: 100, head_sha: C[4], conclusion: null })] }],
+  ]) {
+    const found = await select([C[4]], { fetchImpl: respond({ runs, artifacts: { artifacts: [goodArtifact] } }) });
+    assert.equal(found.commit, null, label);
+  }
+});
+
+test("nothing green among the candidates is an answer, not an error", async () => {
+  const found = await select([C[4], C[3]], {
+    fetchImpl: actionsFetch({ green: [], tipRun: { head_sha: C[4], status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(found.commit, null);
+  assert.equal(found.tipBuild, "is still running");
+});
+
+test("only a handful of artifact lookups are made before giving up", async () => {
+  const urls = [];
+  const many = Array.from({ length: 12 }, (_, index) => String(index + 1).padStart(2, "0").repeat(20));
+  const found = await select(many, { fetchImpl: actionsFetch({ green: many, expired: many, urls }) });
+  assert.equal(found.commit, null);
+  assert.equal(urls.filter((url) => url.includes("/artifacts")).length, 5);
+  assert.deepEqual([found.withoutArtifact, found.capped], [5, true]);
+});
+
+test("a GitHub failure surfaces as a classified error the wrapper can fail open on", async () => {
+  await assert.rejects(
+    select([C[4]], { fetchImpl: actionsFetch({ fail: () => ({ ok: false, status: 403, json: async () => ({}) }) }) }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "rate-limited");
+      // The message names the commit it was looking for, not a placeholder.
+      assert.match(error.message, new RegExp(C[4]));
+      return true;
+    },
+  );
+});
+
+// ---- Which commits are candidates: real git, because the floor is the point.
+
+async function mainHistory(t, count = 5) {
+  const dir = await fixture(t);
+  const git = async (...args) => (await run("git", ["-C", dir, ...args])).stdout.trim();
+  await run("git", ["init", "-q", "-b", "main", dir]);
+  const commits = [];
+  for (let index = 0; index < count; index += 1) {
+    await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", `c${index}`);
+    commits.push(await git("rev-parse", "HEAD"));
+  }
+  await git("update-ref", "refs/remotes/origin/main", commits.at(-1));
+  return { dir, commits, git, gitSync: (args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim() };
+}
+
+test("candidates run from main's tip down to, but not including, the installed build", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [c0, c1, c2, c3, c4] = commits;
+  const listed = listUpdateCandidates({ git: gitSync, installed: c1 });
+  assert.deepEqual(listed.candidates, [c4, c3, c2], "the installed build and everything older is excluded");
+  assert.equal(listed.tip, c4);
+  assert.notEqual(listed.truncated, true);
+  assert.deepEqual(listUpdateCandidates({ git: gitSync, installed: c3 }).candidates, [c4]);
+  assert.ok(!listUpdateCandidates({ git: gitSync, installed: c0 }).candidates.includes(c0));
+});
+
+test("when the floor cannot be proven the selection steps aside rather than guess", async (t) => {
+  const { commits, git, gitSync } = await mainHistory(t);
+  const tip = commits.at(-1);
+  assert.match(listUpdateCandidates({ git: gitSync, installed: null }).skip, /no source commit/);
+  assert.match(listUpdateCandidates({ git: gitSync, installed: tip }).skip, /already main's tip/);
+  assert.match(listUpdateCandidates({ git: gitSync, installed: "9".repeat(40) }).skip, /not an ancestor/);
+  // A build from a commit that never reached main is not on main's history.
+  await git("checkout", "-q", "-b", "side", commits[1]);
+  await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "side");
+  const sideCommit = await git("rev-parse", "HEAD");
+  assert.match(listUpdateCandidates({ git: gitSync, installed: sideCommit }).skip, /not an ancestor/);
+  await git("update-ref", "-d", "refs/remotes/origin/main");
+  assert.match(listUpdateCandidates({ git: gitSync, installed: commits[0] }).skip, /origin\/main cannot be read/);
+});
+
+test("the candidate window is bounded and says when it was cut", async (t) => {
+  const { commits, gitSync } = await mainHistory(t, 6);
+  const listed = listUpdateCandidates({ git: gitSync, installed: commits[0], windowSize: 3 });
+  assert.equal(listed.candidates.length, 3);
+  assert.equal(listed.truncated, true);
+  assert.equal(SELECTION_WINDOW, 100);
+});
+
+test("first-parent history is what is walked, so a merged side branch is never a candidate", async (t) => {
+  const { commits, git, gitSync } = await mainHistory(t, 3);
+  await git("checkout", "-q", "-b", "feature", commits[0]);
+  await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "feature work");
+  const feature = await git("rev-parse", "HEAD");
+  await git("checkout", "-q", "main");
+  await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "merge", "-q", "--no-ff", "-m", "merge feature", "feature");
+  const merge = await git("rev-parse", "HEAD");
+  await git("update-ref", "refs/remotes/origin/main", merge);
+  const listed = listUpdateCandidates({ git: gitSync, installed: commits[0] });
+  assert.deepEqual(listed.candidates, [merge, commits[2], commits[1]]);
+  assert.ok(!listed.candidates.includes(feature), "a commit only reachable through a merge was never pushed to main, so it has no build");
+  // An installed build on the merged side branch: the mainline commits that do
+  // not contain it are not an upgrade from it, so only the merge itself is.
+  assert.deepEqual(listUpdateCandidates({ git: gitSync, installed: feature }).candidates, [merge]);
+});
+
+// ---- The whole decision.
+
+test("selectUpdateTarget picks the tip when it is green and the earlier commit when it is not", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [c0, , c2, c3, c4] = commits;
+  const common = { git: gitSync, installedCommit: c0, env: SELECT_ENV };
+
+  const tipGreen = await selectUpdateTarget({ ...common, fetchImpl: actionsFetch({ green: [c4, c3] }) });
+  assert.deepEqual([tipGreen.status, tipGreen.commit], ["selected", c4]);
+  assert.match(tipGreen.message, new RegExp(`^Updating to ${c4.slice(0, 12)} \\(main's tip; its build succeeded\\)$`));
+
+  const tipCancelled = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [c3, c2], tipRun: { head_sha: c4, status: "completed", conclusion: "cancelled" } }),
+  });
+  assert.deepEqual([tipCancelled.status, tipCancelled.commit], ["selected", c3]);
+  assert.equal(
+    tipCancelled.message,
+    `Updating to ${c3.slice(0, 12)} (main is 1 commit ahead; its build was cancelled)`,
+  );
+
+  const tipRunning = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [c2], tipRun: { head_sha: c4, status: "in_progress", conclusion: null } }),
+  });
+  assert.deepEqual([tipRunning.status, tipRunning.commit], ["selected", c2]);
+  assert.equal(
+    tipRunning.message,
+    `Updating to ${c2.slice(0, 12)} (main is 2 commits ahead; its build is still running)`,
+  );
+});
+
+test("nothing newer than the installed build is green: a clear refusal, never the installed build", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [, c1, , , c4] = commits;
+  // The installed commit (c1) and an older one are green; everything above is
+  // not.  Choosing either would be a reinstall or a downgrade.
+  const decision = await selectUpdateTarget({
+    git: gitSync,
+    installedCommit: c1,
+    env: SELECT_ENV,
+    fetchImpl: actionsFetch({ green: [c1, commits[0]], tipRun: { head_sha: c4, status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(decision.status, "none");
+  assert.match(decision.message, /^No newer hosted build to install\./);
+  assert.match(decision.message, new RegExp(`installed build is ${c1.slice(0, 12)}`));
+  assert.match(decision.message, new RegExp(`Main is at ${c4.slice(0, 12)}, 3 commits ahead`));
+  assert.match(decision.message, /its build is still running/);
+  assert.match(decision.message, /BOTFLEET_UPDATE_SOURCE=local/);
+  assert.ok(!decision.message.includes("\n"), "the explanation is one line, because the wrapper hands it over in a variable");
+});
+
+test("green builds whose artifacts expired ask for a re-run, not a wait", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [, c1, c2, c3, c4] = commits;
+  const common = { git: gitSync, installedCommit: c1, env: SELECT_ENV };
+  const tipRun = { head_sha: c4, status: "completed", conclusion: "success" };
+
+  const all = await selectUpdateTarget({ ...common, fetchImpl: actionsFetch({ green: [c4, c3, c2], expired: [c4, c3, c2], tipRun }) });
+  assert.equal(all.status, "none");
+  assert.match(all.message, /3 commits in between have successful hosted builds, but their artifacts are missing or expired\./);
+  assert.match(all.message, /Re-run the Mac Commit Build workflow on main's tip/);
+  assert.doesNotMatch(all.message, /None of the commits in between has a successful hosted build/);
+  assert.ok(!all.message.includes("\n"));
+
+  const one = await selectUpdateTarget({ ...common, fetchImpl: actionsFetch({ green: [c4], expired: [c4], tipRun }) });
+  assert.match(one.message, /1 commit in between has a successful hosted build, but its artifact is missing or expired\./);
+});
+
+test("a truncated window changes what is said about the span searched, never the distance to the chosen commit", async (t) => {
+  // Six commits, a window of three: the installed build (c0) is further back
+  // than the search looked.
+  const { commits, gitSync } = await mainHistory(t, 6);
+  const [c0, , , c3, c4, c5] = commits;
+  const common = { git: gitSync, installedCommit: c0, env: SELECT_ENV, windowSize: 3 };
+
+  // The chosen commit is two below the tip, and that count is exact: it is the
+  // chosen commit's position counted down from the tip, so it is not "more
+  // than" anything even though the window was cut.
+  const selected = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [c3], tipRun: { head_sha: c5, status: "in_progress", conclusion: null } }),
+  });
+  assert.deepEqual([selected.status, selected.commit, selected.behind, selected.truncated], ["selected", c3, 2, true]);
+  assert.equal(selected.message, `Updating to ${c3.slice(0, 12)} (main is 2 commits ahead; its build is still running)`);
+
+  // Nothing green in the window: the span between the installed build and the
+  // tip is what is unsearched, so THAT count is a lower bound.
+  const none = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [], tipRun: { head_sha: c5, status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(none.status, "none");
+  assert.match(none.message, new RegExp(`Main is at ${c5.slice(0, 12)}, more than 3 commits ahead`));
+
+  // A window that was not cut says nothing of the kind.
+  const whole = await selectUpdateTarget({
+    ...common,
+    windowSize: 100,
+    fetchImpl: actionsFetch({ green: [c4], tipRun: { head_sha: c5, status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(whole.truncated, false);
+  assert.equal(whole.message, `Updating to ${c4.slice(0, 12)} (main is 1 commit ahead; its build is still running)`);
+});
+
+test("the policy decides what 'nothing newer' means: local keeps the tip, auto falls back to it", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const nothingGreen = actionsFetch({ green: [], tipRun: { head_sha: commits[4], status: "in_progress", conclusion: null } });
+  const base = { git: gitSync, installedCommit: commits[0], fetchImpl: nothingGreen };
+
+  const local = await selectUpdateTarget({ ...base, env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "local" } });
+  assert.equal(local.status, "skip");
+  assert.match(local.reason, /packages the commit on this Mac/);
+
+  const auto = await selectUpdateTarget({ ...base, env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "auto" } });
+  assert.equal(auto.status, "skip", "auto packages the tip locally when no hosted build is newer");
+
+  // auto still prefers a hosted build over packaging when one exists.
+  const autoGreen = await selectUpdateTarget({
+    ...base,
+    env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "auto" },
+    fetchImpl: actionsFetch({ green: [commits[3]], tipRun: { head_sha: commits[4], status: "in_progress", conclusion: null } }),
+  });
+  assert.deepEqual([autoGreen.status, autoGreen.commit], ["selected", commits[3]]);
+
+  // local never even asks GitHub.
+  const urls = [];
+  await selectUpdateTarget({ ...base, env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "local" }, fetchImpl: actionsFetch({ urls }) });
+  assert.deepEqual(urls, []);
+});
+
+test("an installed build that is already the tip leaves the plain update path alone", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const urls = [];
+  const decision = await selectUpdateTarget({
+    git: gitSync,
+    installedCommit: commits[4],
+    env: SELECT_ENV,
+    fetchImpl: actionsFetch({ urls }),
+  });
+  assert.equal(decision.status, "skip");
+  assert.deepEqual(urls, [], "nothing is looked up when there is nothing to choose");
+});
+
+test("the installed build is read from the app's build identity", async (t) => {
+  const app = await fixture(t);
+  const identity = join(app, "Contents/Resources/server/build-identity.json");
+  await mkdir(dirname(identity), { recursive: true });
+  await writeFile(identity, JSON.stringify({ sourceCommit: C[1] }));
+  assert.equal(await readInstalledSourceCommit(app), C[1]);
+  await writeFile(identity, JSON.stringify({ sourceCommit: "not-a-commit" }));
+  assert.equal(await readInstalledSourceCommit(app), null);
+  // Strict: a string of exactly 40 lowercase hex digits, nothing that merely
+  // coerces to one.  `RegExp#test` stringifies its argument, so an array
+  // holding a valid sha used to pass.
+  for (const [label, sourceCommit] of [
+    ["an array holding a valid sha", [C[1]]],
+    ["a number", 1234567890],
+    ["null", null],
+    ["an object", { sha: C[1] }],
+    ["39 digits", "a".repeat(39)],
+    ["41 digits", "a".repeat(41)],
+    ["uppercase hex", "A".repeat(40)],
+    ["a sha with a trailing newline", `${C[1]}\n`],
+    ["a sha with surrounding space", ` ${C[1]}`],
+  ]) {
+    await writeFile(identity, JSON.stringify({ sourceCommit }));
+    assert.equal(await readInstalledSourceCommit(app), null, label);
+  }
+  await writeFile(identity, JSON.stringify(null));
+  assert.equal(await readInstalledSourceCommit(app), null, "a manifest that is not an object");
+  await writeFile(identity, JSON.stringify({ sourceCommit: C[1] }));
+  assert.equal(await readInstalledSourceCommit(app), C[1]);
+  await writeFile(identity, "{ torn");
+  assert.equal(await readInstalledSourceCommit(app), null);
+  assert.equal(await readInstalledSourceCommit(join(app, "missing")), null);
 });

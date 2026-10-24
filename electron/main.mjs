@@ -1,6 +1,9 @@
 import { app, BrowserWindow, WebContentsView, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, screen, session, shell, systemPreferences, Tray, utilityProcess } from "electron";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { openServerControls, shutdownAttachedServer } from "./server-controls.mjs";
+import { botfleetDataDir } from "./app-paths.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +11,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { startCua, stopCua, registerCuaIpc, setCuaStateListener } from "./cua.mjs";
 import { createAndroidDeviceController } from "./android-device.mjs";
 import { assemblyAICredential, mintAssemblyAIStreamingToken } from "./assemblyai.mjs";
+import {
+  geminiCredential,
+  mintGeminiLiveToken,
+  mintXaiRealtimeToken,
+  xaiCredential,
+} from "./sts-tokens.mjs";
 import {
   finishSpeech,
   listPersonalVoices,
@@ -25,6 +34,7 @@ import {
 import { openBlankTerminal } from "./terminal-launch.mjs";
 import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
 import { readConfigFile, updateConfigFile } from "./config-file-lock.mjs";
+import { readPersistOnExitPolicy } from "./persist-on-exit-policy.mjs";
 import { buildDiagnosticsReport, decodeLogTail, diagnosticsFileName } from "./diagnostics.mjs";
 import {
   assertExternalWorkspaceCredentialMarkers,
@@ -46,7 +56,7 @@ import { startUiShim } from "./attached-ui-shim.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
-import { mayOpenBotFile, resolveOpenablePath } from "./open-file.mjs";
+import { mayOpenBotFile, resolveLocalRevealPath, resolveOpenablePath } from "./open-file.mjs";
 import { installTrustedIpcGuard, isTrustedRendererUrl } from "./renderer-trust.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
 import {
@@ -78,8 +88,10 @@ import {
   resolveCompanionControlPlaneURL,
 } from "./companion-account-service.mjs";
 import capabilitiesModule from "./capabilities.cjs";
+import appInfoModule from "./app-info.cjs";
 
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
+const { appRuntimeInfo, appRuntimeSummary } = appInfoModule;
 let updateCredentialPreparationPath;
 try {
   updateCredentialPreparationPath = updateCredentialReceiptPath(process.argv);
@@ -89,6 +101,90 @@ try {
 }
 const nativeActions = nativeDesktopActions(process.platform);
 const require = createRequire(import.meta.url);
+
+// Match server/sentry.ts: all-zeros is an unknown checkout, never a release.
+const UNKNOWN_COMMIT = "0".repeat(40);
+const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
+
+function resolvedDesktopReleaseSha() {
+  const candidates = [];
+  for (const key of ["SENTRY_RELEASE", "GITHUB_SHA", "VERCEL_GIT_COMMIT_SHA"]) {
+    const value = process.env[key]?.trim();
+    if (value) candidates.push(value);
+  }
+  // Packaged Electron builds stamp a real SHA in build-identity.json; env
+  // overrides still win when set.
+  if (process.resourcesPath) {
+    try {
+      const build = readPackagedBuildIdentity(path.join(process.resourcesPath, "server"));
+      if (build?.sourceCommit) candidates.push(build.sourceCommit);
+    } catch {
+      /* dev runs and unpackaged CI have no identity; release stays env-only */
+    }
+  }
+  for (const candidate of candidates) {
+    if (candidate && candidate !== UNKNOWN_COMMIT && RELEASE_SHA.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function redactQueryStringTokens(url) {
+  if (url == null || url === "") return url;
+  return String(url).replace(/([?&])(token|key|secret|authorization)=[^&]*/gi, "$1$2=[redacted]");
+}
+
+function scrubDesktopSentryRequest(event) {
+  if (!event) return event;
+  if (event.request) {
+    if (event.request.headers) event.request.headers = {};
+    if (event.request.query_string) {
+      event.request.query_string = "[redacted]";
+    }
+  }
+  return event;
+}
+
+function initDesktopSentry() {
+  if (process.env.VITEST === "true" || process.env.NODE_ENV === "test") return;
+  const dsn = String(process.env.SENTRY_DSN || process.env.VITE_SENTRY_DSN || "").trim();
+  if (!dsn) return;
+  try {
+    const Sentry = require("@sentry/electron/main");
+    const release = resolvedDesktopReleaseSha();
+    Sentry.init({
+      dsn,
+      // @sentry/electron v8 resolves the v11 JavaScript SDK.  v11 replaced
+      // sendDefaultPii with dataCollection and collects these categories by
+      // default, so keep the desktop client on an explicit restrictive policy.
+      dataCollection: {
+        userInfo: false,
+        cookies: false,
+        httpHeaders: { request: false, response: false },
+        httpBodies: [],
+        urlQueryParams: false,
+        genAI: { inputs: false, outputs: false },
+        databaseQueryData: false,
+        queues: false,
+        graphQL: { document: false, variables: false },
+        stackFrameVariables: false,
+        frameContextLines: 0,
+      },
+      environment: String(process.env.SENTRY_ENV || process.env.NODE_ENV || "production").trim() || "production",
+      release,
+      beforeSend(event) {
+        return scrubDesktopSentryRequest(event);
+      },
+      beforeBreadcrumb(breadcrumb) {
+        if (breadcrumb?.data?.url) breadcrumb.data.url = redactQueryStringTokens(breadcrumb.data.url);
+        return breadcrumb;
+      },
+    });
+  } catch {
+    /* @sentry/electron is optional in a source checkout */
+  }
+}
+initDesktopSentry();
+
 const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource } = require(
   "./screen-preview.cjs",
 );
@@ -137,21 +233,23 @@ function readWindowState() {
   }
 }
 
-function writeWindowState(win) {
+async function writeWindowState(win) {
   if (!win || win.isDestroyed()) return;
+  let payload;
+  try {
+    payload = JSON.stringify({ bounds: win.getNormalBounds(), maximized: win.isMaximized() });
+  } catch {
+    return;
+  }
   const file = windowStateFile();
   const temporary = `${file}.${process.pid}.tmp`;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(
-      temporary,
-      JSON.stringify({ bounds: win.getNormalBounds(), maximized: win.isMaximized() }),
-      { mode: 0o600 },
-    );
-    fs.renameSync(temporary, file);
+    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    await fs.promises.writeFile(temporary, payload, { mode: 0o600 });
+    await fs.promises.rename(temporary, file);
   } catch (error) {
     try {
-      fs.rmSync(temporary, { force: true });
+      await fs.promises.rm(temporary, { force: true });
     } catch {}
     slog(`window state save failed: ${error?.message ?? error}`);
   }
@@ -162,7 +260,7 @@ function installWindowStatePersistence(win) {
   const flush = () => {
     if (timer) clearTimeout(timer);
     timer = null;
-    writeWindowState(win);
+    void writeWindowState(win);
   };
   const schedule = () => {
     if (timer) clearTimeout(timer);
@@ -522,7 +620,7 @@ function writeUpdateCredentialReceipt(receiptPath, receipt) {
 }
 
 function desktopConfigPath() {
-  const dataDir = process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet");
+  const dataDir = botfleetDataDir();
   return path.join(dataDir, "config.json");
 }
 
@@ -554,6 +652,11 @@ let managedComposioSetup = { status: "unconfigured" };
 // why stdio is piped, not inherited — under a Finder/Explorer launch the
 // parent's stdio leads nowhere and a failed boot is otherwise undiagnosable.
 const LOG_DIR = app.getPath("logs");
+// The app's own data directory: ~/.botfleet unless OMB_DATA_DIR says
+// otherwise.  The application menu opens this, so it has to resolve to the
+// same place the harness writes to — see app-paths.mjs for why this is one
+// function rather than a literal in three places.
+const DATA_DIR = botfleetDataDir();
 let logStream = null;
 import {
   companionAdvertisedHostedUrl,
@@ -985,7 +1088,7 @@ let credentialRestoreStopped = false;
 let credentialRestoreLastOutcome = null;
 async function replayAttachedWorkspaceCredentials(port, expectedBuild) {
   if (credentialRestoreStopped) return;
-  const owner = readHarnessOwner(process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet"));
+  const owner = readHarnessOwner(botfleetDataDir());
   let outcome = "unavailable";
   try {
     // Hold the existing credential transaction through the network restore.
@@ -1029,7 +1132,7 @@ async function startServerPackaged() {
   // during teardown — one settle-and-retry covers it.
   const result = await resolvePackagedServer({
     ports: [8799, 18799, 28799],
-    owner: () => readHarnessOwner(process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet")),
+    owner: () => readHarnessOwner(botfleetDataDir()),
     probe: (port, owner) => probeHarness({ port, owner, expectedBuild }),
     spawn: startServerOn,
     log: slog,
@@ -1583,7 +1686,8 @@ ipcMain.handle("screen:frame", async (_event, options) => {
       : sources.length > 1
         ? sources[1]
         : sources[0];
-  return target?.thumbnail.toDataURL() ?? null;
+  if (!target) return null;
+  return `data:image/jpeg;base64,${target.thumbnail.toJPEG(75).toString("base64")}`;
 });
 
 // Onboarding permission checks. Status reads are free; the mic request
@@ -1699,6 +1803,20 @@ ipcMain.handle("desktop:show-in-folder", async (_event, rawPath) => {
   return true;
 });
 
+// Plugin install sources may be folders outside ~/.botfleet; reveal them in
+// the file manager without the bot-file confinement used for chat attachments.
+ipcMain.handle("desktop:reveal-local-path", async (_event, rawPath) => {
+  const resolved = await resolveLocalRevealPath(rawPath);
+  const stats = await fs.promises.stat(resolved);
+  if (stats.isDirectory()) {
+    const openError = await shell.openPath(resolved);
+    if (openError) throw new Error(openError);
+  } else {
+    shell.showItemInFolder(resolved);
+  }
+  return true;
+});
+
 // The renderer owns the skin. Native Windows/Linux chrome is intentionally
 // outside that surface; acknowledge the renderer handshake without creating
 // a frameless caption overlay that can cover page controls.
@@ -1810,9 +1928,20 @@ ipcMain.handle("personal-voice:list", async () => {
   if (!nativeActions.appleSpeech) return [];
   return listPersonalVoices();
 });
-ipcMain.handle("personal-voice:speak", async (_event, text, voiceId) => {
+ipcMain.handle("personal-voice:speak", async (event, text, voiceId, options) => {
   if (!nativeActions.appleSpeech) throw new Error("Personal Voice requires macOS.");
-  return speakPersonalVoice(text, voiceId);
+  // Word ranges go back only to the window that asked, tagged with the id
+  // its preload chose, and carry numbers only: no text crosses back.
+  const progressId = Number(options?.progressId);
+  const sender = event.sender;
+  const onRange = Number.isSafeInteger(progressId) && progressId > 0
+    ? ({ location, length, elapsedMs }) => {
+      if (!sender.isDestroyed()) {
+        sender.send("personal-voice:range", { id: progressId, location, length, elapsedMs });
+      }
+    }
+    : undefined;
+  return speakPersonalVoice(text, voiceId, { onRange });
 });
 ipcMain.handle("personal-voice:stop", () => {
   if (nativeActions.appleSpeech) stopPersonalVoice();
@@ -1884,6 +2013,18 @@ ipcMain.handle("desktop:capabilities", async () =>
   }),
 );
 
+// Which build is running, for the settings panel. Answered from the live
+// process, so it always describes the app the user is actually looking at
+// rather than whatever was last installed.
+ipcMain.handle("desktop:app-info", () => {
+  const info = appRuntimeInfo({
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    harness: app.isPackaged ? `${serverMode}:${SERVER_PORT}` : "dev",
+  });
+  return { ...info, summary: appRuntimeSummary(info) };
+});
+
 ipcMain.handle("assemblyai:status", () => ({
   configured: Boolean(assemblyAICredential(secureCredentials)),
 }));
@@ -1906,9 +2047,48 @@ ipcMain.handle("assemblyai:streaming-token", () =>
   mintAssemblyAIStreamingToken(assemblyAICredential(secureCredentials)),
 );
 
+// Speech-to-speech call sessions.  Same rule as the transcription token above:
+// the renderer gets a short-lived, single-session token and never a permanent
+// key.  A provider with no key fails here rather than at socket-open time, so
+// the call view can say which key is missing.
+ipcMain.handle("sts:status", () => ({
+  xai: Boolean(xaiCredential(secureCredentials)),
+  gemini: Boolean(geminiCredential(secureCredentials)),
+}));
+
+// A call session being opened is the one measurable thing about its cost: the
+// audio flows from the renderer to the vendor and never through this process.
+// The harness holds the Usage Monitor connection, so it is told, and the call
+// never waits on it or fails because of it.
+function reportStsSession(provider) {
+  void fetch(`http://127.0.0.1:${SERVER_PORT}/api/sts/session-started`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ provider }),
+    signal: AbortSignal.timeout(3000),
+  }).catch(() => {});
+}
+
+ipcMain.handle("sts:xai-token", async () => {
+  const minted = await mintXaiRealtimeToken(xaiCredential(secureCredentials));
+  reportStsSession("xai");
+  return minted;
+});
+
+ipcMain.handle("sts:gemini-token", async () => {
+  const minted = await mintGeminiLiveToken(geminiCredential(secureCredentials));
+  reportStsSession("gemini");
+  return minted;
+});
+
 const CREDENTIAL_PATCH = {
   composioApiKey: (value) => ({ composio: { apiKey: value } }),
   xaiApiKey: (value) => ({ xai: { key: value } }),
+  // The STS panel offers Gemini beside xAI, so its key has to be settable
+  // through the same path.  Without this entry `credential:set` rejected the
+  // name with "Unsupported credential", so the panel named a key it could
+  // never be given and a fresh install was stuck with no Gemini calls at all.
+  geminiApiKey: (value) => ({ gemini: { key: value } }),
   openaiCompatApiKey: (value) => ({ openaiCompat: { key: value } }),
   minimaxApiKey: (value) => ({ minimax: { key: value } }),
   deepseekApiKey: (value) => ({ deepseek: { key: value } }),
@@ -2161,6 +2341,14 @@ function setupApplicationMenu() {
           label: "Open Data Folder",
           click: () => shell.openPath(DATA_DIR),
         },
+        ...(isMac ? [{
+          label: "Server Controls…",
+          click: () => openServerControls({
+            source: app.isPackaged ? path.join(process.resourcesPath, "BotFleet Control.app") : fileURLToPath(new URL("./resources/BotFleet Control.app", import.meta.url)),
+            shell,
+            dialog,
+          }),
+        }] : []),
         { type: "separator" },
         isMac ? { role: "close" } : { role: "quit" },
       ],
@@ -2239,8 +2427,8 @@ function setupApplicationMenu() {
           click: () => shell.openExternal("https://github.com/Simple-With-Us/BotFleet"),
         },
         {
-          label: "Open Logs & Data Folder",
-          click: () => shell.openPath(DATA_DIR),
+          label: "Open Logs Folder",
+          click: () => shell.openPath(LOG_DIR),
         },
       ],
     },
@@ -2250,6 +2438,14 @@ function setupApplicationMenu() {
 }
 
 app.whenReady().then(async () => {
+  // A deliberate shutdown writes a sentinel so launchd's periodic tick leaves
+  // the harness alone.  Launching the app is the documented way back, so clear
+  // it first — before anything here tries to reach a server, so the request
+  // below is never made against a marker that says "stay down".
+  if (!wantsSafeStorageExport(process.argv) && !updateCredentialPreparationPath) {
+    recordExplicitStartupSession();
+    clearHarnessShutdownMarker();
+  }
   if (wantsSafeStorageExport(process.argv)) {
     try {
       const result = await readSecureCredentials({
@@ -2304,6 +2500,11 @@ app.whenReady().then(async () => {
   tray = new Tray(trayIcon);
   tray.setToolTip("BotFleet");
   tray.setContextMenu(Menu.buildFromTemplate([
+    ...(process.platform === "darwin" ? [{ label: "Server Controls…", click: () => openServerControls({
+      source: app.isPackaged ? path.join(process.resourcesPath, "BotFleet Control.app") : fileURLToPath(new URL("./resources/BotFleet Control.app", import.meta.url)),
+      shell,
+      dialog,
+    }) }] : []),
     { label: "Show BotFleet", click: () => {
         if (app.dock) app.dock.show();
         if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -2465,10 +2666,8 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform === "darwin" && app.dock) {
-    app.dock.hide();
-    return;
-  }
+  // Background controls live in the independent native app.  Closing the
+  // desktop must release Electron, its helpers and its sleep blocker.
   app.quit();
 });
 
@@ -2493,6 +2692,94 @@ const requestSignalQuit = () => {
 process.once("SIGINT", requestSignalQuit);
 process.once("SIGTERM", requestSignalQuit);
 
+// Whether the always-on harness should outlive this window.
+//
+// This reads the config file directly rather than importing the server's
+// config module: main.mjs is plain ESM and server/config.ts is TypeScript, and
+// pulling a transpile step into the Electron entry point to read one boolean
+// is not a trade worth making.  The field is a plain boolean with one
+// documented default, so reading it is safe; a malformed or missing file
+// falls back to the same answer as an absent field.
+//
+// Absent means TRUE on purpose.  The harness is launchd-supervised and is
+// documented as always-on, and every paired phone depends on it still
+// answering after the window closes, so "not configured" must never be read
+// as "shut it all down".  Turning it off is always a deliberate act.
+function serverPersistsOnExit() {
+  try {
+    const dir = botfleetDataDir();
+    const policy = readPersistOnExitPolicy(dir);
+    if (policy !== null) return policy;
+    const parsed = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
+    return parsed?.server?.persistOnExit !== false;
+  } catch {
+    return true;
+  }
+}
+
+// Ask the harness we are attached to stop cleanly, so it writes the sentinel
+// the launchd wrapper reads.  Without that marker the five-minute tick treats
+// the exit as a crash and brings the harness straight back, which is what
+// makes a quiet "shut it down" impossible today.
+//
+// Fire and forget by design: this runs during quit, the app is going away
+// regardless, and the harness's own reply is not something anyone is left to
+// read.  A refused connection means it was already gone.
+//
+// SERVER_PORT, not process.env.OMB_PORT: OMB_PORT is what this process hands
+// a harness it forks itself, and it is unset whenever we attached to one that
+// launchd started.  SERVER_PORT is the port we actually talked to, and it is
+// already a number — reading it also removes the NaN case a non-numeric OMB_PORT
+// would produce here.
+function requestAttachedHarnessShutdown() {
+  return shutdownAttachedServer(SERVER_PORT).catch((error) => {
+    dialog.showErrorBox(
+      "Could Not Confirm Server Shutdown",
+      `The server or a Local VM may still be running.\u00a0 ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+}
+
+// Clear the "stopped on purpose" sentinel when the app starts, which is the
+// other half of what POST /api/system/shutdown promises: the marker text and
+// the docs both say "launch the BotFleet app to let it come back", and without
+// this the app would launch into a permanently blocked harness.
+//
+// Safe to do unconditionally on launch, and the ordering is the reason.  The
+// launchd wrapper reads this marker itself and exits 0 while it exists, so a
+// periodic tick never reaches the harness and never runs this code.  This only
+// runs when a person actually opened the app -- BotFleet is not a login item,
+// and even if it became one, the wrapper would still be the thing refusing to
+// start a server, which is the decision we want to honour only on a real
+// launch.  A manual run of the wrapper clears it too, so there are two ways
+// back and neither depends on the other.
+function clearHarnessShutdownMarker() {
+  const marker = path.join(botfleetDataDir(), "stopped.marker");
+  try {
+    fs.rmSync(marker, { force: true });
+  } catch {
+    // Already gone, or a path we cannot touch.  Either way the app launching
+    // is the intent, and the wrapper treats a missing marker as "start".
+  }
+}
+
+function recordExplicitStartupSession() {
+  if (process.platform !== "darwin") return;
+  // BF_CONTROL_STARTUP_POLICY_V1: a direct app launch allows this boot even
+  // when login startup is disabled.  Marker absence keeps default behavior.
+  const dir = botfleetDataDir();
+  try {
+    const current = process.env.BOTFLEET_BOOT_SESSION_OVERRIDE
+      || execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8" }).trim();
+    if (!current) throw new Error("boot session is empty");
+    const sessionPath = process.env.BOTFLEET_STARTUP_SESSION ?? path.join(dir, "startup-session");
+    fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+    fs.writeFileSync(sessionPath, `${current}\n`, { mode: 0o600 });
+  } catch (error) {
+    console.error("Could not record explicit server start for this boot:", error);
+  }
+}
+
 app.on("before-quit", (e) => {
   credentialRestoreStopped = true;
   clearTimeout(credentialRestoreTimer);
@@ -2502,6 +2789,12 @@ app.on("before-quit", (e) => {
     // serverProc is null when attached — the always-on harness outlives us.
     serverProc?.kill();
   } catch {}
+  // …unless the owner asked for the harness to go down with the window.  Only
+  // meaningful when we did not spawn it ourselves: a child we own is already
+  // killed above, and asking the harness to shut down would be asking a process
+  // that is already dead.  See serverPersistsOnExit() for why absent means yes.
+  const stopAttachedHarness =
+    serverProc || serverPersistsOnExit() ? Promise.resolve() : requestAttachedHarnessShutdown();
   try {
     uiShim?.close();
   } catch {}
@@ -2521,6 +2814,10 @@ app.on("before-quit", (e) => {
       // Shut the connector down first, then the sidecar, without changing the
       // remembered toggle the next launch will restore.
       stopDesktopCompanion({ remember: false }).catch(() => {}),
+      // Asked for, not forced, and it does not outrank the app exiting: a
+      // harness that is already gone answers with a refused connection, which
+      // is a perfectly good outcome for something we are shutting down anyway.
+      stopAttachedHarness.catch(() => {}),
     ]),
     new Promise((resolve) => setTimeout(resolve, CUA_STOP_TIMEOUT_MS).unref()),
   ]);

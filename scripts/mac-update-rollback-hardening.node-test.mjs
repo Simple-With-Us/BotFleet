@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 import test from "node:test";
 import {
   abandonedStages,
+  bundleHolderPids,
   failedInstallBundles,
+  failedInstallBundlesToPrune,
+  failedInstallStamp,
+  FAILED_INSTALL_KEEP,
   generationBelongsToApp,
   ownedRuntimePids,
   prunablePath,
@@ -129,20 +133,50 @@ test("a rollback bundle this run did not move is never promoted over the install
 });
 
 // P1 — argv does not follow a rename; the kernel's open reference does.
+//
+// Hosted macOS 14 lsof lists an ordinary open file and omits the text mapping
+// of an ad-hoc binary.  Hold a marker the way the release-store probe does,
+// then exec system sleep so the descriptor survives.  `lsof -Fn +D` is the
+// command that probe uses.  `lsof -t +D` returned an empty pid list.
+
+async function spawnHoldingMarker(marker, t) {
+  const child = spawn("/bin/sh", ["-c", 'exec 3<"$1"; printf r; exec /bin/sleep 120', "_", marker], { stdio: ["ignore", "pipe", "ignore"] });
+  t.after(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } });
+  const opened = await new Promise((resolve) => {
+    let text = "";
+    const timer = setTimeout(() => resolve(false), 5_000);
+    child.stdout.on("data", (chunk) => {
+      text += chunk;
+      if (!text.includes("r")) return;
+      clearTimeout(timer);
+      resolve(true);
+    });
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+  return { child, opened };
+}
+
+async function assertHolds(bundle, directory, child, label) {
+  const holders = await bundleHolderPids(bundle);
+  if (holders.includes(child.pid)) return;
+  const probe = await run("lsof", ["-Fn", "+D", directory], { allowFailure: true });
+  assert.fail(`${label}: holders=${holders.join(",") || "(none)"} lsof -Fn +D code=${probe.code} stdout=${JSON.stringify(probe.stdout)} stderr=${JSON.stringify(probe.stderr)}`);
+}
 
 test("a process keeps its bundle open across a rename, and only the open reference finds it", macOnly, async (t) => {
   const root = await fixture(t);
   const executable = join(root, "App.app", "Contents", "MacOS", "BotFleet");
   await mkdir(dirname(executable), { recursive: true });
   await copyFile("/bin/sleep", executable);
-  // A copied Apple binary loses its signature and is killed on launch, so
-  // give it an ad-hoc one.
-  await run("codesign", ["-f", "-s", "-", executable]);
+  const marker = join(dirname(executable), "open-marker");
+  await writeFile(marker, "open");
 
-  const child = spawn(executable, ["120"], { stdio: "ignore" });
-  t.after(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } });
-  await new Promise((done) => setTimeout(done, 800));
-  assert.equal(child.exitCode, null, "the signed copy should still be running");
+  const { child, opened } = await spawnHoldingMarker(marker, t);
+  assert.equal(opened, true, "the child never signalled that it had the marker open");
+  assert.equal(child.exitCode, null, "sleep should still be running");
 
   const renamed = join(root, ".App.rollback.app");
   await rename(join(root, "App.app"), renamed);
@@ -157,17 +191,8 @@ test("a process keeps its bundle open across a rename, and only the open referen
     "arguments must still name the pre-rename path, which is why the argv check missed the survivor",
   );
 
-  // lsof resolves the current path of the open vnode, so it finds it.
-  const byReference = await run("lsof", ["-t", "--", renamedExecutable], { allowFailure: true });
-  assert.deepEqual(
-    byReference.stdout.split(/\s+/).filter(Boolean).map(Number),
-    [child.pid],
-  );
-
-  // And the whole-bundle scan finds it under the renamed bundle too.
-  const scan = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
-  const { realpath } = await import("node:fs/promises");
-  assert.ok(txtHolderPids(scan.stdout, await realpath(renamed)).includes(child.pid));
+  // The holder scan follows the open vnode.  ps, above, still has the old path.
+  await assertHolds(renamed, dirname(renamedExecutable), child, "renamed main binary");
 });
 
 // P1 — processes that live inside the bundle but are not its main binary.
@@ -179,32 +204,23 @@ test("the bundle scan finds an embedded driver, not only the main executable", m
   await mkdir(dirname(driver), { recursive: true });
   await mkdir(join(bundle, "Contents", "MacOS"), { recursive: true });
   await copyFile("/bin/sleep", driver);
-  await run("codesign", ["-f", "-s", "-", driver]);
+  const marker = join(dirname(driver), "open-marker");
+  await writeFile(marker, "open");
 
-  const child = spawn(driver, ["120"], { stdio: "ignore" });
-  t.after(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } });
-  await new Promise((done) => setTimeout(done, 800));
-  assert.equal(child.exitCode, null, "the embedded driver should still be running");
+  const { child, opened } = await spawnHoldingMarker(marker, t);
+  assert.equal(opened, true, "the child never signalled that it had the marker open");
+  assert.equal(child.exitCode, null, "sleep should still be running");
 
-  const { realpath } = await import("node:fs/promises");
-  const before = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
-  assert.ok(
-    txtHolderPids(before.stdout, await realpath(bundle)).includes(child.pid),
-    "a process running Contents/Resources/cua-driver holds the bundle",
-  );
+  await assertHolds(bundle, dirname(driver), child, "embedded driver");
 
   // The case that matters is after the swap has renamed the bundle: a helper
   // that outlived quiescence has to be findable in the rollback bundle, and
   // its arguments still name the path it started from.
   const renamed = join(root, ".BotFleet.rollback-1757600000000-2246f19e9de8.app");
   await rename(bundle, renamed);
-  const after = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
-  assert.ok(
-    txtHolderPids(after.stdout, await realpath(renamed)).includes(child.pid),
-    "the embedded driver must still be found under the renamed bundle",
-  );
+  await assertHolds(renamed, join(renamed, "Contents", "Resources"), child, "renamed embedded driver");
   assert.equal(
-    txtHolderPids(after.stdout, join(root, "BotFleet.app")).includes(child.pid),
+    (await bundleHolderPids(join(root, "BotFleet.app"))).includes(child.pid),
     false,
     "and no longer under the path it was launched from",
   );
@@ -229,6 +245,14 @@ test("the txt parser attributes each path to the process that holds it", () => {
   // A sibling whose name merely starts the same way is a different bundle.
   assert.deepEqual(txtHolderPids(output, appPath("Other.app")), [101]);
   assert.deepEqual(txtHolderPids("", appPath("BotFleet.app")), []);
+});
+
+test("the txt parser treats /var and /private/var as the same bundle", { skip: sep === "/" ? false : "macOS path alias" }, () => {
+  const resolved = join("/private", "var", "folders", "xx", "T", "BotFleet.app");
+  const reported = join("/var", "folders", "xx", "T", "BotFleet.app", "Contents", "MacOS", "BotFleet");
+  const output = ["p202", "ftxt", `n${reported}`].join("\n");
+  assert.deepEqual(txtHolderPids(output, resolved), [202]);
+  assert.deepEqual(txtHolderPids(output, join("/var", "folders", "xx", "T", "BotFleet.app")), [202]);
 });
 
 // P1/P3 — orphan visibility in the cache placement.
@@ -393,7 +417,68 @@ test("the receipt names the build the rollback bundle actually is, not just the 
   assert.match(source, /installedCommit: previous\?\.installedCommit/);
 });
 
-test("bundles left behind by a failed install are reported, never deleted", () => {
+test("failed-install bundles are capped, keeping the newest as evidence", () => {
+  const names = [
+    "BotFleet.app",
+    "BotFleet.app.failed-1789260170446",
+    "BotFleet.app.failed-1789111111111",
+    "BotFleet.app.failed-1789000000000",
+    "BotFleet.app.failed-1788000000000",
+    "BotFleet.app.failed-1787000000000",
+  ];
+  // Newest three are evidence; the rest are disk.
+  assert.deepEqual(failedInstallBundlesToPrune(names, "BotFleet.app", 3), [
+    "BotFleet.app.failed-1788000000000",
+    "BotFleet.app.failed-1787000000000",
+  ]);
+  // Nothing to prune under the cap, and nothing to prune on a clean install.
+  assert.deepEqual(failedInstallBundlesToPrune(names.slice(0, 3), "BotFleet.app", 3), []);
+  assert.deepEqual(failedInstallBundlesToPrune(["BotFleet.app"], "BotFleet.app", 3), []);
+});
+
+test("the stamp is what ages a bundle, and a bundle without one is never aged out", () => {
+  assert.equal(failedInstallStamp("BotFleet.app.failed-1789260170446", "BotFleet.app"), 1789260170446);
+  assert.equal(failedInstallStamp("BotFleet.app", "BotFleet.app"), null);
+  assert.equal(failedInstallStamp("BotFleet Beta.app.failed-1789260170446", "BotFleet.app"), null);
+  // A malformed suffix is not ours to delete: guessing could remove the wrong
+  // thing, so it is left strictly alone rather than sorted to the front.
+  assert.equal(failedInstallStamp("BotFleet.app.failed-not-a-stamp", "BotFleet.app"), null);
+  // With a cap of 1 the one well-formed bundle is the newest and is kept, so
+  // there is nothing to prune; the malformed one is never a candidate either
+  // way.  Adding a well-formed bundle older than both is what proves the
+  // malformed name is not being silently sorted into the newest slot.
+  assert.deepEqual(
+    failedInstallBundlesToPrune(
+      [
+        "BotFleet.app.failed-1789000000000",
+        "BotFleet.app.failed-1788000000000",
+        "BotFleet.app.failed-not-a-stamp",
+      ],
+      "BotFleet.app",
+      1,
+    ),
+    ["BotFleet.app.failed-1788000000000"],
+  );
+  assert.deepEqual(
+    failedInstallBundlesToPrune(
+      ["BotFleet.app.failed-not-a-stamp", "BotFleet.app.failed-also-not-a-stamp"],
+      "BotFleet.app",
+      0,
+    ),
+    [],
+  );
+});
+
+test("another bundle's failures are never pruned by this updater", () => {
+  const names = [
+    "BotFleet.app.failed-1789000000000",
+    "BotFleet Beta.app.failed-1788000000000",
+    "BotFleet Beta.app.failed-1787000000000",
+  ];
+  assert.deepEqual(failedInstallBundlesToPrune(names, "BotFleet.app", 1), []);
+});
+
+test("failed-install bundles are not mistaken for update candidates", () => {
   const names = [
     "BotFleet.app",
     "BotFleet.app.failed-1789260170446",
@@ -406,11 +491,22 @@ test("bundles left behind by a failed install are reported, never deleted", () =
     "BotFleet.app.failed-1789111111111",
   ]);
   assert.deepEqual(failedInstallBundles(names, "BotFleet Beta.app"), ["BotFleet Beta.app.failed-1789260170446"]);
-  // They are evidence, so they must not be reachable by the candidate sweep.
   assert.deepEqual(
     staleCandidateNames(names, { prefix: ".BotFleet.update-", suffix: ".app", isAlive: () => false }).stale,
     [".BotFleet.update-4242-1757000000000.app"],
   );
+});
+
+test("a successful rollback deletes the failed replacement instead of keeping it", async () => {
+  const source = await readFile(new URL("./update-botfleet-mac.mjs", import.meta.url), "utf8");
+  assert.match(source, /Removed the failed replacement bundle/);
+  assert.match(source, /await rm\(failedReplacementPath, \{ recursive: true, force: true \}\)/);
+});
+
+test("sweepLeftovers prunes expired failed-install bundles and abandoned stages", async () => {
+  const source = await readFile(new URL("./update-botfleet-mac.mjs", import.meta.url), "utf8");
+  assert.match(source, /sweepLeftovers: async \(\) => \{[\s\S]*sweepAbandonedStageDirectories/);
+  assert.match(source, /sweepLeftovers: async \(\) => \{[\s\S]*sweepExpiredFailedInstallBundles/);
 });
 
 // Second review round.

@@ -15,7 +15,32 @@
 # no harness is currently serving), so rotating here is safe.
 set -euo pipefail
 
+# BF-2456 (owner decision, 2026-10-18): the operator fleet is on, so role
+# bots launch with their BF-<ROLE> seat (AGENT_LAUNCH_SEAT) and the matching
+# seat prompt. Without this, launchIdentityFor returns a null seat and every
+# BF role starts seatless. An explicit operator value still wins.
+export BOTFLEET_FLEET_SEAT_PROMPTS="${BOTFLEET_FLEET_SEAT_PROMPTS-1}"
+
 ROOT="${BOTFLEET_SERVER_ROOT:-$HOME/apps/botfleet-server}"
+# The runtime root is the release store's pointer, not a git checkout.
+#
+# A checkout is a mutable working tree: an update rewrote it under a live
+# server, a seat's branch deleted files the harness still imported, and a
+# janitor removed its node_modules from under a serving process.  A promoted
+# release is immutable and named by the commit it holds, and the pointer at
+# ~/.botfleet/current is the only thing that changes when the harness moves
+# to a new version.
+#
+# The pointer wins when it exists.  BOTFLEET_SERVER_ROOT still overrides it
+# (tests point it at a fixture), and the legacy checkout path stays the
+# fallback for a machine that has never promoted a release, so nothing
+# breaks on a fresh install.
+if [ -z "${BOTFLEET_SERVER_ROOT:-}" ]; then
+  STORE_POINTER="$HOME/.botfleet/current"
+  if [ -e "$STORE_POINTER" ] || [ -L "$STORE_POINTER" ]; then
+    ROOT="$STORE_POINTER"
+  fi
+fi
 # `current` is a symlink into ~/.botfleet/releases/<commit>.  Resolve it once,
 # physically, so every later path is the real directory: `cd -P` means the
 # server's own working directory is the release rather than the pointer, which
@@ -24,7 +49,7 @@ ROOT="${BOTFLEET_SERVER_ROOT:-$HOME/apps/botfleet-server}"
 # which path they are in cannot be compared.
 # If this fails, do NOT let `set -e` abort here: at this point in the script
 # fail_or_stop_storm does not exist yet, so an abort here would exit non-zero
-# with no ledger record and no operator message — the one failure that bypasses
+# with no ledger record and no operator message -- the one failure that bypasses
 # the machinery that exists to report failures.  The half-resolved state is
 # carried and reported through the real channel below, once that function is
 # defined.
@@ -40,7 +65,7 @@ if [ -d "$ROOT" ]; then
   fi
 elif [ -L "$ROOT" ] || [ -e "$ROOT" ]; then
   # It exists but is not a directory.  For a symlink root this is a DANGLING
-  # `current` pointer, because `test -d` follows symlinks — so the branch above
+  # `current` pointer, because `test -d` follows symlinks -- so the branch above
   # never sees it, and without this the operator gets only preflight's
   # "missing $ROOT/server/index.ts" plus a generic "run pnpm install" that
   # reinstalls IN PLACE and cannot recreate a release that has been deleted.
@@ -71,6 +96,82 @@ PREFIX="[botfleet-server-start]"
 FAIL_LEDGER="${BOTFLEET_FAIL_LEDGER:-$HOME/Library/Caches/BotFleet/server-start-failures}"
 FAIL_WINDOW_SECONDS="${BOTFLEET_FAIL_WINDOW_SECONDS:-3600}"
 FAIL_STORM_THRESHOLD="${BOTFLEET_FAIL_STORM_THRESHOLD:-20}"
+
+# The "stopped on purpose" sentinel, written by POST /api/system/shutdown.
+#
+# Without it there is no such thing as a quiet shutdown on this Mac.  The
+# launchd agent carries KeepAlive.SuccessfulExit=false and StartInterval=300,
+# so a clean exit is not resurrected by the first pair of settings -- but the
+# five-minute tick still runs this script, a closed port still reads as a
+# crash, and the harness comes back.  Whoever turned the server off would find
+# it on again a few minutes later with nothing in the logs to explain it.
+#
+# Exiting 0 here is what keeps the tick quiet: SuccessfulExit=false means
+# launchd leaves a clean exit alone, and the periodic run stays the cheap health
+# check it is documented to be.
+#
+# Only the launchd path respects the marker.  A person running this script by
+# hand is asking for the server, so that clears the marker and starts -- which
+# is the recovery path when someone stops it and then changes their mind.
+SHUTDOWN_MARKER="${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/stopped.marker}"
+STARTUP_DISABLED_MARKER="${BOTFLEET_STARTUP_DISABLED_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-disabled.marker}"
+STARTUP_ENABLED_MARKER="${BOTFLEET_STARTUP_ENABLED_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-enabled.marker}"
+STARTUP_SESSION="${BOTFLEET_STARTUP_SESSION:-${OMB_DATA_DIR:-$HOME/.botfleet}/startup-session}"
+LAUNCHD_SERVICE_NAME="${XPC_SERVICE_NAME:-}"
+
+boot_session() {
+  if [ -n "${BOTFLEET_BOOT_SESSION_OVERRIDE:-}" ]; then
+    printf '%s' "$BOTFLEET_BOOT_SESSION_OVERRIDE"
+  else
+    /usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null
+  fi
+}
+
+# The V1 policy is opt-in until the installed wrapper has been upgraded.
+honour_startup_policy() {
+  # BF_CONTROL_STARTUP_POLICY_V1.  Marker absence preserves the original
+  # launchd behaviour; no environment opt-in is needed by installed users.
+  if invoked_by_launchd && [ ! -f "$STARTUP_DISABLED_MARKER" ] && [ ! -f "$STARTUP_ENABLED_MARKER" ]; then return 0; fi
+  local current recorded
+  current="$(boot_session)" || { log_err "cannot read boot session"; exit 1; }
+  [ -n "$current" ] || { log_err "boot session is empty"; exit 1; }
+  if ! invoked_by_launchd; then
+    mkdir -p "$(dirname "$STARTUP_SESSION")"
+    printf '%s\n' "$current" >"$STARTUP_SESSION"
+    return 0
+  fi
+  recorded="$(cat "$STARTUP_SESSION" 2>/dev/null || true)"
+  if [ -f "$STARTUP_DISABLED_MARKER" ] && [ "$recorded" != "$current" ]; then
+    log "startup is disabled at login; leaving the stopped marker unchanged"
+    exit 0
+  fi
+  # Explicit login enablement outranks a stop from a PREVIOUS boot only.
+  # On this boot an intentional Stop must remain durable through every tick.
+  if [ ! -f "$STARTUP_DISABLED_MARKER" ] && [ -f "$STARTUP_ENABLED_MARKER" ] && [ "$recorded" != "$current" ]; then
+    mkdir -p "$(dirname "$STARTUP_SESSION")"
+    printf '%s\n' "$current" >"$STARTUP_SESSION"
+    rm -f "$SHUTDOWN_MARKER"
+    log "startup is enabled at login; starting for this boot"
+  fi
+}
+
+# True when launchd invoked us rather than a person.
+invoked_by_launchd() {
+  [ -n "$LAUNCHD_SERVICE_NAME" ]
+}
+
+# Exit 0 if the harness was stopped on purpose.  Returns 1 to carry on.
+honour_shutdown_marker() {
+  [ -f "$SHUTDOWN_MARKER" ] || return 1
+  if ! invoked_by_launchd; then
+    log "stopped.marker present but this run is not from launchd; treating it as a deliberate start"
+    rm -f "$SHUTDOWN_MARKER"
+    return 1
+  fi
+  log "stopped.marker present ($SHUTDOWN_MARKER); the harness was shut down on purpose and stays down."
+  log "Delete that file, or launch the BotFleet app, to let it come back."
+  exit 0
+}
 
 usage() {
   cat <<EOF
@@ -245,7 +346,7 @@ preflight() {
 probe_imports() {
   local probe_log
   probe_log="$(mktemp "${TMPDIR:-/tmp}/botfleet-probe.XXXXXX")"
-  # Probe packages the harness loads at boot — not only yaml — plus the config
+  # Probe packages the harness loads at boot -- not only yaml -- plus the config
   # module (side-effect free) so a partial install missing any of these still
   # triggers the one-shot heal before exec'ing server/index.ts.
   if (cd "$ROOT" && "$NODE" --experimental-strip-types -e "
@@ -301,6 +402,19 @@ elif [ "$#" -gt 0 ]; then
   exit 2
 fi
 
+# Before anything else: a deliberate stop is a deliberate stop, even when the
+# harness happens to still be healthy.  Checking it ahead of the health
+# shortcut is what makes the marker authoritative rather than advisory.
+#
+# `|| true` is load-bearing under `set -e`: the function returns 1 to mean
+# "carry on and start the harness", and an unguarded bare call would abort the
+# whole script on exactly the ordinary, marker-absent path.  The exit 0 inside
+# the function still exits -- that is an `exit`, not a return status.
+if [ "$HEAL_ONLY" != true ]; then
+  honour_startup_policy
+  honour_shutdown_marker || true
+fi
+
 # --heal-only must prepare the checkout even when the currently running
 # harness is healthy (e.g. during an update while the old process still
 # serves).  Skip the healthy-exit shortcut in that mode.
@@ -346,6 +460,92 @@ reset_fail_ledger
 # Runs last, right before we actually become the writer: every branch above
 # this point can still exit without ever touching the log file.
 rotate_log_if_large
+
+# --- the Infisical machine identity --------------------------------------
+# Recovered through `fleet-secrets get`, and nothing else out of it.
+#
+# This one credential is deliberately not in the vault -- a lock cannot hold
+# its own key -- and not in config.json, which is plaintext, because it can
+# read every name in the project.  That leaves exactly one place a
+# launchd-started harness can get it, and without it the harness comes up
+# "Infisical is not configured" and silently drops every vault-backed
+# credential: the speech-to-speech keys, Zulip's per-role keys, the lot.
+#
+# The desktop app can also replay the identity into a running harness, but
+# only while it is attached -- `before-quit` stops the replay on purpose,
+# because the always-on harness outlives it.  A crash, an update, or a manual
+# restart therefore leaves nothing to restore it, which is exactly when it
+# is most needed.
+#
+# The Node server never calls fleet-secrets.  This wrapper is the launchd entry
+# point, and it copies only the machine-identity pair into the environment
+# loadConfig() already prefers.  The values are fetched one name at a time
+# rather than injected wholesale (`fleet-secrets run` would also refuse every
+# INFISICAL_* name):  `ps eww` prints a process environment and Fleet-OPS holds
+# every fleet secret, so only the identity belongs in this process.  When both
+# halves are already in the environment, nothing is fetched.  A missing helper
+# or a failed fetch is not fatal -- the harness still starts, and the desktop
+# app can still supply the identity in memory.
+#
+# The helper is addressed by its absolute path, $HOME/.local/bin/fleet-secrets,
+# because a LaunchAgent's PATH is minimal.  It authenticates from the login
+# Keychain machine identity (see INFISICAL.md in AI-Fleet-Coordinator).
+#
+# An empty string must not be exported.  loadConfig() treats a defined env var
+# as present (`process.env[name] !== undefined`), so INFISICAL_CLIENT_ID=""
+# would hide config.json and the INFISICAL_UNIVERSAL_AUTH_* aliases.  A half
+# pair would do the same to one side.  Apply the fetched values only when they
+# yield both halves, and only into names that are still empty.  Documented
+# keys (INFISICAL_CLIENT_*) win;  the automation names are the fallback.
+fleet_secret() {
+  local name="$1" bin="$HOME/.local/bin/fleet-secrets"
+  # Anything but an executable file is "no identity"; keep going.
+  [ -f "$bin" ] && [ -x "$bin" ] || return 0
+  # The value goes to stdout only; errors are dropped so no fragment is shown.
+  "$bin" get "$name" 2>/dev/null | tr -d '\r' || true
+  return 0
+}
+
+# First non-empty fetched value among the given names.  Always exits 0 so a
+# missing name cannot trip `set -e` and take the harness down with it.
+first_fleet_secret() {
+  local name value
+  for name in "$@"; do
+    value="$(fleet_secret "$name")"
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done
+  return 0
+}
+
+load_infisical_identity() {
+  local fetched_id="" fetched_secret=""
+  if [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
+    export INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET
+    return 0
+  fi
+  [ -f "$HOME/.local/bin/fleet-secrets" ] && [ -x "$HOME/.local/bin/fleet-secrets" ] || return 0
+  fetched_id="$(first_fleet_secret INFISICAL_CLIENT_ID INFISICAL_AUTOMATION_CLIENT_ID)"
+  fetched_secret="$(first_fleet_secret INFISICAL_CLIENT_SECRET INFISICAL_AUTOMATION_CLIENT_SECRET)"
+  if [ -n "$fetched_id" ] && [ -n "$fetched_secret" ]; then
+    if [ -z "${INFISICAL_CLIENT_ID:-}" ]; then
+      INFISICAL_CLIENT_ID="$fetched_id"
+    fi
+    if [ -z "${INFISICAL_CLIENT_SECRET:-}" ]; then
+      INFISICAL_CLIENT_SECRET="$fetched_secret"
+    fi
+  fi
+  if [ -n "${INFISICAL_CLIENT_ID:-}" ]; then
+    export INFISICAL_CLIENT_ID
+  fi
+  if [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
+    export INFISICAL_CLIENT_SECRET
+  fi
+}
+
+load_infisical_identity
 
 cd "$ROOT"
 exec "$NODE" --experimental-strip-types server/index.ts

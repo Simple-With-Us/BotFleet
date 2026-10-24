@@ -1,7 +1,10 @@
 import { z } from "zod";
+import type { Pronunciation } from "../../shared/pronunciations.ts";
+import { utterancesWithSpans } from "../../shared/speech-spans.ts";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
-import { sanitizeForTTS } from "./minimax.ts";
-import { speakable } from "./speech-text.ts";
+import { aiTokensFromChatUsage, ChatUsageSchema } from "../ai-usage.ts";
+import { telemetry } from "../telemetry.ts";
+import { sanitizeForTTSByLine } from "./minimax.ts";
 
 export const DeepSeekChatMessageSchema = z.object({
   role: z.string().optional(),
@@ -20,7 +23,7 @@ export const DeepSeekChatResponseSchema = z.object({
   created: z.number().optional(),
   model: z.string().optional(),
   choices: z.array(DeepSeekChatChoiceSchema).optional(),
-  usage: z.record(z.string(), z.unknown()).optional(),
+  usage: ChatUsageSchema.optional().catch(undefined),
 });
 
 export type DeepSeekChatResponse = z.infer<typeof DeepSeekChatResponseSchema>;
@@ -39,50 +42,98 @@ export function resolveDeepSeekKey(providedKey?: string): string {
   return "";
 }
 
+/** Report one distiller call to Usage Monitor (BF-2435).  Every call that
+ * came back with a usage figure was billed, whether or not its rewrite was
+ * usable, so this runs on the response and not on the verdict.  DeepSeek
+ * reports the cached share as `prompt_cache_hit_tokens`. */
+function reportSummaryUsage(requestedModel: string, data: DeepSeekChatResponse, startedAt: number): void {
+  const tokens = aiTokensFromChatUsage(data.usage);
+  if (Object.keys(tokens).length === 0) return;
+  telemetry.trackAux({
+    kind: "speech-summary",
+    provider: "deepseek",
+    service: data.model || requestedModel,
+    label: "BotFleet speech summary",
+    unit: "token",
+    latencyMs: Date.now() - startedAt,
+    ai: {
+      model: { requested: requestedModel, served: data.model },
+      tokens,
+      durationMs: Date.now() - startedAt,
+      billingMode: "payg",
+    },
+  });
+}
+
 export function completionsUrl(baseUrl?: string): string {
   return normalizeDeepSeekChatUrl(baseUrl);
 }
 
 export const DEEPSEEK_FLASH_TTS_PROMPT = `<system_prompt>
-You are a highly efficient, specialized post-processing model designed to translate raw, agentic LLM responses into perfectly optimized, spoken-word text for real-time Text-to-Speech (TTS) engines (specifically MiniMax speech synthesis).
+You are a specialized post-processing model that prepares agent replies for Apple Personal Voice (on-device AVSpeechSynthesizer).  BotFleet also plays the same script through other engines; the app adapts pause markers per voice.
 <core_directive>
-Distill the incoming raw text into flowing, natural, and conversational prose. Strip out all visual artifacts, structure, and text that cannot or should not be read aloud. Do not add any conversational preamble (e.g., "Sure, here is the text..."). Output ONLY the final spoken-word text.
+Prepare the incoming text for spoken delivery.  Keep every word from the input in the same order.  Do not paraphrase, summarize, shorten, expand, or add facts.  Do not retell lists as narrative prose (no "First," "Next," or "Finally,").  Do not spell out numbers, acronyms, URLs, paths, or codes unless they already appear as words in the input.  Output ONLY the adjusted text, with no preamble.
 </core_directive>
-<rules_for_spoken_prose>
-1. NO MARKDOWN: Remove all asterisks (**), hashtags (#), headers, backticks, and visual delimiters.
-2. NO BULLET POINTS: Convert lists or bullet points into complete, linked spoken sentences using conversational transitions (e.g., "First, ... Next, ... Finally, ...").
-3. NO EMOJIS: Delete all emojis, icons, and special symbols entirely.
-4. PARAGRAPH BREAKS & BREATHING: Keep sentences concise. Long, winding sentences leave voice engines breathless.
-</rules_for_spoken_prose>
+<allowed_changes>
+1. MARKDOWN DELIMITERS ONLY: Remove markdown syntax characters (asterisks, backticks, heading hashes, list markers, table pipes) while keeping the underlying words.  Do not replace a code block or link with a description; leave the words that remain after stripping delimiters.
+2. PUNCTUATION: Fix punctuation so Personal Voice pauses naturally.  Replace em-dashes (—), en-dashes (–), and floating clause hyphens with a comma or a period.  Replace ellipses (...) with a period.  You may end a run-on with a period and capitalize the next word only when splitting an existing sentence, without changing any words.
+3. PAUSE MARKERS: Insert <#0.3#> (brief breath) or <#0.5#> (topic shift) only between two complete sentences, never at the start or end, never two in a row.  The app strips these for on-device voices and turns them into silence; hosted voices may honor them.
+4. PROSODY TAGS: You may insert MiniMax sound tags (breath), (chuckle), or (sighs) at most once per paragraph, only when the input clearly calls for it, written exactly in that form.  Never use other parentheses or brackets.
+5. EMOJI: Delete emoji and pictographic symbols only; do not delete words.
+</allowed_changes>
 <pacing_and_punctuation>
-The TTS engine interprets punctuation strictly:
-1. NO DASHES (EM-DASH, EN-DASH, HYPHENS): NEVER use em-dashes (—), en-dashes (–), or floating hyphens ( - ) between clauses. The TTS engine drops pauses on dashes, running words together breathlessly. Always replace dashes with a comma, a period, or an inline pause tag.
-2. NO ELLIPSES: NEVER use ellipses (...). They cause the speech engine to stall or draw out syllables awkwardly. End completed thoughts cleanly with a period.
-3. INLINE PAUSES: Use natural commas and periods for standard cadence. When a distinct, deliberate breath or topical transition is needed between major thoughts or steps, insert a native pause tag: <#0.3#> (for a brief pause) or <#0.5#> (for a half-second topic shift).
-4. NO PARENTHESES OR BRACKETS: Never put explanatory text inside parentheses ( ) or brackets [ ]. Parentheses are reserved by the voice engine for sound and IPA tags. Unpack parenthetical remarks into separate spoken sentences.
+Apple Personal Voice pauses on punctuation and utterance boundaries, not on dashes:
+1. NO DASHES: Never leave em-dashes, en-dashes, or isolated hyphens between clauses.
+2. NO ELLIPSES: Never leave ellipses in the output.
+3. NO RAW URL SCHEMES: Do not add https:// or new domains.  Leave hostnames and paths that are already in the input.
 </pacing_and_punctuation>
-<text_normalization>
-You must explicitly write out how abbreviations, numbers, and symbols should sound when spoken:
-- NUMBERS & CURRENCY: Convert "$50" to "fifty dollars". Convert "3.5" to "three point five".
-- PHONE NUMBERS & CODES: Write out sequential individual numbers where necessary, or format them clearly (e.g., "one eight hundred, five five five, zero one two three").
-- TIME & DATES: Convert "10:30 PM" to "ten thirty p m". Convert "10/24" to "October twenty-fourth".
-- ACRONYMS & INITIALISMS: Spell out letters with spaces or periods (e.g., "A P I" or "A. P. I.", "U S A", "C P U"), never with hyphens.
-- URLS & EMAILS: Convert "example.com" to "example dot com". Convert "info@site.com" to "info at site dot com".
-- MATH SYMBOLS: Convert "+" to "plus", "=" to "equals", and "%" to "percent".
-</text_normalization>
 <negative_constraints>
-- DO NOT use em-dashes (—), en-dashes (–), or isolated hyphens ( - ).
-- DO NOT use ellipses (...).
-- DO NOT use parentheses ( ) or brackets [ ] around normal text.
-- DO NOT output any thinking blocks, \`<thought>\` tags, or step-by-step reasoning.
-- DO NOT leave technical shorthand raw. If a TTS engine reads it, it must sound human.
-- DO NOT read out raw git commit hashes, SHA fingerprints, or long hex strings. Omit them completely or summarize simply.
+- DO NOT paraphrase, summarize, or omit sentences, list items, paths, hashes, or identifiers.
+- DO NOT spell out numbers, currency, times, dates, acronyms, or URLs.
+- DO NOT convert bullet or numbered lists into flowing prose.
+- DO NOT use parentheses or brackets except the allowed MiniMax sound tags above.
+- DO NOT output thinking blocks, \`<thought>\` tags, or step-by-step reasoning.
 </negative_constraints>
 <example_transformation>
-INPUT: "Here are your options for the flight: * Flight AA2314 -> Departs at 3:15 PM ($250) — fastest option * Flight DL982 -> Departs at 6:00 PM ($310) Check details at https://jetblue.com..."
-OUTPUT: "Here are your options for the flight. <#0.3#> First, American Airlines flight twenty-three fourteen departs at three fifteen p m, costing two hundred and fifty dollars, which is the fastest option. <#0.3#> Next, Delta flight nine eighty-two departs at six p m, costing three hundred and ten dollars. You can check the details at jet blue dot com slash status."
+INPUT: "Here are your options for the flight:\n* Flight AA2314 -> Departs at 3:15 PM ($250) — fastest option\n* Flight DL982 -> Departs at 6:00 PM ($310)\nCheck details at https://jetblue.com/status"
+OUTPUT: "Here are your options for the flight. <#0.3#> Flight AA2314 departs at 3:15 PM ($250), fastest option. <#0.3#> Flight DL982 departs at 6:00 PM ($310). Check details at https://jetblue.com/status"
 </example_transformation>
 </system_prompt>`;
+
+/**
+ * The system prompt with the workspace pronunciation list appended, so a
+ * distilled script made after the list changes already says each term the
+ * way the owner asked ("sequel" for SQL).  Scripts stored before the change
+ * are reused as they are, with their clips (server/index.ts voiceSummaryFor),
+ * so the list reaches them only through the engine-side pass in
+ * server/tts/index.ts speak.  Kept deliberately small; the prompt itself is
+ * rewritten separately.
+ */
+export function voiceSummarySystemPrompt(pronunciations: readonly Pronunciation[] = []): string {
+  if (!pronunciations.length) return DEEPSEEK_FLASH_TTS_PROMPT;
+  // JSON-quoted, so a term or a respelling can never close the block or
+  // read as an instruction of its own.
+  const pairs = pronunciations.map((p) => `- ${JSON.stringify(p.term)} is said ${JSON.stringify(p.say)}`).join("\n");
+  return `${DEEPSEEK_FLASH_TTS_PROMPT}
+<pronunciations>
+Always say these terms exactly as given.  Write the respelling in place of the term, wherever the term appears as a whole word in the spoken text.  This overrides the acronym rule above: do not spell these terms out letter by letter.
+${pairs}
+</pronunciations>`;
+}
+
+/**
+ * The deterministic spoken text for `text`: speakable()'s rules, split into
+ * utterances and joined with single spaces.  This is exactly the written-mode
+ * script (shared/speech-spans.ts utterancesWithSpans), so when the distiller
+ * is skipped (a short plain reply) or falls back (no key, timeout, a cut-off
+ * rewrite), server/tts/message-audio.ts can recognize the
+ * text it stored and hand clients the source spans that guide the karaoke
+ * highlight.  MiniMax still gets its acoustic pass: synthesize() runs
+ * sanitizeForTTS on every utterance.
+ */
+export function deterministicSpokenText(text: string): string {
+  return utterancesWithSpans(text).map((u) => u.text).join(" ");
+}
 
 export interface SummarizeVoiceOptions {
   key?: string;
@@ -90,6 +141,54 @@ export interface SummarizeVoiceOptions {
   url?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** The workspace pronunciation list, appended to the prompt
+   * (voiceSummarySystemPrompt).  The deterministic fallback leaves it to
+   * the engine-side pass. */
+  pronunciations?: readonly Pronunciation[];
+}
+
+/** Where the speech text came from.  "summary" is the model's rewrite;
+ * "short" is the deterministic pass for a short, plain reply; "fallback" is
+ * the deterministic pass standing in for a rewrite that was not usable. */
+export type VoiceSummarySource = "summary" | "short" | "fallback";
+
+/** Why a rewrite was not used.  "unavailable" is transient (network error,
+ * non-200, empty answer) and worth retrying later.  The others reproduce on
+ * a retry, so the deterministic text can be stored in place of the rewrite.
+ * That includes "timeout": the same long reply at the same budget runs out of
+ * time again, and each retry would cost the full deadline before speech. */
+export type VoiceSummaryFallbackReason = "no-key" | "truncated" | "incomplete" | "timeout" | "unavailable";
+
+export interface VoiceSummaryResult {
+  text: string;
+  source: VoiceSummarySource;
+  reason?: VoiceSummaryFallbackReason;
+}
+
+export const SUMMARY_MIN_TOKENS = 500;
+/** Roughly the 12,000-character spoken cap (server/tts/message-audio.ts) at
+ * about three characters a token.  The 15-second request timeout still
+ * applies, so a reply that would need more simply falls back to the full
+ * deterministic text instead of being cut. */
+export const SUMMARY_MAX_TOKENS = 4_000;
+
+/** The completion budget for a reply of `inputChars` characters.  The prompt
+ * asks for a spoken rewrite, not a digest, so output tracks input length and
+ * spelled-out numbers make it longer; a fixed 500 cut long replies short. */
+export function voiceSummaryMaxTokens(inputChars: number): number {
+  return Math.min(SUMMARY_MAX_TOKENS, Math.max(SUMMARY_MIN_TOKENS, Math.ceil(inputChars / 3)));
+}
+
+/** Whether this result is worth keeping as message.voiceText.  A transient
+ * provider failure (network error, non-200, empty answer) is not: the next
+ * play asks the distiller again, on any device, and a hosted voice's clips of
+ * the stand-in are stamped as the reply as written so they are reused if the
+ * distiller is still down and replaced if it answers (server/tts/
+ * message-audio.ts).  A cut-off rewrite is never returned as text (the full
+ * deterministic text stands in), and that stand-in is kept, because asking
+ * again would only be cut off again and billed again. */
+export function voiceSummaryWorthStoring(result: VoiceSummaryResult): boolean {
+  return !(result.source === "fallback" && result.reason === "unavailable");
 }
 
 export function normalizeDeepSeekChatUrl(baseUrl?: string): string {
@@ -114,7 +213,9 @@ function stripUnclosedFences(text: string): string {
 function cleanSummaryForTTS(summary: string): string {
   const withoutTags = summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "");
   const stripped = stripUnclosedFences(withoutTags);
-  return sanitizeForTTS(speakable(stripped));
+  // Personal Voice distillation keeps the reply's words; acoustic cleanup only.
+  // Preserve newlines so downstream speakable() can split headings and lists.
+  return sanitizeForTTSByLine(stripped.trim());
 }
 
 /**
@@ -127,8 +228,19 @@ export async function summarizeForVoice(
   legacySignal?: AbortSignal,
   extraOptions: { url?: string; timeoutMs?: number } = {},
 ): Promise<string> {
+  return (await summarizeForVoiceDetailed(rawText, optionsOrKey, legacySignal, extraOptions)).text;
+}
+
+/** summarizeForVoice, plus where the text came from, so the caller can
+ * decide whether it is worth storing. */
+export async function summarizeForVoiceDetailed(
+  rawText: string,
+  optionsOrKey?: string | SummarizeVoiceOptions,
+  legacySignal?: AbortSignal,
+  extraOptions: { url?: string; timeoutMs?: number } = {},
+): Promise<VoiceSummaryResult> {
   const cleanInput = stripVoiceSummaryTags(rawText);
-  if (!cleanInput.trim()) return "";
+  if (!cleanInput.trim()) return { text: "", source: "short" };
 
   // Short replies without technical artifacts don't need summarization
   const hasTechnicalContent =
@@ -141,11 +253,10 @@ export async function summarizeForVoice(
     /[*#_\[\]]/.test(cleanInput);
 
   if (cleanInput.length <= 120 && !hasTechnicalContent) {
-    // Normalize the markdown and paragraph structure *before* the acoustic
-    // pass: sanitizeForTTS collapses newlines, and the line anchors that
-    // strip list markers and add audible paragraph pauses only match on the
-    // original text.
-    return sanitizeForTTS(speakable(cleanInput));
+    // The deterministic script, span-aligned to the reply (see
+    // deterministicSpokenText); its markdown and paragraph rules run on the
+    // original text, before synthesize()'s acoustic pass collapses newlines.
+    return { text: deterministicSpokenText(cleanInput), source: "short" };
   }
 
   const options: SummarizeVoiceOptions =
@@ -153,13 +264,16 @@ export async function summarizeForVoice(
       ? { key: optionsOrKey, signal: legacySignal }
       : (optionsOrKey ?? {});
 
+  const deterministic = () => deterministicSpokenText(spokenReply(rawText));
+  const fallback = (reason: VoiceSummaryFallbackReason): VoiceSummaryResult => ({ text: deterministic(), source: "fallback", reason });
+
   const key = resolveDeepSeekKey(options.key);
-  if (!key) {
-    return sanitizeForTTS(speakable(spokenReply(rawText)));
-  }
+  if (!key) return fallback("no-key");
 
   const endpoint = completionsUrl(options.baseUrl || options.url || extraOptions.url);
   const timeoutMs = options.timeoutMs ?? extraOptions.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxTokens = voiceSummaryMaxTokens(cleanInput.length);
+  const systemPrompt = voiceSummarySystemPrompt(options.pronunciations);
   const timeoutController = new AbortController();
   const timer = setTimeout(() => {
     timeoutController.abort(new Error("Voice summary request timed out"));
@@ -178,7 +292,27 @@ export async function summarizeForVoice(
     }
   }
 
+  /** A usable rewrite, a reason to stop with the deterministic text, or
+   * null to try the next model. */
+  const judge = (data: DeepSeekChatResponse | null): VoiceSummaryResult | null => {
+    const choice = data?.choices?.[0];
+    const content = choice?.message?.content?.trim();
+    if (!content) return null;
+    // finish_reason "length" means max_tokens cut the rewrite off mid-reply.
+    // Anything but "stop" is an incomplete answer; asking a second model the
+    // same question at the same budget would cut it again.
+    const finish = choice?.finish_reason;
+    if (finish === "length") return fallback("truncated");
+    if (finish && finish !== "stop") return fallback("incomplete");
+    // A finished rewrite may be shorter only when the model dropped markdown
+    // delimiters; paraphrase or summary is a prompt violation, not expected.
+    const cleaned = cleanSummaryForTTS(content);
+    if (!cleaned) return null;
+    return { text: cleaned, source: "summary" };
+  };
+
   try {
+    let startedAt = Date.now();
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -188,10 +322,10 @@ export async function summarizeForVoice(
       body: JSON.stringify({
         model: "deepseek-flash",
         messages: [
-          { role: "system", content: DEEPSEEK_FLASH_TTS_PROMPT },
+          { role: "system", content: systemPrompt },
           { role: "user", content: cleanInput },
         ],
-        max_tokens: 500,
+        max_tokens: maxTokens,
         temperature: 0.3,
         thinking: { type: "disabled" },
       }),
@@ -199,18 +333,14 @@ export async function summarizeForVoice(
     });
 
     if (response.ok) {
-      const rawData: unknown = await response.json();
-      const parsed = DeepSeekChatResponseSchema.safeParse(rawData);
-      if (parsed.success) {
-        const summary = parsed.data.choices?.[0]?.message?.content?.trim();
-        if (summary) {
-          const cleaned = cleanSummaryForTTS(summary);
-          if (cleaned) return cleaned;
-        }
-      }
+      const parsed = DeepSeekChatResponseSchema.safeParse(await response.json());
+      if (parsed.success) reportSummaryUsage("deepseek-flash", parsed.data, startedAt);
+      const verdict = judge(parsed.success ? parsed.data : null);
+      if (verdict) return verdict;
     }
 
     // Fallback: try deepseek-chat if deepseek-flash returned empty or non-200
+    startedAt = Date.now();
     const fallbackResponse = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -220,28 +350,25 @@ export async function summarizeForVoice(
       body: JSON.stringify({
         model: "deepseek-chat",
         messages: [
-          { role: "system", content: DEEPSEEK_FLASH_TTS_PROMPT },
+          { role: "system", content: systemPrompt },
           { role: "user", content: cleanInput },
         ],
-        max_tokens: 300,
+        max_tokens: maxTokens,
         temperature: 0.3,
       }),
       signal: timeoutController.signal,
     });
 
     if (fallbackResponse.ok) {
-      const fbRawData: unknown = await fallbackResponse.json();
-      const fbParsed = DeepSeekChatResponseSchema.safeParse(fbRawData);
-      if (fbParsed.success) {
-        const fbSummary = fbParsed.data.choices?.[0]?.message?.content?.trim();
-        if (fbSummary) {
-          const cleaned = cleanSummaryForTTS(fbSummary);
-          if (cleaned) return cleaned;
-        }
-      }
+      const parsed = DeepSeekChatResponseSchema.safeParse(await fallbackResponse.json());
+      if (parsed.success) reportSummaryUsage("deepseek-chat", parsed.data, startedAt);
+      const verdict = judge(parsed.success ? parsed.data : null);
+      if (verdict) return verdict;
     }
   } catch {
-    // Graceful fallback to deterministic spoken text
+    // Graceful fallback to deterministic spoken text.  Our own deadline (not
+    // the caller cancelling) is the one failure that will repeat.
+    if (timeoutController.signal.aborted && !effectiveSignal?.aborted) return fallback("timeout");
   } finally {
     clearTimeout(timer);
     if (options.signal) {
@@ -249,5 +376,5 @@ export async function summarizeForVoice(
     }
   }
 
-  return sanitizeForTTS(speakable(spokenReply(rawText)));
+  return fallback("unavailable");
 }

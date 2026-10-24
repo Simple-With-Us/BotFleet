@@ -55,14 +55,20 @@ export async function loginUniversalAuth({ siteUrl, clientId, clientSecret, fetc
 /** GET .../api/v3/secrets/raw for the whole path in one call -- returns a
  * Map<secretKey, secretValue>.  viewSecretValue is always "true" here; this
  * script only ever runs where values are needed (it exists to populate
- * GITHUB_ENV), unlike the probe path in server/infisical.ts. */
+ * GITHUB_ENV), unlike the probe path in server/infisical.ts.
+ *
+ * expandSecretReferences is "true": a secret whose stored value is a bare
+ * reference such as ${prod.some-folder.NAME} (the Fleet-OPS root, OPS-818) comes
+ * back as the referenced value.  With "false" the literal reference string
+ * would land in GITHUB_ENV as if it were the credential.  Expanding needs the
+ * reading identity to be able to read the referenced folder too. */
 export async function listSecretsRaw({ siteUrl, token, projectId, environment, secretPath, fetchImpl = fetch, timeoutMs = 30_000 }) {
   const qs = new URLSearchParams({
     workspaceId: projectId,
     environment,
     secretPath,
     viewSecretValue: "true",
-    expandSecretReferences: "false",
+    expandSecretReferences: "true",
     include_imports: "false",
   });
   const res = await fetchImpl(`${siteUrl}/api/v3/secrets/raw?${qs.toString()}`, {
@@ -123,6 +129,16 @@ export function writeGithubEnvValue(path, name, value, appendFileImpl = appendFi
   appendFileImpl(path, `${name}<<${delimiter}\n${value}\n${delimiter}\n`);
 }
 
+/** A value that is still a bare Infisical reference such as
+ * ${prod.some-folder.NAME}: the server did not expand it (target missing, or
+ * the reading identity cannot read the referenced folder).  Exporting it would
+ * hand a workflow the literal reference string as if it were the credential. */
+export const UNRESOLVED_REFERENCE = /^\$\{[^}]+\}$/;
+
+export function isUnresolvedReference(value) {
+  return UNRESOLVED_REFERENCE.test(String(value ?? "").trim());
+}
+
 /** Resolves the vault snapshot (empty map when unconfigured or the fetch
  * failed) -- never throws; a failure is reported through `log` and the
  * caller proceeds on GH_FALLBACK_<NAME> alone. */
@@ -157,6 +173,7 @@ export async function run({ env = process.env, fetchImpl = fetch, log = (line) =
   const vaultValues = await resolveVaultValues({ siteUrl, projectId, clientId, clientSecret, environment, secretPath, fetchImpl, log });
 
   const missingRequired = [];
+  const unresolved = [];
   for (const name of names) {
     let value = vaultValues.get(name) || "";
     if (!value) {
@@ -172,8 +189,18 @@ export async function run({ env = process.env, fetchImpl = fetch, log = (line) =
       }
       continue;
     }
+    if (isUnresolvedReference(value)) {
+      // Name the KEY only -- never the value, even though it is a reference.
+      unresolved.push(name);
+      log(`::error::${name} is still an unresolved Infisical secret reference after the ${environment} export; check the target exists and the CI identity can read the referenced folder.`);
+      continue;
+    }
     maskValue(value, log);
     writeGithubEnvValue(githubEnvPath, name, value);
+  }
+
+  if (unresolved.length > 0) {
+    throw new Error(`Unresolved Infisical secret reference(s): ${unresolved.join(", ")}`);
   }
 
   if (missingRequired.length > 0) {

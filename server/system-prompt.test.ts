@@ -4,8 +4,17 @@
 // prompt at the volatile boundary — without changing a byte of the joined
 // string the lanes used to concatenate by hand.
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { rmSync } from "node:fs";
+import { afterEach, describe, expect, it } from "vitest";
 
+import {
+  BOTFLEET_STATUS_FIXTURE_NOW,
+  botfleetStatusCacheRoots,
+  cachePath,
+  successCapsule,
+} from "./botfleet-status-capsule.test.ts";
+import { botFleetStatusSystemPrompt } from "./botfleet-status-capsule.ts";
+import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
 import { renderSkillInstructions, selectBundledSkills, type BundledSkill } from "./skill-library.ts";
 import { ownerNotesPrompt } from "./system-prompt.ts";
@@ -47,7 +56,7 @@ function oldDirectLanePrompt(f: DirectLaneFixture): string {
     f.playbooks +
     f.automation +
     (f.tagged.length
-      ? ` The user tagged ${f.tagged.map((t) => `@${t.name} (ask_bot bot_id ${t.id})`).join(" and ")} in their message — bring them in with ask_bot and fold their reply into your answer.`
+      ? ` The user tagged ${f.tagged.map((t) => `@${t.name} (coordinate_bots bot_ids ["${t.id}"])`).join(" and ")} in their message — bring them in with coordinate_bots and fold their result into your answer once it comes back.`
       : "")
   );
 }
@@ -71,7 +80,7 @@ function directLaneParts(f: DirectLaneFixture): PromptPart[] {
       id: "mentions",
       label: "Mentions",
       text: f.tagged.length
-        ? ` The user tagged ${f.tagged.map((t) => `@${t.name} (ask_bot bot_id ${t.id})`).join(" and ")} in their message — bring them in with ask_bot and fold their reply into your answer.`
+        ? ` The user tagged ${f.tagged.map((t) => `@${t.name} (coordinate_bots bot_ids ["${t.id}"])`).join(" and ")} in their message — bring them in with coordinate_bots and fold their result into your answer once it comes back.`
         : "",
     },
   ];
@@ -223,6 +232,57 @@ describe("buildSystemPrompt", () => {
     expect(built.volatile).toBe("");
     expect(built.stable).toBe(built.text);
     expect(built.bytes.volatile).toBe(0);
+  });
+
+  describe.skipIf(process.getuid === undefined)("Chief roster vs volatile BotFleet status", () => {
+    afterEach(() => {
+      for (const root of botfleetStatusCacheRoots.splice(0)) {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    const CLI_AGENT_TOOLS = [
+      "list_bots",
+      "coordinate_bots",
+      "assignment_status",
+      "list_routines",
+      "create_bot",
+      "request_credential",
+      "request_sign_in",
+      "propose_routine",
+      "propose_routine_action",
+    ];
+    const bots = [
+      { id: "chief", name: "Atlas", title: "Operations", section: "Work" },
+      { id: "writer", name: "Quill", title: "Writer", description: "Drafts concise copy", section: "Work" },
+    ];
+
+    it("keeps the Chief roster stable when only BotFleet status freshness moves", () => {
+      const roster = chiefOfStaffSystemPrompt("chief", bots, CLI_AGENT_TOOLS);
+      expect(roster).not.toContain("freshness=");
+      expect(roster).not.toContain("TRUSTED BOTFLEET STATUS");
+
+      const parts = (status: string) =>
+        buildSystemPrompt([
+          { id: "coordination", label: "Team", text: ` ${roster}` },
+          { id: "botfleet-status", label: "BotFleet status", volatile: true, text: `\n${status}` },
+        ]);
+
+      const statusCachePath = cachePath(successCapsule());
+      const freshAt = new Date(BOTFLEET_STATUS_FIXTURE_NOW.getTime() + 1_000);
+      const staleAt = new Date("2026-08-22T06:35:00Z");
+      const fresh = botFleetStatusSystemPrompt({ cachePath: statusCachePath, now: freshAt });
+      const stale = botFleetStatusSystemPrompt({ cachePath: statusCachePath, now: staleAt });
+      expect(fresh).toContain("freshness=fresh");
+      expect(stale).toContain("freshness=stale");
+
+      const before = parts(fresh);
+      const after = parts(stale);
+      expect(after.stable).toBe(before.stable);
+      expect(after.volatile).not.toBe(before.volatile);
+      expect(before.text).toContain("Quill — Writer");
+      expect(before.text).toContain("\nTRUSTED BOTFLEET STATUS");
+    });
   });
 
   it("drops empty parts and lets a part force the volatile half", () => {

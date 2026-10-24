@@ -8,10 +8,15 @@ import { dirname } from "node:path";
 
 import { STATIC_ANTIGRAVITY_MODELS } from "./antigravity-models.ts";
 import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
+import {
+  DSH_DEEPSEEK_FLASH_MODEL,
+  DSH_DEEPSEEK_PRO_MODEL,
+} from "./drivers/acp/dsh.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { doomedDispatches } from "./doomed-dispatch.ts";
 import { modelRejections, type ModelRejectionGate } from "./model-rejections.ts";
 import type { ModelSelection, ProviderErrorCode } from "./contracts.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 import { rewriteModelSelection, rewriteRetiredModelId } from "./retired-model-ids.ts";
 
 /** Antigravity offers no 3.1 Flash, so a naive -pro -> -flash rewrite of
@@ -50,11 +55,28 @@ function isBuiltInClaudeSonnetOrOpus(model: string): boolean {
 
 /** A DSH Pro route cannot read images. Replace it throughout the saved chain
  * when switching an image turn to Flash so no stale Pro fallback can retry
- * the same image prompt. Other engines and models remain untouched. */
+ * the same image prompt. Other engines and models remain untouched.
+ *
+ *  The retired `DeepSeek-V4.1-Pro` spelling is accepted here too: a send path
+ *  can still carry it before the store rewrite reaches the saved chain (see
+ *  `retired-model-ids.ts`), and a Pro turn that quietly stopped switching to
+ *  Flash would fail on the image instead of routing away from it. */
+const DSH_PRO_MODEL_IDS: ReadonlySet<string> = new Set([
+  DSH_DEEPSEEK_PRO_MODEL,
+  "DeepSeek-V4.1-Pro",
+]);
+
+/** True when a route names the DSH Pro row, in either spelling.  The send
+ *  path in `index.ts` asks this instead of comparing ids itself, so the two
+ *  places that decide a Pro turn cannot drift apart. */
+export function isDshVisionlessModel(model: string): boolean {
+  return DSH_PRO_MODEL_IDS.has(model);
+}
+
 export function dshVisionSelection(chain: ModelSelection): ModelSelection {
   const switchPro = (entry: ModelSelection): ModelSelection =>
-    entry.instanceId === "dsh" && entry.model === "DeepSeek-V4.1-Pro"
-      ? { ...entry, model: "DeepSeek-V4.1-Flash" }
+    entry.instanceId === "dsh" && DSH_PRO_MODEL_IDS.has(entry.model)
+      ? { ...entry, model: DSH_DEEPSEEK_FLASH_MODEL }
       : entry;
   return {
     ...switchPro(chain),
@@ -131,7 +153,7 @@ export function unattendedModelDowngrade(
   // target's, and DSH refuses a level its settings do not declare.
   if (
     opts.automationSource === "webhook" &&
-    selection.model === "MiniMax-M3.1-Flash-Preview-thinking" &&
+    selection.model === "MiniMax-M3.1-Flash-thinking" &&
     opts.nonThinkingFlash?.instanceId &&
     opts.nonThinkingFlash.model &&
     !opts.isCooling?.(opts.nonThinkingFlash.instanceId, opts.nonThinkingFlash.model)
@@ -190,6 +212,8 @@ export interface FallbackScanMessage {
   kind: string;
   text?: string;
   tool?: { name?: string; ok?: boolean; kind?: string };
+  /** On a routine's prompt message:  its command allowlist. */
+  toolPolicy?: ToolPolicy;
 }
 
 export interface TurnFallbackPick extends ModelSelection {
@@ -205,6 +229,11 @@ export function selectionForFallbackPick(pick: ModelSelection): ModelSelection {
     instanceId: pick.instanceId,
     model: pick.model,
     effort: pick.effort,
+    // The fallback's own context cap and output limit run with it, like its
+    // effort.  Both are gated per model at dispatch, so one that the fallback
+    // model does not offer is dropped there.
+    ...(pick.contextCap !== undefined ? { contextCap: pick.contextCap } : {}),
+    ...(pick.maxOutputTokens !== undefined ? { maxOutputTokens: pick.maxOutputTokens } : {}),
     ...(pick.latest ? { latest: pick.latest } : {}),
   };
 }
@@ -312,6 +341,16 @@ export function lastTurnStartIndex(messages: FallbackScanMessage[]): number {
     if ((messages[i].role === "user" || messages[i].role === "system") && messages[i].kind === "text") return i;
   }
   return -1;
+}
+
+/** The command allowlist of the turn a continuation resumes (a connector or
+ *  secret card answered, a boot resume):  the one on the active path's latest
+ *  turn starter, which is that turn's own prompt.  A continuation carries no
+ *  persisted starter of its own, so without this it would run the rest of an
+ *  allowlisted routine with everything the bot can do. */
+export function continuedTurnToolPolicy(messages: FallbackScanMessage[]): ToolPolicy | undefined {
+  const index = lastTurnStartIndex(messages);
+  return index >= 0 ? messages[index]?.toolPolicy : undefined;
 }
 
 /** Boot-recovery prompt when the in-flight turn has no persisted starter
@@ -424,16 +463,20 @@ export function shouldReplayPersistedStarter(messages: FallbackScanMessage[], tu
 
 /** Persisted trigger of an auto-delivered turn starter.  Mirrors
  * RoutineRunTrigger without importing routines.ts. */
-export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
+export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
 
 export interface BootRecoveryResumeUser {
   role?: string;
   automationSource?: BootRecoveryAutomationSource;
+  toolPolicy?: ToolPolicy;
 }
 
 export interface BootRecoveryTurnOpts {
   automationSource?: BootRecoveryAutomationSource;
   unattended?: boolean;
+  /** The routine's command allowlist, on the replay and the continuation
+   *  path alike:  a resumed routine turn is held to it as the first was. */
+  toolPolicy?: ToolPolicy;
 }
 
 /**
@@ -459,7 +502,10 @@ export function bootRecoveryTurnOpts(
   // clear the guard and let always-allow authorize a request nobody is
   // watching.  A system row with no source gets the same treatment.
   const unattended = webhookOrResource || resumeUser?.role === "system" ? true : undefined;
-  return { automationSource, unattended };
+  // The allowlist rides on the starter, so neither path may drop it:  the
+  // continuation sends BOOT_RECOVERY_NOTICE instead of the starter, and the
+  // notice is stored with this policy for the next resume.
+  return resumeUser?.toolPolicy ? { automationSource, unattended, toolPolicy: resumeUser.toolPolicy } : { automationSource, unattended };
 }
 
 function sameEngine(a: { instanceId: string; model: string }, b: { instanceId: string; model: string }): boolean {
@@ -662,7 +708,7 @@ export function selectTurnFallback(input: {
     const next = chain[i];
     if (!next?.instanceId) continue;
     // Heal retired picker ids before same-engine / rejection checks so a
-    // saved MiniMax-M3 entry cannot loop against a live Flash Preview
+    // saved MiniMax-M3 entry cannot loop against a live Flash
     // primary or burn another unknown-model spawn.
     const model = rewriteRetiredModelId(next.model);
     if (input.current && sameEngine({ instanceId: next.instanceId, model }, input.current)) continue;
@@ -870,16 +916,29 @@ export class QuotaCooldownRegistry {
     const resetsAt = opts.source === "antigravity-usage"
       ? (opts.resetsAt ?? null)
       : (opts.resetsAt != null ? opts.resetsAt : (recordedAt + DEFAULT_QUOTA_COOLDOWN_TTL_MS));
+    const error = opts.error ?? "Session limit or usage cap reached";
+    const key = `*:${instanceId}:${model}`;
+    const existing = this.cooldowns.get(key);
+    if (
+      existing &&
+      !this.isExpired(existing, recordedAt) &&
+      (opts.resetsAt !== undefined || opts.source === "antigravity-usage") &&
+      existing.resetsAt === resetsAt &&
+      existing.error === error &&
+      existing.source === opts.source
+    ) {
+      return;
+    }
     const cd: BotQuotaCooldown = {
       botId: "*",
       instanceId,
       model,
       resetsAt,
-      error: opts.error ?? "Session limit or usage cap reached",
+      error,
       recordedAt,
       source: opts.source,
     };
-    this.cooldowns.set(`*:${instanceId}:${model}`, cd);
+    this.cooldowns.set(key, cd);
     this.persist();
   }
 
@@ -921,16 +980,19 @@ export class QuotaCooldownRegistry {
 
   clear(botId: string, instanceId?: string, model?: string): void {
     if (instanceId && model) {
-      this.cooldowns.delete(`${botId}:${instanceId}:${model}`);
-      this.persist();
+      if (this.cooldowns.delete(`${botId}:${instanceId}:${model}`)) {
+        this.persist();
+      }
       return;
     }
+    let changed = false;
     for (const key of this.cooldowns.keys()) {
       if (key.startsWith(`${botId}:`)) {
         this.cooldowns.delete(key);
+        changed = true;
       }
     }
-    this.persist();
+    if (changed) this.persist();
   }
 
   clearWhere(predicate: (cooldown: BotQuotaCooldown) => boolean): void {

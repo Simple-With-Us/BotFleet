@@ -11,10 +11,6 @@ function sha512(file) {
   return createHash("sha512").update(readFileSync(file)).digest("base64");
 }
 
-function sha256(file) {
-  return createHash("sha256").update(readFileSync(file)).digest("hex");
-}
-
 export function parseUpdateFeed(text, feedName) {
   const lines = text.split(/\r?\n/);
   const version = lines.find((line) => /^version:\s+/.test(line))?.replace(/^version:\s+/, "").trim();
@@ -121,25 +117,18 @@ export function verifyReleaseAssets(directory, version) {
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
     throw new Error(`invalid package version: ${version}`);
   }
+  // macOS only (Option A, BF-2500): no Windows or Ubuntu desktop artifacts.
   const mac = [
     `BotFleet-${version}-arm64.zip`,
     `BotFleet-${version}-x64.zip`,
     `BotFleet-${version}-arm64.dmg`,
     `BotFleet-${version}-x64.dmg`,
   ];
-  const windows = [`BotFleet-${version}-setup.exe`];
-  const deb = `BotFleet-${version}-amd64.deb`;
-  const linux = [`BotFleet-${version}-x86_64.AppImage`, deb];
 
   verifyFeed(root, "latest-mac.yml", version, mac, mac);
-  verifyFeed(root, "latest.yml", version, windows, windows);
-  verifyFeed(root, "latest-linux.yml", version, linux);
   const stableDownloads = new Map([
     ["BotFleet.dmg", mac[2]],
     ["BotFleet-intel.dmg", mac[3]],
-    ["BotFleet-setup.exe", windows[0]],
-    ["BotFleet.AppImage", linux[0]],
-    ["BotFleet-amd64.deb", `BotFleet-${version}-amd64.deb`],
   ]);
   for (const [alias, versioned] of stableDownloads) {
     const aliasPath = join(root, alias);
@@ -150,37 +139,11 @@ export function verifyReleaseAssets(directory, version) {
     }
   }
 
-  if (!existsSync(join(root, deb))) throw new Error(`missing Linux package ${deb}`);
-  const checksumPath = join(root, "SHA256SUMS-ubuntu-x64.txt");
-  if (!existsSync(checksumPath)) throw new Error("missing SHA256SUMS-ubuntu-x64.txt");
-  const checksums = new Map(
-    readFileSync(checksumPath, "utf8")
-      .trim()
-      .split(/\r?\n/)
-      .map((line) => {
-        const match = line.match(/^([0-9a-f]{64})\s+\*?(\S+)$/);
-        if (!match) throw new Error(`invalid checksum line: ${line}`);
-        return [match[2], match[1]];
-      }),
-  );
-  for (const file of [deb, linux[0]]) {
-    if (checksums.get(file) !== sha256(join(root, file))) {
-      throw new Error(`SHA256SUMS-ubuntu-x64.txt: mismatch for ${file}`);
-    }
-  }
-
   const expectedFiles = new Set([
     ...mac,
     ...mac.map((file) => `${file}.blockmap`),
-    ...windows,
-    ...windows.map((file) => `${file}.blockmap`),
-    ...linux,
-    deb,
     ...stableDownloads.keys(),
     "latest-mac.yml",
-    "latest.yml",
-    "latest-linux.yml",
-    "SHA256SUMS-ubuntu-x64.txt",
   ]);
   const actualFiles = readdirSync(root, { withFileTypes: true })
     .filter((entry) => entry.isFile())

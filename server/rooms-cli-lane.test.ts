@@ -239,8 +239,9 @@ describe("the grant a turn resolves is the same on both lanes", () => {
   });
 
   it("keeps the caught VPS error when an Auto lookup throws and nothing mounts", async () => {
-    // The auto lookup's SSH/timeout error used to be replaced by the generic
-    // "could not be reached" text in the no-mount branch.
+    // A chat turn keeps going when the VPS cannot be reached.  The SSH
+    // error stays in the note, instead of a generic "could not be reached"
+    // and instead of failing the turn.
     const deps = stubDeps({
       readHostConnection: () => null,
       vps: {
@@ -262,7 +263,9 @@ describe("the grant a turn resolves is the same on both lanes", () => {
       allowed: null,
       deps,
     });
-    await expect(run).rejects.toThrow("ssh: connect to host vps-1 port 22: Operation timed out");
+    const resolved = await run;
+    expect(resolved.mounts).toEqual([]);
+    expect(resolved.unavailableNote).toContain("ssh: connect to host vps-1 port 22: Operation timed out");
   });
 
   describe("per-provider toggles are enforced on the cloud backend a bot resolves to", () => {
@@ -626,6 +629,9 @@ posixOnly("room turns carry the same computers as a direct chat", () => {
       USERPROFILE: home,
       OMB_PORT: String(port),
       OMB_EXTRA_PATH: fakeBin,
+      // spawnDetached switches container runtimes off; this fake `docker` is
+      // the one runtime the harness may run, by absolute path.
+      BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR: fakeBin,
       FAKE_DOCKER_DIR: fakeBin,
       FAKE_DOCKER_LOG: dockerLog,
     };

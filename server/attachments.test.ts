@@ -1,6 +1,6 @@
 // attachments.ts: save + read-back, the mime allowlist, size ceiling, and
 // the name-lock that keeps the serving route inside the attachments dir.
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -10,7 +10,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 const DATA_ROOT = mkdtempSync(join(tmpdir(), "omb-attachments-"));
 process.env.OMB_DATA_DIR = join(DATA_ROOT, "data");
 
-const { ATTACHMENTS_DIR, IMAGE_MAX_BYTES, extensionForMime, readAttachment, saveImage } = await import("./attachments.ts");
+const {
+  ATTACHMENTS_DIR,
+  DEFAULT_AUDIO_RETENTION_DAYS,
+  IMAGE_MAX_BYTES,
+  extensionForMime,
+  readAttachment,
+  saveAttachment,
+  saveImage,
+  sweepExpiredAudioAttachments,
+} = await import("./attachments.ts");
 
 describe("extensionForMime", () => {
   it("maps the accepted image mimes to extensions", () => {
@@ -36,10 +45,18 @@ describe("extensionForMime", () => {
     expect(extensionForMime(undefined)).toBeNull();
   });
 
-  it("maps ordinary chat files", () => {
+  it("maps ordinary chat files and audio formats", () => {
     expect(extensionForMime("application/pdf")).toBe(".pdf");
     expect(extensionForMime("text/plain")).toBe(".txt");
     expect(extensionForMime("application/octet-stream")).toBe(".bin");
+    expect(extensionForMime("audio/mpeg")).toBe(".mp3");
+    expect(extensionForMime("audio/wav")).toBe(".wav");
+    expect(extensionForMime("audio/ogg")).toBe(".ogg");
+    expect(extensionForMime("audio/opus")).toBe(".opus");
+    expect(extensionForMime("audio/mp4")).toBe(".m4a");
+    expect(extensionForMime("audio/x-m4a")).toBe(".m4a");
+    expect(extensionForMime("audio/aac")).toBe(".aac");
+    expect(extensionForMime("audio/webm")).toBe(".webm");
   });
 });
 
@@ -71,8 +88,7 @@ describe("saveImage", () => {
     expect(back?.mime).toBe("image/gif");
   });
 
-  it("saves a pdf as a generated .pdf path", async () => {
-    const { saveAttachment } = await import("./attachments.ts");
+  it("saves a pdf as a generated .pdf path", () => {
     const saved = saveAttachment(Buffer.from("%PDF-1.4"), "application/pdf");
     expect(saved.path.endsWith(".pdf")).toBe(true);
     expect(saved.mime).toBe("application/pdf");
@@ -100,5 +116,49 @@ describe("readAttachment name lock", () => {
     expect(readAttachment("a/b.png")).toBeNull();
     expect(readAttachment("no-extension")).toBeNull();
     expect(readAttachment("uuid.jpeg")).toBeNull(); // saved as .jpg
+  });
+});
+
+describe("sweepExpiredAudioAttachments", () => {
+  beforeEach(() => {
+    rmSync(ATTACHMENTS_DIR, { recursive: true, force: true });
+  });
+  afterEach(() => {
+    rmSync(ATTACHMENTS_DIR, { recursive: true, force: true });
+  });
+
+  it("deletes audio files older than retentionDays (default 7) while keeping recent audio and non-audio files", () => {
+    expect(DEFAULT_AUDIO_RETENTION_DAYS).toBe(7);
+    const now = Date.now();
+    const eightDaysAgo = new Date(now - 8 * 24 * 60 * 60 * 1_000);
+    const twoDaysAgo = new Date(now - 2 * 24 * 60 * 60 * 1_000);
+
+    const oldMp3 = saveAttachment(Buffer.from("old-mp3"), "audio/mpeg");
+    const oldOpus = saveAttachment(Buffer.from("old-opus"), "audio/ogg");
+    const freshMp3 = saveAttachment(Buffer.from("fresh-mp3"), "audio/mpeg");
+    const oldPng = saveImage(Buffer.from("old-png"), "image/png");
+
+    utimesSync(oldMp3.path, eightDaysAgo, eightDaysAgo);
+    utimesSync(oldOpus.path, eightDaysAgo, eightDaysAgo);
+    utimesSync(freshMp3.path, twoDaysAgo, twoDaysAgo);
+    utimesSync(oldPng.path, eightDaysAgo, eightDaysAgo);
+
+    const dry = sweepExpiredAudioAttachments(7, { nowMs: now, dryRun: true });
+    expect(dry.removedFiles).toBe(2);
+    expect(existsSync(oldMp3.path)).toBe(true);
+
+    const result = sweepExpiredAudioAttachments(7, { nowMs: now });
+    expect(result.removedFiles).toBe(2);
+    expect(result.freedBytes).toBe(15);
+    expect(existsSync(oldMp3.path)).toBe(false);
+    expect(existsSync(oldOpus.path)).toBe(false);
+    expect(existsSync(freshMp3.path)).toBe(true);
+    expect(existsSync(oldPng.path)).toBe(true);
+
+    // 0 means keep forever
+    utimesSync(freshMp3.path, eightDaysAgo, eightDaysAgo);
+    const forever = sweepExpiredAudioAttachments(0, { nowMs: now });
+    expect(forever.removedFiles).toBe(0);
+    expect(existsSync(freshMp3.path)).toBe(true);
   });
 });

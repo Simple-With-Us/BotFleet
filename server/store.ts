@@ -4,12 +4,16 @@
 // one). messages-<threadId>.json holds the folded transcript.
 import { existsSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 
 import { isDelegationMessage } from "../shared/delegation-message.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
 import { DATA_DIR } from "./config.ts";
+import { rosterIsOnHold } from "./data-faults.ts";
 import * as mdb from "./message-db.ts";
+import type { JsonValue } from "./schema.ts";
+import { interpretRecordList, loadGuarded, logRefusedSave } from "./store-guard.ts";
 import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId, type TurnBillingMode } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
@@ -17,8 +21,11 @@ import { redactSecretsInText } from "./redact.ts";
 import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { withoutNestedFallbacks } from "../shared/model-limits.ts";
+import type { BotVoices } from "../shared/bot-voice.ts";
+import type { SignInRequestCardData } from "../shared/sign-in-request.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
+import { interruptedHelper, type HelperTranscript } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextInjectionRef } from "../shared/context-injection.ts";
 import { taskWorkspaceContextsMatch, type TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
@@ -35,6 +42,7 @@ import {
 import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
 import { rewriteModelSelection } from "./retired-model-ids.ts";
 import { automationRolloverSeedText } from "./automation-rollover.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 
 export type BotColor =
   | "green"
@@ -77,6 +85,8 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
+  /** When true, always-allow on this card needs an extra write-tool warning. */
+  allowKeyWarnWrite?: boolean;
   /** Local actions never share remembered grants with cloud/tool approvals. */
   approvalScope?: "local-computer" | "disposable-computer";
   /** A durable chat-created routine proposal. The scheduler only applies it
@@ -123,15 +133,30 @@ export interface Message {
    * and instead of collapsing every non-webhook/imessage system message
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
+  /** On a routine's prompt message:  the routine's command allowlist
+   *  (server/tool-policy.ts), so a re-dispatch of this message is held to it. */
+  toolPolicy?: ToolPolicy;
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "sign-in";
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
   modelSelection?: { instanceId: string; model: string };
-  /** Persisted audio clips for this exact reply, in playback order. */
+  /** Persisted audio clips for this exact reply, in playback order.  They
+   * belong to `audioVoice`, or to the owner's shared voice on rows written
+   * before audioVoice existed (server/tts/message-audio.ts). */
   audio?: Array<{ path: string; mime: string }>;
-  /** Distilled speech-friendly text generated for TTS synthesis. */
+  /** The voice `audio` was synthesized with. */
+  audioVoice?: string;
+  /** Clips for a device voice that differs from the owner's shared voice,
+   * keyed by voice id, so a Mac and an iPhone with different hosted voices
+   * do not overwrite (and re-bill) each other's clips. */
+  audioByVoice?: Record<string, Array<{ path: string; mime: string }>>;
+  /** The text this reply's voice reads, and its stored clips were made from. */
   voiceText?: string;
+  /** What voiceText is: "written" (the reply as written, the "off" mode) or
+   * "summary" (the distiller path, the default).  Absent on rows from before
+   * karaoke, whose voiceText is reused as a summary (shared/spoken-script.ts). */
+  voiceTextKind?: "written" | "summary";
   /** Original incoming microphone recording and recognizer output never change. */
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   /** Corrections are annotations, not edits to the audio or original transcript. */
@@ -141,6 +166,8 @@ export interface Message {
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  /** A website sign-in the person completes on the computer.  Never a password. */
+  signIn?: SignInRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the same chip as
    * a phrase a voice can read ("reading a file") — computed once here so
    * call mode never has to re-derive it from the raw tool name, and absent
@@ -174,6 +201,9 @@ export interface Message {
      * interleaving parallel helpers' steps with the bot's own. */
     parentItemId?: string;
   };
+  /** The helper card for the row that started an engine-native helper
+   * (jobs P3).  Absent on an ordinary step. */
+  helper?: HelperTranscript;
   /** What the harness put in front of the model for THIS turn that the person
    * did not type — memory, selected skills, a quoted reply, a replayed
    * conversation (shared/context-injection.ts).  One short record each: a
@@ -188,6 +218,21 @@ export interface Message {
   /** screen messages: a frame of the bot's computer (base64 image) */
   png?: string;
   mime?: string;
+  /** Marks a row that belongs to a slash command rather than to the
+   * conversation.  `id` ties together the rows of one invocation: the
+   * `invocation` (what was typed), the `reply` (what BotFleet answered) and the
+   * `output` (what the engine's own command printed).  A marked row is drawn as
+   * a command chip or card, and is never replayed to a model: it is left out of
+   * the transcript a turn is built from.  Clients that predate the marker show
+   * a plain bubble. */
+  command?: {
+    id: string;
+    name: string;
+    source: "botfleet" | "engine";
+    role: "invocation" | "reply" | "output";
+    surface: "desktop" | "ios" | "imessage" | "linq";
+    ok?: boolean;
+  };
   at: number;
   /** the message this one follows; null = thread root. Edited messages
    * share a parentId with the version they replace — that's a fork. */
@@ -352,6 +397,11 @@ export interface TaskUsage {
    * written by builds before cost existed lack the field; read as null. */
   costUsd: number | null;
   turns: number;
+  /** The input tokens of the most recent settled turn that reported any, which
+   * is how full the model's context window was after it (cache reads count:
+   * they fill the window).  Unlike `input`, it is not a running total.  Absent
+   * until a turn reports input. */
+  lastInput?: number;
 }
 
 /** Running timing aggregate for one task, banked at each settled turn from
@@ -533,6 +583,13 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
       error: out.secret.error ? redactSecretsInText(out.secret.error) : undefined,
     };
   }
+  if (out.signIn) {
+    out.signIn = {
+      ...out.signIn,
+      reason: redactSecretsInText(out.signIn.reason),
+      error: out.signIn.error ? redactSecretsInText(out.signIn.error) : undefined,
+    };
+  }
   return out;
 }
 
@@ -613,17 +670,32 @@ export interface BotRecord {
   /** Permission bypass mode: automatically approve all tools, commands,
    * and routines without halting for approval cards or unattended blocks. */
   bypassPermissions?: boolean;
+  /** Bypass, including the requests that control the person's real desktop.
+   * Off by default, so bypass alone keeps stopping at that edge.  Means
+   * nothing without `bypassPermissions`. */
+  bypassLocalComputer?: boolean;
   /** Optional model review of otherwise undecided, attended approval cards.
    * Unknown persisted values are treated as off by the review boundary. */
   autoReview?: "off" | "shadow" | "enforce";
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
+  /** Optional subset of config `mcpServers` this bot may mount; absent = all enabled. */
+  mcpServers?: string[];
   /** Ceiling on model→tool rounds for HTTP toolLoop engines (MiniMax / Grok
    * HTTP / openai-compat). Unset = DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts),
    * which DEFAULT_TURN_LOOP_BUDGET.maxRounds is derived from.
    * Integer 1..200; invalid values are treated as absent at dispatch. */
   maxToolRounds?: number;
+  /** Cap on replayed history turns in a budgeted prompt (ACP engines):
+   * older turns are dropped and summarized even when the byte budget would
+   * fit them.  Unset keeps every turn the byte budget fits.
+   * Integer 0..MAX_HISTORY_TURNS; invalid values are treated as absent. */
+  maxHistoryTurns?: number;
+  /** When true, dropped history turns are summarized by the bot's model
+   * (cached and rolled forward), falling back to the extractive note on
+   * error.  Absent or false is the extractive default. */
+  historySummaryModel?: boolean;
   /** Speak this bot's replies aloud as they settle, without being asked.
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */
@@ -633,6 +705,10 @@ export interface BotRecord {
   /** This bot's own voice id, so a room of bots doesn't sound like one
    * person. Falls back to the app-wide voice in config. */
   voice?: string;
+  /** Per-device overrides of `voice` (shared/bot-voice.ts): an Apple
+   * Personal Voice only exists on the device that made it, so the Mac and
+   * the iPhone each pick their own.  A device without one uses `voice`. */
+  voices?: BotVoices;
   /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
    * "on_demand" (default/opt-in) runs only on manual speak; "always" runs on every turn. */
   voiceSummaryMode?: "off" | "on_demand" | "always";
@@ -642,6 +718,14 @@ export interface BotRecord {
   rewound?: boolean;
   pinned?: boolean;
   hidden?: boolean;
+  /** The bot's On/Off switch (shared/bot-power.ts).  Absent or false = on.
+   *  While true, no NEW turn starts for this bot from any source — chat from
+   *  every channel, routines, webhooks, resource triggers, room fan-out,
+   *  peer delegation, resumes — but the chat stays visible and a turn that was
+   *  already running finishes.  Unlike `hidden` (an archive) it keeps the bot
+   *  in the roster, and unlike a routine-manager "stop" no message clears it:
+   *  only an explicit Turn On does.  Persisted with the roster. */
+  off?: boolean;
   /** Optional labeled divider used to organize this bot in the sidebar. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread; a pin
@@ -710,6 +794,15 @@ const BOTS_FILE = join(DATA_DIR, "bots.json");
 /** Which one-time model-lineage migrations this data dir has had. */
 const MODEL_LINEAGE_MARKER = "model-lineage.json";
 const GROUPS_FILE = join(DATA_DIR, "groups.json");
+/** The least a bots.json entry must be before the Store's own migrations can run on it.  Anything
+ * else in the entry is left to those migrations, as it always was: a stricter test here would set
+ * aside a roster an older build wrote. */
+const botEntrySchema = z.looseObject({ id: z.string().min(1) });
+/** The same for rooms.  Every non-channel room reads `memberIds` before anything else. */
+const groupEntrySchema = z.looseObject({ id: z.string().min(1), memberIds: z.array(z.string()) });
+const isBotEntry = (candidate: JsonValue): candidate is JsonValue & BotRecord => botEntrySchema.safeParse(candidate).success;
+const isGroupEntry = (candidate: JsonValue): candidate is JsonValue & GroupRecord =>
+  groupEntrySchema.safeParse(candidate).success;
 /** How long a burst of saveBots() calls coalesces into one atomic write. */
 const BOTS_SAVE_DEBOUNCE_MS = 250;
 const messagesFile = (threadId: string) => join(DATA_DIR, `messages-${threadId}.json`);
@@ -738,9 +831,9 @@ export const sectionKey = (section?: string | null): string => section?.trim() |
  * "New Bot"), names match case-insensitively, longest name wins (so
  * "@New Bot 2" never half-matches "New Bot"), hidden bots skipped, results
  * deduped. Callers pre-filter the sender out of `peers`. */
-export function mentionedBots<T extends { name: string; hidden?: boolean }>(text: string, peers: T[]): T[] {
+export function mentionedBots<T extends { name: string; hidden?: boolean; off?: boolean }>(text: string, peers: T[]): T[] {
   const candidates = peers
-    .filter((p) => !p.hidden && p.name.trim())
+    .filter((p) => !p.hidden && !p.off && p.name.trim())
     .sort((a, b) => b.name.length - a.name.length);
   const lower = text.toLowerCase();
   const found: T[] = [];
@@ -808,12 +901,13 @@ export function normalizeGroupDefaultResponder(
 
 /** Resolve the bots invoked by a human room message. Explicit targets win;
  * otherwise the room policy chooses one member, everyone, or nobody. */
-export function roomResponders<T extends { id: string; name: string; hidden?: boolean }>(
+export function roomResponders<T extends { id: string; name: string; hidden?: boolean; off?: boolean }>(
   text: string,
   members: T[],
   defaultResponder: GroupDefaultResponder,
 ): T[] {
-  const available = members.filter((member) => !member.hidden);
+  // An Off member cannot speak, so it is skipped exactly like an archived one.
+  const available = members.filter((member) => !member.hidden && !member.off);
   if (/(?:^|\s)@everyone\b/i.test(text)) return available;
   const mentioned = mentionedBots(text, available);
   if (mentioned.length) return mentioned;
@@ -847,17 +941,30 @@ interface ThreadState {
  * the next read just re-hydrates from sqlite. */
 const DEFAULT_THREAD_CACHE_LIMIT = 64;
 
+/** …and how many messages, in total, those warm threads may retain. The
+ * count alone is NOT a memory bound: it bounds how many threads are warm,
+ * never how big one is. A long bot thread carries inline base64 screen
+ * captures, so 64 fully-hydrated threads measured 74 GB RSS over one
+ * working day — which on a 16 GB Mac drove swap until the disk was full
+ * (BF-2424). Bounding retained messages bounds the heap, whatever route
+ * or call site did the hydrating. */
+const DEFAULT_THREAD_CACHE_MAX_MESSAGES = 20_000;
+
 /** A bounded LRU over per-thread message caches. `get` touches (moves the
  * entry to the most-recently-used end); `set` evicts the least-recently-
- * used entries past `limit`. Backed by a plain Map: insertion order is
- * Map's own iteration order, so "delete then re-set" is enough to move a
- * key to the MRU end, and `.keys().next()` is always the LRU key. */
+ * used entries past `limit` OR until the retained message count is back
+ * under `maxMessages`. Backed by a plain Map: insertion order is Map's own
+ * iteration order, so "delete then re-set" is enough to move a key to the
+ * MRU end, and `.keys().next()` is always the LRU key. */
 class ThreadCache {
   private map = new Map<string, ThreadState>();
   private limit: number;
+  private maxMessages: number;
+  private retained = 0;
 
-  constructor(limit: number) {
+  constructor(limit: number, maxMessages: number = DEFAULT_THREAD_CACHE_MAX_MESSAGES) {
     this.limit = limit;
+    this.maxMessages = maxMessages;
   }
 
   get(threadId: string): ThreadState | undefined {
@@ -870,17 +977,49 @@ class ThreadCache {
   }
 
   set(threadId: string, state: ThreadState): void {
+    const previous = this.map.get(threadId);
+    if (previous) this.retained -= previous.messages.length;
     this.map.delete(threadId);
     this.map.set(threadId, state);
-    while (this.map.size > this.limit) {
+    this.retained += state.messages.length;
+    this.evict();
+  }
+
+  /** Drop the least-recently-used threads until BOTH bounds hold. A single
+   * thread larger than the whole budget still gets cached — evicting it
+   * inside `set` would return `undefined` to a caller expecting the state
+   * it just wrote — but it is the first thing the next `set` evicts. */
+  private evict(): void {
+    while (this.map.size > this.limit || this.retained > this.maxMessages) {
       const oldest = this.map.keys().next().value;
       if (oldest === undefined) break;
+      const victim = this.map.get(oldest);
+      if (victim) this.retained -= victim.messages.length;
+      this.map.delete(oldest);
+    }
+  }
+
+  recordAppend(threadId: string): void {
+    if (!this.map.has(threadId)) return;
+    this.retained += 1;
+    while (this.map.size > 1 && (this.map.size > this.limit || this.retained > this.maxMessages)) {
+      const oldest = this.map.keys().next().value;
+      if (oldest === undefined || oldest === threadId) break;
+      const victim = this.map.get(oldest);
+      if (victim) this.retained -= victim.messages.length;
       this.map.delete(oldest);
     }
   }
 
   delete(threadId: string): void {
+    const existing = this.map.get(threadId);
+    if (existing) this.retained -= existing.messages.length;
     this.map.delete(threadId);
+  }
+
+  clear(): void {
+    this.map.clear();
+    this.retained = 0;
   }
 
   /** Membership only — deliberately does not touch LRU order, so a test
@@ -896,11 +1035,18 @@ export class Store {
   private threads: ThreadCache;
   private defaultSelection: () => ModelSelection;
   private listeners = new Set<(change: StoreChange) => void>();
-  /** true when no bots.json existed at load — the one time the roster is seeded */
+  /** true when no bots.json existed at load — the one time the roster is seeded.  Never true while
+   * a set-aside bots.json is waiting beside it: that is a roster to restore, not a fresh install. */
   private firstRun = false;
-  /** true when bots.json existed but did not parse — do not treat an empty
-   * in-memory roster as "every room member was deleted". */
+  /** true when the roster may be incomplete — bots.json could not be read, was set aside, lost
+   * entries, or has a set-aside copy waiting from an earlier run.  An empty or short in-memory
+   * roster is then not evidence that "every room member was deleted", and must not drive any
+   * migration or prune that treats it as the truth.  Read from disk on every boot. */
   private botsLoadFailed = false;
+  /** true when saving would destroy the only copy of something: the file could not be read, or
+   * could not be moved aside.  The only case in which a store stops saving; logged and shown. */
+  private botsWritesRefused = false;
+  private groupsWritesRefused = false;
   /** Coalesces bursts of saveBots() calls — a single startTurn used to fire
    * at least three full-roster fsynced rewrites — into one atomic write.
    * Fires a fixed delay after the first dirty call in a burst rather than
@@ -915,25 +1061,38 @@ export class Store {
 
   /** `opts.threadCacheLimit` only exists so tests can force evictions
    * without creating dozens of real threads; production always takes the
-   * default. */
-  constructor(defaultSelection: () => ModelSelection, opts: { threadCacheLimit?: number } = {}) {
+   * default. `opts.threadCacheMaxMessages` is the same idea for the size
+   * bound: the thread-COUNT limit alone lets 64 huge threads sit resident
+   * (BF-2424), so tests that need to prove the size bound holds can shrink
+   * it instead of writing tens of thousands of messages. */
+  constructor(
+    defaultSelection: () => ModelSelection,
+    opts: { threadCacheLimit?: number; threadCacheMaxMessages?: number } = {},
+  ) {
     this.defaultSelection = defaultSelection;
-    this.threads = new ThreadCache(opts.threadCacheLimit ?? DEFAULT_THREAD_CACHE_LIMIT);
+    this.threads = new ThreadCache(
+      opts.threadCacheLimit ?? DEFAULT_THREAD_CACHE_LIMIT,
+      opts.threadCacheMaxMessages ?? DEFAULT_THREAD_CACHE_MAX_MESSAGES,
+    );
     mkdirSync(DATA_DIR, { recursive: true });
-    try {
-      this.bots = JSON.parse(readFileSync(BOTS_FILE, "utf8"));
-    } catch (error) {
-      this.bots = [];
-      // Only a missing bots.json is a first run. A file that exists but will
-      // not parse must not be silently replaced with a fresh default roster.
-      this.firstRun = (error as NodeJS.ErrnoException)?.code === "ENOENT";
-      this.botsLoadFailed = !this.firstRun;
-    }
-    try {
-      this.groups = JSON.parse(readFileSync(GROUPS_FILE, "utf8"));
-    } catch {
-      this.groups = [];
-    }
+    // Only a missing bots.json is a first run.  A file that exists but cannot be used is moved aside
+    // (never deleted) and reported; see store-guard.ts.  Wrong-typed JSON used to throw out of this
+    // constructor, so the server would not even start.
+    const botsLoad = loadGuarded<BotRecord[]>(BOTS_FILE, (parsed) =>
+      interpretRecordList(parsed, isBotEntry, { one: "bot", many: "bots" }),
+    );
+    this.bots = botsLoad.value ?? [];
+    this.botsWritesRefused = botsLoad.writesRefused;
+    // Asked after the load, so a file it just set aside counts, and so does one set aside by an
+    // earlier run: bots.json is then simply missing, which on its own would read as a fresh install.
+    const rosterOnHold = rosterIsOnHold(DATA_DIR);
+    this.firstRun = botsLoad.status === "missing" && !rosterOnHold;
+    this.botsLoadFailed = rosterOnHold || botsLoad.status === "unreadable" || botsLoad.writesRefused;
+    const groupsLoad = loadGuarded<GroupRecord[]>(GROUPS_FILE, (parsed) =>
+      interpretRecordList(parsed, isGroupEntry, { one: "room", many: "rooms" }),
+    );
+    this.groups = groupsLoad.value ?? [];
+    this.groupsWritesRefused = groupsLoad.writesRefused;
     // busy never survives a restart — no turn does either. Rooms saved
     // before default responders existed adopt their first member as lead.
     let botsMigrated = false;
@@ -1164,6 +1323,12 @@ export class Store {
       this.saveBotsTimer = null;
     }
     if (!this.botsDirty) return;
+    if (this.botsWritesRefused) {
+      // `botsDirty` stays set on purpose: it is cleared only after a write lands, so a refused
+      // write leaves the pending change marked and a later flush still tries to persist it.
+      logRefusedSave(BOTS_FILE);
+      return;
+    }
     // busy/activity never survive a restart (reset on load above) and
     // change on every turn transition, so they are excluded here rather
     // than debounced — nothing to coalesce for state nobody reads back.
@@ -1172,6 +1337,10 @@ export class Store {
   }
 
   private saveGroups() {
+    if (this.groupsWritesRefused) {
+      logRefusedSave(GROUPS_FILE);
+      return;
+    }
     writeFileAtomic(GROUPS_FILE, JSON.stringify(this.groups.map(({ busyBotId, ...g }) => g), null, 2));
   }
 
@@ -1286,6 +1455,14 @@ export class Store {
   deleteGroup(id: string): boolean {
     const group = this.group(id);
     if (!group) return false;
+    // Deleting a room also deletes its threads' message rows, and that is not undoable.  A save
+    // that was refused leaves this removal only in memory, so the room would come back on the next
+    // boot pointing at transcripts that are already gone.  Nothing is deleted until the roster is
+    // known to be writable.
+    if (this.groupsWritesRefused) {
+      logRefusedSave(GROUPS_FILE);
+      return false;
+    }
     this.groups = this.groups.filter((g) => g.id !== id);
     this.saveGroups();
     for (const threadId of new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)])) {
@@ -1681,6 +1858,32 @@ export class Store {
     return this.thread(threadId).messages;
   }
 
+  /** The full transcript for a read-only response, WITHOUT pinning the thread
+   *  in the LRU. `messagesFor` caches every thread it hydrates, and
+   *  GET /api/bots without `?messages=` calls it for every bot AND every
+   *  group in one request — so a single unpaginated poll pulled the whole
+   *  database into the heap and kept it there. The LRU bounds the thread
+   *  COUNT, not a thread's size: 64 fully-hydrated threads with inline
+   *  base64 captures measured 74 GB RSS over one working day, which on this
+   *  16 GB Mac drove swap until the disk was full (BF-2424).
+   *
+   *  An already-warm thread serves straight from memory; a cold one is read,
+   *  returned, and left to the GC — the response is byte-identical either
+   *  way. Mutating callers keep using `messagesFor`, which must stay cached. */
+  messagesForTransient(threadId: string): Message[] {
+    const warm = this.threads.get(threadId);
+    if (warm) return warm.messages;
+    const { messages } = mdb.readThread(threadId, messagesFile(threadId));
+    // legacy rows carry no parentId — chain them in array order, the same
+    // fixup cacheThread() applies, so the response matches a cached read
+    let prev: string | null = null;
+    for (const m of messages) {
+      if (m.parentId === undefined) m.parentId = prev;
+      prev = m.id;
+    }
+    return messages;
+  }
+
   /** A bounded page of a thread's newest messages, for callers that only
    * need a display page — the GET /api/bots hydrate and a fresh
    * scrollback view. Reads just `limit` rows at the SQL boundary instead
@@ -1743,6 +1946,7 @@ export class Store {
     const full: Message = { id: newId(), at: Date.now(), parentId: t.activeLeafId, ...redactBotAuthored(message) };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);
+    this.threads.recordAppend(threadId);
     t.activeLeafId = full.id;
     if (full.kind === "screen") {
       for (const pruned of this.pruneScreenFrames(t)) {
@@ -1818,6 +2022,8 @@ export class Store {
       parentId: source.parentId ?? null,
       replyToId: source.replyToId,
       automationSource: source.automationSource,
+      // an edit or retry of a routine's prompt is still that routine's turn
+      toolPolicy: source.toolPolicy,
       from: source.from ? { ...source.from } : undefined,
       comm: source.comm && source.automationSource !== "delegation" &&
         !isDelegationMessage({ role: source.role, text: source.text, automationSource: source.automationSource })
@@ -1825,6 +2031,7 @@ export class Store {
     };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);
+    this.threads.recordAppend(threadId);
     t.activeLeafId = full.id;
     this.emit({ type: "message", threadId, message: full });
     return full;
@@ -1845,6 +2052,20 @@ export class Store {
     mdb.setActiveLeaf(threadId, cur);
     this.emit({ type: "thread", threadId, activeLeafId: cur });
     return cur;
+  }
+
+  /** A restart drops the in-memory helper tracker.  Any card still marked
+   * running is settled failed, so the header stops counting it and the
+   * duration stops ticking. */
+  settleInterruptedHelpers(now = Date.now()): number {
+    let settled = 0;
+    for (const row of mdb.runningHelperRows()) {
+      if (!row.message.helper) continue;
+      const helper = interruptedHelper(row.message.helper, now);
+      if (!helper) continue;
+      if (this.patchMessage(row.threadId, row.message.id, { helper })) settled += 1;
+    }
+    return settled;
   }
 
   patchMessage(threadId: string, messageId: string, patch: Partial<Message>): Message | null {
@@ -1912,6 +2133,16 @@ export class Store {
   deleteBot(id: string): boolean {
     const bot = this.bot(id);
     if (!bot) return false;
+    // A bot's threads, transcripts and workspace all go with it, and none of that comes back.  The
+    // roster edit is debounced, so a delete cannot be made durable first without reordering the
+    // write path; what it can do is stop while the roster is known to be unwritable, so a refused
+    // save never ends in a workspace that is gone for good and a bot that returns on the next boot
+    // still pointing at it.
+    if (this.botsWritesRefused || this.groupsWritesRefused) {
+      if (this.botsWritesRefused) logRefusedSave(BOTS_FILE);
+      if (this.groupsWritesRefused) logRefusedSave(GROUPS_FILE);
+      return false;
+    }
     this.bots = this.bots.filter((b) => b.id !== id);
     // Rooms keep their own roster.  Strip the deleted id so memberIds and
     // defaultResponder never point at a ghost.  A remaining member becomes
@@ -2102,7 +2333,12 @@ export class Store {
   ): TaskUsage | null {
     const task = this.taskByThread(botId, threadId);
     if (!task) return null;
+    const previousLastInput = task.usage?.lastInput;
     task.usage = mergeTaskUsage(task.usage, turn);
+    // Context fullness is the LAST turn's input, not a running sum.  A turn
+    // that reports no input says nothing about it, so the earlier figure stands.
+    if (turn.input !== undefined && Number.isFinite(turn.input) && turn.input >= 0) task.usage.lastInput = Math.trunc(turn.input);
+    else if (previousLastInput !== undefined) task.usage.lastInput = previousLastInput;
     if (turn.stats) task.stats = mergeTaskStats(task.stats, turn.stats);
     if (instanceId) {
       const byInstance = (task.usageByInstance ??= {});

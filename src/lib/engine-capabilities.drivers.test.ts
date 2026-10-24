@@ -56,8 +56,15 @@ const DERIVED_CELLS: ReadonlyArray<readonly [CapabilityKey, keyof EngineChannelW
   ["imageAttachments", "images"],
 ];
 
-/** Verdicts that assert the channel is present. */
-const AFFIRMATIVE: ReadonlySet<CapabilityState> = new Set<CapabilityState>(["yes", "yes-pro-only"]);
+/** Verdicts that assert the channel is present.  "limited" counts: a partial
+ *  claim no driver backs is an overclaim with the same cost as a full one. */
+const AFFIRMATIVE: ReadonlySet<CapabilityState> = new Set<CapabilityState>(["yes", "limited"]);
+
+/** Cells whose channel the substrate provides itself, with no BotFleet
+ *  driver flag behind them.  Listed explicitly — never inferred — and each
+ *  one must carry a capabilityNotes entry saying where the channel comes
+ *  from, so the carve-out cannot drift into an unchecked claim. */
+const SUBSTRATE_NATIVE: ReadonlySet<string> = new Set(["box.computerUse"]);
 
 interface EngineWiring {
   /** driverKind -> what that one driver mounts. */
@@ -118,6 +125,13 @@ describe("capability matrix against the drivers", () => {
         if (state === undefined) continue;
         if (!AFFIRMATIVE.has(state)) continue;
         if (!anyDriverMounts(wiring, flag)) {
+          const cell = `${engineId}.${key}`;
+          if (SUBSTRATE_NATIVE.has(cell)) {
+            if (!entry.capabilityNotes?.[key]) {
+              offenders.push(`${cell} is substrate-native but carries no capabilityNotes entry saying where the channel comes from`);
+            }
+            continue;
+          }
           offenders.push(`${engineId}.${key} is "${state}" but no driver mounts ${flag}`);
         }
       }

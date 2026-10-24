@@ -17,7 +17,16 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { spawnDetached, waitForExit } from "./testing/cleanup.ts";
-import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage, _queuedCount, type SteerStore } from "./steer-queue.ts";
+import {
+  cancelSteeredMessage,
+  drainEveryReadyBatch,
+  drainSteeredMessages,
+  queueSteeredMessage,
+  restoreSteeredEntries,
+  takeSteeredEntries,
+  _queuedCount,
+  type SteerStore,
+} from "./steer-queue.ts";
 import type { BotRecord, Message } from "./store.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 
@@ -61,10 +70,45 @@ function fakeStore(bots: BotRecord[]): SteerStore & { messages: Message[] } {
       messages[at] = { ...messages[at], ...patch };
       return messages[at];
     },
+    messagesFor: (threadId) => messages.filter((m) => m.id.endsWith(`-${threadId}`)),
   };
 }
 
 describe("steer-queue module", () => {
+  it("lets an update carry a bot's waiting sends off the transcript and put them back in line", () => {
+    const interrupted = fakeBot("bot-carry", "thread-carry", true);
+    const other = fakeBot("bot-stay", "thread-stay", true);
+    const store = fakeStore([interrupted, other]);
+    const first = queueSteeredMessage(interrupted, "carried one", { linqChatId: "chat-c" });
+    queueSteeredMessage(other, "stays queued");
+    const taken = takeSteeredEntries((botId) => botId === "bot-carry");
+    expect(taken).toEqual([{
+      threadId: "thread-carry",
+      botId: "bot-carry",
+      items: [expect.objectContaining({ messageId: first.id, text: "carried one", linqChatId: "chat-c" })],
+    }]);
+    // Out of the queue and still off the transcript.
+    expect(_queuedCount("thread-carry")).toBe(0);
+    expect(_queuedCount("thread-stay")).toBe(1);
+    expect(store.messages).toHaveLength(0);
+
+    // Something queued on the thread since waits behind what is restored.
+    queueSteeredMessage(interrupted, "queued after the restart");
+    restoreSteeredEntries(taken);
+    expect(_queuedCount("thread-carry")).toBe(2);
+    interrupted.busy = false;
+    other.busy = false;
+    const run = vi.fn();
+    // A Linq line drains on its own, so the carried thread takes two passes.
+    drainSteeredMessages(store, run);
+    drainSteeredMessages(store, run);
+    const said = (threadId: string) =>
+      store.messages.filter((m) => m.role === "user" && m.id.endsWith(threadId)).map((m) => m.text);
+    expect(said("thread-carry")).toEqual(["carried one", "queued after the restart"]);
+    expect(said("thread-stay")).toEqual(["stays queued"]);
+    expect(store.messages.find((m) => m.text === "carried one")).toMatchObject({ queueId: first.id });
+  });
+
   it("does not append a queued user message until drain", () => {
     const bot = fakeBot("bot-a", "thread-a", true);
     const store = fakeStore([bot]);
@@ -199,6 +243,111 @@ describe("steer-queue module", () => {
     const run = vi.fn();
     drainSteeredMessages(fakeStore([fakeBot("bot-c", "thread-c", false)]), run);
     expect(run).not.toHaveBeenCalled();
+  });
+
+  it("runs batches an update already committed one at a time, in their place, without appending them again", () => {
+    // Finding 3: carried sends used to start all at once after a restart, so a
+    // second one for the same bot ended as "already working" and never ran.
+    const bot = fakeBot("bot-carried", "thread-carried", false);
+    const store = fakeStore([bot]);
+    const committed = (text: string, heldAt: number) => {
+      const line = store.appendMessage("thread-carried", { role: "user", kind: "text", text });
+      return {
+        messageId: line.id,
+        text,
+        prompt: text,
+        committed: { userMessageId: line.id, excludeIds: [line.id], relayed: text.includes("relayed"), heldAt },
+      };
+    };
+    const first = committed("first carried send", 1);
+    const second = committed("second carried send, relayed", 2);
+    restoreSteeredEntries([{ threadId: "thread-carried", botId: "bot-carried", items: [first, second] }]);
+    // Something queued since waits behind both.
+    bot.busy = true;
+    queueSteeredMessage(bot, "typed after the restart");
+    bot.busy = false;
+    const before = store.messages.length;
+
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0]).toEqual([
+      "bot-carried", "thread-carried", "first carried send",
+      expect.objectContaining({ id: first.messageId }), [first.messageId], undefined, first.committed,
+    ]);
+    expect(store.messages).toHaveLength(before);
+
+    // The first one is running: the second waits, and nothing errors.
+    bot.busy = true;
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    bot.busy = false;
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1][2]).toBe("second carried send, relayed");
+    expect(run.mock.calls[1][6]).toMatchObject({ relayed: true });
+    expect(store.messages).toHaveLength(before);
+
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(run.mock.calls[2][2]).toBe("typed after the restart");
+    expect(run.mock.calls[2][6]).toBeUndefined();
+    expect(store.messages.at(-1)).toMatchObject({ text: "typed after the restart" });
+    expect(_queuedCount("thread-carried")).toBe(0);
+  });
+
+  it("skips a committed batch whose line has left the thread", () => {
+    const bot = fakeBot("bot-gone-line", "thread-gone-line", false);
+    const store = fakeStore([bot]);
+    restoreSteeredEntries([{
+      threadId: "thread-gone-line",
+      botId: "bot-gone-line",
+      items: [
+        { messageId: "gone", text: "gone", prompt: "gone", committed: { userMessageId: "gone", excludeIds: ["gone"], relayed: false, heldAt: 1 } },
+        { messageId: "q1", text: "still here", prompt: "still here" },
+      ],
+    }]);
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][2]).toBe("still here");
+    expect(_queuedCount("thread-gone-line")).toBe(0);
+  });
+
+  it("starts one batch per bot per pass, even across two of its threads", () => {
+    const bot = fakeBot("bot-two-threads", "thread-one", true);
+    const store = fakeStore([bot]);
+    queueSteeredMessage(bot, "on the first thread");
+    bot.threadId = "thread-two";
+    queueSteeredMessage(bot, "on the second thread");
+    bot.busy = false;
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][2]).toBe("on the first thread");
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1][2]).toBe("on the second thread");
+  });
+
+  it("commits every waiting batch for an update with no pass cap, and leaves a busy bot's for the caller", () => {
+    // Kody 4227445923: the update's commit loop stopped after 100 passes, and
+    // every batch past that was never carried: lost with the restart.  150
+    // Linq chats are 150 batches, one per pass.
+    const idle = fakeBot("bot-many", "thread-many", true);
+    const busy = fakeBot("bot-busy-commit", "thread-busy-commit", true);
+    const store = fakeStore([idle, busy]);
+    for (let chat = 0; chat < 150; chat += 1) queueSteeredMessage(idle, `chat ${chat}`, { linqChatId: `chat-${chat}` });
+    queueSteeredMessage(busy, "waits behind a running turn");
+    idle.busy = false;
+    const run = vi.fn();
+    drainEveryReadyBatch(store, run);
+    expect(run).toHaveBeenCalledTimes(150);
+    expect(run.mock.calls.map((call) => call[2])).toEqual(Array.from({ length: 150 }, (_, chat) => `chat ${chat}`));
+    expect(_queuedCount("thread-many")).toBe(0);
+    // A busy bot's queue is left where it is, for the update to carry.
+    expect(_queuedCount("thread-busy-commit")).toBe(1);
+    expect(takeSteeredEntries((botId) => botId === "bot-busy-commit")).toHaveLength(1);
   });
 
   it("drops the queue of a deleted bot without running it", () => {

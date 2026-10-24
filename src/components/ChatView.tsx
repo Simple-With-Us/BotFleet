@@ -39,6 +39,7 @@ import {
   type Message,
 } from "@/state/store";
 import { BotAvatar, BotMascot } from "./Avatar";
+import { BotOffBadge } from "./BotOffBadge";
 import { usePageVisible } from "@/lib/page-visible";
 import { ProviderMark } from "./ProviderIcons";
 import { TurnPresence } from "./TurnPresence";
@@ -49,17 +50,19 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
 import { modelChip } from "@/lib/model-chip";
 import { ChatMarkdown } from "./ChatMarkdown";
-import { splitVoiceSummary, stripVoiceSummaryTags } from "../../shared/voice-summary";
-import { useSpeech } from "@/lib/tts/useSpeech";
+import { splitVoiceSummary, stripVoiceSummaryTags, writtenReply } from "../../shared/voice-summary";
+import { useMessageKaraoke } from "@/lib/tts/useMessageKaraoke";
 import { MentionText } from "./MentionText";
 import { OptionCard, shouldHideOnboardingCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { Composer } from "./Composer";
+import { UpdateDrainNotice } from "./UpdateDrainNotice";
 import { ErrorRow, TurnErrorAnnouncement, latestTurnErrorMessage, turnErrorBranchKey } from "./ErrorRow";
 import { ChatFindBar } from "./ChatFindBar";
 import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretRequestCard } from "./SecretRequestCard";
+import { SignInRequestCard } from "./SignInRequestCard";
 import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
 import { ModelPicker } from "./ModelPicker";
 import { RenameTitle } from "./RenameTitle";
@@ -81,12 +84,14 @@ import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
 import { JobFinishedRow, JobsMenu } from "./JobsMenu";
 import { jobWakeSubtitle } from "../../shared/jobs";
+import { HelperCard } from "./HelperCard";
+import { isHelperRow, runningHelperCount } from "../../shared/helpers";
 import { ToolLine } from "./ToolLine";
 import { ContextInjectionRows } from "./ContextInjectionRows";
 import { webhookMessageView } from "@/lib/webhook-message";
 import { WebhookCard } from "./WebhookCard";
 import { imessageMessageView, stripToImessagePrefix } from "../../shared/imessage-message";
-import { delegationMessageView, isDelegationMessage } from "../../shared/delegation-message";
+import { delegationLiveLine, delegationMessageView, isDelegationMessage } from "../../shared/delegation-message";
 import { DelegationCard } from "./DelegationCard";
 import { splitAttachedImages } from "@/lib/composer-attachments";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
@@ -259,73 +264,6 @@ function BubbleEditor({
   );
 }
 
-function SpokenSummaryCard({
-  messageId,
-  voiceText,
-  legacyVoice,
-}: {
-  messageId: string;
-  voiceText?: string;
-  legacyVoice?: string;
-}) {
-  const speech = useSpeech();
-  const isMine = speech.messageId === messageId && speech.status === "speaking";
-  const isPreparing = speech.messageId === messageId && speech.status === "preparing";
-  const spokenText = (isMine && speech.caption) || voiceText || legacyVoice || "";
-
-  if (!spokenText && !isMine && !isPreparing) return null;
-
-  const words = spokenText.trim().split(/\s+/).filter(Boolean);
-  const activeWordIdx = isMine ? speech.wordIndex ?? -1 : -1;
-
-  return (
-    <details
-      open={isMine || isPreparing ? true : undefined}
-      className="mt-2 border-t border-hairline/40 pt-2"
-      onClick={(event) => event.stopPropagation()}
-    >
-      <summary className="cursor-pointer text-[12px] font-medium text-ink-secondary hover:text-ink flex items-center gap-1.5 select-none">
-        <span>Spoken Summary</span>
-        {isMine && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-accent font-normal animate-pulse">
-            • Reading aloud
-          </span>
-        )}
-        {isPreparing && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-ink-secondary/70 font-normal">
-            • Preparing audio…
-          </span>
-        )}
-      </summary>
-      <div className="mt-2 text-[13px] leading-relaxed text-ink-secondary">
-        {isMine && words.length > 0 ? (
-          <p className="select-text">
-            {words.map((word, idx) => {
-              const isCurrent = idx === activeWordIdx;
-              const isPast = activeWordIdx >= 0 && idx < activeWordIdx;
-              return (
-                <span
-                  key={idx}
-                  className={cn(
-                    "transition-colors duration-75",
-                    isCurrent && "font-bold text-accent px-0.5 rounded bg-accent/15",
-                    isPast && "text-ink font-medium",
-                    !isCurrent && !isPast && "text-ink-secondary/70",
-                  )}
-                >
-                  {word}{" "}
-                </span>
-              );
-            })}
-          </p>
-        ) : (
-          <ChatMarkdown text={spokenText} />
-        )}
-      </div>
-    </details>
-  );
-}
-
 function Bubble({
   bot,
   message,
@@ -367,6 +305,15 @@ function Bubble({
   const [recordingPlaying, setRecordingPlaying] = useState(false);
   const recordingAudio = useRef<HTMLAudioElement | null>(null);
   useEffect(() => () => { recordingAudio.current?.pause(); recordingAudio.current = null; }, []);
+  // Karaoke on the reply itself: while this reply is read aloud, its words
+  // follow the voice (src/lib/karaoke-session.ts).  The spans index the
+  // written text, so that is the source handed over.
+  const spokenRef = useRef<HTMLDivElement>(null);
+  const speakable = message.role === "bot" && message.kind === "text";
+  const writtenSource = useMemo(() => (speakable ? writtenReply(message.text ?? "") : ""), [speakable, message.text]);
+  // The workspace pronunciation list, so a respelled term ("sequel") lights
+  // up the term on screen ("SQL").
+  useMessageKaraoke(spokenRef, message.id, writtenSource, speakable, state.config?.tts?.pronunciations);
   const playRecording = () => {
     if (recordingAudio.current) {
       recordingAudio.current.pause();
@@ -612,6 +559,12 @@ function Bubble({
         {alignRight && !humanTyped && botChrome}
         <div
           onClick={handleBubbleClick}
+          /* Per-bubble identity for assistive tech.  Without this the bubble is
+           * an anonymous div and a screen reader announces only the prose — no
+           * indication of who spoke or when.  `article` plus a speaker/time
+           * label keeps the transcript navigable by message, not by fragment. */
+          role="article"
+          aria-label={`${humanTyped ? "You" : (message.from?.name ?? bot.name)}, ${formatTime(message.at)}`}
           className={cn(
             BUBBLE_WIDTH,
             "rounded-2xl text-[15px] leading-relaxed cursor-pointer select-text relative",
@@ -691,14 +644,9 @@ function Bubble({
               {toImessageBody !== null && (
                 <div className="mb-1 text-[11px] font-medium text-accent">To iMessage</div>
               )}
-              <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />
-              {message.role === "bot" && (
-                <SpokenSummaryCard
-                  messageId={message.id}
-                  voiceText={message.voiceText}
-                  legacyVoice={voiceSections?.voice}
-                />
-              )}
+              <div ref={spokenRef}>
+                <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />
+              </div>
             </MessageBoundary>
           )}
         </div>
@@ -712,23 +660,6 @@ function Bubble({
         <div className="mt-1 flex items-center gap-1.5 pr-1 text-[11px] text-ink-secondary/70">
           <Clock size={11} aria-hidden="true" />
           <span>Queued — sends when this turn finishes</span>
-          <button
-            type="button"
-            onClick={() => dispatch({ type: "interrupt", botId: bot.id })}
-            className="ml-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent hover:bg-raised hover:underline"
-            title="Interrupt current turn and send this message immediately"
-          >
-            Steer Now
-          </button>
-          <button
-            type="button"
-            onClick={() => dispatch({ type: "cancelQueued", botId: bot.id, queueId: message.queueId ?? message.id })}
-            aria-label="Cancel Queued Message"
-            title="Cancel Queued Message"
-            className="ml-0.5 flex size-4 shrink-0 items-center justify-center rounded text-ink-secondary hover:bg-raised hover:text-ink"
-          >
-            <X size={11} strokeWidth={2.5} />
-          </button>
         </div>
       )}
       <ReactionChips threadId={bot.threadId} message={message} align={alignRight ? "right" : "left"} />
@@ -814,8 +745,9 @@ function ActivityChip({ bot, message }: { bot: Bot, message: Message }) {
       </div>
     );
   }
-  // everything that is not a bot⇄bot chip is a step in the work, and a step
-  // is a log line — see ToolLine for why it stopped being a card
+  if (isHelperRow(message)) return <HelperCard message={message} />;
+  // everything that is not a bot⇄bot chip or a helper is a step in the work,
+  // and a step is a log line — see ToolLine for why it stopped being a card
   return <ToolLine message={message} actor={message.from?.name ?? bot.name} threadId={bot.threadId} />;
 }
 
@@ -895,6 +827,16 @@ const MessagesList = memo(function MessagesList({
     const ordered = nestHelperSteps(messages);
     return summarizeToolCalls ? groupActivityRuns(ordered) : ordered.map((m) => ({ kind: "message" as const, message: m }));
   }, [messages, summarizeToolCalls]);
+  const delegationProgressById = useMemo(() => {
+    const busy = Boolean(bot.busy);
+    const map = new Map<string, string | undefined>();
+    for (let index = 0; index < messages.length; index++) {
+      const row = messages[index];
+      if (!isDelegationMessage(row)) continue;
+      map.set(row.id, delegationLiveLine(messages, index, busy));
+    }
+    return map;
+  }, [messages, bot.busy]);
   // A search hit inside a folded run has to open it: the fold keeps the
   // row out of the DOM, and there is nothing for the scroll to land on.
   const focus = state.focusMessage;
@@ -943,6 +885,8 @@ const MessagesList = memo(function MessagesList({
           switch (m.kind) {
             case "secret":
               return m.secret ? <SecretRequestCard botId={bot.id} threadId={bot.threadId} message={m} /> : null;
+            case "sign-in":
+              return m.signIn ? <SignInRequestCard botId={bot.id} threadId={bot.threadId} message={m} /> : null;
             case "connector":
               return m.connector ? <ConnectorCard botId={bot.id} threadId={bot.threadId} message={m} /> : null;
             case "options":
@@ -969,6 +913,8 @@ const MessagesList = memo(function MessagesList({
               }
               // a job's end is news, not a step: shown whatever the setting
               if (m.job) return <JobFinishedRow job={m.job} />;
+              // a helper card is the row, whether or not tool lines are on
+              if (isHelperRow(m)) return <HelperCard message={m} />;
               if (!showToolCalls && !m.comm) return null;
               return <ActivityChip bot={bot} message={m} />;
             }
@@ -1055,8 +1001,9 @@ const MessagesList = memo(function MessagesList({
                 );
               };
               if (delegationView) {
+                const progress = delegationProgressById.get(m.id);
                 return withSystemChrome(
-                  <DelegationCard view={delegationView} comm={m.comm} targetBotName={bot.name} />,
+                  <DelegationCard view={delegationView} comm={m.comm} targetBotName={bot.name} progress={progress} />,
                 );
               }
               const webhookView = autoDelivered ? webhookMessageView(m.text ?? "") : null;
@@ -1289,6 +1236,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
     }));
     return [...serverMessages, ...queued];
   }, [serverMessages, pendingQueued]);
+  const helperCount = useMemo(() => runningHelperCount(messages), [messages]);
   const latestServerError = useMemo(() => latestTurnErrorMessage(serverMessages), [serverMessages]);
   const errorBranchKey = useMemo(() => turnErrorBranchKey(bot.messages, serverMessages), [bot.messages, serverMessages]);
   // Windowed transcript: only a tail of the thread mounts (screenshots make
@@ -1604,6 +1552,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
               <span className="@max-2xl/chathead:hidden">Chief of Staff</span>
             </span>
           )}
+          {bot.off === true && <BotOffBadge />}
           {bot.busy && <Loader2 size={14} className="shrink-0 animate-spin text-ink-secondary" />}
         </div>
         <div style={noDragStyle} className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1.5 md:gap-2">
@@ -1623,7 +1572,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
             <Search size={18} />
           </button>
           {/* Background jobs, left of Stop.  Stop ends the turn, never a job. */}
-          <JobsMenu threadId={bot.threadId} />
+          <JobsMenu threadId={bot.threadId} helperCount={helperCount} />
           {bot.busy && (
             <button
               onClick={() => dispatch({ type: "interrupt", botId: bot.id })}
@@ -1839,7 +1788,20 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
              * settled `popping` message arrives it takes over and animates
              * into place, so we never render both at once. */}
             {!popping && streaming ? (
-              <div className={cn(BUBBLE_WIDTH, "rounded-2xl bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink")}>
+              /* `aria-live="off"` is load-bearing, not decoration.  This whole
+               * transcript sits inside a `role="log" aria-live="polite"`
+               * region, so by default every token frame rewrites a live node
+               * and a screen reader re-announces the entire bubble on each
+               * one — a 30-second turn becomes hundreds of interruptions.
+               * Nesting an off-region here stops that; the SETTLED bubble
+               * below carries the real text and is announced once, when it
+               * lands. `aria-busy` conveys "still generating" to AT that
+               * understands it. */
+              <div
+                aria-live="off"
+                aria-busy="true"
+                className={cn(BUBBLE_WIDTH, "rounded-2xl bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink")}
+              >
                 <MessageBoundary fallbackText={streaming}>
                   <ChatMarkdown text={streaming} streaming />
                 </MessageBoundary>
@@ -1876,6 +1838,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
         </button>
       )}
       <div className="w-full">
+      <UpdateDrainNotice />
       <Composer
         key={bot.id}
         bot={bot}

@@ -6,6 +6,8 @@
 // SDK tax.  Browser Replay/Feedback live in src/lib/sentry.ts.
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
+import { resetSentryCronsForTests } from "./sentry-crons.ts";
+import { runtimeBuildIdentity } from "./runtime-identity.ts";
 
 export type SentryNode = typeof import("@sentry/node");
 type SentryIntegration = Parameters<SentryNode["addIntegration"]>[0];
@@ -24,6 +26,8 @@ export interface SentryRuntimeInput {
   uiTracesSampleRate?: number;
   logsEnabled: boolean;
   source: SentrySource;
+  /** Git SHA so `sentry-deploy.yml` markers line up with events. */
+  release?: string | null;
 }
 
 export interface SentryRuntimeState {
@@ -183,6 +187,24 @@ export function sentryDsnFromEnv(
 ): string | undefined {
   const raw = (env.SENTRY_DSN || env.BOTFLEET_SENTRY_DSN || "").trim();
   return raw || undefined;
+}
+
+const UNKNOWN_COMMIT = "0".repeat(40);
+const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
+
+/** A git SHA Sentry can use as `release`.  All-zeros (unknown checkout) is
+ *  not a release.  `SENTRY_RELEASE` wins, then `GITHUB_SHA`, then
+ *  `VERCEL_GIT_COMMIT_SHA`. */
+export function sentryReleaseName(
+  env: NodeJS.ProcessEnv = process.env,
+  fallback?: string | null,
+): string | undefined {
+  const candidates = [env.SENTRY_RELEASE, env.GITHUB_SHA, env.VERCEL_GIT_COMMIT_SHA, fallback];
+  for (const raw of candidates) {
+    const value = raw?.trim();
+    if (value && value !== UNKNOWN_COMMIT && RELEASE_SHA.test(value)) return value;
+  }
+  return undefined;
 }
 
 interface SentrySdkLoad {
@@ -473,6 +495,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
     input.logsEnabled ? "logs" : "nologs",
     genAiCollection ? "ai-data-on" : "ai-data-off",
     "stream-genai",
+    sentryReleaseName(process.env, input.release) || "norelease",
   ].join("|");
   if (initialized && activeFingerprint === fingerprint) {
     runtimeState = { ...base, active: true, profilingAvailable: runtimeState.profilingAvailable };
@@ -493,22 +516,23 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   if (sdk.httpIntegration) {
     integrations.push(sdk.httpIntegration({
       ignoreIncomingRequests: (urlPath) => isWebhookIngressPath(urlPath),
-      maxIncomingRequestBodySize: "none",
+      maxRequestBodySize: "none",
     }));
   }
-  // enableLogs alone only produces breadcrumbs; the console integration
-  // is what turns a warn or an error into a Sentry log.
+  // v11 dropped enableLogs; the console integration is what turns a
+  // warn or an error into a Sentry log.
   if (input.logsEnabled) integrations.push(sdk.consoleLoggingIntegration({ levels: ["warn", "error"] }));
   try {
     sdk.init({
       dsn: input.dsn,
       environment: input.environment,
+      release: sentryReleaseName(process.env, input.release),
       tracesSampleRate: input.tracesSampleRate,
       tracesSampler: (samplingContext: {
         parentSampled?: boolean;
         name?: string;
         op?: string;
-        attributes?: Record<string, unknown>;
+        attributes?: { "sentry.op"?: string };
       }) => {
         if (samplingContext.parentSampled !== undefined) {
           return samplingContext.parentSampled;
@@ -543,8 +567,11 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
 
         return input.tracesSampleRate;
       },
-      enableLogs: true,
       integrations,
+      // v11 streams spans by default, which makes beforeSendTransaction a
+      // no-op.  Static lifecycle keeps one transaction event so the webhook
+      // secret scrub still walks names, URLs, and child spans.
+      traceLifecycle: "static",
       // Every payload kind the client sends passes the webhook-secret scrub:
       // errors and messages, transactions with all their child spans, and
       // console-derived logs.  No beforeSendSpan: in this SDK the gen_ai
@@ -554,11 +581,9 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
       beforeSend: (event) => safeScrubHook(event),
       beforeSendTransaction: (event) => safeScrubHook(event),
       beforeSendLog: (log) => safeScrubHook(log),
-      sendDefaultPii: false,
-      // Sentry Agents (SaaS): standalone gen_ai envelopes for Conversations.
-      // Opt-out only for self-hosted that cannot ingest them.
-      streamGenAiSpans: true,
       // GenAI I/O collection ON by default; kill with SENTRY_AI_DATA_COLLECTION=0.
+      // v11 dropped sendDefaultPii and streamGenAiSpans; dataCollection is the
+      // remaining privacy knob, and gen_ai spans always stream.
       dataCollection: {
         ...genAiDataCollectionOptions(),
         httpBodies: [],
@@ -653,6 +678,7 @@ export async function initSentry(env: NodeJS.ProcessEnv = process.env): Promise<
       : 0.1,
     logsEnabled: true,
     source: dsn ? "env" : "none",
+    release: sentryReleaseName(env, runtimeBuildIdentity.sourceCommit),
   })).active;
 }
 
@@ -714,4 +740,5 @@ export function resetSentryForTests(): void {
   loaderForTests = null;
   applyQueue = Promise.resolve();
   runtimeState = { ...DORMANT };
+  resetSentryCronsForTests();
 }

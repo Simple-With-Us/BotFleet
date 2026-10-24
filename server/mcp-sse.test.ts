@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { request } from "node:http";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 // Point BOTFLEET_MCP_PORT to a dynamic port for testing
 const TEST_PORT = 38794 + Math.floor(Math.random() * 1000);
@@ -84,6 +84,33 @@ describe("BotFleet MCP HTTP & SSE server", () => {
 
     const correct = await call(AUTH_HEADERS);
     expect(correct.status).toBe(200);
+  });
+
+  it("logs the route of a rejected request, never the caller's query string or path text", async () => {
+    // A request target can carry a token (`?access_token=...`, or a path
+    // segment), and the rejection line used to echo it verbatim.
+    const secret = `leak-${randomUUID()}`;
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      written.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    });
+    try {
+      const known = await fetch(`http://127.0.0.1:${TEST_PORT}/mcp?access_token=${secret}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      });
+      expect(known.status).toBe(401);
+      const unknown = await fetch(`http://127.0.0.1:${TEST_PORT}/${secret}/mcp`, { method: "GET" });
+      expect(unknown.status).toBe(401);
+    } finally {
+      spy.mockRestore();
+    }
+    const logged = written.join("");
+    expect(logged).not.toContain(secret);
+    expect(logged).toContain("Missing or invalid token for POST /mcp\n");
+    expect(logged).toContain("Missing or invalid token for GET (other)\n");
   });
 
   it("answers a malformed Host header with 400 instead of crashing the adapter", async () => {

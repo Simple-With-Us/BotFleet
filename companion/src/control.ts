@@ -14,7 +14,7 @@
 // withhold.
 import { createServer, type Server, type ServerResponse } from "node:http";
 
-import type { PushSenderHealth } from "./apns.ts";
+import { apnsKeySource, type PushSenderHealth } from "./apns.ts";
 import { isJsonObject, isJsonString, type JsonValue } from "./json.ts";
 import type { DeviceRegistry } from "./devices.ts";
 import { companionEndpointCandidates, hostedCompanionUrl } from "./endpoints.ts";
@@ -234,6 +234,10 @@ export function companionState(options: ControlOptions) {
     // A push path that quietly stopped working looks exactly like a quiet
     // fleet from the pairing page.  This is the difference.
     push: options.pushHealth?.() ?? null,
+    // Where the signing key comes from, so the page can name the real remedy
+    // when Apple refuses it.  A name, never the key: the key lives in the
+    // vault, and only the vault secret clears a refusal.
+    keySource: apnsKeySource(),
   };
 }
 
@@ -349,8 +353,11 @@ export function createControlServer(options: ControlOptions): Server {
 }
 
 /** One self-contained page. No build step and no assets on purpose — a
- * sidecar that needed bundling would be a much bigger thing to run. */
-function page(): string {
+ * sidecar that needed bundling would be a much bigger thing to run.
+ *
+ * Exported so the wording can be asserted on: a page that tells an operator
+ * to replace a file that does not exist is a page that sends them nowhere. */
+export function page(): string {
   return `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -414,6 +421,25 @@ const pushDropLines = (push) => {
   const held = Number(push.circuitDropped) || 0;
   return (dropped > 0 ? "<p class=dim>" + dropped + " dropped (queue full).</p>" : "") +
     (held > 0 ? "<p class=dim>" + held + " held back while Apple's push service was unreachable.</p>" : "");
+};
+
+/** The remedy for a refused signing key, in the words a person can act on.
+ *
+ * The key lives wherever the sidecar reads it from — a vault, an injected
+ * environment value, an explicit file — so an operator told to replace a file
+ * on disk would replace something this sidecar never reads, and the pushes
+ * would stay off.  The source name comes from the sidecar, which is the only
+ * party that knows it; the page only carries it.
+ *
+ * The source is missing when an older sidecar sent a state without it, and
+ * the fallback then says what is true in every case: the SIGNING KEY is what
+ * has to change, because a fresh signature from the same key cannot help. */
+const pushRejectedKeyLine = (push, keySource) => {
+  return "<p>Apple refused the signing key (<code>" + esc(push.keyRejected) + "</code>).&nbsp; " +
+    "Replace " + esc(keySource || "the signing key") + " to turn pushes back on.</p>" +
+    (push.lastError
+      ? "<p class=dim>Last error: <code>" + esc(String(push.lastError)) + "</code></p>"
+      : "");
 };
 
 /** One line naming every phone that has something to say about its own push
@@ -485,11 +511,7 @@ function render(s) {
     (!s.push
       ? "<p class=dim>Not reported by this sidecar.</p>"
       : s.push.keyRejected
-        ? "<p>Apple refused the signing key (<code>" + esc(s.push.keyRejected) + "</code>).&nbsp; " +
-          "Replace the key file to turn pushes back on.</p>" +
-          (s.push.lastError
-            ? "<p class=dim>Last error: <code>" + esc(String(s.push.lastError)) + "</code></p>"
-            : "")
+        ? pushRejectedKeyLine(s.push, s.keySource)
         : !s.push.configured
           ? "<p class=dim>No signing key found, so a phone that is not open will not be woken.&nbsp; " +
             "The key is looked for again every few minutes.</p>"

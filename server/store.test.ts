@@ -144,6 +144,7 @@ describe("Store", () => {
       output: 300,
       cachedInput: 1000,
       costUsd: null,
+      lastInput: 1200,
       turns: 1,
     });
     // a driver that never reports the cached share leaves it unchanged
@@ -162,6 +163,7 @@ describe("Store", () => {
       output: 400,
       cachedInput: 1010,
       costUsd: null,
+      lastInput: 10,
       turns: 4,
     });
   });
@@ -371,6 +373,17 @@ describe("Store", () => {
     );
   });
 
+  it("persists provider-tool always-allow grants on the bot across restart", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, {
+      alwaysAllow: ["provider-tool:claude:linear:list_issues:abc", "Bash:git"],
+    });
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.alwaysAllow).toEqual(["provider-tool:claude:linear:list_issues:abc", "Bash:git"]);
+  });
+
   it("persists a bot's effort level across a restart, defaulting to unset", () => {
     const store = new Store(selection);
     const bot = store.createBot();
@@ -516,6 +529,17 @@ describe("Store", () => {
     expect(store.messagesFor(bot.threadId).map((m) => m.id)).toContain(original.id);
 
     expect(store.branchMessage(bot.threadId, "nope", "x")).toBeNull();
+  });
+
+  it("branchMessage keeps a routine's command allowlist, so an edit or retry is still held to it", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const toolPolicy = { mode: "allowlist" as const, commands: [], writePaths: ["/Users/you/apps/state/line.md"], readPaths: [] };
+    const routine = store.appendMessage(bot.threadId, { role: "system", kind: "text", text: "run the routine", automationSource: "manual", toolPolicy });
+    const edited = store.branchMessage(bot.threadId, routine.id, "run the routine again")!;
+    expect(edited.toolPolicy).toEqual(toolPolicy);
+    const chat = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "hello" });
+    expect(store.branchMessage(bot.threadId, chat.id, "hello again")!.toolPolicy).toBeUndefined();
   });
 
   it("branchMessage retains delegated attribution but drops the stale peer-thread link", () => {
@@ -997,15 +1021,23 @@ describe("Store task usage", () => {
       input: 100,
       output: 20,
       costUsd: 0.01,
+      lastInput: 100,
       turns: 1,
     });
     expect(store.addTaskUsage(bot.id, bot.threadId, { input: 50, output: 5, costUsd: 0.005 })).toEqual({
       input: 150,
       output: 25,
       costUsd: 0.015,
+      lastInput: 50,
       turns: 2,
     });
-    expect(store.taskByThread(bot.id, bot.threadId)?.usage).toEqual({ input: 150, output: 25, costUsd: 0.015, turns: 2 });
+    expect(store.taskByThread(bot.id, bot.threadId)?.usage).toEqual({
+      input: 150,
+      output: 25,
+      costUsd: 0.015,
+      lastInput: 50,
+      turns: 2,
+    });
   });
 
   it("keeps cost null until some turn reports one, then sums only reported costs", () => {
@@ -1026,7 +1058,7 @@ describe("Store task usage", () => {
       output: 2,
       costUsd: 0.03,
       billingMode: "estimated",
-    })).toEqual({ input: 30, output: 3, costUsd: 0.02, turns: 2 });
+    })).toEqual({ input: 30, output: 3, costUsd: 0.02, lastInput: 20, turns: 2 });
   });
 
   it("counts a turn that reported no tokens at all", () => {
@@ -1335,6 +1367,72 @@ describe("Store thread cache", () => {
     expect(store.threadIsCachedForTests(b.threadId)).toBe(false);
   });
 
+  // BF-2424 follow-up: a thread-COUNT bound is not a memory bound. 64 fully
+  // hydrated threads carrying inline base64 captures measured 74 GB RSS,
+  // because nothing capped how MANY MESSAGES those 64 threads retained. The
+  // size bound has to bite while the thread count is nowhere near its own
+  // limit — that is exactly the case the count limit missed.
+  it("evicts on retained message count while the thread count stays under its limit", () => {
+    const setup = new Store(selection);
+    const fat = setup.createBot({ name: "Fat" }, { seedMessages: false });
+    for (let i = 0; i < 6; i++) {
+      setup.appendMessage(fat.threadId, { role: "user", kind: "text", text: `m${i}` });
+    }
+    // room for 10 retained messages across 8 threads: the size bound is the
+    // only one that can be reached here
+    const store = new Store(selection, { threadCacheLimit: 8, threadCacheMaxMessages: 10 });
+
+    store.messagesFor(fat.threadId); // 6 retained — under the bound
+    expect(store.threadIsCachedForTests(fat.threadId)).toBe(true);
+
+    const rest = ["s", "a", "b", "c", "d", "e"].map((name) => {
+      const bot = setup.createBot({ name }, { seedMessages: false });
+      setup.appendMessage(bot.threadId, { role: "user", kind: "text", text: name });
+      return bot;
+    });
+
+    // 6 + 5 = 11 retained, over the bound of 10, while only 6 of the 8 slots
+    // are in use — the thread-COUNT limit alone would have kept all of them
+    store.messagesFor(rest[0]!.threadId); // 7
+    store.messagesFor(rest[1]!.threadId); // 8
+    store.messagesFor(rest[2]!.threadId); // 9
+    store.messagesFor(rest[3]!.threadId); // 10 — at the bound
+    store.messagesFor(rest[4]!.threadId); // 11 — over it, evict the LRU end
+    expect(store.threadIsCachedForTests(fat.threadId)).toBe(false);
+    expect(store.threadIsCachedForTests(rest[4]!.threadId)).toBe(true);
+
+    // eviction stays invisible to callers: the thread re-hydrates correctly
+    expect(store.messagesFor(fat.threadId).map((m) => m.text)).toEqual([
+      "m0", "m1", "m2", "m3", "m4", "m5",
+    ]);
+  });
+
+  // BF-2424: the unpaginated GET /api/bots path answers with a thread's whole
+  // transcript for every bot AND every group in one request. It must not cache
+  // them — messagesFor pins a thread for the life of the process, and the LRU
+  // bounds the thread COUNT rather than a thread's size, so a single
+  // unpaginated poll was enough to hold the entire database in the heap.
+  it("messagesForTransient returns the whole transcript without pinning it in the LRU", () => {
+    const setup = new Store(selection);
+    const target = setup.createBot({ name: "Transient" }, { seedMessages: false });
+    setup.appendMessage(target.threadId, { role: "user", kind: "text", text: "one" });
+    setup.appendMessage(target.threadId, { role: "bot", kind: "text", text: "two" });
+
+    const store = new Store(selection);
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(false);
+
+    // same bytes out as the caching read...
+    expect(store.messagesForTransient(target.threadId).map((m) => m.text)).toEqual(["one", "two"]);
+    // ...and nothing retained for the life of the process
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(false);
+
+    // an already-warm thread still serves from memory, and stays warm: the
+    // transient read must not evict what other work legitimately cached
+    store.messagesFor(target.threadId);
+    expect(store.messagesForTransient(target.threadId).map((m) => m.text)).toEqual(["one", "two"]);
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(true);
+  });
+
   it("appendMessage after eviction stays consistent with what is durable on disk", () => {
     const setup = new Store(selection);
     const target = setup.createBot({ name: "Target" }, { seedMessages: false });
@@ -1357,6 +1455,27 @@ describe("Store thread cache", () => {
     // durable across a full restart, not just this process's cache
     const reloaded = new Store(selection);
     expect(reloaded.messagesFor(target.threadId).map((m) => m.text)).toEqual(["before eviction", "after eviction"]);
+  });
+
+  it("appendMessage on a warm thread updates retained message count and evicts older cached threads", () => {
+    const store = new Store(selection, { threadCacheLimit: 8, threadCacheMaxMessages: 4 });
+    const older = store.createBot({ name: "Older" }, { seedMessages: false });
+    const active = store.createBot({ name: "Active" }, { seedMessages: false });
+
+    store.appendMessage(older.threadId, { role: "user", kind: "text", text: "o1" });
+    store.appendMessage(older.threadId, { role: "bot", kind: "text", text: "o2" });
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(true);
+
+    store.appendMessage(active.threadId, { role: "user", kind: "text", text: "a1" });
+    store.appendMessage(active.threadId, { role: "bot", kind: "text", text: "a2" });
+    // 2 + 2 = 4 retained (at the bound of 4)
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(true);
+    expect(store.threadIsCachedForTests(active.threadId)).toBe(true);
+
+    // 5th retained message across the cache via in-place appendMessage evicts older
+    store.appendMessage(active.threadId, { role: "user", kind: "text", text: "a3" });
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(false);
+    expect(store.threadIsCachedForTests(active.threadId)).toBe(true);
   });
 });
 

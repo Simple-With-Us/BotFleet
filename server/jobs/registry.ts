@@ -251,6 +251,11 @@ export interface JobRegistryDeps {
    *  thread or bot is gone, so once it has stopped its record and log go too
    *  — a deleted conversation's output is not left for its bot to read. */
   stopReason?: (job: JobSnapshot) => { reason: string; forget: boolean } | null;
+  /** The launch variables a job's shell is given (server/launch-identity.ts),
+   *  for the bot and thread that started it.  A job is a shell the model
+   *  started, so a fleet tool run from it must see the same launcher and seat
+   *  as one run from the engine.  Absent, the job gets `modelShellEnv()`. */
+  launchEnv?: (botId: string, threadId: string) => NodeJS.ProcessEnv;
   /** The debounced full-set frame for one thread. */
   broadcast: (frame: JobsFrame) => void;
   /** A job ended (any status).  `notice` is the line the bot should read,
@@ -672,7 +677,7 @@ export class JobRegistry {
     const spawned = this.spawnJob({
       command,
       cwd: request.cwd,
-      env: { ...modelShellEnv(), BOTFLEET_JOB_ID: id },
+      env: { ...modelShellEnv(), ...this.deps.launchEnv?.(request.botId, request.threadId), BOTFLEET_JOB_ID: id },
       logPath: record.logPath,
       exitPath: record.exitPath,
       cpuSeconds: minutes * 60 * settings.cpuCores,
@@ -1081,6 +1086,13 @@ export class JobRegistry {
     return strays.length;
   }
 
+  private hasRunningJob(): boolean {
+    for (const record of this.records.values()) {
+      if (record.status === "running") return true;
+    }
+    return false;
+  }
+
   /** Start the tick and the sweep, and stop every job if the process exits. */
   startTimers(sweepMs: number = this.deps.sweepMs ?? 5 * 60_000): void {
     this.lastTick = this.awakeNow();
@@ -1089,7 +1101,7 @@ export class JobRegistry {
     this.tickTimer.unref?.();
     // One stat per running job; nothing at all while none runs.
     this.logTimer ??= setInterval(() => {
-      if (this.records.size > 0 && [...this.records.values()].some((record) => record.status === "running")) this.checkLogs();
+      if (this.hasRunningJob()) this.checkLogs();
     }, this.deps.logCheckMs ?? 500);
     this.logTimer.unref?.();
     this.sweepTimer ??= setInterval(() => {

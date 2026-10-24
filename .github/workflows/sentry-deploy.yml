@@ -53,7 +53,7 @@ jobs:
       # workflow_run events to the repo's default branch (main), not the
       # head ref of the triggering run, so this always runs the trusted,
       # merged copy of the composite action and its script.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Derive deploying seat and PR number
         id: pr-info

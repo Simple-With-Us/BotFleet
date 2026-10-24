@@ -10,11 +10,13 @@ import { unreadConversationCount } from "@/lib/unread";
 import { Sidebar } from "@/components/Sidebar";
 import { ChatView } from "@/components/ChatView";
 import { GroupView } from "@/components/GroupView";
+import { DataFaultBanner } from "@/components/DataFaultBanner";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
 import { NoEngines } from "@/components/NoEngines";
 import { noEngineCanRun } from "@/lib/engine-status";
-import { threadIdForApp } from "@/lib/task-app-thread";
+import { resolveAppContext, shownThreadId, threadIdForApp } from "@/lib/task-app-thread";
+import { useDismissOnSelection } from "@/lib/use-dismiss-on-selection";
 
 // UI2: every one of these is already conditionally rendered — near-modal
 // panels/pages that most sessions never open in a given launch — so they
@@ -33,6 +35,9 @@ const GroupSettingsPanel = lazy(() =>
 );
 const PluginsPanel = lazy(() =>
   import("@/components/PluginsPanel").then((m) => ({ default: m.PluginsPanel })),
+);
+const PluginsManagerView = lazy(() =>
+  import("@/components/PluginsManagerView").then((m) => ({ default: m.PluginsManagerView })),
 );
 const ComputerPanel = lazy(() =>
   import("@/components/ComputerPanel").then((m) => ({ default: m.ComputerPanel })),
@@ -99,12 +104,14 @@ function Shell() {
   const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
   const hasApps = state.groups.some((g) => !g.dm);
 
+  // The task-switch ack clears the pin, so a null pin means "the bot's active
+  // thread", not "left the App" (see resolveAppContext).
   const appKeyboardRouting = Boolean(
     selectedAppId &&
       ((group && !group.dm && group.id === selectedAppId) ||
         (bot &&
-          state.viewedThreadId &&
-          state.viewedThreadId === threadIdForApp(bot, selectedAppId))),
+          shownThreadId(bot, state.viewedThreadId) &&
+          shownThreadId(bot, state.viewedThreadId) === threadIdForApp(bot, selectedAppId))),
   );
 
   // If a group was chosen in the sidebar or store, keep selectedAppId aligned
@@ -114,22 +121,30 @@ function Shell() {
     }
   }, [group?.id, group?.dm]);
 
-  // When selection changes via sidebar or store, yield matrix overview to the selected chat
+  // The overview covers the chat pane, so a pick from anywhere (sidebar, ⌘1–9,
+  // command palette, notification) has to close it.  Only a pick: the store
+  // streams bot and room updates all session and hydrate selects the first bot
+  // at launch, and none of that may dismiss the overview.  The deck, the matrix
+  // and the "All" tab close or open it in their own handlers below.
+  const dismissMatrixOverview = useCallback(() => setMatrixOverviewActive(false), []);
+  useDismissOnSelection(state.selectionNonce, dismissMatrixOverview);
+
+  // Drop the App highlight unless the selection is still in that App.  The
+  // decision is a pure function so it can be tested: this effect re-runs on
+  // every SSE frame, and only a changed selection may clear the highlight.
+  const lastSelectedId = useRef(state.selectedId);
   useEffect(() => {
-    if (state.selectedId) {
-      setMatrixOverviewActive(false);
-    }
-    const selectedGroup = state.groups.find((g) => g.id === state.selectedId);
-    if (selectedGroup && !selectedGroup.dm) return;
-    const selectedBot = state.bots.find((b) => b.id === state.selectedId);
-    if (!selectedBot) return;
-    const inApp =
-      selectedAppId &&
-      state.viewedThreadId &&
-      state.viewedThreadId === threadIdForApp(selectedBot, selectedAppId);
-    if (!inApp) {
-      setSelectedAppId(null);
-    }
+    const selectionChanged = lastSelectedId.current !== state.selectedId;
+    lastSelectedId.current = state.selectedId;
+    const decision = resolveAppContext({
+      selectedAppId,
+      selectedId: state.selectedId,
+      selectionChanged,
+      groups: state.groups,
+      bots: state.bots,
+      viewedThreadId: state.viewedThreadId,
+    });
+    if (decision.selectedAppId !== selectedAppId) setSelectedAppId(decision.selectedAppId);
   }, [state.selectedId, state.viewedThreadId, state.bots, state.groups, selectedAppId]);
 
   // Nothing on this machine can run a bot. A missing cloud login does not
@@ -284,7 +299,7 @@ function Shell() {
   // drawer whenever an action opens something over the chat.
   useEffect(() => {
     setDrawerOpen(false);
-  }, [state.selectedId, state.activeView, state.pluginsOpen, state.settingsOpen]);
+  }, [state.selectedId, state.activeView, state.pluginsOpen, state.pluginsManagerOpen, state.settingsOpen]);
 
   useEffect(() => {
     if (
@@ -313,7 +328,8 @@ function Shell() {
     state.computerOpen ||
     state.inspectorOpen ||
     state.appSettingsOpen ||
-    state.pluginsOpen;
+    state.pluginsOpen ||
+    state.pluginsManagerOpen;
 
   // The viewer outlives ComputerPanel and can target any bot, so release control
   // here (always mounted) when a bot's viewer closes. release() is idempotent.
@@ -348,6 +364,8 @@ function Shell() {
     <div className="flex h-full flex-col">
       {/* fixed-position popup, bottom-left — outside the layout flow */}
       <UpdateBanner />
+      {/* saved data that could not be used (set aside, never deleted); silent when there is none */}
+      <DataFaultBanner />
       {state.error && (
         <div
           role="alert"
@@ -506,7 +524,7 @@ function Shell() {
           )}
         </div>
       </div>
-      {(state.settingsOpen || state.computerOpen || state.inspectorOpen) && (
+      {(state.settingsOpen || state.computerOpen || state.inspectorOpen || state.pluginsManagerOpen) && (
         <div
           aria-hidden
           onMouseDown={(event) => {
@@ -514,6 +532,7 @@ function Shell() {
             if (state.settingsOpen) dispatch({ type: "toggleSettings", open: false });
             else if (state.computerOpen) dispatch({ type: "toggleComputer", open: false });
             else if (state.inspectorOpen) dispatch({ type: "toggleInspector", open: false });
+            else if (state.pluginsManagerOpen) dispatch({ type: "togglePluginsManager", open: false });
           }}
           className="absolute inset-0 z-10 hidden bg-black/40 max-[1099px]:block"
         />
@@ -562,6 +581,11 @@ function Shell() {
       {state.pluginsOpen && (
         <Suspense fallback={<PanelFallback />}>
           <PluginsPanel />
+        </Suspense>
+      )}
+      {state.pluginsManagerOpen && (
+        <Suspense fallback={<PanelFallback />}>
+          <PluginsManagerView onClose={() => dispatch({ type: "togglePluginsManager", open: false })} />
         </Suspense>
       )}
       {/* mounted after the modals: same z-50 tier, so DOM order keeps the

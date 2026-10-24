@@ -34,3 +34,22 @@ export function resolveStaticFile(root: string, urlPath: string): string | null 
   const prefix = realRoot.endsWith(sep) ? realRoot : realRoot + sep;
   return realFile.startsWith(prefix) ? realFile : null;
 }
+
+/** Return Cache-Control header appropriate for the static resource.
+ * Hashed static bundle assets under `/assets/` are immutable and safe to
+ * cache long-term.  HTML and SPA fallback pages must never be cached so
+ * users receive updates promptly. */
+export function staticCacheControl(urlPath: string): string {
+  const normalized = urlPath.replace(/^[/\\]+/, "/");
+  if (normalized.startsWith("/assets/") || normalized.startsWith("assets/")) {
+    return "public, max-age=31536000, immutable";
+  }
+  return "no-cache";
+}
+
+/** Return default response headers for serving a static file. */
+export function staticFileHeaders(urlPath: string): Record<string, string> {
+  return {
+    "Cache-Control": staticCacheControl(urlPath),
+  };
+}

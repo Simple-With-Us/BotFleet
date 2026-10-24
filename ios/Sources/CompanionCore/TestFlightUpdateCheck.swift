@@ -84,19 +84,35 @@ public struct VersionManifestFetcher: Sendable {
 /// build actually running.
 public enum TestFlightUpdateCheck {
     /// Matches `PRODUCT_BUNDLE_IDENTIFIER` in `ios/project.yml`.
-    public static let bundleId = "app.botfleet"
+    public static let bundleId = "app.botfleet.ios"
 
     /// Whether `candidate` is a newer build than `running`.
     ///
-    /// Compares the build number, not the marketing version: the build is
-    /// the fleet's monotonically increasing `YYYYMMDDHHmm` stamp and totally
+    /// Compares the build number, not the marketing version: the build totally
     /// orders two builds even across marketing-version bumps, while
     /// `"1.0.9"` sorting before `"1.0.30"` as strings is exactly the bug a
-    /// marketing-version compare would invite.  Both sides here are that
-    /// same stamp, so a plain numeric compare is enough; a non-numeric build
-    /// (hand-edited fixture, or a future format change) falls back to a
-    /// string inequality rather than silently claiming "no update".
+    /// marketing-version compare would invite.
+    ///
+    /// The fleet moved `CFBundleVersion` from a 12-digit `YYYYMMDDHHmm` stamp
+    /// to the repo commit count (owner 2026-10-18), so a device can briefly
+    /// compare across the two formats.  A stamp is always the larger number,
+    /// so a plain numeric compare would read a fresh commit-count build as
+    /// older than the timestamp build it replaces and never offer the update.
+    /// Order the two schemes explicitly first: commit-count builds sort after
+    /// timestamp builds, and within a scheme the number still decides.
+    /// A non-numeric build (hand-edited fixture, or a future format change)
+    /// falls back to a string inequality rather than silently claiming "no
+    /// update".
     public static func isNewer(_ candidate: AppBuildInfo, than running: AppBuildInfo) -> Bool {
+        let candidateScheme = BuildScheme(candidate.build)
+        let runningScheme = BuildScheme(running.build)
+        // Compare the scheme itself, not the enum cases: two different
+        // timestamp builds are different *cases* carrying different numbers,
+        // and falling through on that would skip the numeric compare entirely.
+        if candidateScheme.scheme != runningScheme.scheme,
+           candidateScheme.isKnown, runningScheme.isKnown {
+            return candidateScheme.sortOrder > runningScheme.sortOrder
+        }
         if let candidateBuild = Int64(candidate.build), let runningBuild = Int64(running.build) {
             return candidateBuild > runningBuild
         }
@@ -139,5 +155,51 @@ public enum TestFlightCheckThrottle {
     public static func isDue(lastCheckedAt: Date?, now: Date = Date(), minimumInterval: TimeInterval = defaultMinimumInterval) -> Bool {
         guard let lastCheckedAt else { return true }
         return now.timeIntervalSince(lastCheckedAt) >= minimumInterval
+    }
+}
+
+/// Which numbering scheme a `CFBundleVersion` was cut under.
+///
+/// The fleet retired the UTC `YYYYMMDDHHmm` stamp on 2026-10-18 in favour of
+/// the repo commit count.  A device running an older build and being offered a
+/// newer one can compare across that boundary exactly once per install, and a
+/// bare numeric compare gets it backwards: a 12-digit stamp is always the larger
+/// number, so the new build looks older and is never offered.
+enum BuildScheme: Equatable {
+    /// A 12-digit UTC minute stamp, e.g. `202610080006`.
+    case timestamp(Int64)
+    /// A repo commit count, e.g. `2058`.
+    case commitCount(Int64)
+    /// Anything else — a hand-edited fixture or a future format.
+    case unknown
+
+    /// The scheme label, carrying no number, so two builds of the same scheme
+    /// compare equal here and the caller falls through to a numeric compare.
+    enum Kind: Equatable { case timestamp, commitCount, unknown }
+
+    var scheme: Kind {
+        switch self {
+        case .timestamp: return .timestamp
+        case .commitCount: return .commitCount
+        case .unknown: return .unknown
+        }
+    }
+
+    init(_ build: String) {
+        guard let value = Int64(build), value >= 0 else { self = .unknown; return }
+        // A 12-digit value is a stamp under the retired scheme.  Anything
+        // shorter is a commit count; both are ordered by the number itself.
+        self = build.count == 12 ? .timestamp(value) : .commitCount(value)
+    }
+
+    var isKnown: Bool { self != .unknown }
+
+    /// Timestamp builds predate commit-count builds, so they sort lower.
+    var sortOrder: Int {
+        switch self {
+        case .timestamp: return 0
+        case .commitCount: return 1
+        case .unknown: return 0
+        }
     }
 }

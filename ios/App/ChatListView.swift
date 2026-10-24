@@ -34,6 +34,17 @@ struct ChatListView: View {
     @FocusState private var searchFocused: Bool
     /// Drives the live-session "Open BotFleet on Mac" header control.
     @State private var isOpeningMacApp = false
+    /// Raising the desktop is a physical action on a computer the person is
+    /// not holding, so it is confirmed before it is sent.
+    @State private var confirmingOpenMacApp = false
+    /// The chat a long-press asked to delete, while its confirmation is up.
+    @State private var pendingDelete: Chat?
+    /// The chat Move To Section is choosing a section for.
+    @State private var sectionTarget: Chat?
+    @State private var showingArchived = false
+    /// DEBUG `-store-preview -open-settings`: land on Settings, for the
+    /// screenshot harness.
+    @State private var showingDebugSettings = false
 
     /// Room for the floating bar, so the last row can scroll clear of it.
     private static let barClearance: CGFloat = 96
@@ -75,10 +86,14 @@ struct ChatListView: View {
                 NavigationStack(path: $path) {
                     roster
                         .navigationDestination(for: Chat.self) { ChatView(chat: $0) }
+                        .navigationDestination(isPresented: $showingDebugSettings) { SettingsView() }
                 }
             }
         }
-        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+        // Same AX5 ceiling as the transcript (ChatView.swift): a roster row
+        // that stops growing at AX3 is unreadable at the sizes those readers
+        // chose.  Rows reflow; they do not truncate.
+        .dynamicTypeSize(...DynamicTypeSize.accessibility5)
         .onAppear { migrateLegacyCollapsedSections() }
         .onChange(of: session.notificationChat) { _, chat in
             guard let chat else { return }
@@ -99,6 +114,9 @@ struct ChatListView: View {
             if ProcessInfo.processInfo.arguments.contains("-open-first"),
                let first = chats.first {
                 open(first.chat)
+            }
+            if ProcessInfo.processInfo.arguments.contains("-open-settings") {
+                showingDebugSettings = true
             }
         }
 #endif
@@ -135,6 +153,19 @@ struct ChatListView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
+        .confirmationDialog(
+            "Open BotFleet on Mac?",
+            isPresented: $confirmingOpenMacApp,
+            titleVisibility: .visible
+        ) {
+            Button("Open BotFleet") {
+                Task { await openMacApp() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(openMacConfirmationMessage(session.connection?.name))
+        }
+        .modifier(rosterManagement)
         .task(id: query) {
             let expected = query
             guard expected.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2 else {
@@ -161,6 +192,15 @@ struct ChatListView: View {
     /// The roster column, shared by the phone stack and the iPad sidebar.
     private var roster: some View {
         GeometryReader { geo in
+            let waiting = waitingChats
+            // Whole-fleet work: build the summaries once per render, never
+            // per row (BOTFLEET-3R).
+            let all = session.state.chatSummaries
+            let roomRows = roomSummaries(in: all)
+            let botRows = botSummaries(in: all)
+            let botChatRows = botChatSummaries(in: all)
+            let matches = chats(in: all)
+            let showingBotChats = query.isEmpty && botChatsExpanded && !botChatRows.isEmpty
             VStack(spacing: 0) {
                 header
                 StatusBanner()
@@ -170,20 +210,20 @@ struct ChatListView: View {
                         if query.isEmpty {
                             sectionToggle(
                                 title: roomTerms.plural,
-                                count: roomSummaries.count,
+                                count: roomRows.count,
                                 expanded: $roomsExpanded
                             )
                             .padding(.top, 2)
                             if roomsExpanded {
-                                ForEach(Array(roomSummaries.enumerated()), id: \.element.id) { index, summary in
+                                ForEach(Array(roomRows.enumerated()), id: \.element.id) { index, summary in
                                     chatOpener(for: summary.chat) {
                                         ChatRow(
                                             chat: summary.chat,
                                             preview: summary.preview,
                                             at: summary.lastActivity,
                                             state: BotState.forChat(summary.chat, in: session.state),
-                                            waiting: waitingChats.contains(summary.chat.id),
-                                            last: index == roomSummaries.count - 1 && !botsExpanded && customSectionNames.isEmpty && !showingBotChats
+                                            waiting: waiting.contains(summary.chat.id),
+                                            last: index == roomRows.count - 1 && !botsExpanded && customSectionNames.isEmpty && !showingBotChats
                                         )
                                     }
                                 }
@@ -198,7 +238,7 @@ struct ChatListView: View {
 
                             sectionToggle(
                                 title: session.config?.primaryPlural ?? "Bots",
-                                count: botSummaries.count,
+                                count: botRows.count,
                                 expanded: $botsExpanded
                             )
                             .padding(.top, 14)
@@ -229,7 +269,7 @@ struct ChatListView: View {
                                 .padding(.bottom, 4)
                         }
 
-                        let rows = query.isEmpty ? (botsExpanded ? botSummaries : []) : chats
+                        let rows = query.isEmpty ? (botsExpanded ? botRows : []) : matches
                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, summary in
                             chatOpener(for: summary.chat) {
                                 ChatRow(
@@ -237,7 +277,7 @@ struct ChatListView: View {
                                     preview: summary.preview,
                                     at: summary.lastActivity,
                                     state: BotState.forChat(summary.chat, in: session.state),
-                                    waiting: waitingChats.contains(summary.chat.id),
+                                    waiting: waiting.contains(summary.chat.id),
                                     last: index == rows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (query.isEmpty ? customSectionNames.isEmpty && !showingBotChats : true)
                                 )
                             }
@@ -255,7 +295,7 @@ struct ChatListView: View {
 
                         if query.isEmpty {
                             ForEach(customSectionNames, id: \.self) { section in
-                                let sectionRows = summaries(forSection: section)
+                                let sectionRows = summaries(forSection: section, in: all)
                                 if !sectionRows.isEmpty {
                                     let isExpanded = sectionBinding(for: section)
                                     sectionToggle(
@@ -273,7 +313,7 @@ struct ChatListView: View {
                                                     preview: summary.preview,
                                                     at: summary.lastActivity,
                                                     state: BotState.forChat(summary.chat, in: session.state),
-                                                    waiting: waitingChats.contains(summary.chat.id),
+                                                    waiting: waiting.contains(summary.chat.id),
                                                     last: index == sectionRows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (section == customSectionNames.last ? !showingBotChats : false)
                                                 )
                                             }
@@ -293,27 +333,32 @@ struct ChatListView: View {
                             }
                         }
 
-                        if query.isEmpty, !botChatSummaries.isEmpty {
+                        if query.isEmpty, !botChatRows.isEmpty {
                             sectionToggle(
                                 title: "Bot Chats",
-                                count: botChatSummaries.count,
+                                count: botChatRows.count,
                                 expanded: $botChatsExpanded
                             )
                             .padding(.top, 14)
                             if botChatsExpanded {
-                                ForEach(Array(botChatSummaries.enumerated()), id: \.element.id) { index, summary in
+                                ForEach(Array(botChatRows.enumerated()), id: \.element.id) { index, summary in
                                     chatOpener(for: summary.chat) {
                                         ChatRow(
                                             chat: summary.chat,
                                             preview: summary.preview,
                                             at: summary.lastActivity,
                                             state: BotState.forChat(summary.chat, in: session.state),
-                                            waiting: waitingChats.contains(summary.chat.id),
-                                            last: index == botChatSummaries.count - 1
+                                            waiting: waiting.contains(summary.chat.id),
+                                            last: index == botChatRows.count - 1
                                         )
                                     }
                                 }
                             }
+                        }
+
+                        if query.isEmpty, archivedCount > 0 {
+                            archivedFooter
+                                .padding(.top, 14)
                         }
                     }
                     .padding(.bottom, Self.barClearance)
@@ -321,8 +366,8 @@ struct ChatListView: View {
                 .refreshable { await session.refresh() }
                 .overlay {
                     if query.isEmpty
-                        ? botSummaries.isEmpty && roomSummaries.isEmpty && botChatSummaries.isEmpty && searchHits.isEmpty
-                        : chats.isEmpty && searchHits.isEmpty
+                        ? botRows.isEmpty && roomRows.isEmpty && botChatRows.isEmpty && searchHits.isEmpty
+                        : matches.isEmpty && searchHits.isEmpty
                     {
                         ContentUnavailableView(
                             query.isEmpty ? "No chats yet" : "Nothing matches",
@@ -350,8 +395,20 @@ struct ChatListView: View {
         .toolbar(.hidden, for: .navigationBar)
     }
 
+    /// A roster row, with the long-press menu that manages it.  Bot-to-bot
+    /// chats get no menu: the desktop keeps them out of user management too.
     @ViewBuilder
     private func chatOpener<Label: View>(for chat: Chat, @ViewBuilder label: () -> Label) -> some View {
+        if chat.isBotToBot {
+            plainOpener(for: chat, label: label)
+        } else {
+            plainOpener(for: chat, label: label)
+                .contextMenu { rowMenu(for: chat) }
+        }
+    }
+
+    @ViewBuilder
+    private func plainOpener<Label: View>(for chat: Chat, @ViewBuilder label: () -> Label) -> some View {
         if usesSplitView {
             Button { open(chat) } label: { label() }
                 .buttonStyle(.plain)
@@ -386,25 +443,31 @@ struct ChatListView: View {
             // running, so the phone stays .live and the offline status banner
             // — the action's other home — is hidden.  A live session needs
             // its own entry point.
+            //
+            // The control used to be a bare `macwindow` glyph, which told a
+            // sighted person nothing about what it did; it now carries the
+            // words "Open on Mac", and the words stand in for the confirmation
+            // a tap no longer implies by itself.
             if sessionIsLive, session.connection != nil {
                 Button {
-                    Task { await openMacApp() }
+                    confirmingOpenMacApp = true
                 } label: {
                     Group {
                         if isOpeningMacApp {
-                            ProgressView()
-                                .controlSize(.small)
+                            ProgressView("Opening on Mac…")
+                                .font(.system(size: 13, weight: .medium))
                         } else {
-                            Image(systemName: "macwindow")
-                                .font(.system(size: 18, weight: .medium))
+                            Label("Open on Mac", systemImage: "macwindow")
+                                .font(.system(size: 13, weight: .medium))
                         }
                     }
                     .foregroundStyle(Color.primary)
-                    .frame(width: 44, height: 44)
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 44)
                 }
                 .buttonStyle(.plain)
                 .glassCapsule()
-                .accessibilityLabel("Open BotFleet on Mac")
+                .accessibilityLabel(isOpeningMacApp ? "Opening BotFleet on Mac" : "Open BotFleet on Mac")
                 .disabled(isOpeningMacApp)
             }
 
@@ -447,7 +510,7 @@ struct ChatListView: View {
             // An unauthorized failure already flips the session to
             // .unauthorized, whose banner explains itself — don't also alert.
             if case .live = session.status {
-                session.actionError = "Could not open BotFleet on Mac.  Check that your Mac is awake and reachable."
+                session.actionError = openMacFailureCopy(error)
             }
         }
     }
@@ -549,9 +612,16 @@ struct ChatListView: View {
 
     // MARK: - Data
 
+    // `chatSummaries` walks every chat's transcripts.  Read it once per render
+    // (see `roster`) and filter that copy — reading it per row, as these
+    // helpers once did, hung the main thread for ~35s (BOTFLEET-3R).
+
     private var chats: [ChatSummary] {
-        let all = session.state.chatSummaries
-        guard !query.isEmpty else { return botSummaries }
+        chats(in: session.state.chatSummaries)
+    }
+
+    private func chats(in all: [ChatSummary]) -> [ChatSummary] {
+        guard !query.isEmpty else { return botSummaries(in: all) }
         return all.filter {
             $0.chat.name.localizedCaseInsensitiveContains(query)
                 || $0.chat.subtitle.localizedCaseInsensitiveContains(query)
@@ -564,46 +634,33 @@ struct ChatListView: View {
         return section.isEmpty
     }
 
-    private var botSummaries: [ChatSummary] {
-        session.state.chatSummaries.filter { 
+    private func botSummaries(in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter { 
             if case .bot = $0.chat { return isUnsectioned($0.chat) }
             return false 
         }
     }
 
     /// User rooms only.  Bot-to-bot DMs sit in Bot Chats, like the Mac sidebar.
-    private var roomSummaries: [ChatSummary] {
-        session.state.chatSummaries.filter {
+    private func roomSummaries(in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter {
             if case .room = $0.chat { return !$0.chat.isBotToBot && isUnsectioned($0.chat) }
             return false
         }
     }
 
+    /// Sections in use, in the Mac's saved order and then by name.  Move To
+    /// Section offers the same list, so it is built in one place.
     private var customSectionNames: [String] {
-        var names = Set<String>()
-        for summary in session.state.chatSummaries {
-            if !summary.chat.isBotToBot, let section = summary.chat.section?.trimmingCharacters(in: .whitespacesAndNewlines), !section.isEmpty {
-                names.insert(section)
-            }
-        }
-        
-        let sorted = Array(names).sorted()
-        // If the user has a manually ordered list of sections (from Mac), respect it.
-        // Sections present in customSectionNames but missing from order go to the end.
-        let order = session.config?.sidebarSectionOrder ?? []
-        var result = [String]()
-        for name in order {
-            if names.contains(name) {
-                result.append(name)
-                names.remove(name)
-            }
-        }
-        result.append(contentsOf: names.sorted())
-        return result
+        BotOrganize.sectionNames(
+            bots: session.state.bots,
+            rooms: session.state.rooms,
+            order: session.config?.sidebarSectionOrder ?? []
+        )
     }
 
-    private func summaries(forSection section: String) -> [ChatSummary] {
-        session.state.chatSummaries.filter {
+    private func summaries(forSection section: String, in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter {
             !$0.chat.isBotToBot && $0.chat.section?.trimmingCharacters(in: .whitespacesAndNewlines) == section
         }
     }
@@ -641,12 +698,8 @@ struct ChatListView: View {
         )
     }
 
-    private var botChatSummaries: [ChatSummary] {
-        session.state.chatSummaries.filter(\.chat.isBotToBot)
-    }
-
-    private var showingBotChats: Bool {
-        query.isEmpty && botChatsExpanded && !botChatSummaries.isEmpty
+    private func botChatSummaries(in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter(\.chat.isBotToBot)
     }
 
     private func nestedTasks(for chat: Chat) -> [BotTask] {
@@ -663,8 +716,17 @@ struct ChatListView: View {
         if let live = session.state.bot(bot.id) { open(Chat.bot(live)) }
     }
 
+    /// Chats with an unanswered approval. Whole-fleet work: read it once per
+    /// render (see `roster`), never once per row — per-row reads hung the
+    /// main thread past the watchdog on large fleets (BOTFLEET-30).
     private var waitingChats: Set<String> {
-        Set(session.state.pendingApprovals.compactMap { session.state.chat(forThread: $0.threadId)?.id })
+        let state = session.state
+        let threads = Set(state.pendingApprovals.map(\.threadId))
+        guard !threads.isEmpty else { return [] }
+        var ids = Set<String>()
+        for bot in state.bots where threads.contains(bot.threadId) { ids.insert(bot.id) }
+        for room in state.rooms where threads.contains(room.threadId) { ids.insert(room.id) }
+        return ids
     }
 
     private func sectionLabel(_ text: String) -> some View {
@@ -673,6 +735,204 @@ struct ChatListView: View {
             .tracking(0.4)
             .foregroundStyle(Color.secondary)
             .padding(.horizontal, 20)
+    }
+
+    // MARK: - Managing a chat
+    //
+    // The long-press menu mirrors the desktop sidebar's (`BotContextMenu` and
+    // `RoomContextMenu` in src/components/Sidebar.tsx), in the same order.
+    // The rules for what is allowed live in `BotOrganize`.
+
+    @ViewBuilder
+    private func rowMenu(for chat: Chat) -> some View {
+        switch chat {
+        case let .bot(bot):
+            botMenu(for: bot, chat: chat)
+        case let .room(room):
+            roomMenu(for: room, chat: chat)
+        }
+    }
+
+    @ViewBuilder
+    private func botMenu(for bot: Bot, chat: Chat) -> some View {
+        Button(bot.pinned == true ? "Unpin" : "Pin", systemImage: bot.pinned == true ? "pin.slash" : "pin") {
+            Task { await session.organizeBot(bot, .pin(bot.pinned != true)) }
+        }
+        chiefMenuItem(for: bot)
+        Button("Move To Section", systemImage: "folder") {
+            sectionTarget = chat
+        }
+        Button("Mark As Unread", systemImage: "circlebadge") {
+            markUnread(bot, chat: chat)
+        }
+        Divider()
+        archiveMenuItem(for: bot)
+        Button("Delete Bot", systemImage: "trash", role: .destructive) {
+            pendingDelete = chat
+        }
+    }
+
+    /// Removing the role is always allowed.  Making a bot Chief of Staff
+    /// needs an engine that can coordinate the others; when it cannot, the
+    /// item stays, off, with the reason under it.
+    @ViewBuilder
+    private func chiefMenuItem(for bot: Bot) -> some View {
+        if bot.chiefOfStaff == true {
+            Button("Remove Chief Of Staff", systemImage: "crown") {
+                Task { await session.organizeBot(bot, .chiefOfStaff(false)) }
+            }
+        } else if let reason = BotOrganize.makeChiefBlockReason(for: bot, instances: session.cachedInstances) {
+            Button("Make Chief Of Staff", systemImage: "crown") {}
+                .disabled(true)
+            Text(reason)
+        } else {
+            Button("Make Chief Of Staff", systemImage: "crown") {
+                Task { await session.organizeBot(bot, .chiefOfStaff(true)) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func archiveMenuItem(for bot: Bot) -> some View {
+        if let reason = BotOrganize.archiveBlockReason(for: bot, among: session.state.bots) {
+            Button("Archive", systemImage: "archivebox") {}
+                .disabled(true)
+            Text(reason)
+        } else {
+            // The open chat closes itself once its bot is archived (iPad:
+            // `selectedChatIsGone`; phone: no chat is open under the list).
+            Button("Archive", systemImage: "archivebox") {
+                Task { await session.organizeBot(bot, .archive) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func roomMenu(for room: Room, chat: Chat) -> some View {
+        Button("Move To Section", systemImage: "folder") {
+            sectionTarget = chat
+        }
+        Divider()
+        Button(
+            BotOrganize.deleteRoomConfirmation(name: room.name, roomTerm: roomTerms.singular).confirmLabel,
+            systemImage: "trash",
+            role: .destructive
+        ) {
+            pendingDelete = chat
+        }
+    }
+
+    /// The open chat marks itself read the moment it sees unread, so on iPad
+    /// it closes first, or the mark would be undone straight away.
+    private func markUnread(_ bot: Bot, chat: Chat) {
+        if usesSplitView, selectedChat == chat { selectedChat = nil }
+        Task { await session.organizeBot(bot, .markUnread) }
+    }
+
+    private func delete(_ chat: Chat) async {
+        do {
+            switch chat {
+            case let .bot(bot): try await session.deleteBot(bot)
+            case let .room(room): try await session.deleteRoom(room)
+            }
+        } catch {
+            session.recordActionError(error)
+        }
+    }
+
+    private func move(_ chat: Chat, to section: String?) async {
+        switch chat {
+        case let .bot(bot): await session.organizeBot(bot, .moveToSection(section))
+        case let .room(room): await session.moveRoom(room, toSection: section)
+        }
+    }
+
+    private var archivedCount: Int {
+        session.state.bots.filter { $0.hidden == true }.count
+    }
+
+    /// Collapsed at the foot of the roster, like the desktop's Archived Bots
+    /// control.  Opens the list with Restore.
+    private var archivedFooter: some View {
+        Button {
+            showingArchived = true
+        } label: {
+            HStack(spacing: 8) {
+                Text("Archived Bots".uppercased())
+                    .font(.system(size: 13, weight: .semibold))
+                    .tracking(0.4)
+                    .foregroundStyle(Color.secondary)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Color.secondary)
+                Spacer(minLength: 0)
+                Text("\(archivedCount)")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.secondary)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Archived Bots, \(archivedCount)")
+        .accessibilityHint("Opens the list of archived bots")
+    }
+
+    /// The sheets and the delete confirmation that the long-press menu
+    /// opens, hosted once for the whole screen rather than on every row.
+    private var rosterManagement: RosterManagementModifier {
+        RosterManagementModifier(
+            pendingDelete: $pendingDelete,
+            sectionTarget: $sectionTarget,
+            showingArchived: $showingArchived,
+            selectedChatIsGone: selectedChat?.isGone(in: session.state) ?? false,
+            roomTerm: roomTerms.singular,
+            sections: customSectionNames,
+            onDelete: { chat in
+                Task { await delete(chat) }
+            },
+            onMove: { chat, section in
+                Task { await move(chat, to: section) }
+            },
+            onSelectedChatGone: {
+                selectedChat = nil
+            }
+        )
+    }
+}
+
+/// Hosts what the roster's long-press menu opens: Move To Section, Archived
+/// Bots, and the delete confirmation.  On iPad it also lets go of a selected
+/// chat once that chat is deleted or archived, because the detail column has
+/// no back step that would close it.
+private struct RosterManagementModifier: ViewModifier {
+    @Binding var pendingDelete: Chat?
+    @Binding var sectionTarget: Chat?
+    @Binding var showingArchived: Bool
+    let selectedChatIsGone: Bool
+    let roomTerm: String
+    let sections: [String]
+    let onDelete: (Chat) -> Void
+    let onMove: (Chat, String?) -> Void
+    let onSelectedChatGone: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(item: $sectionTarget) { chat in
+                SectionPickerSheet(
+                    current: BotOrganize.normalizedSection(chat.section),
+                    sections: sections,
+                    onAssign: { section in onMove(chat, section) }
+                )
+            }
+            .sheet(isPresented: $showingArchived) {
+                ArchivedBotsView()
+            }
+            .modifier(DeleteChatAlert(target: $pendingDelete, roomTerm: roomTerm, onConfirm: onDelete))
+            .onChange(of: selectedChatIsGone) { _, gone in
+                if gone { onSelectedChatGone() }
+            }
     }
 }
 
@@ -811,7 +1071,13 @@ struct ChatRow: View {
             .frame(maxHeight: .infinity)
 
             HStack(alignment: .top, spacing: 14) {
+                // An Off bot keeps its place in the list, dimmed and grey, so
+                // it reads as switched off rather than merely quiet.
                 ChatAvatarView(chat: chat, size: 52, state: state, animated: state.showsActivity)
+                    .opacity(chat.isOff ? 0.5 : 1)
+                    .saturation(chat.isOff ? 0 : 1)
+                    // After the dimming, so the provider badge stays legible on an Off bot.
+                    .providerBadge(for: chat, avatarSize: 52)
                     .padding(.top, 12)
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -821,6 +1087,16 @@ struct ChatRow: View {
                             .foregroundStyle(Color.primary)
                             .lineLimit(1)
                             .layoutPriority(1)
+
+                        if chat.isOff {
+                            Text("Off")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Color.secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.secondary.opacity(0.18)))
+                                .accessibilityLabel("Off")
+                        }
 
                         // the bot's job, the way the desktop shows it
                         if !chat.subtitle.isEmpty {
@@ -890,7 +1166,10 @@ struct UpdatesPill: View {
         Button(action: action) {
             HStack(spacing: 8) {
                 if !updates.isEmpty {
-                    MascotStack(colors: Array(updates.prefix(3).map(\.chat.color)))
+                    MascotStack(
+                        colors: Array(updates.prefix(3).map(\.chat.color)),
+                        chats: Array(updates.prefix(3).map(\.chat))
+                    )
                 }
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 4) {
@@ -945,15 +1224,22 @@ struct UpdatesPill: View {
 /// Up to three mascots overlapping, the way a group of faces reads at a glance.
 struct MascotStack: View {
     let colors: [String]
+    /// The chats behind `colors`, when they are known: each bot's face then
+    /// wears its model badge like every other avatar.
+    var chats: [Chat] = []
     var size: CGFloat = 28
     var overlap: CGFloat = 12
 
     var body: some View {
         HStack(spacing: -overlap) {
-            ForEach(Array(colors.enumerated()), id: \.offset) { _, color in
+            ForEach(Array(colors.enumerated()), id: \.offset) { index, color in
                 BotMascot(color: color, size: size, state: .idle, animated: false)
+                    .providerBadge(for: chats.indices.contains(index) ? chats[index] : nil, avatarSize: size)
                     .padding(2)
                     .background(Circle().fill(Color(uiColor: .systemBackground)))
+                    // Each face sits above the next, so its badge is not
+                    // covered by the face that overlaps it.
+                    .zIndex(Double(colors.count - index))
             }
         }
     }
@@ -964,6 +1250,9 @@ struct StatusBanner: View {
     @EnvironmentObject private var session: Session
     @State private var isOpening = false
     @State private var openError: String?
+    /// Raising the desktop is a physical action on a computer the person is
+    /// not holding, so it is confirmed before it is sent.
+    @State private var confirmingOpenMac = false
 
     var body: some View {
         Group {
@@ -979,27 +1268,22 @@ struct StatusBanner: View {
             case let .offline(reason):
                 VStack(spacing: 6) {
                     banner(reason, systemImage: "wifi.slash", tint: .orange)
-
-                    if session.connection != nil {
-                        if isOpening {
-                            banner("Opening BotFleet on Mac…", systemImage: "arrow.triangle.2.circlepath", tint: .secondary)
-                        } else if let openError {
-                            banner(openError, systemImage: "exclamationmark.triangle", tint: .red) {
-                                Task { await openMacApp() }
-                            }
-                        } else {
-                            banner("Open BotFleet on Mac", systemImage: "macwindow", tint: .secondary) {
-                                Task { await openMacApp() }
-                            }
-                        }
-                    }
+                    openMacBanner
                 }
             case .macOffline:
-                // No `openMacApp` follow-up here on purpose: that call goes
-                // through the same paired route that has been failing with
-                // gateway errors, so it would just fail the same way.  The
-                // banner's default tap already retries via `session.refresh()`.
-                banner("Your Mac is not running BotFleet", systemImage: "wifi.slash", tint: .orange)
+                // This used to be deliberately left without an "open on Mac"
+                // follow-up: the call went out over the same route that was
+                // failing with gateway errors, so offering it only produced a
+                // second failure.  That objection no longer holds — the
+                // harness now answers a refused launch with the wording that
+                // names the setting to change, so the button is the way a
+                // person finds out why.  The banner above still refreshes the
+                // connection on a default tap; this second one asks the Mac to
+                // come up.
+                VStack(spacing: 6) {
+                    banner("Your Mac is not running BotFleet", systemImage: "wifi.slash", tint: .orange)
+                    openMacBanner
+                }
             case .unauthorized:
                 banner("This phone was unpaired on the computer.", systemImage: "lock.slash", tint: .red)
             }
@@ -1009,6 +1293,38 @@ struct StatusBanner: View {
         .animation(.default, value: openError)
         .onChange(of: session.status) { _ in
             openError = nil
+        }
+        .confirmationDialog(
+            "Open BotFleet on Mac?",
+            isPresented: $confirmingOpenMac,
+            titleVisibility: .visible
+        ) {
+            Button("Open BotFleet") {
+                Task { await openMacApp() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(openMacConfirmationMessage(session.connection?.name))
+        }
+    }
+
+    /// The launch control's second home, shared by the offline and
+    /// Mac-offline banners.  It confirms rather than sends, and says why a
+    /// launch was refused when the harness says so.
+    @ViewBuilder
+    private var openMacBanner: some View {
+        if session.connection != nil {
+            if isOpening {
+                banner("Opening BotFleet on Mac…", systemImage: "arrow.triangle.2.circlepath", tint: .secondary)
+            } else if let openError {
+                banner(openError, systemImage: "exclamationmark.triangle", tint: .red) {
+                    confirmingOpenMac = true
+                }
+            } else {
+                banner("Open BotFleet on Mac", systemImage: "macwindow", tint: .secondary) {
+                    confirmingOpenMac = true
+                }
+            }
         }
     }
 
@@ -1040,10 +1356,32 @@ struct StatusBanner: View {
             try await session.openDesktopApp()
             await session.refresh()
         } catch {
-            openError = "Could not open BotFleet on Mac.  Check that your Mac is awake and reachable."
+            openError = openMacFailureCopy(error)
         }
         isOpening = false
     }
+}
+
+/// What the confirmation says, wherever it is shown: what will happen, on
+/// which computer, and where the toggle that governs it lives.
+fileprivate func openMacConfirmationMessage(_ computerName: String?) -> String {
+    let computer = computerName ?? "your Mac"
+    return "This will launch the BotFleet desktop window on your Mac (\(computer)).\u{00A0} Remote desktop launch can be managed in Mac settings."
+}
+
+/// One failure string for both call sites, so the header and the offline
+/// banner never disagree.  The harness's own refusal — "Opening the desktop
+/// app from iOS is disabled in Mac settings", or the not-from-this-computer
+/// refusal — is the only copy that names what to change, so it passes
+/// through under a lead-in, the way `Session.swift` already frames a server
+/// message.  Only a failure with no server wording falls back to the generic
+/// transport advice.
+fileprivate func openMacFailureCopy(_ error: Error) -> String {
+    let lead = "Could not open BotFleet on Mac."
+    if let api = error as? APIError, let message = api.errorDescription, !message.isEmpty {
+        return "\(lead)\u{00A0} \(message)"
+    }
+    return "\(lead)\u{00A0} Check that your Mac is awake and reachable."
 }
 
 struct SearchHitRow: View {

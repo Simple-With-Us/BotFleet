@@ -3,32 +3,35 @@
 // (system-voices.ts, no key).  This file is only the part that reads
 // ~/.botfleet/config.json, picks the engine, and decides whether there
 // is a voice at all.
+import { isPersonalVoiceId, readableVoiceId } from "../../shared/bot-voice.ts";
+import { applyPronunciations, effectivePronunciations, type Pronunciation } from "../../shared/pronunciations.ts";
+import { stripPauseTags } from "../../shared/spoken-script.ts";
 import type { AppConfig } from "../config.ts";
+import * as azure from "./azure.ts";
 import * as minimax from "./minimax.ts";
 import * as systemVoices from "./system-voices.ts";
+import * as xai from "./xai.ts";
 
-export type VoiceProvider = "minimax" | "system";
+import {
+  type HostedTtsProvider,
+  type TtsProvider,
+  isHostedTtsProvider,
+  parseTtsProvider,
+  resolveHostedTtsLadder,
+} from "../../shared/voice-providers.ts";
+import { speakWithFallback } from "./provider-ladder.ts";
 
-export class NoVoiceConfigured extends Error {
-  // a plain field rather than a constructor parameter property: the harness
-  // runs under `node --experimental-strip-types`, which is strip-ONLY, so a
-  // parameter property is rejected at load time even though it typechecks
-  readonly reason: "key" | "voice";
-
-  constructor(reason: "key" | "voice") {
-    super(
-      reason === "key"
-        ? "Add a MiniMax key in Settings on the computer to turn on voice."
-        : "Pick a voice in the agent profile.",
-    );
-    this.reason = reason;
-  }
-}
+export type VoiceProvider = TtsProvider;
+export { NoVoiceConfigured } from "./errors.ts";
+import { NoVoiceConfigured } from "./errors.ts";
 
 export function voiceProvider(cfg: AppConfig): VoiceProvider {
-  if (cfg.tts?.provider === "system") return "system";
-  // Default to MiniMax.  Legacy configs with provider: "elevenlabs" fall
-  // through here and use MiniMax — ElevenLabs support was removed.
+  const explicit = parseTtsProvider(cfg.tts?.provider);
+  if (explicit) return explicit;
+  const ladder = resolveHostedTtsLadder(cfg);
+  if (ladder.length) return ladder[0]!;
+  // Legacy configs with provider: "elevenlabs" fall through here and use
+  // MiniMax — ElevenLabs support was removed.
   return "minimax";
 }
 
@@ -38,6 +41,8 @@ export function voiceProvider(cfg: AppConfig): VoiceProvider {
 export function providerConfigured(cfg: AppConfig): boolean {
   const provider = voiceProvider(cfg);
   if (provider === "system") return systemVoices.systemVoicesAvailable();
+  if (provider === "xai") return Boolean(cfg.xai?.key);
+  if (provider === "azure") return Boolean(cfg.azureSpeech?.key && cfg.azureSpeech?.region);
   return Boolean(cfg.tts?.key);
 }
 
@@ -49,9 +54,10 @@ export function voiceConfigured(cfg: AppConfig): boolean {
   return Boolean(cfg.tts?.key && cfg.tts?.voice);
 }
 
+/** The prefix rule lives in shared/bot-voice.ts so the clients and the
+ * iOS mirror cannot drift from what the harness refuses to synthesize. */
 export function isPersonalVoice(voiceId?: string): boolean {
-  if (!voiceId) return false;
-  return voiceId.startsWith("personal:") || voiceId.startsWith("apple-personal:");
+  return isPersonalVoiceId(voiceId);
 }
 
 /** A per-bot voice is a complete choice too; it should not be blocked just
@@ -67,8 +73,19 @@ export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
   return Boolean(cfg.tts?.key && (voiceId || cfg.tts?.voice));
 }
 
+/** The pronunciation list in force: the saved one, or the seeded defaults
+ * when it has never been saved (shared/pronunciations.ts). */
+export function pronunciations(cfg: AppConfig): readonly Pronunciation[] {
+  return effectivePronunciations(cfg.tts?.pronunciations);
+}
+
+import { DEFAULT_AUDIO_RETENTION_DAYS } from "../attachments.ts";
+
 /** What the settings panel needs. Never includes the key — same write-only
- * rule as every other credential. */
+ * rule as every other credential.  `voice` is the workspace default voice
+ * (every bot without a voice of its own speaks with it); it is a setting,
+ * not a secret, so both clients show it by name.  `pronunciations` is the
+ * list in force, defaults included, so a client never has to know them. */
 export function describeVoice(cfg: AppConfig) {
   return {
     configured: providerConfigured(cfg),
@@ -76,15 +93,25 @@ export function describeVoice(cfg: AppConfig) {
     voice: cfg.tts?.voice || "",
     provider: voiceProvider(cfg),
     optimizedSummary: cfg.tts?.optimizedSummary === true,
+    audioRetentionDays: cfg.tts?.audioRetentionDays ?? DEFAULT_AUDIO_RETENTION_DAYS,
+    pronunciations: pronunciations(cfg).map((entry) => ({ term: entry.term, say: entry.say })),
   };
 }
 
-export function verifyKey(key: string, _cfg: AppConfig) {
+export function verifyKey(key: string, cfg: AppConfig) {
+  const provider = voiceProvider(cfg);
+  if (provider === "xai") return xai.verifyKey((cfg.xai?.key ?? key).trim());
+  if (provider === "azure") {
+    return azure.verifyKey((cfg.azureSpeech?.key ?? key).trim(), cfg.azureSpeech?.region ?? "");
+  }
   return minimax.verifyKey(key);
 }
 
 export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Promise<minimax.Voice[]> {
-  if (voiceProvider(cfg) === "system") return systemVoices.listSystemVoices(run);
+  const provider = voiceProvider(cfg);
+  if (provider === "system") return systemVoices.listSystemVoices(run);
+  if (provider === "xai") return [...xai.CANNED_VOICES];
+  if (provider === "azure") return [...azure.CANNED_VOICES];
   const key = cfg.tts?.key;
   let voices: minimax.Voice[] = [];
   if (key) {
@@ -98,7 +125,7 @@ export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Pro
   }
   if (cfg.tts?.voice && !voices.some((v) => v.id === cfg.tts?.voice)) {
     const defaultVoiceId = cfg.tts.voice;
-    voices.unshift({ id: defaultVoiceId, label: defaultVoiceId, description: "Workspace default" });
+    voices.unshift({ id: defaultVoiceId, label: readableVoiceId(defaultVoiceId), description: "Workspace default" });
   }
   return voices;
 }
@@ -116,24 +143,36 @@ export function listCustomVoices() {
 }
 
 /** Synthesize one utterance. Throws NoVoiceConfigured when there is nothing
- * to speak with, which the route turns into a 409 the client can explain. */
-export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: systemVoices.Runner) {
-  if (isPersonalVoice(voiceId)) {
+ * to speak with, which the route turns into a 409 the client can explain.
+ *
+ * The pronunciation list is applied here, the one layer every hosted and
+ * built-in synthesis goes through (message clips, Try, call mode), and only
+ * to the text sent to the engine: scripts and clip caches never see it, so a
+ * list edit re-bills nothing and applies to new synthesis only.  The list is
+ * idempotent (shared/pronunciations.ts), so text that already says "sequel"
+ * is left as it is. */
+export function speak(cfg: AppConfig, rawText: string, voiceId?: string, run?: systemVoices.Runner) {
+  const provider = voiceProvider(cfg);
+  let text = applyPronunciations(rawText, pronunciations(cfg));
+  // MiniMax pause tags are for that engine only; macOS `say` reads them aloud
+  // or truncates the utterance after the first marker.
+  if (provider === "system") text = stripPauseTags(text);
+  // The workspace default can be a Personal Voice too; it must never reach
+  // a hosted engine as if it were one of that engine's ids.
+  if (isPersonalVoice(voiceId || cfg.tts?.voice)) {
     throw new Error("Apple Personal Voices speak on-device on authorized Apple devices (macOS and iOS) and cannot be synthesized on the server.");
   }
-  if (voiceProvider(cfg) === "system") {
+  if (provider === "system") {
     const voice = voiceId || cfg.tts?.voice;
-    // An injected runner is the cross-platform test seam for `/usr/bin/say`;
-    // production calls omit it and remain strictly Darwin-gated.
-    if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key");
-    if (!voice) throw new NoVoiceConfigured("voice");
-    return systemVoices.synthesizeSystem(text, voice, run);
+    if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key", "system");
+    if (!voice) throw new NoVoiceConfigured("voice", "system");
+  } else {
+    const ladder = resolveHostedTtsLadder(cfg);
+    const hosted: HostedTtsProvider = isHostedTtsProvider(provider) ? provider : "minimax";
+    if (!ladder.length) throw new NoVoiceConfigured("key", hosted);
+    if (provider === "minimax" && !(voiceId || cfg.tts?.voice)) throw new NoVoiceConfigured("voice", "minimax");
   }
-  const key = cfg.tts?.key;
-  if (!key) throw new NoVoiceConfigured("key");
-  const voice = voiceId || cfg.tts?.voice;
-  if (!voice) throw new NoVoiceConfigured("voice");
-  return minimax.synthesize(text, voice, key);
+  return speakWithFallback(cfg, text, voiceId, run);
 }
 
 /** Clone a voice.  The harness route unpacks the base64 body and passes

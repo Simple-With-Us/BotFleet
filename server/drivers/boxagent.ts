@@ -317,7 +317,9 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
         provider: DRIVER_KIND,
         // Jobs matrix: remote, opaque and without MCP — neither jobs nor
         // helpers reach this engine.
-        capabilities: { sessionModelSwitch: "in-session", backgroundJobs: "none", helpers: "none" },
+        // The agent runs on the box and asks nothing here, but its work
+        // events arrive as tool steps, so auto-review can watch them.
+        capabilities: { sessionModelSwitch: "in-session", backgroundJobs: "none", helpers: "none", reviewHook: "after" },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.cancel(),
         respondToRequest: async () => "unavailable" as const, // this engine has no asks to answer

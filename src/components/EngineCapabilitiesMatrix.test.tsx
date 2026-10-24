@@ -42,6 +42,7 @@ import {
 } from "@/lib/engine-capabilities.tsx";
 
 const html = renderToStaticMarkup(createElement(EngineCapabilitiesMatrix));
+const MATRIX_ENGINE_IDS = ENGINE_DISPLAY_ORDER.filter((id) => id !== "box");
 
 /** `renderToStaticMarkup` drops event handlers and class maps that never made
  *  it onto an element, so the behaviour assertions below read the component
@@ -78,11 +79,15 @@ describe("EngineCapabilitiesMatrix layout budget", () => {
 });
 
 describe("EngineCapabilitiesMatrix orientation", () => {
-  it("renders one row per engine", () => {
-    for (const id of ENGINE_DISPLAY_ORDER) {
+  it("renders one row per engine with its platform mark and keeps Box in Computer settings", () => {
+    for (const id of MATRIX_ENGINE_IDS) {
       const entry = ENGINE_CAPABILITIES[id];
       expect(html, `${entry.displayName} row missing`).toContain(entry.displayName);
     }
+    expect(html).not.toContain("ASCII.dev Box");
+    expect(html).toContain("<svg");
+    expect(source).toContain("<ProviderMark");
+    expect(source).not.toContain("entry.capabilityBadgeColor");
   });
 
   it("renders one column per capability", () => {
@@ -107,7 +112,7 @@ describe("EngineCapabilitiesMatrix orientation", () => {
   });
 
   it("gives every cell an accessible name that states the verdict in words", () => {
-    for (const id of ENGINE_DISPLAY_ORDER) {
+    for (const id of MATRIX_ENGINE_IDS) {
       const entry = ENGINE_CAPABILITIES[id];
       for (const key of CAPABILITY_KEYS) {
         const state = entry.capabilities[key];
@@ -119,15 +124,14 @@ describe("EngineCapabilitiesMatrix orientation", () => {
     }
   });
 
-  it("renders a pricing pill for every engine", () => {
-    // The Subscription · $X/mo pill wording is the legacy vocabulary we
-    // kept; pin at least one match across the registered engines.
-    expect(html).toMatch(/Subscription/);
-    // Subscription + API engines emit "Subscription + API · $X/mo";
-    // MiniMax and Grok both qualify, so the string must appear at
-    // least twice.
-    const subscriptionApiMatches = html.match(/Subscription \+ API/g) ?? [];
-    expect(subscriptionApiMatches.length).toBeGreaterThanOrEqual(2);
+  it("renders an access pill for every engine without conflating billing", () => {
+    // Every engine reads CLI or API. "CLI + API" is gone: no engine in the
+    // registry has two drivers, so the compound label described a vendor
+    // surface BotFleet cannot reach rather than one it runs.
+    expect(html).not.toContain("CLI + API");
+    expect(html).toContain("CLI");
+    expect(html).toContain("API");
+    expect(html).not.toContain("Subscription");
   });
 });
 
@@ -174,20 +178,30 @@ describe("EngineCapabilitiesMatrix cell vocabulary", () => {
       /unknown:\s*"[^"]*border-dashed[^"]*"/,
     );
     expect(source).not.toMatch(/unknown:[^"]*bg-inset/);
-    // And the rendered markup agrees: the "?" cells carry the dashed
-    // treatment and none of them carries the "no" background.
-    const unknownCells = html.match(/aria-label="[^"]*: Not audited"[^>]*>/g) ?? [];
-    expect(unknownCells.length, "the registry backfill should leave audited unknowns").toBeGreaterThan(0);
-    for (const cell of unknownCells) {
-      expect(cell).toContain("border-dashed");
-      expect(cell).not.toContain("bg-inset");
+    // Every cell in the default registry is now audited, while an explicit
+    // "unknown" cell still renders with the dashed treatment and never the
+    // "no" background.
+    const defaultUnknownCells = html.match(/aria-label="[^"]*: Not audited"[^>]*>/g) ?? [];
+    expect(defaultUnknownCells.length, "every default registry cell is audited").toBe(0);
+    const prev = ENGINE_CAPABILITIES.qwen.capabilities.webAccess;
+    ENGINE_CAPABILITIES.qwen.capabilities.webAccess = "unknown";
+    try {
+      const withUnknownHtml = renderToStaticMarkup(<EngineCapabilitiesMatrix instances={[]} />);
+      const unknownCells = withUnknownHtml.match(/aria-label="[^"]*: Not audited"[^>]*>/g) ?? [];
+      expect(unknownCells.length).toBe(1);
+      for (const cell of unknownCells) {
+        expect(cell).toContain("border-dashed");
+        expect(cell).not.toContain("bg-inset");
+      }
+    } finally {
+      ENGINE_CAPABILITIES.qwen.capabilities.webAccess = prev;
     }
   });
 
   it("gives every capability note, and every engine a resolvable one", () => {
     for (const key of CAPABILITY_KEYS) {
       expect(CAPABILITY_NOTES[key], `${key} has no capability note`).toBeTruthy();
-      for (const id of ENGINE_DISPLAY_ORDER) {
+      for (const id of MATRIX_ENGINE_IDS) {
         const entry = ENGINE_CAPABILITIES[id];
         expect(capabilityNoteFor(entry, key), `${id}/${key}`).toBeTruthy();
       }

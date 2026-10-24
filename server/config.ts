@@ -3,11 +3,14 @@
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
 import { readFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 
-import { updateConfigFile } from "../electron/config-file-lock.mjs";
+import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
+import { readPersistOnExitPolicy, writePersistOnExitPolicy } from "../electron/persist-on-exit-policy.mjs";
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
+import { dataDir } from "./data-dir.ts";
+import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
 import { resolveKnobFields, stripVaultManagedKnobs } from "./knob-map.ts";
@@ -17,15 +20,39 @@ import {
   STORED_CONVERSATION_MODES,
   type ConversationMode,
 } from "../shared/conversation-mode.ts";
+import { BUSY_SEND_DEFAULTS, type BusySendDefault } from "../shared/busy-send-default.ts";
 import {
   ROOM_LABEL_MAX_LENGTH,
   type CustomRoomLabels,
   type RoomTerminology,
 } from "../shared/terminology.ts";
+import { DEFAULT_MAX_REVIEWS_PER_TURN, MAX_MAX_REVIEWS_PER_TURN, MIN_MAX_REVIEWS_PER_TURN } from "../shared/auto-review.ts";
 import { DEFAULT_VPS_MODE, migrateAllowedComputersToProviders } from "../shared/local-auto-consent.ts";
+import { fsFailureCode, jsonFailureReason, stripBom } from "./store-guard.ts";
+import {
+  checkPronunciations,
+  PronunciationDraftListSchema,
+  sanitizeStoredPronunciations,
+  type Pronunciation,
+} from "../shared/pronunciations.ts";
+import {
+  CALL_STT_PROVIDERS,
+  CLOUD_STT_PROVIDERS,
+  HOSTED_TTS_PROVIDERS,
+  TTS_PROVIDERS,
+} from "../shared/voice-providers.ts";
 
 const optionalText = z.string().optional();
 const externalCredentialStorage = z.literal("external").optional();
+/** The workspace pronunciation list (shared/pronunciations.ts), checked and
+ * canonicalized by the one validator every client also runs.  Absent means
+ * the seeded defaults; a saved list, even an empty one, is used as is. */
+const pronunciationListSchema = PronunciationDraftListSchema.transform((drafts, ctx): Pronunciation[] => {
+  const checked = checkPronunciations(drafts);
+  if (checked.ok) return checked.list;
+  ctx.addIssue({ code: "custom", message: checked.error });
+  return z.NEVER;
+});
 const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
@@ -37,7 +64,8 @@ export const MIN_LOCAL_VM_MAX_INSTANCES = 1;
 export const MAX_LOCAL_VM_MAX_INSTANCES = 4;
 
 export function isValidSshAlias(value: unknown): value is string {
-  return typeof value === "string" && SSH_ALIAS.test(value);
+  if (Object.prototype.toString.call(value) !== "[object String]") return false;
+  return SSH_ALIAS.test(String(value));
 }
 
 /** Custom webhook ingress must be a real origin, not a scheme-less host. */
@@ -241,6 +269,35 @@ const featureConfigSchema = z.object({
   /** Per-turn Git worktree isolation for bots working in a shared repository. */
   gitWorktreeLeases: z.boolean().optional(),
 });
+const zulipConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  dryRun: z.boolean().optional(),
+  realm: optionalText,
+  ownerUserId: z.number().int().positive().optional(),
+  ownerClients: z.array(z.string().trim().min(1)).max(20).optional(),
+  credentialDir: optionalText,
+  credentialSource: z.enum(["file", "infisical"]).optional(),
+  infisicalPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+  // Empty means unset (the harness's own project and environment).
+  infisicalProjectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
+  infisicalEnv: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
+  bots: z
+    .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
+    .optional(),
+  postChannels: z.array(z.string().trim().min(1)).max(50).optional(),
+  autoReply: z.enum(["final", "off"]).optional(),
+  staleMinutes: z.number().int().min(1).max(10_080).optional(),
+  budgets: z
+    .object({
+      dmsPerHour: z.number().int().min(0).max(1000).optional(),
+      peerWakesPerHour: z.number().int().min(0).max(1000).optional(),
+      peerWakesPerTopicPerHour: z.number().int().min(0).max(1000).optional(),
+      ownerWakesPerHour: z.number().int().min(0).max(1000).optional(),
+      peerChainLimit: z.number().int().min(0).max(1000).optional(),
+    })
+    .optional(),
+});
+
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -253,6 +310,7 @@ const instanceConfigMapSchema = z.record(z.string(), instanceConfigSchema);
 const appConfigSchema = z.object({
   deleteInstance: optionalText,
   xai: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  gemini: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   openaiCompat: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   /** MiniMax API key and base URL.  Same shape as `openaiCompat` above and
    * for the same reason: the driver speaks the OpenAI wire protocol against
@@ -276,11 +334,40 @@ const appConfigSchema = z.object({
    * engine does not need the key to function. "for my user" — workspace
    * scope, not per-bot. */
   deepseek: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
-  /** Voice credentials and the selected voice id. `provider` picks the
-   * engine: "minimax" (default; needs a key) or "system" (the Mac's
-   * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
-  callStt: z.object({ provider: z.enum(["apple", "assemblyai"]).nullable().optional(), keyterms: z.array(z.string().trim().min(1)).max(100).optional() }).optional(),
+  /** Voice credentials, the workspace default voice id (what every bot
+   * without a voice of its own speaks with), and the pronunciation list.
+   * `provider` picks the engine; `ladder` overrides hosted fallback order. */
+  tts: z.object({
+    key: optionalText,
+    voice: optionalText,
+    provider: z.enum(TTS_PROVIDERS).optional(),
+    ladder: z.array(z.enum(HOSTED_TTS_PROVIDERS)).max(HOSTED_TTS_PROVIDERS.length).optional(),
+    optimizedSummary: z.boolean().optional(),
+    audioRetentionDays: z.number().int().min(0).max(3650).optional(),
+    pronunciations: pronunciationListSchema.optional(),
+    credentialStorage: externalCredentialStorage,
+  }).strict().optional(),
+  callStt: z.object({
+    provider: z.enum(CALL_STT_PROVIDERS).nullable().optional(),
+    ladder: z.array(z.enum(CLOUD_STT_PROVIDERS)).max(CLOUD_STT_PROVIDERS.length).optional(),
+    keyterms: z.array(z.string().trim().min(1)).max(100).optional(),
+  }).strict().optional(),
+  azureSpeech: z.object({ key: optionalText, region: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  metaSpeech: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  groq: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  assemblyai: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  // Call-mode speech-to-speech.  Opt-in per workspace and deliberately separate
+  // from callStt: an STS provider replaces the whole chained loop rather than
+  // swapping one link of it.  `provider: null` means Auto — use whichever
+  // provider has a key, preferring the configured default.
+  sts: z.object({
+    provider: z.enum(["xai", "gemini"]).nullable().optional(),
+    // Hand real work to the bot's own engine through a function tool.  When
+    // false the model answers alone; when true a slow or failed engine falls
+    // back to the model for that turn and marks the line engineBypassed.
+    frontEngine: z.boolean().optional(),
+    engineTimeoutMs: z.number().int().min(1000).max(120000).optional(),
+  }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   autoUpdate: z
@@ -327,6 +414,12 @@ const appConfigSchema = z.object({
      *  without the operator's explicit consent. */
     allowVoiceByDefault: z.boolean().optional(),
   }).optional(),
+  /** The Zulip source (docs/zulip.md): which BotFleet bots hold a Zulip
+   *  identity, where their keys come from, and the wake and post rules.  No
+   *  key lives here — `credentialDir` names the folder of `<Role>-zuliprc`
+   *  files, and `credentialSource: "infisical"` reads the vault instead.  A malformed section reads as absent rather than failing the
+   *  whole stored config, so a typo turns Zulip off and nothing else. */
+  zulip: zulipConfigSchema.optional().catch(undefined),
   ingress: z.object({
     publicUrl: z
       .string()
@@ -350,6 +443,18 @@ const appConfigSchema = z.object({
     // header pair instead, so it is a separate field, not another API key.
     accessClientId: z.string().optional(),
     accessClientSecret: z.string().optional(),
+  }).optional(),
+  // The fleet's fallback reviewer: the provider instance that reviews a
+  // bot's approvals when the bot's own engine cannot run an isolated review,
+  // or when its own review fails (server/auto-review.ts `reviewersFor`).
+  // Absent or empty is Automatic (the best healthy engine that can review,
+  // shared/auto-review.ts `pickAutoReviewer`), "none" turns it off, and
+  // anything else is the instance id the owner picked.
+  // `maxReviewsPerTurn` caps reviewer calls per turn (a knob, see
+  // server/knob-map.ts); past it On fails closed and Watch stops recording.
+  autoReview: z.object({
+    fallbackReviewer: z.string().max(200).optional(),
+    maxReviewsPerTurn: z.number().int().min(MIN_MAX_REVIEWS_PER_TURN).max(MAX_MAX_REVIEWS_PER_TURN).optional(),
   }).optional(),
   // Usage telemetry has no built-in endpoint: whoever runs BotFleet points
   // it at their own usage monitor. Unconfigured means the stream is off.
@@ -415,6 +520,7 @@ const appConfigSchema = z.object({
   // upgraded install never goes quiet without saying why.
   observability: z.object({
     sentryDsn: optionalText,
+    sentryFleetDsn: optionalText,
     enabled: z.boolean().optional(),
     environment: optionalText,
     tracesSampleRate: z.number().min(0).max(1).optional(),
@@ -439,8 +545,44 @@ const appConfigSchema = z.object({
     credentialStorage: externalCredentialStorage,
     refreshMinutes: z.number().int().min(5).max(1440).optional(),
   }).optional(),
+  // Infisical Agent Proxy settings. Off by default. When enabled, agent CLIs
+  // and child processes route through the local Infisical Agent Proxy
+  // daemon (HTTP_PROXY/HTTPS_PROXY/NO_PROXY and TLS CA certificate injection).
+  agentProxy: z.object({
+    enabled: z.boolean().optional(),
+    address: optionalText,
+    projectId: optionalText,
+    environment: optionalText,
+    secretPath: optionalText,
+    caCertPath: optionalText,
+  }).strict().optional(),
+  // Lifecycle policy for the always-on harness itself: who may wake it, who
+  // may raise the desktop, and what quitting the desktop app does to it.
+  //
+  // Every field is optional and every ABSENT field means the conservative
+  // choice, so an existing config file keeps its behaviour with no migration.
+  // `allowRemoteDesktopLaunch` defaults to false because the path it guards
+  // reaches this Mac from a phone: the Companion sidecar replays a device
+  // request to 127.0.0.1, which satisfies the loopback-only check in the
+  // harness by construction (companion/src/proxy.ts says so in its header).
+  // A named permission that is off until asked for is the only defensible
+  // default for that.
+  //
+  // `persistOnExit` defaults to TRUE, deliberately, and is the one place this
+  // section does not take the conservative option.  False means quitting the
+  // desktop app tears down the harness and the local VM.  The harness is
+  // launchd-supervised and is documented as always-on in MAC-LOCAL-PROCESSES,
+  // and every paired phone depends on it answering after the window closes;
+  // defaulting this to false would turn a normal quit into an outage.  The
+  // native Mac app is the thing that wants false, and it does not exist yet —
+  // when it lands it opts in here explicitly rather than inheriting it.
+  server: z.object({
+    allowRemoteDesktopLaunch: z.boolean().optional(),
+    persistOnExit: z.boolean().optional(),
+  }).strict().optional(),
   features: featureConfigSchema.optional(),
   conversationMode: z.enum(STORED_CONVERSATION_MODES).optional(),
+  busySendDefault: z.enum(BUSY_SEND_DEFAULTS).optional(),
   terminology: z
     .enum(["channels", "groups", "projects", "apps", "topics", "repos", "custom"])
     .optional(),
@@ -453,6 +595,8 @@ const appConfigSchema = z.object({
     })
     .optional(),
   instances: instanceConfigMapSchema.optional(),
+  /** Owner-managed MCP servers (Claude/Cursor `mcpServers` shape). */
+  mcpServers: z.record(z.string(), z.json()).optional(),
 });
 // `deleteInstance` also lives on the base schema (saveConfig's internal
 // callers use appConfigSchema.partial() directly, not this schema) but must
@@ -461,12 +605,17 @@ const appConfigSchema = z.object({
 // check, busy-bot check, atomic reassignment), so accepting it here would let
 // `PATCH /api/config {"deleteInstance":"claude"}` bypass all of them and
 // strand bots on a protected engine that no longer exists.
-const appConfigPatchSchema = appConfigSchema.omit({ instances: true, deleteInstance: true });
+// A save is strict about the Zulip section (a bad value is a 400 the panel
+// can show), while a stored file stays lenient (a bad value turns Zulip off).
+const appConfigPatchSchema = appConfigSchema
+  .omit({ instances: true, deleteInstance: true })
+  .extend({ zulip: zulipConfigSchema.optional() });
 const jsonObjectSchema = z.record(z.string(), z.json());
 
 export interface AppConfig {
   deleteInstance?: string;
   xai?: { key?: string; url?: string; credentialStorage?: "external" };
+  gemini?: { key?: string; credentialStorage?: "external" };
   openaiCompat?: { key?: string; url?: string; credentialStorage?: "external" };
   minimax?: { key?: string; url?: string; credentialStorage?: "external" };
   composio?: { apiKey?: string; userId?: string; sessionId?: string; brokerUrl?: string; credentialStorage?: "external" };
@@ -475,16 +624,36 @@ export interface AppConfig {
   vps?: { sshAlias?: string; memoryGib?: number; cpus?: number };
   opencodeGo?: { apiKey?: string; credentialStorage?: "external" };
   deepseek?: { key?: string; url?: string; credentialStorage?: "external" };
-  tts?: { key?: string; voice?: string; provider?: "minimax" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
+  /** `voice` is the workspace default voice; `pronunciations` is the
+   *  workspace list of terms and how to say them (shared/pronunciations.ts),
+   *  absent until first saved, which means the seeded defaults. */
+  tts?: {
+    key?: string;
+    voice?: string;
+    provider?: (typeof TTS_PROVIDERS)[number];
+    ladder?: Array<(typeof HOSTED_TTS_PROVIDERS)[number]>;
+    optimizedSummary?: boolean;
+    audioRetentionDays?: number;
+    pronunciations?: Pronunciation[];
+    credentialStorage?: "external";
+  };
   /** Call-mode dictation. The picker in `src/lib/transcription-provider.ts`
    *  falls back to platform defaults when `provider` is absent (Apple on
-   *  macOS without a cloud key, AssemblyAI on every other platform, and
-   *  AssemblyAI on macOS the moment a key lands). `keyterms` is the global
-   *  vocabulary the model is told to spell correctly — bot names, model
-   *  handles, product jargon that `format_turns` alone still mangles. */
+   *  macOS without a cloud key, cloud providers when keys land).
+   *  `keyterms` is the global vocabulary the model is told to spell correctly. */
   callStt?: {
-    provider?: "apple" | "assemblyai" | null;
+    provider?: (typeof CALL_STT_PROVIDERS)[number] | null;
+    ladder?: Array<(typeof CLOUD_STT_PROVIDERS)[number]>;
     keyterms?: string[];
+  };
+  azureSpeech?: { key?: string; region?: string; credentialStorage?: "external" };
+  metaSpeech?: { key?: string; credentialStorage?: "external" };
+  groq?: { key?: string; credentialStorage?: "external" };
+  assemblyai?: { key?: string; credentialStorage?: "external" };
+  sts?: {
+    provider?: "xai" | "gemini" | null;
+    frontEngine?: boolean;
+    engineTimeoutMs?: number;
   };
   imageGen?: { key?: string; credentialStorage?: "external" };
   autoUpdate?: {
@@ -540,6 +709,8 @@ export interface AppConfig {
     allowVoiceByDefault?: boolean;
   };
   ingress?: { publicUrl?: string; enabled?: boolean };
+  /** The Zulip source (docs/zulip.md, server/zulip/types.ts). */
+  zulip?: import("./zulip/types.ts").ZulipSettings;
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
   localVm?: {
@@ -580,6 +751,14 @@ export interface AppConfig {
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;
   };
+  /** Who reviews a bot's approvals when its own engine cannot, and how many
+   *  reviews one turn may spend. */
+  autoReview?: {
+    /** Empty or absent is Automatic, "none" is off, else an instance id. */
+    fallbackReviewer?: string;
+    /** Reviewer calls per turn.  Absent means DEFAULT_MAX_REVIEWS_PER_TURN. */
+    maxReviewsPerTurn?: number;
+  };
   usage?: {
     ingestUrl?: string;
     ingestToken?: string;
@@ -602,6 +781,7 @@ export interface AppConfig {
    * it off on purpose. */
   observability?: {
     sentryDsn?: string;
+    sentryFleetDsn?: string;
     enabled?: boolean;
     environment?: string;
     tracesSampleRate?: number;
@@ -631,6 +811,24 @@ export interface AppConfig {
     credentialStorage?: "external";
     refreshMinutes?: number;
   };
+  /** Infisical Agent Proxy settings. Off by default. */
+  agentProxy?: {
+    enabled?: boolean;
+    address?: string;
+    projectId?: string;
+    environment?: string;
+    secretPath?: string;
+    caCertPath?: string;
+  };
+  /** Lifecycle policy for the always-on harness.  Absent means the
+   *  conservative choice for every field; see the zod schema above for why
+   *  `persistOnExit` is the exception. */
+  server?: {
+    /** May a paired phone raise the BotFleet window on this Mac? */
+    allowRemoteDesktopLaunch?: boolean;
+    /** Does the harness outlive the desktop app's window? */
+    persistOnExit?: boolean;
+  };
   /** Opt-in product experiments. Every flag defaults to disabled. */
   features?: {
     skillRecorder?: boolean;
@@ -640,6 +838,8 @@ export interface AppConfig {
   };
   /** How the roster and threads are laid out.  Absent means simple. */
   conversationMode?: ConversationMode;
+  /** Default delivery while a bot turn is busy.  Absent means steer-first. */
+  busySendDefault?: BusySendDefault;
   /** What this person calls a room: one of the presets, or "custom" with a
    * word of their own in `terminologyCustom`.  Absent means channels. */
   terminology?: RoomTerminology;
@@ -647,6 +847,8 @@ export interface AppConfig {
    * `terminology` is "custom"; resolved for clients by `resolveRoomLabels`. */
   terminologyCustom?: CustomRoomLabels;
   instances?: InstanceConfigMap;
+  /** Owner-managed MCP servers (Claude/Cursor `mcpServers` shape). */
+  mcpServers?: Record<string, JsonValue>;
 }
 export type ConfigPatch = Omit<z.output<typeof appConfigPatchSchema>, "conversationMode"> & {
   conversationMode?: ConversationMode;
@@ -662,6 +864,20 @@ export function parseStoredConfig(value: JsonValue): AppConfig {
       value.tts.provider === "elevenlabs") {
     value = { ...value, tts: { ...value.tts, provider: "minimax" } };
   }
+  // A hand-edited pronunciation list must not cost every other setting: the
+  // strict schema below would reject the whole file over one bad entry, and
+  // loadConfig reads a rejection as a first run.  Keep the entries that pass
+  // on their own; a value that is not a list at all reads as never saved.
+  if (value && typeof value === "object" && !Array.isArray(value) &&
+      value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
+      Object.hasOwn(value.tts, "pronunciations")) {
+    const { pronunciations: stored, ...ttsRest } = value.tts;
+    const kept = sanitizeStoredPronunciations(stored);
+    value = {
+      ...value,
+      tts: kept === undefined ? ttsRest : { ...ttsRest, pronunciations: kept.map(({ term, say }) => ({ term, say })) },
+    };
+  }
   const parsed = appConfigSchema.safeParse(value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
   return {
@@ -674,7 +890,7 @@ export function parseStoredConfig(value: JsonValue): AppConfig {
 
 export function parseConfigPatch(value: JsonValue): ConfigPatch {
   if (value && typeof value === "object" && !Array.isArray(value)) {
-    for (const section of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "imageGen", "infisical"]) {
+    for (const section of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "infisical"]) {
       const candidate = value[section];
       if (candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
           Object.hasOwn(candidate, "credentialStorage")) {
@@ -696,6 +912,10 @@ export function parseConfigPatch(value: JsonValue): ConfigPatch {
   const sentryDsn = rest.observability?.sentryDsn;
   if (sentryDsn !== undefined && sentryDsn.trim() && !isSentryDsn(sentryDsn)) {
     throw Object.assign(new Error("observability.sentryDsn must be a Sentry https:// DSN"), { status: 400 });
+  }
+  const sentryFleetDsn = rest.observability?.sentryFleetDsn;
+  if (sentryFleetDsn !== undefined && sentryFleetDsn.trim() && !isSentryDsn(sentryFleetDsn)) {
+    throw Object.assign(new Error("observability.sentryFleetDsn must be a Sentry https:// DSN"), { status: 400 });
   }
   const sentryEnvironment = rest.observability?.environment;
   if (
@@ -803,6 +1023,21 @@ export function usageIngestUrl(cfg: AppConfig): string | null {
 /** Project classification rules, in the order they should be consulted.
  * Rules with no usable slug or no match terms are dropped. */
 /** Local subscription caps divert auto-fallback unless turned off. */
+/** The stored fallback-reviewer setting: null for Automatic, "none" for off,
+ *  or the instance id the owner picked (shared/auto-review.ts
+ *  `fallbackReviewerSetting` reads it). */
+export function autoReviewFallbackReviewer(cfg: AppConfig): string | null {
+  const id = cfg.autoReview?.fallbackReviewer?.trim();
+  return id ? id : null;
+}
+
+/** Reviewer calls one turn may spend, clamped to the knob's bounds. */
+export function autoReviewMaxPerTurn(cfg: AppConfig): number {
+  const value = cfg.autoReview?.maxReviewsPerTurn ?? Number.NaN;
+  if (!Number.isFinite(value)) return DEFAULT_MAX_REVIEWS_PER_TURN;
+  return Math.min(MAX_MAX_REVIEWS_PER_TURN, Math.max(MIN_MAX_REVIEWS_PER_TURN, Math.floor(value)));
+}
+
 export function localQuotaRoutingEnabled(cfg: AppConfig): boolean {
   return cfg.usage?.localQuotaRouting !== false;
 }
@@ -830,6 +1065,7 @@ export const DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE = 0.1;
  * own project or nothing, because BotFleet ships no DSN. */
 export interface ObservabilitySettings {
   dsn: string | null;
+  fleetDsn: string | null;
   enabled: boolean;
   environment: string;
   tracesSampleRate: number;
@@ -844,6 +1080,11 @@ export interface ObservabilitySettings {
  * status card instead of disappearing as "not configured". */
 export function sentryDsnConfigured(cfg: AppConfig): string | null {
   const raw = cfg.observability?.sentryDsn?.trim();
+  return raw || null;
+}
+
+export function sentryFleetDsnConfigured(cfg: AppConfig): string | null {
+  const raw = cfg.observability?.sentryFleetDsn?.trim();
   return raw || null;
 }
 
@@ -887,6 +1128,7 @@ export function observabilitySettings(cfg: AppConfig): ObservabilitySettings {
     "production";
   return {
     dsn: sentryDsnConfigured(cfg),
+    fleetDsn: sentryFleetDsnConfigured(cfg),
     enabled: observabilityEnabled(cfg),
     environment: environment.slice(0, MAX_OBSERVABILITY_ENVIRONMENT_LENGTH),
     tracesSampleRate: Math.min(Math.max(rate, 0), 1),
@@ -961,6 +1203,118 @@ export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
   };
 }
 
+export const DEFAULT_AGENT_PROXY_ADDRESS = "127.0.0.1:17322";
+export const DEFAULT_AGENT_PROXY_ENVIRONMENT = "prod";
+export const DEFAULT_AGENT_PROXY_SECRET_PATH = "/";
+
+export interface AgentProxySettings {
+  enabled: boolean;
+  address: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+  caCertPath?: string;
+}
+
+/** The explicit toggle for Infisical Agent Proxy.  Off by default. */
+export function agentProxyEnabled(cfg: AppConfig): boolean {
+  return cfg.agentProxy?.enabled === true;
+}
+
+/** May a paired phone raise the BotFleet window on this computer?
+ *
+ *  Off unless the owner turned it on.  This is the only thing standing
+ *  between a phone on someone else's network and a window appearing on this
+ *  Mac, because the sidecar replays the device request to 127.0.0.1 and the
+ *  harness's loopback-only check on `/api/desktop/open` is satisfied by
+ *  that replay rather than by the caller actually being local. */
+export function remoteDesktopLaunchAllowed(cfg: AppConfig): boolean {
+  return cfg.server?.allowRemoteDesktopLaunch === true;
+}
+
+/** Does the harness outlive the desktop app's window?
+ *
+ *  True when unset: the harness is launchd-supervised and documented as
+ *  always-on, so a quit that tore it down would strand every paired phone.
+ *
+ *  Deliberately not consumed by this file's callers.  The one place that has
+ *  to act on it is Electron's quit path, and `electron/main.mjs` is plain ESM
+ *  that cannot import this TypeScript module — so it reads the field from the
+ *  config file directly, with its own copy of the `!== false` default.  That
+ *  duplicated default is the thing to watch: if it is ever changed here it
+ *  must be changed there in the same commit, or quitting the app will quietly
+ *  do something other than what this comment says. */
+export const SERVER_PERSISTS_ON_EXIT_WHEN_UNSET = true;
+
+/** Resolve stored Agent Proxy settings against defaults. */
+export function agentProxySettings(cfg: AppConfig): AgentProxySettings {
+  const stored = cfg.agentProxy ?? {};
+  return {
+    enabled: agentProxyEnabled(cfg),
+    address: stored.address?.trim() || DEFAULT_AGENT_PROXY_ADDRESS,
+    projectId: stored.projectId?.trim() || cfg.infisical?.projectId?.trim() || "",
+    environment: stored.environment?.trim() || cfg.infisical?.environment?.trim() || DEFAULT_AGENT_PROXY_ENVIRONMENT,
+    secretPath: stored.secretPath?.trim() || cfg.infisical?.secretPath?.trim() || DEFAULT_AGENT_PROXY_SECRET_PATH,
+    caCertPath: stored.caCertPath?.trim() || undefined,
+  };
+}
+
+/**
+ * Injects proxy environment variables into a process environment when
+ * Agent Proxy is enabled.  When disabled, returns the input baseEnv untouched.
+ *
+ * Precedence: the proxy URL variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+ * `ALL_PROXY`, `NO_PROXY`) keep whatever the caller already set, so a
+ * deliberate corporate proxy is never silently replaced.  Everything the
+ * operator configured under `agentProxy` (address, routing ids, CA path) wins
+ * over an ambient `INFISICAL_*`, `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS` the
+ * harness happened to inherit.  A routing id that only fell back to
+ * BotFleet's own Infisical settings never displaces an inherited one.
+ */
+export function applyAgentProxyEnv(
+  cfg: AppConfig,
+  baseEnv?: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv | undefined {
+  if (!agentProxyEnabled(cfg)) return baseEnv;
+  const settings = agentProxySettings(cfg);
+  const stored = cfg.agentProxy ?? {};
+  const proxyUrl = `http://${settings.address}`;
+  const env: NodeJS.ProcessEnv = { ...(baseEnv ?? process.env) };
+  if (!env.HTTP_PROXY && !env.http_proxy) {
+    env.HTTP_PROXY = proxyUrl;
+    env.http_proxy = proxyUrl;
+  }
+  if (!env.HTTPS_PROXY && !env.https_proxy) {
+    env.HTTPS_PROXY = proxyUrl;
+    env.https_proxy = proxyUrl;
+  }
+  if (!env.ALL_PROXY && !env.all_proxy) {
+    env.ALL_PROXY = proxyUrl;
+    env.all_proxy = proxyUrl;
+  }
+  if (!env.NO_PROXY && !env.no_proxy) {
+    env.NO_PROXY = "localhost,127.0.0.1";
+    env.no_proxy = "localhost,127.0.0.1";
+  }
+  // The resolved address already folds in an ambient INFISICAL_AGENT_PROXY_ADDRESS
+  // (loadConfig) and the vault knob, and it is what the proxy URLs above are
+  // built from, so the two must never disagree.
+  env.INFISICAL_AGENT_PROXY_ADDRESS = settings.address;
+  const routing: Array<[key: string, resolved: string, explicit: string | undefined]> = [
+    ["INFISICAL_PROJECT_ID", settings.projectId, stored.projectId],
+    ["INFISICAL_ENVIRONMENT", settings.environment, stored.environment],
+    ["INFISICAL_SECRET_PATH", settings.secretPath, stored.secretPath],
+  ];
+  for (const [key, resolved, explicit] of routing) {
+    if (resolved && (explicit?.trim() || !env[key])) env[key] = resolved;
+  }
+  if (settings.caCertPath) {
+    env.SSL_CERT_FILE = settings.caCertPath;
+    env.NODE_EXTRA_CA_CERTS = settings.caCertPath;
+  }
+  return env;
+}
+
 export function localVmMaxInstances(cfg: AppConfig): number {
   return cfg.localVm?.maxInstances ?? DEFAULT_LOCAL_VM_MAX_INSTANCES;
 }
@@ -1014,8 +1368,10 @@ export function summarizeToolCallsEnabled(cfg: AppConfig): boolean {
   return cfg.features?.summarizeToolCalls !== false;
 }
 
-// OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
-export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet");
+// OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.  dataDir() applies the
+// same trim-and-blank rule the desktop app does (electron/app-paths.mjs), so both processes
+// resolve one directory.
+export const DATA_DIR = dataDir();
 const LEGACY_HOME_DATA_DIRS = [".openmausbot", ".opengrokbot"] as const;
 export const EVENTS_DIR = join(DATA_DIR, "events");
 export const NATIVE_DIR = join(DATA_DIR, "native");
@@ -1124,12 +1480,171 @@ export function migrateComputerProvidersConfig(cfg: AppConfig): boolean {
   return true;
 }
 
-export function loadConfig(): AppConfig {
-  let cfg: AppConfig = {};
+/** What reading config.json turned up besides the settings themselves. */
+interface StoredConfigProblem {
+  /** "config-ignored": nothing in the file was usable.  "config-partial": some sections were left out. */
+  kind: "config-ignored" | "config-partial";
+  /** For the log and the notice.  Built from paths and error codes only, never from values. */
+  reason: string;
+  sections: string[];
+}
+
+interface StoredConfigRead {
+  config: AppConfig;
+  problem: StoredConfigProblem | null;
+}
+
+/** The sections of config.json this build understands.  Salvage keeps only these, so a key it has
+ * never heard of (a newer build's, or a hostile one such as `__proto__`) never reaches the config. */
+const STORED_CONFIG_SECTIONS: ReadonlySet<string> = new Set<string>(appConfigSchema.keyof().options);
+
+/** The last problem reported, so a file that stays broken is reported once rather than on every
+ * loadConfig() call, which routes make per request.  A clean read resets it, so a file that is
+ * repaired and then breaks again is reported again. */
+let lastStoredConfigWarning: string | null = null;
+
+function ignoredConfig(reason: string): StoredConfigRead {
+  return { config: {}, problem: { kind: "config-ignored", reason, sections: [] } };
+}
+
+/** Keep every section of an invalid config.json that validates on its own, and report the rest.
+ * Inside `instances` the unit is one engine entry, because dropping the whole map reroutes every
+ * engine to its default for the sake of one bad field.  Each piece is validated with the same
+ * parseStoredConfig the whole file goes through, so the legacy-value rewrites apply here too. */
+function salvageStoredConfig(stored: JsonObject): StoredConfigRead {
+  const usable: JsonObject = {};
+  const issues: string[] = [];
+  const left: string[] = [];
+  for (const [section, value] of Object.entries(stored)) {
+    if (!STORED_CONFIG_SECTIONS.has(section)) continue;
+    try {
+      parseStoredConfig({ [section]: value });
+      usable[section] = value;
+      continue;
+    } catch (error) {
+      const entries = section === "instances" ? jsonObjectSchema.safeParse(value) : null;
+      if (!entries?.success) {
+        issues.push(error instanceof Error ? error.message : `${section} is invalid`);
+        left.push(section);
+        continue;
+      }
+      const kept: Array<[string, JsonValue]> = [];
+      for (const [id, entry] of Object.entries(entries.data)) {
+        try {
+          parseStoredConfig({ [section]: { [id]: entry } });
+          kept.push([id, entry]);
+        } catch (entryError) {
+          issues.push(entryError instanceof Error ? entryError.message : `${section}.${id} is invalid`);
+          left.push(`${section}.${id}`);
+        }
+      }
+      if (kept.length > 0) usable[section] = Object.fromEntries(kept);
+    }
+  }
+  // Nothing survived: every setting was left out, so this is a total loss —
+  // the same "using defaults" notice as an unreadable file, not a partial one
+  // that claims the rest of the file is in use.
+  if (Object.keys(usable).length === 0) return ignoredConfig(issues.join("; "));
+  return {
+    config: parseStoredConfig(usable),
+    problem: { kind: "config-partial", reason: issues.join("; "), sections: left },
+  };
+}
+
+/** The set-aside files in `dir`.
+ *
+ * `findSetAsideFiles` is a synchronous read of the whole data directory, and that directory grows
+ * one message file per thread, so asking on every `loadConfig()` would put an O(files in the data
+ * directory) read on a request path — `loadConfig()` is called per turn from the Linq webhook, the
+ * tool lane and the index, and a fresh install has no config.json at all, which is the very branch
+ * that asks.  A directory mtime/ctime/size stamp was tried here as a cheap change signal, but it is
+ * not reliable: a `writeFileSync` of a set-aside into the data directory left mtime, ctime and size
+ * unchanged on the windows-latest runner and on this Linux box, so a cached stamp returned a stale
+ * empty listing and `loadConfig()` after the first-run read reported a first run over a quarantined
+ * file for the life of the process (the "still sees a set-aside file that appears after an earlier
+ * first-run read" test).  The stamp is therefore not trusted to skip `findSetAsideFiles`; the
+ * directory is read every time.  The hot-path cost — one `readdirSync` plus a handful of `statSync`
+ * calls per `loadConfig()` — is accepted; the contract that a new set-aside is always seen is not
+ * worth trading for it. */
+function setAsideFilesIn(dir: string): SetAsideFile[] {
+  return findSetAsideFiles(dir);
+}
+
+/** Read config.json.  Silent only when the file does not exist AND nothing of it is lying around, which
+ * is a first run; every other way of not getting a full config out of it is a problem the caller
+ * reports. */
+function readStoredConfig(path: string): StoredConfigRead {
+  let text: string;
   try {
-    cfg = parseStoredConfig(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")));
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    const code = fsFailureCode(error instanceof Error ? error : new Error(String(error)));
+    if (code !== "ENOENT") return ignoredConfig(`it could not be read (${code})`);
+    // A missing config.json is a first run only when nothing of it is left
+    // over.  The config lock renames the old file aside and then renames the
+    // staged one over it, and a process that dies between those two adjacent
+    // syscalls leaves the file absent with its contents sitting in the
+    // set-aside.  Reading that as a first run would put BotFleet on defaults
+    // with no fault, no log and no banner — the exact silent loss this branch
+    // exists to prevent.  registerLeftOverSetAsideFiles would also raise it,
+    // but only once it runs, and only as history; this branch runs on the read
+    // itself and says which file is waiting, so the two cannot both be quiet.
+    const leftOver = setAsideFilesIn(dirname(path)).find((entry) => entry.file === basename(path));
+    return leftOver
+      ? ignoredConfig(`it is missing, but an earlier copy of it was set aside as ${leftOver.name}, so these are not first-run settings`)
+      : { config: {}, problem: null };
+  }
+  const body = stripBom(text);
+  if (body.trim() === "") return ignoredConfig("it is empty");
+  let parsed: JsonValue;
+  try {
+    parsed = parseJson(body);
+  } catch (error) {
+    return ignoredConfig(jsonFailureReason(error instanceof Error ? error : new Error(String(error)), body.length));
+  }
+  try {
+    return { config: parseStoredConfig(parsed), problem: null };
   } catch {
-    /* first run — env fallbacks below */
+    const asObject = jsonObjectSchema.safeParse(parsed);
+    return asObject.success ? salvageStoredConfig(asObject.data) : ignoredConfig("it must hold a JSON object");
+  }
+}
+
+function reportStoredConfig(path: string, problem: StoredConfigProblem | null): void {
+  if (!problem) {
+    lastStoredConfigWarning = null;
+    clearDataFault("config.json", ["config-ignored", "config-partial"]);
+    return;
+  }
+  const message =
+    problem.kind === "config-ignored"
+      ? `config: ignoring ${path} and using defaults because ${problem.reason}.  The file itself was not changed.`
+      : `config: ${path} has settings BotFleet could not use, and they were left out: ${problem.reason}.  Every other setting in the file is in use.  The file itself was not changed.`;
+  if (message !== lastStoredConfigWarning) {
+    lastStoredConfigWarning = message;
+    console.warn(message);
+  }
+  recordDataFault({
+    file: "config.json",
+    kind: problem.kind,
+    reason: problem.reason,
+    setAsideAs: null,
+    omitted: 0,
+    sections: problem.sections,
+    writesRefused: false,
+    holdsCleanup: false,
+    at: Date.now(),
+  });
+}
+
+export function loadConfig(): AppConfig {
+  const configPath = join(DATA_DIR, "config.json");
+  const stored = readStoredConfig(configPath);
+  reportStoredConfig(configPath, stored.problem);
+  const cfg: AppConfig = stored.config;
+  const persistOnExitPolicy = readPersistOnExitPolicy(DATA_DIR);
+  if (persistOnExitPolicy !== null) {
+    cfg.server = { ...cfg.server, persistOnExit: persistOnExitPolicy };
   }
   // these secrets OS-encrypted and hands them to this process as env at
   // spawn, leaving config.json without the plaintext field — so the file
@@ -1173,6 +1688,15 @@ export function loadConfig(): AppConfig {
   if (process.env.DEEPSEEK_URL !== undefined) cfg.deepseek.url = process.env.DEEPSEEK_URL;
   cfg.tts = { ...cfg.tts };
   if (process.env.OMB_TTS_KEY !== undefined) cfg.tts.key = process.env.OMB_TTS_KEY;
+  cfg.azureSpeech = { ...cfg.azureSpeech };
+  if (process.env.AZURE_SPEECH_KEY !== undefined) cfg.azureSpeech.key = process.env.AZURE_SPEECH_KEY;
+  if (process.env.AZURE_SPEECH_REGION !== undefined) cfg.azureSpeech.region = process.env.AZURE_SPEECH_REGION;
+  cfg.metaSpeech = { ...cfg.metaSpeech };
+  if (process.env.META_SPEECH_API_KEY !== undefined) cfg.metaSpeech.key = process.env.META_SPEECH_API_KEY;
+  cfg.groq = { ...cfg.groq };
+  if (process.env.GROQ_API_KEY !== undefined) cfg.groq.key = process.env.GROQ_API_KEY;
+  cfg.assemblyai = { ...cfg.assemblyai };
+  if (process.env.ASSEMBLYAI_API_KEY !== undefined) cfg.assemblyai.key = process.env.ASSEMBLYAI_API_KEY;
   cfg.imageGen = { ...cfg.imageGen };
   if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
   // The secret store's own machine identity, which is the one credential pair
@@ -1193,6 +1717,22 @@ export function loadConfig(): AppConfig {
   for (const [field, names] of identity) {
     const name = names.find((candidate) => process.env[candidate] !== undefined);
     if (name !== undefined) cfg.infisical[field] = process.env[name];
+  }
+  cfg.agentProxy = { ...cfg.agentProxy };
+  if (process.env.INFISICAL_AGENT_PROXY_ENABLED !== undefined) {
+    const raw = process.env.INFISICAL_AGENT_PROXY_ENABLED.trim().toLowerCase();
+    cfg.agentProxy.enabled = raw === "true" || raw === "1" || raw === "yes";
+  }
+  const proxyFields: Array<[field: "address" | "projectId" | "environment" | "secretPath" | "caCertPath", names: string[]]> = [
+    ["address", ["INFISICAL_AGENT_PROXY_ADDRESS"]],
+    ["projectId", ["INFISICAL_AGENT_PROXY_PROJECT_ID"]],
+    ["environment", ["INFISICAL_AGENT_PROXY_ENV", "INFISICAL_AGENT_PROXY_ENVIRONMENT"]],
+    ["secretPath", ["INFISICAL_AGENT_PROXY_PATH", "INFISICAL_AGENT_PROXY_SECRET_PATH"]],
+    ["caCertPath", ["INFISICAL_AGENT_PROXY_CA_CERT_PATH", "INFISICAL_AGENT_PROXY_CA_CERT"]],
+  ];
+  for (const [field, names] of proxyFields) {
+    const name = names.find((candidate) => process.env[candidate] !== undefined);
+    if (name !== undefined) cfg.agentProxy[field] = process.env[name];
   }
   // One resolution point, last: whatever the store holds for a mapped name
   // overwrites what env and file just agreed on, and the provenance of every
@@ -1243,6 +1783,10 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
     // stay invisible to this process until the next launch.
     [patch.deepseek?.key, "DEEPSEEK_API_KEY"],
     [patch.tts?.key, "OMB_TTS_KEY"],
+    [patch.azureSpeech?.key, "AZURE_SPEECH_KEY"],
+    [patch.metaSpeech?.key, "META_SPEECH_API_KEY"],
+    [patch.groq?.key, "GROQ_API_KEY"],
+    [patch.assemblyai?.key, "ASSEMBLYAI_API_KEY"],
     [patch.imageGen?.key, "OMB_OPENAI_IMAGE_KEY"],
     [patch.usage?.ingestUrl, "USAGE_MONITOR_INGEST_URL"],
     [patch.usage?.ingestToken, "USAGE_MONITOR_INGEST_TOKEN"],
@@ -1268,6 +1812,10 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
   if (patch.deepseek?.url !== undefined) {
     if (patch.deepseek.url) process.env["DEEPSEEK_URL"] = patch.deepseek.url;
     else delete process.env["DEEPSEEK_URL"];
+  }
+  if (patch.azureSpeech?.region !== undefined) {
+    if (patch.azureSpeech.region) process.env["AZURE_SPEECH_REGION"] = patch.azureSpeech.region;
+    else delete process.env["AZURE_SPEECH_REGION"];
   }
   if (patch.infisical?.clientId !== undefined) {
     if (patch.infisical.clientId) process.env["INFISICAL_CLIENT_ID"] = patch.infisical.clientId;
@@ -1300,6 +1848,11 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
   "OMB_TTS_KEY",
+  "AZURE_SPEECH_KEY",
+  "AZURE_SPEECH_REGION",
+  "META_SPEECH_API_KEY",
+  "GROQ_API_KEY",
+  "ASSEMBLYAI_API_KEY",
   "OMB_OPENAI_IMAGE_KEY",
   "COMPOSIO_API_KEY",
   "OMB_COMPOSIO_BROKER_TOKEN",
@@ -1356,7 +1909,21 @@ export const PROVIDER_CREDENTIAL_ENV = [
  * echoed back — callers report configured-or-not booleans only). */
 type CheckedConfigPatch = z.infer<ReturnType<typeof appConfigSchema.partial>>;
 
-type ExternalCredentialSection = "xai" | "openaiCompat" | "minimax" | "composio" | "box" | "opencodeGo" | "deepseek" | "tts" | "imageGen" | "infisical";
+type ExternalCredentialSection =
+  | "xai"
+  | "openaiCompat"
+  | "minimax"
+  | "composio"
+  | "box"
+  | "opencodeGo"
+  | "deepseek"
+  | "tts"
+  | "azureSpeech"
+  | "metaSpeech"
+  | "groq"
+  | "assemblyai"
+  | "imageGen"
+  | "infisical";
 
 export function saveConfig(
   patch: Partial<AppConfig>,
@@ -1385,6 +1952,7 @@ export function saveConfig(
   // does not get baked into `~/.botfleet/config.json` either, or the file
   // starts shadowing the store it is supposed to defer to.  Knob values are
   // not sensitive, so this is about authority, not cleartext.
+  // SAFETY: same partial-config invariant as `stripVaultManagedValues` above.
   const strippedKnobsFromDisk = stripVaultManagedKnobs(checkedPatch as Partial<AppConfig>);
   if (strippedKnobsFromDisk.length > 0) {
     console.warn(`[secrets] not persisting vault-managed knobs: ${strippedKnobsFromDisk.join(", ")}`);
@@ -1405,7 +1973,31 @@ export function saveConfig(
       merged[section] = next;
     }
     return merged;
-  }, { mode: 0o600 });
+  }, { mode: 0o600, onSetAside: reportConfigSetAside });
+  if (checkedPatch.server?.persistOnExit !== undefined) {
+    writePersistOnExitPolicy(DATA_DIR, checkedPatch.server.persistOnExit);
+  }
+}
+
+/** updateConfigFile renamed an unusable config.json aside just before replacing it.  Say so in the
+ * log and in the app: the new file holds this save and nothing else, so the owner needs to know
+ * where the rest of their settings went. */
+function reportConfigSetAside(info: ConfigFileSetAside): void {
+  const to = info.setAsidePath;
+  console.error(
+    `config: ${info.path} could not be used because ${info.reason}.  ${to ? `Moved it to ${to}` : "It had already been moved aside"} and saved this change into a new file.  Nothing was deleted.  Settings that were only in the old file are not in effect until you copy them across.`,
+  );
+  recordDataFault({
+    file: "config.json",
+    kind: "set-aside",
+    reason: info.reason,
+    setAsideAs: to ? basename(to) : null,
+    omitted: 0,
+    sections: [],
+    writesRefused: false,
+    holdsCleanup: false,
+    at: Date.now(),
+  });
 }
 
 /** Merge a validated patch into the parsed on-disk object.  Runs under the
@@ -1429,7 +2021,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
+  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
@@ -1457,6 +2049,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   }
   if (checkedPatch.vps !== undefined) disk.vps = normalizeVpsConfig(checkedPatch.vps);
   if (checkedPatch.conversationMode !== undefined) disk.conversationMode = checkedPatch.conversationMode;
+  if (checkedPatch.busySendDefault !== undefined) disk.busySendDefault = checkedPatch.busySendDefault;
   if (checkedPatch.terminology !== undefined) disk.terminology = checkedPatch.terminology;
   if (checkedPatch.terminologyCustom !== undefined) disk.terminologyCustom = checkedPatch.terminologyCustom;
   if (checkedPatch.deleteInstance) {
@@ -1492,7 +2085,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
 export function patchInstanceConfig(
   cfg: AppConfig,
   instanceId: string,
-  patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean },
+  patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }> },
 ): InstanceCliUpdate {
   const next: AppConfig = structuredClone(cfg);
   const map = instanceConfigs(next);
@@ -1529,6 +2122,14 @@ export function patchInstanceConfig(
       nextConfig.cli = cliKey;
     } else {
       delete nextConfig.cli;
+    }
+  }
+
+  if (patch.models !== undefined) {
+    if (patch.models.length) {
+      nextConfig.userModels = patch.models;
+    } else {
+      delete nextConfig.userModels;
     }
   }
 

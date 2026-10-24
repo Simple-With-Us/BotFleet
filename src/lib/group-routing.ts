@@ -38,12 +38,13 @@ export function groupComposerHint(group: Group, members: Bot[]): string {
 /** Same routing sendGroup uses: explicit @mentions win, otherwise the
  * room's default responder. Keep this aligned with server/store.ts
  * `roomResponders` / `mentionedBots`. */
-export function roomRespondersForComposer<T extends { id: string; name: string; hidden?: boolean }>(
+export function roomRespondersForComposer<T extends { id: string; name: string; hidden?: boolean; off?: boolean }>(
   text: string,
   members: T[],
   group: Pick<Group, "defaultResponder">,
 ): T[] {
-  const available = members.filter((member) => !member.hidden);
+  // An Off member cannot speak (shared/bot-power.ts), same as an archived one.
+  const available = members.filter((member) => !member.hidden && member.off !== true);
   if (/(?:^|\s)@everyone\b/i.test(text)) return available;
   const mentioned = mentionedMembers(text, available);
   if (mentioned.length) return mentioned;
@@ -56,9 +57,9 @@ export function roomRespondersForComposer<T extends { id: string; name: string; 
   return [];
 }
 
-function mentionedMembers<T extends { name: string; hidden?: boolean }>(text: string, peers: T[]): T[] {
+function mentionedMembers<T extends { name: string; hidden?: boolean; off?: boolean }>(text: string, peers: T[]): T[] {
   const candidates = peers
-    .filter((p) => !p.hidden && p.name.trim())
+    .filter((p) => !p.hidden && p.off !== true && p.name.trim())
     .sort((a, b) => b.name.length - a.name.length);
   const lower = text.toLowerCase();
   const found: T[] = [];

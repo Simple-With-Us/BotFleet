@@ -24,12 +24,14 @@ import { effectiveDefaultResponder, groupResponseHint } from "@/lib/group-routin
 import { ChatMarkdown } from "./ChatMarkdown";
 import { MentionText } from "./MentionText";
 import { Composer } from "./Composer";
+import { UpdateDrainNotice } from "./UpdateDrainNotice";
 import { ErrorRow, TurnErrorAnnouncement, latestTurnErrorMessage } from "./ErrorRow";
 import { ChatFindBar } from "./ChatFindBar";
 import { GroupThreadTabs } from "./ThreadTabs";
 import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretRequestCard } from "./SecretRequestCard";
+import { SignInRequestCard } from "./SignInRequestCard";
 import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
 import { ReactionBar, ReactionChips } from "./Reactions";
@@ -38,6 +40,8 @@ import { ApprovalCard } from "./ApprovalCard";
 import { ManageMembersPanel } from "./ManageMembersPanel";
 import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
+import { HelperCard } from "./HelperCard";
+import { isHelperRow, runningHelperCount } from "../../shared/helpers";
 import { ToolLine } from "./ToolLine";
 import { JobFinishedRow, JobsMenu } from "./JobsMenu";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
@@ -75,6 +79,7 @@ function dayLabel(at: number): string {
  * The sender is already named by the cluster label above it. */
 function RoomToolChip({ message }: { message: Message }) {
   if (!message.tool) return null;
+  if (isHelperRow(message)) return <HelperCard message={message} />;
   return <ToolLine message={message} actor={message.from?.name} />;
 }
 
@@ -341,6 +346,8 @@ const Transcript = memo(function Transcript({
           // Allow the broker rejects
           m.kind === "secret" && m.secret && m.from?.botId ? (
             <SecretRequestCard botId={m.from.botId} threadId={group.threadId} message={m} />
+          ) : m.kind === "sign-in" && m.signIn && m.from?.botId ? (
+            <SignInRequestCard botId={m.from.botId} threadId={group.threadId} message={m} />
           ) : m.kind === "connector" && m.connector && m.from?.botId ? (
             <ConnectorCard botId={m.from.botId} threadId={group.threadId} message={m} />
           ) : m.kind === "options" && m.card?.requestId && m.card.tool ? (
@@ -349,6 +356,8 @@ const Transcript = memo(function Transcript({
             </div>
           ) : m.kind === "activity" && m.job ? (
             <JobFinishedRow job={m.job} />
+          ) : m.kind === "activity" && isHelperRow(m) ? (
+            <HelperCard message={m} />
           ) : m.kind === "activity" && m.tool ? (
             m.tool.name.startsWith("error:") ? (
               <div className="flex justify-start max-w-full">
@@ -1037,6 +1046,7 @@ export function GroupView({ group }: { group: Group }) {
   );
   const speaker = members.find((b) => b.id === group.busyBotId);
   const setupPending = roomNeedsSetup(group);
+  const helperCount = useMemo(() => runningHelperCount(group.messages), [group.messages]);
 
   // Mascot stays while a member works; the finished reply pops in above it.
   const lastGroupMessage = group.messages.at(-1);
@@ -1359,7 +1369,7 @@ export function GroupView({ group }: { group: Group }) {
             <Search size={18} />
           </button>
           {/* Members' background jobs on this room's thread: notices only, never a wake. */}
-          <JobsMenu threadId={group.threadId} room />
+          <JobsMenu threadId={group.threadId} room helperCount={helperCount} />
           <GroupCallButton group={group} members={members} />
           {!setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}
@@ -1635,6 +1645,7 @@ export function GroupView({ group }: { group: Group }) {
         </button>
       )}
       <div className="w-full">
+      <UpdateDrainNotice />
       <Composer
         key={group.threadId}
         group={group}

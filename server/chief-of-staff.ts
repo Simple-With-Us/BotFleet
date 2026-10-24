@@ -52,6 +52,8 @@ export function chiefOfStaffSystemPrompt(
   chiefId: string,
   bots: ChiefTeamMember[],
   availableAgentTools: readonly string[],
+  /** @deprecated Prefer the volatile `botfleet-status` prompt section at the
+   *  harness call site (BF-1358) instead of passing status here. */
   trustedBotFleetStatus = "",
 ): string {
   const chief = bots.find((bot) => bot.id === chiefId);
@@ -73,26 +75,18 @@ export function chiefOfStaffSystemPrompt(
         .join("\n") + (overflow > 0 ? `\n- …and ${overflow} more (use list_bots for the full roster).` : "")
     : "- No other visible bots are available yet.";
 
-  const canAskBot = availableAgentTools.includes("ask_bot");
-  const canDelegate = canAskBot && availableAgentTools.includes("delegate_bot");
-  const canBuildTeam = canDelegate && availableAgentTools.includes("create_bot");
-  const delegation = canAskBot
+  const canCoordinate = availableAgentTools.includes("coordinate_bots");
+  const canBuildTeam = canCoordinate && availableAgentTools.includes("create_bot");
+  const delegation = canCoordinate
     ? [
-        "Use list_bots to confirm the live roster, IDs, and who is busy right now — this prompt lists who is on the team, not who is free. Use ask_bot when a teammate is better suited to part of the request.",
+        "Use list_bots to confirm the live roster, IDs, and who is busy right now — this prompt lists who is on the team, not who is free. Use coordinate_bots when a teammate is better suited to part of the request.",
         canBuildTeam
-          ? "When the user asks you to assemble a team, use create_bot for each genuinely useful specialist. Give each one a clear role and instructions, then use delegate_bot to assign its work. Do not create duplicate or unnecessary bots."
+          ? "When the user asks you to assemble a team, use create_bot for each genuinely useful specialist. Give each one a clear role and instructions, then use coordinate_bots to assign its work. Do not create duplicate or unnecessary bots."
           : undefined,
-        // ask_bot holds this turn open for the peer's ENTIRE turn, and the
-        // tool clock ends it eventually however patient the person is.
-        // delegate_bot returns at once and the peer answers as its own turn,
-        // which is the right shape for anything slow — so say so here, where
-        // the Chief decides, rather than leaving it to be discovered by
-        // timing out.
-        canDelegate
-          ? "ask_bot waits for the teammate's whole turn before you can continue, so prefer delegate_bot for anything that might run long — research, a build, a multi-step job — and keep ask_bot for a question you need answered before you can go on."
-          : undefined,
-        "Delegate with a clear, self-contained brief and wait for the teammate's actual reply before claiming its work is complete.",
-        "You may consult more than one teammate when the request genuinely benefits, then combine their results into one coherent answer.",
+        "coordinate_bots records the handoff and returns immediately.  The default reply is resume, so the result comes back on this conversation when the work finishes.  Use reply none when nothing should come back, and assignment_status to read a handoff without waiting.",
+        "A peer that is busy waits.  It is not cancelled, and you do not invent its result.",
+        "Delegate with a clear, self-contained brief.  Do not claim the work is complete until the result has come back.",
+        "You may hand work to more than one teammate when the request genuinely benefits, then combine their results into one coherent answer.",
       ]
         .filter(Boolean)
         .join(" ")

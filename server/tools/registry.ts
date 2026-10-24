@@ -94,6 +94,10 @@ export interface ToolGateContext {
    *  independent of `agents` and the comms depth: a job is the bot's own
    *  work, not a hop to a peer. */
   jobs?: boolean;
+  /** This bot holds a connected Zulip identity (server/zulip/hub.ts), so
+   *  `zulip_reply` and `zulip_post` are offered.  Independent of `agents`
+   *  and the comms depth: posting as yourself is not a hop to a peer. */
+  zulip?: boolean;
 }
 
 /** How a tool asks a person before it runs.  Consumed by the permission
@@ -191,7 +195,7 @@ const LIST_BOTS: HarnessTool = {
   // already see.  The HTTP lane used to say something different and less
   // true (it did not mention `busy`, which it now reports).
   description:
-    "List the other bots (agents) in your BotFleet section you can message, with their model and whether they're busy. Call this before ask_bot to discover who's available.",
+    "List the other bots (agents) in your BotFleet section you can message, with their model and whether they're busy. Call this before coordinate_bots to discover who's available.",
   schema: { type: "object", properties: {} },
   surfaces: { mcp: true, http: true },
   gate: peerComms,
@@ -201,58 +205,73 @@ const LIST_BOTS: HarnessTool = {
     "Use list_bots to see the other bots in your section, with their model and whether they are busy.",
 };
 
-const ASK_BOT: HarnessTool = {
-  name: "ask_bot",
+const COORDINATE_BOTS: HarnessTool = {
+  name: "coordinate_bots",
   description:
-    "Send a message to another bot in your section and wait for its reply. Use it to delegate a subtask to a specialist bot or ask a peer a question. The other bot runs a full turn under its own model and permissions; the reply is returned to you as text. Returns promptly with a note if that bot is busy.",
+    "Hand work to one or more bots in your section.  Returns as soon as the handoff is recorded.  The peers run after this turn, under their own models and permissions, and a reply of \"resume\" brings their results back to this conversation.  Use assignment_status to read a handoff without waiting.",
   schema: {
     type: "object",
     properties: {
-      bot_id: { type: "string", description: "The target bot's id (from list_bots)." },
-      message: { type: "string", description: "What to say / ask the bot." },
+      bot_ids: {
+        type: "array",
+        items: { type: "string" },
+        description: "Target bot ids or @names from list_bots.",
+      },
+      message: { type: "string", description: "The task or question, self-contained." },
+      reason: { type: "string", description: "Optional one-line reason, shown to the user as a chip." },
+      rework: { type: "boolean", description: "Run the same brief again even if this turn already handed it to that bot." },
+      thread: {
+        type: "string",
+        enum: ["standing", "new"],
+        description: "standing keeps the peer's current conversation.  new opens a separate thread.  Default standing.",
+      },
+      reply: {
+        type: "string",
+        enum: ["resume", "none"],
+        description: "resume wakes this conversation with the result.  none sends the work and nothing comes back.  Default resume.",
+      },
+      consult: { type: "boolean", description: "Ask the peer to answer from what it knows and act on nothing." },
+      done_when: { type: "string", description: "Optional completion criterion the peer should meet." },
     },
-    required: ["bot_id", "message"],
+    required: ["bot_ids", "message"],
   },
   surfaces: { mcp: true, http: true },
   gate: peerComms,
   sideEffect: "write",
   settles: "immediate",
-  // A peer's whole turn happens inside this call, and the fleet documents a
-  // three-minute ceiling for a peer reply.  The loop's uniform 90s clock cut
-  // that in half and reported a timeout for a peer that was still working.
-  timeoutMs: 240_000,
   promptFragment:
-    "Use ask_bot to send a peer a task and wait for its reply; pass the bot's id or @name from list_bots.  It blocks until that bot's whole turn finishes, so prefer delegate_bot for anything that might run long — research, a build, a multi-step job — and keep ask_bot for a question you need answered before you can continue.",
-  // Starting a peer's turn spends that bot's tokens under its own model and
-  // permissions, so it is the one registry tool a person may want to see
-  // first.  The verdict itself is NOT decided here: the ask goes through
-  // the same fold a CLI engine's does, so this bot's existing auto-approve,
-  // always-allow and unattended settings decide it — no per-tool switch.
+    "Use coordinate_bots to hand work to peers from list_bots.  It returns immediately.  reply \"resume\" (the default) brings the result back to this conversation when the work finishes; reply \"none\" does not.  Use assignment_status to check a handoff.  A peer that is busy waits.  Do not invent a result you have not been given.",
   approval: {
     policy: "ask",
     summary: (args) => {
-      const target = typeof args.bot_id === "string" ? args.bot_id : "another bot";
-      const raw = typeof args.task === "string" ? args.task : typeof args.message === "string" ? args.message : "";
+      const ids = Array.isArray(args.bot_ids)
+        ? args.bot_ids.map((id) => String(id)).filter(Boolean).join(", ")
+        : typeof args.bot_id === "string"
+          ? args.bot_id
+          : "another bot";
+      const raw = typeof args.message === "string" ? args.message : "";
       const text = raw.replace(/\s+/g, " ").trim();
-      return text ? `ask ${target}: ${text.slice(0, 160)}` : `ask ${target}`;
+      return text ? `hand to ${ids}: ${text.slice(0, 120)}` : `hand to ${ids}`;
     },
   },
-  wire: {
-    http: {
-      reason:
-        "The HTTP lane shipped this argument as `task`, and renaming it on the wire would break in-flight MiniMax and OpenRouter turns whose transcripts already contain the old spelling.  The executor accepts both names, so the two lanes run one body; only the advertised name differs.",
-      description:
-        "Send a message to another bot in your section and wait for its reply.  The other bot runs a full turn under its own model and permissions; the reply is returned to you as text.  Pass either the bot's id or `@name` from list_bots.",
-      schema: {
-        type: "object",
-        properties: {
-          bot_id: { type: "string", description: "The target bot's id (from list_bots) or `@name`." },
-          task: { type: "string", description: "What to say / ask the bot." },
-        },
-        required: ["bot_id", "task"],
-      },
+};
+
+const ASSIGNMENT_STATUS: HarnessTool = {
+  name: "assignment_status",
+  description:
+    "Read durable handoffs for this conversation.  Pass an assignment id for that one handoff and its children, or omit it for everything this conversation is still waiting on.  This does not start, stop, or change any work.",
+  schema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Optional assignment id from coordinate_bots." },
     },
   },
+  surfaces: { mcp: true, http: true },
+  gate: peerComms,
+  sideEffect: "read",
+  settles: "immediate",
+  promptFragment:
+    "Use assignment_status to read a handoff you already recorded.  It never starts or stops work.",
 };
 
 /** Only a chief may build a team, and it is still a peer-comms-shaped
@@ -267,46 +286,10 @@ const chiefOnly = (ctx: ToolGateContext) => ctx.agents && ctx.chiefOfStaff;
  *  routines. */
 const anyAgentsBot = (ctx: ToolGateContext) => ctx.agents;
 
-const DELEGATE_BOT: HarnessTool = {
-  name: "delegate_bot",
-  description:
-    "Hand a task to another bot ASYNCHRONOUSLY: returns immediately and the peer runs after your current turn finishes. Use this when you want to keep working or hand off a long-running subtask without waiting. The user sees the peer's reply as its own turn; you do NOT receive the reply inline.",
-  schema: {
-    type: "object",
-    properties: {
-      bot_id: { type: "string", description: "The target bot's id (from list_bots)." },
-      message: { type: "string", description: "What the peer should do / answer." },
-      reason: {
-        type: "string",
-        description: "Optional one-line reason for the delegation (shown to the user as a chip).",
-      },
-    },
-    required: ["bot_id", "message"],
-  },
-  surfaces: { mcp: true, http: true },
-  gate: peerComms,
-  sideEffect: "write",
-  settles: "immediate",
-  promptFragment:
-    "Use delegate_bot to hand a task to a peer asynchronously when you do not need its reply inline; the user sees the peer's reply as its own turn.",
-  // Starting a peer's turn spends its tokens, same as ask_bot — and unlike
-  // ask_bot, this one runs after the current turn ends, so a denied
-  // delegation must never have been queued in the first place.
-  approval: {
-    policy: "ask",
-    summary: (args) => {
-      const target = typeof args.bot_id === "string" ? args.bot_id : "another bot";
-      const raw = typeof args.message === "string" ? args.message : "";
-      const text = raw.replace(/\s+/g, " ").trim();
-      return text ? `delegate to ${target}: ${text.slice(0, 120)}` : `delegate to ${target}`;
-    },
-  },
-};
-
 const CREATE_BOT: HarnessTool = {
   name: "create_bot",
   description:
-    "Create a specialist bot in your section. Only a section's Chief of Staff may use this. The new bot inherits the Chief's engine, starts with connected apps and automatic approvals disabled, and can then receive work through delegate_bot. Create only the smallest useful team (maximum four per turn).",
+    "Create a specialist bot in your section. Only a section's Chief of Staff may use this. The new bot inherits the Chief's engine, starts with connected apps and automatic approvals disabled, and can then receive work through coordinate_bots. Create only the smallest useful team (maximum four per turn).",
   schema: {
     type: "object",
     properties: {
@@ -324,7 +307,7 @@ const CREATE_BOT: HarnessTool = {
   sideEffect: "write",
   settles: "immediate",
   promptFragment:
-    "If you are the Chief of Staff, use create_bot to add a specialist to your team (up to four per turn), then delegate_bot to assign it work.",
+    "If you are the Chief of Staff, use create_bot to add a specialist to your team (up to four per turn), then coordinate_bots to assign it work.",
 };
 
 /** Mirrors `CREDENTIAL_TARGETS` in `shared/credential-request.ts`.
@@ -368,6 +351,32 @@ const REQUEST_CREDENTIAL: HarnessTool = {
   settles: "suspend",
   promptFragment:
     "If a supported API key is missing, use request_credential to show the secure in-app card. Never ask the user to paste credentials into chat.",
+};
+
+const REQUEST_SIGN_IN: HarnessTool = {
+  name: "request_sign_in",
+  description:
+    "Ask the person to sign in to a website on the computer where you work. Use this instead of asking them to paste a password or one-time code into chat. One Sign in needed card is shown. After calling this tool, end the turn; BotFleet resumes after they press Done or Cancel. You never receive the password.",
+  schema: {
+    type: "object",
+    properties: {
+      site: {
+        type: "string",
+        description: "The site hostname, for example example.com. Not a password, not a username, and not a URL with a path.",
+      },
+      reason: {
+        type: "string",
+        description: "Optional short, non-sensitive explanation of why the task needs the sign-in.",
+      },
+    },
+    required: ["site"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: anyAgentsBot,
+  sideEffect: "write",
+  settles: "suspend",
+  promptFragment:
+    "When a task needs a website sign-in, use request_sign_in. Never ask the person to paste a password or one-time code into chat.",
 };
 
 const WEEKDAYS_ENUM = [
@@ -1143,6 +1152,87 @@ const LINQ_VOICE_MESSAGE: HarnessTool = {
   },
 };
 
+// ── Zulip (docs/zulip.md) ──
+// Offered only to a bot whose Zulip session is connected.  No Zulip tool
+// carries an approval record, and that is deliberate: every rule that makes
+// a post safe is enforced by the harness, not asked of a person — the reply
+// target is the conversation that woke the turn and the model cannot move
+// it, an off-origin post must name a channel the owner allowed, a DM may go
+// only to the owner, a bot, or the person whose DM started the turn (and DMs
+// out are rate limited per bot), and text that looks like a secret is
+// refused (server/zulip/outbound.ts).  A card would only stall an unattended
+// Zulip turn.
+
+const zulipEnabled = (ctx: ToolGateContext) => Boolean(ctx.zulip);
+
+const ZULIP_REPLY: HarnessTool = {
+  name: "zulip_reply",
+  description:
+    "Answer the Zulip message that woke this turn: posts in the same channel topic, or answers the direct message, as your own Zulip bot with your role tag added. Only works on a turn started from Zulip. Never include secrets, keys or tokens: the post is refused.",
+  schema: {
+    type: "object",
+    properties: {
+      content: {
+        type: "string",
+        description: "The reply, in Zulip markdown. Do not add your [BF-...] tag; the harness adds it.",
+      },
+    },
+    required: ["content"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: zulipEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment: "Use zulip_reply to answer a Zulip message in the conversation it came from.",
+};
+
+const ZULIP_POST: HarnessTool = {
+  name: "zulip_post",
+  description:
+    "Post to Zulip as your own bot. A channel post needs a channel AND a topic: one topic per unit of work, at most 58 characters, never your own name. Only the channel that woke you (any topic there) or a channel the owner allowed is accepted. dm_user_id sends a direct message instead: to the owner, to another bot, or to the person whose DM started this turn; never to an integration, a deactivated user, or a person who is not the owner, and only a few an hour. Never include secrets, keys or tokens: the post is refused.",
+  schema: {
+    type: "object",
+    properties: {
+      channel: { type: "string", description: "Channel name without the #, for example agent-sync." },
+      topic: { type: "string", description: "The topic (thread) to post in. Required with channel." },
+      dm_user_id: {
+        type: "integer",
+        description: "Zulip user id to direct-message: the owner, another bot, or the sender of the DM that started this turn.",
+      },
+      content: {
+        type: "string",
+        description: "The message, in Zulip markdown. Do not add your [BF-...] tag; the harness adds it.",
+      },
+    },
+    required: ["content"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: zulipEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment: "Use zulip_post to post in an allowed Zulip channel topic.",
+};
+
+const ZULIP_FOLLOW_TOPIC: HarnessTool = {
+  name: "zulip_follow_topic",
+  description:
+    "Follow or stop following a Zulip topic as your own bot. While you follow a topic, every new message in it wakes you as an @-mention does (never your own posts), and that wake is not auto-replied: answer only when the conversation needs you. The channel must be one your bot is subscribed to. Posts nothing.",
+  schema: {
+    type: "object",
+    properties: {
+      channel: { type: "string", description: "Channel name without the #, for example agent-sync." },
+      topic: { type: "string", description: "The topic (thread) to follow or stop following." },
+      follow: { type: "boolean", description: "true to follow the topic, false to stop following it." },
+    },
+    required: ["channel", "topic", "follow"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: zulipEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment: "Use zulip_follow_topic to follow a Zulip topic whose new messages should wake you, and to stop following it.",
+};
+
 // ── background jobs (P1, docs/plans/2026-10-01-background-jobs-and-subagents-decision.md) ──
 // HTTP lane only in P1: a CLI engine reaches them over MCP in P2.  The
 // numbers below (16 KB, 75 s) are literals because this file imports
@@ -1280,10 +1370,11 @@ const JOB_KILL: HarnessTool = {
  *  edit rather than something that silently reorders the MCP wire list. */
 export const HARNESS_TOOLS: readonly HarnessTool[] = [
   LIST_BOTS,
-  ASK_BOT,
-  DELEGATE_BOT,
+  COORDINATE_BOTS,
+  ASSIGNMENT_STATUS,
   CREATE_BOT,
   REQUEST_CREDENTIAL,
+  REQUEST_SIGN_IN,
   LIST_ROUTINES,
   PROPOSE_ROUTINE,
   PROPOSE_ROUTINE_ACTION,
@@ -1319,6 +1410,9 @@ export const HARNESS_TOOLS: readonly HarnessTool[] = [
   JOB_OUTPUT,
   JOB_LIST,
   JOB_KILL,
+  ZULIP_REPLY,
+  ZULIP_POST,
+  ZULIP_FOLLOW_TOPIC,
 ];
 
 const BY_NAME = new Map(HARNESS_TOOLS.map((tool) => [tool.name, tool]));

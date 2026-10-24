@@ -3,12 +3,16 @@ import { describe, expect, it } from "vitest";
 import {
   availableAgentToolNames,
   credentialPromptFor,
+  githubToolPromptFor,
+  httpCatalogPromptFor,
+  phoneToolPromptFor,
+  signInPromptFor,
   hasFileTools,
   LEGACY_MCP_AGENT_TOOLS,
   promptFragmentsFor,
   routinePromptFor,
 } from "./prompts.ts";
-import type { HarnessTool } from "./registry.ts";
+import { harnessTool, type HarnessTool } from "./registry.ts";
 
 const tool = (overrides: Partial<HarnessTool> & { name: string }): HarnessTool => ({
   description: `${overrides.name} description`,
@@ -92,6 +96,14 @@ describe("credentialPromptFor", () => {
   });
 });
 
+describe("signInPromptFor", () => {
+  it("is silent unless request_sign_in is available", () => {
+    expect(signInPromptFor(["request_credential"])).toBe("");
+    expect(signInPromptFor(["request_sign_in"])).toContain("request_sign_in");
+    expect(signInPromptFor(["request_sign_in"])).toContain("password");
+  });
+});
+
 describe("routinePromptFor", () => {
   it("is silent when neither routines tool is available", () => {
     expect(routinePromptFor(["list_bots", "ask_bot"])).toBe("");
@@ -107,6 +119,57 @@ describe("routinePromptFor", () => {
     const prompt = routinePromptFor(["list_routines", "propose_routine", "propose_routine_action"]);
     expect(prompt).toContain("list_routines");
     expect(prompt).toContain("propose_routine_action");
+  });
+});
+
+describe("githubToolPromptFor", () => {
+  it("is silent when github tools are off", () => {
+    expect(githubToolPromptFor(false)).toBe("");
+  });
+
+  it("names github_clone when github tools are on", () => {
+    expect(githubToolPromptFor(true)).toContain("github_clone");
+  });
+});
+
+describe("phoneToolPromptFor", () => {
+  it("is silent when phone tools are off", () => {
+    expect(phoneToolPromptFor(false)).toBe("");
+  });
+
+  it("names phone_status when phone tools are on", () => {
+    expect(phoneToolPromptFor(true)).toContain("phone_status");
+  });
+});
+
+describe("httpCatalogPromptFor", () => {
+  const gate = {
+    agents: false,
+    localComputer: true,
+    workspace: true,
+    recall: false,
+    phone: false,
+    github: true,
+    commsDepth: 0,
+    maxCommsDepth: 1,
+    chiefOfStaff: false,
+  };
+
+  it("includes github guidance when This Computer is granted", () => {
+    expect(httpCatalogPromptFor(gate)).toContain("github_clone");
+  });
+
+  it("omits bash fragments when the computer section already names them", () => {
+    expect(harnessTool("bash")?.promptFragment).toBeTruthy();
+    const omitted = httpCatalogPromptFor(gate, { omitHostFileToolFragments: true });
+    expect(omitted).not.toContain("Use bash");
+    const kept = httpCatalogPromptFor(gate, { omitHostFileToolFragments: false });
+    expect(kept).toContain("Use bash");
+  });
+
+  it("does not repeat recall tool fragments", () => {
+    const withRecall = httpCatalogPromptFor({ ...gate, recall: true, github: false });
+    expect(withRecall).not.toContain("recall_search");
   });
 });
 

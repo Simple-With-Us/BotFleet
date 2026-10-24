@@ -3,6 +3,8 @@
 // it formats the URL, and what it does on a refusal. The fetch is stubbed
 // through a local HTTP server, the API base is overridden, and the timeout
 // path is hit by swapping fetch for a rejecting stub.
+import { randomUUID } from "node:crypto";
+
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 let server: ReturnType<typeof import("node:http").createServer>;
@@ -11,6 +13,11 @@ let refuse: { status: number; body: unknown } | null = null;
 
 const MP3_BYTES = Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x11, 0x22, 0x33, 0x44]);
 const MP3_HEX = MP3_BYTES.toString("hex");
+
+// Generated per run, never read from MINIMAX_API_KEY and never committed: the
+// requests go to the local stub above, so a real key has no business here, and
+// a credential-shaped literal does not belong in versioned source.
+const testKey = `test-${randomUUID()}`;
 
 beforeAll(async () => {
   const http = await import("node:http");
@@ -165,6 +172,7 @@ describe("synthesize", () => {
     expect(body.output_format).toBe("hex");
     expect(body.voice_setting.voice_id).toBe("English_Graceful_Lady");
     expect(body.audio_setting.format).toBe("mp3");
+    expect(body.audio_setting.bitrate).toBe(64_000);
     expect(body.language_boost).toBe("auto");
   });
 
@@ -227,6 +235,14 @@ describe("synthesize", () => {
     expect((err as Error).message.toLowerCase()).toContain("couldn't reach");
   });
 
+  describe("sanitizeForTTSByLine", () => {
+    it("preserves newlines while cleaning each line", async () => {
+      const { sanitizeForTTSByLine } = await driver();
+      expect(sanitizeForTTSByLine("## Status\n\n- First\n- Second")).toBe("## Status\n\n- First\n- Second");
+      expect(sanitizeForTTSByLine("Line one—pause\nLine two")).toBe("Line one, pause\nLine two");
+    });
+  });
+
   describe("sanitizeForTTS", () => {
     it("converts em-dashes and en-dashes into pauses with comma-space", async () => {
       const { sanitizeForTTS } = await driver();
@@ -271,7 +287,6 @@ describe("synthesize", () => {
     it("sanitizes text before passing to POST /v1/t2a_v2", async () => {
       const { synthesize } = await driver();
       seen.length = 0;
-      const testKey = process.env.MINIMAX_API_KEY || "test-dummy-key";
       await synthesize("Step one—do this - next... finish", "English_Graceful_Lady", testKey);
       const post = seen.find((s) => s.method === "POST" && s.url.includes("/v1/t2a_v2"));
       expect(post).toBeDefined();
@@ -282,7 +297,6 @@ describe("synthesize", () => {
     it("returns empty audio for punctuation-only input without calling network", async () => {
       const { synthesize } = await driver();
       seen.length = 0;
-      const testKey = process.env.MINIMAX_API_KEY || "test-dummy-key";
       const res1 = await synthesize(" — ", "English_Graceful_Lady", testKey);
       expect(res1.bytes.length).toBe(0);
       expect(seen.length).toBe(0);

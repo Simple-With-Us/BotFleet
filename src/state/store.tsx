@@ -15,6 +15,7 @@ import {
   type ReactNode,
 } from "react";
 import { z } from "zod";
+import type { SignInRequestCardData } from "../../shared/sign-in-request.ts";
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { AccessTokenState } from "../../server/recall-access.ts";
 import type { ComputerReach } from "../../server/computer-capability.ts";
@@ -22,8 +23,12 @@ import type { BotColor, BotMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
 import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
+import type { Attachment } from "@/lib/composer-attachments";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
+import type { HelperTranscript } from "../../shared/helpers";
 import type { ToolKind } from "../../shared/tool-activity";
+import type { ReviewHook } from "../../shared/auto-review";
+import type { BusySendDefault } from "../../shared/busy-send-default.ts";
 import type { ContextInjectionRef } from "../../shared/context-injection";
 import { taskWorkspaceContextsMatch, type TaskAppRef, type TaskWorkspaceContext } from "../../shared/task-workspace-context";
 import { eligibleTaskApps } from "@/lib/task-app-context";
@@ -44,8 +49,10 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
-import { spokenReply } from "../../shared/voice-summary";
-import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
+import type { Pronunciation } from "../../shared/pronunciations";
+import { voiceScriptKind } from "../../shared/voice-summary";
+import { applyBotPatch, createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
+import { voiceForDevice, type BotVoices } from "../../shared/bot-voice";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 
 export type { BotColor, MausColor } from "@/lib/mascot";
@@ -64,6 +71,8 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
+  /** Extra confirmation before always-allow on a write-shaped MCP tool. */
+  allowKeyWarnWrite?: boolean;
   approvalScope?: "local-computer" | "disposable-computer";
   /** Persisted proposal used by the server when the user confirms it. */
   routineRequest?: RoutineRequestCardData;
@@ -101,8 +110,8 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "sign-in";
   /** A "Job Finished" row: a background job of the bot's ended. */
   job?: import("../../shared/jobs").JobRowData;
   text?: string;
@@ -110,12 +119,14 @@ export interface Message {
   modelSelection?: { instanceId: string; model: string };
   audio?: Array<{ path: string; mime: string }>;
   voiceText?: string;
+  voiceTextKind?: "written" | "summary";
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   recordingReview?: { correction?: string; comment?: string; updatedAt: number };
   translation?: { language: string; text: string; provider: string };
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  signIn?: SignInRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the server's
    * narration of the same chip ("reading a file"), used by call mode. */
   /** `setup` marks an error fixed by installing something, not by retrying. */
@@ -146,6 +157,9 @@ export interface Message {
      * interleaving parallel helpers' steps with the bot's own. */
     parentItemId?: string;
   };
+  /** The helper card for the row that started an engine-native helper
+   * (jobs P3).  Absent on an ordinary step. */
+  helper?: HelperTranscript;
   /** What the harness put in front of the model for THIS turn that the person
    * did not type — memory, selected skills, a quoted reply, a replayed
    * conversation (shared/context-injection.ts).  One short record each: a
@@ -247,6 +261,13 @@ export interface ModelSelection {
   /** Always the real slug that runs, also for a "Latest <Class>" entry. */
   model: string;
   effort?: EffortLevel;
+  /** Working-context cap in tokens; absent is the model's full window.  `null`
+   *  is how a write clears a saved cap (an absent key keeps it for older
+   *  clients), and the harness never sends it back. */
+  contextCap?: number | null;
+  /** Output limit in tokens; absent leaves the model's own limit.  `null`
+   *  clears a saved limit, like `contextCap`. */
+  maxOutputTokens?: number | null;
   /** The model class this entry floats on ("sonnet" = Latest Sonnet); see
    *  shared/model-lineage.ts.  The picker sends `null` when a person picks
    *  a pinned model, so the harness does not carry an older float forward. */
@@ -351,6 +372,11 @@ export interface Bot {
   computers?: Array<"cloud" | "vm" | "local" | "off">;
   /** Which cloud computer backs `computer: "cloud"`; absent means Box. */
   cloudBackend?: CloudBackend;
+  /** The backend this bot really uses once the workspace default fills in for
+   * an unpinned one.  Read-only on the wire: the phone uses it to decide
+   * whether a live desktop exists; the settings UI keeps reading the raw
+   * `cloudBackend` so "inherited" and "pinned" stay distinguishable. */
+  effectiveCloudBackend?: CloudBackend;
   /** Allow Auto to prepare/start the managed VPS container. Off by default. */
   autoStartVps?: boolean;
   /** where new tasks run their shell tools; absent = the private bot workspace */
@@ -359,6 +385,8 @@ export interface Bot {
   autoApprove?: boolean;
   /** permission bypass mode: automatically approve all tools, commands, and routines without halting */
   bypassPermissions?: boolean;
+  /** bypass mode extended to the requests that control this Mac; means nothing without bypassPermissions */
+  bypassLocalComputer?: boolean;
   /** optional model review for otherwise undecided, attended approvals */
   autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */
@@ -367,16 +395,30 @@ export interface Bot {
    *  Unset or null uses DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts) — the
    *  same number the turn's prompt names and the loop stops at. */
   maxToolRounds?: number | null;
+  /** Cap on replayed history turns before older turns are dropped and
+   *  summarized (ACP engines).  Unset or null keeps every turn the byte
+   *  budget fits. */
+  maxHistoryTurns?: number | null;
+  /** Let the bot's model write the dropped-history summary (cached and
+   *  rolled forward), falling back to the extractive note on error. */
+  historySummaryModel?: boolean;
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
   speechDevices?: Array<"mac" | "iphone">;
   /** this bot's own voice id (falls back to the app-wide one) */
   voice?: string;
+  /** Per-device overrides of `voice`.  The wire sends null when neither
+   * device has one.  Resolve with voiceForDevice (shared/bot-voice.ts). */
+  voices?: BotVoices | null;
   /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
    * "on_demand" runs only on manual speak; "always" runs on every turn; "off" uses raw answer. */
   voiceSummaryMode?: "off" | "on_demand" | "always";
   pinned?: boolean;
   hidden?: boolean;
+  /** The bot's On/Off switch (shared/bot-power.ts).  True = Off: nothing new
+   *  starts for it from any source, but its chat stays visible and a turn
+   *  already running finishes.  Absent or false = on. */
+  off?: boolean;
   /** Sidebar section this bot renders under; absent = unsectioned. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread */
@@ -521,12 +563,34 @@ export interface ConfigStatus {
   /** Voice (MiniMax). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
    * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "minimax" | "system"; optimizedSummary?: boolean };
+  /** `voice` is the workspace default voice (every bot without its own
+   * speaks with it).  `pronunciations` is the list in force, the seeded
+   * defaults included; absent only from a harness older than the list. */
+  tts?: {
+    configured: boolean;
+    ready: boolean;
+    voice: string;
+    provider?: "minimax" | "system" | "xai" | "azure";
+    optimizedSummary?: boolean;
+    audioRetentionDays?: number;
+    pronunciations?: Pronunciation[];
+  };
   /** Call-mode STT preference + global vocabulary, mirrored from AppConfig.
    * `provider` is undefined when the picker has no explicit preference and
    * chooses the platform default. `keyterms` is the global voice vocabulary
    * the user has set up; per-bot terms are layered on top in call-stt.ts. */
-  callStt?: { provider?: "apple" | "assemblyai"; keyterms?: string[] };
+  callStt?: {
+    provider?: "apple" | "assemblyai" | "xai" | "meta" | "azure" | "groq";
+    ladder?: Array<"meta" | "xai" | "assemblyai" | "azure" | "groq">;
+    keyterms?: string[];
+    cloud?: import("../../shared/voice-providers.ts").CloudSttCapabilities;
+  };
+  /** Speech-to-speech call preference, mirrored from AppConfig.  `provider`
+   * is undefined when the picker has no explicit preference and Auto picks
+   * whichever provider has a key; `frontEngine` defaults to true, so an
+   * absent value reads as on, matching prepareStsSession.  `engineTimeoutMs`
+   * is the deadline on one `bot_engine` call; absent means the default. */
+  sts?: { provider?: "xai" | "gemini"; frontEngine?: boolean; engineTimeoutMs?: number };
   /** Shared write-only credential for on-demand GPT Image avatars. */
   imageGen?: { configured: boolean };
   /** who's using the app — collected in onboarding, shown in the sidebar */
@@ -546,6 +610,8 @@ export interface ConfigStatus {
   /** Simple (Grok-style bots + group threads) or Projects (categories of
    * threads).  Absent means simple. */
   conversationMode?: ConversationMode;
+  /** Default delivery while a bot turn is busy.  Absent means steer-first. */
+  busySendDefault?: BusySendDefault;
   /** Shared Qdrant Bot RAG vector database status. `url` and `collection`
    * are empty until the operator sets them — BotFleet ships no endpoint. */
   qdrant?: {
@@ -574,6 +640,13 @@ export interface ConfigStatus {
     projects: Array<{ slug: string; match: string[] }>;
     enginePlans?: Record<string, { planName?: string; costPerMonth?: number | null }>;
   };
+  /** Auto-review's fleet settings.  `fallbackReviewer` is the stored choice
+   * of the engine that reviews a bot's approvals when its own engine cannot:
+   * null for Automatic, "none" for off, or an instance id.
+   * `automaticReviewer` is the engine Automatic picks right now (the card
+   * works it out live from the engine list by the same rule), and
+   * `maxReviewsPerTurn` is the per-turn reviewer-call cap. */
+  autoReview?: { fallbackReviewer: string | null; automaticReviewer?: string | null; maxReviewsPerTurn?: number };
   /** Opt-in flags. Absent means off. */
   features?: { skillRecorder: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
   /** Sentry diagnostics.  `configured` mirrors `hasDsn` — a key is on file,
@@ -650,7 +723,7 @@ export function getConversationMode(config?: ConfigStatus | null): ConversationM
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "callStt" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq"
+  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "callStt" | "sts" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq" | "autoReview"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -671,6 +744,7 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     opencodeGo: frame.opencodeGo,
     tts: frame.tts,
     callStt: frame.callStt,
+    sts: frame.sts,
     imageGen: frame.imageGen,
     profile: frame.profile,
     autoUpdate: frame.autoUpdate,
@@ -685,6 +759,9 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     // Without this every SSE `config` frame wipes Linq status and resets
     // LinqSettings back to its empty defaults.
     imessageLinq: frame.imessageLinq,
+    // Without this every SSE `config` frame forgets the fallback reviewer,
+    // and the Bot Profile tells the owner auto-review is unavailable again.
+    autoReview: frame.autoReview,
   };
 }
 
@@ -768,7 +845,10 @@ export interface InstanceInfo {
        * without a tooltip and a screen-reader hint. */
       badgeTitle?: string;
       effortLevels?: readonly EffortLevel[];
+      defaultEffort?: EffortLevel;
       supportsEffort?: boolean;
+      contextCaps?: readonly number[];
+      supportsMaxOutput?: boolean;
       /** Absent inherits the instance-wide image capability. */
       images?: boolean;
       contextWindow?: number;
@@ -786,8 +866,19 @@ export interface InstanceInfo {
     /** This engine can answer a bounded review prompt without changing the
      * bot's active conversation. */
     approvalReview?: boolean;
+    /** Where auto-review can see this engine's tool calls (shared/auto-review.ts).
+     * Absent means the engine has not reported it yet, never "none". */
+    reviewHook?: ReviewHook;
+    /** A full-auto instance can run a held turn in its asking mode. */
+    asksWhenHeld?: boolean;
+    /** What a bot's Bypass Permissions switch does on this engine
+     * (shared/bypass-coverage.ts).  Absent from an older server, which reads
+     * as "asks": the switch works as described. */
+    bypassCoverage?: "asks" | "native" | "none";
     /** The harness runs this engine's tool loop, so Maximum Tool Rounds applies. */
     toolLoop?: boolean;
+    /** ACP prompt budget: the per-bot history cap/summary settings apply. */
+    historySummary?: boolean;
   };
   /** Which computer destinations this engine can be given at all, derived
    *  server-side in `server/computer-capability.ts` and shipped whole.  The
@@ -803,6 +894,9 @@ export interface InstanceInfo {
   cli?: string;
   /** Driver's default binary name (e.g. "claude"). */
   cliDefault?: string;
+  /** Other command names that run this engine (e.g. Clutch's "clutch" beside
+   * the default "dsh").  The picker searches them alongside the default. */
+  cliAliases?: string[];
   /** Absolute paths of every default binary found on PATH, PATH order. */
   cliCandidates?: string[];
   /** YOLO full access bypass permissions */
@@ -839,6 +933,14 @@ export interface AppState {
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
+  /** Counts the times the person picked something to look at: every `select`,
+   *  including one that lands on the chat already open, and a `botAdded` that
+   *  moves the selection to the new bot.  `selectedId` alone cannot tell a click
+   *  on the open chat from no click, and the store also rewrites it by itself (a
+   *  hydrate that lost the selection, a delete that falls back).  UI that must
+   *  yield to a deliberate pick, such as the Fleet Matrix overview, watches this
+   *  instead; background updates never move it. */
+  selectionNonce: number;
   /** Explicitly selected thread for the active bot (e.g., from App Matrix). Null follows bot.threadId. */
   viewedThreadId: string | null;
   /** Local task-creation dialog; never changes the bot's running thread. */
@@ -853,6 +955,9 @@ export interface AppState {
   resourceTriggers: ResourceTrigger[];
   settingsOpen: boolean;
   pluginsOpen: boolean;
+  /** The Plugins manager view (drop-in extensions).  Distinct from
+   *  `pluginsOpen`, which is the Composio connectors surface. */
+  pluginsManagerOpen: boolean;
   computerOpen: boolean;
   /** the per-thread event inspector (runtime stream + native protocol tee) */
   inspectorOpen: boolean;
@@ -883,7 +988,7 @@ export interface AppState {
   } | null;
   /** 1:1 queue-fallback lines waiting for drain; keyed by threadId.
    * Each entry is identified by the server queueId, not by text. */
-  pendingQueued: Record<string, Array<{ queueId: string; text: string; at: number }>>;
+  pendingQueued: Record<string, Array<{ queueId: string; text: string; rawText?: string; at: number; reply?: Message; attachments: Attachment[] }>>;
   /** queueIds whose drain frame beat the POST continuation. One-shot and
    * bounded to a short event window so other clients cannot grow it forever. */
   consumedQueueIds: Record<string, true>;
@@ -1019,15 +1124,29 @@ export type Action =
       type: "send";
       botId: string;
       text: string;
+      /** Composer text before `composeMessage`; kept on queued entries so edit
+       * restore does not double-expand attachment markers. */
+      rawText?: string;
       replyToId?: string;
+      /** The full reply Message, kept on the queue entry so an edit can
+       * restore it.  The server only sees replyToId; the client needs the
+       * Message to put the quote back through restoreFailedSend. */
+      reply?: Message;
+      /** The attachments the composer held, kept on the queue entry so an
+       * edit can put them back: the composed `text` carries <attached-image …>
+       * placeholders, and restoring only the text would leave those
+       * placeholders stranded on a chip that no longer exists. */
+      attachments?: Attachment[];
       /** The server refused the send or could not be reached.  Called with the
        * reason, after the error banner is set, so a caller that cleared its
        * input can put it back. */
       onError?: (message: string) => void;
+      /** Per-send override while the bot is busy.  Omitted uses the workspace default. */
+      busyDelivery?: BusySendDefault;
     }
-  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number }
+  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; rawText?: string; at?: number; reply?: Message; attachments?: Attachment[] }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
-  | { type: "cancelQueued"; botId: string; queueId: string }
+  | { type: "cancelQueued"; botId: string; queueId: string; onSettled?: () => void }
   | { type: "editMessage"; botId: string; messageId: string; text: string }
   | { type: "switchBranch"; botId: string; messageId: string }
   | { type: "threadActive"; threadId: string; activeLeafId: string }
@@ -1084,6 +1203,7 @@ export type Action =
   | { type: "error"; message: string | null }
   | { type: "toggleSettings"; open?: boolean }
   | { type: "togglePlugins"; open?: boolean }
+  | { type: "togglePluginsManager"; open?: boolean }
   | { type: "toggleComputer"; open?: boolean }
   | { type: "toggleInspector"; open?: boolean }
   | { type: "focusMessage"; threadId: string; messageId: string }
@@ -1149,8 +1269,8 @@ export function mergeHydrateBots(
     const local = localById.get(serverBot.id);
     const started = epochAtFetch[serverBot.id] ?? 0;
     const now = localEpoch[serverBot.id] ?? 0;
-    if (local && now > started) return { ...local, ...overlay };
-    return { ...serverBot, ...overlay };
+    if (local && now > started) return applyBotPatch(local, overlay);
+    return applyBotPatch(serverBot, overlay);
   });
 }
 
@@ -1452,6 +1572,7 @@ export function reducer(state: AppState, action: Action): AppState {
           ...state,
           activeView: "chat",
           selectedId: action.id,
+          selectionNonce: state.selectionNonce + 1,
           // A group is not the bot the pin belongs to.  Leaving it set would
           // show the next bot the previous thread.
           viewedThreadId: null,
@@ -1461,7 +1582,7 @@ export function reducer(state: AppState, action: Action): AppState {
       }
       const wasUnread = state.bots.find((b) => b.id === action.id)?.unread;
       const next = updateBot(
-        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id, viewedThreadId: action.viewedThreadId ?? null }, action.id, "switch"),
+        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id, selectionNonce: state.selectionNonce + 1, viewedThreadId: action.viewedThreadId ?? null }, action.id, "switch"),
         action.id,
         (b) => ({ ...b, unread: false }),
       );
@@ -1497,6 +1618,9 @@ export function reducer(state: AppState, action: Action): AppState {
         bots: [action.bot, ...state.bots.filter((bot) => bot.id !== action.bot.id)],
         activeView: "chat",
         selectedId: action.bot.id,
+        // Same rule as the pin above: the new bot counts as a pick, a second
+        // fold of the bot already on screen does not.
+        selectionNonce: action.bot.id === state.selectedId ? state.selectionNonce : state.selectionNonce + 1,
         viewedThreadId,
       }, action.bot.id, "arrive");
     }
@@ -1694,10 +1818,23 @@ export function reducer(state: AppState, action: Action): AppState {
         computerOpen: open ? false : state.computerOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "togglePlugins":
       return { ...state, pluginsOpen: action.open ?? !state.pluginsOpen };
+    case "togglePluginsManager": {
+      const open = action.open ?? !state.pluginsManagerOpen;
+      return {
+        ...state,
+        pluginsManagerOpen: open,
+        pluginsOpen: open ? false : state.pluginsOpen,
+        settingsOpen: open ? false : state.settingsOpen,
+        appSettingsOpen: open ? false : state.appSettingsOpen,
+        computerOpen: open ? false : state.computerOpen,
+        inspectorOpen: open ? false : state.inspectorOpen,
+      };
+    }
     case "focusMessage":
       return {
         ...state,
@@ -1719,6 +1856,7 @@ export function reducer(state: AppState, action: Action): AppState {
         settingsOpen: open ? false : state.settingsOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "toggleInspector": {
@@ -1729,6 +1867,7 @@ export function reducer(state: AppState, action: Action): AppState {
         settingsOpen: open ? false : state.settingsOpen,
         computerOpen: open ? false : state.computerOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "toggleAppSettings": {
@@ -1741,6 +1880,7 @@ export function reducer(state: AppState, action: Action): AppState {
         computerOpen: open ? false : state.computerOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         pluginsOpen: open ? false : state.pluginsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "updateBot": {
@@ -1762,8 +1902,7 @@ export function reducer(state: AppState, action: Action): AppState {
             ),
           }
         : animated;
-      const { acknowledgeLocalAuto: _ack, ...botPatch } = action.patch;
-      const patched = updateBot(next, action.botId, (b) => ({ ...b, ...botPatch }));
+      const patched = updateBot(next, action.botId, (b) => applyBotPatch(b, action.patch));
       return { ...patched, botEpoch: bumpEpoch(patched.botEpoch, action.botId) };
     }
     case "threadActive": {
@@ -1829,6 +1968,9 @@ export function reducer(state: AppState, action: Action): AppState {
             {
               queueId: action.queueId,
               text: action.text,
+              rawText: action.rawText,
+              reply: action.reply,
+              attachments: action.attachments ?? [],
               // Stamp once at remember-time; ChatView must not remint Date.now().
               at: action.at ?? Date.now(),
             },
@@ -2088,6 +2230,7 @@ export const initialState: AppState = {
   instancesDescribedAt: 0,
   config: null,
   selectedId: "",
+  selectionNonce: 0,
   viewedThreadId: null,
   taskCreationBotId: null,
   activeView: "chat",
@@ -2100,6 +2243,7 @@ export const initialState: AppState = {
   resourceTriggers: [],
   settingsOpen: false,
   pluginsOpen: false,
+  pluginsManagerOpen: false,
   computerOpen: false,
   inspectorOpen: false,
   appSettingsOpen: false,
@@ -2177,10 +2321,15 @@ export const MessagePostResponseSchema = z.union([
  * have to re-fetch or duplicate this function's request/parse logic. */
 export class ApiError extends Error {
   readonly body: any;
-  constructor(message: string, body: any) {
+  /** The HTTP status, so callers can tell a 404 from a 500 without matching
+   * the message: the message prefers body.error when the server sent one, so
+   * the status code is often not in it at all. */
+  readonly status: number;
+  constructor(message: string, body: any, status: number) {
     super(message);
     this.name = "ApiError";
     this.body = body;
+    this.status = status;
   }
 }
 
@@ -2196,7 +2345,7 @@ export async function api(path: string, init?: RequestInit): Promise<any> {
     });
     const body = await res.json().catch(() => ({}));
     if (res.ok) return body;
-    lastError = new ApiError(body.error ?? `${res.status} ${res.statusText}`, body);
+    lastError = new ApiError(body.error ?? `${res.status} ${res.statusText}`, body, res.status);
     if (res.status !== 502) break;
   }
   throw lastError ?? new Error("request failed");
@@ -2397,11 +2546,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return result.bot;
         },
         reconcile: async (botId, signal) => {
-          const result: { bots: BotAnnouncement[] } = await api("/api/bots", { signal });
-          return result.bots.find((candidate) => candidate.id === botId) ?? null;
+          // `?messages=0` — this only needs the bot row to roll the optimistic
+          // patch back, never the transcript. Unpaged, the server answered with
+          // every bot's and group's full history, so one rejected PATCH
+          // serialized megabytes of transcript per conflict (BF-2424).
+          const result: { bots: BotAnnouncement[] } = await api("/api/bots?messages=0", { signal });
+          const found = result.bots.find((candidate) => candidate.id === botId) ?? null;
+          if (!found) return null;
+          // messages=0 answers with `messages: []`, and the reducer treats an
+          // incoming transcript sharing no ids with the screen as a full
+          // snapshot — vacuously true for an empty array, so handing that back
+          // would blank the conversation on every rejected save. This re-read
+          // is for the bot ROW; carry the transcript already on screen.
+          const current = stateRef.current.bots.find((candidate) => candidate.id === botId);
+          return { ...found, messages: current?.messages ?? found.messages };
         },
         onAuthoritative: (bot, optimisticOverlay) => {
-          rawDispatch({ type: "botPatched", bot: { ...bot, ...optimisticOverlay } });
+          rawDispatch({ type: "botPatched", bot: applyBotPatch(bot, optimisticOverlay) });
         },
         onError: (error) => {
           rawDispatch({ type: "error", message: error.message });
@@ -2502,7 +2663,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "cancelQueued":
           void api(`/api/bots/${action.botId}/queue/${action.queueId}`, { method: "DELETE" })
             .then(() => rawDispatch(action))
-            .catch(showError);
+            // The caller restores a draft from the entry it is removing, and
+            // that has to wait for the server: until the DELETE lands the
+            // queued message is still live, so a draft put back now can be
+            // sent twice.  Either way the entry's owner hears how it ended.
+            // onSettled runs on success only, not from finally: a refusal
+            // leaves the queued message live, and putting the draft back
+            // beside it is exactly the duplicate this ordering avoids.
+            .then(() => action.onSettled?.())
+            .catch((error) => {
+              if (error instanceof ApiError && error.status === 404) {
+                // A 404 can mean the entry is already gone or that this harness
+                // is too old to expose DELETE /queue/ (body carries "no route").
+                // iOS keeps the chip in the latter case; mirror that here so a
+                // local drop does not hide a message that is still going to send.
+                if (String(error.body?.error ?? "").includes("no route")) {
+                  showError(error);
+                  return;
+                }
+                rawDispatch(action);
+                action.onSettled?.();
+                return;
+              }
+              showError(error);
+            });
           break;
         case "send": {
           // persist through the existing card route so an older server that
@@ -2527,13 +2711,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // the server then 409s instead of delivering. Omitting it lets the
           // server use the active thread.
           const postMessage = (threadId?: string) => {
+            const body: {
+              text: string;
+              replyToId?: string;
+              threadId?: string;
+              busyDelivery?: BusySendDefault;
+            } = {
+              text: action.text,
+              replyToId: action.replyToId,
+            };
+            if (threadId) body.threadId = threadId;
+            if (action.busyDelivery) body.busyDelivery = action.busyDelivery;
             void api(`/api/bots/${action.botId}/messages`, {
               method: "POST",
-              body: JSON.stringify({
-                text: action.text,
-                replyToId: action.replyToId,
-                ...(threadId ? { threadId } : {}),
-              }),
+              body: JSON.stringify(body),
             })
               .then((body: unknown) => {
                 const parsed = MessagePostResponseSchema.safeParse(body);
@@ -2546,6 +2737,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                     threadId: parsed.data.threadId,
                     queueId: parsed.data.queueId,
                     text: action.text,
+                    rawText: action.rawText,
+                    reply: action.reply,
+                    attachments: action.attachments ?? [],
                     at: sentAt,
                   });
                 }
@@ -3086,11 +3280,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // singleton speaker and microphone ordering for its whole lifetime.
             const owner = stateRef.current.bots.find((b) => b.threadId === frame.threadId || b.tasks?.some((t) => t.threadId === frame.threadId));
             if (owner && (owner.speechDevices ? owner.speechDevices.includes("mac") : owner.speakReplies) && currentCall() === null && frame.message.text?.trim()) {
-              void speaker.speak(spokenReply(frame.message.text), {
+              // The reply as stored: the harness owns what is read, and the
+              // speaker's local fallback picks the written or voice half
+              // by the bot's mode.
+              void speaker.speak(frame.message.text, {
                 botId: owner.id,
                 messageId: frame.message.id,
                 threadId: frame.threadId,
-                voiceId: owner.voice,
+                // This Mac's own voice: its override, else the shared one.
+                voiceId: voiceForDevice(owner, "mac"),
+                scriptKind: voiceScriptKind(owner),
+                enqueue: true,
               });
             }
           }
@@ -3121,7 +3321,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           rawDispatch({
             type: "botPatched",
-            bot: { ...bot, ...botPatchQueue.overlayFor(bot.id) },
+            bot: applyBotPatch(bot, botPatchQueue.overlayFor(bot.id)),
           });
           break;
         }
@@ -3191,6 +3391,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // the Trajectory tab's door: free unless that thread's tab is open
           publishRuntimeEvent(event);
           if (event.type === "content.delta") {
+            // A helper's prose belongs on its card, not in the bot's bubble.
+            if (event.subagentId) break;
             // Batch token deltas per animation frame (t3code-style): a fast
             // stream dispatches once per frame instead of once per token, so
             // the app tree re-renders at most ~60x/s while streaming.

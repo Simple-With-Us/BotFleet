@@ -1,4 +1,7 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.4
+// 6.4 is the first PackageDescription with `.iOS(.v27)` (Xcode 27.0).
+// swiftLanguageModes keeps the Swift 5 language mode the package had under
+// tools 5.9, so the bump does not also switch on Swift 6 strict concurrency.
 import PackageDescription
 
 // CompanionCore is everything the phone knows that is not a view: the wire
@@ -11,10 +14,11 @@ let package = Package(
     name: "CompanionCore",
     // macOS 13 rather than 14: the core needs nothing newer than
     // URLSession.bytes (macOS 12), and `swift test` should run on whatever
-    // Mac is to hand. The app's iOS 17 floor lives in project.yml.
-    platforms: [.iOS(.v17), .macOS(.v13)],
+    // Mac is to hand. The app's iOS 27 floor lives in project.yml.
+    platforms: [.iOS(.v27), .macOS(.v13)],
     products: [
-        .library(name: "CompanionCore", targets: ["CompanionCore"])
+        .library(name: "CompanionCore", targets: ["CompanionCore"]),
+        .executable(name: "CodeBlockLayoutProbe", targets: ["CodeBlockLayoutProbe"]),
     ],
     targets: [
         .target(name: "CompanionCore"),
@@ -23,5 +27,13 @@ let package = Package(
             dependencies: ["CompanionCore"],
             resources: [.copy("Fixtures")]
         ),
-    ]
+        // Timing probe.  `swift test` compiles it.  Run the measurement with
+        // `swift run --package-path ios CodeBlockLayoutProbe`.
+        .executableTarget(
+            name: "CodeBlockLayoutProbe",
+            dependencies: ["CompanionCore"],
+            path: "Scripts/CodeBlockLayoutProbe"
+        ),
+    ],
+    swiftLanguageModes: [.v5]
 )

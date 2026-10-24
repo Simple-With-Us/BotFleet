@@ -1,4 +1,6 @@
 /** Profile input limits shared by every web and server write surface. */
+import { z } from "zod";
+
 export const BOT_PROFILE_LIMITS = {
   name: 100,
   title: 200,
@@ -8,6 +10,23 @@ export const BOT_PROFILE_LIMITS = {
 
 /** Ceiling for per-bot HTTP tool-loop rounds (Designer 2026-09-25). */
 export const MAX_TOOL_ROUNDS = 200;
+
+/** Ceiling for a bot's replayed-history turn cap.  0 keeps none: every
+ *  replayed turn is dropped and summarized. */
+export const MAX_HISTORY_TURNS = 500;
+
+/** The one history-turn-cap contract every surface shares: the bot API
+ *  boundary (server/bot-profile.ts), the prompt-budget decoder
+ *  (server/drivers/acp/prompt-budget.ts), the dispatch lanes
+ *  (server/index.ts) and the web capability gates
+ *  (src/lib/bot-settings-gates.ts).  A non-negative integer at most
+ *  MAX_HISTORY_TURNS; anything else is ignored (treated as absent), never
+ *  applied.  Declared once here so the TypeScript and runtime contracts
+ *  cannot drift apart: derive the type with `MaxHistoryTurns`. */
+export const maxHistoryTurnsSchema = z.number().int().min(0).max(MAX_HISTORY_TURNS);
+
+/** A valid history-turn cap, as `maxHistoryTurnsSchema` accepts it. */
+export type MaxHistoryTurns = z.infer<typeof maxHistoryTurnsSchema>;
 
 /** The round budget an HTTP tool-loop turn gets when a bot sets none.
  *
@@ -34,6 +53,14 @@ export function toolRoundsCaption(): string {
   return `Per turn.  Empty uses ${DEFAULT_MAX_TOOL_ROUNDS}.  Cap is ${MAX_TOOL_ROUNDS}.`;
 }
 
+/** The owner-facing sentence for the Maximum History Turns control, built
+ *  from the real cap. */
+export function historyTurnsCaption(): string {
+  // Rendered in HTML, where two typed spaces collapse:  the gap is U+00A0
+  // plus a space, written as an escape so the source stays ASCII.
+  return `Replayed turns kept per prompt.\u00A0 Empty keeps them all.\u00A0 Cap is ${MAX_HISTORY_TURNS}.`;
+}
+
 /** The budget a turn will actually run under, and whether the owner chose it.
  *
  *  Returns the effective number rather than `undefined` so callers stop
@@ -41,20 +68,24 @@ export function toolRoundsCaption(): string {
  *  and disagreeing about it. */
 /** Why the scheduler may not start a bot's work right now.
  *
- *  Only the three values the loop actually branches on.  A fourth value such
- *  as `"blocked"` (a breaker refusing work silently) was considered and
+ *  Only the values the loop actually branches on.  A value such as
+ *  `"blocked"` (a breaker refusing work silently) was considered and
  *  rejected: the tick loop is `if (busy) continue; if (missing) failRun(...)`
- *  and then it dispatches, so any value that is not `busy` or `missing`
+ *  and then it dispatches, so any value that is not branched on
  *  reaches the dispatch attempt and is indistinguishable from `"ready"` at
  *  every call site.  Adding the value without a branch for it would have
- *  looked like a fix while changing nothing.  The loop must handle `blocked`
- *  explicitly (routines.ts `tick`) before the value may be produced — and no
- *  producer exists yet (index.ts `botState` returns only these three).
+ *  looked like a fix while changing nothing.  The loop must handle a new value
+ *  explicitly (routines.ts `tick`) before it may be produced.
+ *
+ *  `"off"` is the one that has those branches: the bot's On/Off switch
+ *  (shared/bot-power.ts).  Schedule ticks, webhook and resource enqueues and
+ *  the queued-run loop all record a skipped receipt for it and never dispatch,
+ *  and a queued run is settled, not left to wait for the bot to come back.
  *
  *  Declared once here rather than spelled out in `routines.ts`, `webhooks.ts`
  *  and `resource-triggers.ts`, where three independent copies of the union had
  *  already drifted apart once. */
-export type BotDispatchState = "ready" | "busy" | "missing";
+export type BotDispatchState = "ready" | "busy" | "missing" | "off";
 
 /** One reason a dispatch is being held, in words fit for a receipt.
  *
