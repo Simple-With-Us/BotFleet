@@ -3120,9 +3120,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               if (r?.bot) dispatch({ type: "botPatched", bot: r.bot });
               action.onSettled?.({ merged: r?.merged ?? [], skipped: r?.skipped ?? [] }, null);
             })
-            .catch((e: unknown) => {
-              showError(e);
-              action.onSettled?.(null, e instanceof Error ? e.message : String(e));
+            .catch((error) => {
+              showError(error);
+              action.onSettled?.(null, error instanceof Error ? error.message : String(error));
             });
           break;
         case "moveTaskToBot":

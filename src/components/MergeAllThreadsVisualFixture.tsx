@@ -28,17 +28,18 @@ const BOT: Bot = {
   threadId: "thread-history",
   name: "Juniper",
   title: "Juniper",
-  description: "",
+  description: "A bot with a long history and some recent work.",
   notifications: false,
   color: "blue",
   unread: false,
-  modelSelection: { instanceId: "claude", model: "m" },
+  modelSelection: { instanceId: "claude", model: "claude-sonnet" },
+  messages: [],
   tasks: [
     { threadId: "thread-history", title: "Fleet coordination", createdAt: HISTORY, messageCount: 4_211 },
     { threadId: "thread-recent", title: "Release pipeline", createdAt: RECENT, messageCount: 312 },
     { threadId: "thread-today", title: "Usage Monitor heartbeat", createdAt: TODAY, messageCount: 18 },
   ],
-} as unknown as Bot;
+};
 
 export default function MergeAllThreadsVisualFixture() {
   const value = useMemo(() => {

@@ -9,19 +9,19 @@ import { describe, expect, it } from "vitest";
 import { StoreProvider, type Bot } from "@/state/store";
 import { MergeAllThreadsDialog } from "./MergeAllThreadsDialog";
 
-const bot = (tasks: Array<{ threadId: string; title: string; createdAt: number; messageCount?: number }>): Bot =>
-  ({
-    id: "bot-1",
-    threadId: tasks[0]!.threadId,
-    name: "Juniper",
-    title: "Juniper",
-    description: "",
-    notifications: false,
-    color: "blue",
-    unread: false,
-    modelSelection: { instanceId: "claude", model: "m" },
-    tasks: tasks.map((task) => ({ ...task })),
-  }) as unknown as Bot;
+const bot = (tasks: Array<{ threadId: string; title: string; createdAt: number; messageCount?: number }>): Bot => ({
+  id: "bot-1",
+  threadId: tasks[0]!.threadId,
+  name: "Juniper",
+  title: "Juniper",
+  description: "A bot with several conversations.",
+  notifications: false,
+  color: "blue",
+  unread: false,
+  modelSelection: { instanceId: "claude", model: "claude-sonnet" },
+  messages: [],
+  tasks: tasks.map((task) => ({ ...task })),
+});
 
 const render = (target: Bot): string =>
   renderToStaticMarkup(
