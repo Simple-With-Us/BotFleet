@@ -19,11 +19,14 @@
 //   - "Reload from Infisical" is safe to click: the app keeps running.
 //
 // What it never does: it never contacts a real server and it never reaches
-// the owner's Keychain, its user data or its server target.
+// the owner's Keychain, its user data or its server target.  The app reads
+// its Infisical read token from a throwaway keychain this script creates
+// (OMB_SMOKE_KEYCHAIN), never from the login Keychain, so even on an
+// enrolled Mac the run cannot see the owner's enrollment.
 //
 // Usage: node scripts/smoke-mac-server-menu.mjs <path to BotFleet.app>
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -84,6 +87,39 @@ const legacyTarget = {
 const legacyTargetText = `${JSON.stringify(legacyTarget, null, 2)}\n`;
 writeFileSync(legacyTargetFile, legacyTargetText);
 
+// A throwaway keychain for the app to read its Infisical read token from.
+// It is empty, so the app must come up "not-enrolled" on any Mac, enrolled
+// or not; the app refuses to run the smoke without one, so it can never fall
+// through to the login Keychain.  Its password is random and dies with it.
+const smokeKeychain = join(home, "server-menu-smoke.keychain-db");
+let keychainCreated = false;
+function removeSmokeKeychain() {
+  if (!keychainCreated) return;
+  keychainCreated = false;
+  try {
+    execFileSync("/usr/bin/security", ["delete-keychain", smokeKeychain], { stdio: "ignore" });
+  } catch {
+    /* the temporary home is removed below either way */
+  }
+}
+try {
+  const keychainPassword = randomBytes(24).toString("hex");
+  execFileSync("/usr/bin/security", ["create-keychain", "-p", keychainPassword, smokeKeychain], {
+    stdio: "ignore",
+  });
+  keychainCreated = true;
+  // No auto-lock: a locked keychain would make the read a prompt.
+  execFileSync("/usr/bin/security", ["set-keychain-settings", smokeKeychain], { stdio: "ignore" });
+  execFileSync("/usr/bin/security", ["unlock-keychain", "-p", keychainPassword, smokeKeychain], {
+    stdio: "ignore",
+  });
+} catch (error) {
+  removeSmokeKeychain();
+  console.error(`could not create the throwaway keychain: ${error instanceof Error ? error.message : String(error)}`);
+  rmSync(home, { recursive: true, force: true });
+  process.exit(1);
+}
+
 const runnerTemp = process.env.RUNNER_TEMP;
 const logPath = runnerTemp ? join(runnerTemp, "server-menu-smoke.log") : null;
 
@@ -100,6 +136,8 @@ const child = spawn(executable, [], {
     OMB_SMOKE_SERVER_MENU: "1",
     // Where the app must keep its user data.
     OMB_SMOKE_USER_DATA_DIR: userDataDir,
+    // The only keychain the app may read its Infisical read token from.
+    OMB_SMOKE_KEYCHAIN: smokeKeychain,
     // Where the app and the harness keep their own data.
     OMB_DATA_DIR: dataDir,
     // No signing identity is needed for an unsigned local build.
@@ -247,6 +285,7 @@ if (exitedEarly) {
   );
 }
 
+removeSmokeKeychain();
 try {
   rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 } catch {

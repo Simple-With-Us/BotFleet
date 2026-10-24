@@ -245,6 +245,24 @@ test("readInfisicalSecrets refuses a reference embedded in a value", async () =>
   );
 });
 
+test("readInfisicalSecrets refuses an unterminated reference", async () => {
+  for (const secretValue of ["${prod.some-folder.OWNER_LOGINS", "owner${", "${"]) {
+    const fetchImpl = jsonFetch({
+      secrets: [{ secretKey: "BOTFLEET_OWNER_LOGINS", secretValue }],
+    });
+
+    await assert.rejects(
+      () => readInfisicalSecrets({ serviceToken: SERVICE_TOKEN, names: GATE_NAMES, fetchImpl }),
+      (err) => {
+        assert.equal(err instanceof InfisicalReadError, true);
+        assert.equal(err.reason, "bad-output");
+        assert.match(err.message, /BOTFLEET_OWNER_LOGINS/);
+        return true;
+      },
+    );
+  }
+});
+
 test("readInfisicalSecrets keeps a value with a lone dollar sign", async () => {
   const fetchImpl = jsonFetch({
     secrets: [{ secretKey: "BOTFLEET_OWNER_LOGINS", secretValue: "owner$@example.com" }],

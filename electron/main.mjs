@@ -53,7 +53,7 @@ import { pollServerIdentity, probeHarness, resolvePackagedServer } from "./serve
 import { readPackagedBuildIdentity } from "./runtime-identity.mjs";
 import { readHarnessOwner } from "./harness-ownership.mjs";
 import { startUiShim } from "./attached-ui-shim.mjs";
-import { resolveServerTarget } from "./server-target.mjs";
+import { readKeychainServiceToken, resolveServerTarget } from "./server-target.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
@@ -117,6 +117,21 @@ if (process.env.OMB_SMOKE_SERVER_MENU === "1" && process.env.OMB_SMOKE_USER_DATA
   // The log folder travels with the user data for the smoke, so a run
   // leaves nothing behind in the real one.
   app.setPath("logs", smokeLogs);
+}
+
+// The packaged Server-menu smoke must never read the owner's login Keychain
+// either: on an enrolled Mac that would point the app under test at the real
+// server with the real gate token.  The smoke hands the app a throwaway
+// keychain of its own (a test-only launch hook, like the user-data one), and
+// a smoke launched without one stops instead of searching the real Keychain.
+let smokeKeychainPath = null;
+if (process.env.OMB_SMOKE_SERVER_MENU === "1") {
+  const keychain = process.env.OMB_SMOKE_KEYCHAIN ?? "";
+  if (!path.isAbsolute(keychain) || !fs.existsSync(keychain)) {
+    console.error("[smoke] server-menu needs OMB_SMOKE_KEYCHAIN, an absolute path to a throwaway keychain that exists");
+    process.exit(2);
+  }
+  smokeKeychainPath = keychain;
 }
 
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
@@ -1114,6 +1129,7 @@ async function startServerOn(port) {
     bootTimeoutMs: SERVER_BOOT_TIMEOUT_MS,
     isExited: () => exited,
   });
+  smokeStep(`harness on port ${port}: ${identity.outcome}`);
   if (identity.outcome === "ready") {
     // Restore missing encrypted credentials once the child is idle.  The
     // same authenticated path also handles attaching to an existing owner.
@@ -1142,6 +1158,14 @@ async function replayAttachedWorkspaceCredentials(port, expectedBuild) {
   if (credentialRestoreStopped) return;
   // Local Keychain secrets are never copied to a remote server.
   if (serverMode === "remote") return;
+  // The packaged Server-menu smoke never touches the operating-system
+  // credential store: restoring would read and write the encrypted store
+  // through the login Keychain, which the smoke must never reach, and its
+  // throwaway user data holds no credentials to restore anyway.
+  if (serverMenuSmokeEnabled()) {
+    smokeStep("credential restore skipped");
+    return;
+  }
   const owner = readHarnessOwner(botfleetDataDir());
   let outcome = "unavailable";
   try {
@@ -1251,6 +1275,25 @@ function serverTargetFailure(error) {
     legacyFile: false,
     message: `BotFleet could not read its server settings from Infisical: ${error?.message ?? error}`,
   };
+}
+
+// The vault read for this launch.  The packaged Server-menu smoke reads its
+// own throwaway keychain; everything else reads the login Keychain.
+function readServerTargetFromInfisical() {
+  const userDataDir = app.getPath("userData");
+  if (smokeKeychainPath) {
+    return resolveServerTarget({
+      userDataDir,
+      readToken: () => readKeychainServiceToken({ keychain: smokeKeychainPath }),
+    });
+  }
+  return resolveServerTarget({ userDataDir });
+}
+
+// One step of the packaged Server-menu smoke, in the app log.  A smoke that
+// never prints its line then says how far the app got.
+function smokeStep(step) {
+  if (serverMenuSmokeEnabled()) slog(`smoke: ${step}`);
 }
 
 // A remote server replaces the local harness entirely: no child is forked and
@@ -1364,6 +1407,7 @@ async function runServerMenuSmoke() {
       report.health = { status: 0, json: false, error: String(error?.message ?? error) };
     }
 
+    smokeStep(`health ${report.health.status}`);
     report.serverMenu = { labels: serverMenuLabels() };
 
     // "Reload from Infisical" reads the vault again.  On a runner with no
@@ -1372,6 +1416,7 @@ async function runServerMenuSmoke() {
       (entry) => entry.label === "Reload from Infisical",
     );
     await reload?.click?.();
+    smokeStep("reload finished");
     report.reload = { labels: serverMenuLabels(), mode: serverTarget?.mode ?? "" };
   } catch (error) {
     report.error = String(error?.message ?? error);
@@ -1386,7 +1431,7 @@ async function runServerMenuSmoke() {
 async function reloadServerTargetFromInfisical() {
   let target;
   try {
-    target = await resolveServerTarget({ userDataDir: app.getPath("userData") });
+    target = await readServerTargetFromInfisical();
   } catch (error) {
     target = serverTargetFailure(error);
   }
@@ -1398,27 +1443,43 @@ async function reloadServerTargetFromInfisical() {
     }
     return target;
   }
+  // A rotated gate token is a change too: the running pipe still carries the
+  // old one, and every request would be refused until a restart.  The tokens
+  // are compared, never logged.
   const changed =
     target.mode !== serverTarget?.mode ||
-    (target.mode === "remote" && target.origin !== serverTarget?.origin);
-  serverTarget = target;
-  setupApplicationMenu();
+    (target.mode === "remote" &&
+      (target.origin !== serverTarget?.origin || target.token !== serverTarget?.token));
   if (!changed) {
+    // Same server, same token: only the status line (where the target came
+    // from) can differ, so the menu is rebuilt in place.
+    serverTarget = target;
+    setupApplicationMenu();
     slog("the server target from Infisical has not changed");
     return target;
   }
-  await offerRestartForServerTarget(target);
+  // The new target is staged until the restart is accepted.  Until then the
+  // app keeps talking to the server it is on, so the menu and diagnostics
+  // keep describing that server.
+  const relaunched = await offerRestartForServerTarget(target);
+  if (relaunched) {
+    serverTarget = target;
+    setupApplicationMenu();
+  } else {
+    slog("the new server target from Infisical takes effect at the next restart");
+  }
   return target;
 }
 
 // Point the app at a server and offer to restart into it.  The server the
 // app talks to cannot change under a running window: the renderer origin,
 // the trust checks and the event stream are all built on it.
+//
+// Answers whether the app is relaunching into the new target.
 async function offerRestartForServerTarget(target) {
-  setupApplicationMenu();
   if (serverMenuSmokeEnabled()) {
-    slog(`smoke: server target set to ${target?.mode ?? "unknown"}`);
-    return;
+    slog(`smoke: would offer a restart into ${target?.mode ?? "unknown"}`);
+    return false;
   }
   const { response } = await dialog.showMessageBox({
     type: "info",
@@ -1428,9 +1489,10 @@ async function offerRestartForServerTarget(target) {
     message: "Restart BotFleet To Use The Other Server?",
     detail: "BotFleet restarts before it talks to the other server.\u00a0 Your conversations and settings stay where they are.",
   });
-  if (response !== 0) return;
+  if (response !== 0) return false;
   app.relaunch();
   app.quit();
+  return true;
 }
 
 function syncManagedComposioCredentials() {
@@ -1924,9 +1986,11 @@ function createWindow() {
   // active only in a packaged app launched with OMB_SMOKE_SERVER_MENU=1.
   if (app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU === "1") {
     let smokeStarted = false;
+    smokeStep("window created");
     const startServerMenuSmoke = () => {
       if (smokeStarted) return;
       smokeStarted = true;
+      smokeStep("menu smoke started");
       void runServerMenuSmoke();
     };
     win.webContents.once("did-finish-load", startServerMenuSmoke);
@@ -2588,7 +2652,13 @@ function setupApplicationMenu() {
       },
       {
         label: "Reload from Infisical",
-        click: () => reloadServerTargetFromInfisical(),
+        // The promise is returned so the smoke can wait for it; the catch is
+        // the backstop for a menu click nobody awaits, and it logs only the
+        // message, never a target or a token.
+        click: () =>
+          reloadServerTargetFromInfisical().catch((error) => {
+            slog(`the reload from Infisical failed: ${error instanceof Error ? error.message : "unknown error"}`);
+          }),
       },
     ];
   };
@@ -2834,6 +2904,14 @@ app.whenReady().then(async () => {
     return;
   }
   setupApplicationMenu();
+  // The Keychain and vault read for the server target starts now and runs
+  // alongside the credential load, the boot migrations and the CUA start
+  // below, so the first window waits on it only as long as it is still
+  // outstanding.  It is awaited before any server is chosen: there is no
+  // fallback to this Mac while it is in flight or when it fails.
+  const serverTargetRead = app.isPackaged
+    ? readServerTargetFromInfisical().catch((error) => serverTargetFailure(error))
+    : null;
   if (app.isPackaged) {
     app.setAsDefaultProtocolClient("botfleet");
   }
@@ -2960,8 +3038,9 @@ app.whenReady().then(async () => {
     // Infisical decides which BotFleet server this launch talks to: the one
     // on this Mac, or a remote one.  There is no file and no environment
     // variable to fall back on.
-    const target = await resolveServerTarget({ userDataDir: app.getPath("userData") });
+    const target = await serverTargetRead;
     serverTarget = target;
+    smokeStep(`server target ${target.mode} (${target.source})`);
     if (target.legacyFile) {
       slog("server-target.json is no longer read; the server target and gate token come from Infisical (BotFleet prod /botfleet-server).\u00a0 Delete the file.");
     }
@@ -2980,6 +3059,7 @@ app.whenReady().then(async () => {
     }
     if (target.mode === "remote") serverReady = await startRemoteServer(target.origin, target.token ?? "");
     else serverReady = await startServerPackaged();
+    smokeStep(`server settled (ready ${serverReady})`);
     // The Server menu shows where the app is pointed, so it is built again
     // once the server it talks to is settled.
     setupApplicationMenu();

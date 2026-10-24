@@ -117,8 +117,13 @@ function rawSecretsUrl() {
   return `${INFISICAL_SITE}/api/v3/secrets/raw?${query.toString()}`;
 }
 
-/** A `${...}` reference anywhere in a value: one the vault did not expand. */
-const UNRESOLVED_REFERENCE = /\$\{[^}]*\}/;
+/**
+ * A `${` anywhere in a value: the start of a reference the vault did not
+ * expand.  An unterminated `${...` is refused as well, because a value that
+ * merely lost its closing brace is no more a real credential than one that
+ * kept it.  A lone `$` is allowed.
+ */
+const UNRESOLVED_REFERENCE = /\$\{/;
 
 /**
  * Read a set of secrets from the vault.

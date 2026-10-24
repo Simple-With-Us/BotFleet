@@ -193,16 +193,28 @@ function legacyTargetFileExists(userDataDir) {
  * setting.  Any other failure — a locked keychain, a `security` that cannot
  * run — is an error the caller has to report.
  *
- * @param {{ execFileImpl?: Function }} options
+ * `keychain` names one keychain file to search instead of the user's search
+ * list.  Only the packaged Server-menu smoke passes it, with a throwaway
+ * keychain of its own, so the smoke can never read the owner's login
+ * Keychain.  It must be an absolute path.
+ *
+ * @param {{ execFileImpl?: Function, keychain?: string }} options
  * @returns {Promise<string | null>} the service token, or null when there is none
  */
-export async function readKeychainServiceToken({ execFileImpl = execFileAsync } = {}) {
+export async function readKeychainServiceToken({ execFileImpl = execFileAsync, keychain } = {}) {
   if (process.platform !== "darwin") return null;
+  const args = ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"];
+  if (keychain !== undefined) {
+    if (!isString(keychain) || !path.isAbsolute(keychain)) {
+      throw new Error("the keychain to read the Infisical read token from must be an absolute path");
+    }
+    args.push(keychain);
+  }
   let stdout;
   try {
     const result = await execFileImpl(
       "/usr/bin/security",
-      ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
+      args,
       { timeout: 10_000, encoding: "utf8", maxBuffer: 64 * 1024 },
     );
     stdout = isString(result) ? result : result?.stdout;

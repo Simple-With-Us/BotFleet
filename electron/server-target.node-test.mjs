@@ -112,11 +112,15 @@ test("a non-http scheme is refused", () => {
 
 test("a gate token of 16 to 256 URL-safe characters is accepted", () => {
   const good = gateToken();
-  assert.deepEqual(validateGateToken(good), { ok: true, token: good });
+  const accepted = validateGateToken(good);
+  assert.equal(accepted.ok, true);
+  assert.ok(accepted.token === good, "the gate token did not round-trip (value withheld)");
   // The full alphabet the gate token may use.
   assert.equal(validateGateToken("aZ0._~-".repeat(4)).ok, true);
   // A token is trimmed: it is usually pasted out of a terminal.
-  assert.deepEqual(validateGateToken(`  ${good}  `), { ok: true, token: good });
+  const trimmed = validateGateToken(`  ${good}  `);
+  assert.equal(trimmed.ok, true);
+  assert.ok(trimmed.token === good, "the trimmed gate token did not round-trip (value withheld)");
 });
 
 test("a gate token that is too short or too long is refused", () => {
@@ -165,7 +169,7 @@ test("the keychain token is read with the security tool, service and account", a
   };
 
   const result = await withPlatform("darwin", () => readKeychainServiceToken({ execFileImpl }));
-  assert.equal(result, token);
+  assert.ok(result === token, "the keychain service token did not round-trip (value withheld)");
   assert.equal(calls.length, 1);
   assert.equal(calls[0].file, "/usr/bin/security");
   assert.deepEqual(calls[0].args, [
@@ -177,6 +181,35 @@ test("the keychain token is read with the security tool, service and account", a
     "-w",
   ]);
   assert.equal(calls[0].options.timeout, 10_000);
+});
+
+test("an explicit keychain is searched instead of the search list", async () => {
+  const calls = [];
+  const execFileImpl = async (file, args) => {
+    calls.push(args);
+    const error = new Error("could not find the item");
+    error.code = 44;
+    throw error;
+  };
+  const keychain = path.join(os.tmpdir(), "bf-smoke.keychain-db");
+  const result = await withPlatform("darwin", () => readKeychainServiceToken({ execFileImpl, keychain }));
+  assert.equal(result, null);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].at(-1), keychain);
+  assert.equal(calls[0].at(-2), "-w");
+});
+
+test("a relative keychain path is refused before security runs", async () => {
+  let called = false;
+  const execFileImpl = async () => {
+    called = true;
+    return { stdout: "" };
+  };
+  await assert.rejects(
+    () => withPlatform("darwin", () => readKeychainServiceToken({ execFileImpl, keychain: "smoke.keychain-db" })),
+    /must be an absolute path/,
+  );
+  assert.equal(called, false);
 });
 
 test("a keychain without the item is not enrolled, not an error", async () => {
@@ -263,7 +296,7 @@ test("a remote target carries the origin and the gate token", async () => {
   assert.equal(result.mode, "remote");
   assert.equal(result.source, "infisical");
   assert.equal(result.origin, "https://jay-server.boa-roygbiv.ts.net:8799");
-  assert.equal(result.token, token);
+  assert.ok(result.token === token, "the gate token did not come back from the vault (value withheld)");
   assert.equal(result.legacyFile, false);
 });
 
@@ -410,9 +443,9 @@ test("the old target file is flagged and never read", async () => {
   // the file, and the token in it is nowhere in sight.
   assert.equal(result.mode, "local");
   assert.equal(result.source, "not-enrolled");
-  assert.equal(result.token, undefined);
+  assert.ok(result.token === undefined, "the result carried a token (value withheld)");
   assert.equal(result.origin, undefined);
-  assert.equal(JSON.stringify(result).includes(token), false);
+  assert.ok(!JSON.stringify(result).includes(token), "the result carried the legacy token (value withheld)");
 });
 
 test("no message ever carries a token or a url value", async () => {
@@ -456,9 +489,9 @@ test("no message ever carries a token or a url value", async () => {
     const result = await resolveServerTarget({ userDataDir: dir, ...injected });
     assert.equal(result.mode, "error");
     const message = String(result.message);
-    assert.equal(message.includes(token), false, `the message carried the token: ${message}`);
-    assert.equal(message.includes(secret), false, `the message carried the service token: ${message}`);
-    assert.equal(message.includes(url), false, `the message carried the url: ${message}`);
+    assert.ok(!message.includes(token), "the message carried the gate token (message withheld)");
+    assert.ok(!message.includes(secret), "the message carried the service token (message withheld)");
+    assert.ok(!message.includes(url), "the message carried the url (message withheld)");
   }
 });
 
@@ -466,13 +499,43 @@ test("no message ever carries a token or a url value", async () => {
 
 test("main.mjs resolves the target from Infisical and keeps the source order", () => {
   const main = fs.readFileSync(new URL("./main.mjs", import.meta.url), "utf8");
+  // The read starts early, alongside the boot preparation, and is awaited
+  // before any server is chosen.  A failed read becomes an error target, never
+  // a fallback.
   assert.match(
     main,
-    /const target = await resolveServerTarget\(\{ userDataDir: app\.getPath\("userData"\) \}\);/,
+    /const serverTargetRead = app\.isPackaged\s*\? readServerTargetFromInfisical\(\)\.catch\(\(error\) => serverTargetFailure\(error\)\)/,
   );
+  assert.match(main, /const target = await serverTargetRead;/);
+  assert.match(main, /return resolveServerTarget\(\{ userDataDir \}\);/);
+  const readAt = main.indexOf("const target = await serverTargetRead;");
+  const packagedAt = main.indexOf("serverReady = await startServerPackaged()", readAt);
+  assert.ok(readAt > 0 && packagedAt > readAt, "the target is awaited before the local server starts");
   assert.match(main, /if \(target\.mode === "remote"\) serverReady = await startRemoteServer\(/);
   assert.match(main, /else serverReady = await startServerPackaged\(\);/);
   // The remote error page still exists, so the remote path keeps its own
   // failure handling.
   assert.match(main, /startRemoteServer\(target\.origin, target\.token \?\? ""\)/);
+});
+
+test("main.mjs stages a reloaded target until the restart is accepted", () => {
+  const main = fs.readFileSync(new URL("./main.mjs", import.meta.url), "utf8");
+  const start = main.indexOf("async function reloadServerTargetFromInfisical()");
+  const end = main.indexOf("function syncManagedComposioCredentials()", start);
+  assert.ok(start > 0 && end > start, "the reload handler is where it was");
+  const reload = main.slice(start, end);
+  // A rotated gate token is a change, compared without being logged.
+  assert.match(reload, /target\.token !== serverTarget\?\.token/);
+  assert.doesNotMatch(reload, /slog\([^)]*token/);
+  // The target is applied only once the restart was accepted.
+  assert.match(reload, /const relaunched = await offerRestartForServerTarget\(target\);\s*if \(relaunched\) \{\s*serverTarget = target;\s*setupApplicationMenu\(\);/);
+  assert.match(reload, /if \(response !== 0\) return false;/);
+  assert.match(reload, /app\.quit\(\);\s*return true;/);
+});
+
+test("main.mjs gives the Server-menu smoke its own keychain and a reload backstop", () => {
+  const main = fs.readFileSync(new URL("./main.mjs", import.meta.url), "utf8");
+  assert.match(main, /process\.env\.OMB_SMOKE_KEYCHAIN/);
+  assert.match(main, /readKeychainServiceToken\(\{ keychain: smokeKeychainPath \}\)/);
+  assert.match(main, /reloadServerTargetFromInfisical\(\)\.catch\(\(error\) => \{/);
 });

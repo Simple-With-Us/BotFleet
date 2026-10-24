@@ -5,7 +5,7 @@
 # process, so no unit test can reach it -- a packaged app, a real application
 # menu and a real window are needed.  This job packages the app unsigned
 # (exactly like Mac Package Gate does) and then drives the menu headlessly:
-# it checks that a runner with no Infisical read token in its Keychain runs
+# it checks that an app with no Infisical read token in its keychain runs
 # against the server on this Mac, that the old server-target.json is ignored
 # rather than read, that the Server menu offers "This Mac", the Infisical
 # status line and "Reload from Infisical", and that reloading from Infisical
@@ -13,7 +13,8 @@
 #
 # What it never does: it never contacts a real server, never reaches the
 # owner's Keychain and never touches the owner's user data -- the app runs
-# with a throwaway HOME.
+# with a throwaway HOME and reads a throwaway, empty keychain the smoke
+# creates (OMB_SMOKE_KEYCHAIN) instead of the login Keychain.
 #
 # On required-ness: this is deliberately NOT a required check.  A path-filtered
 # required check is a trap -- when the filter skips the workflow the check
