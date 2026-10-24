@@ -23,7 +23,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 const REMOTE_URL = "https://botfleet-smoke.invalid:8799";
 const SMOKE_TIMEOUT_MS = 120_000;
@@ -35,7 +35,8 @@ if (!appPath) {
   process.exit(2);
 }
 
-const executable = join(appPath, "Contents", "MacOS", "BotFleet");
+// Absolute, because the app is spawned with its cwd in the temp HOME.
+const executable = resolve(appPath, "Contents", "MacOS", "BotFleet");
 if (!existsSync(executable)) {
   console.error(`no executable at ${executable}`);
   process.exit(1);
