@@ -38,7 +38,7 @@ describe("tvFaceSkinDir", () => {
   });
 
   it("maps every shipped BotColor to its own directory", () => {
-    for (const color of ["blue", "green", "purple", "pink", "red", "yellow", "cyan", "teal", "coral"] as const) {
+    for (const color of ["blue", "green", "purple", "pink", "red", "yellow", "cyan", "teal", "coral", "white", "black"] as const) {
       expect(SHIPPED_SKINS.has(color), `${color} should be shipped`).toBe(true);
       expect(tvFaceSkinDir(color)).toBe(color);
     }

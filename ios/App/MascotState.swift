@@ -34,14 +34,25 @@ extension BotState {
                 profile.range(of: "\\b\(NSRegularExpression.escapedPattern(for: word))\\b", options: .regularExpression) != nil
             }
         }
-        if matches(["code", "coding", "developer", "development", "engineer", "engineering", "build", "debug", "program", "software"]) { return .working }
+        // Prefer super-specific TV-Face sheet faces when the role is clear.
+        if matches(["git", "github", "pull request", "pr", "commit", "merge", "deploy", "compiler", "build", "ci", "testflight"]) { return .git }
+        if matches(["webhook", "hooks", "callback", "event stream"]) { return .webhook }
+        if matches(["fleet", "director", "coordinator", "orchestrat"]) { return .fleet }
+        if matches(["sneak", "stealth", "quiet"]) { return .sneaking }
+        if matches(["memory", "rag", "vector", "embedding", "recall"]) { return .memory }
+        if matches(["tool", "tools", "adapter", "plumber", "connector", "skill"]) { return .tools }
+        if matches(["computer", "desktop", "shell", "terminal", "ssh"]) { return .computer }
+        if matches(["routine", "schedule", "cron", "recurring", "housekeeper"]) { return .routine }
+        if matches(["screen", "ui", "ux", "designer", "frontend"]) { return .screen }
+        if matches(["crash", "sentry", "pagerduty", "fixer", "incident response"]) { return .crash }
+        if matches(["code", "coding", "developer", "development", "engineer", "engineering", "debug", "program", "software"]) { return .working }
         if matches(["research", "researcher", "search", "investigate", "strategy", "strategist", "study", "learn", "knowledge"]) { return .searching }
         if matches(["marketing", "growth", "launch", "campaign", "social", "sales", "outreach", "brand"]) { return .excited }
         if matches(["overnight", "night", "background", "async", "queue", "batch", "long-running"]) { return .drowsy }
         if matches(["monitor", "monitoring", "incident", "alert", "watch", "status", "uptime"]) { return .radar }
-        if matches(["review", "reviewer", "audit", "critic", "critique", "quality", "qa", "test", "legal"]) { return .suspicious }
+        if matches(["review", "reviewer", "audit", "critic", "critique", "quality", "qa", "test", "legal", "publisher"]) { return .suspicious }
         if matches(["security", "secure", "compliance", "risk", "privacy", "finance", "financial"]) { return .scared }
-        if matches(["design", "designer", "creative", "brainstorm", "art", "illustration", "music", "story"]) { return .playful }
+        if matches(["design", "creative", "brainstorm", "art", "illustration", "music", "story"]) { return .playful }
         if matches(["support", "help", "success", "onboarding", "coach", "teacher", "guide", "welcome"]) { return .happy }
         return .idle
     }

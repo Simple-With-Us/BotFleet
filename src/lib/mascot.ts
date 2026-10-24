@@ -14,6 +14,7 @@ export const GROK_ACTIONS = [
   "computer",
   "typing",
   "speaking",
+  "sneaking",
 ] as const;
 
 export type BotState = CursorState | typeof GROK_ACTIONS[number];
@@ -69,6 +70,7 @@ export const STATE_GROUPS: Record<string, BotState[]> = {
     "computer",
     "typing",
     "speaking",
+    "sneaking",
   ],
 };
 
@@ -85,6 +87,7 @@ export function mapBotStateToCursorState(state: BotState): CursorState {
     computer: "working",
     typing: "writing",
     speaking: "dictating",
+    sneaking: "playful",
   };
   return (map[state] as CursorState) || (state as CursorState);
 }
@@ -100,6 +103,8 @@ export const BOT_COLOR_NAMES = [
   "yellow",
   "teal",
   "coral",
+  "white",
+  "black",
 ] as const;
 
 export type BotColor = (typeof BOT_COLOR_NAMES)[number];
@@ -115,6 +120,8 @@ export const BOT_COLORS = {
   yellow: "#D8A729",
   teal: "#01A492",
   coral: "#E5634E",
+  white: "#E8EAED",
+  black: "#2D3036",
 } satisfies Record<BotColor, string>;
 
 export const BOT_MOTIONS = [
