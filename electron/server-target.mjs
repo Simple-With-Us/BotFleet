@@ -168,6 +168,58 @@ function readTargetFile(userDataDir) {
   }
 }
 
+/**
+ * Validate the parsed target file.
+ *
+ * The file is hand-editable by design ("Set Remote Server…" opens it), so
+ * every field is checked before anything uses it.  The mode must be one the
+ * app knows, the urls must be strings, and the token must be a real gate
+ * token.
+ *
+ * An invalid token is dropped and reported rather than used: a token the
+ * gate will refuse is worse than no token, because it looks configured.
+ * The same rule decides whether a token may be carried over into a new
+ * file, so the reader and the writer can never disagree about it.
+ *
+ * @param {unknown} parsed
+ * @returns {{ value: { mode: "local" | "remote", url?: string, savedUrl?: string, token?: string } | null, error: string | null }}
+ */
+export function validateTargetFile(parsed) {
+  if (!isRecord(parsed)) {
+    return { value: null, error: `${SERVER_TARGET_FILE} is not a JSON object` };
+  }
+  const mode = parsed.mode;
+  if (mode !== "local" && mode !== "remote") {
+    return { value: null, error: `${SERVER_TARGET_FILE} has no valid "mode"` };
+  }
+  const value = { mode };
+  if (isString(parsed.url)) value.url = parsed.url.trim();
+  if (isString(parsed.savedUrl)) value.savedUrl = parsed.savedUrl.trim();
+  let error = null;
+  if (isString(parsed.token) && parsed.token.trim()) {
+    const checked = validateGateToken(parsed.token);
+    if (checked.ok) value.token = checked.token;
+    else error = `The gate token in ${SERVER_TARGET_FILE} is not valid: ${checked.error}`;
+  }
+  return { value, error };
+}
+
+/**
+ * The validated target file, or null when there is no readable file.
+ *
+ * This is the one way to look at the file's contents: every field comes
+ * back validated, so a caller can never act on a shape the app would
+ * refuse.
+ *
+ * @param {string} userDataDir
+ * @returns {{ mode: "local" | "remote", url?: string, savedUrl?: string, token?: string } | null}
+ */
+export function readServerTargetFile(userDataDir) {
+  const parsed = readTargetFile(userDataDir);
+  if (!parsed) return null;
+  return validateTargetFile(parsed).value;
+}
+
 /** The last url in the file that is still valid, as an origin, or null. */
 function savedOriginFrom(parsed) {
   if (!parsed) return null;
@@ -255,16 +307,18 @@ export function readServerTarget({ userDataDir, env = process.env } = {}) {
   } catch {
     return { mode: "local", error: `${SERVER_TARGET_FILE} is not valid JSON` };
   }
-  if (!isRecord(parsed)) {
-    return { mode: "local", error: `${SERVER_TARGET_FILE} is not a JSON object` };
-  }
 
-  const mode = parsed.mode;
-  if (mode === "local") return { mode: "local" };
-  if (mode !== "remote") {
-    return { mode: "local", error: `${SERVER_TARGET_FILE} has no valid "mode"` };
+  // The file is hand-editable, so it is validated as a whole before any of
+  // it is used: an unknown mode, a missing url or a bad token is reported,
+  // never acted on.
+  const checked = validateTargetFile(parsed);
+  if (!checked.value) {
+    return { mode: "local", error: checked.error };
   }
-  const validated = validateRemoteServerUrl(parsed.url);
+  const file = checked.value;
+
+  if (file.mode === "local") return { mode: "local" };
+  const validated = validateRemoteServerUrl(file.url);
   if (!validated.ok) {
     return { mode: "local", error: `The remote server URL in ${SERVER_TARGET_FILE} is not valid: ${validated.error}` };
   }
@@ -280,17 +334,9 @@ export function readServerTarget({ userDataDir, env = process.env } = {}) {
     };
   }
   if (fromEnv.token) return { ...remote, token: fromEnv.token };
-
-  const inFile = isString(parsed.token) ? parsed.token.trim() : "";
-  if (!inFile) return remote;
-  const checked = validateGateToken(inFile);
-  if (!checked.ok) {
-    return {
-      ...remote,
-      error: `The gate token in ${SERVER_TARGET_FILE} is not valid and was ignored: ${checked.error}`,
-    };
-  }
-  return { ...remote, token: checked.token };
+  if (file.token) return { ...remote, token: file.token };
+  if (checked.error) return { ...remote, error: checked.error };
+  return remote;
 }
 
 /**
@@ -318,16 +364,22 @@ export function writeServerTarget(userDataDir, { mode, url, token } = {}) {
   }
   const previousFile = readTargetFile(userDataDir);
   const previous = savedOriginFrom(previousFile);
+  // The carried-over token is validated with the same rule the reader uses:
+  // the file is hand-editable, so a token typed by hand (or pasted with a
+  // stray character) must not be written back — the reader would reject it
+  // and the owner would be locked out of the server they had configured.
+  const previousChecked = previousFile ? validateTargetFile(previousFile) : null;
+  const previousToken = previousChecked?.value?.token ?? "";
 
-  // A token handed in is checked; a token already in the file is kept as it
-  // is, because it was checked when it was read.
+  // A token handed in is checked; a token already in the file is kept only
+  // when it is a valid gate token.
   let chosenToken = "";
   if (isString(token) && token.trim()) {
     const checked = validateGateToken(token);
     if (!checked.ok) throw new Error(checked.error);
     chosenToken = checked.token;
-  } else if (isString(previousFile?.token) && previousFile.token.trim()) {
-    chosenToken = previousFile.token.trim();
+  } else if (previousToken) {
+    chosenToken = previousToken;
   }
 
   let target;

@@ -21,9 +21,9 @@
 // Usage: node scripts/smoke-mac-server-menu.mjs <path to BotFleet.app>
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir, userInfo } from "node:os";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve, sep } from "node:path";
 
 const REMOTE_URL = "https://botfleet-smoke.invalid:8799";
 const SMOKE_TIMEOUT_MS = 120_000;
@@ -45,6 +45,26 @@ if (!existsSync(executable)) {
 // A throwaway HOME: the app writes its user-data (and the target file) there,
 // so a run never touches the real one.
 const home = mkdtempSync(join(tmpdir(), "bf-server-menu-smoke-"));
+// macOS resolves the home directory from the password database, not from
+// $HOME, so overriding HOME alone would leave `app.getPath("userData")`
+// pointing at the owner's real directory and the smoke would overwrite their
+// configured server target.  The app is therefore told exactly where its
+// user data goes, inside the throwaway HOME.
+const userDataDir = join(home, "userData");
+mkdirSync(userDataDir, { recursive: true });
+// The data directory the harness and the app share, also inside the
+// throwaway HOME.
+const dataDir = join(home, ".botfleet");
+mkdirSync(dataDir, { recursive: true });
+// The one thing this script must never do is point the app at a directory
+// outside its own throwaway home.  Refuse instead of risking the owner's
+// real user data.
+if (!resolve(userDataDir).startsWith(`${resolve(home)}${sep}`)) {
+  console.error(
+    `refusing to run: the smoke user-data directory ${userDataDir} is outside the temporary home ${home}`,
+  );
+  process.exit(2);
+}
 const runnerTemp = process.env.RUNNER_TEMP;
 const logPath = runnerTemp ? join(runnerTemp, "server-menu-smoke.log") : null;
 
@@ -59,6 +79,10 @@ const child = spawn(executable, [], {
     HOME: home,
     // The smoke hook itself.
     OMB_SMOKE_SERVER_MENU: "1",
+    // Where the app must keep its user data (and the target file it writes).
+    OMB_SMOKE_USER_DATA_DIR: userDataDir,
+    // Where the app and the harness keep their own data.
+    OMB_DATA_DIR: dataDir,
     // The server this launch talks to: unreachable on purpose.
     BOTFLEET_SERVER_URL: REMOTE_URL,
     // The server the menu should switch to.
@@ -160,23 +184,28 @@ if (!report) {
     `the Server menu must still list "${EXPECTED_REMOTE_LABEL}" after switching back, got ${JSON.stringify(localLabels)}`,
   );
 
-  // The target file on disk, where Electron put the user-data directory.
-  // macOS resolves the home directory from the password database, not from
-  // $HOME, so the file may land in either place; the app's own report above
-  // is what proves it was written, and this checks what it says.
-  const roots = [join(home, "Library", "Application Support"), join(userInfo().homedir, "Library", "Application Support")];
-  const found = roots.flatMap((root) =>
-    existsSync(root)
-      ? readdirSync(root).flatMap((name) => {
-          const candidate = join(root, name, "server-target.json");
-          return existsSync(candidate) ? [candidate] : [];
-        })
-      : [],
-  );
-  for (const file of found) {
-    const parsed = JSON.parse(readFileSync(file, "utf8"));
-    check(parsed.mode === "local", `the target file must end in "local", got ${JSON.stringify(parsed.mode)}`);
-    check(!parsed.token, "the target file must not carry a token");
+  // The target file on disk, in the throwaway user-data directory the app
+  // was pointed at.  It is checked with explicit assertions instead of a
+  // schema: this script is deliberately dependency-free so it can run
+  // before the app's dependencies exist, and it asserts on every field it
+  // reads.
+  const targetFile = join(userDataDir, "server-target.json");
+  check(existsSync(targetFile), `the target file must exist at ${targetFile}`);
+  if (existsSync(targetFile)) {
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(targetFile, "utf8"));
+    } catch (error) {
+      check(false, `the target file must be valid JSON: ${String(error?.message ?? error)}`);
+    }
+    if (parsed !== undefined) {
+      check(
+        Object.prototype.toString.call(parsed) === "[object Object]",
+        `the target file must be a JSON object, got ${JSON.stringify(parsed)}`,
+      );
+      check(parsed.mode === "local", `the target file must end in "local", got ${JSON.stringify(parsed.mode)}`);
+      check(!parsed.token, "the target file must not carry a token");
+    }
   }
 }
 

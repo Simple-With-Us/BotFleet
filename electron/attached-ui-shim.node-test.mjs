@@ -602,6 +602,35 @@ test("a remote origin proxies /api to the remote server and serves the UI locall
   }
 });
 
+test("a remote origin is used even when a local harness port is given", async () => {
+  const upstream = await startRecordingUpstream();
+  const harness = await startCountingHarness();
+  try {
+    // A remote server replaces the harness entirely.  The local port is
+    // never contacted, so a remote-mode path can not reach an unrelated
+    // local process that happens to sit on the harness port.
+    const shim = await startUiShim({
+      uiDir: makeUiDir(),
+      harnessPort: harness.port,
+      remoteOrigin: `http://127.0.0.1:${upstream.port}`,
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${shim.port}/api/health`, {
+        signal: AbortSignal.timeout(5_000),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("x-upstream"), "remote");
+      assert.equal(upstream.seen.length, 1);
+      assert.equal(harness.seen.length, 0);
+    } finally {
+      await shim.close();
+    }
+  } finally {
+    await upstream.close();
+    await harness.close();
+  }
+});
+
 test("a remote server that is gone yields 502, not a hang", async () => {
   const upstream = await startRecordingUpstream();
   const deadPort = upstream.port;

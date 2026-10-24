@@ -97,6 +97,28 @@ import {
 import capabilitiesModule from "./capabilities.cjs";
 import appInfoModule from "./app-info.cjs";
 
+// The packaged Server-menu smoke must never touch the owner's real
+// user-data directory.  On macOS `app.getPath("userData")` resolves from the
+// password database, not from $HOME, so a smoke that only overrides HOME
+// would write the owner's real target file.  The smoke therefore hands the
+// app its own throwaway directory, and this runs before anything reads a
+// path — every later `app.getPath("userData")` sees the isolated directory.
+if (process.env.OMB_SMOKE_SERVER_MENU === "1" && process.env.OMB_SMOKE_USER_DATA_DIR) {
+  const smokeUserData = path.resolve(process.env.OMB_SMOKE_USER_DATA_DIR);
+  const smokeLogs = path.join(smokeUserData, "logs");
+  // Electron refuses to point a path at a directory that does not exist.
+  try {
+    fs.mkdirSync(smokeUserData, { recursive: true });
+    fs.mkdirSync(smokeLogs, { recursive: true });
+  } catch {
+    /* the smoke reports the missing directory itself */
+  }
+  app.setPath("userData", smokeUserData);
+  // The log folder travels with the user data for the smoke, so a run
+  // leaves nothing behind in the real one.
+  app.setPath("logs", smokeLogs);
+}
+
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
 const { appRuntimeInfo, appRuntimeSummary } = appInfoModule;
 let updateCredentialPreparationPath;
@@ -359,6 +381,9 @@ let serverMode = "spawned";
 // ("local") or a remote server the owner pointed the app at ("remote").
 // Read once at boot from the user-data target file; see server-target.mjs.
 let serverTarget = { mode: "local" };
+// Why the remote server could not be used (an invalid gate token, say).  The
+// error page shows it instead of the generic "could not reach it" line.
+let serverRemoteError = null;
 // Serves the bundled UI (and streams /api through) when the attached harness
 // runs headless — see attached-ui-shim.mjs.
 let uiShim = null;
@@ -768,7 +793,15 @@ async function desktopCompanionState() {
   return decorateDesktopCompanionState(await companionState());
 }
 
+// A remote server has its own phone pairing, so the local sidecar never runs
+// in remote mode: it would hand the sidecar a harness port where nothing
+// listens, and its proxy would offer the remote server to any paired
+// device.  This is the error the owner sees instead.
+const REMOTE_COMPANION_ERROR = "The phone companion runs on the remote server, not this app.";
+
 function companionLaunchOptions(hostedUrl = null) {
+  // Remote mode has no local harness to point the sidecar at.
+  if (serverMode === "remote") throw new Error(REMOTE_COMPANION_ERROR);
   return {
     resourcesPath: process.resourcesPath,
     harnessPort: SERVER_PORT,
@@ -846,6 +879,10 @@ async function startManagedCompanionConnection({ waitForVerification = true } = 
 }
 
 async function startDesktopCompanion({ waitForHosted = true, remember = true } = {}) {
+  // The sidecar talks to a harness on this Mac, so it cannot run against a
+  // remote server.  Refuse here as well as at the call sites: this is the
+  // one place that would hand SERVER_PORT to the sidecar.
+  if (serverMode === "remote") throw new Error(REMOTE_COMPANION_ERROR);
   companionDesiredThisLaunch = true;
   companionLaunchGeneration += 1;
   // Direct LAN comes up first. The hosted endpoint is added in place only
@@ -1221,6 +1258,12 @@ function readDesktopServerTarget() {
 async function startRemoteServer(remoteOrigin, remoteToken = "") {
   serverMode = "remote";
   serverProc = null;
+  if (!remoteToken) {
+    // A token is optional by design: a server behind a Tailscale login
+    // admits its own devices without one.  Say so once, so the log explains
+    // a 403 from the gate instead of leaving it to be guessed.
+    slog("the remote server has no gate token; only devices signed in to the tailnet can reach it");
+  }
   try {
     uiShim = await startUiShim({
       uiDir: path.join(process.resourcesPath, "ui"),
@@ -1344,7 +1387,12 @@ async function runServerMenuSmoke() {
   } catch (error) {
     report.error = String(error?.message ?? error);
   }
-  console.log(`[smoke] server-menu ${JSON.stringify(report)}`);
+  // The report goes out through the write callback, not through a bare
+  // console.log: a pipe write is asynchronous on macOS, and quitting on the
+  // next line would drop the queued line before the parent ever saw it.
+  await new Promise((resolve) => {
+    process.stdout.write(`[smoke] server-menu ${JSON.stringify(report)}\n`, resolve);
+  });
   app.quit();
 }
 
@@ -1399,15 +1447,21 @@ function openServerTargetFile() {
     slog(`smoke: would open the server target file at ${file}`);
     return;
   }
-  void shell.openPath(file);
-  void dialog.showMessageBox({
-    type: "info",
-    buttons: ["OK"],
-    message: "Edit The Server Target File",
-    detail:
-      `Set "url" to the server's address, paste the gate token from the server into "token", ` +
-      `set "mode" to "remote", then restart BotFleet.\u00a0 The file is ${file}`,
+  void shell.openPath(file).catch((error) => {
+    slog(`could not open the server target file: ${error instanceof Error ? error.message : String(error)}`);
   });
+  void dialog
+    .showMessageBox({
+      type: "info",
+      buttons: ["OK"],
+      message: "Edit The Server Target File",
+      detail:
+        `Set "url" to the server's address, paste the gate token from the server into "token", ` +
+        `set "mode" to "remote", then restart BotFleet.\u00a0 The file is ${file}`,
+    })
+    .catch((error) => {
+      slog(`could not show the server target instructions: ${error instanceof Error ? error.message : String(error)}`);
+    });
 }
 
 function syncManagedComposioCredentials() {
@@ -1445,10 +1499,12 @@ const ERROR_PAGE_STYLE =
 // harness probe runs again.  Never opened externally (it is not http).
 const SERVER_RETRY_URL = "botfleet://retry-server";
 
-function buildErrorPage({ allPortsOccupied, unresponsiveOwner = null, remoteOrigin = null }) {
+function buildErrorPage({ allPortsOccupied, unresponsiveOwner = null, remoteOrigin = null, remoteError = null }) {
   const serverLogPath = path.join(LOG_DIR, "server.log");
   const serverLogHref = pathToFileURL(serverLogPath).href;
-  const reason = remoteOrigin
+  const reason = remoteError
+    ? `BotFleet could not use the remote server at ${remoteOrigin}.\u00a0 ${remoteError}`
+    : remoteOrigin
     ? `BotFleet could not reach the server at ${remoteOrigin}.\u00a0 Check that the address is right and that this Mac can reach it, then try again.`
     : unresponsiveOwner
     ? `A BotFleet server that owns this Mac's fleet data (process ${unresponsiveOwner.pid} on port ${unresponsiveOwner.port}) is running but not answering.\u00a0 BotFleet will not start a second server on the same data.\u00a0 Wait a minute and try again, or quit that process first.`
@@ -1917,6 +1973,7 @@ function createWindow() {
             allPortsOccupied: serverStartConflictOnly,
             unresponsiveOwner: serverStartUnresponsiveOwner,
             remoteOrigin: serverMode === "remote" ? serverTarget.origin : null,
+            remoteError: serverMode === "remote" ? serverRemoteError : null,
           }),
     );
   } else {
@@ -2229,7 +2286,13 @@ ipcMain.handle("companion:trycloudflare", async (_event, enable) => {
 });
 
 ipcMain.handle("companion:state", () => desktopCompanionState());
-ipcMain.handle("companion:start", () => startDesktopCompanion());
+ipcMain.handle("companion:start", () => {
+  // The same gate as the at-rest start: a remote server has its own phone
+  // pairing, so the local sidecar must not run against a port that holds no
+  // BotFleet server.
+  if (serverMode === "remote") throw new Error(REMOTE_COMPANION_ERROR);
+  return startDesktopCompanion();
+});
 ipcMain.handle("companion:stop", () => stopDesktopCompanion());
 ipcMain.handle("companion:keep-awake", async (_event, enabled) => {
   rememberCompanionKeepAwake(Boolean(enabled));
@@ -2363,7 +2426,20 @@ const CREDENTIAL_PATCH = {
   infisicalClientSecret: (value) => ({ infisical: { clientSecret: value } }),
 };
 
+// A remote server owns its own secrets.  A key set in this app would land in
+// this Mac's encrypted store and never reach the server that uses it, so the
+// handlers refuse before anything is stored or decrypted — the owner is told
+// where the key belongs instead of watching a "configured" badge that lies.
+const REMOTE_CREDENTIAL_ERROR =
+  "This app is using a remote BotFleet server.\u00a0 Set keys on that server, not in this app.";
+
+function refuseCredentialsInRemoteMode() {
+  if (serverMode !== "remote") return;
+  throw new Error(REMOTE_CREDENTIAL_ERROR);
+}
+
 ipcMain.handle("credential:set", async (_event, name, value, provider) => {
+  refuseCredentialsInRemoteMode();
   if (name === "ttsKey" && provider !== undefined && !["minimax", "elevenlabs", "system"].includes(provider)) {
     throw new Error("Unsupported voice engine");
   }
@@ -2376,8 +2452,11 @@ ipcMain.handle("credential:set", async (_event, name, value, provider) => {
   }
   const secret = value.trim();
   const applyToHarness = async () => {
-    // Local Keychain secrets are never copied to a remote server.
-    if (serverMode === "remote") return null;
+    // Local Keychain secrets are never copied to a remote server.  The
+    // handler refuses in remote mode before it gets here, so this is the
+    // backstop: it throws rather than returning a value the shared
+    // credential state would turn into the decrypted document.
+    if (serverMode === "remote") throw new Error(REMOTE_CREDENTIAL_ERROR);
     // In development the server is a separately launched process, so it
     // cannot receive credentials from Electron at boot. Keep its established
     // local config path there; production always uses the encrypted store.
@@ -2415,6 +2494,7 @@ ipcMain.handle("credential:set", async (_event, name, value, provider) => {
 // config.json, applying it only to the live running instance's
 // environment (server/index.ts's instanceKeyOverrides).
 ipcMain.handle("credential:set-instance", async (_event, instanceId, value) => {
+  refuseCredentialsInRemoteMode();
   if (typeof instanceId !== "string" || !/^[\w.-]+$/.test(instanceId) || typeof value !== "string") {
     throw new Error("Unsupported credential");
   }
@@ -2423,8 +2503,11 @@ ipcMain.handle("credential:set-instance", async (_event, instanceId, value) => {
   }
   const secret = value.trim();
   const applyToHarness = async () => {
-    // Local Keychain secrets are never copied to a remote server.
-    if (serverMode === "remote") return null;
+    // Local Keychain secrets are never copied to a remote server.  The
+    // handler refuses in remote mode before it gets here, so this is the
+    // backstop: it throws rather than returning a value the shared
+    // credential state would turn into the decrypted document.
+    if (serverMode === "remote") throw new Error(REMOTE_CREDENTIAL_ERROR);
     // Dev/browser fallback: no desktop shell to replay this from at the next
     // spawn, so the server's own PATCH persists the key in config.json —
     // the same plaintext shape the create-time flow already falls back to.
@@ -2913,19 +2996,25 @@ app.whenReady().then(async () => {
     // this launch talks to: the one on this Mac, or a remote one.
     const target = readDesktopServerTarget();
     serverTarget = target;
-    // A remote target with an ignored problem (an invalid gate token, say)
-    // still points at the remote server, so the message must not claim the
-    // app fell back to this Mac.
-    if (target.error) {
-      slog(
-        target.mode === "remote"
-          ? `server target: ${target.error}`
-          : `server target: ${target.error}; using the server on this Mac`,
-      );
+    if (target.mode === "remote" && target.error) {
+      // The remote target is unusable — an invalid gate token, say.  Falling
+      // back to the server on this Mac would talk to a different server than
+      // the owner configured, and starting the shim with a rejected token
+      // would only produce a 403.  Neither happens: the remote error page
+      // says what is wrong instead.
+      slog(`server target: ${target.error}`);
+      serverMode = "remote";
+      serverRemoteError = target.error;
+      serverStartConflictOnly = false;
+      serverReady = false;
+    } else {
+      if (target.error) {
+        slog(`server target: ${target.error}; using the server on this Mac`);
+      }
+      serverReady = target.mode === "remote"
+        ? await startRemoteServer(target.origin, target.token ?? "")
+        : await startServerPackaged();
     }
-    serverReady = target.mode === "remote"
-      ? await startRemoteServer(target.origin, target.token ?? "")
-      : await startServerPackaged();
     // The Server menu shows where the app is pointed, so it is built again
     // once the server it talks to is settled.
     setupApplicationMenu();

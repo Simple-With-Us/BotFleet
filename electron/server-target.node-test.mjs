@@ -9,8 +9,10 @@ import { randomBytes } from "node:crypto";
 import {
   readSavedRemoteUrl,
   readServerTarget,
+  readServerTargetFile,
   validateGateToken,
   validateRemoteServerUrl,
+  validateTargetFile,
   writeServerTarget,
   writeServerTargetTemplate,
   SERVER_TARGET_FILE,
@@ -345,12 +347,36 @@ test("writing a remote target keeps the token the file already had", () => {
     JSON.stringify({ mode: "remote", url: "https://host.example:8799", token }),
   );
   writeServerTarget(dir, { mode: "local" });
-  const after = JSON.parse(fs.readFileSync(path.join(dir, SERVER_TARGET_FILE), "utf8"));
+  // The file is read through the app's own validated reader, so a malformed
+  // target can never reach the assertions unnoticed.
+  const after = readServerTargetFile(dir);
   assert.equal(after.token, token);
 
   // …and switching back to remote keeps it too.
   writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799" });
   assert.equal(readServerTarget({ userDataDir: dir, env: {} }).token, token);
+});
+
+test("an invalid token in the file is dropped, not written back", () => {
+  const dir = makeUserDataDir();
+  // The file is hand-editable by design, so a token typed by hand can be
+  // wrong.  Carrying it over would write it back verbatim, and the reader
+  // would then reject it — locking the owner out of the server they had
+  // configured.
+  writeTargetFile(
+    dir,
+    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: "short" }),
+  );
+  writeServerTarget(dir, { mode: "local" });
+
+  const after = readServerTargetFile(dir);
+  assert.equal(after.token, undefined);
+  assert.deepEqual(readServerTarget({ userDataDir: dir, env: {} }), { mode: "local" });
+
+  // A new token still replaces whatever was there.
+  const token = randomBytes(16).toString("hex");
+  writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799", token });
+  assert.equal(readServerTargetFile(dir).token, token);
 });
 
 test("a new token replaces the one in the file", () => {
@@ -372,6 +398,55 @@ test("writing an invalid token throws and leaves the file alone", () => {
   assert.equal(readServerTarget({ userDataDir: dir, env: {} }).token, token);
 });
 
+test("the reader validates the file before anything uses it", () => {
+  const dir = makeUserDataDir();
+
+  // A file that is not an object at all.
+  writeTargetFile(dir, JSON.stringify(["not", "an", "object"]));
+  assert.equal(readServerTargetFile(dir), null);
+
+  // An unknown mode.
+  writeTargetFile(dir, JSON.stringify({ mode: "sideways" }));
+  assert.equal(readServerTargetFile(dir), null);
+
+  // A remote file comes back validated, with its token trimmed.
+  const token = randomBytes(16).toString("hex");
+  writeTargetFile(
+    dir,
+    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: `  ${token}\n` }),
+  );
+  assert.deepEqual(readServerTargetFile(dir), {
+    mode: "remote",
+    url: "https://host.example:8799",
+    token,
+  });
+
+  // An invalid token is dropped by the reader, and the reader says so.
+  writeTargetFile(
+    dir,
+    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: "short" }),
+  );
+  assert.deepEqual(readServerTargetFile(dir), {
+    mode: "remote",
+    url: "https://host.example:8799",
+  });
+  const result = readServerTarget({ userDataDir: dir, env: {} });
+  assert.equal(result.mode, "remote");
+  assert.equal(result.token, undefined);
+  assert.match(result.error, /token/i);
+});
+
+test("validateTargetFile refuses a shape the app would never use", () => {
+  assert.equal(validateTargetFile(null).value, null);
+  assert.equal(validateTargetFile("remote").value, null);
+  assert.equal(validateTargetFile({}).value, null);
+  assert.equal(validateTargetFile({ mode: "sideways" }).value, null);
+
+  const checked = validateTargetFile({ mode: "remote", url: "https://host.example:8799" });
+  assert.deepEqual(checked.value, { mode: "remote", url: "https://host.example:8799" });
+  assert.equal(checked.error, null);
+});
+
 // ── writeServerTargetTemplate ──────────────────────────────────────────────
 
 test("the template is written when there is no target file yet", () => {
@@ -385,6 +460,8 @@ test("the template is written when there is no target file yet", () => {
 
   const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
   assert.deepEqual(parsed, { mode: "local", url: "", token: "" });
+  // …and the same file read through the app's own validated reader.
+  assert.deepEqual(readServerTargetFile(dir), { mode: "local", url: "" });
 });
 
 test("the template never overwrites an existing target file", () => {
