@@ -54,7 +54,7 @@ export FAKE_ASC_PEM="${tmp}/asc.p8"
 
 extract() {
   awk '
-    /^fs_get\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
+    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
     grab { print }
     grab && /^\}/ { grab = 0 }
   ' "$script"
@@ -432,5 +432,85 @@ fi
 if grep -nE '\-f "\$\{?ASC_KEY_PATH' "$script" >/dev/null; then
   fail "ship-testflight.sh still tests a named path for the credential"
 fi
+
+# 7. macOS TMPDIR ends in a slash.  The staged path still has to be normal,
+#    the run still cleans it up, and a missing TMPDIR uses /tmp the same way.
+path_is_normal() {
+  node -e 'const p=require("path").posix; const s=process.argv[1]; process.exit(p.normalize(s)===s ? 0 : 1)' "$1"
+}
+
+stage_from_tmpdir() {
+  local label="$1"
+  shift
+  local out
+  out="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
+    -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+    "$@" bash -c '
+    set -euo pipefail
+    source "'"$funcs"'"
+    load_secrets
+    [[ "$AUTH_MODE" == api_key ]]
+    [[ -z "${ASC_AUTH_FAILURE:-}" ]]
+    [[ "$ASC_KEY_PATH" != *//* ]]
+    echo "$ASC_KEY_PATH"
+    cleanup_asc_tmp
+    [[ ! -e "$ASC_KEY_PATH" ]]
+  ')" || fail "$label"
+  local staged
+  staged="$(printf '%s\n' "$out" | tail -1)"
+  path_is_normal "$staged" || fail "$label staged a path that is not normal: $staged"
+  [[ ! -e "$staged" ]] || fail "$label left the staged key behind"
+}
+
+mkdir -p "${tmp}/slash-tmp"
+stage_from_tmpdir "trailing-slash TMPDIR" TMPDIR="${tmp}/slash-tmp/"
+stage_from_tmpdir "TMPDIR without a trailing slash" TMPDIR="${tmp}/tmp"
+stage_from_tmpdir "unset TMPDIR" -u TMPDIR
+
+# 8. A staging refusal is not a missing credential.  The key resolves, the
+#    writer refuses the path, and the upload block says staging.
+real_node="$(command -v node)"
+mkdir -p "${tmp}/bin"
+cat > "${tmp}/bin/node" <<WRAP
+#!/usr/bin/env bash
+if [[ "\${1:-}" == *asc-key.mjs && "\${2:-}" == write ]]; then
+  echo "asc-key: the staged key path is not a normal path" >&2
+  exit 1
+fi
+exec "$real_node" "\$@"
+WRAP
+chmod 700 "${tmp}/bin/node"
+stage_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
+  -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+  PATH="${tmp}/bin:${PATH}" bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  load_secrets
+  [[ "$AUTH_MODE" == none ]]
+  [[ "$ASC_AUTH_FAILURE" == staging ]]
+  [[ "$(asc_upload_block)" == staging ]]
+')" || fail "a path refusal was classified as a missing key"
+case "$stage_log" in
+  *"the credential was resolved and the staging path was refused"*) ;;
+  *) fail "a path refusal did not say the credential was resolved: ${stage_log}" ;;
+esac
+case "$stage_log" in
+  *"no App Store Connect API key"*) fail "a path refusal was reported as a missing key" ;;
+esac
+
+# 9. No credential at all still classifies as missing, so the owner handoff
+#    for a missing key stays on that path.
+env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
+  -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  # The sourced file points at the fake fleet-secrets.  Point it at nothing
+  # after that, so this case really has no credential.
+  FLEET_SECRETS_BIN="'"${tmp}"'/no-such-fleet-secrets"
+  load_secrets
+  [[ "$AUTH_MODE" == none ]]
+  [[ -z "${ASC_AUTH_FAILURE:-}" ]]
+  [[ "$(asc_upload_block)" == missing ]]
+' || fail "a missing credential was not classified as missing"
 
 echo "ok: ASC credential resolution (environment first, then Infisical, a named path ignored, temp key removed)"
