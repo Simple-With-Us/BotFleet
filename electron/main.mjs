@@ -2985,19 +2985,22 @@ app.whenReady().then(async () => {
     // this launch talks to: the one on this Mac, or a remote one.
     const target = readDesktopServerTarget();
     serverTarget = target;
-    if (target.mode === "remote" && target.error) {
-      // The remote target is unusable — an invalid gate token, say.  Falling
-      // back to the server on this Mac would talk to a different server than
-      // the owner configured, and starting the shim with a rejected token
-      // would only produce a 403.  Neither happens: the remote error page
-      // says what is wrong instead.
+    if (target.mode === "remote" && target.error && !target.tokenDropped) {
+      // The remote target is unusable.  Falling back to the server on this
+      // Mac would talk to a different server than the owner configured, so
+      // the remote error page says what is wrong instead.  A dropped gate
+      // token is not this case:  the token is optional (a tailnet-signed-in
+      // device reaches the server without one), and the reader has already
+      // left the bad token out, so the launch below goes on without it.
       slog(`server target: ${target.error}`);
       serverMode = "remote";
       serverRemoteError = target.error;
       serverStartConflictOnly = false;
       serverReady = false;
     } else {
-      if (target.error) {
+      if (target.error && target.tokenDropped) {
+        slog(`server target: ${target.error}; connecting to the remote server without a gate token`);
+      } else if (target.error) {
         slog(`server target: ${target.error}; using the server on this Mac`);
       }
       if (target.mode === "remote") serverReady = await startRemoteServer(target.origin, target.token ?? "");

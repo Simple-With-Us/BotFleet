@@ -182,7 +182,7 @@ function readTargetFile(userDataDir) {
  * file, so the reader and the writer can never disagree about it.
  *
  * @param {unknown} parsed
- * @returns {{ value: { mode: "local" | "remote", url?: string, savedUrl?: string, token?: string } | null, error: string | null }}
+ * @returns {{ value: { mode: "local" | "remote", url?: string, savedUrl?: string, token?: string } | null, error: string | null, urlError?: string | null }}
  */
 export function validateTargetFile(parsed) {
   if (!isRecord(parsed)) {
@@ -193,7 +193,24 @@ export function validateTargetFile(parsed) {
     return { value: null, error: `${SERVER_TARGET_FILE} has no valid "mode"` };
   }
   const value = { mode };
-  if (isString(parsed.url)) value.url = parsed.url.trim();
+  let urlError = null;
+  if (isString(parsed.url)) {
+    const trimmed = parsed.url.trim();
+    if (mode === "remote") {
+      // A remote url is the one field the app acts on, so it is validated
+      // here with the rest of the file:  no caller can see an unchecked one.
+      // An invalid one is left out of the value and reported, and the rest
+      // of the file (the token) is still returned, so the writer can carry
+      // the token over when the owner fixes the address from the menu.
+      const validated = validateRemoteServerUrl(trimmed);
+      if (validated.ok) value.url = validated.origin;
+      else urlError = `The remote server URL in ${SERVER_TARGET_FILE} is not valid: ${validated.error}`;
+    } else {
+      // A local file may carry a url the user is still typing (the
+      // template), so it is kept as given and validated before use.
+      value.url = trimmed;
+    }
+  }
   if (isString(parsed.savedUrl)) value.savedUrl = parsed.savedUrl.trim();
   let error = null;
   if (isString(parsed.token) && parsed.token.trim()) {
@@ -201,7 +218,9 @@ export function validateTargetFile(parsed) {
     if (checked.ok) value.token = checked.token;
     else error = `The gate token in ${SERVER_TARGET_FILE} is not valid: ${checked.error}`;
   }
-  return { value, error };
+  // An unusable address outranks a dropped token:  it is the error that
+  // decides where the app can go.
+  return { value, error: urlError ?? error, urlError };
 }
 
 /**
@@ -271,7 +290,7 @@ function tokenFromEnv(environment) {
  * talks to the remote server and the log says why the gate may refuse it.
  *
  * @param {{ userDataDir: string, env?: NodeJS.ProcessEnv }} options
- * @returns {{ mode: "local" } | { mode: "remote", origin: string, token?: string, error?: string } | { mode: "local", error: string }}
+ * @returns {{ mode: "local" } | { mode: "remote", origin: string, token?: string, error?: string, tokenDropped?: boolean } | { mode: "local", error: string }}
  */
 export function readServerTarget({ userDataDir, env = process.env } = {}) {
   const overrideValue = env?.BOTFLEET_SERVER_URL;
@@ -286,6 +305,7 @@ export function readServerTarget({ userDataDir, env = process.env } = {}) {
         mode: "remote",
         origin: validated.origin,
         error: `BOTFLEET_SERVER_TOKEN is not a valid gate token: ${fromEnv.error}`,
+        tokenDropped: true,
       };
     }
     return fromEnv.token
@@ -318,6 +338,7 @@ export function readServerTarget({ userDataDir, env = process.env } = {}) {
   const file = checked.value;
 
   if (file.mode === "local") return { mode: "local" };
+  if (checked.urlError) return { mode: "local", error: checked.urlError };
   const validated = validateRemoteServerUrl(file.url);
   if (!validated.ok) {
     return { mode: "local", error: `The remote server URL in ${SERVER_TARGET_FILE} is not valid: ${validated.error}` };
@@ -331,11 +352,12 @@ export function readServerTarget({ userDataDir, env = process.env } = {}) {
     return {
       ...remote,
       error: `BOTFLEET_SERVER_TOKEN is not a valid gate token: ${fromEnv.error}`,
+      tokenDropped: true,
     };
   }
   if (fromEnv.token) return { ...remote, token: fromEnv.token };
   if (file.token) return { ...remote, token: file.token };
-  if (checked.error) return { ...remote, error: checked.error };
+  if (checked.error) return { ...remote, error: checked.error, tokenDropped: true };
   return remote;
 }
 

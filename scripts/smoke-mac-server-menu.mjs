@@ -133,7 +133,9 @@ while (!report && Date.now() < deadline) {
   await delay(100);
 }
 
-const exitedEarly = !running();
+// "Never started" and "exited early" are different failures:  a spawn error
+// is reported on its own, and is never also counted as a crash.
+const exitedEarly = spawnError === null && !running();
 await stopProcess();
 
 if (logPath) {

@@ -447,6 +447,59 @@ test("validateTargetFile refuses a shape the app would never use", () => {
   assert.equal(checked.error, null);
 });
 
+test("a dropped gate token is marked, so the launch goes on without it", () => {
+  const dir = makeUserDataDir();
+  writeTargetFile(
+    dir,
+    JSON.stringify({ mode: "remote", url: "https://host.example:8799", token: "short" }),
+  );
+  const fromFile = readServerTarget({ userDataDir: dir, env: {} });
+  assert.equal(fromFile.mode, "remote");
+  assert.equal(fromFile.origin, "https://host.example:8799");
+  assert.equal(fromFile.tokenDropped, true);
+
+  const fromEnv = readServerTarget({ userDataDir: dir, env: { BOTFLEET_SERVER_TOKEN: "nope" } });
+  assert.equal(fromEnv.tokenDropped, true);
+  assert.equal(fromEnv.token, undefined);
+
+  const override = readServerTarget({
+    userDataDir: dir,
+    env: { BOTFLEET_SERVER_URL: "https://other.example:8799", BOTFLEET_SERVER_TOKEN: "nope" },
+  });
+  assert.equal(override.tokenDropped, true);
+  assert.equal(override.origin, "https://other.example:8799");
+});
+
+test("main.mjs aborts the launch only for a remote error that is not a dropped token", () => {
+  const main = fs.readFileSync(new URL("./main.mjs", import.meta.url), "utf8");
+  assert.match(main, /if \(target\.mode === "remote" && target\.error && !target\.tokenDropped\) \{/);
+  assert.match(main, /startRemoteServer\(target\.origin, target\.token \?\? ""\)/);
+});
+
+test("validateTargetFile validates a remote url and never returns an unchecked one", () => {
+  const bad = validateTargetFile({ mode: "remote", url: "ftp://host.example", token: "a".repeat(32) });
+  assert.match(bad.error, /remote server URL/);
+  assert.match(bad.urlError, /remote server URL/);
+  assert.equal(bad.value.url, undefined);
+  // The rest of the file is still read, so the token can be carried over.
+  assert.equal(bad.value.token, "a".repeat(32));
+
+  const good = validateTargetFile({ mode: "remote", url: " https://host.example:8799/ " });
+  assert.equal(good.value.url, "https://host.example:8799");
+
+  // A local file keeps its template url as typed.
+  assert.equal(validateTargetFile({ mode: "local", url: "not yet" }).value.url, "not yet");
+});
+
+test("a remote file with a bad url still hands its token to the next write", () => {
+  const dir = makeUserDataDir();
+  const token = randomBytes(16).toString("hex");
+  writeTargetFile(dir, JSON.stringify({ mode: "remote", url: "ftp://host.example", token }));
+  assert.equal(readServerTarget({ userDataDir: dir, env: {} }).mode, "local");
+  const written = writeServerTarget(dir, { mode: "remote", url: "https://host.example:8799" });
+  assert.equal(written.token, token);
+});
+
 // ── writeServerTargetTemplate ──────────────────────────────────────────────
 
 test("the template is written when there is no target file yet", () => {
