@@ -392,6 +392,22 @@ for app in $APP_KEYS; do
 done
 FAKE_ASC_FLOOR=0
 
+# A pinned patch with a leading zero is still compared in base 10, so the
+# 1.0.N (N) guard bumps the build instead of reading "0237" as octal 159.
+for app in $APP_KEYS; do
+  rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
+  write_record "$app" 5
+  FAKE_ASC_FLOOR=236
+  run_ship "$app" --repo-root "$REPO" --allow-dirty --dry-run --version 1.0.0237
+  planned_pair
+  check "${app}: a leading-zero pinned patch still bumps the build off 237 (got '${PLANNED_MARKETING}' / '${PLANNED_BUILD}')" \
+    "$([[ "$PLANNED_BUILD" == "238" ]] && echo 0 || echo 1)"
+  check "${app}: the 1.0.N guard does not trip bash arithmetic" \
+    "$(contains 'value too great for base' && echo 1 || echo 0)"
+  remove_record "$app"
+done
+FAKE_ASC_FLOOR=0
+
 # --build pins the build number exactly, and the marketing version is still
 # the automatic next patch.
 for app in $APP_KEYS; do

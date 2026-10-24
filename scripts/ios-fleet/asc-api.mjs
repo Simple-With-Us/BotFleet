@@ -918,21 +918,41 @@ async function main() {
   // 5xx or network-failed answer is retried with backoff, because these
   // queries gate every ship and one rate-limit blip must not fail it.
   async function ascGet(url) {
+    // Every url is resolved against the App Store Connect origin, and any
+    // other origin is refused before a request is made:  api() sends the
+    // bearer token, so a `links.next` naming another host must never be
+    // followed.  This is the one gate for every paginated read below.
+    let target;
+    try {
+      target = new URL(String(url), ASC_ORIGIN);
+    } catch {
+      return { ok: false, status: "invalid App Store Connect url", parsed: {} };
+    }
+    if (target.origin !== new URL(ASC_ORIGIN).origin) {
+      console.error(`asc: refused a link to ${target.origin}; only ${new URL(ASC_ORIGIN).origin} is followed`);
+      return { ok: false, status: "off-host link refused", parsed: {} };
+    }
     // A dropped connection or DNS failure makes fetch throw rather than
-    // return a status, so a throw counts as a retryable failure too; the last
-    // one is re-thrown.
-    const once = async (last) => {
+    // return a status, so a throw counts as a retryable failure too.  The
+    // last one comes back as the same failure shape, never as a throw, so
+    // every caller reports it on its own error path.
+    let networkError = null;
+    const once = async () => {
       try {
-        return await api("GET", url);
+        return await api("GET", target.href);
       } catch (err) {
-        if (last) throw err;
+        networkError = err;
         return { ok: false, status: 0, networkError: true, parsed: {} };
       }
     };
-    let res = await once(false);
+    let res = await once();
     for (let attempt = 1; attempt <= 3 && !res.ok && (!res.status || res.status === 429 || res.status >= 500); attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
-      res = await once(attempt === 3);
+      res = await once();
+    }
+    if (res.networkError) {
+      const code = networkError?.cause?.code || networkError?.code || networkError?.name || "error";
+      console.error(`asc: App Store Connect is unreachable after 4 attempts (${code})`);
     }
     return res;
   }
@@ -1050,8 +1070,12 @@ async function main() {
       console.error("latest-marketing-patch: more than 10 pages of App Store versions");
       process.exit(2);
     }
+    // A version record with no version number set yet (null or empty) has
+    // no patch to count, so it is skipped.  A version string that is present
+    // but not dotted integers still fails the query below.
     const appStoreVersions = storeRows
-      .map((v) => v?.attributes?.versionString);
+      .map((v) => v?.attributes?.versionString)
+      .filter((v) => v !== null && v !== undefined && v !== "");
     const badStore = appStoreVersions.findIndex((v) => !validVersion(v));
     if (badStore !== -1) {
       console.error(`latest-marketing-patch: malformed App Store version ${JSON.stringify(appStoreVersions[badStore] ?? null)}`);
@@ -1125,6 +1149,13 @@ async function main() {
         trainBuilds.push(b.attributes.version);
       }
       url = res.parsed.links?.next || "";
+    }
+    // The train list is not sorted, so a cut-off list can drop its newest
+    // builds and understate the floor.  A list that is still going after the
+    // last page fails the query, the same as fetchTrains.
+    if (url) {
+      console.error("build-floor: more than 10 pages of train builds");
+      process.exit(2);
     }
 
     const appBuilds = [];

@@ -660,16 +660,17 @@ asc_build_floor() {
   set +e
   out=$(asc_client build-floor "$BUNDLE_ID" "$version" "$plat" "${APPLE_ID:-}" 2>"$errf")
   rc=$?
-  # Keep the client's build-floor lines:  they carry Apple's HTTP status,
-  # which the fatal message below tells the operator to look for.
-  if [[ -s "$errf" ]]; then
-    while IFS= read -r _fl; do
-      case "$_fl" in build-floor:*|latest-build-seq:*) logerr "asc-floor: ${_fl}" ;; esac
-    done <"$errf"
-  fi
   if [[ $rc -eq 4 ]]; then
     set -e
     logerr "asc-floor: App Store Connect rejected the credential (HTTP 401/403)"
+    # Keep the client's build-floor lines:  they carry Apple's HTTP status.
+    # Only this path forwards them here;  every other path forwards the
+    # whole client output once, below.
+    if [[ -s "$errf" ]]; then
+      while IFS= read -r _fl; do
+        case "$_fl" in build-floor:*|latest-build-seq:*) logerr "asc-floor: ${_fl}" ;; esac
+      done <"$errf"
+    fi
     rm -f "$errf" >/dev/null 2>&1 || true
     return 4
   fi
@@ -1146,7 +1147,10 @@ else
     fi
     # A ship must never look like "1.0.N (N)":  if the build number happens
     # to be the patch number of the marketing version, move it one up.
-    if [[ -n "$PLAN_TARGET_PATCH" && "$BUILD_NUM" -eq "$PLAN_TARGET_PATCH" ]]; then
+    # Both sides are compared as base-10 digit strings:  a pinned patch such
+    # as "0237" would otherwise be read as octal and slip past this guard.
+    if [[ "$PLAN_TARGET_PATCH" =~ ^[0-9]+$ && "$BUILD_NUM" =~ ^[0-9]+$ ]] \
+      && (( 10#$BUILD_NUM == 10#$PLAN_TARGET_PATCH )); then
       _bumped="$((BUILD_NUM + 1))"
       log "build: ${BUILD_NUM} equals the patch number; using ${_bumped} so the ship does not read ${MARKETING} (${BUILD_NUM})"
       BUILD_NUM="$_bumped"
