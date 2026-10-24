@@ -83,19 +83,6 @@ export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>([
   "black",
 ]);
 
-export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>([
-  "orange",
-  "blue",
-  "green",
-  "purple",
-  "pink",
-  "red",
-  "cyan",
-  "yellow",
-  "teal",
-  "coral",
-]);
-
 /** The skins directory a color renders from.  `orange` IS the default skin. */
 export function tvFaceSkinDir(color: TVFaceSkin): string {
   if (color === "orange" || color === "default") return "default";

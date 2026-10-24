@@ -6,6 +6,9 @@ import ImageIO
 
 struct AnimatedGIFView: UIViewRepresentable {
     let data: Data?
+    /// Decode cap in pixels (0 = native size).  Passed through to the GIF
+    /// decoder so a 52pt avatar never retains 480x480 frames.
+    var maxPixelSize: Int = 0
     let contentMode: UIView.ContentMode
 
     init(data: Data?, contentMode: UIView.ContentMode = .scaleAspectFit) {
@@ -35,7 +38,7 @@ struct AnimatedGIFView: UIViewRepresentable {
         // animation at frame 0 each time would stutter a scrolling bot list.
         guard context.coordinator.lastData != data else { return }
         context.coordinator.lastData = data
-        if let animated = UIImage.animatedImage(withAnimatedGIFData: data) {
+        if let animated = UIImage.animatedImage(withAnimatedGIFData: data, maxPixelSize: maxPixelSize) {
             view.image = animated
             view.startAnimating()
         } else {
@@ -56,23 +59,57 @@ struct AnimatedGIFView: UIViewRepresentable {
 extension UIImage {
     /// Decode a multi-frame GIF into an animated UIImage. Falls back to the
     /// first frame when the source is not animated.
-    static func animatedImage(withAnimatedGIFData data: Data) -> UIImage? {
+    /// Decode a multi-frame GIF into an animated UIImage. Falls back to the
+    /// first frame when the source is not animated.
+    /// - Parameter maxPixelSize: when > 0, each frame is decoded as an ImageIO
+    ///   thumbnail capped at this pixel size.  Several visible avatars used to
+    ///   each hold every 480x480 frame (about 62 MiB per 71-frame pack before
+    ///   UIKit overhead); at avatar sizes the decode is capped to the pixels
+    ///   actually rendered.
+    static func animatedImage(withAnimatedGIFData data: Data, maxPixelSize: Int = 0) -> UIImage? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         let count = CGImageSourceGetCount(source)
         guard count > 1 else {
             guard let cg = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
             return UIImage(cgImage: cg)
         }
+        var frames: [(UIImage, Double)] = []
+        for i in 0..<count {
+            let cg: CGImage?
+            if maxPixelSize > 0 {
+                let options: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+                ]
+                cg = CGImageSourceCreateThumbnailAtIndex(source, i, options as CFDictionary)
+            } else {
+                cg = CGImageSourceCreateImageAtIndex(source, i, nil)
+            }
+            guard let cg else { continue }
+            frames.append((UIImage(cgImage: cg), gifFrameDuration(source: source, index: i)))
+        }
+        guard !frames.isEmpty else { return nil }
+        // UIImage.animatedImage(with:duration:) distributes one total duration
+        // uniformly, which would discard the authored per-frame cadence (holds
+        // mixing 80/160 ms, transitions mixing 40/80 ms).  Expand frames on a
+        // common 20 ms quantum instead; repeated entries share the same
+        // UIImage/CGImage, so the expansion costs pointers, not pixels.
+        let quantum = 0.02
         var images: [UIImage] = []
         var duration: Double = 0
-        for i in 0..<count {
-            guard let cg = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
-            let frameDuration = gifFrameDuration(source: source, index: i)
-            duration += frameDuration
-            images.append(UIImage(cgImage: cg))
+        var expanded = 0
+        for (image, delay) in frames {
+            let copies = max(1, Int((delay / quantum).rounded()))
+            expanded += copies
+            guard expanded <= 2000 else {
+                // Pathological pack: fall back to uniform timing rather than
+                // building an unbounded frame list.
+                return UIImage.animatedImage(with: frames.map(\.0), duration: max(duration + frames[frames.count - 1].1, 0.1))
+            }
+            images.append(contentsOf: repeatElement(image, count: copies))
+            duration += delay
         }
-        guard !images.isEmpty else { return nil }
-        // UIImage animatedImageWithDuration expects the total duration.
         return UIImage.animatedImage(with: images, duration: max(duration, 0.1))
     }
 

@@ -119,6 +119,20 @@ final class TVFacePlayer: ObservableObject {
         Self.sharedCache.object(forKey: url as NSURL) as Data?
     }
 
+    /// Recently-missed URLs (true 404s).  Transient failures are never
+    /// negative-cached, and entries expire so regenerated packs are retried.
+    private static let negativeCache = NSCache<NSURL, NSDate>()
+    private static let negativeCacheTTL: TimeInterval = 300
+
+    private func recentlyMissed(_ url: URL) -> Bool {
+        guard let when = Self.negativeCache.object(forKey: url as NSURL) as Date? else { return false }
+        return Date().timeIntervalSince(when) < Self.negativeCacheTTL
+    }
+
+    private func markMissed(_ url: URL) {
+        Self.negativeCache.setObject(NSDate(), forKey: url as NSURL)
+    }
+
     private func storeCache(url: URL, data: Data) {
         Self.sharedCache.setObject(data as NSData, forKey: url as NSURL, cost: data.count)
     }
@@ -130,35 +144,53 @@ final class TVFacePlayer: ObservableObject {
             return
         }
         // Fallback chain: requested → still of same expression → resting still.
-        let primary = await fetch(url)
-        switch primary {
-        case .hit(let data):
-            storeCache(url: url, data: data)
-            imageData = data
-            return
-        case .missing, .failed:
-            break
+        // A negative entry means the pack has no such asset (or it failed
+        // recently): go straight to the fallback instead of re-issuing a
+        // guaranteed 404, and never alias fallback bytes under the missing
+        // GIF URL (a 5xx/timeout while the small still succeeds would
+        // otherwise pin the wrong bytes process-wide).
+        var primaryFailed = false
+        if !recentlyMissed(url) {
+            switch await fetch(url) {
+            case .hit(let data):
+                storeCache(url: url, data: data)
+                imageData = data
+                return
+            case .missing:
+                markMissed(url)
+            case .failed:
+                primaryFailed = true
+            }
         }
         let still = source.url(color: color, expression: expression, kind: .still)
-        switch await fetch(still) {
-        case .hit(let data):
-            storeCache(url: still, data: data)
-            if case .missing = primary { storeCache(url: url, data: data) }
-            imageData = data
+        if let cached = cachedData(for: still) {
+            imageData = cached
             return
-        case .missing:
-            break
-        case .failed:
-            if case .failed = primary { return }
         }
+        var stillFailed = false
+        if !recentlyMissed(still) {
+            switch await fetch(still) {
+            case .hit(let data):
+                storeCache(url: still, data: data)
+                imageData = data
+                return
+            case .missing:
+                markMissed(still)
+            case .failed:
+                stillFailed = true
+            }
+        }
+        // Both fetches failing means we are offline or the CDN is down;
+        // trying the resting still would just burn another timeout.
+        if primaryFailed && stillFailed { return }
         let rest = source.url(color: color, expression: .resting, kind: .still)
-        switch await fetch(rest) {
-        case .hit(let data):
+        if let cached = cachedData(for: rest) {
+            imageData = cached
+            return
+        }
+        if !recentlyMissed(rest), case .hit(let data) = await fetch(rest) {
             storeCache(url: rest, data: data)
-            if case .missing = primary { storeCache(url: url, data: data) }
             imageData = data
-        case .missing, .failed:
-            break
         }
     }
 
@@ -212,7 +244,9 @@ struct TVFaceAvatar: View {
         ZStack {
             Color.black.opacity(0.001) // hit target
             if let data = player.imageData {
-                AnimatedGIFView(data: data)
+                // Avatars render well under 200pt; decode thumbnails at the
+                // actual display size (@3x) instead of every 480x480 frame.
+                AnimatedGIFView(data: data, maxPixelSize: max(1, Int(size * 3)))
                     .frame(width: size, height: size)
             } else {
                 ProgressView()

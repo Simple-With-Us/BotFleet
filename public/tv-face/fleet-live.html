@@ -6,7 +6,14 @@
 <title>BotFleet TV-Face — Live fleet demo</title>
 <meta name="apple-itunes-app" content="app-clip-bundle-id=online.fleetlink.Clip, app-clip-display=card"/>
 <style>
-  :root { --bg:#0b0b0f; --card:#14141c; --line:#2a2a36; --text:#e8e8ef; --muted:#9aa0b2; --accent:#4fd1c5; --enter:#7dd3fc; --return:#f9a8d4; }
+  /* Light is the first-visit default (AGENTS.md); the dark palette applies
+     only after a user or system dark-theme choice. */
+  :root { --bg:#f6f7fb; --card:#ffffff; --line:#d8dae4; --text:#181a22; --muted:#565d70; --accent:#0f766e; --enter:#0284c7; --return:#db2777;
+          --stage-bg: radial-gradient(circle at 50% 40%, #ffffff 0%, #eceef4 70%); --chip-bg:#eceef4; --on-accent:#ffffff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0b0b0f; --card:#14141c; --line:#2a2a36; --text:#e8e8ef; --muted:#9aa0b2; --accent:#4fd1c5; --enter:#7dd3fc; --return:#f9a8d4;
+            --stage-bg: radial-gradient(circle at 50% 40%, #1c1c24 0%, #0e0e14 70%); --chip-bg:#1a1a22; --on-accent:#0b1220; }
+  }
   * { box-sizing: border-box; }
   body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text);
          min-height:100vh; padding:1.25rem 1rem 3rem; }
@@ -18,25 +25,25 @@
   .bot { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:1rem .9rem 1.1rem;
          text-align:center; position:relative; overflow:hidden; }
   .bot .face-wrap { width:128px; height:128px; margin:0 auto .65rem; position:relative;
-         background: radial-gradient(circle at 50% 40%, #1c1c24 0%, #0e0e14 70%);
-         border-radius:18px; border:1px solid #2a2a36; }
+         background: var(--stage-bg);
+         border-radius:18px; border:1px solid var(--line); }
   .bot canvas.face { width:128px; height:128px; display:block; }
   .bot .name { font-weight:650; font-size:.95rem; }
   .bot .role { color:var(--muted); font-size:.8rem; margin-top:.15rem; }
   .bot .state { margin-top:.55rem; display:inline-block; font-size:.72rem; letter-spacing:.04em; text-transform:uppercase;
-                padding:.25rem .55rem; border-radius:999px; background:#1a1a22; color:var(--accent); border:1px solid #2a2a36; }
-  .bot .state.enter { color:#0b1220; background:var(--enter); border-color:transparent; }
-  .bot .state.return { color:#2a1020; background:var(--return); border-color:transparent; }
+                padding:.25rem .55rem; border-radius:999px; background:var(--chip-bg); color:var(--accent); border:1px solid var(--line); }
+  .bot .state.enter { color:var(--on-accent); background:var(--enter); border-color:transparent; }
+  .bot .state.return { color:var(--on-accent); background:var(--return); border-color:transparent; }
   .bot.transitioning .face-wrap { box-shadow: 0 0 0 2px var(--accent); }
   .clock { color:var(--muted); font-size:.85rem; margin:0 0 1rem; }
   .note { max-width:980px; margin-top:1.5rem; color:var(--muted); font-size:.88rem; line-height:1.5; }
   .tap { margin:0 0 1rem; }
-  .tap button { background:var(--accent); color:#0b1220; border:0; border-radius:10px; padding:.55rem 1rem;
+  .tap button { background:var(--accent); color:var(--on-accent); border:0; border-radius:10px; padding:.55rem 1rem;
                 font-weight:650; font-size:.9rem; cursor:pointer; }
 </style>
 <meta name="apple-itunes-app" content="app-clip-bundle-id=online.fleetlink.Clip, app-clip-display=card"></head>
 <body>
-  <h1>Live fleet — six bots at once</h1>
+  <h1>Live Fleet — Six Bots at Once</h1>
   <p class="sub">Each card is a real BotFleet TV-Face skin.  Enter → hold → return transitions play for about a minute, then loop.  Bookends stay on the resting face.  GIFs are decoded onto a canvas so Safari / iOS animate without needing “Animate Image”.</p>
   <div class="tap"><button type="button" id="wake">Tap / click to start animations</button></div>
   <div class="bar">
