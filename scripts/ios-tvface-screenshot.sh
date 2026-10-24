@@ -75,4 +75,11 @@ if [[ ! -f "$BASELINE" ]]; then
   exit 0
 fi
 
-node "$ROOT/scripts/ios-tvface-screenshot-verify.mjs" "$BASELINE" "$OUT"
+# The compare needs pngjs + pixelmatch; install just those, only on the
+# baseline path, so the ios-build job never pays a monorepo install for a
+# capture-only run.  NODE_PATH is honored by the verify script's CJS require.
+VERIFY_DEPS="$ROOT/artifacts/.tvface-verify-deps"
+if [[ ! -d "$VERIFY_DEPS/node_modules/pixelmatch" ]]; then
+  npm install --no-save --prefix "$VERIFY_DEPS" pngjs pixelmatch
+fi
+NODE_PATH="$VERIFY_DEPS/node_modules" node "$ROOT/scripts/ios-tvface-screenshot-verify.mjs" "$BASELINE" "$OUT"
