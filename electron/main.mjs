@@ -89,6 +89,7 @@ import {
   wantsSafeStorageExport,
 } from "./secure-credentials.mjs";
 import { createControlPlaneClient } from "./control-plane-client.mjs";
+import { REMOTE_CREDENTIAL_ERROR, refuseCredentialsInRemoteMode } from "./remote-credential-guard.mjs";
 import {
   companionAccountCleanupPending,
   createCompanionAccountService,
@@ -2426,20 +2427,8 @@ const CREDENTIAL_PATCH = {
   infisicalClientSecret: (value) => ({ infisical: { clientSecret: value } }),
 };
 
-// A remote server owns its own secrets.  A key set in this app would land in
-// this Mac's encrypted store and never reach the server that uses it, so the
-// handlers refuse before anything is stored or decrypted — the owner is told
-// where the key belongs instead of watching a "configured" badge that lies.
-const REMOTE_CREDENTIAL_ERROR =
-  "This app is using a remote BotFleet server.\u00a0 Set keys on that server, not in this app.";
-
-function refuseCredentialsInRemoteMode() {
-  if (serverMode !== "remote") return;
-  throw new Error(REMOTE_CREDENTIAL_ERROR);
-}
-
 ipcMain.handle("credential:set", async (_event, name, value, provider) => {
-  refuseCredentialsInRemoteMode();
+  refuseCredentialsInRemoteMode(serverMode);
   if (name === "ttsKey" && provider !== undefined && !["minimax", "elevenlabs", "system"].includes(provider)) {
     throw new Error("Unsupported voice engine");
   }
@@ -2494,7 +2483,7 @@ ipcMain.handle("credential:set", async (_event, name, value, provider) => {
 // config.json, applying it only to the live running instance's
 // environment (server/index.ts's instanceKeyOverrides).
 ipcMain.handle("credential:set-instance", async (_event, instanceId, value) => {
-  refuseCredentialsInRemoteMode();
+  refuseCredentialsInRemoteMode(serverMode);
   if (typeof instanceId !== "string" || !/^[\w.-]+$/.test(instanceId) || typeof value !== "string") {
     throw new Error("Unsupported credential");
   }
