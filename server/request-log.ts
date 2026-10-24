@@ -174,11 +174,13 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
       for (const record of pending) {
         try {
           const parsed = JSON.parse(record) as { line?: string; delivery?: string };
-          if (typeof parsed.line !== "string") continue;
+          if (typeof parsed.line !== "string") throw new Error("invalid spool record");
           if (parsed.delivery && seen.has(parsed.delivery)) continue;
           lines.push(parsed.line);
         } catch {
-          // Skip an unparseable spool record rather than stalling the drain.
+          // Preserve the entire spool and cursor for recovery. Never silently
+          // discard malformed or partially-written records.
+          throw new Error("request-log spool requires recovery");
         }
       }
       if (lines.length > 0) {

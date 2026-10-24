@@ -164,3 +164,17 @@ describe("createRequestLog", () => {
     expect(errors.length).toBeGreaterThan(0);
   });
 });
+
+describe("malformed spool preservation", () => {
+  it("preserves malformed records and the cursor instead of truncating them", () => {
+    const p = paths(tmp());
+    const broken = '{"line":"partial';
+    writeFileSync(p.spoolPath, broken);
+    writeFileSync(p.cursorPath, "0");
+    const errors: string[] = [];
+    createRequestLog({ ...p, onError: (message) => errors.push(message) }).replay();
+    expect(readFileSync(p.spoolPath, "utf8")).toBe(broken);
+    expect(readFileSync(p.cursorPath, "utf8")).toBe("0");
+    expect(errors).toHaveLength(1);
+  });
+});

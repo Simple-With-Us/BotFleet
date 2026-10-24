@@ -1,140 +1,100 @@
 #!/usr/bin/env node
-/** Reconcile the GitHub request log against a hook's server-side delivery
- *  history.  If a delivery never landed in the log (the spool-write failure
- *  window: dispatch ACKed 200, so GitHub will not retry on its own), read the
- *  delivery's stored payload and append the metadata line DIRECTLY to the
- *  append-only Markdown log - never a GitHub redelivery, so no hook, existing
- *  or new, can re-dispatch a bot run.  Deliveries whose payload GitHub no
- *  longer retains (or whose read fails) get an explicit gap-marker line
- *  instead of silence.  All writes are append-only; the BotFleet server
- *  stays the only spool writer.
- *
- *  Usage: node scripts/github-request-log-reconcile.mjs \
- *    --org Simple-With-Us --hook <org-hook-id> \
- *    --log ~/.botfleet/github-request-log.md \
- *    --cursor ~/.botfleet/github-request-log.reconcile-cursor
- *
- *  Needs an admin:org_hook credential on `gh` (org hooks) or repo admin
- *  (repo hooks: pass --repo owner/name instead of --org). */
-
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { execFileSync } from "node:child_process";
+// Recover metadata by GET only. Never redeliver a dispatching webhook.
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 export function parseArgs(argv) {
-  const args = { org: undefined, repo: undefined, hook: undefined, log: undefined, cursor: undefined };
-  for (let i = 2; i < argv.length; i += 2) {
-    const key = argv[i].replace(/^--/, "");
-    if (!(key in args)) throw new Error(`unknown argument ${argv[i]}`);
-    args[key] = argv[i + 1];
+  const a = {};
+  for (let i=2;i<argv.length;i+=2) {
+    const k=argv[i].replace(/^--/,'');
+    if (!['org','repo','hook','log','cursor'].includes(k) || !argv[i+1]) throw Error('invalid arguments');
+    a[k]=argv[i+1];
   }
-  if (!args.hook || !args.log || !args.cursor || (!args.org && !args.repo)) {
-    throw new Error("missing --hook/--log/--cursor and one of --org/--repo");
+  if (!a.hook||!a.log||!a.cursor||Boolean(a.org)===Boolean(a.repo)) throw Error('hook, log, cursor and exactly one org/repo required');
+  return a;
+}
+function writeAll(fd,text) {
+  const b=Buffer.from(text); let offset=0;
+  while(offset<b.length) { const n=writeSync(fd,b,offset,b.length-offset); if(n<=0) throw Error('short write'); offset+=n; }
+  fsyncSync(fd);
+}
+function append(path,text) {
+  mkdirSync(dirname(path),{recursive:true});const fd=openSync(path,'a',0o600);
+  try { writeAll(fd,text); } finally { closeSync(fd); }
+}
+function checkpoint(path,state) {
+  mkdirSync(dirname(path),{recursive:true});const tmp=path+'.tmp';const fd=openSync(tmp,'w',0o600);
+  try { writeAll(fd,JSON.stringify(state)); } finally { closeSync(fd); }
+  renameSync(tmp,path);const d=openSync(dirname(path),'r');try { fsyncSync(d); } finally { closeSync(d); }
+}
+export function loggedDeliveryIds(path) {
+  try { return new Set([...readFileSync(path,'utf8').matchAll(/\(delivery ([^)\r\n]+)\)/g)].map(m=>m[1])); }
+  catch(e) { if(e.code==='ENOENT') return new Set();throw e; }
+}
+function clean(s,max=200) { return String(s??'').replace(/[\r\n\x00-\x1f\x7f]/g,' ').replace(/[()]/g,'').slice(0,max); }
+export function extractMetadata(p) {
+  const x=p&&typeof p==='object'?p:{};const m={};
+  if(x.action) m.action=clean(x.action,64);
+  if(x.repository?.full_name) m.repository=clean(x.repository.full_name);
+  if(x.sender?.login) m.actor=clean(x.sender.login,100);
+  for(const k of ['pull_request','issue','discussion']) if(Number.isSafeInteger(x[k]?.number)) { m.number=x[k].number;break; }
+  return m;
+}
+export function formatRecoveredLine({ts,eventName,meta,deliveryId}) {
+  const target=(meta.repository??'')+(meta.number!==undefined?'#'+meta.number:'');
+  return `- ${ts.toISOString()} ${clean(eventName,64)}${meta.action?'.'+meta.action:''}${target?' '+target:''}${meta.actor?' by '+meta.actor:''} [recovered] via github-request-log-reconcile (delivery ${clean(deliveryId,100)})`;
+}
+function ghGet(path) {
+  // --include exposes Link cursors; no tokens or request headers are logged.
+  const raw=execFileSync('gh',['api','--include',path],{encoding:'utf8',timeout:30000,maxBuffer:16*1024*1024,stdio:['ignore','pipe','pipe']});
+  const split=raw.search(/\r?\n\r?\n/);if(split<0) throw Error('missing API headers');
+  const headers=raw.slice(0,split);const data=JSON.parse(raw.slice(split).trim());
+  const link=headers.match(/^link:\s*(.*)$/im)?.[1];const next=link?.split(',').find(x=>/rel="next"/.test(x))?.match(/<([^>]+)>/)?.[1];
+  return {data,next};
+}
+export function reconcile({org,repo,hook,log,cursor,get=ghGet,now=()=>new Date(),maxPages=100}) {
+  const base=org?`orgs/${org}`:`repos/${repo}`;const prefix=`${base}/hooks/${hook}/deliveries`;
+  let state={version:1,through:null,pending:{},gaps:{}};
+  try { state=JSON.parse(readFileSync(cursor,'utf8')); if(state.version!==1||!state.pending||!state.gaps) throw Error('invalid reconcile checkpoint'); }
+  catch(e) { if(e.code!=='ENOENT') throw e; }
+  const stamp=now();const seen=loggedDeliveryIds(log);const pages=[];let path=prefix+'?per_page=100';let complete=false;
+  for(let page=0;page<maxPages;page++) {
+    const response=get(path);if(!Array.isArray(response.data)) throw Error('invalid delivery listing');
+    pages.push(...response.data);
+    if(!response.next) { complete=true;break; }
+    const u=new URL(response.next,'https://api.github.com/');
+    if(u.origin!=='https://api.github.com'||u.pathname!=='/'+prefix) throw Error('unexpected pagination URL');
+    path=u.pathname.slice(1)+u.search;
   }
-  return args;
-}
-
-export function loggedDeliveryIds(logPath, tailBytes = 65536) {
-  let text = "";
-  try {
-    text = readFileSync(logPath, "utf8");
-  } catch {
-    return new Set();
-  }
-  const ids = new Set();
-  for (const match of text.slice(-tailBytes).matchAll(/\(delivery ([^)]+)\)/g)) ids.add(match[1]);
-  return ids;
-}
-
-function gh(args) {
-  return execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-}
-
-/** Same metadata-only discipline as server/request-log.ts: never titles or bodies. */
-export function extractMetadata(payload) {
-  const meta = {};
-  const source = payload && typeof payload === "object" ? payload : {};
-  if (typeof source.action === "string" && source.action) meta.action = source.action.slice(0, 64);
-  if (source.repository && typeof source.repository.full_name === "string") {
-    meta.repository = source.repository.full_name.slice(0, 200);
-  }
-  if (source.sender && typeof source.sender.login === "string") meta.actor = source.sender.login.slice(0, 100);
-  for (const key of ["pull_request", "issue", "discussion", "release", "check_run"]) {
-    const entry = source[key];
-    if (entry && typeof entry === "object" && typeof entry.number === "number") {
-      meta.number = entry.number;
-      break;
-    }
-  }
-  return meta;
-}
-
-export function formatRecoveredLine({ ts, eventName, meta, deliveryId }) {
-  const stamp = ts.toISOString().replace(/\.\d{3}Z$/, "Z");
-  const action = meta.action ? `${eventName}.${meta.action}` : eventName;
-  const target = (meta.repository ?? "") + (typeof meta.number === "number" ? `#${meta.number}` : "");
-  const actor = meta.actor ? ` by ${meta.actor}` : "";
-  return `- ${stamp} ${action}${target ? ` ${target}` : ""}${actor} [recovered] via github-request-log-reconcile (delivery ${deliveryId})`;
-}
-
-function gapLine(missing, now) {
-  const stamp = now().toISOString().replace(/\.\d{3}Z$/, "Z");
-  const ids = missing.map((d) => d.guid ?? d.id).join(", ");
-  return `- ${stamp} reconcile [gap] via github-request-log-reconcile (${missing.length} deliver${missing.length === 1 ? "y" : "ies"} unrecoverable: ${ids}) (delivery gap-${now().getTime()})`;
-}
-
-export function reconcile({ org, repo, hook, log, cursor, run = gh, now = () => new Date() }) {
-  const base = org ? `orgs/${org}` : `repos/${repo}`;
-  let cursorState = { lastId: 0 };
-  try {
-    const parsed = JSON.parse(readFileSync(cursor, "utf8"));
-    if (typeof parsed.lastId === "number") cursorState = parsed;
-  } catch {
-    // Missing or corrupt cursor: reconcile from the log, then rewrite the cursor.
-  }
-  const deliveries = JSON.parse(run(["api", `${base}/hooks/${hook}/deliveries?per_page=100`]));
-  const logged = loggedDeliveryIds(log);
-  const missing = deliveries.filter((d) => !logged.has(String(d.guid ?? d.id)));
-  const failed = [];
-  let recovered = 0;
-  const lines = [];
-  for (const delivery of missing) {
+  if(!complete) throw Error('delivery pagination limit: checkpoint unchanged');
+  // Every retained delivery is inspected. through records successful full-list
+  // coverage, not a numeric-id ordering assumption. Pending failures survive runs.
+  for(const d of pages) if(!seen.has(String(d.guid))) state.pending[String(d.id)]={id:d.id,guid:d.guid,delivered_at:d.delivered_at,event:d.event};
+  for(const [id,d] of Object.entries(state.pending)) if(seen.has(String(d.guid))) delete state.pending[id];
+  let recovered=0;const errors=[];
+  for(const [id,d] of Object.entries(state.pending)) {
     try {
-      const detail = JSON.parse(run(["api", `${base}/hooks/${hook}/deliveries/${delivery.id}`]));
-      const payload = detail.request?.payload ?? detail.payload;
-      if (!payload || typeof payload !== "object") throw new Error("payload not retained");
-      const eventName = String(detail.event ?? delivery.event ?? "unknown").slice(0, 64);
-      const deliveryId = String(delivery.guid ?? delivery.id);
-      lines.push(
-        formatRecoveredLine({
-          ts: new Date(delivery.delivered_at ?? detail.delivered_at ?? now().toISOString()),
-          eventName,
-          meta: extractMetadata(payload),
-          deliveryId,
-        }),
-      );
-      recovered += 1;
-    } catch {
-      failed.push(delivery);
-    }
+      const detail=get(prefix+'/'+encodeURIComponent(id)).data;
+      if(!detail.request?.payload||typeof detail.request.payload!=='object') throw Error('payload unavailable');
+      const line=formatRecoveredLine({ts:new Date(d.delivered_at),eventName:detail.event??d.event,meta:extractMetadata(detail.request.payload),deliveryId:d.guid});
+      append(log,line+'\n');seen.add(String(d.guid));delete state.pending[id];recovered++;
+    } catch { errors.push(id); }
   }
-  if (lines.length > 0 || failed.length > 0) {
-    mkdirSync(dirname(log), { recursive: true });
-    appendFileSync(log, lines.map((line) => line + "\n").join(""));
-    if (failed.length > 0) appendFileSync(log, gapLine(failed, now) + "\n");
+  // A failed GET is retryable, never proof of permanent loss. Only elapsed
+  // retention creates a potential-gap marker, with unknown count if history
+  // no longer covers the prior successful checkpoint.
+  if(state.through && stamp-new Date(state.through)>3*86400000) {
+    const key=state.through;
+    if(!state.gaps[key]) { append(log,`- ${stamp.toISOString()} reconcile [potential-gap] history older than 3 days; missing count unknown; since ${clean(key)}\n`);state.gaps[key]=true; }
   }
-  const newest = deliveries.reduce((max, d) => Math.max(max, Number(d.id) || 0), cursorState.lastId ?? 0);
-  mkdirSync(dirname(cursor), { recursive: true });
-  writeFileSync(cursor, JSON.stringify({ lastId: newest, at: now().toISOString() }), { mode: 0o600 });
-  return { scanned: deliveries.length, missing: missing.length, recovered, gaps: failed.length };
+  for(const [id,d] of Object.entries(state.pending)) if(stamp-new Date(d.delivered_at)>3*86400000&&!state.gaps[id]) {
+    append(log,`- ${stamp.toISOString()} reconcile [potential-gap] delivery ${clean(d.guid)} outside 3-day history; recovery unverified\n`);state.gaps[id]=true;
+  }
+  state.through=stamp.toISOString();checkpoint(cursor,state);
+  return {scanned:pages.length,recovered,pending:Object.keys(state.pending).length,ok:errors.length===0};
 }
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  try {
-    const result = reconcile(parseArgs(process.argv));
-    console.log(JSON.stringify({ ok: true, ...result }));
-  } catch (error) {
-    console.error(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
-    process.exit(1);
-  }
+if(import.meta.url===`file://${process.argv[1]}`) {
+  try {const r=reconcile(parseArgs(process.argv));console.log(JSON.stringify(r));if(!r.ok)process.exitCode=1;}
+  catch {console.error('github-request-log reconciliation failed; checkpoint retained');process.exitCode=1;}
 }

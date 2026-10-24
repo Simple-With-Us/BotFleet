@@ -1,129 +1,33 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, it } from "node:test";
-import assert from "node:assert/strict";
-
-import { extractMetadata, formatRecoveredLine, loggedDeliveryIds, parseArgs, reconcile } from "./github-request-log-reconcile.mjs";
-
-const dirs = [];
-function tmp() {
-  const dir = mkdtempSync(join(tmpdir(), "reconcile-"));
-  dirs.push(dir);
-  return dir;
-}
-afterEach(() => {
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
-
-const deliveries = [
-  { id: 1003, guid: "g-1003", event: "pull_request", delivered_at: "2026-10-24T07:03:00Z" },
-  { id: 1002, guid: "g-1002", event: "pull_request", delivered_at: "2026-10-24T07:02:00Z" },
-  { id: 1001, guid: "g-1001", event: "pull_request", delivered_at: "2026-10-24T07:01:00Z" },
-];
-
-const payloadFor = {
-  1002: { action: "synchronize", repository: { full_name: "Simple-With-Us/BotFleet" }, pull_request: { number: 1320, title: "title text must not leak" }, sender: { login: "kody-ai[bot]" } },
-  1003: { action: "opened", repository: { full_name: "Simple-With-Us/BotFleet" }, pull_request: { number: 1321 }, sender: { login: "swu-echo[bot]" } },
-};
-
-function fakeRun(failOn = []) {
-  const calls = [];
-  return {
-    calls,
-    run: (args) => {
-      const target = args.join(" ");
-      calls.push(target);
-      if (target.endsWith("deliveries?per_page=100")) return JSON.stringify(deliveries);
-      const match = target.match(/deliveries\/(\d+)$/);
-      if (match) {
-        if (failOn.includes(Number(match[1]))) throw new Error("404");
-        const payload = payloadFor[match[1]];
-        if (!payload) throw new Error("410 Gone");
-        return JSON.stringify({ id: Number(match[1]), event: "pull_request", request: { payload } });
-      }
-      throw new Error(`unexpected call: ${target}`);
-    },
-  };
-}
-
-function paths(dir) {
-  return { org: "Org", hook: "9", log: join(dir, "log.md"), cursor: join(dir, "cursor.json") };
-}
-
-describe("parseArgs", () => {
-  it("requires hook, log, cursor and org or repo", () => {
-    assert.throws(() => parseArgs(["node", "x", "--org", "O"]), /missing/);
-    assert.deepEqual(parseArgs(["node", "x", "--repo", "o/r", "--hook", "1", "--log", "L", "--cursor", "C"]), {
-      org: undefined,
-      repo: "o/r",
-      hook: "1",
-      log: "L",
-      cursor: "C",
-    });
-  });
-});
-
-describe("loggedDeliveryIds", () => {
-  it("collects delivery ids from log lines", () => {
-    const dir = tmp();
-    const log = join(dir, "log.md");
-    writeFileSync(log, "- ts pull_request.opened o/r#1 by bot [received] via hook (delivery g-1001)\n");
-    assert.deepEqual([...loggedDeliveryIds(log)], ["g-1001"]);
-  });
-  it("returns an empty set when the log does not exist", () => {
-    assert.equal(loggedDeliveryIds(join(tmp(), "nope.md")).size, 0);
-  });
-});
-
-describe("extractMetadata", () => {
-  it("keeps metadata only", () => {
-    const meta = extractMetadata(payloadFor[1002]);
-    assert.deepEqual(meta, { action: "synchronize", repository: "Simple-With-Us/BotFleet", number: 1320, actor: "kody-ai[bot]" });
-    assert.ok(!("title" in meta));
-  });
-});
-
-describe("reconcile", () => {
-  it("recovers missing deliveries by reading payloads - never requests redelivery", () => {
-    const dir = tmp();
-    const p = paths(dir);
-    writeFileSync(p.log, "- ts x [received] via hook (delivery g-1001)\n");
-    const { run, calls } = fakeRun();
-    const result = reconcile({ ...p, run });
-    assert.deepEqual(result, { scanned: 3, missing: 2, recovered: 2, gaps: 0 });
-    assert.ok(!calls.some((c) => c.includes("/attempts")), "no redelivery attempts");
-    const text = readFileSync(p.log, "utf8");
-    assert.match(text, /pull_request\.synchronize Simple-With-Us\/BotFleet#1320 by kody-ai\[bot\] \[recovered\] via github-request-log-reconcile \(delivery g-1002\)/);
-    assert.match(text, /\(delivery g-1003\)/);
-    assert.ok(!text.includes("title text must not leak"));
-    const cursor = JSON.parse(readFileSync(p.cursor, "utf8"));
-    assert.equal(cursor.lastId, 1003);
-    // Idempotent: everything logged now, nothing re-appended.
-    const before = readFileSync(p.log, "utf8");
-    const second = reconcile({ ...p, run });
-    assert.equal(second.missing, 0);
-    assert.equal(readFileSync(p.log, "utf8"), before);
-  });
-
-  it("writes a gap-marker line when GitHub no longer retains the payload", () => {
-    const dir = tmp();
-    const p = paths(dir);
-    writeFileSync(p.log, "- (delivery g-1001)\n- (delivery g-1002)\n");
-    const { run } = fakeRun([1003]);
-    const result = reconcile({ ...p, run });
-    assert.equal(result.gaps, 1);
-    assert.match(readFileSync(p.log, "utf8"), /\[gap\] via github-request-log-reconcile \(1 delivery unrecoverable: g-1003\)/);
-  });
-
-  it("tolerates a corrupt cursor and rewrites it", () => {
-    const dir = tmp();
-    const p = paths(dir);
-    writeFileSync(p.log, "- (delivery g-1001)\n- (delivery g-1002)\n- (delivery g-1003)\n");
-    writeFileSync(p.cursor, "{not json");
-    const { run } = fakeRun();
-    const result = reconcile({ ...p, run });
-    assert.equal(result.missing, 0);
-    assert.equal(JSON.parse(readFileSync(p.cursor, "utf8")).lastId, 1003);
-  });
-});
+import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';import {join} from 'node:path';import {test} from 'node:test';import assert from 'node:assert/strict';
+import {reconcile,loggedDeliveryIds} from './github-request-log-reconcile.mjs';
+function fixture(fn) {const dir=mkdtempSync(join(tmpdir(),'reconcile-'));try{return fn({org:'Org',hook:'9',log:join(dir,'log'),cursor:join(dir,'cursor')});}finally{rmSync(dir,{recursive:true,force:true});}}
+const stamp=()=>new Date('2026-10-24T07:00:00Z');
+const d=(id)=>({id,guid:'g-'+id,event:'issue_comment',delivered_at:'2026-10-24T06:00:00Z'});
+const detail={request:{payload:{action:'created',repository:{full_name:'o/r'},sender:{login:'bot'},issue:{number:1},comment:{body:'never log me'}}}};
+test('Link cursor page two is recovered with GET only',()=>fixture(p=>{
+ const calls=[];const get=path=>{calls.push(path);if(path.endsWith('per_page=100'))return {data:[d(2)],next:'https://api.github.com/orgs/Org/hooks/9/deliveries?cursor=abc'};if(path.endsWith('cursor=abc'))return {data:[d(1)]};return {data:detail};};
+ const r=reconcile({...p,get,now:stamp});assert.equal(r.recovered,2);assert.ok(calls.some(x=>x.endsWith('cursor=abc')));assert.ok(!calls.some(x=>x.includes('attempts')));assert.ok(!readFileSync(p.log,'utf8').includes('never log me'));
+}));
+test('dedupe survives more than 64KB after delivery',()=>fixture(p=>{
+ writeFileSync(p.log,'- (delivery g-1)\n'+'x'.repeat(100000));assert.ok(loggedDeliveryIds(p.log).has('g-1'));
+ const r=reconcile({...p,get:()=>({data:[d(1)]}),now:stamp});assert.equal(r.recovered,0);
+}));
+test('transient detail failure stays pending and recovers next run',()=>fixture(p=>{
+ const first=reconcile({...p,get:path=>{if(path.includes('?'))return {data:[d(1)]};throw Error('503');},now:stamp});assert.equal(first.ok,false);assert.equal(first.pending,1);assert.ok(!JSON.stringify(JSON.parse(readFileSync(p.cursor))).includes('unrecoverable'));
+ const second=reconcile({...p,get:path=>({data:path.includes('?')?[d(1)]:detail}),now:stamp});assert.equal(second.recovered,1);assert.equal(second.pending,0);
+}));
+test('pagination cap leaves checkpoint untouched',()=>fixture(p=>{
+ const state={version:1,through:null,pending:{},gaps:{}};writeFileSync(p.cursor,JSON.stringify(state));
+ assert.throws(()=>reconcile({...p,maxPages:1,get:()=>({data:[d(1)],next:'https://api.github.com/orgs/Org/hooks/9/deliveries?cursor=x'}),now:stamp}),/pagination/);assert.deepEqual(JSON.parse(readFileSync(p.cursor)),state);
+}));
+test('invalid cursor fails visibly without replacing it',()=>fixture(p=>{
+ writeFileSync(p.cursor,'broken');assert.throws(()=>reconcile({...p,now:stamp,get:()=>({data:[]})}));assert.equal(readFileSync(p.cursor,'utf8'),'broken');
+}));
+test('retention gap marker states unknown count instead of invented loss',()=>fixture(p=>{
+ writeFileSync(p.cursor,JSON.stringify({version:1,through:'2026-10-19T00:00:00Z',pending:{},gaps:{}}));
+ reconcile({...p,now:stamp,get:()=>({data:[]})});assert.match(readFileSync(p.log,'utf8'),/potential-gap.*missing count unknown/);
+}));
+test('repeated recovery is idempotent with persisted log',()=>fixture(p=>{
+ const get=path=>({data:path.includes('?')?[d(1)]:detail});reconcile({...p,get,now:stamp});const before=readFileSync(p.log,'utf8');reconcile({...p,get,now:stamp});assert.equal(readFileSync(p.log,'utf8'),before);
+}));
