@@ -308,6 +308,7 @@ import {
   ITEM_IO_DIR,
   NATIVE_DIR,
 } from "./config.ts";
+import { createRequestLogWriter } from "./request-log.ts";
 import {
   appendBounded,
   describeSweep,
@@ -8351,8 +8352,15 @@ function resolveAndSendRoutine(
 // Webhook definitions are independent from calendar schedules, but every
 // delivery joins the same RoutineManager queue. That keeps unattended work
 // ordered behind a busy bot and gives webhook runs the same durable receipts.
+const webhookRequestLog = createRequestLogWriter({
+  filePath: process.env.BOTFLEET_REQUEST_LOG_PATH ?? join(DATA_DIR, "github-request-log.md"),
+  webhookName: (webhookId) => webhooks.list().find((hook) => hook.id === webhookId)?.name ?? webhookId,
+});
 const webhooks = new WebhookManager({
-  emit: broadcast,
+  emit: (event) => {
+    broadcast(event);
+    webhookRequestLog(event);
+  },
   botState: (botId) => {
     const bot = store.bot(botId);
     return !bot ? "missing" : botIsOff(bot) ? "off" : bot.busy ? "busy" : "ready";

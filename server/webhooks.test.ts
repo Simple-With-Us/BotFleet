@@ -1867,3 +1867,33 @@ describe("WebhookManager merged pull requests only", () => {
     expect(h.manager.update(webhook.id, { ignoredCount: 99, lastIgnoredAt: 1 })?.ignoredCount).toBeUndefined();
   });
 });
+
+describe("request metadata on attempt events", () => {
+  it("carries repo/actor/action/number for accepted and duplicate deliveries, never titles", () => {
+    const h = harness();
+    const { webhook, secret } = create(h.manager);
+    const payload = {
+      action: "opened",
+      repository: { full_name: "Simple-With-Us/BotFleet" },
+      pull_request: { number: 901, title: "titles never leak" },
+      sender: { login: "jaywedgeworth22" },
+    };
+    const input = { payload, contentType: "application/json", eventName: "pull_request", deliveryId: "d-1" };
+    h.manager.receive(webhook.endpointId, secret, input);
+    h.manager.receive(webhook.endpointId, secret, input);
+    const attempts = (h.emitted as Array<Record<string, unknown>>).filter((e) => e.kind === "webhook.attempt");
+    expect(attempts).toHaveLength(2);
+    for (const e of attempts) {
+      const meta = e.requestMetadata as Record<string, unknown>;
+      expect(meta).toMatchObject({
+        repository: "Simple-With-Us/BotFleet",
+        number: 901,
+        actor: "jaywedgeworth22",
+        action: "opened",
+      });
+      expect(JSON.stringify(meta)).not.toContain("titles never leak");
+    }
+    expect((attempts[0]?.attempt as Record<string, unknown>).outcome).toBe("accepted");
+    expect((attempts[1]?.attempt as Record<string, unknown>).outcome).toBe("duplicate");
+  });
+});

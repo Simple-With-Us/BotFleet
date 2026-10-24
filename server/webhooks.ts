@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 
 import { writeFileAtomic } from "./atomic.ts";
+import { extractRequestMetadata, type WebhookRequestMetadata } from "./request-log.ts";
 import { DATA_DIR } from "./config.ts";
 import type { RoutineRunOn } from "./routines.ts";
 import { parseJson, schemaIssue, type JsonValue } from "./schema.ts";
@@ -167,7 +168,7 @@ export interface WebhookManagerOptions {
 export type WebhookManagerEvent =
   | { kind: "webhook"; webhook: WebhookTrigger }
   | { kind: "webhook.deleted"; webhookId: string }
-  | { kind: "webhook.attempt"; attempt: WebhookAttempt };
+  | { kind: "webhook.attempt"; attempt: WebhookAttempt; requestMetadata?: WebhookRequestMetadata };
 
 /** How long a burst of save() calls coalesces into one atomic write.
  * Trailing-edge: set once per burst, not reset per call, so sustained
@@ -1429,7 +1430,11 @@ export class WebhookManager {
     if (details.reason) attempt.reason = details.reason;
     this.attempts.push(attempt);
     if (this.attempts.length > MAX_ATTEMPTS) this.attempts.splice(0, this.attempts.length - MAX_ATTEMPTS);
-    this.options.emit?.({ kind: "webhook.attempt", attempt: { ...attempt } });
+    this.options.emit?.({
+      kind: "webhook.attempt",
+      attempt,
+      requestMetadata: extractRequestMetadata(event),
+    });
     return attempt;
   }
 
