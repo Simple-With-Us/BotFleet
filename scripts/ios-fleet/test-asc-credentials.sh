@@ -731,4 +731,42 @@ env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
   [[ "$(asc_upload_block)" == missing ]]
 ' || fail "a missing credential was not classified as missing"
 
+# 9. A preview never carries a line break.  NEL, LS and PS are withheld by
+#    their UTF-8 bytes whatever the locale, and so is any other control
+#    character, so a rejected value cannot inject a log line.
+for term in $'\302\205' $'\342\200\250' $'\342\200\251'; do
+  for loc in C en_US.UTF-8; do
+    got="$(LC_ALL="$loc" bash -c 'source "'"$funcs"'"; key_preview "$1"' _ "AAAAAAAAAAAAAAAA${term}BBBBBBBBBBBBBBBB" 2>/dev/null)"
+    case "$got" in
+      *"$term"*) fail "a Unicode line terminator survived key_preview under LC_ALL=${loc}" ;;
+      "[withheld: line terminator]") ;;
+      *) fail "a value with a Unicode line terminator was not withheld under LC_ALL=${loc}: ${got}" ;;
+    esac
+  done
+done
+got="$(bash -c 'source "'"$funcs"'"; key_preview "$1"' _ "AAAAAAAAAAAAAAAA"$'\033'"BBBBBBBBBBBBBBBB")"
+[[ "$got" == "[withheld: control character]" ]] || fail "a control character was not withheld by key_preview: ${got}"
+
+# 10. Every caller reads asc_temp_root's refusal.  An inline "$(asc_temp_root)/"
+#     expansion turns the refused root into a path that names "/", and under
+#     errexit a bare assignment ends the run before the owner handoff.
+if grep -nE '\$\(asc_temp_root\)[^"]|"\$\(asc_temp_root\)/' "${here}/ship-testflight.sh" >&2; then
+  fail "ship-testflight.sh expands asc_temp_root inline instead of reading its status"
+fi
+grep -cE '="\$\(asc_temp_root\)" \|\| \{' "${here}/ship-testflight.sh" | grep -qx 3 \
+  || fail "expected the three asc_temp_root callers to read its status"
+# The run-level caller ends with the owner-handoff status 3 and a log line,
+# not with a silent errexit status 1.
+out_rc="$(TMPDIR=/ bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  log() { echo "[ios-ship] $*"; }
+  '"$(awk '/^SHIP_TMP_ROOT="\$\(asc_temp_root\)" \|\| \{/,/^\}/' "${here}/ship-testflight.sh")"'
+  echo "not reached"
+' 2>&1; echo "rc=$?")"
+case "$out_rc" in
+  *"Ship blocked: TMPDIR resolves to the filesystem root"*"rc=3") ;;
+  *) fail "a root TMPDIR did not end the run with the owner-handoff status: ${out_rc}" ;;
+esac
+
 echo "ok: ASC credential resolution (environment first, then Infisical, a named path ignored, temp key removed)"

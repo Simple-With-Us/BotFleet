@@ -255,9 +255,22 @@ asc_upload_block() {
 # expansion.
 key_preview() {
   local v="${1:-}" n
+  #  The Unicode line terminators NEL, LS and PS are matched by their UTF-8
+  #  bytes, because [[:space:]] and [[:cntrl:]] depend on the locale and can
+  #  miss them.  A value that carries one is withheld whole, so it can never
+  #  inject a line break into the log line the preview is written into.
+  if [[ "$v" == *$'\302\205'* || "$v" == *$'\342\200\250'* || "$v" == *$'\342\200\251'* ]]; then
+    printf '%s' "[withheld: line terminator]"
+    return 0
+  fi
   #  Whitespace is removed first:  a PEM is wrapped, and a preview that
   #  carried a newline would break the log line it is written into.
   v="${v//[[:space:]]/}"
+  #  Any control character left after that is withheld the same way.
+  if [[ "$v" == *[[:cntrl:]]* ]]; then
+    printf '%s' "[withheld: control character]"
+    return 0
+  fi
   n=${#v}
   if [[ "$n" -eq 0 ]]; then
     printf '%s' "(empty)"
@@ -737,7 +750,14 @@ asc_latest_seq() {
   # 401)" -- and turned every auth or app-resolution fault into the same
   # contentless "query failed (rc=2)". Surfaced here so an UNVERIFIED floor is
   # self-diagnosing in the run log.
-  errf="$(mktemp "$(asc_temp_root)/asc-seq-err.XXXXXX")"
+  #  asc_temp_root refuses the filesystem root with a status, so the status
+  #  is read here:  expanding its empty output would build "/asc-seq-err.*".
+  local errf_root
+  errf_root="$(asc_temp_root)" || {
+    logerr "asc-seq: TMPDIR resolves to the filesystem root; refusing to write there, so App Store Connect cannot be verified"
+    return 1
+  }
+  errf="$(mktemp "${errf_root}/asc-seq-err.XXXXXX")"
   set +e
   out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" "${APPLE_ID:-}" 2>"$errf")
   rc=$?
@@ -1291,7 +1311,15 @@ AUTH_MODE="none"
 load_secrets
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-OUT_ROOT="$(asc_temp_root)/ios-ship-${APP_KEY}-${STAMP}"
+#  asc_temp_root refuses the filesystem root with a status.  Read it here:
+#  under errexit a bare assignment would end the run with status 1 and no log
+#  line, before the owner handoff below could classify it.
+SHIP_TMP_ROOT="$(asc_temp_root)" || {
+  log "Ship blocked: TMPDIR resolves to the filesystem root, so the staging path was refused."
+  log "This is a path failure, not a missing key."
+  exit 3
+}
+OUT_ROOT="${SHIP_TMP_ROOT}/ios-ship-${APP_KEY}-${STAMP}"
 ARCHIVE_PATH="${OUT_ROOT}/${SCHEME}.xcarchive"
 EXPORT_DIR="${OUT_ROOT}/export"
 LOG_DIR="${OUT_ROOT}/logs"
