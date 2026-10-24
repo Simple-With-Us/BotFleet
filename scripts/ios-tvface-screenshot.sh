@@ -45,16 +45,23 @@ if ! xcrun simctl list devices available | grep -F "${DEVICE} (" >/dev/null; the
   # device", SimError 403). Fail clearly when no runtime supports the type.
   RUNTIMES_JSON="$ROOT/artifacts/simctl-runtimes.json"
   xcrun simctl list -j runtimes > "$RUNTIMES_JSON"
-  RUNTIME_ID="$(python3 - "${DEVICE_TYPE}" "$RUNTIMES_JSON" <<'PY'
+  DEPLOY_FLOOR="$(awk -F"'" '/IPHONEOS_DEPLOYMENT_TARGET:/{print $2; exit}' "$ROOT/ios/project.yml")"
+  if [[ -z "${DEPLOY_FLOOR:-}" ]]; then
+    echo "ios-tvface-screenshot: IPHONEOS_DEPLOYMENT_TARGET not found in ios/project.yml" >&2
+    exit 1
+  fi
+  RUNTIME_ID="$(python3 - "${DEVICE_TYPE}" "$RUNTIMES_JSON" "$DEPLOY_FLOOR" <<'PY'
 import json, sys
 want = sys.argv[1]
 runtimes = json.load(open(sys.argv[2]))["runtimes"]
+floor = [int(x) for x in sys.argv[3].split(".")]
 def ver(r):
     return [int(x) for x in r.get("version", "0").split(".")]
 cands = [
     r for r in runtimes
     if r.get("platform") == "iOS"
     and r.get("isAvailable", True)
+    and ver(r) >= floor
     and any(t.get("identifier") == want for t in r.get("supportedDeviceTypes", []))
 ]
 if not cands:
@@ -63,7 +70,7 @@ cands.sort(key=ver)
 print(cands[-1]["identifier"])
 PY
 )" || {
-    echo "ios-tvface-screenshot: no available iOS runtime supports ${DEVICE_TYPE} on this runner" >&2
+    echo "ios-tvface-screenshot: no available iOS runtime supports ${DEVICE_TYPE} at or above the iOS ${DEPLOY_FLOOR} deployment target on this runner" >&2
     exit 1
   }
   echo "ios-tvface-screenshot: simulator '${DEVICE}' not present; creating ${DEVICE_TYPE} on ${RUNTIME_ID}"
@@ -87,7 +94,18 @@ if [[ -z "${UDID:-}" ]]; then
 fi
 
 xcrun simctl boot "$UDID" 2>/dev/null || true
-xcrun simctl bootstatus "$UDID" -b
+# A freshly created device is the slowest to boot; bound the wait so a slow
+# boot cannot eat the job's 20-minute budget and fail for an unrelated cause.
+BOOT_DEADLINE=$(( $(date +%s) + 240 ))
+while true; do
+  STATE="$(xcrun simctl list devices | awk -F '[()]' -v udid="$UDID" '$0 ~ udid {gsub(/^ +| +$/,"",$3); print $3; exit}')"
+  [[ "$STATE" == "Booted" ]] && break
+  if (( $(date +%s) >= BOOT_DEADLINE )); then
+    echo "ios-tvface-screenshot: simulator $UDID not Booted after 240s (state: ${STATE:-unknown})" >&2
+    exit 1
+  fi
+  sleep 5
+done
 
 xcrun simctl install "$UDID" "$APP_PATH"
 xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
@@ -101,11 +119,7 @@ if [[ ! -f "$BASELINE" ]]; then
   exit 0
 fi
 
-# The compare needs pngjs + pixelmatch; install just those, only on the
-# baseline path, so the ios-build job never pays a monorepo install for a
-# capture-only run.  NODE_PATH is honored by the verify script's CJS require.
-VERIFY_DEPS="$ROOT/artifacts/.tvface-verify-deps"
-if [[ ! -d "$VERIFY_DEPS/node_modules/pixelmatch" ]]; then
-  npm install --no-save --prefix "$VERIFY_DEPS" pngjs pixelmatch
-fi
-NODE_PATH="$VERIFY_DEPS/node_modules" node "$ROOT/scripts/ios-tvface-screenshot-verify.mjs" "$BASELINE" "$OUT"
+echo "ios-tvface-screenshot: baseline present but pixel compare is not available in this job" >&2
+echo "  (rule: standalone CI entries carry no third-party runtime dependencies;" >&2
+echo "   compare returns with a dependency-free decoder when a baseline ships)" >&2
+exit 1
