@@ -128,7 +128,6 @@ test("planVersion picks the next patch on the train (real Congress.Trade data)",
   });
   assert.equal(ascPatch, 236);
 
-  const targetTrain = "1.0.237";
   const floor = buildFloor({
     trainBuilds: [],                       // the new train is empty
     appBuilds: ["2353", "2358", "202610180036"],

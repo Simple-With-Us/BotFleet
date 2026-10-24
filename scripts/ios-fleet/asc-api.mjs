@@ -933,7 +933,7 @@ async function main() {
     const bundleId = path;
     const prefix = body;
     const platformArg = (arg4 || "").toUpperCase();
-    const platform = platformArg === "MACOS" ? "MAC_OS" : "IOS";
+    const platform = platformArg === "MACOS" || platformArg === "MAC_OS" ? "MAC_OS" : "IOS";
     if (!bundleId || !prefix) {
       console.error("Usage: node asc-api.mjs latest-marketing-patch <bundleId> <prefix> [platform=IOS] [appleId]");
       process.exit(2);
@@ -993,7 +993,7 @@ async function main() {
     const bundleId = path;
     const version = body;
     const platformArg = (arg4 || "").toUpperCase();
-    const platform = platformArg === "MACOS" ? "MAC_OS" : "IOS";
+    const platform = platformArg === "MACOS" || platformArg === "MAC_OS" ? "MAC_OS" : "IOS";
     if (!bundleId || !version) {
       console.error("Usage: node asc-api.mjs build-floor <bundleId> <version> [platform=IOS] [appleId]");
       process.exit(2);
