@@ -149,6 +149,21 @@ describe("App task creation and local continuity", () => {
     expect(bot.messages).toEqual([]);
   });
 
+  it("lands the merged conversation's own page with its pagination flag", () => {
+    const state = fixture();
+    const merged = reducer(state, { type: "mergeAllBotTasks", botId: "bot-a", intoThreadId: "legacy-task" });
+    // the destination's page comes back from the server after the merge
+    const page = [
+      { id: "m-1", at: 10, role: "user" as const, kind: "text" as const, text: "oldest" },
+      { id: "m-2", at: 11, role: "user" as const, kind: "text" as const, text: "newest" },
+    ];
+    const loaded = reducer(merged, { type: "earlierLoaded", threadId: "legacy-task", messages: page, hasMore: true });
+    const bot = loaded.bots.find((candidate) => candidate.id === "bot-a")!;
+    expect(bot.messages.map((message) => message.id)).toEqual(["m-1", "m-2"]);
+    // the older messages of a long conversation stay reachable
+    expect(loaded.hasMore["legacy-task"]).toBe(true);
+  });
+
   it("keeps the metadata a narrow merge answer does not carry", () => {
     const state = fixture();
     const spent = {
