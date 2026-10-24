@@ -23,6 +23,15 @@ fi
 brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
 xcodegen generate
 
+# The CI runner image ships no "iPhone 17 Pro" device, so a named destination
+# fails before the build starts. Create the device when it is absent; the
+# device type ships with Xcode and the latest installed iOS runtime is used.
+if ! xcrun simctl list devices available | grep -F "${DEVICE} (" >/dev/null; then
+  RUNTIME_ID="$(xcrun simctl list runtimes | awk '/^iOS /{print $NF}' | sort -V | tail -1)"
+  echo "ios-tvface-screenshot: simulator '${DEVICE}' not present; creating it on ${RUNTIME_ID}"
+  xcrun simctl create "${DEVICE}" "${DEVICE}" "${RUNTIME_ID}"
+fi
+
 xcodebuild \
   -project BotFleet.xcodeproj \
   -scheme BotFleet \
