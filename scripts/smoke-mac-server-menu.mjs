@@ -29,7 +29,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 
-const SMOKE_TIMEOUT_MS = 120_000;
+// The budget covers the app's own worst case before it prints the line.  A
+// runner with no Infisical read token runs against the server on this Mac,
+// so the app boots its local harness before the window exists, and that boot
+// may take two passes over three ports with a 60s health wait each (6 min)
+// before the app gives up and shows its error page.  Then the window load
+// (20s at most), the health probe (15s) and the Keychain read on reload
+// (10s).  The old 120s budget was set when the smoke ran in remote mode and
+// never booted the harness; it timed out before the window was ever made.
+const SMOKE_TIMEOUT_MS = 480_000;
 
 const appPath = process.argv[2];
 if (!appPath) {
@@ -150,10 +158,22 @@ while (!report && Date.now() < deadline) {
 const exitedEarly = spawnError === null && !running();
 await stopProcess();
 
+// The app's own log, from the throwaway user-data directory.  The app writes
+// its startup steps (server target, harness boot, window) there and not to
+// stdout, so without it a timeout says nothing about where the app stopped.
+// The runner holds no secrets, and the only token-shaped value in this run
+// is the random one in the legacy file, which the app never reads.
+let appLog = "";
+try {
+  appLog = readFileSync(join(userDataDir, "logs", "server.log"), "utf8");
+} catch {
+  appLog = "(the app wrote no server.log)\n";
+}
+
 if (logPath) {
   try {
     mkdirSync(runnerTemp, { recursive: true });
-    writeFileSync(logPath, output);
+    writeFileSync(logPath, `${output}\n--- app server.log ---\n${appLog}`);
   } catch {
     /* the log is a convenience, never the assertion */
   }
@@ -243,6 +263,8 @@ if (failures.length > 0) {
   for (const failure of failures) console.error(`  - ${failure}`);
   console.error("--- app output ---");
   console.error(output);
+  console.error("--- app server.log ---");
+  console.error(appLog);
   process.exit(1);
 }
 
