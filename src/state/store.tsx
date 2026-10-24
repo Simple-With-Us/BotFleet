@@ -1762,14 +1762,14 @@ export function reducer(state: AppState, action: Action): AppState {
       // a whole transcript at once, so it arrives in one piece instead of
       // thousands of single-message frames.
       //
-      // The frame belongs to a CONVERSATION, and the bot that owns one is
-      // the one showing it or the one holding it in its roster.  A merge
-      // moves the bot to another conversation, so the active thread alone
-      // does not name the owner — and the frame was dropped, leaving the
-      // merged conversation invisible until the next hydrate.
-      const bot =
-        state.bots.find((b) => b.threadId === action.threadId)
-        ?? state.bots.find((b) => (b.tasks ?? []).some((task) => task.threadId === action.threadId));
+      // The frame belongs to a CONVERSATION, and the bot that shows it is
+      // the one whose active thread it is.  A merge can land in a
+      // background conversation — a single pair folded while another one is
+      // open — and that frame is not the conversation on screen, so it is
+      // not painted into it: the reader would see one conversation's words
+      // under another conversation's title.  The conversation that was
+      // merged into gets its own page when the bot moves to it.
+      const bot = state.bots.find((b) => b.threadId === action.threadId);
       if (!bot) {
         const group = state.groups.find((g) => g.threadId === action.threadId);
         if (!group) return state;
@@ -1783,17 +1783,11 @@ export function reducer(state: AppState, action: Action): AppState {
           ),
         };
       }
-      // Two conversations never share a transcript.  A frame for a
-      // conversation the bot is not showing IS that conversation's
-      // transcript, so it replaces the one on screen instead of being
-      // appended to it — the merge moved the bot, and the old
-      // conversation's words are not the new one's.
-      const showing = bot.threadId === action.threadId;
       const known = new Set(bot.messages.map((m) => m.id));
       const fresh = action.messages.filter((m) => !known.has(m.id));
-      if (showing && fresh.length === 0) return state;
+      if (fresh.length === 0) return state;
       return updateBot(state, bot.id, (b) => {
-        let messages = showing ? [...b.messages, ...fresh] : action.messages;
+        let messages = [...b.messages, ...fresh];
         // base64 screen frames are big; a long computer-use session would
         // grow memory without bound. Keep the newest few frames' pixels and
         // strip the rest (the message row survives as a placeholder).
@@ -2246,19 +2240,29 @@ export function reducer(state: AppState, action: Action): AppState {
       // The server's own answer about what is left: the conversations that
       // stayed behind, and the one that is now live.
       //
-      // The answer names the conversations, not their full records: the
-      // roster needs more than that — how much a conversation cost, whether
-      // it is asleep, which folder it runs in, which engine it uses — and a
-      // narrow record would leave all of it out until the next hydrate.  So
-      // each conversation the server kept is paired with the full record the
-      // client already holds, and only a conversation the client never saw
-      // falls back to the narrow one.
+      // Two kinds of truth meet here.  The server's record carries the
+      // counters it reads from the live transcript — how many messages a
+      // conversation holds, when it last spoke, when it began — and those
+      // are the fresh ones after a merge.  The client's record carries what
+      // only the client knows: what a conversation cost, whether it is
+      // asleep, which folder it runs in.  So the server's counters win and
+      // the client's own fields are kept.
       return {
         ...state,
         bots: state.bots.map((bot) => {
           if (bot.id !== action.botId) return bot;
           const held = new Map((bot.tasks ?? []).map((task) => [task.threadId, task]));
-          const tasks = action.tasks.map((task) => held.get(task.threadId) ?? task);
+          const tasks = action.tasks.map((task) => {
+            const previous = held.get(task.threadId);
+            if (!previous) return task;
+            return {
+              ...previous,
+              title: task.title,
+              messageCount: task.messageCount ?? previous.messageCount,
+              lastActivity: task.lastActivity ?? previous.lastActivity,
+              startedAt: task.startedAt ?? previous.startedAt,
+            };
+          });
           return { ...bot, tasks, threadId: action.threadId };
         }),
       };
@@ -2440,6 +2444,53 @@ export const MessagePostResponseSchema = z.union([
     replayed: replayedFlag,
   }).strict(),
 ]);
+
+/** What a message must be for the store and the renderer to trust it.
+ *
+ * A transcript carries far more than the renderer reads, so the rest passes
+ * through; what is checked is the identity, the role and the kind, because
+ * a row with the wrong shape is what breaks a conversation view. */
+const transcriptMessage = z
+  .object({
+    id: z.string(),
+    role: z.enum(["bot", "user", "system"]),
+    kind: z.enum(["text", "options", "activity", "screen", "connector", "secret", "sign-in"]),
+    at: z.number(),
+    parentId: z.string().nullable().optional(),
+  })
+  .catchall(z.any());
+
+/** One conversation's page of messages. */
+const threadMessagesPageSchema = z.object({
+  messages: z.array(transcriptMessage).optional(),
+});
+
+/** The fleet list, narrowed to the one bot a failed merge has to put back.
+ *
+ * The list carries every bot, so only the fields the restore reads are
+ * required and the rest pass through: a bot this shape accepts is one the
+ * roster can take back. */
+const botRestoreSchema = z
+  .object({
+    id: z.string(),
+    threadId: z.string(),
+    messages: z.array(transcriptMessage).optional(),
+    tasks: z
+      .array(
+        z
+          .object({
+            threadId: z.string(),
+            title: z.string(),
+            createdAt: z.number(),
+          })
+          .catchall(z.any()),
+      )
+      .optional(),
+  })
+  .catchall(z.any());
+const botRestoreListSchema = z.object({
+  bots: z.array(botRestoreSchema).optional(),
+});
 
 // ── API client ─────────────────────────────────────────────────────────
 /** Thrown by `api()` on a non-2xx response.  Carries the parsed JSON body
@@ -3228,11 +3279,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               // failed has to put the server's own state back rather than
               // leave an empty chat under a conversation that never changed.
               api("/api/bots")
-                .then((body: { bots?: Bot[] }) => {
-                  const restored = body?.bots?.find((candidate) => candidate.id === action.botId);
-                  if (restored) rawDispatch({ type: "botPatched", bot: restored });
+                .then((body) => {
+                  const parsed = botRestoreListSchema.safeParse(body);
+                  if (!parsed.success) throw new Error("The bot list was not in the expected shape.");
+                  const restored = parsed.data.bots?.find((candidate) => candidate.id === action.botId);
+                  const current = stateRef.current.bots.find((candidate) => candidate.id === action.botId);
+                  if (!restored || !current) return;
+                  // the server's own conversation list and transcript win; the
+                  // rest of the bot is what this client already holds
+                  rawDispatch({
+                    type: "botPatched",
+                    bot: { ...current, ...restored, messages: restored.messages ?? current.messages },
+                  });
                 })
-                .catch(() => {});
+                .catch((restoreError) => {
+                  console.warn(
+                    "Failed to restore the bot after a merge did not work",
+                    restoreError instanceof Error ? restoreError.message : "unknown error",
+                  );
+                });
             });
           break;
         case "moveTaskToBot":
@@ -3495,13 +3560,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // transcript it builds can be larger than an event frame carries,
           // so the frame is deliberately light — and the conversation it
           // names is fetched instead.
+          //
+          // Only a conversation the client has no transcript for is worth a
+          // request: an ordinary switch carries its transcript in the
+          // switch response, so it needs no second read.  A merge leaves
+          // the client with none, because the transcript it was showing
+          // belonged to the conversation that was folded away.
           const before = stateRef.current.bots.find((candidate) => candidate.id === bot.id);
-          if (before && before.threadId !== bot.threadId && !bot.messages?.length) {
+          if (before && before.threadId !== bot.threadId && before.messages.length === 0 && !bot.messages?.length) {
             void api(`/api/threads/${bot.threadId}/messages?limit=${PAGE_SIZE}`)
-              .then((page: { messages?: Message[] }) => {
-                rawDispatch({ type: "botPatched", bot: { ...bot, messages: page?.messages ?? [] } });
+              .then((body) => {
+                const parsed = threadMessagesPageSchema.safeParse(body);
+                if (!parsed.success) throw new Error("The conversation page was not in the expected shape.");
+                // The bot may have moved on while the page was in flight, and
+                // then this answer belongs to a conversation nobody is
+                // looking at any more.
+                const current = stateRef.current.bots.find((candidate) => candidate.id === bot.id);
+                if (!current || current.threadId !== bot.threadId) return;
+                rawDispatch({
+                  type: "botPatched",
+                  bot: applyBotPatch(
+                    { ...bot, messages: parsed.data.messages ?? [] },
+                    botPatchQueue.overlayFor(bot.id),
+                  ),
+                });
               })
-              .catch(() => {});
+              .catch((error) => {
+                console.warn(
+                  "Failed to load the conversation page",
+                  error instanceof Error ? error.message : "unknown error",
+                );
+              });
           }
           rawDispatch({
             type: "botPatched",

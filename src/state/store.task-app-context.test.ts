@@ -113,7 +113,7 @@ describe("App task creation and local continuity", () => {
     expect(reducer(added, { type: "messagesAdded", threadId: "bound-task", messages })).toBe(added);
   });
 
-  it("lands a folded transcript on the bot that owns the conversation", () => {
+  it("leaves the visible conversation alone when a merge lands in a background one", () => {
     const state = fixture();
     // the bot is showing one conversation and holds another
     const showing = {
@@ -125,10 +125,11 @@ describe("App task creation and local continuity", () => {
     };
     const messages = [{ id: "m-9", at: 20, role: "user" as const, kind: "text" as const, text: "folded" }];
     const added = reducer(showing, { type: "messagesAdded", threadId: "legacy-task", messages });
-    const bot = added.bots.find((candidate) => candidate.id === "bot-a")!;
-    // the frame belongs to the conversation the bot HOLDS, so it is not
-    // dropped, and it does not mix with the conversation on screen
-    expect(bot.messages.map((message) => message.id)).toEqual(["m-9"]);
+    // the frame belongs to a conversation the bot is not showing, so the
+    // words on screen stay the ones the reader is looking at
+    expect(added).toBe(showing);
+    expect(added.bots.find((candidate) => candidate.id === "bot-a")!.messages.map((message) => message.id))
+      .toEqual(["m-1"]);
   });
 
   it("drops the transcript of the conversation a merge moved the bot away from", () => {
@@ -161,6 +162,8 @@ describe("App task creation and local continuity", () => {
                 cwd: "/repo-b",
                 snoozedUntil: 1_700_000_000_000,
                 usage: { input: 10, output: 20, costUsd: 0.5, turns: 2 },
+                messageCount: 4,
+                lastActivity: 99,
               }
             : task,
         ),
@@ -172,12 +175,16 @@ describe("App task creation and local continuity", () => {
       type: "mergeApplied",
       botId: "bot-a",
       threadId: "legacy-task",
-      tasks: [{ threadId: "legacy-task", title: "Unassigned", createdAt: 2 }],
+      tasks: [{ threadId: "legacy-task", title: "Unassigned", createdAt: 2, messageCount: 12, lastActivity: 500 }],
     });
     const task = applied.bots.find((candidate) => candidate.id === "bot-a")!.tasks![0]!;
     expect(task.usage).toEqual({ input: 10, output: 20, costUsd: 0.5, turns: 2 });
     expect(task.snoozedUntil).toBe(1_700_000_000_000);
     expect(task.cwd).toBe("/repo-b");
+    // the server reads the counts from the live transcript, so after a
+    // merge its numbers are the fresh ones
+    expect(task.messageCount).toBe(12);
+    expect(task.lastActivity).toBe(500);
   });
 
   it("refuses a merge-all whose destination is not one of the bot's conversations", () => {
