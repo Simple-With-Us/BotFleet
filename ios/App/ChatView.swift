@@ -1306,38 +1306,53 @@ struct ChatView: View {
                                 .foregroundStyle(Color.primary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                            Button {
-                                editQueuedMessage(item)
-                            } label: {
-                                Image(systemName: "pencil")
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(Color.secondary)
-                                    .frame(width: 28, height: 28)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Edit Queued Message")
-
+                            // Labeled actions, not bare glyphs: three 28pt icons in a
+                            // row were easy to mis-tap, and "Steer" beside "Cancel"
+                            // says which one ends the wait.  The order is Steer,
+                            // Edit, Cancel — Edit sits in the middle so neither
+                            // neighbour reads as its default.  The accessibility
+                            // labels stay the ones the screen readers already use.
                             Button {
                                 steerNow()
                             } label: {
-                                Image(systemName: "arrow.up")
-                                    .font(.system(size: 13, weight: .bold))
+                                Text("Steer")
+                                    .font(.system(size: 12, weight: .semibold))
                                     .foregroundStyle(BubbleColor.mine)
-                                    .frame(width: 28, height: 28)
-                                    .contentShape(Rectangle())
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 28)
+                                    .background(Capsule().strokeBorder(BubbleColor.mine.opacity(0.5), lineWidth: 1))
+                                    .contentShape(Capsule())
+                                    .fixedSize()
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("Steer Now")
 
                             Button {
+                                editQueuedMessage(item)
+                            } label: {
+                                Text("Edit")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(Color.secondary)
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 28)
+                                    .background(Capsule().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1))
+                                    .contentShape(Capsule())
+                                    .fixedSize()
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Edit Queued Message")
+
+                            Button {
                                 cancelQueuedMessage(item.queueId)
                             } label: {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 13, weight: .medium))
+                                Text("Cancel")
+                                    .font(.system(size: 12, weight: .semibold))
                                     .foregroundStyle(Color.red.opacity(0.85))
-                                    .frame(width: 28, height: 28)
-                                    .contentShape(Rectangle())
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 28)
+                                    .background(Capsule().strokeBorder(Color.red.opacity(0.4), lineWidth: 1))
+                                    .contentShape(Capsule())
+                                    .fixedSize()
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("Cancel Queued Message")
