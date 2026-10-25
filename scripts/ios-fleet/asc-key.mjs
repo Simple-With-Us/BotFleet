@@ -41,6 +41,18 @@ import { posix } from "node:path";
 // A private key is a few kilobytes.  Anything larger is not one.
 const MAX_KEY_BYTES = 64 * 1024;
 
+//  The exit codes the shell layer reads.  3 is a credential the Apple tools
+//  cannot use.  2 is a staging failure where the credential was fine but the
+//  path or the file could not be used.  1 is the status this process uses for
+//  usage and for a crash, and it is also the status node uses for an uncaught
+//  exception.  A missing node is 127, and a killed process is 128 plus the
+//  signal.  None of those are a credential, so the credential status is a
+//  code node does not use for them.  One code for a broken key and a refused
+//  path, or for a broken key and a crash, would send the owner to the wrong
+//  place.
+const EXIT_CREDENTIAL = 3;
+const EXIT_STAGING = 2;
+
 // Normalizes a PEM private key and refuses anything that is not one.
 //
 // The envelope alone is not enough: a truncated key, an armored block or a
@@ -178,16 +190,20 @@ export function resolveStagingTarget(keyPath) {
  *  where the path resolves to now, the file is truncated on the verified
  *  handle, written, and set to mode 600 whatever it was before.
  *
- *  Returns { pem } when the key was written, and { error } for every other
- *  outcome.  The key is never printed. */
+ *  Returns { pem } when the key was written, and { error, reason } for every
+ *  other outcome.  The reason says which of the two failures it was:  a
+ *  credential the Apple tools cannot use, or a staging target that could not
+ *  be used.  The target is classified first, matching the command line, so a
+ *  value that is both a broken PEM and a refused path is a staging failure.
+ *  The key is never printed. */
 export function writePrivateKeyFile(keyPath, value) {
-  const pem = normalizePrivateKey(value);
-  if (!pem) {
-    return { error: "the value is not a PEM private key" };
-  }
   const target = resolveStagingTarget(keyPath);
   if (target.error) {
-    return { error: target.error };
+    return { error: target.error, reason: "staging" };
+  }
+  const pem = normalizePrivateKey(value);
+  if (!pem) {
+    return { error: "the value is not a PEM private key", reason: "credential" };
   }
   let fd;
   try {
@@ -196,29 +212,29 @@ export function writePrivateKeyFile(keyPath, value) {
     fd = openSync(target.path, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
   } catch (error) {
     if (error && error.code === "ELOOP") {
-      return { error: `the staged key path ${keyPath} is a symbolic link, which is not written` };
+      return { error: `the staged key path ${keyPath} is a symbolic link, which is not written`, reason: "staging" };
     }
-    return { error: `the staged key file ${keyPath} could not be opened` };
+    return { error: `the staged key file ${keyPath} could not be opened`, reason: "staging" };
   }
   try {
     const opened = fstatSync(fd);
     if (!opened.isFile() || opened.nlink !== 1) {
-      return { error: `the staged key file ${keyPath} is not a regular file with one link` };
+      return { error: `the staged key file ${keyPath} is not a regular file with one link`, reason: "staging" };
     }
     //  Where the path lands now has to be the file this handle is on:  a
     //  link or a directory swapped in between the checks and the open makes
     //  the device and inode differ, and the handle is refused.
     const real = resolvedLocation(target.path);
     if (real === null || isProtectedPath(real)) {
-      return { error: `the staged key path ${keyPath} no longer resolves to a usable place` };
+      return { error: `the staged key path ${keyPath} no longer resolves to a usable place`, reason: "staging" };
     }
     try {
       const now = lstatSync(real);
       if (now.dev !== opened.dev || now.ino !== opened.ino) {
-        return { error: `the staged key path ${keyPath} was swapped while it was opened` };
+        return { error: `the staged key path ${keyPath} was swapped while it was opened`, reason: "staging" };
       }
     } catch {
-      return { error: `the staged key file ${keyPath} could not be verified` };
+      return { error: `the staged key file ${keyPath} could not be verified`, reason: "staging" };
     }
     ftruncateSync(fd, 0);
     //  The mode is set before the key is written, so the bytes never sit on
@@ -227,7 +243,7 @@ export function writePrivateKeyFile(keyPath, value) {
     writeSync(fd, pem);
     return { pem };
   } catch {
-    return { error: `the staged key file ${keyPath} could not be written` };
+    return { error: `the staged key file ${keyPath} could not be written`, reason: "staging" };
   } finally {
     closeSync(fd);
   }
@@ -284,7 +300,7 @@ async function main() {
     const pem = normalizePrivateKey(await readStdin());
     if (!pem) {
       console.error("asc-key: the value is not a PEM private key");
-      return 1;
+      return EXIT_CREDENTIAL;
     }
     //  The key is not printed here either:  see the module header.
     console.log("asc-key: the value is a PEM private key");
@@ -300,12 +316,16 @@ async function main() {
     const staging = resolveStagingTarget(target);
     if (staging.error) {
       console.error(`asc-key: ${staging.error}`);
-      return 1;
+      return EXIT_STAGING;
     }
     const written = writePrivateKeyFile(target, await readStdin());
     if (written.error) {
       console.error(`asc-key: ${written.error}`);
-      return 1;
+      //  The exit code says which failure it was, because the shell layer
+      //  reports the two differently:  a value the tools cannot use is a
+      //  credential problem, and a path or file that could not be used is a
+      //  staging problem.
+      return written.reason === "credential" ? EXIT_CREDENTIAL : EXIT_STAGING;
     }
     return 0;
   }

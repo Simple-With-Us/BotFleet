@@ -25,6 +25,7 @@ import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from
 import { DEFAULT_ROOM_TERMINOLOGY, lowerRoomLabels, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
+import { MergeThreadsBodySchema } from "../shared/merge-threads.ts";
 import {
   applyFallbackSlots,
   KEEP_FALLBACK_SLOT,
@@ -681,6 +682,93 @@ import {
   type BootRecoveryDispatch,
   type InterruptedTurnRecord,
 } from "./boot-recovery.ts";
+
+// ── the provider reload fence ────────────────────────────────────────────
+//
+// This block lives at the TOP of the module on purpose.  The four bindings
+// below are read by `startTurn`, and `startTurn` is reachable WHILE this
+// module is still being evaluated.
+//
+// `jobHost.boot()` is a top-level call — it is what resumes the durable job
+// runtime after a restart — and boot dispatches a queued assignment
+// synchronously: `Runtime.tick()` -> `dispatchDue()` -> `dispatch()` ->
+// `runner.run()` -> `runTurn()` -> `startTurn()`.  `startTurn` reads
+// `providerReloadInProgress` before its first `await`, so while that binding
+// was declared further down this file the read landed in its temporal dead
+// zone and threw `Cannot access 'providerReloadInProgress' before
+// initialization`.  The assignment being dispatched then failed with
+// `provider_error` and its turn was killed.
+//
+// `tsc` cannot see this: the read is inside a function body reached through
+// a call graph that starts at module evaluation, so there is no ordering for
+// the compiler to complain about.  `server/provider-reload-order.test.ts`
+// pins the order instead — the mutation it is written against is this block
+// moving back down.
+//
+// The functions that keep the fence follow the state it keeps.  They are
+// hoisted declarations, so they can be called from anywhere in the module;
+// the state they read cannot, because a `let` is dead until its declaration
+// has run.
+
+/** The rebuild currently running, if any.  Every caller queues behind it.
+ *
+ * The sequence below is `detachAll` -> `disposeAll` -> `load` -> `attach`, and
+ * two of those overlapping is the worst outcome available: one run's `load`
+ * repopulates the registry while the other's `disposeAll` empties it, leaving
+ * instances registered but disposed, or the bus attached to a torn-down fleet.
+ * `providerConfigBusy` fences the two Settings routes, but not the secret
+ * paths — `POST /api/infisical/sync` and a late `onApplied` both reach here on
+ * their own — so the guarantee lives here, where the sequence does.
+ *
+ * Queued, not coalesced: a caller that arrives mid-run gets its OWN rebuild
+ * afterwards.  Handing it the run already in flight would be cheaper and
+ * wrong — that run read `cfg` before this caller changed it. */
+let providerReloadChain: Promise<void> = Promise.resolve();
+let pendingProviderReloads = 0;
+let providerReloadInProgress = false;
+let providerReloadGeneration = 0;
+
+async function waitForProviderReloads(): Promise<void> {
+  while (providerReloadInProgress) await providerReloadChain;
+}
+
+function finishProviderReloadMutation(): void {
+  providerReloadGeneration += 1;
+  pendingProviderReloads -= 1;
+  if (pendingProviderReloads !== 0) return;
+  providerReloadInProgress = false;
+  // Success and failure both lower the global fence.  Unaffected engines can
+  // accept deferred work after a failed mutation, and the original rejection
+  // still reaches its settings caller through serializeProviderReload.
+  drainProviderReloadContinuations();
+}
+
+function serializeProviderReload(runProviderMutation: () => Promise<void>): Promise<void> {
+  pendingProviderReloads += 1;
+  // Fence dispatch as soon as a mutation is queued, including the gap
+  // between two serialized reloads.  Otherwise the first run's drain can
+  // start work that the already-queued second run immediately disposes.
+  providerReloadInProgress = true;
+  const run = providerReloadChain.then(runProviderMutation, runProviderMutation);
+  const settled = run.then(
+    () => finishProviderReloadMutation(),
+    (error) => {
+      finishProviderReloadMutation();
+      throw error;
+    },
+  );
+  // The chain itself must never reject, or every later caller inherits the
+  // failure; the run each caller awaits still rejects normally.
+  providerReloadChain = settled.catch(() => {});
+  return settled;
+}
+
+/** Rebuild the provider fleet after a config change so new keys take
+ * effect without a server restart (kills any in-flight turns).  Serialized:
+ * see `providerReloadChain`. */
+function reloadProviders(): Promise<void> {
+  return serializeProviderReload(runProviderReload);
+}
 
 // OP7: before any other logging in this file — the launchd StandardOutPath
 // is one shared, unrotated file with the companion sidecar's already-
@@ -3036,7 +3124,8 @@ setInterval(() => {
  * than the desktop window did. Stripped here rather than at each call site
  * so a new broadcast cannot forget. */
 const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: TaskRecord) => {
-  const last = store.messagesFor(task.threadId).at(-1);
+  const messages = store.messagesFor(task.threadId);
+  const last = messages.at(-1);
   // Time-based snoozes heal on read against the HARNESS clock, so a phone
   // whose clock is minutes off still agrees with the desktop about whether
   // a thread is asleep.  The 0 sentinel is not a time and survives every
@@ -3046,6 +3135,13 @@ const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: Task
     ...(isThreadSnoozed(snoozedUntil) ? { snoozedUntil } : {}),
     lastActivity: last?.at ?? task.createdAt,
     lastMessage: last,
+    // How much conversation a thread holds, so a person can tell a long
+    // history from a recent one before choosing what to merge into what.
+    messageCount: messages.length,
+    // When the conversation first spoke.  A merge folds transcripts in the
+    // order they began, and the task's own creation time can disagree with
+    // that, so the client orders by this one.
+    startedAt: messages[0]?.at ?? task.createdAt,
   };
 };
 const wireGroupTask = (task: GroupTaskRecord) => {
@@ -3164,6 +3260,11 @@ store.onChange((change) => {
   switch (change.type) {
     case "message":
       broadcast({ kind: "message", threadId: change.threadId, message: change.message });
+      break;
+    case "messages":
+      // A bulk copy (a merge) writes a whole transcript at once, so it
+      // arrives as one frame instead of thousands of single-message ones.
+      broadcast({ kind: "messages", threadId: change.threadId, messages: change.messages });
       break;
     case "message.patch":
       broadcast({ kind: "message.patch", threadId: change.threadId, message: change.message });
@@ -11182,66 +11283,6 @@ function configStatus() {
   };
 }
 
-/** The rebuild currently running, if any.  Every caller queues behind it.
- *
- * The sequence below is `detachAll` -> `disposeAll` -> `load` -> `attach`, and
- * two of those overlapping is the worst outcome available: one run's `load`
- * repopulates the registry while the other's `disposeAll` empties it, leaving
- * instances registered but disposed, or the bus attached to a torn-down fleet.
- * `providerConfigBusy` fences the two Settings routes, but not the secret
- * paths — `POST /api/infisical/sync` and a late `onApplied` both reach here on
- * their own — so the guarantee lives here, where the sequence does.
- *
- * Queued, not coalesced: a caller that arrives mid-run gets its OWN rebuild
- * afterwards.  Handing it the run already in flight would be cheaper and
- * wrong — that run read `cfg` before this caller changed it. */
-let providerReloadChain: Promise<void> = Promise.resolve();
-let pendingProviderReloads = 0;
-let providerReloadInProgress = false;
-let providerReloadGeneration = 0;
-
-async function waitForProviderReloads(): Promise<void> {
-  while (providerReloadInProgress) await providerReloadChain;
-}
-
-function finishProviderReloadMutation(): void {
-  providerReloadGeneration += 1;
-  pendingProviderReloads -= 1;
-  if (pendingProviderReloads !== 0) return;
-  providerReloadInProgress = false;
-  // Success and failure both lower the global fence.  Unaffected engines can
-  // accept deferred work after a failed mutation, and the original rejection
-  // still reaches its settings caller through serializeProviderReload.
-  drainProviderReloadContinuations();
-}
-
-function serializeProviderReload(runProviderMutation: () => Promise<void>): Promise<void> {
-  pendingProviderReloads += 1;
-  // Fence dispatch as soon as a mutation is queued, including the gap
-  // between two serialized reloads.  Otherwise the first run's drain can
-  // start work that the already-queued second run immediately disposes.
-  providerReloadInProgress = true;
-  const run = providerReloadChain.then(runProviderMutation, runProviderMutation);
-  const settled = run.then(
-    () => finishProviderReloadMutation(),
-    (error) => {
-      finishProviderReloadMutation();
-      throw error;
-    },
-  );
-  // The chain itself must never reject, or every later caller inherits the
-  // failure; the run each caller awaits still rejects normally.
-  providerReloadChain = settled.catch(() => {});
-  return settled;
-}
-
-/** Rebuild the provider fleet after a config change so new keys take
- * effect without a server restart (kills any in-flight turns).  Serialized:
- * see `providerReloadChain`. */
-function reloadProviders(): Promise<void> {
-  return serializeProviderReload(runProviderReload);
-}
-
 const RELOAD_REASON = "The turn was interrupted — provider settings changed";
 
 function activeInterruptedTurns(instanceId?: string): InterruptedTurn[] {
@@ -16545,6 +16586,44 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const fresh = botWithThread(updated);
       broadcast({ kind: "bot", bot: fresh });
       return json(res, 200, { bot: fresh });
+    }
+
+    // Fold every other conversation of ONE bot into the one the person picks.
+    // The workspace switch has a merge of its own, but that one moves every
+    // bot and room at once and only as a side effect of changing the
+    // arrangement, so a single bot's threads cannot be gathered on demand.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/merge-threads$/);
+    if (m && method === "POST") {
+      const parsed = MergeThreadsBodySchema.safeParse(await readBody(req));
+      if (!parsed.success) return json(res, 400, { error: "choose the conversation to merge into" });
+      const { intoThreadId } = parsed.data;
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      if (bot.busy) {
+        return json(res, 409, { error: "this bot is working — let it finish before merging its threads" });
+      }
+      if (!(bot.tasks ?? []).some((task) => task.threadId === intoThreadId)) {
+        return json(res, 400, { error: "that is not one of this bot's conversations" });
+      }
+      const result = store.mergeAllBotTasks(bot.id, intoThreadId);
+      if (!result || !result.bot) return json(res, 400, { error: "this bot has nothing to merge" });
+      // A merge COPIES the source's messages into the target and then deletes
+      // the source task, so — unlike a move, which keeps its thread id — the
+      // source thread ids name nothing afterwards and their logs would sit on
+      // disk forever.
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, result.merged);
+      // The source conversations are gone, so anything still scheduled against
+      // them — a routine, a webhook — would keep writing into a thread that
+      // no longer exists.
+      stopJobsForDeleted(result.merged, "its conversation was merged away");
+      // The merged conversation can hold far more than one event frame
+      // carries (the companion's limit is 1 MB), so the bot frame goes out
+      // WITHOUT the transcript.  The messages themselves arrive on their own
+      // frames as the fold writes them, and the roster is all this frame
+      // has to carry.
+      const light = wireBot(result.bot);
+      broadcast({ kind: "bot", bot: light });
+      return json(res, 200, { bot: light, merged: result.merged, skipped: result.skipped });
     }
 
     // what the user's machine can host: which runtime is installed, whether

@@ -20,6 +20,7 @@ function fixture(): AppState {
     tasks: [
       { threadId: "bound-task", title: "Build", createdAt: 1, cwd: context.cwd, workspaceContext: context },
       { threadId: "legacy-task", title: "Unassigned", createdAt: 2 },
+      { threadId: "plain-task", title: "Also unassigned", createdAt: 3 },
     ],
   };
   const group: Group = {
@@ -70,6 +71,141 @@ describe("App task creation and local continuity", () => {
     const state = fixture();
     expect(reducer(state, { type: "mergeTasks", botId: "bot-a", threadId: "bound-task", intoThreadId: "legacy-task" })).toBe(state);
     expect(reducer(state, { type: "moveTaskToGroup", botId: "bot-a", threadId: "bound-task", toGroupId: "app-b" })).toBe(state);
+  });
+
+  it("folds the mergeable conversations into the chosen one and keeps the App-bound one", () => {
+    const state = fixture();
+    const merged = reducer(state, { type: "mergeAllBotTasks", botId: "bot-a", intoThreadId: "legacy-task" });
+    const bot = merged.bots.find((candidate) => candidate.id === "bot-a")!;
+    // the plain conversation folds in; the App-bound one cannot, so it stays
+    // and the roster agrees with what the server will report.
+    expect(bot.tasks!.map((task) => task.threadId)).toEqual(["bound-task", "legacy-task"]);
+    expect(bot.threadId).toBe("legacy-task");
+  });
+
+  it("takes the server's own list of what is left after a merge", () => {
+    const state = fixture();
+    // the server is the one that knows what stayed behind, so the roster
+    // takes its answer rather than the optimistic guess
+    const applied = reducer(state, {
+      type: "mergeApplied",
+      botId: "bot-a",
+      threadId: "legacy-task",
+      tasks: [{ threadId: "legacy-task", title: "Unassigned", createdAt: 2 }],
+    });
+    const bot = applied.bots.find((candidate) => candidate.id === "bot-a")!;
+    expect(bot.tasks!.map((task) => task.threadId)).toEqual(["legacy-task"]);
+    expect(bot.threadId).toBe("legacy-task");
+  });
+
+  it("takes a folded transcript in one piece", () => {
+    const state = fixture();
+    const messages = [
+      { id: "m-1", at: 10, role: "user" as const, kind: "text" as const, text: "first" },
+      { id: "m-2", at: 11, role: "user" as const, kind: "text" as const, text: "second" },
+    ];
+    const added = reducer(state, { type: "messagesAdded", threadId: "bound-task", messages });
+    const bot = added.bots.find((candidate) => candidate.id === "bot-a")!;
+    // the whole batch lands at once, and the branch head is its last message
+    expect(bot.messages.map((message) => message.id)).toEqual(["m-1", "m-2"]);
+    expect(bot.activeLeafId).toBe("m-2");
+    // a second copy of the same batch changes nothing
+    expect(reducer(added, { type: "messagesAdded", threadId: "bound-task", messages })).toBe(added);
+  });
+
+  it("leaves the visible conversation alone when a merge lands in a background one", () => {
+    const state = fixture();
+    // the bot is showing one conversation and holds another
+    const showing = {
+      ...state,
+      bots: state.bots.map((bot) => ({
+        ...bot,
+        messages: [{ id: "m-1", at: 10, role: "user" as const, kind: "text" as const, text: "shown" }],
+      })),
+    };
+    const messages = [{ id: "m-9", at: 20, role: "user" as const, kind: "text" as const, text: "folded" }];
+    const added = reducer(showing, { type: "messagesAdded", threadId: "legacy-task", messages });
+    // the frame belongs to a conversation the bot is not showing, so the
+    // words on screen stay the ones the reader is looking at
+    expect(added).toBe(showing);
+    expect(added.bots.find((candidate) => candidate.id === "bot-a")!.messages.map((message) => message.id))
+      .toEqual(["m-1"]);
+  });
+
+  it("drops the transcript of the conversation a merge moved the bot away from", () => {
+    const state = fixture();
+    const showing = {
+      ...state,
+      bots: state.bots.map((bot) => ({
+        ...bot,
+        messages: [{ id: "m-1", at: 10, role: "user" as const, kind: "text" as const, text: "shown" }],
+      })),
+    };
+    const merged = reducer(showing, { type: "mergeAllBotTasks", botId: "bot-a", intoThreadId: "legacy-task" });
+    const bot = merged.bots.find((candidate) => candidate.id === "bot-a")!;
+    expect(bot.threadId).toBe("legacy-task");
+    // the words on screen belonged to the other conversation, so they go
+    // with it instead of standing under the new one
+    expect(bot.messages).toEqual([]);
+  });
+
+  it("lands the merged conversation's own page with its pagination flag", () => {
+    const state = fixture();
+    const merged = reducer(state, { type: "mergeAllBotTasks", botId: "bot-a", intoThreadId: "legacy-task" });
+    // the destination's page comes back from the server after the merge
+    const page = [
+      { id: "m-1", at: 10, role: "user" as const, kind: "text" as const, text: "oldest" },
+      { id: "m-2", at: 11, role: "user" as const, kind: "text" as const, text: "newest" },
+    ];
+    const loaded = reducer(merged, { type: "earlierLoaded", threadId: "legacy-task", messages: page, hasMore: true });
+    const bot = loaded.bots.find((candidate) => candidate.id === "bot-a")!;
+    expect(bot.messages.map((message) => message.id)).toEqual(["m-1", "m-2"]);
+    // the older messages of a long conversation stay reachable
+    expect(loaded.hasMore["legacy-task"]).toBe(true);
+  });
+
+  it("keeps the metadata a narrow merge answer does not carry", () => {
+    const state = fixture();
+    const spent = {
+      ...state,
+      bots: state.bots.map((bot) => ({
+        ...bot,
+        tasks: bot.tasks!.map((task) =>
+          task.threadId === "legacy-task"
+            ? {
+                ...task,
+                cwd: "/repo-b",
+                snoozedUntil: 1_700_000_000_000,
+                usage: { input: 10, output: 20, costUsd: 0.5, turns: 2 },
+                messageCount: 4,
+                lastActivity: 99,
+              }
+            : task,
+        ),
+      })),
+    };
+    // the server's answer names the conversations that stayed, not their
+    // full records
+    const applied = reducer(spent, {
+      type: "mergeApplied",
+      botId: "bot-a",
+      threadId: "legacy-task",
+      tasks: [{ threadId: "legacy-task", title: "Unassigned", createdAt: 2, messageCount: 12, lastActivity: 500 }],
+    });
+    const task = applied.bots.find((candidate) => candidate.id === "bot-a")!.tasks![0]!;
+    expect(task.usage).toEqual({ input: 10, output: 20, costUsd: 0.5, turns: 2 });
+    expect(task.snoozedUntil).toBe(1_700_000_000_000);
+    expect(task.cwd).toBe("/repo-b");
+    // the server reads the counts from the live transcript, so after a
+    // merge its numbers are the fresh ones
+    expect(task.messageCount).toBe(12);
+    expect(task.lastActivity).toBe(500);
+  });
+
+  it("refuses a merge-all whose destination is not one of the bot's conversations", () => {
+    const state = fixture();
+    expect(reducer(state, { type: "mergeAllBotTasks", botId: "bot-a", intoThreadId: "no-such-thread" })).toBe(state);
+    expect(reducer(state, { type: "mergeAllBotTasks", botId: "bot-b", intoThreadId: "legacy-task" })).toBe(state);
   });
 
   it("preserves saved context through a room round-trip and refuses another App", () => {

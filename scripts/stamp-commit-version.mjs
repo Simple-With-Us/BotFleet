@@ -1,5 +1,8 @@
 // Compute the build version for a Mac/Windows/Linux build: 1.0.<commit_count>,
-// the same scheme the iOS client already ships under.
+// the desktop release scheme.  (The iOS/TestFlight ship numbering is separate
+// and lives in scripts/ios-fleet/version-plan.mjs:  the marketing version is
+// the next patch on the App Store Connect train, the build number is the
+// commit count.)
 //
 // Why a computed number rather than a hand-edited one: a build number is only
 // useful if it cannot collide and cannot go backwards.  A human-typed semver can
