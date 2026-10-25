@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { evaluateGates, isCompletedState } from "./check-decommission-gates.mjs";
-import { findUncovered } from "./audit-node-decommission.mjs";
+import { INVENTORY_DOCS, findUncovered, trackedFiles } from "./audit-node-decommission.mjs";
 
 const ALL_DONE = {
   issues: {
@@ -96,4 +99,24 @@ test("feature tests follow their subsystem's prefix", () => {
     INVENTORY,
   );
   assert.deepEqual(uncovered, []);
+});
+
+// The fixtures above prove the matcher works; this one proves the committed
+// tree is still covered by it.  Without it the audit is a script somebody has
+// to remember to run, and the drift it exists to catch — a subsystem landing
+// on main with no owner row — is exactly the change nobody remembers to
+// audit.  It happened twice: BF-2544 added electron/server-target.mjs and its
+// twins, #1335 added server/provider-reload-order.test.ts, and neither showed
+// up until the audit was run by hand on 2026-10-25.
+test("the tree as committed is fully covered by the inventories", () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const inventoryText = INVENTORY_DOCS.map((doc) =>
+    readFileSync(join(repoRoot, doc), "utf8"),
+  ).join("\n");
+  const uncovered = findUncovered(trackedFiles(repoRoot), inventoryText);
+  assert.deepEqual(
+    uncovered,
+    [],
+    `no inventory row names these files, so BF-2514/BF-2515 cannot cite the inventory as their gate: ${uncovered.join(", ")}`,
+  );
 });
