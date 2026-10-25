@@ -425,10 +425,11 @@ env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
 #     ever an argument of a process.
 ci_body="SYNTHETICciBODY00000000000000000000000000000000000tail"
 # The armor is assembled from parts, the way case 11 does it:  a literal
-# "-----BEGIN PRIVATE KEY-----" next to a body reads as a private key to
-# gitleaks' private-key rule, and the repo's allowlist for this file does
-# not cover this fixture because its marker is SYNTHETICciBODY, which the
-# allowlist's SYNTHETIC[A-Z]{4,} pattern does not match.
+# PEM BEGIN header naming the key type, written out in full next to a body,
+# reads as a private key to gitleaks' private-key rule, and the repo's
+# allowlist for this file does not cover this fixture because its marker is
+# SYNTHETICciBODY, which the allowlist's SYNTHETIC[A-Z]{4,} pattern does not
+# match.
 ci_kind="PRIVATE"" KEY"
 ci_pem="-----BEGIN ${ci_kind}-----"$'\n'"${ci_body}"$'\n'"-----END ${ci_kind}-----"
 printf '%s' "$ci_pem" | base64 | tr -d '\n' > "${tmp}/ci.b64"
