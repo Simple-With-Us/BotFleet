@@ -66,7 +66,7 @@ chmod 700 "${tmp}/no-vault"
 
 extract() {
   awk '
-    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_preview\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
+    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_label\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
     grab { print }
     grab && /^\}/ { grab = 0 }
   ' "$script"
@@ -579,31 +579,31 @@ esac
 case "$cred_log" in
   *"no App Store Connect API key"*) fail "a broken credential was reported as a missing key" ;;
 esac
-# The rejected credential is identified by its public label, the key id, and
-# by a MASKED PREVIEW of the key:  the first eight and the last four
-# characters with the middle elided.  That is the fleet's canonical mask,
-# and it is what lets an owner tell one rejected key from another without
-# the key ever being printed.
+# The rejected credential is identified by its source and its public label,
+# the key id, and by nothing taken from the key:  a slice of a private key is
+# private-key-derived material whether or not its armor was stripped.
 case "$cred_log" in
-  *"key id ABCDE12345"*) ;;
-  *) fail "a broken credential did not name the key id" ;;
+  *"source Infisical /asc, key id ABCDE12345"*) ;;
+  *) fail "a broken credential did not name its source and key id" ;;
 esac
 case "$cred_log" in
-  *"preview "*) ;;
-  *) fail "a broken credential did not carry a masked preview" ;;
+  *preview*) fail "a broken credential still carried a preview" ;;
 esac
-# The preview is a mask and not the key:  neither the PEM armor nor any
-# slice of the key body may appear in the log.  The slice is matched with
-# bash pattern matching, so no byte of the key ever reaches the argument
-# list of a process, where another user could read it through ps.
-if [[ "$cred_log" == *"BEGIN PRIVATE KEY"* ]]; then
-  fail "a broken credential printed the key itself"
+# No byte run of the key may appear in the log.  Every 6-character window of
+# the body is checked with bash pattern matching, so no byte of the key ever
+# reaches the argument list of a process, where another user could read it
+# through ps.
+if [[ "$cred_log" == *"PRIVATE KEY"* ]]; then
+  fail "a broken credential printed the key armor"
 fi
-key_slice="$(sed -n '2p' "${tmp}/asc.p8" | cut -c1-12)"
-if [[ "$cred_log" == *"$key_slice"* ]]; then
-  fail "a broken credential printed a slice of the key body"
-fi
-unset key_slice
+key_body="$(sed '1d;$d' "${tmp}/asc.p8")"
+key_body="${key_body//[[:space:]]/}"
+for ((i = 0; i + 6 <= ${#key_body}; i++)); do
+  if [[ "$cred_log" == *"${key_body:i:6}"* ]]; then
+    fail "a broken credential printed a fragment of the key body"
+  fi
+done
+unset key_body i
 
 # 8c. The two failures are told apart by the writer's exit code, not by the
 #     text of its message.  A staging failure is 2 and a credential failure
@@ -731,21 +731,22 @@ env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
   [[ "$(asc_upload_block)" == missing ]]
 ' || fail "a missing credential was not classified as missing"
 
-# 9. A preview never carries a line break.  NEL, LS and PS are withheld by
-#    their UTF-8 bytes whatever the locale, and so is any other control
-#    character, so a rejected value cannot inject a log line.
-for term in $'\302\205' $'\342\200\250' $'\342\200\251'; do
+# 9. A key id is printed only when it looks like one.  A missing id says so,
+#    and an id that holds anything else (a line break, a control character,
+#    or a value as long as a key) is reported as unrecognized, so a mis-set id
+#    can never carry a key or a forged log line into the log.
+# shellcheck source=/dev/null
+lbl() { ( source "$funcs"; key_label "$1" ); }
+[[ "$(lbl ABCDE12345)" == ABCDE12345 ]] || fail "a well-formed key id was not printed"
+[[ "$(lbl "")" == missing ]] || fail "a missing key id was not reported as missing"
+for bad in "ABC"$'\n'"DEF" "ABC"$'\302\205'"DEF" "ABC"$'\342\200\250'"DEF" "ABC"$'\033'"DEF" \
+    "ABC DEF" "$(printf 'A%.0s' {1..33})" "MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg"; do
   for loc in C en_US.UTF-8; do
-    got="$(LC_ALL="$loc" bash -c 'source "'"$funcs"'"; key_preview "$1"' _ "AAAAAAAAAAAAAAAA${term}BBBBBBBBBBBBBBBB" 2>/dev/null)"
-    case "$got" in
-      *"$term"*) fail "a Unicode line terminator survived key_preview under LC_ALL=${loc}" ;;
-      "[withheld: line terminator]") ;;
-      *) fail "a value with a Unicode line terminator was not withheld under LC_ALL=${loc}: ${got}" ;;
-    esac
+    got="$(LC_ALL="$loc" lbl "$bad" 2>/dev/null)"
+    [[ "$got" == unrecognized ]] || fail "a malformed key id was not reported as unrecognized under LC_ALL=${loc}"
   done
 done
-got="$(bash -c 'source "'"$funcs"'"; key_preview "$1"' _ "AAAAAAAAAAAAAAAA"$'\033'"BBBBBBBBBBBBBBBB")"
-[[ "$got" == "[withheld: control character]" ]] || fail "a control character was not withheld by key_preview: ${got}"
+unset bad got loc
 
 # 10. Every caller reads asc_temp_root's refusal.  An inline "$(asc_temp_root)/"
 #     expansion turns the refused root into a path that names "/", and under
@@ -774,29 +775,57 @@ case "$out_rc" in
   *) fail "a root TMPDIR did not end the run with the owner-handoff status: ${out_rc}" ;;
 esac
 
-# 11. A PEM is masked over its base64 body, not its armor.  The armor is the
-#     same on every key, so two different keys have to give two different
-#     previews, and no preview may carry the armor.  The values are synthetic,
-#     and key_preview runs in a subshell, so they never reach a process argv.
-#     The armor is assembled from parts, so the synthetic PEMs below never
-#     look like a committed private key to a secret scanner.
+# 11. Every rejection diagnostic names the source, the key id and the failure
+#     class, and no fragment of the key.  Each source is fed a synthetic value
+#     the validator refuses (status 3), with a well-formed, a missing and an
+#     unrecognized key id.  The armor is assembled from parts, so the
+#     synthetic PEM never looks like a committed private key to a scanner.
 pem_kind="PRIVATE"" KEY"
-pem_a="-----BEGIN ${pem_kind}-----"$'\nMIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgSYNTHETICaaaa\nSYNTHETICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1111\n'"-----END ${pem_kind}-----"$'\n'
-pem_b="-----BEGIN ${pem_kind}-----"$'\nMIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgSYNTHETICbbbb\nSYNTHETICBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB2222\n'"-----END ${pem_kind}-----"$'\n'
-# shellcheck source=/dev/null
-prev_a="$( source "$funcs"; key_preview "$pem_a" )"
-# shellcheck source=/dev/null
-prev_b="$( source "$funcs"; key_preview "$pem_b" )"
-unset pem_a pem_b pem_kind
-[[ "$prev_a" != "$prev_b" ]] || fail "two different keys gave the same preview: ${prev_a}"
-case "${prev_a}${prev_b}" in
-  *BEGIN*|*END*|*-----*) fail "a preview carried the PEM armor: ${prev_a} / ${prev_b}" ;;
-esac
-[[ "$prev_a" == "MIGTAgEA...1111" ]] || fail "a PEM preview was not first-eight/last-four of its body: ${prev_a}"
-unset prev_a prev_b
-# shellcheck source=/dev/null
-prev_raw="$( source "$funcs"; key_preview "not-a-pem-but-long-enough-to-mask-9999" )"
-[[ "$prev_raw" == "not-a-pe...9999" ]] || fail "a value without armor was not masked as itself: ${prev_raw}"
-unset prev_raw
+syn_body="SYNTHETICbodyAAAAqqqqBBBBrrrrCCCCssssDDDDttttEEEEuuuuFFFFvvvvGGGG"
+syn_pem="-----BEGIN ${pem_kind}-----"$'\n'"${syn_body}"$'\n'"-----END ${pem_kind}-----"
+check_diag() {  # <label> <log> <expected substring>
+  local label="$1" out="$2" want="$3" i
+  [[ "$out" == *"$want"* ]] || fail "${label}: diagnostic did not say: ${want}"
+  [[ "$out" != *preview* ]] || fail "${label}: diagnostic still carried a preview"
+  [[ "$out" != *"PRIVATE KEY"* ]] || fail "${label}: diagnostic carried the key armor"
+  for ((i = 0; i + 6 <= ${#syn_body}; i++)); do
+    [[ "$out" != *"${syn_body:i:6}"* ]] || fail "${label}: diagnostic carried a fragment of the key body"
+  done
+}
+mkdir -p "${tmp}/bin-val3"
+cat > "${tmp}/bin-val3/node" <<WRAP
+#!/usr/bin/env bash
+if [[ "\${1:-}" == *asc-key.mjs && "\${2:-}" == validate ]]; then cat >/dev/null; exit 3; fi
+exec "$real_node" "\$@"
+WRAP
+chmod 700 "${tmp}/bin-val3/node"
+run_diag() {  # env assignments..., then load_secrets with the refusing validator
+  env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
+    -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+    PATH="${tmp}/bin-val3:${PATH}" "$@" bash -c '
+    source "'"$funcs"'"
+    FLEET_SECRETS_BIN="'"${tmp}"'/no-vault"
+    load_secrets
+    echo "class=${ASC_AUTH_FAILURE:-none}"
+  ' 2>&1
+}
+for kid in ABCDE12345 "" "bad id"; do
+  case "$kid" in ABCDE12345) want_id=ABCDE12345 ;; "") want_id=missing ;; *) want_id=unrecognized ;; esac
+  out="$(run_diag APPLE_API_KEY_ID="$kid" APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="$syn_pem")"
+  # An empty APPLE_API_KEY_ID skips that source entirely, so only the
+  # well-formed and unrecognized ids reach its rejection.
+  if [[ -n "$kid" ]]; then
+    check_diag "APPLE_API_KEY_P8_BASE64 id=${want_id}" "$out" "(source APPLE_API_KEY_P8_BASE64, key id ${want_id})"
+    check_diag "APPLE_API_KEY_P8_BASE64 class" "$out" "class=credential"
+  fi
+  out="$(run_diag ASC_KEY_ID="$kid" ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$syn_pem")"
+  if [[ -n "$kid" ]]; then
+    check_diag "ASC_KEY_P8 id=${want_id}" "$out" "does not hold a PEM private key; ignoring it (source ASC_KEY_P8, key id ${want_id})"
+    check_diag "ASC_KEY_P8 class" "$out" "class=credential"
+  else
+    check_diag "ASC_KEY_P8 without id" "$out" "set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it (source ASC_KEY_P8, key id missing)"
+  fi
+done
+unset kid want_id out syn_pem syn_body pem_kind
 
 echo "ok: ASC credential resolution (environment first, then Infisical, a named path ignored, temp key removed)"

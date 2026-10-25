@@ -263,58 +263,22 @@ asc_upload_block() {
   esac
 }
 
-# A MASKED PREVIEW of a rejected credential:  the first eight and the last
-# four characters, with the middle elided.  That is the fleet's canonical
-# mask, and the same helper the other fleet repos carry:  it answers "which
-# key is this?" without printing a value anyone could authenticate with.  A
-# value too short to mask safely is withheld whole, so the preview can never
-# become the secret.
-#
-# The value never reaches an external command:  it arrives as a function
-# argument, which bash keeps in the shell's own memory and never puts into a
-# process argument list, and the preview itself is built with parameter
-# expansion.
-key_preview() {
-  local v="${1:-}" n
-  #  The Unicode line terminators NEL, LS and PS are matched by their UTF-8
-  #  bytes, because [[:space:]] and [[:cntrl:]] depend on the locale and can
-  #  miss them.  A value that carries one is withheld whole, so it can never
-  #  inject a line break into the log line the preview is written into.
-  if [[ "$v" == *$'\302\205'* || "$v" == *$'\342\200\250'* || "$v" == *$'\342\200\251'* ]]; then
-    printf '%s' "[withheld: line terminator]"
-    return 0
+# A rejected credential is named by its KEY ID and its SOURCE, never by any
+# part of the key.  A slice of a private key, armor stripped or not, is still
+# private-key-derived material, so no preview of it is ever printed (BF-2542).
+# The key id is a public label that travels in every App Store Connect request
+# header, and it is printed only when it looks like one:  anything else is
+# reported as "unrecognized", so a mis-set id that happens to hold the key, or
+# a line break, can never reach the log.
+key_label() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    printf '%s' "missing"
+  elif [[ "${#v}" -le 32 && "$v" =~ ^[A-Za-z0-9]+$ ]]; then
+    printf '%s' "$v"
+  else
+    printf '%s' "unrecognized"
   fi
-  #  Whitespace is removed first:  a PEM is wrapped, and a preview that
-  #  carried a newline would break the log line it is written into.
-  v="${v//[[:space:]]/}"
-  #  Any control character left after that is withheld the same way.
-  if [[ "$v" == *[[:cntrl:]]* ]]; then
-    printf '%s' "[withheld: control character]"
-    return 0
-  fi
-  #  A PEM is masked over its base64 body, not its armor:  the armor is the
-  #  same string on every key ever issued, so a mask taken over it would name
-  #  nothing.  A value without armor is masked as itself.
-  if [[ "$v" == -----BEGIN*-----* ]]; then
-    v="${v#-----BEGIN*-----}"
-    v="${v%-----END*}"
-  fi
-  n=${#v}
-  if [[ "$n" -eq 0 ]]; then
-    printf '%s' "(empty)"
-    return 0
-  fi
-  if [[ "$n" -le 24 ]]; then
-    #  Withheld unless the value is comfortably longer than the twelve
-    #  characters a preview discloses:  a 13-character rejected credential
-    #  would otherwise be logged as 12 of its 13 characters, which is the
-    #  mask becoming the secret.
-    printf '[%d chars, withheld]' "$n"
-    return 0
-  fi
-  #  The offset is computed arithmetically:  ${v: -4} needs bash 4.2 and this
-  #  script targets Apple bash 3.2, where it is a bad substitution.
-  printf '%s...%s' "${v:0:8}" "${v:$((${#v}-4))}"
 }
 
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
@@ -349,7 +313,7 @@ load_secrets() {
   local named_path="${ASC_KEY_PATH:-}"
   unset ASC_KEY_PATH
   local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" key_pem="" rc=0
-  local key_path="" asc_kid=""
+  local key_path="" asc_kid="" key_src=""
 
   # 1. CI: the APPLE_API_* names the ship workflow exports from Infisical.
   #    The p8 is base64 there, so it is decoded here, and it never travels in
@@ -366,12 +330,9 @@ load_secrets() {
         #  The credential was resolved and then rejected.  That is a
         #  credential failure, not a missing key:  the owner has to fix the
         #  value that is there, not create a key that already exists.
-        #  The rejected value is named by a masked preview and never by
-        #  itself.
-        local preview
-        preview="$(key_preview "$key_pem")" || preview=""
-        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it; preview: ${preview:-withheld}"
-        unset preview
+        #  The rejected value is named by its source and key id, never by
+        #  any part of itself.
+        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"))"
         key_pem=""
         ASC_AUTH_FAILURE="credential"
       elif [[ "$rc" -ne 0 ]]; then
@@ -385,6 +346,7 @@ load_secrets() {
       else
         kid="$APPLE_API_KEY_ID"
         iss="$APPLE_API_ISSUER_ID"
+        key_src="APPLE_API_KEY_P8_BASE64"
       fi
     else
       logerr "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key"
@@ -404,19 +366,13 @@ load_secrets() {
   #    private key and comes with the key id and issuer it belongs to.
   if [[ -z "$key_pem" && -n "${ASC_KEY_P8:-}" ]]; then
     if [[ -z "$kid" || -z "$iss" ]]; then
-      local preview
-      preview="$(key_preview "$ASC_KEY_P8")" || preview=""
-      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it; preview: ${preview:-withheld}"
-      unset preview
+      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"))"
       unset ASC_KEY_P8
     else
       rc=0
       node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8" || rc=$?
       if [[ "$rc" -eq 3 ]]; then
-        local preview
-        preview="$(key_preview "$ASC_KEY_P8")" || preview=""
-        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it; preview: ${preview:-withheld}"
-        unset preview
+        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"))"
         #  The client would refuse this value, so it is removed from the
         #  environment:  the client has to see the credential this shell layer
         #  resolved, not one that cannot be used.
@@ -434,6 +390,7 @@ load_secrets() {
         ASC_AUTH_FAILURE="writer"
       else
         key_pem="$ASC_KEY_P8"
+        key_src="ASC_KEY_P8"
         #  A usable credential was found, so an earlier rejection of another
         #  source no longer describes this run.
         ASC_AUTH_FAILURE=""
@@ -456,6 +413,7 @@ load_secrets() {
     # has no Infisical copy:  fail with a clear message rather than guess.
     if [[ "$kid" == "$asc_kid" ]]; then
       key_pem="$(fs_get ASC_KEY_P8 /asc)" || key_pem=""
+      key_src="Infisical /asc"
     fi
     if [[ -z "$key_pem" ]]; then
       log "no .p8 for key ${kid}: Infisical /asc ASC_KEY_P8 holds a different key (or is unreadable);  export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this key"
@@ -494,16 +452,10 @@ load_secrets() {
     # them a missing key is not.
     if [[ "$rc" -eq 3 ]]; then
       # The credential was resolved and it is not a usable PEM private key.
-      # It is named by its key id, which is a public label that travels in
-      # every request header and is not part of the key, and by a MASKED
-      # PREVIEW of the key:  the first eight and the last four characters,
-      # with the middle elided.  The preview answers "which key is this?"
-      # without printing a value anyone could authenticate with, and it is
-      # cleared as soon as it has been logged.
-      local preview
-      preview="$(key_preview "$key_pem")" || preview=""
-      log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key (key id ${kid:-unknown}, preview ${preview:-withheld})"
-      unset preview
+      # It is named by its source and its key id, a public label that travels
+      # in every request header and is not part of the key.  No part of the
+      # key itself is printed, not even a masked slice of it.
+      log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key (source ${key_src:-unknown}, key id $(key_label "$kid"))"
       ASC_AUTH_FAILURE="credential"
     elif [[ "$rc" -eq 2 ]]; then
       # The credential was resolved.  The staging path was refused.
