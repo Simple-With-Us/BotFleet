@@ -305,6 +305,9 @@ public actor AcpProcessRunner: EngineDriver {
 
                 await coordinator.completeWithPromptResult(promptResult)
             } catch let error as EngineDriverError {
+                // The turn is over: release the thread before the terminal event, so a consumer that
+                // retries the moment it sees the failure is not told a turn is still active.
+                await self?.clearSession(threadId: threadId, token: sessionToken)
                 switch error {
                 case .protocolError(let code, let message):
                     await coordinator.emitTerminalError(code: code, message: message)
@@ -314,6 +317,7 @@ public actor AcpProcessRunner: EngineDriver {
                     await coordinator.emitTerminalError(code: "acp_error", message: error.localizedDescription)
                 }
             } catch {
+                await self?.clearSession(threadId: threadId, token: sessionToken)
                 await coordinator.emitTerminalError(code: "acp_error", message: error.localizedDescription)
             }
 
@@ -466,9 +470,18 @@ private actor AcpRpcSessionCoordinator {
         )
 
         // Verify round-trip config option ACK when the agent returns `configOptions`.
-        if let options = reply["configOptions"] as? [[String: Any]],
-           let matching = options.first(where: { ($0["id"] as? String) == configId }),
-           let reported = matching["currentValue"] as? String {
+        // An agent that answers with a `configOptions` array that does NOT carry the requested id
+        // (or carries it without a `currentValue`) silently ignored the switch, so the turn must not
+        // report the config as applied.  Only a reply with no `configOptions` array at all falls back
+        // to reporting the requested value.
+        if let options = reply["configOptions"] as? [[String: Any]] {
+            guard let matching = options.first(where: { ($0["id"] as? String) == configId }),
+                  let reported = matching["currentValue"] as? String else {
+                throw EngineDriverError.protocolError(
+                    code: "config_mismatch",
+                    message: "\(harnessKind.rawValue) did not acknowledge config '\(configId)' = '\(requestedValue)'"
+                )
+            }
             if reported != requestedValue {
                 throw EngineDriverError.protocolError(
                     code: "config_mismatch",

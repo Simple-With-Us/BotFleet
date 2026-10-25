@@ -50,11 +50,19 @@ public actor CodexAppServerRunner: EngineDriver {
         self.approvalHandler = approvalHandler
     }
 
+    /// Reasoning-effort values Codex accepts.  The value is interpolated into a Codex `-c` config
+    /// override, so it is validated against this set instead of being interpolated raw: a value with a
+    /// quote could otherwise append extra override keys and turn off the sandbox and the approval prompt.
+    public static let allowedEfforts: Set<String> = ["minimal", "low", "medium", "high"]
+
     /// Builds the verified spawn specification for Codex `app-server` over stdio.
     public static func buildSpawnSpec(executable: String = "codex", input: TurnInput) -> EngineSpawnSpec {
         var args = ["app-server"]
         if let effort = input.configOptions["effort"], !effort.isEmpty {
-            args.append(contentsOf: ["-c", "model_reasoning_effort=\"\(effort)\""])
+            let normalized = effort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if allowedEfforts.contains(normalized) {
+                args.append(contentsOf: ["-c", "model_reasoning_effort=\"\(normalized)\""])
+            }
         }
         var env = input.environment
         // Strip ambient OPENAI_API_KEY so the CLI uses its ChatGPT subscription login unless explicitly overridden.
@@ -166,6 +174,9 @@ public actor CodexAppServerRunner: EngineDriver {
 
                 await coordinator.waitForTurnCompletion()
             } catch let error as EngineDriverError {
+                // The turn is over: release the thread before the terminal event, so a consumer that
+                // retries the moment it sees the failure is not told a turn is still active.
+                await self?.clearSession(threadId: threadId, token: sessionToken)
                 switch error {
                 case .protocolError(let code, let message):
                     await coordinator.settleWithError(code: code, message: message)
@@ -175,6 +186,7 @@ public actor CodexAppServerRunner: EngineDriver {
                     await coordinator.settleWithError(code: "codex_error", message: error.localizedDescription)
                 }
             } catch {
+                await self?.clearSession(threadId: threadId, token: sessionToken)
                 await coordinator.settleWithError(code: "codex_error", message: error.localizedDescription)
             }
 

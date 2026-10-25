@@ -161,20 +161,22 @@ public struct NativeProtocolRecord: Equatable, Sendable, Codable {
     /// Redacts bearer tokens, API keys, and credential-shaped JSON fields before diagnostic logging.
     public static func redactSecrets(in raw: String) -> String {
         var result = raw
-        let patterns = [
-            #"("?(?:api_key|apiKey|token|secret|password|authorization)"?\s*:\s*")([^"]+)(")"#,
-            #"(sk-[A-Za-z0-9_-]{12,})"#
+        // The first pattern keeps the JSON field name and quotes so the redacted line still reads as
+        // the shape the CLI sent; every other pattern replaces the credential itself.
+        let patterns: [(pattern: String, template: String)] = [
+            (#"("?(?:api_key|apiKey|token|secret|password|authorization)"?\s*:\s*")([^"]+)(")"#, "$1[REDACTED]$3"),
+            (#"(?i)(bearer\s+)([A-Za-z0-9._~+/=-]{8,})"#, "$1[REDACTED]"),
+            (#"(sk-[A-Za-z0-9_-]{12,})"#, "[REDACTED]"),
+            (#"(xai-[A-Za-z0-9_-]{12,})"#, "[REDACTED]"),
+            (#"(gsk_[A-Za-z0-9_-]{12,})"#, "[REDACTED]"),
+            (#"(AIza[A-Za-z0-9_-]{20,})"#, "[REDACTED]")
         ]
-        for (index, pattern) in patterns.enumerated() {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+        for entry in patterns {
+            guard let regex = try? NSRegularExpression(pattern: entry.pattern, options: [.caseInsensitive]) else {
                 continue
             }
             let range = NSRange(result.startIndex..<result.endIndex, in: result)
-            if index == 0 {
-                result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "$1[REDACTED]$3")
-            } else {
-                result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "[REDACTED]")
-            }
+            result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: entry.template)
         }
         return result
     }
@@ -454,7 +456,7 @@ public actor TurnDispatcherActor {
         }
 
         let (stream, continuation) = AsyncStream<TurnEvent>.makeStream(
-            bufferingPolicy: .bufferingNewest(bufferCapacity)
+            bufferingPolicy: .unbounded
         )
 
         let task = Task { [weak self] in
@@ -508,8 +510,19 @@ public actor TurnDispatcherActor {
 
         if let database {
             let now = Date().timeIntervalSince1970
+            // `upsertThread` overwrites `title` and `bot_id` on conflict, so a thread that already
+            // carries a user-visible title must keep it: only a thread that does not exist yet gets
+            // the raw thread id as its title.
+            let existing = try? await database.loadThreads(forBot: nil, limit: 1000)
+                .first(where: { $0.id == input.threadId })
             try? await database.upsertThread(
-                ThreadRecord(id: input.threadId, title: input.threadId, botId: input.botId, createdAt: now, updatedAt: now)
+                ThreadRecord(
+                    id: input.threadId,
+                    title: existing?.title ?? input.threadId,
+                    botId: existing?.botId ?? input.botId,
+                    createdAt: existing?.createdAt ?? now,
+                    updatedAt: now
+                )
             )
             try? await database.insertMessage(
                 MessageRecord(

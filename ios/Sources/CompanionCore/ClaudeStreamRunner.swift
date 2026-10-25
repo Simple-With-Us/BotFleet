@@ -110,7 +110,16 @@ public actor ClaudeStreamRunner: EngineDriver {
         activeSessionTokens[input.threadId] = sessionToken
 
         let userFrame = Self.buildUserStdinFrame(prompt: input.prompt)
-        try await session.writeStdinLine(userFrame)
+        do {
+            try await session.writeStdinLine(userFrame)
+        } catch {
+            // The thread is registered already: release it and cancel the child, or every retry for
+            // this thread would fail with `turnAlreadyActive` while the child stayed alive.
+            activeSessions.removeValue(forKey: input.threadId)
+            activeSessionTokens.removeValue(forKey: input.threadId)
+            await session.cancel()
+            throw error
+        }
         await session.closeStdin()
 
         let (stream, continuation) = AsyncStream<TurnEvent>.makeStream()
@@ -290,7 +299,9 @@ public actor ClaudeStreamRunner: EngineDriver {
                    let thinking = block["thinking"] as? String,
                    !thinking.isEmpty,
                    !state.sawStreamDelta {
-                    // Only emit if no streaming deltas preceded the whole message.
+                    // Only emit if no streaming deltas preceded the whole message: the streamed
+                    // `thinking_delta` events already carried this reasoning.
+                    events.append(.reasoningDelta(thinking))
                 } else if blockType == "tool_use",
                           let id = block["id"] as? String,
                           let name = block["name"] as? String,

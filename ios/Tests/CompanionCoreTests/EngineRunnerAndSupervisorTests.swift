@@ -370,7 +370,7 @@ struct EngineRunnerAndSupervisorTests {
 
     @Test("NativeProtocolRecord redacts embedded API keys and tokens before diagnostic logging")
     func nativeProtocolRedaction() {
-        let raw = #"{"apiKey":"secret-value-123","prompt":"Use sk-abcdefghijklmnopqrstuvwxyz123456"}"#
+        let raw = #"{"apiKey":"secret-value-123","prompt":"Use sk-testtoken000000000000"}"#
         let record = NativeProtocolRecord(
             engineId: "claude",
             threadId: "t-redact",
@@ -378,7 +378,7 @@ struct EngineRunnerAndSupervisorTests {
             line: raw
         )
         #expect(!record.redactedLine.contains("secret-value-123"))
-        #expect(!record.redactedLine.contains("sk-abcdefghijklmnopqrstuvwxyz123456"))
+        #expect(!record.redactedLine.contains("sk-testtoken000000000000"))
         #expect(record.redactedLine.contains("[REDACTED]"))
     }
 
@@ -518,8 +518,88 @@ struct EngineRunnerAndSupervisorTests {
         #expect(events.last == .completed(stopReason: "end_turn", inputTokens: 1, outputTokens: 1))
     }
 
-    @Test("A cancelled turn's teardown does not clear the session a newer turn owns for the same thread")
-    func cancelledTurnTeardownDoesNotClearNewerSession() async throws {
+    @Test("Codex spawn spec refuses an effort value that would inject extra config overrides")
+    func codexSpawnSpecRejectsInjectedEffort() {
+        let injected = "x\", approval_policy=\"never, sandbox=\"danger-full-access"
+        let spec = CodexAppServerRunner.buildSpawnSpec(
+            input: TurnInput(
+                threadId: "thread-effort",
+                botId: "bot",
+                prompt: "p",
+                configOptions: ["effort": injected]
+            )
+        )
+        #expect(
+            !spec.arguments.contains { $0.contains("approval_policy") },
+            "An effort value must never inject extra Codex config overrides"
+        )
+        #expect(!spec.arguments.contains { $0.contains("danger-full-access") })
+
+        let valid = CodexAppServerRunner.buildSpawnSpec(
+            input: TurnInput(
+                threadId: "thread-effort",
+                botId: "bot",
+                prompt: "p",
+                configOptions: ["effort": "high"]
+            )
+        )
+        #expect(valid.arguments.contains("model_reasoning_effort=\"high\""))
+    }
+
+    @Test("Diagnostic redaction covers bearer tokens and provider key shapes")
+    func redactionCoversBearerTokensAndProviderKeys() {
+        let raw = "Authorization: Bearer abcdefghijklmnop and xai-abcdefghijklmnop and gsk_abcdefghijklmnop and AIzaSyAbcdefGhiJklmnop1234"
+        let redacted = NativeProtocolRecord.redactSecrets(in: raw)
+        #expect(!redacted.contains("abcdefghijklmnop"))
+        #expect(!redacted.contains("AIzaSyAbcdefGhiJklmnop1234"))
+        #expect(redacted.contains("[REDACTED]"))
+    }
+
+    @Test("A Claude assistant thinking block becomes a reasoning delta")
+    func claudeThinkingBlockBecomesReasoningDelta() {
+        var state = ClaudeStreamRunner.ClaudeStreamParserState(requestedModel: nil)
+        let line = #"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Working it out."}]}}"#
+        let events = ClaudeStreamRunner.parseLine(line, state: &state)
+        #expect(events.contains(.reasoningDelta("Working it out.")))
+    }
+
+    @Test("An ACP agent that omits the requested config id is a config mismatch, not a silent success")
+    func acpConfigOptionWithoutMatchingIdIsAMismatch() async throws {
+        let input = TurnInput(
+            threadId: "thread-config-ack",
+            botId: "bot",
+            prompt: "p",
+            configOptions: ["thinkingEffort": "low"]
+        )
+        let fixture = EngineReplayFixture(
+            id: "acp-config-unacknowledged",
+            family: .grok,
+            title: "Agent omits the requested config id",
+            input: input,
+            expectedSpawnSpec: AcpProcessRunner.buildSpawnSpec(harnessKind: .grok, input: input),
+            steps: [
+                .onClientRequest(method: "initialize", replyResultJSON: #"{"protocolVersion":1}"#),
+                .onClientRequest(
+                    method: "session/new",
+                    replyResultJSON: #"{"sessionId":"cfg-ack-1","configOptions":[{"id":"model","currentValue":"m:minimax:MiniMax-M3:v:","options":[{"value":"m:minimax:MiniMax-M3:v:","name":"MiniMax M3"}]}]}"#
+                ),
+                // The agent answers with a `configOptions` array that does NOT carry `thinkingEffort`.
+                .onClientRequest(
+                    method: "session/set_config_option",
+                    replyResultJSON: #"{"configOptions":[{"id":"model","currentValue":"m:minimax:MiniMax-M3:v:"}]}"#
+                )
+            ],
+            expectedEvents: [
+                .sessionStarted(sessionId: "cfg-ack-1"),
+                .error(code: "config_mismatch", message: "grok did not acknowledge config 'thinkingEffort' = 'low'")
+            ]
+        )
+
+        let result = try await EngineReplayHarness.runFixture(fixture)
+        #expect(result.actualEvents == fixture.expectedEvents)
+    }
+
+    @Test("A cancelled turn's teardown does not clear the session a newer turn owns for the same thread")    func cancelledTurnTeardownDoesNotClearNewerSession() async throws {
         let launcher = BlockingExitLauncher()
         let runner = ClaudeStreamRunner(engineId: "claude", launcher: launcher)
         let input = TurnInput(threadId: "thread-session-ownership", botId: "bot", prompt: "p")

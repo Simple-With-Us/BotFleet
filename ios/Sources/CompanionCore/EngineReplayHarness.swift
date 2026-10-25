@@ -611,7 +611,7 @@ public enum EngineReplayHarness {
                 modelId: "gpt-5.4",
                 resumeSessionId: isResumed ? threadId : nil,
                 workingDirectory: "/tmp/codex",
-                environment: ["OPENAI_API_KEY": "sk-should-be-stripped-1234567890"]
+                environment: ["OPENAI_API_KEY": "sk-testtoken000000000000"]
             )
             let spec = CodexAppServerRunner.buildSpawnSpec(input: input)
 

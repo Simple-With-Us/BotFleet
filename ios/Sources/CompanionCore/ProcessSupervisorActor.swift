@@ -49,6 +49,7 @@ private final class SupervisedProcessState: @unchecked Sendable {
     private var isCancelled: Bool = false
     private var stdoutFinished: Bool = false
     private var stderrFinished: Bool = false
+    private var stopReadingRequested: Bool = false
     private var exitWaiters: [CheckedContinuation<ProcessExitReason, Never>] = []
     private var stdoutDrainWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -169,8 +170,10 @@ private final class SupervisedProcessState: @unchecked Sendable {
             }
             group.addTask {
                 try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                self.closeStdoutRead()
-                self.closeStderrRead()
+                // Ask the readers to stop rather than closing their descriptors from this thread:
+                // the descriptor number would be handed to the next `pipe()` while the reader is
+                // still blocked in `read()` on it.
+                self.requestStopReading()
             }
             _ = await group.next()
             group.cancelAll()
@@ -229,6 +232,24 @@ private final class SupervisedProcessState: @unchecked Sendable {
             Darwin.close(fd)
         }
     }
+
+    /// Asks the stdout and stderr readers to stop.
+    ///
+    /// The read descriptors are deliberately NOT closed here: on Darwin closing a descriptor from a
+    /// thread other than the one blocked in `read()` does not wake that reader, and the freed
+    /// descriptor number can be handed to the next `pipe()` so a stale reader swallows the next
+    /// child's output.  The reader owns its descriptor and closes it when it leaves its loop.
+    func requestStopReading() {
+        lock.lock()
+        stopReadingRequested = true
+        lock.unlock()
+    }
+
+    var shouldStopReading: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopReadingRequested
+    }
 }
 
 /// Actor supervising child CLI processes with isolated process groups (`POSIX_SPAWN_SETPGROUP`),
@@ -241,6 +262,11 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
     private let protocolTee: ProtocolTeeHandler?
     private var activeProcesses: [Int32: SupervisedProcessState] = [:]
     private var pidsByThread: [String: Int32] = [:]
+    /// PIDs this supervisor has already reaped.  A late cancel for one of them must not sweep the
+    /// process group: the number can already belong to an unrelated process group.
+    /// Kept as a bounded FIFO so a long-lived supervisor cannot grow it without limit.
+    private var reapedPids: [Int32] = []
+    private let reapedPidsLimit = 4096
 
     public init(
         config: ProcessSupervisorConfig = .production,
@@ -376,6 +402,10 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
         )
         activeProcesses[childPid] = state
         pidsByThread[threadId] = childPid
+        // The kernel can hand out a PID this supervisor reaped earlier; this child owns the number now.
+        if let index = reapedPids.firstIndex(of: childPid) {
+            reapedPids.remove(at: index)
+        }
 
         let (stdoutLines, stdoutContinuation) = AsyncStream<String>.makeStream()
         let (stderrChunks, stderrContinuation) = AsyncStream<String>.makeStream()
@@ -396,8 +426,21 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
             var accumulator = Data()
             accumulator.reserveCapacity(65_536)
             var scanOffset = 0
+            var consumedThrough = 0
 
             while true {
+                if state.shouldStopReading { break }
+
+                // `poll()` with a short timeout keeps the reader responsive to a stop request.
+                // A blocking `read()` cannot be woken by another thread closing the descriptor.
+                var pollFds = [pollfd(fd: stdoutFd, events: Int16(POLLIN), revents: 0)]
+                let pollResult = Darwin.poll(&pollFds, 1, 50)
+                if pollResult < 0 {
+                    if errno == EINTR { continue }
+                    break
+                }
+                if pollResult == 0 { continue }
+
                 let bytesRead = Darwin.read(stdoutFd, chunkBuf, chunkSize)
                 if bytesRead > 0 {
                     accumulator.append(chunkBuf, count: bytesRead)
@@ -407,21 +450,30 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
                         let searchRange = scanOffset..<accumulator.count
                         if let nlIndex = accumulator[searchRange].firstIndex(of: 0x0A) {
                             var lineEnd = nlIndex
-                            if lineEnd > accumulator.startIndex && accumulator[lineEnd - 1] == 0x0D {
+                            if lineEnd > consumedThrough && accumulator[lineEnd - 1] == 0x0D {
                                 lineEnd -= 1
                             }
-                            let lineData = accumulator.subdata(in: accumulator.startIndex..<lineEnd)
+                            let lineData = accumulator.subdata(in: consumedThrough..<lineEnd)
                             let line = String(decoding: lineData, as: UTF8.self)
                             if let tee {
                                 tee(NativeProtocolRecord(engineId: engineId, threadId: threadId, direction: .inbound, line: line))
                             }
                             stdoutContinuation.yield(line)
-                            accumulator.removeSubrange(accumulator.startIndex...nlIndex)
-                            scanOffset = 0
+                            consumedThrough = nlIndex + 1
+                            scanOffset = consumedThrough
                         } else {
                             scanOffset = accumulator.count
                             break
                         }
+                    }
+
+                    // Drop the consumed prefix once per read chunk.  Removing it line by line would
+                    // memmove the rest of the buffer for every line and turn newline-heavy output
+                    // into quadratic memory traffic.
+                    if consumedThrough > 0 {
+                        accumulator.removeSubrange(accumulator.startIndex..<consumedThrough)
+                        scanOffset -= consumedThrough
+                        consumedThrough = 0
                     }
 
                     if accumulator.count > maxLineBytes {
@@ -465,6 +517,16 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
             defer { chunkBuf.deallocate() }
 
             while true {
+                if state.shouldStopReading { break }
+
+                var pollFds = [pollfd(fd: stderrFd, events: Int16(POLLIN), revents: 0)]
+                let pollResult = Darwin.poll(&pollFds, 1, 50)
+                if pollResult < 0 {
+                    if errno == EINTR { continue }
+                    break
+                }
+                if pollResult == 0 { continue }
+
                 let bytesRead = Darwin.read(stderrFd, chunkBuf, chunkSize)
                 if bytesRead > 0 {
                     let chunk = String(decoding: UnsafeBufferPointer(start: chunkBuf, count: bytesRead), as: UTF8.self)
@@ -484,10 +546,19 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
 
         // Monitor process lifecycle and reap on exit.
         let pollMs = config.pollIntervalMilliseconds
+        // The descendant sweep reads the whole process table, so it runs on a slower cadence than
+        // the reap poll: scanning it every poll would cost a full `KERN_PROC_ALL` dump per
+        // supervised child several times a second.
+        let descendantScanIntervalMilliseconds = 250
         Task.detached(priority: .userInitiated) { [weak self] in
+            var lastDescendantScanUptime: UInt64 = 0
             while true {
-                let currentTree = Self.discoverDescendantAndGroupPIDs(rootPid: childPid, pgid: childPid)
-                _ = state.recordDescendants(currentTree)
+                let now = DispatchTime.now().uptimeNanoseconds
+                if now - lastDescendantScanUptime >= UInt64(descendantScanIntervalMilliseconds) * 1_000_000 {
+                    lastDescendantScanUptime = now
+                    let currentTree = Self.discoverDescendantAndGroupPIDs(rootPid: childPid, pgid: childPid)
+                    _ = state.recordDescendants(currentTree)
+                }
 
                 var status: Int32 = 0
                 let w = waitpid(childPid, &status, WNOHANG)
@@ -566,6 +637,10 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
     public func cancel(pid: Int32) async {
         #if os(macOS)
         guard let state = activeProcesses[pid] else {
+            // A PID this supervisor already reaped can have been recycled by the kernel, and the
+            // number can now belong to an unrelated process group.  Sweeping it would SIGKILL
+            // processes this supervisor never started, so a reaped PID is left alone.
+            if reapedPids.contains(pid) { return }
             // Even if the leader already exited, sweep any surviving group or descendant processes.
             let survivors = Self.discoverDescendantAndGroupPIDs(rootPid: pid, pgid: pid)
             if !survivors.isEmpty {
@@ -615,9 +690,10 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
         )
         Self.terminateGroupAndDescendantsImmediately(pgid: state.pgid, knownDescendants: allTracked)
 
-        // Close read pipes so blocked readers unblock immediately if an external process held a descriptor.
-        state.closeStdoutRead()
-        state.closeStderrRead()
+        // Ask the readers to stop rather than closing their descriptors from this thread: the
+        // descriptor number would be handed to the next `pipe()` while the reader is still blocked
+        // in `read()` on it.  The reader owns its descriptor and closes it when it leaves its loop.
+        state.requestStopReading()
 
         _ = await state.waitForExit()
         #endif
@@ -637,32 +713,39 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
 
         Task {
             var sawCompleted = false
-            for await line in session.stdoutLines {
-                let events = lineParser(line)
-                for event in events {
-                    if case .completed = event {
-                        sawCompleted = true
+            // The stream is always closed, even if the task is cancelled or the parse throws, so a
+            // consumer can never wait on a stream that will not end.
+            defer { continuation.finish() }
+            do {
+                for await line in session.stdoutLines {
+                    let events = lineParser(line)
+                    for event in events {
+                        if case .completed = event {
+                            sawCompleted = true
+                        }
+                        continuation.yield(event)
                     }
-                    continuation.yield(event)
                 }
-            }
 
-            let exitReason = await session.waitForExit()
-            if !sawCompleted {
-                switch exitReason {
-                case .signaled(let sig):
-                    continuation.yield(.error(code: "process_signal", message: "Process \(session.pid) terminated by signal \(sig)"))
-                case .exited(let code) where code != 0:
-                    continuation.yield(.error(code: "process_exit", message: "Process \(session.pid) exited with code \(code)"))
-                case .cancelled:
-                    continuation.yield(.error(code: "cancelled", message: "Process \(session.pid) was cancelled"))
-                case .spawnFailed(let msg):
-                    continuation.yield(.error(code: "spawn_error", message: msg))
-                case .exited:
-                    break
+                let exitReason = await session.waitForExit()
+                if !sawCompleted {
+                    switch exitReason {
+                    case .signaled(let sig):
+                        continuation.yield(.error(code: "process_signal", message: "Process \(session.pid) terminated by signal \(sig)"))
+                    case .exited(let code) where code != 0:
+                        continuation.yield(.error(code: "process_exit", message: "Process \(session.pid) exited with code \(code)"))
+                    case .cancelled:
+                        continuation.yield(.error(code: "cancelled", message: "Process \(session.pid) was cancelled"))
+                    case .spawnFailed(let msg):
+                        continuation.yield(.error(code: "spawn_error", message: msg))
+                    case .exited:
+                        break
+                    }
                 }
+            } catch {
+                // Only the failure description is reported: no prompt, no environment, no credentials.
+                continuation.yield(.error(code: "stream_error", message: error.localizedDescription))
             }
-            continuation.finish()
         }
 
         return stream
@@ -670,6 +753,10 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
 
     private func removeProcess(pid: Int32, threadId: String) {
         activeProcesses.removeValue(forKey: pid)
+        reapedPids.append(pid)
+        if reapedPids.count > reapedPidsLimit {
+            reapedPids.removeFirst(reapedPids.count - reapedPidsLimit)
+        }
         if pidsByThread[threadId] == pid {
             pidsByThread.removeValue(forKey: threadId)
         }
