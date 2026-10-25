@@ -26,6 +26,14 @@ public struct MessageRecord: Equatable, Sendable, Identifiable {
     public let createdAt: Double
     public let model: String?
     public let activeLeafId: String?
+    /// The part of the source message JSON the native columns have no home for.
+    ///
+    /// The legacy store keeps a message's parent id, its reactions, its card,
+    /// its tool payload and its audio inside the message's own JSON.  The
+    /// native columns carry the text of a message, so the rest of that JSON is
+    /// kept verbatim here instead of being dropped, and the native app can
+    /// read it back.
+    public let metadataJSON: String?
 
     public init(
         id: String,
@@ -35,7 +43,8 @@ public struct MessageRecord: Equatable, Sendable, Identifiable {
         content: String,
         createdAt: Double = Date().timeIntervalSince1970,
         model: String? = nil,
-        activeLeafId: String? = nil
+        activeLeafId: String? = nil,
+        metadataJSON: String? = nil
     ) {
         self.id = id
         self.threadId = threadId
@@ -45,6 +54,7 @@ public struct MessageRecord: Equatable, Sendable, Identifiable {
         self.createdAt = createdAt
         self.model = model
         self.activeLeafId = activeLeafId
+        self.metadataJSON = metadataJSON
     }
 }
 
@@ -120,12 +130,97 @@ public struct WebhookDeliveryRecord: Equatable, Sendable, Identifiable {
     }
 }
 
+public struct StoredBotRecord: Equatable, Sendable, Identifiable {
+    public let id: String
+    public let name: String
+    public let threadId: String?
+    public let createdAt: Double
+    public let rawJSON: String
+
+    public init(id: String, name: String, threadId: String? = nil, createdAt: Double, rawJSON: String) {
+        self.id = id
+        self.name = name
+        self.threadId = threadId
+        self.createdAt = createdAt
+        self.rawJSON = rawJSON
+    }
+}
+
+public struct StoredRoutineRecord: Equatable, Sendable, Identifiable {
+    public let id: String
+    public let name: String
+    public let botId: String
+    public let schedule: String
+    public let enabled: Bool
+    public let createdAt: Double
+    public let updatedAt: Double
+    public let rawJSON: String
+
+    public init(
+        id: String,
+        name: String,
+        botId: String,
+        schedule: String,
+        enabled: Bool,
+        createdAt: Double,
+        updatedAt: Double,
+        rawJSON: String
+    ) {
+        self.id = id
+        self.name = name
+        self.botId = botId
+        self.schedule = schedule
+        self.enabled = enabled
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.rawJSON = rawJSON
+    }
+}
+
+public struct StoredWebhookRecord: Equatable, Sendable, Identifiable {
+    public let id: String
+    public let endpointId: String
+    public let name: String
+    public let botId: String
+    public let enabled: Bool
+    public let createdAt: Double
+    public let updatedAt: Double
+    public let rawJSON: String
+
+    public init(
+        id: String,
+        endpointId: String,
+        name: String,
+        botId: String,
+        enabled: Bool,
+        createdAt: Double,
+        updatedAt: Double,
+        rawJSON: String
+    ) {
+        self.id = id
+        self.endpointId = endpointId
+        self.name = name
+        self.botId = botId
+        self.enabled = enabled
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.rawJSON = rawJSON
+    }
+}
+
 public enum DatabaseError: LocalizedError, Equatable {
     case openFailed(String)
     case executionFailed(String)
     case prepareFailed(String)
     case stepFailed(String)
     case notFound
+    /// A message id is already owned by a different thread.
+    ///
+    /// `messages` is keyed on `id`, while the legacy Node store keys a message
+    /// on `(thread_id, id)`, so the same message id can exist in two threads
+    /// there.  Writing it here would either drop a message or move it out of
+    /// the thread that owns it, so the write is refused instead.
+    case messageThreadConflict(id: String, existingThreadId: String, incomingThreadId: String)
 
     public var errorDescription: String? {
         switch self {
@@ -134,6 +229,8 @@ public enum DatabaseError: LocalizedError, Equatable {
         case .prepareFailed(let msg): return "SQLite statement prepare failed: \(msg)"
         case .stepFailed(let msg): return "SQLite step failed: \(msg)"
         case .notFound: return "Requested record not found in database"
+        case .messageThreadConflict(let id, let existingThreadId, let incomingThreadId):
+            return "Message '\(id)' already belongs to thread '\(existingThreadId)' and cannot be written to thread '\(incomingThreadId)'."
         }
     }
 }
@@ -145,9 +242,19 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 /// transactional reads, concurrent background writes, and instant snippet search.
 public actor DatabaseService {
     private var db: OpaquePointer?
+    private let databasePath: String
 
-    public init(path: String? = nil) throws {
+    /// Opens the native store.
+    ///
+    /// - Parameters:
+    ///   - path: the store path, or nil for an in-memory store.
+    ///   - createSchemaIfNeeded: false opens an already-provisioned store
+    ///     without running the schema DDL.  The performance harness uses it
+    ///     to time the launch path rather than the installer, because
+    ///     `CREATE TABLE IF NOT EXISTS` is first-run install work.
+    public init(path: String? = nil, createSchemaIfNeeded: Bool = true) throws {
         let dbPath = path ?? ":memory:"
+        self.databasePath = dbPath
         if let parent = path.flatMap({ URL(fileURLWithPath: $0).deletingLastPathComponent().path }), parent != "/" && !parent.isEmpty {
             try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
         }
@@ -161,6 +268,10 @@ public actor DatabaseService {
         }
         self.db = handle
 
+        // Another writer can hold the store's write lock, so an ordinary open
+        // waits for it instead of failing with SQLITE_BUSY.  The pragma is set
+        // before the first statement that can need the lock.
+        try execute(sql: "PRAGMA busy_timeout = 5000;")
         try execute(sql: "PRAGMA journal_mode = WAL;")
         // sqlite3_exec reports no error when WAL is unsupported and SQLite
         // silently keeps rollback journaling; read the mode back so the
@@ -174,7 +285,7 @@ public actor DatabaseService {
         // the FTS delete triggers do not cascade.
         try execute(sql: "PRAGMA recursive_triggers = ON;")
 
-        try createSchema()
+        try createSchema(createIfNeeded: createSchemaIfNeeded)
     }
 
     deinit {
@@ -205,7 +316,13 @@ public actor DatabaseService {
         }
     }
 
-    private func createSchema() throws {
+    /// Creates the native schema.
+    ///
+    /// - Parameter createIfNeeded: false leaves an already-provisioned store
+    ///   alone.  The performance harness opens the store this way so the
+    ///   launch path is timed instead of the installer.
+    private func createSchema(createIfNeeded: Bool = true) throws {
+        guard createIfNeeded else { return }
         let schema = """
         CREATE TABLE IF NOT EXISTS threads (
             id TEXT PRIMARY KEY,
@@ -224,6 +341,7 @@ public actor DatabaseService {
             created_at REAL NOT NULL,
             model TEXT,
             active_leaf_id TEXT,
+            metadata_json TEXT,
             FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
         );
 
@@ -235,21 +353,6 @@ public actor DatabaseService {
             message_id UNINDEXED,
             tokenize = 'porter unicode61'
         );
-
-        CREATE TRIGGER IF NOT EXISTS trg_messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(content, thread_id, message_id)
-            VALUES (new.content, new.thread_id, new.id);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_messages_ad AFTER DELETE ON messages BEGIN
-            DELETE FROM messages_fts WHERE message_id = old.id;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_messages_au AFTER UPDATE ON messages BEGIN
-            DELETE FROM messages_fts WHERE message_id = old.id;
-            INSERT INTO messages_fts(content, thread_id, message_id)
-            VALUES (new.content, new.thread_id, new.id);
-        END;
 
         CREATE TABLE IF NOT EXISTS routine_runs (
             id TEXT PRIMARY KEY,
@@ -263,6 +366,18 @@ public actor DatabaseService {
 
         CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at);
 
+        CREATE TABLE IF NOT EXISTS routine_request_receipts (
+            request_id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
+            bot_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            fingerprint_version INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL,
+            result_id TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS webhook_deliveries (
             id TEXT PRIMARY KEY,
             webhook_id TEXT NOT NULL,
@@ -274,8 +389,161 @@ public actor DatabaseService {
         );
 
         CREATE INDEX IF NOT EXISTS idx_webhook_deliveries ON webhook_deliveries(webhook_id, delivered_at);
+
+        CREATE TABLE IF NOT EXISTS bots (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            thread_id TEXT,
+            created_at REAL NOT NULL,
+            raw_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS routines (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            bot_id TEXT NOT NULL,
+            schedule TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            raw_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS webhooks (
+            id TEXT PRIMARY KEY,
+            endpoint_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            bot_id TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            raw_json TEXT NOT NULL
+        );
         """
         try execute(sql: schema)
+        // A store provisioned by an earlier native build does not carry the
+        // metadata column yet, so add it when it is missing.  The check keeps
+        // the launch path free of a write on a store that is already current.
+        if try !tableHasColumn("metadata_json", inTable: "messages") {
+            try execute(sql: "ALTER TABLE messages ADD COLUMN metadata_json TEXT;")
+        }
+        try ensureMessageTriggers()
+    }
+
+    /// Whether a table carries a named column.
+    ///
+    /// The table name is an internal constant, never anything from a caller.
+    private func tableHasColumn(_ column: String, inTable table: String) throws -> Bool {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "PRAGMA table_info(\(table));"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let name = sqlite3_column_text(stmt, 1) else { continue }
+            if String(cString: name) == column {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Makes sure the FTS triggers exist and carry the current bodies.
+    ///
+    /// A store that predates the rewrite ran legacy trigger bodies: the
+    /// insert trigger let SQLite assign the FTS rowid itself, and the update
+    /// trigger removed a row by `message_id` before inserting a replacement
+    /// with a new rowid.  A store still running those bodies ends up with an
+    /// FTS rowid that no longer matches `messages.rowid`, so a search can pair
+    /// a snippet with the wrong message.
+    ///
+    /// A healthy store already carries the three current triggers, so it is
+    /// opened with no DDL at all.  A store that predates the rewrite, or one
+    /// whose triggers were lost to an interrupted launch, has them replaced
+    /// inside a single transaction: the drops, the creates and the index
+    /// rebuild commit together, so a crash cannot leave the store with no
+    /// triggers and a permanently stale index.
+    private func ensureMessageTriggers() throws {
+        let legacyTriggerCount = try countLegacyMessageTriggers()
+        let currentTriggerCount = try countCurrentMessageTriggers()
+        if currentTriggerCount == 3 && legacyTriggerCount == 0 {
+            return
+        }
+
+        try execute(sql: "BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            for name in ["trg_messages_ai", "trg_messages_ad", "trg_messages_au"] {
+                try execute(sql: "DROP TRIGGER IF EXISTS \(name);")
+            }
+            try execute(sql: """
+            CREATE TRIGGER trg_messages_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+                VALUES (new.rowid, new.content, new.thread_id, new.id);
+            END;
+
+            CREATE TRIGGER trg_messages_ad AFTER DELETE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.rowid;
+            END;
+
+            CREATE TRIGGER trg_messages_au AFTER UPDATE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.rowid;
+                INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+                VALUES (new.rowid, new.content, new.thread_id, new.id);
+            END;
+            """)
+
+            // The index is rebuilt only when the store was still carrying the
+            // legacy bodies, because those bodies are what let the FTS rowid
+            // drift away from the message rowid it belongs to.
+            if legacyTriggerCount > 0 {
+                try resyncFTSIndexInCurrentTransaction()
+            }
+            try execute(sql: "COMMIT;")
+        } catch {
+            try? execute(sql: "ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Counts the message triggers that still carry a legacy body.
+    ///
+    /// A current body names `rowid`; a legacy one lets SQLite assign the FTS
+    /// rowid itself.
+    private func countLegacyMessageTriggers() throws -> Int {
+        try countMessageTriggers(matching: "sql NOT LIKE '%rowid%'")
+    }
+
+    /// Counts the message triggers that carry the current body.
+    private func countCurrentMessageTriggers() throws -> Int {
+        try countMessageTriggers(matching: "sql LIKE '%rowid%'")
+    }
+
+    /// Counts the message triggers whose stored body matches the predicate.
+    private func countMessageTriggers(matching predicate: String) throws -> Int {
+        let sql = """
+        SELECT COUNT(*) FROM sqlite_master
+        WHERE type = 'trigger'
+          AND name IN ('trg_messages_ai', 'trg_messages_ad', 'trg_messages_au')
+          AND \(predicate);
+        """
+        guard let value = try queryString(sql: sql) else { return 0 }
+        return Int(value) ?? 0
+    }
+
+    /// Rebuilds the FTS index from `messages` so every index rowid matches the
+    /// message rowid it belongs to.
+    ///
+    /// Runs inside the caller's transaction, so the rebuilt index and the
+    /// replaced triggers commit together.
+    private func resyncFTSIndexInCurrentTransaction() throws {
+        try execute(sql: "DELETE FROM messages_fts;")
+        try execute(sql: """
+        INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+        SELECT rowid, content, thread_id, id FROM messages;
+        """)
     }
 
     // MARK: - Thread Operations
@@ -360,8 +628,8 @@ public actor DatabaseService {
     public func insertMessage(_ message: MessageRecord) throws {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let sql = """
-        INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         ON CONFLICT(id) DO UPDATE SET
             thread_id = excluded.thread_id,
             role = excluded.role,
@@ -369,7 +637,9 @@ public actor DatabaseService {
             content = excluded.content,
             created_at = excluded.created_at,
             model = excluded.model,
-            active_leaf_id = excluded.active_leaf_id;
+            active_leaf_id = excluded.active_leaf_id,
+            metadata_json = excluded.metadata_json
+        WHERE messages.thread_id = excluded.thread_id;
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -396,8 +666,21 @@ public actor DatabaseService {
             sqlite3_bind_null(stmt, 8)
         }
 
+        if let metadata = message.metadataJSON {
+            sqlite3_bind_text(stmt, 9, (metadata as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 9)
+        }
+
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        // The update above only fires for a row that already belongs to this
+        // thread, so a write that changed nothing means the message id is
+        // owned by another thread.  That is refused rather than allowed to
+        // move the message out of the thread that has it.
+        if sqlite3_changes(db) == 0 {
+            try throwIfOwnedByAnotherThread(message)
         }
 
         // Update thread updated_at timestamp inside the same logical write
@@ -417,8 +700,8 @@ public actor DatabaseService {
     public func loadMessages(forThread threadId: String, limit: Int = 100, before: Double? = nil) throws -> [MessageRecord] {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let sql = before == nil
-            ? "SELECT id, thread_id, role, kind, content, created_at, model, active_leaf_id FROM messages WHERE thread_id = ?1 ORDER BY created_at ASC LIMIT ?2;"
-            : "SELECT id, thread_id, role, kind, content, created_at, model, active_leaf_id FROM messages WHERE thread_id = ?1 AND created_at < ?3 ORDER BY created_at ASC LIMIT ?2;"
+            ? "SELECT id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json FROM messages WHERE thread_id = ?1 ORDER BY created_at ASC LIMIT ?2;"
+            : "SELECT id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json FROM messages WHERE thread_id = ?1 AND created_at < ?3 ORDER BY created_at ASC LIMIT ?2;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -442,6 +725,7 @@ public actor DatabaseService {
             let createdAt = sqlite3_column_double(stmt, 5)
             let model = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
             let activeLeafId = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
+            let metadataJSON = sqlite3_column_type(stmt, 8) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 8)) : nil
 
             results.append(MessageRecord(
                 id: id,
@@ -451,7 +735,8 @@ public actor DatabaseService {
                 content: content,
                 createdAt: createdAt,
                 model: model,
-                activeLeafId: activeLeafId
+                activeLeafId: activeLeafId,
+                metadataJSON: metadataJSON
             ))
         }
         return results
@@ -461,9 +746,32 @@ public actor DatabaseService {
 
     /// Full-text search across transcripts using SQLite3 FTS5 with BM25 ranking and highlighted snippets.
     public func search(query: String, inThread threadId: String? = nil, limit: Int = 50) throws -> [DatabaseSearchResult] {
+        try performSearch(query: query, inThread: threadId, limit: limit).results
+    }
+
+    /// Runs the same FTS5 search as `search(query:inThread:limit:)` and reports
+    /// how long the query itself took.
+    ///
+    /// The duration is measured inside the actor, around the prepared
+    /// statement.  A caller that times the `await` from outside also measures
+    /// the actor hop and its own instrumentation, which says more about the
+    /// caller's scheduler than about the search.
+    func searchMeasuringLatency(
+        query: String,
+        inThread threadId: String? = nil,
+        limit: Int = 50
+    ) throws -> (results: [DatabaseSearchResult], durationMs: Double) {
+        try performSearch(query: query, inThread: threadId, limit: limit)
+    }
+
+    private func performSearch(
+        query: String,
+        inThread threadId: String?,
+        limit: Int
+    ) throws -> (results: [DatabaseSearchResult], durationMs: Double) {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanQuery.isEmpty else { return [] }
+        guard !cleanQuery.isEmpty else { return ([], 0) }
 
         // Sanitize query tokens for FTS5 syntax
         let formattedQuery = cleanQuery
@@ -474,21 +782,31 @@ public actor DatabaseService {
 
         let sql = threadId == nil
             ? """
-            SELECT m.id, m.thread_id, snippet(messages_fts, 0, '<b>', '</b>', '…', 32), m.content, m.created_at
-            FROM messages_fts fts
-            JOIN messages m ON fts.message_id = m.id
-            WHERE messages_fts MATCH ?1
-            ORDER BY bm25(messages_fts)
-            LIMIT ?2;
+            SELECT m.id, m.thread_id, fts.snip, m.content, m.created_at
+            FROM (
+                SELECT rowid, snippet(messages_fts, 0, '<b>', '</b>', '…', 32) AS snip, rank
+                FROM messages_fts
+                WHERE messages_fts MATCH ?1
+                ORDER BY rank
+                LIMIT ?2
+            ) fts
+            JOIN messages m ON m.rowid = fts.rowid
+            ORDER BY fts.rank;
             """
             : """
-            SELECT m.id, m.thread_id, snippet(messages_fts, 0, '<b>', '</b>', '…', 32), m.content, m.created_at
-            FROM messages_fts fts
-            JOIN messages m ON fts.message_id = m.id
-            WHERE messages_fts MATCH ?1 AND fts.thread_id = ?3
-            ORDER BY bm25(messages_fts)
-            LIMIT ?2;
+            SELECT m.id, m.thread_id, fts.snip, m.content, m.created_at
+            FROM (
+                SELECT rowid, snippet(messages_fts, 0, '<b>', '</b>', '…', 32) AS snip, rank
+                FROM messages_fts
+                WHERE messages_fts MATCH ?1 AND thread_id = ?3
+                ORDER BY rank
+                LIMIT ?2
+            ) fts
+            JOIN messages m ON m.rowid = fts.rowid
+            ORDER BY fts.rank;
             """
+
+        let queryBegin = DispatchTime.now().uptimeNanoseconds
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -518,7 +836,10 @@ public actor DatabaseService {
                 createdAt: createdAt
             ))
         }
-        return results
+
+        let queryEnd = DispatchTime.now().uptimeNanoseconds
+        let durationMs = Double(queryEnd - queryBegin) / 1_000_000.0
+        return (results, durationMs)
     }
 
     // MARK: - Routine Runs
@@ -636,6 +957,78 @@ public actor DatabaseService {
         }
     }
 
+    // MARK: - Routine Request Receipts
+
+    /// Records a durable commit receipt for a routine request.
+    ///
+    /// The receipt is the idempotency key that lets a routine request be
+    /// confirmed again after a crash without applying its change twice, so it
+    /// is keyed on the request id and replaced when the same request is
+    /// recorded again.
+    public func recordRoutineRequestReceipt(_ receipt: RoutineRequestReceiptRecord) throws {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = """
+        INSERT OR REPLACE INTO routine_request_receipts
+            (request_id, message_id, bot_id, thread_id, action, fingerprint_version, fingerprint, result_id, applied_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (receipt.requestId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (receipt.messageId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, (receipt.botId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 4, (receipt.threadId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 5, (receipt.action as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt, 6, Int32(receipt.fingerprintVersion))
+        sqlite3_bind_text(stmt, 7, (receipt.fingerprint as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 8, (receipt.resultId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(stmt, 9, receipt.appliedAt)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Every routine-request receipt, oldest first.
+    public func loadRoutineRequestReceipts() throws -> [RoutineRequestReceiptRecord] {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = """
+        SELECT request_id, message_id, bot_id, thread_id, action, fingerprint_version, fingerprint, result_id, applied_at
+        FROM routine_request_receipts
+        ORDER BY applied_at ASC, request_id ASC;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var receipts: [RoutineRequestReceiptRecord] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            receipts.append(RoutineRequestReceiptRecord(
+                requestId: String(cString: sqlite3_column_text(stmt, 0)),
+                messageId: String(cString: sqlite3_column_text(stmt, 1)),
+                botId: String(cString: sqlite3_column_text(stmt, 2)),
+                threadId: String(cString: sqlite3_column_text(stmt, 3)),
+                action: String(cString: sqlite3_column_text(stmt, 4)),
+                fingerprintVersion: Int(sqlite3_column_int64(stmt, 5)),
+                fingerprint: String(cString: sqlite3_column_text(stmt, 6)),
+                resultId: String(cString: sqlite3_column_text(stmt, 7)),
+                appliedAt: sqlite3_column_double(stmt, 8)
+            ))
+        }
+        return receipts
+    }
+
+    /// How many routine-request receipts the store holds.
+    public func countRoutineRequestReceipts() throws -> Int {
+        try countRows(inTable: "routine_request_receipts")
+    }
+
     public func loadWebhookDeliveries(forWebhook webhookId: String, limit: Int = 50) throws -> [WebhookDeliveryRecord] {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let sql = "SELECT id, webhook_id, bot_id, status_code, delivered_at, payload, response FROM webhook_deliveries WHERE webhook_id = ?1 ORDER BY delivered_at DESC LIMIT ?2;"
@@ -669,5 +1062,534 @@ public actor DatabaseService {
             ))
         }
         return results
+    }
+
+    // MARK: - Bot, Routine & Webhook Definition Tables
+
+    public func upsertBot(_ bot: StoredBotRecord) throws {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = """
+        INSERT INTO bots (id, name, thread_id, created_at, raw_json)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            thread_id = excluded.thread_id,
+            created_at = excluded.created_at,
+            raw_json = excluded.raw_json;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (bot.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (bot.name as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        if let threadId = bot.threadId {
+            sqlite3_bind_text(stmt, 3, (threadId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 3)
+        }
+        sqlite3_bind_double(stmt, 4, bot.createdAt)
+        sqlite3_bind_text(stmt, 5, (bot.rawJSON as NSString).utf8String, -1, SQLITE_TRANSIENT)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    public func loadBots() throws -> [StoredBotRecord] {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT id, name, thread_id, created_at, raw_json FROM bots ORDER BY created_at ASC, id ASC;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var results: [StoredBotRecord] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = String(cString: sqlite3_column_text(stmt, 0))
+            let name = String(cString: sqlite3_column_text(stmt, 1))
+            let threadId = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 2)) : nil
+            let createdAt = sqlite3_column_double(stmt, 3)
+            let rawJSON = String(cString: sqlite3_column_text(stmt, 4))
+            results.append(StoredBotRecord(id: id, name: name, threadId: threadId, createdAt: createdAt, rawJSON: rawJSON))
+        }
+        return results
+    }
+
+    public func upsertRoutine(_ routine: StoredRoutineRecord) throws {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = """
+        INSERT INTO routines (id, name, bot_id, schedule, enabled, created_at, updated_at, raw_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            bot_id = excluded.bot_id,
+            schedule = excluded.schedule,
+            enabled = excluded.enabled,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            raw_json = excluded.raw_json;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (routine.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (routine.name as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, (routine.botId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 4, (routine.schedule as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt, 5, routine.enabled ? 1 : 0)
+        sqlite3_bind_double(stmt, 6, routine.createdAt)
+        sqlite3_bind_double(stmt, 7, routine.updatedAt)
+        sqlite3_bind_text(stmt, 8, (routine.rawJSON as NSString).utf8String, -1, SQLITE_TRANSIENT)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    public func loadRoutines() throws -> [StoredRoutineRecord] {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT id, name, bot_id, schedule, enabled, created_at, updated_at, raw_json FROM routines ORDER BY created_at ASC, id ASC;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var results: [StoredRoutineRecord] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = String(cString: sqlite3_column_text(stmt, 0))
+            let name = String(cString: sqlite3_column_text(stmt, 1))
+            let botId = String(cString: sqlite3_column_text(stmt, 2))
+            let schedule = String(cString: sqlite3_column_text(stmt, 3))
+            let enabled = sqlite3_column_int(stmt, 4) != 0
+            let createdAt = sqlite3_column_double(stmt, 5)
+            let updatedAt = sqlite3_column_double(stmt, 6)
+            let rawJSON = String(cString: sqlite3_column_text(stmt, 7))
+            results.append(StoredRoutineRecord(
+                id: id,
+                name: name,
+                botId: botId,
+                schedule: schedule,
+                enabled: enabled,
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                rawJSON: rawJSON
+            ))
+        }
+        return results
+    }
+
+    public func upsertWebhook(_ webhook: StoredWebhookRecord) throws {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = """
+        INSERT INTO webhooks (id, endpoint_id, name, bot_id, enabled, created_at, updated_at, raw_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(id) DO UPDATE SET
+            endpoint_id = excluded.endpoint_id,
+            name = excluded.name,
+            bot_id = excluded.bot_id,
+            enabled = excluded.enabled,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            raw_json = excluded.raw_json;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (webhook.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (webhook.endpointId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, (webhook.name as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 4, (webhook.botId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt, 5, webhook.enabled ? 1 : 0)
+        sqlite3_bind_double(stmt, 6, webhook.createdAt)
+        sqlite3_bind_double(stmt, 7, webhook.updatedAt)
+        sqlite3_bind_text(stmt, 8, (webhook.rawJSON as NSString).utf8String, -1, SQLITE_TRANSIENT)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    public func loadWebhooks() throws -> [StoredWebhookRecord] {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT id, endpoint_id, name, bot_id, enabled, created_at, updated_at, raw_json FROM webhooks ORDER BY created_at ASC, id ASC;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var results: [StoredWebhookRecord] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = String(cString: sqlite3_column_text(stmt, 0))
+            let endpointId = String(cString: sqlite3_column_text(stmt, 1))
+            let name = String(cString: sqlite3_column_text(stmt, 2))
+            let botId = String(cString: sqlite3_column_text(stmt, 3))
+            let enabled = sqlite3_column_int(stmt, 4) != 0
+            let createdAt = sqlite3_column_double(stmt, 5)
+            let updatedAt = sqlite3_column_double(stmt, 6)
+            let rawJSON = String(cString: sqlite3_column_text(stmt, 7))
+            results.append(StoredWebhookRecord(
+                id: id,
+                endpointId: endpointId,
+                name: name,
+                botId: botId,
+                enabled: enabled,
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                rawJSON: rawJSON
+            ))
+        }
+        return results
+    }
+
+    // MARK: - Contract Aliases, Batch Import & Parity Queries
+
+    public func save(_ message: MessageRecord) throws {
+        try insertMessage(message)
+    }
+
+    public func loadThread(id: String) throws -> ThreadRecord? {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT id, title, bot_id, created_at, updated_at FROM threads WHERE id = ?1 LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+
+        let threadId = String(cString: sqlite3_column_text(stmt, 0))
+        let title = String(cString: sqlite3_column_text(stmt, 1))
+        let botId = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 2)) : nil
+        let createdAt = sqlite3_column_double(stmt, 3)
+        let updatedAt = sqlite3_column_double(stmt, 4)
+        return ThreadRecord(id: threadId, title: title, botId: botId, createdAt: createdAt, updatedAt: updatedAt)
+    }
+
+    /// Inserts or updates a batch of messages inside a single transaction.
+    /// When `skipIdentical` is true, rows already in `messages` with identical fields
+    /// are ignored (`WHERE` guard on `DO UPDATE`) so an idempotent rerun writes 0 rows
+    /// and returns `0`.
+    @discardableResult
+    public func insertMessagesBatch(_ messages: [MessageRecord], skipIdentical: Bool = true) throws -> Int {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        guard !messages.isEmpty else { return 0 }
+
+        try execute(sql: "BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            let sql = skipIdentical
+                ? """
+                INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(id) DO UPDATE SET
+                    thread_id = excluded.thread_id,
+                    role = excluded.role,
+                    kind = excluded.kind,
+                    content = excluded.content,
+                    created_at = excluded.created_at,
+                    model = excluded.model,
+                    active_leaf_id = excluded.active_leaf_id,
+                    metadata_json = excluded.metadata_json
+                WHERE messages.thread_id = excluded.thread_id
+                   AND (messages.role IS NOT excluded.role
+                   OR messages.kind IS NOT excluded.kind
+                   OR messages.content IS NOT excluded.content
+                   OR messages.created_at IS NOT excluded.created_at
+                   OR messages.model IS NOT excluded.model
+                   OR messages.active_leaf_id IS NOT excluded.active_leaf_id
+                   OR messages.metadata_json IS NOT excluded.metadata_json);
+                """
+                : """
+                INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(id) DO UPDATE SET
+                    thread_id = excluded.thread_id,
+                    role = excluded.role,
+                    kind = excluded.kind,
+                    content = excluded.content,
+                    created_at = excluded.created_at,
+                    model = excluded.model,
+                    active_leaf_id = excluded.active_leaf_id,
+                    metadata_json = excluded.metadata_json
+                WHERE messages.thread_id = excluded.thread_id;
+                """
+
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            // The ownership probe is prepared once for the whole batch.  A
+            // resumed or idempotent import skips every row it already wrote,
+            // so one statement per row would double the statement traffic of
+            // the import for no reason.
+            var ownershipStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT thread_id FROM messages WHERE id = ?1 LIMIT 1;", -1, &ownershipStmt, nil) == SQLITE_OK else {
+                throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            guard let preparedOwnershipStmt = ownershipStmt else {
+                throw DatabaseError.prepareFailed("Ownership statement was not prepared")
+            }
+            defer { sqlite3_finalize(ownershipStmt) }
+
+            var changedCount = 0
+            for message in messages {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+
+                sqlite3_bind_text(stmt, 1, (message.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(stmt, 2, (message.threadId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(stmt, 3, (message.role as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(stmt, 4, (message.kind as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(stmt, 5, (message.content as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_double(stmt, 6, message.createdAt)
+
+                if let model = message.model {
+                    sqlite3_bind_text(stmt, 7, (model as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                } else {
+                    sqlite3_bind_null(stmt, 7)
+                }
+
+                if let leaf = message.activeLeafId {
+                    sqlite3_bind_text(stmt, 8, (leaf as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                } else {
+                    sqlite3_bind_null(stmt, 8)
+                }
+
+                if let metadata = message.metadataJSON {
+                    sqlite3_bind_text(stmt, 9, (metadata as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                } else {
+                    sqlite3_bind_null(stmt, 9)
+                }
+
+                guard sqlite3_step(stmt) == SQLITE_DONE else {
+                    throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+                }
+                let rowChanges = Int(sqlite3_changes(db))
+                changedCount += rowChanges
+                // A row that changed nothing was either already identical,
+                // which is the idempotent skip this batch asked for, or it is
+                // owned by another thread, which is refused.
+                if rowChanges == 0 {
+                    try throwIfOwnedByAnotherThread(message, using: preparedOwnershipStmt)
+                }
+            }
+
+            try execute(sql: "COMMIT;")
+            return changedCount
+        } catch {
+            try? execute(sql: "ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Throws when a message id is already owned by a different thread.
+    ///
+    /// `messages` is keyed on `id` while the legacy Node store keys a message
+    /// on `(thread_id, id)`, so the same message id can exist in two threads
+    /// in the source.  Writing the second one here would either drop a
+    /// message or move it out of the thread that owns it, so it is refused
+    /// with the two thread ids named.
+    private func throwIfOwnedByAnotherThread(_ message: MessageRecord) throws {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT thread_id FROM messages WHERE id = ?1 LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        guard let preparedOwnershipStmt = stmt else {
+            throw DatabaseError.prepareFailed("Ownership statement was not prepared")
+        }
+        try throwIfOwnedByAnotherThread(message, using: preparedOwnershipStmt)
+    }
+
+    /// Throws when a message id is already owned by a different thread.
+    ///
+    /// The probe reuses a statement the caller prepared once, so a batch that
+    /// skips thousands of identical rows runs one prepared statement rather
+    /// than one per row.
+    private func throwIfOwnedByAnotherThread(_ message: MessageRecord, using ownershipStmt: OpaquePointer) throws {
+        guard let existingThreadId = try threadIdOwningMessage(id: message.id, using: ownershipStmt),
+              existingThreadId != message.threadId else {
+            return
+        }
+        throw DatabaseError.messageThreadConflict(
+            id: message.id,
+            existingThreadId: existingThreadId,
+            incomingThreadId: message.threadId
+        )
+    }
+
+    /// The thread that currently holds a message id, if any.
+    ///
+    /// The statement is reused across calls, so it is reset and rebound before
+    /// every probe.
+    private func threadIdOwningMessage(id: String, using stmt: OpaquePointer) throws -> String? {
+        sqlite3_reset(stmt)
+        sqlite3_clear_bindings(stmt)
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        guard let cText = sqlite3_column_text(stmt, 0) else { return nil }
+        return String(cString: cText)
+    }
+
+    /// The store's schema version, which SQLite bumps whenever the schema changes.
+    ///
+    /// Comparing it across two opens proves that the second open ran no DDL
+    /// at all, which is what keeps a healthy store's launch path read-only.
+    public func schemaVersion() throws -> Int {
+        guard let value = try queryString(sql: "PRAGMA schema_version;") else { return 0 }
+        return Int(value) ?? 0
+    }
+
+    /// How long the store waits for a lock held by another writer, in
+    /// milliseconds.
+    ///
+    /// The connection sets a busy timeout so a concurrent writer turns an
+    /// ordinary open into a wait instead of an immediate SQLITE_BUSY.
+    public func busyTimeoutMilliseconds() throws -> Int {
+        guard let value = try queryString(sql: "PRAGMA busy_timeout;") else { return 0 }
+        return Int(value) ?? 0
+    }
+
+    /// The SQL text of every trigger this store carries, sorted by name.
+    ///
+    /// A test uses it to prove that the FTS triggers exist and carry the
+    /// current bodies.
+    public func triggerDefinitions() throws -> [String: String] {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'trigger' ORDER BY name;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var definitions: [String: String] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            definitions[String(cString: sqlite3_column_text(stmt, 0))] = String(cString: sqlite3_column_text(stmt, 1))
+        }
+        return definitions
+    }
+
+    public func countRows(inTable table: String) throws -> Int {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let allowedTables: Set<String> = [
+            "threads", "messages", "messages_fts",
+            "routine_runs", "routine_request_receipts", "webhook_deliveries",
+            "bots", "routines", "webhooks"
+        ]
+        guard allowedTables.contains(table) else {
+            throw DatabaseError.executionFailed("Disallowed table name in countRows: \(table)")
+        }
+        let sql = "SELECT COUNT(*) FROM \(table);"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    public func countOrphanedMessages() throws -> Int {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = """
+        SELECT COUNT(*)
+        FROM messages m
+        LEFT JOIN threads t ON m.thread_id = t.id
+        WHERE t.id IS NULL;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    public func messageCountsByThread() throws -> [String: Int] {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT thread_id, COUNT(*) FROM messages GROUP BY thread_id;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var counts: [String: Int] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let threadId = String(cString: sqlite3_column_text(stmt, 0))
+            let count = Int(sqlite3_column_int64(stmt, 1))
+            counts[threadId] = count
+        }
+        return counts
+    }
+
+    public func streamMessageDigestElements(onRow: (String, String, String) -> Void) throws {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT thread_id, id, content FROM messages ORDER BY thread_id ASC, id ASC;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let threadId = String(cString: sqlite3_column_text(stmt, 0))
+            let id = String(cString: sqlite3_column_text(stmt, 1))
+            let content = String(cString: sqlite3_column_text(stmt, 2))
+            onRow(threadId, id, content)
+        }
+    }
+
+    /// Runs `PRAGMA wal_checkpoint(TRUNCATE)` so the `-wal` file is truncated back to 0 bytes
+    /// once concurrent readers close, returning the resulting `-wal` file size in bytes.
+    @discardableResult
+    public func checkpointWALTruncate() throws -> UInt64 {
+        try execute(sql: "PRAGMA wal_checkpoint(TRUNCATE);")
+        return try currentWALSizeBytes()
+    }
+
+    /// Runs `PRAGMA wal_checkpoint(PASSIVE)` and returns the resulting `-wal`
+    /// file size in bytes.
+    ///
+    /// A passive checkpoint copies the frames into the database without
+    /// truncating the write-ahead log, so the returned size is the log's
+    /// high-water mark.  A truncating checkpoint empties the file before it
+    /// is measured, which is why the performance harness measures the log
+    /// this way: the budget is about how much log a write burst produced,
+    /// not about how much log is left after a checkpoint.
+    @discardableResult
+    public func checkpointWALPassive() throws -> UInt64 {
+        try execute(sql: "PRAGMA wal_checkpoint(PASSIVE);")
+        return try currentWALSizeBytes()
+    }
+
+    /// The current size of the `-wal` file in bytes, or 0 when there is none.
+    public func currentWALSizeBytes() throws -> UInt64 {
+        guard databasePath != ":memory:" else { return 0 }
+        let walPath = databasePath + "-wal"
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: walPath),
+              let size = attrs[.size] as? NSNumber else {
+            return 0
+        }
+        return size.uint64Value
     }
 }
