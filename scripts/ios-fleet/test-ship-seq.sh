@@ -155,11 +155,14 @@ OUT=""
 RC=0
 
 # run_ship <args...> - invoke ship-testflight.sh in the sandbox.
+# SHIP_TMPDIR overrides the TMPDIR the sandboxed run sees, so a test can
+# drive the root-TMPDIR path.  It defaults to a scratch directory under the
+# sandbox, which is what every other case wants.
 run_ship() {
   OUT="$(env -i \
     HOME="$FAKE_HOME" \
     PATH="${FAKE_BIN}:/usr/bin:/bin:/usr/sbin:/sbin" \
-    TMPDIR="${WORK}/tmp" \
+    TMPDIR="${SHIP_TMPDIR:-${WORK}/tmp}" \
     IOS_FLEET_STATE_DIR="$STATE" \
     FLEET_SECRETS="${FAKE_BIN}/fleet-secrets" \
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
@@ -512,6 +515,34 @@ run_ship botfleet --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "a rejected key fails the run (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
 check "says the key was rejected" "$(contains 'rejected the API key' && echo 0 || echo 1)"
 check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || echo 0)"
+FAKE_ASC_PATCH=236
+echo
+
+# --- 12. A root TMPDIR is a PATH failure, not a credential failure ----------
+# The version plan consults App Store Connect before the run creates its
+# staging directory, and those two queries write scratch files through
+# asc_temp_root.  A root TMPDIR makes them fail, and their failure looks
+# exactly like an unreachable App Store Connect, so the run used to die
+# telling the owner to fix ASC_* credentials for what is a path refusal.
+# The root has to be classified BEFORE the version plan, and the run has to
+# end with the path-failure status (3), not the credential status (1).
+echo "12. a root TMPDIR is classified as a path failure before the version plan"
+reset_state
+FAKE_ASC_PATCH=""
+SHIP_TMPDIR="/" run_ship botfleet --repo-root "$REPO" --allow-unverified-seq
+check "exits 3 (the path-failure status)" "$([[ $RC -eq 3 ]] && echo 0 || echo 1)"
+check "says the staging path was refused" \
+  "$(contains 'staging path was refused' && echo 0 || echo 1)"
+check "says it is a path failure, not a missing key" \
+  "$(contains 'not a missing key' && echo 0 || echo 1)"
+check "does not send the owner to repair ASC credentials" \
+  "$(contains 'restore ASC access' && echo 1 || echo 0)"
+check "does not claim App Store Connect could not be consulted" \
+  "$(contains 'App Store Connect could not be' && echo 1 || echo 0)"
+# The version plan never runs, so it never asks App Store Connect anything.
+check "no App Store Connect query was made" \
+  "$(contains 'asc-patch:' && echo 1 || echo 0)"
+SHIP_TMPDIR=""
 FAKE_ASC_PATCH=236
 echo
 

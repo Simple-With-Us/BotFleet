@@ -1138,6 +1138,23 @@ if [[ "$SHIP_GATE_DECISION" == "skip" && "$DRY_RUN" -eq 0 ]]; then
   exit 0
 fi
 
+#  A root TMPDIR is a PATH failure, and it has to be classified as one before
+#  any App Store Connect query runs.  The two version queries below write
+#  their scratch files through asc_temp_root, so a root TMPDIR makes them
+#  fail, and their failure is indistinguishable from an unreachable App Store
+#  Connect:  the run would die telling the owner to fix ASC_* credentials for
+#  what is a path refusal.  Classify it once, here, before the version plan,
+#  and exit with the path-failure status.  The classification needs no
+#  credential and no STAMP, so it can sit this early.
+#  asc_temp_root refuses the filesystem root with a status.  Read it with
+#  that status:  under errexit a bare assignment would end the run with
+#  status 1 and no log line, before the owner handoff could classify it.
+SHIP_TMP_ROOT="$(asc_temp_root)" || {
+  log "Ship blocked: TMPDIR resolves to the filesystem root, so the staging path was refused."
+  log "This is a path failure, not a missing key."
+  exit 3
+}
+
 # Where the version the project itself declares lives. Best-effort: for
 # XcodeGen apps the .xcodeproj may not exist until it is generated below, in
 # which case the project contributes 0 to the floor and says so.
@@ -1354,14 +1371,10 @@ AUTH_MODE="none"
 load_secrets
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-#  asc_temp_root refuses the filesystem root with a status.  Read it here:
-#  under errexit a bare assignment would end the run with status 1 and no log
-#  line, before the owner handoff below could classify it.
-SHIP_TMP_ROOT="$(asc_temp_root)" || {
-  log "Ship blocked: TMPDIR resolves to the filesystem root, so the staging path was refused."
-  log "This is a path failure, not a missing key."
-  exit 3
-}
+#  SHIP_TMP_ROOT was classified above, before the version plan, so a root
+#  TMPDIR is reported as the path failure it is instead of as an
+#  unreachable App Store Connect.  It is the same value here:  nothing
+#  between the two points changes TMPDIR.
 OUT_ROOT="${SHIP_TMP_ROOT}/ios-ship-${APP_KEY}-${STAMP}"
 ARCHIVE_PATH="${OUT_ROOT}/${SCHEME}.xcarchive"
 EXPORT_DIR="${OUT_ROOT}/export"
