@@ -336,41 +336,53 @@ key_label() {
   fi
 }
 
-# The public label of the credential the App Store Connect client used:  the
-# key id, which travels in every request header and is not part of the key.
-# The order is the client's own (asc-api.mjs):  the APPLE_API_* trio first,
-# then ASC_KEY_ID in the environment, then Infisical /asc.  The private key is
-# never read here and nothing derived from it is ever printed (BF-2542).
-# An unknown id prints nothing, and key_label turns that into "missing".
-asc_public_key_id() {
-  local id="${APPLE_API_KEY_ID:-}"
-  [[ -n "$id" ]] || id="${ASC_KEY_ID:-}"
-  [[ -n "$id" ]] || id="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
-  printf '%s' "$id"
-}
-
-# The masked preview of the credential the App Store Connect client used, for
-# the rejection paths where the shell has not resolved the credential yet.
-# The order is the client's own (asc-api.mjs):  the APPLE_API_* trio, then
-# ASC_KEY_P8 in the environment, then Infisical /asc.  Only the mask is
-# printed, and the material is cleared before the function returns.
-asc_credential_preview() {
-  local v="" p=""
-  if [[ -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
+# The credential the App Store Connect client used, for the rejection paths
+# where the shell has not resolved it yet.  The source selection mirrors
+# asc-api.mjs exactly:  a source counts only when its WHOLE trio is present
+# and its key decodes to a PEM, so a diagnostic never names a key the client
+# skipped.
+#
+# Only material the ENVIRONMENT already holds is read.  The vault is never
+# asked for the key material here:  a diagnostic must not cause a secret
+# read.  The vault's KEY ID is read when no environment source qualifies,
+# because the key id is a public label that travels in every request header.
+#
+# The result is the public key id in ASC_DIAG_KEY_ID and the fleet's masked
+# preview in ASC_DIAG_PREVIEW.  The material is cleared before returning.
+ASC_DIAG_KEY_ID=""
+ASC_DIAG_PREVIEW=""
+asc_resolve_diagnostic_credential() {
+  local v="" id="" p=""
+  if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
     case "$APPLE_API_KEY_P8_BASE64" in
       *BEGIN*) v="$APPLE_API_KEY_P8_BASE64" ;;
       *) v="$(base64 --decode <<< "$APPLE_API_KEY_P8_BASE64" 2>/dev/null)" || v="" ;;
     esac
-  elif [[ -n "${ASC_KEY_P8:-}" ]]; then
-    v="$ASC_KEY_P8"
-  else
-    v="$(fs_get ASC_KEY_P8 /asc 2>/dev/null || true)"
+    if [[ -n "$v" ]] && node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$v"; then
+      id="$APPLE_API_KEY_ID"
+    else
+      #  The client skips a source whose key is not a usable PEM, so this
+      #  diagnostic must not name it either.
+      v=""
+    fi
+  elif [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]]; then
+    if node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8"; then
+      v="$ASC_KEY_P8"
+      id="$ASC_KEY_ID"
+    fi
   fi
+  if [[ -z "$id" ]]; then
+    #  The client's last source is Infisical /asc.  Only the KEY ID is read
+    #  from it:  that is a public label, not key material.
+    id="${ASC_KEY_ID:-}"
+    [[ -n "$id" ]] || id="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
+  fi
+  ASC_DIAG_KEY_ID="$id"
   if [[ -n "$v" ]]; then
     p="$(key_preview "$v")" || p=""
     v=""
   fi
-  printf '%s' "${p:-[withheld: no credential]}"
+  ASC_DIAG_PREVIEW="${p:-[withheld: no usable credential in the environment]}"
 }
 
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
@@ -1340,9 +1352,9 @@ else
       #  The rejected credential is named by its key id and the fleet's
       #  sanctioned masked preview of it, so the owner can tell WHICH key
       #  App Store Connect refused.
-      _rejected_key="$(key_label "$(asc_public_key_id)")"
-      _rejected_preview="$(asc_credential_preview)"
-      die "App Store Connect rejected the API key (HTTP 401/403) while reading the next marketing version (key id ${_rejected_key}, preview ${_rejected_preview}).
+      asc_resolve_diagnostic_credential
+      _rejected_key="$(key_label "$ASC_DIAG_KEY_ID")"
+      die "App Store Connect rejected the API key (HTTP 401/403) while reading the next marketing version (key id ${_rejected_key}, preview ${ASC_DIAG_PREVIEW}).
   Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
   --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
     fi
@@ -1396,9 +1408,9 @@ else
     if [[ $_rc -eq 4 ]]; then
       # The same public label as the marketing-version rejection above:  the
       # key id, and nothing that came out of the key.
-      _rejected_key="$(key_label "$(asc_public_key_id)")"
-      _rejected_preview="$(asc_credential_preview)"
-      die "App Store Connect rejected the API key (HTTP 401/403) while reading the build floor (key id ${_rejected_key}, preview ${_rejected_preview}).
+      asc_resolve_diagnostic_credential
+      _rejected_key="$(key_label "$ASC_DIAG_KEY_ID")"
+      die "App Store Connect rejected the API key (HTTP 401/403) while reading the build floor (key id ${_rejected_key}, preview ${ASC_DIAG_PREVIEW}).
   Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
   --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
     fi

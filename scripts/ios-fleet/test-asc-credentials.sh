@@ -66,7 +66,7 @@ chmod 700 "${tmp}/no-vault"
 
 extract() {
   awk '
-    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_label\(\) \{/ || /^key_preview\(\) \{/ || /^asc_public_key_id\(\) \{/ || /^asc_credential_preview\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
+    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_label\(\) \{/ || /^key_preview\(\) \{/ || /^asc_resolve_diagnostic_credential\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
     grab { print }
     grab && /^\}/ { grab = 0 }
   ' "$script"
@@ -105,6 +105,8 @@ funcs="${tmp}/funcs.sh"
   echo 'log() { echo "[ios-ship] $*"; }'
   echo 'logerr() { echo "[ios-ship] $*" >&2; }'
   echo 'ASC_TMP_DIR=""'
+  echo 'ASC_DIAG_KEY_ID=""'
+  echo 'ASC_DIAG_PREVIEW=""'
   echo "FLEET_SECRETS_BIN=\"${tmp}/fleet-secrets\""
   echo "FLEET_DIR=\"${here}\""
   echo "ASC_COMPARE_TOOL=\"${tmp}/compare.cjs\""
@@ -842,35 +844,52 @@ for kid in ABCDE12345 "" "bad id"; do
 done
 unset kid want_id out syn_pem syn_body pem_kind
 
-# 12. A rejected credential is named by its KEY ID, which is a public label
-#     that travels in every App Store Connect request header, and by nothing
-#     that came out of the key.  The id is resolved from the sources the
-#     client resolves it from, in the client's order:  the APPLE_API_* trio
-#     first, then ASC_KEY_ID in the environment, then Infisical /asc.  An id
-#     that does not look like one is reported as unrecognized, so a mis-set
-#     value never reaches the log raw.
-run_public_id() {  # env assignments..., then asc_public_key_id
-  env -u APPLE_API_KEY_ID -u ASC_KEY_ID "$@" bash -c '
+# 12. The diagnostic identity of a rejected credential mirrors the CLIENT's
+#     source selection:  a source counts only when its whole trio is present
+#     and its key decodes to a PEM, so the diagnostic never names a key the
+#     client skipped.  The preview is the fleet's masked preview of the key
+#     BODY, and it is taken only from material the ENVIRONMENT already holds:
+#     a diagnostic never causes a secret read from the vault.
+run_diag_identity() {  # env assignments..., then the resolver
+  env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+    -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
+    FLEET_SECRETS_BIN="${tmp}/fleet-secrets" "$@" bash -c '
     source "'"$funcs"'"
-    asc_public_key_id
+    asc_resolve_diagnostic_credential
+    printf "id=%s\npreview=%s\n" "$ASC_DIAG_KEY_ID" "$ASC_DIAG_PREVIEW"
   ' 2>&1
 }
-out="$(run_public_id APPLE_API_KEY_ID=ABCDE12345)"
-[[ "$out" == "ABCDE12345" ]] || fail "the APPLE_API_* key id was not named: ${out}"
-out="$(run_public_id ASC_KEY_ID=ZZZZZZZZZZ)"
-[[ "$out" == "ZZZZZZZZZZ" ]] || fail "the ASC_KEY_ID key id was not named: ${out}"
-out="$(run_public_id)"
-[[ "$out" == "ABCDE12345" ]] || fail "the Infisical key id was not named: ${out}"
-# The APPLE_API_* name wins over the environment and over Infisical, because
-# that is the order the client resolves the credential in.
-out="$(run_public_id APPLE_API_KEY_ID=ABCDE12345 ASC_KEY_ID=ZZZZZZZZZZ)"
-[[ "$out" == "ABCDE12345" ]] || fail "the APPLE_API_* key id did not win: ${out}"
-# An id that does not look like one is withheld, not printed raw.
-out="$(env -u APPLE_API_KEY_ID ASC_KEY_ID='bad id' bash -c '
-  source "'"$funcs"'"
-  key_label "$(asc_public_key_id)"
-' 2>&1)"
-[[ "$out" == "unrecognized" ]] || fail "a malformed key id was not withheld: ${out}"
-unset out
+real_body="$(sed '1d;$d' "${tmp}/asc.p8")"
+real_body="${real_body//[[:space:]]/}"
+real_mask="$(printf '%s...%s' "${real_body:0:8}" "${real_body:$((${#real_body}-4))}")"
+real_b64="$(base64 < "${tmp}/asc.p8" | tr -d '\n')"
+
+out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="$real_b64")"
+[[ "$out" == *"id=CIKEY00001"* ]] || fail "the CI key id was not named: ${out}"
+[[ "$out" == *"preview=${real_mask}"* ]] || fail "the CI preview was not the masked body: ${out}"
+out="$(run_diag_identity ASC_KEY_ID=ENVKEY00002 ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$(cat "${tmp}/asc.p8")")"
+[[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named: ${out}"
+[[ "$out" == *"preview=${real_mask}"* ]] || fail "the environment preview was not the masked body: ${out}"
+
+# A half-set trio is skipped by the client, so the diagnostic must not name
+# it:  the key id comes from the client's last source instead.
+out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001)"
+[[ "$out" != *"CIKEY00001"* ]] || fail "a half-set trio was named: ${out}"
+[[ "$out" == *"id=ABCDE12345"* ]] || fail "the fallback key id was not named: ${out}"
+# A trio whose key does not decode is skipped by the client too.
+out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="not-base64-at-all")"
+[[ "$out" != *"CIKEY00001"* ]] || fail "a key that does not decode was named: ${out}"
+
+# A diagnostic never causes a secret read:  the vault is asked for the KEY
+# ID, which is a public label, and never for the key material.
+: > "$FAKE_LOG"
+out="$(run_diag_identity)"
+[[ "$out" == *"preview=[withheld: no usable credential in the environment]"* ]] \
+  || fail "a preview was invented without material: ${out}"
+if grep -q "ASC_KEY_P8 /asc" "$FAKE_LOG"; then
+  fail "the diagnostic read the key material from the vault"
+fi
+grep -q "ASC_KEY_ID /asc" "$FAKE_LOG" || fail "the diagnostic did not read the vault key id"
+unset out real_body real_mask real_b64
 
 echo "ok: ASC credential resolution (environment first, then Infisical, a named path ignored, temp key removed)"

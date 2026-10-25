@@ -167,6 +167,7 @@ run_ship() {
     FLEET_SECRETS="${FAKE_BIN}/fleet-secrets" \
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
     ASC_KEY_ID="${TEST_ASC_KEY_ID:-}" \
+    ASC_ISSUER_ID="${TEST_ASC_ISSUER_ID:-}" \
     ASC_KEY_P8="${TEST_ASC_KEY_P8:-}" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
@@ -523,9 +524,13 @@ check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || e
 # refused.  The preview is the first eight and the last four of the key body.
 # The armor is assembled from parts, so the fixture never looks like a
 # committed private key to a scanner.
-syn_body="SYNTHETICbodyAAAAqqqqBBBBrrrrCCCCssssDDDDttttEEEEuuuuFFFFvvvvGGGG"
-syn_pem="$(printf -- '-----BEGIN %s-----\n%s\n-----END %s-----\n' "PRIVATE"" KEY" "$syn_body" "PRIVATE"" KEY")"
+# A REAL key pair, generated here and never committed:  the diagnostic
+# resolves the credential the way the client does, and a value that is not a
+# usable PEM is skipped by both.
+syn_pem="$(node -e 'process.stdout.write(require("crypto").generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey.export({ type: "pkcs8", format: "pem" }))')"
+syn_body="$(printf '%s\n' "$syn_pem" | sed '1d;$d' | tr -d ' \n')"
 TEST_ASC_KEY_ID="ABCDE12345"
+TEST_ASC_ISSUER_ID="issuer-synthetic"
 TEST_ASC_KEY_P8="$syn_pem"
 run_ship botfleet --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "names the rejected key by its key id" \
@@ -535,6 +540,7 @@ check "carries the masked preview of the key" \
 check "does not print the key itself" \
   "$([[ "$OUT" != *"$syn_body"* ]] && echo 0 || echo 1)"
 TEST_ASC_KEY_ID=""
+TEST_ASC_ISSUER_ID=""
 TEST_ASC_KEY_P8=""
 unset syn_body syn_pem
 FAKE_ASC_PATCH=236
