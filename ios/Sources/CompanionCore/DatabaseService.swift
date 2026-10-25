@@ -204,6 +204,13 @@ public enum DatabaseError: LocalizedError, Equatable {
     case prepareFailed(String)
     case stepFailed(String)
     case notFound
+    /// A message id is already owned by a different thread.
+    ///
+    /// `messages` is keyed on `id`, while the legacy Node store keys a message
+    /// on `(thread_id, id)`, so the same message id can exist in two threads
+    /// there.  Writing it here would either drop a message or move it out of
+    /// the thread that owns it, so the write is refused instead.
+    case messageThreadConflict(id: String, existingThreadId: String, incomingThreadId: String)
 
     public var errorDescription: String? {
         switch self {
@@ -212,6 +219,8 @@ public enum DatabaseError: LocalizedError, Equatable {
         case .prepareFailed(let msg): return "SQLite statement prepare failed: \(msg)"
         case .stepFailed(let msg): return "SQLite step failed: \(msg)"
         case .notFound: return "Requested record not found in database"
+        case .messageThreadConflict(let id, let existingThreadId, let incomingThreadId):
+            return "Message '\(id)' already belongs to thread '\(existingThreadId)' and cannot be written to thread '\(incomingThreadId)'."
         }
     }
 }
@@ -316,21 +325,6 @@ public actor DatabaseService {
             tokenize = 'porter unicode61'
         );
 
-        CREATE TRIGGER IF NOT EXISTS trg_messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
-            VALUES (new.rowid, new.content, new.thread_id, new.id);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_messages_ad AFTER DELETE ON messages BEGIN
-            DELETE FROM messages_fts WHERE rowid = old.rowid;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_messages_au AFTER UPDATE ON messages BEGIN
-            DELETE FROM messages_fts WHERE rowid = old.rowid;
-            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
-            VALUES (new.rowid, new.content, new.thread_id, new.id);
-        END;
-
         CREATE TABLE IF NOT EXISTS routine_runs (
             id TEXT PRIMARY KEY,
             routine_id TEXT NOT NULL,
@@ -386,6 +380,77 @@ public actor DatabaseService {
         );
         """
         try execute(sql: schema)
+        try recreateMessageTriggers()
+    }
+
+    /// Recreates the FTS triggers and resyncs the index when an older store is
+    /// still running the legacy trigger bodies.
+    ///
+    /// A legacy trigger body let SQLite assign the FTS rowid itself, and the
+    /// legacy update trigger removed a row by `message_id` before inserting a
+    /// fresh one with a new rowid.  A store that still runs those bodies ends
+    /// up with an FTS rowid that no longer matches `messages.rowid`, so a
+    /// search can pair a snippet with the wrong message.  The triggers are
+    /// always replaced, and the index is rebuilt only when the store was
+    /// still carrying the legacy bodies.
+    private func recreateMessageTriggers() throws {
+        let legacyTriggerCount = try countLegacyMessageTriggers()
+
+        for name in ["trg_messages_ai", "trg_messages_ad", "trg_messages_au"] {
+            try execute(sql: "DROP TRIGGER IF EXISTS \(name);")
+        }
+        try execute(sql: """
+        CREATE TRIGGER trg_messages_ai AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+            VALUES (new.rowid, new.content, new.thread_id, new.id);
+        END;
+
+        CREATE TRIGGER trg_messages_ad AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.rowid;
+        END;
+
+        CREATE TRIGGER trg_messages_au AFTER UPDATE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.rowid;
+            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+            VALUES (new.rowid, new.content, new.thread_id, new.id);
+        END;
+        """)
+
+        if legacyTriggerCount > 0 {
+            try resyncFTSIndex()
+        }
+    }
+
+    /// Counts the message triggers that still carry a legacy body.
+    ///
+    /// A current body names `rowid`; a legacy one lets SQLite assign the FTS
+    /// rowid itself.
+    private func countLegacyMessageTriggers() throws -> Int {
+        let sql = """
+        SELECT COUNT(*) FROM sqlite_master
+        WHERE type = 'trigger'
+          AND name IN ('trg_messages_ai', 'trg_messages_ad', 'trg_messages_au')
+          AND sql NOT LIKE '%rowid%';
+        """
+        guard let value = try queryString(sql: sql) else { return 0 }
+        return Int(value) ?? 0
+    }
+
+    /// Rebuilds the FTS index from `messages` so every index rowid matches the
+    /// message rowid it belongs to.
+    private func resyncFTSIndex() throws {
+        try execute(sql: "BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            try execute(sql: "DELETE FROM messages_fts;")
+            try execute(sql: """
+            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+            SELECT rowid, content, thread_id, id FROM messages;
+            """)
+            try execute(sql: "COMMIT;")
+        } catch {
+            try? execute(sql: "ROLLBACK;")
+            throw error
+        }
     }
 
     // MARK: - Thread Operations
@@ -479,7 +544,8 @@ public actor DatabaseService {
             content = excluded.content,
             created_at = excluded.created_at,
             model = excluded.model,
-            active_leaf_id = excluded.active_leaf_id;
+            active_leaf_id = excluded.active_leaf_id
+        WHERE messages.thread_id = excluded.thread_id;
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -508,6 +574,13 @@ public actor DatabaseService {
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        // The update above only fires for a row that already belongs to this
+        // thread, so a write that changed nothing means the message id is
+        // owned by another thread.  That is refused rather than allowed to
+        // move the message out of the thread that has it.
+        if sqlite3_changes(db) == 0 {
+            try throwIfOwnedByAnotherThread(message)
         }
 
         // Update thread updated_at timestamp inside the same logical write
@@ -1055,13 +1128,13 @@ public actor DatabaseService {
                     created_at = excluded.created_at,
                     model = excluded.model,
                     active_leaf_id = excluded.active_leaf_id
-                WHERE messages.thread_id IS NOT excluded.thread_id
-                   OR messages.role IS NOT excluded.role
+                WHERE messages.thread_id = excluded.thread_id
+                   AND (messages.role IS NOT excluded.role
                    OR messages.kind IS NOT excluded.kind
                    OR messages.content IS NOT excluded.content
                    OR messages.created_at IS NOT excluded.created_at
                    OR messages.model IS NOT excluded.model
-                   OR messages.active_leaf_id IS NOT excluded.active_leaf_id;
+                   OR messages.active_leaf_id IS NOT excluded.active_leaf_id);
                 """
                 : """
                 INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id)
@@ -1073,7 +1146,8 @@ public actor DatabaseService {
                     content = excluded.content,
                     created_at = excluded.created_at,
                     model = excluded.model,
-                    active_leaf_id = excluded.active_leaf_id;
+                    active_leaf_id = excluded.active_leaf_id
+                WHERE messages.thread_id = excluded.thread_id;
                 """
 
             var stmt: OpaquePointer?
@@ -1109,7 +1183,14 @@ public actor DatabaseService {
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
                     throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
                 }
-                changedCount += Int(sqlite3_changes(db))
+                let rowChanges = Int(sqlite3_changes(db))
+                changedCount += rowChanges
+                // A row that changed nothing was either already identical,
+                // which is the idempotent skip this batch asked for, or it is
+                // owned by another thread, which is refused.
+                if rowChanges == 0 {
+                    try throwIfOwnedByAnotherThread(message)
+                }
             }
 
             try execute(sql: "COMMIT;")
@@ -1118,6 +1199,41 @@ public actor DatabaseService {
             try? execute(sql: "ROLLBACK;")
             throw error
         }
+    }
+
+    /// Throws when a message id is already owned by a different thread.
+    ///
+    /// `messages` is keyed on `id` while the legacy Node store keys a message
+    /// on `(thread_id, id)`, so the same message id can exist in two threads
+    /// in the source.  Writing the second one here would either drop a
+    /// message or move it out of the thread that owns it, so it is refused
+    /// with the two thread ids named.
+    private func throwIfOwnedByAnotherThread(_ message: MessageRecord) throws {
+        guard let existingThreadId = try threadIdOwningMessage(id: message.id),
+              existingThreadId != message.threadId else {
+            return
+        }
+        throw DatabaseError.messageThreadConflict(
+            id: message.id,
+            existingThreadId: existingThreadId,
+            incomingThreadId: message.threadId
+        )
+    }
+
+    /// The thread that currently holds a message id, if any.
+    private func threadIdOwningMessage(id: String) throws -> String? {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT thread_id FROM messages WHERE id = ?1 LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        guard let cText = sqlite3_column_text(stmt, 0) else { return nil }
+        return String(cString: cText)
     }
 
     public func countRows(inTable table: String) throws -> Int {
