@@ -421,7 +421,11 @@ public enum EngineMatrixRegistry {
             }
             argv.append(contentsOf: [
                 "--output-format", "stream-json",
-                "--print-timeout", "\(max(1, input.printTimeoutSeconds))s",
+                // Mirror `antigravityPrintTimeout` (server/drivers/antigravity.ts):
+                // a whole number of minutes one minute ABOVE the driver's own
+                // ceiling, so `agy` never kills a still-streaming turn at the
+                // same moment the driver decides to give up.
+                "--print-timeout", "\(Self.antigravityPrintTimeoutMinutes(for: input.printTimeoutSeconds))m",
                 "--add-dir", input.workspacePath,
             ])
             // Host-control turns never receive `--dangerously-skip-permissions`
@@ -463,7 +467,7 @@ public enum EngineMatrixRegistry {
                 executable: executable,
                 argv: argv,
                 workingDirectory: input.workspacePath,
-                stdinPayload: input.prompt
+                stdinPayload: Self.claudeStreamJSONUserMessage(prompt: input.prompt)
             )
 
         case .codex, .grokAcp, .mcode, .muse, .cursor, .geminiCli, .dsh, .opencode:
@@ -478,6 +482,31 @@ public enum EngineMatrixRegistry {
         case .grokApi, .minimaxApi, .geminiApi:
             return nil
         }
+    }
+
+    /// `agy --print-timeout` in whole minutes, one minute above the driver's own
+    /// ceiling (the reference implementation's `antigravityPrintTimeout`).
+    static func antigravityPrintTimeoutMinutes(for printTimeoutSeconds: Int) -> Int {
+        Int((Double(max(1, printTimeoutSeconds)) / 60.0).rounded(.up)) + 1
+    }
+
+    /// The `--input-format stream-json` frame the Claude CLI reads on stdin.
+    ///
+    /// The CLI parses stdin as NDJSON, so a bare prompt string is not a valid
+    /// frame and the turn never starts.  The reference driver
+    /// (server/drivers/claude.ts) writes a `user` message frame terminated by a
+    /// newline.
+    static func claudeStreamJSONUserMessage(prompt: String) -> String {
+        let frame: [String: Any] = [
+            "type": "user",
+            "uuid": UUID().uuidString,
+            "message": ["role": "user", "content": prompt],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: frame),
+              let json = String(data: data, encoding: .utf8) else {
+            return prompt
+        }
+        return json + "\n"
     }
 }
 
@@ -537,14 +566,20 @@ public enum EngineReplayVerifier {
                 continue
             }
 
-            let type = json["type"] as? String ?? ""
+            // `agy` frames its stream-json output as
+            // `{"event":"init","init":{…}}`: the payload lives under the event
+            // name, and the driver reads it as `o[o.event]`.  Older fixtures
+            // keyed the frame on `type` with the payload at the top level, so
+            // that shape is still accepted.
+            let eventName = (json["event"] as? String) ?? (json["type"] as? String) ?? ""
+            let payload = (json[eventName] as? [String: Any]) ?? json
             if let conv = (json["conversation_id"] as? String) ?? (json["session_id"] as? String), !conv.isEmpty {
                 conversationId = conv
             }
 
-            switch type {
+            switch eventName {
             case "system", "init":
-                let permissionMode = json["permission_mode"] as? String
+                let permissionMode = (payload["permission_mode"] as? String) ?? (json["permission_mode"] as? String)
                 if controlsHostMac, let policyRefusal = AntigravityDriverPolicy.hostPolicyRefusal(for: permissionMode) {
                     refusal = policyRefusal
                     return EngineReplayTurnTranscript(
@@ -558,10 +593,24 @@ public enum EngineReplayVerifier {
                     )
                 }
 
+            case "step_update":
+                // `agy` reports the assistant's text and its tool steps as
+                // `step_update` events carrying a `step_type`.
+                let stepType = payload["step_type"] as? String ?? ""
+                if stepType == "agent_response" {
+                    if let textDelta = payload["text_delta"] as? String, !textDelta.isEmpty {
+                        assistantChunks.append(textDelta)
+                    }
+                } else if stepType == "tool" {
+                    if let toolName = payload["tool_name"] as? String, !toolName.isEmpty {
+                        toolNames.append(toolName)
+                    }
+                }
+
             case "assistant", "message":
-                if let text = json["text"] as? String {
+                if let text = payload["text"] as? String {
                     assistantChunks.append(text)
-                } else if let message = json["message"] as? [String: Any],
+                } else if let message = payload["message"] as? [String: Any],
                           let content = message["content"] as? [[String: Any]] {
                     for block in content {
                         let blockType = block["type"] as? String ?? "text"
@@ -576,15 +625,19 @@ public enum EngineReplayVerifier {
                 }
 
             case "tool_use", "tool_call":
-                if let name = json["name"] as? String {
+                if let name = payload["name"] as? String {
                     toolNames.append(name)
                 }
 
             case "result":
-                if let resultText = json["result"] as? String, assistantChunks.isEmpty {
+                if let response = payload["response"] as? String, !response.isEmpty {
+                    if assistantChunks.isEmpty {
+                        assistantChunks.append(response)
+                    }
+                } else if let resultText = payload["result"] as? String, assistantChunks.isEmpty {
                     assistantChunks.append(resultText)
                 }
-                let isError = (json["is_error"] as? Bool) == true
+                let isError = ((payload["is_error"] as? Bool) ?? (json["is_error"] as? Bool)) == true
                 completed = !isError
 
             default:
@@ -603,27 +656,125 @@ public enum EngineReplayVerifier {
         )
     }
 
+    /// Replays a sequence of Claude Code `--output-format stream-json` frames.
+    ///
+    /// Claude frames on `type` (`system`, `assistant`, `user`, `result`) and
+    /// carries the session in `session_id`; it has no `permission_mode`, so the
+    /// Antigravity host-control policy does not apply to it.
+    public static func replayClaudeStreamJSON(
+        lines: [String]
+    ) -> EngineReplayTurnTranscript {
+        var conversationId: String?
+        var assistantChunks: [String] = []
+        var reasoningChunks: [String] = []
+        var toolNames: [String] = []
+        var completed = false
+
+        for rawLine in lines {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let data = trimmed.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                continue
+            }
+
+            if let session = json["session_id"] as? String, !session.isEmpty {
+                conversationId = session
+            }
+
+            switch json["type"] as? String ?? "" {
+            case "assistant":
+                if let message = json["message"] as? [String: Any],
+                   let content = message["content"] as? [[String: Any]] {
+                    for block in content {
+                        let blockType = block["type"] as? String ?? "text"
+                        if blockType == "text", let text = block["text"] as? String {
+                            assistantChunks.append(text)
+                        } else if blockType == "thinking", let thinking = block["thinking"] as? String {
+                            reasoningChunks.append(thinking)
+                        } else if blockType == "tool_use", let name = block["name"] as? String {
+                            toolNames.append(name)
+                        }
+                    }
+                }
+
+            case "result":
+                if let resultText = json["result"] as? String, assistantChunks.isEmpty {
+                    assistantChunks.append(resultText)
+                }
+                completed = (json["is_error"] as? Bool) != true
+
+            default:
+                break
+            }
+        }
+
+        return EngineReplayTurnTranscript(
+            engineId: .claude,
+            conversationId: conversationId,
+            assistantText: assistantChunks.joined(),
+            reasoningText: reasoningChunks.joined(),
+            toolCalls: toolNames,
+            permissionPolicyRefusal: nil,
+            completedNormally: completed
+        )
+    }
+
     /// Replays a simulated turn for any engine in the 13-engine matrix to verify
     /// that its descriptor, protocol family, and parser produce a deterministic transcript.
     public static func verifyMatrixEngineReplay(for id: EngineMatrixID) -> EngineReplayTurnTranscript {
         let desc = EngineMatrixRegistry.descriptor(for: id)
         switch desc.wireProtocol {
         case .streamJSONStdio:
-            let sampleLines = [
-                #"{"type":"init","conversation_id":"conv-\#(id.rawValue)","permission_mode":"request-review"}"#,
-                #"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"plan"},{"type":"tool_use","name":"read_file"},{"type":"text","text":"Verified \#(desc.displayName)"}]}}"#,
-                #"{"type":"result","conversation_id":"conv-\#(id.rawValue)","is_error":false}"#,
-            ]
-            let replayed = replayAntigravityStreamJSON(lines: sampleLines, controlsHostMac: true)
-            return EngineReplayTurnTranscript(
-                engineId: id,
-                conversationId: replayed.conversationId,
-                assistantText: replayed.assistantText,
-                reasoningText: replayed.reasoningText,
-                toolCalls: replayed.toolCalls,
-                permissionPolicyRefusal: replayed.permissionPolicyRefusal,
-                completedNormally: replayed.completedNormally
-            )
+            // The `streamJSONStdio` family holds two different wire formats, so
+            // the replay is chosen by engine id rather than by protocol family.
+            switch id {
+            case .antigravity:
+                let sampleLines = [
+                    #"{"event":"init","conversation_id":"conv-\#(id.rawValue)","init":{"permission_mode":"request-review"}}"#,
+                    #"{"event":"step_update","conversation_id":"conv-\#(id.rawValue)","step_update":{"step_type":"agent_response","text_delta":"Verified \#(desc.displayName)"}}"#,
+                    #"{"event":"result","conversation_id":"conv-\#(id.rawValue)","result":{"response":"Verified \#(desc.displayName)"}}"#,
+                ]
+                let replayed = replayAntigravityStreamJSON(lines: sampleLines, controlsHostMac: true)
+                return EngineReplayTurnTranscript(
+                    engineId: id,
+                    conversationId: replayed.conversationId,
+                    assistantText: replayed.assistantText,
+                    reasoningText: replayed.reasoningText,
+                    toolCalls: replayed.toolCalls,
+                    permissionPolicyRefusal: replayed.permissionPolicyRefusal,
+                    completedNormally: replayed.completedNormally
+                )
+
+            case .claude:
+                let sampleLines = [
+                    #"{"type":"system","subtype":"init","session_id":"session-\#(id.rawValue)","model":"\#(desc.defaultModel)"}"#,
+                    #"{"type":"assistant","session_id":"session-\#(id.rawValue)","message":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"},{"type":"tool_use","name":"read_file"},{"type":"text","text":"Verified \#(desc.displayName)"}]}}"#,
+                    #"{"type":"result","subtype":"success","session_id":"session-\#(id.rawValue)","is_error":false,"result":"Verified \#(desc.displayName)"}"#,
+                ]
+                let replayed = replayClaudeStreamJSON(lines: sampleLines)
+                return EngineReplayTurnTranscript(
+                    engineId: id,
+                    conversationId: replayed.conversationId,
+                    assistantText: replayed.assistantText,
+                    reasoningText: replayed.reasoningText,
+                    toolCalls: replayed.toolCalls,
+                    permissionPolicyRefusal: replayed.permissionPolicyRefusal,
+                    completedNormally: replayed.completedNormally
+                )
+
+            default:
+                return EngineReplayTurnTranscript(
+                    engineId: id,
+                    conversationId: "session-\(id.rawValue)",
+                    assistantText: "Verified \(desc.displayName)",
+                    reasoningText: "plan",
+                    toolCalls: ["cli_tool"],
+                    permissionPolicyRefusal: nil,
+                    completedNormally: true
+                )
+            }
 
         case .appServerJSONRPC, .acpJSONRPC:
             return EngineReplayTurnTranscript(

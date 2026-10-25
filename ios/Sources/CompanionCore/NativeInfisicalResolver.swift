@@ -385,8 +385,13 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
 
     // MARK: - Secret Resolution (In-Memory Only, Fail-Closed)
 
-    /// Resolves a secret by name (`secretKey`), returning its value from the in-memory
-    /// TTL cache or fetching a fresh snapshot from Infisical via Universal Auth.
+    /// Resolves a secret by name (`secretKey`), returning its value from the
+    /// process environment first, then from the in-memory TTL cache, and
+    /// finally by fetching a fresh snapshot from Infisical via Universal Auth.
+    ///
+    /// The process environment takes precedence over the vault so an operator
+    /// can override a secret for one run without touching the vault.  The value
+    /// is never logged or echoed.
     ///
     /// Fails closed before making any network request if the Keychain machine identity
     /// is `.empty` or `.unavailable`.
@@ -394,6 +399,13 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
         let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedKey.isEmpty else {
             throw InfisicalResolverError.secretNotFound(key: key)
+        }
+
+        if let environmentValue = ProcessInfo.processInfo.environment[trimmedKey] {
+            let trimmedValue = environmentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedValue.isEmpty {
+                return RedactedSecret(trimmedValue)
+            }
         }
 
         let currentTime = now()

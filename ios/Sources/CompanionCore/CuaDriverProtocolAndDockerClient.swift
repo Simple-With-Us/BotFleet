@@ -13,8 +13,9 @@ public enum CuaTargetKind: Equatable, Hashable, Sendable {
     case localVM(containerName: String, viewerPort: Int)
 }
 
-/// Frame captured from a CUA target surface.  Supports zero-copy `CVPixelBuffer`
-/// (`IOSurface`-backed on macOS) as well as encoded PNG/BGRA bytes for VM viewers.
+/// Frame captured from a CUA target surface.  Supports a CPU-mapped
+/// `CVPixelBuffer` holding the real screen as well as encoded PNG/BGRA bytes
+/// for VM viewers.
 public struct CuaCapturedFrame: @unchecked Sendable, Equatable {
     public let width: Int
     public let height: Int
@@ -240,29 +241,72 @@ public final class HostMacCuaDriver: CuaDriverProtocol {
 
     public func captureFrame() async throws -> CuaCapturedFrame {
         let displays = macDriver.activeDisplays()
-        let primary = displays.first(where: \.isPrimary) ?? displays.first
-        let width = Int(primary?.width ?? 1440)
-        let height = Int(primary?.height ?? 900)
-        let scale = primary?.scaleFactor ?? 2.0
+        guard let primary = displays.first(where: \.isPrimary) ?? displays.first else {
+            throw ContainerSocketError.httpStatus(code: 503, body: "No display is attached, so there is nothing to capture.")
+        }
+        guard macDriver.checkPermissions().hasScreenRecording else {
+            throw ContainerSocketError.httpStatus(
+                code: 403,
+                body: "Screen Recording permission is not granted, so BotFleet cannot capture the screen."
+            )
+        }
+        guard let capturedImage = CGDisplayCreateImage(primary.id) else {
+            throw ContainerSocketError.httpStatus(
+                code: 502,
+                body: "The macOS screen capture API returned no image for display \(primary.id)."
+            )
+        }
 
+        let width = capturedImage.width
+        let height = capturedImage.height
         var pixelBuffer: CVPixelBuffer?
-        let attrs: [CFString: Any] = [
+        let attributes: [CFString: Any] = [
             kCVPixelBufferCGImageCompatibilityKey: true,
             kCVPixelBufferCGBitmapContextCompatibilityKey: true,
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
         ]
-        CVPixelBufferCreate(
+        let status = CVPixelBufferCreate(
             kCFAllocatorDefault,
             max(1, width),
             max(1, height),
             kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary,
+            attributes as CFDictionary,
             &pixelBuffer
         )
+        guard status == kCVReturnSuccess, let pixelBuffer else {
+            throw ContainerSocketError.httpStatus(
+                code: 500,
+                body: "Screen capture buffer allocation failed (\(status))."
+            )
+        }
+
+        // Draw the captured screen into the buffer through a bitmap context, so
+        // the pixels are the real screen rather than uninitialized memory and
+        // keep their top-down orientation.
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer),
+              let context = CGContext(
+                  data: baseAddress,
+                  width: width,
+                  height: height,
+                  bitsPerComponent: 8,
+                  bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                      | CGBitmapInfo.byteOrder32Little.rawValue
+              )
+        else {
+            throw ContainerSocketError.httpStatus(
+                code: 500,
+                body: "Screen capture buffer could not be mapped for drawing."
+            )
+        }
+        context.draw(capturedImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
         return CuaCapturedFrame(
             width: width,
             height: height,
-            scaleFactor: scale,
+            scaleFactor: primary.scaleFactor,
             pixelBuffer: pixelBuffer,
             encodedImageBytes: nil
         )
@@ -307,46 +351,58 @@ public final class LocalVmCuaDriver: CuaDriverProtocol {
     }
 
     public func captureFrame() async throws -> CuaCapturedFrame {
-        let detail = try await socketClient.inspectContainer(idOrName: containerName)
-        guard detail.running else {
-            throw ContainerSocketError.httpStatus(code: 409, body: "Local VM container '\(containerName)' is not running.")
-        }
-        return CuaCapturedFrame(
-            width: 1280,
-            height: 800,
-            scaleFactor: 1.0,
-            pixelBuffer: nil,
-            encodedImageBytes: Data("VM_FRAME_\(containerName)_\(viewerPort)".utf8)
+        try await requireRunningContainer()
+        // The guest's screen is served by `cua-driver` inside the container,
+        // which the Node harness drives through `docker exec`.  The Swift
+        // client speaks to the daemon socket, so it cannot read a real frame
+        // yet.  Returning a placeholder would leave the agent reasoning
+        // against a stale screen, so the driver fails loudly instead.
+        throw ContainerSocketError.unsupportedOperation(
+            operation: "captureFrame",
+            reason: "reading the guest screen needs the container's cua-driver bridge, which is not wired up in the native client yet"
         )
     }
 
     public func click(point: CGPoint, button: MouseButton = .left, count: Int = 1) async throws {
-        let detail = try await socketClient.inspectContainer(idOrName: containerName)
-        guard detail.running else {
-            throw ContainerSocketError.httpStatus(code: 409, body: "Local VM container '\(containerName)' is not running.")
-        }
+        try await requireRunningContainer()
+        throw ContainerSocketError.unsupportedOperation(
+            operation: "click",
+            reason: "driving the guest's pointer needs the container's cua-driver bridge, which is not wired up in the native client yet"
+        )
     }
 
     public func move(to point: CGPoint) async throws {
-        let detail = try await socketClient.inspectContainer(idOrName: containerName)
-        guard detail.running else {
-            throw ContainerSocketError.httpStatus(code: 409, body: "Local VM container '\(containerName)' is not running.")
-        }
+        try await requireRunningContainer()
+        throw ContainerSocketError.unsupportedOperation(
+            operation: "move",
+            reason: "driving the guest's pointer needs the container's cua-driver bridge, which is not wired up in the native client yet"
+        )
     }
 
     public func type(text: String) async throws {
-        let detail = try await socketClient.inspectContainer(idOrName: containerName)
-        guard detail.running else {
-            throw ContainerSocketError.httpStatus(code: 409, body: "Local VM container '\(containerName)' is not running.")
-        }
+        try await requireRunningContainer()
+        throw ContainerSocketError.unsupportedOperation(
+            operation: "type",
+            reason: "driving the guest's keyboard needs the container's cua-driver bridge, which is not wired up in the native client yet"
+        )
     }
 
     public func inspectAccessibilityTree(pid: pid_t? = nil) async throws -> [AXElementNode] {
+        try await requireRunningContainer()
+        throw ContainerSocketError.unsupportedOperation(
+            operation: "inspectAccessibilityTree",
+            reason: "reading the guest's accessibility tree needs the container's cua-driver bridge, which is not wired up in the native client yet"
+        )
+    }
+
+    /// Confirms the Local VM container is running before an operation is
+    /// attempted, so a stopped VM reports its own state rather than the
+    /// unsupported-operation error.
+    private func requireRunningContainer() async throws {
         let detail = try await socketClient.inspectContainer(idOrName: containerName)
         guard detail.running else {
             throw ContainerSocketError.httpStatus(code: 409, body: "Local VM container '\(containerName)' is not running.")
         }
-        return [AXElementNode(role: "AXWindow", title: containerName, frame: CGRect(x: 0, y: 0, width: 1280, height: 800))]
     }
 }
 
@@ -435,6 +491,8 @@ public enum ContainerSocketError: LocalizedError, Equatable, Sendable {
     case invalidSocketPath(String)
     case connectionFailed(socketPath: String, errnoCode: Int32)
     case malformedHTTPResponse
+    case malformedHTTPRequest
+    case unsupportedOperation(operation: String, reason: String)
     case httpStatus(code: Int, body: String)
 
     public var errorDescription: String? {
@@ -451,6 +509,10 @@ public enum ContainerSocketError: LocalizedError, Equatable, Sendable {
             return "Could not connect to container UNIX socket at \(path) (errno \(code))."
         case .malformedHTTPResponse:
             return "Container socket returned a malformed HTTP/1.1 response."
+        case .malformedHTTPRequest:
+            return "Refused a malformed HTTP request to the container socket: the method or path carried characters that are not allowed in an HTTP request line."
+        case .unsupportedOperation(let operation, let reason):
+            return "The \(operation) operation is not available on this target: \(reason)"
         case .httpStatus(let code, let body):
             return "Container daemon returned HTTP \(code): \(body)"
         }
@@ -607,6 +669,14 @@ public final class ContainerSocketClient: Sendable {
         path: String,
         body: Data? = nil
     ) async throws -> (statusCode: Int, body: Data) {
+        // The request line is written straight onto the daemon socket, so a
+        // method or path carrying CR, LF, or a space would let a caller split
+        // the request and smuggle extra headers or a second request past the
+        // container-name guard.  Validate both here rather than trusting every
+        // caller to sanitize its own identifiers.
+        guard Self.isValidHTTPMethod(method), Self.isValidHTTPPath(path) else {
+            throw ContainerSocketError.malformedHTTPRequest
+        }
         let sockPath = self.socketPath
         return try await Task.detached(priority: .userInitiated) {
             try Self.sendSynchronousUnixSocketHTTP(
@@ -616,6 +686,27 @@ public final class ContainerSocketClient: Sendable {
                 body: body
             )
         }.value
+    }
+
+    /// An HTTP method is a token: ASCII letters, digits, `-`, and `_` only.
+    private static func isValidHTTPMethod(_ method: String) -> Bool {
+        guard !method.isEmpty, method.utf8.count <= 32 else { return false }
+        return method.utf8.allSatisfy { byte in
+            (byte >= 0x41 && byte <= 0x5A)
+                || (byte >= 0x61 && byte <= 0x7A)
+                || (byte >= 0x30 && byte <= 0x39)
+                || byte == 0x2D
+                || byte == 0x5F
+        }
+    }
+
+    /// An HTTP request target is an absolute path with no space and no control
+    /// characters, so it cannot terminate the request line or start a header.
+    private static func isValidHTTPPath(_ path: String) -> Bool {
+        guard path.hasPrefix("/"), path.utf8.count <= 2_048 else { return false }
+        return path.utf8.allSatisfy { byte in
+            byte > 0x20 && byte != 0x7F
+        }
     }
 
     private static func sendSynchronousUnixSocketHTTP(

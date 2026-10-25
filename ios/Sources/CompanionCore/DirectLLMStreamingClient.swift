@@ -34,6 +34,25 @@ public enum DirectLLMProviderKind: String, Codable, Equatable, Sendable {
             return "https://generativelanguage.googleapis.com"
         }
     }
+
+    /// Hosts this provider's credential is allowed to be sent to.
+    ///
+    /// A provider key resolved from the vault must never travel to a host named
+    /// by a bot- or user-settable endpoint, so the endpoint host is checked
+    /// against this set (plus the operator allowlist the client is built with)
+    /// before the credential is attached to the request.
+    public var credentialHosts: Set<String> {
+        switch self {
+        case .openAICompatible:
+            return ["api.openai.com"]
+        case .xAI:
+            return ["api.x.ai"]
+        case .miniMax:
+            return ["api.minimax.io", "api.minimaxi.com"]
+        case .gemini:
+            return ["generativelanguage.googleapis.com"]
+        }
+    }
 }
 
 /// Chat message input for a direct LLM streaming turn.
@@ -222,17 +241,31 @@ public struct URLSessionDirectLLMStreamTransport: DirectLLMStreamTransportProtoc
 public final class DirectLLMStreamingClient: Sendable {
     private let resolver: NativeInfisicalResolver
     private let transport: DirectLLMStreamTransportProtocol
+    private let operatorAllowedHosts: Set<String>
 
+    /// - Parameters:
+    ///   - resolver: the vault the provider credential is resolved from.
+    ///   - transport: the line transport the SSE stream is read from.
+    ///   - operatorAllowedHosts: extra hosts an operator has explicitly
+    ///     approved to receive a provider credential, for self-hosted
+    ///     OpenAI-compatible gateways.  This is set by the composition root and
+    ///     never by per-bot configuration.
     public init(
         resolver: NativeInfisicalResolver,
-        transport: DirectLLMStreamTransportProtocol = URLSessionDirectLLMStreamTransport()
+        transport: DirectLLMStreamTransportProtocol = URLSessionDirectLLMStreamTransport(),
+        operatorAllowedHosts: Set<String> = []
     ) {
         self.resolver = resolver
         self.transport = transport
+        self.operatorAllowedHosts = Set(operatorAllowedHosts.map { $0.lowercased() })
     }
 
     /// Builds an authenticated `URLRequest` after verifying that `NativeInfisicalResolver`
     /// holds a non-empty API key for the target provider.
+    ///
+    /// The credential is only attached to an `https` endpoint whose host is the
+    /// provider's own host or an operator-approved one, so a bot- or
+    /// user-settable `baseURL` cannot exfiltrate the resolved key.
     public func buildAuthenticatedRequest(for spec: DirectLLMStreamRequest) async throws -> URLRequest {
         let secretKey = spec.infisicalSecretKey ?? spec.provider.defaultInfisicalSecretKey
         let resolvedSecret: RedactedSecret
@@ -257,9 +290,7 @@ public final class DirectLLMStreamingClient: Sendable {
         switch spec.provider {
         case .openAICompatible, .xAI:
             let path = base.hasSuffix("/v1") ? "\(base)/chat/completions" : "\(base)/v1/chat/completions"
-            guard let url = URL(string: path) else {
-                throw DirectLLMStreamError.invalidEndpoint(path)
-            }
+            let url = try approvedCredentialEndpoint(path, provider: spec.provider)
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -279,9 +310,7 @@ public final class DirectLLMStreamingClient: Sendable {
                     ? "\(base)/chat/completions"
                     : "\(base)/v1/chat/completions"
             }
-            guard let url = URL(string: endpointPath) else {
-                throw DirectLLMStreamError.invalidEndpoint(endpointPath)
-            }
+            let url = try approvedCredentialEndpoint(endpointPath, provider: spec.provider)
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -293,9 +322,7 @@ public final class DirectLLMStreamingClient: Sendable {
         case .gemini:
             let encodedModel = spec.model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? spec.model
             let endpointPath = "\(base)/v1beta/models/\(encodedModel):streamGenerateContent?alt=sse"
-            guard let url = URL(string: endpointPath) else {
-                throw DirectLLMStreamError.invalidEndpoint(endpointPath)
-            }
+            let url = try approvedCredentialEndpoint(endpointPath, provider: spec.provider)
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -337,6 +364,18 @@ public final class DirectLLMStreamingClient: Sendable {
                             }
                         }
                     }
+                    // End of stream is an event boundary.  `SSEParser` only closes
+                    // an event on a blank line, so a provider that closes the body
+                    // without a trailing blank line would otherwise lose its last
+                    // delta and its completion frame.  Feeding the parser a final
+                    // blank line returns whatever it still has buffered, and
+                    // returns nil when nothing is pending.
+                    if let event = sseParser.line("") {
+                        let deltas = Self.parseSSEPayload(event.data, provider: spec.provider)
+                        for delta in deltas {
+                            continuation.yield(delta)
+                        }
+                    }
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish(throwing: DirectLLMStreamError.cancelled)
@@ -353,6 +392,27 @@ public final class DirectLLMStreamingClient: Sendable {
     }
 
     // MARK: - Request Encoders
+
+    /// Returns the endpoint URL when it is safe to attach the provider credential
+    /// to it: `https`, no embedded userinfo, and a host that the provider owns
+    /// or the operator explicitly approved.  Anything else throws, so a
+    /// bot- or user-settable `baseURL` cannot redirect the resolved vault key to
+    /// another host.
+    private func approvedCredentialEndpoint(
+        _ raw: String,
+        provider: DirectLLMProviderKind
+    ) throws -> URL {
+        guard let url = URL(string: raw),
+              url.scheme?.lowercased() == "https",
+              url.user == nil,
+              url.password == nil,
+              let host = url.host?.lowercased(),
+              provider.credentialHosts.contains(host) || operatorAllowedHosts.contains(host)
+        else {
+            throw DirectLLMStreamError.invalidEndpoint(raw)
+        }
+        return url
+    }
 
     private func encodeOpenAICompatibleBody(for spec: DirectLLMStreamRequest) throws -> Data {
         var body: [String: Any] = [

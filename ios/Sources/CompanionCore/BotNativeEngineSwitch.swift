@@ -99,6 +99,11 @@ public actor BotNativeEngineSwitchActor {
     private var activeTurnsByBot: [String: Set<String>] = [:]
     private var pendingNativeWritesByBot: [String: [PendingNativeTurnWrite]] = [:]
 
+    /// Row ceiling used by the parity verification window.  `DatabaseService`
+    /// binds the limit as an `Int32`, so the value has to stay well inside that
+    /// range while still dwarfing any realistic bot history.
+    private static let parityVerificationRowLimit = 1_000_000
+
     public init(database: DatabaseService) {
         self.database = database
     }
@@ -134,11 +139,18 @@ public actor BotNativeEngineSwitchActor {
     }
 
     /// Buffers a native turn message to be flushed on turn completion or before a switch-back.
+    ///
+    /// Staging is refused while an ownership transition is in flight: the handback
+    /// flush drains the buffer, so a write appended after that drain would be
+    /// neither persisted nor exported and would be lost at the cutover.
     public func stagePendingNativeTurnWrite(
         botId: String,
         thread: ThreadRecord,
         message: MessageRecord
     ) throws {
+        if transitioningBots.contains(botId) {
+            throw BotEngineSwitchError.transitionInProgress(botId: botId)
+        }
         let currentOwner = owner(for: botId)
         guard currentOwner == .nativeSwift else {
             throw BotEngineSwitchError.runtimeFenced(
@@ -160,16 +172,38 @@ public actor BotNativeEngineSwitchActor {
     }
 
     /// Flushes any staged native turn writes for `botId` into `DatabaseService`.
+    ///
+    /// Writes land one at a time and only leave the pending buffer once they are
+    /// persisted: a failed write re-queues the unwritten suffix so a transient
+    /// SQLite error never drops a staged native turn message.
     @discardableResult
     public func flushPendingNativeWrites(for botId: String) async throws -> Int {
-        guard let pending = pendingNativeWritesByBot.removeValue(forKey: botId), !pending.isEmpty else {
+        guard let pending = pendingNativeWritesByBot[botId], !pending.isEmpty else {
+            pendingNativeWritesByBot.removeValue(forKey: botId)
             return 0
         }
-        for item in pending {
-            try await database.upsertThread(item.thread)
-            try await database.insertMessage(item.message)
+
+        var written = 0
+        for (index, item) in pending.enumerated() {
+            do {
+                // The thread row goes in first because `messages.thread_id` is a
+                // foreign key, and again at the end because
+                // `DatabaseService.insertMessage` finishes with
+                // `UPDATE threads SET updated_at = message.created_at`, which
+                // would otherwise regress the staged `max(thread.updatedAt,
+                // message.createdAt)` timestamp back to the message's own time.
+                try await database.upsertThread(item.thread)
+                try await database.insertMessage(item.message)
+                try await database.upsertThread(item.thread)
+                written += 1
+            } catch {
+                pendingNativeWritesByBot[botId] = Array(pending[index...])
+                throw error
+            }
         }
-        return pending.count
+
+        pendingNativeWritesByBot.removeValue(forKey: botId)
+        return written
     }
 
     /// Switches `botId` from `.nodeHarness` to `.nativeSwift`.
@@ -214,8 +248,16 @@ public actor BotNativeEngineSwitchActor {
             }
         }
 
-        // Verify parity in DatabaseService before flipping ownership
-        let storedThreads = try await database.loadThreads(forBot: botId, limit: max(100, uniqueThreadIds.count + 10))
+        // Verify parity in DatabaseService before flipping ownership.  The
+        // verification window is sized from a fixed ceiling rather than from
+        // the incoming snapshot: `loadThreads` orders by `updated_at DESC` and
+        // `loadMessages` by `created_at ASC`, so a snapshot-sized window lets
+        // rows the bot already stored push the imported rows out of view and
+        // report a parity mismatch for rows that were in fact written.
+        let storedThreads = try await database.loadThreads(
+            forBot: botId,
+            limit: Self.parityVerificationRowLimit
+        )
         let storedThreadIds = Set(storedThreads.map(\.id))
         let verifiedThreads = uniqueThreadIds.intersection(storedThreadIds).count
 
@@ -223,7 +265,7 @@ public actor BotNativeEngineSwitchActor {
         for threadId in uniqueThreadIds {
             let storedMessages = try await database.loadMessages(
                 forThread: threadId,
-                limit: max(500, (historySnapshot.messagesByThread[threadId]?.count ?? 0) + 10)
+                limit: Self.parityVerificationRowLimit
             )
             let storedIds = Set(storedMessages.map(\.id))
             let expectedForThread = Set((historySnapshot.messagesByThread[threadId] ?? []).map(\.id))
@@ -245,7 +287,7 @@ public actor BotNativeEngineSwitchActor {
             botId: botId,
             previousOwner: previousOwner,
             newOwner: .nativeSwift,
-            verifiedThreadCount: storedThreads.count,
+            verifiedThreadCount: verifiedThreads,
             verifiedMessageCount: verifiedMessages,
             flushedPendingTurnCount: 0
         )
@@ -294,6 +336,10 @@ public actor BotNativeEngineSwitchActor {
 
     /// Routes search for a native-switched bot through `DatabaseService.search` (`messages_fts`),
     /// returning results scoped to `botId`'s threads and the measured query latency in milliseconds.
+    ///
+    /// The query is scoped to the bot's own threads instead of being filtered out of a
+    /// globally truncated result set: another bot's messages could otherwise occupy the
+    /// head of the global ranking and push this bot's highest-ranked hits past the limit.
     public func searchMessages(
         forBot botId: String,
         query: String,
@@ -302,8 +348,17 @@ public actor BotNativeEngineSwitchActor {
         let startNs = DispatchTime.now().uptimeNanoseconds
         let botThreads = try await database.loadThreads(forBot: botId, limit: 10_000)
         let botThreadIds = Set(botThreads.map(\.id))
-        let allMatches = try await database.search(query: query, inThread: nil, limit: max(limit * 2, 100))
-        let filtered = Array(allMatches.filter { botThreadIds.contains($0.threadId) }.prefix(limit))
+
+        var scoped: [DatabaseSearchResult] = []
+        for threadId in botThreadIds {
+            let matches = try await database.search(query: query, inThread: threadId, limit: limit)
+            scoped.append(contentsOf: matches)
+        }
+        // `DatabaseService.search` exposes no BM25 score, so the merged rows are
+        // ordered by recency to keep the per-thread pages deterministic.
+        scoped.sort { $0.createdAt > $1.createdAt }
+
+        let filtered = Array(scoped.prefix(limit))
         let endNs = DispatchTime.now().uptimeNanoseconds
         let elapsedMs = Double(endNs - startNs) / 1_000_000.0
         return (filtered, elapsedMs)

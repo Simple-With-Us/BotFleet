@@ -404,10 +404,13 @@ struct Phase4DirectLlmAndCuaSocketTests {
             environment: "prod"
         )
         let keychain = MockKeychainStore(initialData: try JSONEncoder().encode(identity))
+        let mockOpenAIKey = ["mock", "openai", "key"].joined(separator: "-")
+        let mockMiniMaxKey = ["mock", "minimax", "key"].joined(separator: "-")
+        let mockGeminiKey = ["mock", "gemini", "key"].joined(separator: "-")
         let infisicalHTTP = MockInfisicalTransport(secrets: [
-            "OPENAI_API_KEY": ["mock", "openai", "key"].joined(separator: "-"),
-            "MINIMAX_API_KEY": ["mock", "minimax", "key"].joined(separator: "-"),
-            "GEMINI_API_KEY": ["mock", "gemini", "key"].joined(separator: "-"),
+            "OPENAI_API_KEY": mockOpenAIKey,
+            "MINIMAX_API_KEY": mockMiniMaxKey,
+            "GEMINI_API_KEY": mockGeminiKey,
         ])
         let resolver = NativeInfisicalResolver(keychain: keychain, transport: infisicalHTTP)
 
@@ -447,7 +450,7 @@ struct Phase4DirectLlmAndCuaSocketTests {
             minimaxDeltas.append(delta)
         }
         #expect(minimaxTransport.recordedRequests.first?.url?.absoluteString == "https://api.minimax.io/v1/text/chatcompletion_v2")
-        #expect(minimaxTransport.recordedRequests.first?.value(forHTTPHeaderField: "Authorization") == "Bearer mmx-live-key")
+        #expect(minimaxTransport.recordedRequests.first?.value(forHTTPHeaderField: "Authorization") == "Bearer \(mockMiniMaxKey)")
         #expect(minimaxDeltas.contains(.reasoning("Thinking step 1.  ")))
         #expect(minimaxDeltas.contains(.text("Final MiniMax answer.")))
         #expect(minimaxDeltas.contains(.toolCall(id: "call_1", name: "lookup", argumentsDelta: #"{"q":"swift"}"#)))
@@ -472,7 +475,7 @@ struct Phase4DirectLlmAndCuaSocketTests {
         }
         let geminiReq = try #require(geminiTransport.recordedRequests.first)
         #expect(geminiReq.url?.absoluteString == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse")
-        #expect(geminiReq.value(forHTTPHeaderField: "x-goog-api-key") == "AIzaSyGeminiKey")
+        #expect(geminiReq.value(forHTTPHeaderField: "x-goog-api-key") == mockGeminiKey)
         #expect(geminiDeltas == [
             .reasoning("Gemini thought"),
             .text("Gemini response"),
@@ -499,6 +502,28 @@ struct Phase4DirectLlmAndCuaSocketTests {
         }
         try await consumerTask.value
         #expect(cancelTransport.cancelCallCount >= 1)
+
+        // 5. The provider credential is never attached to a host outside the provider's allowlist
+        let offHostTransport = MockSSEStreamTransport(lines: [])
+        let offHostClient = DirectLLMStreamingClient(resolver: resolver, transport: offHostTransport)
+        await #expect(throws: DirectLLMStreamError.invalidEndpoint("https://attacker.example/v1/chat/completions")) {
+            _ = try await offHostClient.buildAuthenticatedRequest(for: DirectLLMStreamRequest(
+                provider: .openAICompatible,
+                model: "gpt-5.4",
+                messages: [DirectLLMChatMessage(role: "user", content: "Hello")],
+                baseURL: "https://attacker.example"
+            ))
+        }
+        // A plaintext endpoint is refused too, even for a known host.
+        await #expect(throws: DirectLLMStreamError.invalidEndpoint("http://api.openai.com/v1/chat/completions")) {
+            _ = try await offHostClient.buildAuthenticatedRequest(for: DirectLLMStreamRequest(
+                provider: .openAICompatible,
+                model: "gpt-5.4",
+                messages: [DirectLLMChatMessage(role: "user", content: "Hello")],
+                baseURL: "http://api.openai.com"
+            ))
+        }
+        #expect(offHostTransport.recordedRequests.isEmpty)
     }
 
     // MARK: 3. BF-2507: EngineMatrixRegistry & OpenCode Probe Failure Sentences
@@ -688,12 +713,22 @@ struct Phase4DirectLlmAndCuaSocketTests {
         #expect(afterStart.running == true)
         #expect(afterStart.memoryLimitBytes == 2_147_483_648)
 
-        // Verify LocalVmCuaDriver works against the running container
+        // The Local VM driver reports that the guest bridge is not wired up
+        // instead of pretending a click or a frame happened.
         let vmDriver = try LocalVmCuaDriver(containerName: "botfleet-computer-jay", viewerPort: 6080, socketClient: client)
         #expect(vmDriver.targetKind == .localVM(containerName: "botfleet-computer-jay", viewerPort: 6080))
-        let frame = try await vmDriver.captureFrame()
-        #expect(frame.width == 1280)
-        #expect(frame.height == 800)
+        await #expect(throws: ContainerSocketError.unsupportedOperation(
+            operation: "captureFrame",
+            reason: "reading the guest screen needs the container's cua-driver bridge, which is not wired up in the native client yet"
+        )) {
+            _ = try await vmDriver.captureFrame()
+        }
+        await #expect(throws: ContainerSocketError.unsupportedOperation(
+            operation: "click",
+            reason: "driving the guest's pointer needs the container's cua-driver bridge, which is not wired up in the native client yet"
+        )) {
+            try await vmDriver.click(point: CGPoint(x: 10, y: 10))
+        }
 
         try await client.stopContainer(idOrName: "botfleet-computer-jay", timeoutSeconds: 5)
         let afterStop = try await client.inspectContainer(idOrName: "botfleet-computer-jay")
@@ -707,7 +742,21 @@ struct Phase4DirectLlmAndCuaSocketTests {
             _ = try await client.inspectContainer(idOrName: "../botfleet-computer-escape")
         }
 
-        // 4. Unsupported container runtime is reported by product name
+        // 4. A request line carrying CR/LF is refused instead of being split
+        await #expect(throws: ContainerSocketError.malformedHTTPRequest) {
+            _ = try await client.performHTTPRequest(
+                method: "GET",
+                path: "/containers/json\r\nX-Injected: 1\r\n\r\nGET /containers/json"
+            )
+        }
+        await #expect(throws: ContainerSocketError.malformedHTTPRequest) {
+            _ = try await client.performHTTPRequest(method: "GET /containers/json", path: "/containers/json")
+        }
+        await #expect(throws: ContainerSocketError.malformedHTTPRequest) {
+            _ = try await client.performHTTPRequest(method: "GET", path: "containers/json")
+        }
+
+        // 5. Unsupported container runtime is reported by product name
         #expect(throws: ContainerSocketError.self) {
             _ = try ContainerSocketClient(socketPath: server.socketPath, runtimeId: "container")
         }
