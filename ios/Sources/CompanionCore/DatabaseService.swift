@@ -571,9 +571,32 @@ public actor DatabaseService {
 
     /// Full-text search across transcripts using SQLite3 FTS5 with BM25 ranking and highlighted snippets.
     public func search(query: String, inThread threadId: String? = nil, limit: Int = 50) throws -> [DatabaseSearchResult] {
+        try performSearch(query: query, inThread: threadId, limit: limit).results
+    }
+
+    /// Runs the same FTS5 search as `search(query:inThread:limit:)` and reports
+    /// how long the query itself took.
+    ///
+    /// The duration is measured inside the actor, around the prepared
+    /// statement.  A caller that times the `await` from outside also measures
+    /// the actor hop and its own instrumentation, which says more about the
+    /// caller's scheduler than about the search.
+    func searchMeasuringLatency(
+        query: String,
+        inThread threadId: String? = nil,
+        limit: Int = 50
+    ) throws -> (results: [DatabaseSearchResult], durationMs: Double) {
+        try performSearch(query: query, inThread: threadId, limit: limit)
+    }
+
+    private func performSearch(
+        query: String,
+        inThread threadId: String?,
+        limit: Int
+    ) throws -> (results: [DatabaseSearchResult], durationMs: Double) {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanQuery.isEmpty else { return [] }
+        guard !cleanQuery.isEmpty else { return ([], 0) }
 
         // Sanitize query tokens for FTS5 syntax
         let formattedQuery = cleanQuery
@@ -608,6 +631,8 @@ public actor DatabaseService {
             ORDER BY fts.rank;
             """
 
+        let queryBegin = DispatchTime.now().uptimeNanoseconds
+
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
@@ -636,7 +661,10 @@ public actor DatabaseService {
                 createdAt: createdAt
             ))
         }
-        return results
+
+        let queryEnd = DispatchTime.now().uptimeNanoseconds
+        let durationMs = Double(queryEnd - queryBegin) / 1_000_000.0
+        return (results, durationMs)
     }
 
     // MARK: - Routine Runs
