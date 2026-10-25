@@ -1,0 +1,13 @@
+# BF-2544: commit 12509854 used fixed dummy test tokens ("0123…") in node tests; later commits replaced them with randomBytes().
+# Fingerprints are commit-pinned, so a real secret anywhere else still fails the scan.
+12509854f59def9357f9fa68fc380bcac87f3b75:deploy/linux-server/owner-gate.node-test.mjs:generic-api-key:283
+12509854f59def9357f9fa68fc380bcac87f3b75:deploy/linux-server/owner-gate.node-test.mjs:generic-api-key:29
+12509854f59def9357f9fa68fc380bcac87f3b75:deploy/linux-server/owner-gate.node-test.mjs:generic-api-key:525
+12509854f59def9357f9fa68fc380bcac87f3b75:electron/attached-ui-shim.node-test.mjs:generic-api-key:681
+12509854f59def9357f9fa68fc380bcac87f3b75:electron/server-target.node-test.mjs:generic-api-key:268
+12509854f59def9357f9fa68fc380bcac87f3b75:electron/server-target.node-test.mjs:generic-api-key:282
+12509854f59def9357f9fa68fc380bcac87f3b75:electron/server-target.node-test.mjs:generic-api-key:309
+12509854f59def9357f9fa68fc380bcac87f3b75:electron/server-target.node-test.mjs:generic-api-key:341
+12509854f59def9357f9fa68fc380bcac87f3b75:electron/server-target.node-test.mjs:generic-api-key:357
+12509854f59def9357f9fa68fc380bcac87f3b75:electron/server-target.node-test.mjs:generic-api-key:366
+12509854f59def9357f9fa68fc380bcac87f3b75:electron/server-target.node-test.mjs:generic-api-key:391
