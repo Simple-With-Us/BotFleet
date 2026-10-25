@@ -9,16 +9,6 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const ELECTRON_MAIN = join(ROOT, "electron/main.mjs");
 const COMPANION_CONTROL = join(ROOT, "companion/src/control.ts");
 
-// The packs in this repo that state the sentence-gap rule.  Every one of them
-// has to name the one chat-pane exception, because a seat that reads only one
-// pack must still learn that its own chat pane takes the `&nbsp;` entity.
-const RULE_STATING_PACKS = [
-  ".claude/skills/sentence-gap/SKILL.md",
-  ".claude/skills/fleet-coordination/SKILL.md",
-  ".claude/skills/owner-copy/SKILL.md",
-  ".claude/skills/land-lane/SKILL.md",
-];
-
 /** Read a repo source file as text, with line endings normalised. */
 const read = (path) => readFileSync(path, "utf8").replace(/\r\n/g, "\n");
 
