@@ -139,6 +139,9 @@ public actor AcpProcessRunner: EngineDriver {
     private let permissionHandler: PermissionHandler?
     private var activeSessions: [String: EngineProcessSession] = [:]
     private var activeSessionIds: [String: String] = [:]
+    /// Identifies the turn that owns each registered session, so a turn that is winding down cannot
+    /// clear a newer turn's session for the same thread.
+    private var activeSessionTokens: [String: UUID] = [:]
 
     public init(
         harnessKind: AcpHarnessKind,
@@ -168,7 +171,8 @@ public actor AcpProcessRunner: EngineDriver {
             executable: executable ?? harnessKind.defaultExecutable,
             arguments: harnessKind.buildSpawnArguments(input: input),
             workingDirectory: input.workingDirectory,
-            environment: env
+            environment: env,
+            unsetEnvironmentKeys: harnessKind == .grok ? ["XAI_API_KEY"] : []
         )
     }
 
@@ -179,7 +183,9 @@ public actor AcpProcessRunner: EngineDriver {
 
         let spec = Self.buildSpawnSpec(harnessKind: harnessKind, executable: executable, input: input)
         let session = try await launcher.launch(spec: spec, threadId: input.threadId, engineId: engineId)
+        let sessionToken = UUID()
         activeSessions[input.threadId] = session
+        activeSessionTokens[input.threadId] = sessionToken
 
         let (stream, continuation) = AsyncStream<TurnEvent>.makeStream()
         let threadId = input.threadId
@@ -311,11 +317,13 @@ public actor AcpProcessRunner: EngineDriver {
                 await coordinator.emitTerminalError(code: "acp_error", message: error.localizedDescription)
             }
 
-            continuation.finish()
             await session.closeStdin()
             readerTask.cancel()
             _ = await session.waitForExit()
-            await self?.clearSession(threadId: threadId)
+            // Release the thread before the stream ends so a consumer that retries the moment the stream
+            // closes is not told a turn is still active.
+            await self?.clearSession(threadId: threadId, token: sessionToken)
+            continuation.finish()
         }
 
         return stream
@@ -323,6 +331,7 @@ public actor AcpProcessRunner: EngineDriver {
 
     public func cancelTurn(threadId: String) async {
         guard let session = activeSessions.removeValue(forKey: threadId) else { return }
+        activeSessionTokens.removeValue(forKey: threadId)
         if let sessionId = activeSessionIds.removeValue(forKey: threadId) {
             let cancelFrame: [String: Any] = [
                 "jsonrpc": "2.0",
@@ -341,9 +350,13 @@ public actor AcpProcessRunner: EngineDriver {
         activeSessionIds[threadId] = sessionId
     }
 
-    private func clearSession(threadId: String) {
+    private func clearSession(threadId: String, token: UUID) {
+        // Only the turn that registered the session may clear it: a cancelled turn winds down after the
+        // cancel, and by then a newer turn may already own the thread.
+        guard activeSessionTokens[threadId] == token else { return }
         activeSessions.removeValue(forKey: threadId)
         activeSessionIds.removeValue(forKey: threadId)
+        activeSessionTokens.removeValue(forKey: threadId)
     }
 
     /// Resolves a requested MiniMax Code picker model id against the `configOptions` the session

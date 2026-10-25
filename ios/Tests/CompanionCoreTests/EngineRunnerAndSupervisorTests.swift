@@ -381,4 +381,238 @@ struct EngineRunnerAndSupervisorTests {
         #expect(!record.redactedLine.contains("sk-abcdefghijklmnopqrstuvwxyz123456"))
         #expect(record.redactedLine.contains("[REDACTED]"))
     }
+
+    // MARK: - 4. Ambient Credential Containment, Session Ownership, and Silent Termination
+
+    @Test("Codex and Grok spawn specs declare the ambient API keys that must not reach the child")
+    func spawnSpecsDeclareAmbientApiKeysToUnset() {
+        let base = TurnInput(threadId: "thread-unset-spec", botId: "bot", prompt: "p")
+
+        let codexSpec = CodexAppServerRunner.buildSpawnSpec(input: base)
+        #expect(codexSpec.unsetEnvironmentKeys == ["OPENAI_API_KEY"])
+
+        let codexKeepKey = CodexAppServerRunner.buildSpawnSpec(
+            input: TurnInput(
+                threadId: "thread-unset-spec",
+                botId: "bot",
+                prompt: "p",
+                configOptions: ["keepOpenAIKey": "true"]
+            )
+        )
+        #expect(codexKeepKey.unsetEnvironmentKeys.isEmpty)
+
+        let grokSpec = AcpProcessRunner.buildSpawnSpec(harnessKind: .grok, input: base)
+        #expect(grokSpec.unsetEnvironmentKeys == ["XAI_API_KEY"])
+
+        let mcodeSpec = AcpProcessRunner.buildSpawnSpec(harnessKind: .mcode, input: base)
+        #expect(mcodeSpec.unsetEnvironmentKeys.isEmpty)
+    }
+
+    #if os(macOS)
+    @Test("ProcessSupervisorActor removes the keys a spawn spec marks unset from the child environment")
+    func supervisorRemovesUnsetKeysFromChildEnvironment() async throws {
+        let key = "BOTFLEET_TEST_AMBIENT_API_KEY"
+        setenv(key, "must-not-reach-the-child", 1)
+        defer { unsetenv(key) }
+
+        let supervisor = ProcessSupervisorActor()
+        let spec = EngineSpawnSpec(
+            executable: "/usr/bin/env",
+            arguments: [],
+            unsetEnvironmentKeys: [key]
+        )
+        let session = try await supervisor.launch(spec: spec, threadId: "thread-unset-env", engineId: "test")
+
+        var childEnvironment = ""
+        for await line in session.stdoutLines {
+            childEnvironment += line
+            childEnvironment += "\n"
+        }
+        _ = await session.waitForExit()
+
+        #expect(
+            !childEnvironment.contains(key),
+            "Child environment must not carry a key the spawn spec marks unset"
+        )
+
+        // Control: without the unset declaration the ambient key really is inherited, so the
+        // assertion above is proving the removal and not an environment that never had the key.
+        let controlSession = try await supervisor.launch(
+            spec: EngineSpawnSpec(executable: "/usr/bin/env", arguments: []),
+            threadId: "thread-unset-env-control",
+            engineId: "test"
+        )
+        var controlEnvironment = ""
+        for await line in controlSession.stdoutLines {
+            controlEnvironment += line
+            controlEnvironment += "\n"
+        }
+        _ = await controlSession.waitForExit()
+
+        #expect(
+            controlEnvironment.contains(key),
+            "Control: the ambient key is inherited when the spawn spec does not mark it unset"
+        )
+    }
+    #endif
+
+    @Test("A stream that ends silently after visible output ends the turn instead of failing over")
+    func silentTerminationAfterVisibleOutputDoesNotFailOver() async throws {
+        let primary = SilentEndingDriver(engineId: "primary", events: [.textDelta("partial answer")])
+        let fallback = SilentEndingDriver(
+            engineId: "fallback",
+            events: [.completed(stopReason: "end_turn", inputTokens: 1, outputTokens: 1)]
+        )
+
+        let dispatcher = TurnDispatcherActor(
+            stallTimeoutSeconds: 5.0,
+            maxRetriesPerEngine: 0,
+            retryDelaySeconds: 0
+        )
+        let input = TurnInput(threadId: "thread-silent-after-output", botId: "bot", prompt: "p")
+        let stream = try await dispatcher.dispatchTurn(input: input, fallbackChain: [primary, fallback])
+
+        var events: [TurnEvent] = []
+        for await event in stream {
+            events.append(event)
+        }
+
+        let fallbackUsed = await fallback.wasUsed
+        #expect(
+            !fallbackUsed,
+            "Fallback engine must not run once visible output exists: re-running the prompt would duplicate it"
+        )
+        #expect(events.contains(.textDelta("partial answer")))
+        #expect(
+            events.contains { event in
+                guard case .error(let code, _) = event else { return false }
+                return code == "eof_before_result"
+            },
+            "Silent termination after visible output must end the turn with a terminal error"
+        )
+    }
+
+    @Test("A stream that ends silently before any output fails over to the next engine")
+    func silentTerminationBeforeVisibleOutputFailsOver() async throws {
+        let primary = SilentEndingDriver(engineId: "primary", events: [])
+        let fallback = SilentEndingDriver(
+            engineId: "fallback",
+            events: [.completed(stopReason: "end_turn", inputTokens: 1, outputTokens: 1)]
+        )
+
+        let dispatcher = TurnDispatcherActor(
+            stallTimeoutSeconds: 5.0,
+            maxRetriesPerEngine: 0,
+            retryDelaySeconds: 0
+        )
+        let input = TurnInput(threadId: "thread-silent-before-output", botId: "bot", prompt: "p")
+        let stream = try await dispatcher.dispatchTurn(input: input, fallbackChain: [primary, fallback])
+
+        var events: [TurnEvent] = []
+        for await event in stream {
+            events.append(event)
+        }
+
+        let fallbackUsed = await fallback.wasUsed
+        #expect(fallbackUsed, "Nothing was produced, so the next engine can safely take the turn")
+        #expect(events.last == .completed(stopReason: "end_turn", inputTokens: 1, outputTokens: 1))
+    }
+
+    @Test("A cancelled turn's teardown does not clear the session a newer turn owns for the same thread")
+    func cancelledTurnTeardownDoesNotClearNewerSession() async throws {
+        let launcher = BlockingExitLauncher()
+        let runner = ClaudeStreamRunner(engineId: "claude", launcher: launcher)
+        let input = TurnInput(threadId: "thread-session-ownership", botId: "bot", prompt: "p")
+
+        let streamA = try await runner.sendTurn(input: input)
+        let drainA = Task { for await _ in streamA {} }
+
+        // Cancelling unregisters the first turn's session but leaves the turn winding down.
+        await runner.cancelTurn(threadId: "thread-session-ownership")
+
+        // A newer turn claims the same thread while the cancelled turn is still tearing down.
+        _ = try await runner.sendTurn(input: input)
+
+        // Release only the cancelled turn so its teardown runs against a thread the newer turn owns.
+        await launcher.release(0)
+        await drainA.value
+
+        do {
+            _ = try await runner.sendTurn(input: input)
+            Issue.record("The cancelled turn's teardown cleared the newer turn's session")
+        } catch let error as EngineDriverError {
+            #expect(error == .turnAlreadyActive(threadId: "thread-session-ownership"))
+        }
+    }
+}
+
+/// Test double for a driver whose stream ends without a terminal event.
+private actor SilentEndingDriver: EngineDriver {
+    let engineId: String
+    private let events: [TurnEvent]
+    private(set) var wasUsed = false
+
+    init(engineId: String, events: [TurnEvent]) {
+        self.engineId = engineId
+        self.events = events
+    }
+
+    func sendTurn(input: TurnInput) async throws -> AsyncStream<TurnEvent> {
+        wasUsed = true
+        let (stream, continuation) = AsyncStream<TurnEvent>.makeStream()
+        for event in events {
+            continuation.yield(event)
+        }
+        continuation.finish()
+        return stream
+    }
+
+    func cancelTurn(threadId: String) async {}
+}
+
+/// A launcher whose sessions block in `waitForExit` until the test releases them, so a turn's
+/// teardown can be sequenced after a newer turn has already claimed the same thread.
+private actor BlockingExitLauncher: EngineProcessLauncher {
+    private var gates: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var released: Set<Int> = []
+    private var launchCount = 0
+
+    func launch(
+        spec: EngineSpawnSpec,
+        threadId: String,
+        engineId: String
+    ) async throws -> EngineProcessSession {
+        let index = launchCount
+        launchCount += 1
+
+        let (stdoutLines, stdoutContinuation) = AsyncStream<String>.makeStream()
+        let (stderrChunks, stderrContinuation) = AsyncStream<String>.makeStream()
+        stderrContinuation.finish()
+
+        return EngineProcessSession(
+            pid: 42_100 + Int32(index),
+            stdoutLines: stdoutLines,
+            stderrChunks: stderrChunks,
+            writeStdinLine: { _ in },
+            closeStdin: { stdoutContinuation.finish() },
+            cancel: { stdoutContinuation.finish() },
+            waitForExit: { [weak self] in
+                await self?.waitForRelease(index)
+                return .exited(code: 0)
+            }
+        )
+    }
+
+    /// Releases the turn at `index` so its teardown can run.
+    func release(_ index: Int) {
+        released.insert(index)
+        gates.removeValue(forKey: index)?.resume()
+    }
+
+    private func waitForRelease(_ index: Int) async {
+        if released.contains(index) { return }
+        await withCheckedContinuation { continuation in
+            gates[index] = continuation
+        }
+    }
 }

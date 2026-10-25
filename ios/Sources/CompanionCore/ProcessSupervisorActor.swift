@@ -324,6 +324,12 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
         for (k, v) in spec.environment {
             mergedEnv[k] = v
         }
+        // `spec.environment` is an overlay, so a key the runner dropped from it is still present in the
+        // parent environment and would reach the child.  The keys the runner marked as unset are removed
+        // from the merged result so the child really does not inherit them.
+        for key in spec.unsetEnvironmentKeys {
+            mergedEnv.removeValue(forKey: key)
+        }
         let envStrings = mergedEnv.map { "\($0.key)=\($0.value)" }
 
         let cArgs = argvStrings.map { strdup($0) } + [nil]

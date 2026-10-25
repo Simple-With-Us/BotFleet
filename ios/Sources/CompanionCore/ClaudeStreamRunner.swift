@@ -8,6 +8,9 @@ public actor ClaudeStreamRunner: EngineDriver {
     public nonisolated let executable: String
     private let launcher: any EngineProcessLauncher
     private var activeSessions: [String: EngineProcessSession] = [:]
+    /// Identifies the turn that owns each registered session, so a turn that is winding down cannot
+    /// clear a newer turn's session for the same thread.
+    private var activeSessionTokens: [String: UUID] = [:]
 
     /// Containment environment variables matching `CLAUDE_CONTAINMENT_ENV` in `server/drivers/claude.ts`.
     public static let containmentEnvironment: [String: String] = [
@@ -102,7 +105,9 @@ public actor ClaudeStreamRunner: EngineDriver {
 
         let spec = Self.buildSpawnSpec(executable: executable, input: input)
         let session = try await launcher.launch(spec: spec, threadId: input.threadId, engineId: engineId)
+        let sessionToken = UUID()
         activeSessions[input.threadId] = session
+        activeSessionTokens[input.threadId] = sessionToken
 
         let userFrame = Self.buildUserStdinFrame(prompt: input.prompt)
         try await session.writeStdinLine(userFrame)
@@ -152,7 +157,7 @@ public actor ClaudeStreamRunner: EngineDriver {
                 }
             }
 
-            await self?.clearSession(threadId: threadId)
+            await self?.clearSession(threadId: threadId, token: sessionToken)
             continuation.finish()
         }
 
@@ -161,11 +166,16 @@ public actor ClaudeStreamRunner: EngineDriver {
 
     public func cancelTurn(threadId: String) async {
         guard let session = activeSessions.removeValue(forKey: threadId) else { return }
+        activeSessionTokens.removeValue(forKey: threadId)
         await session.cancel()
     }
 
-    private func clearSession(threadId: String) {
+    private func clearSession(threadId: String, token: UUID) {
+        // Only the turn that registered the session may clear it: a cancelled turn winds down after the
+        // cancel, and by then a newer turn may already own the thread.
+        guard activeSessionTokens[threadId] == token else { return }
         activeSessions.removeValue(forKey: threadId)
+        activeSessionTokens.removeValue(forKey: threadId)
     }
 
     // MARK: - Stateful Stream-JSON Line Parser

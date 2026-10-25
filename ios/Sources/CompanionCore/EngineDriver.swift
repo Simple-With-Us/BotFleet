@@ -98,17 +98,35 @@ public struct EngineSpawnSpec: Equatable, Sendable, Codable {
     public let arguments: [String]
     public let workingDirectory: String?
     public let environment: [String: String]
+    /// Environment keys that must NOT reach the child process, even when the parent process carries them.
+    ///
+    /// `environment` is an overlay on the parent's environment, so dropping a key from it cannot express
+    /// "the child must not see this key" — the parent still carries it.  A runner that must not hand an
+    /// ambient API key to a CLI (so the CLI uses its subscription login instead of pay-as-you-go billing)
+    /// states the key here.
+    public let unsetEnvironmentKeys: [String]
 
     public init(
         executable: String,
         arguments: [String],
         workingDirectory: String? = nil,
-        environment: [String: String] = [:]
+        environment: [String: String] = [:],
+        unsetEnvironmentKeys: [String] = []
     ) {
         self.executable = executable
         self.arguments = arguments
         self.workingDirectory = workingDirectory
         self.environment = environment
+        self.unsetEnvironmentKeys = unsetEnvironmentKeys
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.executable = try container.decode(String.self, forKey: .executable)
+        self.arguments = try container.decode([String].self, forKey: .arguments)
+        self.workingDirectory = try container.decodeIfPresent(String.self, forKey: .workingDirectory)
+        self.environment = try container.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
+        self.unsetEnvironmentKeys = try container.decodeIfPresent([String].self, forKey: .unsetEnvironmentKeys) ?? []
     }
 }
 
@@ -598,7 +616,33 @@ public actor TurnDispatcherActor {
                     return
                 }
 
-                break
+                // The engine stream ended without a terminal event and without an error.
+                // Failing over is only safe while nothing has been produced: once visible output or a
+                // tool call exists, re-running the prompt on the next engine would duplicate text or
+                // side-effects.  That is the same rule `TurnRetryClassifier` applies to error paths.
+                if sawVisibleOutput {
+                    continuation.yield(
+                        TurnEvent.error(
+                            code: "eof_before_result",
+                            message: "Engine stream ended before completing the turn after producing output"
+                        )
+                    )
+                    return
+                }
+
+                if (engineIndex + 1) < fallbackChain.count {
+                    // Nothing was produced, so the next engine can safely take the turn.
+                    continue engineLoop
+                }
+
+                // Last engine in the chain: the turn still ends with exactly one terminal event.
+                continuation.yield(
+                    TurnEvent.error(
+                        code: "eof_before_result",
+                        message: "Engine stream ended before completing the turn"
+                    )
+                )
+                return
             }
         }
 

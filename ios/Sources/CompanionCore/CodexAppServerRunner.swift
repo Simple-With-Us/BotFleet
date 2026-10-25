@@ -21,6 +21,9 @@ public actor CodexAppServerRunner: EngineDriver {
     private let launcher: any EngineProcessLauncher
     private let approvalHandler: ApprovalHandler?
     private var activeSessions: [String: EngineProcessSession] = [:]
+    /// Identifies the turn that owns each registered session, so a turn that is winding down cannot
+    /// clear a newer turn's session for the same thread.
+    private var activeSessionTokens: [String: UUID] = [:]
 
     /// Outcome fields excluded when serializing a Codex tool item's input arguments,
     /// matching `CODEX_ITEM_OUTCOME_FIELDS` in `server/drivers/codex.ts`.
@@ -55,7 +58,8 @@ public actor CodexAppServerRunner: EngineDriver {
         }
         var env = input.environment
         // Strip ambient OPENAI_API_KEY so the CLI uses its ChatGPT subscription login unless explicitly overridden.
-        if input.configOptions["keepOpenAIKey"] != "true" {
+        let keepOpenAIKey = input.configOptions["keepOpenAIKey"] == "true"
+        if !keepOpenAIKey {
             env.removeValue(forKey: "OPENAI_API_KEY")
         }
         env["NPM_CONFIG_LOGLEVEL"] = "error"
@@ -63,7 +67,8 @@ public actor CodexAppServerRunner: EngineDriver {
             executable: executable,
             arguments: args,
             workingDirectory: input.workingDirectory,
-            environment: env
+            environment: env,
+            unsetEnvironmentKeys: keepOpenAIKey ? [] : ["OPENAI_API_KEY"]
         )
     }
 
@@ -74,7 +79,9 @@ public actor CodexAppServerRunner: EngineDriver {
 
         let spec = Self.buildSpawnSpec(executable: executable, input: input)
         let session = try await launcher.launch(spec: spec, threadId: input.threadId, engineId: engineId)
+        let sessionToken = UUID()
         activeSessions[input.threadId] = session
+        activeSessionTokens[input.threadId] = sessionToken
 
         let (stream, continuation) = AsyncStream<TurnEvent>.makeStream()
         let threadId = input.threadId
@@ -171,11 +178,13 @@ public actor CodexAppServerRunner: EngineDriver {
                 await coordinator.settleWithError(code: "codex_error", message: error.localizedDescription)
             }
 
-            continuation.finish()
             await session.closeStdin()
             readerTask.cancel()
             _ = await session.waitForExit()
-            await self?.clearSession(threadId: threadId)
+            // Release the thread before the stream ends so a consumer that retries the moment the stream
+            // closes is not told a turn is still active.
+            await self?.clearSession(threadId: threadId, token: sessionToken)
+            continuation.finish()
         }
 
         return stream
@@ -183,11 +192,16 @@ public actor CodexAppServerRunner: EngineDriver {
 
     public func cancelTurn(threadId: String) async {
         guard let session = activeSessions.removeValue(forKey: threadId) else { return }
+        activeSessionTokens.removeValue(forKey: threadId)
         await session.cancel()
     }
 
-    private func clearSession(threadId: String) {
+    private func clearSession(threadId: String, token: UUID) {
+        // Only the turn that registered the session may clear it: a cancelled turn winds down after the
+        // cancel, and by then a newer turn may already own the thread.
+        guard activeSessionTokens[threadId] == token else { return }
         activeSessions.removeValue(forKey: threadId)
+        activeSessionTokens.removeValue(forKey: threadId)
     }
 }
 
