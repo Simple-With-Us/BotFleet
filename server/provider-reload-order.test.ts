@@ -171,6 +171,10 @@ describe("the provider reload fence is declared above every top-level effect", (
     // future edit to the detector cannot quietly narrow the rule.
     const calls = topLevelCalls();
     const awaits = moduleScopeAwaits();
+    // Guards against a vacuous pass: if the await detector ever stops
+    // matching, the loop below never runs and this test would prove
+    // nothing.  The sibling test guards its own detector the same way.
+    expect(awaits.length).toBeGreaterThan(0);
     for (const awaited of awaits) {
       expect(
         calls.some((call) => call.line === awaited.line),
