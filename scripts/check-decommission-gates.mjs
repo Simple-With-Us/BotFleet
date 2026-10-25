@@ -140,4 +140,7 @@ if (isEntryModule()) {
     process.exit(1);
   }
   console.log("Phase 6 decommission gates: all green. Deletion may proceed; the reboot check still belongs to BF-2515.");
+  console.log(
+    "Scope: this covers the Node harness and companion only.  The Electron shell and its updater feed additionally need BF-2485 and BF-2486; see docs/native-rewrite-decommission-runbook.md steps 6 and 7.",
+  );
 }

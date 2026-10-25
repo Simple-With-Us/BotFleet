@@ -139,7 +139,7 @@ This is the irreversible one, and it is the step the whole gate exists for.
 
 ### Step 6 — The Electron Shell
 
-**Precondition:** Step 5 complete, which is what makes this step legal rather than fatal.
+**Precondition:** Step 5 complete, which is what makes this step legal rather than fatal, plus BF-2486 Done and one installed build already updated through the Sparkle feed.  Deleting `electron/updater*.mjs` before that leaves every installed app polling an update feed that nothing maintains any more, which reads as a working app that silently never updates again.
 
 - `electron/` (135 tracked files), `electron-builder.yml`, `package.json` `main`, `preload.cjs`.
 - `.github/workflows/release.yml`, `mac-commit-build.yml`, `mac-package-gate.yml`, `mac-server-menu-smoke.yml`, and the electron-updater feed jobs.
