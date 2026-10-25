@@ -10,7 +10,6 @@ import {
   DSH_MINIMUM_ACP_VERSION,
   DSH_PROVIDER_ID,
   DSH_MINIMAX_PROVIDER_ID,
-  dshCanonicalWireModelId,
   classifyDshError,
   dshCredentialCandidates,
   dshInstalledEffortLevels,
@@ -402,7 +401,26 @@ export function dshSpawnArgs(config: AcpConfig, turn: Pick<SendTurnInput, "integ
   return clutchDshSpawnArgs(config, turn);
 }
 
+const DSH_FLASH_WIRE_MODEL_ID = "deepseek-flash";
 const dshSelectModel = clutchDshSupport.selectModel;
+
+/** Rewrite a resolved `[provider, id]` model value whose id is a non-canonical
+ * spelling of DeepSeek Flash (for example the settings alias
+ * `deepseek-v4.1-flash`) to the stock wire id, keeping the provider route the
+ * session advertised.  Every other value is returned unchanged. */
+export function dshCanonicalFlashWireValue(value: string): string {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value);
+  } catch {
+    return value;
+  }
+  if (!Array.isArray(decoded) || decoded.length !== 2) return value;
+  const [provider, id] = decoded;
+  if (typeof provider !== "string" || typeof id !== "string") return value;
+  if (id === DSH_FLASH_WIRE_MODEL_ID || !dshSameModel(id, DSH_FLASH_WIRE_MODEL_ID)) return value;
+  return JSON.stringify([provider, DSH_FLASH_WIRE_MODEL_ID]);
+}
 
 /**
  * The Clutch package's error codes include "unknown"; BotFleet's
@@ -435,16 +453,17 @@ export const dshSupport = {
   images: true,
   models: STATIC_DSH_MODELS,
   resolveModels: (environment) => readDshModelCatalog(environment),
-  // The installed settings can advertise `deepseek-v4.1-flash`, but DeepSeek's
-  // API accepts the stock `deepseek-flash` id.  Keep Clutch's advertised-value
-  // resolution for every other model, while canonicalizing this settings-only
-  // alias before BotFleet sends the model option over ACP.
+  // The installed settings can declare Flash as `deepseek-v4.1-flash`, but
+  // DeepSeek's API accepts only the stock `deepseek-flash` id.  Resolve every
+  // model through Clutch first, so the advertised route and the not-offered
+  // check (DshModelNotOfferedError) still apply, then rewrite only the model
+  // id of a resolved Flash-family tuple to the canonical wire id.
   selectModel: dshSelectModel && {
     ...dshSelectModel,
-    valueForModel: (model, advertised) =>
-      model.toLowerCase() === "deepseek-v4.1-flash"
-        ? dshSelectModel.valueForModel?.(dshCanonicalWireModelId(model))
-        : dshSelectModel.valueForModel?.(model, advertised),
+    valueForModel: (model, advertised) => {
+      const value = dshSelectModel.valueForModel?.(model, advertised);
+      return typeof value === "string" ? dshCanonicalFlashWireValue(value) : value;
+    },
   },
   loginNote: clutchDshSupport.loginNote ?? "DSH CLI auth missing — add ~/.dsh/.credentials.yaml",
   resumeMethod: "session/resume" as const,

@@ -14,6 +14,7 @@ import {
   classifyDshError,
   DshModelNotOfferedError,
   dshCredentialCandidates,
+  dshCanonicalFlashWireValue,
   dshSupport,
   dshModelIdFromOptionValue,
   dshModelOptionValue,
@@ -897,6 +898,54 @@ describe("dsh model option resolution (Clutch #54 consumer)", () => {
     );
     expect(dshModelOptionValue("DeepSeek-V4.1-Flash", undefined)).toBe('["deepseek-official","deepseek-flash"]');
     expect(dshModelOptionValue("deepseek-pro")).toBe('["deepseek-official","deepseek-v4-pro"]');
+  });
+
+  describe("dshSupport.selectModel canonicalizes Flash after advertised resolution", () => {
+    // An install whose settings.yaml declares Flash under the settings alias.
+    const SETTINGS_ADVERTISED = [
+      {
+        id: "model",
+        options: [
+          {
+            group: "deepseek-official",
+            options: [
+              { value: '["deepseek-official","deepseek-v4.1-flash"]', name: "deepseek-v4.1-flash" },
+              { value: '["deepseek-official","deepseek-v4-pro"]', name: "DeepSeek-V4-Pro" },
+            ],
+          },
+        ],
+      },
+    ];
+    const valueForModel = (model: string, advertised?: unknown) =>
+      dshSupport.selectModel?.valueForModel?.(model, advertised);
+    const FLASH = '["deepseek-official","deepseek-flash"]';
+
+    it("sends the canonical Flash pair for every Flash spelling", () => {
+      for (const model of ["DeepSeek-V4.1-Flash", "deepseek-v4.1-flash", "deepseek-v4-1-flash", "deepseek v4.1 flash"]) {
+        expect(valueForModel(model, STOCK_ADVERTISED)).toBe(FLASH);
+        expect(valueForModel(model, SETTINGS_ADVERTISED)).toBe(FLASH);
+        expect(valueForModel(model, undefined)).toBe(FLASH);
+      }
+    });
+
+    it("resolves Pro through the advertised options unchanged", () => {
+      expect(valueForModel("DeepSeek-V4-Pro", STOCK_ADVERTISED)).toBe('["deepseek-official","deepseek-v4-pro"]');
+    });
+
+    it("keeps the advertised provider route when rewriting the Flash id", () => {
+      expect(dshCanonicalFlashWireValue('["deepseek-other","deepseek-v4.1-flash"]')).toBe(
+        '["deepseek-other","deepseek-flash"]',
+      );
+      expect(dshCanonicalFlashWireValue('["minimax","MiniMax-M3.1-Flash"]')).toBe('["minimax","MiniMax-M3.1-Flash"]');
+      expect(dshCanonicalFlashWireValue("not-a-tuple")).toBe("not-a-tuple");
+    });
+
+    it("still refuses Flash when the session does not offer it", () => {
+      const minimaxOnly = [
+        { id: "model", options: [{ value: '["minimax","MiniMax-M3.1-Flash"]', name: "MiniMax-M3.1-Flash" }] },
+      ];
+      expect(() => valueForModel("deepseek-v4.1-flash", minimaxOnly)).toThrow(DshModelNotOfferedError);
+    });
   });
 
   it("refuses a retired MiniMax id instead of silently substituting another model", () => {
