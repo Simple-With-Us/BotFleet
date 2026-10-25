@@ -30,6 +30,17 @@ public enum ZulipActorError: LocalizedError, Sendable, Equatable {
     }
 }
 
+/// A short, non-reversible preview of a credential, safe to put in an error
+/// message: the first eight and the last four characters only, and nothing at
+/// all for a credential too short to preview safely.
+public enum CredentialPreview {
+    public static func masked(_ credential: String) -> String {
+        let characters = Array(credential)
+        guard characters.count > 12 else { return "" }
+        return String(characters.prefix(8)) + "…" + String(characters.suffix(4))
+    }
+}
+
 /// Verified bot identity and Zulip connection credentials.
 /// Enforces the fleet rule that an agent never authenticates or posts as Jay's owner account.
 public struct ZulipBotIdentity: Sendable, Equatable {
@@ -46,13 +57,10 @@ public struct ZulipBotIdentity: Sendable, Equatable {
         "jay.owner",
     ]
 
-    /// A short, non-reversible preview of a credential, safe to put in an
-    /// error message: the first eight and the last four characters only, and
-    /// nothing at all for a credential too short to preview safely.
+    /// A masked preview of the bot credential, safe to put in an error
+    /// message.
     public static func maskedCredentialPreview(_ credential: String) -> String {
-        let characters = Array(credential)
-        guard characters.count > 12 else { return "" }
-        return String(characters.prefix(8)) + "…" + String(characters.suffix(4))
+        CredentialPreview.masked(credential)
     }
 
     /// `realmURL` has no default on purpose.  The realm is deployment
@@ -438,6 +446,9 @@ public actor ZulipEventActor {
     private var seenOrder: [Int] = []
     private let deduplicationCapacity: Int
 
+    /// How many messages one backfill reads.
+    public static let catchUpLimit: Int = 1_000
+
     public init(
         identity: ZulipBotIdentity,
         transport: ZulipTransport = URLSessionZulipTransport(),
@@ -501,6 +512,15 @@ public actor ZulipEventActor {
                 escaped += "&#10;"
             case "\r":
                 escaped += "&#13;"
+            // The Unicode line terminators are line breaks to a downstream
+            // parser even though Swift does not treat them as `Character`
+            // newlines.
+            case "\u{0085}":
+                escaped += "&#133;"
+            case "\u{2028}":
+                escaped += "&#8232;"
+            case "\u{2029}":
+                escaped += "&#8233;"
             default:
                 escaped.append(character)
             }
@@ -618,16 +638,19 @@ public actor ZulipEventActor {
         let reg = try await transport.registerEventQueue(identity: identity, eventTypes: ["message"])
 
         // Anchor the backfill at the last message this actor emitted.  A first
-        // registration has no high-water mark yet, so it anchors at the realm's
-        // newest message instead of id 0: a fresh bot reads recent traffic
-        // rather than walking the whole message history from the beginning.
-        let anchor = previousHighWater > 0 ? previousHighWater : reg.maxMessageId
+        // registration has no high-water mark yet, so it anchors one window
+        // back from the realm's newest message: the bot picks up the recent
+        // traffic instead of walking the whole message history from id 0, and
+        // it still sees the messages that arrived just before it started.
+        let anchor = previousHighWater > 0
+            ? previousHighWater
+            : max(0, reg.maxMessageId - Self.catchUpLimit)
 
         // Backfill any messages that arrived while the queue was unregistered or expired.
         let missed = try await transport.fetchMessagesAfter(
             identity: identity,
             anchorMessageId: anchor,
-            limit: 1_000
+            limit: Self.catchUpLimit
         )
 
         // The new queue is adopted only after the backfill succeeded.  Adopting
@@ -636,10 +659,11 @@ public actor ZulipEventActor {
         // good: the next poll would anchor past them.
         self.queueId = reg.queueId
         self.lastEventId = reg.lastEventId
-        if previousHighWater == 0, reg.maxMessageId > 0 {
+        let ingested = ingestRawMessages(missed)
+        if previousHighWater == 0, reg.maxMessageId > highWaterMessageId {
             self.highWaterMessageId = reg.maxMessageId
         }
-        return ingestRawMessages(missed)
+        return ingested
     }
 
     private func ingestEvents(_ events: [ZulipEventEnvelope]) -> [ZulipFencedMessage] {
@@ -840,9 +864,20 @@ public struct URLSessionLinearGraphQLTransport: LinearGraphQLTransport {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LinearSyncError.graphQLError("Invalid GraphQL JSON response")
         }
-        if let errors = json["errors"] as? [[String: Any]],
-           let firstMsg = errors.first?["message"] as? String {
-            throw LinearSyncError.graphQLError(firstMsg)
+        if let errors = json["errors"] as? [[String: Any]] {
+            // A rejected credential is reported with a masked preview of the
+            // key rather than the provider's raw message, so the failure is
+            // diagnosable without the key ever appearing in the error.
+            if Self.isAuthFailure(errors) {
+                let preview = CredentialPreview.masked(apiKey)
+                let suffix = preview.isEmpty ? "" : " (credential \(preview))"
+                throw LinearSyncError.graphQLError(
+                    "Linear rejected the API credential\(suffix)"
+                )
+            }
+            if let firstMsg = errors.first?["message"] as? String {
+                throw LinearSyncError.graphQLError(firstMsg)
+            }
         }
         guard let states = (json["data"] as? [String: Any])?["workflowStates"] as? [String: Any],
               let nodes = states["nodes"] as? [[String: Any]],
@@ -852,6 +887,22 @@ public struct URLSessionLinearGraphQLTransport: LinearGraphQLTransport {
             throw LinearSyncError.graphQLError("No Linear workflow state named '\(stateName)'")
         }
         return id
+    }
+
+    /// True when a GraphQL error list reports a rejected credential.
+    static func isAuthFailure(_ errors: [[String: Any]]) -> Bool {
+        for error in errors {
+            let code = ((error["extensions"] as? [String: Any])?["code"] as? String) ?? ""
+            let message = (error["message"] as? String) ?? ""
+            let haystack = "\(code) \(message)".uppercased()
+            if haystack.contains("AUTHENTICATION")
+                || haystack.contains("UNAUTHENTICATED")
+                || haystack.contains("INVALID_API_KEY")
+                || haystack.contains("UNAUTHORIZED") {
+                return true
+            }
+        }
+        return false
     }
 }
 
@@ -868,6 +919,9 @@ public actor LinearSyncClient {
     /// cache is only written after the await, so without this set two
     /// concurrent callers would both post.
     private var inFlightIdempotencyKeys: Set<String> = []
+    /// Workflow state ids by name.  A workspace state id does not change, so
+    /// one lookup per state name is enough; a failed lookup drops the entry.
+    private var workflowStateIdsByName: [String: String] = [:]
 
     public init(
         seat: String,
@@ -930,7 +984,7 @@ public actor LinearSyncClient {
         let formattedNote = "\(sessionTag) Claimed \(cleanIssue) on branch `\(branch)` in `\(worktree)`."
         // `issueUpdate` takes the workflow state id, not its name, so the name
         // is resolved to the UUID Linear expects.
-        let stateId = try await transport.workflowStateId(named: "In Progress", apiKey: apiKey)
+        let stateId = try await resolveWorkflowStateId(named: "In Progress")
         let mutation = """
         mutation ClaimIssue($issueId: String!, $stateId: String!, $commentBody: String!) {
             issueUpdate(id: $issueId, input: { stateId: $stateId }) { success }
@@ -979,7 +1033,7 @@ public actor LinearSyncClient {
 
         let summary = resolution.map { "\(sessionTag) Status -> \(status): \($0)" } ?? "\(sessionTag) Status -> \(status)"
         // `issueUpdate` takes the workflow state id, not its name.
-        let stateId = try await transport.workflowStateId(named: status, apiKey: apiKey)
+        let stateId = try await resolveWorkflowStateId(named: status)
         let mutation = """
         mutation UpdateIssueStatus($issueId: String!, $stateId: String!, $commentBody: String!) {
             issueUpdate(id: $issueId, input: { stateId: $stateId }) { success }
@@ -1055,6 +1109,23 @@ public actor LinearSyncClient {
         )
         completedByIdempotencyKey[key] = receipt
         return receipt
+    }
+
+    /// Resolves a workflow state name to its UUID, caching the answer.  A
+    /// workspace state id does not change, so re-querying it for every
+    /// mutation only costs latency and API quota.
+    private func resolveWorkflowStateId(named stateName: String) async throws -> String {
+        if let cached = workflowStateIdsByName[stateName] {
+            return cached
+        }
+        do {
+            let resolved = try await transport.workflowStateId(named: stateName, apiKey: apiKey)
+            workflowStateIdsByName[stateName] = resolved
+            return resolved
+        } catch {
+            workflowStateIdsByName.removeValue(forKey: stateName)
+            throw error
+        }
     }
 
     /// Reserves an idempotency key for a mutation that is about to be sent.

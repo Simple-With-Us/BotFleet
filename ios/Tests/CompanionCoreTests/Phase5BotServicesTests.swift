@@ -12,18 +12,21 @@ private actor MockZulipTransport: ZulipTransport {
     var currentFailures: Int = 0
     var catchUpMessages: [ZulipRawMessage] = []
     var pollBatchesByQueue: [String: [[ZulipEventEnvelope]]] = [:]
+    var maxMessageId: Int = 0
     var sentMessages: [(stream: String, topic: String, content: String)] = []
 
     func configure(
         shouldThrowBadQueueOnFirstPoll: Bool = false,
         simulatedFailureCountBeforeRecovery: Int = 0,
         catchUpMessages: [ZulipRawMessage] = [],
-        pollBatchesByQueue: [String: [[ZulipEventEnvelope]]] = [:]
+        pollBatchesByQueue: [String: [[ZulipEventEnvelope]]] = [:],
+        maxMessageId: Int = 0
     ) {
         self.shouldThrowBadQueueOnFirstPoll = shouldThrowBadQueueOnFirstPoll
         self.simulatedFailureCountBeforeRecovery = simulatedFailureCountBeforeRecovery
         self.catchUpMessages = catchUpMessages
         self.pollBatchesByQueue = pollBatchesByQueue
+        self.maxMessageId = maxMessageId
     }
 
     func registerEventQueue(identity: ZulipBotIdentity, eventTypes: [String]) async throws -> ZulipRegisterResponse {
@@ -33,7 +36,7 @@ private actor MockZulipTransport: ZulipTransport {
         }
         let qid = "queue-\(nextQueueNumber)"
         nextQueueNumber += 1
-        return ZulipRegisterResponse(queueId: qid, lastEventId: 100)
+        return ZulipRegisterResponse(queueId: qid, lastEventId: 100, maxMessageId: maxMessageId)
     }
 
     func getEvents(identity: ZulipBotIdentity, queueId: String, lastEventId: Int) async throws -> ZulipEventsResponse {
@@ -892,5 +895,81 @@ struct Phase5BotServicesTests {
         #expect(firstComment.idempotencyKey == secondComment.idempotencyKey)
         #expect(secondComment.wasDeduplicated == true)
         #expect(LinearSyncClient.stableIdempotencyDigest("[AG·sess42] progress").count == 64)
+
+        // A second claim reuses the cached workflow state id instead of
+        // querying Linear again.
+        let lookupsAfterFirstClaim = await transport.lookups()
+        _ = try await client.claim(
+            issueId: "BF-2513",
+            branch: "ag/bf-phase5-bot-services",
+            worktree: "~/apps/lanes/BotFleet/antigravity-phase5-bot-services"
+        )
+        #expect(await transport.lookups() == lookupsAfterFirstClaim)
+    }
+
+    @Test("A first Zulip registration anchors one window back, so recent traffic is not skipped")
+    func zulipFirstRegistrationAnchorsRecentWindow() async throws {
+        let identity = try ZulipBotIdentity(
+            realmURL: zulipTestRealmURL,
+            botEmail: "ag-bot@simplewithus.zulipchat.com",
+            apiKey: "bot-key",
+            seat: "AG",
+            sessionId: "session8"
+        )
+        let transport = MockZulipTransport()
+        let recent = ZulipRawMessage(
+            id: 4500,
+            senderEmail: "mm-bot@simplewithus.zulipchat.com",
+            senderFullName: "MM",
+            streamName: "Work-In-Progress",
+            subject: "BF-2512",
+            content: "Recent message the bot must not skip",
+            timestamp: 50
+        )
+        await transport.configure(
+            catchUpMessages: [recent],
+            pollBatchesByQueue: [:],
+            maxMessageId: 5000
+        )
+
+        let actor = ZulipEventActor(
+            identity: identity,
+            transport: transport,
+            randomFactorProvider: { 1.0 },
+            sleepHandler: { _ in }
+        )
+
+        let emitted = try await actor.pollOnce()
+        #expect(emitted.map(\.id) == [4500])
+        #expect(await actor.highWaterMessageId == 5000)
+    }
+
+    @Test("The fence escaper encodes the Unicode line terminators")
+    func zulipFenceEscapesUnicodeLineTerminators() {
+        let raw = ZulipRawMessage(
+            id: 888,
+            senderEmail: "peer-bot@simplewithus.zulipchat.com",
+            senderFullName: "Peer Bot",
+            streamName: "Work-In-Progress",
+            subject: "BF-2512\u{2028}injected",
+            content: "hello",
+            timestamp: 1_730_000_000
+        )
+        let fenced = ZulipFencedMessage(from: raw)
+        #expect(!fenced.fencedContent.contains("\u{2028}"))
+        #expect(fenced.fencedContent.contains("&#8232;"))
+    }
+
+    @Test("The request reader refuses a body over the size limit")
+    func requestReaderBoundsTheBufferedRequest() {
+        let oversized = String(repeating: "x", count: NativeCompanionServer.maxRequestBytes + 1)
+        let request = "POST /api/threads/t/messages HTTP/1.1\r\nContent-Length: \(oversized.count)\r\n\r\n"
+        let data = Data(request.utf8)
+        #expect(NativeCompanionServer.declaredContentLength(data) == oversized.count)
+        #expect((NativeCompanionServer.declaredContentLength(data) ?? 0) > NativeCompanionServer.maxRequestBytes)
+
+        let small = Data("POST /api/threads/t/messages HTTP/1.1\r\nContent-Length: 12\r\n\r\nhello world!".utf8)
+        #expect(NativeCompanionServer.declaredContentLength(small) == 12)
+        #expect(NativeCompanionServer.requestBodyIsComplete(small))
     }
 }

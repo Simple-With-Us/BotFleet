@@ -258,6 +258,13 @@ public actor NativeRoutinesSchedulerActor {
         guard let resolvedRoutine = routine ?? routinesById[queuedRun.routineId] else {
             throw RoutineSchedulerError.routineNotFound(queuedRun.routineId)
         }
+        // The same reservation `fireRoutine` takes.  Without it a concurrent
+        // resume could run a queued id while a fire is still persisting it.
+        guard !inFlightRunIds.contains(queuedRun.id) else {
+            throw RoutineSchedulerError.duplicateRunExecutionRefused(queuedRun.id)
+        }
+        inFlightRunIds.insert(queuedRun.id)
+        defer { inFlightRunIds.remove(queuedRun.id) }
         executedRunIds.insert(queuedRun.id)
 
         let runner = executor ?? defaultExecutor

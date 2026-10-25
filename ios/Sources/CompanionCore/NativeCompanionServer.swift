@@ -467,6 +467,15 @@ public actor NativeCompanionServer {
     public static let defaultSearchLimit: Int = 50
     public static let maxSearchLimit: Int = 500
 
+    /// The largest request the server buffers, in bytes.  A request is
+    /// buffered before it is routed or authenticated, so an unauthenticated
+    /// peer must not be able to grow the process's memory.
+    public static let maxRequestBytes: Int = 256 * 1024
+
+    /// How many SSE frames are kept for a subscriber that is not reading.
+    /// The newest frames win, so a slow client cannot grow the buffer.
+    public static let sseBufferCapacity: Int = 256
+
     /// The address returned for a peer whose endpoint kind this server does not
     /// recognise.  It is deliberately not a loopback address: an unclassified
     /// peer must fail the loopback gate closed, not open.
@@ -594,8 +603,15 @@ public actor NativeCompanionServer {
 
     /// Subscribes to Server-Sent Events emitted by the companion server.
     public func subscribeSSE() -> AsyncStream<String> {
+        subscribeSSEWithIdentifier().stream
+    }
+
+    /// Subscribes to Server-Sent Events and returns the subscriber's id, so a
+    /// caller that owns the transport can retire the subscription itself
+    /// instead of waiting for the stream to terminate.
+    func subscribeSSEWithIdentifier() -> (stream: AsyncStream<String>, id: UUID) {
         let id = UUID()
-        return AsyncStream { continuation in
+        let stream = AsyncStream<String>(bufferingPolicy: .bufferingNewest(Self.sseBufferCapacity)) { continuation in
             sseContinuationById[id] = continuation
             continuation.yield("event: connected\ndata: {\"ok\":true}\n\n")
             continuation.onTermination = { [weak self] _ in
@@ -604,6 +620,7 @@ public actor NativeCompanionServer {
                 }
             }
         }
+        return (stream, id)
     }
 
     private func removeSSESubscriber(id: UUID) {
@@ -1133,6 +1150,19 @@ public actor NativeCompanionServer {
                 connection.cancel()
                 return
             }
+            // The buffer holds the request before it is routed or
+            // authenticated, so it is bounded.  A peer that keeps sending
+            // must not be able to grow the process's memory.
+            if accumulated.count > Self.maxRequestBytes {
+                Self.rejectOversizedRequest(on: connection)
+                return
+            }
+            // A declared length over the limit is refused before the body is
+            // read, so the peer never gets to fill the buffer.
+            if let declared = Self.declaredContentLength(accumulated), declared > Self.maxRequestBytes {
+                Self.rejectOversizedRequest(on: connection)
+                return
+            }
             if Self.requestBodyIsComplete(accumulated) {
                 Task {
                     await self?.handleIncomingRequest(accumulated, on: connection)
@@ -1147,6 +1177,15 @@ public actor NativeCompanionServer {
                 await self?.receiveRequest(on: connection, buffer: accumulated)
             }
         }
+    }
+
+    /// Answers a request whose declared or actual size is over the limit and
+    /// closes the connection.
+    private static func rejectOversizedRequest(on connection: NWConnection) {
+        let response = CompanionHTTPResponse.error(413, "request_too_large")
+        connection.send(content: serializeHTTPResponse(response), completion: .contentProcessed { _ in
+            connection.cancel()
+        })
     }
 
     /// Serves one complete request off an accepted socket.
@@ -1183,11 +1222,21 @@ public actor NativeCompanionServer {
         }
         let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
         connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
-        let stream = subscribeSSE()
-        Task.detached {
-            for await frame in stream {
-                connection.send(content: Data(frame.utf8), completion: .contentProcessed { _ in })
+        let subscription = subscribeSSEWithIdentifier()
+        Task.detached { [weak self] in
+            for await frame in subscription.stream {
+                // A write that fails means the peer is gone.  The loop ends
+                // there, so the task and its subscriber do not outlive the
+                // connection.
+                let failed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                    connection.send(content: Data(frame.utf8), completion: .contentProcessed { error in
+                        continuation.resume(returning: error != nil)
+                    })
+                }
+                if failed { break }
             }
+            await self?.removeSSESubscriber(id: subscription.id)
+            connection.cancel()
         }
     }
 
@@ -1197,22 +1246,26 @@ public actor NativeCompanionServer {
         guard let separator = data.range(of: Data("\r\n\r\n".utf8)) else {
             return false
         }
-        let headData = data[data.startIndex..<separator.lowerBound]
         let bodyLength = data.distance(from: separator.upperBound, to: data.endIndex)
-        guard let head = String(data: headData, encoding: .utf8) else {
-            return false
-        }
-        var declared = 0
+        let declared = declaredContentLength(data) ?? 0
+        guard declared > 0 else { return true }
+        return bodyLength >= declared
+    }
+
+    /// The `Content-Length` declared in a request's header block, if the
+    /// header block has arrived and the value is a number.
+    static func declaredContentLength(_ data: Data) -> Int? {
+        guard let separator = data.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let headData = data[data.startIndex..<separator.lowerBound]
+        guard let head = String(data: headData, encoding: .utf8) else { return nil }
         for line in head.components(separatedBy: "\r\n") {
             guard let colon = line.firstIndex(of: ":") else { continue }
             let name = String(line[..<colon]).trimmingCharacters(in: .whitespaces).lowercased()
             guard name == "content-length" else { continue }
             let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
-            guard let parsed = Int(value), parsed >= 0 else { return false }
-            declared = parsed
+            return Int(value)
         }
-        guard declared > 0 else { return true }
-        return bodyLength >= declared
+        return nil
     }
 
     private static func extractRemoteAddress(from endpoint: NWEndpoint) -> String {
