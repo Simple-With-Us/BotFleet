@@ -17,6 +17,11 @@ struct BotFleetMacApp: App {
                 .onAppear {
                     session.connect()
                 }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                    Task {
+                        await session.handleAppTermination()
+                    }
+                }
         }
         .windowStyle(.titleBar)
         .defaultSize(width: 1120, height: 760)
@@ -45,12 +50,24 @@ struct BotFleetMacApp: App {
                 }
                 .keyboardShortcut(".", modifiers: [.command])
                 .disabled(session.activeStreamingText == nil)
+
+                Divider()
+
+                Button("Stop Desktop Control (Emergency Stop)") {
+                    session.triggerCuaEmergencyStop()
+                }
+                .keyboardShortcut(.escape, modifiers: [.command, .shift])
+
+                Button("Shut Down Server & Local VM") {
+                    Task { await session.shutDownServerAndLocalVM() }
+                }
+                .disabled(session.isShuttingDownServer)
             }
         }
 
         #if os(macOS)
         Settings {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 20) {
                 Text("BotFleet Desktop Settings")
                     .font(.headline)
 
@@ -67,10 +84,54 @@ struct BotFleetMacApp: App {
                     session.connect(host: session.host, port: session.port)
                 }
 
+                Divider()
+
+                GroupBox("Remote Wake & Lifecycle") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle(
+                            "Allow iOS Remote Desktop Launch",
+                            isOn: Binding(
+                                get: { session.lifecycleSettings.allowRemoteDesktopLaunch },
+                                set: { newValue in
+                                    var updated = session.lifecycleSettings
+                                    updated.allowRemoteDesktopLaunch = newValue
+                                    Task { await session.saveLifecycleSettings(updated) }
+                                }
+                            )
+                        )
+
+                        Toggle(
+                            "Keep Server Running When Window Closes",
+                            isOn: Binding(
+                                get: { session.lifecycleSettings.persistOnExit },
+                                set: { newValue in
+                                    var updated = session.lifecycleSettings
+                                    updated.persistOnExit = newValue
+                                    Task { await session.saveLifecycleSettings(updated) }
+                                }
+                            )
+                        )
+
+                        HStack {
+                            Button(role: .destructive) {
+                                Task { await session.shutDownServerAndLocalVM() }
+                            } label: {
+                                Text(session.isShuttingDownServer ? "Shutting Down…" : "Shut Down Server & Local VM")
+                            }
+                            .disabled(session.isShuttingDownServer)
+
+                            Spacer()
+                        }
+                        .padding(.top, 4)
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 Spacer()
             }
             .padding(24)
-            .frame(width: 440, height: 260)
+            .frame(width: 480, height: 380)
         }
         #endif
     }
