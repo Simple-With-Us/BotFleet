@@ -31,8 +31,8 @@ inside a URL, email, filename, or a brand name containing a period.
 
 Jay, Fri, Oct 23:  update the rule everywhere, so it is the same on every surface.  Between
 sentences, write a **real U+00A0 (no-break space) followed by a normal space**.  That covers
-chat replies in every pane, Zulip, GitHub PR and issue text and review comments, Linear,
-Slack, commit messages, repo docs and Markdown, skills, agent instructions, and UI copy.
+chat replies, Zulip, GitHub PR and issue text and review comments, Linear,
+Slack, commit messages, repo docs and Markdown, skills, agent instructions, and UI copy, on every surface but the two chat panes named below.
 
 - **The one exception:  the chat panes of Claude Code (the Code tab) and MiniMax Code (the
   MiniMax Code pane).**  Those panes normalize a raw U+00A0 away and collapse two ASCII
@@ -68,7 +68,7 @@ depends on the surface, so pick by destination:
 
 | Destination | Use | Why |
 |---|---|---|
-| **Every surface** — chat replies in any pane, Zulip, GitHub PR and issue titles, bodies and comments, review comments, Linear, Slack, commit messages, repo docs and Markdown, skills and agent instructions, rendered product copy | a real U+00A0 plus a normal space | Owner ruling 2026-10-23:  one rule everywhere.  Two ASCII spaces collapse on rendered surfaces, and the `&nbsp;` entity shows as literal text in squash commits, plain-text email and many APIs.  This replaces every earlier per-surface row. |
+| **Every surface** — chat replies in any other pane, Zulip, GitHub PR and issue titles, bodies and comments, review comments, Linear, Slack, commit messages, repo docs and Markdown, skills and agent instructions, rendered product copy | a real U+00A0 plus a normal space | Owner ruling 2026-10-23:  one rule everywhere.  Two ASCII spaces collapse on rendered surfaces, and the `&nbsp;` entity shows as literal text in squash commits, plain-text email and many APIs.  This replaces every earlier per-surface row. |
 | **Claude Code Code tab and the MiniMax Code chat pane: chat replies** (owner-verified 2026-10-08 with a screenshot, and 2026-10-18 for the MiniMax Code pane) | the `&nbsp;` entity plus a normal space, outside code spans:  `End.&nbsp; Next.` | The one exception.  These panes normalize a raw U+00A0 away (a verified reply held 0 NBSPs) and collapse two ASCII spaces, so the entity is the form that renders a real gap there.  The entity is never the form anywhere else. |
 | **HTML / JSX / Swift source for product copy** | Swift `"\u{00A0} "`, JS/TS strings `"\u00A0 "`, JSX text `{'\u00A0'}` plus a space or `&#160;`, HTML markup source `&#160;`, or a shared `SENTENCE_GAP` constant | The rendered result is the same U+00A0 plus a space.  Never `&nbsp; `. |
 | **Code, identifiers and machine-readable config** | no gap character | Never put U+00A0 into code, identifiers or config. |

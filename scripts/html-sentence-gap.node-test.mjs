@@ -8,7 +8,16 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const ELECTRON_MAIN = join(ROOT, "electron/main.mjs");
 const COMPANION_CONTROL = join(ROOT, "companion/src/control.ts");
-const PORTABLE_SKILL = join(ROOT, ".claude/skills/sentence-gap/SKILL.md");
+
+// The packs in this repo that state the sentence-gap rule.  Every one of them
+// has to name the one chat-pane exception, because a seat that reads only one
+// pack must still learn that its own chat pane takes the `&nbsp;` entity.
+const RULE_STATING_PACKS = [
+  ".claude/skills/sentence-gap/SKILL.md",
+  ".claude/skills/fleet-coordination/SKILL.md",
+  ".claude/skills/owner-copy/SKILL.md",
+  ".claude/skills/land-lane/SKILL.md",
+];
 
 /** Read a repo source file as text, with line endings normalised. */
 const read = (path) => readFileSync(path, "utf8").replace(/\r\n/g, "\n");
@@ -56,26 +65,64 @@ test("the companion control page does not hang a sentence gap off a non-sentence
 // panes of Claude Code (the Code tab) and MiniMax Code (the MiniMax Code pane) take
 // the `&nbsp;` entity plus a normal space, because those panes normalize a raw
 // U+00A0 away and collapse two ASCII spaces.  Every other surface takes the real
-// U+00A0.  The portable skill is what the cloud agents read, so a copy of it that
-// still says "never write the entity" with no exception sends every seat down the
-// wrong path, which is exactly what it did until 2026-10-25.
+// U+00A0.  The portable packs are what the cloud agents read, so a copy that still
+// says "never write the entity" with no exception sends every seat down the wrong
+// path, which is exactly what it did until 2026-10-25.
+//
+// The gate covers every pack that states the rule, not only the gap skill:  a seat
+// that opens owner-copy or land-lane instead of sentence-gap must learn the same
+// exception from it.
 
-test("the portable gap skill names the one chat-pane exception", () => {
-  const source = read(PORTABLE_SKILL);
-  assert.ok(
-    source.includes("MiniMax Code chat pane"),
-    ".claude/skills/sentence-gap/SKILL.md must name the MiniMax Code chat pane as an exception",
-  );
-  assert.ok(
-    source.includes("Claude Code Code tab"),
-    ".claude/skills/sentence-gap/SKILL.md must name the Claude Code Code tab as an exception",
-  );
-  assert.ok(
-    source.includes("one exception"),
-    ".claude/skills/sentence-gap/SKILL.md must state that there is one exception",
-  );
-  assert.ok(
-    !source.includes("- **Never write the `&nbsp;` entity.**"),
-    ".claude/skills/sentence-gap/SKILL.md must not ban the entity everywhere; the two chat panes take it",
-  );
+test("every pack that states the gap rule names the one chat-pane exception", () => {
+  for (const rel of RULE_STATING_PACKS) {
+    const source = read(join(ROOT, rel));
+    assert.ok(
+      source.includes("MiniMax Code"),
+      `${rel} must name the MiniMax Code chat pane as an exception`,
+    );
+    assert.ok(
+      source.includes("Claude Code"),
+      `${rel} must name the Claude Code Code tab as an exception`,
+    );
+    assert.ok(
+      source.includes("one exception"),
+      `${rel} must state that there is one exception`,
+    );
+    assert.ok(source.includes("U+00A0"), `${rel} must state the real U+00A0 rule`);
+    assert.ok(source.includes("`&nbsp;`"), `${rel} must name the entity`);
+  }
+});
+
+test("no pack bans the entity everywhere without the two chat panes", () => {
+  // The blanket bans that the exception contradicts.  Each is the pre-2026-10-25
+  // wording, where the entity was refused on every surface including the two
+  // panes that need it.
+  const blanketBans = [
+    "- **Never write the `&nbsp;` entity.**",
+    "- **Never the `&nbsp;` entity.**",
+  ];
+  for (const rel of RULE_STATING_PACKS) {
+    const source = read(join(ROOT, rel));
+    for (const ban of blanketBans) {
+      assert.ok(
+        !source.includes(ban),
+        `${rel} must not ban the entity everywhere; the two chat panes take it`,
+      );
+    }
+  }
+});
+
+test("no pack claims every chat pane takes the real U+00A0", () => {
+  // A blanket claim here contradicts the two panes, so a pack that still makes
+  // it has not absorbed the exception.
+  const blanketClaims = ["chat replies in every pane", "chat replies in any pane"];
+  for (const rel of RULE_STATING_PACKS) {
+    const source = read(join(ROOT, rel));
+    for (const claim of blanketClaims) {
+      assert.ok(
+        !source.includes(claim),
+        `${rel} must not claim "${claim}" takes the real U+00A0; the two panes take the entity`,
+      );
+    }
+  }
 });
