@@ -681,6 +681,93 @@ import {
   type InterruptedTurnRecord,
 } from "./boot-recovery.ts";
 
+// ── the provider reload fence ────────────────────────────────────────────
+//
+// This block lives at the TOP of the module on purpose.  The four bindings
+// below are read by `startTurn`, and `startTurn` is reachable WHILE this
+// module is still being evaluated.
+//
+// `jobHost.boot()` is a top-level call — it is what resumes the durable job
+// runtime after a restart — and boot dispatches a queued assignment
+// synchronously: `Runtime.tick()` -> `dispatchDue()` -> `dispatch()` ->
+// `runner.run()` -> `runTurn()` -> `startTurn()`.  `startTurn` reads
+// `providerReloadInProgress` before its first `await`, so while that binding
+// was declared further down this file the read landed in its temporal dead
+// zone and threw `Cannot access 'providerReloadInProgress' before
+// initialization`.  The assignment being dispatched then failed with
+// `provider_error` and its turn was killed.
+//
+// `tsc` cannot see this: the read is inside a function body reached through
+// a call graph that starts at module evaluation, so there is no ordering for
+// the compiler to complain about.  `server/provider-reload-order.test.ts`
+// pins the order instead — the mutation it is written against is this block
+// moving back down.
+//
+// The functions that keep the fence follow the state it keeps.  They are
+// hoisted declarations, so they can be called from anywhere in the module;
+// the state they read cannot, because a `let` is dead until its declaration
+// has run.
+
+/** The rebuild currently running, if any.  Every caller queues behind it.
+ *
+ * The sequence below is `detachAll` -> `disposeAll` -> `load` -> `attach`, and
+ * two of those overlapping is the worst outcome available: one run's `load`
+ * repopulates the registry while the other's `disposeAll` empties it, leaving
+ * instances registered but disposed, or the bus attached to a torn-down fleet.
+ * `providerConfigBusy` fences the two Settings routes, but not the secret
+ * paths — `POST /api/infisical/sync` and a late `onApplied` both reach here on
+ * their own — so the guarantee lives here, where the sequence does.
+ *
+ * Queued, not coalesced: a caller that arrives mid-run gets its OWN rebuild
+ * afterwards.  Handing it the run already in flight would be cheaper and
+ * wrong — that run read `cfg` before this caller changed it. */
+let providerReloadChain: Promise<void> = Promise.resolve();
+let pendingProviderReloads = 0;
+let providerReloadInProgress = false;
+let providerReloadGeneration = 0;
+
+async function waitForProviderReloads(): Promise<void> {
+  while (providerReloadInProgress) await providerReloadChain;
+}
+
+function finishProviderReloadMutation(): void {
+  providerReloadGeneration += 1;
+  pendingProviderReloads -= 1;
+  if (pendingProviderReloads !== 0) return;
+  providerReloadInProgress = false;
+  // Success and failure both lower the global fence.  Unaffected engines can
+  // accept deferred work after a failed mutation, and the original rejection
+  // still reaches its settings caller through serializeProviderReload.
+  drainProviderReloadContinuations();
+}
+
+function serializeProviderReload(runProviderMutation: () => Promise<void>): Promise<void> {
+  pendingProviderReloads += 1;
+  // Fence dispatch as soon as a mutation is queued, including the gap
+  // between two serialized reloads.  Otherwise the first run's drain can
+  // start work that the already-queued second run immediately disposes.
+  providerReloadInProgress = true;
+  const run = providerReloadChain.then(runProviderMutation, runProviderMutation);
+  const settled = run.then(
+    () => finishProviderReloadMutation(),
+    (error) => {
+      finishProviderReloadMutation();
+      throw error;
+    },
+  );
+  // The chain itself must never reject, or every later caller inherits the
+  // failure; the run each caller awaits still rejects normally.
+  providerReloadChain = settled.catch(() => {});
+  return settled;
+}
+
+/** Rebuild the provider fleet after a config change so new keys take
+ * effect without a server restart (kills any in-flight turns).  Serialized:
+ * see `providerReloadChain`. */
+function reloadProviders(): Promise<void> {
+  return serializeProviderReload(runProviderReload);
+}
+
 // OP7: before any other logging in this file — the launchd StandardOutPath
 // is one shared, unrotated file with the companion sidecar's already-
 // timestamped lines, and every harness line below (boot sweeps, telemetry,
@@ -11169,66 +11256,6 @@ function configStatus() {
       summarizeToolCalls: summarizeToolCallsEnabled(cfg),
     },
   };
-}
-
-/** The rebuild currently running, if any.  Every caller queues behind it.
- *
- * The sequence below is `detachAll` -> `disposeAll` -> `load` -> `attach`, and
- * two of those overlapping is the worst outcome available: one run's `load`
- * repopulates the registry while the other's `disposeAll` empties it, leaving
- * instances registered but disposed, or the bus attached to a torn-down fleet.
- * `providerConfigBusy` fences the two Settings routes, but not the secret
- * paths — `POST /api/infisical/sync` and a late `onApplied` both reach here on
- * their own — so the guarantee lives here, where the sequence does.
- *
- * Queued, not coalesced: a caller that arrives mid-run gets its OWN rebuild
- * afterwards.  Handing it the run already in flight would be cheaper and
- * wrong — that run read `cfg` before this caller changed it. */
-let providerReloadChain: Promise<void> = Promise.resolve();
-let pendingProviderReloads = 0;
-let providerReloadInProgress = false;
-let providerReloadGeneration = 0;
-
-async function waitForProviderReloads(): Promise<void> {
-  while (providerReloadInProgress) await providerReloadChain;
-}
-
-function finishProviderReloadMutation(): void {
-  providerReloadGeneration += 1;
-  pendingProviderReloads -= 1;
-  if (pendingProviderReloads !== 0) return;
-  providerReloadInProgress = false;
-  // Success and failure both lower the global fence.  Unaffected engines can
-  // accept deferred work after a failed mutation, and the original rejection
-  // still reaches its settings caller through serializeProviderReload.
-  drainProviderReloadContinuations();
-}
-
-function serializeProviderReload(runProviderMutation: () => Promise<void>): Promise<void> {
-  pendingProviderReloads += 1;
-  // Fence dispatch as soon as a mutation is queued, including the gap
-  // between two serialized reloads.  Otherwise the first run's drain can
-  // start work that the already-queued second run immediately disposes.
-  providerReloadInProgress = true;
-  const run = providerReloadChain.then(runProviderMutation, runProviderMutation);
-  const settled = run.then(
-    () => finishProviderReloadMutation(),
-    (error) => {
-      finishProviderReloadMutation();
-      throw error;
-    },
-  );
-  // The chain itself must never reject, or every later caller inherits the
-  // failure; the run each caller awaits still rejects normally.
-  providerReloadChain = settled.catch(() => {});
-  return settled;
-}
-
-/** Rebuild the provider fleet after a config change so new keys take
- * effect without a server restart (kills any in-flight turns).  Serialized:
- * see `providerReloadChain`. */
-function reloadProviders(): Promise<void> {
-  return serializeProviderReload(runProviderReload);
 }
 
 const RELOAD_REASON = "The turn was interrupted — provider settings changed";

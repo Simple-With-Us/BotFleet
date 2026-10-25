@@ -23,7 +23,7 @@ import { cn } from "@/lib/cn";
 import { taskWorkspaceContextsMatch } from "../../shared/task-workspace-context";
 
 const messageCount = (task: Task): string | null =>
-  typeof task.messageCount === "number" ? task.messageCount.toLocaleString() : null;
+  task.messageCount === undefined ? null : task.messageCount.toLocaleString();
 
 /** Oldest first, so the default destination is the one that keeps the
  * transcript in order.
@@ -222,6 +222,6 @@ export function MergeAllThreadsDialog({
   // fixed backdrop inside the sidebar column.  Under SSR (this repo's
   // component tests) there is no document to portal into, and the markup
   // renders inline.
-  if (typeof globalThis.document === "undefined") return content;
+  if (globalThis.document === undefined) return content;
   return createPortal(content, document.body);
 }
