@@ -6,7 +6,7 @@ struct BotFleetMacApp: App {
     @StateObject private var session = MacSession()
 
     init() {
-        // Any early native Mac initialization
+        // Native macOS app startup; notifications are NEVER requested at launch.
     }
 
     var body: some Scene {
@@ -15,6 +15,9 @@ struct BotFleetMacApp: App {
                 .environmentObject(session)
                 .frame(minWidth: 860, minHeight: 560)
                 .onAppear {
+                    #if os(macOS)
+                    session.menubarController.installIfNeeded()
+                    #endif
                     session.connect()
                 }
         }
@@ -27,8 +30,8 @@ struct BotFleetMacApp: App {
                 Button("About BotFleet") {
                     NSApplication.shared.orderFrontStandardAboutPanel(
                         options: [
-                            NSApplication.AboutPanelOptionKey.applicationName: "BotFleet (Native macOS)",
-                            NSApplication.AboutPanelOptionKey.version: "Option A Native Alpha",
+                            NSApplication.AboutPanelOptionKey.applicationName: "BotFleet",
+                            NSApplication.AboutPanelOptionKey.version: session.capabilities.versionStamp,
                         ]
                     )
                 }
@@ -45,32 +48,61 @@ struct BotFleetMacApp: App {
                 }
                 .keyboardShortcut(".", modifiers: [.command])
                 .disabled(session.activeStreamingText == nil)
+
+                Divider()
+
+                Menu("Settings Section") {
+                    ForEach(MacSettingsSection.allCases) { section in
+                        Button(section.displayTitle) {
+                            session.activeSettingsSection = section
+                        }
+                    }
+                }
             }
         }
 
         #if os(macOS)
         Settings {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("BotFleet Desktop Settings")
-                    .font(.headline)
+            TabView(selection: $session.activeSettingsSection) {
+                ForEach(MacSettingsSection.allCases) { section in
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text(section.displayTitle)
+                            .font(.headline)
 
-                HStack {
-                    Text("Local Harness Address:")
-                    TextField("Host", text: $session.host)
-                        .frame(width: 120)
-                    Text(":")
-                    TextField("Port", value: $session.port, format: .number.grouping(.never))
-                        .frame(width: 70)
+                        if section == .general {
+                            HStack {
+                                Text("Local Harness Address:")
+                                TextField("Host", text: $session.host)
+                                    .frame(width: 120)
+                                Text(":")
+                                TextField("Port", value: $session.port, format: .number.grouping(.never))
+                                    .frame(width: 70)
+                            }
+
+                            Button("Save and Reconnect") {
+                                session.connect(host: session.host, port: session.port)
+                            }
+                        } else if section == .permissions,
+                                  let banner = session.notificationCoordinator.settingsStatusBanner {
+                            Text(banner)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text(session.capabilities.versionStamp)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+
+                        Spacer()
+                    }
+                    .padding(24)
+                    .tabItem {
+                        Label(section.displayTitle, systemImage: section.symbolName)
+                    }
+                    .tag(section)
                 }
-
-                Button("Save and Reconnect") {
-                    session.connect(host: session.host, port: session.port)
-                }
-
-                Spacer()
             }
-            .padding(24)
-            .frame(width: 440, height: 260)
+            .frame(width: 520, height: 320)
         }
         #endif
     }
