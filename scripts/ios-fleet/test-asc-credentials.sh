@@ -753,8 +753,13 @@ got="$(bash -c 'source "'"$funcs"'"; key_preview "$1"' _ "AAAAAAAAAAAAAAAA"$'\03
 if grep -nE '\$\(asc_temp_root\)[^"]|"\$\(asc_temp_root\)/' "${here}/ship-testflight.sh" >&2; then
   fail "ship-testflight.sh expands asc_temp_root inline instead of reading its status"
 fi
-grep -cE '="\$\(asc_temp_root\)" \|\| \{' "${here}/ship-testflight.sh" | grep -qx 3 \
-  || fail "expected the three asc_temp_root callers to read its status"
+grep -cE '="\$\(asc_temp_root\)" \|\| \{' "${here}/ship-testflight.sh" | grep -qx 4 \
+  || fail "expected the four asc_temp_root callers to read its status"
+#     No mktemp may build its path from TMPDIR directly:  every temp file
+#     goes through asc_temp_root, so a root TMPDIR is refused everywhere.
+if grep -nE 'mktemp[^#]*\$\{TMPDIR' "${here}/ship-testflight.sh" >&2; then
+  fail "ship-testflight.sh builds a mktemp path from TMPDIR instead of asc_temp_root"
+fi
 # The run-level caller ends with the owner-handoff status 3 and a log line,
 # not with a silent errexit status 1.
 out_rc="$(TMPDIR=/ bash -c '
@@ -768,5 +773,27 @@ case "$out_rc" in
   *"Ship blocked: TMPDIR resolves to the filesystem root"*"rc=3") ;;
   *) fail "a root TMPDIR did not end the run with the owner-handoff status: ${out_rc}" ;;
 esac
+
+# 11. A PEM is masked over its base64 body, not its armor.  The armor is the
+#     same on every key, so two different keys have to give two different
+#     previews, and no preview may carry the armor.  The values are synthetic,
+#     and key_preview runs in a subshell, so they never reach a process argv.
+pem_a=$'-----BEGIN PRIVATE KEY-----\nMIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgSYNTHETICaaaa\nSYNTHETICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1111\n-----END PRIVATE KEY-----\n'
+pem_b=$'-----BEGIN PRIVATE KEY-----\nMIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgSYNTHETICbbbb\nSYNTHETICBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB2222\n-----END PRIVATE KEY-----\n'
+# shellcheck source=/dev/null
+prev_a="$( source "$funcs"; key_preview "$pem_a" )"
+# shellcheck source=/dev/null
+prev_b="$( source "$funcs"; key_preview "$pem_b" )"
+unset pem_a pem_b
+[[ "$prev_a" != "$prev_b" ]] || fail "two different keys gave the same preview: ${prev_a}"
+case "${prev_a}${prev_b}" in
+  *BEGIN*|*END*|*-----*) fail "a preview carried the PEM armor: ${prev_a} / ${prev_b}" ;;
+esac
+[[ "$prev_a" == "MIGTAgEA...1111" ]] || fail "a PEM preview was not first-eight/last-four of its body: ${prev_a}"
+unset prev_a prev_b
+# shellcheck source=/dev/null
+prev_raw="$( source "$funcs"; key_preview "not-a-pem-but-long-enough-to-mask-9999" )"
+[[ "$prev_raw" == "not-a-pe...9999" ]] || fail "a value without armor was not masked as itself: ${prev_raw}"
+unset prev_raw
 
 echo "ok: ASC credential resolution (environment first, then Infisical, a named path ignored, temp key removed)"

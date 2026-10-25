@@ -292,6 +292,13 @@ key_preview() {
     printf '%s' "[withheld: control character]"
     return 0
   fi
+  #  A PEM is masked over its base64 body, not its armor:  the armor is the
+  #  same string on every key ever issued, so a mask taken over it would name
+  #  nothing.  A value without armor is masked as itself.
+  if [[ "$v" == -----BEGIN*-----* ]]; then
+    v="${v#-----BEGIN*-----}"
+    v="${v%-----END*}"
+  fi
   n=${#v}
   if [[ "$n" -eq 0 ]]; then
     printf '%s' "(empty)"
@@ -844,7 +851,14 @@ asc_build_floor() {
     logerr "asc-floor: no App Store Connect credential available; cannot verify against App Store Connect"
     return 1
   fi
-  errf="$(mktemp "${TMPDIR:-/tmp}/asc-floor-err.XXXXXX")"
+  #  Read asc_temp_root's refusal here too:  a root TMPDIR would otherwise
+  #  build "/asc-floor-err.*".
+  local errf_root
+  errf_root="$(asc_temp_root)" || {
+    logerr "asc-floor: TMPDIR resolves to the filesystem root; refusing to write there, so App Store Connect cannot be verified"
+    return 1
+  }
+  errf="$(mktemp "${errf_root}/asc-floor-err.XXXXXX")"
   set +e
   out=$(asc_client build-floor "$BUNDLE_ID" "$version" "$plat" "${APPLE_ID:-}" 2>"$errf")
   rc=$?
