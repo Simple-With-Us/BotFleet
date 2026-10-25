@@ -6,7 +6,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { buildMacFeed, regenerateMacFeed } from "./regenerate-mac-feed.mjs";
+import { buildMacFeed, macArtifactNames, regenerateMacFeed, resolveFeedVersion } from "./regenerate-mac-feed.mjs";
 import { verifyReleaseAssets } from "./verify-release-assets.mjs";
 import { verifyReleaseTag } from "./verify-release-tag.mjs";
 
@@ -74,6 +74,74 @@ test("mac feed regeneration replaces duplicate intermediate entries deterministi
     assert.doesNotThrow(() => verifyReleaseAssets(directory, VERSION));
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the mac feed names the stamped release, not the package.json floor", () => {
+  // package.json's version is the FLOOR of the stamp scheme, and it is also
+  // the version already installed on the owner's Mac.  The first unified
+  // release died regenerating the feed because the script fell back to it:
+  // the run looked for BotFleet-1.0.31-arm64.zip while the build had made
+  // BotFleet-1.0.2193-arm64.zip.
+  assert.equal(resolveFeedVersion({ env: { BOTFLEET_BUILD_VERSION: " 1.0.2193 " } }), "1.0.2193");
+  // An unset or blank stamp falls back to the floor, which is right for a
+  // local build that never stamped one.
+  assert.equal(resolveFeedVersion({ env: { BOTFLEET_BUILD_VERSION: "" } }), VERSION);
+  assert.equal(resolveFeedVersion({ env: {} }), VERSION);
+
+  // And the feed the release writes names the stamped version and its files.
+  const pinned = "1.0.2193";
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-feed-"));
+  try {
+    for (const file of macArtifactNames(pinned)) {
+      writeFileSync(join(directory, file), `bytes:${file}`);
+    }
+    const feedPath = join(directory, "latest-mac.yml");
+    regenerateMacFeed({
+      feedPath,
+      version: resolveFeedVersion({ env: { BOTFLEET_BUILD_VERSION: pinned } }),
+      releaseDate: "2026-10-24T00:00:00.000Z",
+    });
+    const feed = readFileSync(feedPath, "utf8");
+    assert.match(feed, new RegExp(`^version: ${pinned}$`, "m"));
+    for (const file of macArtifactNames(pinned)) {
+      assert.ok(feed.includes(file), `the feed lists ${file}`);
+    }
+    assert.doesNotMatch(feed, new RegExp(`^version: ${VERSION}$`, "m"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a missing release artifact names the version instead of failing bare", () => {
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-feed-missing-"));
+  try {
+    assert.throws(
+      () => buildMacFeed(directory, "1.0.2193"),
+      /missing release artifact BotFleet-1\.0\.2193-arm64\.zip for version 1\.0\.2193/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the release workflow hands the pinned version to every feed regeneration", () => {
+  const workflow = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8").replace(/\r\n/g, "\n");
+  const macMerge = workflow.slice(workflow.indexOf("\n  mac-merge:"), workflow.indexOf("\n  assemble:"));
+  assert.ok(macMerge.length > 0, "the workflow has a mac-merge job");
+
+  // The feed has to describe the release that was just built.  The script
+  // falls back to package.json's version when it is not told which release
+  // this is, and that fallback is the floor of the stamp scheme.
+  assert.match(macMerge, /node scripts\/regenerate-mac-feed\.mjs release\/latest-mac\.yml "\$v"/);
+  assert.match(macMerge, /v="\$\{\{ needs\.prepare\.outputs\.version \}\}"/);
+
+  // Every call in the workflow names the version, so no release can drift
+  // back onto the floor.
+  const calls = [...workflow.matchAll(/node scripts\/regenerate-mac-feed\.mjs[^\n]*/g)].map((match) => match[0]);
+  assert.ok(calls.length > 0, "the workflow regenerates the feed");
+  for (const call of calls) {
+    assert.match(call, /"\$v"/, `the feed regeneration names the version: ${call}`);
   }
 });
 

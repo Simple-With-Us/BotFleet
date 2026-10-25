@@ -233,8 +233,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                     mcpServerState: mcpServerState)
         if !wheelhouse.entries.isEmpty {
             menu.addItem(.separator())
-            add("Wheelhouse:")
-            for entry in wheelhouse.entries { add("  \(entry.title): \(entry.summary)") }
+            for entry in wheelhouse.entries { add("\(entry.title): \(entry.summary)") }
         }
         menu.addItem(.separator())
         add("Start Server", selector: #selector(startServer), enabled: ready && startup.supportsPolicy && apiUnavailable && installedServerState == .stopped)
