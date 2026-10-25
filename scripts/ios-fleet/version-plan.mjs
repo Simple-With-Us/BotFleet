@@ -100,6 +100,38 @@ export function isDriftTrain(trainVersion, buildVersions, prefix) {
 }
 
 /**
+ * The marketing version of an App Store version entry.
+ *
+ * The API answers with either a plain version string or an object carrying
+ * versionString, so this boundary helper picks the domain value once, and the
+ * callers below branch on that value instead of narrowing a representation at
+ * runtime.
+ */
+function appStoreVersionString(entry) {
+  if (entry === null || entry === undefined) return null;
+  const value = entry.versionString;
+  return value === undefined ? entry : value;
+}
+
+/**
+ * The version of a TestFlight train entry, in the same shape as the entry
+ * itself: a plain version string, or an object carrying version.
+ */
+function trainVersionString(train) {
+  if (train === null || train === undefined) return null;
+  const value = train.version;
+  return value === undefined ? train : value;
+}
+
+/** The builds a TestFlight train entry holds; a plain version holds none. */
+function trainBuildList(train) {
+  if (train === null || train === undefined) return [];
+  const value = train.builds;
+  if (value === undefined) return [];
+  return value || [];
+}
+
+/**
  * The highest patch already used on a train.
  *
  * appStoreVersions: ["1.0.235"]  -- the App Store versions, never ignored.
@@ -117,14 +149,14 @@ export function latestMarketingPatch({ prefix, appStoreVersions = [], trains = [
   };
 
   for (const version of appStoreVersions || []) {
-    const value = typeof version === "string" ? version : version?.versionString;
+    const value = appStoreVersionString(version);
     consider(parsePatch(value, prefix));
   }
 
   for (const train of trains || []) {
     if (!train) continue;
-    const version = typeof train === "string" ? train : train.version;
-    const builds = typeof train === "string" ? [] : train.builds || [];
+    const version = trainVersionString(train);
+    const builds = trainBuildList(train);
     if (isDriftTrain(version, builds, prefix)) continue;
     consider(parsePatch(version, prefix));
   }
@@ -144,12 +176,12 @@ export function nextMarketingPatch({ prefix, appStoreVersions = [], trains = [] 
   const taken = new Set();
   for (const train of trains || []) {
     if (!train) continue;
-    const version = typeof train === "string" ? train : train.version;
+    const version = trainVersionString(train);
     const patch = parsePatch(version, prefix);
     if (patch !== null) taken.add(patch);
   }
   for (const version of appStoreVersions || []) {
-    const value = typeof version === "string" ? version : version?.versionString;
+    const value = appStoreVersionString(version);
     const patch = parsePatch(value, prefix);
     if (patch !== null) taken.add(patch);
   }
