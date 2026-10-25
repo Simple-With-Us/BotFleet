@@ -122,7 +122,8 @@ if (isEntryModule()) {
   if (!statePath || !existsSync(statePath)) {
     console.error(
       "usage: node scripts/check-decommission-gates.mjs <state.json>\n" +
-        'state.json: {"issues": {"BF-2510": "Done", ...}, "evidence": {"soak-24h-no-node": true, ...}}',
+        'state.json: {"issues": {"BF-2510": "Done", ...}, "evidence": {"soak-24h-no-node": true, ...}}\n' +
+        "the deletion order this gate protects: docs/native-rewrite-decommission-runbook.md",
     );
     process.exit(2);
   }

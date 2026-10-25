@@ -6,10 +6,12 @@ native. Gated-by reference for **BF-2514** (Phase 5 single-writer cutover and
 decommission): neither lands until every row below has a Swift owner or a
 retired reason.
 
-Surveyed at commit `c7902d63` (2026-10-21):
-`server/` 359 non-test files, ~140,350 lines · `companion/src/` 16 files,
-~7,462 lines · `shared/` 55 non-test files, ~10,448 lines (zero `node:`
-imports — all portable) · `electron/` 112 `.mjs`/`.cjs` files.
+Surveyed at commit `c7902d63` (2026-10-21), re-counted 2026-10-25:
+`server/` 374 non-test files, ~142,800 lines · `companion/src/` 17 files,
+~11,330 lines · `shared/` 58 non-test files, ~11,050 lines (zero `node:`
+imports in source — only the three `*.test.ts` files reach for `node:fs`, so
+the portable set really is portable) · `electron/` 122 `.mjs`/`.cjs` files,
+135 tracked in total.
 
 Phases (reconstructed from the rewrite issue texts; `*` = no covering issue
 yet, file a follow-up before Phase 5):
@@ -56,7 +58,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/resume-recovery.ts`, `server/turn-worktree-admission.ts` | Resume/rebuild → `EngineDriver` BF-2504 + per-bot switch BF-2508 |
 | `server/checkpoints.ts` | Per-turn workspace snapshots → `EngineDriver` BF-2504 (git-based, reimplement with libgit2 or `git` CLI) |
 | `server/worktree-leases.ts` | Lease queue → `EngineDriver` BF-2504 |
-| `server/testing/*` (23 fakes/harness files) | Retired; replaced by `ReplayHarness` fixtures BF-2503 |
+| `server/testing/*` (28 fakes/harness files) | Retired; replaced by `ReplayHarness` fixtures BF-2503 |
 | `server/provider-reload-order.test.ts` | Guards the module-scope provider reload fence in `server/index.ts` (the temporal-dead-zone read that surfaced as `provider_error`) → `EngineCoordinator` BF-2504, where the fence becomes actor state; the test retires with the file in BF-2515 |
 | `server/index.ts` (composition root: routes, boot wiring, harness entry) | Wiring collapses into `LifecycleService` BF-2497 and the Phase 5 actors; the file itself retires BF-2515 |
 | `server/cli-failure.ts`, `server/cli-probe-env.ts`, `server/stderr-excerpt.ts`, `server/host-dispatch-hot.ts` | Engine support (failure wording, credential-free probe env, shared host probe) → `EngineDriver` BF-2504 |
@@ -98,7 +100,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 
 | Node file(s) | Swift owner |
 |---|---|
-| `server/zulip/*` (13 files: client, hub, router, outbound, webhook, wire, credentials, format, mount, state, sentence-gap, outgoing-spool, types) + `server/tools/zulip.ts`, `server/plugin-zulip-dispatch.ts` | `ZulipEventActor` + Linear sync BF-2512 |
+| `server/zulip/*` (23 files: client, hub, router, outbound, webhook, wire, credentials, format, mount, state, sentence-gap, outgoing-spool, types and their siblings) + `server/tools/zulip.ts`, `server/plugin-zulip-dispatch.ts` | `ZulipEventActor` + Linear sync BF-2512 |
 | `server/webhooks.ts`, `webhook-ingress.ts`, `webhook-payload.ts`, `server/routes/linq-webhook.ts` | Webhook ingress → `RoutinesScheduler` BF-2513 |
 | `server/routines.ts` (engine), `routine-requests.ts`, `resource-triggers.ts`, `trigger-gap.ts`, `automation-rollover.ts`, `ephemeral-dispatch.ts`, `room-queue.ts`, `room-turn-timeout.ts`, `room-cwd.ts`, `steer-queue.ts`, `member-turn.ts`, `delegations.ts`, `server/runtime/{runtime,envelope,level,tree,invariants,types}.ts`, `server/jobs/{admission,engine-fixtures,engine-lanes,mcp-lane,prompt,runner,sweep,wake,wake-usage}.ts`, `server/job-host.ts`, `server/update-turn-starter.ts`, `server/update-drain.ts`, `server/task-title.ts` | Scheduler + delegation runtime → `RoutinesScheduler` BF-2513; `update-drain` admission fence → cutover procedure BF-2514 |
 | `server/linq/{client,dispatch,outbound,types}.ts`, `server/routes/linq-webhook.ts`, `server/tools/linq.ts` | Linq partner channel → Phase 4* (no covering issue; file follow-up: third comms actor or fold into `ZulipEventActor` pattern) |
@@ -115,8 +117,8 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `companion/src/mdns.ts`, `advertise-watch.ts`, `endpoints.ts`, `connected-devices.ts` | Discovery + presence → `NetworkService` (Network.framework/Bonjour) BF-2511 |
 | `companion/src/apns.ts` | APNs provider → push relay BF-2511 (server-side JWT stays out of the app) |
 | `companion/src/json.ts` | Trivial guards → fold into `NetworkService` |
-| `companion/test/*` (18 files), `scripts/capture-companion-fixtures.mjs` | Retired Phase 6; iOS parity covered by native `XCTest` + BF-2503-style fixtures |
-| `scripts/botfleet-companion-start.sh`, `scripts/launchd/app.botfleet.companion.plist`, `electron/managed-companion-*.mjs`, `companion-guardian/tunnel/account-service` | LaunchAgent supervision → retired Phase 5 BF-2514 (app as login item owns its sidecar or none) |
+| `companion/test/*` (19 files), `scripts/capture-companion-fixtures.mjs` | Retired Phase 6; iOS parity covered by native `XCTest` + BF-2503-style fixtures |
+| `scripts/botfleet-companion-start.sh`, `scripts/launchd/app.botfleet.companion.plist`, `electron/managed-companion-*.mjs`, `electron/companion-*.mjs` | LaunchAgent supervision → retired Phase 5 BF-2514 (app as login item owns its sidecar or none) |
 | `ios/Sources/CompanionCore/*`, `ios/App/*` | Already Swift; endpoint contract follows BF-2510 decision, build per BF-2511 |
 
 ## 6. Mac app shell and lifecycle → Phase 3 / Phase 5
