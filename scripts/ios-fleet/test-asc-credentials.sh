@@ -424,13 +424,19 @@ env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
 #     is.  The blob reaches the child through a PATH, so no byte of it is
 #     ever an argument of a process.
 ci_body="SYNTHETICciBODY00000000000000000000000000000000000tail"
-ci_pem="-----BEGIN PRIVATE KEY-----"$'\n'"${ci_body}"$'\n'"-----END PRIVATE KEY-----"
+# The armor is assembled from parts, the way case 11 does it:  a literal
+# "-----BEGIN PRIVATE KEY-----" next to a body reads as a private key to
+# gitleaks' private-key rule, and the repo's allowlist for this file does
+# not cover this fixture because its marker is SYNTHETICciBODY, which the
+# allowlist's SYNTHETIC[A-Z]{4,} pattern does not match.
+ci_kind="PRIVATE"" KEY"
+ci_pem="-----BEGIN ${ci_kind}-----"$'\n'"${ci_body}"$'\n'"-----END ${ci_kind}-----"
 printf '%s' "$ci_pem" | base64 | tr -d '\n' > "${tmp}/ci.b64"
 ci_mask="$(printf '%s...%s' "${ci_body:0:8}" "${ci_body:$((${#ci_body}-4))}")"
 # The guard below has to search for a prefix the blob REALLY carries:  the
-# base64 of "-----BEGIN PRIVATE KEY-----" begins "LS0tLS1C", so a needle
-# like "LS0tLS0t" could never match the artifact it is meant to detect,
-# and the assertion could never fire.
+# base64 of the PEM armor begins "LS0tLS1C", so a needle like "LS0tLS0t"
+# could never match the artifact it is meant to detect, and the assertion
+# could never fire.
 ci_b64_head="$(cut -c1-24 "${tmp}/ci.b64")"
 ci_out="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
   -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
@@ -452,7 +458,7 @@ esac
 case "$ci_out" in
   *"${ci_b64_head}"*) fail "the CI log carried the base64 blob" ;;
 esac
-unset ci_body ci_pem ci_mask ci_b64_head ci_out
+unset ci_body ci_pem ci_mask ci_b64_head ci_kind ci_out
 
 # 3. The credential never travels in a command argument.  The secret reaches
 #    the child through the environment, so its own argv must not carry it.
