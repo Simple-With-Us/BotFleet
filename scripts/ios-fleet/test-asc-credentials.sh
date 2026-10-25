@@ -66,7 +66,7 @@ chmod 700 "${tmp}/no-vault"
 
 extract() {
   awk '
-    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_label\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
+    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_label\(\) \{/ || /^asc_public_key_id\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
     grab { print }
     grab && /^\}/ { grab = 0 }
   ' "$script"
@@ -827,5 +827,36 @@ for kid in ABCDE12345 "" "bad id"; do
   fi
 done
 unset kid want_id out syn_pem syn_body pem_kind
+
+# 12. A rejected credential is named by its KEY ID, which is a public label
+#     that travels in every App Store Connect request header, and by nothing
+#     that came out of the key.  The id is resolved from the sources the
+#     client resolves it from, in the client's order:  the APPLE_API_* trio
+#     first, then ASC_KEY_ID in the environment, then Infisical /asc.  An id
+#     that does not look like one is reported as unrecognized, so a mis-set
+#     value never reaches the log raw.
+run_public_id() {  # env assignments..., then asc_public_key_id
+  env -u APPLE_API_KEY_ID -u ASC_KEY_ID "$@" bash -c '
+    source "'"$funcs"'"
+    asc_public_key_id
+  ' 2>&1
+}
+out="$(run_public_id APPLE_API_KEY_ID=ABCDE12345)"
+[[ "$out" == "ABCDE12345" ]] || fail "the APPLE_API_* key id was not named: ${out}"
+out="$(run_public_id ASC_KEY_ID=ZZZZZZZZZZ)"
+[[ "$out" == "ZZZZZZZZZZ" ]] || fail "the ASC_KEY_ID key id was not named: ${out}"
+out="$(run_public_id)"
+[[ "$out" == "ABCDE12345" ]] || fail "the Infisical key id was not named: ${out}"
+# The APPLE_API_* name wins over the environment and over Infisical, because
+# that is the order the client resolves the credential in.
+out="$(run_public_id APPLE_API_KEY_ID=ABCDE12345 ASC_KEY_ID=ZZZZZZZZZZ)"
+[[ "$out" == "ABCDE12345" ]] || fail "the APPLE_API_* key id did not win: ${out}"
+# An id that does not look like one is withheld, not printed raw.
+out="$(env -u APPLE_API_KEY_ID ASC_KEY_ID='bad id' bash -c '
+  source "'"$funcs"'"
+  key_label "$(asc_public_key_id)"
+' 2>&1)"
+[[ "$out" == "unrecognized" ]] || fail "a malformed key id was not withheld: ${out}"
+unset out
 
 echo "ok: ASC credential resolution (environment first, then Infisical, a named path ignored, temp key removed)"

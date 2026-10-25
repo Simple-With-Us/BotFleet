@@ -166,6 +166,7 @@ run_ship() {
     IOS_FLEET_STATE_DIR="$STATE" \
     FLEET_SECRETS="${FAKE_BIN}/fleet-secrets" \
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
+    ASC_KEY_ID="${TEST_ASC_KEY_ID:-}" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
     bash "$SHIP" "$@" 2>&1)"
@@ -515,6 +516,18 @@ run_ship botfleet --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "a rejected key fails the run (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
 check "says the key was rejected" "$(contains 'rejected the API key' && echo 0 || echo 1)"
 check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || echo 0)"
+# The rejected credential is named by its KEY ID, the public label that
+# travels in every App Store Connect request header, so the owner knows which
+# key Apple refused.  No part of the key is printed:  a slice of a private key
+# is private-key-derived material, and a first-8/last-4 slice identifies
+# nothing, while the key id identifies exactly one key.
+TEST_ASC_KEY_ID="ABCDE12345"
+run_ship botfleet --repo-root "$REPO" --allow-unverified-seq --dry-run
+check "names the rejected key by its key id" \
+  "$(contains 'key id ABCDE12345' && echo 0 || echo 1)"
+check "prints no preview of the key" \
+  "$([[ "$OUT" != *preview* ]] && echo 0 || echo 1)"
+TEST_ASC_KEY_ID=""
 FAKE_ASC_PATCH=236
 echo
 

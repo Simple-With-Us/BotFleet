@@ -281,6 +281,19 @@ key_label() {
   fi
 }
 
+# The public label of the credential the App Store Connect client used:  the
+# key id, which travels in every request header and is not part of the key.
+# The order is the client's own (asc-api.mjs):  the APPLE_API_* trio first,
+# then ASC_KEY_ID in the environment, then Infisical /asc.  The private key is
+# never read here and nothing derived from it is ever printed (BF-2542).
+# An unknown id prints nothing, and key_label turns that into "missing".
+asc_public_key_id() {
+  local id="${APPLE_API_KEY_ID:-}"
+  [[ -n "$id" ]] || id="${ASC_KEY_ID:-}"
+  [[ -n "$id" ]] || id="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
+  printf '%s' "$id"
+}
+
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
 # exported ASC_* vars are discarded with the subshell). Sets AUTH_MODE to
 # "api_key" or "none". Never prints secret values.
@@ -1221,7 +1234,12 @@ else
     _patch="$(asc_latest_marketing_patch "$MARKETING_PREFIX" "$ASC_PLATFORM")"
     _rc=$?
     if [[ $_rc -eq 4 ]]; then
-      die "App Store Connect rejected the API key (HTTP 401/403) while reading the next marketing version.
+      # The rejected credential is named by its key id, the public label that
+      # travels in every request header, so the owner knows WHICH key App
+      # Store Connect refused.  No part of the key is printed:  a slice of a
+      # private key is private-key-derived material, previewed or not.
+      _rejected_key="$(key_label "$(asc_public_key_id)")"
+      die "App Store Connect rejected the API key (HTTP 401/403) while reading the next marketing version (key id ${_rejected_key}).
   Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
   --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
     fi
@@ -1273,7 +1291,10 @@ else
     _floor_line="$(asc_build_floor "$MARKETING" "$ASC_PLATFORM")"
     _rc=$?
     if [[ $_rc -eq 4 ]]; then
-      die "App Store Connect rejected the API key (HTTP 401/403) while reading the build floor.
+      # The same public label as the marketing-version rejection above:  the
+      # key id, and nothing that came out of the key.
+      _rejected_key="$(key_label "$(asc_public_key_id)")"
+      die "App Store Connect rejected the API key (HTTP 401/403) while reading the build floor (key id ${_rejected_key}).
   Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
   --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
     fi
@@ -1409,13 +1430,13 @@ if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
   [[ -f "$UPLOAD_ONLY_IPA" ]] || die "package not found: $UPLOAD_ONLY_IPA"
   if [[ "$AUTH_MODE" != "api_key" ]]; then
     if [[ "$(asc_upload_block)" == "staging" ]]; then
-      die "upload-only: the App Store Connect credential was resolved, and the staging path was refused. This is a path failure, not a missing key."
+      die "upload-only: the App Store Connect credential was resolved, and the staging path was refused.  This is a path failure, not a missing key."
     fi
     if [[ "$(asc_upload_block)" == "credential" ]]; then
-      die "upload-only: the App Store Connect credential was resolved, but it is not a usable PEM private key. This is a credential failure, not a missing key and not a path failure."
+      die "upload-only: the App Store Connect credential was resolved, but it is not a usable PEM private key.  This is a credential failure, not a missing key and not a path failure."
     fi
     if [[ "$(asc_upload_block)" == "writer" ]]; then
-      die "upload-only: the key writer itself failed. It classified neither the credential nor the path, so this is not a missing key and not a path failure."
+      die "upload-only: the key writer itself failed.  It classified neither the credential nor the path, so this is not a missing key and not a path failure."
     fi
     die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
   fi
