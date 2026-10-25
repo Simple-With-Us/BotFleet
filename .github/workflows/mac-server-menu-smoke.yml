@@ -1,0 +1,94 @@
+# Mac Server Menu Smoke
+#
+# What this proves: the packaged Mac app really does read its server target
+# from Infisical and nowhere else.  The menu lives in the Electron main
+# process, so no unit test can reach it -- a packaged app, a real application
+# menu and a real window are needed.  This job packages the app unsigned
+# (exactly like Mac Package Gate does) and then drives the menu headlessly:
+# it checks that an app with no Infisical read token in its keychain runs
+# against the server on this Mac, that the old server-target.json is ignored
+# rather than read, that the Server menu offers "This Mac", the Infisical
+# status line and "Reload From Infisical", and that reloading from Infisical
+# leaves a working app behind.
+#
+# What it never does: it never contacts a real server, never reaches the
+# owner's Keychain and never touches the owner's user data -- the app runs
+# with a throwaway HOME and reads a throwaway, empty keychain the smoke
+# creates (OMB_SMOKE_KEYCHAIN) instead of the login Keychain.
+#
+# On required-ness: this is deliberately NOT a required check.  A path-filtered
+# required check is a trap -- when the filter skips the workflow the check
+# never reports and the pull request blocks forever -- and this is a macOS
+# runner, the slowest and scarcest runner class in the fleet.  It is a fast
+# signal for the Server menu, not a gate on the merge.
+name: Mac Server Menu Smoke
+
+on:
+  pull_request:
+    paths:
+      - electron/main.mjs
+      - electron/server-target.mjs
+      - electron/infisical-read.mjs
+      - electron/attached-ui-shim.mjs
+      - scripts/smoke-mac-server-menu.mjs
+      - .github/workflows/mac-server-menu-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-server-menu-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Packaged Server menu smoke
+    runs-on: macos-26
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install exactly what is committed
+        run: pnpm install --frozen-lockfile
+
+      # Same reason Mac Commit Build does this: stale output ships an app that
+      # looks corrupt because it is actually assembled from an older build.
+      - name: Clean generated output
+        run: rm -rf dist dist-server dist-native release
+
+      # The packaged app ships the CUA driver, so the driver must resolve
+      # before the package step or the bundle is assembled without it.
+      - name: "Gate 1: prepare-cua resolves a pinned driver for the installed SDK"
+        run: pnpm build:cua
+
+      # The unsigned arm64 package path, exactly as Mac Package Gate runs it.
+      # `--dir` stops before the DMG, and CSC_IDENTITY_AUTO_DISCOVERY=false
+      # keeps electron-builder out of the keychain, so this needs no
+      # certificate and cannot publish one.
+      - name: "Gate 2: unsigned arm64 package"
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          OMB_CLOUDFLARED_CURRENT: "1"
+        run: pnpm package:mac:local
+
+      # The smoke itself: drive the Server menu in the packaged app.
+      - name: "Gate 3: the packaged Server menu works"
+        run: node scripts/smoke-mac-server-menu.mjs release/mac-arm64/BotFleet.app
+
+      # The app's own output, kept even when the smoke fails: it is the only
+      # place the failure is explained.
+      - name: Upload the smoke log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: server-menu-smoke-log
+          path: ${{ runner.temp }}/server-menu-smoke.log
+          if-no-files-found: ignore
