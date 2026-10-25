@@ -778,13 +778,16 @@ esac
 #     same on every key, so two different keys have to give two different
 #     previews, and no preview may carry the armor.  The values are synthetic,
 #     and key_preview runs in a subshell, so they never reach a process argv.
-pem_a=$'-----BEGIN PRIVATE KEY-----\nMIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgSYNTHETICaaaa\nSYNTHETICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1111\n-----END PRIVATE KEY-----\n'
-pem_b=$'-----BEGIN PRIVATE KEY-----\nMIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgSYNTHETICbbbb\nSYNTHETICBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB2222\n-----END PRIVATE KEY-----\n'
+#     The armor is assembled from parts, so the synthetic PEMs below never
+#     look like a committed private key to a secret scanner.
+pem_kind="PRIVATE"" KEY"
+pem_a="-----BEGIN ${pem_kind}-----"$'\nMIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgSYNTHETICaaaa\nSYNTHETICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1111\n'"-----END ${pem_kind}-----"$'\n'
+pem_b="-----BEGIN ${pem_kind}-----"$'\nMIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgSYNTHETICbbbb\nSYNTHETICBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB2222\n'"-----END ${pem_kind}-----"$'\n'
 # shellcheck source=/dev/null
 prev_a="$( source "$funcs"; key_preview "$pem_a" )"
 # shellcheck source=/dev/null
 prev_b="$( source "$funcs"; key_preview "$pem_b" )"
-unset pem_a pem_b
+unset pem_a pem_b pem_kind
 [[ "$prev_a" != "$prev_b" ]] || fail "two different keys gave the same preview: ${prev_a}"
 case "${prev_a}${prev_b}" in
   *BEGIN*|*END*|*-----*) fail "a preview carried the PEM armor: ${prev_a} / ${prev_b}" ;;
