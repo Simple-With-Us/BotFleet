@@ -1,30 +1,66 @@
 // Refuse the Phase 6 Node decommission until every gate it depends on is
-// green (BF-2515).  Deleting server/, companion/ and the Node build chain is
-// the one irreversible step in the native rewrite: done early it does not
-// degrade a feature, it stops every bot.  The port inventory already says
-// what replaces each file; this script says whether the replacements have
-// actually landed, in a form a human or a workflow can run before anyone
-// types `git rm`.
+// green (BF-2515).  Deleting the Mac-local Node harness is the one
+// irreversible step in the native rewrite: done early it does not degrade a
+// feature, it stops every bot.  The port inventory already says what replaces
+// each file; this script says whether the replacements have actually landed,
+// in a form a human or a workflow can run before anyone types `git rm`.
+//
+// SCOPE: the Mac-local Node stack, and only that.  BotFleet may also run
+// with the server as the primary BotFleet server (BF-2544), and
+// deploy/linux-server/ ships the SAME server/ code as that optional
+// deployment.  So the optional server path is deliberately retained and this
+// gate never asks for it to be decommissioned: the question is "does the Mac
+// still run the Node stack", never "does the Node code still exist anywhere".
+// The optional path is named in RETAINED_OPTIONAL_SERVER_PATHS, and
+// scripts/audit-node-decommission.mjs records it as retained rather than as
+// an uncovered file.
 //
 // Input is a plain JSON state file so the check itself needs no network and
 // can be unit-tested with fixtures:
 //
 //   {
 //     "issues":   { "BF-2510": "Done", "BF-2514": "In Progress", ... },
-//     "evidence": { "soak-24h-no-node": false, "replay-parity": true, ... }
+//     "evidence": { "soak-24h-no-node": false, "replay-parity": true, ... },
+//     "macLocalHarness": {
+//       "present": false,
+//       "retained": { "deploy/linux-server/": "optional server deployment (BF-2544)" }
+//     }
 //   }
 //
 // Issue states are Linear workflow state names ("Todo", "In Progress",
 // "In Review", "Done", ...).  Anything that is not a completed state counts
 // as unmet: "In Review" is not landed, and this gate is precisely about not
-// mistaking nearly-done for done.  Refresh the state file from Linear at
-// run time (board api query ... project issues) rather than editing it by
-// hand; a stale all-Done file is the one input that defeats the guard, so
-// the CLI prints the age of the file it read when it can stat it.
+// mistaking nearly-done for done.  Cancelled and duplicate are not landed
+// either: the replacement never existed, so deleting the code it was to
+// replace stops the bots.  Refresh the state file from Linear at run time
+// (board api query ... project issues) rather than editing it by hand; a
+// stale all-Done file is the one input that defeats the guard, so the CLI
+// prints the age of the file it read when it can stat it.
+//
+// The state file is the trust boundary: it decides whether an irreversible
+// deletion may happen, so it is parsed against a strict schema and only the
+// validated result reaches evaluateGates.
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
 
-const COMPLETED = new Set(["done", "completed", "complete", "cancelled", "canceled", "duplicate"]);
+/** Issue states that mean the replacement actually landed. */
+const COMPLETED = new Set(["done", "completed", "complete"]);
+
+/**
+ * The Mac-local Node stack this gate retires.  The optional server
+ * deployment is deliberately NOT one of them: deploy/linux-server/ ships the
+ * same server/ code and stays (BF-2544).
+ */
+export const MAC_LOCAL_ROOTS = ["server", "companion", "shared", "electron"];
+
+/**
+ * Paths the decommission deliberately keeps.  The optional server deployment
+ * is one of them, and naming it here is what makes the exclusion explicit:
+ * the gate never blocks on it, and the audit records it as retained rather
+ * than as an uncovered file.
+ */
+export const RETAINED_OPTIONAL_SERVER_PATHS = ["deploy/linux-server/"];
 
 /** Issues that must be Done before any Node deletion lands. */
 export const REQUIRED_ISSUES = [
@@ -74,9 +110,24 @@ export const REQUIRED_EVIDENCE = [
   },
   {
     id: "inventory-clean",
-    why: "scripts/audit-node-decommission.mjs reports no file in server/, companion/, shared/ or electron/ without a Swift owner or a retired reason",
+    why: `scripts/audit-node-decommission.mjs reports no file in ${MAC_LOCAL_ROOTS.join(", ")} without a Swift owner or a retired reason; the optional deploy/linux-server/ server deployment is deliberately retained and is not part of this gate`,
   },
 ];
+
+/**
+ * The state file's schema.  Strict on purpose: a mistyped key must fail
+ * loudly rather than read as an unasserted gate.
+ */
+export const StateSchema = z.strictObject({
+  issues: z.record(z.string(), z.string()).optional(),
+  evidence: z.record(z.string(), z.boolean()).optional(),
+  macLocalHarness: z
+    .strictObject({
+      present: z.boolean(),
+      retained: z.record(z.string(), z.string()).optional(),
+    })
+    .optional(),
+});
 
 export function isCompletedState(name) {
   return typeof name === "string" && COMPLETED.has(name.trim().toLowerCase());
@@ -90,6 +141,7 @@ export function evaluateGates(state = {}) {
   const issues = state.issues ?? {};
   const evidence = state.evidence ?? {};
   const blockers = [];
+  const retained = [];
   for (const gate of REQUIRED_ISSUES) {
     const current = issues[gate.id];
     if (current === undefined) {
@@ -103,7 +155,31 @@ export function evaluateGates(state = {}) {
       blockers.push(`evidence ${gate.id}: not asserted — ${gate.why}`);
     }
   }
-  return { ok: blockers.length === 0, blockers };
+  // The Mac-local harness itself.  This is the gate's stated purpose: the
+  // Mac no longer runs the Node stack.
+  const harness = state.macLocalHarness;
+  if (harness === undefined) {
+    blockers.push(
+      "macLocalHarness: no state supplied (treating as unmet) — assert that the Mac no longer runs the Node harness",
+    );
+  } else if (harness.present !== false) {
+    blockers.push(
+      "macLocalHarness: still present — the Mac-local Node harness must be gone before the code it runs is deleted",
+    );
+  }
+  // The optional server deployment is an approved exclusion, so declaring it
+  // retained is recorded and never blocked.  Any OTHER retained path is a
+  // finding: it means Mac-local code was quietly spared.
+  for (const [path, why] of Object.entries(harness?.retained ?? {})) {
+    if (!RETAINED_OPTIONAL_SERVER_PATHS.includes(path)) {
+      blockers.push(
+        `retained ${path}: not an approved exclusion — only ${RETAINED_OPTIONAL_SERVER_PATHS.join(", ")} may be retained`,
+      );
+      continue;
+    }
+    retained.push({ path, why });
+  }
+  return { ok: blockers.length === 0, blockers, retained };
 }
 
 // Compare physical paths.  Node's ESM loader realpaths the entry module, so an
@@ -122,7 +198,7 @@ if (isEntryModule()) {
   if (!statePath || !existsSync(statePath)) {
     console.error(
       "usage: node scripts/check-decommission-gates.mjs <state.json>\n" +
-        'state.json: {"issues": {"BF-2510": "Done", ...}, "evidence": {"soak-24h-no-node": true, ...}}\n' +
+        'state.json: {"issues": {"BF-2510": "Done", ...}, "evidence": {"soak-24h-no-node": true, ...}, "macLocalHarness": {"present": false, "retained": {"deploy/linux-server/": "optional server deployment (BF-2544)"}}}\n' +
         "the deletion order this gate protects: docs/native-rewrite-decommission-runbook.md",
     );
     process.exit(2);
@@ -133,7 +209,23 @@ if (isEntryModule()) {
       `warning: ${statePath} is ${Math.floor(ageHours)}h old; refresh it from Linear before trusting this verdict`,
     );
   }
-  const verdict = evaluateGates(JSON.parse(readFileSync(statePath, "utf8")));
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(statePath, "utf8"));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`error: ${statePath} is not valid JSON: ${message}`);
+    process.exit(2);
+  }
+  const parsed = StateSchema.safeParse(raw);
+  if (!parsed.success) {
+    console.error(`error: ${statePath} does not match the state schema:`);
+    for (const issue of parsed.error.issues) {
+      console.error(`  - ${issue.path.join(".") || "(root)"}: ${issue.message}`);
+    }
+    process.exit(2);
+  }
+  const verdict = evaluateGates(parsed.data);
   if (!verdict.ok) {
     console.error("Phase 6 decommission is BLOCKED:");
     for (const blocker of verdict.blockers) console.error(`  - ${blocker}`);
@@ -141,6 +233,13 @@ if (isEntryModule()) {
   }
   console.log("Phase 6 decommission gates: all green. Deletion may proceed; the reboot check still belongs to BF-2515.");
   console.log(
-    "Scope: this covers the Node harness and companion only.  The Electron shell and its updater feed additionally need BF-2485 and BF-2486; see docs/native-rewrite-decommission-runbook.md steps 6 and 7.",
+    `Scope: the Mac-local Node harness only (${MAC_LOCAL_ROOTS.join(", ")}).  ` +
+      "The optional server deployment (deploy/linux-server/, BF-2544) is deliberately retained and is not a decommission target.",
+  );
+  for (const entry of verdict.retained) {
+    console.log(`Retained on purpose: ${entry.path} — ${entry.why}`);
+  }
+  console.log(
+    "The Electron shell and its updater feed additionally need BF-2485 and BF-2486; see docs/native-rewrite-decommission-runbook.md steps 6 and 7.",
   );
 }

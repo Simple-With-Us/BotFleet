@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -7,6 +9,19 @@ import test from "node:test";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = readFileSync(join(ROOT, ".github/workflows/native-mac-release.yml"), "utf8");
 const localScript = readFileSync(join(ROOT, "scripts/mac-package.sh"), "utf8");
+
+/** One top-level shell function, taken verbatim out of the script. */
+function shellFunction(source, name) {
+  const match = source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"));
+  assert.ok(match, `${name}() must exist in the script`);
+  return match[0];
+}
+
+/** Run a shell snippet and hand back its status and output. */
+function runShell(script) {
+  const result = spawnSync("bash", ["-c", script], { encoding: "utf8" });
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
 
 test("the native workflow is dispatch-only and never publishes", () => {
   assert.match(workflow, /workflow_dispatch:/);
@@ -66,4 +81,170 @@ test("the local script refuses beta toolchains and labels dev builds", () => {
   assert.match(localScript, /grep -qi beta/);
   assert.match(localScript, /NOT DISTRIBUTABLE/);
   assert.match(localScript, /spctl --assess/);
+});
+
+// A failed version stamp must stop the job where it happens.  `echo
+// "$(...)"` returns echo's status, so the stamp script's failure was
+// swallowed and an empty version was published.
+test("a failed version stamp stops the prepare job", () => {
+  assert.match(
+    workflow,
+    /version="\$\(node scripts\/stamp-commit-version\.mjs \.\)" \|\| exit 1/,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /echo "version=\$\(node scripts\/stamp-commit-version\.mjs \.\)"/,
+  );
+});
+
+// The notary's own output is the only place the reason for a rejection is
+// written down, so it has to be printed before the step fails.
+test("the notarization output is printed before the failure", () => {
+  for (const text of [workflow, localScript]) {
+    const submits = text.match(/notarytool submit/g) ?? [];
+    assert.ok(submits.length > 0, "there must be a notarization to check");
+    // EVERY submission must print its captured output before it fails: the
+    // notary's output is the only place the reason is written down.
+    const prints = text.match(/\|\| \{\s*\n\s*echo "\$out"/g) ?? [];
+    assert.equal(
+      prints.length,
+      submits.length,
+      "every notarytool submission must print its output before failing",
+    );
+  }
+});
+
+// sign_update is not on the runner image, so the Sparkle branch could never
+// run: a provisioned key still produced an unsigned feed, silently.
+test("the Sparkle signing branch can actually run", () => {
+  assert.match(workflow, /brew install sparkle/);
+  // A key with no tool is a hard error, not a warning.
+  assert.match(workflow, /command -v sign_update > \/dev\/null \|\| \{/);
+  assert.match(workflow, /::error::sign_update is not installed/);
+});
+
+// The key never stays at a path: it is decoded into a private file, that
+// file is opened on a descriptor and unlinked at once, and notarytool reads
+// it through the descriptor.
+test("the signing key is passed through a descriptor, never at a path", () => {
+  for (const text of [workflow, localScript]) {
+    assert.match(text, /--key \/dev\/fd\/3/);
+    assert.doesNotMatch(text, /--key "\$RUNNER_TEMP\/notary\.p8"/);
+    assert.doesNotMatch(text, /--key "\$P8_FILE"/);
+  }
+});
+
+// release.yml owns the v<version> release: it verifies that release's asset
+// set is exactly the Electron set and deletes every asset it does not
+// recognise.  The native assets therefore live on their own tag.
+test("the native assets live on their own release tag", () => {
+  assert.match(workflow, /NATIVE_TAG_SUFFIX: "-native"/);
+  // The tag is used for the release, for the published guard, and for the
+  // appcast's enclosure URL, or the feed would point at a release that does
+  // not carry the bytes.
+  assert.match(workflow, /tag="v\$VERSION\$\{NATIVE_TAG_SUFFIX\}"/);
+  assert.match(workflow, /v="v\$\{\{ steps\.pin\.outputs\.version \}\}\$\{NATIVE_TAG_SUFFIX\}"/);
+  assert.match(
+    workflow,
+    /node scripts\/native-appcast\.mjs native-upload "\$VERSION" "v\$VERSION\$\{NATIVE_TAG_SUFFIX\}"/,
+  );
+  assert.match(localScript, /native-appcast\.mjs" "\$OUT" "\$VERSION" "v\$VERSION\$\{NATIVE_TAG_SUFFIX\}"/);
+});
+
+// A signature left over from an earlier run of the same version describes
+// different bytes, and the appcast would publish it as the signature of the
+// new ZIP.
+test("a stale signature never rides along with a new ZIP", () => {
+  const remove = localScript.indexOf('rm -f "$OUT/${APP_NAME}.zip.edsig"');
+  const sign = localScript.indexOf("sign_update --ed-key-file");
+  assert.ok(remove !== -1, "the stale sidecar must be removed");
+  assert.ok(sign !== -1 && remove < sign, "the sidecar goes before the signing, never after");
+});
+
+// An un-notarized build must never look like a release build.
+test("an un-notarized build gets its own directory and no feed", () => {
+  assert.match(localScript, /OUT="\$OUT\/UNSIGNED"/);
+  const unsigned = localScript.indexOf('OUT="$OUT/UNSIGNED"');
+  const appcast = localScript.indexOf("native-appcast.mjs");
+  assert.ok(unsigned !== -1 && appcast > unsigned);
+  // The script leaves before the appcast when notarization was skipped.
+  assert.match(localScript, /NOT DISTRIBUTABLE; no appcast generated/);
+});
+
+// The EXIT trap runs after the last command, so a trap body that ends on a
+// false test used to turn a successful packaging run into a failed one.
+test("the EXIT trap cannot flip a successful run to a failure", () => {
+  const cleanup = shellFunction(localScript, "cleanup");
+  const harness = [
+    "#!/usr/bin/env bash",
+    "set -euo pipefail",
+    'P8_FILE=""',
+    "P8_FD_OPEN=0",
+    'WORK="$(mktemp -d)"',
+    cleanup,
+    "trap cleanup EXIT",
+    "echo body-ok",
+  ].join("\n");
+  const result = runShell(harness);
+  assert.equal(result.status, 0, `a successful run must exit 0: ${result.stderr}`);
+  assert.match(result.stdout, /body-ok/);
+});
+
+// One key file serves every notarization in the run, and it never outlives
+// it: the second notarization must not orphan a second copy of the key.
+test("one key file serves every notarization, and it leaves no copy behind", () => {
+  const openApiKey = shellFunction(localScript, "open_api_key");
+  // One file for the whole run: a second notarization must not create a
+  // second copy of the key.
+  assert.equal(
+    (openApiKey.match(/mktemp/g) ?? []).length,
+    1,
+    "the key file must be created once",
+  );
+  assert.match(
+    openApiKey,
+    /P8_FD_OPEN" -eq 1 \]; then return 0; fi/,
+    "a second notarization must reuse the open descriptor",
+  );
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-p8-"));
+  try {
+    const harness = [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      `export TMPDIR="${directory}"`,
+      'APPLE_API_KEY_P8="dummy-not-a-real-key"',
+      'P8_FILE=""',
+      "P8_FD_OPEN=0",
+      openApiKey,
+      "open_api_key",
+      "open_api_key",
+      'echo "fd=$P8_FD_OPEN"',
+      'echo "path=[$P8_FILE]"',
+      `echo "left=$(ls -1 "$TMPDIR" | wc -l | tr -d ' ')"`,
+    ].join("\n");
+    const result = runShell(harness);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /fd=1/, "the key must be opened exactly once");
+    assert.match(result.stdout, /path=\[\]/, "the key file must not stay at a path");
+    assert.match(
+      result.stdout,
+      /left=0/,
+      `no copy of the key may be left in the temp directory: ${result.stdout}`,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// The fleet's approved order: the environment first, then Infisical, and
+// the keychain profile only as this machine's bootstrap identity.
+test("the notarization credentials are resolved in the approved order", () => {
+  assert.match(localScript, /fleet-secrets get APPLE_API_KEY_P8/);
+  assert.match(localScript, /fleet-secrets get APPLE_API_KEY_ID/);
+  assert.match(localScript, /fleet-secrets get APPLE_API_ISSUER_ID/);
+  const resolver = localScript.indexOf("resolve_notary_credentials");
+  const call = localScript.indexOf("resolve_notary_credentials\n");
+  assert.ok(resolver !== -1 && call !== -1, "the resolver must run before notarization");
+  // The keychain profile is the fallback, never the first choice.
+  assert.match(localScript, /--keychain-profile/);
 });

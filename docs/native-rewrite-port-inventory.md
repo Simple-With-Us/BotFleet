@@ -176,7 +176,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 
 ## 9. Gate statement
 
-BF-2514 and BF-2515 both cite this file as their Phase 4 inventory gate.  Coverage is re-checked by `scripts/audit-node-decommission.mjs` (BF-2515, 2026-10-24): every tracked file under `server/`, `companion/`, `shared/` and `electron/` must be named here or in the Electron inventory, and `scripts/check-decommission-gates.mjs` refuses the deletion until the Phase 5 issues and evidence are green.  Re-survey command for deltas:
+BF-2514 and BF-2515 both cite this file as their Phase 4 inventory gate.  Coverage is re-checked by `scripts/audit-node-decommission.mjs` (BF-2515, 2026-10-24): every tracked file under `server/`, `companion/`, `shared/` and `electron/` must be named here or in the Electron inventory, and `scripts/check-decommission-gates.mjs` refuses the deletion until the Phase 5 issues and evidence are green.  `deploy/` is audited as well, and the optional `deploy/linux-server/` server deployment is a documented exception rather than a finding: it ships the same `server/` code and stays, because BotFleet may run with the server as the primary BotFleet server (BF-2544).  Re-survey command for deltas:
 `find server companion/src shared -maxdepth 1 -name '*.ts' ! -name '*.test.ts' | wc -l`
 and per-area `wc -l`. Any new `server/` or `companion/` file after this
 commit must land a row here before Phase 5 starts.

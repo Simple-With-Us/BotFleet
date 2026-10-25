@@ -70,7 +70,6 @@ function escapeXml(value) {
  */
 export function buildAppcast({
   version,
-  feedBaseUrl = DEFAULT_FEED_BASE_URL,
   pubDate = new Date(),
   minimumSystemVersion = "14.0",
   items,
@@ -166,7 +165,6 @@ export function generateAppcast({
   const edSignature = readEdSignature(releaseDir, zip);
   const appcast = buildAppcast({
     version,
-    feedBaseUrl,
     pubDate,
     items: [
       {
