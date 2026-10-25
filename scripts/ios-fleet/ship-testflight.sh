@@ -126,6 +126,10 @@ TEAM_ID="CC8UTF7ATG"
 # Infisical Fleet-OPS via fleet-secrets.  Nothing is read from the old secrets folder.
 FLEET_SECRETS_BIN="${FLEET_SECRETS:-${HOME}/.local/bin/fleet-secrets}"
 ASC_TMP_DIR=""
+# "staging" means a credential was resolved and the staging path was refused.
+# Anything else, including empty, means no credential was resolved.  The upload
+# step has to say which one it is.  A path refusal is not a missing key.
+ASC_AUTH_FAILURE=""
 cleanup_asc_tmp() {
   if [[ -n "${ASC_TMP_DIR:-}" ]]; then
     rm -rf "$ASC_TMP_DIR" 2>/dev/null || true
@@ -211,11 +215,155 @@ fs_get() {
   printf '%s' "$v"
 }
 
+# A directory mktemp may use.  macOS TMPDIR ends in a slash, and joining
+# another slash onto it produces a doubled slash.  resolveStagingTarget
+# refuses a path that is not normal, so every trailing slash is stripped
+# here.  A TMPDIR of "/" strips down to nothing, and nothing is not a
+# directory:  the root of the filesystem is refused rather than turned into
+# a path that can be written, because a key staged there would land in "/".
+asc_temp_root() {
+  local root="${TMPDIR:-/tmp}"
+  while [[ "$root" == */ ]]; do
+    root="${root%/}"
+  done
+  #  An empty root is the filesystem root:  a key staged there would land in
+  #  "/", so it is refused instead of being turned into a writable path.
+  [[ -n "$root" ]] || return 1
+  printf '%s' "$root"
+}
+
 # Make the temp directory that holds a materialised .p8 (0700), once.
+# A directory that cannot be created is a path failure and not a crash:  the
+# caller classifies it.  A root TMPDIR reaches it, because asc_temp_root
+# refuses the root of the filesystem before mktemp is ever called.
 asc_tmp_dir() {
   if [[ -z "$ASC_TMP_DIR" ]]; then
-    ASC_TMP_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/asc-key.XXXXXX")"
+    local root
+    root="$(asc_temp_root)" || { ASC_TMP_DIR=""; return 1; }
+    ASC_TMP_DIR="$(umask 077; mktemp -d "${root}/asc-key.XXXXXX")" || {
+      ASC_TMP_DIR=""
+      return 1
+    }
   fi
+  return 0
+}
+
+# Why an upload has no usable staged key.  "staging" is a path or file refusal
+# after a credential was resolved.  "credential" is a resolved credential that
+# is not a usable PEM private key.  "writer" is the key writer itself failing
+# (a crash, a missing node, or a signal), which classifies neither the key nor
+# the path.  "missing" is no credential.  The owner handoff for a missing key
+# applies to none of the other three.
+asc_upload_block() {
+  case "${ASC_AUTH_FAILURE:-}" in
+    staging) printf '%s\n' "staging" ;;
+    credential) printf '%s\n' "credential" ;;
+    writer) printf '%s\n' "writer" ;;
+    *) printf '%s\n' "missing" ;;
+  esac
+}
+
+# A rejected credential is named by its SOURCE, its KEY ID and its ISSUER ID:
+#  the id and the issuer id are public labels that travel in every App Store
+# Connect request header, and together they say exactly WHICH key was
+# refused.  The id is printed only when it looks like one:  anything else is
+# reported as "unrecognized", so a mis-set id that happens to hold the key, or
+# a line break, can never reach the log.
+#
+# NOTHING taken out of the key itself is printed.  A PEM body is the base64
+# of the DER of the private key, so every byte of it is secret and a
+# first-eight/last-four slice of it is a slice of the key's own encoding;
+# there is no non-secret prefix of a private key the way there is for a
+# provider API key, where the prefix is a public label.  A review rule cannot
+# authorize exposing a value, and a body mask could not even identify the
+# credential:  two different keys share a first eight and a last four.  The
+# key id and the issuer id are the public labels that do identify it.
+key_label() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    printf '%s' "missing"
+  elif [[ "${#v}" -le 32 && "$v" =~ ^[A-Za-z0-9]+$ ]]; then
+    printf '%s' "$v"
+  else
+    printf '%s' "unrecognized"
+  fi
+}
+
+# The ISSUER ID is the other public label of the credential:  it travels in
+# every request header beside the key id, so it identifies the key exactly.
+# It is a UUID, so it carries dashes, and key_label would report it as
+# unrecognized;  it is printed when it looks like one, and anything else is
+# reported as "unrecognized", so a mis-set issuer id or a line break can
+# never reach the log.
+key_issuer_label() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    printf '%s' "missing"
+  elif [[ "${#v}" -le 64 && "$v" =~ ^[A-Za-z0-9-]+$ ]]; then
+    printf '%s' "$v"
+  else
+    printf '%s' "unrecognized"
+  fi
+}
+
+# The credential the App Store Connect client used, for the rejection paths
+# where the shell has not resolved it yet.  The source selection mirrors
+# asc-api.mjs exactly:  a source counts only when its WHOLE trio is present
+# and its key decodes to a PEM, so a diagnostic never names a key the client
+# skipped.
+#
+# Only material the ENVIRONMENT already holds is read.  The vault is never
+# asked for the key material here:  a diagnostic must not cause a secret
+# read.  The vault's KEY ID and ISSUER ID are read when no environment source
+# qualifies, because both are public labels that travel in every request
+# header.
+#
+# The result is the public key id in ASC_DIAG_KEY_ID and the public issuer id
+# in ASC_DIAG_ISSUER_ID.  NOTHING taken out of the key is reported:  a masked
+# preview of a private-key body is not printed anywhere, because every byte
+# of that body is secret (see the comment above key_label).
+ASC_DIAG_KEY_ID=""
+ASC_DIAG_ISSUER_ID=""
+asc_resolve_diagnostic_credential() {
+  local v="" id="" issuer=""
+  if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
+    case "$APPLE_API_KEY_P8_BASE64" in
+      *BEGIN*) v="$APPLE_API_KEY_P8_BASE64" ;;
+      *) v="$(base64 --decode <<< "$APPLE_API_KEY_P8_BASE64" 2>/dev/null)" || v="" ;;
+    esac
+    if [[ -n "$v" ]] && node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$v"; then
+      id="$APPLE_API_KEY_ID"
+      issuer="$APPLE_API_ISSUER_ID"
+    else
+      #  The client skips a source whose key is not a usable PEM and goes on
+      #  to the NEXT source, so this diagnostic must not name it -- and must
+      #  not stop looking for the source the client did use.
+      v=""
+    fi
+  fi
+  #  The client falls through to the environment source when the CI trio is
+  #  absent or unusable, so this branch is evaluated on its own and NOT as an
+  #  alternative to the CI branch:  an elif would leave a valid ASC_*
+  #  credential unreported whenever an APPLE_* trio is present but invalid.
+  if [[ -z "$id" && -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]]; then
+    if node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8"; then
+      v="$ASC_KEY_P8"
+      id="$ASC_KEY_ID"
+      issuer="$ASC_ISSUER_ID"
+    fi
+  fi
+  if [[ -z "$id" ]]; then
+    #  The client's last source is Infisical /asc.  Only the KEY ID and the
+    #  ISSUER ID are read from it:  both are public labels, not key
+    #  material.
+    id="${ASC_KEY_ID:-}"
+    [[ -n "$id" ]] || id="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
+    issuer="${ASC_ISSUER_ID:-}"
+    [[ -n "$issuer" ]] || issuer="$(fs_get ASC_ISSUER_ID /asc 2>/dev/null || true)"
+  fi
+  v=""
+  ASC_DIAG_KEY_ID="$id"
+  ASC_DIAG_ISSUER_ID="$issuer"
 }
 
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
@@ -241,6 +389,7 @@ asc_tmp_dir() {
 # never reaches a log line.
 load_secrets() {
   AUTH_MODE="none"
+  ASC_AUTH_FAILURE=""
   #  A named ASC_KEY_PATH is not a credential source.  It is remembered only
   #  so the run can say that it ignored it, and it is cleared here:  an
   #  inherited path must never reach xcodebuild when the resolution below
@@ -249,7 +398,7 @@ load_secrets() {
   local named_path="${ASC_KEY_PATH:-}"
   unset ASC_KEY_PATH
   local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" key_pem="" rc=0
-  local key_path="" asc_kid=""
+  local key_path="" asc_kid="" key_src=""
 
   # 1. CI: the APPLE_API_* names the ship workflow exports from Infisical.
   #    The p8 is base64 there, so it is decoded here, and it never travels in
@@ -262,15 +411,38 @@ load_secrets() {
     if [[ -n "$key_pem" ]]; then
       rc=0
       node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$key_pem" || rc=$?
-      if [[ "$rc" -ne 0 ]]; then
-        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it"
+      if [[ "$rc" -eq 3 ]]; then
+        #  The credential was resolved and then rejected.  That is a
+        #  credential failure, not a missing key:  the owner has to fix the
+        #  value that is there, not create a key that already exists.
+        #  The rejected value is named by its SOURCE, its KEY ID and its
+        #  ISSUER ID, and by nothing that came out of the key:  every byte of
+        #  a private-key body is secret, so there is no fragment of it that
+        #  may be shown.
+        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), issuer id $(key_issuer_label "${APPLE_API_ISSUER_ID:-}"))"
         key_pem=""
+        ASC_AUTH_FAILURE="credential"
+      elif [[ "$rc" -ne 0 ]]; then
+        #  The validator itself failed (a crash, a missing node):  it never
+        #  classified the credential, so this run must not classify it
+        #  either.  Calling it a bad credential would send the owner to
+        #  re-export a key that is perfectly fine.
+        log "could not check APPLE_API_KEY_P8_BASE64; the key validator failed with status ${rc}"
+        key_pem=""
+        ASC_AUTH_FAILURE="writer"
       else
         kid="$APPLE_API_KEY_ID"
         iss="$APPLE_API_ISSUER_ID"
+        key_src="APPLE_API_KEY_P8_BASE64"
       fi
     else
-      logerr "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key"
+      #  The value did not decode at all, so it failed local validation
+      #  before it could be looked at:  it is named by its source, its key
+      #  id and its issuer id, and by nothing taken out of the key.
+      logerr "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), issuer id $(key_issuer_label "${APPLE_API_ISSUER_ID:-}"))"
+      #  Same class as the validate refusal above:  a credential that was
+      #  resolved and cannot be used.
+      ASC_AUTH_FAILURE="credential"
     fi
     if [[ -z "$key_pem" ]]; then
       #  An unusable source is removed from the environment.  The client looks
@@ -284,19 +456,40 @@ load_secrets() {
   #    private key and comes with the key id and issuer it belongs to.
   if [[ -z "$key_pem" && -n "${ASC_KEY_P8:-}" ]]; then
     if [[ -z "$kid" || -z "$iss" ]]; then
-      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it"
+      #  A credential without the id and issuer it belongs to is unusable
+      #  here, so it failed local validation:  it is named by its source and
+      #  by its public labels, and by nothing taken out of the key.
+      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
       unset ASC_KEY_P8
     else
       rc=0
       node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8" || rc=$?
-      if [[ "$rc" -ne 0 ]]; then
-        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it"
+      if [[ "$rc" -eq 3 ]]; then
+        #  The credential failed local validation:  it is named by its
+        #  source, its key id and its issuer id, and by nothing taken out of
+        #  the key.
+        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
         #  The client would refuse this value, so it is removed from the
         #  environment:  the client has to see the credential this shell layer
         #  resolved, not one that cannot be used.
         unset ASC_KEY_P8
+        #  Resolved and then rejected, so it is a credential failure and not a
+        #  missing key.
+        ASC_AUTH_FAILURE="credential"
+      elif [[ "$rc" -ne 0 ]]; then
+        #  The validator itself failed (a crash, a missing node):  it never
+        #  classified the credential, so this run must not classify it
+        #  either.  Calling it a bad credential would send the owner to
+        #  re-export a key that is perfectly fine.
+        log "could not check ASC_KEY_P8; the key validator failed with status ${rc}"
+        unset ASC_KEY_P8
+        ASC_AUTH_FAILURE="writer"
       else
         key_pem="$ASC_KEY_P8"
+        key_src="ASC_KEY_P8"
+        #  A usable credential was found, so an earlier rejection of another
+        #  source no longer describes this run.
+        ASC_AUTH_FAILURE=""
       fi
     fi
   fi
@@ -316,20 +509,63 @@ load_secrets() {
     # has no Infisical copy:  fail with a clear message rather than guess.
     if [[ "$kid" == "$asc_kid" ]]; then
       key_pem="$(fs_get ASC_KEY_P8 /asc)" || key_pem=""
+      key_src="Infisical /asc"
     fi
     if [[ -z "$key_pem" ]]; then
       log "no .p8 for key ${kid}: Infisical /asc ASC_KEY_P8 holds a different key (or is unreadable);  export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this key"
       return 0
     fi
+    #  A usable credential was found, so an earlier rejection of another
+    #  source no longer describes this run.
+    ASC_AUTH_FAILURE=""
   fi
 
   # The key has to be in a mode-600 file for altool and Xcode, and in the
   # environment for the node client, which never reads a file.  The file is
   # written FROM the resolved credential, so it is never read back as one.
-  asc_tmp_dir
+  asc_tmp_dir || {
+    # The credential was resolved and the directory it has to be staged in
+    # could not be created.  That is a path failure and not a crash.
+    log "could not stage the ASC key; the credential was resolved and the staging directory could not be created"
+    ASC_AUTH_FAILURE="staging"
+    key_pem=""
+    return 0
+  }
   key_path="${ASC_TMP_DIR}/AuthKey_${kid}.p8"
-  if ! node "${FLEET_DIR}/asc-key.mjs" write "$key_path" <<< "$key_pem"; then
-    log "could not write the ASC key file; the credential is not usable"
+  #  The writer says WHICH failure it was through its exit code:  3 is a value
+  #  the Apple tools cannot use, 2 is a path or a file that could not be used.
+  #  The two are reported differently, so the code is kept rather than folded
+  #  into "something went wrong".
+  #
+  #  Only the exit code is read.  The helper's own message is never captured
+  #  into a shell variable, because the repo's key-capture guard refuses a
+  #  `$( ... )` that mentions asc-key.mjs, and a captured message could carry
+  #  the key into a trace.
+  rc=0
+  node "${FLEET_DIR}/asc-key.mjs" write "$key_path" <<< "$key_pem" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    # Leaving AUTH_MODE as none is correct in every case, and calling any of
+    # them a missing key is not.
+    if [[ "$rc" -eq 3 ]]; then
+      # The credential was resolved and it is not a usable PEM private key.
+      # It is named by its source, by its key id and by its issuer id -- both
+      # public labels that travel in every request header and are not part of
+      # the key -- and by NOTHING taken from the key itself:  every byte of a
+      # private-key body is secret, so there is no fragment of it that may be
+      # shown.
+      log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key (source ${key_src:-unknown}, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
+      ASC_AUTH_FAILURE="credential"
+    elif [[ "$rc" -eq 2 ]]; then
+      # The credential was resolved.  The staging path was refused.
+      log "could not stage the ASC key; the credential was resolved and the staging path was refused"
+      ASC_AUTH_FAILURE="staging"
+    else
+      # The writer itself failed:  a crash, a missing node, a signal.  It
+      # classified neither the key nor the path, so this must not be reported
+      # as either one.
+      log "could not stage the ASC key; the key writer failed with status ${rc}"
+      ASC_AUTH_FAILURE="writer"
+    fi
     key_pem=""
     return 0
   fi
@@ -605,7 +841,14 @@ asc_latest_marketing_patch() {
   # 401)" -- and turned every auth or app-resolution fault into the same
   # contentless "query failed (rc=2)". Surfaced here so an UNVERIFIED plan is
   # self-diagnosing in the run log.
-  errf="$(mktemp "${TMPDIR:-/tmp}/asc-patch-err.XXXXXX")"
+  #  asc_temp_root refuses the filesystem root with a status, so the status
+  #  is read here:  expanding its empty output would build "/asc-patch-err.*".
+  local errf_root
+  errf_root="$(asc_temp_root)" || {
+    logerr "asc-patch: TMPDIR resolves to the filesystem root; refusing to write there, so App Store Connect cannot be verified"
+    return 1
+  }
+  errf="$(mktemp "${errf_root}/asc-patch-err.XXXXXX")"
   set +e
   out=$(asc_client latest-marketing-patch "$BUNDLE_ID" "$prefix" "$plat" "${APPLE_ID:-}" 2>"$errf")
   rc=$?
@@ -658,7 +901,14 @@ asc_build_floor() {
     logerr "asc-floor: no App Store Connect credential available; cannot verify against App Store Connect"
     return 1
   fi
-  errf="$(mktemp "${TMPDIR:-/tmp}/asc-floor-err.XXXXXX")"
+  #  Read asc_temp_root's refusal here too:  a root TMPDIR would otherwise
+  #  build "/asc-floor-err.*".
+  local errf_root
+  errf_root="$(asc_temp_root)" || {
+    logerr "asc-floor: TMPDIR resolves to the filesystem root; refusing to write there, so App Store Connect cannot be verified"
+    return 1
+  }
+  errf="$(mktemp "${errf_root}/asc-floor-err.XXXXXX")"
   set +e
   out=$(asc_client build-floor "$BUNDLE_ID" "$version" "$plat" "${APPLE_ID:-}" 2>"$errf")
   rc=$?
@@ -986,6 +1236,23 @@ if [[ "$SHIP_GATE_DECISION" == "skip" && "$DRY_RUN" -eq 0 ]]; then
   exit 0
 fi
 
+#  A root TMPDIR is a PATH failure, and it has to be classified as one before
+#  any App Store Connect query runs.  The two version queries below write
+#  their scratch files through asc_temp_root, so a root TMPDIR makes them
+#  fail, and their failure is indistinguishable from an unreachable App Store
+#  Connect:  the run would die telling the owner to fix ASC_* credentials for
+#  what is a path refusal.  Classify it once, here, before the version plan,
+#  and exit with the path-failure status.  The classification needs no
+#  credential and no STAMP, so it can sit this early.
+#  asc_temp_root refuses the filesystem root with a status.  Read it with
+#  that status:  under errexit a bare assignment would end the run with
+#  status 1 and no log line, before the owner handoff could classify it.
+SHIP_TMP_ROOT="$(asc_temp_root)" || {
+  log "Ship blocked: TMPDIR resolves to the filesystem root, so the staging path was refused."
+  log "This is a path failure, not a missing key."
+  exit 3
+}
+
 # Where the version the project itself declares lives. Best-effort: for
 # XcodeGen apps the .xcodeproj may not exist until it is generated below, in
 # which case the project contributes 0 to the floor and says so.
@@ -1052,7 +1319,15 @@ else
     _patch="$(asc_latest_marketing_patch "$MARKETING_PREFIX" "$ASC_PLATFORM")"
     _rc=$?
     if [[ $_rc -eq 4 ]]; then
-      die "App Store Connect rejected the API key (HTTP 401/403) while reading the next marketing version.
+      # The rejected credential is named by its key id and its issuer id:
+      # both are public labels that travel in every request header, and
+      # together they say exactly WHICH key App Store Connect refused.  No
+      # part of the key is printed:  every byte of a private-key body is
+      # secret, so there is no fragment of it that may be shown.
+      asc_resolve_diagnostic_credential
+      _rejected_key="$(key_label "$ASC_DIAG_KEY_ID")"
+      _rejected_issuer="$(key_issuer_label "$ASC_DIAG_ISSUER_ID")"
+      die "App Store Connect rejected the API key (HTTP 401/403) while reading the next marketing version (key id ${_rejected_key}, issuer id ${_rejected_issuer}).
   Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
   --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
     fi
@@ -1104,7 +1379,12 @@ else
     _floor_line="$(asc_build_floor "$MARKETING" "$ASC_PLATFORM")"
     _rc=$?
     if [[ $_rc -eq 4 ]]; then
-      die "App Store Connect rejected the API key (HTTP 401/403) while reading the build floor.
+      # The same public labels as the marketing-version rejection above:  the
+      # key id and the issuer id, and nothing that came out of the key.
+      asc_resolve_diagnostic_credential
+      _rejected_key="$(key_label "$ASC_DIAG_KEY_ID")"
+      _rejected_issuer="$(key_issuer_label "$ASC_DIAG_ISSUER_ID")"
+      die "App Store Connect rejected the API key (HTTP 401/403) while reading the build floor (key id ${_rejected_key}, issuer id ${_rejected_issuer}).
   Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
   --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
     fi
@@ -1202,7 +1482,11 @@ AUTH_MODE="none"
 load_secrets
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-OUT_ROOT="${TMPDIR:-/tmp}/ios-ship-${APP_KEY}-${STAMP}"
+#  SHIP_TMP_ROOT was classified above, before the version plan, so a root
+#  TMPDIR is reported as the path failure it is instead of as an
+#  unreachable App Store Connect.  It is the same value here:  nothing
+#  between the two points changes TMPDIR.
+OUT_ROOT="${SHIP_TMP_ROOT}/ios-ship-${APP_KEY}-${STAMP}"
 ARCHIVE_PATH="${OUT_ROOT}/${SCHEME}.xcarchive"
 EXPORT_DIR="${OUT_ROOT}/export"
 LOG_DIR="${OUT_ROOT}/logs"
@@ -1234,7 +1518,18 @@ fi
 
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
   [[ -f "$UPLOAD_ONLY_IPA" ]] || die "package not found: $UPLOAD_ONLY_IPA"
-  [[ "$AUTH_MODE" == "api_key" ]] || die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
+  if [[ "$AUTH_MODE" != "api_key" ]]; then
+    if [[ "$(asc_upload_block)" == "staging" ]]; then
+      die "upload-only: the App Store Connect credential was resolved, and the staging path was refused.  This is a path failure, not a missing key."
+    fi
+    if [[ "$(asc_upload_block)" == "credential" ]]; then
+      die "upload-only: the App Store Connect credential was resolved, but it is not a usable PEM private key.  This is a credential failure, not a missing key and not a path failure."
+    fi
+    if [[ "$(asc_upload_block)" == "writer" ]]; then
+      die "upload-only: the key writer itself failed.  It classified neither the credential nor the path, so this is not a missing key and not a path failure."
+    fi
+    die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
+  fi
   link_private_key "$ASC_KEY_PATH" "$ASC_KEY_ID"
   log "uploading existing package via altool (api key)"
   set +e
@@ -1601,6 +1896,28 @@ PACKAGE="$(ls -1 "$EXPORT_DIR"/*.ipa "$EXPORT_DIR"/*.pkg 2>/dev/null | head -1 |
 load_secrets
 if [[ "$AUTH_MODE" != "api_key" ]]; then
   log "Package ready at: $PACKAGE"
+  if [[ "$(asc_upload_block)" == "staging" ]]; then
+    log "Upload blocked: the App Store Connect credential was resolved, and the staging path was refused."
+    log "This is a path failure, not a missing key."
+    exit 3
+  fi
+  if [[ "$(asc_upload_block)" == "credential" ]]; then
+    log "Upload blocked: the App Store Connect credential was resolved, but it is not a usable PEM private key."
+    log "This is a credential failure, not a missing key and not a path failure."
+    log "The key exists; the value that came back from the vault cannot be used to sign an upload."
+    log "Owner handoff:"
+    log "  1) Export the .p8 again in App Store Connect (App Manager+)"
+    log "  2) Store that file as ASC_KEY_P8 in Infisical Fleet-OPS /asc"
+    log "  3) Or export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this run"
+    log "  4) Re-run: bash $0 $APP_KEY --upload-only \"$PACKAGE\""
+    exit 3
+  fi
+  if [[ "$(asc_upload_block)" == "writer" ]]; then
+    log "Upload blocked: the key tool itself failed."
+    log "It classified neither the credential nor the path, so this is not a missing key and not a path failure."
+    log "The credential was resolved; the tool that checks or stages it for the Apple tools did not finish."
+    exit 3
+  fi
   log "Upload blocked: no App Store Connect API key."
   log "Owner handoff:"
   log "  1) Create ASC API key (App Manager+) in App Store Connect"

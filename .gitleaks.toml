@@ -11,3 +11,15 @@ useDefault = true
 description = "MCP strict handshake tests use disposable API-key header literals"
 targetRules = ["generic-api-key"]
 paths = ['''^server/mcp-strict-handshake\.test\.ts$''']
+
+# test-asc-credentials.sh case 11 masks two synthetic PEMs whose bodies carry
+# the word SYNTHETIC.  b4f88bda committed them with a literal armor before the
+# armor was split into parts, and that commit stays in the pull request range.
+# Scoped to private-key, this one file, and the SYNTHETIC marker, so a real key
+# anywhere (including this file) still fails.
+[[allowlists]]
+description = "Synthetic PEMs in the ASC key-preview test (case 11)"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''^scripts/ios-fleet/test-asc-credentials\.sh$''']
+regexes = ['''SYNTHETIC[A-Z]{4,}''']

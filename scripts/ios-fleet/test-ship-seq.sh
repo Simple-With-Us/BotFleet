@@ -79,33 +79,47 @@ chmod +x "${FAKE_BIN}/xcodebuild"
 # The build-floor answer also carries the "train=N app=N -> floor=N" note the
 # ship script parses for the version-plan log line;  without it the two floors
 # would fall back to the floor itself.
-cat >"${FAKE_BIN}/node" <<'FAKE'
+#
+# The key VALIDATOR is the real one:  the diagnostic resolves the credential
+# the way the client does, so a stub that refuses the validation leaves the
+# masked preview withheld and the rejected credential unnamed.  The real node
+# is captured here, before the stub exists, so the result does not depend on
+# an ambient node in /opt/homebrew/bin or /usr/local/bin --  a runner without
+# one used to leave the preview withheld and the assertion failed there.
+real_node="$(command -v node)"
+cat >"${FAKE_BIN}/node" <<FAKE
 #!/usr/bin/env bash
 cmd=""
-for a in "$@"; do
-  case "$a" in
+for a in "\$@"; do
+  case "\$a" in
     */asc-api.mjs) cmd="asc-api" ;;
     latest-marketing-patch|build-floor)
-      if [[ "$cmd" == "asc-api" ]]; then cmd="${cmd}:${a}"; fi
+      if [[ "\$cmd" == "asc-api" ]]; then cmd="\${cmd}:\${a}"; fi
       ;;
   esac
 done
-case "$cmd" in
+case "\$cmd" in
   asc-api:latest-marketing-patch)
     # No stubbed patch = App Store Connect cannot be consulted.
     # "auth" = App Store Connect rejected the key (asc-api exits 4).
-    [[ "${FAKE_ASC_PATCH:-}" == "auth" ]] && exit 4
-    [[ -n "${FAKE_ASC_PATCH:-}" ]] || exit 2
-    printf '%s\n' "$FAKE_ASC_PATCH"
+    [[ "\${FAKE_ASC_PATCH:-}" == "auth" ]] && exit 4
+    [[ -n "\${FAKE_ASC_PATCH:-}" ]] || exit 2
+    printf '%s\n' "\$FAKE_ASC_PATCH"
     exit 0
     ;;
   asc-api:build-floor)
-    _floor="${FAKE_ASC_FLOOR:-0}"
-    printf '%s\n' "$_floor"
-    echo "build-floor: train=${_floor} app=${_floor} -> floor=${_floor}" >&2
+    _floor="\${FAKE_ASC_FLOOR:-0}"
+    printf '%s\n' "\$_floor"
+    echo "build-floor: train=\${_floor} app=\${_floor} -> floor=\${_floor}" >&2
     exit 0
     ;;
 esac
+# The key validator is the real one.  The staged WRITE stays refused, exactly
+# as it was before the stub delegated.
+if [[ "\${1:-}" == *asc-key.mjs ]]; then
+  if [[ "\${2:-}" == "write" ]]; then exit 2; fi
+  exec "$real_node" "\$@"
+fi
 exit 2
 FAKE
 chmod +x "${FAKE_BIN}/node"
@@ -155,18 +169,80 @@ OUT=""
 RC=0
 
 # run_ship <args...> - invoke ship-testflight.sh in the sandbox.
+# SHIP_TMPDIR overrides the TMPDIR the sandboxed run sees, so a test can
+# drive the root-TMPDIR path.  It defaults to a scratch directory under the
+# sandbox, which is what every other case wants.
+# The synthetic credential is handed to the sandboxed run through an
+# INHERITED DESCRIPTOR, never through a command argument:  an argument is
+# readable by every process on the machine through ps.  The here-string that
+# carries it is a temporary file that bash unlinks as soon as it is open, so
+# nothing is left on disk either.  The key id and the issuer are public
+# labels, so they stay in the environment where the run expects them.
 run_ship() {
-  OUT="$(env -i \
+  # A credential is EXPECTED whenever the case put one in TEST_ASC_KEY_P8:
+  # the descriptor handoff must then be proven to have delivered it.
+  local expect_key=0
+  [[ -n "${TEST_ASC_KEY_P8:-}" ]] && expect_key=1
+  case "${EXPECT_ASC_KEY:-}" in
+    0) expect_key=0 ;;
+    1) expect_key=1 ;;
+  esac
+  OUT="$(
+    exec 3<<<"${TEST_ASC_KEY_P8:-}"
+    env -i \
     HOME="$FAKE_HOME" \
     PATH="${FAKE_BIN}:/usr/bin:/bin:/usr/sbin:/sbin" \
-    TMPDIR="${WORK}/tmp" \
+    TMPDIR="${SHIP_TMPDIR:-${WORK}/tmp}" \
     IOS_FLEET_STATE_DIR="$STATE" \
     FLEET_SECRETS="${FAKE_BIN}/fleet-secrets" \
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
+    ASC_KEY_ID="${TEST_ASC_KEY_ID:-}" \
+    ASC_ISSUER_ID="${TEST_ASC_ISSUER_ID:-}" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
-    bash "$SHIP" "$@" 2>&1)"
+    EXPECT_ASC_KEY="$expect_key" \
+    bash -c '
+      if [[ "${EXPECT_ASC_KEY:-0}" == "1" ]]; then
+        # The credential is EXPECTED here.  An unreadable or empty descriptor
+        # is a FAILURE of this harness, not a missing credential:  it has to
+        # be loud, or every case would report "missing credentials" and pass
+        # vacuously.
+        if [[ ! -r /dev/fd/3 ]]; then
+          echo "FLEET-TEST: the inherited credential descriptor was not readable" >&2
+          exit 90
+        fi
+        _pem="$(cat <&3)"
+        if [[ -z "$_pem" ]]; then
+          echo "FLEET-TEST: the inherited credential descriptor was empty" >&2
+          exit 91
+        fi
+        export ASC_KEY_P8="$_pem"
+        unset _pem
+        echo "FLEET-TEST-CREDENTIAL-ARRIVED"
+      elif [[ -r /dev/fd/3 ]]; then
+        _pem="$(cat <&3)"
+        if [[ -n "$_pem" ]]; then export ASC_KEY_P8="$_pem"; fi
+        unset _pem
+      fi
+      exec bash "$1" "${@:2}"
+    ' _ "$SHIP" "$@" 2>&1
+  )"
   RC=$?
+  # The marker is matched and stripped with BASH pattern removal, never with
+  # grep:  the captured output carries a UTF-8 em-dash (ship-testflight.sh
+  # logs "ship-gate: skip - ..."), and under a C/POSIX locale grep treats
+  # that stream as BINARY and replaces the whole capture with a binary-file
+  # message, which would make every later assertion fail misleadingly.
+  if [[ "$expect_key" == "1" && "$OUT" != *"FLEET-TEST-CREDENTIAL-ARRIVED"* ]]; then
+    bad "the credential never reached the sandboxed run (rc=${RC})"
+  fi
+  # The marker is the harness's own line, and the cases match on the ship
+  # script's output, so it is stripped before they look.
+  OUT="$(
+    while IFS= read -r _line; do
+      [[ "$_line" == "FLEET-TEST-CREDENTIAL-ARRIVED" ]] || printf '%s\n' "$_line"
+    done <<< "$OUT"
+  )"
   return 0
 }
 
@@ -174,9 +250,10 @@ ok() { PASS=$((PASS + 1)); echo "  PASS  $1"; }
 bad() {
   FAIL=$((FAIL + 1))
   echo "  FAIL  $1"
-  echo "        ---- output ----"
-  printf '%s\n' "$OUT" | sed 's/^/        /'
-  echo "        ---- end (rc=${RC}) ----"
+  # The captured output is NOT printed:  it can carry the credential the
+  # case put in the environment, and a failure message lands in the CI log.
+  # The count of lines is enough to see that something was produced.
+  echo "        (output withheld: it can carry credential bytes; ${#OUT} bytes captured, rc=${RC})"
 }
 
 check() { # check <desc> <condition-result 0/1>
@@ -191,8 +268,12 @@ contains() { [[ "$OUT" == *"$1"* ]]; }
 
 # The planned pair, read out of the "marketing=<m> build=<b>" log line.
 planned_pair() {
+  # The planned pair is read out of the "marketing=<m> build=<b>" log line.
+  # grep runs with -a:  the capture carries a UTF-8 em-dash, and under a
+  # C/POSIX locale grep treats that stream as binary and would refuse to
+  # match.  -a makes grep treat the stream as text.
   local line
-  line="$(printf '%s' "$OUT" | grep -o 'marketing=[^ ]* build=[^ ]*' | head -1)"
+  line="$(printf '%s' "$OUT" | grep -a -o 'marketing=[^ ]* build=[^ ]*' | head -1)"
   PLANNED_MARKETING="$(printf '%s' "$line" | sed 's/^marketing=//; s/ build=.*$//')"
   PLANNED_BUILD="$(printf '%s' "$line" | sed 's/^.* build=//')"
 }
@@ -512,6 +593,59 @@ run_ship botfleet --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "a rejected key fails the run (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
 check "says the key was rejected" "$(contains 'rejected the API key' && echo 0 || echo 1)"
 check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || echo 0)"
+# The rejected credential is named by its KEY ID and its ISSUER ID, the two
+# public labels that travel in every App Store Connect request header, so
+# the owner can tell exactly which key Apple refused.  NOTHING taken out of
+# the key is printed:  every byte of a private-key body is secret, and a
+# first-eight/last-four slice of it could not even identify the credential,
+# because two different keys share one.
+# A REAL key pair, generated here and never committed:  the diagnostic
+# resolves the credential the way the client does, and a value that is not a
+# usable PEM is skipped by both.
+syn_pem="$(node -e 'process.stdout.write(require("crypto").generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey.export({ type: "pkcs8", format: "pem" }))')"
+syn_body="$(printf '%s\n' "$syn_pem" | sed '1d;$d' | tr -d ' \n')"
+TEST_ASC_KEY_ID="ABCDE12345"
+TEST_ASC_ISSUER_ID="issuer-synthetic"
+TEST_ASC_KEY_P8="$syn_pem"
+run_ship botfleet --repo-root "$REPO" --allow-unverified-seq --dry-run
+check "names the rejected key by its key id" \
+  "$(contains 'key id ABCDE12345' && echo 0 || echo 1)"
+check "names the rejected key by its issuer id" \
+  "$(contains 'issuer id issuer-synthetic' && echo 0 || echo 1)"
+check "does not print the key or any masked slice of it" \
+  "$([[ "$OUT" != *"$syn_body"* && "$OUT" != *"${syn_body:0:8}...${syn_body:$((${#syn_body}-4))}"* ]] && echo 0 || echo 1)"
+TEST_ASC_KEY_ID=""
+TEST_ASC_ISSUER_ID=""
+TEST_ASC_KEY_P8=""
+unset syn_body syn_pem
+FAKE_ASC_PATCH=236
+echo
+
+# --- 12. A root TMPDIR is a PATH failure, not a credential failure ----------
+# The version plan consults App Store Connect before the run creates its
+# staging directory, and those two queries write scratch files through
+# asc_temp_root.  A root TMPDIR makes them fail, and their failure looks
+# exactly like an unreachable App Store Connect, so the run used to die
+# telling the owner to fix ASC_* credentials for what is a path refusal.
+# The root has to be classified BEFORE the version plan, and the run has to
+# end with the path-failure status (3), not the credential status (1).
+echo "12. a root TMPDIR is classified as a path failure before the version plan"
+reset_state
+FAKE_ASC_PATCH=""
+SHIP_TMPDIR="/" run_ship botfleet --repo-root "$REPO" --allow-unverified-seq
+check "exits 3 (the path-failure status)" "$([[ $RC -eq 3 ]] && echo 0 || echo 1)"
+check "says the staging path was refused" \
+  "$(contains 'staging path was refused' && echo 0 || echo 1)"
+check "says it is a path failure, not a missing key" \
+  "$(contains 'not a missing key' && echo 0 || echo 1)"
+check "does not send the owner to repair ASC credentials" \
+  "$(contains 'restore ASC access' && echo 1 || echo 0)"
+check "does not claim App Store Connect could not be consulted" \
+  "$(contains 'App Store Connect could not be' && echo 1 || echo 0)"
+# The version plan never runs, so it never asks App Store Connect anything.
+check "no App Store Connect query was made" \
+  "$(contains 'asc-patch:' && echo 1 || echo 0)"
+SHIP_TMPDIR=""
 FAKE_ASC_PATCH=236
 echo
 
