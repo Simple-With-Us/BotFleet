@@ -65,63 +65,140 @@ test("the companion control page does not hang a sentence gap off a non-sentence
 // panes of Claude Code (the Code tab) and MiniMax Code (the MiniMax Code pane) take
 // the `&nbsp;` entity plus a normal space, because those panes normalize a raw
 // U+00A0 away and collapse two ASCII spaces.  Every other surface takes the real
-// U+00A0.  The portable packs are what the cloud agents read, so a copy that still
-// says "never write the entity" with no exception sends every seat down the wrong
-// path, which is exactly what it did until 2026-10-25.
+// U+00A0.
 //
-// The gate covers every pack that states the rule, not only the gap skill:  a seat
-// that opens owner-copy or land-lane instead of sentence-gap must learn the same
-// exception from it.
+// The gate covers every copy in this repo that states the rule, not only the gap
+// skill:  a seat that opens owner-copy or land-lane instead of sentence-gap must
+// learn the same exception from it, and AGENTS.md is the repo's own
+// agent-instruction file, read by the very seats the exception names.
+//
+// Each copy is read through an *operative* region, bounded by the heading that
+// carries the live rule and the next one.  Without that bound the assertions
+// could be satisfied by a History block or a changelog while the live rule still
+// banned the entity everywhere, and a wrong mechanism could be reintroduced
+// without a red build.
 
-test("every pack that states the gap rule names the one chat-pane exception", () => {
-  for (const rel of RULE_STATING_PACKS) {
-    const source = read(join(ROOT, rel));
+const RULE_STATING_COPIES = [
+  {
+    path: ".claude/skills/sentence-gap/SKILL.md",
+    start: "### Current rule",
+    end: "### History",
+  },
+  {
+    path: ".claude/skills/fleet-coordination/SKILL.md",
+    start: "## 5. Sentence Gap Protocol",
+    end: "\n## ",
+  },
+  {
+    path: ".claude/skills/owner-copy/SKILL.md",
+    start: "## Two spaces between sentences",
+    end: "\n## ",
+  },
+  {
+    path: ".claude/skills/land-lane/SKILL.md",
+    start: "## Docs before the PR",
+    end: "\n## ",
+  },
+  {
+    path: "AGENTS.md",
+    start: "**HOW to emit it",
+    end: "\n## ",
+  },
+];
+
+/**
+ * The operative rule region of one copy:  from its start anchor to its end
+ * anchor.  Fails loudly when an anchor is missing, so a renamed heading cannot
+ * silently turn the gate into a no-op.
+ */
+const operativeRule = (source, copy) => {
+  const start = source.indexOf(copy.start);
+  assert.notEqual(
+    start,
+    -1,
+    `${copy.path} must contain its rule anchor ${JSON.stringify(copy.start)}`,
+  );
+  const end = source.indexOf(copy.end, start + copy.start.length);
+  assert.notEqual(
+    end,
+    -1,
+    `${copy.path} must contain its rule end anchor ${JSON.stringify(copy.end)}`,
+  );
+  return source.slice(start, end);
+};
+
+test("every copy that states the gap rule names the one chat-pane exception", () => {
+  for (const copy of RULE_STATING_COPIES) {
+    const rule = operativeRule(read(join(ROOT, copy.path)), copy);
     assert.ok(
-      source.includes("MiniMax Code"),
-      `${rel} must name the MiniMax Code chat pane as an exception`,
+      rule.includes("MiniMax Code"),
+      `${copy.path} must name the MiniMax Code chat pane as an exception`,
     );
     assert.ok(
-      source.includes("Claude Code"),
-      `${rel} must name the Claude Code Code tab as an exception`,
+      rule.includes("Claude Code"),
+      `${copy.path} must name the Claude Code Code tab as an exception`,
     );
     assert.ok(
-      source.includes("one exception"),
-      `${rel} must state that there is one exception`,
+      /one exception/i.test(rule),
+      `${copy.path} must state that there is one exception`,
     );
-    assert.ok(source.includes("U+00A0"), `${rel} must state the real U+00A0 rule`);
-    assert.ok(source.includes("`&nbsp;`"), `${rel} must name the entity`);
+    assert.ok(rule.includes("U+00A0"), `${copy.path} must state the real U+00A0 rule`);
   }
 });
 
-test("no pack bans the entity everywhere without the two chat panes", () => {
-  // The blanket bans that the exception contradicts.  Each is the pre-2026-10-25
-  // wording, where the entity was refused on every surface including the two
-  // panes that need it.
-  const blanketBans = [
-    "- **Never write the `&nbsp;` entity.**",
-    "- **Never the `&nbsp;` entity.**",
-  ];
-  for (const rel of RULE_STATING_PACKS) {
-    const source = read(join(ROOT, rel));
-    for (const ban of blanketBans) {
+test("the operative rule pins the entity as the two chat panes' mechanism", () => {
+  // Naming the exception is not enough:  the operative rule has to say which
+  // mechanism the two panes take, so a different one cannot slip through.
+  for (const copy of RULE_STATING_COPIES) {
+    const rule = operativeRule(read(join(ROOT, copy.path)), copy);
+    assert.ok(
+      /`&nbsp;` entity plus a normal space/i.test(rule),
+      `${copy.path} must say the two chat panes take the entity plus a normal space`,
+    );
+  }
+});
+
+test("no operative rule bans the entity everywhere", () => {
+  // A blanket ban refuses the entity without the "anywhere else" qualifier, so
+  // it contradicts the two chat panes that need it.  The qualifier is what
+  // makes the canonical wording legal, so the ban is matched up to it.
+  const blanketBan = /never (?:write )?the `&nbsp;` entity(?!\s+anywhere else)/i;
+  for (const copy of RULE_STATING_COPIES) {
+    const rule = operativeRule(read(join(ROOT, copy.path)), copy);
+    assert.ok(
+      !blanketBan.test(rule),
+      `${copy.path} must not ban the entity everywhere; the two chat panes take it`,
+    );
+  }
+});
+
+test("no operative rule claims every chat pane takes the real U+00A0", () => {
+  // A blanket claim here contradicts the two panes, so a copy that still makes
+  // it has not absorbed the exception.
+  const blanketClaims = ["chat replies in every pane", "chat replies in any pane"];
+  for (const copy of RULE_STATING_COPIES) {
+    const rule = operativeRule(read(join(ROOT, copy.path)), copy);
+    for (const claim of blanketClaims) {
       assert.ok(
-        !source.includes(ban),
-        `${rel} must not ban the entity everywhere; the two chat panes take it`,
+        !rule.includes(claim),
+        `${copy.path} must not claim "${claim}" takes the real U+00A0; the two panes take the entity`,
       );
     }
   }
 });
 
-test("no pack claims every chat pane takes the real U+00A0", () => {
-  // A blanket claim here contradicts the two panes, so a pack that still makes
-  // it has not absorbed the exception.
-  const blanketClaims = ["chat replies in every pane", "chat replies in any pane"];
-  for (const rel of RULE_STATING_PACKS) {
-    const source = read(join(ROOT, rel));
-    for (const claim of blanketClaims) {
+test("no operative rule closes the chat panes out of the exception", () => {
+  // The pre-2026-10-25 wording claimed the entity rule was replaced outright,
+  // which is exactly what sends a seat down the wrong path.
+  const closedClaims = [
+    "This replaces the earlier per-surface rules (the entity in chat panes or on GitHub, and two plain ASCII spaces in files, commits and terminals).",
+  ];
+  for (const copy of RULE_STATING_COPIES) {
+    const rule = operativeRule(read(join(ROOT, copy.path)), copy);
+    for (const claim of closedClaims) {
       assert.ok(
-        !source.includes(claim),
-        `${rel} must not claim "${claim}" takes the real U+00A0; the two panes take the entity`,
+        !rule.includes(claim),
+        `${copy.path} must not claim the entity rule is replaced with no exception`,
       );
     }
   }

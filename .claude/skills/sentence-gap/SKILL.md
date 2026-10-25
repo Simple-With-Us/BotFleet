@@ -84,11 +84,12 @@ output holds at least one U+00A0 (`grep -c $'\xc2\xa0' body.nbsp.txt`) before pa
 
 ### Verify, don't assume — run this self-test only on a NEW, unlisted surface
 
-Since 2026-10-23 every surface takes a real U+00A0 plus a normal space,  except the two chat
-panes named above, so there is nothing else to choose.  On a surface nobody has checked yet,
-post one test line with the gap generated in the shell and ask the human whether they see a
-wider gap.  If the surface strips the U+00A0, leave the text as it is, never switch to the
-`&nbsp;` entity, and report the surface in #Work-In-Progress.
+Since 2026-10-23 every surface takes a real U+00A0 plus a normal space, apart from the Claude
+Code Code tab and the MiniMax Code chat pane, so there is nothing else to
+choose.  On a surface nobody has checked yet, post one test line with the gap generated in the
+shell and ask the human whether they see a wider gap.  If the surface strips the U+00A0, leave
+the text as it is, never switch to the `&nbsp;` entity, and report the surface in
+#Work-In-Progress.
 
 ### History — 2026-08-19/20 findings on Claude Code (terminal + desktop), do NOT re-run these tests
 
