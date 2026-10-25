@@ -66,7 +66,7 @@ chmod 700 "${tmp}/no-vault"
 
 extract() {
   awk '
-    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_label\(\) \{/ || /^key_preview\(\) \{/ || /^asc_resolve_diagnostic_credential\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
+    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_label\(\) \{/ || /^key_issuer_label\(\) \{/ || /^asc_resolve_diagnostic_credential\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
     grab { print }
     grab && /^\}/ { grab = 0 }
   ' "$script"
@@ -106,7 +106,7 @@ funcs="${tmp}/funcs.sh"
   echo 'logerr() { echo "[ios-ship] $*" >&2; }'
   echo 'ASC_TMP_DIR=""'
   echo 'ASC_DIAG_KEY_ID=""'
-  echo 'ASC_DIAG_PREVIEW=""'
+  echo 'ASC_DIAG_ISSUER_ID=""'
   echo "FLEET_SECRETS_BIN=\"${tmp}/fleet-secrets\""
   echo "FLEET_DIR=\"${here}\""
   echo "ASC_COMPARE_TOOL=\"${tmp}/compare.cjs\""
@@ -415,11 +415,14 @@ env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
   [[ -z "${APPLE_API_ISSUER_ID:-}" ]]
 ' || fail "an unusable APPLE_API_* trio stayed in the environment"
 
-# 2n. The CI trio's preview is the mask of the KEY BODY, not of the base64
-#     blob it arrived in:  the base64 of the armor is the same string for
-#     every key ever issued, so a preview taken over it names no key at all.
-#     The blob reaches the child through a PATH, so no byte of it is ever an
-#     argument of a process.
+# 2n. A rejected credential is named by its SOURCE, its KEY ID and its
+#     ISSUER ID, and by NOTHING taken out of the key.  There is no masked
+#     preview of a private-key body anywhere:  every byte of that body is
+#     secret, so a slice of it may never be printed, and it could not even
+#     identify the credential -- two different keys share a first eight and a
+#     last four, while the key id and the issuer id say exactly which one it
+#     is.  The blob reaches the child through a PATH, so no byte of it is
+#     ever an argument of a process.
 ci_body="SYNTHETICciBODY00000000000000000000000000000000000tail"
 ci_pem="-----BEGIN PRIVATE KEY-----"$'\n'"${ci_body}"$'\n'"-----END PRIVATE KEY-----"
 printf '%s' "$ci_pem" | base64 | tr -d '\n' > "${tmp}/ci.b64"
@@ -435,11 +438,14 @@ ci_out="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
   load_secrets
 ' 2>&1)"
 case "$ci_out" in
-  *"preview ${ci_mask}"*) ;;
-  *) fail "the CI preview was not the masked key body: ${ci_out}" ;;
+  *"source APPLE_API_KEY_P8_BASE64, key id BADKEY00001, issuer id bad-issuer"*) ;;
+  *) fail "the CI credential was not named by its source, key id and issuer id: ${ci_out}" ;;
 esac
 case "$ci_out" in
-  *"LS0tLS0t"*) fail "the CI preview was taken over the base64 blob: ${ci_out}" ;;
+  *"preview "*) fail "a rejected credential was previewed: ${ci_out}" ;;
+esac
+case "$ci_out" in
+  *"LS0tLS0t"*) fail "the CI log carried the base64 blob: ${ci_out}" ;;
 esac
 unset ci_body ci_pem ci_mask ci_out
 
@@ -460,7 +466,17 @@ pem="$(<"${tmp}/other.p8")"
 #    that sits on the next line is still found.
 for f in "$0" "$script" "${here}/test-ship-seq.sh"; do
   [[ -f "$f" ]] || continue
-  flat="$(perl -0pe 's/\\\n/ /g' "$f")"
+  # The continuations are joined with awk and not with perl:  a runner
+  # without perl must still run this guard, and must not abort the suite
+  # before a single case has run.
+  flat="$(awk '
+    {
+      if (pending != "") { line = pending " " $0 } else { line = $0 }
+      if (line ~ /\\$/) { sub(/\\$/, "", line); pending = line }
+      else { print line; pending = "" }
+    }
+    END { if (pending != "") print pending }
+  ' "$f")"
   if printf '%s' "$flat" | grep -qE '(^|[[:space:]])env [^|\n]*ASC_KEY_P8='; then
     fail "$(basename "$f") passes a credential through env arguments"
   fi
@@ -630,26 +646,23 @@ esac
 case "$cred_log" in
   *"no App Store Connect API key"*) fail "a broken credential was reported as a missing key" ;;
 esac
-# The rejected credential is identified by its source and its public label,
-# the key id, and by nothing taken from the key:  a slice of a private key is
-# private-key-derived material whether or not its armor was stripped.
+# The rejected credential is identified by its source and its two PUBLIC
+# labels, the key id and the issuer id, and by nothing taken from the key:
+# every byte of a private-key body is secret, whether or not its armor was
+# stripped.
 case "$cred_log" in
-  *"source Infisical /asc, key id ABCDE12345"*) ;;
-  *) fail "a broken credential did not name its source and key id" ;;
+  *"source Infisical /asc, key id ABCDE12345, issuer id issuer-synthetic"*) ;;
+  *) fail "a broken credential did not name its source, key id and issuer id" ;;
 esac
-# The masked preview is the fleet's sanctioned way to say WHICH key was
-# refused (owner ruling 2026-07-16), so it has to be there, beside the key
-# id.  It is the one thing in the line that may carry key bytes, so it is
-# removed before the scan below:  the scan then fails only for an UNMASKED
+# There is no masked preview of a private-key body at all, so NOT ONE byte
+# of the key may reach the log -- not the mask, not the armor, not a
 # fragment.
 key_body="$(sed '1d;$d' "${tmp}/asc.p8")"
 key_body="${key_body//[[:space:]]/}"
 mask="$(printf '%s...%s' "${key_body:0:8}" "${key_body:$((${#key_body}-4))}")"
 case "$cred_log" in
-  *"$mask"*) ;;
-  *) fail "a broken credential did not carry the masked preview" ;;
+  *"$mask"*) fail "a rejected credential carried the masked key body" ;;
 esac
-cred_log="${cred_log//"$mask"/}"
 unset mask
 # No byte run of the key may appear in the log beyond that mask.  Every
 # 6-character window of the body is checked with bash pattern matching, so no
@@ -847,12 +860,10 @@ check_diag() {  # <label> <log> <expected substring>
   local label="$1" out="$2" want="$3" i mask
   [[ "$out" == *"$want"* ]] || fail "${label}: diagnostic did not say: ${want}"
   [[ "$out" != *"PRIVATE KEY"* ]] || fail "${label}: diagnostic carried the key armor"
-  #  The masked preview is required, and it is the ONE thing in the line that
-  #  may carry key bytes:  it is removed before the scan, so the scan fails
-  #  only for an unmasked fragment.
+  #  The diagnostic carries NO masked preview of the key:  every byte of a
+  #  private-key body is secret, so not one byte of it may reach the log.
   mask="$(printf '%s...%s' "${syn_body:0:8}" "${syn_body:$((${#syn_body}-4))}")"
-  [[ "$out" == *"$mask"* ]] || fail "${label}: diagnostic did not carry the masked preview"
-  out="${out//"$mask"/}"
+  [[ "$out" != *"$mask"* ]] || fail "${label}: diagnostic carried the masked key body"
   for ((i = 0; i + 6 <= ${#syn_body}; i++)); do
     [[ "$out" != *"${syn_body:i:6}"* ]] || fail "${label}: diagnostic carried a fragment of the key body"
   done
@@ -920,8 +931,13 @@ run_diag_identity() {  # env assignments..., then the resolver
     env FLEET_SECRETS_BIN="${tmp}/fleet-secrets" bash -c '
     source "'"$funcs"'"
     asc_resolve_diagnostic_credential
-    printf "id=%s\npreview=%s\n" "$ASC_DIAG_KEY_ID" "$ASC_DIAG_PREVIEW"
-    printf "argv=%s\n" "$(ps -o args= -p $$ 2>/dev/null || true)"
+    printf "id=%s\nissuer=%s\n" "$ASC_DIAG_KEY_ID" "$ASC_DIAG_ISSUER_ID"
+    # The argv block is DELIMITED, and it is not a single line:  a command
+    # line can carry more than one physical line, so the guard that reads it
+    # must scan the whole block and not only its first line.
+    printf "argv-begin\n"
+    ps -o args= -p $$ 2>/dev/null || true
+    printf "argv-end\n"
   ' 2>&1
   )
 }
@@ -932,20 +948,24 @@ real_b64="$(base64 < "${tmp}/asc.p8" | tr -d '\n')"
 
 out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="$real_b64")"
 [[ "$out" == *"id=CIKEY00001"* ]] || fail "the CI key id was not named: ${out}"
-[[ "$out" == *"preview=${real_mask}"* ]] || fail "the CI preview was not the masked body: ${out}"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the CI issuer id was not named: ${out}"
+[[ "$out" != *"$real_mask"* ]] || fail "the CI diagnostic carried the masked key body: ${out}"
 out="$(run_diag_identity ASC_KEY_ID=ENVKEY00002 ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$(cat "${tmp}/asc.p8")")"
 [[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named: ${out}"
-[[ "$out" == *"preview=${real_mask}"* ]] || fail "the environment preview was not the masked body: ${out}"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the environment issuer id was not named: ${out}"
+[[ "$out" != *"$real_mask"* ]] || fail "the environment diagnostic carried the masked key body: ${out}"
 # The credential reaches the child in its ENVIRONMENT, so the child's own
 # arguments must not carry a byte of it:  an argument is readable by every
 # process on the machine through ps.  The guard below covers the process
 # that starts the child; this one covers the child itself.
 case "$out" in
-  *"argv="*) ;;
+  *"argv-begin"*"argv-end"*) ;;
   *) fail "the diagnostic child did not report its own arguments" ;;
 esac
-argv_line="$(printf '%s\n' "$out" | grep '^argv=' || true)"
-[[ "$argv_line" != *"$real_body"* ]] || fail "the credential reached the diagnostic child in its command arguments"
+# The WHOLE delimited block is scanned:  a credential on any later physical
+# line of the argv must not slip past this guard.
+argv_block="$(printf '%s\n' "$out" | awk '/^argv-begin$/{f=1;next} /^argv-end$/{f=0} f')"
+[[ "$argv_block" != *"$real_body"* ]] || fail "the credential reached the diagnostic child in its command arguments"
 
 # A half-set trio is skipped by the client, so the diagnostic must not name
 # it:  the key id comes from the client's last source instead.
@@ -963,14 +983,16 @@ out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-
   ASC_KEY_ID=ENVKEY00002 ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$(cat "${tmp}/asc.p8")")"
 [[ "$out" != *"CIKEY00001"* ]] || fail "an unusable CI trio was named: ${out}"
 [[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named after the CI trio was skipped: ${out}"
-[[ "$out" == *"preview=${real_mask}"* ]] || fail "the environment preview was not the masked body after the CI trio was skipped: ${out}"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the environment issuer id was not named after the CI trio was skipped: ${out}"
+[[ "$out" != *"$real_mask"* ]] || fail "the environment diagnostic carried the masked key body after the CI trio was skipped: ${out}"
 
 # A diagnostic never causes a secret read:  the vault is asked for the KEY
 # ID, which is a public label, and never for the key material.
 : > "$FAKE_LOG"
 out="$(run_diag_identity)"
-[[ "$out" == *"preview=[withheld: no usable credential in the environment]"* ]] \
-  || fail "a preview was invented without material: ${out}"
+[[ "$out" == *"id=ABCDE12345"* ]] || fail "the vault key id was not named: ${out}"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the vault issuer id was not named: ${out}"
+[[ "$out" != *"preview"* ]] || fail "a preview was invented: ${out}"
 if grep -q "ASC_KEY_P8 /asc" "$FAKE_LOG"; then
   fail "the diagnostic read the key material from the vault"
 fi

@@ -263,73 +263,43 @@ asc_upload_block() {
   esac
 }
 
-# A MASKED PREVIEW of a rejected credential:  the first eight and the last
-# four characters, with the middle elided.  That is the fleet's canonical
-# mask, and the same helper the other fleet repos carry:  it answers "which
-# key is this?" without printing a value anyone could authenticate with.  A
-# value too short to mask safely is withheld whole, so the preview can never
-# become the secret.
+# A rejected credential is named by its SOURCE, its KEY ID and its ISSUER ID:
+#  the id and the issuer id are public labels that travel in every App Store
+# Connect request header, and together they say exactly WHICH key was
+# refused.  The id is printed only when it looks like one:  anything else is
+# reported as "unrecognized", so a mis-set id that happens to hold the key, or
+# a line break, can never reach the log.
 #
-# The value never reaches an external command:  it arrives as a function
-# argument, which bash keeps in the shell's own memory and never puts into a
-# process argument list, and the preview itself is built with parameter
-# expansion.
-key_preview() {
-  local v="${1:-}" n
-  #  The Unicode line terminators NEL, LS and PS are matched by their UTF-8
-  #  bytes, because [[:space:]] and [[:cntrl:]] depend on the locale and can
-  #  miss them.  A value that carries one is withheld whole, so it can never
-  #  inject a line break into the log line the preview is written into.
-  if [[ "$v" == *$'\302\205'* || "$v" == *$'\342\200\250'* || "$v" == *$'\342\200\251'* ]]; then
-    printf '%s' "[withheld: line terminator]"
-    return 0
-  fi
-  #  Whitespace is removed first:  a PEM is wrapped, and a preview that
-  #  carried a newline would break the log line it is written into.
-  v="${v//[[:space:]]/}"
-  #  Any control character left after that is withheld the same way.
-  if [[ "$v" == *[[:cntrl:]]* ]]; then
-    printf '%s' "[withheld: control character]"
-    return 0
-  fi
-  #  A PEM is masked over its base64 body, not its armor:  the armor is the
-  #  same string on every key ever issued, so a mask taken over it would name
-  #  nothing.  A value without armor is masked as itself.
-  if [[ "$v" == -----BEGIN*-----* ]]; then
-    v="${v#-----BEGIN*-----}"
-    v="${v%-----END*}"
-  fi
-  n=${#v}
-  if [[ "$n" -eq 0 ]]; then
-    printf '%s' "(empty)"
-    return 0
-  fi
-  if [[ "$n" -le 24 ]]; then
-    #  Withheld unless the value is comfortably longer than the twelve
-    #  characters a preview discloses:  a 13-character rejected credential
-    #  would otherwise be logged as 12 of its 13 characters, which is the
-    #  mask becoming the secret.
-    printf '[%d chars, withheld]' "$n"
-    return 0
-  fi
-  #  The offset is computed arithmetically:  ${v: -4} needs bash 4.2 and this
-  #  script targets Apple bash 3.2, where it is a bad substitution.
-  printf '%s...%s' "${v:0:8}" "${v:$((${#v}-4))}"
-}
-
-# A rejected credential is named by its KEY ID and its SOURCE, and the fleet's
-# sanctioned masked preview of the key sits BESIDE the id:  the id is a public
-# label that travels in every App Store Connect request header, and the
-# preview is the fleet's own owner-mandated way to say which of several keys
-# is the one in play (owner ruling 2026-07-16).  The id is printed only when
-# it looks like one:  anything else is reported as "unrecognized", so a
-# mis-set id that happens to hold the key, or a line break, can never reach
-# the log.
+# NOTHING taken out of the key itself is printed.  A PEM body is the base64
+# of the DER of the private key, so every byte of it is secret and a
+# first-eight/last-four slice of it is a slice of the key's own encoding;
+# there is no non-secret prefix of a private key the way there is for a
+# provider API key, where the prefix is a public label.  A review rule cannot
+# authorize exposing a value, and a body mask could not even identify the
+# credential:  two different keys share a first eight and a last four.  The
+# key id and the issuer id are the public labels that do identify it.
 key_label() {
   local v="${1:-}"
   if [[ -z "$v" ]]; then
     printf '%s' "missing"
   elif [[ "${#v}" -le 32 && "$v" =~ ^[A-Za-z0-9]+$ ]]; then
+    printf '%s' "$v"
+  else
+    printf '%s' "unrecognized"
+  fi
+}
+
+# The ISSUER ID is the other public label of the credential:  it travels in
+# every request header beside the key id, so it identifies the key exactly.
+# It is a UUID, so it carries dashes, and key_label would report it as
+# unrecognized;  it is printed when it looks like one, and anything else is
+# reported as "unrecognized", so a mis-set issuer id or a line break can
+# never reach the log.
+key_issuer_label() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    printf '%s' "missing"
+  elif [[ "${#v}" -le 64 && "$v" =~ ^[A-Za-z0-9-]+$ ]]; then
     printf '%s' "$v"
   else
     printf '%s' "unrecognized"
@@ -344,15 +314,18 @@ key_label() {
 #
 # Only material the ENVIRONMENT already holds is read.  The vault is never
 # asked for the key material here:  a diagnostic must not cause a secret
-# read.  The vault's KEY ID is read when no environment source qualifies,
-# because the key id is a public label that travels in every request header.
+# read.  The vault's KEY ID and ISSUER ID are read when no environment source
+# qualifies, because both are public labels that travel in every request
+# header.
 #
-# The result is the public key id in ASC_DIAG_KEY_ID and the fleet's masked
-# preview in ASC_DIAG_PREVIEW.  The material is cleared before returning.
+# The result is the public key id in ASC_DIAG_KEY_ID and the public issuer id
+# in ASC_DIAG_ISSUER_ID.  NOTHING taken out of the key is reported:  a masked
+# preview of a private-key body is not printed anywhere, because every byte
+# of that body is secret (see the comment above key_label).
 ASC_DIAG_KEY_ID=""
-ASC_DIAG_PREVIEW=""
+ASC_DIAG_ISSUER_ID=""
 asc_resolve_diagnostic_credential() {
-  local v="" id="" p=""
+  local v="" id="" issuer=""
   if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
     case "$APPLE_API_KEY_P8_BASE64" in
       *BEGIN*) v="$APPLE_API_KEY_P8_BASE64" ;;
@@ -360,6 +333,7 @@ asc_resolve_diagnostic_credential() {
     esac
     if [[ -n "$v" ]] && node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$v"; then
       id="$APPLE_API_KEY_ID"
+      issuer="$APPLE_API_ISSUER_ID"
     else
       #  The client skips a source whose key is not a usable PEM and goes on
       #  to the NEXT source, so this diagnostic must not name it -- and must
@@ -375,20 +349,21 @@ asc_resolve_diagnostic_credential() {
     if node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8"; then
       v="$ASC_KEY_P8"
       id="$ASC_KEY_ID"
+      issuer="$ASC_ISSUER_ID"
     fi
   fi
   if [[ -z "$id" ]]; then
-    #  The client's last source is Infisical /asc.  Only the KEY ID is read
-    #  from it:  that is a public label, not key material.
+    #  The client's last source is Infisical /asc.  Only the KEY ID and the
+    #  ISSUER ID are read from it:  both are public labels, not key
+    #  material.
     id="${ASC_KEY_ID:-}"
     [[ -n "$id" ]] || id="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
+    issuer="${ASC_ISSUER_ID:-}"
+    [[ -n "$issuer" ]] || issuer="$(fs_get ASC_ISSUER_ID /asc 2>/dev/null || true)"
   fi
+  v=""
   ASC_DIAG_KEY_ID="$id"
-  if [[ -n "$v" ]]; then
-    p="$(key_preview "$v")" || p=""
-    v=""
-  fi
-  ASC_DIAG_PREVIEW="${p:-[withheld: no usable credential in the environment]}"
+  ASC_DIAG_ISSUER_ID="$issuer"
 }
 
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
@@ -440,18 +415,11 @@ load_secrets() {
         #  The credential was resolved and then rejected.  That is a
         #  credential failure, not a missing key:  the owner has to fix the
         #  value that is there, not create a key that already exists.
-        #  The rejected value is named by its source and key id, never by
-        #  any part of itself.
-        #  The rejected credential is named by its source, its key id and the
-        #  fleet's sanctioned masked preview of it.  The preview is computed
-        #  from the value that was refused and cleared right after.
-        #  The preview is taken over the DECODED key, so it is the mask of
-        #  the key body:  the base64 of the armor is the same string for
-        #  every key ever issued and would name nothing.
-        local preview_a
-        preview_a="$(key_preview "$key_pem")" || preview_a=""
-        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), preview ${preview_a:-withheld})"
-        preview_a=""
+        #  The rejected value is named by its SOURCE, its KEY ID and its
+        #  ISSUER ID, and by nothing that came out of the key:  every byte of
+        #  a private-key body is secret, so there is no fragment of it that
+        #  may be shown.
+        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), issuer id $(key_issuer_label "${APPLE_API_ISSUER_ID:-}"))"
         key_pem=""
         ASC_AUTH_FAILURE="credential"
       elif [[ "$rc" -ne 0 ]]; then
@@ -468,12 +436,10 @@ load_secrets() {
         key_src="APPLE_API_KEY_P8_BASE64"
       fi
     else
-      #  The value in play is the base64 blob itself, so that is what the
-      #  masked preview is taken over.
-      local preview_dec
-      preview_dec="$(key_preview "$APPLE_API_KEY_P8_BASE64")" || preview_dec=""
-      logerr "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), preview ${preview_dec:-withheld})"
-      preview_dec=""
+      #  The value did not decode at all, so it failed local validation
+      #  before it could be looked at:  it is named by its source, its key
+      #  id and its issuer id, and by nothing taken out of the key.
+      logerr "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), issuer id $(key_issuer_label "${APPLE_API_ISSUER_ID:-}"))"
       #  Same class as the validate refusal above:  a credential that was
       #  resolved and cannot be used.
       ASC_AUTH_FAILURE="credential"
@@ -490,19 +456,19 @@ load_secrets() {
   #    private key and comes with the key id and issuer it belongs to.
   if [[ -z "$key_pem" && -n "${ASC_KEY_P8:-}" ]]; then
     if [[ -z "$kid" || -z "$iss" ]]; then
-      local preview_b
-      preview_b="$(key_preview "$ASC_KEY_P8")" || preview_b=""
-      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"), preview ${preview_b:-withheld})"
-      preview_b=""
+      #  A credential without the id and issuer it belongs to is unusable
+      #  here, so it failed local validation:  it is named by its source and
+      #  by its public labels, and by nothing taken out of the key.
+      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
       unset ASC_KEY_P8
     else
       rc=0
       node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8" || rc=$?
       if [[ "$rc" -eq 3 ]]; then
-        local preview_c
-        preview_c="$(key_preview "$ASC_KEY_P8")" || preview_c=""
-        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"), preview ${preview_c:-withheld})"
-        preview_c=""
+        #  The credential failed local validation:  it is named by its
+        #  source, its key id and its issuer id, and by nothing taken out of
+        #  the key.
+        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
         #  The client would refuse this value, so it is removed from the
         #  environment:  the client has to see the credential this shell layer
         #  resolved, not one that cannot be used.
@@ -582,17 +548,12 @@ load_secrets() {
     # them a missing key is not.
     if [[ "$rc" -eq 3 ]]; then
       # The credential was resolved and it is not a usable PEM private key.
-      # It is named by its source, by its key id -- a public label that
-      # travels in every request header and is not part of the key -- and by
-      # the fleet's sanctioned masked preview of the key body, which is its
-      # first eight and last four characters.  The whole key is never
-      # printed:  the preview is the only part of the key that reaches the
-      # log, and it is withheld whole when the value is too short to mask
-      # safely or carries a control character.
-      local preview_d
-      preview_d="$(key_preview "$key_pem")" || preview_d=""
-      log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key (source ${key_src:-unknown}, key id $(key_label "$kid"), preview ${preview_d:-withheld})"
-      preview_d=""
+      # It is named by its source, by its key id and by its issuer id -- both
+      # public labels that travel in every request header and are not part of
+      # the key -- and by NOTHING taken from the key itself:  every byte of a
+      # private-key body is secret, so there is no fragment of it that may be
+      # shown.
+      log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key (source ${key_src:-unknown}, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
       ASC_AUTH_FAILURE="credential"
     elif [[ "$rc" -eq 2 ]]; then
       # The credential was resolved.  The staging path was refused.
@@ -1358,16 +1319,15 @@ else
     _patch="$(asc_latest_marketing_patch "$MARKETING_PREFIX" "$ASC_PLATFORM")"
     _rc=$?
     if [[ $_rc -eq 4 ]]; then
-      # The rejected credential is named by its key id, the public label that
-      # travels in every request header, so the owner knows WHICH key App
-      # Store Connect refused.  No part of the key is printed:  a slice of a
-      # private key is private-key-derived material, previewed or not.
-      #  The rejected credential is named by its key id and the fleet's
-      #  sanctioned masked preview of it, so the owner can tell WHICH key
-      #  App Store Connect refused.
+      # The rejected credential is named by its key id and its issuer id:
+      # both are public labels that travel in every request header, and
+      # together they say exactly WHICH key App Store Connect refused.  No
+      # part of the key is printed:  every byte of a private-key body is
+      # secret, so there is no fragment of it that may be shown.
       asc_resolve_diagnostic_credential
       _rejected_key="$(key_label "$ASC_DIAG_KEY_ID")"
-      die "App Store Connect rejected the API key (HTTP 401/403) while reading the next marketing version (key id ${_rejected_key}, preview ${ASC_DIAG_PREVIEW}).
+      _rejected_issuer="$(key_issuer_label "$ASC_DIAG_ISSUER_ID")"
+      die "App Store Connect rejected the API key (HTTP 401/403) while reading the next marketing version (key id ${_rejected_key}, issuer id ${_rejected_issuer}).
   Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
   --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
     fi
@@ -1419,11 +1379,12 @@ else
     _floor_line="$(asc_build_floor "$MARKETING" "$ASC_PLATFORM")"
     _rc=$?
     if [[ $_rc -eq 4 ]]; then
-      # The same public label as the marketing-version rejection above:  the
-      # key id, and nothing that came out of the key.
+      # The same public labels as the marketing-version rejection above:  the
+      # key id and the issuer id, and nothing that came out of the key.
       asc_resolve_diagnostic_credential
       _rejected_key="$(key_label "$ASC_DIAG_KEY_ID")"
-      die "App Store Connect rejected the API key (HTTP 401/403) while reading the build floor (key id ${_rejected_key}, preview ${ASC_DIAG_PREVIEW}).
+      _rejected_issuer="$(key_issuer_label "$ASC_DIAG_ISSUER_ID")"
+      die "App Store Connect rejected the API key (HTTP 401/403) while reading the build floor (key id ${_rejected_key}, issuer id ${_rejected_issuer}).
   Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
   --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
     fi

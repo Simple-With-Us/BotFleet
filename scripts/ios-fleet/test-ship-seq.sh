@@ -179,6 +179,14 @@ RC=0
 # nothing is left on disk either.  The key id and the issuer are public
 # labels, so they stay in the environment where the run expects them.
 run_ship() {
+  # A credential is EXPECTED whenever the case put one in TEST_ASC_KEY_P8:
+  # the descriptor handoff must then be proven to have delivered it.
+  local expect_key=0
+  [[ -n "${TEST_ASC_KEY_P8:-}" ]] && expect_key=1
+  case "${EXPECT_ASC_KEY:-}" in
+    0) expect_key=0 ;;
+    1) expect_key=1 ;;
+  esac
   OUT="$(
     exec 3<<<"${TEST_ASC_KEY_P8:-}"
     env -i \
@@ -192,8 +200,26 @@ run_ship() {
     ASC_ISSUER_ID="${TEST_ASC_ISSUER_ID:-}" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
+    EXPECT_ASC_KEY="$expect_key" \
     bash -c '
-      if [[ -r /dev/fd/3 ]]; then
+      if [[ "${EXPECT_ASC_KEY:-0}" == "1" ]]; then
+        # The credential is EXPECTED here.  An unreadable or empty descriptor
+        # is a FAILURE of this harness, not a missing credential:  it has to
+        # be loud, or every case would report "missing credentials" and pass
+        # vacuously.
+        if [[ ! -r /dev/fd/3 ]]; then
+          echo "FLEET-TEST: the inherited credential descriptor was not readable" >&2
+          exit 90
+        fi
+        _pem="$(cat <&3)"
+        if [[ -z "$_pem" ]]; then
+          echo "FLEET-TEST: the inherited credential descriptor was empty" >&2
+          exit 91
+        fi
+        export ASC_KEY_P8="$_pem"
+        unset _pem
+        echo "FLEET-TEST-CREDENTIAL-ARRIVED"
+      elif [[ -r /dev/fd/3 ]]; then
         _pem="$(cat <&3)"
         if [[ -n "$_pem" ]]; then export ASC_KEY_P8="$_pem"; fi
         unset _pem
@@ -202,6 +228,12 @@ run_ship() {
     ' _ "$SHIP" "$@" 2>&1
   )"
   RC=$?
+  if [[ "$expect_key" == "1" ]] && ! printf '%s\n' "$OUT" | grep -q '^FLEET-TEST-CREDENTIAL-ARRIVED$'; then
+    bad "the credential never reached the sandboxed run (rc=${RC})"
+  fi
+  # The marker is the harness's own line, and the cases match on the ship
+  # script's output, so it is stripped before they look.
+  OUT="$(printf '%s\n' "$OUT" | grep -v '^FLEET-TEST-CREDENTIAL-ARRIVED$' || true)"
   return 0
 }
 
@@ -547,12 +579,12 @@ run_ship botfleet --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "a rejected key fails the run (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
 check "says the key was rejected" "$(contains 'rejected the API key' && echo 0 || echo 1)"
 check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || echo 0)"
-# The rejected credential is named by its KEY ID, the public label that
-# travels in every App Store Connect request header, AND by the fleet's
-# sanctioned masked preview of it, so the owner can tell which key Apple
-# refused.  The preview is the first eight and the last four of the key body.
-# The armor is assembled from parts, so the fixture never looks like a
-# committed private key to a scanner.
+# The rejected credential is named by its KEY ID and its ISSUER ID, the two
+# public labels that travel in every App Store Connect request header, so
+# the owner can tell exactly which key Apple refused.  NOTHING taken out of
+# the key is printed:  every byte of a private-key body is secret, and a
+# first-eight/last-four slice of it could not even identify the credential,
+# because two different keys share one.
 # A REAL key pair, generated here and never committed:  the diagnostic
 # resolves the credential the way the client does, and a value that is not a
 # usable PEM is skipped by both.
@@ -564,10 +596,10 @@ TEST_ASC_KEY_P8="$syn_pem"
 run_ship botfleet --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "names the rejected key by its key id" \
   "$(contains 'key id ABCDE12345' && echo 0 || echo 1)"
-check "carries the masked preview of the key" \
-  "$(contains "preview ${syn_body:0:8}...${syn_body:$((${#syn_body}-4))}" && echo 0 || echo 1)"
-check "does not print the key itself" \
-  "$([[ "$OUT" != *"$syn_body"* ]] && echo 0 || echo 1)"
+check "names the rejected key by its issuer id" \
+  "$(contains 'issuer id issuer-synthetic' && echo 0 || echo 1)"
+check "does not print the key or any masked slice of it" \
+  "$([[ "$OUT" != *"$syn_body"* && "$OUT" != *"${syn_body:0:8}...${syn_body:$((${#syn_body}-4))}"* ]] && echo 0 || echo 1)"
 TEST_ASC_KEY_ID=""
 TEST_ASC_ISSUER_ID=""
 TEST_ASC_KEY_P8=""
