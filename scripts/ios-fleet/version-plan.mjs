@@ -100,6 +100,59 @@ export function isDriftTrain(trainVersion, buildVersions, prefix) {
 }
 
 /**
+ * True when the value is a string.
+ *
+ * The App Store Connect shapes are decoded at this boundary, so a string is
+ * recognised by its tag instead of by a runtime `typeof` check.
+ */
+function isStringValue(value) {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
+/**
+ * The marketing version of an App Store version entry.
+ *
+ * The API answers with either a plain version string or an object carrying
+ * versionString, so this boundary helper picks the domain value once, and the
+ * callers below branch on that value instead of narrowing a representation at
+ * runtime.  The entry is validated BEFORE it is read: a plain version string
+ * or an object with an own string versionString is the version, and anything
+ * else is malformed and has no version to count.
+ */
+function appStoreVersionString(entry) {
+  if (entry === null || entry === undefined) return null;
+  if (isStringValue(entry)) return entry;
+  if (Object.prototype.toString.call(entry) !== "[object Object]") return null;
+  if (!Object.hasOwn(entry, "versionString")) return null;
+  const value = entry.versionString;
+  return isStringValue(value) ? value : null;
+}
+
+/**
+ * The version value of a TestFlight train entry.
+ *
+ * The entry is either a plain version string or an object carrying version;
+ * anything else is malformed and has no version.
+ */
+function trainVersionString(train) {
+  if (train === null || train === undefined) return null;
+  if (isStringValue(train)) return train;
+  if (Object.prototype.toString.call(train) !== "[object Object]") return null;
+  if (!Object.hasOwn(train, "version")) return null;
+  const value = train.version;
+  return isStringValue(value) ? value : null;
+}
+
+/** The builds a TestFlight train entry holds; a plain version holds none. */
+function trainBuildList(train) {
+  if (train === null || train === undefined) return [];
+  if (Object.prototype.toString.call(train) !== "[object Object]") return [];
+  if (!Object.hasOwn(train, "builds")) return [];
+  const value = train.builds;
+  return Array.isArray(value) ? value : [];
+}
+
+/**
  * The highest patch already used on a train.
  *
  * appStoreVersions: ["1.0.235"]  -- the App Store versions, never ignored.
@@ -117,14 +170,14 @@ export function latestMarketingPatch({ prefix, appStoreVersions = [], trains = [
   };
 
   for (const version of appStoreVersions || []) {
-    const value = typeof version === "string" ? version : version?.versionString;
+    const value = appStoreVersionString(version);
     consider(parsePatch(value, prefix));
   }
 
   for (const train of trains || []) {
     if (!train) continue;
-    const version = typeof train === "string" ? train : train.version;
-    const builds = typeof train === "string" ? [] : train.builds || [];
+    const version = trainVersionString(train);
+    const builds = trainBuildList(train);
     if (isDriftTrain(version, builds, prefix)) continue;
     consider(parsePatch(version, prefix));
   }
@@ -144,12 +197,12 @@ export function nextMarketingPatch({ prefix, appStoreVersions = [], trains = [] 
   const taken = new Set();
   for (const train of trains || []) {
     if (!train) continue;
-    const version = typeof train === "string" ? train : train.version;
+    const version = trainVersionString(train);
     const patch = parsePatch(version, prefix);
     if (patch !== null) taken.add(patch);
   }
   for (const version of appStoreVersions || []) {
-    const value = typeof version === "string" ? version : version?.versionString;
+    const value = appStoreVersionString(version);
     const patch = parsePatch(value, prefix);
     if (patch !== null) taken.add(patch);
   }

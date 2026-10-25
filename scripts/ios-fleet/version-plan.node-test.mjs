@@ -258,6 +258,33 @@ test("nextMarketingPatch is latest + 1 when nothing is in the way", () => {
   );
 });
 
+test("the App Store and train shapes are decoded at the boundary (BF-2262)", () => {
+  //  An App Store version is either a plain version string or an object
+  //  carrying versionString.  Both must count: a version that is already on
+  //  sale and is ignored would let the next patch collide with it.
+  assert.equal(latestMarketingPatch({ prefix: "1.0", appStoreVersions: ["1.0.235"], trains: [] }), 235);
+  assert.equal(
+    latestMarketingPatch({ prefix: "1.0", appStoreVersions: [{ versionString: "1.0.235" }], trains: [] }),
+    235
+  );
+  assert.equal(nextMarketingPatch({ prefix: "1.0", appStoreVersions: [{ versionString: "1.0.235" }], trains: [] }), 236);
+  //  A train is either a plain version string or an object carrying version.
+  assert.equal(latestMarketingPatch({ prefix: "1.0", appStoreVersions: [], trains: ["1.0.236"] }), 236);
+  assert.equal(
+    latestMarketingPatch({ prefix: "1.0", appStoreVersions: [], trains: [{ version: "1.0.236" }] }),
+    236
+  );
+  //  A malformed entry has no version: it is ignored, never guessed at.
+  assert.equal(
+    latestMarketingPatch({ prefix: "1.0", appStoreVersions: [42, null, {}, { versionString: 7 }], trains: [] }),
+    0
+  );
+  assert.equal(
+    latestMarketingPatch({ prefix: "1.0", appStoreVersions: [], trains: [{ version: 7 }, { builds: ["236"] }] }),
+    0
+  );
+});
+
 test("planVersion refuses a forced build that recreates 1.0.N (N) (Kody, AFC-517)", () => {
   assert.throws(() => planVersion({ prefix: "1.0", ascPatch: 236, forcedBuild: "237", commitCount: 10, floor: 0 }));
   assert.throws(() => planVersion({ prefix: "1.0", forcedVersion: "1.0.236", forcedBuild: "236", commitCount: 10, floor: 0 }));
