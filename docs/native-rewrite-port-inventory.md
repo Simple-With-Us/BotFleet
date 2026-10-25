@@ -57,6 +57,19 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/checkpoints.ts` | Per-turn workspace snapshots → `EngineDriver` BF-2504 (git-based, reimplement with libgit2 or `git` CLI) |
 | `server/worktree-leases.ts` | Lease queue → `EngineDriver` BF-2504 |
 | `server/testing/*` (23 fakes/harness files) | Retired; replaced by `ReplayHarness` fixtures BF-2503 |
+| `server/index.ts` (composition root: routes, boot wiring, harness entry) | Wiring collapses into `LifecycleService` BF-2497 and the Phase 5 actors; the file itself retires BF-2515 |
+| `server/cli-failure.ts`, `server/cli-probe-env.ts`, `server/stderr-excerpt.ts`, `server/host-dispatch-hot.ts` | Engine support (failure wording, credential-free probe env, shared host probe) → `EngineDriver` BF-2504 |
+| `server/attachments.ts` | Composer attachment staging → `EngineDriver` tool lane BF-2504 |
+| `server/bot-desktop-session.ts` | Shared-desktop identity → `CUAEngine` BF-2509, beside the `local-vm-*` rows |
+| `server/cloud-backend.ts` | Cloud-backend switch guard → per-bot switch BF-2508 |
+| `server/data-dir.ts`, `server/harness-ports.ts` | Data-root and port-ladder rules → app startup BF-2497 (twins of `electron/app-paths.mjs` and the `main.mjs` ladder) |
+| `server/idempotency.ts` | Retry-safe POST outcomes → companion endpoint BF-2511 and `RoutinesScheduler` BF-2513 |
+| `server/companion-writes.ts`, `server/named-tunnel-gate.ts` | Phone-write shapes and tunnel gate → the BF-2510 endpoint, built by BF-2511 |
+| `server/replies.ts` | Reply excerpt rendering → `TextKitTranscript` BF-2501 (pure logic port) |
+| `server/*-wiring.test.ts`, `server/*-e2e.test.ts`, `server/boot-*.test.ts`, `server/agent-docs-linear-board.test.ts`, `server/branching.test.ts`, `server/comms.test.ts`, `server/composer-attachments.test.ts`, `server/delete-refusal-routes.test.ts`, `server/drafts.test.ts`, `server/external-credential-startup.test.ts`, `server/fallback-tiers.test.ts`, `server/group-tasks.test.ts`, `server/harness-trust-boundary.test.ts`, `server/kill-tree.test.ts`, `server/max-tool-rounds.test.ts`, `server/mcp-server*.test.ts`, `server/mcp-sse*.test.ts`, `server/mcp-strict-handshake.test.ts`, `server/no-owner-defaults.test.ts`, `server/prompt-privacy.test.ts`, `server/retention-hold.test.ts`, `server/room-drain.test.ts`, `server/rooms-*.test.ts`, `server/secret-persistence.test.ts`, `server/task-*.test.ts`, `server/tasks.test.ts`, `server/unattended.test.ts`, `server/update-held-boot.test.ts`, `server/zulip-*.test.ts`, `server/bot-off*.test.ts` | Cross-cutting wiring, boot and lane tests.  Each ports with the subsystem it exercises (owners above); the corpus retires Phase 6 and replay coverage is BF-2503 |
+| `server/test-parent-watchdog.ts` | Test harness; retired with `server/testing/*`, replaced by BF-2503 fixtures |
+| `companion/README.md` | Pointer doc for the retired sidecar tree; deleted with it in BF-2515 |
+| `electron/error-page.test.mjs`, `electron/sentry-desktop.node-test.mjs`, `electron/sts-packaging.node-test.mjs`, `server/sts-launch.node-test.mjs` | Boot-page, Sentry and STS packaging tests.  Each retires with its subject (`LifecycleService` BF-2497 boot page, Sentry Cocoa follow-up, BF-2489 STS) in BF-2485/BF-2515 |
 
 ## 2. Secrets and config → Phase 4 (BF-2506) unless noted
 
@@ -159,8 +172,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 
 ## 9. Gate statement
 
-BF-2514 and BF-2515 both cite this file as their Phase 4 inventory gate.
-Re-survey command for deltas:
+BF-2514 and BF-2515 both cite this file as their Phase 4 inventory gate.  Coverage is re-checked by `scripts/audit-node-decommission.mjs` (BF-2515, 2026-10-24): every tracked file under `server/`, `companion/`, `shared/` and `electron/` must be named here or in the Electron inventory, and `scripts/check-decommission-gates.mjs` refuses the deletion until the Phase 5 issues and evidence are green.  Re-survey command for deltas:
 `find server companion/src shared -maxdepth 1 -name '*.ts' ! -name '*.test.ts' | wc -l`
 and per-area `wc -l`. Any new `server/` or `companion/` file after this
 commit must land a row here before Phase 5 starts.

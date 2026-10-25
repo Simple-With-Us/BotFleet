@@ -122,3 +122,15 @@ notarize with the local keychain profile (`xcrun notarytool submit …
 `node scripts/regenerate-mac-feed.mjs`, upload to the matching
 `Simple-With-Us/BotFleet` release, publish, and always verify the
 published bytes against the published feed by downloading them back.
+
+## The Native Mac Build (BF-2486, Phase 6)
+
+The native `BotFleetMac` app has its own pipeline, **Actions → Native Mac Release → Run workflow**, with `scripts/mac-package.sh` as the local equivalent.  Both produce the same asset names from the same pinned commit, and neither ever publishes: tick **draft** to attach the verified assets to the `v<version>` draft, then publish by hand after checking them.
+
+Native assets are `BotFleetMac-<version>.zip`, `BotFleetMac-<version>.dmg` and one `appcast.xml`, on the same GitHub release as the Electron set.  The names are disjoint on purpose: Sparkle reads the appcast, electron-updater reads `latest-mac.yml`, and a native ZIP wearing an Electron name would be offered to installed Electron apps as an update they cannot run.  `scripts/verify-native-release.mjs` fails the run if the two sets ever share a directory.
+
+The version is the same `1.0.<commit_count>` stamp as every other build, computed once in the `prepare` job.  Gates run in the Electron pipeline's order, for the same reasons: the signature verifies before anything is submitted to the notary service, and the ZIP, DMG, feed lengths and appcast are all produced after stapling rewrites the bundle.
+
+Sparkle signing waits on one owner action: create the EdDSA key, back it up in Infisical as `SPARKLE_EDDSA_PRIVATE_KEY_B64`, and put `sign_update` on the packaging path.  Until then the appcast is generated unsigned and the run says so; an app carrying `SUPublicEDKey` refuses unsigned items, so the gap fails closed rather than shipping an unverifiable feed.  The check schedule and probe-retry rules the eventual Sparkle controller must implement already live in `NativeUpdatePolicy.swift` (CompanionCore), with the Electron updater's constants resolved on BF-2486.
+
+Deleting the Node harness is a separate, later step (BF-2515).  `node scripts/audit-node-decommission.mjs` proves every file under `server/`, `companion/`, `shared/` and `electron/` still has an inventory row, and `node scripts/check-decommission-gates.mjs <state.json>` refuses the deletion until the Phase 5 issues are Done and the 24-hour no-Node evidence is asserted.

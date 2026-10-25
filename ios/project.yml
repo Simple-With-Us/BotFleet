@@ -193,6 +193,10 @@ targets:
         CURRENT_PROJECT_VERSION: "2132"
         SWIFT_VERSION: '5.9'
         MACOSX_DEPLOYMENT_TARGET: '14.0'
+        # Notarization refuses a bundle without the Hardened Runtime, and
+        # Phase 6 ships this target only as a notarized Developer ID build
+        # (scripts/mac-package.sh, native-mac-release.yml).
+        ENABLE_HARDENED_RUNTIME: YES
         ENABLE_ON_DEMAND_RESOURCES: false
         COMBINE_HIDPI_IMAGES: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
