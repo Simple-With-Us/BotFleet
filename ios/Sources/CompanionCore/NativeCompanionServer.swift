@@ -200,7 +200,7 @@ public actor NativeAPNsProvider {
     public let bundleId: String
     public let production: Bool
 
-    private let privateKey: P256.Signing.PrivateKey
+    private let signingKey: P256.Signing.PrivateKey
     private var cachedToken: (jwt: String, issuedAt: Date)?
     /// Reuse provider JWTs for 50 minutes (Apple enforces a 20-minute minimum refresh interval and 60-minute expiry).
     public static let tokenReuseInterval: TimeInterval = 50 * 60
@@ -221,7 +221,7 @@ public actor NativeAPNsProvider {
         production: Bool = true
     ) throws {
         do {
-            self.privateKey = try P256.Signing.PrivateKey(pemRepresentation: p8PEM)
+            self.signingKey = try P256.Signing.PrivateKey(pemRepresentation: p8PEM)
         } catch {
             throw NativeAPNsError.invalidPrivateKey(error.localizedDescription)
         }
@@ -232,13 +232,13 @@ public actor NativeAPNsProvider {
     }
 
     public init(
-        privateKey: P256.Signing.PrivateKey,
+        signingKey: P256.Signing.PrivateKey,
         keyId: String,
         teamId: String,
         bundleId: String = "app.botfleet.ios",
         production: Bool = true
     ) {
-        self.privateKey = privateKey
+        self.signingKey = signingKey
         self.keyId = keyId
         self.teamId = teamId
         self.bundleId = bundleId
@@ -246,7 +246,7 @@ public actor NativeAPNsProvider {
     }
 
     public nonisolated var publicKey: P256.Signing.PublicKey {
-        privateKey.publicKey
+        signingKey.publicKey
     }
 
     /// Generates or returns a cached ES256 JWT signed with the provider's `.p8` key.
@@ -259,7 +259,7 @@ public actor NativeAPNsProvider {
         }
 
         let jwt = try Self.generateES256JWT(
-            privateKey: privateKey,
+            signingKey: signingKey,
             keyId: keyId,
             teamId: teamId,
             issuedAt: now
@@ -270,7 +270,7 @@ public actor NativeAPNsProvider {
 
     /// Stateless helper that signs an APNs ES256 JWT using CryptoKit P-256.
     public static func generateES256JWT(
-        privateKey: P256.Signing.PrivateKey,
+        signingKey: P256.Signing.PrivateKey,
         keyId: String,
         teamId: String,
         issuedAt: Date = Date()
@@ -283,7 +283,7 @@ public actor NativeAPNsProvider {
         let claimsB64 = base64URLEncode(Data(claimsJSON.utf8))
         let signingInput = "\(headerB64).\(claimsB64)"
 
-        let signature = try privateKey.signature(for: Data(signingInput.utf8))
+        let signature = try signingKey.signature(for: Data(signingInput.utf8))
         // JWS ES256 requires the 64-byte IEEE P1363 raw (r || s) representation.
         let signatureB64 = base64URLEncode(signature.rawRepresentation)
         return "\(signingInput).\(signatureB64)"

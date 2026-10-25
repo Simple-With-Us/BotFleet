@@ -309,7 +309,7 @@ struct Phase5BotServicesTests {
 
         // Build HTTP/2 APNs URLRequest
         let pushReq = try await provider.buildPushRequest(
-            deviceToken: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            deviceToken: String(repeating: "0", count: 64),
             payload: ["aps": ["content-available": 1], "seq": 42],
             pushType: "background",
             priority: 5,
