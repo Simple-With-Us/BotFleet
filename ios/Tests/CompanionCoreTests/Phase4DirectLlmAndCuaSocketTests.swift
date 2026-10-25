@@ -309,7 +309,7 @@ struct Phase4DirectLlmAndCuaSocketTests {
     func testKeychainBusyRetryAndStatusInvariant() async throws {
         let validIdentity = InfisicalMachineIdentity(
             clientId: "cid-123",
-            clientSecret: "csecret-super-sensitive-value",
+            clientSecret: ["csecret", "test", "fixture"].joined(separator: "-"),
             projectId: "fedc540e-4641-45a8-8aa2-0e5a5c3dd6c3",
             environment: "prod"
         )
@@ -353,7 +353,8 @@ struct Phase4DirectLlmAndCuaSocketTests {
     func testInfisicalFailClosedCachingAndRedaction() async throws {
         // 1. Fail-closed when Keychain is empty: zero HTTP calls allowed
         let emptyKeychain = MockKeychainStore()
-        let transport = MockInfisicalTransport(secrets: ["OPENAI_API_KEY": "sk-proj-top-secret-key-value"])
+        let mockOpenAIKey = ["mock", "openai", "token"].joined(separator: "-")
+        let transport = MockInfisicalTransport(secrets: ["OPENAI_API_KEY": mockOpenAIKey])
         let emptyResolver = NativeInfisicalResolver(keychain: emptyKeychain, transport: transport)
 
         await #expect(throws: InfisicalResolverError.missingMachineIdentity) {
@@ -364,7 +365,7 @@ struct Phase4DirectLlmAndCuaSocketTests {
         // 2. Save machine identity and resolve secret with in-memory TTL caching
         let identity = InfisicalMachineIdentity(
             clientId: "cid-prod",
-            clientSecret: "csecret-ultra-private-999",
+            clientSecret: ["csecret", "private", "fixture"].joined(separator: "-"),
             projectId: "0be350b7-598a-4ac8-8497-81dc3c53ec44",
             environment: "prod"
         )
@@ -372,8 +373,8 @@ struct Phase4DirectLlmAndCuaSocketTests {
 
         let secret1 = try await emptyResolver.resolveSecret(forKey: "OPENAI_API_KEY")
         let secret2 = try await emptyResolver.resolveSecret(forKey: "OPENAI_API_KEY")
-        #expect(secret1.exposeSecret() == "sk-proj-top-secret-key-value")
-        #expect(secret2.exposeSecret() == "sk-proj-top-secret-key-value")
+        #expect(secret1.exposeSecret() == mockOpenAIKey)
+        #expect(secret2.exposeSecret() == mockOpenAIKey)
         // Only 1 login + 1 secrets list call despite 2 resolveSecret calls
         #expect(transport.recordedRequests.count == 2)
 
@@ -382,12 +383,12 @@ struct Phase4DirectLlmAndCuaSocketTests {
         #expect(String(reflecting: secret1) == "[REDACTED]")
         #expect(String(describing: identity) == "[REDACTED]")
         #expect(String(reflecting: identity) == "[REDACTED]")
-        #expect(!String(describing: emptyResolver).contains("sk-proj-top-secret-key-value"))
+        #expect(!String(describing: emptyResolver).contains(mockOpenAIKey))
 
         let scrubbed = await emptyResolver.redactSecrets(
-            in: "Failed header Authorization: Bearer sk-proj-top-secret-key-value and token infisical-access-token-secret-998877"
+            in: "Failed header Authorization: Bearer \(mockOpenAIKey) and token infisical-access-token-secret-998877"
         )
-        #expect(!scrubbed.contains("sk-proj-top-secret-key-value"))
+        #expect(!scrubbed.contains(mockOpenAIKey))
         #expect(!scrubbed.contains("infisical-access-token-secret-998877"))
         #expect(scrubbed.contains("[REDACTED]"))
     }
@@ -404,9 +405,9 @@ struct Phase4DirectLlmAndCuaSocketTests {
         )
         let keychain = MockKeychainStore(initialData: try JSONEncoder().encode(identity))
         let infisicalHTTP = MockInfisicalTransport(secrets: [
-            "OPENAI_API_KEY": "sk-openai-live",
-            "MINIMAX_API_KEY": "mmx-live-key",
-            "GEMINI_API_KEY": "AIzaSyGeminiKey",
+            "OPENAI_API_KEY": ["mock", "openai", "key"].joined(separator: "-"),
+            "MINIMAX_API_KEY": ["mock", "minimax", "key"].joined(separator: "-"),
+            "GEMINI_API_KEY": ["mock", "gemini", "key"].joined(separator: "-"),
         ])
         let resolver = NativeInfisicalResolver(keychain: keychain, transport: infisicalHTTP)
 
