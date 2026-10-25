@@ -117,16 +117,13 @@ export function latestMarketingPatch({ prefix, appStoreVersions = [], trains = [
   };
 
   for (const version of appStoreVersions || []) {
-    const value = typeof version === "string" ? version : version?.versionString;
-    consider(parsePatch(value, prefix));
+    consider(parsePatch(version, prefix));
   }
 
   for (const train of trains || []) {
     if (!train) continue;
-    const version = typeof train === "string" ? train : train.version;
-    const builds = typeof train === "string" ? [] : train.builds || [];
-    if (isDriftTrain(version, builds, prefix)) continue;
-    consider(parsePatch(version, prefix));
+    if (isDriftTrain(train.version, train.builds || [], prefix)) continue;
+    consider(parsePatch(train.version, prefix));
   }
 
   return best;
@@ -144,13 +141,11 @@ export function nextMarketingPatch({ prefix, appStoreVersions = [], trains = [] 
   const taken = new Set();
   for (const train of trains || []) {
     if (!train) continue;
-    const version = typeof train === "string" ? train : train.version;
-    const patch = parsePatch(version, prefix);
+    const patch = parsePatch(train.version, prefix);
     if (patch !== null) taken.add(patch);
   }
   for (const version of appStoreVersions || []) {
-    const value = typeof version === "string" ? version : version?.versionString;
-    const patch = parsePatch(value, prefix);
+    const patch = parsePatch(version, prefix);
     if (patch !== null) taken.add(patch);
   }
   let next = latestMarketingPatch({ prefix, appStoreVersions, trains }) + 1;
