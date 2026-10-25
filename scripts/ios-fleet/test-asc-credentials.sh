@@ -415,6 +415,34 @@ env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
   [[ -z "${APPLE_API_ISSUER_ID:-}" ]]
 ' || fail "an unusable APPLE_API_* trio stayed in the environment"
 
+# 2n. The CI trio's preview is the mask of the KEY BODY, not of the base64
+#     blob it arrived in:  the base64 of the armor is the same string for
+#     every key ever issued, so a preview taken over it names no key at all.
+#     The blob reaches the child through a PATH, so no byte of it is ever an
+#     argument of a process.
+ci_body="SYNTHETICciBODY00000000000000000000000000000000000tail"
+ci_pem="-----BEGIN PRIVATE KEY-----"$'\n'"${ci_body}"$'\n'"-----END PRIVATE KEY-----"
+printf '%s' "$ci_pem" | base64 | tr -d '\n' > "${tmp}/ci.b64"
+ci_mask="$(printf '%s...%s' "${ci_body:0:8}" "${ci_body:$((${#ci_body}-4))}")"
+ci_out="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
+  -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
+  ASC_TEST_B64="${tmp}/ci.b64" bash -c '
+  set -euo pipefail
+  source "'"$funcs"'"
+  APPLE_API_KEY_ID=BADKEY00001
+  APPLE_API_ISSUER_ID=bad-issuer
+  APPLE_API_KEY_P8_BASE64="$(cat "$ASC_TEST_B64")"
+  load_secrets
+' 2>&1)"
+case "$ci_out" in
+  *"preview ${ci_mask}"*) ;;
+  *) fail "the CI preview was not the masked key body: ${ci_out}" ;;
+esac
+case "$ci_out" in
+  *"LS0tLS0t"*) fail "the CI preview was taken over the base64 blob: ${ci_out}" ;;
+esac
+unset ci_body ci_pem ci_mask ci_out
+
 # 3. The credential never travels in a command argument.  The secret reaches
 #    the child through the environment, so its own argv must not carry it.
 argv="$(ASC_KEY_P8="$(<"${tmp}/other.p8")" \
@@ -427,12 +455,23 @@ pem="$(<"${tmp}/other.p8")"
 [[ "$argv" != *"$pem"* ]] || fail "the credential reached the child in its command arguments"
 
 # 4. Neither this test nor the ship script passes a credential to `env`, which
-#    would put it in the process arguments of every child.
-for f in "$0" "$script"; do
-  if grep -nE '(^|[[:space:]])env [^|]*ASC_KEY_P8=' "$f" >/dev/null; then
+#    would put it in the process arguments of every child.  The patterns are
+#    matched against the file with its line continuations joined, so a value
+#    that sits on the next line is still found.
+for f in "$0" "$script" "${here}/test-ship-seq.sh"; do
+  [[ -f "$f" ]] || continue
+  flat="$(perl -0pe 's/\\\n/ /g' "$f")"
+  if printf '%s' "$flat" | grep -qE '(^|[[:space:]])env [^|\n]*ASC_KEY_P8='; then
     fail "$(basename "$f") passes a credential through env arguments"
   fi
+  # A caller's assignments must never be handed to env as arguments either:
+  # the names arrive one NAME=VALUE at a time, and every one of them is then
+  # a process argument of the env that starts the child.
+  if printf '%s' "$flat" | grep -qE '(^|[[:space:]])env [^|\n]*"\$@"'; then
+    fail "$(basename "$f") hands a caller's assignments to env"
+  fi
 done
+unset flat
 
 # 5. Nothing is created under the old secrets folder or ~/.appstoreconnect.
 [[ ! -e "${HOME}/.secrets" ]] || fail "created the old secrets folder"
@@ -453,13 +492,23 @@ path_is_normal() {
   node -e 'const p=require("path").posix; const s=process.argv[1]; process.exit(p.normalize(s)===s ? 0 : 1)' "$1"
 }
 
+# The TMPDIR the run sees is a PATH, not a credential, so it can travel in
+# the environment of the env that starts the child.  It is never handed to
+# env as a caller's argument list:  an argument is readable by every process
+# on the machine through ps, and the house rule is that a credential never
+# rides in one.
 stage_from_tmpdir() {
-  local label="$1"
-  shift
+  local label="$1" tmpdir="$2"
+  local env_args=()
+  if [[ "$tmpdir" == "unset" ]]; then
+    env_args=(-u TMPDIR)
+  else
+    env_args=(TMPDIR="$tmpdir")
+  fi
   local out
   out="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
     -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
-    "$@" bash -c '
+    "${env_args[@]}" bash -c '
     set -euo pipefail
     source "'"$funcs"'"
     load_secrets
@@ -477,9 +526,9 @@ stage_from_tmpdir() {
 }
 
 mkdir -p "${tmp}/slash-tmp"
-stage_from_tmpdir "trailing-slash TMPDIR" TMPDIR="${tmp}/slash-tmp/"
-stage_from_tmpdir "TMPDIR without a trailing slash" TMPDIR="${tmp}/tmp"
-stage_from_tmpdir "unset TMPDIR" -u TMPDIR
+stage_from_tmpdir "trailing-slash TMPDIR" "${tmp}/slash-tmp/"
+stage_from_tmpdir "TMPDIR without a trailing slash" "${tmp}/tmp"
+stage_from_tmpdir "unset TMPDIR" unset
 # A root-level TMPDIR is "/" and nothing else.  Every trailing slash is
 # stripped, so the root becomes empty and the join adds exactly one slash:
 # "//asc-key.XXXXXX" is the doubled slash the staging check refuses.  The
@@ -511,7 +560,7 @@ root_rc="$(TMPDIR=/ bash -c '
 [[ "$root_rc" == "rc=1" ]] || fail "a root TMPDIR was not refused by asc_temp_root (${root_rc})"
 # A doubled trailing slash is not the root, so it strips down to the real
 # directory and the key stages there.
-stage_from_tmpdir "double-slash TMPDIR" TMPDIR="${tmp}//"
+stage_from_tmpdir "double-slash TMPDIR" "${tmp}//"
 
 # 8. A staging refusal is not a missing credential.  The key resolves, the
 #    writer refuses the path, and the upload block says staging.  The writer
@@ -816,14 +865,21 @@ exec "$real_node" "\$@"
 WRAP
 chmod 700 "${tmp}/bin-val3/node"
 run_diag() {  # env assignments..., then load_secrets with the refusing validator
-  env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
-    -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
-    PATH="${tmp}/bin-val3:${PATH}" "$@" bash -c '
+  # The credential travels in the CHILD's environment, never in the
+  # arguments of a process:  an argument is readable by every process on the
+  # machine through ps.
+  (
+    unset APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64 \
+          ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 ASC_KEY_PATH
+    local a
+    for a in "$@"; do export "$a"; done
+    env PATH="${tmp}/bin-val3:${PATH}" bash -c '
     source "'"$funcs"'"
     FLEET_SECRETS_BIN="'"${tmp}"'/no-vault"
     load_secrets
     echo "class=${ASC_AUTH_FAILURE:-none}"
   ' 2>&1
+  )
 }
 for kid in ABCDE12345 "" "bad id"; do
   case "$kid" in ABCDE12345) want_id=ABCDE12345 ;; "") want_id=missing ;; *) want_id=unrecognized ;; esac
@@ -851,13 +907,23 @@ unset kid want_id out syn_pem syn_body pem_kind
 #     BODY, and it is taken only from material the ENVIRONMENT already holds:
 #     a diagnostic never causes a secret read from the vault.
 run_diag_identity() {  # env assignments..., then the resolver
-  env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
-    -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
-    FLEET_SECRETS_BIN="${tmp}/fleet-secrets" "$@" bash -c '
+  # The credential travels in the CHILD's environment, never in the
+  # arguments of a process:  an argument is readable by every process on the
+  # machine through ps.  The names this call does not set are cleared first,
+  # so one call can never see the previous call's credential, and the
+  # clearing happens in a subshell so the test's own environment is intact.
+  (
+    unset APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64 \
+          ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 ASC_KEY_PATH
+    local a
+    for a in "$@"; do export "$a"; done
+    env FLEET_SECRETS_BIN="${tmp}/fleet-secrets" bash -c '
     source "'"$funcs"'"
     asc_resolve_diagnostic_credential
     printf "id=%s\npreview=%s\n" "$ASC_DIAG_KEY_ID" "$ASC_DIAG_PREVIEW"
+    printf "argv=%s\n" "$(ps -o args= -p $$ 2>/dev/null || true)"
   ' 2>&1
+  )
 }
 real_body="$(sed '1d;$d' "${tmp}/asc.p8")"
 real_body="${real_body//[[:space:]]/}"
@@ -870,6 +936,16 @@ out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-
 out="$(run_diag_identity ASC_KEY_ID=ENVKEY00002 ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$(cat "${tmp}/asc.p8")")"
 [[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named: ${out}"
 [[ "$out" == *"preview=${real_mask}"* ]] || fail "the environment preview was not the masked body: ${out}"
+# The credential reaches the child in its ENVIRONMENT, so the child's own
+# arguments must not carry a byte of it:  an argument is readable by every
+# process on the machine through ps.  The guard below covers the process
+# that starts the child; this one covers the child itself.
+case "$out" in
+  *"argv="*) ;;
+  *) fail "the diagnostic child did not report its own arguments" ;;
+esac
+argv_line="$(printf '%s\n' "$out" | grep '^argv=' || true)"
+[[ "$argv_line" != *"$real_body"* ]] || fail "the credential reached the diagnostic child in its command arguments"
 
 # A half-set trio is skipped by the client, so the diagnostic must not name
 # it:  the key id comes from the client's last source instead.
@@ -879,6 +955,15 @@ out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001)"
 # A trio whose key does not decode is skipped by the client too.
 out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="not-base64-at-all")"
 [[ "$out" != *"CIKEY00001"* ]] || fail "a key that does not decode was named: ${out}"
+
+# The client SKIPS an unusable CI trio and goes on to the environment trio,
+# so the diagnostic has to do the same:  it must not stop at the CI source,
+# and it must name the environment credential the client went on to use.
+out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="not-base64-at-all" \
+  ASC_KEY_ID=ENVKEY00002 ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$(cat "${tmp}/asc.p8")")"
+[[ "$out" != *"CIKEY00001"* ]] || fail "an unusable CI trio was named: ${out}"
+[[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named after the CI trio was skipped: ${out}"
+[[ "$out" == *"preview=${real_mask}"* ]] || fail "the environment preview was not the masked body after the CI trio was skipped: ${out}"
 
 # A diagnostic never causes a secret read:  the vault is asked for the KEY
 # ID, which is a public label, and never for the key material.

@@ -361,11 +361,17 @@ asc_resolve_diagnostic_credential() {
     if [[ -n "$v" ]] && node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$v"; then
       id="$APPLE_API_KEY_ID"
     else
-      #  The client skips a source whose key is not a usable PEM, so this
-      #  diagnostic must not name it either.
+      #  The client skips a source whose key is not a usable PEM and goes on
+      #  to the NEXT source, so this diagnostic must not name it -- and must
+      #  not stop looking for the source the client did use.
       v=""
     fi
-  elif [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]]; then
+  fi
+  #  The client falls through to the environment source when the CI trio is
+  #  absent or unusable, so this branch is evaluated on its own and NOT as an
+  #  alternative to the CI branch:  an elif would leave a valid ASC_*
+  #  credential unreported whenever an APPLE_* trio is present but invalid.
+  if [[ -z "$id" && -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]]; then
     if node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8"; then
       v="$ASC_KEY_P8"
       id="$ASC_KEY_ID"
@@ -439,8 +445,11 @@ load_secrets() {
         #  The rejected credential is named by its source, its key id and the
         #  fleet's sanctioned masked preview of it.  The preview is computed
         #  from the value that was refused and cleared right after.
+        #  The preview is taken over the DECODED key, so it is the mask of
+        #  the key body:  the base64 of the armor is the same string for
+        #  every key ever issued and would name nothing.
         local preview_a
-        preview_a="$(key_preview "$APPLE_API_KEY_P8_BASE64")" || preview_a=""
+        preview_a="$(key_preview "$key_pem")" || preview_a=""
         log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), preview ${preview_a:-withheld})"
         preview_a=""
         key_pem=""
@@ -573,9 +582,13 @@ load_secrets() {
     # them a missing key is not.
     if [[ "$rc" -eq 3 ]]; then
       # The credential was resolved and it is not a usable PEM private key.
-      # It is named by its source and its key id, a public label that travels
-      # in every request header and is not part of the key.  No part of the
-      # key itself is printed, not even a masked slice of it.
+      # It is named by its source, by its key id -- a public label that
+      # travels in every request header and is not part of the key -- and by
+      # the fleet's sanctioned masked preview of the key body, which is its
+      # first eight and last four characters.  The whole key is never
+      # printed:  the preview is the only part of the key that reaches the
+      # log, and it is withheld whole when the value is too short to mask
+      # safely or carries a control character.
       local preview_d
       preview_d="$(key_preview "$key_pem")" || preview_d=""
       log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key (source ${key_src:-unknown}, key id $(key_label "$kid"), preview ${preview_d:-withheld})"

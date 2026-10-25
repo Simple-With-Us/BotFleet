@@ -158,8 +158,16 @@ RC=0
 # SHIP_TMPDIR overrides the TMPDIR the sandboxed run sees, so a test can
 # drive the root-TMPDIR path.  It defaults to a scratch directory under the
 # sandbox, which is what every other case wants.
+# The synthetic credential is handed to the sandboxed run through an
+# INHERITED DESCRIPTOR, never through a command argument:  an argument is
+# readable by every process on the machine through ps.  The here-string that
+# carries it is a temporary file that bash unlinks as soon as it is open, so
+# nothing is left on disk either.  The key id and the issuer are public
+# labels, so they stay in the environment where the run expects them.
 run_ship() {
-  OUT="$(env -i \
+  OUT="$(
+    exec 3<<<"${TEST_ASC_KEY_P8:-}"
+    env -i \
     HOME="$FAKE_HOME" \
     PATH="${FAKE_BIN}:/usr/bin:/bin:/usr/sbin:/sbin" \
     TMPDIR="${SHIP_TMPDIR:-${WORK}/tmp}" \
@@ -168,10 +176,17 @@ run_ship() {
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
     ASC_KEY_ID="${TEST_ASC_KEY_ID:-}" \
     ASC_ISSUER_ID="${TEST_ASC_ISSUER_ID:-}" \
-    ASC_KEY_P8="${TEST_ASC_KEY_P8:-}" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
-    bash "$SHIP" "$@" 2>&1)"
+    bash -c '
+      if [[ -r /dev/fd/3 ]]; then
+        _pem="$(cat <&3)"
+        if [[ -n "$_pem" ]]; then export ASC_KEY_P8="$_pem"; fi
+        unset _pem
+      fi
+      exec bash "$1" "${@:2}"
+    ' _ "$SHIP" "$@" 2>&1
+  )"
   RC=$?
   return 0
 }
