@@ -32,6 +32,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { createJobHost, type JobHost, type JobHostDeps } from "./job-host.ts";
 import { DATA_DIR } from "./config.ts";
+import { closeMessageDb } from "./message-db.ts";
 import { Store } from "./store.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
@@ -64,11 +65,28 @@ function declarationLine(binding: string): number {
  *  These are the statements that run while the module is still being
  *  evaluated, so a binding read from inside one of them — or from anything
  *  they call synchronously — is read before its declaration when the
- *  declaration sits further down the file. */
+ *  declaration sits further down the file.
+ *
+ *  A module-scope `await` counts as one of them: it is a top-level effect
+ *  that runs while the module evaluates, and it is the one most easily
+ *  missed, because the call after the keyword is what looks like the
+ *  statement.  `await infisical.preload();` is a top-level effect, so the
+ *  fence has to be above it. */
 function topLevelCalls(): Array<{ line: number; text: string }> {
   const found: Array<{ line: number; text: string }> = [];
   lines.forEach((text, index) => {
-    if (!/^[A-Za-z_$][\w$.]*\(/.test(text)) return;
+    if (!/^(?:await\s+)?[A-Za-z_$][\w$.]*\(/.test(text)) return;
+    found.push({ line: index + 1, text: text.trim() });
+  });
+  return found;
+}
+
+/** Every module-scope `await` expression, found independently of the call
+ *  detector above so the two can be cross-checked against each other. */
+function moduleScopeAwaits(): Array<{ line: number; text: string }> {
+  const found: Array<{ line: number; text: string }> = [];
+  lines.forEach((text, index) => {
+    if (!/^await\s/.test(text)) return;
     found.push({ line: index + 1, text: text.trim() });
   });
   return found;
@@ -79,6 +97,10 @@ describe("the provider reload fence is reachable while the module evaluates", ()
 
   afterEach(() => {
     for (const host of hosts.splice(0)) host.close();
+    // The message database is a process-wide handle, and it has to close
+    // before this directory goes: a directory that still holds an open
+    // database cannot be removed on Windows.
+    closeMessageDb();
     rmSync(DATA_DIR, { recursive: true, force: true });
   });
 
@@ -140,6 +162,21 @@ describe("the provider reload fence is declared above every top-level effect", (
     const calls = topLevelCalls();
     expect(calls.length).toBeGreaterThan(0);
     expect(calls.some((call) => call.text.startsWith("jobHost.boot()"))).toBe(true);
+  });
+
+  it("sees every module-scope await as a top-level effect", () => {
+    // A module-scope `await` is a top-level effect, and it is the easiest one
+    // for the detector above to miss, because the call after the keyword is
+    // what looks like the statement.  Cross-check the two independently so a
+    // future edit to the detector cannot quietly narrow the rule.
+    const calls = topLevelCalls();
+    const awaits = moduleScopeAwaits();
+    for (const awaited of awaits) {
+      expect(
+        calls.some((call) => call.line === awaited.line),
+        `module-scope await on line ${awaited.line} is not detected as a top-level effect`,
+      ).toBe(true);
+    }
   });
 
   it("declares the fence above the boot that resumes the job runtime", () => {
