@@ -228,12 +228,16 @@ run_ship() {
     ' _ "$SHIP" "$@" 2>&1
   )"
   RC=$?
-  if [[ "$expect_key" == "1" ]] && ! printf '%s\n' "$OUT" | grep -q '^FLEET-TEST-CREDENTIAL-ARRIVED$'; then
+  if [[ "$expect_key" == "1" ]] && ! printf '%s\n' "$OUT" | grep -a -q '^FLEET-TEST-CREDENTIAL-ARRIVED$'; then
     bad "the credential never reached the sandboxed run (rc=${RC})"
   fi
   # The marker is the harness's own line, and the cases match on the ship
   # script's output, so it is stripped before they look.
-  OUT="$(printf '%s\n' "$OUT" | grep -v '^FLEET-TEST-CREDENTIAL-ARRIVED$' || true)"
+  # The captured ship output can carry a UTF-8 em-dash, and a C-locale
+  # grep then treats the stream as binary and replaces it with a
+  # "Binary file matches" message, so the marker is stripped in TEXT
+  # mode (-a), the way contains() avoids grep for the same reason.
+  OUT="$(printf '%s\n' "$OUT" | grep -a -v '^FLEET-TEST-CREDENTIAL-ARRIVED$' || true)"
   return 0
 }
 

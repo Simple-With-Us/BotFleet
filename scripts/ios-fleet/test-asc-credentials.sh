@@ -209,7 +209,7 @@ log_out="$(env -u ASC_KEY_P8 -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE
 ')" || fail "load_secrets with a named path"
 case "$log_out" in
   *"ASC_KEY_PATH is not a credential source"*) ;;
-  *) fail "the run did not say that it ignored the named path: ${log_out}" ;;
+  *) fail "the run did not say that it ignored the named path" ;;
 esac
 
 # The scanner that finds a command substitution which runs the key reader.
@@ -427,6 +427,10 @@ ci_body="SYNTHETICciBODY00000000000000000000000000000000000tail"
 ci_pem="-----BEGIN PRIVATE KEY-----"$'\n'"${ci_body}"$'\n'"-----END PRIVATE KEY-----"
 printf '%s' "$ci_pem" | base64 | tr -d '\n' > "${tmp}/ci.b64"
 ci_mask="$(printf '%s...%s' "${ci_body:0:8}" "${ci_body:$((${#ci_body}-4))}")"
+# The guard below has to search for a prefix the blob REALLY carries:  the
+# base64 of "-----BEGIN PRIVATE KEY-----" begins "LS0tLS1C", so a needle
+# like "LS0tLS0t" could never match the artifact it is meant to detect.
+ci_b64_head="$(cut -c1-24 "${tmp}/ci.b64")"
 ci_out="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
   -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
   ASC_TEST_B64="${tmp}/ci.b64" bash -c '
@@ -439,15 +443,15 @@ ci_out="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
 ' 2>&1)"
 case "$ci_out" in
   *"source APPLE_API_KEY_P8_BASE64, key id BADKEY00001, issuer id bad-issuer"*) ;;
-  *) fail "the CI credential was not named by its source, key id and issuer id: ${ci_out}" ;;
+  *) fail "the CI credential was not named by its source, key id and issuer id" ;;
 esac
 case "$ci_out" in
-  *"preview "*) fail "a rejected credential was previewed: ${ci_out}" ;;
+  *"preview "*) fail "a rejected credential was previewed" ;;
 esac
 case "$ci_out" in
-  *"LS0tLS0t"*) fail "the CI log carried the base64 blob: ${ci_out}" ;;
+  *"${ci_b64_head}"*) fail "the CI log carried the base64 blob" ;;
 esac
-unset ci_body ci_pem ci_mask ci_out
+unset ci_body ci_pem ci_mask ci_b64_head ci_out
 
 # 3. The credential never travels in a command argument.  The secret reaches
 #    the child through the environment, so its own argv must not carry it.
@@ -561,7 +565,7 @@ root_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
   [[ "$(asc_upload_block)" == staging ]]
 ')" || fail "a root TMPDIR was not classified as a path failure"
 case "$root_log" in
-  *"no App Store Connect API key"*) fail "a root TMPDIR was reported as a missing key: ${root_log}" ;;
+  *"no App Store Connect API key"*) fail "a root TMPDIR was reported as a missing key" ;;
 esac
 # The refusal has to hold for a user who CAN write to the root of the
 # filesystem, so it is asserted on the helper itself and not on whether
@@ -604,7 +608,7 @@ stage_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
 ')" || fail "a path refusal was classified as a missing key"
 case "$stage_log" in
   *"the credential was resolved and the staging path was refused"*) ;;
-  *) fail "a path refusal did not say the credential was resolved: ${stage_log}" ;;
+  *) fail "a path refusal did not say the credential was resolved" ;;
 esac
 case "$stage_log" in
   *"no App Store Connect API key"*) fail "a path refusal was reported as a missing key" ;;
@@ -715,16 +719,16 @@ writer_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8 \
 ')" || fail "a writer crash was classified as a credential or a path failure"
 case "$writer_log" in
   *"the key writer failed with status"*) ;;
-  *) fail "a writer crash did not say the writer failed: ${writer_log}" ;;
+  *) fail "a writer crash did not say the writer failed" ;;
 esac
 case "$writer_log" in
-  *"is not a usable PEM private key"*) fail "a writer crash was reported as a broken key: ${writer_log}" ;;
+  *"is not a usable PEM private key"*) fail "a writer crash was reported as a broken key" ;;
 esac
 case "$writer_log" in
-  *"the staging path was refused"*) fail "a writer crash was reported as a path refusal: ${writer_log}" ;;
+  *"the staging path was refused"*) fail "a writer crash was reported as a path refusal" ;;
 esac
 case "$writer_log" in
-  *"no App Store Connect API key"*) fail "a writer crash was reported as a missing key: ${writer_log}" ;;
+  *"no App Store Connect API key"*) fail "a writer crash was reported as a missing key" ;;
 esac
 
 # 8e. A credential that is resolved and then rejected by the earlier validate
@@ -745,7 +749,7 @@ validate_log="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_PATH -u ASC_KEY_P8
   [[ "$(asc_upload_block)" == credential ]]
 ')" || fail "a credential rejected by validate was classified as a missing key"
 case "$validate_log" in
-  *"no App Store Connect API key"*) fail "a rejected credential was reported as a missing key: ${validate_log}" ;;
+  *"no App Store Connect API key"*) fail "a rejected credential was reported as a missing key" ;;
 esac
 
 # 8f. A validator that fails without classifying anything is not a broken
@@ -845,7 +849,7 @@ out_rc="$(TMPDIR=/ bash -c '
 ' 2>&1; echo "rc=$?")"
 case "$out_rc" in
   *"Ship blocked: TMPDIR resolves to the filesystem root"*"rc=3") ;;
-  *) fail "a root TMPDIR did not end the run with the owner-handoff status: ${out_rc}" ;;
+  *) fail "a root TMPDIR did not end the run with the owner-handoff status" ;;
 esac
 
 # 11. Every rejection diagnostic names the source, the key id and the failure
@@ -858,14 +862,14 @@ syn_body="SYNTHETICbodyAAAAqqqqBBBBrrrrCCCCssssDDDDttttEEEEuuuuFFFFvvvvGGGG"
 syn_pem="-----BEGIN ${pem_kind}-----"$'\n'"${syn_body}"$'\n'"-----END ${pem_kind}-----"
 check_diag() {  # <label> <log> <expected substring>
   local label="$1" out="$2" want="$3" i mask
-  [[ "$out" == *"$want"* ]] || fail "${label}: diagnostic did not say: ${want}"
+  [[ "$out" == *"$want"* ]] || fail "${label}: the diagnostic did not say what it had to say"
   [[ "$out" != *"PRIVATE KEY"* ]] || fail "${label}: diagnostic carried the key armor"
   #  The diagnostic carries NO masked preview of the key:  every byte of a
   #  private-key body is secret, so not one byte of it may reach the log.
   mask="$(printf '%s...%s' "${syn_body:0:8}" "${syn_body:$((${#syn_body}-4))}")"
-  [[ "$out" != *"$mask"* ]] || fail "${label}: diagnostic carried the masked key body"
+  [[ "$out" != *"$mask"* ]] || fail "${label}: the diagnostic carried the masked key body"
   for ((i = 0; i + 6 <= ${#syn_body}; i++)); do
-    [[ "$out" != *"${syn_body:i:6}"* ]] || fail "${label}: diagnostic carried a fragment of the key body"
+    [[ "$out" != *"${syn_body:i:6}"* ]] || fail "${label}: the diagnostic carried a fragment of the key body"
   done
 }
 mkdir -p "${tmp}/bin-val3"
@@ -947,13 +951,13 @@ real_mask="$(printf '%s...%s' "${real_body:0:8}" "${real_body:$((${#real_body}-4
 real_b64="$(base64 < "${tmp}/asc.p8" | tr -d '\n')"
 
 out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="$real_b64")"
-[[ "$out" == *"id=CIKEY00001"* ]] || fail "the CI key id was not named: ${out}"
-[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the CI issuer id was not named: ${out}"
-[[ "$out" != *"$real_mask"* ]] || fail "the CI diagnostic carried the masked key body: ${out}"
+[[ "$out" == *"id=CIKEY00001"* ]] || fail "the diagnostic did not carry what it must not carry"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the diagnostic did not carry what it must not carry"
+[[ "$out" != *"$real_mask"* ]] || fail "the diagnostic did not carry what it must not carry"
 out="$(run_diag_identity ASC_KEY_ID=ENVKEY00002 ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$(cat "${tmp}/asc.p8")")"
-[[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named: ${out}"
-[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the environment issuer id was not named: ${out}"
-[[ "$out" != *"$real_mask"* ]] || fail "the environment diagnostic carried the masked key body: ${out}"
+[[ "$out" == *"id=ENVKEY00002"* ]] || fail "the diagnostic did not carry what it must not carry"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the diagnostic did not carry what it must not carry"
+[[ "$out" != *"$real_mask"* ]] || fail "the diagnostic did not carry what it must not carry"
 # The credential reaches the child in its ENVIRONMENT, so the child's own
 # arguments must not carry a byte of it:  an argument is readable by every
 # process on the machine through ps.  The guard below covers the process
@@ -970,29 +974,29 @@ argv_block="$(printf '%s\n' "$out" | awk '/^argv-begin$/{f=1;next} /^argv-end$/{
 # A half-set trio is skipped by the client, so the diagnostic must not name
 # it:  the key id comes from the client's last source instead.
 out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001)"
-[[ "$out" != *"CIKEY00001"* ]] || fail "a half-set trio was named: ${out}"
-[[ "$out" == *"id=ABCDE12345"* ]] || fail "the fallback key id was not named: ${out}"
+[[ "$out" != *"CIKEY00001"* ]] || fail "the diagnostic did not carry what it must not carry"
+[[ "$out" == *"id=ABCDE12345"* ]] || fail "the diagnostic did not carry what it must not carry"
 # A trio whose key does not decode is skipped by the client too.
 out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="not-base64-at-all")"
-[[ "$out" != *"CIKEY00001"* ]] || fail "a key that does not decode was named: ${out}"
+[[ "$out" != *"CIKEY00001"* ]] || fail "the diagnostic did not carry what it must not carry"
 
 # The client SKIPS an unusable CI trio and goes on to the environment trio,
 # so the diagnostic has to do the same:  it must not stop at the CI source,
 # and it must name the environment credential the client went on to use.
 out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="not-base64-at-all" \
   ASC_KEY_ID=ENVKEY00002 ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$(cat "${tmp}/asc.p8")")"
-[[ "$out" != *"CIKEY00001"* ]] || fail "an unusable CI trio was named: ${out}"
-[[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named after the CI trio was skipped: ${out}"
-[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the environment issuer id was not named after the CI trio was skipped: ${out}"
-[[ "$out" != *"$real_mask"* ]] || fail "the environment diagnostic carried the masked key body after the CI trio was skipped: ${out}"
+[[ "$out" != *"CIKEY00001"* ]] || fail "the diagnostic did not carry what it must not carry"
+[[ "$out" == *"id=ENVKEY00002"* ]] || fail "the diagnostic did not carry what it must not carry"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the diagnostic did not carry what it must not carry"
+[[ "$out" != *"$real_mask"* ]] || fail "the diagnostic did not carry what it must not carry"
 
 # A diagnostic never causes a secret read:  the vault is asked for the KEY
 # ID, which is a public label, and never for the key material.
 : > "$FAKE_LOG"
 out="$(run_diag_identity)"
-[[ "$out" == *"id=ABCDE12345"* ]] || fail "the vault key id was not named: ${out}"
-[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the vault issuer id was not named: ${out}"
-[[ "$out" != *"preview"* ]] || fail "a preview was invented: ${out}"
+[[ "$out" == *"id=ABCDE12345"* ]] || fail "the diagnostic did not carry what it must not carry"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the diagnostic did not carry what it must not carry"
+[[ "$out" != *"preview"* ]] || fail "the diagnostic did not carry what it must not carry"
 if grep -q "ASC_KEY_P8 /asc" "$FAKE_LOG"; then
   fail "the diagnostic read the key material from the vault"
 fi
