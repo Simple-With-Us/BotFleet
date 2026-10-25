@@ -91,6 +91,10 @@ public actor NativeRoutinesSchedulerActor {
     private var defaultExecutor: (@Sendable (ScheduledRoutine, RoutineRunRecord) async throws -> Void)?
     /// Tracks run IDs that have already executed or been settled by crash recovery so no run ever executes twice.
     private var executedRunIds: Set<String> = []
+    /// Run ids whose first persistence is in flight.  The reservation closes
+    /// the window between the duplicate guard and the write, without marking a
+    /// run as executed when the write fails.
+    private var inFlightRunIds: Set<String> = []
 
     public init(
         database: DatabaseService,
@@ -130,7 +134,13 @@ public actor NativeRoutinesSchedulerActor {
         guard !executedRunIds.contains(resolvedRunId) else {
             throw RoutineSchedulerError.duplicateRunExecutionRefused(resolvedRunId)
         }
-        executedRunIds.insert(resolvedRunId)
+        // A run that is being persisted right now is reserved too, so two
+        // concurrent firings of the same id cannot both pass the guard.
+        guard !inFlightRunIds.contains(resolvedRunId) else {
+            throw RoutineSchedulerError.duplicateRunExecutionRefused(resolvedRunId)
+        }
+        inFlightRunIds.insert(resolvedRunId)
+        defer { inFlightRunIds.remove(resolvedRunId) }
 
         let runningRecord = RoutineRunRecord(
             id: resolvedRunId,
@@ -142,6 +152,10 @@ public actor NativeRoutinesSchedulerActor {
             error: nil
         )
         try await database.recordRoutineRun(runningRecord)
+        // The run id is marked executed only once the run is persisted.  Marking
+        // it first meant a failed write left the id marked, so the run could
+        // never be retried with the same id.
+        executedRunIds.insert(resolvedRunId)
 
         let runner = executor ?? defaultExecutor
         do {
@@ -503,38 +517,15 @@ public actor NativeWebhookIngressActor {
 
         for attempt in 0..<totalAllowedAttempts {
             let attemptRecordId = attempt == 0 ? baseDeliveryId : "\(baseDeliveryId)_retry\(attempt)"
+
+            // The dispatch and the bookkeeping are separate steps.  Folding
+            // them into one `do` block meant a database write that failed
+            // after a successful dispatch was caught as a dispatch failure,
+            // and the retry sent the same payload to the endpoint a second
+            // time.
+            let responseBody: String
             do {
-                let responseBody = try await dispatchHandler(endpoint, eventType, payload)
-                let runId = "run_\(baseDeliveryId)"
-
-                let deliveryRecord = WebhookDeliveryRecord(
-                    id: attemptRecordId,
-                    webhookId: webhookId,
-                    botId: endpoint.botId,
-                    statusCode: 200,
-                    deliveredAt: now + Double(attempt),
-                    payload: payloadText,
-                    response: responseBody
-                )
-                try await database.recordWebhookDelivery(deliveryRecord)
-
-                let runRecord = RoutineRunRecord(
-                    id: runId,
-                    routineId: "webhook:\(webhookId)",
-                    botId: endpoint.botId,
-                    status: "success",
-                    startedAt: now,
-                    completedAt: now + Double(attempt),
-                    error: nil
-                )
-                try await database.recordRoutineRun(runRecord)
-
-                return .delivered(
-                    deliveryId: attemptRecordId,
-                    runId: runId,
-                    attempts: attempt + 1,
-                    response: responseBody
-                )
+                responseBody = try await dispatchHandler(endpoint, eventType, payload)
             } catch {
                 lastErrorText = error.localizedDescription
                 let failedAttemptRecord = WebhookDeliveryRecord(
@@ -542,7 +533,7 @@ public actor NativeWebhookIngressActor {
                     webhookId: webhookId,
                     botId: endpoint.botId,
                     statusCode: 502,
-                    deliveredAt: now + Double(attempt),
+                    deliveredAt: Date().timeIntervalSince1970,
                     payload: payloadText,
                     response: "{\"error\":\"\(lastErrorText)\",\"attempt\":\(attempt + 1)}"
                 )
@@ -553,7 +544,42 @@ public actor NativeWebhookIngressActor {
                     recordedBackoffDelays.append(backoff)
                     await sleepHandler(backoff)
                 }
+                continue
             }
+
+            // The endpoint already has the payload.  A failure to write the
+            // record is surfaced to the caller instead of re-sending it.
+            let deliveredAt = Date().timeIntervalSince1970
+            let runId = "run_\(baseDeliveryId)"
+
+            let deliveryRecord = WebhookDeliveryRecord(
+                id: attemptRecordId,
+                webhookId: webhookId,
+                botId: endpoint.botId,
+                statusCode: 200,
+                deliveredAt: deliveredAt,
+                payload: payloadText,
+                response: responseBody
+            )
+            try await database.recordWebhookDelivery(deliveryRecord)
+
+            let runRecord = RoutineRunRecord(
+                id: runId,
+                routineId: "webhook:\(webhookId)",
+                botId: endpoint.botId,
+                status: "success",
+                startedAt: now,
+                completedAt: deliveredAt,
+                error: nil
+            )
+            try await database.recordRoutineRun(runRecord)
+
+            return .delivered(
+                deliveryId: attemptRecordId,
+                runId: runId,
+                attempts: attempt + 1,
+                response: responseBody
+            )
         }
 
         return .failedAfterRetries(

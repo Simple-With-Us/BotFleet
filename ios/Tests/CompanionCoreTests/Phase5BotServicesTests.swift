@@ -70,14 +70,25 @@ private actor MockZulipTransport: ZulipTransport {
 
 private actor MockLinearTransport: LinearGraphQLTransport {
     var executedRequests: [LinearGraphQLRequest] = []
+    var resolvedStateIds: [String: String] = [:]
+    var stateIdLookupCount = 0
 
     func execute(_ request: LinearGraphQLRequest, apiKey: String) async throws -> [String: String] {
         executedRequests.append(request)
         return ["ok": "true"]
     }
 
+    func workflowStateId(named stateName: String, apiKey: String) async throws -> String {
+        stateIdLookupCount += 1
+        return resolvedStateIds[stateName] ?? "state-uuid-\(stateName.lowercased().replacingOccurrences(of: " ", with: "-"))"
+    }
+
     func requests() -> [LinearGraphQLRequest] {
         executedRequests
+    }
+
+    func lookups() -> Int {
+        stateIdLookupCount
     }
 }
 
@@ -93,6 +104,10 @@ private actor TestCounter {
         value
     }
 }
+
+/// The realm the Zulip tests point at.  It is never contacted: every test
+/// uses `MockZulipTransport`.  The `.invalid` TLD is reserved by RFC 2606.
+private let zulipTestRealmURL = URL(string: "https://zulip.example.invalid") ?? URL(fileURLWithPath: "/")
 
 // MARK: - Phase 5 Bot Services Test Suite
 
@@ -171,7 +186,10 @@ struct Phase5BotServicesTests {
         #expect(loopbackDisabled.bodyString.contains("Opening the desktop app from iOS is disabled in Mac settings"))
         #expect(await server.desktopOpenCount == 0)
 
-        // Case 2: Enable allowRemoteDesktopLaunch via PUT /api/config, but call from non-loopback LAN IP -> 403
+        // Case 2: A paired phone may not flip the BF-2489 desktop-launch gate.
+        // The knob is owner-side Mac configuration, and the companion proxy
+        // replays a phone request over loopback, so a phone that could write
+        // it would clear both gates of POST /api/desktop/open.
         let putConfig = await server.handleRequest(
             CompanionHTTPRequest(
                 method: "PUT",
@@ -180,7 +198,11 @@ struct Phase5BotServicesTests {
                 jsonString: "{\"allowRemoteDesktopLaunch\":true}"
             )
         )
-        #expect(putConfig.statusCode == 200)
+        #expect(putConfig.statusCode == 403)
+        #expect(putConfig.bodyString.contains("allowRemoteDesktopLaunch"))
+
+        // The owner-side setter is the only way to open the gate.
+        await server.setAllowRemoteDesktopLaunch(true)
 
         let remoteDenied = await server.handleRequest(
             CompanionHTTPRequest(
@@ -357,6 +379,7 @@ struct Phase5BotServicesTests {
         // Refuses owner account
         #expect(throws: ZulipActorError.self) {
             _ = try ZulipBotIdentity(
+                realmURL: zulipTestRealmURL,
                 botEmail: "jay@simplewithus.zulipchat.com",
                 apiKey: "secret",
                 seat: "AG",
@@ -367,6 +390,7 @@ struct Phase5BotServicesTests {
         // Refuses non-bot email lacking -bot suffix
         #expect(throws: ZulipActorError.self) {
             _ = try ZulipBotIdentity(
+                realmURL: zulipTestRealmURL,
                 botEmail: "antigravity@simplewithus.zulipchat.com",
                 apiKey: "secret",
                 seat: "AG",
@@ -376,6 +400,7 @@ struct Phase5BotServicesTests {
 
         // Accepts valid *-bot@... email and formats repo: + [SEAT·session]
         let identity = try ZulipBotIdentity(
+            realmURL: zulipTestRealmURL,
             botEmail: "ag-bot@simplewithus.zulipchat.com",
             apiKey: "valid-key",
             seat: "ag",
@@ -405,6 +430,7 @@ struct Phase5BotServicesTests {
     @Test("ZulipEventActor recovers from BAD_EVENT_QUEUE_ID and a 10-minute network outage with zero lost or duplicate messages")
     func zulipQueueReRegistrationAndTenMinuteOutageDeduplication() async throws {
         let identity = try ZulipBotIdentity(
+            realmURL: zulipTestRealmURL,
             botEmail: "ag-bot@simplewithus.zulipchat.com",
             apiKey: "bot-key",
             seat: "AG",
@@ -689,5 +715,182 @@ struct Phase5BotServicesTests {
         #expect(recordedDeliveries.count == 5)
         #expect(recordedDeliveries.contains(where: { $0.id == "deliv-merged_retry2" && $0.statusCode == 200 }))
         #expect(recordedDeliveries.contains(where: { $0.id == "deliv-invalid-sig" && $0.statusCode == 401 }))
+    }
+
+    // MARK: - Review Triage Regression Tests
+
+    @Test("Pairing fails closed with no open window, caps wrong guesses, and spends the code")
+    func pairingWindowFailsClosedAndIsCapped() async throws {
+        let db = try DatabaseService(path: ":memory:")
+
+        // No pairing code at all: the request must not mint a working token.
+        let noWindow = NativeCompanionServer(database: db, pairedTokens: [])
+        let refused = await noWindow.handleRequest(
+            CompanionHTTPRequest(method: "POST", path: "/api/pair", jsonString: "{\"code\":\"849201\"}")
+        )
+        #expect(refused.statusCode == 503)
+        #expect(refused.bodyString.contains("pairing_unavailable"))
+        #expect(!refused.bodyString.contains("bf_tok_"))
+
+        // Wrong codes are refused and burn the window's attempts.
+        let capped = NativeCompanionServer(database: db, pairedTokens: [], pairingCode: "849201")
+        var lastStatus = 0
+        for _ in 0..<NativeCompanionServer.pairingMaxAttempts {
+            let response = await capped.handleRequest(
+                CompanionHTTPRequest(method: "POST", path: "/api/pair", jsonString: "{\"code\":\"000000\"}")
+            )
+            lastStatus = response.statusCode
+        }
+        #expect(lastStatus == 429)
+        // The window is gone, so even the right code no longer works.
+        let afterBurn = await capped.handleRequest(
+            CompanionHTTPRequest(method: "POST", path: "/api/pair", jsonString: "{\"code\":\"849201\"}")
+        )
+        #expect(afterBurn.statusCode == 503)
+
+        // The right code pairs once and is spent afterwards.
+        let singleUse = NativeCompanionServer(database: db, pairedTokens: [], pairingCode: "849201")
+        let paired = await singleUse.handleRequest(
+            CompanionHTTPRequest(method: "POST", path: "/api/pair", jsonString: "{\"code\":\"849201\"}")
+        )
+        #expect(paired.statusCode == 200)
+        #expect(paired.bodyString.contains("bf_tok_"))
+        let replay = await singleUse.handleRequest(
+            CompanionHTTPRequest(method: "POST", path: "/api/pair", jsonString: "{\"code\":\"849201\"}")
+        )
+        #expect(replay.statusCode == 503)
+    }
+
+    @Test("Search clamps an oversized or negative limit instead of trapping on the Int32 bind")
+    func searchClampsOversizedLimit() async throws {
+        let db = try DatabaseService(path: ":memory:")
+        let token = "bf_tok_limit_test"
+        let authHeaders = ["Authorization": "Bearer \(token)"]
+        let server = NativeCompanionServer(database: db, pairedTokens: [token])
+
+        // `sqlite3_bind_int` takes an `Int32`: an unclamped limit would trap
+        // the process, and a negative one would become `LIMIT -1`.
+        let huge = await server.handleRequest(
+            CompanionHTTPRequest(
+                method: "GET",
+                path: "/api/search?q=anything&limit=99999999999",
+                headers: authHeaders
+            )
+        )
+        #expect(huge.statusCode == 200)
+
+        let negative = await server.handleRequest(
+            CompanionHTTPRequest(
+                method: "GET",
+                path: "/api/search?q=anything&limit=-5",
+                headers: authHeaders
+            )
+        )
+        #expect(negative.statusCode == 200)
+    }
+
+    @Test("An unclassified peer address fails the loopback gate closed")
+    func unclassifiedRemoteAddressFailsClosed() async throws {
+        let db = try DatabaseService(path: ":memory:")
+        let token = "bf_tok_loopback_test"
+        let authHeaders = ["Authorization": "Bearer \(token)"]
+        let server = NativeCompanionServer(
+            database: db,
+            pairedTokens: [token],
+            config: CompanionServerConfig(allowRemoteDesktopLaunch: true)
+        )
+
+        let response = await server.handleRequest(
+            CompanionHTTPRequest(
+                method: "POST",
+                path: "/api/desktop/open",
+                headers: authHeaders,
+                remoteAddress: NativeCompanionServer.unclassifiedRemoteAddress
+            )
+        )
+        #expect(response.statusCode == 403)
+        #expect(await server.desktopOpenCount == 0)
+    }
+
+    @Test("Zulip fencing escapes peer-supplied fence attributes")
+    func zulipFenceAttributeEscaping() {
+        let raw = ZulipRawMessage(
+            id: 777,
+            senderEmail: "peer-bot@simplewithus.zulipchat.com\" onload=\"alert(1)",
+            senderFullName: "Peer Bot",
+            streamName: "Work-In-Progress",
+            subject: "BF-2512",
+            content: "hello",
+            timestamp: 1_730_000_000
+        )
+        let fenced = ZulipFencedMessage(from: raw)
+        #expect(!fenced.fencedContent.contains("onload=\"alert(1)\""))
+        #expect(fenced.fencedContent.contains("&quot;"))
+    }
+
+    @Test("Zulip catch-up messages are emitted, not swallowed by the deduplication set")
+    func zulipCatchUpMessagesAreEmitted() async throws {
+        let identity = try ZulipBotIdentity(
+            realmURL: zulipTestRealmURL,
+            botEmail: "ag-bot@simplewithus.zulipchat.com",
+            apiKey: "bot-key",
+            seat: "AG",
+            sessionId: "session8"
+        )
+        let transport = MockZulipTransport()
+        let missed = ZulipRawMessage(
+            id: 2001,
+            senderEmail: "mm-bot@simplewithus.zulipchat.com",
+            senderFullName: "MM",
+            streamName: "Work-In-Progress",
+            subject: "BF-2512",
+            content: "Message that arrived while the queue was down",
+            timestamp: 40
+        )
+        await transport.configure(catchUpMessages: [missed], pollBatchesByQueue: [:])
+
+        let actor = ZulipEventActor(
+            identity: identity,
+            transport: transport,
+            randomFactorProvider: { 1.0 },
+            sleepHandler: { _ in }
+        )
+
+        let emitted = try await actor.pollOnce()
+        #expect(emitted.map(\.id) == [2001])
+        #expect(await actor.highWaterMessageId == 2001)
+    }
+
+    @Test("LinearSyncClient resolves the workflow state id and keeps the comment key stable")
+    func linearResolvesWorkflowStateIdAndStableCommentKey() async throws {
+        let transport = MockLinearTransport()
+        let client = try LinearSyncClient(
+            seat: "ag",
+            sessionId: "sess42",
+            apiKey: "lin_api_test",
+            transport: transport
+        )
+
+        let receipt = try await client.claim(
+            issueId: "BF-2512",
+            branch: "ag/bf-phase5-bot-services",
+            worktree: "~/apps/lanes/BotFleet/antigravity-phase5-bot-services"
+        )
+        #expect(receipt.wasDeduplicated == false)
+
+        let requests = await transport.requests()
+        #expect(requests.count == 1)
+        #expect(requests[0].variables["stateId"] == "state-uuid-in-progress")
+        #expect(requests[0].variables["stateName"] == nil)
+        #expect(requests[0].query.contains("stateId: $stateId"))
+        #expect(await transport.lookups() == 1)
+
+        // The same comment body must produce the same idempotency key every
+        // time, so a restart does not re-post it.
+        let firstComment = try await client.comment(issueId: "BF-2512", body: "progress")
+        let secondComment = try await client.comment(issueId: "BF-2512", body: "progress")
+        #expect(firstComment.idempotencyKey == secondComment.idempotencyKey)
+        #expect(secondComment.wasDeduplicated == true)
+        #expect(LinearSyncClient.stableIdempotencyDigest("[AG·sess42] progress").count == 64)
     }
 }

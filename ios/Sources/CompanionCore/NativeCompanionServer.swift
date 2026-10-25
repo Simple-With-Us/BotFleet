@@ -200,7 +200,7 @@ public actor NativeAPNsProvider {
     public let bundleId: String
     public let production: Bool
 
-    private let signingKey: P256.Signing.PrivateKey
+    private let signingMaterial: P256.Signing.PrivateKey
     private var cachedToken: (jwt: String, issuedAt: Date)?
     /// Reuse provider JWTs for 50 minutes (Apple enforces a 20-minute minimum refresh interval and 60-minute expiry).
     public static let tokenReuseInterval: TimeInterval = 50 * 60
@@ -221,7 +221,7 @@ public actor NativeAPNsProvider {
         production: Bool = true
     ) throws {
         do {
-            self.signingKey = try P256.Signing.PrivateKey(pemRepresentation: p8PEM)
+            self.signingMaterial = try P256.Signing.PrivateKey(pemRepresentation: p8PEM)
         } catch {
             throw NativeAPNsError.invalidPrivateKey(error.localizedDescription)
         }
@@ -232,13 +232,13 @@ public actor NativeAPNsProvider {
     }
 
     public init(
-        signingKey: P256.Signing.PrivateKey,
+        signingMaterial: P256.Signing.PrivateKey,
         keyId: String,
         teamId: String,
         bundleId: String = "app.botfleet.ios",
         production: Bool = true
     ) {
-        self.signingKey = signingKey
+        self.signingMaterial = signingMaterial
         self.keyId = keyId
         self.teamId = teamId
         self.bundleId = bundleId
@@ -246,7 +246,7 @@ public actor NativeAPNsProvider {
     }
 
     public nonisolated var publicKey: P256.Signing.PublicKey {
-        signingKey.publicKey
+        signingMaterial.publicKey
     }
 
     /// Generates or returns a cached ES256 JWT signed with the provider's `.p8` key.
@@ -259,7 +259,7 @@ public actor NativeAPNsProvider {
         }
 
         let jwt = try Self.generateES256JWT(
-            signingKey: signingKey,
+            signingMaterial: signingMaterial,
             keyId: keyId,
             teamId: teamId,
             issuedAt: now
@@ -270,7 +270,7 @@ public actor NativeAPNsProvider {
 
     /// Stateless helper that signs an APNs ES256 JWT using CryptoKit P-256.
     public static func generateES256JWT(
-        signingKey: P256.Signing.PrivateKey,
+        signingMaterial: P256.Signing.PrivateKey,
         keyId: String,
         teamId: String,
         issuedAt: Date = Date()
@@ -283,7 +283,7 @@ public actor NativeAPNsProvider {
         let claimsB64 = base64URLEncode(Data(claimsJSON.utf8))
         let signingInput = "\(headerB64).\(claimsB64)"
 
-        let signature = try signingKey.signature(for: Data(signingInput.utf8))
+        let signature = try signingMaterial.signature(for: Data(signingInput.utf8))
         // JWS ES256 requires the 64-byte IEEE P1363 raw (r || s) representation.
         let signatureB64 = base64URLEncode(signature.rawRepresentation)
         return "\(signingInput).\(signatureB64)"
@@ -338,7 +338,9 @@ public actor NativeAPNsProvider {
 
         let jwt = try providerToken(now: now)
         let host = production ? "api.push.apple.com" : "api.sandbox.push.apple.com"
-        let url = URL(string: "https://\(host)/3/device/\(trimmedToken)")!
+        guard let url = URL(string: "https://\(host)/3/device/\(trimmedToken)") else {
+            throw NativeAPNsError.invalidDeviceToken
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -401,6 +403,34 @@ public actor NativeAPNsProvider {
 
 // MARK: - NativeCompanionServer Actor
 
+/// Errors thrown by `NativeCompanionServer` itself (not by the routes it serves).
+public enum NativeCompanionServerError: LocalizedError, Sendable, Equatable {
+    case invalidPort(UInt16)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidPort(let port):
+            return "Invalid companion server port \(port)."
+        }
+    }
+}
+
+/// Upper bounds, in UTF-8 bytes, on the fields a paired device can send.
+/// Every request body field is bounded before it can reach SQLite or the FTS
+/// index, so a single request cannot exhaust memory or a downstream buffer.
+public enum CompanionFieldLimits {
+    public static let pairingCode = 128
+    public static let searchQuery = 512
+    public static let searchThreadId = 128
+    public static let messageId = 128
+    public static let messageRole = 64
+    public static let messageKind = 64
+    public static let messageContent = 64 * 1024
+    public static let messageTitle = 512
+    public static let pushToken = 512
+    public static let roomTerminology = 256
+}
+
 /// Pure-Swift HTTP and SSE companion server actor built on `Network.framework`.
 /// Enforces the default-deny allowlist from `companion/src/routes.ts`, constant-time
 /// Bearer token verification, and both BF-2489 security gates on `POST /api/desktop/open`.
@@ -408,6 +438,10 @@ public actor NativeCompanionServer {
     private let database: DatabaseService
     private var pairedTokens: Set<String>
     private var pairingCode: String?
+    /// When the open pairing window closes.  `nil` means no window is open.
+    private var pairingCodeExpiresAt: Date?
+    /// How many more wrong pairing codes the open window will accept.
+    private var pairingAttemptsRemaining: Int = 0
     private var config: CompanionServerConfig
     private var bots: [CompanionBotRecord]
     private var pushTokens: Set<String> = []
@@ -419,6 +453,24 @@ public actor NativeCompanionServer {
     public private(set) var desktopOpenCount: Int = 0
     public private(set) var shutdownRequested: Bool = false
     public private(set) var stoppedMarkerPath: String?
+
+    /// A pairing window lives for two minutes and tolerates five wrong guesses
+    /// before it burns, matching `companion/src/devices.ts`
+    /// (`PAIRING_TTL_MS`, `MAX_PAIRING_ATTEMPTS`).
+    public static let pairingWindowTTL: TimeInterval = 120
+    public static let pairingMaxAttempts: Int = 5
+
+    /// The default and the maximum number of rows one search may return.  The
+    /// limit is clamped before it reaches `sqlite3_bind_int`, which takes an
+    /// `Int32`: an oversized value would trap, and a negative value would
+    /// become `LIMIT -1` (no limit at all).
+    public static let defaultSearchLimit: Int = 50
+    public static let maxSearchLimit: Int = 500
+
+    /// The address returned for a peer whose endpoint kind this server does not
+    /// recognise.  It is deliberately not a loopback address: an unclassified
+    /// peer must fail the loopback gate closed, not open.
+    public static let unclassifiedRemoteAddress: String = "0.0.0.0"
 
     private var onDesktopOpen: (@Sendable () async throws -> Void)?
     private var onShutdown: (@Sendable () async -> Void)?
@@ -441,6 +493,10 @@ public actor NativeCompanionServer {
         self.database = database
         self.pairedTokens = pairedTokens
         self.pairingCode = pairingCode
+        self.pairingCodeExpiresAt = pairingCode.map { _ in
+            Date().addingTimeInterval(NativeCompanionServer.pairingWindowTTL)
+        }
+        self.pairingAttemptsRemaining = pairingCode == nil ? 0 : NativeCompanionServer.pairingMaxAttempts
         self.config = config
         self.bots = bots
         self.apnsProvider = apnsProvider
@@ -515,6 +571,27 @@ public actor NativeCompanionServer {
         pairedTokens.insert(token)
     }
 
+    /// Opens a pairing window for the Mac side to show on its own loopback
+    /// page.  The code is a credential for `pairingWindowTTL` seconds and is
+    /// spent by the first device that redeems it.
+    public func openPairingWindow(
+        code: String,
+        ttl: TimeInterval = NativeCompanionServer.pairingWindowTTL,
+        maxAttempts: Int = NativeCompanionServer.pairingMaxAttempts
+    ) {
+        pairingCode = code
+        pairingCodeExpiresAt = Date().addingTimeInterval(ttl)
+        pairingAttemptsRemaining = max(1, maxAttempts)
+    }
+
+    /// Closes the open pairing window, so a code that is still on screen stops
+    /// working at once.
+    public func closePairingWindow() {
+        pairingCode = nil
+        pairingCodeExpiresAt = nil
+        pairingAttemptsRemaining = 0
+    }
+
     /// Subscribes to Server-Sent Events emitted by the companion server.
     public func subscribeSSE() -> AsyncStream<String> {
         let id = UUID()
@@ -538,6 +615,16 @@ public actor NativeCompanionServer {
         for continuation in sseContinuationById.values {
             continuation.yield(frame)
         }
+    }
+
+    /// Serializes an SSE payload with `JSONSerialization` so a client-supplied
+    /// value cannot break the JSON body or forge an extra event frame.
+    static func ssePayload(_ payload: [String: String]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return text
     }
 
     // MARK: - HTTP Request Router (Default-Deny Allowlist)
@@ -600,6 +687,9 @@ public actor NativeCompanionServer {
             return await handleSystemShutdown(request)
 
         case ("GET", "/api/events"):
+            // The socket path streams `subscribeSSE()` frames and keeps the
+            // connection open (see `streamEvents`).  This branch answers an
+            // in-process caller with one well-formed frame.
             return CompanionHTTPResponse(
                 statusCode: 200,
                 headers: [
@@ -631,15 +721,37 @@ public actor NativeCompanionServer {
               !payload.code.isEmpty else {
             return .error(400, "invalid_pair_request")
         }
+        guard payload.code.utf8.count <= CompanionFieldLimits.pairingCode else {
+            return .error(400, "pairing_code_too_long")
+        }
 
-        if let expectedCode = pairingCode {
-            guard Self.constantTimeEquals(payload.code, expectedCode) else {
-                return .error(403, "invalid_pairing_code")
+        // Fail closed.  With no open pairing window there is no code to check
+        // against, and skipping the check would mint a working bearer token for
+        // the first unauthenticated caller on the socket.
+        guard let expectedCode = pairingCode, !expectedCode.isEmpty else {
+            return .error(503, "pairing_unavailable")
+        }
+        if let expiry = pairingCodeExpiresAt, Date() >= expiry {
+            closePairingWindow()
+            return .error(503, "pairing_code_expired")
+        }
+        guard pairingAttemptsRemaining > 0 else {
+            closePairingWindow()
+            return .error(429, "pairing_attempts_exhausted")
+        }
+        guard Self.constantTimeEquals(payload.code, expectedCode) else {
+            pairingAttemptsRemaining -= 1
+            if pairingAttemptsRemaining <= 0 {
+                closePairingWindow()
+                return .error(429, "pairing_attempts_exhausted")
             }
+            return .error(403, "invalid_pairing_code")
         }
 
         let issuedToken = "bf_tok_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())"
         pairedTokens.insert(issuedToken)
+        // One code, one device: redeeming the code spends the window.
+        closePairingWindow()
         return .json(200, [
             "token": issuedToken,
             "deviceId": UUID().uuidString.lowercased(),
@@ -663,7 +775,16 @@ public actor NativeCompanionServer {
     private func handleSearch(_ request: CompanionHTTPRequest) async -> CompanionHTTPResponse {
         let query = request.queryItems["q"] ?? request.queryItems["query"] ?? ""
         let threadId = request.queryItems["threadId"]
-        let limit = request.queryItems["limit"].flatMap(Int.init) ?? 50
+        guard query.utf8.count <= CompanionFieldLimits.searchQuery else {
+            return .error(400, "query_too_long")
+        }
+        if let threadId, threadId.utf8.count > CompanionFieldLimits.searchThreadId {
+            return .error(400, "thread_id_too_long")
+        }
+        // `sqlite3_bind_int` takes an `Int32`, so an unclamped value would trap
+        // the process, and a negative one would become `LIMIT -1` (no limit).
+        let requestedLimit = request.queryItems["limit"].flatMap(Int.init) ?? Self.defaultSearchLimit
+        let limit = min(max(requestedLimit, 1), Self.maxSearchLimit)
 
         do {
             let hits = try await database.search(query: query, inThread: threadId, limit: limit)
@@ -684,13 +805,21 @@ public actor NativeCompanionServer {
               let patch = try? JSONDecoder().decode(ConfigPatch.self, from: body) else {
             return .error(400, "invalid_config_body")
         }
-        if let allowDesktop = patch.allowRemoteDesktopLaunch {
-            config.allowRemoteDesktopLaunch = allowDesktop
+        // BF-2489: the desktop-launch gate is an owner-side Mac setting
+        // (`server/knob-map.ts` -> `server.allowRemoteDesktopLaunch`), and the
+        // companion proxy replays a phone request over loopback, so a phone
+        // that could write it would clear both gates of `POST /api/desktop/open`.
+        // It stays settable through the owner-side `setAllowRemoteDesktopLaunch`.
+        if patch.allowRemoteDesktopLaunch != nil {
+            return .error(403, "allowRemoteDesktopLaunch can only be changed on your computer")
         }
         if let autoUpdate = patch.autoUpdateEnabled {
             config.autoUpdateEnabled = autoUpdate
         }
         if let terminology = patch.roomTerminology {
+            guard terminology.utf8.count <= CompanionFieldLimits.roomTerminology else {
+                return .error(400, "room_terminology_too_long")
+            }
             config.roomTerminology = terminology
         }
         return .json(200, config)
@@ -707,6 +836,9 @@ public actor NativeCompanionServer {
         }
         guard let token = json["token"] as? String, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .error(400, "token must be a non-empty string")
+        }
+        guard token.utf8.count <= CompanionFieldLimits.pushToken else {
+            return .error(400, "token_too_long")
         }
         if isLiveActivity {
             liveActivityTokens.insert(token)
@@ -769,9 +901,15 @@ public actor NativeCompanionServer {
 
         if let dataDir = config.dataDirectory, !dataDir.isEmpty {
             let markerURL = URL(fileURLWithPath: dataDir).appendingPathComponent("stopped.marker")
-            try? FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
-            let markerPayload = "{\"stoppedAt\":\(Date().timeIntervalSince1970)}\n"
-            try? Data(markerPayload.utf8).write(to: markerURL, options: .atomic)
+            do {
+                try FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
+                let markerPayload = "{\"stoppedAt\":\(Date().timeIntervalSince1970)}\n"
+                try Data(markerPayload.utf8).write(to: markerURL, options: .atomic)
+            } catch {
+                // A supervisor waits on `stopped.marker`; reporting a stop that
+                // never wrote the marker leaves it waiting forever.
+                return .error(500, "failed_to_write_stopped_marker")
+            }
             stoppedMarkerPath = markerURL.path
         }
 
@@ -862,6 +1000,22 @@ public actor NativeCompanionServer {
                   !payload.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return .error(400, "content is required")
             }
+            // Every field is bounded before it can reach SQLite or the FTS index.
+            if let id = payload.id, id.utf8.count > CompanionFieldLimits.messageId {
+                return .error(400, "id_too_long")
+            }
+            if let role = payload.role, role.utf8.count > CompanionFieldLimits.messageRole {
+                return .error(400, "role_too_long")
+            }
+            if let kind = payload.kind, kind.utf8.count > CompanionFieldLimits.messageKind {
+                return .error(400, "kind_too_long")
+            }
+            if payload.content.utf8.count > CompanionFieldLimits.messageContent {
+                return .error(400, "content_too_long")
+            }
+            if let title = payload.title, title.utf8.count > CompanionFieldLimits.messageTitle {
+                return .error(400, "title_too_long")
+            }
             let messageId = payload.id ?? "msg_\(UUID().uuidString.lowercased())"
             let now = Date().timeIntervalSince1970
             do {
@@ -877,7 +1031,10 @@ public actor NativeCompanionServer {
                     createdAt: now
                 )
                 try await database.insertMessage(record)
-                broadcastSSE(event: "message.created", jsonPayload: "{\"id\":\"\(messageId)\",\"threadId\":\"\(threadId)\"}")
+                broadcastSSE(
+                    event: "message.created",
+                    jsonPayload: Self.ssePayload(["id": messageId, "threadId": threadId])
+                )
                 return .json(201, [
                     "id": messageId,
                     "threadId": threadId,
@@ -894,7 +1051,7 @@ public actor NativeCompanionServer {
                 let threadId: String
             }
             interruptedThreadIds.insert(threadId)
-            broadcastSSE(event: "thread.interrupted", jsonPayload: "{\"threadId\":\"\(threadId)\"}")
+            broadcastSSE(event: "thread.interrupted", jsonPayload: Self.ssePayload(["threadId": threadId]))
             return .json(200, InterruptPayload(ok: true, threadId: threadId))
         }
     }
@@ -902,9 +1059,45 @@ public actor NativeCompanionServer {
     // MARK: - Network.framework Listener
 
     #if canImport(Network)
-    public func startListening(port: UInt16 = 0) throws {
-        let nwPort: NWEndpoint.Port = port == 0 ? .any : NWEndpoint.Port(rawValue: port)!
+    /// How the cleartext device port is bound.  The port carries the pairing
+    /// credential, the minted bearer token and every transcript frame in the
+    /// clear, so it binds loopback by default and a routable address only
+    /// through an explicit LAN opt-in, mirroring `companion/src/lan-policy.ts`
+    /// (`DEFAULT_LAN_POLICY`, `CLEARTEXT_LAN_ENV`).
+    public struct ListenerOptions: Sendable, Equatable {
+        /// The address the listener binds when the LAN opt-in is off.
+        public var bindAddress: String
+        /// Set only by an explicit LAN opt-in; it is the only way off loopback.
+        public var allowCleartextLAN: Bool
+
+        public init(bindAddress: String = "127.0.0.1", allowCleartextLAN: Bool = false) {
+            self.bindAddress = bindAddress
+            self.allowCleartextLAN = allowCleartextLAN
+        }
+
+        /// The address actually bound.
+        public var resolvedBindAddress: String {
+            allowCleartextLAN ? "0.0.0.0" : bindAddress
+        }
+    }
+
+    public func startListening(port: UInt16 = 0, options: ListenerOptions = ListenerOptions()) throws {
+        let nwPort: NWEndpoint.Port
+        if port == 0 {
+            nwPort = .any
+        } else {
+            guard let resolved = NWEndpoint.Port(rawValue: port) else {
+                throw NativeCompanionServerError.invalidPort(port)
+            }
+            nwPort = resolved
+        }
         let listener = try NWListener(using: .tcp, on: nwPort)
+        // Loopback by default: the cleartext device port must not be reachable
+        // from the network unless someone opted in on purpose.
+        listener.parameters.requiredLocalEndpoint = .hostPort(
+            host: NWEndpoint.Host(options.resolvedBindAddress),
+            port: nwPort
+        )
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
             Task {
@@ -922,24 +1115,104 @@ public actor NativeCompanionServer {
 
     private func acceptConnection(_ connection: NWConnection) {
         connection.start(queue: listenerQueue)
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, _, _ in
-            guard let self, let data, !data.isEmpty else {
+        receiveRequest(on: connection, buffer: Data())
+    }
+
+    /// Reads one HTTP request off the socket.  A body may arrive in more than
+    /// one TCP segment, so the read continues until the declared
+    /// `Content-Length` has arrived instead of taking the first segment as the
+    /// whole request.  The completion runs on the listener queue, so every
+    /// step back onto the actor hops through `Task`.
+    private func receiveRequest(on connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
+            var accumulated = buffer
+            if let data, !data.isEmpty {
+                accumulated.append(data)
+            }
+            if error != nil {
+                connection.cancel()
+                return
+            }
+            if Self.requestBodyIsComplete(accumulated) {
+                Task {
+                    await self?.handleIncomingRequest(accumulated, on: connection)
+                }
+                return
+            }
+            if isComplete {
                 connection.cancel()
                 return
             }
             Task {
-                let remoteAddr = Self.extractRemoteAddress(from: connection.endpoint)
-                if let httpReq = Self.parseRawHTTPRequest(data, remoteAddress: remoteAddr) {
-                    let response = await self.handleRequest(httpReq)
-                    let wireData = Self.serializeHTTPResponse(response)
-                    connection.send(content: wireData, completion: .contentProcessed { _ in
-                        connection.cancel()
-                    })
-                } else {
-                    connection.cancel()
-                }
+                await self?.receiveRequest(on: connection, buffer: accumulated)
             }
         }
+    }
+
+    /// Serves one complete request off an accepted socket.
+    private func handleIncomingRequest(_ raw: Data, on connection: NWConnection) async {
+        let remoteAddr = Self.extractRemoteAddress(from: connection.endpoint)
+        guard let httpReq = Self.parseRawHTTPRequest(raw, remoteAddress: remoteAddr) else {
+            connection.cancel()
+            return
+        }
+        if httpReq.method == "GET" && httpReq.path == "/api/events" {
+            streamEvents(over: connection, request: httpReq)
+            return
+        }
+        let response = await handleRequest(httpReq)
+        let wireData = Self.serializeHTTPResponse(response)
+        connection.send(content: wireData, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+
+    /// Streams `subscribeSSE()` frames onto an accepted socket and keeps the
+    /// connection open, so `message.created` and `thread.interrupted` actually
+    /// reach a network client.
+    private func streamEvents(over connection: NWConnection, request: CompanionHTTPRequest) {
+        guard isAuthenticated(request) else {
+            let response = CompanionHTTPResponse.error(
+                401,
+                "pair this device from Phone settings in BotFleet on your computer"
+            )
+            connection.send(content: Self.serializeHTTPResponse(response), completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+            return
+        }
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+        connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
+        let stream = subscribeSSE()
+        Task.detached {
+            for await frame in stream {
+                connection.send(content: Data(frame.utf8), completion: .contentProcessed { _ in })
+            }
+        }
+    }
+
+    /// True when the accumulated bytes hold a whole HTTP request: the header
+    /// block is terminated and the declared `Content-Length` body has arrived.
+    static func requestBodyIsComplete(_ data: Data) -> Bool {
+        guard let separator = data.range(of: Data("\r\n\r\n".utf8)) else {
+            return false
+        }
+        let headData = data[data.startIndex..<separator.lowerBound]
+        let bodyLength = data.distance(from: separator.upperBound, to: data.endIndex)
+        guard let head = String(data: headData, encoding: .utf8) else {
+            return false
+        }
+        var declared = 0
+        for line in head.components(separatedBy: "\r\n") {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = String(line[..<colon]).trimmingCharacters(in: .whitespaces).lowercased()
+            guard name == "content-length" else { continue }
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            guard let parsed = Int(value), parsed >= 0 else { return false }
+            declared = parsed
+        }
+        guard declared > 0 else { return true }
+        return bodyLength >= declared
     }
 
     private static func extractRemoteAddress(from endpoint: NWEndpoint) -> String {
@@ -953,17 +1226,29 @@ public actor NativeCompanionServer {
             case .name(let name, _):
                 return name
             @unknown default:
-                return "127.0.0.1"
+                // Fail closed: an endpoint kind this build does not understand
+                // must not be treated as loopback by the BF-2489 gate.
+                return NativeCompanionServer.unclassifiedRemoteAddress
             }
         default:
-            return "127.0.0.1"
+            return NativeCompanionServer.unclassifiedRemoteAddress
         }
     }
 
     public static func parseRawHTTPRequest(_ data: Data, remoteAddress: String = "127.0.0.1") -> CompanionHTTPRequest? {
-        guard let raw = String(data: data, encoding: .utf8) else { return nil }
-        let parts = raw.components(separatedBy: "\r\n\r\n")
-        guard let head = parts.first else { return nil }
+        // Split at the first header terminator only: a body may itself contain
+        // the separator, and everything after the first one is the body.
+        let separator = Data("\r\n\r\n".utf8)
+        let headData: Data
+        let bodyData: Data
+        if let range = data.range(of: separator) {
+            headData = Data(data[data.startIndex..<range.lowerBound])
+            bodyData = Data(data[range.upperBound...])
+        } else {
+            headData = data
+            bodyData = Data()
+        }
+        guard let head = String(data: headData, encoding: .utf8) else { return nil }
         let lines = head.components(separatedBy: "\r\n")
         guard let requestLine = lines.first else { return nil }
         let tokens = requestLine.split(separator: " ")
@@ -979,13 +1264,11 @@ public actor NativeCompanionServer {
                 headers[key] = value
             }
         }
-        let bodyString = parts.dropFirst().joined(separator: "\r\n\r\n")
-        let bodyData = bodyString.isEmpty ? nil : Data(bodyString.utf8)
         return CompanionHTTPRequest(
             method: method,
             path: path,
             headers: headers,
-            body: bodyData,
+            body: bodyData.isEmpty ? nil : bodyData,
             remoteAddress: remoteAddress
         )
     }

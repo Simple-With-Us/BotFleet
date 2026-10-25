@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // MARK: - Zulip Models & Errors
@@ -45,8 +46,21 @@ public struct ZulipBotIdentity: Sendable, Equatable {
         "jay.owner",
     ]
 
+    /// A short, non-reversible preview of a credential, safe to put in an
+    /// error message: the first eight and the last four characters only, and
+    /// nothing at all for a credential too short to preview safely.
+    public static func maskedCredentialPreview(_ credential: String) -> String {
+        let characters = Array(credential)
+        guard characters.count > 12 else { return "" }
+        return String(characters.prefix(8)) + "…" + String(characters.suffix(4))
+    }
+
+    /// `realmURL` has no default on purpose.  The realm is deployment
+    /// configuration, and a hardcoded default would let a caller that forgot
+    /// to resolve it silently talk to one fixed site instead of the configured
+    /// one.  The caller resolves it from the deployment's approved source.
     public init(
-        realmURL: URL = URL(string: "https://simplewithus.zulipchat.com")!,
+        realmURL: URL,
         botEmail: String,
         apiKey: String,
         seat: String,
@@ -154,10 +168,15 @@ public struct ZulipFencedMessage: Sendable, Equatable, Identifiable {
 public struct ZulipRegisterResponse: Codable, Sendable, Equatable {
     public let queueId: String
     public let lastEventId: Int
+    /// The newest message id in the realm at registration time.  The first
+    /// catch-up anchors here, so a fresh bot reads recent traffic instead of
+    /// walking the whole message history from id 0.
+    public let maxMessageId: Int
 
-    public init(queueId: String, lastEventId: Int) {
+    public init(queueId: String, lastEventId: Int, maxMessageId: Int = 0) {
         self.queueId = queueId
         self.lastEventId = lastEventId
+        self.maxMessageId = maxMessageId
     }
 }
 
@@ -205,6 +224,34 @@ public struct URLSessionZulipTransport: ZulipTransport {
         return "Basic \(encoded)"
     }
 
+    /// Zulip reports a rejected credential with an error envelope.  The thrown
+    /// error carries a masked preview of the key, so an operator can tell
+    /// which credential was rejected without the key itself ever appearing.
+    static func apiError(
+        code: String,
+        message: String,
+        identity: ZulipBotIdentity
+    ) -> ZulipActorError {
+        guard isAuthFailureCode(code) else {
+            return .apiError(code: code, message: message)
+        }
+        let preview = ZulipBotIdentity.maskedCredentialPreview(identity.apiKey)
+        let suffix = preview.isEmpty ? "" : " (credential \(preview))"
+        return .apiError(
+            code: "AUTH_REJECTED",
+            message: "Zulip rejected the bot credential\(suffix): \(message)"
+        )
+    }
+
+    /// The error codes Zulip uses for a credential it will not accept.
+    static func isAuthFailureCode(_ code: String) -> Bool {
+        let upper = code.uppercased()
+        return upper == "INVALID_API_KEY"
+            || upper == "INVALID_API_KEY_OR_EMAIL"
+            || upper == "AUTHENTICATION_FAILED"
+            || upper == "UNAUTHORIZED"
+    }
+
     public func registerEventQueue(identity: ZulipBotIdentity, eventTypes: [String]) async throws -> ZulipRegisterResponse {
         let url = identity.realmURL.appendingPathComponent("api/v1/register")
         var request = URLRequest(url: url)
@@ -224,23 +271,32 @@ public struct URLSessionZulipTransport: ZulipTransport {
         if let result = json["result"] as? String, result == "error" {
             let code = (json["code"] as? String) ?? "UNKNOWN"
             let msg = (json["msg"] as? String) ?? "Unknown error"
-            throw ZulipActorError.apiError(code: code, message: msg)
+            throw Self.apiError(code: code, message: msg, identity: identity)
         }
         guard let queueId = json["queue_id"] as? String,
               let lastEventId = json["last_event_id"] as? Int else {
             throw ZulipActorError.transportError("Missing queue_id or last_event_id")
         }
-        return ZulipRegisterResponse(queueId: queueId, lastEventId: lastEventId)
+        let maxMessageId = (json["max_message_id"] as? Int) ?? 0
+        return ZulipRegisterResponse(queueId: queueId, lastEventId: lastEventId, maxMessageId: maxMessageId)
     }
 
     public func getEvents(identity: ZulipBotIdentity, queueId: String, lastEventId: Int) async throws -> ZulipEventsResponse {
-        var components = URLComponents(url: identity.realmURL.appendingPathComponent("api/v1/events"), resolvingAgainstBaseURL: false)!
+        guard var components = URLComponents(
+            url: identity.realmURL.appendingPathComponent("api/v1/events"),
+            resolvingAgainstBaseURL: false
+        ) else {
+            throw ZulipActorError.transportError("Could not build the Zulip events URL")
+        }
         components.queryItems = [
             URLQueryItem(name: "queue_id", value: queueId),
             URLQueryItem(name: "last_event_id", value: String(lastEventId)),
             URLQueryItem(name: "dont_block", value: "false"),
         ]
-        var request = URLRequest(url: components.url!)
+        guard let url = components.url else {
+            throw ZulipActorError.transportError("Could not build the Zulip events URL")
+        }
+        var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue(basicAuthHeader(for: identity), forHTTPHeaderField: "Authorization")
 
@@ -254,7 +310,7 @@ public struct URLSessionZulipTransport: ZulipTransport {
             if code == "BAD_EVENT_QUEUE_ID" {
                 throw ZulipActorError.badEventQueueId(queueId)
             }
-            throw ZulipActorError.apiError(code: code, message: msg)
+            throw Self.apiError(code: code, message: msg, identity: identity)
         }
         let rawEvents = (json["events"] as? [[String: Any]]) ?? []
         var parsedEvents: [ZulipEventEnvelope] = []
@@ -280,21 +336,39 @@ public struct URLSessionZulipTransport: ZulipTransport {
     }
 
     public func fetchMessagesAfter(identity: ZulipBotIdentity, anchorMessageId: Int, limit: Int) async throws -> [ZulipRawMessage] {
-        var components = URLComponents(url: identity.realmURL.appendingPathComponent("api/v1/messages"), resolvingAgainstBaseURL: false)!
+        guard var components = URLComponents(
+            url: identity.realmURL.appendingPathComponent("api/v1/messages"),
+            resolvingAgainstBaseURL: false
+        ) else {
+            throw ZulipActorError.transportError("Could not build the Zulip messages URL")
+        }
         components.queryItems = [
             URLQueryItem(name: "anchor", value: String(anchorMessageId)),
             URLQueryItem(name: "include_anchor", value: "false"),
             URLQueryItem(name: "num_before", value: "0"),
             URLQueryItem(name: "num_after", value: String(limit)),
         ]
-        var request = URLRequest(url: components.url!)
+        guard let url = components.url else {
+            throw ZulipActorError.transportError("Could not build the Zulip messages URL")
+        }
+        var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue(basicAuthHeader(for: identity), forHTTPHeaderField: "Authorization")
 
         let (data, _) = try await session.data(for: request)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let messages = json["messages"] as? [[String: Any]] else {
-            return []
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ZulipActorError.transportError("Malformed JSON from /api/v1/messages")
+        }
+        // An error envelope carries no `messages` key.  Treating it as "no
+        // messages" would report an empty catch-up and let the caller believe
+        // the backfill succeeded, so the envelope is surfaced instead.
+        if let result = json["result"] as? String, result == "error" {
+            let code = (json["code"] as? String) ?? "UNKNOWN"
+            let msg = (json["msg"] as? String) ?? "Unknown error"
+            throw Self.apiError(code: code, message: msg, identity: identity)
+        }
+        guard let messages = json["messages"] as? [[String: Any]] else {
+            throw ZulipActorError.transportError("Malformed messages payload from /api/v1/messages")
         }
         return messages.compactMap { msgDict in
             guard let msgId = msgDict["id"] as? Int else { return nil }
@@ -327,8 +401,15 @@ public struct URLSessionZulipTransport: ZulipTransport {
         request.httpBody = Data((components.percentEncodedQuery ?? "").utf8)
 
         let (data, _) = try await session.data(for: request)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let msgId = json["id"] as? Int else {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ZulipActorError.transportError("Malformed JSON from /api/v1/messages")
+        }
+        if let result = json["result"] as? String, result == "error" {
+            let code = (json["code"] as? String) ?? "UNKNOWN"
+            let msg = (json["msg"] as? String) ?? "Unknown error"
+            throw Self.apiError(code: code, message: msg, identity: identity)
+        }
+        guard let msgId = json["id"] as? Int else {
             throw ZulipActorError.transportError("Failed to decode sent message ID")
         }
         return msgId
@@ -392,10 +473,39 @@ public actor ZulipEventActor {
             with: "&lt;/untrusted_peer_message&gt;"
         )
         return """
-        <untrusted_peer_message sender="\(message.senderEmail)" stream="\(message.streamName)" topic="\(message.subject)" message_id="\(message.id)">
+        <untrusted_peer_message sender="\(escapeFenceAttribute(message.senderEmail))" stream="\(escapeFenceAttribute(message.streamName))" topic="\(escapeFenceAttribute(message.subject))" message_id="\(message.id)">
         \(sanitizedBody)
         </untrusted_peer_message>
         """
+    }
+
+    /// Escapes a value that is interpolated into a fence attribute.  A quote
+    /// would close the attribute early and let a peer inject their own
+    /// attribute or element into the fence.
+    static func escapeFenceAttribute(_ value: String) -> String {
+        var escaped = ""
+        escaped.reserveCapacity(value.count)
+        for character in value {
+            switch character {
+            case "&":
+                escaped += "&amp;"
+            case "<":
+                escaped += "&lt;"
+            case ">":
+                escaped += "&gt;"
+            case "\"":
+                escaped += "&quot;"
+            case "'":
+                escaped += "&#39;"
+            case "\n":
+                escaped += "&#10;"
+            case "\r":
+                escaped += "&#13;"
+            default:
+                escaped.append(character)
+            }
+        }
+        return escaped
     }
 
     /// Performs a single long-poll cycle, automatically registering the queue if needed,
@@ -403,11 +513,16 @@ public actor ZulipEventActor {
     /// and deduplicating all emitted `ZulipFencedMessage` values.
     public func pollOnce() async throws -> [ZulipFencedMessage] {
         do {
+            // The catch-up messages are the result of the backfill itself, so
+            // they are emitted too.  Dropping them here would mark them as
+            // seen (the ingest is what advances the high-water mark) and lose
+            // them for good.
+            var caughtUp: [ZulipFencedMessage] = []
             if queueId == nil {
-                try await registerAndCatchUp()
+                caughtUp = try await registerAndCatchUp()
             }
             guard let activeQueueId = queueId else {
-                return []
+                return caughtUp
             }
 
             let response: ZulipEventsResponse
@@ -454,7 +569,7 @@ public actor ZulipEventActor {
 
             let emitted = ingestEvents(response.events)
             consecutiveFailures = 0
-            return emitted
+            return caughtUp + emitted
         } catch {
             let delay = Self.computeBackoffDelay(
                 attempt: consecutiveFailures,
@@ -501,15 +616,29 @@ public actor ZulipEventActor {
     private func registerAndCatchUp() async throws -> [ZulipFencedMessage] {
         let previousHighWater = highWaterMessageId
         let reg = try await transport.registerEventQueue(identity: identity, eventTypes: ["message"])
-        self.queueId = reg.queueId
-        self.lastEventId = reg.lastEventId
+
+        // Anchor the backfill at the last message this actor emitted.  A first
+        // registration has no high-water mark yet, so it anchors at the realm's
+        // newest message instead of id 0: a fresh bot reads recent traffic
+        // rather than walking the whole message history from the beginning.
+        let anchor = previousHighWater > 0 ? previousHighWater : reg.maxMessageId
 
         // Backfill any messages that arrived while the queue was unregistered or expired.
         let missed = try await transport.fetchMessagesAfter(
             identity: identity,
-            anchorMessageId: previousHighWater,
+            anchorMessageId: anchor,
             limit: 1_000
         )
+
+        // The new queue is adopted only after the backfill succeeded.  Adopting
+        // it first would leave the actor polling a fresh queue with the missed
+        // messages still unread, and a failed backfill would skip them for
+        // good: the next poll would anchor past them.
+        self.queueId = reg.queueId
+        self.lastEventId = reg.lastEventId
+        if previousHighWater == 0, reg.maxMessageId > 0 {
+            self.highWaterMessageId = reg.maxMessageId
+        }
         return ingestRawMessages(missed)
     }
 
@@ -555,6 +684,7 @@ public enum LinearSyncError: LocalizedError, Sendable, Equatable {
     case invalidSeat(String)
     case emptyIssueId
     case graphQLError(String)
+    case mutationInFlight(String)
 
     public var errorDescription: String? {
         switch self {
@@ -564,6 +694,8 @@ public enum LinearSyncError: LocalizedError, Sendable, Equatable {
             return "Linear issue identifier must not be empty."
         case .graphQLError(let detail):
             return "Linear GraphQL error: \(detail)"
+        case .mutationInFlight(let key):
+            return "A Linear mutation with idempotency key \(key) is already in flight."
         }
     }
 }
@@ -625,6 +757,10 @@ public struct LinearGraphQLRequest: Sendable, Equatable {
 /// Transport protocol for executing Linear GraphQL requests.
 public protocol LinearGraphQLTransport: Sendable {
     func execute(_ request: LinearGraphQLRequest, apiKey: String) async throws -> [String: String]
+    /// Resolves a workflow state name to the UUID that `issueUpdate` expects
+    /// in `stateId`.  Linear's mutation input takes the state id, not the
+    /// name, so a state change has to look the id up first.
+    func workflowStateId(named stateName: String, apiKey: String) async throws -> String
 }
 
 /// Default `URLSession` transport for Linear's GraphQL endpoint (`https://api.linear.app/graphql`).
@@ -632,11 +768,17 @@ public struct URLSessionLinearGraphQLTransport: LinearGraphQLTransport {
     private let endpoint: URL
     private let session: URLSession
 
+    /// The Linear GraphQL endpoint.  There is no force-unwrapped default:
+    /// `URL(string:)` returns an optional, and the endpoint is validated when
+    /// the transport is built.
     public init(
-        endpoint: URL = URL(string: "https://api.linear.app/graphql")!,
+        endpoint: URL? = nil,
         session: URLSession = .shared
-    ) {
-        self.endpoint = endpoint
+    ) throws {
+        guard let resolved = endpoint ?? URL(string: "https://api.linear.app/graphql") else {
+            throw LinearSyncError.graphQLError("Invalid Linear GraphQL endpoint URL.")
+        }
+        self.endpoint = resolved
         self.session = session
     }
 
@@ -661,7 +803,55 @@ public struct URLSessionLinearGraphQLTransport: LinearGraphQLTransport {
            let firstMsg = errors.first?["message"] as? String {
             throw LinearSyncError.graphQLError(firstMsg)
         }
+        // A GraphQL response can carry an empty `errors` array and still report
+        // a failed mutation inside `data`.  Linear sets `success: false`
+        // there, and treating that as a success would report a claim or a
+        // status change that never happened.
+        if let dataPayload = json["data"] as? [String: Any] {
+            for (field, value) in dataPayload {
+                guard let fieldPayload = value as? [String: Any] else { continue }
+                if let success = fieldPayload["success"] as? Bool, success == false {
+                    throw LinearSyncError.graphQLError("Linear reported \(field) as unsuccessful")
+                }
+            }
+        }
         return ["ok": "true"]
+    }
+
+    public func workflowStateId(named stateName: String, apiKey: String) async throws -> String {
+        let query = """
+        query WorkflowStateId($stateName: String!) {
+            workflowStates(filter: { name: { eq: $stateName } }, first: 1) {
+                nodes { id name }
+            }
+        }
+        """
+        let payload: [String: Any] = [
+            "query": query,
+            "variables": ["stateName": stateName],
+        ]
+        var urlRequest = URLRequest(url: endpoint)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue(apiKey, forHTTPHeaderField: "Authorization")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+        let (data, _) = try await session.data(for: urlRequest)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw LinearSyncError.graphQLError("Invalid GraphQL JSON response")
+        }
+        if let errors = json["errors"] as? [[String: Any]],
+           let firstMsg = errors.first?["message"] as? String {
+            throw LinearSyncError.graphQLError(firstMsg)
+        }
+        guard let states = (json["data"] as? [String: Any])?["workflowStates"] as? [String: Any],
+              let nodes = states["nodes"] as? [[String: Any]],
+              let first = nodes.first,
+              let id = first["id"] as? String,
+              !id.isEmpty else {
+            throw LinearSyncError.graphQLError("No Linear workflow state named '\(stateName)'")
+        }
+        return id
     }
 }
 
@@ -673,12 +863,17 @@ public actor LinearSyncClient {
     private let apiKey: String
     private let transport: LinearGraphQLTransport
     private var completedByIdempotencyKey: [String: LinearSyncReceipt] = [:]
+    /// Keys whose mutation is in flight.  A second caller that arrives before
+    /// the first one finishes must not send the mutation again: the receipt
+    /// cache is only written after the await, so without this set two
+    /// concurrent callers would both post.
+    private var inFlightIdempotencyKeys: Set<String> = []
 
     public init(
         seat: String,
         sessionId: String,
         apiKey: String,
-        transport: LinearGraphQLTransport = URLSessionLinearGraphQLTransport()
+        transport: LinearGraphQLTransport? = nil
     ) throws {
         let cleanSeat = seat.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !cleanSeat.isEmpty else {
@@ -695,11 +890,24 @@ public actor LinearSyncClient {
         self.seat = cleanSeat
         self.sessionId = cleanSession
         self.apiKey = apiKey
-        self.transport = transport
+        if let transport {
+            self.transport = transport
+        } else {
+            self.transport = try URLSessionLinearGraphQLTransport()
+        }
     }
 
     public nonisolated var sessionTag: String {
         "[\(seat)·\(sessionId)]"
+    }
+
+    /// A stable digest for an idempotency key.  `hashValue` is seeded per
+    /// process, so the same comment would get a different key after a restart
+    /// and the de-duplication would silently stop matching.
+    static func stableIdempotencyDigest(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     /// Claims a Linear issue (`In Progress`) and posts the claiming seat's branch and worktree metadata.
@@ -716,11 +924,16 @@ public actor LinearSyncClient {
         if let existing = completedByIdempotencyKey[key] {
             return existing.markingDeduplicated()
         }
+        try beginMutation(key: key)
+        defer { endMutation(key: key) }
 
         let formattedNote = "\(sessionTag) Claimed \(cleanIssue) on branch `\(branch)` in `\(worktree)`."
+        // `issueUpdate` takes the workflow state id, not its name, so the name
+        // is resolved to the UUID Linear expects.
+        let stateId = try await transport.workflowStateId(named: "In Progress", apiKey: apiKey)
         let mutation = """
-        mutation ClaimIssue($issueId: String!, $stateName: String!, $commentBody: String!) {
-            issueUpdate(id: $issueId, input: { stateId: $stateName }) { success }
+        mutation ClaimIssue($issueId: String!, $stateId: String!, $commentBody: String!) {
+            issueUpdate(id: $issueId, input: { stateId: $stateId }) { success }
             commentCreate(input: { issueId: $issueId, body: $commentBody }) { success }
         }
         """
@@ -728,7 +941,7 @@ public actor LinearSyncClient {
             query: mutation,
             variables: [
                 "issueId": cleanIssue,
-                "stateName": "In Progress",
+                "stateId": stateId,
                 "commentBody": formattedNote,
             ],
             idempotencyKey: key
@@ -761,11 +974,15 @@ public actor LinearSyncClient {
         if let existing = completedByIdempotencyKey[key] {
             return existing.markingDeduplicated()
         }
+        try beginMutation(key: key)
+        defer { endMutation(key: key) }
 
         let summary = resolution.map { "\(sessionTag) Status -> \(status): \($0)" } ?? "\(sessionTag) Status -> \(status)"
+        // `issueUpdate` takes the workflow state id, not its name.
+        let stateId = try await transport.workflowStateId(named: status, apiKey: apiKey)
         let mutation = """
-        mutation UpdateIssueStatus($issueId: String!, $status: String!, $commentBody: String!) {
-            issueUpdate(id: $issueId, input: { stateId: $status }) { success }
+        mutation UpdateIssueStatus($issueId: String!, $stateId: String!, $commentBody: String!) {
+            issueUpdate(id: $issueId, input: { stateId: $stateId }) { success }
             commentCreate(input: { issueId: $issueId, body: $commentBody }) { success }
         }
         """
@@ -773,7 +990,7 @@ public actor LinearSyncClient {
             query: mutation,
             variables: [
                 "issueId": cleanIssue,
-                "status": status,
+                "stateId": stateId,
                 "commentBody": summary,
             ],
             idempotencyKey: key
@@ -802,10 +1019,16 @@ public actor LinearSyncClient {
         guard !cleanIssue.isEmpty else { throw LinearSyncError.emptyIssueId }
 
         let taggedBody = body.hasPrefix(sessionTag) ? body : "\(sessionTag) \(body)"
-        let key = idempotencyKey ?? "comment:\(cleanIssue):\(seat):\(taggedBody.hashValue)"
+        // `hashValue` is seeded per process, so the same comment would get a
+        // different key after a restart and the de-duplication would stop
+        // matching.  A stable digest keeps the key the same across restarts.
+        let key = idempotencyKey
+            ?? "comment:\(cleanIssue):\(seat):\(Self.stableIdempotencyDigest(taggedBody))"
         if let existing = completedByIdempotencyKey[key] {
             return existing.markingDeduplicated()
         }
+        try beginMutation(key: key)
+        defer { endMutation(key: key) }
 
         let mutation = """
         mutation CreateIssueComment($issueId: String!, $body: String!) {
@@ -832,5 +1055,21 @@ public actor LinearSyncClient {
         )
         completedByIdempotencyKey[key] = receipt
         return receipt
+    }
+
+    /// Reserves an idempotency key for a mutation that is about to be sent.
+    /// The receipt cache is only written once the mutation returns, so without
+    /// this reservation two concurrent callers could send the same mutation.
+    private func beginMutation(key: String) throws {
+        guard !inFlightIdempotencyKeys.contains(key) else {
+            throw LinearSyncError.mutationInFlight(key)
+        }
+        inFlightIdempotencyKeys.insert(key)
+    }
+
+    /// Releases the reservation for a mutation that finished, successfully or
+    /// not.
+    private func endMutation(key: String) {
+        inFlightIdempotencyKeys.remove(key)
     }
 }
