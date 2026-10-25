@@ -8,6 +8,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const ELECTRON_MAIN = join(ROOT, "electron/main.mjs");
 const COMPANION_CONTROL = join(ROOT, "companion/src/control.ts");
+const PORTABLE_SKILL = join(ROOT, ".claude/skills/sentence-gap/SKILL.md");
 
 /** Read a repo source file as text, with line endings normalised. */
 const read = (path) => readFileSync(path, "utf8").replace(/\r\n/g, "\n");
@@ -49,4 +50,32 @@ test("the companion control page does not hang a sentence gap off a non-sentence
   const source = read(COMPANION_CONTROL);
   assert.ok(!source.includes("&nbsp; in a row"), "companion/src/control.ts must not use &nbsp; in a row");
   assert.ok(!source.includes("&#160; in a row"), "companion/src/control.ts must not use &#160; in a row");
+});
+
+// The owner rule of 2026-10-25 named one exception to the one mechanism:  the chat
+// panes of Claude Code (the Code tab) and MiniMax Code (the MiniMax Code pane) take
+// the `&nbsp;` entity plus a normal space, because those panes normalize a raw
+// U+00A0 away and collapse two ASCII spaces.  Every other surface takes the real
+// U+00A0.  The portable skill is what the cloud agents read, so a copy of it that
+// still says "never write the entity" with no exception sends every seat down the
+// wrong path, which is exactly what it did until 2026-10-25.
+
+test("the portable gap skill names the one chat-pane exception", () => {
+  const source = read(PORTABLE_SKILL);
+  assert.ok(
+    source.includes("MiniMax Code chat pane"),
+    ".claude/skills/sentence-gap/SKILL.md must name the MiniMax Code chat pane as an exception",
+  );
+  assert.ok(
+    source.includes("Claude Code Code tab"),
+    ".claude/skills/sentence-gap/SKILL.md must name the Claude Code Code tab as an exception",
+  );
+  assert.ok(
+    source.includes("one exception"),
+    ".claude/skills/sentence-gap/SKILL.md must state that there is one exception",
+  );
+  assert.ok(
+    !source.includes("- **Never write the `&nbsp;` entity.**"),
+    ".claude/skills/sentence-gap/SKILL.md must not ban the entity everywhere; the two chat panes take it",
+  );
 });
