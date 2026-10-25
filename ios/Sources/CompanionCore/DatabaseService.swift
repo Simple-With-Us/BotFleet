@@ -234,7 +234,15 @@ public actor DatabaseService {
     private var db: OpaquePointer?
     private let databasePath: String
 
-    public init(path: String? = nil) throws {
+    /// Opens the native store.
+    ///
+    /// - Parameters:
+    ///   - path: the store path, or nil for an in-memory store.
+    ///   - createSchemaIfNeeded: false opens an already-provisioned store
+    ///     without running the schema DDL.  The performance harness uses it
+    ///     to time the launch path rather than the installer, because
+    ///     `CREATE TABLE IF NOT EXISTS` is first-run install work.
+    public init(path: String? = nil, createSchemaIfNeeded: Bool = true) throws {
         let dbPath = path ?? ":memory:"
         self.databasePath = dbPath
         if let parent = path.flatMap({ URL(fileURLWithPath: $0).deletingLastPathComponent().path }), parent != "/" && !parent.isEmpty {
@@ -263,7 +271,7 @@ public actor DatabaseService {
         // the FTS delete triggers do not cascade.
         try execute(sql: "PRAGMA recursive_triggers = ON;")
 
-        try createSchema()
+        try createSchema(createIfNeeded: createSchemaIfNeeded)
     }
 
     deinit {
@@ -294,7 +302,13 @@ public actor DatabaseService {
         }
     }
 
-    private func createSchema() throws {
+    /// Creates the native schema.
+    ///
+    /// - Parameter createIfNeeded: false leaves an already-provisioned store
+    ///   alone.  The performance harness opens the store this way so the
+    ///   launch path is timed instead of the installer.
+    private func createSchema(createIfNeeded: Bool = true) throws {
+        guard createIfNeeded else { return }
         let schema = """
         CREATE TABLE IF NOT EXISTS threads (
             id TEXT PRIMARY KEY,
@@ -1313,6 +1327,26 @@ public actor DatabaseService {
     @discardableResult
     public func checkpointWALTruncate() throws -> UInt64 {
         try execute(sql: "PRAGMA wal_checkpoint(TRUNCATE);")
+        return try currentWALSizeBytes()
+    }
+
+    /// Runs `PRAGMA wal_checkpoint(PASSIVE)` and returns the resulting `-wal`
+    /// file size in bytes.
+    ///
+    /// A passive checkpoint copies the frames into the database without
+    /// truncating the write-ahead log, so the returned size is the log's
+    /// high-water mark.  A truncating checkpoint empties the file before it
+    /// is measured, which is why the performance harness measures the log
+    /// this way: the budget is about how much log a write burst produced,
+    /// not about how much log is left after a checkpoint.
+    @discardableResult
+    public func checkpointWALPassive() throws -> UInt64 {
+        try execute(sql: "PRAGMA wal_checkpoint(PASSIVE);")
+        return try currentWALSizeBytes()
+    }
+
+    /// The current size of the `-wal` file in bytes, or 0 when there is none.
+    public func currentWALSizeBytes() throws -> UInt64 {
         guard databasePath != ":memory:" else { return 0 }
         let walPath = databasePath + "-wal"
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: walPath),

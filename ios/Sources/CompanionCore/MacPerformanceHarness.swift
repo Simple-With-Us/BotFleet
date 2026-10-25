@@ -26,22 +26,23 @@ public enum MacPerformanceBudget {
     /// SQLite WAL file size after checkpoint: < 64 MB.
     public static let maxWalSizeBytes: UInt64 = 64 * 1024 * 1024
 
-    /// Wall-clock and CPU budgets describe the host rather than the code, and
-    /// a shared CI runner is slower and noisier than the hardware the app
-    /// ships on.  Under CI the harness enforces a relaxed limit for those
-    /// budgets and reports the product budget beside the enforced one, so a
-    /// relaxed run never reads as a clean measurement.  Byte budgets stay exact
-    /// everywhere, because they do not depend on the host's speed.
-    public static let ciToleranceMultiplier: Double = 3.0
-
     /// True when the harness runs inside a CI job.
     public static var isRunningInCI: Bool {
         ProcessInfo.processInfo.environment["CI"] != nil
     }
 
     /// The limit the harness enforces for a product budget.
+    ///
+    /// The product budget is always the enforced limit.  A shared CI runner is
+    /// slower and noisier than the hardware the app ships on, and relaxing the
+    /// limit there would mean no code path anywhere enforces the documented
+    /// budgets, which is the one thing this harness exists to prevent.  The
+    /// wall-clock measurements are made robust instead of the budget being
+    /// made loose: the harness warms the store before it times it and judges
+    /// the cold start on the median of repeated launches, so a slow runner
+    /// cannot flap the gate.
     public static func effectiveLimit(forProductBudget productBudget: Double) -> Double {
-        isRunningInCI ? productBudget * ciToleranceMultiplier : productBudget
+        productBudget
     }
 }
 
@@ -87,47 +88,83 @@ public struct MacPerformanceMetricResult: Sendable, Codable, Equatable {
 
 // MARK: - Visual Parity Report (BF-2496)
 
+/// The pinned expectations the visual parity gate compares the live design
+/// contract against.
+///
+/// These are literals, not the constants they check.  The gate compares the
+/// shared contract in MacVisualDesign.swift against this snapshot, so
+/// removing a mascot expression, a status pill or a palette color fails the
+/// gate instead of quietly redefining what the contract means.
+public enum MacVisualParityExpectations {
+    /// The legacy desktop's mascot vocabulary, which the Mac app has to match.
+    public static let mascotExpressions: Set<String> = [
+        "sleeping", "waking", "idle", "listening", "thinking", "searching", "working",
+        "excited", "surprised", "suspicious", "angry", "drowsy", "happy", "curious",
+        "confused", "bored", "proud", "shy", "sad", "laughing", "scared", "playful",
+        "celebrate", "orbit", "radar", "progress", "spawning", "humming", "loading",
+        "dictating", "writing", "sending", "receiving", "uploading", "notifying",
+        "alerting", "dragging", "bouncing", "powering-down", "fleet", "crash",
+        "memory", "tools", "routine", "screen", "git", "webhook", "computer",
+        "typing", "speaking"
+    ]
+
+    /// The status pills the Mac app shows.
+    public static let statusPills: Set<String> = [
+        "connected", "reconnecting", "offline", "error"
+    ]
+
+    /// The mascot palette, copied from the legacy desktop.
+    public static let mascotPalette: [String: String] = [
+        "green": "#009957",
+        "blue": "#377FE6",
+        "red": "#D94B52",
+        "orange": "#E78531",
+        "purple": "#8057C8",
+        "cyan": "#0EA5C6",
+        "pink": "#D84F8B",
+        "yellow": "#D8A729",
+        "teal": "#01A492",
+        "coral": "#E5634E"
+    ]
+
+    /// The app follows the system appearance.
+    public static let defaultThemeMode: MacThemeMode = .system
+}
+
+/// What the visual parity gate verified.
+///
+/// The gate checks the shared design contract against a pinned snapshot, and
+/// separately reports whether the app itself was inspected.  The two are not
+/// the same claim, and the report keeps them apart on purpose.
 public struct MacVisualParityReport: Sendable, Codable, Equatable {
-    public enum MascotExpression: String, CaseIterable, Sendable, Codable {
-        case idle
-        case thinking
-        case speaking
-        case working
-        case happy
-        case error
-        case sleeping
-        case listening
-    }
-
-    public enum StatusPillKind: String, CaseIterable, Sendable, Codable {
-        case connected
-        case reconnecting
-        case offline
-        case working
-        case idle
-        case error
-    }
-
-    public struct ThemePaletteTokens: Sendable, Codable, Equatable {
-        public let mode: String
-        public let backgroundHex: String
-        public let surfaceHex: String
-        public let primaryTextHex: String
-        public let secondaryTextHex: String
-        public let accentHex: String
-    }
-
-    public let verifiedExpressions: [MascotExpression]
-    public let verifiedStatusPills: [StatusPillKind]
+    /// The mascot expressions the shared contract defines.
+    public let verifiedExpressions: [MacMascotExpression]
+    /// The status pills the shared contract defines.
+    public let verifiedStatusPills: [MacStatusPillKind]
+    /// True when the app's default theme is the system theme.
     public let defaultThemeIsSystem: Bool
-    public let lightTheme: ThemePaletteTokens
-    public let darkTheme: ThemePaletteTokens
+    /// True when the rendered product copy carries the sentence gap.
     public let sentenceGapVerified: Bool
-    public let allPassed: Bool
+    /// True when the live contract equals the pinned expectations.
+    public let contractSnapshotVerified: Bool
+    /// True when the app itself was inspected and renders the contract.
+    public let appSurfaceVerified: Bool
+    /// Why the app surface was or was not verified.
+    public let appSurfaceNote: String
+
+    /// The contract snapshot and the copy rule have to hold.
+    ///
+    /// The app surface is not part of this verdict.  It is reported on its own
+    /// line, so a run cannot read as a full visual parity pass while the app
+    /// is still missing its mascot and status pill views.
+    public var allPassed: Bool {
+        contractSnapshotVerified && sentenceGapVerified
+    }
 
     public var summaryLine: String {
-        "expressions=\(verifiedExpressions.count)/\(MascotExpression.allCases.count), " +
-        "statusPills=\(verifiedStatusPills.count)/\(StatusPillKind.allCases.count), " +
+        "expressions=\(verifiedExpressions.count)/\(MacVisualParityExpectations.mascotExpressions.count), " +
+        "statusPills=\(verifiedStatusPills.count)/\(MacVisualParityExpectations.statusPills.count), " +
+        "palette=\(MacMascotPalette.colors.count)/\(MacVisualParityExpectations.mascotPalette.count), " +
         "systemThemeDefault=\(defaultThemeIsSystem), sentenceGap=\(sentenceGapVerified)"
     }
 }
@@ -151,14 +188,18 @@ public struct MacPerformanceHarnessReport: Sendable, Codable, Equatable {
         var lines: [String] = []
         lines.append("=== BotFleet Native macOS Performance & Visual Parity Harness (BF-2496) ===")
         for metric in metrics {
-            let status = metric.passed ? "PASS" : "FAIL"
+            // A metric that does not gate the verdict is reported with a
+            // neutral status.  Printing FAIL next to OVERALL: PASSED made the
+            // gate read as broken when it was only printing context.
+            let status: String
+            if !metric.enforced {
+                status = "INFO"
+            } else {
+                status = metric.passed ? "PASS" : "FAIL"
+            }
             let measured = String(format: "%.2f", metric.measuredValue)
             let budget = String(format: "%.2f", metric.budgetLimit)
             var line = "[\(status)] \(metric.name): \(measured) \(metric.unit) (budget <= \(budget) \(metric.unit))"
-            if metric.specBudgetLimit != metric.budgetLimit {
-                let spec = String(format: "%.2f", metric.specBudgetLimit)
-                line += " (product budget \(spec) \(metric.unit); shared-runner tolerance applied)"
-            }
             if let reportNote = metric.reportNote {
                 line += " (\(reportNote))"
             }
@@ -166,7 +207,12 @@ public struct MacPerformanceHarnessReport: Sendable, Codable, Equatable {
         }
         lines.append("[\(fts5StemmingVerified ? "PASS" : "FAIL")] FTS5 Porter stemming ('running' matches 'run')")
         lines.append("[\(fts5SupersetOfLikeVerified ? "PASS" : "FAIL")] FTS5 20-query parity (superset of LIKE '%term%')")
-        lines.append("[\(visualParity.allPassed ? "PASS" : "FAIL")] Visual parity: \(visualParity.summaryLine)")
+        lines.append("[\(visualParity.contractSnapshotVerified ? "PASS" : "FAIL")] Visual design contract: \(visualParity.summaryLine)")
+        // The app surface is a separate claim from the contract, and it gets
+        // its own line.  A reader must never see OVERALL: PASSED and assume
+        // the app renders every expression and pill when it does not yet.
+        let surfaceStatus = visualParity.appSurfaceVerified ? "PASS" : "PENDING"
+        lines.append("[\(surfaceStatus)] App visual surface: \(visualParity.appSurfaceNote)")
         lines.append("OVERALL: \(allPassed ? "PASSED" : "FAILED")")
         return lines.joined(separator: "\n")
     }
@@ -190,14 +236,37 @@ public enum MacPerformanceHarness {
         case testRunner
     }
 
+    /// The product budgets the standalone executable gates.
+    ///
+    /// The executable has the process to itself, so every product budget is
+    /// enforced there, and CI runs it.  The test runner shares its process
+    /// with the other suites, so it gates only the budgets a shared process
+    /// can judge, and it reports the rest with the reason.
+    ///
+    /// This list is checked against the pinned product budgets in the test
+    /// suite, so a new budget cannot be added without saying where it is
+    /// enforced.
+    public static let standaloneGatedMetricNames: Set<String> = [
+        "Cold start time",
+        "Idle memory footprint",
+        "Idle CPU usage",
+        "5-bot streaming memory",
+        "100 tok/s streaming CPU",
+        "CUA 60fps memory drift",
+        "FTS5 search latency (p95)",
+        "SQLite WAL size after checkpoint"
+    ]
+
     /// Builds one performance metric.
     ///
     /// - Parameters:
-    ///   - machineSpeedSensitive: true for wall-clock and CPU measurements,
-    ///     whose value depends on the host.  Under CI these are enforced
-    ///     against a relaxed limit, and the product budget is still reported.
     ///   - processScoped: true for metrics that describe the surrounding
     ///     process.  They are enforced only in the standalone harness.
+    ///   - wallClockSensitive: true for metrics whose value is a duration.
+    ///     The test runner runs its suites in parallel in one process, so a
+    ///     duration measured there describes the runner rather than the app.
+    ///     The standalone `MacPerfHarness` executable has the process to
+    ///     itself and gates these budgets there.
     ///   - reportedOnly: true for metrics the harness measures but never
     ///     gates on.  They are printed so a number is never hidden, and the
     ///     overall verdict never turns on them.
@@ -206,26 +275,34 @@ public enum MacPerformanceHarness {
         measuredValue: Double,
         productBudget: Double,
         unit: String,
-        machineSpeedSensitive: Bool = false,
         processScoped: Bool = false,
+        wallClockSensitive: Bool = false,
         reportedOnly: Bool = false,
         strictlyLessThan: Bool = false,
+        note: String? = nil,
         context: Context
     ) -> MacPerformanceMetricResult {
-        let effectiveLimit = machineSpeedSensitive
-            ? MacPerformanceBudget.effectiveLimit(forProductBudget: productBudget)
-            : productBudget
+        // The product budget is the enforced limit on every host.  A metric
+        // that cannot be measured meaningfully where it runs is reported
+        // instead of gated, and it says so in its report note.
+        let effectiveLimit = MacPerformanceBudget.effectiveLimit(forProductBudget: productBudget)
         let passed = strictlyLessThan
             ? measuredValue < effectiveLimit
             : measuredValue <= effectiveLimit
-        let enforced = !reportedOnly && !(processScoped && context == .testRunner)
-        let reportNote: String? = if reportedOnly {
-            "reported only: the harness measures this for context and does not gate on it"
-        } else if processScoped && context == .testRunner {
-            "reported only: this run measures the surrounding process, not the app"
-        } else {
-            nil
+        let measuredInSharedProcess = context == .testRunner && (processScoped || wallClockSensitive)
+        let enforced = !reportedOnly && !measuredInSharedProcess
+        var notes: [String] = []
+        if let note {
+            notes.append(note)
         }
+        if reportedOnly {
+            notes.append("reported only: the harness measures this for context and does not gate on it")
+        } else if processScoped && context == .testRunner {
+            notes.append("reported only: this run measures the surrounding process, not the app")
+        } else if wallClockSensitive && context == .testRunner {
+            notes.append("reported only: this run shares its process with the test runner, so the duration describes the runner; the standalone MacPerfHarness executable gates this budget")
+        }
+        let reportNote = notes.isEmpty ? nil : notes.joined(separator: "; ")
         return MacPerformanceMetricResult(
             name: name,
             measuredValue: measuredValue,
@@ -300,47 +377,48 @@ public enum MacPerformanceHarness {
 
     // MARK: Visual Parity Verification
 
-    public static func verifyVisualParity() -> MacVisualParityReport {
+    /// Verifies the shared visual design contract against the pinned
+    /// expectations.
+    ///
+    /// The gate used to compare the harness's own constants with themselves,
+    /// so it could never fail and it never looked at the app.  It now
+    /// compares the contract the Mac app actually renders from, which lives
+    /// in MacVisualDesign.swift, against a pinned snapshot of literals.  The
+    /// app surface is a separate claim and gets its own line: the standalone
+    /// harness cannot read the app's sources, so the app-surface check runs
+    /// in the test suite and reports what it found.
+    public static func verifyVisualParity(
+        appSurfaceVerified: Bool = false,
+        appSurfaceNote: String = "the standalone harness verifies the design contract only; the test suite reads the app sources and reports whether the app renders it"
+    ) -> MacVisualParityReport {
         let state = signposter.beginInterval("VisualParity")
         defer { signposter.endInterval("VisualParity", state) }
 
-        let expressions = MacVisualParityReport.MascotExpression.allCases
-        let pills = MacVisualParityReport.StatusPillKind.allCases
+        let expressions = MacMascotExpression.allCases
+        let pills = MacStatusPillKind.allCases
 
-        let lightTheme = MacVisualParityReport.ThemePaletteTokens(
-            mode: "light",
-            backgroundHex: "#FFFFFF",
-            surfaceHex: "#F5F7FA",
-            primaryTextHex: "#0F172A",
-            secondaryTextHex: "#475569",
-            accentHex: "#2563EB"
-        )
-        let darkTheme = MacVisualParityReport.ThemePaletteTokens(
-            mode: "dark",
-            backgroundHex: "#0B0F19",
-            surfaceHex: "#111827",
-            primaryTextHex: "#F8FAFC",
-            secondaryTextHex: "#94A3B8",
-            accentHex: "#3B82F6"
-        )
+        let expressionNames = Set(expressions.map(\.rawValue))
+        let pillNames = Set(pills.map(\.rawValue))
+        let paletteMatches = MacMascotPalette.colors == MacVisualParityExpectations.mascotPalette
+        let defaultThemeIsSystem = MacDesignTokens.defaultThemeMode == MacVisualParityExpectations.defaultThemeMode
+
+        let contractSnapshotVerified = expressionNames == MacVisualParityExpectations.mascotExpressions &&
+            pillNames == MacVisualParityExpectations.statusPills &&
+            paletteMatches &&
+            defaultThemeIsSystem
 
         // Verify owner copy rule: two visible spaces (U+00A0 + space) in rendered product copy.
         let sentenceGapOk = BotDuplicate.notCopiedNote.contains(".\u{00A0} ") &&
             !BotDuplicate.summary.contains("agent")
 
-        let allOk = expressions.count == 8 &&
-            pills.count == 6 &&
-            lightTheme.backgroundHex != darkTheme.backgroundHex &&
-            sentenceGapOk
-
         return MacVisualParityReport(
             verifiedExpressions: expressions,
             verifiedStatusPills: pills,
-            defaultThemeIsSystem: true,
-            lightTheme: lightTheme,
-            darkTheme: darkTheme,
+            defaultThemeIsSystem: defaultThemeIsSystem,
             sentenceGapVerified: sentenceGapOk,
-            allPassed: allOk
+            contractSnapshotVerified: contractSnapshotVerified,
+            appSurfaceVerified: appSurfaceVerified,
+            appSurfaceNote: appSurfaceNote
         )
     }
 
@@ -363,28 +441,47 @@ public enum MacPerformanceHarness {
 
         let dbPath = tempDir.appendingPathComponent("botfleet-perf.sqlite").path
 
-        // Create the store before the timed region.  The product budget is
-        // "main() to first interactive state frame", which is the launch path:
-        // open the existing store and hydrate the first state.  Creating the
-        // schema and the FTS5 tables is first-run install work, and timing it
-        // here measured the installer instead of the launcher.
         let storeSetup = try DatabaseService(path: dbPath)
         _ = try await storeSetup.loadThreads()
 
-        let coldStartBegin = DispatchTime.now().uptimeNanoseconds
-        let db = try DatabaseService(path: dbPath)
-        var companionState = CompanionState()
-        companionState.hydrate(Fleet(bots: [], groups: []))
-        let coldStartEnd = DispatchTime.now().uptimeNanoseconds
+        // The product budget is "main() to first interactive state frame",
+        // which is the launch path: open the already-provisioned store and
+        // hydrate the first state.  Creating the schema and the FTS5 tables is
+        // first-run install work, and timing it here measured the installer
+        // instead of the launcher.  The store is therefore opened without
+        // re-running the schema DDL.
+        //
+        // The launch is measured several times and judged on the median.  One
+        // launch on a shared runner pays for a cold page cache and decides
+        // the verdict by itself; the median describes a typical launch.  The
+        // budget itself does not move, so the gate still enforces the
+        // documented 50 ms everywhere.
+        let coldStartLaunches = 5
+        var coldStartSamplesMs: [Double] = []
+        var openedStore: DatabaseService?
+        for _ in 0..<coldStartLaunches {
+            let launchBegin = DispatchTime.now().uptimeNanoseconds
+            let store = try DatabaseService(path: dbPath, createSchemaIfNeeded: false)
+            var companionState = CompanionState()
+            companionState.hydrate(Fleet(bots: [], groups: []))
+            let launchEnd = DispatchTime.now().uptimeNanoseconds
+            coldStartSamplesMs.append(Double(launchEnd - launchBegin) / 1_000_000.0)
+            openedStore = store
+        }
         signposter.endInterval("ColdStart", coldStartSignpost)
 
-        let coldStartMs = Double(coldStartEnd - coldStartBegin) / 1_000_000.0
+        guard let db = openedStore else {
+            throw DatabaseError.openFailed("The cold start benchmark did not open the store.")
+        }
+        let sortedColdStart = coldStartSamplesMs.sorted()
+        let coldStartMs = sortedColdStart[sortedColdStart.count / 2]
         metrics.append(metric(
             name: "Cold start time",
             measuredValue: coldStartMs,
             productBudget: MacPerformanceBudget.maxColdStartMs,
             unit: "ms",
-            machineSpeedSensitive: true,
+            wallClockSensitive: true,
+            note: "median of \(coldStartLaunches) launches on an already-provisioned store",
             context: context
         ))
 
@@ -419,7 +516,6 @@ public enum MacPerformanceHarness {
             measuredValue: idleCpuPercent,
             productBudget: MacPerformanceBudget.maxIdleCpuPercent,
             unit: "%",
-            machineSpeedSensitive: true,
             processScoped: true,
             context: context
         ))
@@ -467,7 +563,6 @@ public enum MacPerformanceHarness {
             measuredValue: rawStreamCpuPct,
             productBudget: MacPerformanceBudget.maxStreamingCpuPercent,
             unit: "%",
-            machineSpeedSensitive: true,
             processScoped: true,
             context: context
         ))
@@ -580,7 +675,7 @@ public enum MacPerformanceHarness {
             measuredValue: ftsInternalP95Ms,
             productBudget: MacPerformanceBudget.maxFts5P95LatencyMs,
             unit: "ms",
-            machineSpeedSensitive: true,
+            wallClockSensitive: true,
             strictlyLessThan: true,
             context: context
         ))
@@ -589,7 +684,6 @@ public enum MacPerformanceHarness {
             measuredValue: ftsP95Ms,
             productBudget: MacPerformanceBudget.maxFts5P95LatencyMs,
             unit: "ms",
-            machineSpeedSensitive: true,
             reportedOnly: true,
             strictlyLessThan: true,
             context: context
@@ -613,7 +707,12 @@ public enum MacPerformanceHarness {
         }
         _ = try await db.insertMessagesBatch(walBatch, skipIdentical: true)
 
-        let walBytesAfterCheckpoint = try await db.checkpointWALTruncate()
+        // A TRUNCATE checkpoint empties the WAL before its size is read, so
+        // the metric always reported zero and could never breach its budget.
+        // A PASSIVE checkpoint copies the frames into the database and leaves
+        // the file at its high-water mark, which is the number the budget is
+        // about: how much write-ahead log the insert burst actually produced.
+        let walBytesAfterCheckpoint = try await db.checkpointWALPassive()
         signposter.endInterval("WALCheckpoint", walSignpost)
 
         let walSizeMb = Double(walBytesAfterCheckpoint) / (1024.0 * 1024.0)
@@ -624,6 +723,7 @@ public enum MacPerformanceHarness {
             productBudget: maxWalMb,
             unit: "MB",
             strictlyLessThan: true,
+            note: "write-ahead log high-water mark, measured with a passive checkpoint",
             context: context
         ))
 

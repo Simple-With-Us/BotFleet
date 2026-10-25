@@ -728,26 +728,37 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(report.fts5SupersetOfLikeVerified == true)
         #expect(report.visualParity.allPassed == true)
 
-        // Every enforced metric has to pass.  The wall-clock budgets are
-        // measured on a shared runner, so CI applies a documented tolerance to
-        // them; the product budget is asserted separately below, so nobody can
-        // widen the specification to turn this gate green.
+        // Every enforced metric has to pass.  The product budget is the
+        // enforced limit on every host, a shared CI runner included: the
+        // harness makes the wall-clock measurements robust instead of
+        // relaxing the budget, so a breach is a breach everywhere.
         for metric in report.metrics where metric.enforced {
             #expect(metric.passed == true, "Metric '\(metric.name)' breached budget: \(metric.measuredValue) \(metric.unit) > \(metric.budgetLimit) \(metric.unit)")
         }
         #expect(report.allPassed == true)
 
-        // The product budgets are the P-BF-6 specification and must not drift.
+        // The product budgets are the P-BF-6 specification.  They are pinned
+        // here as literals on purpose.  Deriving the expectation from the
+        // constants under test would let anyone widen a budget and keep this
+        // gate green, which is the same tautology the visual parity gate had.
         let specBudgets: [String: Double] = [
-            "Cold start time": MacPerformanceBudget.maxColdStartMs,
-            "Idle memory footprint": Double(MacPerformanceBudget.maxIdleMemoryBytes) / (1024.0 * 1024.0),
-            "Idle CPU usage": MacPerformanceBudget.maxIdleCpuPercent,
-            "5-bot streaming memory": Double(MacPerformanceBudget.maxStreamingMemoryBytes) / (1024.0 * 1024.0),
-            "100 tok/s streaming CPU": MacPerformanceBudget.maxStreamingCpuPercent,
-            "CUA 60fps memory drift": Double(MacPerformanceBudget.maxCuaMemoryDriftBytes) / (1024.0 * 1024.0),
-            "FTS5 search latency (p95)": MacPerformanceBudget.maxFts5P95LatencyMs,
-            "SQLite WAL size after checkpoint": Double(MacPerformanceBudget.maxWalSizeBytes) / (1024.0 * 1024.0)
+            "Cold start time": 50.0,
+            "Idle memory footprint": 80.0,
+            "Idle CPU usage": 0.1,
+            "5-bot streaming memory": 150.0,
+            "100 tok/s streaming CPU": 6.0,
+            "CUA 60fps memory drift": 10.0,
+            "FTS5 search latency (p95)": 10.0,
+            "SQLite WAL size after checkpoint": 64.0
         ]
+        #expect(MacPerformanceBudget.maxColdStartMs == 50.0)
+        #expect(Double(MacPerformanceBudget.maxIdleMemoryBytes) / (1024.0 * 1024.0) == 80.0)
+        #expect(MacPerformanceBudget.maxIdleCpuPercent == 0.1)
+        #expect(Double(MacPerformanceBudget.maxStreamingMemoryBytes) / (1024.0 * 1024.0) == 150.0)
+        #expect(MacPerformanceBudget.maxStreamingCpuPercent == 6.0)
+        #expect(Double(MacPerformanceBudget.maxCuaMemoryDriftBytes) / (1024.0 * 1024.0) == 10.0)
+        #expect(MacPerformanceBudget.maxFts5P95LatencyMs == 10.0)
+        #expect(Double(MacPerformanceBudget.maxWalSizeBytes) / (1024.0 * 1024.0) == 64.0)
 
         // The harness also prints the FTS5 latency including the caller's round
         // trip.  It is context, not a gate, and it carries the same product
@@ -772,15 +783,208 @@ struct Phase1StoreImporterAndPerfTests {
         // out of the gate would quietly remove its budget from the
         // specification, so the gated set is asserted by name.
         //
-        // The process-scoped budgets (memory and CPU) describe the app, and a
-        // test run measures the test runner instead, so they are enforced by
-        // the standalone `MacPerfHarness` executable rather than here.
+        // The process-scoped budgets (memory and CPU) describe the app, and
+        // the wall-clock budgets are durations.  A test run measures the test
+        // runner in both cases, because the runner runs its suites in
+        // parallel in one process, so a duration measured here describes that
+        // contention rather than the app.  Those six budgets are enforced by
+        // the standalone `MacPerfHarness` executable, which has the process
+        // to itself and which CI runs.  The two byte budgets below are
+        // enforced here as well.
         let gatedNames: Set<String> = [
-            "Cold start time",
             "CUA 60fps memory drift",
-            "FTS5 search latency (p95)",
             "SQLite WAL size after checkpoint"
         ]
         #expect(Set(report.metrics.filter { $0.enforced }.map(\.name)) == gatedNames)
+
+        // Every product budget is gated by the standalone executable, and
+        // that set is exactly the set of pinned product budgets.  A new
+        // budget cannot be added without saying where it is enforced.
+        #expect(MacPerformanceHarness.standaloneGatedMetricNames == Set(specBudgets.keys))
+
+        // The budgets the test runner cannot judge are still reported, still
+        // carry their product budget, and still say why they are not gated.
+        let wallClockNames: Set<String> = [
+            "Cold start time",
+            "FTS5 search latency (p95)"
+        ]
+        for metric in report.metrics where wallClockNames.contains(metric.name) {
+            #expect(metric.enforced == false)
+            #expect(metric.reportNote != nil)
+            #expect(metric.specBudgetLimit == specBudgets[metric.name])
+        }
+
+        // The summary must not read as a full visual parity pass while the
+        // app surface is still pending.
+        let summary = report.formattedSummary()
+        #expect(summary.contains("[PASS] Visual design contract:"))
+        #expect(summary.contains("[PENDING] App visual surface:"))
+    }
+
+    // MARK: - Visual parity against the legacy source and the app (BF-2496)
+
+    /// The repository root, derived from this file's path.
+    ///
+    /// The test runs with the package directory as its working directory, so
+    /// the root cannot be read off the working directory.
+    private static func repoRoot() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    /// The Mac app's Swift sources.
+    private static func macAppSources(repoRoot: URL) throws -> [String] {
+        let directory = repoRoot.appendingPathComponent("ios/MacApp")
+        return try FileManager.default
+            .contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "swift" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .map { try String(contentsOf: $0, encoding: .utf8) }
+    }
+
+    /// The legacy desktop's mascot vocabulary, read out of the legacy source.
+    ///
+    /// The group names are keys rather than states.  They are either
+    /// unquoted, or quoted with a space or an upper-case letter, so a
+    /// lower-case-only pattern matches the states and nothing else.
+    private static func legacyMascotStates(in source: String) throws -> [String] {
+        guard let start = source.range(of: "STATE_GROUPS"),
+              let end = source.range(of: "};", range: start.lowerBound..<source.endIndex) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let block = String(source[start.lowerBound..<end.lowerBound])
+        let regex = try NSRegularExpression(pattern: "\"([a-z-]+)\"")
+        let nsRange = NSRange(block.startIndex..<block.endIndex, in: block)
+        var states: [String] = []
+        for match in regex.matches(in: block, range: nsRange) {
+            guard let range = Range(match.range(at: 1), in: block) else { continue }
+            states.append(String(block[range]))
+        }
+        return states
+    }
+
+    /// The legacy desktop's mascot palette, read out of the legacy source.
+    private static func legacyMascotPalette(in source: String) throws -> [String: String] {
+        guard let start = source.range(of: "BOT_COLORS"),
+              let end = source.range(of: "satisfies Record<BotColor", range: start.lowerBound..<source.endIndex) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let block = String(source[start.lowerBound..<end.lowerBound])
+        let regex = try NSRegularExpression(pattern: "([a-z]+):\\s*\"(#[0-9A-Fa-f]{6})\"")
+        let nsRange = NSRange(block.startIndex..<block.endIndex, in: block)
+        var palette: [String: String] = [:]
+        for match in regex.matches(in: block, range: nsRange) {
+            guard let nameRange = Range(match.range(at: 1), in: block),
+                  let hexRange = Range(match.range(at: 2), in: block) else { continue }
+            palette[String(block[nameRange])] = String(block[hexRange])
+        }
+        return palette
+    }
+
+    @Test("The visual design contract carries the legacy mascot vocabulary and palette")
+    func visualDesignContractMatchesTheLegacySource() throws {
+        let repoRoot = Self.repoRoot()
+        let source = try String(
+            contentsOf: repoRoot.appendingPathComponent("src/lib/mascot.ts"),
+            encoding: .utf8
+        )
+        let legacyStates = try Self.legacyMascotStates(in: source)
+        let legacyPalette = try Self.legacyMascotPalette(in: source)
+
+        #expect(legacyStates.count == 50)
+        #expect(legacyPalette.count == 10)
+
+        // The native contract is the legacy vocabulary, verbatim.
+        #expect(Set(MacMascotExpression.allCases.map(\.rawValue)) == Set(legacyStates))
+        #expect(MacMascotPalette.colors == legacyPalette)
+
+        // The gate's pinned snapshot has to agree with the legacy source as
+        // well, so widening the native contract is not a way to pass the gate.
+        #expect(MacVisualParityExpectations.mascotExpressions == Set(legacyStates))
+        #expect(MacVisualParityExpectations.mascotPalette == legacyPalette)
+
+        // The comparison has to be able to fail.  The contract is checked
+        // against the pinned snapshot, so dropping an expression breaks it.
+        let drifted = MacMascotExpression.allCases.dropLast()
+        #expect(Set(drifted.map(\.rawValue)) != MacVisualParityExpectations.mascotExpressions)
+    }
+
+    @Test("The Mac app follows the system theme and its connection states map onto the shared status pills")
+    func macAppFollowsTheSystemThemeAndTheSharedStatusPills() throws {
+        let repoRoot = Self.repoRoot()
+        let sources = try Self.macAppSources(repoRoot: repoRoot)
+        #expect(sources.isEmpty == false)
+
+        // The app resolves its colors from the system palette, so it carries
+        // no hex colors of its own.
+        let hexPattern = try NSRegularExpression(pattern: "#[0-9A-Fa-f]{6}")
+        for source in sources {
+            let nsRange = NSRange(source.startIndex..<source.endIndex, in: source)
+            #expect(
+                hexPattern.firstMatch(in: source, range: nsRange) == nil,
+                "The Mac app carries a hardcoded hex color; the theme has to follow the system."
+            )
+        }
+
+        // The system theme is the first-visit default, so the app must not
+        // pin an appearance of its own.
+        #expect(sources.contains { $0.contains(".preferredColorScheme(") } == false)
+        #expect(MacDesignTokens.defaultThemeMode == .system)
+
+        // Every connection state the app can be in has a status pill, and
+        // every pill belongs to a connection state.  A new state without a
+        // pill decision fails here.
+        let sessionSource = try String(
+            contentsOf: repoRoot.appendingPathComponent("ios/MacApp/MacSession.swift"),
+            encoding: .utf8
+        )
+        guard let enumStart = sessionSource.range(of: "enum MacConnectionStatus"),
+              let enumEnd = sessionSource.range(of: "\n}", range: enumStart.lowerBound..<sessionSource.endIndex) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let enumBody = String(sessionSource[enumStart.lowerBound..<enumEnd.lowerBound])
+        let casePattern = try NSRegularExpression(pattern: "case ([a-zA-Z]+)")
+        let nsRange = NSRange(enumBody.startIndex..<enumBody.endIndex, in: enumBody)
+        var connectionStates: Set<String> = []
+        for match in casePattern.matches(in: enumBody, range: nsRange) {
+            guard let range = Range(match.range(at: 1), in: enumBody) else { continue }
+            connectionStates.insert(String(enumBody[range]))
+        }
+
+        #expect(connectionStates == Set(MacConnectionStatusPill.pillByConnectionState.keys))
+        #expect(Set(MacConnectionStatusPill.pillByConnectionState.values) == Set(MacStatusPillKind.allCases))
+    }
+
+    @Test("The Mac app does not render the mascot or status pill surface yet")
+    func macAppVisualSurfaceIsNotImplementedYet() throws {
+        let repoRoot = Self.repoRoot()
+        let sources = try Self.macAppSources(repoRoot: repoRoot)
+
+        let rendersMascot = sources.contains { $0.contains("MacMascotExpression") }
+        let rendersStatusPills = sources.contains { $0.contains("MacStatusPillKind") }
+        let appSurfaceVerified = rendersMascot && rendersStatusPills
+
+        // Phase 1 ships the shared design contract; the views that draw it
+        // land with the Phase 2 and Phase 3 user interface.  This tripwire
+        // fails the moment the app starts rendering the contract, so the
+        // visual parity gate has to be updated to verify the app surface and
+        // to run the snapshot suite BF-2496 asks for.
+        #expect(
+            appSurfaceVerified == false,
+            "The Mac app renders the mascot or status pill surface now; update the visual parity gate to verify the app surface and to run the snapshot suite."
+        )
+
+        // The gate reports the app surface separately from the contract, so a
+        // contract pass can never read as an app surface pass.
+        let report = MacPerformanceHarness.verifyVisualParity(
+            appSurfaceVerified: appSurfaceVerified,
+            appSurfaceNote: "the Mac app does not render the mascot or status pill surface yet"
+        )
+        #expect(report.contractSnapshotVerified == true)
+        #expect(report.appSurfaceVerified == false)
+        #expect(report.allPassed == true)
     }
 }
