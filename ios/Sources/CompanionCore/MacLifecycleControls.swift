@@ -6,10 +6,17 @@ import Foundation
 /// Maps directly to the harness configuration section `server.allowRemoteDesktopLaunch`
 /// (default `false`) and `server.persistOnExit` (default `true` per PR #1248).
 public struct MacLifecycleSettings: Codable, Equatable, Sendable {
-    public var allowRemoteDesktopLaunch: Bool
+    /// The operator's remote-desktop-launch grant.
+    ///
+    /// `nil` means "unknown": the harness did not report the value, so the app
+    /// must never write one back.  `GET /api/config` returns `configStatus()`,
+    /// which has no `server` section, so a missing section leaves the grant
+    /// unknown instead of defaulting it to `false` and silently revoking it on
+    /// the next save.
+    public var allowRemoteDesktopLaunch: Bool?
     public var persistOnExit: Bool
 
-    public init(allowRemoteDesktopLaunch: Bool = false, persistOnExit: Bool = true) {
+    public init(allowRemoteDesktopLaunch: Bool? = nil, persistOnExit: Bool = true) {
         self.allowRemoteDesktopLaunch = allowRemoteDesktopLaunch
         self.persistOnExit = persistOnExit
     }
@@ -19,6 +26,38 @@ public struct MacLifecycleSettings: Codable, Equatable, Sendable {
 public enum MacQuitPolicyDecision: String, Codable, Equatable, Sendable {
     case keepServerRunning
     case shutDownServerAndVM
+
+    /// The action taken when the desktop window closes.
+    ///
+    /// The Settings toggle reads "Keep Server Running When Window Closes", so a
+    /// window close has to run through the same policy as a quit.  Closing the
+    /// SwiftUI window does not terminate the app, so evaluating the policy only
+    /// on termination would leave the harness running on the most common path.
+    public static func windowCloseAction(persistOnExit: Bool) -> MacQuitPolicyDecision {
+        MacLifecycleClient.evaluateQuitAction(persistOnExit: persistOnExit)
+    }
+}
+
+/// Whether a connection attempt is the operator deliberately launching the
+/// desktop app or an ordinary reconnect of an app that is already running.
+public enum MacConnectionIntent: String, Codable, Equatable, Sendable {
+    case appLaunch
+    case reconnect
+}
+
+/// The outcome of a lifecycle-settings save.
+///
+/// A rejected write restores the previous settings, so the Settings toggles
+/// never keep showing a value the harness never accepted.
+public enum MacLifecycleSaveResult: Equatable, Sendable {
+    case saved(MacLifecycleSettings)
+    case failed(previous: MacLifecycleSettings, message: String)
+}
+
+/// The outcome of a deliberate shutdown of the harness and the local VM.
+public enum MacShutdownOutcome: Equatable, Sendable {
+    case stopped(MacShutdownReceipt)
+    case failed(message: String)
 }
 
 /// Structured receipt returned by `POST /api/system/shutdown`.
@@ -77,9 +116,21 @@ public final class MacPersistencePolicyStore: @unchecked Sendable {
     public let dataDir: URL
     private let files: FileManager
 
+    /// The current user's home directory.
+    ///
+    /// `FileManager.homeDirectoryForCurrentUser` is unavailable on iOS and
+    /// `CompanionCore` is built for both platforms, so the lookup is guarded.
+    public static var defaultHomeDirectory: URL {
+        #if os(macOS)
+        return FileManager.default.homeDirectoryForCurrentUser
+        #else
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        #endif
+    }
+
     public init(
         dataDir: URL? = nil,
-        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        home: URL = MacPersistencePolicyStore.defaultHomeDirectory,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         files: FileManager = .default
     ) {
@@ -160,6 +211,18 @@ public final class MacPersistencePolicyStore: @unchecked Sendable {
     @discardableResult
     public static func clearStoppedMarkerOnDeliberateLaunch(dataDir: URL) throws -> Bool {
         try MacPersistencePolicyStore(dataDir: dataDir).clearStoppedMarkerOnDeliberateLaunch(dataDir: dataDir)
+    }
+
+    /// Clears the deliberate-stop sentinel, but only for a deliberate app launch.
+    ///
+    /// A reconnect must leave the sentinel in place.
+    /// `scripts/botfleet-server-start.sh` starts nothing while the marker
+    /// exists, and it is the only thing keeping the launchd `StartInterval` tick
+    /// from resurrecting a harness the operator stopped on purpose.
+    @discardableResult
+    public func clearStoppedMarker(for intent: MacConnectionIntent, dataDir: URL? = nil) throws -> Bool {
+        guard intent == .appLaunch else { return false }
+        return try clearStoppedMarkerOnDeliberateLaunch(dataDir: dataDir)
     }
 
     /// Writes `stopped.marker` with mode `0600` so the 5-minute launchd `StartInterval` health check
@@ -279,8 +342,10 @@ public final class MacLifecycleClient: @unchecked Sendable {
             (data, response) = try await session.data(for: request)
         } catch {
             // Fall back to the local policy file when the server is unreachable.
+            // The remote-launch grant stays unknown, because the harness never
+            // reported it and a local fallback must not invent a value.
             let localPersist = policyStore.readPersistOnExit() ?? true
-            return MacLifecycleSettings(allowRemoteDesktopLaunch: false, persistOnExit: localPersist)
+            return MacLifecycleSettings(allowRemoteDesktopLaunch: nil, persistOnExit: localPersist)
         }
 
         guard let http = response as? HTTPURLResponse else {
@@ -304,15 +369,23 @@ public final class MacLifecycleClient: @unchecked Sendable {
 
     /// Saves `allowRemoteDesktopLaunch` and `persistOnExit` via `PUT /api/config` and mirrors
     /// `persistOnExit` to `~/.botfleet/persist-on-exit.policy`.
+    ///
+    /// The remote-launch grant is only sent when it is known.
+    /// `GET /api/config` returns `configStatus()`, which has no `server` section,
+    /// so a grant the app never read must not be written back as `false`: that
+    /// would silently revoke the operator's grant.
     public func saveLifecycleSettings(_ settings: MacLifecycleSettings) async throws {
         guard let url = URL(string: "/api/config", relativeTo: baseURL)?.absoluteURL else {
             throw MacLifecycleError.invalidURL
         }
+        var server: [String: Any] = [
+            "persistOnExit": settings.persistOnExit
+        ]
+        if let allowRemote = settings.allowRemoteDesktopLaunch {
+            server["allowRemoteDesktopLaunch"] = allowRemote
+        }
         let payload: [String: Any] = [
-            "server": [
-                "allowRemoteDesktopLaunch": settings.allowRemoteDesktopLaunch,
-                "persistOnExit": settings.persistOnExit,
-            ]
+            "server": server
         ]
         let body = try JSONSerialization.data(withJSONObject: payload)
 
@@ -337,6 +410,25 @@ public final class MacLifecycleClient: @unchecked Sendable {
         }
 
         try policyStore.writePersistOnExit(settings.persistOnExit)
+    }
+
+    /// Saves `settings` and reports the settings the UI should show afterwards.
+    ///
+    /// A rejected write restores `previous`, so the Settings toggles never keep
+    /// showing a value the harness never accepted.  The local policy file still
+    /// mirrors the operator's choice, because it is the offline source of truth
+    /// for the quit policy.
+    public func saveLifecycleSettings(
+        _ settings: MacLifecycleSettings,
+        restoring previous: MacLifecycleSettings
+    ) async -> MacLifecycleSaveResult {
+        do {
+            try await saveLifecycleSettings(settings)
+            return .saved(settings)
+        } catch {
+            try? policyStore.writePersistOnExit(settings.persistOnExit)
+            return .failed(previous: previous, message: error.localizedDescription)
+        }
     }
 
     /// Calls `POST /api/system/shutdown` to stop the local VM and harness cleanly, ensuring
@@ -387,6 +479,21 @@ public final class MacLifecycleClient: @unchecked Sendable {
         persistOnExit ? .keepServerRunning : .shutDownServerAndVM
     }
 
+    /// Performs a deliberate shutdown and reports the outcome.
+    ///
+    /// A failed shutdown must not leave the deliberate-stop sentinel behind: the
+    /// harness is still running, and the marker would make
+    /// `scripts/botfleet-server-start.sh` treat a live server as deliberately
+    /// stopped, so launchd would never revive it after a later crash.
+    public func performDeliberateShutdown() async -> MacShutdownOutcome {
+        do {
+            let receipt = try await shutDownServerAndLocalVM()
+            return .stopped(receipt)
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
+    }
+
     // MARK: - Internal Helpers
 
     private func originHeaderValue() -> String {
@@ -402,7 +509,11 @@ public final class MacLifecycleClient: @unchecked Sendable {
             throw MacLifecycleError.invalidResponse
         }
         let serverSection = root["server"] as? [String: Any]
-        let allowRemote = (serverSection?["allowRemoteDesktopLaunch"] as? Bool) ?? false
+        // `GET /api/config` returns `configStatus()`, which has no `server`
+        // section at all.  A grant the harness did not report stays unknown
+        // (`nil`), so a later save never writes back a `false` the app never
+        // read and silently revokes the operator's grant.
+        let allowRemote = serverSection?["allowRemoteDesktopLaunch"] as? Bool
         let persist: Bool
         if let serverPersist = serverSection?["persistOnExit"] as? Bool {
             persist = serverPersist
@@ -451,5 +562,28 @@ public final class MacLifecycleClient: @unchecked Sendable {
             if let message = obj["message"] as? String, !message.isEmpty { return message }
         }
         return "BotFleet Server refused the request (HTTP \(statusCode))."
+    }
+}
+
+/// One connection cycle against the local harness.
+///
+/// The lifecycle settings ride on the fleet-snapshot cadence: exactly one
+/// `GET /api/config` per successful connection.  Fetching them on the connect
+/// path as well would double the request count on every reconnect, which is
+/// exactly when the harness is least able to serve it.
+public enum MacHarnessConnectionCycle {
+    /// Runs one connection cycle: the roster snapshot, the state hydration, and
+    /// exactly one lifecycle-settings refresh.
+    ///
+    /// The closures keep the harness calls injectable, so the refresh cadence is
+    /// covered by a test that counts the requests instead of assuming them.
+    public static func connect(
+        fetchFleet: @Sendable () async throws -> Fleet,
+        hydrate: @MainActor (Fleet) -> Void,
+        refreshLifecycleSettings: @MainActor () async -> Void
+    ) async throws {
+        let fleet = try await fetchFleet()
+        await hydrate(fleet)
+        await refreshLifecycleSettings()
     }
 }

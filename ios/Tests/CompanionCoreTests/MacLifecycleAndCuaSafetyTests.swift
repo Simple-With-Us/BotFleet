@@ -162,8 +162,10 @@ struct MacLifecycleAndCuaSafetyTests {
         )
 
         // Step 1: Default values on a fresh MacLifecycleSettings struct.
+        // The remote-launch grant is unknown until the harness reports it, so a
+        // value the app never read is never written back as `false`.
         let defaults = MacLifecycleSettings()
-        #expect(defaults.allowRemoteDesktopLaunch == false)
+        #expect(defaults.allowRemoteDesktopLaunch == nil)
         #expect(defaults.persistOnExit == true)
 
         // Step 2: Save settings via PUT /api/config.
@@ -197,12 +199,93 @@ struct MacLifecycleAndCuaSafetyTests {
         #expect(fetched == updated)
 
         // Step 4: Offline fallback reads `~/.botfleet/persist-on-exit.policy`.
+        // The remote-launch grant stays unknown offline.
         MacLifecycleStubURLProtocol.configure { _, _ in
             (0, Data(), URLError(.cannotConnectToHost))
         }
         let offlineSettings = try await client.fetchLifecycleSettings()
-        #expect(offlineSettings.allowRemoteDesktopLaunch == false)
+        #expect(offlineSettings.allowRemoteDesktopLaunch == nil)
         #expect(offlineSettings.persistOnExit == false)
+    }
+
+    @Test("A GET /api/config without a server section leaves the remote-launch grant unknown")
+    func testMissingServerSectionKeepsRemoteLaunchGrantUnknown() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MacPersistencePolicyStore(dataDir: tempDir)
+        try store.writePersistOnExit(true, dataDir: tempDir)
+
+        let session = makeStubbedSession()
+        let client = MacLifecycleClient(
+            baseURL: URL(string: "http://127.0.0.1:8799")!,
+            session: session,
+            policyStore: store
+        )
+
+        // `GET /api/config` returns `configStatus()`, which has no `server`
+        // section at all.
+        MacLifecycleStubURLProtocol.configure { _, _ in
+            (200, Data(#"{"ok":true,"drain":{},"jobs":{}}"#.utf8), nil)
+        }
+        let fetched = try await client.fetchLifecycleSettings()
+        #expect(fetched.allowRemoteDesktopLaunch == nil)
+        #expect(fetched.persistOnExit == true)
+
+        // The unknown grant must never be written back as `false`.
+        MacLifecycleStubURLProtocol.configure { _, _ in
+            (200, Data(#"{"ok":true}"#.utf8), nil)
+        }
+        try await client.saveLifecycleSettings(
+            MacLifecycleSettings(allowRemoteDesktopLaunch: fetched.allowRemoteDesktopLaunch, persistOnExit: false)
+        )
+
+        let requests = MacLifecycleStubURLProtocol.recordedRequests()
+        #expect(requests.count == 1)
+        if let body = requests[0].body,
+           let parsed = try JSONSerialization.jsonObject(with: body) as? [String: Any],
+           let serverObj = parsed["server"] as? [String: Any] {
+            #expect(serverObj["persistOnExit"] as? Bool == false)
+            #expect(serverObj["allowRemoteDesktopLaunch"] == nil)
+        } else {
+            Issue.record("Expected PUT /api/config JSON body with server section")
+        }
+    }
+
+    @Test("A rejected lifecycle save restores the previous settings and reports the error")
+    func testRejectedLifecycleSaveRestoresPreviousSettings() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MacPersistencePolicyStore(dataDir: tempDir)
+        let session = makeStubbedSession()
+        let client = MacLifecycleClient(
+            baseURL: URL(string: "http://127.0.0.1:8799")!,
+            session: session,
+            policyStore: store
+        )
+
+        let previous = MacLifecycleSettings(allowRemoteDesktopLaunch: true, persistOnExit: true)
+        let attempted = MacLifecycleSettings(allowRemoteDesktopLaunch: false, persistOnExit: false)
+
+        MacLifecycleStubURLProtocol.configure { _, _ in
+            (500, Data(#"{"error":"config write failed"}"#.utf8), nil)
+        }
+
+        let result = await client.saveLifecycleSettings(attempted, restoring: previous)
+        switch result {
+        case .saved:
+            Issue.record("Expected a rejected save, got a successful one")
+        case .failed(let restored, let message):
+            // The Settings toggles go back to the last value the harness
+            // accepted instead of keeping the value it never took.
+            #expect(restored == previous)
+            #expect(message.contains("config write failed"))
+        }
+
+        // The local policy file is the offline source of truth, so it still
+        // mirrors the operator's choice.
+        #expect(store.readPersistOnExit() == false)
     }
 
     @Test("MacLifecycleClient shutDownServerAndLocalVM calls POST /api/system/shutdown and ensures stopped.marker")
@@ -236,10 +319,106 @@ struct MacLifecycleAndCuaSafetyTests {
         #expect(requests[0].headers["Origin"] == "http://127.0.0.1:8799")
     }
 
+    @Test("A failed shutdown leaves no deliberate-stop marker behind")
+    func testFailedShutdownDoesNotWriteStoppedMarker() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MacPersistencePolicyStore(dataDir: tempDir)
+        let session = makeStubbedSession()
+        let client = MacLifecycleClient(
+            baseURL: URL(string: "http://127.0.0.1:8799")!,
+            session: session,
+            policyStore: store
+        )
+
+        MacLifecycleStubURLProtocol.configure { _, _ in
+            (500, Data(#"{"error":"shutdown failed"}"#.utf8), nil)
+        }
+
+        let outcome = await client.performDeliberateShutdown()
+        switch outcome {
+        case .stopped:
+            Issue.record("Expected a failed shutdown, got a receipt")
+        case .failed(let message):
+            #expect(message.contains("shutdown failed"))
+        }
+
+        // The harness is still running, so the marker must not claim it was
+        // deliberately stopped: launchd would then never revive it.
+        #expect(store.hasStoppedMarker(dataDir: tempDir) == false)
+    }
+
+    @Test("A reconnect never clears the deliberate-stop marker, a deliberate launch does")
+    func testReconnectKeepsStoppedMarkerButLaunchClearsIt() throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MacPersistencePolicyStore(dataDir: tempDir)
+        try store.writeStoppedMarker(dataDir: tempDir)
+        #expect(store.hasStoppedMarker(dataDir: tempDir))
+
+        // A reconnect is not a deliberate launch, so the sentinel survives.
+        #expect(try store.clearStoppedMarker(for: .reconnect, dataDir: tempDir) == false)
+        #expect(store.hasStoppedMarker(dataDir: tempDir) == true)
+
+        // A deliberate launch clears it, so the launchd wrapper may start the
+        // harness again.
+        #expect(try store.clearStoppedMarker(for: .appLaunch, dataDir: tempDir) == true)
+        #expect(store.hasStoppedMarker(dataDir: tempDir) == false)
+    }
+
     @Test("MacQuitPolicyDecision honors persistOnExit == true vs false")
     func testQuitPolicyDecision() {
         #expect(MacLifecycleClient.evaluateQuitAction(persistOnExit: true) == .keepServerRunning)
         #expect(MacLifecycleClient.evaluateQuitAction(persistOnExit: false) == .shutDownServerAndVM)
+    }
+
+    @Test("Closing the desktop window applies the same policy as quitting")
+    func testWindowCloseActionMatchesQuitPolicy() {
+        // The Settings toggle reads "Keep Server Running When Window Closes",
+        // so a window close must not leave the harness running when the
+        // operator turned that setting off.
+        #expect(MacQuitPolicyDecision.windowCloseAction(persistOnExit: false) == .shutDownServerAndVM)
+        #expect(MacQuitPolicyDecision.windowCloseAction(persistOnExit: true) == .keepServerRunning)
+        #expect(
+            MacQuitPolicyDecision.windowCloseAction(persistOnExit: false)
+                == MacLifecycleClient.evaluateQuitAction(persistOnExit: false)
+        )
+        #expect(
+            MacQuitPolicyDecision.windowCloseAction(persistOnExit: true)
+                == MacLifecycleClient.evaluateQuitAction(persistOnExit: true)
+        )
+    }
+
+    @Test("One connection cycle refreshes the lifecycle settings exactly once")
+    @MainActor
+    func testConnectionCycleRefreshesLifecycleSettingsOnce() async throws {
+        let fleet = Fleet(bots: [], groups: [])
+        let fleetFetches = ThreadSafeBox(0)
+        let lifecycleRefreshes = ThreadSafeBox(0)
+        let hydrations = ThreadSafeBox(0)
+
+        for _ in 0..<3 {
+            try await MacHarnessConnectionCycle.connect(
+                fetchFleet: {
+                    fleetFetches.value += 1
+                    return fleet
+                },
+                hydrate: { _ in
+                    hydrations.value += 1
+                },
+                refreshLifecycleSettings: {
+                    lifecycleRefreshes.value += 1
+                }
+            )
+        }
+
+        // The lifecycle settings ride on the roster cadence: one
+        // `GET /api/config` per successful connection, never two.
+        #expect(fleetFetches.value == 3)
+        #expect(hydrations.value == 3)
+        #expect(lifecycleRefreshes.value == 3)
     }
 
     // MARK: - BF-2499: CUA Emergency Safety Stop Tests
@@ -251,6 +430,24 @@ struct MacLifecycleAndCuaSafetyTests {
         var value: T {
             get { lock.lock(); defer { lock.unlock() }; return _value }
             set { lock.lock(); defer { lock.unlock() }; _value = newValue }
+        }
+    }
+
+    /// An append-only event log that several threads can write to safely.
+    private final class ThreadSafeEventLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _entries: [String] = []
+
+        func append(_ entry: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            _entries.append(entry)
+        }
+
+        var entries: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return _entries
         }
     }
 
@@ -463,6 +660,151 @@ struct MacLifecycleAndCuaSafetyTests {
             signingFlags: 0
         )
         #expect(wrongTeam.hasStableTCCIdentity == false)
+    }
+
+    // MARK: - BF-2499: Safety-Stop Regression Tests
+
+    @Test("The emergency-stop confirmation survives the asynchronous stream-stopped update")
+    func testCuaStatusStateKeepsEmergencyStopConfirmation() {
+        let state = CuaStatusState()
+
+        state.record(.starting)
+        #expect(state.current == .starting)
+
+        // The operator triggers the emergency stop.
+        state.record(.emergencyStopActivated)
+        #expect(state.current == .emergencyStopActivated)
+
+        // The asynchronous "stream stopped" update lands right after it and
+        // must not replace the safety confirmation.
+        state.record(.streamStopped)
+        #expect(state.current == .emergencyStopActivated)
+        #expect(state.current?.message == MacCuaStatus.emergencyStopActivated.message)
+
+        // A freshly started capture session clears the latch.
+        state.reset()
+        state.record(.liveDesktopShared)
+        #expect(state.current == .liveDesktopShared)
+    }
+
+    @available(macOS 14.0, *)
+    @Test("A benign capture failure is not reported as a permission revocation")
+    func testBenignStreamFailureIsNotReportedAsRevocation() {
+        let driver = MacCuaDriver()
+        driver.resetEmergencyStop()
+
+        let monitor = CuaPermissionMonitor(
+            driver: driver,
+            permissionChecker: {
+                CuaPermissions(hasScreenRecording: true, hasAccessibility: true)
+            }
+        )
+
+        // The baseline: both permissions were granted.
+        monitor.startMonitoring()
+        #expect(monitor.state == .authorized)
+
+        let state = monitor.notifyStreamStoppedWithError(
+            ScreenStreamError.captureFailed("the display was reconfigured")
+        )
+
+        // A transient capture failure is not a lost permission, so the operator
+        // must not see the "permission was revoked" banner.
+        #expect(state.isRevoked == false)
+        #expect(state.bannerMessage == nil)
+        // The capture really did stop, so the driver is still latched.
+        #expect(driver.isEmergencyStopped == true)
+    }
+
+    @Test("A permission that was never granted is missing, not revoked")
+    func testNeverGrantedAccessibilityIsMissingNotRevoked() {
+        let driver = MacCuaDriver()
+        driver.resetEmergencyStop()
+
+        let monitor = CuaPermissionMonitor(
+            driver: driver,
+            pollInterval: 0.05,
+            permissionChecker: {
+                // Screen Recording was granted, Accessibility never was.
+                CuaPermissions(hasScreenRecording: true, hasAccessibility: false)
+            }
+        )
+
+        let revocationSignal = DispatchSemaphore(value: 0)
+        monitor.startMonitoring { _ in
+            revocationSignal.signal()
+        }
+
+        if case .missingPermissions(let missingScreen, let missingAX) = monitor.state {
+            #expect(missingScreen == false)
+            #expect(missingAX == true)
+        } else {
+            Issue.record("Expected .missingPermissions, got \(monitor.state)")
+        }
+
+        // A poll must not escalate a never-granted permission into a revocation:
+        // nothing was taken away from the operator, so the live capture keeps
+        // running and the driver is not latched.
+        let state = monitor.pollOnce()
+        #expect(state.isRevoked == false)
+        #expect(revocationSignal.wait(timeout: .now() + 0.3) == .timedOut)
+        #expect(driver.isEmergencyStopped == false)
+    }
+
+    @Test("An emergency stop cannot leave a mouse button held when it interleaves with a mouse-down")
+    func testEmergencyStopCannotLeaveMouseButtonHeld() {
+        let driver = MacCuaDriver()
+        driver.resetEmergencyStop()
+
+        let postedOrder = ThreadSafeEventLog()
+        driver.mouseEventPostedHook = { type, button in
+            let label: String
+            switch type {
+            case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+                label = "down-\(button.rawValue)"
+            default:
+                label = "up-\(button.rawValue)"
+            }
+            postedOrder.append(label)
+        }
+
+        let hookReached = DispatchSemaphore(value: 0)
+        let releaseHook = DispatchSemaphore(value: 0)
+        driver.mouseDownPrePostHook = {
+            hookReached.signal()
+            _ = releaseHook.wait(timeout: .now() + 5.0)
+        }
+
+        let downFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = driver.mouseDown(at: CGPoint(x: 42, y: 42), button: .left)
+            downFinished.signal()
+        }
+
+        #expect(hookReached.wait(timeout: .now() + 5.0) == .success)
+
+        // The emergency stop runs while the mouse-down is still in flight.
+        let stopFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = driver.emergencyStop()
+            stopFinished.signal()
+        }
+
+        // Give the stop a moment to contend for the driver lock, then let the
+        // mouse-down finish.
+        Thread.sleep(forTimeInterval: 0.05)
+        releaseHook.signal()
+
+        #expect(downFinished.wait(timeout: .now() + 5.0) == .success)
+        #expect(stopFinished.wait(timeout: .now() + 5.0) == .success)
+
+        // The down event has to reach the window server before the release.
+        // Otherwise the window server sees the release first, the physical
+        // button stays held, and no later emergency stop can release it.
+        #expect(postedOrder.entries.first == "down-left")
+        #expect(postedOrder.entries.contains("up-left"))
+        #expect(driver.heldMouseButtons.isEmpty)
+        #expect(driver.lastEmergencyStopReleasedButtons == [.left])
     }
 }
 #endif

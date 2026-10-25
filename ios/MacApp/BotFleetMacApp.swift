@@ -1,9 +1,62 @@
 import SwiftUI
+import AppKit
 import CompanionCore
+
+/// Application delegate for the native macOS desktop app.
+///
+/// The quit-time shutdown has to finish before the process exits, so the
+/// delegate answers `applicationShouldTerminate(_:)` with `.terminateLater` and
+/// only replies once the async shutdown is done.  AppKit terminates the process
+/// as soon as `willTerminateNotification` is delivered, so a detached `Task`
+/// in a notification handler is abandoned before the shutdown request ever
+/// reaches the harness.
+final class BotFleetMacAppDelegate: NSObject, NSApplicationDelegate {
+    /// The session that owns the lifecycle policy.  Weak, because the session
+    /// outlives neither the delegate nor the app, and the delegate must not
+    /// keep it alive across a termination.
+    weak var session: MacSession?
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let session else { return .terminateNow }
+        Task { @MainActor in
+            await session.handleAppTermination()
+            NSApplication.shared.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+
+/// Captures the `NSWindow` that hosts a SwiftUI scene.
+///
+/// The window-close policy has to be evaluated for the app's main window only,
+/// so the observer is bound to that window instance instead of to every
+/// `NSWindow` (closing the Settings panel must not stop the harness).
+private final class WindowCaptureView: NSView {
+    var onWindow: ((NSWindow) -> Void)?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else { return }
+        onWindow?(window)
+    }
+}
+
+private struct WindowAccessor: NSViewRepresentable {
+    let onWindow: (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = WindowCaptureView()
+        view.onWindow = onWindow
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
 
 @main
 struct BotFleetMacApp: App {
     @StateObject private var session = MacSession()
+    @NSApplicationDelegateAdaptor(BotFleetMacAppDelegate.self) private var appDelegate
 
     init() {
         // Any early native Mac initialization
@@ -14,13 +67,12 @@ struct BotFleetMacApp: App {
             MacRootView()
                 .environmentObject(session)
                 .frame(minWidth: 860, minHeight: 560)
+                .background(WindowAccessor { window in
+                    session.registerMainWindow(window)
+                })
                 .onAppear {
-                    session.connect()
-                }
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
-                    Task {
-                        await session.handleAppTermination()
-                    }
+                    appDelegate.session = session
+                    session.launch()
                 }
         }
         .windowStyle(.titleBar)
@@ -91,7 +143,7 @@ struct BotFleetMacApp: App {
                         Toggle(
                             "Allow iOS Remote Desktop Launch",
                             isOn: Binding(
-                                get: { session.lifecycleSettings.allowRemoteDesktopLaunch },
+                                get: { session.lifecycleSettings.allowRemoteDesktopLaunch ?? false },
                                 set: { newValue in
                                     var updated = session.lifecycleSettings
                                     updated.allowRemoteDesktopLaunch = newValue
@@ -123,6 +175,12 @@ struct BotFleetMacApp: App {
                             Spacer()
                         }
                         .padding(.top, 4)
+
+                        if let errorMessage = session.lifecycleErrorMessage {
+                            Text(errorMessage)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                        }
                     }
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)

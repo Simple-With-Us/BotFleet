@@ -205,17 +205,101 @@ public enum CuaPermissionState: Equatable, Sendable {
         switch self {
         case .authorized:
             return nil
-        case .missingPermissions(let missingScreen, let missingAX),
-             .revoked(let missingScreen, let missingAX, _):
+        case .missingPermissions(let missingScreen, let missingAX):
             if missingScreen && missingAX {
-                return "Screen Recording and Accessibility permissions were revoked.  Desktop control has been stopped."
+                return "Screen Recording and Accessibility permissions are required for desktop control."
             } else if missingScreen {
-                return "Screen Recording permission was revoked.  Live capture and desktop control have been stopped."
+                return "Screen Recording permission is required for live capture."
             } else if missingAX {
-                return "Accessibility permission was revoked.  Desktop control has been stopped."
+                return "Accessibility permission is required for desktop control."
+            }
+            return nil
+        case .revoked(let missingScreen, let missingAX, _):
+            if missingScreen && missingAX {
+                return "Screen Recording and Accessibility permissions were revoked.\u{00A0} Desktop control has been stopped."
+            } else if missingScreen {
+                return "Screen Recording permission was revoked.\u{00A0} Live capture and desktop control have been stopped."
+            } else if missingAX {
+                return "Accessibility permission was revoked.\u{00A0} Desktop control has been stopped."
             }
             return nil
         }
+    }
+}
+
+/// The status copy the CUA inspector shows while desktop control is running.
+public enum MacCuaStatus: Equatable, Sendable {
+    case starting
+    case liveDesktopShared
+    case streamStopped
+    case emergencyStopActivated
+    case screenRecordingPermissionNeeded
+    case liveCaptureUnavailable
+    case noDisplayAvailable
+
+    /// The product copy shown in the CUA inspector status bar.
+    public var message: String {
+        switch self {
+        case .starting:
+            return "Starting live capture…"
+        case .liveDesktopShared:
+            return "Live desktop shared"
+        case .streamStopped:
+            return "Stream stopped"
+        case .emergencyStopActivated:
+            return "Emergency stop activated — desktop control halted"
+        case .screenRecordingPermissionNeeded:
+            return "Screen recording permission needed"
+        case .liveCaptureUnavailable:
+            return "Live capture could not start"
+        case .noDisplayAvailable:
+            return "No display available to capture"
+        }
+    }
+}
+
+/// Holds the CUA inspector status copy.
+///
+/// The emergency-stop confirmation is sticky: the asynchronous "stream stopped"
+/// update that lands right after an emergency stop must not overwrite the safety
+/// message the operator just triggered, or the inspector would report a plain
+/// stop instead of the latched safety stop.
+public final class CuaStatusState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _current: MacCuaStatus?
+    private var _emergencyLatched = false
+
+    public init() {}
+
+    /// The copy currently shown.
+    public var current: MacCuaStatus? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _current
+    }
+
+    /// Records a status update and returns the copy that is now shown.
+    @discardableResult
+    public func record(_ status: MacCuaStatus) -> MacCuaStatus? {
+        lock.lock()
+        defer { lock.unlock() }
+        if _emergencyLatched && status != .emergencyStopActivated {
+            return _current
+        }
+        if status == .emergencyStopActivated {
+            _emergencyLatched = true
+        }
+        _current = status
+        return status
+    }
+
+    /// Clears the latched emergency stop, so a freshly started capture session
+    /// can report its own status again.
+    public func reset() {
+        lock.lock()
+        _emergencyLatched = false
+        _current = nil
+        lock.unlock()
     }
 }
 
@@ -234,6 +318,18 @@ public final class MacCuaDriver: @unchecked Sendable {
 
     /// Optional observer invoked whenever a mouse event is synthesized (useful for deterministic test assertions).
     public var mouseEventObserver: (@Sendable (CGEventType, CGPoint, CuaMouseButton) -> Void)?
+
+    /// Test seam invoked while the driver state lock is held, immediately before
+    /// a mouse-down event is posted.
+    ///
+    /// It lets a test hold the lock while a concurrent emergency stop contends
+    /// for it, which is the window in which a stopped button used to be left
+    /// physically held.
+    var mouseDownPrePostHook: (() -> Void)?
+
+    /// Test seam invoked right after a synthesized mouse event reaches the window
+    /// server, so a test can assert the real post order of the events.
+    var mouseEventPostedHook: ((CGEventType, CuaMouseButton) -> Void)?
 
     public init() {}
 
@@ -303,6 +399,7 @@ public final class MacCuaDriver: @unchecked Sendable {
                 mouseButton: cgButton
             ) {
                 upEvent.post(tap: .cghidEventTap)
+                mouseEventPostedHook?(upType, button)
             }
             observer?(upType, releasePoint, button)
         }
@@ -498,9 +595,17 @@ public final class MacCuaDriver: @unchecked Sendable {
         _lastCursorPosition = point
         _heldMouseButtons.insert(button)
         let observer = mouseEventObserver
+        let prePostHook = mouseDownPrePostHook
+        prePostHook?()
+        // The down event is posted while the state lock is still held, so an
+        // emergency stop cannot slip in between the bookkeeping above and the
+        // post.  Otherwise the stop would release the button first and the
+        // later down event would leave it physically held, with no record left
+        // to release it.
+        downEvent.post(tap: .cghidEventTap)
+        mouseEventPostedHook?(downType, button)
         stateLock.unlock()
 
-        downEvent.post(tap: .cghidEventTap)
         observer?(downType, point, button)
         return true
     }
@@ -526,6 +631,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         stateLock.unlock()
 
         upEvent.post(tap: .cghidEventTap)
+        mouseEventPostedHook?(upType, button)
         observer?(upType, point, button)
         return true
     }
@@ -789,6 +895,13 @@ public final class CuaPermissionMonitor: @unchecked Sendable {
 
     private var _state: CuaPermissionState = .authorized
     private var _isMonitoring: Bool = false
+    /// Whether a Screen Recording grant was ever observed during this session.
+    ///
+    /// A grant that was never given is "missing", not "revoked": only a grant
+    /// that was observed can later be revoked.
+    private var _screenRecordingWasAuthorized: Bool = false
+    /// Whether an Accessibility grant was ever observed during this session.
+    private var _accessibilityWasAuthorized: Bool = false
     public var onRevocation: (@Sendable (CuaPermissionState) -> Void)?
 
     public init(
@@ -820,6 +933,10 @@ public final class CuaPermissionMonitor: @unchecked Sendable {
     }
 
     /// Evaluates current permissions before starting a CUA stream or session.
+    ///
+    /// This establishes the baseline for the session: a permission that is not
+    /// granted yet is recorded as missing, and only a grant that was observed
+    /// can later be reported as revoked.
     @discardableResult
     public func evaluateInitialPermissions() -> CuaPermissionState {
         let perms = permissionChecker()
@@ -834,6 +951,8 @@ public final class CuaPermissionMonitor: @unchecked Sendable {
         }
         lock.lock()
         _state = nextState
+        _screenRecordingWasAuthorized = perms.hasScreenRecording
+        _accessibilityWasAuthorized = perms.hasAccessibility
         lock.unlock()
         return nextState
     }
@@ -847,8 +966,11 @@ public final class CuaPermissionMonitor: @unchecked Sendable {
             self.onRevocation = onRevocation
         }
         _isMonitoring = true
-        _state = .authorized
         lock.unlock()
+
+        // The baseline has to be established before the first poll, otherwise a
+        // permission that was never granted looks exactly like a revoked one.
+        _ = evaluateInitialPermissions()
 
         let timer = DispatchSource.makeTimerSource(queue: monitorQueue)
         timer.schedule(
@@ -875,29 +997,91 @@ public final class CuaPermissionMonitor: @unchecked Sendable {
         timer?.cancel()
     }
 
-    /// Performs an immediate permission check and transitions to `.revoked` if either TCC grant was lost.
+    /// Performs an immediate permission check and transitions to `.revoked` if a
+    /// TCC grant that was observed during this session was lost.
+    ///
+    /// A permission that was never granted stays `.missingPermissions`: the live
+    /// capture keeps running and the driver is not latched into an emergency
+    /// stop, because nothing was taken away from the operator.
     @discardableResult
     public func pollOnce() -> CuaPermissionState {
         let perms = permissionChecker()
-        guard !perms.isFullyAuthorized else {
-            return state
+        lock.lock()
+        // A permission observed as granted joins the baseline, so a later
+        // revocation is detected even when the grant happened mid-session.
+        _screenRecordingWasAuthorized = _screenRecordingWasAuthorized || perms.hasScreenRecording
+        _accessibilityWasAuthorized = _accessibilityWasAuthorized || perms.hasAccessibility
+        let screenRevoked = _screenRecordingWasAuthorized && !perms.hasScreenRecording
+        let accessibilityRevoked = _accessibilityWasAuthorized && !perms.hasAccessibility
+        lock.unlock()
+
+        if perms.isFullyAuthorized {
+            lock.lock()
+            if case .missingPermissions = _state {
+                _state = .authorized
+            }
+            let current = _state
+            lock.unlock()
+            return current
         }
-        return transitionToRevoked(
-            missingScreenRecording: !perms.hasScreenRecording,
-            missingAccessibility: !perms.hasAccessibility
-        )
+
+        if screenRevoked || accessibilityRevoked {
+            return transitionToRevoked(
+                missingScreenRecording: screenRevoked,
+                missingAccessibility: accessibilityRevoked
+            )
+        }
+
+        // A grant that was never given is "missing", not "revoked": keep the
+        // capture running and only refresh which permissions are outstanding.
+        lock.lock()
+        if case .missingPermissions = _state {
+            _state = .missingPermissions(
+                missingScreenRecording: !perms.hasScreenRecording,
+                missingAccessibility: !perms.hasAccessibility
+            )
+        }
+        let current = _state
+        lock.unlock()
+        return current
     }
 
     /// Handles an immediate stream failure reported by `ScreenStreamActor.stream(_:didStopWithError:)`.
+    ///
+    /// Only an explicitly recognized Screen Recording denial counts as a
+    /// revocation.  A benign capture failure (a display reconfigure, a
+    /// transient `SCStream` error) stops the stream and latches the driver, but
+    /// it is never reported to the operator as a lost permission.
     @discardableResult
     public func notifyStreamStoppedWithError(_ error: Error) -> CuaPermissionState {
         let perms = permissionChecker()
-        let missingScreen = !perms.hasScreenRecording || isLikelyScreenCaptureRevocation(error)
-        let missingAX = !perms.hasAccessibility
-        return transitionToRevoked(
-            missingScreenRecording: missingScreen,
-            missingAccessibility: missingAX
-        )
+        let screenCaptureRevoked = isLikelyScreenCaptureRevocation(error)
+        lock.lock()
+        _screenRecordingWasAuthorized = _screenRecordingWasAuthorized || perms.hasScreenRecording
+        _accessibilityWasAuthorized = _accessibilityWasAuthorized || perms.hasAccessibility
+        let screenRevoked = screenCaptureRevoked
+            || (_screenRecordingWasAuthorized && !perms.hasScreenRecording)
+        let accessibilityRevoked = _accessibilityWasAuthorized && !perms.hasAccessibility
+        lock.unlock()
+
+        if screenRevoked || accessibilityRevoked {
+            return transitionToRevoked(
+                missingScreenRecording: screenRevoked,
+                missingAccessibility: accessibilityRevoked
+            )
+        }
+
+        // A benign capture failure is not a TCC revocation.  The driver is still
+        // latched and the stream still stops, but the permission state stays
+        // what it was, so no revocation banner is shown.
+        stopMonitoring()
+        driver.emergencyStop()
+        if #available(macOS 14.0, *) {
+            Task {
+                await ScreenStreamActor.shared.stopStreaming()
+            }
+        }
+        return state
     }
 
     private func transitionToRevoked(
@@ -951,7 +1135,9 @@ public final class CuaPermissionMonitor: @unchecked Sendable {
         if nsError.domain.contains("SCStream") || [-3801, -3817, -3818].contains(nsError.code) {
             return true
         }
-        return true
+        // Anything else is a benign capture failure: a display reconfigure or a
+        // transient stream error must not be reported as a lost permission.
+        return false
     }
 }
 
