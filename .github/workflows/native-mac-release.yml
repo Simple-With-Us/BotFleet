@@ -39,6 +39,15 @@ permissions:
 
 env:
   RELEASES_REPO: Simple-With-Us/BotFleet
+  # The native assets live on their OWN release tag, never on the Electron
+  # pipeline's v<version> release.  release.yml verifies that release's asset
+  # set is exactly the Electron set and deletes every asset it does not
+  # recognise, so a shared tag either fails the Electron release ("release
+  # asset set differs: unexpected [...]") or deletes the native ZIP, DMG and
+  # appcast.  The suffix keeps the two feeds on separate releases; the
+  # end state where both asset sets share one release is BF-2559's work and
+  # needs release.yml and scripts/verify-release-assets.mjs.
+  NATIVE_TAG_SUFFIX: "-native"
 
 jobs:
   prepare:
@@ -59,7 +68,11 @@ jobs:
       - id: pin
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "version=$(node scripts/stamp-commit-version.mjs .)" >> "$GITHUB_OUTPUT"
+          # The stamp script exits 1 on a shallow clone or a git error, and
+          # `echo "$(...)"` would return echo's status and publish an EMPTY
+          # version, which then fails much later with an unrelated error.
+          version="$(node scripts/stamp-commit-version.mjs .)" || exit 1
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Refuse to overwrite a published release
         if: ${{ inputs.draft }}
         env:
@@ -69,7 +82,7 @@ jobs:
           # inside the job that produces an output, needs is still empty,
           # which is how the release.yml guard silently never fired before
           # PR #1315 fixed it there.
-          v="v${{ steps.pin.outputs.version }}"
+          v="v${{ steps.pin.outputs.version }}${NATIVE_TAG_SUFFIX}"
           if gh release view "$v" --repo "$RELEASES_REPO" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
             echo "::error::$v is already published on $RELEASES_REPO; refusing to add native assets to it"
             exit 1
@@ -147,6 +160,7 @@ jobs:
       - name: "Gate: the signature must verify BEFORE notarization"
         run: |
           app="$RUNNER_TEMP/export/BotFleet.app"
+          [ -d "$app" ] || { echo "::error::the export produced no BotFleet.app"; exit 1; }
           codesign --verify --deep --strict "$app"
           team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
           test "$team" = "CC8UTF7ATG" || {
@@ -170,20 +184,31 @@ jobs:
           APPLE_API_KEY_ID: ${{ env.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ env.APPLE_API_ISSUER_ID }}
         run: |
-          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          # The key never stays at a path: it is decoded into a private
+          # temporary file, that file is opened on a file descriptor and
+          # unlinked at once, and notarytool reads it through the
+          # descriptor.
+          p8="$RUNNER_TEMP/notary.p8"
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$p8"
+          exec 3< "$p8"
+          rm -f "$p8"
           app="$RUNNER_TEMP/export/BotFleet.app"
           ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/submit.zip"
+          # The notary's own output is the only place the reason is written
+          # down, so it is printed before the failure instead of being
+          # swallowed by `set -e`.
           out=$(xcrun notarytool submit "$RUNNER_TEMP/submit.zip" \
-            --key "$RUNNER_TEMP/notary.p8" \
+            --key /dev/fd/3 \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
-            --wait 2>&1)
+            --wait 2>&1) || {
+              echo "$out"
+              echo "::error::notarization failed for the app ZIP"; exit 1; }
           echo "$out" | tail -2
           echo "$out" | grep -q "status: Accepted" || { echo "::error::notarization not Accepted for the app ZIP"; exit 1; }
           xcrun stapler staple "$app"
           xcrun stapler validate "$app"
           spctl --assess --type execute "$app"
-          rm "$RUNNER_TEMP/notary.p8"
           echo "ok: notarized, stapled, Gatekeeper-clean"
       - name: Package the final ZIP and DMG from the stapled app
         env:
@@ -197,15 +222,19 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$app" "native-upload/BotFleetMac-$VERSION.zip"
           hdiutil create -volname "BotFleet" -srcfolder "$app" -ov -format UDZO \
             "native-upload/BotFleetMac-$VERSION.dmg" > /dev/null
-          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          p8="$RUNNER_TEMP/notary.p8"
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$p8"
+          exec 3< "$p8"
+          rm -f "$p8"
           out=$(xcrun notarytool submit "native-upload/BotFleetMac-$VERSION.dmg" \
-            --key "$RUNNER_TEMP/notary.p8" \
+            --key /dev/fd/3 \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
-            --wait 2>&1)
+            --wait 2>&1) || {
+              echo "$out"
+              echo "::error::notarization failed for the DMG"; exit 1; }
           echo "$out" | tail -2
           echo "$out" | grep -q "status: Accepted" || { echo "::error::notarization not Accepted for the DMG"; exit 1; }
-          rm "$RUNNER_TEMP/notary.p8"
           xcrun stapler staple "native-upload/BotFleetMac-$VERSION.dmg"
           xcrun stapler validate "native-upload/BotFleetMac-$VERSION.dmg"
       # Best-effort by design: until the owner provisions the EdDSA key in
@@ -225,7 +254,21 @@ jobs:
           SPARKLE_EDDSA_PRIVATE_KEY_B64: ${{ env.SPARKLE_EDDSA_PRIVATE_KEY_B64 }}
         run: |
           zip="native-upload/BotFleetMac-$VERSION.zip"
-          if [ -n "${SPARKLE_EDDSA_PRIVATE_KEY_B64:-}" ] && command -v sign_update > /dev/null; then
+          if [ -n "${SPARKLE_EDDSA_PRIVATE_KEY_B64:-}" ]; then
+            # sign_update is NOT part of the macOS runner image, so without
+            # this install the signing branch can never run and a
+            # provisioned key would still produce an unsigned feed.  The
+            # install is best effort, but a key with no tool is a hard
+            # error: an unsigned appcast that looks signed is the failure
+            # this pipeline exists to prevent.
+            brew install sparkle || echo "::warning::brew install sparkle failed"
+            sparkle_bin="$(brew --prefix 2>/dev/null)/bin"
+            if [ -x "$sparkle_bin/sign_update" ]; then
+              echo "$sparkle_bin" >> "$GITHUB_PATH"
+              export PATH="$sparkle_bin:$PATH"
+            fi
+            command -v sign_update > /dev/null || {
+              echo "::error::sign_update is not installed; cannot sign the appcast"; exit 1; }
             key="$RUNNER_TEMP/sparkle-ed-key"
             echo "$SPARKLE_EDDSA_PRIVATE_KEY_B64" | base64 --decode > "$key"
             signature=$(sign_update --ed-key-file "$key" "$zip" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
@@ -234,9 +277,9 @@ jobs:
             rm "$key"
             echo "Sparkle update signed"
           else
-            echo "::warning::no Sparkle EdDSA signing (key unprovisioned or sign_update missing); appcast is an unsigned draft"
+            echo "::warning::no Sparkle EdDSA signing (key unprovisioned); appcast is an unsigned draft"
           fi
-          node scripts/native-appcast.mjs native-upload "$VERSION"
+          node scripts/native-appcast.mjs native-upload "$VERSION" "v$VERSION${NATIVE_TAG_SUFFIX}"
           if [ -f "$zip.edsig" ]; then
             node scripts/verify-native-release.mjs native-upload "$VERSION" --require-signature
             rm "$zip.edsig"
@@ -299,7 +342,7 @@ jobs:
           SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           cd assets
-          tag="v$VERSION"
+          tag="v$VERSION${NATIVE_TAG_SUFFIX}"
           if existing=$(gh api "repos/$RELEASES_REPO/releases/tags/$tag" 2>/dev/null); then
             is_draft=$(jq -r .draft <<< "$existing")
             if [ "$is_draft" != true ]; then
@@ -308,8 +351,8 @@ jobs:
             fi
           else
             gh release create "$tag" --repo "$RELEASES_REPO" \
-              --draft --target "$SHA" --title "BotFleet $VERSION" \
-              --notes "Draft assembled by the release workflows. Edit these notes, then publish."
+              --draft --target "$SHA" --title "BotFleet $VERSION (native)" \
+              --notes "Draft assembled by the native release workflow. Edit these notes, then publish."
           fi
           # Native names never collide with the Electron set, so --clobber
           # here can only replace this workflow's own earlier uploads.

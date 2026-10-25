@@ -187,6 +187,13 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.botfleet.macos
+        # The product is BotFleet.app: it is the app this target replaces in
+        # /Applications, and it carries the same bundle id the Electron
+        # shell did, so it installs over it.  The TARGET is named BotFleetMac
+        # only to tell it apart from the iOS app inside the project file; the
+        # release assets keep the BotFleetMac- prefix so the Sparkle and
+        # electron-updater feeds never share a name.
+        PRODUCT_NAME: BotFleet
         DEVELOPMENT_TEAM: CC8UTF7ATG
         CODE_SIGN_STYLE: Automatic
         MARKETING_VERSION: "1.0.2132"
@@ -203,6 +210,16 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: BotFleet
     info:
       path: MacApp/Info.plist
+      properties:
+        # These two keys must be declared here, not hand-edited into the
+        # plist: `xcodegen generate` REWRITES ios/MacApp/Info.plist, and a
+        # key it does not know about is reset to its default (1.0 / 1).  A
+        # release stamped 1.0.<commit_count> would then ship as CFBundleVersion
+        # 1, which disagrees with the appcast and starts a Sparkle update
+        # loop.  Declaring them here makes the generated plist carry the
+        # build settings.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
     entitlements:
       path: MacApp/BotFleetMac.entitlements
 schemes:

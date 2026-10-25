@@ -14,6 +14,13 @@
 // new subsystem in a new place, not a new file beside a covered one.  Test
 // files follow their implementation file, so a *.test.* / *.node-test.*
 // twin of a covered file is covered.
+//
+// The optional server deployment is audited too, and is a documented
+// exception rather than a finding.  BotFleet may run with the server as the
+// primary BotFleet server (BF-2544), and deploy/linux-server/ ships the SAME
+// server/ code as that optional deployment.  The Mac-local harness is what
+// Phase 6 retires; the optional server path stays, so it is listed in
+// RETAINED_PATHS and reported as retained, never as uncovered.
 import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -23,7 +30,20 @@ export const INVENTORY_DOCS = [
   "docs/native-rewrite-port-inventory.md",
   "docs/native-rewrite-electron-inventory.md",
 ];
-export const AUDITED_ROOTS = ["server", "companion", "shared", "electron"];
+export const AUDITED_ROOTS = ["server", "companion", "shared", "electron", "deploy"];
+
+/**
+ * Paths the audit deliberately keeps.  Each one is a documented, expected
+ * exception: its files are reported as retained rather than as uncovered, so
+ * a reader can see at a glance that they are meant to stay.  A path added
+ * here is an exclusion from the decommission, never a hole in the inventory.
+ */
+export const RETAINED_PATHS = [
+  {
+    path: "deploy/linux-server/",
+    why: "the optional Linux server deployment (BF-2544) ships the same server/ code and is deliberately retained",
+  },
+];
 
 /** Expand one `dir/{a,b,c}.ts` claim into the files it names. */
 function expandBraces(token) {
@@ -78,6 +98,20 @@ function testTwinBase(file) {
     .replace(/\.spec\.(ts|tsx)$/, "")
     .replace(/\.fixtures\.(ts|tsx)$/, "")
     .replace(/\.d\.mts$/, "");
+}
+
+/**
+ * Is this file inside one of the deliberately retained paths?  Retained files
+ * are excluded from the decommission: they are an approved exception, not an
+ * inventory gap.
+ */
+export function isRetained(file) {
+  return RETAINED_PATHS.some((entry) => file.startsWith(entry.path));
+}
+
+/** The retained files present in `files`, so the CLI can report them. */
+export function retainedFiles(files) {
+  return files.filter((file) => isRetained(file)).sort();
 }
 
 /**
@@ -145,7 +179,7 @@ export function findUncovered(files, inventoryText) {
     return false;
   };
 
-  return files.filter((file) => !covered(file)).sort();
+  return files.filter((file) => !isRetained(file) && !covered(file)).sort();
 }
 
 export function trackedFiles(repoRoot) {
@@ -179,6 +213,12 @@ if (isEntryModule()) {
     `audited ${files.length} tracked files under ${AUDITED_ROOTS.join(", ")} ` +
       `against ${INVENTORY_DOCS.length} inventory docs`,
   );
+  for (const entry of RETAINED_PATHS) {
+    const count = files.filter((file) => file.startsWith(entry.path)).length;
+    console.log(
+      `retained on purpose: ${entry.path} (${count} tracked file(s)) — ${entry.why}`,
+    );
+  }
   if (uncovered.length > 0) {
     console.error(`UNCOVERED (${uncovered.length}): no inventory row names these files`);
     for (const file of uncovered) console.error(`  - ${file}`);
@@ -187,5 +227,5 @@ if (isEntryModule()) {
     );
     process.exit(1);
   }
-  console.log("every audited file has an inventory row");
+  console.log("every audited file has an inventory row, or is a deliberately retained path");
 }

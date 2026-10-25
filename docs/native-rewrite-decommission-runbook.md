@@ -21,11 +21,15 @@ The state file is plain JSON, so the check itself needs no network:
 ```json
 {
   "issues":   { "BF-2510": "In Progress", "BF-2514": "Todo" },
-  "evidence": { "soak-24h-no-node": false, "inventory-clean": true }
+  "evidence": { "soak-24h-no-node": false, "inventory-clean": true },
+  "macLocalHarness": {
+    "present": false,
+    "retained": { "deploy/linux-server/": "optional server deployment (BF-2544)" }
+  }
 }
 ```
 
-Seven issues must be Done and four evidence items asserted:
+Seven issues must be Done, four evidence items asserted, and the Mac-local harness asserted to be gone:
 
 | Gate | Why it blocks the deletion |
 |---|---|
@@ -42,9 +46,9 @@ Seven issues must be Done and four evidence items asserted:
 | `soak-24h-no-node` | 24 hours with the Node harness stopped and its launchd job booted out, every bot answering. |
 | `replay-parity` | Each engine's recorded turns replay through `EngineDriver` with the same ordered `TurnEvent` kinds the Node harness recorded. |
 | `final-import-parity` | The final import parity report matches, the Node store is archived read-only, and rollback has been rehearsed once. |
-| `inventory-clean` | `scripts/audit-node-decommission.mjs` reports no file under `server/`, `companion/`, `shared/` or `electron/` without a Swift owner or a retired reason. |
+| `inventory-clean` | `scripts/audit-node-decommission.mjs` reports no file under `server/`, `companion/`, `shared/` or `electron/` without a Swift owner or a retired reason.  The optional `deploy/linux-server/` server deployment is deliberately retained and is not part of this gate. |
 
-Anything that is not a completed state counts as unmet, including `In Review`.  The gate exists to stop nearly-done from reading as done.
+Anything that is not a completed state counts as unmet, including `In Review`.  The gate exists to stop nearly-done from reading as done.  A cancelled or duplicate issue is not a completed state either: the replacement never landed, so deleting the code it was to replace stops the bots instead of cleaning up after a finished job.
 
 Refresh the state file from Linear at run time rather than editing it by hand.  A stale all-Done file is the one input that defeats the guard, so the CLI prints the age of the file it read:
 
@@ -54,6 +58,14 @@ board api query --max-chars 64000 \
 ```
 
 `inventory-clean` is checked for you.  `pnpm test:native-release` runs `scripts/decommission-gates.node-test.mjs`, whose last test audits the committed tree against both inventory documents, so inventory drift fails CI on the pull request that caused it rather than surfacing during a rebase months later.
+
+## What This Gate Does Not Cover
+
+BotFleet may also run with the server as the primary BotFleet server, and `deploy/linux-server/` deploys that same `server/` code as the optional deployment (BF-2544).  The optional server path is therefore deliberately retained, and this gate never asks for it to be decommissioned.
+
+The gate asks one question: does the Mac still run the Node stack.  It does not ask whether the Node code still exists anywhere, because it does.  The `macLocalHarness.present` field is that question, and `macLocalHarness.retained` records the optional server path with the reason it is kept.  `scripts/audit-node-decommission.mjs` audits `deploy/` too and reports the optional path as retained, never as an uncovered file, so the exclusion stays visible to whoever reads the inventory later.
+
+A retained path that is not the optional server deployment blocks the gate: sparing Mac-local code quietly is exactly what the gate exists to prevent.
 
 ## Why The Order Is Not The Obvious Order
 
@@ -78,7 +90,7 @@ node scripts/check-decommission-gates.mjs /tmp/phase6-state.json
 
 Both must be green before anything else in this document.  If the gate blocks, stop here; the blockers name the issues to finish, and the rest of this runbook is not yet in scope.
 
-**Verification:** `every audited file has an inventory row`, then `Phase 6 decommission gates: all green.`
+**Verification:** `every audited file has an inventory row, or is a deliberately retained path`, then `Phase 6 decommission gates: all green.`
 
 ### Step 1 — Archive Before Anything Moves
 
@@ -162,7 +174,7 @@ This is the irreversible one, and it is the step the whole gate exists for.
 
 - Cold boot on a clean data root, and again after a reboot.
 - One full day of routines, Zulip traffic and a phone session.
-- `node scripts/audit-node-decommission.mjs` reports zero tracked files under the four roots, which is the honest end state rather than a stale green.
+- `node scripts/audit-node-decommission.mjs` reports zero tracked files under the four Mac-local roots, which is the honest end state rather than a stale green.  The optional `deploy/linux-server/` deployment is still audited, and still reported as retained on purpose.
 - The gate script now reports all green with `inventory-clean` satisfied by an empty tree.
 - BF-2515 closes with the deletion commit, the soak dates and the archive location.
 
