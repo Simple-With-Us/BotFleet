@@ -79,33 +79,47 @@ chmod +x "${FAKE_BIN}/xcodebuild"
 # The build-floor answer also carries the "train=N app=N -> floor=N" note the
 # ship script parses for the version-plan log line;  without it the two floors
 # would fall back to the floor itself.
-cat >"${FAKE_BIN}/node" <<'FAKE'
+#
+# The key VALIDATOR is the real one:  the diagnostic resolves the credential
+# the way the client does, so a stub that refuses the validation leaves the
+# masked preview withheld and the rejected credential unnamed.  The real node
+# is captured here, before the stub exists, so the result does not depend on
+# an ambient node in /opt/homebrew/bin or /usr/local/bin --  a runner without
+# one used to leave the preview withheld and the assertion failed there.
+real_node="$(command -v node)"
+cat >"${FAKE_BIN}/node" <<FAKE
 #!/usr/bin/env bash
 cmd=""
-for a in "$@"; do
-  case "$a" in
+for a in "\$@"; do
+  case "\$a" in
     */asc-api.mjs) cmd="asc-api" ;;
     latest-marketing-patch|build-floor)
-      if [[ "$cmd" == "asc-api" ]]; then cmd="${cmd}:${a}"; fi
+      if [[ "\$cmd" == "asc-api" ]]; then cmd="\${cmd}:\${a}"; fi
       ;;
   esac
 done
-case "$cmd" in
+case "\$cmd" in
   asc-api:latest-marketing-patch)
     # No stubbed patch = App Store Connect cannot be consulted.
     # "auth" = App Store Connect rejected the key (asc-api exits 4).
-    [[ "${FAKE_ASC_PATCH:-}" == "auth" ]] && exit 4
-    [[ -n "${FAKE_ASC_PATCH:-}" ]] || exit 2
-    printf '%s\n' "$FAKE_ASC_PATCH"
+    [[ "\${FAKE_ASC_PATCH:-}" == "auth" ]] && exit 4
+    [[ -n "\${FAKE_ASC_PATCH:-}" ]] || exit 2
+    printf '%s\n' "\$FAKE_ASC_PATCH"
     exit 0
     ;;
   asc-api:build-floor)
-    _floor="${FAKE_ASC_FLOOR:-0}"
-    printf '%s\n' "$_floor"
-    echo "build-floor: train=${_floor} app=${_floor} -> floor=${_floor}" >&2
+    _floor="\${FAKE_ASC_FLOOR:-0}"
+    printf '%s\n' "\$_floor"
+    echo "build-floor: train=\${_floor} app=\${_floor} -> floor=\${_floor}" >&2
     exit 0
     ;;
 esac
+# The key validator is the real one.  The staged WRITE stays refused, exactly
+# as it was before the stub delegated.
+if [[ "\${1:-}" == *asc-key.mjs ]]; then
+  if [[ "\${2:-}" == "write" ]]; then exit 2; fi
+  exec "$real_node" "\$@"
+fi
 exit 2
 FAKE
 chmod +x "${FAKE_BIN}/node"
