@@ -63,7 +63,14 @@ describe("routine calendar timezone", () => {
 
   it("names both the Central calendar policy and a preserved legacy host zone", () => {
     expect(timeZoneLabel("America/Chicago", Date.parse("2026-07-01T12:00:00Z"))).toBe("Central Time (CDT)");
-    const legacy = routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" });
+    //  The zone name follows the instant the label is built from, so the
+    //  fixture pins one.  Europe/Athens is GMT+3 in July and GMT+2 in
+    //  winter, so an unpinned label flips with the daylight-saving switch
+    //  and fails every run on one side of it.
+    const legacy = {
+      ...routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" }),
+      nextRunAt: Date.parse("2026-07-01T09:00:00Z"),
+    };
     expect(routineScheduleLabel(legacy)).toMatch(/^Mon at 9:00 AM (GMT\+3|EEST)$/);
   });
 
