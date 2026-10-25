@@ -427,6 +427,11 @@ ci_body="SYNTHETICciBODY00000000000000000000000000000000000tail"
 ci_pem="-----BEGIN PRIVATE KEY-----"$'\n'"${ci_body}"$'\n'"-----END PRIVATE KEY-----"
 printf '%s' "$ci_pem" | base64 | tr -d '\n' > "${tmp}/ci.b64"
 ci_mask="$(printf '%s...%s' "${ci_body:0:8}" "${ci_body:$((${#ci_body}-4))}")"
+# The guard below has to search for a prefix the blob REALLY carries:  the
+# base64 of "-----BEGIN PRIVATE KEY-----" begins "LS0tLS1C", so a needle
+# like "LS0tLS0t" could never match the artifact it is meant to detect,
+# and the assertion could never fire.
+ci_b64_head="$(cut -c1-24 "${tmp}/ci.b64")"
 ci_out="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
   -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_P8_BASE64 \
   ASC_TEST_B64="${tmp}/ci.b64" bash -c '
@@ -439,15 +444,15 @@ ci_out="$(env -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_KEY_P8 -u ASC_KEY_PATH \
 ' 2>&1)"
 case "$ci_out" in
   *"source APPLE_API_KEY_P8_BASE64, key id BADKEY00001, issuer id bad-issuer"*) ;;
-  *) fail "the CI credential was not named by its source, key id and issuer id: ${ci_out}" ;;
+  *) fail "the CI credential was not named by its source, key id and issuer id" ;;
 esac
 case "$ci_out" in
-  *"preview "*) fail "a rejected credential was previewed: ${ci_out}" ;;
+  *"preview "*) fail "a rejected credential was previewed" ;;
 esac
 case "$ci_out" in
-  *"LS0tLS0t"*) fail "the CI log carried the base64 blob: ${ci_out}" ;;
+  *"${ci_b64_head}"*) fail "the CI log carried the base64 blob" ;;
 esac
-unset ci_body ci_pem ci_mask ci_out
+unset ci_body ci_pem ci_mask ci_b64_head ci_out
 
 # 3. The credential never travels in a command argument.  The secret reaches
 #    the child through the environment, so its own argv must not carry it.
@@ -947,13 +952,13 @@ real_mask="$(printf '%s...%s' "${real_body:0:8}" "${real_body:$((${#real_body}-4
 real_b64="$(base64 < "${tmp}/asc.p8" | tr -d '\n')"
 
 out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="$real_b64")"
-[[ "$out" == *"id=CIKEY00001"* ]] || fail "the CI key id was not named: ${out}"
-[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the CI issuer id was not named: ${out}"
-[[ "$out" != *"$real_mask"* ]] || fail "the CI diagnostic carried the masked key body: ${out}"
+[[ "$out" == *"id=CIKEY00001"* ]] || fail "the CI key id was not named"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the CI issuer id was not named"
+[[ "$out" != *"$real_mask"* ]] || fail "the CI diagnostic carried the masked key body"
 out="$(run_diag_identity ASC_KEY_ID=ENVKEY00002 ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$(cat "${tmp}/asc.p8")")"
-[[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named: ${out}"
-[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the environment issuer id was not named: ${out}"
-[[ "$out" != *"$real_mask"* ]] || fail "the environment diagnostic carried the masked key body: ${out}"
+[[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the environment issuer id was not named"
+[[ "$out" != *"$real_mask"* ]] || fail "the environment diagnostic carried the masked key body"
 # The credential reaches the child in its ENVIRONMENT, so the child's own
 # arguments must not carry a byte of it:  an argument is readable by every
 # process on the machine through ps.  The guard below covers the process
@@ -970,29 +975,29 @@ argv_block="$(printf '%s\n' "$out" | awk '/^argv-begin$/{f=1;next} /^argv-end$/{
 # A half-set trio is skipped by the client, so the diagnostic must not name
 # it:  the key id comes from the client's last source instead.
 out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001)"
-[[ "$out" != *"CIKEY00001"* ]] || fail "a half-set trio was named: ${out}"
-[[ "$out" == *"id=ABCDE12345"* ]] || fail "the fallback key id was not named: ${out}"
+[[ "$out" != *"CIKEY00001"* ]] || fail "a half-set trio was named"
+[[ "$out" == *"id=ABCDE12345"* ]] || fail "the fallback key id was not named"
 # A trio whose key does not decode is skipped by the client too.
 out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="not-base64-at-all")"
-[[ "$out" != *"CIKEY00001"* ]] || fail "a key that does not decode was named: ${out}"
+[[ "$out" != *"CIKEY00001"* ]] || fail "a key that does not decode was named"
 
 # The client SKIPS an unusable CI trio and goes on to the environment trio,
 # so the diagnostic has to do the same:  it must not stop at the CI source,
 # and it must name the environment credential the client went on to use.
 out="$(run_diag_identity APPLE_API_KEY_ID=CIKEY00001 APPLE_API_ISSUER_ID=issuer-synthetic APPLE_API_KEY_P8_BASE64="not-base64-at-all" \
   ASC_KEY_ID=ENVKEY00002 ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$(cat "${tmp}/asc.p8")")"
-[[ "$out" != *"CIKEY00001"* ]] || fail "an unusable CI trio was named: ${out}"
-[[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named after the CI trio was skipped: ${out}"
-[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the environment issuer id was not named after the CI trio was skipped: ${out}"
-[[ "$out" != *"$real_mask"* ]] || fail "the environment diagnostic carried the masked key body after the CI trio was skipped: ${out}"
+[[ "$out" != *"CIKEY00001"* ]] || fail "an unusable CI trio was named"
+[[ "$out" == *"id=ENVKEY00002"* ]] || fail "the environment key id was not named after the CI trio was skipped"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the environment issuer id was not named after the CI trio was skipped"
+[[ "$out" != *"$real_mask"* ]] || fail "the environment diagnostic carried the masked key body after the CI trio was skipped"
 
 # A diagnostic never causes a secret read:  the vault is asked for the KEY
 # ID, which is a public label, and never for the key material.
 : > "$FAKE_LOG"
 out="$(run_diag_identity)"
-[[ "$out" == *"id=ABCDE12345"* ]] || fail "the vault key id was not named: ${out}"
-[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the vault issuer id was not named: ${out}"
-[[ "$out" != *"preview"* ]] || fail "a preview was invented: ${out}"
+[[ "$out" == *"id=ABCDE12345"* ]] || fail "the vault key id was not named"
+[[ "$out" == *"issuer=issuer-synthetic"* ]] || fail "the vault issuer id was not named"
+[[ "$out" != *"preview"* ]] || fail "a preview was invented"
 if grep -q "ASC_KEY_P8 /asc" "$FAKE_LOG"; then
   fail "the diagnostic read the key material from the vault"
 fi

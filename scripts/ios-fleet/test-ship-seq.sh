@@ -228,12 +228,21 @@ run_ship() {
     ' _ "$SHIP" "$@" 2>&1
   )"
   RC=$?
-  if [[ "$expect_key" == "1" ]] && ! printf '%s\n' "$OUT" | grep -q '^FLEET-TEST-CREDENTIAL-ARRIVED$'; then
+  # The marker is matched and stripped with BASH pattern removal, never with
+  # grep:  the captured output carries a UTF-8 em-dash (ship-testflight.sh
+  # logs "ship-gate: skip - ..."), and under a C/POSIX locale grep treats
+  # that stream as BINARY and replaces the whole capture with a binary-file
+  # message, which would make every later assertion fail misleadingly.
+  if [[ "$expect_key" == "1" && "$OUT" != *"FLEET-TEST-CREDENTIAL-ARRIVED"* ]]; then
     bad "the credential never reached the sandboxed run (rc=${RC})"
   fi
   # The marker is the harness's own line, and the cases match on the ship
   # script's output, so it is stripped before they look.
-  OUT="$(printf '%s\n' "$OUT" | grep -v '^FLEET-TEST-CREDENTIAL-ARRIVED$' || true)"
+  OUT="$(
+    while IFS= read -r _line; do
+      [[ "$_line" == "FLEET-TEST-CREDENTIAL-ARRIVED" ]] || printf '%s\n' "$_line"
+    done <<< "$OUT"
+  )"
   return 0
 }
 
@@ -241,9 +250,10 @@ ok() { PASS=$((PASS + 1)); echo "  PASS  $1"; }
 bad() {
   FAIL=$((FAIL + 1))
   echo "  FAIL  $1"
-  echo "        ---- output ----"
-  printf '%s\n' "$OUT" | sed 's/^/        /'
-  echo "        ---- end (rc=${RC}) ----"
+  # The captured output is NOT printed:  it can carry the credential the
+  # case put in the environment, and a failure message lands in the CI log.
+  # The count of lines is enough to see that something was produced.
+  echo "        (output withheld: it can carry credential bytes; ${#OUT} bytes captured, rc=${RC})"
 }
 
 check() { # check <desc> <condition-result 0/1>
@@ -258,8 +268,12 @@ contains() { [[ "$OUT" == *"$1"* ]]; }
 
 # The planned pair, read out of the "marketing=<m> build=<b>" log line.
 planned_pair() {
+  # The planned pair is read out of the "marketing=<m> build=<b>" log line.
+  # grep runs with -a:  the capture carries a UTF-8 em-dash, and under a
+  # C/POSIX locale grep treats that stream as binary and would refuse to
+  # match.  -a makes grep treat the stream as text.
   local line
-  line="$(printf '%s' "$OUT" | grep -o 'marketing=[^ ]* build=[^ ]*' | head -1)"
+  line="$(printf '%s' "$OUT" | grep -a -o 'marketing=[^ ]* build=[^ ]*' | head -1)"
   PLANNED_MARKETING="$(printf '%s' "$line" | sed 's/^marketing=//; s/ build=.*$//')"
   PLANNED_BUILD="$(printf '%s' "$line" | sed 's/^.* build=//')"
 }
