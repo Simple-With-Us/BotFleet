@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 /** The override, trimmed, or "" when it is unset or blank. */
 export function dataDirOverride(value: string | undefined): string {
-  return typeof value === "string" && value.trim() ? value.trim() : "";
+  return value?.trim() ? value.trim() : "";
 }
 
 export function dataDir(env: NodeJS.ProcessEnv = process.env): string {
