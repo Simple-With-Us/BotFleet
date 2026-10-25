@@ -258,6 +258,10 @@ public actor DatabaseService {
         }
         self.db = handle
 
+        // Another writer can hold the store's write lock, so an ordinary open
+        // waits for it instead of failing with SQLITE_BUSY.  The pragma is set
+        // before the first statement that can need the lock.
+        try execute(sql: "PRAGMA busy_timeout = 5000;")
         try execute(sql: "PRAGMA journal_mode = WAL;")
         // sqlite3_exec reports no error when WAL is unsupported and SQLite
         // silently keeps rollback journaling; read the mode back so the
@@ -351,6 +355,18 @@ public actor DatabaseService {
 
         CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at);
 
+        CREATE TABLE IF NOT EXISTS routine_request_receipts (
+            request_id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
+            bot_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            fingerprint_version INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL,
+            result_id TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS webhook_deliveries (
             id TEXT PRIMARY KEY,
             webhook_id TEXT NOT NULL,
@@ -394,44 +410,63 @@ public actor DatabaseService {
         );
         """
         try execute(sql: schema)
-        try recreateMessageTriggers()
+        try ensureMessageTriggers()
     }
 
-    /// Recreates the FTS triggers and resyncs the index when an older store is
-    /// still running the legacy trigger bodies.
+    /// Makes sure the FTS triggers exist and carry the current bodies.
     ///
-    /// A legacy trigger body let SQLite assign the FTS rowid itself, and the
-    /// legacy update trigger removed a row by `message_id` before inserting a
-    /// fresh one with a new rowid.  A store that still runs those bodies ends
-    /// up with an FTS rowid that no longer matches `messages.rowid`, so a
-    /// search can pair a snippet with the wrong message.  The triggers are
-    /// always replaced, and the index is rebuilt only when the store was
-    /// still carrying the legacy bodies.
-    private func recreateMessageTriggers() throws {
+    /// A store that predates the rewrite ran legacy trigger bodies: the
+    /// insert trigger let SQLite assign the FTS rowid itself, and the update
+    /// trigger removed a row by `message_id` before inserting a replacement
+    /// with a new rowid.  A store still running those bodies ends up with an
+    /// FTS rowid that no longer matches `messages.rowid`, so a search can pair
+    /// a snippet with the wrong message.
+    ///
+    /// A healthy store already carries the three current triggers, so it is
+    /// opened with no DDL at all.  A store that predates the rewrite, or one
+    /// whose triggers were lost to an interrupted launch, has them replaced
+    /// inside a single transaction: the drops, the creates and the index
+    /// rebuild commit together, so a crash cannot leave the store with no
+    /// triggers and a permanently stale index.
+    private func ensureMessageTriggers() throws {
         let legacyTriggerCount = try countLegacyMessageTriggers()
-
-        for name in ["trg_messages_ai", "trg_messages_ad", "trg_messages_au"] {
-            try execute(sql: "DROP TRIGGER IF EXISTS \(name);")
+        let currentTriggerCount = try countCurrentMessageTriggers()
+        if currentTriggerCount == 3 && legacyTriggerCount == 0 {
+            return
         }
-        try execute(sql: """
-        CREATE TRIGGER trg_messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
-            VALUES (new.rowid, new.content, new.thread_id, new.id);
-        END;
 
-        CREATE TRIGGER trg_messages_ad AFTER DELETE ON messages BEGIN
-            DELETE FROM messages_fts WHERE rowid = old.rowid;
-        END;
+        try execute(sql: "BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            for name in ["trg_messages_ai", "trg_messages_ad", "trg_messages_au"] {
+                try execute(sql: "DROP TRIGGER IF EXISTS \(name);")
+            }
+            try execute(sql: """
+            CREATE TRIGGER trg_messages_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+                VALUES (new.rowid, new.content, new.thread_id, new.id);
+            END;
 
-        CREATE TRIGGER trg_messages_au AFTER UPDATE ON messages BEGIN
-            DELETE FROM messages_fts WHERE rowid = old.rowid;
-            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
-            VALUES (new.rowid, new.content, new.thread_id, new.id);
-        END;
-        """)
+            CREATE TRIGGER trg_messages_ad AFTER DELETE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.rowid;
+            END;
 
-        if legacyTriggerCount > 0 {
-            try resyncFTSIndex()
+            CREATE TRIGGER trg_messages_au AFTER UPDATE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.rowid;
+                INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+                VALUES (new.rowid, new.content, new.thread_id, new.id);
+            END;
+            """)
+
+            // The index is rebuilt only when the store was still carrying the
+            // legacy bodies, because those bodies are what let the FTS rowid
+            // drift away from the message rowid it belongs to.
+            if legacyTriggerCount > 0 {
+                try resyncFTSIndexInCurrentTransaction()
+            }
+            try execute(sql: "COMMIT;")
+        } catch {
+            try? execute(sql: "ROLLBACK;")
+            throw error
         }
     }
 
@@ -440,11 +475,21 @@ public actor DatabaseService {
     /// A current body names `rowid`; a legacy one lets SQLite assign the FTS
     /// rowid itself.
     private func countLegacyMessageTriggers() throws -> Int {
+        try countMessageTriggers(matching: "sql NOT LIKE '%rowid%'")
+    }
+
+    /// Counts the message triggers that carry the current body.
+    private func countCurrentMessageTriggers() throws -> Int {
+        try countMessageTriggers(matching: "sql LIKE '%rowid%'")
+    }
+
+    /// Counts the message triggers whose stored body matches the predicate.
+    private func countMessageTriggers(matching predicate: String) throws -> Int {
         let sql = """
         SELECT COUNT(*) FROM sqlite_master
         WHERE type = 'trigger'
           AND name IN ('trg_messages_ai', 'trg_messages_ad', 'trg_messages_au')
-          AND sql NOT LIKE '%rowid%';
+          AND \(predicate);
         """
         guard let value = try queryString(sql: sql) else { return 0 }
         return Int(value) ?? 0
@@ -452,19 +497,15 @@ public actor DatabaseService {
 
     /// Rebuilds the FTS index from `messages` so every index rowid matches the
     /// message rowid it belongs to.
-    private func resyncFTSIndex() throws {
-        try execute(sql: "BEGIN IMMEDIATE TRANSACTION;")
-        do {
-            try execute(sql: "DELETE FROM messages_fts;")
-            try execute(sql: """
-            INSERT INTO messages_fts(rowid, content, thread_id, message_id)
-            SELECT rowid, content, thread_id, id FROM messages;
-            """)
-            try execute(sql: "COMMIT;")
-        } catch {
-            try? execute(sql: "ROLLBACK;")
-            throw error
-        }
+    ///
+    /// Runs inside the caller's transaction, so the rebuilt index and the
+    /// replaced triggers commit together.
+    private func resyncFTSIndexInCurrentTransaction() throws {
+        try execute(sql: "DELETE FROM messages_fts;")
+        try execute(sql: """
+        INSERT INTO messages_fts(rowid, content, thread_id, message_id)
+        SELECT rowid, content, thread_id, id FROM messages;
+        """)
     }
 
     // MARK: - Thread Operations
@@ -869,6 +910,78 @@ public actor DatabaseService {
         }
     }
 
+    // MARK: - Routine Request Receipts
+
+    /// Records a durable commit receipt for a routine request.
+    ///
+    /// The receipt is the idempotency key that lets a routine request be
+    /// confirmed again after a crash without applying its change twice, so it
+    /// is keyed on the request id and replaced when the same request is
+    /// recorded again.
+    public func recordRoutineRequestReceipt(_ receipt: RoutineRequestReceiptRecord) throws {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = """
+        INSERT OR REPLACE INTO routine_request_receipts
+            (request_id, message_id, bot_id, thread_id, action, fingerprint_version, fingerprint, result_id, applied_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (receipt.requestId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (receipt.messageId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, (receipt.botId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 4, (receipt.threadId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 5, (receipt.action as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt, 6, Int32(receipt.fingerprintVersion))
+        sqlite3_bind_text(stmt, 7, (receipt.fingerprint as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 8, (receipt.resultId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(stmt, 9, receipt.appliedAt)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Every routine-request receipt, oldest first.
+    public func loadRoutineRequestReceipts() throws -> [RoutineRequestReceiptRecord] {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = """
+        SELECT request_id, message_id, bot_id, thread_id, action, fingerprint_version, fingerprint, result_id, applied_at
+        FROM routine_request_receipts
+        ORDER BY applied_at ASC, request_id ASC;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var receipts: [RoutineRequestReceiptRecord] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            receipts.append(RoutineRequestReceiptRecord(
+                requestId: String(cString: sqlite3_column_text(stmt, 0)),
+                messageId: String(cString: sqlite3_column_text(stmt, 1)),
+                botId: String(cString: sqlite3_column_text(stmt, 2)),
+                threadId: String(cString: sqlite3_column_text(stmt, 3)),
+                action: String(cString: sqlite3_column_text(stmt, 4)),
+                fingerprintVersion: Int(sqlite3_column_int64(stmt, 5)),
+                fingerprint: String(cString: sqlite3_column_text(stmt, 6)),
+                resultId: String(cString: sqlite3_column_text(stmt, 7)),
+                appliedAt: sqlite3_column_double(stmt, 8)
+            ))
+        }
+        return receipts
+    }
+
+    /// How many routine-request receipts the store holds.
+    public func countRoutineRequestReceipts() throws -> Int {
+        try countRows(inTable: "routine_request_receipts")
+    }
+
     public func loadWebhookDeliveries(forWebhook webhookId: String, limit: Int = 50) throws -> [WebhookDeliveryRecord] {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let sql = "SELECT id, webhook_id, bot_id, status_code, delivered_at, payload, response FROM webhook_deliveries WHERE webhook_id = ?1 ORDER BY delivered_at DESC LIMIT ?2;"
@@ -1170,6 +1283,19 @@ public actor DatabaseService {
             }
             defer { sqlite3_finalize(stmt) }
 
+            // The ownership probe is prepared once for the whole batch.  A
+            // resumed or idempotent import skips every row it already wrote,
+            // so one statement per row would double the statement traffic of
+            // the import for no reason.
+            var ownershipStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT thread_id FROM messages WHERE id = ?1 LIMIT 1;", -1, &ownershipStmt, nil) == SQLITE_OK else {
+                throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            guard let preparedOwnershipStmt = ownershipStmt else {
+                throw DatabaseError.prepareFailed("Ownership statement was not prepared")
+            }
+            defer { sqlite3_finalize(ownershipStmt) }
+
             var changedCount = 0
             for message in messages {
                 sqlite3_reset(stmt)
@@ -1203,7 +1329,7 @@ public actor DatabaseService {
                 // which is the idempotent skip this batch asked for, or it is
                 // owned by another thread, which is refused.
                 if rowChanges == 0 {
-                    try throwIfOwnedByAnotherThread(message)
+                    try throwIfOwnedByAnotherThread(message, using: preparedOwnershipStmt)
                 }
             }
 
@@ -1223,7 +1349,26 @@ public actor DatabaseService {
     /// message or move it out of the thread that owns it, so it is refused
     /// with the two thread ids named.
     private func throwIfOwnedByAnotherThread(_ message: MessageRecord) throws {
-        guard let existingThreadId = try threadIdOwningMessage(id: message.id),
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT thread_id FROM messages WHERE id = ?1 LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        guard let preparedOwnershipStmt = stmt else {
+            throw DatabaseError.prepareFailed("Ownership statement was not prepared")
+        }
+        try throwIfOwnedByAnotherThread(message, using: preparedOwnershipStmt)
+    }
+
+    /// Throws when a message id is already owned by a different thread.
+    ///
+    /// The probe reuses a statement the caller prepared once, so a batch that
+    /// skips thousands of identical rows runs one prepared statement rather
+    /// than one per row.
+    private func throwIfOwnedByAnotherThread(_ message: MessageRecord, using ownershipStmt: OpaquePointer) throws {
+        guard let existingThreadId = try threadIdOwningMessage(id: message.id, using: ownershipStmt),
               existingThreadId != message.threadId else {
             return
         }
@@ -1235,26 +1380,62 @@ public actor DatabaseService {
     }
 
     /// The thread that currently holds a message id, if any.
-    private func threadIdOwningMessage(id: String) throws -> String? {
-        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
-        let sql = "SELECT thread_id FROM messages WHERE id = ?1 LIMIT 1;"
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
-        }
-        defer { sqlite3_finalize(stmt) }
-
+    ///
+    /// The statement is reused across calls, so it is reset and rebound before
+    /// every probe.
+    private func threadIdOwningMessage(id: String, using stmt: OpaquePointer) throws -> String? {
+        sqlite3_reset(stmt)
+        sqlite3_clear_bindings(stmt)
         sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         guard let cText = sqlite3_column_text(stmt, 0) else { return nil }
         return String(cString: cText)
     }
 
+    /// The store's schema version, which SQLite bumps whenever the schema changes.
+    ///
+    /// Comparing it across two opens proves that the second open ran no DDL
+    /// at all, which is what keeps a healthy store's launch path read-only.
+    public func schemaVersion() throws -> Int {
+        guard let value = try queryString(sql: "PRAGMA schema_version;") else { return 0 }
+        return Int(value) ?? 0
+    }
+
+    /// How long the store waits for a lock held by another writer, in
+    /// milliseconds.
+    ///
+    /// The connection sets a busy timeout so a concurrent writer turns an
+    /// ordinary open into a wait instead of an immediate SQLITE_BUSY.
+    public func busyTimeoutMilliseconds() throws -> Int {
+        guard let value = try queryString(sql: "PRAGMA busy_timeout;") else { return 0 }
+        return Int(value) ?? 0
+    }
+
+    /// The SQL text of every trigger this store carries, sorted by name.
+    ///
+    /// A test uses it to prove that the FTS triggers exist and carry the
+    /// current bodies.
+    public func triggerDefinitions() throws -> [String: String] {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'trigger' ORDER BY name;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var definitions: [String: String] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            definitions[String(cString: sqlite3_column_text(stmt, 0))] = String(cString: sqlite3_column_text(stmt, 1))
+        }
+        return definitions
+    }
+
     public func countRows(inTable table: String) throws -> Int {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let allowedTables: Set<String> = [
             "threads", "messages", "messages_fts",
-            "routine_runs", "webhook_deliveries",
+            "routine_runs", "routine_request_receipts", "webhook_deliveries",
             "bots", "routines", "webhooks"
         ]
         guard allowedTables.contains(table) else {

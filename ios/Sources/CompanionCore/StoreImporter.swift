@@ -12,6 +12,12 @@ public enum StoreImportError: LocalizedError, Equatable {
     case unknownSourceColumns(source: String, columns: [String])
     case interruptedAfterBatch(completedBatches: Int)
     case parityMismatch(reasons: [String])
+    /// A message id in the source belongs to two different threads.
+    ///
+    /// The native store keys a message on its id alone, so the same id can
+    /// only live in one thread there.  The import refuses the whole batch
+    /// rather than dropping one of the two messages.
+    case messageThreadConflict(id: String, existingThreadId: String, incomingThreadId: String)
 
     public var errorDescription: String? {
         switch self {
@@ -29,6 +35,8 @@ public enum StoreImportError: LocalizedError, Equatable {
             return "Import interrupted after \(batches) batch(es) for resumability verification."
         case .parityMismatch(let reasons):
             return "Import parity verification failed: \(reasons.joined(separator: "; "))"
+        case .messageThreadConflict(let id, let existingThreadId, let incomingThreadId):
+            return "Message '\(id)' belongs to thread '\(existingThreadId)' in the source and cannot be written to thread '\(incomingThreadId)'."
         }
     }
 }
@@ -38,9 +46,9 @@ public enum StoreImportError: LocalizedError, Equatable {
 ///
 /// The receipt is the legacy store's record that a confirmed routine-request
 /// card was already applied, so a re-issued card cannot apply the same change
-/// twice.  The Phase 1 native schema has no table for it yet, so the import
-/// carries the receipts in the parity report instead of dropping them, and
-/// names the gap in `warnings`.
+/// twice.  The native store holds them in `routine_request_receipts`, keyed
+/// on the request id, so the idempotency survives the migration.  The import
+/// persists every receipt and also carries them in the parity report.
 public struct RoutineRequestReceiptRecord: Equatable, Sendable, Codable {
     public let requestId: String
     public let messageId: String
@@ -94,9 +102,9 @@ public struct StoreImportParityReport: Equatable, Sendable, Codable {
     /// make a redelivered webhook a duplicate instead of a second bot run.
     public let sourceWebhookDeliveryLedgerCount: Int
     public let targetWebhookDeliveryLedgerCount: Int
-    /// The `routines.json` commit receipts.  The Phase 1 native schema has no
-    /// table for them, so the target count is 0 and every receipt travels in
-    /// `routineRequestReceipts` instead of being dropped.
+    /// The `routines.json` commit receipts.  They land in the native
+    /// `routine_request_receipts` table, so the target count is the number of
+    /// receipts the store holds.
     public let sourceRoutineRequestReceiptCount: Int
     public let targetRoutineRequestReceiptCount: Int
     /// Source messages whose JSON carries metadata the native `messages` table
@@ -107,8 +115,9 @@ public struct StoreImportParityReport: Equatable, Sendable, Codable {
     /// A fingerprint of exactly what was dropped, so the loss is verifiable
     /// instead of silent and a future native column can be checked against it.
     public let sourceMessageMetadataDigestSHA256: String
-    /// Every routine-request receipt read from the source, kept so the caller
-    /// can persist them once the native table exists.
+    /// Every routine-request receipt read from the source.  They are also
+    /// persisted in the native `routine_request_receipts` table, so the
+    /// idempotency key survives the migration.
     public let routineRequestReceipts: [RoutineRequestReceiptRecord]
     public let perThreadMessageCountsMatch: Bool
     public let orphanedMessageCount: Int
@@ -128,6 +137,7 @@ public struct StoreImportParityReport: Equatable, Sendable, Codable {
         sourceMessageCount == targetMessageCount &&
         sourceRoutineCount == targetRoutineCount &&
         sourceRoutineRunCount == targetRoutineRunCount &&
+        sourceRoutineRequestReceiptCount == targetRoutineRequestReceiptCount &&
         sourceWebhookCount == targetWebhookCount &&
         sourceWebhookDeliveryCount == targetWebhookDeliveryCount &&
         sourceWebhookDeliveryLedgerCount == targetWebhookDeliveryLedgerCount &&
@@ -321,6 +331,13 @@ public struct StoreImporter: Sendable {
         for run in routinesSnapshot.runs {
             try await targetDatabase.recordRoutineRun(run)
         }
+        // The routine-request receipts are the durable idempotency keys that
+        // let a confirmed routine request be confirmed again after a crash
+        // without applying its change twice, so they are persisted rather
+        // than only carried in the report.
+        for receipt in routinesSnapshot.requestReceipts {
+            try await targetDatabase.recordRoutineRequestReceipt(receipt)
+        }
         for webhook in webhooksSnapshot.webhooks {
             try await targetDatabase.upsertWebhook(webhook)
         }
@@ -432,7 +449,20 @@ public struct StoreImporter: Sendable {
             for thread in widenedThreads.values {
                 try await targetDatabase.upsertThread(thread)
             }
-            let changed = try await targetDatabase.insertMessagesBatch(batch, skipIdentical: true)
+            // A cross-thread message id is a property of the source, not of
+            // this import, so it is translated into the importer's own error
+            // type.  The caller sees why the import stopped instead of an
+            // untranslated storage error that names no thread.
+            let changed: Int
+            do {
+                changed = try await targetDatabase.insertMessagesBatch(batch, skipIdentical: true)
+            } catch DatabaseError.messageThreadConflict(let id, let existingThreadId, let incomingThreadId) {
+                throw StoreImportError.messageThreadConflict(
+                    id: id,
+                    existingThreadId: existingThreadId,
+                    incomingThreadId: incomingThreadId
+                )
+            }
             newlyInserted += changed
             completedBatches += 1
         }
@@ -1174,6 +1204,7 @@ public struct StoreImporter: Sendable {
         let targetMessageCount = try await targetDatabase.countRows(inTable: "messages")
         let targetRoutineCount = try await targetDatabase.countRows(inTable: "routines")
         let targetRoutineRunCount = try await targetDatabase.countRows(inTable: "routine_runs")
+        let targetRoutineRequestReceiptCount = try await targetDatabase.countRoutineRequestReceipts()
         let targetWebhookCount = try await targetDatabase.countRows(inTable: "webhooks")
         let targetWebhookDeliveryCount = try await targetDatabase.countRows(inTable: "webhook_deliveries")
         let orphanedMessageCount = try await targetDatabase.countOrphanedMessages()
@@ -1243,11 +1274,6 @@ public struct StoreImporter: Sendable {
                 "\(metadataDroppedCount) source message(s) carry JSON metadata the native messages table has no column for (fields: \(metadataDroppedFields.joined(separator: ", "))).  Fingerprint: \(metadataDigestSHA256)."
             )
         }
-        if routinesSnapshot.requestReceipts.count > 0 {
-            warnings.append(
-                "\(routinesSnapshot.requestReceipts.count) routine request receipt(s) have no native table yet, so they are carried in this report instead of the store."
-            )
-        }
         if webhooksSnapshot.unmappedDeliveryCount > 0 {
             warnings.append(
                 "\(webhooksSnapshot.unmappedDeliveryCount) webhook delivery receipt(s) name an endpoint that no longer resolves to a webhook, so they could not be migrated."
@@ -1277,7 +1303,7 @@ public struct StoreImporter: Sendable {
             sourceWebhookDeliveryLedgerCount: webhooksSnapshot.deliveryLedger.count,
             targetWebhookDeliveryLedgerCount: targetLedgerCount,
             sourceRoutineRequestReceiptCount: routinesSnapshot.requestReceipts.count,
-            targetRoutineRequestReceiptCount: 0,
+            targetRoutineRequestReceiptCount: targetRoutineRequestReceiptCount,
             sourceMessageMetadataDroppedCount: metadataDroppedCount,
             sourceMessageMetadataDroppedFields: metadataDroppedFields,
             sourceMessageMetadataDigestSHA256: metadataDigestSHA256,

@@ -275,4 +275,103 @@ struct Phase1DatabaseStoreIntegrityTests {
         #expect(hits.first?.id == "msg-epsilon")
         #expect(hits.first?.content == "epsilon brand new word")
     }
+
+    // MARK: - Opening An Existing Store
+
+    @Test("Reopening a healthy store runs no schema DDL")
+    func reopeningAHealthyStoreRunsNoSchemaDDL() async throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("healthy.sqlite").path
+
+        let first = try DatabaseService(path: path)
+        let versionAfterFirstOpen = try await first.schemaVersion()
+        #expect(versionAfterFirstOpen > 0, "The first open provisions the schema.")
+
+        // The second open must not rewrite the triggers.  A schema change
+        // would mean a write transaction on every launch, which is what made
+        // a concurrent writer fail the open outright.
+        let second = try DatabaseService(path: path)
+        let versionAfterSecondOpen = try await second.schemaVersion()
+        #expect(versionAfterSecondOpen == versionAfterFirstOpen,
+                "Reopening a healthy store must not change the schema, so the launch path stays read-only.")
+
+        // The triggers are still the current bodies.
+        let triggers = try await second.triggerDefinitions()
+        #expect(triggers["trg_messages_ai"]?.contains("rowid") == true)
+        #expect(triggers["trg_messages_ad"]?.contains("rowid") == true)
+        #expect(triggers["trg_messages_au"]?.contains("rowid") == true)
+    }
+
+    @Test("The store waits for a lock held by another writer instead of failing at once")
+    func theStoreWaitsForAConcurrentWriter() async throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let db = try DatabaseService(path: dir.appendingPathComponent("busy.sqlite").path)
+
+        // Without a busy timeout the very first statement that needs the
+        // write lock fails with SQLITE_BUSY while another writer holds it.
+        let timeout = try await db.busyTimeoutMilliseconds()
+        #expect(timeout > 0, "The connection must wait for a lock held by another writer.")
+    }
+
+    @Test("A store whose triggers were lost gets them back, and its index stays in step")
+    func storeWithLostTriggersGetsThemBack() async throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("lost-triggers.sqlite").path
+
+        let db = try DatabaseService(path: path)
+        try await db.upsertThread(ThreadRecord(
+            id: "thread-1", title: "Thread one", botId: "bot-1", createdAt: 1000, updatedAt: 1000
+        ))
+        try await db.insertMessage(MessageRecord(
+            id: "msg-alpha", threadId: "thread-1", role: "user", kind: "text",
+            content: "alpha original word", createdAt: 1001
+        ))
+        try await db.insertMessage(MessageRecord(
+            id: "msg-beta", threadId: "thread-1", role: "assistant", kind: "text",
+            content: "beta original word", createdAt: 1002
+        ))
+
+        // An interrupted launch can leave the triggers gone.  Drop them
+        // behind the service's back, the way a half-finished replacement
+        // would.
+        try dropMessageTriggers(at: path)
+        let withoutTriggers = try DatabaseService(path: path, createSchemaIfNeeded: false)
+        let dropped = try await withoutTriggers.triggerDefinitions()
+        #expect(dropped["trg_messages_ai"] == nil)
+
+        // The next open puts them back.
+        let reopened = try DatabaseService(path: path)
+        let restored = try await reopened.triggerDefinitions()
+        #expect(restored["trg_messages_ai"]?.contains("rowid") == true)
+        #expect(restored["trg_messages_ad"]?.contains("rowid") == true)
+        #expect(restored["trg_messages_au"]?.contains("rowid") == true)
+
+        // And the index still pairs a snippet with the right message.
+        let hits = try await reopened.search(query: "beta", limit: 50)
+        #expect(hits.count == 1)
+        #expect(hits.first?.id == "msg-beta")
+        #expect(hits.first?.content == "beta original word")
+    }
+
+    /// Drops the FTS triggers behind the service's back, the way an
+    /// interrupted trigger replacement would leave the store.
+    private func dropMessageTriggers(at path: String) throws {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
+            throw DatabaseError.openFailed("Failed to open the store to drop its triggers")
+        }
+        defer { sqlite3_close(db) }
+
+        let sql = """
+        DROP TRIGGER IF EXISTS trg_messages_ai;
+        DROP TRIGGER IF EXISTS trg_messages_ad;
+        DROP TRIGGER IF EXISTS trg_messages_au;
+        """
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.executionFailed("Failed to drop the message triggers")
+        }
+    }
 }

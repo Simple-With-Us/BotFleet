@@ -433,7 +433,7 @@ struct Phase1StoreImporterAndPerfTests {
 
     // MARK: - Review Fix 2: the durable ledgers are migrated, not dropped
 
-    @Test("StoreImporter migrates the webhook delivery idempotency ledger and carries the routine request receipts it cannot persist")
+    @Test("StoreImporter migrates the webhook delivery idempotency ledger and the routine request receipts")
     func storeImporterMigratesDurableLedgers() async throws {
         let tempDir = try makeTempDir("ledger-test")
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -524,10 +524,10 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(ledgerRow?.botId == "bot-1")
         #expect(ledgerRow?.deliveredAt == 1_700_000_300)
 
-        // The routine request receipts have no native table yet, so they travel
-        // in the report and are named as a known gap instead of dropped.
+        // The routine request receipts are migrated too, so a re-issued
+        // routine card cannot apply the same change twice after the move.
         #expect(report.sourceRoutineRequestReceiptCount == 1)
-        #expect(report.targetRoutineRequestReceiptCount == 0)
+        #expect(report.targetRoutineRequestReceiptCount == 1)
         #expect(report.routineRequestReceipts.count == 1)
         let receipt = report.routineRequestReceipts.first
         #expect(receipt?.requestId == "req-1")
@@ -535,10 +535,75 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(receipt?.action == "run_now")
         #expect(receipt?.fingerprintVersion == 1)
         #expect(receipt?.appliedAt == 1_700_000_400)
-        #expect(report.warnings.contains { $0.contains("routine request receipt") })
+
+        // The receipt is in the store, not only in the report.
+        let storedReceipts = try await db.loadRoutineRequestReceipts()
+        #expect(storedReceipts.count == 1)
+        let storedReceipt = storedReceipts.first
+        #expect(storedReceipt?.requestId == "req-1")
+        #expect(storedReceipt?.messageId == "m-2")
+        #expect(storedReceipt?.botId == "bot-1")
+        #expect(storedReceipt?.threadId == "thread-bot-1")
+        #expect(storedReceipt?.action == "run_now")
+        #expect(storedReceipt?.fingerprintVersion == 1)
+        #expect(storedReceipt?.fingerprint == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        #expect(storedReceipt?.resultId == "run-1")
+        #expect(storedReceipt?.appliedAt == 1_700_000_400)
+        #expect(try await db.countRoutineRequestReceipts() == 1)
+
+        // Nothing was dropped, so there is no receipt gap to report.
+        #expect(report.warnings.contains { $0.contains("routine request receipt") } == false)
 
         // The manual snooze has no native column either, and says so.
         #expect(report.warnings.contains { $0.contains("bot snooze") })
+    }
+
+    // MARK: - Review Fix: a cross-thread message id fails the import in the importer's own words
+
+    @Test("The importer names both threads when a message id belongs to two of them")
+    func theImporterNamesBothThreadsOnACrossThreadConflict() async throws {
+        let tempDir = try makeTempDir("conflict-test")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try populateSourceFixture(in: tempDir)
+
+        // The legacy store keys a message on `(thread_id, id)`, so the same id
+        // can live in two threads there.  The native store keys it on the id
+        // alone, so the import has to refuse rather than drop one of them.
+        let messagesPath = tempDir.appendingPathComponent("messages.db")
+        try? FileManager.default.removeItem(at: messagesPath)
+        try createLegacyDb(
+            at: messagesPath.path,
+            rows: [
+                LegacyRow(threadId: "thread-bot-1", id: "m-dup", at: 1_700_000_100_000, role: "user", kind: "text", text: "the same id in one thread", json: "{\"id\":\"m-dup\",\"role\":\"user\",\"kind\":\"text\",\"at\":1700000100000,\"text\":\"the same id in one thread\"}"),
+                LegacyRow(threadId: "thread-room-1", id: "m-dup", at: 1_700_000_200_000, role: "user", kind: "text", text: "the same id in another thread", json: "{\"id\":\"m-dup\",\"role\":\"user\",\"kind\":\"text\",\"at\":1700000200000,\"text\":\"the same id in another thread\"}")
+            ]
+        )
+
+        let db = try DatabaseService(path: tempDir.appendingPathComponent("native.sqlite").path)
+        let importer = StoreImporter(batchSize: 10)
+
+        var thrown: StoreImportError?
+        do {
+            _ = try await importer.importStore(from: tempDir, into: db)
+        } catch let error as StoreImportError {
+            thrown = error
+        } catch {
+            Issue.record("Expected a StoreImportError, got \(String(describing: error)).")
+        }
+
+        #expect(thrown != nil, "A message id owned by two threads must fail the import with the importer's own error type.")
+        if case .messageThreadConflict(let id, let existingThreadId, let incomingThreadId) = thrown {
+            #expect(id == "m-dup")
+            #expect(existingThreadId == "thread-bot-1")
+            #expect(incomingThreadId == "thread-room-1")
+        } else {
+            Issue.record("Expected a messageThreadConflict error, got \(String(describing: thrown)).")
+        }
+
+        // The refused batch left nothing behind.
+        let botThread = try await db.loadMessages(forThread: "thread-bot-1")
+        #expect(botThread.isEmpty)
     }
 
     // MARK: - Review Fix 3: active_leaf_id belongs on one message, not all of them
