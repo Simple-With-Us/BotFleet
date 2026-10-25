@@ -167,6 +167,7 @@ run_ship() {
     FLEET_SECRETS="${FAKE_BIN}/fleet-secrets" \
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
     ASC_KEY_ID="${TEST_ASC_KEY_ID:-}" \
+    ASC_KEY_P8="${TEST_ASC_KEY_P8:-}" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
     bash "$SHIP" "$@" 2>&1)"
@@ -517,17 +518,25 @@ check "a rejected key fails the run (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || 
 check "says the key was rejected" "$(contains 'rejected the API key' && echo 0 || echo 1)"
 check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || echo 0)"
 # The rejected credential is named by its KEY ID, the public label that
-# travels in every App Store Connect request header, so the owner knows which
-# key Apple refused.  No part of the key is printed:  a slice of a private key
-# is private-key-derived material, and a first-8/last-4 slice identifies
-# nothing, while the key id identifies exactly one key.
+# travels in every App Store Connect request header, AND by the fleet's
+# sanctioned masked preview of it, so the owner can tell which key Apple
+# refused.  The preview is the first eight and the last four of the key body.
+# The armor is assembled from parts, so the fixture never looks like a
+# committed private key to a scanner.
+syn_body="SYNTHETICbodyAAAAqqqqBBBBrrrrCCCCssssDDDDttttEEEEuuuuFFFFvvvvGGGG"
+syn_pem="$(printf -- '-----BEGIN %s-----\n%s\n-----END %s-----\n' "PRIVATE"" KEY" "$syn_body" "PRIVATE"" KEY")"
 TEST_ASC_KEY_ID="ABCDE12345"
+TEST_ASC_KEY_P8="$syn_pem"
 run_ship botfleet --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "names the rejected key by its key id" \
   "$(contains 'key id ABCDE12345' && echo 0 || echo 1)"
-check "prints no preview of the key" \
-  "$([[ "$OUT" != *preview* ]] && echo 0 || echo 1)"
+check "carries the masked preview of the key" \
+  "$(contains "preview ${syn_body:0:8}...${syn_body:$((${#syn_body}-4))}" && echo 0 || echo 1)"
+check "does not print the key itself" \
+  "$([[ "$OUT" != *"$syn_body"* ]] && echo 0 || echo 1)"
 TEST_ASC_KEY_ID=""
+TEST_ASC_KEY_P8=""
+unset syn_body syn_pem
 FAKE_ASC_PATCH=236
 echo
 

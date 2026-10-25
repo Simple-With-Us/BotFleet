@@ -66,7 +66,7 @@ chmod 700 "${tmp}/no-vault"
 
 extract() {
   awk '
-    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_label\(\) \{/ || /^asc_public_key_id\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
+    /^fs_get\(\) \{/ || /^asc_temp_root\(\) \{/ || /^asc_tmp_dir\(\) \{/ || /^asc_upload_block\(\) \{/ || /^key_label\(\) \{/ || /^key_preview\(\) \{/ || /^asc_public_key_id\(\) \{/ || /^asc_credential_preview\(\) \{/ || /^load_secrets\(\) \{/ || /^cleanup_asc_tmp\(\) \{/ { grab = 1 }
     grab { print }
     grab && /^\}/ { grab = 0 }
   ' "$script"
@@ -586,18 +586,27 @@ case "$cred_log" in
   *"source Infisical /asc, key id ABCDE12345"*) ;;
   *) fail "a broken credential did not name its source and key id" ;;
 esac
+# The masked preview is the fleet's sanctioned way to say WHICH key was
+# refused (owner ruling 2026-07-16), so it has to be there, beside the key
+# id.  It is the one thing in the line that may carry key bytes, so it is
+# removed before the scan below:  the scan then fails only for an UNMASKED
+# fragment.
+key_body="$(sed '1d;$d' "${tmp}/asc.p8")"
+key_body="${key_body//[[:space:]]/}"
+mask="$(printf '%s...%s' "${key_body:0:8}" "${key_body:$((${#key_body}-4))}")"
 case "$cred_log" in
-  *preview*) fail "a broken credential still carried a preview" ;;
+  *"$mask"*) ;;
+  *) fail "a broken credential did not carry the masked preview" ;;
 esac
-# No byte run of the key may appear in the log.  Every 6-character window of
-# the body is checked with bash pattern matching, so no byte of the key ever
-# reaches the argument list of a process, where another user could read it
-# through ps.
+cred_log="${cred_log//"$mask"/}"
+unset mask
+# No byte run of the key may appear in the log beyond that mask.  Every
+# 6-character window of the body is checked with bash pattern matching, so no
+# byte of the key ever reaches the argument list of a process, where another
+# user could read it through ps.
 if [[ "$cred_log" == *"PRIVATE KEY"* ]]; then
   fail "a broken credential printed the key armor"
 fi
-key_body="$(sed '1d;$d' "${tmp}/asc.p8")"
-key_body="${key_body//[[:space:]]/}"
 for ((i = 0; i + 6 <= ${#key_body}; i++)); do
   if [[ "$cred_log" == *"${key_body:i:6}"* ]]; then
     fail "a broken credential printed a fragment of the key body"
@@ -740,7 +749,7 @@ lbl() { ( source "$funcs"; key_label "$1" ); }
 [[ "$(lbl ABCDE12345)" == ABCDE12345 ]] || fail "a well-formed key id was not printed"
 [[ "$(lbl "")" == missing ]] || fail "a missing key id was not reported as missing"
 for bad in "ABC"$'\n'"DEF" "ABC"$'\302\205'"DEF" "ABC"$'\342\200\250'"DEF" "ABC"$'\033'"DEF" \
-    "ABC DEF" "$(printf 'A%.0s' {1..33})" "MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg"; do
+    "ABC DEF" "$(printf 'A%.0s' {1..33})" "$(printf 'B%.0s' {1..48})"; do
   for loc in C en_US.UTF-8; do
     got="$(LC_ALL="$loc" lbl "$bad" 2>/dev/null)"
     [[ "$got" == unrecognized ]] || fail "a malformed key id was not reported as unrecognized under LC_ALL=${loc}"
@@ -784,10 +793,15 @@ pem_kind="PRIVATE"" KEY"
 syn_body="SYNTHETICbodyAAAAqqqqBBBBrrrrCCCCssssDDDDttttEEEEuuuuFFFFvvvvGGGG"
 syn_pem="-----BEGIN ${pem_kind}-----"$'\n'"${syn_body}"$'\n'"-----END ${pem_kind}-----"
 check_diag() {  # <label> <log> <expected substring>
-  local label="$1" out="$2" want="$3" i
+  local label="$1" out="$2" want="$3" i mask
   [[ "$out" == *"$want"* ]] || fail "${label}: diagnostic did not say: ${want}"
-  [[ "$out" != *preview* ]] || fail "${label}: diagnostic still carried a preview"
   [[ "$out" != *"PRIVATE KEY"* ]] || fail "${label}: diagnostic carried the key armor"
+  #  The masked preview is required, and it is the ONE thing in the line that
+  #  may carry key bytes:  it is removed before the scan, so the scan fails
+  #  only for an unmasked fragment.
+  mask="$(printf '%s...%s' "${syn_body:0:8}" "${syn_body:$((${#syn_body}-4))}")"
+  [[ "$out" == *"$mask"* ]] || fail "${label}: diagnostic did not carry the masked preview"
+  out="${out//"$mask"/}"
   for ((i = 0; i + 6 <= ${#syn_body}; i++)); do
     [[ "$out" != *"${syn_body:i:6}"* ]] || fail "${label}: diagnostic carried a fragment of the key body"
   done
@@ -815,15 +829,15 @@ for kid in ABCDE12345 "" "bad id"; do
   # An empty APPLE_API_KEY_ID skips that source entirely, so only the
   # well-formed and unrecognized ids reach its rejection.
   if [[ -n "$kid" ]]; then
-    check_diag "APPLE_API_KEY_P8_BASE64 id=${want_id}" "$out" "(source APPLE_API_KEY_P8_BASE64, key id ${want_id})"
+    check_diag "APPLE_API_KEY_P8_BASE64 id=${want_id}" "$out" "(source APPLE_API_KEY_P8_BASE64, key id ${want_id}"
     check_diag "APPLE_API_KEY_P8_BASE64 class" "$out" "class=credential"
   fi
   out="$(run_diag ASC_KEY_ID="$kid" ASC_ISSUER_ID=issuer-synthetic ASC_KEY_P8="$syn_pem")"
   if [[ -n "$kid" ]]; then
-    check_diag "ASC_KEY_P8 id=${want_id}" "$out" "does not hold a PEM private key; ignoring it (source ASC_KEY_P8, key id ${want_id})"
+    check_diag "ASC_KEY_P8 id=${want_id}" "$out" "does not hold a PEM private key; ignoring it (source ASC_KEY_P8, key id ${want_id}"
     check_diag "ASC_KEY_P8 class" "$out" "class=credential"
   else
-    check_diag "ASC_KEY_P8 without id" "$out" "set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it (source ASC_KEY_P8, key id missing)"
+    check_diag "ASC_KEY_P8 without id" "$out" "set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it (source ASC_KEY_P8, key id missing"
   fi
 done
 unset kid want_id out syn_pem syn_body pem_kind
