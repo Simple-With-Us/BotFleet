@@ -57,6 +57,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/checkpoints.ts` | Per-turn workspace snapshots → `EngineDriver` BF-2504 (git-based, reimplement with libgit2 or `git` CLI) |
 | `server/worktree-leases.ts` | Lease queue → `EngineDriver` BF-2504 |
 | `server/testing/*` (23 fakes/harness files) | Retired; replaced by `ReplayHarness` fixtures BF-2503 |
+| `server/provider-reload-order.test.ts` | Guards the module-scope provider reload fence in `server/index.ts` (the temporal-dead-zone read that surfaced as `provider_error`) → `EngineCoordinator` BF-2504, where the fence becomes actor state; the test retires with the file in BF-2515 |
 | `server/index.ts` (composition root: routes, boot wiring, harness entry) | Wiring collapses into `LifecycleService` BF-2497 and the Phase 5 actors; the file itself retires BF-2515 |
 | `server/cli-failure.ts`, `server/cli-probe-env.ts`, `server/stderr-excerpt.ts`, `server/host-dispatch-hot.ts` | Engine support (failure wording, credential-free probe env, shared host probe) → `EngineDriver` BF-2504 |
 | `server/attachments.ts` | Composer attachment staging → `EngineDriver` tool lane BF-2504 |
@@ -81,6 +82,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/env-path.ts` | GUI-launch PATH augmentation → app startup BF-2497 (Finder-launch env) |
 | `server/proxy-paths.ts`, `server/runtime-identity.ts` | Runtime path/identity → app startup BF-2497 |
 | `server/atomic.ts`, `server/store-guard.ts` | Atomic writes + corrupt-store guard → `DatabaseService` BF-2480 (SQLite transactions subsume both) |
+| `electron/infisical-read.mjs`, `electron/server-target.mjs`, `electron/remote-credential-guard.mjs` + their `.node-test.mjs` twins | Out-of-harness vault read, the `local`/`remote` server target, and the remote-mode credential refusal (BF-2544) → `InfisicalResolver` + app settings BF-2506; the target choice becomes native settings and the refusal rule ports as a guard on the native credential path |
 
 ## 3. Storage → Phase 1 (BF-2480, BF-2495)
 
