@@ -693,10 +693,10 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(resumed.sourceBodyDigestSHA256 == resumed.targetBodyDigestSHA256)
     }
 
-    // MARK: - Review Fix 5: the JSON metadata the native row cannot hold is named
+    // MARK: - Review Fix 5: the JSON metadata the native columns cannot carry is preserved
 
-    @Test("StoreImporter reports the JSON metadata the native messages table cannot carry")
-    func storeImporterReportsDroppedMessageMetadata() async throws {
+    @Test("StoreImporter preserves the JSON metadata the native columns cannot carry")
+    func storeImporterPreservesMessageMetadata() async throws {
         let tempDir = try makeTempDir("metadata-test")
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
@@ -738,17 +738,34 @@ struct Phase1StoreImporterAndPerfTests {
         let report = try await importer.importStore(from: tempDir, into: db)
 
         #expect(report.isParityVerified == true)
-        // The dropped metadata is counted, named, and fingerprinted.
-        #expect(report.sourceMessageMetadataDroppedCount == 1)
-        #expect(report.sourceMessageMetadataDroppedFields == ["card", "parentId", "reactions"])
-        #expect(report.sourceMessageMetadataDigestSHA256.isEmpty == false)
-        #expect(report.warnings.contains { $0.contains("parentId") })
+        // The metadata is counted, named, and fingerprinted as preserved.
+        #expect(report.sourceMessageMetadataPreservedCount == 1)
+        #expect(report.sourceMessageMetadataPreservedFields == ["card", "parentId", "reactions"])
+        #expect(report.sourceMessageMetadataPreservedDigestSHA256.isEmpty == false)
+        // Nothing was lost, so there is no metadata gap to report.
+        #expect(report.sourceMessageMetadataDroppedCount == 0)
+        #expect(report.warnings.contains { $0.contains("parentId") } == false)
 
         // The native row keeps the text, and the screen row keeps its JSON.
         let loaded = try await db.loadMessages(forThread: "thread-bot-1")
         let byId = Dictionary(uniqueKeysWithValues: loaded.map { ($0.id, $0) })
         #expect(byId["m-1"]?.content == "parented message")
         #expect(byId["m-2"]?.content.contains("\"png\"") == true)
+
+        // The metadata itself is in the store, not only counted.
+        let metadata = try #require(byId["m-1"]?.metadataJSON)
+        #expect(metadata.contains("\"parentId\":\"m-0\""))
+        #expect(metadata.contains("\"reactions\""))
+        #expect(metadata.contains("\"card\""))
+        // A row with nothing to preserve carries no metadata.
+        #expect(byId["m-2"]?.metadataJSON == nil)
+
+        // The preserved metadata survives a second import unchanged, so the
+        // migration is still idempotent.
+        let second = try await importer.importStore(from: tempDir, into: db)
+        #expect(second.newlyInsertedMessages == 0)
+        #expect(second.sourceMessageMetadataPreservedCount == 1)
+        #expect(second.sourceMessageMetadataDroppedCount == 0)
     }
 
     // MARK: - PackageLinkAllowlist Tests
@@ -826,10 +843,12 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(Double(MacPerformanceBudget.maxWalSizeBytes) / (1024.0 * 1024.0) == 64.0)
 
         // The harness also prints the FTS5 latency including the caller's round
-        // trip.  It is context, not a gate, and it carries the same product
-        // budget as the latency it sits beside.
+        // trip, and the pooled percentile over every raw sample.  Both are
+        // context, not gates, and both carry the same product budget as the
+        // latency they sit beside.
         let reportedOnlyNames: Set<String> = [
-            "FTS5 search latency incl. caller round trip (p95, reported only)"
+            "FTS5 search latency incl. caller round trip (p95, reported only)",
+            "FTS5 search latency (pooled sample p95, reported only)"
         ]
 
         for metric in report.metrics {

@@ -107,14 +107,20 @@ public struct StoreImportParityReport: Equatable, Sendable, Codable {
     /// receipts the store holds.
     public let sourceRoutineRequestReceiptCount: Int
     public let targetRoutineRequestReceiptCount: Int
-    /// Source messages whose JSON carries metadata the native `messages` table
-    /// has no column for (`parentId`, `reactions`, `audio`, `card`, `tool`, …).
+    /// Source messages whose JSON carried metadata the native columns have no
+    /// home for (`parentId`, `reactions`, `audio`, `card`, `tool`, …).  The
+    /// metadata is kept in the store's `metadata_json` column, so the count
+    /// here is a count of what was preserved, not of what was lost.
+    public let sourceMessageMetadataPreservedCount: Int
+    /// The distinct JSON keys that were preserved, sorted.
+    public let sourceMessageMetadataPreservedFields: [String]
+    /// A fingerprint of exactly what was preserved, so the migration can be
+    /// checked against the source instead of trusted.
+    public let sourceMessageMetadataPreservedDigestSHA256: String
+    /// Source messages whose metadata could not be preserved.  A row that
+    /// cannot carry its own metadata is a bug in the importer, not a schema
+    /// gap, so this count is zero unless something went wrong.
     public let sourceMessageMetadataDroppedCount: Int
-    /// The distinct JSON keys that were dropped, sorted.
-    public let sourceMessageMetadataDroppedFields: [String]
-    /// A fingerprint of exactly what was dropped, so the loss is verifiable
-    /// instead of silent and a future native column can be checked against it.
-    public let sourceMessageMetadataDigestSHA256: String
     /// Every routine-request receipt read from the source.  They are also
     /// persisted in the native `routine_request_receipts` table, so the
     /// idempotency key survives the migration.
@@ -375,8 +381,9 @@ public struct StoreImporter: Sendable {
         var perThreadCounts: [String: Int] = [:]
         var sourceHasher = SHA256()
         var metadataHasher = SHA256()
+        var metadataPreservedCount = 0
+        var metadataPreservedFields: Set<String> = []
         var metadataDroppedCount = 0
-        var metadataDroppedFields: Set<String> = []
 
         while true {
             if let limit = maxBatchesBeforeInterrupt, completedBatches >= limit {
@@ -397,14 +404,20 @@ public struct StoreImporter: Sendable {
                 Self.feedDigest(hasher: &sourceHasher, threadId: row.threadId, id: row.id, content: row.content)
 
                 if !row.unmappedMetadataFragment.isEmpty {
-                    metadataDroppedCount += 1
-                    metadataDroppedFields.formUnion(row.unmappedMetadataKeys)
+                    metadataPreservedCount += 1
+                    metadataPreservedFields.formUnion(row.unmappedMetadataKeys)
                     Self.feedDigest(
                         hasher: &metadataHasher,
                         threadId: row.threadId,
                         id: row.id,
                         content: row.unmappedMetadataFragment
                     )
+                } else if !row.unmappedMetadataKeys.isEmpty {
+                    // The keys were found but no fragment could be built for
+                    // them, so this row's metadata is genuinely lost.  It is
+                    // counted and named rather than dropped in silence.
+                    metadataDroppedCount += 1
+                    metadataPreservedFields.formUnion(row.unmappedMetadataKeys)
                 }
 
                 // Keep every message's thread_id backed by a parent row so the
@@ -442,7 +455,8 @@ public struct StoreImporter: Sendable {
                     content: row.content,
                     createdAt: row.createdAt,
                     model: row.model,
-                    activeLeafId: row.activeLeafId
+                    activeLeafId: row.activeLeafId,
+                    metadataJSON: row.unmappedMetadataFragment.isEmpty ? nil : row.unmappedMetadataFragment
                 ))
             }
 
@@ -476,9 +490,10 @@ public struct StoreImporter: Sendable {
             sourceMessageCount: sourceMessageCount,
             perThreadCounts: perThreadCounts,
             sourceBodyDigestSHA256: sourceHasher.finalize().map { String(format: "%02x", $0) }.joined(),
+            metadataPreservedCount: metadataPreservedCount,
+            metadataPreservedFields: metadataPreservedFields.sorted(),
+            metadataPreservedDigestSHA256: metadataHasher.finalize().map { String(format: "%02x", $0) }.joined(),
             metadataDroppedCount: metadataDroppedCount,
-            metadataDroppedFields: metadataDroppedFields.sorted(),
-            metadataDigestSHA256: metadataHasher.finalize().map { String(format: "%02x", $0) }.joined(),
             targetDatabase: targetDatabase,
             newlyInsertedMessages: newlyInserted
         )
@@ -1193,9 +1208,10 @@ public struct StoreImporter: Sendable {
         sourceMessageCount: Int,
         perThreadCounts: [String: Int],
         sourceBodyDigestSHA256: String,
+        metadataPreservedCount: Int,
+        metadataPreservedFields: [String],
+        metadataPreservedDigestSHA256: String,
         metadataDroppedCount: Int,
-        metadataDroppedFields: [String],
-        metadataDigestSHA256: String,
         targetDatabase: DatabaseService,
         newlyInsertedMessages: Int
     ) async throws -> StoreImportParityReport {
@@ -1271,7 +1287,7 @@ public struct StoreImporter: Sendable {
         // rather than silent.
         if metadataDroppedCount > 0 {
             warnings.append(
-                "\(metadataDroppedCount) source message(s) carry JSON metadata the native messages table has no column for (fields: \(metadataDroppedFields.joined(separator: ", "))).  Fingerprint: \(metadataDigestSHA256)."
+                "\(metadataDroppedCount) source message(s) carry JSON metadata the importer could not preserve (fields: \(metadataPreservedFields.joined(separator: ", "))).  Fingerprint: \(metadataPreservedDigestSHA256)."
             )
         }
         if webhooksSnapshot.unmappedDeliveryCount > 0 {
@@ -1304,9 +1320,10 @@ public struct StoreImporter: Sendable {
             targetWebhookDeliveryLedgerCount: targetLedgerCount,
             sourceRoutineRequestReceiptCount: routinesSnapshot.requestReceipts.count,
             targetRoutineRequestReceiptCount: targetRoutineRequestReceiptCount,
+            sourceMessageMetadataPreservedCount: metadataPreservedCount,
+            sourceMessageMetadataPreservedFields: metadataPreservedFields,
+            sourceMessageMetadataPreservedDigestSHA256: metadataPreservedDigestSHA256,
             sourceMessageMetadataDroppedCount: metadataDroppedCount,
-            sourceMessageMetadataDroppedFields: metadataDroppedFields,
-            sourceMessageMetadataDigestSHA256: metadataDigestSHA256,
             routineRequestReceipts: routinesSnapshot.requestReceipts,
             perThreadMessageCountsMatch: perThreadMatch,
             orphanedMessageCount: orphanedMessageCount,

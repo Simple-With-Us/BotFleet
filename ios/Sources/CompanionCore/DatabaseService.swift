@@ -26,6 +26,14 @@ public struct MessageRecord: Equatable, Sendable, Identifiable {
     public let createdAt: Double
     public let model: String?
     public let activeLeafId: String?
+    /// The part of the source message JSON the native columns have no home for.
+    ///
+    /// The legacy store keeps a message's parent id, its reactions, its card,
+    /// its tool payload and its audio inside the message's own JSON.  The
+    /// native columns carry the text of a message, so the rest of that JSON is
+    /// kept verbatim here instead of being dropped, and the native app can
+    /// read it back.
+    public let metadataJSON: String?
 
     public init(
         id: String,
@@ -35,7 +43,8 @@ public struct MessageRecord: Equatable, Sendable, Identifiable {
         content: String,
         createdAt: Double = Date().timeIntervalSince1970,
         model: String? = nil,
-        activeLeafId: String? = nil
+        activeLeafId: String? = nil,
+        metadataJSON: String? = nil
     ) {
         self.id = id
         self.threadId = threadId
@@ -45,6 +54,7 @@ public struct MessageRecord: Equatable, Sendable, Identifiable {
         self.createdAt = createdAt
         self.model = model
         self.activeLeafId = activeLeafId
+        self.metadataJSON = metadataJSON
     }
 }
 
@@ -331,6 +341,7 @@ public actor DatabaseService {
             created_at REAL NOT NULL,
             model TEXT,
             active_leaf_id TEXT,
+            metadata_json TEXT,
             FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
         );
 
@@ -410,7 +421,34 @@ public actor DatabaseService {
         );
         """
         try execute(sql: schema)
+        // A store provisioned by an earlier native build does not carry the
+        // metadata column yet, so add it when it is missing.  The check keeps
+        // the launch path free of a write on a store that is already current.
+        if try !tableHasColumn("metadata_json", inTable: "messages") {
+            try execute(sql: "ALTER TABLE messages ADD COLUMN metadata_json TEXT;")
+        }
         try ensureMessageTriggers()
+    }
+
+    /// Whether a table carries a named column.
+    ///
+    /// The table name is an internal constant, never anything from a caller.
+    private func tableHasColumn(_ column: String, inTable table: String) throws -> Bool {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "PRAGMA table_info(\(table));"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let name = sqlite3_column_text(stmt, 1) else { continue }
+            if String(cString: name) == column {
+                return true
+            }
+        }
+        return false
     }
 
     /// Makes sure the FTS triggers exist and carry the current bodies.
@@ -590,8 +628,8 @@ public actor DatabaseService {
     public func insertMessage(_ message: MessageRecord) throws {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let sql = """
-        INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         ON CONFLICT(id) DO UPDATE SET
             thread_id = excluded.thread_id,
             role = excluded.role,
@@ -599,7 +637,8 @@ public actor DatabaseService {
             content = excluded.content,
             created_at = excluded.created_at,
             model = excluded.model,
-            active_leaf_id = excluded.active_leaf_id
+            active_leaf_id = excluded.active_leaf_id,
+            metadata_json = excluded.metadata_json
         WHERE messages.thread_id = excluded.thread_id;
         """
         var stmt: OpaquePointer?
@@ -625,6 +664,12 @@ public actor DatabaseService {
             sqlite3_bind_text(stmt, 8, (leaf as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 8)
+        }
+
+        if let metadata = message.metadataJSON {
+            sqlite3_bind_text(stmt, 9, (metadata as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 9)
         }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -655,8 +700,8 @@ public actor DatabaseService {
     public func loadMessages(forThread threadId: String, limit: Int = 100, before: Double? = nil) throws -> [MessageRecord] {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let sql = before == nil
-            ? "SELECT id, thread_id, role, kind, content, created_at, model, active_leaf_id FROM messages WHERE thread_id = ?1 ORDER BY created_at ASC LIMIT ?2;"
-            : "SELECT id, thread_id, role, kind, content, created_at, model, active_leaf_id FROM messages WHERE thread_id = ?1 AND created_at < ?3 ORDER BY created_at ASC LIMIT ?2;"
+            ? "SELECT id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json FROM messages WHERE thread_id = ?1 ORDER BY created_at ASC LIMIT ?2;"
+            : "SELECT id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json FROM messages WHERE thread_id = ?1 AND created_at < ?3 ORDER BY created_at ASC LIMIT ?2;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -680,6 +725,7 @@ public actor DatabaseService {
             let createdAt = sqlite3_column_double(stmt, 5)
             let model = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
             let activeLeafId = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
+            let metadataJSON = sqlite3_column_type(stmt, 8) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 8)) : nil
 
             results.append(MessageRecord(
                 id: id,
@@ -689,7 +735,8 @@ public actor DatabaseService {
                 content: content,
                 createdAt: createdAt,
                 model: model,
-                activeLeafId: activeLeafId
+                activeLeafId: activeLeafId,
+                metadataJSON: metadataJSON
             ))
         }
         return results
@@ -1245,8 +1292,8 @@ public actor DatabaseService {
         do {
             let sql = skipIdentical
                 ? """
-                INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ON CONFLICT(id) DO UPDATE SET
                     thread_id = excluded.thread_id,
                     role = excluded.role,
@@ -1254,18 +1301,20 @@ public actor DatabaseService {
                     content = excluded.content,
                     created_at = excluded.created_at,
                     model = excluded.model,
-                    active_leaf_id = excluded.active_leaf_id
+                    active_leaf_id = excluded.active_leaf_id,
+                    metadata_json = excluded.metadata_json
                 WHERE messages.thread_id = excluded.thread_id
                    AND (messages.role IS NOT excluded.role
                    OR messages.kind IS NOT excluded.kind
                    OR messages.content IS NOT excluded.content
                    OR messages.created_at IS NOT excluded.created_at
                    OR messages.model IS NOT excluded.model
-                   OR messages.active_leaf_id IS NOT excluded.active_leaf_id);
+                   OR messages.active_leaf_id IS NOT excluded.active_leaf_id
+                   OR messages.metadata_json IS NOT excluded.metadata_json);
                 """
                 : """
-                INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                INSERT INTO messages (id, thread_id, role, kind, content, created_at, model, active_leaf_id, metadata_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ON CONFLICT(id) DO UPDATE SET
                     thread_id = excluded.thread_id,
                     role = excluded.role,
@@ -1273,7 +1322,8 @@ public actor DatabaseService {
                     content = excluded.content,
                     created_at = excluded.created_at,
                     model = excluded.model,
-                    active_leaf_id = excluded.active_leaf_id
+                    active_leaf_id = excluded.active_leaf_id,
+                    metadata_json = excluded.metadata_json
                 WHERE messages.thread_id = excluded.thread_id;
                 """
 
@@ -1318,6 +1368,12 @@ public actor DatabaseService {
                     sqlite3_bind_text(stmt, 8, (leaf as NSString).utf8String, -1, SQLITE_TRANSIENT)
                 } else {
                     sqlite3_bind_null(stmt, 8)
+                }
+
+                if let metadata = message.metadataJSON {
+                    sqlite3_bind_text(stmt, 9, (metadata as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                } else {
+                    sqlite3_bind_null(stmt, 9)
                 }
 
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
