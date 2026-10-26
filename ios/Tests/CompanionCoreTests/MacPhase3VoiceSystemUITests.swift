@@ -606,10 +606,16 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
 
         // Deep-link routing to all 6 settings sections.
         for section in MacSettingsSection.allCases {
-            let url = URL(string: "botfleet://settings/\(section.rawValue)")!
+            guard let url = URL(string: "botfleet://settings/\(section.rawValue)") else {
+                XCTFail("Failed to construct settings deep-link URL for section \(section)")
+                continue
+            }
             XCTAssertEqual(MacSettingsDeepLinkRouter.section(for: url), section)
         }
-        let queryURL = URL(string: "botfleet://settings?section=permissions")!
+        guard let queryURL = URL(string: "botfleet://settings?section=permissions") else {
+            XCTFail("Failed to construct settings query deep-link URL")
+            return
+        }
         XCTAssertEqual(MacSettingsDeepLinkRouter.section(for: queryURL), .permissions)
         XCTAssertEqual(
             MacSettingsDeepLinkRouter.section(forVoiceFailure: .languageNotSupported),

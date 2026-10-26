@@ -231,6 +231,7 @@ public final class MacVoiceEngine: @unchecked Sendable {
         switch state {
         case .starting:
             cancelPendingStart()
+            self.currentDraft = currentDraft
             return nil
         case .recording:
             stopCapture()
