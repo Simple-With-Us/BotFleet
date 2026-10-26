@@ -132,13 +132,19 @@ was doing.
 The `speaking` range is a talking loop, so it repeats until the voice stops.  The
 wildcard entry is what the avatar shows at every other moment.
 
-`tests/fixtures/avatar/tvface-speaking-demo.webp` is exactly that:  thirty six
+An avatar that declares no speaking state is unaffected.  The state the app
+asks for falls back to the wildcard entry, and a file that names no wildcard
+rests on its resting frame.  So no existing avatar needs re-cutting: only a
+file that declares a speaking range changes what it shows while the voice
+plays.
+
+`tests/fixtures/avatar/tvface-speaking-demo.webp` is exactly that: thirty six
 frames of the resting face and seventy one of the TV-Face talking loop, built
 from the shipped art at 256 x 256.  The face in that art has its mouth drawn
 into every frame, so the mouth moves because the frames are a different
 picture, and not because the player draws a mouth of its own.
 
-That is the limit of what the format carries today:  the mouth moves with the
+That is the limit of what the format carries today: the mouth moves with the
 voice, and not with the words.  A file whose mouth has to follow each word
 would need a mouth of its own, which the format does not carry yet.
 
