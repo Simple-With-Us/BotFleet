@@ -805,7 +805,10 @@ test("the ship readiness is external installability, and never prints a false su
   assert.match(rc6, /::warning title=TestFlight installability unverified::/);
   assert.doesNotMatch(rc6, /can install this build/);
   // The only success line is the rc=0 branch, and it names external testing.
-  assert.equal(sh.split("TestFlight external testers can install this build after Beta App Review").length - 1, 1);
+  // The readiness step runs before the sync assigns the build, so the rc=0
+  // line states exactly what was verified: the app's external install path.
+  assert.equal(sh.split("TestFlight external install path is live for ${BUNDLE_ID} (an external group has testers or an enabled public link); the standing-testers sync assigns and verifies this build next").length - 1, 1);
+  assert.doesNotMatch(sh, /TestFlight external testers can install this build/);
   assert.doesNotMatch(sh, /TestFlight internal testers can install this build/);
   // The sync step must NOT re-create the internal group; it deletes leftovers.
   const syncStart = mjs.indexOf('method === "ensure-standing-testers"');
@@ -817,6 +820,11 @@ test("the ship readiness is external installability, and never prints a false su
   // awaited call would re-create the group.
   assert.doesNotMatch(syncBranch, /await ensureInternalTesterGroup\(/);
   assert.match(syncBranch, /await deleteInternalGroups\(/);
+  // After assigning the build to the external group, the sync independently
+  // verifies membership through the group-side builds read (Apple forbids
+  // reading a build's betaGroups).
+  assert.match(syncBranch, /\/v1\/betaGroups\/\$\{group\.id\}\/builds/);
+  assert.match(syncBranch, /verified \$\{buildLabel\} is in group/);
   // Standing testers join the external group with createFirst so an email
   // whose only tester record belongs to another app still gets an app-scoped
   // record (the cross-app 409 path cannot recover one that does not exist).
