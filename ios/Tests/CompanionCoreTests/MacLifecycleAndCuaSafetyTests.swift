@@ -455,6 +455,10 @@ struct MacLifecycleAndCuaSafetyTests {
     func testEmergencyStopMidDragAndButtonRelease() throws {
         let driver = MacCuaDriver()
         driver.resetEmergencyStop()
+        // Desktop control needs the Accessibility grant, so the test models a
+        // granted machine: the subject of this test is the emergency stop, not
+        // the TCC state.
+        driver.accessibilityProvider = { true }
 
         // Hold all three mouse buttons to verify emergencyStop releases every held button.
         _ = driver.mouseDown(at: CGPoint(x: 100, y: 100), button: .right)
@@ -569,6 +573,7 @@ struct MacLifecycleAndCuaSafetyTests {
     func testPermissionMonitorDetectsRevocationAndStopsDriver() throws {
         let driver = MacCuaDriver()
         driver.resetEmergencyStop()
+        driver.accessibilityProvider = { true }
         _ = driver.mouseDown(at: CGPoint(x: 200, y: 200), button: .left)
 
         let permissionsBox = ThreadSafeBox(CuaPermissions(hasScreenRecording: true, hasAccessibility: true))
@@ -751,10 +756,51 @@ struct MacLifecycleAndCuaSafetyTests {
         #expect(driver.isEmergencyStopped == false)
     }
 
+    @Test("Desktop control is refused when the Accessibility grant was never given")
+    func testDesktopControlRefusedWithoutAccessibilityGrant() {
+        let driver = MacCuaDriver()
+        driver.resetEmergencyStop()
+        // The Accessibility grant was never given, so the driver must not
+        // synthesize input: the event would reach the operator's screen
+        // without the permission that authorizes it.
+        driver.accessibilityProvider = { false }
+
+        let posted = ThreadSafeEventLog()
+        driver.mouseEventPostedHook = { type, button in
+            let label: String
+            switch type {
+            case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+                label = "down-\(button.rawValue)"
+            default:
+                label = "up-\(button.rawValue)"
+            }
+            posted.append(label)
+        }
+
+        #expect(driver.moveMouse(to: CGPoint(x: 10, y: 10)) == false)
+        #expect(driver.mouseDown(at: CGPoint(x: 10, y: 10), button: .left) == false)
+        #expect(driver.click(at: CGPoint(x: 10, y: 10)) == false)
+        #expect(driver.scroll(deltaX: 0, deltaY: 5) == false)
+        #expect(driver.keyPress(keyCode: 36) == false)
+        #expect(driver.typeText("hello") == false)
+
+        // Nothing reached the window server, and no button was recorded as held.
+        #expect(posted.entries.isEmpty)
+        #expect(driver.heldMouseButtons.isEmpty)
+
+        // With the grant in place the actions work again.
+        driver.accessibilityProvider = { true }
+        #expect(driver.mouseDown(at: CGPoint(x: 10, y: 10), button: .left) == true)
+        #expect(driver.heldMouseButtons.contains(.left))
+        #expect(driver.mouseUp(at: CGPoint(x: 10, y: 10), button: .left) == true)
+        #expect(driver.heldMouseButtons.isEmpty)
+    }
+
     @Test("An emergency stop cannot leave a mouse button held when it interleaves with a mouse-down")
     func testEmergencyStopCannotLeaveMouseButtonHeld() {
         let driver = MacCuaDriver()
         driver.resetEmergencyStop()
+        driver.accessibilityProvider = { true }
 
         let postedOrder = ThreadSafeEventLog()
         driver.mouseEventPostedHook = { type, button in

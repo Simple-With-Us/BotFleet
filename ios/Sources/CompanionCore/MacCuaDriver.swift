@@ -331,6 +331,17 @@ public final class MacCuaDriver: @unchecked Sendable {
     /// server, so a test can assert the real post order of the events.
     var mouseEventPostedHook: ((CGEventType, CuaMouseButton) -> Void)?
 
+    /// Whether the process currently holds the Accessibility grant.
+    ///
+    /// Desktop control needs the Accessibility permission: without it the driver
+    /// must not synthesize input, because the event would reach the operator's
+    /// screen without the permission that authorizes it.  The live capture needs
+    /// the independent Screen Recording grant, so a missing Accessibility grant
+    /// no longer stops the capture.
+    ///
+    /// Injectable so a test can model a granted machine.
+    public var accessibilityProvider: @Sendable () -> Bool = { AXIsProcessTrusted() }
+
     public init() {}
 
     // MARK: - Emergency Stop State
@@ -587,6 +598,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         }
         downEvent.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount))
 
+        guard desktopControlIsAuthorized() else { return false }
         stateLock.lock()
         if _isEmergencyStopped {
             stateLock.unlock()
@@ -684,6 +696,9 @@ public final class MacCuaDriver: @unchecked Sendable {
             if !isGenerationActive(startGeneration) {
                 return false
             }
+            // The grant can be taken away mid-drag, so every step re-checks it
+            // instead of relying on the check that opened the drag.
+            guard desktopControlIsAuthorized() else { return false }
 
             if stepDelayMs > 0 {
                 if !sleepInterruptibly(milliseconds: stepDelayMs, generation: startGeneration) {
@@ -731,6 +746,7 @@ public final class MacCuaDriver: @unchecked Sendable {
     /// Synthesizes a scroll wheel event with pixel-accurate deltas.
     @discardableResult
     public func scroll(deltaX: Int32, deltaY: Int32) -> Bool {
+        guard desktopControlIsAuthorized() else { return false }
         guard !isEmergencyStopped else { return false }
         guard let event = CGEvent(
             scrollWheelEvent2Source: nil,
@@ -754,6 +770,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         keyCode: CGKeyCode,
         modifiers: CuaKeyModifier = []
     ) -> Bool {
+        guard desktopControlIsAuthorized() else { return false }
         guard !isEmergencyStopped else { return false }
         guard let downEvent = CGEvent(
             keyboardEventSource: nil,
@@ -785,6 +802,7 @@ public final class MacCuaDriver: @unchecked Sendable {
     /// if `emergencyStop()` is triggered mid-sequence.
     @discardableResult
     public func typeText(_ text: String, characterDelayMs: Double = 0) -> Bool {
+        guard desktopControlIsAuthorized() else { return false }
         stateLock.lock()
         if _isEmergencyStopped {
             stateLock.unlock()
@@ -828,11 +846,20 @@ public final class MacCuaDriver: @unchecked Sendable {
     // MARK: - Internal Helpers
 
     private func canProceedWithAction(updatingCursorTo point: CGPoint) -> Bool {
+        guard desktopControlIsAuthorized() else { return false }
         stateLock.lock()
         defer { stateLock.unlock() }
         guard !_isEmergencyStopped else { return false }
         _lastCursorPosition = point
         return true
+    }
+
+    /// Whether a desktop-control action is allowed to run.
+    ///
+    /// A mouse release is never gated: a button that was pressed has to be
+    /// releasable even when the grant was taken away in the meantime.
+    private func desktopControlIsAuthorized() -> Bool {
+        accessibilityProvider()
     }
 
     private func isGenerationActive(_ expectedGeneration: UInt64) -> Bool {
