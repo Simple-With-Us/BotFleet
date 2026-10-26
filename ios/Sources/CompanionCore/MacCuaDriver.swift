@@ -100,6 +100,27 @@ public struct CuaPermissions: Sendable, Hashable, Codable {
 
 /// Native macOS CUA driver providing zero-overhead mouse and keyboard event synthesis.
 public final class MacCuaDriver: @unchecked Sendable {
+    /// Posts one event to the live desktop.
+    ///
+    /// A test runner never posts.  The suite used to post real mouse and
+    /// keyboard events to the live desktop, which took the person's mouse
+    /// over while they worked.  The shipping app is an application bundle,
+    /// never a test runner, so the product capability is unchanged.
+    private static func postToDesktop(_ event: CGEvent) {
+        guard !Self.isRunningUnderATestRunner else { return }
+        event.post(tap: .cghidEventTap)
+    }
+
+    /// True when this process is a test runner rather than the app.
+    ///
+    /// The SwiftPM testing helper is the process that runs the suite, and an
+    /// XCTest run is an XCTest bundle.
+    private static var isRunningUnderATestRunner: Bool {
+        if ProcessInfo.processInfo.processName == "swiftpm-testing-helper" { return true }
+        if Bundle.main.bundleURL.pathExtension == "xctest" { return true }
+        return NSClassFromString("XCTest") != nil
+    }
+
     public static let shared = MacCuaDriver()
 
     public init() {}
@@ -190,7 +211,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         ) else {
             return false
         }
-        event.post(tap: .cghidEventTap)
+        Self.postToDesktop(event)
         return true
     }
 
@@ -241,8 +262,8 @@ public final class MacCuaDriver: @unchecked Sendable {
         downEvent.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount))
         upEvent.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount))
 
-        downEvent.post(tap: .cghidEventTap)
-        upEvent.post(tap: .cghidEventTap)
+        Self.postToDesktop(downEvent)
+        Self.postToDesktop(upEvent)
         return true
     }
 
@@ -262,7 +283,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         ) else {
             return false
         }
-        downEvent.post(tap: .cghidEventTap)
+        Self.postToDesktop(downEvent)
 
         let safeSteps = max(steps, 1)
         for i in 1...safeSteps {
@@ -277,7 +298,7 @@ public final class MacCuaDriver: @unchecked Sendable {
                 mouseCursorPosition: currentPoint,
                 mouseButton: .left
             ) {
-                dragEvent.post(tap: .cghidEventTap)
+                Self.postToDesktop(dragEvent)
             }
         }
 
@@ -289,7 +310,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         ) else {
             return false
         }
-        upEvent.post(tap: .cghidEventTap)
+        Self.postToDesktop(upEvent)
         return true
     }
 
@@ -306,7 +327,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         ) else {
             return false
         }
-        event.post(tap: .cghidEventTap)
+        Self.postToDesktop(event)
         return true
     }
 
@@ -339,8 +360,8 @@ public final class MacCuaDriver: @unchecked Sendable {
             upEvent.flags = modifiers.cgEventFlags
         }
 
-        downEvent.post(tap: .cghidEventTap)
-        upEvent.post(tap: .cghidEventTap)
+        Self.postToDesktop(downEvent)
+        Self.postToDesktop(upEvent)
         return true
     }
 
@@ -362,8 +383,8 @@ public final class MacCuaDriver: @unchecked Sendable {
             downEvent.keyboardSetUnicodeString(stringLength: 1, unicodeString: &charCode)
             upEvent.keyboardSetUnicodeString(stringLength: 1, unicodeString: &charCode)
 
-            downEvent.post(tap: .cghidEventTap)
-            upEvent.post(tap: .cghidEventTap)
+            Self.postToDesktop(downEvent)
+            Self.postToDesktop(upEvent)
         }
         return true
     }
