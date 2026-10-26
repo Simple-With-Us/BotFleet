@@ -68,7 +68,11 @@ public protocol MacSessionSourceProtocol: AnyObject {
 public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public var state: CompanionState = CompanionState()
     @Published public var status: MacConnectionStatus = .disconnected
-    @Published public var selection: SidebarSelection?
+    @Published public var selection: SidebarSelection? {
+        didSet {
+            reconcileWaitingThreadPin()
+        }
+    }
     @Published public var selectedThreadId: String?
     @Published public var isSending: Bool = false
     @Published public var host: String = "127.0.0.1"
@@ -116,8 +120,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private let cuaStatusState = CuaStatusState()
     private var hasLaunched = false
     private var didDeliberatelyStopServer = false
-    private var mainWindowObserver: NSObjectProtocol?
-    private var lastSystemSurfaceSync: Date?
+    private weak var mainWindow: NSWindow?
+    private var mainWindowObservers: [NSObjectProtocol] = []
+    private var surfaceSyncThrottle = MacSystemSurfaceSyncThrottle()
+    private var waitingThreadPin = MacWaitingThreadPin()
     private var pendingSystemSurfaceSync: Task<Void, Never>?
     private var notificationAuthorizationTask: Task<Bool, Never>?
     #if os(macOS)
@@ -281,13 +287,28 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         voiceRouteBanner = voiceEngine.routeBanner
         guard opened else { return }
 
-        let coordinator = MacVoiceCaptureCoordinator { [weak self] partial, level in
-            Task { @MainActor in
-                guard let self else { return }
-                self.voiceEngine.receivePartialTranscript(partial, audioLevel: level)
-                self.voiceState = self.voiceEngine.state
+        let coordinator = MacVoiceCaptureCoordinator(
+            onPartialTranscript: { [weak self] partial, level in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.voiceEngine.receivePartialTranscript(partial, audioLevel: level)
+                    self.voiceState = self.voiceEngine.state
+                    // The composer is live while dictation runs:  the
+                    // partials stream into it, exactly like the Electron
+                    // composer, which shows the text typed before the
+                    // microphone went on and then the latest partial.
+                    if let liveDraft = self.voiceEngine.liveComposerDraft {
+                        self.composerDraft = liveDraft
+                    }
+                }
+            },
+            onRecognitionEnded: { [weak self] end in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.handleVoiceCaptureEnded(end)
+                }
             }
-        }
+        )
         voiceCaptureCoordinator = coordinator
         if !coordinator.start() {
             voiceEngine.handleMidSessionRecognitionFailure()
@@ -296,6 +317,28 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         #else
         _ = attemptId
         #endif
+    }
+
+    /// Leaves the recording state when the capture stack ends on its own.
+    ///
+    /// A recognizer that fails or finishes closes the microphone without a
+    /// tap, so the session has to hear about it:  otherwise the composer
+    /// keeps showing a recording that no longer exists.
+    private func handleVoiceCaptureEnded(_ end: MacVoiceCaptureEnd) {
+        voiceCaptureCoordinator = nil
+        voiceEngine.handleCaptureEnded(end)
+        voiceState = voiceEngine.state
+        switch end {
+        case .recognitionFailed:
+            // A failed recognition restores the text the user had before
+            // dictating, so a half-transcribed fragment never stays behind
+            // as if it were what they said.
+            composerDraft = voiceEngine.currentDraft
+        case .completed:
+            // The final transcript is already in the composer;  the engine
+            // only stops.
+            break
+        }
     }
 
     /// Closes the microphone and stops recognition.
@@ -368,8 +411,20 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// Selects a bot that is waiting for the person.
     public func selectWaitingBot(_ item: MacWaitingBotItem) {
         selectedBotId = item.id
+        waitingThreadPin.pin(threadId: item.threadId, botId: item.id)
         selectedThreadId = item.threadId
         activateMainWindow()
+    }
+
+    /// Drops a menubar thread pin once the sidebar selection moves on.
+    ///
+    /// The menubar pins the thread it opened, so a later sidebar pick has
+    /// to release it:  otherwise the transcript on screen stays on the
+    /// thread the menubar picked while the sidebar shows another bot.
+    private func reconcileWaitingThreadPin() {
+        if waitingThreadPin.dropIfSelectionMoved(toBotId: selectedBotId) {
+            selectedThreadId = nil
+        }
     }
 
     /// Pauses or resumes every bot.
@@ -430,12 +485,18 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
 
     private func syncSystemSurfaces(force: Bool = false) {
         let now = Date()
-        if !force, !MacSystemSurfaceSyncPolicy.shouldSync(now: now, lastSync: lastSystemSurfaceSync) {
+        switch surfaceSyncThrottle.action(for: now, force: force) {
+        case .scheduleDeferred:
             scheduleDeferredSystemSurfaceSync()
-            return
+        case .syncNow:
+            // A forced rebuild replaces the pending deferred one:  the
+            // surfaces are current, so the deferred rebuild would only
+            // repeat it with older state.
+            pendingSystemSurfaceSync?.cancel()
+            pendingSystemSurfaceSync = nil
+            surfaceSyncThrottle.recordSync(at: now)
+            performSystemSurfaceSync()
         }
-        lastSystemSurfaceSync = now
-        performSystemSurfaceSync()
     }
 
     /// Rebuilds the surfaces once the throttle window has passed, so the last
@@ -445,8 +506,11 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         pendingSystemSurfaceSync = Task { @MainActor [weak self] in
             let nanoseconds = UInt64(MacSystemSurfaceSyncPolicy.minimumInterval * 1_000_000_000)
             try? await Task.sleep(nanoseconds: nanoseconds)
-            guard let self else { return }
+            guard let self, !Task.isCancelled else { return }
             self.pendingSystemSurfaceSync = nil
+            // The deferred rebuild advances the throttle too:  without this
+            // the next frame would schedule another rebuild immediately.
+            self.surfaceSyncThrottle.recordSync(at: Date())
             self.performSystemSurfaceSync()
         }
     }
@@ -521,21 +585,77 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// The observer is bound to the main window instance rather than to every
     /// `NSWindow`, so closing the Settings panel never applies the quit policy.
     public func registerMainWindow(_ window: NSWindow) {
-        // SwiftUI can recreate the window, so the previous observer is dropped
-        // rather than left pointing at a window that no longer exists.
-        if let mainWindowObserver {
-            NotificationCenter.default.removeObserver(mainWindowObserver)
-            self.mainWindowObserver = nil
+        // SwiftUI can recreate the window, so the previous observers are
+        // dropped rather than left pointing at a window that no longer
+        // exists.
+        for observer in mainWindowObservers {
+            NotificationCenter.default.removeObserver(observer)
         }
-        mainWindowObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification,
-            object: window,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                await self?.handleWindowClose()
+        mainWindowObservers.removeAll()
+        mainWindow = window
+
+        mainWindowObservers.append(
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    await self?.handleWindowClose()
+                    self?.updateMainWindowFocusState()
+                }
             }
+        )
+
+        // The notification coordinator only suppresses a banner for the
+        // thread on screen while the app is actually in front, so the
+        // window's visibility and the app's focus both have to be tracked.
+        let windowNotifications: [Notification.Name] = [
+            NSWindow.didMiniaturizeNotification,
+            NSWindow.didDeminiaturizeNotification
+        ]
+        for name in windowNotifications {
+            mainWindowObservers.append(
+                NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.updateMainWindowFocusState()
+                    }
+                }
+            )
         }
+        let applicationNotifications: [Notification.Name] = [
+            NSApplication.didBecomeActiveNotification,
+            NSApplication.didResignActiveNotification,
+            NSApplication.didUnhideNotification
+        ]
+        for name in applicationNotifications {
+            mainWindowObservers.append(
+                NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.updateMainWindowFocusState()
+                    }
+                }
+            )
+        }
+        updateMainWindowFocusState()
+    }
+
+    /// Keeps the coordinator's on-screen flag in step with the window.
+    ///
+    /// The Electron app suppresses a desktop banner whenever the app has
+    /// focus, because the chat on screen already shows the card.  The Mac
+    /// only suppresses it for the thread actually on screen, so it needs
+    /// both facts:  the window is on screen, and the app is active.
+    private func updateMainWindowFocusState() {
+        #if os(macOS)
+        let window = mainWindow
+        let windowIsVisible = (window?.isVisible ?? false) && !(window?.isMiniaturized ?? false)
+        let applicationIsActive = NSApplication.shared.isActive
+        notificationCoordinator.isMainWindowVisibleAndFocused = MacMainWindowFocus.isVisibleAndFocused(
+            windowIsVisible: windowIsVisible,
+            applicationIsActive: applicationIsActive
+        )
+        #endif
     }
 
     public func disconnect() {

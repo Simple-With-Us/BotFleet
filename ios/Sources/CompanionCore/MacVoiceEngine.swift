@@ -56,6 +56,21 @@ public enum MacMicTapOutcome: Equatable, Sendable {
     case stoppedCapture
 }
 
+/// Why a capture ended without the user asking for it.
+///
+/// The capture stack reports its own endings, because a recognizer that
+/// fails or finishes leaves the microphone closed on its own:  nobody taps
+/// the button, so nobody else would notice that the recording state is
+/// stale.
+public enum MacVoiceCaptureEnd: Equatable, Sendable {
+    /// The recognizer failed mid-session.  The engine reports the voice
+    /// failure and releases the microphone.
+    case recognitionFailed
+    /// The recognizer produced its final transcript and ended the session.
+    /// The engine returns to idle and keeps the transcript.
+    case completed
+}
+
 /// Recoverable and unrecoverable voice failures with exact product copy.
 public enum MacVoiceFailure: Equatable, Sendable {
     case microphoneRefused(isCall: Bool)
@@ -280,15 +295,30 @@ public final class MacVoiceEngine: @unchecked Sendable {
 
     /// The composer text to show after a microphone tap.
     ///
-    /// A cancelled pending start keeps the caller's draft verbatim:  the
-    /// engine's frozen snapshot was taken before the microphone warmed up, so
-    /// returning it would silently discard anything typed in the meantime.
-    /// Every other outcome returns the engine draft, which carries the latest
-    /// partial transcript.
+    /// The caller's draft is the truth, because the composer is live while
+    /// dictation runs:  the partials stream into it, and anything the user
+    /// typed after the last partial belongs to them.  The engine's own draft
+    /// is rebased on the frozen base, so returning it would silently discard
+    /// the text typed during dictation — the same reason a cancelled pending
+    /// start keeps the caller's draft verbatim.
     public func composerDraftAfterTap(incomingDraft: String) -> String {
-        if lastTapOutcome == .cancelledPendingStart {
+        switch lastTapOutcome {
+        case .cancelledPendingStart, .stoppedCapture:
             return incomingDraft
+        case .startedCapture, .none:
+            return currentDraft
         }
+    }
+
+    /// The composer text to show right now while composer dictation runs,
+    /// and `nil` in every other mode.
+    ///
+    /// The Electron composer streams partials into the input as they arrive
+    /// (the text typed before the microphone went on, then the latest
+    /// partial), so the Mac mirrors the same text into its composer while
+    /// the microphone is open.
+    public var liveComposerDraft: String? {
+        guard case .recording(_, _, .composerDictation) = state else { return nil }
         return currentDraft
     }
 
@@ -534,6 +564,21 @@ public final class MacVoiceEngine: @unchecked Sendable {
         state = .failed(.recognitionFailedMidSession)
     }
 
+    /// Leaves the recording state when the capture stack ends on its own.
+    ///
+    /// A recognizer that fails or finishes closes the microphone without a
+    /// tap, so the engine has to hear about it:  otherwise the UI keeps
+    /// showing a recording that no longer exists, with the microphone
+    /// hardware still marked open.
+    public func handleCaptureEnded(_ end: MacVoiceCaptureEnd) {
+        switch end {
+        case .recognitionFailed:
+            handleMidSessionRecognitionFailure()
+        case .completed:
+            stopCapture()
+        }
+    }
+
     // MARK: - Audio Route Changes
 
     /// Handles a macOS CoreAudio / AVAudioEngine input device route change.
@@ -723,9 +768,18 @@ public final class MacVoiceCaptureCoordinator: @unchecked Sendable {
     private var recognitionTask: SFSpeechRecognitionTask?
     private var isInputTapInstalled = false
     private let onPartialTranscript: @Sendable (String, Float) -> Void
+    private let onRecognitionEnded: @Sendable (MacVoiceCaptureEnd) -> Void
+    /// Guards the one-shot ending, so the cancellation an ending triggers
+    /// never reports a second one.
+    private let endLock = NSLock()
+    private var hasEnded = false
 
-    public init(onPartialTranscript: @escaping @Sendable (String, Float) -> Void) {
+    public init(
+        onPartialTranscript: @escaping @Sendable (String, Float) -> Void,
+        onRecognitionEnded: @escaping @Sendable (MacVoiceCaptureEnd) -> Void = { _ in }
+    ) {
         self.onPartialTranscript = onPartialTranscript
+        self.onRecognitionEnded = onRecognitionEnded
     }
 
     /// Whether the running bundle declares the microphone usage description
@@ -836,19 +890,51 @@ public final class MacVoiceCaptureCoordinator: @unchecked Sendable {
         }
 
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+            if error != nil {
+                // The recognizer gave up:  the microphone is closed and the
+                // owner has to leave the recording state.
+                self.finishRecognition(.recognitionFailed)
+                return
+            }
             if let result {
                 let text = result.bestTranscription.formattedString
-                self?.onPartialTranscript(text, 0.5)
-            }
-            if error != nil {
-                self?.stop()
+                self.onPartialTranscript(text, 0.5)
+                if result.isFinal {
+                    // The recognizer finished on its own:  the final
+                    // transcript is delivered above, and the session ends.
+                    self.finishRecognition(.completed)
+                }
             }
         }
         return true
     }
 
+    /// Ends the capture stack once the recognizer is done, and reports why.
+    ///
+    /// A deliberate `stop()` never reports an ending:  the user asked for
+    /// it, so it is not a failure.
+    private func finishRecognition(_ end: MacVoiceCaptureEnd) {
+        guard claimEnding() else { return }
+        stop()
+        onRecognitionEnded(end)
+    }
+
+    /// Claims the one-shot ending, so the cancellation the ending itself
+    /// triggers cannot report a second one.
+    private func claimEnding() -> Bool {
+        endLock.lock()
+        defer { endLock.unlock() }
+        if hasEnded { return false }
+        hasEnded = true
+        return true
+    }
+
     /// Closes the input node and stops recognition.
     public func stop() {
+        // A deliberate stop is not an ending the owner has to hear about:
+        // claiming it here keeps the cancellation error quiet.
+        _ = claimEnding()
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest?.endAudio()

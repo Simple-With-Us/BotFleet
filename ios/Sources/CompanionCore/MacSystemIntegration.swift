@@ -36,6 +36,100 @@ public enum MacSystemSurfaceSyncPolicy {
     }
 }
 
+/// What a request to rebuild the system surfaces should do.
+public enum MacSystemSurfaceSyncAction: Equatable, Sendable {
+    /// Rebuild the surfaces now.
+    case syncNow
+    /// The throttle window has not passed:  rebuild once it does.
+    case scheduleDeferred
+}
+
+/// The throttle state for the macOS system surfaces.
+///
+/// The surfaces are rebuilt on every harness frame, and a burst of frames
+/// would rebuild the menubar dozens of times a second.  The throttle keeps
+/// one rebuild per interval, and remembers the timestamp of the LAST
+/// rebuild — including a deferred one, so a burst that ends with a deferred
+/// rebuild does not immediately schedule another one.
+public struct MacSystemSurfaceSyncThrottle: Equatable, Sendable {
+    /// The timestamp of the last rebuild, whatever ran it.
+    public private(set) var lastSync: Date?
+
+    public init(lastSync: Date? = nil) {
+        self.lastSync = lastSync
+    }
+
+    /// What a sync request should do, given the current time.
+    ///
+    /// A forced sync always runs now:  it is how the surfaces are rebuilt
+    /// when the connection changes, and a stale menubar is worse than a
+    /// redundant rebuild.
+    public func action(for now: Date, force: Bool) -> MacSystemSurfaceSyncAction {
+        if force { return .syncNow }
+        return MacSystemSurfaceSyncPolicy.shouldSync(now: now, lastSync: lastSync)
+            ? .syncNow
+            : .scheduleDeferred
+    }
+
+    /// Records that the surfaces were rebuilt now.
+    public mutating func recordSync(at now: Date) {
+        lastSync = now
+    }
+}
+
+/// The thread a menubar pick pinned.
+///
+/// The menubar opens a waiting bot's thread directly, so the thread is
+/// pinned for the moment.  A later sidebar pick moves the selection to
+/// another bot or to a room, and the pin is dropped then:  a stale pin
+/// would keep the old thread on screen while the sidebar shows something
+/// else.
+public struct MacWaitingThreadPin: Equatable, Sendable {
+    /// The pinned thread, and the bot it belongs to.
+    public private(set) var threadId: String?
+    public private(set) var botId: String?
+
+    public init() {
+        threadId = nil
+        botId = nil
+    }
+
+    /// Pins the thread a waiting bot's pick opened.
+    public mutating func pin(threadId: String, botId: String) {
+        self.threadId = threadId
+        self.botId = botId
+    }
+
+    /// Drops the pin.
+    public mutating func clear() {
+        threadId = nil
+        botId = nil
+    }
+
+    /// Drops the pin when the selection moved away from the pinned bot.
+    ///
+    /// Returns true when the pin was dropped, so the caller knows to clear
+    /// the session's selected thread as well.
+    @discardableResult
+    public mutating func dropIfSelectionMoved(toBotId selectedBotId: String?) -> Bool {
+        guard let pinnedBotId = botId, pinnedBotId != selectedBotId else { return false }
+        clear()
+        return true
+    }
+}
+
+/// Whether the main window is on screen and the app is in front.
+///
+/// The Electron app suppresses a desktop banner whenever the app has focus
+/// (`document.hasFocus()`), because the chat on screen already shows the
+/// card.  The Mac narrows that to the thread actually on screen, so it
+/// needs both facts:  the window is on screen, and the app is active.
+public enum MacMainWindowFocus {
+    public static func isVisibleAndFocused(windowIsVisible: Bool, applicationIsActive: Bool) -> Bool {
+        windowIsVisible && applicationIsActive
+    }
+}
+
 /// Visual states for the macOS `NSStatusItem` menubar mark.
 public enum MacMenubarIconState: String, Equatable, Sendable {
     /// Plain BotFleet mark when all bots are idle.
@@ -776,9 +870,11 @@ public enum MacCandidateNotificationEvent: Equatable, Sendable {
     /// Maps a harness notify frame onto the candidate event the coordinator
     /// evaluates.
     ///
-    /// The wire protocol's `approval` and `question` kinds are the two
-    /// person-blocking events it carries;  `done` and `routine-failed` are
-    /// routine progress and NEVER notify.
+    /// The wire protocol carries five kinds.  `approval` and `question` are
+    /// the two kinds where a request is waiting on a person, and `takeover`
+    /// is the third:  the bot needs the person's hands (a sign-in, or a
+    /// computer-control lease), so it reaches for them.  `done` and
+    /// `routine-failed` are routine progress and NEVER notify.
     public init(notificationFrame: NotificationFrame) {
         switch notificationFrame.kind {
         case "approval":
@@ -796,6 +892,16 @@ public enum MacCandidateNotificationEvent: Equatable, Sendable {
                 threadId: notificationFrame.threadId,
                 requestId: notificationFrame.requestId ?? "",
                 question: notificationFrame.body
+            )
+        case "takeover":
+            // The harness asks for the person's hands.  It carries no
+            // request id, because there is no card to answer — the person
+            // just has to take over.
+            self = .callOrMentionNeedsPerson(
+                botId: notificationFrame.botId,
+                botName: notificationFrame.botName,
+                threadId: notificationFrame.threadId,
+                message: notificationFrame.body
             )
         case "routine-failed":
             self = .routineProgress(
@@ -827,7 +933,7 @@ public enum MacNotificationCenter {
         content.title = payload.title
         content.body = payload.body
         content.categoryIdentifier = payload.categoryIdentifier
-        content.interruptionLevel = .timeSensitive
+        content.interruptionLevel = payload.interruptionLevel.unNotificationInterruptionLevel
         content.threadIdentifier = payload.threadId
         let request = UNNotificationRequest(
             identifier: payload.identifier,
@@ -842,7 +948,21 @@ public enum MacNotificationCenter {
 /// Built notification payload ready for `UNUserNotificationCenter`.
 public struct MacDeliverableNotification: Equatable, Sendable {
     public enum InterruptionLevel: String, Equatable, Sendable {
+        /// Breaks through Focus modes, the way an approval or a question
+        /// does on the paired phone.
         case timeSensitive
+        /// An ordinary banner, the way a takeover is delivered on the
+        /// paired phone (`APNS_UPDATE_CATEGORY`, `interruptionLevel:
+        /// "active"`).
+        case active
+
+        /// The `UNUserNotificationCenter` level that matches this one.
+        public var unNotificationInterruptionLevel: UNNotificationInterruptionLevel {
+            switch self {
+            case .timeSensitive: return .timeSensitive
+            case .active: return .active
+            }
+        }
     }
 
     public let identifier: String
@@ -1020,7 +1140,11 @@ public final class MacNotificationCoordinator: @unchecked Sendable {
                 categoryIdentifier: NotificationCategoryIdentifier.update,
                 actionTitles: ["Open"],
                 supportsInlineTextReply: false,
-                interruptionLevel: .timeSensitive,
+                // An ordinary banner, not a Focus-mode interruption:  the
+                // paired phone delivers a takeover the same way, and a
+                // takeover asks for the person's hands rather than for an
+                // answer.
+                interruptionLevel: .active,
                 threadId: threadId,
                 botId: botId,
                 requestId: nil

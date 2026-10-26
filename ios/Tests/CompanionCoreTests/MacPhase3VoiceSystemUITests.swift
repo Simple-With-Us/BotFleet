@@ -496,7 +496,9 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         guard case .deliver(let mentionPayload) = mentionDecision else {
             return XCTFail("Expected mention notification delivery")
         }
-        XCTAssertEqual(mentionPayload.interruptionLevel, .timeSensitive)
+        // A takeover asks for the person's hands, not for an answer, so it
+        // arrives as an ordinary banner — the way the paired phone sends it.
+        XCTAssertEqual(mentionPayload.interruptionLevel, .active)
 
         // Refused permission surfaces exact Settings status copy and "Open Settings".
         let deniedCoordinator = MacNotificationCoordinator(
