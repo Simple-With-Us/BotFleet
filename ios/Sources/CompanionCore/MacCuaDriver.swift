@@ -4,6 +4,75 @@ import CoreGraphics
 import Foundation
 import Security
 
+/// Whether this process may post to the live desktop.
+///
+/// The CUA suite used to post real mouse and keyboard events to the live
+/// desktop, so running it took the person's mouse over while they worked.
+/// The sink seam keeps the tests off the live path, and this is the belt on
+/// that seam: a process that is a test runner never posts, whatever sink it
+/// was handed.  The shipping app is an application bundle and is never a test
+/// runner, so the product capability is unchanged.
+public enum MacDesktopInputPolicy {
+    /// True when this process is a test runner rather than the app.
+    ///
+    /// The SwiftPM testing helper is the process that runs the suite, and an
+    /// XCTest run is an XCTest bundle.  This is computed once, so the check
+    /// costs a single boolean read on the hot path.
+    public static let isUnderTestRunner: Bool = {
+        // The helper is the process that runs the suite under SwiftPM.  The
+        // name is folded before the comparison so a differently cased helper
+        // still matches.
+        if ProcessInfo.processInfo.processName.lowercased() == "swiftpm-testing-helper" { return true }
+        if Bundle.main.bundleURL.pathExtension.lowercased() == "xctest" { return true }
+        // XCTestCase and XCTestExpectation are the classes that actually
+        // exist in XCTest; the bare name "XCTest" never resolved to anything,
+        // so the old probe silently stopped recognizing other runners.
+        if NSClassFromString("XCTestCase") != nil { return true }
+        if NSClassFromString("XCTestExpectation") != nil { return true }
+        return false
+    }()
+
+    /// True when a synthesized event may be posted to the live desktop.
+    public static let mayPostToDesktop: Bool = !isUnderTestRunner
+
+    /// The one place in the shipping sources that posts to the live desktop.
+    ///
+    /// Every other delivery goes through the injected sink, which reaches the
+    /// window server only when its caller says so.  Routing the single real
+    /// post through here means handing the driver a different sink cannot
+    /// bypass the policy, and a test that scans the sources fails if a second
+    /// post site ever appears.  A test runner is refused, and the refusal is
+    /// counted so a test can prove the guard fired.
+    @discardableResult
+    static func postToDesktop(_ event: CGEvent) -> Bool {
+        guard mayPostToDesktop else {
+            recordSuppressedPost()
+            return false
+        }
+        event.post(tap: .cghidEventTap)
+        return true
+    }
+
+    /// How many desktop posts this policy suppressed.
+    ///
+    /// Only the denying path moves the counter, so the shipping app pays
+    /// nothing to carry it.
+    static var suppressedDesktopPostCount: Int {
+        suppressedPostLock.lock()
+        defer { suppressedPostLock.unlock() }
+        return _suppressedDesktopPostCount
+    }
+
+    private static let suppressedPostLock = NSLock()
+    private static var _suppressedDesktopPostCount = 0
+
+    private static func recordSuppressedPost() {
+        suppressedPostLock.lock()
+        _suppressedDesktopPostCount += 1
+        suppressedPostLock.unlock()
+    }
+}
+
 /// Normalized or absolute coordinates for Computer Use Agent (CUA) interactions.
 public struct CuaPoint: Sendable, Hashable, Codable {
     public var x: Double
@@ -336,7 +405,16 @@ public final class MacCuaDriver: @unchecked Sendable {
     private let eventSink: @Sendable (CGEvent) -> Void
 
     public convenience init() {
-        self.init(eventSink: { $0.post(tap: .cghidEventTap) })
+        // A test runner never reaches the live desktop, even with the
+        // production sink.  The app is not a test runner, so it still
+        // drives the desktop exactly as before.
+        //
+        // The post itself lives in the policy, so this sink is the only
+        // route to the window server and the guard cannot be stepped around
+        // by handing the driver a different sink.
+        self.init(eventSink: { event in
+            MacDesktopInputPolicy.postToDesktop(event)
+        })
     }
 
     /// Internal so ordinary tests can exercise synthesis and safety bookkeeping
