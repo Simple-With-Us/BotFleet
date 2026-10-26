@@ -582,16 +582,19 @@ const DELETE_INTERNAL_GROUPS_APP_IDS = new Set([
   "6820881005", // UM Client
 ]);
 
-// Whether a processed build can reach anyone through external testing: it is
-// assigned to at least one external group that has testers or an enabled
-// public link.  Under the owner's external-only policy (2026-10-18/19) this
-// replaces the internal-tester count as the installability check; approval is
-// still Apple's gate after that.  Never throws; { ok:false } means the read
-// failed, which is not the same as uninstallable.
-export async function externalInstallability({ api, buildId }) {
+// Whether an app's builds can reach anyone through external testing: the app
+// has at least one external group that has testers or an enabled public link.
+// This is APP-LEVEL on purpose: Apple forbids GET on a build's betaGroups
+// relationship (403 FORBIDDEN_ERROR, observed live 2026-10-26), and the ship
+// assigns the build to the group in the sync step anyway - the same app-level
+// semantics the internal-tester count had.  Under the owner's external-only
+// policy (2026-10-18/19) this replaces that count as the installability
+// check; approval is still Apple's gate after that.  Never throws; { ok:false }
+// means the read failed, which is not the same as uninstallable.
+export async function externalInstallability({ api, appId }) {
   let groupsRes;
   try {
-    groupsRes = await ascAllRows({ api, url: `/v1/builds/${buildId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled` });
+    groupsRes = await ascAllRows({ api, url: `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled` });
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e), installable: false };
   }
@@ -630,7 +633,7 @@ export async function externalInstallability({ api, buildId }) {
     installable: false,
     detail: external.length
       ? "external groups have neither testers nor a public link"
-      : "build is assigned to no external group"
+      : "app has no external group"
   };
 }
 
@@ -1820,7 +1823,7 @@ async function main() {
         // policy (2026-10-18/19) there is no internal group, so installability
         // means the build sits in an external group that has testers or an
         // enabled public link.  This is how 14 green ships reached nobody (GH #1018).
-        const reach = await externalInstallability({ api, buildId });
+        const reach = await externalInstallability({ api, appId });
         if (reach.ok) {
           console.error(`ensure-tf-ready: external installability=${reach.installable} (${reach.detail})`);
         } else {
