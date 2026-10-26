@@ -1,13 +1,20 @@
 import Foundation
 
-public struct LocalVM: Decodable, Equatable {
+public struct LocalVM: Decodable, Equatable, Sendable {
     public let key: String
     public let name: String
     public let running: Bool
     public let state: String?
+
+    public init(key: String, name: String, running: Bool, state: String? = nil) {
+        self.key = key
+        self.name = name
+        self.running = running
+        self.state = state
+    }
 }
 
-public struct ControlStatus: Decodable, Equatable {
+public struct ControlStatus: Decodable, Equatable, Sendable {
     public let activeBotCount: Int
     public let localVms: [LocalVM]
     public let persistOnExit: Bool
@@ -20,9 +27,23 @@ public struct ControlStatus: Decodable, Equatable {
     /// for that refusal, so the dialog and the refusal agree.
     public let blockingWork: [BlockingWork]?
 
+    public init(
+        activeBotCount: Int,
+        localVms: [LocalVM],
+        persistOnExit: Bool = true,
+        blockingWork: [BlockingWork]? = nil
+    ) {
+        self.activeBotCount = activeBotCount
+        self.localVms = localVms
+        self.persistOnExit = persistOnExit
+        self.blockingWork = blockingWork
+    }
+
     public var runningVMCount: Int { localVms.filter(\.running).count }
     public var sharedVM: LocalVM? { localVms.first { $0.key == "shared" } }
+    public var isSharedVMRunning: Bool { sharedVM?.running == true }
     public var canStartSharedVM: Bool { ["missing", "created"].contains(sharedVM?.state ?? "") }
+    public var canStopSharedVM: Bool { sharedVM?.running == true }
 
     /// The blocking work as a sentence, or nil when nothing is in flight.
     public var blockingWorkSummary: String? {
@@ -33,9 +54,14 @@ public struct ControlStatus: Decodable, Equatable {
 }
 
 /// One kind of work that is in flight and would block a stop.
-public struct BlockingWork: Decodable, Equatable {
+public struct BlockingWork: Decodable, Equatable, Sendable {
     public let count: Int
     public let label: String
+
+    public init(count: Int, label: String) {
+        self.count = count
+        self.label = label
+    }
 }
 
 public enum ControlAPIError: LocalizedError, Equatable {
@@ -51,7 +77,7 @@ public enum ControlAPIError: LocalizedError, Equatable {
         switch self {
         case .unavailable: return "BotFleet Server is unavailable."
         case .unresponsive: return "BotFleet Server is running but did not answer in time."
-        case .foreignService: return "Port 8799 is not answering as BotFleet Server."
+        case .foreignService: return "Port is not answering as BotFleet Server."
         case .invalidResponse: return "BotFleet Server returned an invalid response.  Update BotFleet and try again."
         case .refused(let message): return message
         }
@@ -60,12 +86,26 @@ public enum ControlAPIError: LocalizedError, Equatable {
 
 public final class ControlAPI {
     private let session: URLSession
+    public let host: ServerHost
     private let baseURL: URL
     private let decoder = JSONDecoder()
 
-    public init(session: URLSession = .shared, baseURL: URL = URL(string: "http://127.0.0.1:8799")!) {
+    public init(session: URLSession = .shared, host: ServerHost = .defaultLocal) {
         self.session = session
-        self.baseURL = baseURL
+        self.host = host
+        self.baseURL = host.baseURL
+    }
+
+    public convenience init(session: URLSession, baseURL: URL) {
+        let isLocal = (baseURL.host == "127.0.0.1" || baseURL.host == "localhost")
+        let host = ServerHost(name: isLocal ? "Local Mac" : "Custom Server", baseURL: baseURL, isLocal: isLocal)
+        self.init(session: session, host: host)
+    }
+
+    public convenience init(baseURL: URL) {
+        let isLocal = (baseURL.host == "127.0.0.1" || baseURL.host == "localhost")
+        let host = ServerHost(name: isLocal ? "Local Mac" : "Custom Server", baseURL: baseURL, isLocal: isLocal)
+        self.init(session: .shared, host: host)
     }
 
     /// How long the status probe waits for the server's own answer.
@@ -105,6 +145,9 @@ public final class ControlAPI {
     public func startVM() async throws { try await post("/api/system/control/vms/start") }
     public func stopVMs() async throws { try await post("/api/system/control/vms/stop") }
 
+    public func startSharedVM() async throws { try await startVM() }
+    public func stopSharedVM() async throws { try await stopVMs() }
+
     private func post(_ path: String) async throws {
         try await verifyIdentity()
         let data = try await send(path, method: "POST", body: Data("{}".utf8), timeout: 300)
@@ -116,13 +159,17 @@ public final class ControlAPI {
     private func verifyIdentity() async throws {
         let data = try await send("/api/health", method: "GET")
         guard let value = try? decoder.decode(Health.self, from: data),
-              value.app == "botfleet", value.pid > 0, value.ready == true else {
+              value.app == "botfleet",
+              (!host.isLocal || value.pid > 0),
+              value.ready == true else {
             throw ControlAPIError.foreignService
         }
     }
 
     private func send(_ path: String, method: String, body: Data? = nil, timeout: TimeInterval = 3) async throws -> Data {
-        guard baseURL.scheme == "http", baseURL.host == "127.0.0.1",
+        let validScheme = host.isLocal ? (baseURL.scheme == "http") : (baseURL.scheme == "http" || baseURL.scheme == "https")
+        let validHost = host.isLocal ? (baseURL.host == "127.0.0.1") : (baseURL.host != nil && !baseURL.host!.isEmpty)
+        guard validScheme, validHost,
               let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else {
             throw ControlAPIError.invalidResponse
         }
@@ -131,6 +178,9 @@ public final class ControlAPI {
         request.timeoutInterval = timeout
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let token = host.authToken, !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         if let body {
             request.httpBody = body
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -140,8 +190,10 @@ public final class ControlAPI {
         do { (data, response) = try await session.data(for: request, delegate: NoRedirects()) }
         catch { throw ControlAPIError.unavailable }
         guard let http = response as? HTTPURLResponse else { throw ControlAPIError.invalidResponse }
-        guard http.url?.scheme == "http", http.url?.host == "127.0.0.1",
-              http.url?.port == baseURL.port else { throw ControlAPIError.foreignService }
+        if host.isLocal {
+            guard http.url?.scheme == "http", http.url?.host == "127.0.0.1",
+                  http.url?.port == baseURL.port else { throw ControlAPIError.foreignService }
+        }
         if !(200..<300).contains(http.statusCode) {
             if path == "/api/health" { throw ControlAPIError.foreignService }
             let message = (try? decoder.decode(ErrorResponse.self, from: data))?.message
