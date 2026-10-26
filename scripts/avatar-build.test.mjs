@@ -262,11 +262,14 @@ describe("validateManifestAgainstFrames", () => {
     expect(problems.join(" ")).toMatch(/0-35/);
   });
 
-  it("accepts art that is bigger than the declared size, because the build scales it down", () => {
-    // The shipped TV-Face art is 480 x 480 and the shipped files are 256 x
-    // 256, so art that is bigger than the manifest declares is the ordinary
-    // case rather than a mistake.
-    expect(validateManifestAgainstFrames(MANIFEST, 36, { width: 480, height: 480 })).toEqual([]);
+  it("objects when the source size is not the declared size", () => {
+    // The check compares the manifest with the frames that are really
+    // there, so art of a different size is refused with both sizes named.
+    const problems = validateManifestAgainstFrames(MANIFEST, 36, { width: 480, height: 480 });
+    expect(problems.join(" ")).toMatch(
+      /the source frames are 480x480 but the manifest declares 256x256/,
+    );
+    expect(problems.join(" ")).toMatch(/have to be the size it declares/);
   });
 
   it("objects when the art is smaller than the declared size", () => {
@@ -275,16 +278,15 @@ describe("validateManifestAgainstFrames", () => {
     expect(problems.join(" ")).toMatch(
       /the source frames are 128x128 but the manifest declares 256x256/,
     );
-    expect(problems.join(" ")).toMatch(/will not make pixels/);
   });
 
   it("objects when the art does not have the proportions the manifest declares", () => {
-    // Squashing a wide drawing into a square would change what the author
-    // drew, so the build says so instead of doing it.
-    // 512 x 256 is big enough in both directions, so this is not the
-    // "there are not enough pixels" case; it is the shape of the art.
+    // A wide drawing is not a square drawing, and the build says which two
+    // sizes it found rather than quietly changing the shape of the art.
     const problems = validateManifestAgainstFrames(MANIFEST, 36, { width: 512, height: 256 });
-    expect(problems.join(" ")).toMatch(/change the proportions of the art/);
+    expect(problems.join(" ")).toMatch(
+      /the source frames are 512x256 but the manifest declares 256x256/,
+    );
   });
 
   it("objects when the resting frame is past the end", () => {
@@ -534,18 +536,17 @@ describe("the whole build", () => {
   );
 
   it.skipIf(!toolchain)(
-    "scales art that is bigger than the manifest declares down to it",
+    "builds art that is the size the manifest declares",
     async () => {
-      // The shipped TV-Face art is 480 x 480 and the shipped files are 256 x
-      // 256.  The build has to be able to do that, because that is how the
-      // files in the repository were made.
+      // The frames have to be the size the manifest declares, because the
+      // manifest is what tells the player how big a frame is.
       const { buildAvatar } = await import("./avatar-build.ts");
       const dir = mkdtempSync(join(tmpdir(), "avatar-build-scale-"));
       try {
         const frames = join(dir, "frames");
         mkdirSync(frames);
         for (let i = 1; i <= 4; i++) {
-          writeFileSync(join(frames, `${String(i).padStart(2, "0")}.png`), png(480, 480, i * 20));
+          writeFileSync(join(frames, `${String(i).padStart(2, "0")}.png`), png(256, 256, i * 20));
         }
         const manifestPath = join(dir, "avatar.json");
         writeFileSync(
