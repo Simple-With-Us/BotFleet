@@ -118,19 +118,43 @@ export function readWebpSize(path: string): FrameSize {
 export function readImageSize(path: string): FrameSize {
   const handle = readFileSync(path);
   const name = basename(path);
+  const format = sniffFormat(handle, name);
+  if (format === "png") {
+    return { width: handle.readUInt32BE(16), height: handle.readUInt32BE(20) };
+  }
+  if (format === "jpeg") return jpegSize(handle, name);
+  return webpSize(handle, name);
+}
+
+/** The picture formats the build can read. */
+export type ImageFormat = "png" | "jpeg" | "webp";
+
+/**
+ * Which picture format a file really is, read from its first bytes.
+ *
+ * The name of the file is not evidence: a frame called `01.png` that holds
+ * JPEG bytes is a JPEG, and the build has to treat it as one, because
+ * `ffmpeg` picks its decoder from the format it is handed.
+ */
+export function imageFormat(path: string): ImageFormat {
+  const handle = readFileSync(path);
+  return sniffFormat(handle, basename(path));
+}
+
+function sniffFormat(handle: Buffer, name: string): ImageFormat {
   if (handle.length >= 8 && handle.readUInt32BE(0) === 0x89504e47) {
     if (handle.length < 24 || handle.subarray(12, 16).toString("latin1") !== "IHDR") {
       throw new Error(`${name}: no IHDR chunk`);
     }
-    return { width: handle.readUInt32BE(16), height: handle.readUInt32BE(20) };
+    return "png";
   }
-  if (handle.length >= 3 && handle.readUInt16BE(0) === 0xffd8) return jpegSize(handle, name);
+  if (handle.length >= 3 && handle.readUInt16BE(0) === 0xffd8) return "jpeg";
   if (
     handle.length >= 16 &&
     handle.subarray(0, 4).toString("latin1") === "RIFF" &&
     handle.subarray(8, 12).toString("latin1") === "WEBP"
   ) {
-    return webpSize(handle, name);
+    return "webp";
   }
   throw new Error(`${name}: not a PNG, a JPEG or a WebP`);
 }
@@ -401,16 +425,41 @@ export function validateManifestAgainstFrames(
   }
 
   if (frameSize) {
-    if (frameSize.width !== manifest.frame.width || frameSize.height !== manifest.frame.height) {
+    // The manifest declares the size the avatar is DELIVERED at, so the build
+    // scales the art down to it.  That is how the shipped examples were made:
+    // the TV-Face art is 480 x 480 and the files are 256 x 256.  What the
+    // build will not do is invent pixels by scaling up, or squash a drawing
+    // whose shape does not match, because either would change what the author
+    // drew without saying so.
+    if (frameSize.width < manifest.frame.width || frameSize.height < manifest.frame.height) {
       problems.push(
         `the source frames are ${frameSize.width}x${frameSize.height} but the manifest declares ` +
-          `${manifest.frame.width}x${manifest.frame.height}; the manifest describes the file the ` +
-          "player draws, so the frames have to be the size it declares",
+          `${manifest.frame.width}x${manifest.frame.height}; the build scales art down to the ` +
+          "declared size, but it will not make pixels that are not there",
+      );
+    } else if (!sameAspect(frameSize, manifest.frame)) {
+      problems.push(
+        `the source frames are ${frameSize.width}x${frameSize.height} but the manifest declares ` +
+          `${manifest.frame.width}x${manifest.frame.height}; scaling them to the declared size ` +
+          "would change the proportions of the art, so declare the size that matches it",
       );
     }
   }
 
   return problems;
+}
+
+/**
+ * Whether art of one size has the same proportions as another.
+ *
+ * The build scales the art to the declared size, and a scale that is not the
+ * same in both directions would squash the drawing.  One pixel of difference
+ * is not a different proportion, so the comparison allows about a percent.
+ */
+function sameAspect(size: FrameSize, frame: { width: number; height: number }): boolean {
+  const source = size.width / size.height;
+  const declared = frame.width / frame.height;
+  return Math.abs(source - declared) / declared <= 0.01;
 }
 
 function run(command: string, args: string[]): void {
@@ -422,15 +471,28 @@ function run(command: string, args: string[]): void {
  *
  * `ffmpeg` and `img2webp` both want a predictable sequence, and the author
  * should not have to name their files `frame_0001.png` to use the tool.
+ *
+ * The staged files keep the format they really are.  `ffmpeg` picks its
+ * decoder from the extension it is given, so a JPEG frame dressed up as a PNG
+ * is a picture it cannot read, and the build would fail on the frame itself
+ * instead of on the manifest.
  */
-function stageFrames(frames: string[], dir: string): string {
+function stageFrames(frames: string[], dir: string, format: ImageFormat): string {
   const width = String(frames.length).length;
+  const extension = FORMAT_EXTENSION[format];
   frames.forEach((frame, index) => {
-    const name = `${String(index + 1).padStart(width, "0")}.png`;
+    const name = `${String(index + 1).padStart(width, "0")}${extension}`;
     symlinkSync(resolve(frame), join(dir, name));
   });
-  return join(dir, `%0${width}d.png`);
+  return join(dir, `%0${width}d${extension}`);
 }
+
+/** The file extension each picture format is staged under. */
+const FORMAT_EXTENSION = {
+  png: ".png",
+  jpeg: ".jpg",
+  webp: ".webp",
+} satisfies Record<ImageFormat, string>;
 
 export interface BuildOptions {
   framesDir: string;
@@ -472,6 +534,20 @@ export function buildAvatar(options: BuildOptions): BuildResult {
     throw new Error(`${options.manifestPath}: not a valid avatar manifest`);
   }
 
+  // The frames are staged as one sequence, so they have to be in one format.
+  // The format is read out of the bytes rather than the name, because the
+  // name is not evidence.
+  const formats = new Set(frames.map((frame) => imageFormat(frame)));
+  if (formats.size > 1) {
+    throw new Error(
+      `the frames in ${options.framesDir} are in more than one format (${[...formats].sort().join(", ")}); ` +
+        "the build reads them as one sequence, so put them in one format",
+    );
+  }
+  // Read from the first frame rather than out of the set, so the format is
+  // known to be there instead of possibly missing.
+  const format = imageFormat(frames[0]);
+
   const sourceSize = readImageSize(frames[0]);
   for (const frame of frames.slice(1)) {
     const size = readImageSize(frame);
@@ -494,14 +570,14 @@ export function buildAvatar(options: BuildOptions): BuildResult {
 
   const scratch = mkdtempSync(join(tmpdir(), "avatar-build-"));
   try {
-    const staged = stageFrames(frames, scratch);
+    const staged = stageFrames(frames, scratch, format);
     const scaled = join(scratch, "scaled");
     mkdirSync(scaled);
 
     // The frames are scaled to the size the manifest declares.  The check
-    // above has already made sure that they are that size, and the scale is
-    // kept so the encoder is always handed the same shape whatever the
-    // source folder held.
+    // above has made sure that this scales down rather than up, and that it
+    // keeps the shape of the art, so the encoder is always handed the shape
+    // the player is going to draw.
     const scaledPattern = join(scaled, "%0" + String(frames.length).length + "d.png");
     run("ffmpeg", [
       "-y",

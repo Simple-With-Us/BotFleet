@@ -7,6 +7,7 @@ import { deflateSync } from "node:zlib";
 
 import {
   collectFrameFiles,
+  imageFormat,
   inspectAvatar,
   mapSourceFramesToEncoded,
   readEncodedFrames,
@@ -179,6 +180,29 @@ describe("collectFrameFiles", () => {
   });
 });
 
+describe("imageFormat", () => {
+  it("reads the format out of the bytes and not out of the name", () => {
+    const dir = mkdtempSync(join(tmpdir(), "avatar-format-"));
+    try {
+      // A JPEG with a PNG name is a JPEG, and the build has to treat it as
+      // one: ffmpeg picks its decoder from the format it is handed.
+      const misnamed = join(dir, "frame.png");
+      writeFileSync(misnamed, jpeg(3, 4));
+      expect(imageFormat(misnamed)).toBe("jpeg");
+
+      const real = join(dir, "real.png");
+      writeFileSync(real, png(2, 2, 10));
+      expect(imageFormat(real)).toBe("png");
+
+      const webpFile = join(dir, "real.webp");
+      writeFileSync(webpFile, webp(5, 6));
+      expect(imageFormat(webpFile)).toBe("webp");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("readImageSize", () => {
   it("reads the size of a PNG, a JPEG and a WebP", () => {
     const dir = mkdtempSync(join(tmpdir(), "avatar-test-"));
@@ -238,9 +262,29 @@ describe("validateManifestAgainstFrames", () => {
     expect(problems.join(" ")).toMatch(/0-35/);
   });
 
-  it("objects when the source size is not the declared size", () => {
-    const problems = validateManifestAgainstFrames(MANIFEST, 36, { width: 480, height: 480 });
-    expect(problems.join(" ")).toMatch(/480x480/);
+  it("accepts art that is bigger than the declared size, because the build scales it down", () => {
+    // The shipped TV-Face art is 480 x 480 and the shipped files are 256 x
+    // 256, so art that is bigger than the manifest declares is the ordinary
+    // case rather than a mistake.
+    expect(validateManifestAgainstFrames(MANIFEST, 36, { width: 480, height: 480 })).toEqual([]);
+  });
+
+  it("objects when the art is smaller than the declared size", () => {
+    // Scaling up would invent pixels the author never drew.
+    const problems = validateManifestAgainstFrames(MANIFEST, 36, { width: 128, height: 128 });
+    expect(problems.join(" ")).toMatch(
+      /the source frames are 128x128 but the manifest declares 256x256/,
+    );
+    expect(problems.join(" ")).toMatch(/will not make pixels/);
+  });
+
+  it("objects when the art does not have the proportions the manifest declares", () => {
+    // Squashing a wide drawing into a square would change what the author
+    // drew, so the build says so instead of doing it.
+    // 512 x 256 is big enough in both directions, so this is not the
+    // "there are not enough pixels" case; it is the shape of the art.
+    const problems = validateManifestAgainstFrames(MANIFEST, 36, { width: 512, height: 256 });
+    expect(problems.join(" ")).toMatch(/change the proportions of the art/);
   });
 
   it("objects when the resting frame is past the end", () => {
@@ -373,6 +417,114 @@ describe("the whole build", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("refuses a folder that holds more than one format", async () => {
+    // The frames are staged as one sequence, so a folder that mixes a PNG
+    // with a JPEG has to be refused rather than half read.
+    const { buildAvatar } = await import("./avatar-build.ts");
+    const dir = mkdtempSync(join(tmpdir(), "avatar-build-mixed-"));
+    try {
+      const frames = join(dir, "frames");
+      mkdirSync(frames);
+      writeFileSync(join(frames, "01.png"), png(64, 64, 20));
+      writeFileSync(join(frames, "02.jpg"), jpeg(64, 64));
+      const manifestPath = join(dir, "avatar.json");
+      writeFileSync(
+        manifestPath,
+        JSON.stringify({
+          ...MANIFEST,
+          frame: { ...MANIFEST.frame, count: 2 },
+          states: { "*": { hold: { from: 0, to: 1 } } },
+        }),
+      );
+      expect(() =>
+        buildAvatar({ framesDir: frames, manifestPath, out: join(dir, "out.webp") }),
+      ).toThrow(/more than one format/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!toolchain)(
+    "builds from a folder of JPEG frames",
+    async () => {
+      // The collector takes JPEG frames, so the build has to be able to read
+      // them all the way through.  The frames are staged under the format
+      // they really are, because ffmpeg picks its decoder from the extension
+      // it is given, and a JPEG dressed up as a PNG is not a picture it can
+      // read.
+      const { buildAvatar } = await import("./avatar-build.ts");
+      const dir = mkdtempSync(join(tmpdir(), "avatar-build-jpeg-"));
+      try {
+        const source = join(dir, "source");
+        const frames = join(dir, "frames");
+        mkdirSync(source);
+        mkdirSync(frames);
+        for (let i = 1; i <= 4; i++) {
+          const name = String(i).padStart(2, "0");
+          const pngPath = join(source, `${name}.png`);
+          writeFileSync(pngPath, png(256, 256, i * 20));
+          execFileSync(
+            "ffmpeg",
+            ["-y", "-i", pngPath, "-q:v", "2", join(frames, `${name}.jpg`)],
+            { stdio: "ignore" },
+          );
+        }
+        const manifestPath = join(dir, "avatar.json");
+        writeFileSync(
+          manifestPath,
+          JSON.stringify({
+            ...MANIFEST,
+            frame: { ...MANIFEST.frame, count: 4 },
+            states: { "*": { hold: { from: 0, to: 3 } } },
+          }),
+        );
+        const out = join(dir, "out.webp");
+        const result = buildAvatar({ framesDir: frames, manifestPath, out });
+        expect(result.sourceFrameCount).toBe(4);
+        expect(result.outputSize).toEqual({ width: 256, height: 256 });
+        expect(inspectAvatar(out)).toMatch(/frames: 4 at 256x256/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!toolchain)(
+    "scales art that is bigger than the manifest declares down to it",
+    async () => {
+      // The shipped TV-Face art is 480 x 480 and the shipped files are 256 x
+      // 256.  The build has to be able to do that, because that is how the
+      // files in the repository were made.
+      const { buildAvatar } = await import("./avatar-build.ts");
+      const dir = mkdtempSync(join(tmpdir(), "avatar-build-scale-"));
+      try {
+        const frames = join(dir, "frames");
+        mkdirSync(frames);
+        for (let i = 1; i <= 4; i++) {
+          writeFileSync(join(frames, `${String(i).padStart(2, "0")}.png`), png(480, 480, i * 20));
+        }
+        const manifestPath = join(dir, "avatar.json");
+        writeFileSync(
+          manifestPath,
+          JSON.stringify({
+            ...MANIFEST,
+            frame: { ...MANIFEST.frame, count: 4 },
+            states: { "*": { hold: { from: 0, to: 3 } } },
+          }),
+        );
+        const out = join(dir, "out.webp");
+        const result = buildAvatar({ framesDir: frames, manifestPath, out });
+
+        expect(result.outputSize).toEqual({ width: 256, height: 256 });
+        expect(result.manifest.frame.width).toBe(256);
+        expect(result.manifest.frame.height).toBe(256);
+        expect(inspectAvatar(out)).toMatch(/frames: 4 at 256x256/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.skipIf(!toolchain)(
     "turns a folder of frames into one animated file with the manifest inside",

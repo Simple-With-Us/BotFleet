@@ -151,6 +151,10 @@ because that is the one that describes the file.
   composited over whatever the interface happens to be, in light and dark.
 - **One size for every frame.**  The player draws one frame at a time, and a
   sequence that changes size jumps.
+- **One format for every frame.**  The build reads the frames as one sequence,
+  so a folder that mixes PNG with JPEG is refused rather than half read.  PNG is
+  what the art pipeline gives you, and it is what the shipped examples were built
+  from.
 - **The first and last frames of the enter and the return should match the
   resting frame.**  That is what makes the transition look like it grows out
   of the resting pose instead of cutting to it.
@@ -192,6 +196,13 @@ disagrees with the manifest, when a range points past the last frame, when
 the frames are not all the same size, and when the manifest does not parse.
 It also refuses to write a manifest that does not match the file it produced,
 which is the one mistake that would otherwise ship quietly.
+
+Art that is bigger than the size the manifest declares is scaled down, which is
+how the shipped examples were made: the TV-Face art is 480 x 480 and the files
+are 256 x 256.  The build will not scale art up, because that would invent
+pixels, and it will not squash a drawing whose proportions do not match
+the declared size, because that would change what you drew.  In both cases it
+says what it found and what it would have had to do.
 
 ## Checking it
 
