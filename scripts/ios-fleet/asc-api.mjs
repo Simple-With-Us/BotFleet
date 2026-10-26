@@ -539,12 +539,12 @@ export async function countInternalTesters({ api, appId }) {
 // ends its access to the builds; it never deletes the testers from TestFlight.
 // Returns { deleted, failed }; a failed delete is a warning, never a throw.
 export async function deleteInternalGroups({ api, appId, log, warn }) {
-  const groupsRes = await api("GET", `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup`);
+  const groupsRes = await ascAllRows({ api, url: `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup` });
   if (!groupsRes.ok) {
-    warn(`could not list groups for internal-group cleanup (${ascErrorText(groupsRes)})`);
+    warn(`could not list groups for internal-group cleanup (${groupsRes.error})`);
     return { deleted: 0, failed: 1 };
   }
-  const internal = ascRows(groupsRes).filter((g) => g.attributes?.isInternalGroup === true);
+  const internal = groupsRes.rows.filter((g) => g.attributes?.isInternalGroup === true);
   let deleted = 0;
   let failed = 0;
   for (const g of internal) {
@@ -567,18 +567,26 @@ export async function deleteInternalGroups({ api, appId, log, warn }) {
 // still Apple's gate after that.  Never throws; { ok:false } means the read
 // failed, which is not the same as uninstallable.
 export async function externalInstallability({ api, buildId }) {
-  const groupsRes = await api("GET", `/v1/builds/${buildId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled`);
-  if (!groupsRes.ok) return { ok: false, error: ascErrorText(groupsRes), installable: false };
-  const external = ascRows(groupsRes).filter((g) => g.attributes?.isInternalGroup === false);
+  const groupsRes = await ascAllRows({ api, url: `/v1/builds/${buildId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled` });
+  if (!groupsRes.ok) return { ok: false, error: groupsRes.error, installable: false };
+  // A group with a missing flag is not known to be internal, so it counts as
+  // external here; only isInternalGroup === true is excluded.
+  const external = groupsRes.rows.filter((g) => g.attributes?.isInternalGroup !== true);
+  // Public link first: one shareable group settles installability even when a
+  // tester read on another group fails transiently.
+  const linked = external.find((g) => g.attributes?.publicLinkEnabled === true);
+  if (linked) return { ok: true, installable: true, detail: `public link on "${linked.attributes?.name}"` };
+  let firstError = null;
   for (const g of external) {
-    if (g.attributes?.publicLinkEnabled === true) {
-      return { ok: true, installable: true, detail: `public link on "${g.attributes?.name}"` };
+    const members = await ascAllRows({ api, url: `/v1/betaGroups/${g.id}/betaTesters?limit=200&fields[betaTesters]=email` });
+    if (!members.ok) {
+      firstError = firstError || members.error;
+      continue;
     }
-    const members = await api("GET", `/v1/betaGroups/${g.id}/betaTesters?limit=200&fields[betaTesters]=email`);
-    if (!members.ok) return { ok: false, error: ascErrorText(members), installable: false };
-    const count = ascRows(members).length;
+    const count = members.rows.length;
     if (count > 0) return { ok: true, installable: true, detail: `${count} tester(s) in "${g.attributes?.name}"` };
   }
+  if (firstError) return { ok: false, error: firstError, installable: false };
   return {
     ok: true,
     installable: false,

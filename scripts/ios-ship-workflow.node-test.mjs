@@ -826,6 +826,33 @@ test("the ship readiness is external installability, and never prints a false su
   assert.match(mjs, /export async function ensureInternalTesterGroup\(/);
 });
 
+test("externalInstallability defers tester-read failures behind public links and counts missing-flag groups as external", async () => {
+  const { externalInstallability } = await import("./ios-fleet/asc-api.mjs");
+  const grp = (id, name, internal, link) => ({ id, attributes: { name, ...(internal === undefined ? {} : { isInternalGroup: internal }), publicLinkEnabled: link } });
+  const listRes = (data) => ({ status: 200, ok: true, parsed: { data }, text: "" });
+  const failRes = { status: 500, ok: false, parsed: { errors: [{ detail: "boom" }] }, text: "" };
+
+  // A later group's public link settles installability even when an earlier
+  // group's tester read fails transiently.
+  const api1 = async (m, path) => path.includes("/betaTesters") ? failRes
+    : listRes([grp("g-bad", "Public Beta", false, false), grp("g-link", "Beta Link", false, true)]);
+  const linked = await externalInstallability({ api: api1, buildId: "b1" });
+  assert.equal(linked.ok, true);
+  assert.equal(linked.installable, true);
+  assert.match(linked.detail, /Beta Link/);
+
+  // A missing isInternalGroup flag is not known-internal, so it counts as external.
+  const api2 = async () => listRes([grp("g1", "Public Beta", undefined, true)]);
+  const missingFlag = await externalInstallability({ api: api2, buildId: "b1" });
+  assert.equal(missingFlag.installable, true);
+
+  // Every tester read failing and no link anywhere is unverified, not uninstallable.
+  const api3 = async (m, path) => path.includes("/betaTesters") ? failRes : listRes([grp("g1", "Public Beta", false, false)]);
+  const unreadable = await externalInstallability({ api: api3, buildId: "b1" });
+  assert.equal(unreadable.ok, false);
+  assert.equal(unreadable.installable, false);
+});
+
 test("deleteInternalGroups deletes only internal groups, tolerates 404, and warns instead of throwing on failure", async () => {
   const { deleteInternalGroups } = await import("./ios-fleet/asc-api.mjs");
   const logs = [];
