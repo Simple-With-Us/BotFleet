@@ -114,14 +114,20 @@ struct MacCuaDriverTests {
     func testMouseDeliveryAndEmergencyStop() {
         let sink = RecordingCuaEventSink()
         let driver = sink.makeDriver()
-        for button in CuaMouseButton.allCases {
+        let endpointTypes: [(CGEventType, CGEventType)] = [
+            (.leftMouseDown, .leftMouseUp),
+            (.rightMouseDown, .rightMouseUp),
+            (.otherMouseDown, .otherMouseUp),
+        ]
+        for (index, button) in CuaMouseButton.allCases.enumerated() {
             #expect(driver.drag(from: .zero, to: CGPoint(x: 20, y: 30), button: button, steps: 2))
+            let events = Array(sink.events.dropFirst(index * 4))
+            #expect(events.count == 4)
+            #expect(events.first?.type == endpointTypes[index].0)
+            #expect(events.last?.type == endpointTypes[index].1)
+            #expect(events[1].location == CGPoint(x: 10, y: 15))
+            #expect(events[2].location == CGPoint(x: 20, y: 30))
         }
-        #expect(sink.events.map(\.type) == [
-            .leftMouseDown, .leftMouseDragged, .leftMouseDragged, .leftMouseUp,
-            .rightMouseDown, .rightMouseDragged, .rightMouseDragged, .rightMouseUp,
-            .otherMouseDown, .otherMouseDragged, .otherMouseDragged, .otherMouseUp,
-        ])
         for button in CuaMouseButton.allCases {
             #expect(driver.mouseDown(at: .zero, button: button))
         }
