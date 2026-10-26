@@ -6,7 +6,6 @@ import AppKit
 
 public struct MacRootView: View {
     @EnvironmentObject private var session: MacSession
-    @State private var inputText: String = ""
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     public init() {}
@@ -20,7 +19,7 @@ public struct MacRootView: View {
                 .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 360)
         } detail: {
             HSplitView {
-                MacDetailChatView(inputText: $inputText)
+                MacDetailChatView(inputText: $session.composerDraft)
                     .frame(minWidth: 400)
 
                 if session.showCuaViewer {
@@ -80,20 +79,19 @@ struct MacSidebarView: View {
                             .padding(.vertical, 8)
                     } else {
                         ForEach(session.state.bots) { bot in
+                            // The pill and the mascot expression come from ONE
+                            // scan of the bot's thread, not two.
+                            let pill = MacSidebarStatusPill.forBot(
+                                bot,
+                                in: session.state,
+                                isConnected: session.status.isConnected
+                            )
                             MacBotRowView(
                                 bot: bot,
-                                pill: MacSidebarStatusPill.forBot(
-                                    bot,
-                                    in: session.state,
-                                    isConnected: session.status.isConnected
-                                ),
+                                pill: pill,
                                 expression: MacBotMascotExpression.resolve(
                                     for: bot,
-                                    hasPendingCard: MacSidebarStatusPill.forBot(
-                                        bot,
-                                        in: session.state,
-                                        isConnected: session.status.isConnected
-                                    ).kind == .waiting,
+                                    hasPendingCard: pill.kind == .waiting,
                                     hasReasoning: (session.state.reasoning[bot.threadId]?.isEmpty == false),
                                     isConnected: session.status.isConnected
                                 )
@@ -408,25 +406,41 @@ struct MacMessageBubbleView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .contextMenu {
                         let raw = message.text ?? ""
-                        Button("Copy") {
-                            #if os(macOS)
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(raw, forType: .string)
-                            #endif
-                        }
-                        if let firstCode = renderedBlocks.compactMap({ block -> String? in
-                            if case .code(_, let code) = block.block { return code }
-                            return nil
-                        }).first {
-                            Button("Copy Code Block") {
-                                #if os(macOS)
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(firstCode, forType: .string)
-                                #endif
+                        let codeBlocks: [(code: String, language: String?)] = renderedBlocks.compactMap { block in
+                            if case .code(let language, let code) = block.block {
+                                return (code, language)
                             }
+                            return nil
                         }
-                        Button("Quote in Reply") {
-                            onQuoteInReply?(raw)
+                        // The context menu belongs to the whole bubble, so it can
+                        // only name a code block when there is exactly one:
+                        // picking the first of several would copy the wrong
+                        // snippet without saying so.  Each code block carries
+                        // its own Copy button for that case.
+                        let focusedCodeBlock = codeBlocks.count == 1 ? codeBlocks[0] : nil
+                        ForEach(
+                            Array(
+                                MacTranscriptContextMenuBuilder.actions(
+                                    messageText: raw,
+                                    focusedCodeBlock: focusedCodeBlock
+                                ).enumerated()
+                            ),
+                            id: \.offset
+                        ) { _, action in
+                            switch action {
+                            case .copyText(let text):
+                                Button("Copy") {
+                                    copyToPasteboard(text)
+                                }
+                            case .copyCodeBlock(let code, _):
+                                Button("Copy Code Block") {
+                                    copyToPasteboard(code)
+                                }
+                            case .quoteInReply(_):
+                                Button("Quote in Reply") {
+                                    onQuoteInReply?(raw)
+                                }
+                            }
                         }
                     }
             }
@@ -440,6 +454,13 @@ struct MacMessageBubbleView: View {
                 Spacer(minLength: 48)
             }
         }
+    }
+
+    private func copyToPasteboard(_ string: String) {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(string, forType: .string)
+        #endif
     }
 }
 
@@ -505,6 +526,7 @@ struct MacReasoningChamberView: View {
 struct MacComposerBar: View {
     @EnvironmentObject private var session: MacSession
     @Binding var inputText: String
+    @FocusState private var isComposerFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -534,7 +556,7 @@ struct MacComposerBar: View {
                         .foregroundColor(.red)
                     if let actionTitle = failure.actionButtonTitle {
                         Button(actionTitle) {
-                            session.activeSettingsSection = MacSettingsDeepLinkRouter.section(forVoiceFailure: failure)
+                            session.openSettingsForVoiceFailure(failure)
                         }
                         .font(.caption.bold())
                     }
@@ -553,6 +575,10 @@ struct MacComposerBar: View {
                         RoundedRectangle(cornerRadius: 8)
                             .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
                     )
+                    .focused($isComposerFocused)
+                    .onChange(of: session.composerFocusToken) { _, _ in
+                        isComposerFocused = true
+                    }
 
                 Button(action: {
                     inputText = session.toggleComposerDictation(currentDraft: inputText)

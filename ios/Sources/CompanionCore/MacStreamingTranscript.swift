@@ -92,6 +92,10 @@ public final class MacTranscriptEngine: @unchecked Sendable {
 
     /// Cached rendered blocks for settled messages that have entered the viewport.
     private var settledBlockCache: [String: [MacRenderedMarkdownBlock]] = [:]
+    /// The text each cached block list was parsed from.  A message patched
+    /// under the same id carries new text, and the cache must notice that or
+    /// the transcript keeps rendering the pre-patch Markdown.
+    private var settledBlockText: [String: String] = [:]
     /// Measured height overrides for messages that have been laid out on screen.
     private var measuredHeights: [String: Double] = [:]
 
@@ -109,16 +113,21 @@ public final class MacTranscriptEngine: @unchecked Sendable {
     }
 
     /// Returns cached rendered blocks for a settled message, parsing on first
-    /// visible access and memoizing Thereafter.
+    /// visible access and memoizing thereafter.
+    ///
+    /// The cache is keyed by the message id AND the text it was parsed from:
+    /// a message patched under the same id carries new text, and serving the
+    /// old blocks would leave the transcript showing pre-patch Markdown.
     public func renderedBlocks(for message: Message) -> [MacRenderedMarkdownBlock] {
-        if let cached = settledBlockCache[message.id] {
+        let raw = message.text ?? ""
+        if let cached = settledBlockCache[message.id], settledBlockText[message.id] == raw {
             return cached
         }
-        let raw = message.text ?? ""
         let parsed = Markdown.blocks(raw).enumerated().map { idx, blk in
             MacRenderedMarkdownBlock(id: idx, block: blk, isStreamingTail: false)
         }
         settledBlockCache[message.id] = parsed
+        settledBlockText[message.id] = raw
         return parsed
     }
 
@@ -341,6 +350,28 @@ public enum MacBotMascotExpression: String, Codable, CaseIterable, Equatable, Se
     }
 }
 
+/// Finds the most recent pending card in a thread.
+///
+/// The scan walks the messages backwards and stops at the first pending card,
+/// so it never materializes the card list of a 50,000-message thread and never
+/// touches a message the caller does not need.
+public enum MacPendingCardScanner {
+    /// The most recent pending card in `messages`, or `nil` when the thread
+    /// has nothing waiting for the person.
+    public static func mostRecentPendingCard(in messages: [Message]) -> OptionCard? {
+        for message in messages.reversed() {
+            guard let card = message.card, card.isPending else { continue }
+            return card
+        }
+        return nil
+    }
+
+    /// Whether the thread has a card waiting for the person.
+    public static func hasPendingCard(in messages: [Message]) -> Bool {
+        mostRecentPendingCard(in: messages) != nil
+    }
+}
+
 /// Sidebar status pill model for a bot or room row.
 public struct MacSidebarStatusPill: Equatable, Sendable {
     public enum Kind: String, Equatable, Sendable {
@@ -372,8 +403,7 @@ public struct MacSidebarStatusPill: Equatable, Sendable {
             return MacSidebarStatusPill(text: "Off", kind: .off)
         }
         let messages = state.messages[bot.threadId] ?? bot.messages ?? []
-        let hasPendingCard = messages.reversed().compactMap(\.card).contains(where: \.isPending)
-        if hasPendingCard {
+        if MacPendingCardScanner.hasPendingCard(in: messages) {
             return MacSidebarStatusPill(text: "Needs you", kind: .waiting)
         }
         if let reasoning = state.reasoning[bot.threadId], !reasoning.isEmpty {
@@ -417,7 +447,7 @@ public struct MacUnreadBadgeSummary: Equatable, Sendable {
                 unreadBots += 1
             }
             let messages = state.messages[bot.threadId] ?? bot.messages ?? []
-            if messages.reversed().compactMap(\.card).contains(where: \.isPending) {
+            if MacPendingCardScanner.hasPendingCard(in: messages) {
                 waitingBots += 1
             }
         }

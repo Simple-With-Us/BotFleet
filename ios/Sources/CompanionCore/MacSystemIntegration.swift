@@ -19,6 +19,23 @@ import Carbon.HIToolbox
 
 // MARK: - 1. Menubar State & Controller
 
+/// How often the menubar, the Dock badge, and the notification surfaces are
+/// allowed to be rebuilt while a stream is running.
+///
+/// Streaming a reply can produce dozens of frames a second, and rebuilding the
+/// surfaces for every one of them walks the whole transcript on the main
+/// actor.  The policy coalesces those rebuilds into at most one per interval.
+public enum MacSystemSurfaceSyncPolicy {
+    /// The shortest gap between two rebuilds.
+    public static let minimumInterval: TimeInterval = 0.2
+
+    /// Whether a rebuild may run now.
+    public static func shouldSync(now: Date, lastSync: Date?) -> Bool {
+        guard let lastSync else { return true }
+        return now.timeIntervalSince(lastSync) >= minimumInterval
+    }
+}
+
 /// Visual states for the macOS `NSStatusItem` menubar mark.
 public enum MacMenubarIconState: String, Equatable, Sendable {
     /// Plain BotFleet mark when all bots are idle.
@@ -210,6 +227,16 @@ public struct MacMenubarState: Equatable, Sendable {
         return items
     }
 
+    /// Whether the menu object has to be rebuilt for a new state.
+    ///
+    /// The menu rows are what the user sees and clicks, so the `NSMenu` is
+    /// only rebuilt when those rows actually change.  Rebuilding it on every
+    /// streamed frame churns AppKit objects and can dismiss a menu the user
+    /// has open.
+    public static func menuNeedsRebuild(previous: MacMenubarState, next: MacMenubarState) -> Bool {
+        previous.menuItems != next.menuItems
+    }
+
     /// Derives `MacMenubarState` from `CompanionState`.
     public static func from(
         state: CompanionState,
@@ -225,7 +252,7 @@ public struct MacMenubarState: Equatable, Sendable {
                 workingCount += 1
             }
             let messages = state.messages[bot.threadId] ?? bot.messages ?? []
-            if let pendingCard = messages.reversed().compactMap(\.card).first(where: \.isPending) {
+            if let pendingCard = MacPendingCardScanner.mostRecentPendingCard(in: messages) {
                 let need = pendingCard.isPermission ? "Approve a change" : "Answer a question"
                 waitingItems.append(
                     MacWaitingBotItem(
@@ -275,16 +302,26 @@ public final class MacMenubarController: NSObject {
     }
 
     public func apply(_ state: MacMenubarState) {
+        let previous = currentState
         currentState = state
         guard let statusItem else { return }
-        if let button = statusItem.button {
-            button.image = NSImage(
-                systemSymbolName: state.iconState.symbolName,
-                accessibilityDescription: state.statusLine
-            )
-            button.toolTip = state.statusLine
+
+        let isFirstApply = statusItem.menu == nil
+        if previous != state || isFirstApply {
+            if let button = statusItem.button {
+                button.image = NSImage(
+                    systemSymbolName: state.iconState.symbolName,
+                    accessibilityDescription: state.statusLine
+                )
+                button.toolTip = state.statusLine
+            }
         }
-        statusItem.menu = buildNSMenu(from: state)
+
+        // The menu object is only rebuilt when its rows actually change, so a
+        // streamed frame never replaces a menu the user has open.
+        if isFirstApply || MacMenubarState.menuNeedsRebuild(previous: previous, next: state) {
+            statusItem.menu = buildNSMenu(from: state)
+        }
     }
 
     public func buildNSMenu(from state: MacMenubarState) -> NSMenu {
@@ -377,6 +414,17 @@ public enum MacGlobalHotkeyAction: String, CaseIterable, Codable, Hashable, Send
         case .pushToTalk: return 2
         }
     }
+
+    /// The action a Carbon `kEventHotKeyPressed` event belongs to.
+    public init?(carbonHotKeyId: UInt32) {
+        if carbonHotKeyId == MacGlobalHotkeyAction.showOrHideBotFleet.carbonHotKeyID {
+            self = .showOrHideBotFleet
+        } else if carbonHotKeyId == MacGlobalHotkeyAction.pushToTalk.carbonHotKeyID {
+            self = .pushToTalk
+        } else {
+            return nil
+        }
+    }
 }
 
 /// Key code + Carbon modifier mask for a global shortcut.
@@ -434,12 +482,17 @@ public final class MacGlobalHotkeyManager: @unchecked Sendable {
     public private(set) var triggeredHistory: [MacGlobalHotkeyAction] = []
 
     private let secureInputProvider: () -> Bool
-    private let carbonRegistrar: (MacGlobalHotkeyAction, MacKeyCombo) -> MacCarbonRegistrationStatus
-    private let carbonUnregistrar: (MacGlobalHotkeyAction) -> Void
+    /// A nil registrar means the built-in Carbon registrar, which talks to the
+    /// window server for real.  It is optional so the manager never has to
+    /// capture itself before it is fully initialized.
+    private var carbonRegistrar: ((MacGlobalHotkeyAction, MacKeyCombo) -> MacCarbonRegistrationStatus)?
+    /// A nil unregistrar means the built-in Carbon unregistration.
+    private var carbonUnregistrar: ((MacGlobalHotkeyAction) -> Void)?
     private var occupiedSystemCombos: Set<MacKeyCombo> = []
 
     #if os(macOS)
     private var hotKeyRefs: [MacGlobalHotkeyAction: EventHotKeyRef] = [:]
+    private var carbonEventHandler: EventHandlerRef?
     #endif
 
     public init(
@@ -463,17 +516,11 @@ public final class MacGlobalHotkeyManager: @unchecked Sendable {
             #endif
         }
 
-        if let carbonRegistrar {
-            self.carbonRegistrar = carbonRegistrar
-        } else {
-            self.carbonRegistrar = { _ , _ in .success }
-        }
-
-        if let carbonUnregistrar {
-            self.carbonUnregistrar = carbonUnregistrar
-        } else {
-            self.carbonUnregistrar = { _ in }
-        }
+        // A nil registrar means the built-in Carbon registrar:  a shortcut
+        // that reports success without ever being registered with the window
+        // server is a shortcut that never fires.
+        self.carbonRegistrar = carbonRegistrar
+        self.carbonUnregistrar = carbonUnregistrar
     }
 
     /// Marks a key combo as already claimed by another app (or tests Carbon
@@ -531,7 +578,16 @@ public final class MacGlobalHotkeyManager: @unchecked Sendable {
             return false
         }
 
-        let status = carbonRegistrar(action, combo)
+        let status: MacCarbonRegistrationStatus
+        if let carbonRegistrar {
+            status = carbonRegistrar(action, combo)
+        } else {
+            #if os(macOS)
+            status = registerCarbonHotKeyInSystem(action: action, combo: combo)
+            #else
+            status = .success
+            #endif
+        }
         switch status {
         case .conflict:
             inlineCollisionError = Self.shortcutCollisionCopy
@@ -551,7 +607,7 @@ public final class MacGlobalHotkeyManager: @unchecked Sendable {
 
     /// Clears a shortcut back to off and unregisters its Carbon hotkey.
     public func clearShortcut(for action: MacGlobalHotkeyAction) {
-        carbonUnregistrar(action)
+        carbonUnregistrar?(action)
         #if os(macOS)
         if let ref = hotKeyRefs.removeValue(forKey: action) {
             UnregisterEventHotKey(ref)
@@ -585,6 +641,7 @@ public final class MacGlobalHotkeyManager: @unchecked Sendable {
     /// Performs live Carbon `RegisterEventHotKey` registration when running in
     /// the macOS app process.
     public func registerCarbonHotKeyInSystem(action: MacGlobalHotkeyAction, combo: MacKeyCombo) -> MacCarbonRegistrationStatus {
+        installCarbonEventHandlerIfNeeded()
         if let existing = hotKeyRefs.removeValue(forKey: action) {
             UnregisterEventHotKey(existing)
         }
@@ -607,6 +664,54 @@ public final class MacGlobalHotkeyManager: @unchecked Sendable {
         }
         hotKeyRefs[action] = ref
         return .success
+    }
+
+    /// Installs the `kEventHotKeyPressed` handler once, so a registered
+    /// shortcut actually reaches `triggerIfAllowed`.
+    private func installCarbonEventHandlerIfNeeded() {
+        guard carbonEventHandler == nil else { return }
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        var handlerRef: EventHandlerRef?
+        let status = InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, event, userData in
+                MacGlobalHotkeyManager.handleCarbonHotKeyEvent(event: event, userData: userData)
+            },
+            1,
+            &eventType,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &handlerRef
+        )
+        if status == noErr {
+            carbonEventHandler = handlerRef
+        }
+    }
+
+    /// Routes a Carbon hotkey press to the manager that registered it.
+    private static func handleCarbonHotKeyEvent(
+        event: EventRef?,
+        userData: UnsafeMutableRawPointer?
+    ) -> OSStatus {
+        guard let event, let userData else { return noErr }
+        var hotKeyID = EventHotKeyID()
+        let status = GetEventParameter(
+            event,
+            EventParamName(UInt32(kEventParamDirectObject)),
+            EventParamType(UInt32(typeEventHotKeyID)),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotKeyID
+        )
+        guard status == noErr else { return status }
+        let manager = Unmanaged<MacGlobalHotkeyManager>.fromOpaque(userData).takeUnretainedValue()
+        if let action = MacGlobalHotkeyAction(carbonHotKeyId: hotKeyID.id) {
+            _ = manager.triggerIfAllowed(action)
+        }
+        return noErr
     }
     #endif
 }
@@ -666,6 +771,71 @@ public enum MacCandidateNotificationEvent: Equatable, Sendable {
         case .routineProgress, .normalCompletion, .connectionStateChanged:
             return false
         }
+    }
+
+    /// Maps a harness notify frame onto the candidate event the coordinator
+    /// evaluates.
+    ///
+    /// The wire protocol's `approval` and `question` kinds are the two
+    /// person-blocking events it carries;  `done` and `routine-failed` are
+    /// routine progress and NEVER notify.
+    public init(notificationFrame: NotificationFrame) {
+        switch notificationFrame.kind {
+        case "approval":
+            self = .botNeedsApproval(
+                botId: notificationFrame.botId,
+                botName: notificationFrame.botName,
+                threadId: notificationFrame.threadId,
+                requestId: notificationFrame.requestId ?? "",
+                summary: notificationFrame.body
+            )
+        case "question":
+            self = .botAskedQuestion(
+                botId: notificationFrame.botId,
+                botName: notificationFrame.botName,
+                threadId: notificationFrame.threadId,
+                requestId: notificationFrame.requestId ?? "",
+                question: notificationFrame.body
+            )
+        case "routine-failed":
+            self = .routineProgress(
+                botId: notificationFrame.botId,
+                threadId: notificationFrame.threadId,
+                detail: notificationFrame.body
+            )
+        default:
+            self = .normalCompletion(
+                botId: notificationFrame.botId,
+                threadId: notificationFrame.threadId,
+                summary: notificationFrame.body
+            )
+        }
+    }
+}
+
+/// Builds and submits the macOS notification for a deliverable payload.
+public enum MacNotificationCenter {
+    /// Registers the notification categories the app's payloads carry.
+    public static func registerCategories() {
+        UNUserNotificationCenter.current().setNotificationCategories(NotificationCategories.all())
+    }
+
+    /// Hands a payload to `UNUserNotificationCenter`.
+    public static func submit(_ payload: MacDeliverableNotification) {
+        #if os(macOS)
+        let content = UNMutableNotificationContent()
+        content.title = payload.title
+        content.body = payload.body
+        content.categoryIdentifier = payload.categoryIdentifier
+        content.interruptionLevel = .timeSensitive
+        content.threadIdentifier = payload.threadId
+        let request = UNNotificationRequest(
+            identifier: payload.identifier,
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+        #endif
     }
 }
 
@@ -740,14 +910,26 @@ public final class MacNotificationCoordinator: @unchecked Sendable {
     public var isMainWindowVisibleAndFocused: Bool = true
 
     private let permissionGrantResult: Bool
+    private let notificationSubmitter: (@Sendable (MacDeliverableNotification) -> Void)?
 
     public init(
         initialPermission: MacNotificationPermissionState = .notDetermined,
-        permissionGrantResult: Bool = true
+        permissionGrantResult: Bool = true,
+        notificationSubmitter: (@Sendable (MacDeliverableNotification) -> Void)? = nil
     ) {
         // Never requests permission at launch (`hasRequestedPermission` starts false).
         self.permissionState = initialPermission
         self.permissionGrantResult = permissionGrantResult
+        self.notificationSubmitter = notificationSubmitter
+    }
+
+    /// Records the system's answer to the notification permission request.
+    ///
+    /// The app asks the system once, lazily, at the first person-blocking
+    /// event;  this is where that answer lands.
+    public func applyResolvedPermission(_ granted: Bool) {
+        hasRequestedPermission = true
+        permissionState = granted ? .authorized : .denied
     }
 
     /// Status banner shown in Settings when notification permission is refused.
@@ -798,6 +980,7 @@ public final class MacNotificationCoordinator: @unchecked Sendable {
 
         let payload = buildDeliverableNotification(for: event)
         deliveredNotifications.append(payload)
+        notificationSubmitter?(payload)
         return .deliver(payload)
     }
 
