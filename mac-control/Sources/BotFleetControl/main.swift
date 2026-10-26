@@ -143,13 +143,17 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.problem = self.apiUnavailable && self.installedServerState == .stopped ? nil : error.localizedDescription
             }
 
-            // 2. Concurrently probe remote hosts
+            // Clear loading immediately so local controls and status render without waiting for remote hosts
+            self.isLoading = false
+            self.rebuildMenu()
+
+            // 2. Concurrently probe remote hosts with 5s timeout and update incrementally
             await withTaskGroup(of: (String, Result<ControlStatus, Error>).self) { group in
                 for host in self.hosts where !host.isLocal {
                     let client = self.api(for: host)
                     group.addTask {
                         do {
-                            let st = try await client.status()
+                            let st = try await client.status(timeout: 5.0)
                             return (host.id, .success(st))
                         } catch {
                             return (host.id, .failure(error))
@@ -165,10 +169,10 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.hostStatuses.removeValue(forKey: id)
                         self.hostErrors[id] = err.localizedDescription
                     }
+                    self.rebuildMenu()
                 }
             }
 
-            self.isLoading = false
             self.rebuildMenu()
             // The wheelhouse is reconciled behind the menu.  pm2 can take
             // seconds to start or stop a service, and a menu that waits for
@@ -337,7 +341,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let err = hostErrors[host.id] { add("Notice: \(err)") }
 
                 add("Start Shared VM (\(host.name))", selector: #selector(startHostSharedVM), enabled: ready && st.canStartSharedVM, representedObject: host)
-                add("Stop Shared VM (\(host.name))…", selector: #selector(stopHostSharedVM), enabled: ready && st.canStopSharedVM, representedObject: host)
+                add("Stop Shared & Local VMs (\(host.name))…", selector: #selector(stopHostSharedVM), enabled: ready && st.canStopSharedVM, representedObject: host)
                 add("Stop Server (\(host.name))…", selector: #selector(stopRemoteServer), enabled: ready, representedObject: host)
             } else {
                 let err = hostErrors[host.id] ?? "unreachable"

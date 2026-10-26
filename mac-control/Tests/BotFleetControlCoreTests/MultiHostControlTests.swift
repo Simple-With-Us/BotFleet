@@ -151,6 +151,28 @@ final class MultiHostControlTests: XCTestCase {
         XCTAssertTrue(MockURLProtocol.requests.contains { $0.url!.path == "/api/system/control/vms/stop" })
     }
 
+    func testServerHostStorePreservesCorruptFileAndRefusesOverwrite() throws {
+        let storeFile = tempDir.appendingPathComponent("hosts.json")
+        try "{ not valid json ...".write(to: storeFile, atomically: true, encoding: .utf8)
+
+        let store = ServerHostStore(fileURL: storeFile)
+        let loaded = store.loadHosts()
+        XCTAssertEqual(loaded.count, 2)
+
+        // Verify a .corrupt backup file was created
+        let files = try FileManager.default.contentsOfDirectory(atPath: tempDir.path)
+        XCTAssertTrue(files.contains { $0.contains("corrupt") })
+
+        // Re-corrupt the file
+        try "corrupt content".write(to: storeFile, atomically: true, encoding: .utf8)
+        let hostToUpsert = ServerHost(id: "h1", name: "H1", baseURL: URL(string: "https://example.com")!)
+        store.upsertHost(hostToUpsert)
+
+        // Refused to overwrite with defaults, original corrupt content is preserved
+        let raw = try String(contentsOf: storeFile, encoding: .utf8)
+        XCTAssertEqual(raw, "corrupt content")
+    }
+
     private func mockSession() -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockURLProtocol.self]

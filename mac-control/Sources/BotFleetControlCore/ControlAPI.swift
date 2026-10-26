@@ -116,11 +116,11 @@ public final class ControlAPI {
     /// which greyed out Start Local VM on a server that was running fine.
     public static let statusTimeout: TimeInterval = 30
 
-    public func status() async throws -> ControlStatus {
+    public func status(timeout: TimeInterval = ControlAPI.statusTimeout) async throws -> ControlStatus {
         try await verifyIdentity()
         let data: Data
         do {
-            data = try await send("/api/system/control", method: "GET", timeout: Self.statusTimeout)
+            data = try await send("/api/system/control", method: "GET", timeout: timeout)
         } catch ControlAPIError.unavailable {
             // The identity check already proved the server is alive and ready,
             // so a failure here means it was too slow to answer, not that it

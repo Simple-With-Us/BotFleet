@@ -78,7 +78,11 @@ public final class ServerHostStore: @unchecked Sendable {
             }
             return hosts
         } catch {
-            return [ServerHost.defaultLocal, ServerHost.defaultHetzner]
+            // Preserve the unreadable file by backing it up rather than silently erasing it.
+            let backupURL = fileURL.deletingPathExtension().appendingPathExtension("corrupt.\(Int(Date().timeIntervalSince1970)).json")
+            try? FileManager.default.copyItem(at: fileURL, to: backupURL)
+            let defaults = [ServerHost.defaultLocal, ServerHost.defaultHetzner]
+            return defaults
         }
     }
 
@@ -89,11 +93,13 @@ public final class ServerHostStore: @unchecked Sendable {
         saveInternal(hosts)
     }
 
-    /// Appends or updates a host.
+    /// Appends or updates a host. Refuses to overwrite if an existing file failed decoding.
     public func upsertHost(_ host: ServerHost) {
         lock.lock()
         defer { lock.unlock() }
-        var current = loadHostsInternal()
+        guard var current = loadHostsInternal() else {
+            return
+        }
         if let idx = current.firstIndex(where: { $0.id == host.id }) {
             current[idx] = host
         } else {
@@ -108,7 +114,9 @@ public final class ServerHostStore: @unchecked Sendable {
         guard id != ServerHost.defaultLocal.id else { return false }
         lock.lock()
         defer { lock.unlock() }
-        var current = loadHostsInternal()
+        guard var current = loadHostsInternal() else {
+            return false
+        }
         let countBefore = current.count
         current.removeAll { $0.id == id && !$0.isLocal }
         if current.count != countBefore {
@@ -118,11 +126,13 @@ public final class ServerHostStore: @unchecked Sendable {
         return false
     }
 
-    private func loadHostsInternal() -> [ServerHost] {
-        guard FileManager.default.fileExists(atPath: fileURL.path),
-              let data = try? Data(contentsOf: fileURL),
-              let hosts = try? JSONDecoder().decode([ServerHost].self, from: data) else {
+    private func loadHostsInternal() -> [ServerHost]? {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return [ServerHost.defaultLocal, ServerHost.defaultHetzner]
+        }
+        guard let data = try? Data(contentsOf: fileURL),
+              let hosts = try? JSONDecoder().decode([ServerHost].self, from: data) else {
+            return nil
         }
         return hosts
     }
