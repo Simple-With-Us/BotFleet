@@ -67,6 +67,25 @@ describe("credential shape parity with shared/redact.ts", () => {
       expect(out).toMatch(/«redacted \d+ chars»/);
     }
   });
+
+  it("masks a DOTTED infisical service token whole, not just its first segment", () => {
+    // Infisical issues `st.<uuid>.<segment>.<segment>`.  A pattern that
+    // stops at the first dot masks the uuid and leaves the two secret
+    // segments in the clear, which is the whole credential.
+    const token = [
+      "st",
+      ".",
+      "11111111-2222-3333-4444-555555555555",
+      ".",
+      "abcdefabcdefabcdefabcdefabcdefab",
+      ".",
+      "0123456789abcdef0123456789abcdef",
+    ].join("");
+    const out = redactSecretsInLine(`login failed while sending ${token}`);
+    expect(out).not.toContain("abcdefabcdefabcdefabcdefabcdefab");
+    expect(out).not.toContain("0123456789abcdef0123456789abcdef");
+    expect(out).not.toContain(token);
+  });
 });
 
 describe("buildDiagnosticsReport", () => {

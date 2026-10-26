@@ -93,11 +93,16 @@ const KEY_PREFIXES: RegExp[] = [
   // Infisical service token: `st.` plus a long base64url body.  It is the
   // credential every app outside the agent seats now holds, and it is not a
   // `Bearer` header and not a NAME=value pair when it turns up in a log
-  // line, so without this shape it would ride out in the clear.  The floor
+  // line, so without this shape it would ride out in the clear.  The body
+  // is DOTTED: Infisical issues `st.<uuid>.<segment>.<segment>`, so a
+  // pattern that stops at the first dot masks the uuid and leaves the two
+  // secret segments in the clear.  The trailing segments are optional and
+  // floor at 16 characters, which is long enough that an ordinary word
+  // after a dotted phrase is not swallowed.  The floor on the first segment
   // sits at 20 body characters: the prefix on its own ("the st. prefix is
   // what Infisical issues") is prose, and 1st. place never matches because
   // the `st` there has no word boundary in front of it.
-  /\bst\.[A-Za-z0-9_-]{20,}/g,
+  /\bst\.[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{16,}){0,3}/g,
 ];
 
 /** The credential-shape list, published so there is exactly ONE of them.

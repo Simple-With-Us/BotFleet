@@ -40,6 +40,30 @@ describe("credential shapes BotFleet issues or stores", () => {
     expect(out).toBe("the deployment finished and the invoice went out by email");
   });
 
+  it("masks a DOTTED infisical service token whole, not just its first segment", () => {
+    // Infisical issues `st.<uuid>.<segment>.<segment>`.  A pattern that
+    // stops at the first dot masks the uuid and leaves the two secret
+    // segments in the clear, which is the whole credential.
+    const token = [
+      "st",
+      ".",
+      "11111111-2222-3333-4444-555555555555",
+      ".",
+      "abcdefabcdefabcdefabcdefabcdefab",
+      ".",
+      "0123456789abcdef0123456789abcdef",
+    ].join("");
+    const out = redactSecretsInText(`the header carried ${token} to the vault`);
+    expect(out).not.toContain("abcdefabcdefabcdefabcdefabcdefab");
+    expect(out).not.toContain("0123456789abcdef0123456789abcdef");
+    expect(out).not.toContain(token);
+  });
+
+  it("does not swallow an ordinary word after a dotted phrase", () => {
+    const prose = "the st. credential was rotated by the operator";
+    expect(redactSecretsInText(prose)).toBe(prose);
+  });
+
   it("masks a bare mention of a prefix is not a credential", () => {
     // The floors exist to reject prose that NAMES a shape without carrying
     // one.  Each of these is the leading marker on its own, and each is

@@ -543,9 +543,12 @@ load_infisical_identity() {
   if [ -n "${INFISICAL_WRITE_TOKEN:-}" ]; then
     export INFISICAL_WRITE_TOKEN
   fi
-  if [ -n "${INFISICAL_TOKEN:-}" ]; then
-    return 0
-  fi
+  # No early return here.  The token is the PREFERRED identity, not the only
+  # one: the machine identity below stays as the fallback for the two cases
+  # a token cannot cover -- a write with no write token provisioned, and a
+  # read of another project than the token's own.  Returning as soon as the
+  # token is set would leave a token-only host with neither, and the write
+  # would fail at login with an error that reads like a broken vault.
   if [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
     export INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET
     return 0

@@ -439,7 +439,7 @@ test("documented names are fetched and exported, and nothing else is", () => {
   }
 });
 
-test("a service token from the vault is the identity, and the machine identity is not needed", () => {
+test("a service token from the vault is the identity, and the machine identity stays as the fallback", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -454,8 +454,34 @@ test("a service token from the vault is the identity, and the machine identity i
     const got = identityReport(fixture, runIdentity(fixture));
     assert.equal(got.INFISICAL_TOKEN, "fixture-read-token");
     assert.equal(got.INFISICAL_WRITE_TOKEN, "fixture-write-token");
-    // The machine identity is not fetched once a token is in hand: a token
-    // scoped to one folder is the identity now.
+    // The token is what the server uses, but the machine identity is still
+    // fetched and exported: it is the fallback for the two cases a token
+    // cannot cover -- a write with no write token, and a read of a project
+    // other than the token's own.  Returning early on the token would
+    // leave a token-only host with neither, and the write would fail at
+    // login with an error that reads like a broken vault.
+    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a token-only host still starts, with no machine identity to fall back to", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      [
+        "BOTFLEET_HARNESS_INFISICAL_READ_TOKEN=fixture-read-token",
+        "BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN=fixture-write-token",
+      ].join("\n"),
+    );
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(got.INFISICAL_TOKEN, "fixture-read-token");
+    assert.equal(got.INFISICAL_WRITE_TOKEN, "fixture-write-token");
+    // Nothing to fetch means nothing is exported, and the missing
+    // fallback is not a startup failure.
     assert.equal(got.INFISICAL_CLIENT_ID, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });

@@ -74,7 +74,7 @@ const CREDENTIAL_TOKEN_FORMATS = [
   /\bAIza[0-9A-Za-z_-]{30,}/g,
   /\bnpm_[A-Za-z0-9]{20,}/g,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g,
-  /\bst\.[A-Za-z0-9_-]{20,}/g,
+  /\bst\.[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{16,}){0,3}/g,
 ];
 const KEY_VALUE_PAIR =
   /\b([A-Za-z0-9_.-]*(?:api[_-]?key|apikey|secret|token|password|passwd|authorization|auth[_-]?token|access[_-]?key|private[_-]?key)s?)\s*[:=]\s*("[^"]*"|'[^']*'|[^\s"',;)\]}]+)/gi;

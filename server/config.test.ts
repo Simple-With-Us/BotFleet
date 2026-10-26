@@ -1526,6 +1526,30 @@ describe("the secret-store section", () => {
     ).toMatchObject({ token: "st.read", writeToken: "st.write" });
   });
 
+  it("keeps a service token that arrives in the config file or in a patch", () => {
+    // The schema strips the keys it does not know, so a token the schema
+    // does not mention is dropped on the floor: the file looks configured
+    // and the server falls back to the machine identity.  This pins the
+    // file route and the patch route, because both go through the schema.
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        infisical: {
+          projectId: "836aebe2-c8f7-4e09-978e-7e3e82500bce",
+          token: "st.file-read-token",
+          writeToken: "st.file-write-token",
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.infisical?.token).toBe("st.file-read-token");
+    expect(cfg.infisical?.writeToken).toBe("st.file-write-token");
+
+    const patch = parseConfigPatch({ infisical: { token: "st.patched-token" } });
+    expect(patch).toMatchObject({ infisical: { token: "st.patched-token" } });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+
   it("rejects a site URL, path, environment, or project id that cannot be trusted in a query", () => {
     expect(() => parseConfigPatch({ infisical: { siteUrl: "http://vault.example.test" } })).toThrow(
       "infisical.siteUrl must be an absolute https:// URL",

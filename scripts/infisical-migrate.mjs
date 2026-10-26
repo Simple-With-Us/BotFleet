@@ -71,6 +71,41 @@ export function rowsWithLocalValues(cfg) {
   return rows;
 }
 
+/** The token each side of the vault uses.
+ *
+ * A read token and a write token are two different credentials, and a read
+ * token cannot write.  So the write side uses the write token when there is
+ * one, falls back to the machine identity when there is not, and reports NO
+ * write credential when neither is there: passing the read token to a write
+ * fails with a 403 that reads like a broken vault rather than a missing
+ * write credential.
+ *
+ * Returns `{ readToken, writeToken }`.  `writeToken` is the EMPTY string when
+ * this install has no write credential at all, and the caller says so rather
+ * than trying the write anyway.  A failed machine login throws, exactly as
+ * the previous inline login did. */
+export async function resolveVaultTokens(settings, { loginImpl = login } = {}) {
+  const readToken = settings.token.trim();
+  const writeToken = settings.writeToken.trim();
+  const loginArgs = {
+    siteUrl: settings.siteUrl,
+    clientId: settings.clientId,
+    clientSecret: settings.clientSecret,
+  };
+  if (readToken) {
+    if (writeToken) return { readToken, writeToken };
+    // The read token cannot write, so the write falls back to the machine
+    // identity when this host still has one.
+    try {
+      return { readToken, writeToken: await loginImpl(loginArgs) };
+    } catch {
+      return { readToken, writeToken: "" };
+    }
+  }
+  const machine = await loginImpl(loginArgs);
+  return { readToken: machine, writeToken: writeToken || machine };
+}
+
 export async function run({
   argv = process.argv.slice(2),
   log = (line) => console.log(line),
@@ -104,17 +139,15 @@ export async function run({
   }
 
   // A service token is the identity; the machine identity is the fallback.
-  const readToken = settings.token.trim();
-  let token;
+  let tokens;
   try {
-    token = readToken
-      ? readToken
-      : await loginImpl({ siteUrl: settings.siteUrl, clientId: settings.clientId, clientSecret: settings.clientSecret });
+    tokens = await resolveVaultTokens(settings, { loginImpl });
   } catch (caught) {
     err(`Could not log in to Infisical: ${caught instanceof Error ? caught.message : "unknown error"}`);
     process.exitCode = 1;
     return;
   }
+  const token = tokens.readToken;
 
   let vaultValues;
   try {
@@ -152,6 +185,16 @@ export async function run({
     return;
   }
 
+  if (!tokens.writeToken) {
+    err(
+      "This install has no write credential: set INFISICAL_WRITE_TOKEN (or " +
+        "infisical.writeToken in the config file), or keep the machine " +
+        "identity so the script can log in and write as it always did.",
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   log("");
   for (const { spec, local, status } of classified) {
     if (status === "present-and-same") {
@@ -161,8 +204,10 @@ export async function run({
     try {
       await upsertSecretImpl({
         siteUrl: settings.siteUrl,
-        // The write token, when there is one: a read token cannot write.
-        token: settings.writeToken.trim() || token,
+        // The WRITE token.  A read token cannot write, so it is never the
+        // one used here: it would fail with a 403 that reads like a broken
+        // vault instead of a missing write credential.
+        token: tokens.writeToken,
         projectId: settings.projectId,
         environment: settings.environment,
         secretPath: settings.secretPath,

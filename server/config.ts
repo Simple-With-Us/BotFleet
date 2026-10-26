@@ -542,6 +542,13 @@ const appConfigSchema = z.object({
     secretPath: optionalText,
     clientId: optionalText,
     clientSecret: optionalText,
+    // The two service tokens.  They are declared here because the schema
+    // strips the keys it does not know: a token in the config file that
+    // the schema does not mention is dropped on the floor, and the file
+    // would look configured while the server fell back to the machine
+    // identity.  The environment names are the primary route.
+    token: optionalText,
+    writeToken: optionalText,
     credentialStorage: externalCredentialStorage,
     refreshMinutes: z.number().int().min(5).max(1440).optional(),
   }).optional(),
