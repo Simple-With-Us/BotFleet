@@ -607,14 +607,13 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         // Deep-link routing to all 6 settings sections.
         for section in MacSettingsSection.allCases {
             guard let url = URL(string: "botfleet://settings/\(section.rawValue)") else {
-                XCTFail("Failed to construct settings deep-link URL for section \(section)")
+                XCTFail("Failed to construct the settings deep-link URL for \(section.rawValue)")
                 continue
             }
             XCTAssertEqual(MacSettingsDeepLinkRouter.section(for: url), section)
         }
         guard let queryURL = URL(string: "botfleet://settings?section=permissions") else {
-            XCTFail("Failed to construct settings query deep-link URL")
-            return
+            return XCTFail("Failed to construct the query-form settings deep-link URL")
         }
         XCTAssertEqual(MacSettingsDeepLinkRouter.section(for: queryURL), .permissions)
         XCTAssertEqual(
@@ -645,5 +644,256 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         XCTAssertEqual(normalBadge.dockBadgeLabel, "6")
         let cappedBadge = MacUnreadBadgeSummary(unreadBotCount: 80, unreadRoomCount: 25, waitingBotCount: 0)
         XCTAssertEqual(cappedBadge.dockBadgeLabel, "99+")
+    }
+
+    // MARK: - 4. Review Triage: Voice State Machine
+
+    /// A microphone tap that cancels a pending start must never hand the
+    /// composer a stale snapshot of the text.
+    func testCancellingAPendingStartKeepsTextTypedWhileTheMicrophoneWarmedUp() {
+        let engine = MacVoiceEngine()
+
+        let firstTap = engine.tapMicrophoneButtonReportingOutcome(
+            mode: .composerDictation,
+            currentDraft: "Typed before"
+        )
+        guard case .startedCapture = firstTap else {
+            return XCTFail("Expected the first tap to start a capture")
+        }
+        XCTAssertEqual(engine.state, .starting)
+
+        // The user keeps typing while the microphone is warming up.
+        let secondTap = engine.tapMicrophoneButtonReportingOutcome(
+            mode: .composerDictation,
+            currentDraft: "Typed before and after"
+        )
+        XCTAssertEqual(secondTap, .cancelledPendingStart)
+        XCTAssertEqual(engine.state, .idle)
+
+        // The engine's own snapshot still holds the pre-tap text.
+        XCTAssertEqual(engine.currentDraft, "Typed before")
+        // The composer keeps what the user actually has: the stale snapshot
+        // must never overwrite it.
+        XCTAssertEqual(
+            engine.composerDraftAfterTap(incomingDraft: "Typed before and after"),
+            "Typed before and after"
+        )
+    }
+
+    /// Pausing and resuming must not rebase the draft on itself, or the
+    /// spoken words come back twice.
+    func testResumingFromPauseDoesNotDuplicateTheSpokenWords() {
+        let engine = MacVoiceEngine()
+        let attempt = engine.beginStart(mode: .composerDictation, currentDraft: "Hello")
+        engine.completeStartPermissionGrant(attemptId: attempt, micGranted: true, speechGranted: true)
+        engine.receivePartialTranscript("world", audioLevel: 0.5)
+        XCTAssertEqual(engine.currentDraft, "Hello world")
+
+        engine.pauseCapture()
+        XCTAssertTrue(engine.resumeFromPause())
+
+        // The recognizer's next result is cumulative.
+        engine.receivePartialTranscript("world how are you", audioLevel: 0.6)
+        XCTAssertEqual(engine.currentDraft, "Hello world how are you")
+        // The frozen base is still the text from before dictation started.
+        XCTAssertEqual(engine.frozenBaseDraft, "Hello")
+    }
+
+    /// A playback failure during an active capture must not clobber the
+    /// capture state machine or drop the later partials.
+    func testAPlaybackFailureDuringRecordingKeepsTheCaptureAlive() {
+        let engine = MacVoiceEngine()
+        let attempt = engine.beginStart(mode: .composerDictation, currentDraft: "Hello")
+        engine.completeStartPermissionGrant(attemptId: attempt, micGranted: true, speechGranted: true)
+        engine.receivePartialTranscript("world", audioLevel: 0.5)
+
+        engine.handlePlaybackFailure(forMessageId: "msg-1")
+
+        XCTAssertEqual(
+            engine.state,
+            .recording(level: 0.5, partialTranscript: "world", mode: .composerDictation)
+        )
+        XCTAssertTrue(engine.isMicrophoneHardwareOpen)
+        XCTAssertEqual(engine.textFallbackMessageIds, ["msg-1"])
+
+        // Later partials are still accepted.
+        engine.receivePartialTranscript("world how are you", audioLevel: 0.6)
+        XCTAssertEqual(engine.currentDraft, "Hello world how are you")
+    }
+
+    // MARK: - 5. Review Triage: Transcript Cache & Surface Cost
+
+    /// A message patched under the same id carries new text, and the rendered
+    /// block cache must notice that.
+    func testRenderedBlocksReparseAMessagePatchedUnderTheSameId() {
+        let engine = MacTranscriptEngine()
+        var message = Message(id: "msg-1", role: .bot, kind: .text, at: 0)
+        message.text = "# Old heading"
+
+        let beforePatch = engine.renderedBlocks(for: message)
+        guard case .heading(let beforeLevel, let beforeText) = beforePatch[0].block else {
+            return XCTFail("Expected a heading block")
+        }
+        XCTAssertEqual(beforeLevel, 1)
+        XCTAssertEqual(beforeText, "Old heading")
+
+        // The harness patches the message under the same id.
+        message.text = "# New heading"
+        let afterPatch = engine.renderedBlocks(for: message)
+        guard case .heading(_, let afterText) = afterPatch[0].block else {
+            return XCTFail("Expected a heading block")
+        }
+        XCTAssertEqual(afterText, "New heading")
+        XCTAssertNotEqual(beforePatch, afterPatch)
+    }
+
+    /// The pending-card scan finds the newest pending card without walking
+    /// the whole card list of the thread.
+    func testPendingCardScanFindsTheNewestPendingCard() {
+        func cardMessage(_ id: String, requestId: String?, tool: String?) -> Message {
+            var message = Message(id: id, role: .bot, kind: .options, at: 0)
+            message.card = OptionCard(
+                title: "Approval needed",
+                subtitle: "rm -rf ./build",
+                options: ["Allow", "Deny"],
+                answered: nil,
+                dismissed: nil,
+                requestId: requestId,
+                tool: tool,
+                held: nil,
+                allowKey: nil
+            )
+            return message
+        }
+
+        let messages = [
+            cardMessage("m1", requestId: "r-1", tool: "Bash"),
+            cardMessage("m2", requestId: nil, tool: nil),
+            cardMessage("m3", requestId: "r-3", tool: nil),
+        ]
+
+        XCTAssertEqual(MacPendingCardScanner.mostRecentPendingCard(in: messages)?.requestId, "r-3")
+        XCTAssertTrue(MacPendingCardScanner.hasPendingCard(in: messages))
+        XCTAssertFalse(
+            MacPendingCardScanner.hasPendingCard(in: [cardMessage("m2", requestId: nil, tool: nil)])
+        )
+        XCTAssertNil(MacPendingCardScanner.mostRecentPendingCard(in: []))
+    }
+
+    /// The system surfaces are rebuilt at most once per interval, and the
+    /// menubar menu object is only rebuilt when its rows actually change.
+    func testSystemSurfaceSyncIsThrottledAndTheMenuOnlyRebuildsWhenItsRowsChange() {
+        let now = Date()
+        XCTAssertTrue(MacSystemSurfaceSyncPolicy.shouldSync(now: now, lastSync: nil))
+        // A rebuild 50 ms ago is inside the window, so it has to wait.
+        XCTAssertFalse(
+            MacSystemSurfaceSyncPolicy.shouldSync(now: now, lastSync: now.addingTimeInterval(-0.05))
+        )
+        // A rebuild 250 ms ago is outside the window, so it may run now.
+        XCTAssertTrue(
+            MacSystemSurfaceSyncPolicy.shouldSync(now: now, lastSync: now.addingTimeInterval(-0.25))
+        )
+
+        let base = MacMenubarState(
+            isConnected: true,
+            workingBotCount: 1,
+            waitingBots: [],
+            allBotsPaused: false,
+            reduceMotion: false
+        )
+        XCTAssertFalse(MacMenubarState.menuNeedsRebuild(previous: base, next: base))
+
+        // A changed status line changes the rows, so the menu is rebuilt.
+        var moreWorking = base
+        moreWorking.workingBotCount = 2
+        XCTAssertTrue(MacMenubarState.menuNeedsRebuild(previous: base, next: moreWorking))
+    }
+
+    // MARK: - 6. Review Triage: Notifications & Hotkeys
+
+    /// A harness notify frame becomes the candidate event the coordinator
+    /// evaluates, and the delivered payload reaches the notification submitter
+    /// instead of only an in-memory array.
+    func testNotifyFramesBecomeCandidateEventsAndReachTheNotificationSubmitter() {
+        let approval = NotificationFrame(
+            kind: "approval",
+            botId: "b1",
+            botName: "Scout",
+            threadId: "t1",
+            title: "Scout needs approval",
+            body: "rm -rf ./build",
+            requestId: "req-9"
+        )
+        let event = MacCandidateNotificationEvent(notificationFrame: approval)
+        XCTAssertEqual(
+            event,
+            .botNeedsApproval(
+                botId: "b1",
+                botName: "Scout",
+                threadId: "t1",
+                requestId: "req-9",
+                summary: "rm -rf ./build"
+            )
+        )
+        XCTAssertTrue(event.requiresPersonAttention)
+
+        // Routine completion NEVER notifies.
+        let done = NotificationFrame(
+            kind: "done",
+            botId: "b1",
+            botName: "Scout",
+            threadId: "t1",
+            title: "Scout finished",
+            body: "pushed"
+        )
+        let doneEvent = MacCandidateNotificationEvent(notificationFrame: done)
+        XCTAssertFalse(doneEvent.requiresPersonAttention)
+
+        // The payload reaches the submitter.
+        let recorder = NotificationRecorder()
+        let coordinator = MacNotificationCoordinator(
+            initialPermission: .notDetermined,
+            permissionGrantResult: true
+        ) { payload in
+            recorder.record(payload)
+        }
+        let decision = coordinator.handleEvent(event)
+        guard case .deliver(let payload) = decision else {
+            return XCTFail("Expected the approval notification to be delivered")
+        }
+        XCTAssertEqual(recorder.recorded, [payload])
+        XCTAssertEqual(payload.categoryIdentifier, NotificationCategoryIdentifier.approval)
+    }
+
+    /// A registered Carbon hotkey has to route back to the action that
+    /// registered it.
+    func testCarbonHotKeyIdsRoundTripToTheirActions() {
+        XCTAssertEqual(
+            MacGlobalHotkeyAction(carbonHotKeyId: MacGlobalHotkeyAction.showOrHideBotFleet.carbonHotKeyID),
+            .showOrHideBotFleet
+        )
+        XCTAssertEqual(
+            MacGlobalHotkeyAction(carbonHotKeyId: MacGlobalHotkeyAction.pushToTalk.carbonHotKeyID),
+            .pushToTalk
+        )
+        XCTAssertNil(MacGlobalHotkeyAction(carbonHotKeyId: 99))
+    }
+}
+
+/// Collects the notification payloads handed to the coordinator's submitter.
+private final class NotificationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var payloads: [MacDeliverableNotification] = []
+
+    func record(_ payload: MacDeliverableNotification) {
+        lock.lock()
+        payloads.append(payload)
+        lock.unlock()
+    }
+
+    var recorded: [MacDeliverableNotification] {
+        lock.lock()
+        defer { lock.unlock() }
+        return payloads
     }
 }
