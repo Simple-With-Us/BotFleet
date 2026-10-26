@@ -44,7 +44,9 @@ struct MacCuaDriverTests {
         let fileManager = FileManager.default
         var postSites: [String] = []
 
-        for directory in ["Sources", "MacApp"] {
+        // Every directory that reaches the macOS build, so a post site
+        // cannot appear in shared app code and slip past the scan.
+        for directory in ["Sources", "MacApp", "App", "Shared", "Widgets", "Scripts"] {
             let root = iosRoot.appendingPathComponent(directory)
             guard let enumerator = fileManager.enumerator(
                 at: root,
