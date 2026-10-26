@@ -108,7 +108,39 @@ fall into it for free.
 
 Bot state names are in `src/lib/mascot.ts` as `BotState`.  The ones worth
 naming are `working`, `thinking`, `listening`, `searching`, `resting`,
-`sleeping`, `happy`, `excited`, `sad`, `alerting`, `crash` and `error`.
+`sleeping`, `happy`, `excited`, `sad`, `alerting`, `crash`, `error` and
+`speaking`.
+
+### A talking avatar
+
+A bot that is speaking is drawn as speaking.  The app asks for the `speaking`
+state while that bot's voice is playing, so an avatar that declares one talks
+for exactly as long as it is talking, and every other bot carries on with what it
+was doing.
+
+```json
+{
+  "frame": { "width": 256, "height": 256, "count": 107, "delayMs": 80 },
+  "restingFrame": 0,
+  "states": {
+    "*": { "hold": { "from": 0, "to": 35 } },
+    "speaking": { "hold": { "from": 36, "to": 106 } }
+  }
+}
+```
+
+The `speaking` range is a talking loop, so it repeats until the voice stops.  The
+wildcard entry is what the avatar shows at every other moment.
+
+`tests/fixtures/avatar/tvface-speaking-demo.webp` is exactly that:  thirty six
+frames of the resting face and seventy one of the TV-Face talking loop, built
+from the shipped art at 256 x 256.  The face in that art has its mouth drawn
+into every frame, so the mouth moves because the frames are a different
+picture, and not because the player draws a mouth of its own.
+
+That is the limit of what the format carries today:  the mouth moves with the
+voice, and not with the words.  A file whose mouth has to follow each word
+would need a mouth of its own, which the format does not carry yet.
 
 ### Ranges are inclusive on both ends
 

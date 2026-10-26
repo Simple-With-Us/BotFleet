@@ -258,6 +258,26 @@ export function stateForBot(bot: MascotBotProfile): BotState {
 }
 
 
+/**
+ * The state a bot is drawn in, once the speech snapshot is taken into account.
+ *
+ * A bot that is speaking is drawn as speaking, whatever else it is doing,
+ * because a moving mouth is the thing a listener is watching.  The snapshot
+ * names the bot whose voice is playing, so only that bot changes, and only
+ * while the voice is playing.  A bot that is not speaking keeps the state it
+ * was given, which is what every other state in the app is built on.
+ */
+export function stateWithSpeech(
+  state: BotState | undefined,
+  speech: { status: string; botId?: string },
+  botId: string | undefined,
+): BotState | undefined {
+  if (!botId) return state;
+  if (speech.status !== "speaking") return state;
+  if (speech.botId !== botId) return state;
+  return "speaking";
+}
+
 /** @deprecated Temporary aliases during the Maus → Bot rebrand. Prefer Bot*. */
 export type MausColor = BotColor;
 export type MausState = BotState;

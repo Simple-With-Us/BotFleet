@@ -16,10 +16,12 @@ import {
 import {
   BOT_COLORS,
   mapBotStateToCursorState,
+  stateWithSpeech,
   type BotColor,
   type BotMotion,
   type BotState,
 } from "@/lib/mascot";
+import { useSpeech } from "@/lib/tts/useSpeech";
 import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
 import { AnimatedFileAvatar } from "./avatar-file/AnimatedFileAvatar";
 import {
@@ -233,6 +235,8 @@ export const BotMascot = memo(forwardRef(BotMascotComponent));
 
 export type BotAvatarProps = Omit<BotMascotProps, "color"> & {
   bot: {
+    /** The bot's id, which is how the speech snapshot names the bot talking. */
+    id?: string;
     name?: string;
     color: BotColor;
     avatarUrl?: string | null;
@@ -249,12 +253,19 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
   const profile = botAvatarProfile(bot);
   const [imageFailed, setImageFailed] = useState(false);
 
+  // A bot that is speaking is drawn as speaking, whatever else it is doing,
+  // because a moving mouth is the thing a listener is watching.  The speaker
+  // is a window-wide singleton, so this is the one place that can tell
+  // whether this bot is the one talking.
+  const speech = useSpeech();
+  const state = stateWithSpeech(mascotProps.state, speech, bot.id);
+
   useEffect(() => setImageFailed(false), [profile.avatarUrl]);
 
   if (profile.avatarCrop === "tvface") {
     return (
       <TVFaceAvatar
-        state={mascotProps.state}
+        state={state}
         color={bot.color}
         size={size}
         label={label ?? bot.name}
@@ -280,7 +291,7 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
     return (
       <AnimatedFileAvatar
         src={profile.avatarUrl}
-        state={mascotProps.state}
+        state={state}
         size={size}
         alt={label ?? (bot.name ? `${bot.name} avatar` : "Bot avatar")}
         radius={radius}
@@ -294,6 +305,7 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
     return (
       <BotMascot
         {...mascotProps}
+        state={state}
         color={bot.color}
         size={size}
         label={label ?? bot.name}
