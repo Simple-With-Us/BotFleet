@@ -30,7 +30,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const RUNTIME_MODE = "runtime";
@@ -68,9 +68,16 @@ export function parseLipoArchs(output) {
     .map(normalizeArch);
 }
 
-/** The packaged executable inside a built .app bundle. */
+/**
+ * The packaged executable inside a built .app bundle.
+ *
+ * The path is absolute on purpose.  The gate hands this binary to child
+ * processes that run with a different working directory (the preflight
+ * scratch directory, the staging tree), and a relative path would be
+ * resolved against THAT directory instead of the one the operator named.
+ */
 export function packagedBinaryPath(appPath) {
-  return join(appPath, ...PACKAGED_BINARY_SEGMENTS);
+  return join(resolve(appPath), ...PACKAGED_BINARY_SEGMENTS);
 }
 
 /**
@@ -146,8 +153,8 @@ export function resolveSmokeRuntime({
  * report a bundle check's result as a runtime pass.
  */
 export function resolveRuntime(runtimePath, { runnerNode = process.execPath } = {}) {
-  const named = String(runtimePath ?? "").trim();
-  if (!named) {
+  const raw = String(runtimePath ?? "").trim();
+  if (!raw) {
     return {
       mode: BUNDLE_MODE,
       label: BUNDLE_LABEL,
@@ -158,6 +165,10 @@ export function resolveRuntime(runtimePath, { runnerNode = process.execPath } = 
       reason: "no runtime was named, so this is a bundle check against the runner's Node",
     };
   }
+  // Absolute, because every child that runs it uses a different working
+  // directory.  A relative name would resolve against that directory and
+  // fail with ENOENT on a binary that is really there.
+  const named = resolve(raw);
   if (!existsSync(named)) {
     throw new Error(
       `the named runtime ${named} does not exist.  Refusing to fall back to the runner's Node: ` +
@@ -276,6 +287,26 @@ function describe(plan) {
   ];
 }
 
+/**
+ * The environment the smoke script runs with.
+ *
+ * The runtime name is set for a runtime pass and REMOVED for a bundle check.
+ * Without the removal, a stale OMB_SMOKE_RUNTIME inherited from the parent
+ * process would make the smoke script boot a runtime while the gate, the
+ * label and the step summary all said bundle check, so the two would
+ * disagree about what actually ran.
+ */
+export function buildGateEnv(plan, { dist = null, parentEnv = process.env } = {}) {
+  const env = { ...parentEnv, ...plan.env };
+  if (plan.mode === RUNTIME_MODE) {
+    env.OMB_SMOKE_RUNTIME = plan.runtime;
+  } else {
+    delete env.OMB_SMOKE_RUNTIME;
+  }
+  if (dist) env.OMB_SMOKE_DIST = resolve(dist);
+  return env;
+}
+
 async function gate({ values, flags }) {
   const app = values.get("app") ?? null;
   if (!app) {
@@ -296,10 +327,7 @@ async function gate({ values, flags }) {
   for (const line of describe(plan)) console.log(line);
   console.log(`::notice::packaged server smoke gate: ${plan.mode} (${plan.label}) -- ${plan.reason}`);
 
-  const env = { ...process.env, ...plan.env };
-  if (plan.mode === RUNTIME_MODE) env.OMB_SMOKE_RUNTIME = plan.runtime;
-  const dist = values.get("dist") ?? null;
-  if (dist) env.OMB_SMOKE_DIST = dist;
+  const env = buildGateEnv(plan, { dist: values.get("dist") ?? null });
 
   const smoke = join(ROOT, "scripts", "smoke-packaged-server.mjs");
   const result = spawnSync(process.execPath, [smoke], { stdio: "inherit", env });

@@ -13,11 +13,12 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative as relativePath } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   assertRuntimeExecutable,
+  buildGateEnv,
   BUNDLE_KIND,
   BUNDLE_LABEL,
   BUNDLE_MODE,
@@ -65,6 +66,64 @@ test("the packaged binary is the one the shipped app runs", () => {
     packagedBinaryPath("/build/BotFleet.app"),
     "/build/BotFleet.app/Contents/MacOS/BotFleet",
   );
+});
+
+test("a relative app path becomes absolute, and the control is unchanged", () => {
+  // Every child that runs the binary uses a different working directory, so
+  // a relative name would resolve against THAT directory and fail with
+  // ENOENT on a binary that is really there.
+  const relative = join("release", "mac-arm64", "BotFleet.app");
+  const resolved = packagedBinaryPath(relative);
+  assert.equal(isAbsolute(resolved), true);
+  assert.equal(resolved, join(process.cwd(), relative, "Contents", "MacOS", "BotFleet"));
+
+  // The CONTROL: the same call with an absolute path is unchanged, so the
+  // assertion above measures the resolution and not a coincidence.
+  assert.equal(
+    packagedBinaryPath("/build/BotFleet.app"),
+    "/build/BotFleet.app/Contents/MacOS/BotFleet",
+  );
+});
+
+test("a named runtime is absolute before any child is handed it", () => {
+  const { dir, cleanup } = scratch();
+  try {
+    const binary = executable(dir, "runtime", 0);
+    const relative = relativePath(process.cwd(), binary);
+    assert.notEqual(relative, binary);
+
+    const plan = resolveRuntime(relative);
+    assert.equal(isAbsolute(plan.command), true);
+    assert.equal(plan.command, binary);
+
+    // The CONTROL: the same binary named absolutely resolves to itself.
+    assert.equal(resolveRuntime(binary).command, binary);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a bundle gate drops a stale runtime name, and a runtime gate keeps its own", () => {
+  const stale = { OMB_SMOKE_RUNTIME: "/stale/BotFleet.app/Contents/MacOS/BotFleet" };
+
+  // The bundle case: the stale name is removed, so the smoke script cannot
+  // boot a runtime while the gate, its label and its step summary all say
+  // bundle check.
+  const bundleEnv = buildGateEnv({ mode: BUNDLE_MODE, env: {} }, { parentEnv: { ...stale } });
+  assert.equal("OMB_SMOKE_RUNTIME" in bundleEnv, false);
+
+  // The CONTROL: the same call with a runtime plan keeps the runtime, so the
+  // removal above is the mode and not an accident of the helper.
+  const runtimeEnv = buildGateEnv(
+    {
+      mode: RUNTIME_MODE,
+      env: { ELECTRON_RUN_AS_NODE: "1" },
+      runtime: "/build/BotFleet.app/Contents/MacOS/BotFleet",
+    },
+    { parentEnv: { ...stale } },
+  );
+  assert.equal(runtimeEnv.OMB_SMOKE_RUNTIME, "/build/BotFleet.app/Contents/MacOS/BotFleet");
+  assert.equal(runtimeEnv.ELECTRON_RUN_AS_NODE, "1");
 });
 
 test("the app's architecture decides the mode, and the control flips it", () => {
