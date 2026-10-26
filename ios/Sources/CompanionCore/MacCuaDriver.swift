@@ -4,6 +4,29 @@ import CoreGraphics
 import Foundation
 import Security
 
+/// Whether this process may post to the live desktop.
+///
+/// The CUA suite used to post real mouse and keyboard events to the live
+/// desktop, so running it took the person's mouse over while they worked.
+/// The sink seam keeps the tests off the live path, and this is the belt on
+/// that seam: a process that is a test runner never posts, whatever sink it
+/// was handed.  The shipping app is an application bundle and is never a test
+/// runner, so the product capability is unchanged.
+public enum MacDesktopInputPolicy {
+    /// True when this process is a test runner rather than the app.
+    ///
+    /// The SwiftPM testing helper is the process that runs the suite, and an
+    /// XCTest run is an XCTest bundle.
+    public static var isUnderTestRunner: Bool {
+        if ProcessInfo.processInfo.processName == "swiftpm-testing-helper" { return true }
+        if Bundle.main.bundleURL.pathExtension == "xctest" { return true }
+        return NSClassFromString("XCTest") != nil
+    }
+
+    /// True when a synthesized event may be posted to the live desktop.
+    public static var mayPostToDesktop: Bool { !isUnderTestRunner }
+}
+
 /// Normalized or absolute coordinates for Computer Use Agent (CUA) interactions.
 public struct CuaPoint: Sendable, Hashable, Codable {
     public var x: Double
@@ -336,7 +359,13 @@ public final class MacCuaDriver: @unchecked Sendable {
     private let eventSink: @Sendable (CGEvent) -> Void
 
     public convenience init() {
-        self.init(eventSink: { $0.post(tap: .cghidEventTap) })
+        // A test runner never reaches the live desktop, even with the
+        // production sink.  The app is not a test runner, so it still
+        // drives the desktop exactly as before.
+        self.init(eventSink: { event in
+            guard MacDesktopInputPolicy.mayPostToDesktop else { return }
+            event.post(tap: .cghidEventTap)
+        })
     }
 
     /// Internal so ordinary tests can exercise synthesis and safety bookkeeping

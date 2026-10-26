@@ -7,6 +7,24 @@ import Testing
 struct MacCuaDriverTests {
     let driver = RecordingCuaEventSink().makeDriver()
 
+    @Test("A test runner never posts to the live desktop")
+    func testRunnerNeverPostsToTheLiveDesktop() {
+        // The CUA suite used to post real mouse and keyboard events to the
+        // live desktop, so running it took the person's mouse over while
+        // they worked.  This is the tripwire: if the policy ever stops
+        // recognising a test runner, the hijack comes back and the gate has
+        // to fail first.
+        #expect(MacDesktopInputPolicy.isUnderTestRunner == true)
+        #expect(MacDesktopInputPolicy.mayPostToDesktop == false)
+
+        // The driver the app uses is the one with the production sink, so it
+        // has to obey the policy as well.  It still synthesizes its events
+        // and reports success; they simply never reach the display.
+        let driver = MacCuaDriver()
+        #expect(driver.moveMouse(to: CGPoint(x: 40, y: 40)) == true)
+        #expect(driver.typeText("hello") == true)
+    }
+
     @Test("CuaPoint properly stores and converts to CGPoint")
     func testPointConversion() {
         let point = CuaPoint(x: 150.5, y: 300.25)
