@@ -802,6 +802,10 @@ test("the ship no longer claims internal testers can install when none exist", (
   assert.doesNotMatch(rc6, /internal testers can install this build/);
   // The only place the success line is printed is the rc=0 branch.
   assert.equal(sh.split("TestFlight internal testers can install this build").length - 1, 1);
-  // The sync step creates the group, so the workflow must keep calling it.
-  assert.match(mjs, /await ensureInternalTesterGroup\(/);
+  // Owner directive 2026-10-18/19: public external testing only.  The sync
+  // step must NOT re-create the internal group; the function itself stays
+  // for flows that need an internal group on purpose.
+  const syncBranch = mjs.slice(mjs.indexOf('method === "ensure-standing-testers"'), mjs.indexOf('method === "ensure-tf-ready"'));
+  assert.doesNotMatch(syncBranch, /await ensureInternalTesterGroup\(/);
+  assert.match(mjs, /export async function ensureInternalTesterGroup\(/);
 });

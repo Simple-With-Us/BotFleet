@@ -1517,15 +1517,10 @@ async function main() {
       }
     }
 
-    // 2b) Internal group: App Store Connect users install every build with no
-    //     Beta App Review.  This is the path that reaches the owner's phone; a
-    //     new app record has none until this creates it (GH #1018).
-    // Its warnings go through warn(), so they count toward the exit code.
-    await ensureInternalTesterGroup({
-      api, appId, emails,
-      log: (m) => console.error(`${prefix}: ${m}`),
-      warn
-    });
+    // 2b) Internal group: NOT created here.  Owner directive 2026-10-18/19:
+    //     public external testing only, so a ship must not re-create the
+    //     internal "Internal Testers" group.  ensureInternalTesterGroup
+    //     stays available for flows that need an internal group on purpose.
 
     // 3) Build: the given CFBundleVersion, else the newest upload.
     const buildQuery = wantBuild
