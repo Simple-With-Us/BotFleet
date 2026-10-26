@@ -460,7 +460,7 @@ export function maskEmail(email) {
 // every record that email has across the team's apps, and adding another app's
 // record to this app's group answers 409 STATE_ERROR "Tester(s) cannot be
 // assigned" (seen live on 2026-10-09 for the owner's own address).  So:
-//   - createFirst (the internal group path): POST /v1/betaTesters with the group
+//   - createFirst (standing-tester paths, internal and external): POST /v1/betaTesters with the group
 //     relationship.  For an existing address on THIS app Apple answers with that
 //     app's own record, and for an App Store Connect user it makes an internal
 //     tester.  Falls back to the lookup below if the create is refused.
@@ -531,6 +531,107 @@ export async function countInternalTesters({ api, appId }) {
     for (const t of members.rows) seen.add(String(t.attributes?.email || "").toLowerCase());
   }
   return { ok: true, groups: groups.length, testers: seen.size };
+}
+
+// Delete the app's internal beta groups.  Owner directive 2026-10-18 ("delete
+// internal group if that isn't problem to do"), made automatic 2026-10-19:
+// covered apps carry no internal testing groups.  Deleting a beta group only
+// ends its access to the builds; it never deletes the testers from TestFlight.
+// Returns { deleted, failed }; a failed delete is a warning, never a throw.
+export async function deleteInternalGroups({ api, appId, log, warn }) {
+  if (!DELETE_INTERNAL_GROUPS_APP_IDS.has(String(appId))) {
+    log(`internal-group cleanup skipped: app ${appId} is not in the owner's external-only set`);
+    return { deleted: 0, failed: 0 };
+  }
+  const groupsRes = await ascAllRows({ api, url: `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup` });
+  if (!groupsRes.ok) {
+    warn(`could not list groups for internal-group cleanup (${groupsRes.error})`);
+    return { deleted: 0, failed: 1 };
+  }
+  const internal = groupsRes.rows.filter((g) => g.attributes?.isInternalGroup === true);
+  let deleted = 0;
+  let failed = 0;
+  for (const g of internal) {
+    const del = await api("DELETE", `/v1/betaGroups/${g.id}`);
+    if (del.ok || del.status === 204 || del.status === 404) {
+      deleted += 1;
+      log(`deleted internal group "${g.attributes?.name}" id=${g.id} (owner directive 2026-10-18/19: external testing only)`);
+    } else {
+      failed += 1;
+      warn(`could not delete internal group "${g.attributes?.name}" id=${g.id} (${ascErrorText(del)})`);
+    }
+  }
+  return { deleted, failed };
+}
+
+// Internal groups are deleted only for the apps the owner moved to public
+// external testing (2026-10-18/19 directive).  Exception apps keep theirs:
+// Congress.Trade is watch-only, Socratic Trade stays internal-only, and
+// CodeCaps Mac's internal groups are untouched.  Any other appId is left
+// completely alone - deleting a group ends its build access irreversibly.
+const DELETE_INTERNAL_GROUPS_APP_IDS = new Set([
+  "6817951255", // Clutch.Codes
+  "6820175685", // BotFleet
+  "6816633156", // Hog Hunter
+  "6814623846", // CodeCaps
+  "6804249232", // DealDex
+  "6804247582", // ContactLogo
+  "6804248235", // ContactLogo Mac
+  "6818901017", // FleetLink
+  "6820885210", // UM Local
+  "6820881005", // UM Client
+]);
+
+// Whether a processed build can reach anyone through external testing: it is
+// assigned to at least one external group that has testers or an enabled
+// public link.  Under the owner's external-only policy (2026-10-18/19) this
+// replaces the internal-tester count as the installability check; approval is
+// still Apple's gate after that.  Never throws; { ok:false } means the read
+// failed, which is not the same as uninstallable.
+export async function externalInstallability({ api, buildId }) {
+  let groupsRes;
+  try {
+    groupsRes = await ascAllRows({ api, url: `/v1/builds/${buildId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled` });
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e), installable: false };
+  }
+  if (!groupsRes.ok) return { ok: false, error: groupsRes.error, installable: false };
+  // A group with a missing flag is not known to be internal, so it counts as
+  // external here; only isInternalGroup === true is excluded.
+  const external = groupsRes.rows.filter((g) => g.attributes?.isInternalGroup !== true);
+  // Public link first: one shareable group settles installability even when a
+  // tester read on another group fails transiently.
+  const linked = external.find((g) => g.attributes?.publicLinkEnabled === true);
+  if (linked) return { ok: true, installable: true, detail: `public link on "${linked.attributes?.name}"` };
+  // Existence only: one page of one row proves a tester, so no full-roster
+  // pagination.  Probes run in small batches with an early return on the
+  // first hit: unbounded concurrency wastes quota and risks 429s flipping
+  // readiness to unreadable.  A failed or thrown read is deferred: it only
+  // decides the outcome when no group proved installable.  Never throws.
+  const PROBE_BATCH = 4;
+  let firstError = null;
+  for (let i = 0; i < external.length; i += PROBE_BATCH) {
+    const probes = await Promise.all(external.slice(i, i + PROBE_BATCH).map(async (g) => {
+      try {
+        const res = await api("GET", `/v1/betaGroups/${g.id}/betaTesters?limit=1&fields[betaTesters]=email`);
+        if (!res.ok) return { g, error: ascErrorText(res) };
+        return { g, testers: ascRows(res).length };
+      } catch (e) {
+        return { g, error: String((e && e.message) || e) };
+      }
+    }));
+    const hit = probes.find((p) => p.testers > 0);
+    if (hit) return { ok: true, installable: true, detail: `tester(s) in "${hit.g.attributes?.name}"` };
+    firstError = firstError || (probes.find((p) => p.error) || {}).error || null;
+  }
+  if (firstError) return { ok: false, error: firstError, installable: false };
+  return {
+    ok: true,
+    installable: false,
+    detail: external.length
+      ? "external groups have neither testers nor a public link"
+      : "build is assigned to no external group"
+  };
 }
 
 // Make sure the app has an internal group with access to all builds, and that
@@ -1255,10 +1356,11 @@ async function main() {
   //
   // Exit codes: 0 ready | 2 usage/API error | 3 readiness timeout (build found,
   // still processing) | 4 the uploaded build never appeared within the discovery
-  // budget, so compliance was NOT declared on it | 5 the build is ready but the
-  // app has no internal tester who could install it (see countInternalTesters) |
-  // 6 the build is ready but the internal-tester count could not be read, so
-  // whether anyone can install it is unverified.
+  // budget, so compliance was NOT declared on it | 5 the build is ready but no
+  // external group with testers or a public link can install it (see
+  // externalInstallability) | 6 the build is ready but the external
+  // installability could not be read, so whether anyone can install it is
+  // unverified.
   if (method === "ensure-appstore-profiles") {
     const mapPath = path;
     if (!mapPath) {
@@ -1496,18 +1598,18 @@ async function main() {
     }
 
     // 2) Testers: add each standing email to the group, reusing tester records.
-    const inGroupRes = await api("GET", `/v1/betaGroups/${group.id}/betaTesters?limit=200&fields[betaTesters]=email`);
+    const inGroupRes = await ascAllRows({ api, url: `/v1/betaGroups/${group.id}/betaTesters?limit=200&fields[betaTesters]=email` });
     if (!inGroupRes.ok) {
-      warn(`could not list testers in group "${group.attributes?.name}" (${errText(inGroupRes)}); not re-adding anyone`);
+      warn(`could not list testers in group "${group.attributes?.name}" (${inGroupRes.error}); not re-adding anyone`);
       process.exit(3);
     }
-    const inGroup = new Set(rows(inGroupRes).map((t) => String(t.attributes?.email || "").toLowerCase()));
+    const inGroup = new Set(inGroupRes.rows.map((t) => String(t.attributes?.email || "").toLowerCase()));
     for (const email of emails) {
       if (inGroup.has(email)) {
         console.error(`${prefix}: ${mask(email)} already in group`);
         continue;
       }
-      const added = await addTesterToGroup({ api, appId, groupId: group.id, email });
+      const added = await addTesterToGroup({ api, appId, groupId: group.id, email, createFirst: true });
       const res = added.res;
       const existing = added.existing;
       if (res.ok || res.status === 204) {
@@ -1517,12 +1619,20 @@ async function main() {
       }
     }
 
-    // 2b) Internal group: App Store Connect users install every build with no
-    //     Beta App Review.  This is the path that reaches the owner's phone; a
-    //     new app record has none until this creates it (GH #1018).
-    // Its warnings go through warn(), so they count toward the exit code.
-    await ensureInternalTesterGroup({
-      api, appId, emails,
+    // 2b) Internal group: NOT created here.  Owner directive 2026-10-18/19:
+    //     public external testing only, so a ship must not re-create the
+    //     internal "Internal Testers" group.  ensureInternalTesterGroup
+    //     stays available for flows that need an internal group on purpose.
+
+    // 2c) Internal groups that DO exist: delete them.  Owner directive
+    //     2026-10-18 ("delete internal group if that isn't problem to do")
+    //     made automatic 2026-10-19 ("do the same for all other apps too and
+    //     make that automatic").  A group deleted here only ends its access to
+    //     the builds; it never deletes the testers from TestFlight.  Failure
+    //     to delete warns instead of failing the sync.
+    await deleteInternalGroups({
+      api,
+      appId,
       log: (m) => console.error(`${prefix}: ${m}`),
       warn
     });
@@ -1706,25 +1816,27 @@ async function main() {
       console.error(`ensure-tf-ready: poll ${pollNo} enc=${attrs.usesNonExemptEncryption} internal=${state}`);
       if (state === "IN_BETA_TESTING" || state === "READY_FOR_BETA_TESTING") {
         // READY_FOR_BETA_TESTING only says Apple finished processing.  It does
-        // not say anyone can install the build: a new app record has no internal
-        // group, and that is how 14 green ships reached nobody (GH #1018).
-        const internalTesters = await countInternalTesters({ api, appId });
-        if (internalTesters.ok) {
-          console.error(`ensure-tf-ready: internal testers with access to all builds=${internalTesters.testers} (groups=${internalTesters.groups})`);
+        // not say anyone can install the build.  Under the owner's external-only
+        // policy (2026-10-18/19) there is no internal group, so installability
+        // means the build sits in an external group that has testers or an
+        // enabled public link.  This is how 14 green ships reached nobody (GH #1018).
+        const reach = await externalInstallability({ api, buildId });
+        if (reach.ok) {
+          console.error(`ensure-tf-ready: external installability=${reach.installable} (${reach.detail})`);
         } else {
-          console.error(`ensure-tf-ready: could not count internal testers (${internalTesters.error})`);
+          console.error(`ensure-tf-ready: could not read external installability (${reach.error})`);
         }
-        const nobody = internalTesters.ok && internalTesters.testers === 0;
+        const nobody = reach.ok && !reach.installable;
         console.log(JSON.stringify({
           ok: true,
           buildId,
           version,
           internalBuildState: state,
           usesNonExemptEncryption: attrs.usesNonExemptEncryption,
-          internalTesterCount: internalTesters.ok ? internalTesters.testers : null
+          externalInstallable: reach.ok ? reach.installable : null
         }));
-        // 5 = read and zero; 6 = could not be read, so installability is unverified.
-        process.exit(nobody ? 5 : internalTesters.ok ? 0 : 6);
+        // 5 = read and nobody can install; 6 = could not be read, so installability is unverified.
+        process.exit(nobody ? 5 : reach.ok ? 0 : 6);
       }
       await sleep(POLL_MS);
     }
