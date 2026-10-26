@@ -39,6 +39,11 @@ export const CREDENTIAL_ENV_NAMES = [
   // clear.
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+  // The service tokens: the read token and the write token are credentials
+  // too, and a bundle collected on an install that exports them would
+  // otherwise carry them in the clear.
+  "INFISICAL_TOKEN",
+  "INFISICAL_WRITE_TOKEN",
 ];
 
 // Credential-shaped tokens: unmistakable formats are masked wherever they
