@@ -430,59 +430,6 @@ public struct MacUnreadBadgeSummary: Equatable, Sendable {
     }
 }
 
-/// Sidebar selection target shared by `MacSessionSourceProtocol` and SwiftUI views.
-public enum SidebarSelection: Hashable, Sendable {
-    case bot(String)
-    case room(String)
-}
-
-/// Connection state value shared across `MacSessionSourceProtocol` implementations.
-public enum MacConnectionStatus: Equatable, Sendable {
-    case disconnected
-    case connecting
-    case connected(endpoint: String)
-    case failed(String)
-
-    public var isConnected: Bool {
-        if case .connected = self { return true }
-        return false
-    }
-
-    public var displayText: String {
-        switch self {
-        case .connected(let endpoint): return "Connected (\(endpoint))"
-        case .connecting: return "Connecting…"
-        case .disconnected: return "Disconnected"
-        case .failed(let msg): return "Error: \(msg)"
-        }
-    }
-}
-
-/// Protocol seam separating SwiftUI views from the underlying transport.
-///
-/// Phase 3 binds views to `MacSession` (backed by SSE + REST); Phase 5 can swap
-/// in an in-process `EngineCoordinator` adapter conforming to this exact protocol.
-@MainActor
-public protocol MacSessionSourceProtocol: AnyObject {
-    var state: CompanionState { get }
-    var status: MacConnectionStatus { get }
-    var selection: SidebarSelection? { get set }
-    var selectedThreadId: String? { get set }
-    var activeThreadId: String? { get }
-    var activeTitle: String { get }
-    var activeSubtitle: String { get }
-    var activeMessages: [Message] { get }
-    var activeStreamingText: String? { get }
-    var activeReasoningText: String? { get }
-    var unreadSummary: MacUnreadBadgeSummary { get }
-
-    func connect(host: String, port: Int)
-    func disconnect()
-    @discardableResult
-    func sendMessage(_ text: String) async -> Bool
-    func stopActiveTurn() async
-}
-
 // MARK: - 3. Electron Parity Surfaces (BF-2498 / BF-2501)
 
 /// Surface 1: Desktop capability and version descriptor.

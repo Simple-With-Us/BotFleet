@@ -7,8 +7,18 @@ import CompanionCore
 import AppKit
 #endif
 
-public extension MacConnectionStatus {
-    var statusColor: Color {
+public enum MacConnectionStatus: Equatable, Sendable {
+    case disconnected
+    case connecting
+    case connected(endpoint: String)
+    case failed(String)
+
+    public var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
+    }
+
+    public var statusColor: Color {
         switch self {
         case .connected: return .green
         case .connecting: return .yellow
@@ -16,6 +26,41 @@ public extension MacConnectionStatus {
         case .failed: return .red
         }
     }
+
+    public var displayText: String {
+        switch self {
+        case .connected(let endpoint): return "Connected (\(endpoint))"
+        case .connecting: return "Connecting…"
+        case .disconnected: return "Disconnected"
+        case .failed(let msg): return "Error: \(msg)"
+        }
+    }
+}
+
+public enum SidebarSelection: Hashable, Sendable {
+    case bot(String)
+    case room(String)
+}
+
+@MainActor
+public protocol MacSessionSourceProtocol: AnyObject {
+    var state: CompanionState { get }
+    var status: MacConnectionStatus { get }
+    var selection: SidebarSelection? { get set }
+    var selectedThreadId: String? { get set }
+    var activeThreadId: String? { get }
+    var activeTitle: String { get }
+    var activeSubtitle: String { get }
+    var activeMessages: [Message] { get }
+    var activeStreamingText: String? { get }
+    var activeReasoningText: String? { get }
+    var unreadSummary: MacUnreadBadgeSummary { get }
+
+    func connect(host: String, port: Int)
+    func disconnect()
+    @discardableResult
+    func sendMessage(_ text: String) async -> Bool
+    func stopActiveTurn() async
 }
 
 @MainActor
