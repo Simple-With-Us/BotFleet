@@ -1659,6 +1659,17 @@ async function main() {
       JSON.stringify({ data: [{ type: "builds", id: build.id }] }));
     if (link.ok || link.status === 204) {
       console.error(`${prefix}: ${buildLabel} assigned to group "${group.attributes?.name}"`);
+      // Independently verify the assignment took: Apple forbids reading a
+      // build's betaGroups (403 FORBIDDEN_ERROR, observed 2026-10-26), so read
+      // the group's builds (documented GET /v1/betaGroups/{id}/builds).
+      const inGroup = await ascAllRows({ api, url: `/v1/betaGroups/${group.id}/builds?limit=200&fields[builds]=version` });
+      if (!inGroup.ok) {
+        warn(`could not verify ${buildLabel} in group "${group.attributes?.name}" (${inGroup.error}); the assignment POST already succeeded`);
+      } else if (inGroup.rows.some((b) => b.id === build.id)) {
+        console.error(`${prefix}: verified ${buildLabel} is in group "${group.attributes?.name}"`);
+      } else {
+        warn(`${buildLabel} is not in group "${group.attributes?.name}" after a successful assignment POST; external testers cannot see it`);
+      }
     } else {
       warn(`could not assign ${buildLabel} to group (${errText(link)})`);
     }
