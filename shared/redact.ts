@@ -90,6 +90,14 @@ const KEY_PREFIXES: RegExp[] = [
   // its payload), and the header alone is `{"alg":…}`, so anchoring on a
   // complete three-segment token is exactly what lets a cut one through.
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g,
+  // Infisical service token: `st.` plus a long base64url body.  It is the
+  // credential every app outside the agent seats now holds, and it is not a
+  // `Bearer` header and not a NAME=value pair when it turns up in a log
+  // line, so without this shape it would ride out in the clear.  The floor
+  // sits at 20 body characters: the prefix on its own ("the st. prefix is
+  // what Infisical issues") is prose, and 1st. place never matches because
+  // the `st` there has no word boundary in front of it.
+  /\bst\.[A-Za-z0-9_-]{20,}/g,
 ];
 
 /** The credential-shape list, published so there is exactly ONE of them.

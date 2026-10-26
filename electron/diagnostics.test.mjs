@@ -59,6 +59,7 @@ describe("credential shape parity with shared/redact.ts", () => {
       ["webhook signing secret", ["wh", "sec_", "test", "_", "fake"].join("")],
       ["google oauth", ["ya29", ".", "fake"].join("")],
       ["gitlab pat", ["glpat", "-", "fake0000"].join("")],
+      ["infisical service token", ["st", ".", "fake0000000000000000000"].join("")],
     ];
     for (const [label, sample] of samples) {
       const out = redactSecretsInLine(`login failed while sending ${sample}`);
