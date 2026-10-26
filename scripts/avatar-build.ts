@@ -656,6 +656,14 @@ export function buildAvatar(options: BuildOptions): BuildResult {
       writeFileSync(options.out, bytes);
     }
 
+    // The file's own manifest, written beside the file.  It is the manifest
+    // from inside the file rather than the one the author wrote, because the
+    // two count different frames when the encoder folded identical frames
+    // together, and the sidecar has to describe the file that is actually
+    // there.  Writing it here is what keeps it true.
+    const sidecar = options.out.replace(/\.[^./\\]+$/, "") + ".manifest.json";
+    writeFileSync(sidecar, `${JSON.stringify(fileManifest, null, 2)}\n`);
+
     if (options.gif) {
       // A GIF cannot carry the manifest, so it is the compatibility copy:
       // the file loops as a whole and plays in anything that takes a GIF.
