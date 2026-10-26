@@ -550,24 +550,25 @@ export function buildAvatar(options: BuildOptions): BuildResult {
   const scratch = mkdtempSync(join(tmpdir(), "avatar-build-"));
   try {
     const staged = stageFrames(frames, scratch, format);
-    const scaled = join(scratch, "scaled");
-    mkdirSync(scaled);
+    const converted = join(scratch, "converted");
+    mkdirSync(converted);
 
-    // The frames are scaled to the size the manifest declares.  The check
-    // above has already made sure that they are that size, so the encoder is
-    // always handed the shape the player is going to draw.
-    const scaledPattern = join(scaled, "%0" + String(frames.length).length + "d.png");
+    // The frames are handed to the encoder at the size they are.  The check
+    // above has already made sure that they are the size the manifest
+    // declares, and a resampling filter that scales a picture to its own
+    // size is not an identity pass: it quietly touches pixels the author
+    // drew.  The conversion to PNG is the only thing done to them here.
+    const convertedPattern = join(converted, "%0" + String(frames.length).length + "d.png");
     run("ffmpeg", [
       "-y",
       "-framerate", "1",
       "-i", staged,
-      "-vf", `scale=${manifest.frame.width}:${manifest.frame.height}:flags=lanczos`,
       "-pix_fmt", "rgba",
-      scaledPattern,
+      convertedPattern,
     ]);
 
-    const scaledFrames = readdirSync(scaled).sort();
-    const webpPattern = join(scaled, "%0" + String(frames.length).length + "d.png");
+    const convertedFrames = readdirSync(converted).sort();
+    const webpPattern = join(converted, "%0" + String(frames.length).length + "d.png");
     // The encoder settings are a deliberate balance, not a default nobody
     // looked at:
     //
@@ -586,7 +587,7 @@ export function buildAvatar(options: BuildOptions): BuildResult {
       "-loop", "0",
       "-d", String(manifest.frame.delayMs),
       ...encoder,
-      ...scaledFrames.map((name) => join(scaled, name)),
+      ...convertedFrames.map((name) => join(converted, name)),
       "-o", options.out,
     ]);
 
