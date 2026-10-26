@@ -5,8 +5,6 @@ import CoreVideo
 import Darwin
 import Foundation
 
-public typealias MouseButton = CuaMouseButton
-
 /// Destination surface controlled by a `CuaDriverProtocol` instance.
 public enum CuaTargetKind: Equatable, Hashable, Sendable {
     case hostMac
