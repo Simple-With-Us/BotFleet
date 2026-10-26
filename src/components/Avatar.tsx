@@ -21,6 +21,7 @@ import {
   type BotState,
 } from "@/lib/mascot";
 import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
+import { AnimatedFileAvatar } from "./avatar-file/AnimatedFileAvatar";
 import {
   CursorAvatar,
   DEFAULT_SILHOUETTE,
@@ -262,6 +263,33 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
     );
   }
 
+  // The corner radius of an image crop.  It is worked out before the
+  // branches because the animated crop needs it too: that crop is not a crop
+  // at all, it plays the file's own frames, and the artwork is drawn whole.
+  const radius =
+    profile.avatarCrop === "circle"
+      ? "50%"
+      : profile.avatarCrop === "rounded"
+        ? "22%"
+        : "0";
+
+  if (profile.avatarCrop === "animated" && profile.avatarUrl && !imageFailed) {
+    // A one-file animated avatar.  The component draws the ordinary image
+    // until the file proves it carries a manifest, so an avatar that turns
+    // out to be a plain picture looks exactly as it always did.
+    return (
+      <AnimatedFileAvatar
+        src={profile.avatarUrl}
+        state={mascotProps.state}
+        size={size}
+        alt={label ?? (bot.name ? `${bot.name} avatar` : "Bot avatar")}
+        radius={radius}
+        animated={mascotProps.animated}
+        onError={() => setImageFailed(true)}
+      />
+    );
+  }
+
   if (profile.avatarCrop === "mascot" || !profile.avatarUrl || imageFailed) {
     return (
       <BotMascot
@@ -273,12 +301,6 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
     );
   }
 
-  const radius =
-    profile.avatarCrop === "circle"
-      ? "50%"
-      : profile.avatarCrop === "rounded"
-        ? "22%"
-        : "0";
   return (
     <img
       src={profile.avatarUrl}
