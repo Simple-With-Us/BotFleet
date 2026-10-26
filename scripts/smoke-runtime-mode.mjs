@@ -232,25 +232,37 @@ export function readAppArches(binaryPath) {
   }
 }
 
+/**
+ * The command line, parsed once here so the call sites branch on WHAT a flag
+ * is rather than on what type it happens to be.  A flag written with a value
+ * lands in `values`, and every value there is a string the operator typed; a
+ * bare switch lands in `flags`.  Nothing downstream has to ask what it is
+ * holding.
+ */
 function parseArgs(argv) {
-  const out = { _: [] };
+  const positional = [];
+  const values = new Map();
+  const flags = new Set();
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (!arg.startsWith("--")) {
-      out._.push(arg);
+      positional.push(arg);
       continue;
     }
     const [key, inline] = arg.slice(2).split("=");
     if (inline !== undefined) {
-      out[key] = inline;
-    } else if (argv[index + 1] !== undefined && !argv[index + 1].startsWith("--")) {
-      out[key] = argv[index + 1];
-      index += 1;
-    } else {
-      out[key] = true;
+      values.set(key, inline);
+      continue;
     }
+    const next = argv[index + 1];
+    if (next !== undefined && !next.startsWith("--")) {
+      values.set(key, next);
+      index += 1;
+      continue;
+    }
+    flags.add(key);
   }
-  return out;
+  return { positional, values, flags };
 }
 
 function describe(plan) {
@@ -264,9 +276,9 @@ function describe(plan) {
   ];
 }
 
-async function gate(args) {
-  const app = args.app;
-  if (!app || typeof app !== "string") {
+async function gate({ values, flags }) {
+  const app = values.get("app") ?? null;
+  if (!app) {
     console.error("smoke-runtime-mode gate: --app <path to the packaged .app> is required");
     process.exit(2);
   }
@@ -279,19 +291,21 @@ async function gate(args) {
   const plan = resolveSmokeRuntime({
     appPath: app,
     appArches: readAppArches(binary),
-    requireRuntime: args["require-runtime"] === true,
+    requireRuntime: flags.has("require-runtime"),
   });
   for (const line of describe(plan)) console.log(line);
   console.log(`::notice::packaged server smoke gate: ${plan.mode} (${plan.label}) -- ${plan.reason}`);
 
   const env = { ...process.env, ...plan.env };
   if (plan.mode === RUNTIME_MODE) env.OMB_SMOKE_RUNTIME = plan.runtime;
-  if (typeof args.dist === "string") env.OMB_SMOKE_DIST = args.dist;
+  const dist = values.get("dist") ?? null;
+  if (dist) env.OMB_SMOKE_DIST = dist;
 
   const smoke = join(ROOT, "scripts", "smoke-packaged-server.mjs");
   const result = spawnSync(process.execPath, [smoke], { stdio: "inherit", env });
 
-  if (typeof args.summary === "string") {
+  const summary = values.get("summary") ?? null;
+  if (summary) {
     const mode = plan.mode === RUNTIME_MODE ? "**runtime pass**" : "**bundle check**";
     const lines = [
       "### Packaged server smoke gate",
@@ -304,7 +318,7 @@ async function gate(args) {
       "",
     ];
     try {
-      writeFileSync(args.summary, lines.join("\n"), { flag: "a" });
+      writeFileSync(summary, lines.join("\n"), { flag: "a" });
     } catch (error) {
       console.error(`smoke-runtime-mode gate: could not write the step summary: ${error.message}`);
     }
@@ -320,7 +334,7 @@ async function main() {
     return;
   }
   if (command === "plan") {
-    const app = typeof args.app === "string" ? args.app : null;
+    const app = args.values.get("app") ?? null;
     const plan = resolveSmokeRuntime({
       appPath: app,
       appArches: app ? readAppArches(packagedBinaryPath(app)) : [],
