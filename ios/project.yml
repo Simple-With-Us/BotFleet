@@ -236,6 +236,17 @@ targets:
           and voice calls with bots.
         NSSpeechRecognitionUsageDescription: BotFleet converts your speech into
           text for messaging bots.
+        # Same rewrite rule again:  `xcodegen generate` REWRITES the plist, so a
+        # hand-added CFBundleURLTypes is dropped before the archive is built and
+        # macOS never delivers a botfleet:// URL to the app.  Without the scheme
+        # the whole deep-link router is dead code, because the voice failure
+        # recovery URL points at botfleet://settings/voice and the Application
+        # menu routes the same way.  Declaring the scheme here makes the
+        # generated plist register it.
+        CFBundleURLTypes:
+        - CFBundleURLName: app.botfleet.macos
+          CFBundleURLSchemes:
+          - botfleet
     entitlements:
       path: MacApp/BotFleetMac.entitlements
       properties:
