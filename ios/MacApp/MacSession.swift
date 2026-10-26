@@ -3,8 +3,11 @@ import SwiftUI
 import AppKit
 import CoreVideo
 import CompanionCore
+#if os(macOS)
+import AppKit
+#endif
 
-public enum MacConnectionStatus: Equatable {
+public enum MacConnectionStatus: Equatable, Sendable {
     case disconnected
     case connecting
     case connected(endpoint: String)
@@ -40,7 +43,28 @@ public enum SidebarSelection: Hashable, Sendable {
 }
 
 @MainActor
-public final class MacSession: ObservableObject {
+public protocol MacSessionSourceProtocol: AnyObject {
+    var state: CompanionState { get }
+    var status: MacConnectionStatus { get }
+    var selection: SidebarSelection? { get set }
+    var selectedThreadId: String? { get set }
+    var activeThreadId: String? { get }
+    var activeTitle: String { get }
+    var activeSubtitle: String { get }
+    var activeMessages: [Message] { get }
+    var activeStreamingText: String? { get }
+    var activeReasoningText: String? { get }
+    var unreadSummary: MacUnreadBadgeSummary { get }
+
+    func connect(host: String, port: Int)
+    func disconnect()
+    @discardableResult
+    func sendMessage(_ text: String) async -> Bool
+    func stopActiveTurn() async
+}
+
+@MainActor
+public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public var state: CompanionState = CompanionState()
     @Published public var status: MacConnectionStatus = .disconnected
     @Published public var selection: SidebarSelection?
@@ -62,6 +86,21 @@ public final class MacSession: ObservableObject {
     @Published public var cuaPixelBuffer: CVPixelBuffer?
     @Published public var cuaStatusMessage: String?
     @Published public var cuaRevocationBanner: String?
+
+    // Phase 3: Voice, System Integration, Streaming Transcript & Settings Routing
+    @Published public var voiceState: MacVoiceCaptureState = .idle
+    @Published public var voiceRouteBanner: String?
+    @Published public var activeSettingsSection: MacSettingsSection = .general
+    @Published public var allBotsPaused: Bool = false
+
+    public let voiceEngine = MacVoiceEngine()
+    public let transcriptEngine = MacTranscriptEngine()
+    public let hotkeyManager = MacGlobalHotkeyManager()
+    public let notificationCoordinator = MacNotificationCoordinator()
+    public let capabilities = MacDesktopCapabilities()
+    #if os(macOS)
+    public let menubarController = MacMenubarController()
+    #endif
 
     private var client: CompanionClient?
     private var streamTask: Task<Void, Never>?
@@ -85,6 +124,18 @@ public final class MacSession: ObservableObject {
                 persistOnExit: localPersist
             )
         }
+    }
+
+    public var unreadSummary: MacUnreadBadgeSummary {
+        MacUnreadBadgeSummary.from(state: state)
+    }
+
+    public var menubarState: MacMenubarState {
+        MacMenubarState.from(
+            state: state,
+            isConnected: status.isConnected,
+            allBotsPaused: allBotsPaused
+        )
     }
 
     public var selectedBotId: String? {
@@ -161,6 +212,29 @@ public final class MacSession: ObservableObject {
     public var activeReasoningText: String? {
         guard let threadKey = activeThreadId else { return nil }
         return state.reasoning[threadKey]
+    }
+
+    // MARK: - Voice & System Sync
+
+    public func toggleComposerDictation(currentDraft: String) -> String {
+        _ = voiceEngine.tapMicrophoneButton(mode: .composerDictation, currentDraft: currentDraft)
+        voiceState = voiceEngine.state
+        voiceRouteBanner = voiceEngine.routeBanner
+        return voiceEngine.currentDraft
+    }
+
+    public func routeSettingsDeepLink(_ url: URL) {
+        if let section = MacSettingsDeepLinkRouter.section(for: url) {
+            activeSettingsSection = section
+        }
+    }
+
+    private func syncSystemSurfaces() {
+        notificationCoordinator.activeOnScreenThreadId = activeThreadId
+        #if os(macOS)
+        menubarController.apply(menubarState)
+        NSApplication.shared.dockTile.badgeLabel = unreadSummary.dockBadgeLabel
+        #endif
     }
 
     /// Connects to the local harness.
@@ -247,6 +321,7 @@ public final class MacSession: ObservableObject {
         streamTask = nil
         client = nil
         status = .disconnected
+        syncSystemSurfaces()
     }
 
     private func runConnectionLoop(client: CompanionClient, endpoint: String) async {
@@ -272,12 +347,17 @@ public final class MacSession: ObservableObject {
                 )
                 self.status = .connected(endpoint: endpoint)
                 self.reconnectAttempt = 0
+                self.syncSystemSurfaces()
 
-                // Open SSE stream
                 let stream = try client.events(since: state.cursor, screens: true)
                 for try await frame in stream {
                     if Task.isCancelled { break }
                     self.state.apply(frame)
+                    if let threadKey = self.activeThreadId,
+                       let streaming = self.state.streaming[threadKey] {
+                        self.transcriptEngine.updateStreamingText(streaming, messageId: "streaming:\(threadKey)")
+                    }
+                    self.syncSystemSurfaces()
                 }
             } catch {
                 if Task.isCancelled { break }
@@ -286,6 +366,7 @@ public final class MacSession: ObservableObject {
                 let jitter = Double.random(in: -0.2...0.2) * baseBackoff
                 let backoff = max(1.0, baseBackoff + jitter)
                 status = .failed("Connection lost. Retrying in \(Int(backoff))s…")
+                syncSystemSurfaces()
                 try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
             }
         }
@@ -484,9 +565,6 @@ public final class MacSession: ObservableObject {
                 self.isCuaStreaming = true
                 self.setCuaStatus(.liveDesktopShared)
             } catch {
-                // The raw error is a developer string (framework domain codes,
-                // TCC denial text), so it goes to the log and the status bar
-                // gets product copy.
                 NSLog("CUA stream error: %@", error.localizedDescription)
                 monitor.stopMonitoring()
                 let hasScreenRecording = MacCuaDriver.shared.checkPermissions().hasScreenRecording

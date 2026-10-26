@@ -1,5 +1,8 @@
 import SwiftUI
 import CompanionCore
+#if os(macOS)
+import AppKit
+#endif
 
 public struct MacRootView: View {
     @EnvironmentObject private var session: MacSession
@@ -27,6 +30,9 @@ public struct MacRootView: View {
             }
         }
         .navigationTitle(session.activeTitle)
+        .onOpenURL { url in
+            session.routeSettingsDeepLink(url)
+        }
         .toolbar {
             ToolbarItem(placement: .automatic) {
                 Button(action: {
@@ -58,7 +64,7 @@ public struct MacRootView: View {
     }
 }
 
-// MARK: - Sidebar
+// MARK: - Sidebar (macOS 26 Liquid Glass aware, macOS 14 standard sidebar fallback)
 
 struct MacSidebarView: View {
     @EnvironmentObject private var session: MacSession
@@ -74,8 +80,25 @@ struct MacSidebarView: View {
                             .padding(.vertical, 8)
                     } else {
                         ForEach(session.state.bots) { bot in
-                            MacBotRowView(bot: bot)
-                                .tag(SidebarSelection.bot(bot.id))
+                            MacBotRowView(
+                                bot: bot,
+                                pill: MacSidebarStatusPill.forBot(
+                                    bot,
+                                    in: session.state,
+                                    isConnected: session.status.isConnected
+                                ),
+                                expression: MacBotMascotExpression.resolve(
+                                    for: bot,
+                                    hasPendingCard: MacSidebarStatusPill.forBot(
+                                        bot,
+                                        in: session.state,
+                                        isConnected: session.status.isConnected
+                                    ).kind == .waiting,
+                                    hasReasoning: (session.state.reasoning[bot.threadId]?.isEmpty == false),
+                                    isConnected: session.status.isConnected
+                                )
+                            )
+                            .tag(SidebarSelection.bot(bot.id))
                         }
                     }
                 }
@@ -88,6 +111,12 @@ struct MacSidebarView: View {
                                     .foregroundColor(.accentColor)
                                 Text(room.name)
                                     .font(.body)
+                                Spacer()
+                                if room.unread {
+                                    Circle()
+                                        .fill(Color.accentColor)
+                                        .frame(width: 8, height: 8)
+                                }
                             }
                             .tag(SidebarSelection.room(room.id))
                         }
@@ -100,7 +129,7 @@ struct MacSidebarView: View {
 
             HStack {
                 Button(action: {
-                    // Open settings modal
+                    session.activeSettingsSection = .general
                 }) {
                     Label("Settings", systemImage: "gearshape")
                 }
@@ -109,6 +138,15 @@ struct MacSidebarView: View {
                 .padding(.vertical, 8)
 
                 Spacer()
+
+                if let dockBadge = session.unreadSummary.dockBadgeLabel {
+                    Text(dockBadge)
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.18))
+                        .clipShape(Capsule())
+                }
 
                 Button(action: {
                     // Quick add bot
@@ -119,18 +157,24 @@ struct MacSidebarView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             }
-            .background(Color(NSColor.windowBackgroundColor))
+            .background(
+                session.capabilities.supportsLiquidGlassSidebar
+                    ? Color.clear
+                    : Color(NSColor.windowBackgroundColor)
+            )
         }
     }
 }
 
 struct MacBotRowView: View {
     let bot: Bot
+    let pill: MacSidebarStatusPill
+    let expression: MacBotMascotExpression
 
     var body: some View {
         HStack(spacing: 10) {
             ZStack(alignment: .bottomTrailing) {
-                Image(systemName: "cpu")
+                Image(systemName: expression.symbolName)
                     .resizable()
                     .scaledToFit()
                     .frame(width: 24, height: 24)
@@ -140,24 +184,50 @@ struct MacBotRowView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
 
                 Circle()
-                    .fill((bot.busy == true) ? Color.orange : Color.green)
+                    .fill(statusDotColor)
                     .frame(width: 8, height: 8)
                     .overlay(Circle().stroke(Color(NSColor.windowBackgroundColor), lineWidth: 1.5))
             }
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(bot.name)
-                    .font(.body)
-                    .fontWeight(.medium)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(bot.name)
+                        .font(.body)
+                        .fontWeight(bot.unread ? .semibold : .medium)
+                        .lineLimit(1)
 
-                Text(bot.modelSelection.model)
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
+                    if bot.unread {
+                        Circle()
+                            .fill(Color.accentColor)
+                            .frame(width: 6, height: 6)
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    Text(pill.text)
+                        .font(.caption2)
+                        .foregroundColor(statusDotColor)
+                    Text("·")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text(bot.modelSelection.model)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
             }
         }
         .padding(.vertical, 2)
+    }
+
+    private var statusDotColor: Color {
+        switch pill.kind {
+        case .waiting: return .red
+        case .working: return .orange
+        case .thinking: return .purple
+        case .idle: return .green
+        case .off, .offline: return .gray
+        }
     }
 }
 
@@ -238,8 +308,17 @@ struct MacDetailChatView: View {
                     ScrollView {
                         LazyVStack(spacing: 16) {
                             ForEach(session.activeMessages) { message in
-                                MacMessageBubbleView(message: message)
-                                    .id(message.id)
+                                MacMessageBubbleView(
+                                    message: message,
+                                    renderedBlocks: session.transcriptEngine.renderedBlocks(for: message),
+                                    onQuoteInReply: { text in
+                                        inputText = MacTranscriptContextMenuBuilder.applyQuoteInReply(
+                                            text,
+                                            to: inputText
+                                        )
+                                    }
+                                )
+                                .id(message.id)
                             }
 
                             if let reasoning = session.activeReasoningText, !reasoning.isEmpty {
@@ -247,8 +326,14 @@ struct MacDetailChatView: View {
                             }
 
                             if let streaming = session.activeStreamingText, !streaming.isEmpty {
-                                MacStreamingBubbleView(botName: session.activeTitle, text: streaming)
-                                    .id("streaming-anchor")
+                                MacStreamingBubbleView(
+                                    botName: session.activeTitle,
+                                    renderedBlocks: session.transcriptEngine.updateStreamingText(
+                                        streaming,
+                                        messageId: "streaming:\(session.activeThreadId ?? "default")"
+                                    )
+                                )
+                                .id("streaming-anchor")
                             }
                         }
                         .padding(16)
@@ -267,7 +352,7 @@ struct MacDetailChatView: View {
 
                 Divider()
 
-                // Composer Bar
+                // Composer Bar with Native Voice Dictation
                 MacComposerBar(inputText: $inputText)
             } else {
                 VStack(spacing: 12) {
@@ -293,6 +378,8 @@ struct MacDetailChatView: View {
 
 struct MacMessageBubbleView: View {
     let message: Message
+    let renderedBlocks: [MacRenderedMarkdownBlock]
+    var onQuoteInReply: ((String) -> Void)?
 
     var isUser: Bool {
         message.role == .user
@@ -314,11 +401,34 @@ struct MacMessageBubbleView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                MarkdownText(message.text ?? "")
+                MarkdownText(renderedBlocks: renderedBlocks)
                     .textSelection(.enabled)
                     .padding(12)
                     .background(isUser ? Color.accentColor.opacity(0.15) : Color(NSColor.controlBackgroundColor))
                     .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .contextMenu {
+                        let raw = message.text ?? ""
+                        Button("Copy") {
+                            #if os(macOS)
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(raw, forType: .string)
+                            #endif
+                        }
+                        if let firstCode = renderedBlocks.compactMap({ block -> String? in
+                            if case .code(_, let code) = block.block { return code }
+                            return nil
+                        }).first {
+                            Button("Copy Code Block") {
+                                #if os(macOS)
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(firstCode, forType: .string)
+                                #endif
+                            }
+                        }
+                        Button("Quote in Reply") {
+                            onQuoteInReply?(raw)
+                        }
+                    }
             }
 
             if isUser {
@@ -335,7 +445,7 @@ struct MacMessageBubbleView: View {
 
 struct MacStreamingBubbleView: View {
     let botName: String
-    let text: String
+    let renderedBlocks: [MacRenderedMarkdownBlock]
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -353,7 +463,7 @@ struct MacStreamingBubbleView: View {
                         .scaleEffect(0.6)
                 }
 
-                MarkdownText(text)
+                MarkdownText(renderedBlocks: renderedBlocks)
                     .textSelection(.enabled)
                     .padding(12)
                     .background(Color(NSColor.controlBackgroundColor))
@@ -397,52 +507,124 @@ struct MacComposerBar: View {
     @Binding var inputText: String
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextEditor(text: $inputText)
-                .font(.body)
-                .frame(minHeight: 38, maxHeight: 120)
-                .padding(6)
-                .background(Color(NSColor.textBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-                )
+        VStack(alignment: .leading, spacing: 6) {
+            if let routeBanner = session.voiceRouteBanner {
+                Text(routeBanner)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 12)
+            }
 
-            if session.activeStreamingText != nil {
+            if case .paused(let reason) = session.voiceState {
                 Button(action: {
-                    Task { await session.stopActiveTurn() }
-                }) {
-                    Image(systemName: "stop.circle.fill")
-                        .resizable()
-                        .frame(width: 28, height: 28)
-                        .foregroundColor(.red)
-                }
-                .buttonStyle(.plain)
-                .help("Stop turn")
-            } else {
-                Button(action: {
-                    let text = inputText
-                    Task {
-                        let sent = await session.sendMessage(text)
-                        if sent {
-                            inputText = ""
-                        }
+                    if session.voiceEngine.resumeFromPause() {
+                        session.voiceState = session.voiceEngine.state
                     }
                 }) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .resizable()
-                        .frame(width: 28, height: 28)
-                        .foregroundColor(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .secondary : .accentColor)
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundColor(.orange)
                 }
                 .buttonStyle(.plain)
-                .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || session.isSending)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .help("Send turn (⌘Return)")
+                .padding(.horizontal, 12)
+            } else if case .failed(let failure) = session.voiceState {
+                HStack(spacing: 8) {
+                    Text(failure.message)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                    if let actionTitle = failure.actionButtonTitle {
+                        Button(actionTitle) {
+                            session.activeSettingsSection = MacSettingsDeepLinkRouter.section(forVoiceFailure: failure)
+                        }
+                        .font(.caption.bold())
+                    }
+                }
+                .padding(.horizontal, 12)
             }
+
+            HStack(alignment: .bottom, spacing: 8) {
+                TextEditor(text: $inputText)
+                    .font(.body)
+                    .frame(minHeight: 38, maxHeight: 120)
+                    .padding(6)
+                    .background(Color(NSColor.textBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                    )
+
+                Button(action: {
+                    inputText = session.toggleComposerDictation(currentDraft: inputText)
+                }) {
+                    Image(systemName: microphoneSymbolName)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 20, height: 20)
+                        .padding(4)
+                        .foregroundColor(microphoneTintColor)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(session.voiceState.accessibilityLabel)
+                .help(session.voiceState.accessibilityLabel)
+
+                if session.activeStreamingText != nil {
+                    Button(action: {
+                        Task { await session.stopActiveTurn() }
+                    }) {
+                        Image(systemName: "stop.circle.fill")
+                            .resizable()
+                            .frame(width: 28, height: 28)
+                            .foregroundColor(.red)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Stop turn")
+                } else {
+                    Button(action: {
+                        let text = inputText
+                        Task {
+                            let sent = await session.sendMessage(text)
+                            if sent {
+                                inputText = ""
+                            }
+                        }
+                    }) {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .resizable()
+                            .frame(width: 28, height: 28)
+                            .foregroundColor(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .secondary : .accentColor)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || session.isSending)
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .help("Send turn (⌘Return)")
+                }
+            }
+            .padding(12)
         }
-        .padding(12)
         .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    private var microphoneSymbolName: String {
+        switch session.voiceState {
+        case .recording:
+            return "waveform.circle.fill"
+        case .starting:
+            return "ellipsis.circle"
+        case .paused:
+            return "pause.circle.fill"
+        case .idle, .failed:
+            return "mic.circle"
+        }
+    }
+
+    private var microphoneTintColor: Color {
+        switch session.voiceState {
+        case .recording: return .red
+        case .starting, .paused: return .orange
+        case .failed: return .red
+        case .idle: return .secondary
+        }
     }
 }
 
@@ -453,7 +635,6 @@ struct MacCuaInspectorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header
             HStack {
                 Label("Computer Use", systemImage: "display")
                     .font(.headline)
@@ -505,7 +686,6 @@ struct MacCuaInspectorView: View {
 
             Divider()
 
-            // Metal Surface
             ZStack {
                 CuaMetalView(pixelBuffer: session.cuaPixelBuffer)
                     .background(Color.black)
@@ -533,7 +713,6 @@ struct MacCuaInspectorView: View {
 
             Divider()
 
-            // Status bar
             HStack {
                 Text(session.cuaStatusMessage ?? (session.isCuaStreaming ? "Live" : "Idle"))
                     .font(.caption)
@@ -545,4 +724,3 @@ struct MacCuaInspectorView: View {
         }
     }
 }
-
