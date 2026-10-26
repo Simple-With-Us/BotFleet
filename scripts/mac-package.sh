@@ -16,13 +16,15 @@
 #
 # Signing material is never read from this repo and never printed:
 #   MAC_SIGN_IDENTITY   Keychain identity (default: Developer ID Application)
-#   APPLE_API_KEY_P8    Apple notarization API key, plus APPLE_API_KEY_ID and
-#   APPLE_API_ISSUER_ID APPLE_API_ISSUER_ID.  Read from the environment
-#                       first, then from fleet-secrets (Infisical).  The
-#                       Keychain is not an approved source for a provider
-#                       credential, so there is no keychain-profile fallback:
-#                       a missing credential fails the build instead of
-#                       quietly reading a different store.
+#   APPLE_API_KEY_P8    Apple notarization API key as a PEM, plus
+#   APPLE_API_KEY_ID and APPLE_API_ISSUER_ID.  The vault holds the key as
+#   APPLE_API_KEY_P8_BASE64, so a base64 value is decoded before it is
+#   handed to notarytool.  Read from the environment first, then from
+#   Infisical: this app's read-only service token when INFISICAL_TOKEN is
+#   set, otherwise the local `infisical` session.  The Keychain is not an
+#   approved source for a provider credential, so there is no
+#   keychain-profile fallback: a missing credential fails the build instead
+#   of quietly reading a different store.
 #   SPARKLE_EDDSA_KEY   sign_update private key file; without it (and
 #                       without sign_update on PATH) the appcast is an
 #                       unsigned draft and the output says so
@@ -99,23 +101,49 @@ TEAM="$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
 [ "$TEAM" = "CC8UTF7ATG" ] || { echo "app is signed by team '${TEAM:-none}', not CC8UTF7ATG" >&2; exit 69; }
 echo "ok: signature verifies (team $TEAM)"
 
-# Notarization credentials: the environment first, fleet-secrets (Infisical)
-# second.  A keychain profile is not an approved source for a provider
-# credential, so there is no keychain fallback here; a build without
-# credentials fails loudly instead of authenticating from an unexpected
-# store.  The values never reach a command line and never reach the log.
+# Notarization credentials: the environment first, Infisical second.  A
+# keychain profile is not an approved source for a provider credential, so
+# there is no keychain fallback here; a build without credentials fails
+# loudly instead of authenticating from an unexpected store.  The values
+# never reach a command line and never reach the log.
+BOTFLEET_INFISICAL_PROJECT_ID="${INFISICAL_PROJECT_ID:-836aebe2-c8f7-4e09-978e-7e3e82500bce}"
 APPLE_API_KEY_P8="${APPLE_API_KEY_P8:-}"
+APPLE_API_KEY_P8_BASE64="${APPLE_API_KEY_P8_BASE64:-}"
 APPLE_API_KEY_ID="${APPLE_API_KEY_ID:-}"
 APPLE_API_ISSUER_ID="${APPLE_API_ISSUER_ID:-}"
-if [ -z "$APPLE_API_KEY_P8" ] && command -v fleet-secrets >/dev/null; then
-  APPLE_API_KEY_P8="$(fleet-secrets get APPLE_API_KEY_P8 2>/dev/null || true)"
-  APPLE_API_KEY_ID="$(fleet-secrets get APPLE_API_KEY_ID 2>/dev/null || true)"
-  APPLE_API_ISSUER_ID="$(fleet-secrets get APPLE_API_ISSUER_ID 2>/dev/null || true)"
+
+# Read one named secret from the BotFleet project.  This app's read-only
+# service token when INFISICAL_TOKEN names one, otherwise the local
+# `infisical` session.  The value never reaches a command line: the
+# here-string expands in the shell, not in argv.
+infisical_get() {
+  local name="$1" value
+  if [ -n "${INFISICAL_TOKEN:-}" ]; then
+    value="$(infisical secrets get "$name" --projectId "$BOTFLEET_INFISICAL_PROJECT_ID" \
+      --env prod --path / --plain --token "$INFISICAL_TOKEN" 2>/dev/null)" || return 1
+  else
+    command -v infisical >/dev/null || return 1
+    value="$(infisical secrets get "$name" --projectId "$BOTFLEET_INFISICAL_PROJECT_ID" \
+      --env prod --path / --plain 2>/dev/null)" || return 1
+  fi
+  [ -n "$value" ] || return 1
+  cat <<< "$value"
+}
+
+if [ -z "$APPLE_API_KEY_P8" ] && [ -z "$APPLE_API_KEY_P8_BASE64" ]; then
+  APPLE_API_KEY_P8_BASE64="$(infisical_get APPLE_API_KEY_P8_BASE64 || true)"
+  APPLE_API_KEY_ID="$(infisical_get APPLE_API_KEY_ID || true)"
+  APPLE_API_ISSUER_ID="$(infisical_get APPLE_API_ISSUER_ID || true)"
 fi
-if [ "$SKIP_NOTARIZE" -eq 0 ] &&
-  { [ -z "$APPLE_API_KEY_P8" ] || [ -z "$APPLE_API_KEY_ID" ] || [ -z "$APPLE_API_ISSUER_ID" ]; }; then
-  echo "notarization credentials are missing: set APPLE_API_KEY_P8, APPLE_API_KEY_ID and APPLE_API_ISSUER_ID in the environment, or provision them for fleet-secrets" >&2
-  exit 69
+if [ "$SKIP_NOTARIZE" -eq 0 ]; then
+  if [ -z "$APPLE_API_KEY_P8" ] && [ -z "$APPLE_API_KEY_P8_BASE64" ]; then
+    echo "notarization credentials are missing: set APPLE_API_KEY_P8_BASE64 (or APPLE_API_KEY_P8) in the environment, or provision it in Infisical" >&2
+    exit 69
+  fi
+  if [ -z "$APPLE_API_KEY_ID" ] || [ -z "$APPLE_API_ISSUER_ID" ]; then
+    echo "notarization credentials are missing: set APPLE_API_KEY_ID and APPLE_API_ISSUER_ID in the environment, or provision them in Infisical" >&2
+    exit 69
+  fi
 fi
 
 notarize() {
@@ -129,7 +157,11 @@ notarize() {
   fi
   # The private key never enters a command line: the here-string expands in
   # the shell, not in argv, so a traced run cannot print the value.
-  cat > "$P8_FILE" <<< "$APPLE_API_KEY_P8"
+  if [ -n "$APPLE_API_KEY_P8" ]; then
+    cat > "$P8_FILE" <<< "$APPLE_API_KEY_P8"
+  else
+    base64 --decode <<< "$APPLE_API_KEY_P8_BASE64" > "$P8_FILE"
+  fi
   chmod 600 "$P8_FILE"
   if ! out="$(xcrun notarytool submit "$file" --key "$P8_FILE" \
     --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait 2>&1)"; then

@@ -105,17 +105,52 @@ jobs:
             echo "::error::xcodebuild reports a beta Xcode toolchain"
             exit 1
           fi
-      - name: Load the Developer ID certificate
-        uses: ./.github/actions/infisical-secrets
-        with:
-          names: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
-          required: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
-          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+      - name: Load the signing credentials with this app's service token
         env:
-          GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
-          GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          # This app reads the BotFleet project through ONE read-only service
+          # token scoped to prod:/ (the root folder is the project's only
+          # folder).  The shared infisical-secrets action authenticates with a
+          # machine identity instead, so the fetch is inline here; that action
+          # should grow a token input, and then this step goes away.
+          [ -n "${INFISICAL_TOKEN:-}" ] || {
+            echo "::error::INFISICAL_NATIVE_RELEASE_READ_TOKEN is not set"; exit 1; }
+          payload="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${INFISICAL_TOKEN}" \
+            --get \
+            --data-urlencode "secretPath=/" \
+            --data-urlencode "environment=prod" \
+            --data-urlencode "workspaceId=${INFISICAL_PROJECT_ID}" \
+            "https://app.infisical.com/api/v3/secrets/raw")"
+          # The value is masked before it reaches GITHUB_ENV and never
+          # reaches a command line: the here-strings expand in the shell.
+          export_secret() {
+            local name="$1" value="$2"
+            cat <<< "::add-mask::$value"
+            {
+              printf '%s\n' "${name}<<INFISICAL_EOF"
+              cat <<< "$value"
+              printf '%s\n' "INFISICAL_EOF"
+            } >> "$GITHUB_ENV"
+          }
+          for name in MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD \
+                      APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            value="$(jq -r --arg n "$name" '.secrets[] | select(.secretKey == $n) | .secretValue' <<< "$payload")"
+            if [ -z "$value" ] || [ "$value" = "null" ]; then
+              echo "::error::$name is missing from Infisical"
+              exit 1
+            fi
+            export_secret "$name" "$value"
+          done
+          # The Sparkle key is optional: until the owner provisions it the
+          # appcast ships unsigned and the app refuses unsigned items.
+          sparkle="$(jq -r '.secrets[] | select(.secretKey == "SPARKLE_EDDSA_PRIVATE_KEY_B64") | .secretValue' <<< "$payload")"
+          if [ -n "$sparkle" ] && [ "$sparkle" != "null" ]; then
+            export_secret SPARKLE_EDDSA_PRIVATE_KEY_B64 "$sparkle"
+          fi
       - name: Import the Developer ID certificate into a throwaway keychain
         env:
           MAC_CERT_P12_BASE64: ${{ env.MAC_CERT_P12_BASE64 }}
@@ -167,18 +202,6 @@ jobs:
           test "$team" = "CC8UTF7ATG" || {
             echo "::error::BotFleetMac.app is signed by team '${team:-none}', not CC8UTF7ATG"; exit 1; }
           echo "ok: $app"
-      - name: Load the notarization credentials
-        uses: ./.github/actions/infisical-secrets
-        with:
-          names: APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID
-          required: APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID
-          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
-        env:
-          GH_FALLBACK_APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
-          GH_FALLBACK_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          GH_FALLBACK_APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
       - name: Notarize and staple the app
         env:
           APPLE_API_KEY_P8_BASE64: ${{ env.APPLE_API_KEY_P8_BASE64 }}
@@ -239,14 +262,8 @@ jobs:
       # Best-effort by design: until the owner provisions the EdDSA key in
       # Infisical (Phase 6 owner action), the appcast ships unsigned and the
       # verify step below runs without --require-signature.  An app carrying
-      # SUPublicEDKey refuses unsigned items, so this fails closed.
-      - name: Load the Sparkle EdDSA key (optional)
-        uses: ./.github/actions/infisical-secrets
-        with:
-          names: SPARKLE_EDDSA_PRIVATE_KEY_B64
-          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+      # SUPublicEDKey refuses unsigned items, so this fails closed.  The key
+      # arrives with the service-token fetch above when it is provisioned.
       # sign_update is NOT on the runner image.  Without this step the
       # signing branch below is unreachable and the appcast can never be
       # signed from CI, whatever the owner provisions.

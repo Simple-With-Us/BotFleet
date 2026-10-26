@@ -84,9 +84,28 @@ test("no secret is expanded into a command line", () => {
   assert.match(workflow, /sign_update --ed-key-file - "\$zip"/);
   assert.doesNotMatch(workflow, /sparkle-ed-key/);
   assert.match(localScript, /cat > "\$P8_FILE" <<< "\$APPLE_API_KEY_P8"/);
-  // The local script reads the provider credential from the environment
-  // first, then from fleet-secrets.
-  assert.match(localScript, /fleet-secrets get APPLE_API_KEY_P8/);
+});
+
+test("the native release reads Infisical with its own read-only service token", () => {
+  // The shared action authenticates with a machine identity that has the
+  // whole project; this app gets a token scoped to prod:/ instead.
+  assert.match(workflow, /INFISICAL_NATIVE_RELEASE_READ_TOKEN/);
+  assert.doesNotMatch(workflow, /INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/);
+  assert.doesNotMatch(workflow, /uses: \.\/\.github\/actions\/infisical-secrets/);
+  assert.match(workflow, /Authorization: Bearer \$\{INFISICAL_TOKEN\}/);
+  assert.match(workflow, /data-urlencode "secretPath=\/"/);
+  assert.match(workflow, /data-urlencode "environment=prod"/);
+  // The values are masked before they reach GITHUB_ENV.
+  assert.match(workflow, /::add-mask::/);
+});
+
+test("the local script reads the notary credentials from Infisical by their vault names", () => {
+  // The vault holds the key base64-encoded as APPLE_API_KEY_P8_BASE64; the
+  // PEM is what notarytool needs.
+  assert.match(localScript, /infisical secrets get "\$name"/);
+  assert.match(localScript, /APPLE_API_KEY_P8_BASE64/);
+  assert.match(localScript, /base64 --decode <<< "\$APPLE_API_KEY_P8_BASE64" > "\$P8_FILE"/);
+  assert.doesNotMatch(localScript, /fleet-secrets get APPLE_API/);
 });
 
 test("the bundle name is the one the target actually builds", () => {
