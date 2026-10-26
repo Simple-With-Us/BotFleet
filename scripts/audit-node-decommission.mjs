@@ -14,6 +14,13 @@
 // new subsystem in a new place, not a new file beside a covered one.  Test
 // files follow their implementation file, so a *.test.* / *.node-test.*
 // twin of a covered file is covered.
+//
+// Retained paths (BF-2544).  Not everything in the tree is a Node file
+// waiting for a Swift owner.  The optional server deployment under
+// deploy/linux-server survives the native rewrite by decision: it is the
+// server product, not the Mac harness.  Those files are audited as
+// deliberately retained — and the audit fails when one of them disappears,
+// because a retired server path is exactly the accident this records.
 import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -24,6 +31,17 @@ export const INVENTORY_DOCS = [
   "docs/native-rewrite-electron-inventory.md",
 ];
 export const AUDITED_ROOTS = ["server", "companion", "shared", "electron"];
+
+/**
+ * Paths the rewrite keeps on purpose.  They are not waiting for a Swift
+ * owner, and the audit's job is to prove they are still there.
+ */
+export const RETAINED_PATHS = [
+  {
+    path: "deploy/linux-server",
+    why: "BF-2544: the optional server deployment survives the native rewrite; Phase 6 retires the Mac Node harness, not the server",
+  },
+];
 
 /** Expand one `dir/{a,b,c}.ts` claim into the files it names. */
 function expandBraces(token) {
@@ -148,13 +166,38 @@ export function findUncovered(files, inventoryText) {
   return files.filter((file) => !covered(file)).sort();
 }
 
-export function trackedFiles(repoRoot) {
+/** Tracked files under the given roots, in path order. */
+export function trackedFilesUnder(repoRoot, roots) {
+  if (roots.length === 0) return [];
   const out = execFileSync(
     "git",
-    ["-C", repoRoot, "ls-files", "--", ...AUDITED_ROOTS],
+    ["-C", repoRoot, "ls-files", "--", ...roots],
     { encoding: "utf8", timeout: 30_000 },
   );
   return out.split("\n").filter(Boolean).sort();
+}
+
+export function trackedFiles(repoRoot) {
+  return trackedFilesUnder(repoRoot, AUDITED_ROOTS);
+}
+
+/** Tracked files under the retained paths. */
+export function retainedFiles(repoRoot) {
+  return trackedFilesUnder(
+    repoRoot,
+    RETAINED_PATHS.map((entry) => entry.path),
+  );
+}
+
+/**
+ * Retained paths that hold no tracked file any more.  A retained path that
+ * disappeared was retired by accident or by a decision nobody recorded, and
+ * the optional server deployment must not vanish quietly (BF-2544).
+ */
+export function findMissingRetained(repoRoot, files = retainedFiles(repoRoot)) {
+  return RETAINED_PATHS.filter(
+    (entry) => !files.some((file) => file.startsWith(`${entry.path}/`)),
+  ).map((entry) => entry.path);
 }
 
 // Compare physical paths.  Node's ESM loader realpaths the entry module, so an
@@ -175,17 +218,37 @@ if (isEntryModule()) {
   ).join("\n");
   const files = trackedFiles(repoRoot);
   const uncovered = findUncovered(files, inventoryText);
+  const retained = retainedFiles(repoRoot);
+  const missingRetained = findMissingRetained(repoRoot, retained);
   console.log(
     `audited ${files.length} tracked files under ${AUDITED_ROOTS.join(", ")} ` +
       `against ${INVENTORY_DOCS.length} inventory docs`,
   );
+  console.log(
+    `retained by decision: ${RETAINED_PATHS.map(
+      (entry) =>
+        `${entry.path} (${retained.filter((file) => file.startsWith(`${entry.path}/`)).length} tracked files)`,
+    ).join(", ")}`,
+  );
+  let failed = false;
   if (uncovered.length > 0) {
     console.error(`UNCOVERED (${uncovered.length}): no inventory row names these files`);
     for (const file of uncovered) console.error(`  - ${file}`);
     console.error(
       "Add each to its owner's row in the port inventory (or record its retired reason) before BF-2514/BF-2515 cite the inventory as their gate.",
     );
-    process.exit(1);
+    failed = true;
   }
-  console.log("every audited file has an inventory row");
+  if (missingRetained.length > 0) {
+    console.error(
+      `MISSING RETAINED PATHS (${missingRetained.length}): these paths must survive the rewrite`,
+    );
+    for (const path of missingRetained) {
+      const entry = RETAINED_PATHS.find((item) => item.path === path);
+      console.error(`  - ${path}: ${entry?.why ?? "retained path"}`);
+    }
+    failed = true;
+  }
+  if (failed) process.exit(1);
+  console.log("every audited file has an inventory row, and every retained path is still there");
 }

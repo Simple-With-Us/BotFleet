@@ -8,6 +8,8 @@
 	<string>CC8UTF7ATG</string>
 	<key>signingStyle</key>
 	<string>manual</string>
+	<key>signingCertificate</key>
+	<string>Developer ID Application</string>
 	<key>stripSwiftSymbols</key>
 	<true/>
 	<key>manageAppVersionAndBuildNumber</key>

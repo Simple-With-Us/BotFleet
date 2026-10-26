@@ -8,6 +8,7 @@ import {
   buildNumberFor,
   generateAppcast,
   nativeArtifactNames,
+  nativeReleaseTag,
 } from "./native-appcast.mjs";
 import { verifyNativeRelease } from "./verify-native-release.mjs";
 
@@ -112,4 +113,33 @@ test("items must be newest-first so Sparkle offers the head build", () => {
       }),
     /newest-first/,
   );
+});
+
+test("the appcast points at the native release namespace, never the Electron one", () => {
+  // The Electron release for the same version carries exactly the Electron
+  // asset set, so an enclosure pointed at v<version> names a ZIP that
+  // release does not hold.
+  assert.equal(nativeReleaseTag(VERSION), `native-v${VERSION}`);
+  const directory = fixture();
+  try {
+    generateAppcast({ releaseDir: directory, version: VERSION });
+    const xml = readFileSync(join(directory, "appcast.xml"), "utf8");
+    assert.match(xml, new RegExp(`/native-v${VERSION}/BotFleetMac-${VERSION}\\.zip`));
+    assert.doesNotMatch(xml, /\/v1\.0\.2200\//);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a feed pointing at the Electron release is refused", () => {
+  const directory = fixture();
+  try {
+    generateAppcast({ releaseDir: directory, version: VERSION, tag: `v${VERSION}` });
+    assert.throws(
+      () => verifyNativeRelease(directory, VERSION),
+      /native release namespace/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

@@ -203,6 +203,12 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: BotFleet
     info:
       path: MacApp/Info.plist
+      # xcodegen rewrites this plist on every generate, so the version keys
+      # have to be declared here or they reset to 1.0 and 1 and the shipped
+      # bundle reports a build number the appcast never mentions.
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
     entitlements:
       path: MacApp/BotFleetMac.entitlements
 schemes:

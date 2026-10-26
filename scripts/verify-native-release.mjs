@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { NATIVE_FEED_NAME, buildNumberFor, nativeArtifactNames } from "./native-appcast.mjs";
+import { NATIVE_FEED_NAME, buildNumberFor, nativeArtifactNames, nativeReleaseTag } from "./native-appcast.mjs";
 
 export function parseAppcast(text) {
   const items = [];
@@ -81,6 +81,16 @@ export function verifyNativeRelease(directory, version, { requireSignature = fal
   if (basename(head.enclosureUrl ?? "") !== zip) {
     throw new Error(
       `${NATIVE_FEED_NAME}: head enclosure ${head.enclosureUrl} does not name ${zip}`,
+    );
+  }
+  // The enclosure must live in the native release namespace.  The Electron
+  // release for the same version carries exactly the Electron asset set, so
+  // an enclosure pointed at v<version> names a ZIP nobody ships.
+  const tag = nativeReleaseTag(version);
+  const pathSegments = (head.enclosureUrl ?? "").split("/");
+  if (!pathSegments.some((segment) => segment === tag)) {
+    throw new Error(
+      `${NATIVE_FEED_NAME}: head enclosure ${head.enclosureUrl} does not live in the native release namespace (${tag})`,
     );
   }
   const actualLength = statSync(join(rootDir, zip)).size;

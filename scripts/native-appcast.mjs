@@ -42,6 +42,19 @@ export function nativeArtifactNames(version) {
   };
 }
 
+/**
+ * The tag the native assets are published under.  It is its own namespace:
+ * the Electron release for the same version carries exactly the Electron
+ * asset set, so a native enclosure pointed at v<version> would name a ZIP
+ * that release does not hold.
+ */
+export function nativeReleaseTag(version) {
+  if (!/^\d+\.\d+\.\d+$/.test(version)) {
+    throw new Error(`invalid native release version: ${version}`);
+  }
+  return `native-v${version}`;
+}
+
 /** The Sparkle build number for 1.0.<commit_count> is the count itself. */
 export function buildNumberFor(version) {
   const match = /^1\.0\.(\d+)$/.exec(version);
@@ -70,7 +83,6 @@ function escapeXml(value) {
  */
 export function buildAppcast({
   version,
-  feedBaseUrl = DEFAULT_FEED_BASE_URL,
   pubDate = new Date(),
   minimumSystemVersion = "14.0",
   items,
@@ -139,13 +151,17 @@ export function readEdSignature(releaseDir, zipName) {
 /**
  * Generate appcast.xml in `releaseDir` for `version` from the final,
  * post-staple ZIP.  `tag` is the GitHub release tag the ZIP will be
- * downloaded from (v<version>); the enclosure URL is assembled from it so
- * the feed cannot point at a release that does not carry the bytes.
+ * downloaded from (native-v<version>); the enclosure URL is assembled from
+ * it so the feed cannot point at a release that does not carry the bytes.
+ *
+ * The native tag namespace is its own: the Electron release for the same
+ * version carries exactly the Electron asset set, so a native enclosure
+ * pointed at it would name a ZIP that release does not hold.
  */
 export function generateAppcast({
   releaseDir,
   version,
-  tag = `v${version}`,
+  tag = nativeReleaseTag(version),
   feedBaseUrl = DEFAULT_FEED_BASE_URL,
   pubDate,
 } = {}) {
@@ -166,7 +182,6 @@ export function generateAppcast({
   const edSignature = readEdSignature(releaseDir, zip);
   const appcast = buildAppcast({
     version,
-    feedBaseUrl,
     pubDate,
     items: [
       {

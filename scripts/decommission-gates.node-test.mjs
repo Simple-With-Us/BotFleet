@@ -1,12 +1,35 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { evaluateGates, isCompletedState } from "./check-decommission-gates.mjs";
-import { INVENTORY_DOCS, findUncovered, trackedFiles } from "./audit-node-decommission.mjs";
+import {
+  HARNESS_LAUNCH_AGENT,
+  OPTIONAL_SERVER_DEPLOYMENT,
+  StateSchema,
+  evaluateGates,
+  isCompletedState,
+} from "./check-decommission-gates.mjs";
+import {
+  INVENTORY_DOCS,
+  RETAINED_PATHS,
+  findMissingRetained,
+  findUncovered,
+  retainedFiles,
+  trackedFiles,
+} from "./audit-node-decommission.mjs";
+
+// The retirement scope BF-2544 asks for: the Mac's Node harness LaunchAgent
+// goes, the optional server deployment stays.
+const SCOPE = {
+  retire: [HARNESS_LAUNCH_AGENT],
+  retain: [OPTIONAL_SERVER_DEPLOYMENT],
+};
 
 const ALL_DONE = {
+  scope: SCOPE,
   issues: {
     "BF-2510": "Done",
     "BF-2511": "Done",
@@ -58,6 +81,94 @@ test("one unasserted evidence item blocks on its own", () => {
   });
   assert.deepEqual(verdict.blockers.length, 1);
   assert.match(verdict.blockers[0], /final-import-parity/);
+});
+
+test("a canceled or duplicate issue is unmet, not landed", () => {
+  // Cancelled means the work was abandoned; a duplicate points at work that
+  // may never have happened.  Either way the replacement never landed, and
+  // the gate is precisely about not mistaking that for done.
+  assert.equal(isCompletedState("Cancelled"), false);
+  assert.equal(isCompletedState("Canceled"), false);
+  assert.equal(isCompletedState("Duplicate"), false);
+  for (const state of ["Cancelled", "Duplicate"]) {
+    const verdict = evaluateGates({
+      ...ALL_DONE,
+      issues: { ...ALL_DONE.issues, "BF-2514": state },
+    });
+    assert.equal(verdict.ok, false, state);
+    assert.ok(
+      verdict.blockers.some((line) => line.startsWith("BF-2514:")),
+      `${state} must name the issue`,
+    );
+  }
+});
+
+test("the gate refuses a retirement that would take the optional server deployment", () => {
+  const verdict = evaluateGates({
+    ...ALL_DONE,
+    scope: {
+      retire: [HARNESS_LAUNCH_AGENT, OPTIONAL_SERVER_DEPLOYMENT],
+      retain: [],
+    },
+  });
+  assert.equal(verdict.ok, false);
+  assert.ok(
+    verdict.blockers.some((line) => /BF-2544 keeps it/.test(line)),
+    `blockers: ${verdict.blockers.join(" | ")}`,
+  );
+});
+
+test("the gate refuses a scope that forgets to retain the optional server deployment", () => {
+  const verdict = evaluateGates({
+    ...ALL_DONE,
+    scope: { retire: [HARNESS_LAUNCH_AGENT], retain: [] },
+  });
+  assert.equal(verdict.ok, false);
+  assert.ok(verdict.blockers.some((line) => /must be listed in scope\.retain/.test(line)));
+});
+
+test("the gate refuses a scope that does not name the Mac harness LaunchAgent", () => {
+  const verdict = evaluateGates({
+    ...ALL_DONE,
+    scope: { retire: ["server"], retain: [OPTIONAL_SERVER_DEPLOYMENT] },
+  });
+  assert.equal(verdict.ok, false);
+  assert.ok(
+    verdict.blockers.some((line) => line.includes(HARNESS_LAUNCH_AGENT)),
+    `blockers: ${verdict.blockers.join(" | ")}`,
+  );
+});
+
+test("a missing scope is unmet: the retirement scope is never assumed", () => {
+  const verdict = evaluateGates({
+    issues: ALL_DONE.issues,
+    evidence: ALL_DONE.evidence,
+  });
+  assert.equal(verdict.ok, false);
+  assert.ok(
+    verdict.blockers.some((line) => line.startsWith("scope: no retirement scope supplied")),
+    `blockers: ${verdict.blockers.join(" | ")}`,
+  );
+});
+
+test("the state file is validated before it decides anything", () => {
+  assert.equal(StateSchema.safeParse(ALL_DONE).success, true);
+  // An unknown key means the file was hand-edited into a shape the gate
+  // never agreed to read.
+  assert.equal(StateSchema.safeParse({ ...ALL_DONE, extra: true }).success, false);
+  // Evidence must be a boolean claim, not a string that reads as true.
+  assert.equal(
+    StateSchema.safeParse({
+      ...ALL_DONE,
+      evidence: { ...ALL_DONE.evidence, "inventory-clean": "true" },
+    }).success,
+    false,
+  );
+  // A state file without a scope cannot say what it retires.
+  assert.equal(
+    StateSchema.safeParse({ issues: ALL_DONE.issues, evidence: ALL_DONE.evidence }).success,
+    false,
+  );
 });
 
 const INVENTORY = [
@@ -119,4 +230,46 @@ test("the tree as committed is fully covered by the inventories", () => {
     [],
     `no inventory row names these files, so BF-2514/BF-2515 cannot cite the inventory as their gate: ${uncovered.join(", ")}`,
   );
+});
+
+/** A throwaway git repository with one commit, for the retained-path audit. */
+function makeTempRepo(files) {
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-retained-"));
+  execFileSync("git", ["init", "-q", "-b", "main", directory]);
+  execFileSync("git", ["-C", directory, "config", "user.email", "test@example.invalid"]);
+  execFileSync("git", ["-C", directory, "config", "user.name", "Test"]);
+  for (const [name, body] of Object.entries(files)) {
+    mkdirSync(dirname(join(directory, name)), { recursive: true });
+    writeFileSync(join(directory, name), body);
+  }
+  execFileSync("git", ["-C", directory, "add", "-A"]);
+  execFileSync("git", ["-C", directory, "commit", "-q", "-m", "fixture"]);
+  return directory;
+}
+
+test("the optional server deployment is audited as retained, and its loss is a finding", () => {
+  // BF-2544: the server deployment survives the native rewrite.  The audit
+  // records that on purpose, and fails when the path disappears.
+  const entry = RETAINED_PATHS.find((item) => item.path === OPTIONAL_SERVER_DEPLOYMENT);
+  assert.ok(entry, "the optional server deployment must be a declared retained path");
+  assert.match(entry.why, /BF-2544/);
+
+  const repo = makeTempRepo({ "deploy/linux-server/install.sh": "#!/bin/sh\n" });
+  try {
+    assert.deepEqual(findMissingRetained(repo), []);
+    rmSync(join(repo, "deploy/linux-server"), { recursive: true, force: true });
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "drop the server"]);
+    assert.deepEqual(findMissingRetained(repo), [OPTIONAL_SERVER_DEPLOYMENT]);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("the committed tree still holds the optional server deployment", () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  assert.deepEqual(findMissingRetained(repoRoot), []);
+  const retained = retainedFiles(repoRoot);
+  assert.ok(retained.length > 0, "deploy/linux-server must hold tracked files");
+  assert.ok(retained.every((file) => file.startsWith(`${OPTIONAL_SERVER_DEPLOYMENT}/`)));
 });

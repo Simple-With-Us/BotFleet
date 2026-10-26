@@ -16,6 +16,13 @@
 # signatures), hashes and lengths AFTER stapling (stapling rewrites bytes),
 # and the version stamped once in `prepare` from a full-history checkout.
 #
+# The native assets go on their OWN release, tagged native-v<version>, never
+# on the Electron release for the same version.  release.yml asserts that
+# v<version> carries exactly the Electron asset set and deletes every other
+# asset it finds there, so a shared tag would fail that check in one order
+# and lose the native bytes in the other.  The appcast points at the native
+# tag, so the feed and the bytes stay in the same place.
+#
 # When this workflow gains push triggers, their paths must cover
 # ios/MacApp/**, ios/Sources/**, ios/project.yml and this file, or a
 # native-only change becomes unshippable (the C-86 lesson BF-2486 records).
@@ -29,7 +36,7 @@ on:
         required: false
         type: string
       draft:
-        description: "Attach the verified native assets to the v<version> draft release"
+        description: "Attach the verified native assets to the native-v<version> draft release"
         required: false
         type: boolean
         default: false
@@ -59,7 +66,12 @@ jobs:
       - id: pin
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "version=$(node scripts/stamp-commit-version.mjs .)" >> "$GITHUB_OUTPUT"
+          # Capture the stamp separately from the echo: an assignment takes
+          # the status of the command substitution, so a failed stamp must
+          # stop the job here instead of publishing an empty version that
+          # fails much later, for an unrelated reason.
+          version="$(node scripts/stamp-commit-version.mjs .)" || exit 1
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Refuse to overwrite a published release
         if: ${{ inputs.draft }}
         env:
@@ -69,7 +81,7 @@ jobs:
           # inside the job that produces an output, needs is still empty,
           # which is how the release.yml guard silently never fired before
           # PR #1315 fixed it there.
-          v="v${{ steps.pin.outputs.version }}"
+          v="native-v${{ steps.pin.outputs.version }}"
           if gh release view "$v" --repo "$RELEASES_REPO" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
             echo "::error::$v is already published on $RELEASES_REPO; refusing to add native assets to it"
             exit 1
@@ -111,7 +123,9 @@ jobs:
         run: |
           KEYCHAIN="$RUNNER_TEMP/release.keychain-db"
           KEYCHAIN_PASSWORD="$(uuidgen)"
-          echo "$MAC_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          # The base64 never reaches a command line: the here-string expands
+          # in the shell, so a traced run cannot print the secret.
+          base64 --decode <<< "$MAC_CERT_P12_BASE64" > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
@@ -146,11 +160,12 @@ jobs:
             -exportPath "$RUNNER_TEMP/export"
       - name: "Gate: the signature must verify BEFORE notarization"
         run: |
-          app="$RUNNER_TEMP/export/BotFleet.app"
+          app="$RUNNER_TEMP/export/BotFleetMac.app"
+          test -d "$app" || { echo "::error::export produced no BotFleetMac.app"; exit 1; }
           codesign --verify --deep --strict "$app"
           team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
           test "$team" = "CC8UTF7ATG" || {
-            echo "::error::BotFleet.app is signed by team '${team:-none}', not CC8UTF7ATG"; exit 1; }
+            echo "::error::BotFleetMac.app is signed by team '${team:-none}', not CC8UTF7ATG"; exit 1; }
           echo "ok: $app"
       - name: Load the notarization credentials
         uses: ./.github/actions/infisical-secrets
@@ -170,14 +185,23 @@ jobs:
           APPLE_API_KEY_ID: ${{ env.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ env.APPLE_API_ISSUER_ID }}
         run: |
-          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
-          app="$RUNNER_TEMP/export/BotFleet.app"
+          # The base64 never reaches a command line: the here-string expands
+          # in the shell, so a traced run cannot print the secret.
+          base64 --decode <<< "$APPLE_API_KEY_P8_BASE64" > "$RUNNER_TEMP/notary.p8"
+          app="$RUNNER_TEMP/export/BotFleetMac.app"
           ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/submit.zip"
-          out=$(xcrun notarytool submit "$RUNNER_TEMP/submit.zip" \
+          # Capture the status separately, so the notary's own diagnostic is
+          # printed before the step fails.  A bare assignment would exit on
+          # the failed command substitution and swallow the reason.
+          if ! out=$(xcrun notarytool submit "$RUNNER_TEMP/submit.zip" \
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
-            --wait 2>&1)
+            --wait 2>&1); then
+            echo "$out"
+            echo "::error::notarization failed for the app ZIP"
+            exit 1
+          fi
           echo "$out" | tail -2
           echo "$out" | grep -q "status: Accepted" || { echo "::error::notarization not Accepted for the app ZIP"; exit 1; }
           xcrun stapler staple "$app"
@@ -193,16 +217,20 @@ jobs:
           APPLE_API_ISSUER_ID: ${{ env.APPLE_API_ISSUER_ID }}
         run: |
           mkdir -p native-upload
-          app="$RUNNER_TEMP/export/BotFleet.app"
+          app="$RUNNER_TEMP/export/BotFleetMac.app"
           ditto -c -k --sequesterRsrc --keepParent "$app" "native-upload/BotFleetMac-$VERSION.zip"
           hdiutil create -volname "BotFleet" -srcfolder "$app" -ov -format UDZO \
             "native-upload/BotFleetMac-$VERSION.dmg" > /dev/null
-          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
-          out=$(xcrun notarytool submit "native-upload/BotFleetMac-$VERSION.dmg" \
+          base64 --decode <<< "$APPLE_API_KEY_P8_BASE64" > "$RUNNER_TEMP/notary.p8"
+          if ! out=$(xcrun notarytool submit "native-upload/BotFleetMac-$VERSION.dmg" \
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
-            --wait 2>&1)
+            --wait 2>&1); then
+            echo "$out"
+            echo "::error::notarization failed for the DMG"
+            exit 1
+          fi
           echo "$out" | tail -2
           echo "$out" | grep -q "status: Accepted" || { echo "::error::notarization not Accepted for the DMG"; exit 1; }
           rm "$RUNNER_TEMP/notary.p8"
@@ -219,24 +247,46 @@ jobs:
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
           client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+      # sign_update is NOT on the runner image.  Without this step the
+      # signing branch below is unreachable and the appcast can never be
+      # signed from CI, whatever the owner provisions.
+      - name: Install Sparkle's sign_update
+        env:
+          SPARKLE_VERSION: "2.10.1"
+          SPARKLE_SHA256: "1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27"
+        run: |
+          set -euo pipefail
+          url="https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          curl --fail --location --silent --show-error "$url" -o "$RUNNER_TEMP/sparkle.tar.xz"
+          echo "${SPARKLE_SHA256}  $RUNNER_TEMP/sparkle.tar.xz" | shasum -a 256 -c -
+          tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP" ./bin/sign_update
+          chmod +x "$RUNNER_TEMP/bin/sign_update"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Generate and verify the appcast over the final bytes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           SPARKLE_EDDSA_PRIVATE_KEY_B64: ${{ env.SPARKLE_EDDSA_PRIVATE_KEY_B64 }}
         run: |
           zip="native-upload/BotFleetMac-$VERSION.zip"
-          if [ -n "${SPARKLE_EDDSA_PRIVATE_KEY_B64:-}" ] && command -v sign_update > /dev/null; then
-            key="$RUNNER_TEMP/sparkle-ed-key"
-            echo "$SPARKLE_EDDSA_PRIVATE_KEY_B64" | base64 --decode > "$key"
-            signature=$(sign_update --ed-key-file "$key" "$zip" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
+          if [ -n "${SPARKLE_EDDSA_PRIVATE_KEY_B64:-}" ]; then
+            # A provisioned key with no signing tool is a broken pipeline,
+            # not an unsigned draft: fail here rather than publish a feed
+            # the app will refuse.
+            command -v sign_update > /dev/null || {
+              echo "::error::sign_update is not installed; cannot sign the appcast"; exit 1; }
+            # sign_update reads the EdDSA key from stdin when --ed-key-file
+            # is "-", so the private key never reaches the filesystem and
+            # never reaches a command line.
+            signature=$(base64 --decode <<< "$SPARKLE_EDDSA_PRIVATE_KEY_B64" \
+              | sign_update --ed-key-file - "$zip" \
+              | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
             test -n "$signature" || { echo "::error::sign_update produced no signature"; exit 1; }
             printf '%s' "$signature" > "$zip.edsig"
-            rm "$key"
             echo "Sparkle update signed"
           else
-            echo "::warning::no Sparkle EdDSA signing (key unprovisioned or sign_update missing); appcast is an unsigned draft"
+            echo "::warning::no Sparkle EdDSA signing (key unprovisioned); appcast is an unsigned draft"
           fi
-          node scripts/native-appcast.mjs native-upload "$VERSION"
+          node scripts/native-appcast.mjs native-upload "$VERSION" "native-v$VERSION"
           if [ -f "$zip.edsig" ]; then
             node scripts/verify-native-release.mjs native-upload "$VERSION" --require-signature
             rm "$zip.edsig"
@@ -299,7 +349,12 @@ jobs:
           SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           cd assets
-          tag="v$VERSION"
+          # The native assets live on their OWN release, never on the
+          # Electron release for the same version: release.yml asserts that
+          # v<version> carries exactly the Electron asset set and deletes
+          # anything else it finds there, so a shared tag would either fail
+          # that check or lose the native bytes.
+          tag="native-v$VERSION"
           if existing=$(gh api "repos/$RELEASES_REPO/releases/tags/$tag" 2>/dev/null); then
             is_draft=$(jq -r .draft <<< "$existing")
             if [ "$is_draft" != true ]; then
@@ -308,8 +363,8 @@ jobs:
             fi
           else
             gh release create "$tag" --repo "$RELEASES_REPO" \
-              --draft --target "$SHA" --title "BotFleet $VERSION" \
-              --notes "Draft assembled by the release workflows. Edit these notes, then publish."
+              --draft --target "$SHA" --title "BotFleet $VERSION (native)" \
+              --notes "Draft assembled by the release workflows.  Edit these notes, then publish."
           fi
           # Native names never collide with the Electron set, so --clobber
           # here can only replace this workflow's own earlier uploads.
