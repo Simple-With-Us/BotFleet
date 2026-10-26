@@ -125,6 +125,23 @@ export interface Routine {
   updatedAt: number;
 }
 
+/** What became of a terminal Crons check-in.  "undelivered" means the close
+ *  never reached Sentry, so the monitor stays `in_progress` until Sentry
+ *  times it out and opens a "Cron failure" for a routine that ran fine. */
+export type RoutineCheckInDelivery = "delivered" | "undelivered";
+
+/** A close that did not land, kept on the run record.  It survives a restart
+ *  and is re-asserted by the sweep until it lands or the monitor's own
+ *  `max_runtime` window closes. */
+export interface PendingCheckInClose {
+  /** The terminal status the close carries. */
+  status: "ok" | "error";
+  /** How many times the close has been handed to Sentry without landing. */
+  attempts: number;
+  /** When the last attempt was made. */
+  lastAttemptAt: number;
+}
+
 export interface RoutineRun {
   id: string;
   routineId: string;
@@ -186,6 +203,11 @@ export interface RoutineRun {
    *  close the same one.  Only set for a genuine "schedule" trigger on a
    *  recurring routine — see `checkInStart`/`checkInFinish`. */
   sentryCheckInId?: string;
+  /** A terminal check-in that has not reached Sentry yet.  The sweep keeps
+   *  re-asserting it, because a close that never lands leaves the monitor
+   *  `in_progress` until Sentry times it out — a false "Cron failure" for a
+   *  routine that completed. */
+  pendingCheckInClose?: PendingCheckInClose;
 }
 
 export interface RoutineRequestReceipt {
@@ -369,8 +391,16 @@ export interface RoutineManagerOptions {
    *  close later, or undefined when there is nothing to check in (Sentry
    *  off, or a one-off routine with no recurrence to watch). */
   checkInStart?: (run: RoutineRun, routine: Routine) => string | undefined;
-  /** Close a check-in `checkInStart` opened. */
-  checkInFinish?: (run: RoutineRun, checkInId: string, ok: boolean) => void;
+  /** Close a check-in `checkInStart` opened.  `onSettled` reports whether the
+   *  close actually reached Sentry: a close that did not is kept on the run
+   *  record and re-asserted, so a lost close cannot leave the monitor
+   *  `in_progress` until it times out. */
+  checkInFinish?: (
+    run: RoutineRun,
+    checkInId: string,
+    ok: boolean,
+    onSettled?: (delivery: RoutineCheckInDelivery) => void,
+  ) => void;
   /** Is this run's turn still in flight on the harness? Consulted by the
    * periodic sweep for runs stuck in running/waiting: the completion path
    * settles a run on `turn.completed`, but a harness path that settles the
@@ -409,6 +439,26 @@ const SAVE_DEBOUNCE_MS = 250;
  * dispatch this long to mark the bot busy before the sweep may call it an
  * orphan. */
 const ORPHAN_GRACE_MS = 30_000;
+/** How long the sweep waits before it re-asserts a check-in close that was
+ *  never confirmed.  The monitor's own window is `max_runtime` MINUTES from
+ *  the check-in START, so a close that lands inside that window turns a false
+ *  "Cron failure" back into a normal green monitor. */
+const PENDING_CHECK_IN_REASSERT_MS = 60_000;
+/** The cap on the re-assert backoff.  A close that is still lost after this
+ *  many minutes is a real Sentry-side problem, and hammering the endpoint
+ *  every few seconds would only bury the warning. */
+const PENDING_CHECK_IN_REASSERT_MAX_MS = 5 * 60_000;
+/** Slack before the monitor's own timeout: the last re-assert has to land
+ *  INSIDE the window, not on its edge. */
+const PENDING_CHECK_IN_CLOSE_SLACK_MS = 5 * 60_000;
+/** How long one close delivery may stay in flight before the sweep is
+ *  allowed to try again.  The delivery budget in sentry-crons.ts is bounded
+ *  (a 10s flush plus three fixed backoffs), so a delivery still open past
+ *  this point is stuck, not slow. */
+const PENDING_CHECK_IN_MAX_FLIGHT_MS = 5 * 60_000;
+/** How often the sweep looks for closes to re-assert.  It is a cheap
+ *  in-process scan; the per-run backoff decides whether anything is sent. */
+const PENDING_CHECK_IN_SWEEP_MS = 30_000;
 const ROUTINE_REQUEST_ACTIONS = new Set<RoutineRequestOperation["action"]>([
   "create",
   "update",
@@ -501,6 +551,15 @@ export class RoutineManager {
   private routineRequestReceipts: RoutineRequestReceipt[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
+  /** The sweep that re-asserts check-in closes which were never confirmed.
+   *  It runs on its own timer rather than inside `tick()`, because `tick()`
+   *  is gated by `admit` — and the moments a close gets lost (a hot host, a
+   *  draining update) are exactly the moments `admit` is closed. */
+  private checkInTimer: ReturnType<typeof setInterval> | null = null;
+  /** Closes currently being handed to Sentry, keyed by run id, with the time
+   *  the hand-off started.  The sweep must not start a second delivery for a
+   *  close that is still in flight. */
+  private readonly pendingCloseInFlight = new Map<string, number>();
   /** Coalesces bursts of save() calls (every run-state transition, every
    * markRunSeen) into one atomic write instead of one per call — a save at
    * today's size costs about 45 ms of blocked loop. Fires a fixed delay
@@ -653,7 +712,7 @@ export class RoutineManager {
       // `this.options` is assigned first thing in the constructor, and the
       // server applies its Sentry settings before building this manager.
       for (const run of recovered) {
-        if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+        this.closeCheckIn(run, false);
       }
     }
   }
@@ -1185,7 +1244,7 @@ export class RoutineManager {
     this.emitRun(run);
     // The later turn.completed cannot close the check-in: handleRuntimeEvent
     // only matches running/waiting runs, and this one is now cancelled.
-    if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+    this.closeCheckIn(run, false);
     if (run.threadId) await this.options.interruptTurn?.(run.botId, run.threadId, normalizeRunOn(run.runOn)).catch(() => {});
     queueMicrotask(() => void this.tick());
     return { ...run };
@@ -1241,11 +1300,18 @@ export class RoutineManager {
     void this.tick();
     this.timer = setInterval(() => void this.tick(), 10_000);
     this.timer.unref?.();
+    // A close left pending by the previous process is re-asserted as soon as
+    // this one is up: the monitor's window is already running down.
+    this.reassertPendingCheckInCloses();
+    this.checkInTimer = setInterval(() => this.reassertPendingCheckInCloses(), PENDING_CHECK_IN_SWEEP_MS);
+    this.checkInTimer.unref?.();
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.checkInTimer) clearInterval(this.checkInTimer);
+    this.checkInTimer = null;
     if (this.gapWake) clearTimeout(this.gapWake);
     this.gapWake = null;
     this.gapWakeAt = 0;
@@ -1301,7 +1367,7 @@ export class RoutineManager {
           const skipped = this.newRun(routine, scheduledFor, false);
           this.skipForOff(skipped);
           skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
-          if (skipped.sentryCheckInId) this.options.checkInFinish?.(skipped, skipped.sentryCheckInId, false);
+          this.closeCheckIn(skipped, false);
         } else if (snoozed) {
           const skipped = this.newRun(routine, scheduledFor, false);
           skipped.status = "missed";
@@ -1315,7 +1381,7 @@ export class RoutineManager {
           // is a deliberate pause, not a success — the check-in opens and
           // closes non-ok, because the only statuses Sentry offers are `ok`
           // and `error` and emitting nothing would synthesize `missed`.
-          if (skipped.sentryCheckInId) this.options.checkInFinish?.(skipped, skipped.sentryCheckInId, false);
+          this.closeCheckIn(skipped, false);
         } else if (late > CATCH_UP_MS) {
           const missed = this.newRun(routine, scheduledFor, false);
           missed.status = "missed";
@@ -1756,7 +1822,7 @@ export class RoutineManager {
         // A cancelled scheduled run did not complete, so Sentry sees it the
         // same as an error — that is what lets an owner ask "did today's
         // Housekeeper run actually happen" and get a real answer.
-        if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+        this.closeCheckIn(run, false);
       } else if (!event.ok) {
         this.failRun(run, reason ?? "The bot did not complete this run", code);
         if (run.ownerThreadId && run.threadId) {
@@ -1778,7 +1844,7 @@ export class RoutineManager {
         run.setupFailed = false;
         run.finishedAt = this.now();
         run.error = undefined;
-        if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, true);
+        this.closeCheckIn(run, true);
       }
       if (run.ownerThreadId && run.threadId && event.ok) {
         this.options.deliverEphemeralResult?.({
@@ -1943,6 +2009,121 @@ export class RoutineManager {
     return skipped;
   }
 
+  /** Close the Sentry Crons check-in this run opened, and remember the close
+   *  until it is PROVEN to have landed.
+   *
+   *  `sdk.flush()` only proves the envelope left the local buffer, so it
+   *  cannot be the last word on delivery.  When the close is lost the
+   *  monitor stays `in_progress` and Sentry times it out at `max_runtime`
+   *  minutes, opening a "Cron failure" for a routine that actually ran and
+   *  finished — a completed run and a hung run are identical to Sentry.
+   *
+   *  So the close is recorded as PENDING first and cleared only when the
+   *  transport confirms it.  A close that is lost, or whose delivery hangs,
+   *  then leaves the sweep something to re-assert: re-sending the same
+   *  `checkInId` is idempotent on Sentry's side. */
+  private closeCheckIn(run: RoutineRun, ok: boolean): void {
+    const checkInId = run.sentryCheckInId;
+    if (!checkInId) return;
+    const finish = this.options.checkInFinish;
+    if (!finish) return;
+    // Re-read the run from the manager: a failed mutation rolls the run list
+    // back to COPIES, so the reference the caller holds can be stale by the
+    // time the settle callback fires.
+    const target = this.runs.find((r) => r.id === run.id) ?? run;
+    const attempt = (target.pendingCheckInClose?.attempts ?? 0) + 1;
+    target.pendingCheckInClose = {
+      status: ok ? "ok" : "error",
+      attempts: attempt,
+      lastAttemptAt: this.now(),
+    };
+    this.save();
+    this.pendingCloseInFlight.set(target.id, this.now());
+    try {
+      finish(target, checkInId, ok, (delivery) => {
+        this.pendingCloseInFlight.delete(target.id);
+        const current = this.runs.find((r) => r.id === target.id);
+        if (!current) return;
+        if (delivery === "delivered") {
+          // Only clear the record if it is still THIS attempt's: a newer
+          // attempt may have started while this one was in flight.
+          if (current.pendingCheckInClose?.attempts === attempt) delete current.pendingCheckInClose;
+        }
+        this.save();
+      });
+    } catch {
+      // Check-in reporting must never take down a run.  The pending record
+      // stays, so the sweep still re-asserts this close.
+      this.pendingCloseInFlight.delete(target.id);
+      console.warn(`routines: check-in close threw run=${target.id}`);
+      this.save();
+    }
+  }
+
+  /** The monitor's own timeout, mirrored from `routineMonitorConfig` in
+   *  sentry-crons.ts: `max_runtime` is `max(durationMinutes, 60)` MINUTES
+   *  measured from the check-in START.  A close is only worth re-asserting
+   *  while that window is still open — after it, Sentry has already failed
+   *  the monitor and a close lands on nothing. */
+  private checkInWindowMs(run: RoutineRun): number {
+    return Math.max(run.durationMinutes || 30, 60) * 60_000;
+  }
+
+  /** How long to wait before the next re-assert of one stuck close.  The
+   *  backoff keeps a close that cannot be delivered from hammering the
+   *  endpoint every minute for the whole window. */
+  private pendingCloseIntervalMs(attempts: number): number {
+    const backoff = PENDING_CHECK_IN_REASSERT_MS * 2 ** Math.max(0, attempts - 1);
+    return Math.min(backoff, PENDING_CHECK_IN_REASSERT_MAX_MS);
+  }
+
+  /** Re-assert every terminal check-in close that was never confirmed.
+   *
+   *  This is the half of the fix that a flush check cannot be: the close is
+   *  re-sent while the run record still holds the check-in id and the
+   *  monitor's window is still open.  A close that is genuinely lost ends
+   *  as a loud warning, never as silence — silence is what turned a
+   *  successful routine into a false "Cron failure" page.
+   *
+   *  Driven by its own timer, not by `tick()`: `tick()` is gated by
+   *  `admit`, and the moments a close gets lost (a hot host, a draining
+   *  update) are exactly the moments `admit` is closed. */
+  reassertPendingCheckInCloses(): void {
+    const now = this.now();
+    for (const run of this.runs) {
+      const pending = run.pendingCheckInClose;
+      if (!pending) continue;
+      if (!run.sentryCheckInId) {
+        // Nothing to re-assert against: the id is gone, so the close can
+        // never be re-sent.
+        delete run.pendingCheckInClose;
+        this.save();
+        continue;
+      }
+      const startedAt = run.startedAt ?? run.finishedAt ?? pending.lastAttemptAt;
+      const deadline = startedAt + this.checkInWindowMs(run) - PENDING_CHECK_IN_CLOSE_SLACK_MS;
+      if (now >= deadline) {
+        // The monitor has already timed out, or is about to.  A close now
+        // would land on a monitor Sentry has already failed — but the reason
+        // has to be on the record, because this is the case that produces a
+        // "Cron failure" for a routine that ran.
+        console.warn(
+          `routines: check-in close gave up run=${run.id} routine=${run.routineName} attempts=${pending.attempts} status=${pending.status}`,
+        );
+        delete run.pendingCheckInClose;
+        this.save();
+        continue;
+      }
+      const flightStartedAt = this.pendingCloseInFlight.get(run.id);
+      if (flightStartedAt !== undefined && now - flightStartedAt < PENDING_CHECK_IN_MAX_FLIGHT_MS) continue;
+      if (now - pending.lastAttemptAt < this.pendingCloseIntervalMs(pending.attempts)) continue;
+      console.warn(
+        `routines: re-asserting check-in close run=${run.id} routine=${run.routineName} attempts=${pending.attempts} status=${pending.status}`,
+      );
+      this.closeCheckIn(run, pending.status === "ok");
+    }
+  }
+
   private failRun(run: RoutineRun, message: string, code = routineFailureCode(message)) {
     this.leaveQueued(run, "failed");
     run.error = message.slice(0, 500);
@@ -1954,7 +2135,7 @@ export class RoutineManager {
     // any run that never opened a check-in (nothing was running yet, or it
     // was not a "schedule" trigger) leaves sentryCheckInId unset and this
     // is a no-op.
-    if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+    this.closeCheckIn(run, false);
     this.save();
     this.emitRun(run);
     this.options.onRunFailed?.({ ...run });

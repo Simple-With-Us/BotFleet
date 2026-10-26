@@ -60,6 +60,7 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
     ok: boolean;
   }> = [];
   let checkInIdSeq = 0;
+  let checkInDelivery: "delivered" | "undelivered" | "silent" = "delivered";
   let live = true;
   let admitting = true;
   let canStart = true;
@@ -98,8 +99,12 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
       checkInStarts.push({ run: { ...run }, routine: { ...routine } });
       return `check-in-${++checkInIdSeq}`;
     },
-    checkInFinish: (run, checkInId, ok) => {
+    checkInFinish: (run, checkInId, ok, onSettled) => {
       checkInFinishes.push({ run: { ...run }, checkInId, ok });
+      // "silent" stands for a close whose delivery never settles — the case
+      // that used to leave the monitor stuck `in_progress` with nobody to
+      // notice, because the flush check was the last word on delivery.
+      if (checkInDelivery !== "silent") onSettled?.(checkInDelivery);
     },
   };
   const manager = new RoutineManager(options);
@@ -122,6 +127,7 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
     setLive: (value: boolean) => (live = value),
     setAdmitting: (value: boolean) => (admitting = value),
     setCanStart: (value: boolean) => (canStart = value),
+    setCheckInDelivery: (value: typeof checkInDelivery) => (checkInDelivery = value),
   };
 }
 
@@ -2267,6 +2273,127 @@ describe("Sentry Crons check-ins", () => {
     expect(h.started).toHaveLength(1);
     expect(h.checkInStarts).toHaveLength(1);
     expect(h.checkInStarts[0].routine.schedule).toEqual({ type: "once", at: routine.nextRunAt });
+  });
+});
+
+describe("Sentry Crons check-in closes that never landed", () => {
+  /** Drive one scheduled run to a terminal state and hand back the clock it
+   *  started on, so a test can move time deliberately. */
+  async function runOnce(options: { ok: boolean; delivery: "delivered" | "undelivered" | "silent" }) {
+    const h = harness();
+    h.setCheckInDelivery(options.delivery);
+    const routine = h.manager.create({
+      name: "Lost close sweep",
+      prompt: "check uptime",
+      botId: "maus-1",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const startedAt = h.options.now!();
+    const run = h.manager.listRuns()[0]!;
+    const base = { eventId: "e", provider: "claude" as const, threadId: run.threadId!, createdAt: new Date().toISOString() };
+    h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: options.ok, stopReason: "end_turn" });
+    return { h, run, startedAt };
+  }
+
+  it("keeps an unconfirmed close on the run record instead of dropping it", async () => {
+    const { h } = await runOnce({ ok: true, delivery: "undelivered" });
+
+    expect(h.checkInFinishes).toHaveLength(1);
+    expect(h.checkInFinishes[0]).toMatchObject({ checkInId: "check-in-1", ok: true });
+    // The close was handed over but never confirmed, so it stays on the run
+    // record.  Before this, the run carried no trace of it at all: a close
+    // that was lost simply disappeared, and Sentry timed the monitor out for
+    // a routine that had finished.
+    expect(h.manager.listRuns()[0]!.pendingCheckInClose).toMatchObject({ status: "ok", attempts: 1 });
+  });
+
+  it("leaves nothing pending when the close is confirmed", async () => {
+    const { h, startedAt } = await runOnce({ ok: true, delivery: "delivered" });
+
+    expect(h.manager.listRuns()[0]!.pendingCheckInClose).toBeUndefined();
+    h.setNow(startedAt + 90_000);
+    h.manager.reassertPendingCheckInCloses();
+    // A confirmed close is never re-sent.
+    expect(h.checkInFinishes).toHaveLength(1);
+  });
+
+  it("re-asserts a lost close on the same check-in id once the backoff has elapsed", async () => {
+    const { h, startedAt } = await runOnce({ ok: true, delivery: "undelivered" });
+
+    // Too soon: the re-assert backoff has not elapsed.
+    h.setNow(startedAt + 30_000);
+    h.manager.reassertPendingCheckInCloses();
+    expect(h.checkInFinishes).toHaveLength(1);
+
+    // Past the backoff: the same check-in id is closed again.  Re-sending a
+    // check-in id is idempotent on Sentry's side, so a close that actually
+    // landed the first time is harmless to repeat.
+    h.setNow(startedAt + 90_000);
+    h.manager.reassertPendingCheckInCloses();
+    expect(h.checkInFinishes).toHaveLength(2);
+    expect(h.checkInFinishes[1]).toMatchObject({ checkInId: "check-in-1", ok: true });
+    expect(h.manager.listRuns()[0]!.pendingCheckInClose).toMatchObject({ status: "ok", attempts: 2 });
+  });
+
+  it("re-asserts a lost failure close with the same error status", async () => {
+    const { h, startedAt } = await runOnce({ ok: false, delivery: "undelivered" });
+
+    expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
+    expect(h.manager.listRuns()[0]!.pendingCheckInClose).toMatchObject({ status: "error" });
+
+    h.setNow(startedAt + 90_000);
+    h.manager.reassertPendingCheckInCloses();
+    expect(h.checkInFinishes[1]).toMatchObject({ checkInId: "check-in-1", ok: false });
+  });
+
+  it("does not re-assert a close that is still in flight, but does once the flight budget is spent", async () => {
+    const { h, startedAt } = await runOnce({ ok: true, delivery: "silent" });
+
+    // Still in flight: a second delivery would race the first one.
+    h.setNow(startedAt + 90_000);
+    h.manager.reassertPendingCheckInCloses();
+    expect(h.checkInFinishes).toHaveLength(1);
+
+    // The delivery budget is spent and the close never settled, so the
+    // pending record is all that is left to act on.
+    h.setNow(startedAt + 6 * 60_000);
+    h.manager.reassertPendingCheckInCloses();
+    expect(h.checkInFinishes).toHaveLength(2);
+  });
+
+  it("keeps an unconfirmed close across a restart and re-asserts it in the new process", async () => {
+    const { h, startedAt } = await runOnce({ ok: true, delivery: "undelivered" });
+    h.manager.flushNow();
+
+    const reloaded = new RoutineManager(h.options);
+    expect(reloaded.listRuns()[0]!.pendingCheckInClose).toMatchObject({ status: "ok", attempts: 1 });
+
+    h.setNow(startedAt + 90_000);
+    reloaded.reassertPendingCheckInCloses();
+    expect(h.checkInFinishes).toHaveLength(2);
+    expect(h.checkInFinishes[1]).toMatchObject({ checkInId: "check-in-1", ok: true });
+  });
+
+  it("gives up on a lost close once the monitor's window has closed, and says so out loud", async () => {
+    const { h, startedAt } = await runOnce({ ok: true, delivery: "undelivered" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // The monitor's own timeout is max(durationMinutes, 60) minutes after
+      // the check-in start, and five minutes of that are kept as slack so the
+      // last attempt lands inside the window.
+      h.setNow(startedAt + 56 * 60_000);
+      h.manager.reassertPendingCheckInCloses();
+
+      expect(warn).toHaveBeenCalled();
+      expect(String(warn.mock.calls[0]![0])).toContain("check-in close gave up");
+      expect(h.manager.listRuns()[0]!.pendingCheckInClose).toBeUndefined();
+      // Giving up is not a re-assert: the window is already shut.
+      expect(h.checkInFinishes).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

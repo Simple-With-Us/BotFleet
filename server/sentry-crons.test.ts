@@ -341,13 +341,89 @@ describe("checkInRoutineFinish close delivery", () => {
     }
   });
 
-  it("is a no-op — no close, no flush, no retry — when Sentry is inactive", async () => {
+  it("sends nothing when Sentry is inactive — and says the close was lost", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const settlements: string[] = [];
     try {
       expect(isSentryActive()).toBe(false);
-      checkInRoutineFinish(run(), "check-in-id-1", true);
+      checkInRoutineFinish(run(), "check-in-id-1", true, (delivery) => settlements.push(delivery));
       await awaitPendingCheckInCloses();
-      expect(warn).not.toHaveBeenCalled();
+      // No close, no flush, no retry — but the loss is reported, because a
+      // close that is never sent leaves the monitor `in_progress` until
+      // Sentry times it out and pages a routine that ran fine.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(settlements).toEqual(["undelivered"]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("checkInRoutineFinish delivery reporting", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reports the close as delivered once the transport takes it", async () => {
+    vi.useFakeTimers();
+    await activateFlushableSentry([true]);
+    const settlements: string[] = [];
+    checkInRoutineFinish(run(), "check-in-id-1", true, (delivery) => settlements.push(delivery));
+    const settled = awaitPendingCheckInCloses();
+    await vi.advanceTimersByTimeAsync(RETRY_BUDGET_MS);
+    await settled;
+
+    expect(settlements).toEqual(["delivered"]);
+  });
+
+  it("reports the close as undelivered once the retry budget runs out", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await activateFlushableSentry([false]);
+      const settlements: string[] = [];
+      checkInRoutineFinish(run(), "check-in-id-1", true, (delivery) => settlements.push(delivery));
+      const settled = awaitPendingCheckInCloses();
+      await vi.advanceTimersByTimeAsync(RETRY_BUDGET_MS);
+      await settled;
+
+      expect(settlements).toEqual(["undelivered"]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reports the close as undelivered when the SDK itself throws", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // SAFETY: empty object shell — runtime only calls the members stamped below.
+      const sdk = Object.assign({} as FakeSentrySdk, {
+        init() {},
+        close() {
+          return Promise.resolve(true);
+        },
+        addIntegration() {},
+        consoleLoggingIntegration() {
+          return { name: "ConsoleLogs" };
+        },
+        captureCheckIn() {
+          throw new Error("ingest unreachable");
+        },
+      });
+      setSentryLoaderForTests(sentryTestLoader(sdk));
+      await applySentryConfig({
+        dsn: "https://abc123@o0.ingest.sentry.io/1",
+        enabled: true,
+        environment: "test",
+        tracesSampleRate: 1,
+        logsEnabled: false,
+        source: "config",
+      });
+      const settlements: string[] = [];
+      checkInRoutineFinish(run(), "check-in-id-1", true, (delivery) => settlements.push(delivery));
+      await awaitPendingCheckInCloses();
+
+      expect(settlements).toEqual(["undelivered"]);
     } finally {
       warn.mockRestore();
     }
