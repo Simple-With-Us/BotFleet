@@ -6,10 +6,12 @@ native. Gated-by reference for **BF-2514** (Phase 5 single-writer cutover and
 decommission): neither lands until every row below has a Swift owner or a
 retired reason.
 
-Surveyed at commit `c7902d63` (2026-10-21):
-`server/` 359 non-test files, ~140,350 lines · `companion/src/` 16 files,
-~7,462 lines · `shared/` 55 non-test files, ~10,448 lines (zero `node:`
-imports — all portable) · `electron/` 112 `.mjs`/`.cjs` files.
+Surveyed at commit `c7902d63` (2026-10-21), re-counted 2026-10-25:
+`server/` 374 non-test files, ~142,800 lines · `companion/src/` 17 files,
+~11,330 lines · `shared/` 58 non-test files, ~11,050 lines (zero `node:`
+imports in source — only the three `*.test.ts` files reach for `node:fs`, so
+the portable set really is portable) · `electron/` 122 `.mjs`/`.cjs` files,
+135 tracked in total.
 
 Phases (reconstructed from the rewrite issue texts; `*` = no covering issue
 yet, file a follow-up before Phase 5):
@@ -56,7 +58,21 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/resume-recovery.ts`, `server/turn-worktree-admission.ts` | Resume/rebuild → `EngineDriver` BF-2504 + per-bot switch BF-2508 |
 | `server/checkpoints.ts` | Per-turn workspace snapshots → `EngineDriver` BF-2504 (git-based, reimplement with libgit2 or `git` CLI) |
 | `server/worktree-leases.ts` | Lease queue → `EngineDriver` BF-2504 |
-| `server/testing/*` (23 fakes/harness files) | Retired; replaced by `ReplayHarness` fixtures BF-2503 |
+| `server/testing/*` (28 fakes/harness files) | Retired; replaced by `ReplayHarness` fixtures BF-2503 |
+| `server/provider-reload-order.test.ts` | Guards the module-scope provider reload fence in `server/index.ts` (the temporal-dead-zone read that surfaced as `provider_error`) → `EngineCoordinator` BF-2504, where the fence becomes actor state; the test retires with the file in BF-2515 |
+| `server/index.ts` (composition root: routes, boot wiring, harness entry) | Wiring collapses into `LifecycleService` BF-2497 and the Phase 5 actors; the file itself retires BF-2515 |
+| `server/cli-failure.ts`, `server/cli-probe-env.ts`, `server/stderr-excerpt.ts`, `server/host-dispatch-hot.ts` | Engine support (failure wording, credential-free probe env, shared host probe) → `EngineDriver` BF-2504 |
+| `server/attachments.ts` | Composer attachment staging → `EngineDriver` tool lane BF-2504 |
+| `server/bot-desktop-session.ts` | Shared-desktop identity → `CUAEngine` BF-2509, beside the `local-vm-*` rows |
+| `server/cloud-backend.ts` | Cloud-backend switch guard → per-bot switch BF-2508 |
+| `server/data-dir.ts`, `server/harness-ports.ts` | Data-root and port-ladder rules → app startup BF-2497 (twins of `electron/app-paths.mjs` and the `main.mjs` ladder) |
+| `server/idempotency.ts` | Retry-safe POST outcomes → companion endpoint BF-2511 and `RoutinesScheduler` BF-2513 |
+| `server/companion-writes.ts`, `server/named-tunnel-gate.ts` | Phone-write shapes and tunnel gate → the BF-2510 endpoint, built by BF-2511 |
+| `server/replies.ts` | Reply excerpt rendering → `TextKitTranscript` BF-2501 (pure logic port) |
+| `server/*-wiring.test.ts`, `server/*-e2e.test.ts`, `server/boot-*.test.ts`, `server/agent-docs-linear-board.test.ts`, `server/branching.test.ts`, `server/comms.test.ts`, `server/composer-attachments.test.ts`, `server/delete-refusal-routes.test.ts`, `server/drafts.test.ts`, `server/external-credential-startup.test.ts`, `server/fallback-tiers.test.ts`, `server/group-tasks.test.ts`, `server/harness-trust-boundary.test.ts`, `server/kill-tree.test.ts`, `server/max-tool-rounds.test.ts`, `server/mcp-server*.test.ts`, `server/mcp-sse*.test.ts`, `server/mcp-strict-handshake.test.ts`, `server/no-owner-defaults.test.ts`, `server/prompt-privacy.test.ts`, `server/retention-hold.test.ts`, `server/room-drain.test.ts`, `server/rooms-*.test.ts`, `server/secret-persistence.test.ts`, `server/task-*.test.ts`, `server/tasks.test.ts`, `server/unattended.test.ts`, `server/update-held-boot.test.ts`, `server/zulip-*.test.ts`, `server/bot-off*.test.ts` | Cross-cutting wiring, boot and lane tests.  Each ports with the subsystem it exercises (owners above); the corpus retires Phase 6 and replay coverage is BF-2503 |
+| `server/test-parent-watchdog.ts` | Test harness; retired with `server/testing/*`, replaced by BF-2503 fixtures |
+| `companion/README.md` | Pointer doc for the retired sidecar tree; deleted with it in BF-2515 |
+| `electron/error-page.test.mjs`, `electron/sentry-desktop.node-test.mjs`, `electron/sts-packaging.node-test.mjs`, `server/sts-launch.node-test.mjs` | Boot-page, Sentry and STS packaging tests.  Each retires with its subject (`LifecycleService` BF-2497 boot page, Sentry Cocoa follow-up, BF-2489 STS) in BF-2485/BF-2515 |
 
 ## 2. Secrets and config → Phase 4 (BF-2506) unless noted
 
@@ -68,6 +84,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/env-path.ts` | GUI-launch PATH augmentation → app startup BF-2497 (Finder-launch env) |
 | `server/proxy-paths.ts`, `server/runtime-identity.ts` | Runtime path/identity → app startup BF-2497 |
 | `server/atomic.ts`, `server/store-guard.ts` | Atomic writes + corrupt-store guard → `DatabaseService` BF-2480 (SQLite transactions subsume both) |
+| `electron/infisical-read.mjs`, `electron/server-target.mjs`, `electron/remote-credential-guard.mjs` + their `.node-test.mjs` twins | Out-of-harness vault read, the `local`/`remote` server target, and the remote-mode credential refusal (BF-2544) → `InfisicalResolver` + app settings BF-2506; the target choice becomes native settings and the refusal rule ports as a guard on the native credential path |
 
 ## 3. Storage → Phase 1 (BF-2480, BF-2495)
 
@@ -83,7 +100,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 
 | Node file(s) | Swift owner |
 |---|---|
-| `server/zulip/*` (13 files: client, hub, router, outbound, webhook, wire, credentials, format, mount, state, sentence-gap, outgoing-spool, types) + `server/tools/zulip.ts`, `server/plugin-zulip-dispatch.ts` | `ZulipEventActor` + Linear sync BF-2512 |
+| `server/zulip/*` (23 files: client, hub, router, outbound, webhook, wire, credentials, format, mount, state, sentence-gap, outgoing-spool, types and their siblings) + `server/tools/zulip.ts`, `server/plugin-zulip-dispatch.ts` | `ZulipEventActor` + Linear sync BF-2512 |
 | `server/webhooks.ts`, `webhook-ingress.ts`, `webhook-payload.ts`, `server/routes/linq-webhook.ts` | Webhook ingress → `RoutinesScheduler` BF-2513 |
 | `server/routines.ts` (engine), `routine-requests.ts`, `resource-triggers.ts`, `trigger-gap.ts`, `automation-rollover.ts`, `ephemeral-dispatch.ts`, `room-queue.ts`, `room-turn-timeout.ts`, `room-cwd.ts`, `steer-queue.ts`, `member-turn.ts`, `delegations.ts`, `server/runtime/{runtime,envelope,level,tree,invariants,types}.ts`, `server/jobs/{admission,engine-fixtures,engine-lanes,mcp-lane,prompt,runner,sweep,wake,wake-usage}.ts`, `server/job-host.ts`, `server/update-turn-starter.ts`, `server/update-drain.ts`, `server/task-title.ts` | Scheduler + delegation runtime → `RoutinesScheduler` BF-2513; `update-drain` admission fence → cutover procedure BF-2514 |
 | `server/linq/{client,dispatch,outbound,types}.ts`, `server/routes/linq-webhook.ts`, `server/tools/linq.ts` | Linq partner channel → Phase 4* (no covering issue; file follow-up: third comms actor or fold into `ZulipEventActor` pattern) |
@@ -100,8 +117,8 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `companion/src/mdns.ts`, `advertise-watch.ts`, `endpoints.ts`, `connected-devices.ts` | Discovery + presence → `NetworkService` (Network.framework/Bonjour) BF-2511 |
 | `companion/src/apns.ts` | APNs provider → push relay BF-2511 (server-side JWT stays out of the app) |
 | `companion/src/json.ts` | Trivial guards → fold into `NetworkService` |
-| `companion/test/*` (18 files), `scripts/capture-companion-fixtures.mjs` | Retired Phase 6; iOS parity covered by native `XCTest` + BF-2503-style fixtures |
-| `scripts/botfleet-companion-start.sh`, `scripts/launchd/app.botfleet.companion.plist`, `electron/managed-companion-*.mjs`, `companion-guardian/tunnel/account-service` | LaunchAgent supervision → retired Phase 5 BF-2514 (app as login item owns its sidecar or none) |
+| `companion/test/*` (19 files), `scripts/capture-companion-fixtures.mjs` | Retired Phase 6; iOS parity covered by native `XCTest` + BF-2503-style fixtures |
+| `scripts/botfleet-companion-start.sh`, `scripts/launchd/app.botfleet.companion.plist`, `electron/managed-companion-*.mjs`, `electron/companion-*.mjs` | LaunchAgent supervision → retired Phase 5 BF-2514 (app as login item owns its sidecar or none) |
 | `ios/Sources/CompanionCore/*`, `ios/App/*` | Already Swift; endpoint contract follows BF-2510 decision, build per BF-2511 |
 
 ## 6. Mac app shell and lifecycle → Phase 3 / Phase 5
@@ -159,8 +176,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 
 ## 9. Gate statement
 
-BF-2514 and BF-2515 both cite this file as their Phase 4 inventory gate.
-Re-survey command for deltas:
+BF-2514 and BF-2515 both cite this file as their Phase 4 inventory gate.  Coverage is re-checked by `scripts/audit-node-decommission.mjs` (BF-2515, 2026-10-24): every tracked file under `server/`, `companion/`, `shared/` and `electron/` must be named here or in the Electron inventory, and `scripts/check-decommission-gates.mjs` refuses the deletion until the Phase 5 issues and evidence are green.  `deploy/` is audited as well, and the optional `deploy/linux-server/` server deployment is a documented exception rather than a finding: it ships the same `server/` code and stays, because BotFleet may run with the server as the primary BotFleet server (BF-2544).  Re-survey command for deltas:
 `find server companion/src shared -maxdepth 1 -name '*.ts' ! -name '*.test.ts' | wc -l`
 and per-area `wc -l`. Any new `server/` or `companion/` file after this
 commit must land a row here before Phase 5 starts.
