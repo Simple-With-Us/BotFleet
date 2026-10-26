@@ -905,6 +905,81 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(summary.contains("[PENDING] App visual surface:"))
     }
 
+    @Test("The active streaming CPU budget is measured over the streaming second and still catches a regression")
+    func streamingCpuBudgetIsMeasuredOverTheStreamingSecond() async throws {
+        // The shape the P-BF-6 budget is written against: five bots, one
+        // hundred tokens each, at one hundred tokens per second, so one
+        // window covers exactly one simulated second of streaming.
+        let shape = MacStreamingCpuShape.product
+        #expect(shape.botCount == 5)
+        #expect(shape.tokensPerBot == 100)
+        #expect(shape.tokensPerSecond == 100)
+        #expect(shape.repeats == 3)
+        #expect(shape.simulatedSeconds == 1.0)
+
+        // The budget's own arithmetic: the CPU a window costs over the
+        // simulated second it covers.  A window that costs more than 6% of
+        // one core breaches the 6% budget and one that costs less passes,
+        // so the budget still fails a regression that makes streaming
+        // expensive.
+        let atBudget = MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.060, simulatedSeconds: 1.0)
+        #expect(abs(atBudget - 6.0) < 0.0001)
+        #expect(atBudget <= MacPerformanceBudget.maxStreamingCpuPercent)
+        let overBudget = MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.0601, simulatedSeconds: 1.0)
+        #expect(overBudget > MacPerformanceBudget.maxStreamingCpuPercent)
+        let underBudget = MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.010, simulatedSeconds: 1.0)
+        #expect(underBudget < MacPerformanceBudget.maxStreamingCpuPercent)
+
+        // A window that covers no simulated time cannot be converted, and it
+        // must not turn into an infinite percentage that passes or fails at
+        // random.
+        #expect(MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.060, simulatedSeconds: 0) == 0)
+
+        // The gate's own verdict.  A window that costs more than 6% of one
+        // core over its simulated second fails the budget, and the same
+        // metric built from a cheap window passes, so the budget is still
+        // able to fail a regression.
+        let breach = MacPerformanceHarness.streamingCpuMetric(
+            cpuSeconds: 0.0601,
+            shape: shape,
+            context: .standalone
+        )
+        #expect(breach.passed == false)
+        #expect(breach.enforced == true)
+        #expect(breach.name == "100 tok/s streaming CPU")
+        #expect(breach.specBudgetLimit == 6.0)
+        let within = MacPerformanceHarness.streamingCpuMetric(
+            cpuSeconds: 0.010,
+            shape: shape,
+            context: .standalone
+        )
+        #expect(within.passed == true)
+        #expect(within.enforced == true)
+
+        // The measurement itself.  The concurrency pool is warmed before the
+        // measured windows, so the one-time cost of starting the process's
+        // threads is not charged to streaming, and the reported number is
+        // the median of the windows rather than one sample.
+        let smallShape = MacStreamingCpuShape(botCount: 2, tokensPerBot: 4, tokensPerSecond: 40, repeats: 2)
+        let measurement = await MacPerformanceHarness.measureStreamingCpu(shape: smallShape)
+        #expect(measurement.samples.count == smallShape.repeats)
+        #expect(measurement.simulatedSeconds == smallShape.simulatedSeconds)
+        #expect(measurement.cpuPercent.isFinite == true)
+
+        // The reported number is the median of the windows, divided by the
+        // simulated second and not by the wall clock the host took.  The
+        // conversion takes no wall-clock input at all, so a host that
+        // finishes the window slowly cannot move the number.
+        let ordered = measurement.samples.sorted()
+        let median = ordered[ordered.count / 2]
+        #expect(abs(measurement.medianCpuSeconds - median) < 0.000000001)
+        let expected = MacPerformanceHarness.streamingCpuPercent(
+            cpuSeconds: median,
+            simulatedSeconds: smallShape.simulatedSeconds
+        )
+        #expect(abs(measurement.cpuPercent - expected) < 0.000001)
+    }
+
     // MARK: - Visual parity against the legacy source and the app (BF-2496)
 
     /// The repository root, derived from this file's path.
