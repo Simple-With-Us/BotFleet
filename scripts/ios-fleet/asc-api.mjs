@@ -539,6 +539,10 @@ export async function countInternalTesters({ api, appId }) {
 // ends its access to the builds; it never deletes the testers from TestFlight.
 // Returns { deleted, failed }; a failed delete is a warning, never a throw.
 export async function deleteInternalGroups({ api, appId, log, warn }) {
+  if (!DELETE_INTERNAL_GROUPS_APP_IDS.has(String(appId))) {
+    log(`internal-group cleanup skipped: app ${appId} is not in the owner's external-only set`);
+    return { deleted: 0, failed: 0 };
+  }
   const groupsRes = await ascAllRows({ api, url: `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup` });
   if (!groupsRes.ok) {
     warn(`could not list groups for internal-group cleanup (${groupsRes.error})`);
@@ -560,6 +564,24 @@ export async function deleteInternalGroups({ api, appId, log, warn }) {
   return { deleted, failed };
 }
 
+// Internal groups are deleted only for the apps the owner moved to public
+// external testing (2026-10-18/19 directive).  Exception apps keep theirs:
+// Congress.Trade is watch-only, Socratic Trade stays internal-only, and
+// CodeCaps Mac's internal groups are untouched.  Any other appId is left
+// completely alone - deleting a group ends its build access irreversibly.
+const DELETE_INTERNAL_GROUPS_APP_IDS = new Set([
+  "6817951255", // Clutch.Codes
+  "6820175685", // BotFleet
+  "6816633156", // Hog Hunter
+  "6814623846", // CodeCaps
+  "6804249232", // DealDex
+  "6804247582", // ContactLogo
+  "6804248235", // ContactLogo Mac
+  "6818901017", // FleetLink
+  "6820885210", // UM Local
+  "6820881005", // UM Client
+]);
+
 // Whether a processed build can reach anyone through external testing: it is
 // assigned to at least one external group that has testers or an enabled
 // public link.  Under the owner's external-only policy (2026-10-18/19) this
@@ -576,17 +598,19 @@ export async function externalInstallability({ api, buildId }) {
   // tester read on another group fails transiently.
   const linked = external.find((g) => g.attributes?.publicLinkEnabled === true);
   if (linked) return { ok: true, installable: true, detail: `public link on "${linked.attributes?.name}"` };
-  let firstError = null;
-  for (const g of external) {
-    const members = await ascAllRows({ api, url: `/v1/betaGroups/${g.id}/betaTesters?limit=200&fields[betaTesters]=email` });
-    if (!members.ok) {
-      firstError = firstError || members.error;
-      continue;
-    }
-    const count = members.rows.length;
-    if (count > 0) return { ok: true, installable: true, detail: `${count} tester(s) in "${g.attributes?.name}"` };
-  }
-  if (firstError) return { ok: false, error: firstError, installable: false };
+  // Existence only: one page of one row proves a tester, so no full-roster
+  // pagination; probes run concurrently so a build in many groups does not
+  // stall on sequential round-trips.  A failed read is deferred: it only
+  // decides the outcome when no group proved installable.
+  const probes = await Promise.all(external.map(async (g) => {
+    const res = await api("GET", `/v1/betaGroups/${g.id}/betaTesters?limit=1&fields[betaTesters]=email`);
+    if (!res.ok) return { g, error: ascErrorText(res) };
+    return { g, testers: ascRows(res).length };
+  }));
+  const hit = probes.find((p) => p.testers > 0);
+  if (hit) return { ok: true, installable: true, detail: `tester(s) in "${hit.g.attributes?.name}"` };
+  const firstError = probes.find((p) => p.error);
+  if (firstError) return { ok: false, error: firstError.error, installable: false };
   return {
     ok: true,
     installable: false,
@@ -1560,12 +1584,12 @@ async function main() {
     }
 
     // 2) Testers: add each standing email to the group, reusing tester records.
-    const inGroupRes = await api("GET", `/v1/betaGroups/${group.id}/betaTesters?limit=200&fields[betaTesters]=email`);
+    const inGroupRes = await ascAllRows({ api, url: `/v1/betaGroups/${group.id}/betaTesters?limit=200&fields[betaTesters]=email` });
     if (!inGroupRes.ok) {
-      warn(`could not list testers in group "${group.attributes?.name}" (${errText(inGroupRes)}); not re-adding anyone`);
+      warn(`could not list testers in group "${group.attributes?.name}" (${inGroupRes.error}); not re-adding anyone`);
       process.exit(3);
     }
-    const inGroup = new Set(rows(inGroupRes).map((t) => String(t.attributes?.email || "").toLowerCase()));
+    const inGroup = new Set(inGroupRes.rows.map((t) => String(t.attributes?.email || "").toLowerCase()));
     for (const email of emails) {
       if (inGroup.has(email)) {
         console.error(`${prefix}: ${mask(email)} already in group`);

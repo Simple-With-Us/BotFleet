@@ -828,7 +828,11 @@ test("the ship readiness is external installability, and never prints a false su
 
 test("externalInstallability defers tester-read failures behind public links and counts missing-flag groups as external", async () => {
   const { externalInstallability } = await import("./ios-fleet/asc-api.mjs");
-  const grp = (id, name, internal, link) => ({ id, attributes: { name, ...(internal === undefined ? {} : { isInternalGroup: internal }), publicLinkEnabled: link } });
+  const grp = (id, name, internal, link) => {
+    const attributes = { name, publicLinkEnabled: link };
+    if (internal !== undefined) attributes.isInternalGroup = internal;
+    return { id, attributes };
+  };
   const listRes = (data) => ({ status: 200, ok: true, parsed: { data }, text: "" });
   const failRes = { status: 500, ok: false, parsed: { errors: [{ detail: "boom" }] }, text: "" };
 
@@ -867,14 +871,19 @@ test("deleteInternalGroups deletes only internal groups, tolerates 404, and warn
     if (method === "DELETE") { deleted.push(path); return { status: 204, ok: true, parsed: {}, text: "" }; }
     throw new Error(`unexpected ${method} ${path}`);
   };
-  assert.deepEqual(await deleteInternalGroups({ api, appId: "1", log, warn }), { deleted: 1, failed: 0 });
+  assert.deepEqual(await deleteInternalGroups({ api, appId: "6820175685", log, warn }), { deleted: 1, failed: 0 });
   assert.deepEqual(deleted, ["/v1/betaGroups/g-int"], "the external group is untouched");
 
+  // Exception apps keep their internal groups: an appId outside the owner's
+  // external-only set must not even read the group list, let alone delete.
+  const uncovered = await deleteInternalGroups({ api: async () => { throw new Error("must not be called"); }, appId: "6798076688", log, warn });
+  assert.deepEqual(uncovered, { deleted: 0, failed: 0 });
+
   const gone = async (method) => method === "GET" ? listRes([group("g1", "Internal Testers", true)]) : { status: 404, ok: false, parsed: {}, text: "" };
-  assert.deepEqual(await deleteInternalGroups({ api: gone, appId: "1", log, warn }), { deleted: 1, failed: 0 }, "an already-gone group counts as deleted");
+  assert.deepEqual(await deleteInternalGroups({ api: gone, appId: "6820175685", log, warn }), { deleted: 1, failed: 0 }, "an already-gone group counts as deleted");
 
   const failing = async (method) => method === "GET" ? listRes([group("g1", "Internal Testers", true)]) : { status: 500, ok: false, parsed: { errors: [{ detail: "boom" }] }, text: "" };
-  assert.deepEqual(await deleteInternalGroups({ api: failing, appId: "1", log, warn }), { deleted: 0, failed: 1 }, "a failed delete warns, never throws");
+  assert.deepEqual(await deleteInternalGroups({ api: failing, appId: "6820175685", log, warn }), { deleted: 0, failed: 1 }, "a failed delete warns, never throws");
 });
 
 test("externalInstallability follows the external-group/public-link policy", async () => {
