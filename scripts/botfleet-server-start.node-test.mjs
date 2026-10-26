@@ -294,6 +294,8 @@ function writeIdentityNode(dir) {
     "INFISICAL_CLIENT_SECRET",
     "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
     "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+    "INFISICAL_TOKEN",
+    "INFISICAL_WRITE_TOKEN",
   ];
   // The launcher execs `$NODE --experimental-strip-types -e ...` for the import
   // probe and `$NODE --experimental-strip-types server/index.ts` to boot.  The
@@ -432,6 +434,29 @@ test("documented names are fetched and exported, and nothing else is", () => {
     assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
     assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
     assert.equal(got.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a service token from the vault is the identity, and the machine identity is not needed", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      [
+        "BOTFLEET_HARNESS_INFISICAL_READ_TOKEN=fixture-read-token",
+        "BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN=fixture-write-token",
+        "INFISICAL_CLIENT_ID=fixture-canonical-id",
+        "INFISICAL_CLIENT_SECRET=fixture-canonical-secret",
+      ].join("\n"),
+    );
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(got.INFISICAL_TOKEN, "fixture-read-token");
+    assert.equal(got.INFISICAL_WRITE_TOKEN, "fixture-write-token");
+    // The machine identity is not fetched once a token is in hand: a token
+    // scoped to one folder is the identity now.
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }

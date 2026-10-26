@@ -86,8 +86,9 @@ export async function run({
 
   if (!infisicalConfigured(cfg)) {
     err(
-      "Infisical is not configured -- add a project id and a machine identity first " +
-        "(INFISICAL_CLIENT_ID / INFISICAL_CLIENT_SECRET in the environment, infisical.* in " +
+      "Infisical is not configured -- add a project id and an identity first " +
+        "(INFISICAL_TOKEN / INFISICAL_WRITE_TOKEN, or INFISICAL_CLIENT_ID / " +
+        "INFISICAL_CLIENT_SECRET, in the environment, infisical.* in " +
         "~/.botfleet/config.json, or Settings > Secrets once the harness is running).",
     );
     process.exitCode = 1;
@@ -102,9 +103,13 @@ export async function run({
     return;
   }
 
+  // A service token is the identity; the machine identity is the fallback.
+  const readToken = settings.token.trim();
   let token;
   try {
-    token = await loginImpl({ siteUrl: settings.siteUrl, clientId: settings.clientId, clientSecret: settings.clientSecret });
+    token = readToken
+      ? readToken
+      : await loginImpl({ siteUrl: settings.siteUrl, clientId: settings.clientId, clientSecret: settings.clientSecret });
   } catch (caught) {
     err(`Could not log in to Infisical: ${caught instanceof Error ? caught.message : "unknown error"}`);
     process.exitCode = 1;
@@ -156,7 +161,8 @@ export async function run({
     try {
       await upsertSecretImpl({
         siteUrl: settings.siteUrl,
-        token,
+        // The write token, when there is one: a read token cannot write.
+        token: settings.writeToken.trim() || token,
         projectId: settings.projectId,
         environment: settings.environment,
         secretPath: settings.secretPath,
