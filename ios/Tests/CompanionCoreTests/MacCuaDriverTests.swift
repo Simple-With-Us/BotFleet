@@ -5,7 +5,7 @@ import Testing
 
 @Suite("Native macOS CUA Driver")
 struct MacCuaDriverTests {
-    let driver = MacCuaDriver()
+    let driver = RecordingCuaEventSink().makeDriver()
 
     @Test("CuaPoint properly stores and converts to CGPoint")
     func testPointConversion() {
@@ -83,15 +83,62 @@ struct MacCuaDriverTests {
         }
     }
 
-    @Test("Mouse, scroll, and keyboard event builders execute without crashing")
-    func testEventGeneration() {
-        // In headless or sandboxed CI environments, CGEvent.post may be a no-op or silently dropped,
-        // but event generation itself must execute reliably and return gracefully.
-        _ = driver.moveMouse(to: CGPoint(x: 100, y: 100))
-        _ = driver.click(at: CGPoint(x: 100, y: 100), button: .left, clickCount: 1)
-        _ = driver.scroll(deltaX: 0, deltaY: -50)
-        _ = driver.keyPress(keyCode: 0, modifiers: [.command])
-        _ = driver.typeText("BotFleet Option A")
+    @Test("Mouse, scroll, and keyboard events are delivered only to the injected sink")
+    func testEventGeneration() throws {
+        let sink = RecordingCuaEventSink()
+        let driver = sink.makeDriver()
+        let point = CGPoint(x: 100, y: 100)
+        #expect(driver.moveMouse(to: point))
+        #expect(driver.click(at: point, button: .left, clickCount: 2))
+        #expect(driver.scroll(deltaX: 3, deltaY: -50))
+        #expect(driver.keyPress(keyCode: 0, modifiers: [.command]))
+        #expect(driver.typeText("A😀"))
+
+        let events = sink.events
+        #expect(events.map(\.type) == [
+            .mouseMoved, .leftMouseDown, .leftMouseUp, .scrollWheel,
+            .keyDown, .keyUp, .keyDown, .keyUp, .keyDown, .keyUp,
+        ])
+        #expect(events[0].location == point)
+        #expect(events[1].getIntegerValueField(.mouseEventClickState) == 2)
+        #expect(events[3].getIntegerValueField(.scrollWheelEventPointDeltaAxis1) == -50)
+        #expect(events[3].getIntegerValueField(.scrollWheelEventPointDeltaAxis2) == 3)
+        #expect(events[4].getIntegerValueField(.keyboardEventKeycode) == 0)
+        #expect(events[4].flags.contains(.maskCommand))
+        #expect(events[5].flags.contains(.maskCommand))
+        #expect(sink.unicodeText(of: events[6]) == "A")
+        #expect(sink.unicodeText(of: events[8]) == "😀")
+    }
+
+    @Test("The event sink records each button, drag, and emergency release")
+    func testMouseDeliveryAndEmergencyStop() {
+        let sink = RecordingCuaEventSink()
+        let driver = sink.makeDriver()
+        for button in CuaMouseButton.allCases {
+            #expect(driver.drag(from: .zero, to: CGPoint(x: 20, y: 30), button: button, steps: 2))
+        }
+        #expect(sink.events.map(\.type) == [
+            .leftMouseDown, .leftMouseDragged, .leftMouseDragged, .leftMouseUp,
+            .rightMouseDown, .rightMouseDragged, .rightMouseDragged, .rightMouseUp,
+            .otherMouseDown, .otherMouseDragged, .otherMouseDragged, .otherMouseUp,
+        ])
+        for button in CuaMouseButton.allCases {
+            #expect(driver.mouseDown(at: .zero, button: button))
+        }
+        #expect(Set(driver.emergencyStop()) == Set(CuaMouseButton.allCases))
+        #expect(sink.events.suffix(3).map(\.type) == [.leftMouseUp, .rightMouseUp, .otherMouseUp])
+        #expect(driver.heldMouseButtons.isEmpty)
+        let count = sink.events.count
+        #expect(!driver.moveMouse(to: .zero))
+        #expect(!driver.click(at: .zero))
+        #expect(!driver.drag(from: .zero, to: .zero))
+        #expect(!driver.scroll(deltaX: 0, deltaY: 1))
+        #expect(!driver.keyPress(keyCode: 0))
+        #expect(!driver.typeText("blocked"))
+        #expect(sink.events.count == count)
+        driver.resetEmergencyStop()
+        #expect(driver.keyPress(keyCode: 0))
+        #expect(sink.events.count == count + 2)
     }
 
     @available(macOS 14.0, *)
