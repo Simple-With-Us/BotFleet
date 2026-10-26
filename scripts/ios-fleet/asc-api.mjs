@@ -589,7 +589,12 @@ const DELETE_INTERNAL_GROUPS_APP_IDS = new Set([
 // still Apple's gate after that.  Never throws; { ok:false } means the read
 // failed, which is not the same as uninstallable.
 export async function externalInstallability({ api, buildId }) {
-  const groupsRes = await ascAllRows({ api, url: `/v1/builds/${buildId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled` });
+  let groupsRes;
+  try {
+    groupsRes = await ascAllRows({ api, url: `/v1/builds/${buildId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled` });
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e), installable: false };
+  }
   if (!groupsRes.ok) return { ok: false, error: groupsRes.error, installable: false };
   // A group with a missing flag is not known to be internal, so it counts as
   // external here; only isInternalGroup === true is excluded.
@@ -599,18 +604,27 @@ export async function externalInstallability({ api, buildId }) {
   const linked = external.find((g) => g.attributes?.publicLinkEnabled === true);
   if (linked) return { ok: true, installable: true, detail: `public link on "${linked.attributes?.name}"` };
   // Existence only: one page of one row proves a tester, so no full-roster
-  // pagination; probes run concurrently so a build in many groups does not
-  // stall on sequential round-trips.  A failed read is deferred: it only
-  // decides the outcome when no group proved installable.
-  const probes = await Promise.all(external.map(async (g) => {
-    const res = await api("GET", `/v1/betaGroups/${g.id}/betaTesters?limit=1&fields[betaTesters]=email`);
-    if (!res.ok) return { g, error: ascErrorText(res) };
-    return { g, testers: ascRows(res).length };
-  }));
-  const hit = probes.find((p) => p.testers > 0);
-  if (hit) return { ok: true, installable: true, detail: `tester(s) in "${hit.g.attributes?.name}"` };
-  const firstError = probes.find((p) => p.error);
-  if (firstError) return { ok: false, error: firstError.error, installable: false };
+  // pagination.  Probes run in small batches with an early return on the
+  // first hit: unbounded concurrency wastes quota and risks 429s flipping
+  // readiness to unreadable.  A failed or thrown read is deferred: it only
+  // decides the outcome when no group proved installable.  Never throws.
+  const PROBE_BATCH = 4;
+  let firstError = null;
+  for (let i = 0; i < external.length; i += PROBE_BATCH) {
+    const probes = await Promise.all(external.slice(i, i + PROBE_BATCH).map(async (g) => {
+      try {
+        const res = await api("GET", `/v1/betaGroups/${g.id}/betaTesters?limit=1&fields[betaTesters]=email`);
+        if (!res.ok) return { g, error: ascErrorText(res) };
+        return { g, testers: ascRows(res).length };
+      } catch (e) {
+        return { g, error: String((e && e.message) || e) };
+      }
+    }));
+    const hit = probes.find((p) => p.testers > 0);
+    if (hit) return { ok: true, installable: true, detail: `tester(s) in "${hit.g.attributes?.name}"` };
+    firstError = firstError || (probes.find((p) => p.error) || {}).error || null;
+  }
+  if (firstError) return { ok: false, error: firstError, installable: false };
   return {
     ok: true,
     installable: false,

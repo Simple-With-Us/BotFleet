@@ -850,6 +850,13 @@ test("externalInstallability defers tester-read failures behind public links and
   const missingFlag = await externalInstallability({ api: api2, buildId: "b1" });
   assert.equal(missingFlag.installable, true);
 
+  // A transport throw is unreadable, never a crash of ensure-tf-ready.
+  const apiThrow = async () => { throw new Error("socket hangup"); };
+  const thrown = await externalInstallability({ api: apiThrow, buildId: "b1" });
+  assert.equal(thrown.ok, false);
+  assert.equal(thrown.installable, false);
+  assert.match(thrown.error, /socket hangup/);
+
   // Every tester read failing and no link anywhere is unverified, not uninstallable.
   const api3 = async (m, path) => path.includes("/betaTesters") ? failRes : listRes([grp("g1", "Public Beta", false, false)]);
   const unreadable = await externalInstallability({ api: api3, buildId: "b1" });
