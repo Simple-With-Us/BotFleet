@@ -199,6 +199,14 @@ jobs:
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
           IOS_MANUAL_SIGN: "1"  # 2026-10-07: API profiles; no Xcode provisioning service
+          # The fleet iOS version manifest lives in AI-Fleet-Coordinator, and
+          # that repository's ruleset refuses a direct write to its protected
+          # branch, so the publish is a branch plus a pull request.  The
+          # workflow's own GITHUB_TOKEN is read-only by declaration and cannot
+          # write to another repository, so the fleet's elevated token is
+          # passed for that one step.  The publisher refuses GITHUB_TOKEN
+          # outright, and it never arms auto-merge with one.
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: bash scripts/ios-ship-testflight.sh
 
       # Standing TestFlight testers (asc-standing-testers skill): make sure the

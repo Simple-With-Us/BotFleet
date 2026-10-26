@@ -1,214 +1,303 @@
 #!/usr/bin/env bash
-# Publish a successful TestFlight ship to the fleet iOS versions manifest.
+# publish-ios-versions.sh — open a pull request that updates the public fleet
+# iOS version manifest.
 #
-# Reads from --bundle-id, --version, --build, --apple-id, --display-name and
-# rewrites the matching entry under `apps` in
-#   ai-fleet-coordinator/site/ios-versions.json
-# bumping `updatedAt` to the run's ISO 8601 instant.  A first-time entry
-# starts at the data the caller passed; an existing entry keeps every field
-# the caller did NOT pass (so a routine ship that knows only the version and
-# build does not stomp the appleId a previous ship recorded).
+# Called by ship-testflight.sh after a successful upload.  Also safe to run by
+# hand.  Never prints secret values.  Failure is non-fatal for ships.
 #
-# The AFC site is GitHub Pages from the main branch, so a single
-# `commit + push` on main is enough — the fleet-activity-site.yml workflow
-# picks the change up on its every-six-hours schedule and on the next push.
-# Pages serves the manifest at the mixed-case path (case-sensitive):
-#   https://simple-with-us.github.io/AI-Fleet-Coordinator/ios-versions.json
-# iOS TestFlightUpdateCheck must use that URL until infra renames the site path.
-# This script NEVER pushes anywhere else; it commits only `site/ios-versions.json`
-# on the AFC main branch and only after a clean tree, so a concurrent edit
-# in another worktree (digest refresh, calendar regen) surfaces as a non-fatal
-# warning instead of silently overwriting.
+# Usage:
+#   bash scripts/ios-fleet/publish-ios-versions.sh \
+#     --bundle-id com.socratictrade.ios \
+#     --version 1.0.68 \
+#     [--build 202608211800] \
+#     [--apple-id 6799238379] \
+#     [--display-name "Socratic-Trade"]
+#     [--base-json path] [--out-json path] [--skip-push] [--skip-local-write]
 #
-# Best-effort: ship-testflight.sh wraps this in `>/dev/null 2>&1 || true`,
-# so a missing AFC checkout, a no-push-auth gh login, or a stale working tree
-# logs a warning rather than failing the upload that already succeeded.
+# Writes:
+#   <this-dir>/ios-app-versions.json  (local cache; may be stale)
+#   a pull request against Simple-With-Us/AI-Fleet-Coordinator :
+#     site/ios-versions.json
 #
-# Resolution order for the AFC checkout:
-#   1. ${AI_FLEET_COORDINATOR_ROOT} if set and points at a real repo on main
-#   2. ~/Code/ai-fleet-coordinator  if it is a git repo on main
-#   3. /Users/jay/apps/ai-fleet-coordinator  (Mac runtime copy) same rules
-#   4. gh repo clone into a per-run tmpdir (uses whatever gh is logged in as)
+# WHY A PULL REQUEST AND NOT A DIRECT WRITE:  AI-Fleet-Coordinator's ruleset
+# requires `test` and `gitleaks` on main, and a ruleset with required status
+# checks refuses a direct write to the protected branch.  A Contents API PUT
+# to the default branch is therefore rejected, the ship treats the publish as
+# best effort, and the only trace anywhere is one warning line in the ship
+# log.  A pull request merge is exempt from that gate, so the manifest is
+# published as a branch plus a pull request.  The script never writes to the
+# default branch.
+#
+# THE TOKEN:  the publish needs a credential with write access to
+# AI-Fleet-Coordinator.  The ship workflow passes the fleet's GH_PAT secret
+# as GH_TOKEN; a hand run uses whatever gh is already logged in as.  The
+# workflow's own GITHUB_TOKEN is read-only by declaration and cannot write to
+# another repository, so it is never used for this and never arms auto-merge.
+#
+# SAFETY: the vendored ios-app-versions.json in this repo is a stale snapshot
+# (2026-08-21).  Starting from that file and publishing it would drop
+# net.dealdex 1.0.2 and roll Usage Client 1.0.11→1.0.8, Usage Local
+# 1.0.9→1.0.7, and Autorotate 1.0.4→1.0.1.  Always seed from the live remote
+# (or an explicit --base-json).  Refuse to publish a single-app / empty-apps
+# document over a multi-app remote.  Same class as DealDex #173.
+
 set -euo pipefail
 
-usage() {
-  cat <<'EOF'
-usage: publish-ios-versions.sh --bundle-id <id> --version <marketing> [--build <n>] [--apple-id <id>] [--display-name <name>]
-
-  --bundle-id      REQUIRED  e.g. app.botfleet, codes.autorotate
-  --version        REQUIRED  marketing version, e.g. 1.0.31
-  --build          OPTIONAL  build number as string (CURRENT_PROJECT_VERSION)
-  --apple-id       OPTIONAL  numeric App Store Connect appleId, kept if unset
-  --display-name   OPTIONAL  human label, kept if unset
-EOF
-  exit 64
-}
-
-log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >&2; }
-warn() { log "warning: $*" >&2; }
-die() { log "error: $*" >&2; exit 1; }
+FLEET_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOCAL_JSON="${FLEET_DIR}/ios-app-versions.json"
+REPO="${AFC_MANIFEST_REPO:-Simple-With-Us/AI-Fleet-Coordinator}"
+REMOTE_PATH="site/ios-versions.json"
+BASE_BRANCH="${AFC_MANIFEST_BRANCH:-main}"
+PR_BRANCH_PREFIX="${AFC_MANIFEST_BRANCH_PREFIX:-ios-versions-publish}"
+AUTO_MERGE="${AFC_MANIFEST_AUTO_MERGE:-1}"
 
 BUNDLE_ID=""
-MARKETING=""
-BUILD_NUM=""
+VERSION=""
+BUILD=""
 APPLE_ID=""
 DISPLAY_NAME=""
+BASE_JSON=""
+OUT_JSON=""
+SKIP_PUSH=0
+SKIP_LOCAL_WRITE=0
+
+usage() {
+  sed -n '1,45p' "$0"
+  exit 2
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bundle-id) BUNDLE_ID="${2:-}"; shift 2 ;;
-    --version)   MARKETING="${2:-}"; shift 2 ;;
-    --build)     BUILD_NUM="${2:-}"; shift 2 ;;
-    --apple-id)  APPLE_ID="${2:-}"; shift 2 ;;
-    --display-name) DISPLAY_NAME="${2:-}"; shift 2 ;;
+    --bundle-id) BUNDLE_ID="$2"; shift 2 ;;
+    --version) VERSION="$2"; shift 2 ;;
+    --build) BUILD="$2"; shift 2 ;;
+    --apple-id) APPLE_ID="$2"; shift 2 ;;
+    --display-name) DISPLAY_NAME="$2"; shift 2 ;;
+    --base-json) BASE_JSON="$2"; shift 2 ;;
+    --out-json) OUT_JSON="$2"; shift 2 ;;
+    --skip-push) SKIP_PUSH=1; shift ;;
+    --skip-local-write) SKIP_LOCAL_WRITE=1; shift ;;
     -h|--help) usage ;;
-    *) die "unknown argument: $1" ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
-[[ -n "$BUNDLE_ID" ]] || usage
-[[ -n "$MARKETING" ]] || usage
+[[ -n "$BUNDLE_ID" && -n "$VERSION" ]] || { echo "need --bundle-id and --version" >&2; exit 2; }
 
-MANIFEST_REL="site/ios-versions.json"
-AFC_REPO="Simple-With-Us/ai-fleet-coordinator"
-DEFAULT_BRANCH="main"
-
-resolve_afc_root() {
-  if [[ -n "${AI_FLEET_COORDINATOR_ROOT:-}" && -d "${AI_FLEET_COORDINATOR_ROOT}/.git" ]]; then
-    echo "${AI_FLEET_COORDINATOR_ROOT}"
+# The token the publish uses.  GITHUB_TOKEN is the workflow's own token:  it is
+# read-only by declaration and it cannot write to another repository, so it is
+# refused here rather than failing later with an authorization error that reads
+# like a branch rule.
+TOKEN=""
+TOKEN_SOURCE=""
+resolve_token() {
+  if [[ -n "${GH_TOKEN:-}" ]]; then
+    TOKEN="$GH_TOKEN"
+    TOKEN_SOURCE="env"
     return 0
   fi
-  for cand in "${HOME}/Code/ai-fleet-coordinator" "/Users/jay/apps/ai-fleet-coordinator"; do
-    if [[ -d "$cand/.git" ]]; then echo "$cand"; return 0; fi
-  done
-  if command -v gh >/dev/null 2>&1; then
-    local clone_root tmp
-    tmp="$(mktemp -d -t publish-ios-versions.XXXXXX)"
-    if gh repo clone "${AFC_REPO}" "$tmp/afc" -- --depth 1 -b "${DEFAULT_BRANCH}" >/dev/null 2>&1; then
-      echo "$tmp/afc"
-      return 0
-    fi
-    rm -rf "$tmp"
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    echo "error: GITHUB_TOKEN cannot write to ${REPO}" >&2
+    echo "error: pass the fleet GH_PAT secret as GH_TOKEN (the ship workflow does)" >&2
+    return 1
   fi
-  return 1
+  # No token in the environment:  gh uses its own stored credential.
+  if ! gh auth status >/dev/null 2>&1; then
+    echo "error: no gh credential and no GH_TOKEN; cannot publish the manifest" >&2
+    return 1
+  fi
+  TOKEN_SOURCE="gh-auth"
 }
 
-if ! AFC_ROOT="$(resolve_afc_root)"; then
-  warn "could not locate ai-fleet-coordinator (set AI_FLEET_COORDINATOR_ROOT or 'gh auth login')"
+fetch_remote_json() {
+  local dest="$1"
+  if ! command -v gh >/dev/null 2>&1; then
+    return 1
+  fi
+  local b64
+  b64="$(gh api "repos/${REPO}/contents/${REMOTE_PATH}?ref=${BASE_BRANCH}" --jq .content 2>/dev/null || true)"
+  [[ -n "$b64" ]] || return 1
+  python3 -c 'import base64,sys; sys.stdout.write(base64.b64decode("".join(sys.argv[1].split())).decode())' "$b64" >"$dest"
+}
+
+TMP_REMOTE=""
+cleanup() {
+  if [[ -n "${TMP_REMOTE}" && -f "${TMP_REMOTE}" ]]; then
+    rm -f "${TMP_REMOTE}"
+  fi
+}
+trap cleanup EXIT
+
+if [[ -z "$BASE_JSON" ]]; then
+  TMP_REMOTE="$(mktemp)"
+  if fetch_remote_json "$TMP_REMOTE"; then
+    BASE_JSON="$TMP_REMOTE"
+  elif [[ -f "$LOCAL_JSON" ]]; then
+    echo "warning: could not read the live manifest; seeding from the local snapshot ${LOCAL_JSON}" >&2
+    BASE_JSON="$LOCAL_JSON"
+  else
+    echo "error: no remote ${REPO}/${REMOTE_PATH} and no local ${LOCAL_JSON}" >&2
+    echo "error: refusing to publish an empty apps map (would wipe the fleet manifest)" >&2
+    exit 1
+  fi
+fi
+
+if [[ ! -f "$BASE_JSON" ]]; then
+  echo "error: base json not found: ${BASE_JSON}" >&2
+  exit 1
+fi
+
+MERGED="$(python3 - "$BASE_JSON" "$BUNDLE_ID" "$VERSION" "$BUILD" "$APPLE_ID" "$DISPLAY_NAME" <<'PY'
+import json, sys, datetime
+path, bundle, version, build, apple_id, display = sys.argv[1:7]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+if not isinstance(data, dict):
+    print("error: base json is not an object", file=sys.stderr)
+    sys.exit(1)
+apps = data.get("apps")
+if not isinstance(apps, dict) or not apps:
+    print("error: base json has no apps; refusing to publish a one-app replacement", file=sys.stderr)
+    sys.exit(1)
+before = set(apps)
+entry = dict(apps.get(bundle) or {})
+entry["marketingVersion"] = version
+if build:
+    entry["build"] = build
+if apple_id:
+    entry["appleId"] = int(apple_id)
+if display:
+    entry["displayName"] = display
+apps[bundle] = entry
+after = set(apps)
+lost = sorted(before - after)
+if lost:
+    print("error: merge dropped apps: " + ", ".join(lost), file=sys.stderr)
+    sys.exit(1)
+if len(apps) < len(before) or (len(before) > 1 and len(apps) < 2):
+    print("error: refusing to publish a one-app document over a multi-app remote", file=sys.stderr)
+    sys.exit(1)
+data["apps"] = apps
+data["schemaVersion"] = 1
+data["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(data, sys.stdout, indent=2)
+sys.stdout.write("\n")
+PY
+)"
+
+if [[ "$SKIP_LOCAL_WRITE" -eq 0 ]]; then
+  printf '%s' "$MERGED" >"$LOCAL_JSON"
+  echo "local-manifest-updated ${BUNDLE_ID} ${VERSION}"
+fi
+if [[ -n "$OUT_JSON" ]]; then
+  printf '%s' "$MERGED" >"$OUT_JSON"
+fi
+
+if [[ "$SKIP_PUSH" -eq 1 ]]; then
+  echo "skip-push ${BUNDLE_ID} ${VERSION} apps=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("apps") or {}))' <<<"$MERGED")"
   exit 0
 fi
 
-cd "$AFC_ROOT"
-
-BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
-if [[ "$BRANCH" != "$DEFAULT_BRANCH" ]]; then
-  warn "AFC checkout is on '${BRANCH:-detached}', not main — skipping publish"
+# Nothing to publish:  the remote already carries this version.  A pull
+# request for an unchanged manifest is noise, and the fleet's merge queue is
+# small.  The build is part of the comparison when one was passed, because a
+# ship that re-records the same marketing version with a NEW build is a real
+# change:  the version a tester installs is the build, not the label.
+#
+# This check runs BEFORE the credential is resolved.  A ship that has nothing
+# to publish must not need a token, and it must not reach the network at all;
+# a run that only re-records the version already on main leaves no pull
+# request behind and says so.
+read -r REMOTE_VERSION REMOTE_BUILD < <(python3 - "$BASE_JSON" "$BUNDLE_ID" <<'PY'
+import json, sys
+path, bundle = sys.argv[1:3]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+entry = (data.get("apps") or {}).get(bundle) or {}
+print(entry.get("marketingVersion") or "", entry.get("build") or "")
+PY
+)
+if [[ "$REMOTE_VERSION" == "$VERSION" && ( -z "$BUILD" || "$REMOTE_BUILD" == "$BUILD" ) ]]; then
+  echo "version-manifest: ${BUNDLE_ID} ${VERSION}${BUILD:+ build ${BUILD}} is already recorded"
   exit 0
 fi
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  warn "AFC working tree is dirty — refusing to publish (run 'cd ${AFC_ROOT} && git status' to inspect)"
-  exit 0
+# The credential is resolved before any API call, so a run that cannot
+# possibly publish says why, instead of failing later on an authorization
+# error that reads like a branch rule.
+resolve_token
+if [[ -n "$TOKEN" ]]; then
+  export GH_TOKEN="$TOKEN"
+  unset GITHUB_TOKEN || true
 fi
 
-if ! command -v jq >/dev/null 2>&1 && ! command -v node >/dev/null 2>&1; then
-  warn "neither jq nor node is on PATH — cannot edit ${MANIFEST_REL}"
-  exit 0
+if ! command -v gh >/dev/null 2>&1; then
+  echo "gh not installed; local manifest only" >&2
+  exit 1
 fi
 
-MANIFEST_PATH="${AFC_ROOT}/${MANIFEST_REL}"
-[[ -f "$MANIFEST_PATH" ]] || { warn "manifest ${MANIFEST_PATH} missing"; exit 0; }
+PR_BRANCH="${PR_BRANCH_PREFIX}/$(printf '%s' "$BUNDLE_ID" | tr -c 'A-Za-z0-9._-' '-')"
+PR_TITLE="chore: record ${BUNDLE_ID} ${VERSION} in the fleet iOS manifest"
+# The gap between the sentences is a real no-break space plus a normal space,
+# which is what GitHub renders.  The entity would show up literally.
+SENTENCE_GAP=$'\xc2\xa0 '
+PR_BODY="Automated fleet iOS version manifest update for ${BUNDLE_ID} ${VERSION}.${SENTENCE_GAP}Published by scripts/ios-fleet/publish-ios-versions.sh as a pull request, because AI-Fleet-Coordinator's ruleset refuses a direct write to main."
 
-NOW_ISO="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-
-if command -v jq >/dev/null 2>&1; then
-  tmp="$(mktemp)"
-  # Idempotent merge: only the fields the caller passed are written; an
-  # existing entry is left alone on every field the caller omitted.  We then
-  # bump updatedAt only when something actually changed, so a routine ship
-  # that re-records the same marketingVersion+build pair is a no-op rather
-  # than a fresh commit on the AFC main branch.
-  jq -e \
-    --arg bundle "$BUNDLE_ID" \
-    --arg version "$MARKETING" \
-    --arg now "$NOW_ISO" \
-    --arg build "${BUILD_NUM:-}" \
-    --arg apple "${APPLE_ID:-}" \
-    --arg display "${DISPLAY_NAME:-}" \
-    '
-      (.apps[$bundle] // {}) as $prev
-      | (
-          $prev
-          | (if $version != "" then .marketingVersion = $version else . end)
-          | (if $build   != "" then .build           = $build   else . end)
-          | (if $apple   != "" then .appleId         = ($apple|tonumber) else . end)
-          | (if $display != "" then .displayName     = $display else . end)
-        ) as $merged
-      | if ($merged == $prev) and (.updatedAt // "") != "" then
-          .
-        else
-          .updatedAt = $now | .apps[$bundle] = $merged
-        end
-    ' "$MANIFEST_PATH" > "$tmp"
+# 1.  The branch starts at the current default branch, so the pull request
+#     never carries a stale manifest forward.
+BASE_SHA="$(gh api "repos/${REPO}/git/ref/heads/${BASE_BRANCH}" --jq .object.sha)" || {
+  echo "error: could not read ${REPO} ${BASE_BRANCH}" >&2
+  exit 1
+}
+if gh api "repos/${REPO}/git/ref/heads/${PR_BRANCH}" >/dev/null 2>&1; then
+  gh api --method PATCH "repos/${REPO}/git/refs/heads/${PR_BRANCH}" -f sha="$BASE_SHA" -F force=true >/dev/null
 else
-  # node fallback — same shape, slightly more code, identical JSON output.
-  tmp="$(mktemp)"
-  BUNDLE_ID="$BUNDLE_ID" \
-  MARKETING="$MARKETING" \
-  BUILD_NUM="$BUILD_NUM" \
-  APPLE_ID="$APPLE_ID" \
-  DISPLAY_NAME="$DISPLAY_NAME" \
-  NOW_ISO="$NOW_ISO" \
-  node -e '
-    const fs = require("fs");
-    const path = process.argv[1];
-    const env = process.env;
-    const data = JSON.parse(fs.readFileSync(path, "utf8"));
-    const apps = data.apps || {};
-    const prev = apps[env.BUNDLE_ID] || {};
-    const next = { ...prev };
-    if (env.MARKETING) next.marketingVersion = env.MARKETING;
-    if (env.BUILD_NUM) next.build = env.BUILD_NUM;
-    if (env.APPLE_ID) next.appleId = Number(env.APPLE_ID);
-    if (env.DISPLAY_NAME) next.displayName = env.DISPLAY_NAME;
-    const sameContent = JSON.stringify(next) === JSON.stringify(prev);
-    if (sameContent && data.updatedAt) {
-      // no-op: leave manifest alone so the script does not push an empty commit
-      fs.writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
-    } else {
-      data.apps = { ...apps, [env.BUNDLE_ID]: next };
-      data.updatedAt = env.NOW_ISO;
-      fs.writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
-    }
-  ' "$MANIFEST_PATH"
-  cp "$MANIFEST_PATH" "$tmp"
+  gh api --method POST "repos/${REPO}/git/refs" -f ref="refs/heads/${PR_BRANCH}" -f sha="$BASE_SHA" >/dev/null
 fi
 
-if ! diff -q "$MANIFEST_PATH" "$tmp" >/dev/null 2>&1; then
-  cp "$tmp" "$MANIFEST_PATH"
+# 2.  The document lands on that branch, never on the default branch.
+CONTENT_B64="$(printf '%s' "$MERGED" | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()).decode())')"
+FILE_SHA="$(gh api "repos/${REPO}/contents/${REMOTE_PATH}?ref=${PR_BRANCH}" --jq .sha 2>/dev/null || true)"
+PUT_ARGS=(
+  --method PUT
+  "repos/${REPO}/contents/${REMOTE_PATH}"
+  -f message="chore: ${BUNDLE_ID} ${VERSION}"
+  -f content="${CONTENT_B64}"
+  -f branch="${PR_BRANCH}"
+)
+if [[ -n "$FILE_SHA" ]]; then
+  PUT_ARGS+=(-f sha="$FILE_SHA")
 fi
-rm -f "$tmp"
+gh api "${PUT_ARGS[@]}" >/dev/null || {
+  echo "error: version-manifest publish failed (branch ${PR_BRANCH})" >&2
+  exit 1
+}
 
-if [[ -z "$(git status --porcelain -- "$MANIFEST_REL")" ]]; then
-  log "version-manifest: ${BUNDLE_ID} ${MARKETING} already current"
-  exit 0
+# 3.  The pull request.  An open one for this branch is reused, so a fleet
+#     that ships twice a day leaves one reviewable pull request, not a pile.
+PR_NUMBER="$(gh api "repos/${REPO}/pulls?head=${REPO%%/*}:${PR_BRANCH}&state=open" --jq '.[0].number' 2>/dev/null || true)"
+if [[ -n "$PR_NUMBER" && "$PR_NUMBER" != "null" ]]; then
+  gh api --method PATCH "repos/${REPO}/pulls/${PR_NUMBER}" -f title="$PR_TITLE" -f body="$PR_BODY" >/dev/null
+  PR_URL="https://github.com/${REPO}/pull/${PR_NUMBER}"
+else
+  PR_URL="$(gh api --method POST "repos/${REPO}/pulls" -f title="$PR_TITLE" -f body="$PR_BODY" -f head="$PR_BRANCH" -f base="$BASE_BRANCH" --jq .html_url)" || {
+    echo "error: version-manifest publish failed (could not open the pull request)" >&2
+    exit 1
+  }
 fi
 
-if ! git remote get-url origin >/dev/null 2>&1; then
-  warn "AFC has no origin remote configured — leaving manifest edit staged but uncommitted"
-  exit 0
+# 4.  Arm the merge with the same elevated credential.  GitHub raises no
+#     workflow events for a merge made with the repository's own
+#     GITHUB_TOKEN, so the merge is armed here with the fleet token and
+#     lands once `test` and `gitleaks` are green.  The default branch's
+#     ruleset still decides whether the merge is allowed.
+if [[ "$AUTO_MERGE" == "1" && ( "$TOKEN_SOURCE" == "env" || "$TOKEN_SOURCE" == "gh-auth" ) ]]; then
+  PR_NUM="${PR_URL##*/}"
+  if gh pr merge "$PR_NUM" --repo "$REPO" --squash --auto >/dev/null 2>&1; then
+    echo "version-manifest: auto-merge armed on ${PR_URL}"
+  else
+    echo "version-manifest: auto-merge could not be armed on ${PR_URL}" >&2
+  fi
 fi
 
-COMMIT_MSG="version-manifest: ${BUNDLE_ID} ${MARKETING}${BUILD_NUM:+ (build ${BUILD_NUM})}"
-if ! git -C "$AFC_ROOT" -c user.name="BotFleet iOS Ship" -c user.email="ship@botfleet.local" \
-      commit --only -m "$COMMIT_MSG" -- "$MANIFEST_REL" >/dev/null 2>&1; then
-  warn "AFC commit failed — manifest staged but not pushed"
-  exit 0
-fi
-
-if ! git -C "$AFC_ROOT" push origin "${DEFAULT_BRANCH}" >/dev/null 2>&1; then
-  warn "AFC push failed — manifest committed locally on ${DEFAULT_BRANCH}; rerun after auth"
-  exit 0
-fi
-
-log "version-manifest: published ${BUNDLE_ID} ${MARKETING}"
+echo "version-manifest-pr ${PR_URL}"

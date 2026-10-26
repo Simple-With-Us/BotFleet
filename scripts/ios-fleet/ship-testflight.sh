@@ -1058,7 +1058,7 @@ record_successful_ship() {
   # Public version manifest for the in-app update prompt.  Best-effort —
   # a publish miss must never fail a ship that already uploaded.
   if [[ -n "${BUNDLE_ID:-}" && -n "${MARKETING:-}" ]]; then
-    local apple_id display
+    local apple_id display pub_out pr_url
     local -a pub_args
     apple_id="$(json_get "$APP_KEY" appleId || true)"
     display="$(json_get "$APP_KEY" displayName || true)"
@@ -1066,10 +1066,22 @@ record_successful_ship() {
     [[ -n "${BUILD_NUM:-}" ]] && pub_args+=(--build "$BUILD_NUM")
     [[ -n "${apple_id:-}" ]] && pub_args+=(--apple-id "$apple_id")
     [[ -n "${display:-}" ]] && pub_args+=(--display-name "$display")
-    if bash "${FLEET_DIR}/publish-ios-versions.sh" "${pub_args[@]}" >/dev/null 2>&1; then
-      log "version-manifest: published ${BUNDLE_ID} ${MARKETING}"
+    # The publisher opens a pull request against AI-Fleet-Coordinator, so its
+    # result is a pull request URL, not a silent write.  The URL is logged,
+    # so a ship leaves a reviewable trace instead of one warning line.
+    if pub_out="$(bash "${FLEET_DIR}/publish-ios-versions.sh" "${pub_args[@]}" 2>&1)"; then
+      # `|| true` keeps the no-URL case (the publisher's no-op path) from
+      # tripping `set -e` through pipefail:  a ship that already uploaded must
+      # never die on a missing pull request URL.
+      pr_url="$(printf '%s\n' "$pub_out" | grep -Eo 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 || true)"
+      if [[ -n "$pr_url" ]]; then
+        log "version-manifest: opened ${pr_url}"
+      else
+        log "version-manifest: ${BUNDLE_ID} ${MARKETING} recorded (${pub_out%%$'\n'*})"
+      fi
     else
       log "warning: version-manifest publish failed (non-fatal)"
+      printf '%s\n' "$pub_out" | sed 's/^/  /' >&2
     fi
   fi
 }

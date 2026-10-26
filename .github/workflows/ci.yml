@@ -132,6 +132,17 @@ jobs:
       - name: Complete application test chain
         if: needs.changes.outputs.docs_only != 'true'
         run: pnpm test
+      # The fleet iOS version manifest publisher (AFC-540).  It publishes as a
+      # branch plus a pull request against AI-Fleet-Coordinator, because that
+      # repository's ruleset refuses a direct write to main.  The tests assert
+      # the merge keeps every sibling app, that the publish never names the
+      # default branch, and that the workflow's own read-only GITHUB_TOKEN is
+      # refused.
+      - name: Fleet iOS version manifest publisher tests
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          node --test scripts/ios-fleet/publish-ios-versions.test.mjs
+          bash -n scripts/ios-fleet/publish-ios-versions.sh
       - if: needs.changes.outputs.docs_only != 'true'
         run: pnpm check:electron
       - name: production UI build
