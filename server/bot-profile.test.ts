@@ -186,7 +186,9 @@ describe("parseBotProfilePatch (both modes)", () => {
   it("maps an avatarCrop issue to the readable message", () => {
     expect(parseBotProfilePatch({ avatarCrop: "hexagon" } as never, true)).toEqual({
       ok: false,
-      error: "avatarCrop must be mascot, circle, rounded, or square",
+      // The message names every crop the schema accepts, so it cannot drift
+      // away from the list again when a crop is added.
+      error: "avatarCrop must be mascot, tvface, animated, circle, rounded, square",
     });
   });
 });
