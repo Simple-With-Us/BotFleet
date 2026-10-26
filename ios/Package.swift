@@ -12,13 +12,14 @@ import PackageDescription
 // from a real harness.
 let package = Package(
     name: "CompanionCore",
-    // macOS 13 rather than 14: the core needs nothing newer than
-    // URLSession.bytes (macOS 12), and `swift test` should run on whatever
-    // Mac is to hand. The app's iOS 27 floor lives in project.yml.
-    platforms: [.iOS(.v27), .macOS(.v13)],
+    // Raised from macOS 13 to macOS 14 per Phase 1 Foundation scope so
+    // ScreenCaptureKit and native macOS actors need no legacy @available guards.
+    // The app's iOS 27 floor lives in project.yml.
+    platforms: [.iOS(.v27), .macOS(.v14)],
     products: [
         .library(name: "CompanionCore", targets: ["CompanionCore"]),
         .executable(name: "CodeBlockLayoutProbe", targets: ["CodeBlockLayoutProbe"]),
+        .executable(name: "MacPerfHarness", targets: ["MacPerfHarness"]),
     ],
     targets: [
         .target(name: "CompanionCore"),
@@ -33,6 +34,13 @@ let package = Package(
             name: "CodeBlockLayoutProbe",
             dependencies: ["CompanionCore"],
             path: "Scripts/CodeBlockLayoutProbe"
+        ),
+        // Repeatable performance budget and visual parity harness (BF-2496).
+        // Run with `swift run --package-path ios MacPerfHarness`.
+        .executableTarget(
+            name: "MacPerfHarness",
+            dependencies: ["CompanionCore"],
+            path: "Scripts/MacPerfHarness"
         ),
     ],
     swiftLanguageModes: [.v5]

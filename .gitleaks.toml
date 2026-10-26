@@ -23,3 +23,20 @@ targetRules = ["private-key"]
 condition = "AND"
 paths = ['''^scripts/ios-fleet/test-asc-credentials\.sh$''']
 regexes = ['''SYNTHETIC[A-Z]{4,}''']
+
+# The Phase 5 native companion commits (1569ebc2, 91ed4ae6) landed a Swift type
+# name (`P256.Signing.PrivateKey`) and a synthetic APNs device token that the
+# generic-api-key rule reads as a credential.  Both were rewritten in the
+# source by the follow-up commit, so the files themselves are clean, but those
+# two commits stay in the pull request range and the scan reads their diffs.
+# Scoped to generic-api-key, these two files, and the two exact literals, so a
+# real secret anywhere (including these files) still fails.
+[[allowlists]]
+description = "Synthetic APNs device token and Swift type name in the Phase 5 native companion sources"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+  '''^ios/Sources/CompanionCore/NativeCompanionServer\.swift$''',
+  '''^ios/Tests/CompanionCoreTests/Phase5BotServicesTests\.swift$''',
+]
+regexes = ['''P256\.Signing\.PrivateKey''', '''00112233445566778899aabbccddeeff''']

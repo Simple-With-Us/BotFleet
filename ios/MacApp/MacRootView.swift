@@ -656,6 +656,12 @@ struct MacCuaInspectorView: View {
                     .cornerRadius(4)
                 }
 
+                Button(role: .destructive, action: { session.triggerCuaEmergencyStop() }) {
+                    Image(systemName: "hand.raised.fill")
+                }
+                .help("Emergency Stop Desktop Control (⌘⇧Esc)")
+                .accessibilityLabel("Emergency Stop Desktop Control")
+
                 Button(action: { session.toggleCuaStreaming() }) {
                     Image(systemName: session.isCuaStreaming ? "stop.fill" : "play.fill")
                 }
@@ -664,6 +670,19 @@ struct MacCuaInspectorView: View {
             }
             .padding(12)
             .background(Color(NSColor.windowBackgroundColor))
+
+            if let banner = session.cuaRevocationBanner {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text(banner)
+                        .font(.caption)
+                        .foregroundColor(.primary)
+                    Spacer()
+                }
+                .padding(8)
+                .background(Color.orange.opacity(0.15))
+            }
 
             Divider()
 

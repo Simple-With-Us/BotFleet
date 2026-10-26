@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AppKit
 import CoreVideo
 import CompanionCore
 #if os(macOS)
@@ -27,11 +28,19 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public var host: String = "127.0.0.1"
     @Published public var port: Int = 8799
 
-    // CUA Live Stream state
+    // Lifecycle & Remote Wake state (BF-2497)
+    @Published public var lifecycleSettings = MacLifecycleSettings()
+    @Published public var isShuttingDownServer = false
+    /// The last lifecycle-save failure, so the Settings panel can say why the
+    /// toggles went back to their previous values.
+    @Published public var lifecycleErrorMessage: String?
+
+    // CUA Live Stream & Safety state (BF-2499)
     @Published public var showCuaViewer: Bool = false
     @Published public var isCuaStreaming: Bool = false
     @Published public var cuaPixelBuffer: CVPixelBuffer?
     @Published public var cuaStatusMessage: String?
+    @Published public var cuaRevocationBanner: String?
 
     // Phase 3: Voice, System Integration, Streaming Transcript & Settings Routing
     @Published public var voiceState: MacVoiceCaptureState = .idle
@@ -51,8 +60,26 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private var client: CompanionClient?
     private var streamTask: Task<Void, Never>?
     private var reconnectAttempt = 0
+    private let policyStore: MacPersistencePolicyStore
+    private let permissionMonitor: CuaPermissionMonitor
+    private let cuaStatusState = CuaStatusState()
+    private var hasLaunched = false
+    private var didDeliberatelyStopServer = false
+    private var mainWindowObserver: NSObjectProtocol?
 
-    public init() {}
+    public init(
+        policyStore: MacPersistencePolicyStore = MacPersistencePolicyStore(),
+        permissionMonitor: CuaPermissionMonitor = CuaPermissionMonitor()
+    ) {
+        self.policyStore = policyStore
+        self.permissionMonitor = permissionMonitor
+        if let localPersist = policyStore.readPersistOnExit() {
+            self.lifecycleSettings = MacLifecycleSettings(
+                allowRemoteDesktopLaunch: nil,
+                persistOnExit: localPersist
+            )
+        }
+    }
 
     public var unreadSummary: MacUnreadBadgeSummary {
         MacUnreadBadgeSummary.from(state: state)
@@ -165,10 +192,22 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         #endif
     }
 
+    /// Connects to the local harness.
+    ///
+    /// A reconnect never clears the deliberate-stop sentinel: the marker is the
+    /// only thing keeping the launchd `StartInterval` tick from resurrecting a
+    /// harness the operator stopped on purpose.  Only `launch()` clears it.
     public func connect(host: String = "127.0.0.1", port: Int = 8799) {
         self.host = host
         self.port = port
         disconnect()
+
+        if didDeliberatelyStopServer {
+            // The harness was deliberately stopped in this session, so a
+            // reconnect would only hammer a server that is meant to stay down.
+            status = .failed("Server was deliberately stopped. Start the harness to reconnect.")
+            return
+        }
 
         status = .connecting
 
@@ -198,6 +237,40 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         }
     }
 
+    /// Called once when the desktop app is deliberately launched.
+    ///
+    /// The launch clears the deliberate-stop sentinel so the launchd wrapper is
+    /// allowed to start or supervise the harness again.
+    public func launch(host: String = "127.0.0.1", port: Int = 8799) {
+        if !hasLaunched {
+            hasLaunched = true
+            _ = try? policyStore.clearStoppedMarker(for: .appLaunch)
+        }
+        connect(host: host, port: port)
+    }
+
+    /// Observes the close of the app's main window.
+    ///
+    /// The observer is bound to the main window instance rather than to every
+    /// `NSWindow`, so closing the Settings panel never applies the quit policy.
+    public func registerMainWindow(_ window: NSWindow) {
+        // SwiftUI can recreate the window, so the previous observer is dropped
+        // rather than left pointing at a window that no longer exists.
+        if let mainWindowObserver {
+            NotificationCenter.default.removeObserver(mainWindowObserver)
+            self.mainWindowObserver = nil
+        }
+        mainWindowObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.handleWindowClose()
+            }
+        }
+    }
+
     public func disconnect() {
         streamTask?.cancel()
         streamTask = nil
@@ -209,11 +282,24 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     private func runConnectionLoop(client: CompanionClient, endpoint: String) async {
         while !Task.isCancelled {
             do {
-                let fleet = try await client.fleet()
-                self.state.hydrate(fleet)
-                if self.selection == nil, let first = fleet.bots.first {
-                    self.selection = .bot(first.id)
-                }
+                // The roster snapshot and the lifecycle settings are fetched once
+                // per successful connection.  Fetching the settings on the
+                // connect path as well would double the request count on every
+                // reconnect, which is exactly when the harness is least able to
+                // serve it.
+                try await MacHarnessConnectionCycle.connect(
+                    fetchFleet: { try await client.fleet() },
+                    hydrate: { [weak self] fleet in
+                        guard let self else { return }
+                        self.state.hydrate(fleet)
+                        if self.selection == nil, let first = fleet.bots.first {
+                            self.selection = .bot(first.id)
+                        }
+                    },
+                    refreshLifecycleSettings: { [weak self] in
+                        await self?.refreshLifecycleSettings()
+                    }
+                )
                 self.status = .connected(endpoint: endpoint)
                 self.reconnectAttempt = 0
                 self.syncSystemSurfaces()
@@ -288,7 +374,95 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         }
     }
 
-    // MARK: - CUA Stream Controls
+    // MARK: - Lifecycle Controls (BF-2497)
+
+    private func makeLifecycleClient() -> MacLifecycleClient {
+        MacLifecycleClient(host: host, port: port, policyStore: policyStore)
+    }
+
+    public func refreshLifecycleSettings() async {
+        let lifecycleClient = makeLifecycleClient()
+        guard let fetched = try? await lifecycleClient.fetchLifecycleSettings() else { return }
+        // A grant the harness did not report stays unknown, so the next save
+        // never writes back a `false` the app never read.
+        var merged = fetched
+        if merged.allowRemoteDesktopLaunch == nil {
+            merged.allowRemoteDesktopLaunch = lifecycleSettings.allowRemoteDesktopLaunch
+        }
+        lifecycleSettings = merged
+    }
+
+    public func saveLifecycleSettings(_ settings: MacLifecycleSettings) async {
+        let previous = lifecycleSettings
+        let result = await makeLifecycleClient().saveLifecycleSettings(settings, restoring: previous)
+        switch result {
+        case .saved(let saved):
+            lifecycleSettings = saved
+            lifecycleErrorMessage = nil
+        case .failed(let restored, let message):
+            // The write was rejected, so the toggles go back to the last value
+            // the harness actually accepted.
+            lifecycleSettings = restored
+            lifecycleErrorMessage = message
+            NSLog("Failed to save lifecycle settings: %@", message)
+        }
+    }
+
+    public func shutDownServerAndLocalVM() async {
+        guard !isShuttingDownServer else { return }
+        isShuttingDownServer = true
+        defer { isShuttingDownServer = false }
+
+        triggerCuaEmergencyStop()
+        let lifecycleClient = makeLifecycleClient()
+        switch await lifecycleClient.performDeliberateShutdown() {
+        case .stopped:
+            didDeliberatelyStopServer = true
+            disconnect()
+            status = .disconnected
+        case .failed(let message):
+            // A failed shutdown must not leave the deliberate-stop marker behind:
+            // the harness is still running, and the marker would make the launchd
+            // wrapper treat it as deliberately stopped forever.
+            NSLog("Server shutdown failed: %@", message)
+            status = .failed("Shutdown error: \(message)")
+        }
+    }
+
+    /// Applies the exit policy when the desktop window closes.
+    ///
+    /// The Settings toggle reads "Keep Server Running When Window Closes", and
+    /// closing the SwiftUI window does not terminate the app, so the policy has
+    /// to be evaluated here as well as on termination.
+    public func handleWindowClose() async {
+        await applyExitPolicy()
+    }
+
+    /// Applies the exit policy when the app terminates.
+    public func handleAppTermination() async {
+        triggerCuaEmergencyStop()
+        await applyExitPolicy()
+    }
+
+    private func applyExitPolicy() async {
+        let persist = policyStore.readPersistOnExit() ?? lifecycleSettings.persistOnExit
+        guard MacLifecycleClient.evaluateQuitAction(persistOnExit: persist) == .shutDownServerAndVM else {
+            return
+        }
+        guard !didDeliberatelyStopServer else { return }
+        await shutDownServerAndLocalVM()
+    }
+
+    // MARK: - CUA Stream & Emergency Safety Stop Controls (BF-2499)
+
+    public func triggerCuaEmergencyStop() {
+        _ = MacCuaDriver.shared.emergencyStop()
+        permissionMonitor.stopMonitoring()
+        if isCuaStreaming {
+            stopCuaStreaming(updateStatusMessage: false)
+        }
+        setCuaStatus(.emergencyStopActivated)
+    }
 
     public func toggleCuaStreaming() {
         if isCuaStreaming {
@@ -299,37 +473,102 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
 
     public func startCuaStreaming() {
-        Task {
+        let monitor = permissionMonitor
+        Task { [weak self] in
+            guard let self else { return }
             do {
-                cuaStatusMessage = "Starting live capture…"
-                try await ScreenStreamActor.shared.startStreaming { [weak self] buffer in
+                MacCuaDriver.shared.resetEmergencyStop()
+                self.cuaStatusState.reset()
+                self.cuaRevocationBanner = nil
+                self.setCuaStatus(.starting)
+
+                monitor.startMonitoring { [weak self] permissionState in
                     Task { @MainActor [weak self] in
-                        self?.cuaPixelBuffer = buffer
+                        guard let self else { return }
+                        self.isCuaStreaming = false
+                        self.cuaPixelBuffer = nil
+                        self.cuaRevocationBanner = permissionState.bannerMessage
+                        self.setCuaStatus(.screenRecordingPermissionNeeded)
                     }
                 }
-                isCuaStreaming = true
-                cuaStatusMessage = "Live desktop shared"
+
+                try await ScreenStreamActor.shared.startStreaming(
+                    onStreamStoppedWithError: { [weak self] error in
+                        let permissionState = monitor.notifyStreamStoppedWithError(error)
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.isCuaStreaming = false
+                            self.cuaPixelBuffer = nil
+                            switch permissionState {
+                            case .authorized:
+                                // A benign capture failure is not a lost
+                                // permission, so no revocation banner is shown.
+                                self.cuaRevocationBanner = nil
+                                self.setCuaStatus(.streamStopped)
+                            case .missingPermissions, .revoked:
+                                self.cuaRevocationBanner = permissionState.bannerMessage
+                                self.setCuaStatus(.screenRecordingPermissionNeeded)
+                            }
+                        }
+                    },
+                    onFrame: { [weak self] buffer in
+                        Task { @MainActor [weak self] in
+                            self?.cuaPixelBuffer = buffer
+                        }
+                    }
+                )
+                self.isCuaStreaming = true
+                self.setCuaStatus(.liveDesktopShared)
             } catch {
                 NSLog("CUA stream error: %@", error.localizedDescription)
+                monitor.stopMonitoring()
                 let hasScreenRecording = MacCuaDriver.shared.checkPermissions().hasScreenRecording
                 if let streamError = error as? ScreenStreamError {
-                    cuaStatusMessage = streamError.statusMessage(hasScreenRecording: hasScreenRecording)
+                    switch streamError {
+                    case .notAuthorized:
+                        self.setCuaStatus(.screenRecordingPermissionNeeded)
+                    case .noDisplayFound:
+                        self.setCuaStatus(.noDisplayAvailable)
+                    case .streamInitializationFailed, .captureFailed:
+                        self.setCuaStatus(
+                            hasScreenRecording ? .liveCaptureUnavailable : .screenRecordingPermissionNeeded
+                        )
+                    }
                 } else {
-                    cuaStatusMessage = hasScreenRecording
-                        ? "Live capture could not start"
-                        : "Screen recording permission needed"
+                    self.setCuaStatus(
+                        hasScreenRecording ? .liveCaptureUnavailable : .screenRecordingPermissionNeeded
+                    )
                 }
-                isCuaStreaming = false
+                if !hasScreenRecording {
+                    self.cuaRevocationBanner = CuaPermissionState.missingPermissions(
+                        missingScreenRecording: true,
+                        missingAccessibility: !MacCuaDriver.shared.checkPermissions().hasAccessibility
+                    ).bannerMessage
+                }
+                self.isCuaStreaming = false
             }
         }
     }
 
-    public func stopCuaStreaming() {
+    public func stopCuaStreaming(updateStatusMessage: Bool = true) {
+        permissionMonitor.stopMonitoring()
         Task {
             await ScreenStreamActor.shared.stopStreaming()
             isCuaStreaming = false
             cuaPixelBuffer = nil
-            cuaStatusMessage = "Stream stopped"
+            if updateStatusMessage {
+                setCuaStatus(.streamStopped)
+            }
         }
+    }
+
+    /// Records a CUA inspector status update.
+    ///
+    /// The emergency-stop confirmation is sticky, so the asynchronous
+    /// "stream stopped" update that lands right after an emergency stop cannot
+    /// replace the safety message the operator just triggered.
+    private func setCuaStatus(_ status: MacCuaStatus) {
+        cuaStatusState.record(status)
+        cuaStatusMessage = cuaStatusState.current?.message
     }
 }
