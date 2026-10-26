@@ -25,6 +25,23 @@ public enum MacPerformanceBudget {
     public static let maxFts5P95LatencyMs: Double = 10.0
     /// SQLite WAL file size after checkpoint: < 64 MB.
     public static let maxWalSizeBytes: UInt64 = 64 * 1024 * 1024
+    /// Badge, menubar and sidebar surface rebuild: < 10 ms.
+    ///
+    /// The surfaces answer "is anything waiting for the person?" by looking
+    /// for a pending card in the thread, and the scan stops at the newest
+    /// pending card.  The cost this budget is about is therefore the worst
+    /// case: one rebuild over a thread with nothing pending, which is the
+    /// only shape in which the scan walks the whole transcript.
+    ///
+    /// The budget is measured over the product shape, the 2,000-message
+    /// transcript the rest of this harness seeds, and it is measured in the
+    /// debug build the harness runs in.  A release build of the same scan is
+    /// roughly twenty-five times cheaper, so the budget describes the gate,
+    /// not the app's worst case on a loaded machine.
+    ///
+    /// The surfaces rebuild on a throttle rather than on every streamed frame,
+    /// so this is the cost of one rebuild and not the cost per token.
+    public static let maxSurfaceSyncMs: Double = 10.0
 
     /// True when the harness runs inside a CI job.
     public static var isRunningInCI: Bool {
@@ -44,6 +61,13 @@ public enum MacPerformanceBudget {
     public static func effectiveLimit(forProductBudget productBudget: Double) -> Double {
         productBudget
     }
+}
+
+/// A reason the harness could not produce a measurement at all.
+public enum MacPerformanceHarnessError: Error, Equatable {
+    /// The surface-sync benchmark was asked to measure no transcript size, so
+    /// it had nothing to report and a budget could not be judged.
+    case missingSurfaceSyncMeasurement
 }
 
 // MARK: - Streaming CPU Shape and Measurement
@@ -314,7 +338,8 @@ public enum MacPerformanceHarness {
         "100 tok/s streaming CPU",
         "CUA 60fps memory drift",
         "FTS5 search latency (p95)",
-        "SQLite WAL size after checkpoint"
+        "SQLite WAL size after checkpoint",
+        "Badge/menubar surface sync"
     ]
 
     /// Builds one performance metric.
@@ -373,6 +398,31 @@ public enum MacPerformanceHarness {
             enforced: enforced,
             reportNote: reportNote
         )
+    }
+
+    // MARK: Surface Sync Fixture
+
+    /// A bot for the badge/menubar surface-sync benchmark.
+    ///
+    /// `Bot` carries too many fields to spell out at a call site, and the
+    /// fields this benchmark does not care about have no bearing on the
+    /// pending-card scan, so the fixture is decoded from the smallest payload
+    /// that still produces a valid bot.
+    private static func surfaceSyncBot(id: String, threadId: String) throws -> Bot {
+        let object: [String: Any] = [
+            "id": id,
+            "threadId": threadId,
+            "name": "Perf",
+            "title": "",
+            "description": "",
+            "notifications": true,
+            "color": "blue",
+            "unread": false,
+            "modelSelection": ["instanceId": "claude", "model": "default"],
+            "createdAt": 1
+        ]
+        let data = try JSONSerialization.data(withJSONObject: object)
+        return try JSONDecoder().decode(Bot.self, from: data)
     }
 
     // MARK: Mach Process Telemetry
@@ -476,6 +526,25 @@ public enum MacPerformanceHarness {
     /// means different things depending on the window it was measured over.
     private static func streamingCpuNote(_ shape: MacStreamingCpuShape) -> String {
         "the median of \(shape.repeats) windows of \(String(format: "%.0f", shape.simulatedSeconds)) simulated seconds at \(shape.tokensPerSecond) tok/s per bot, measured after a warm-up window, so the number is the CPU that streaming costs rather than the cost of starting the process"
+    }
+
+    /// Builds the badge/menubar surface-sync metric from a measured duration.
+    ///
+    /// The gate compares this result against the product budget, so the test
+    /// suite can prove that a rebuild which costs too much fails the budget,
+    /// rather than only proving that the arithmetic adds up.
+    public static func surfaceSyncMetric(
+        measuredMs: Double,
+        context: Context
+    ) -> MacPerformanceMetricResult {
+        metric(
+            name: "Badge/menubar surface sync",
+            measuredValue: measuredMs,
+            productBudget: MacPerformanceBudget.maxSurfaceSyncMs,
+            unit: "ms",
+            wallClockSensitive: true,
+            context: context
+        )
     }
 
     /// Measures the CPU cost of the simulated streaming load.
@@ -599,6 +668,8 @@ public enum MacPerformanceHarness {
     public static func runFullSuite(
         messageCount: Int = 2_000,
         walInsertCount: Int = 10_000,
+        surfaceSyncTranscriptSizes: [Int] = [2_000, 10_000, 50_000],
+        surfaceSyncRepeats: Int = 5,
         context: Context = .standalone
     ) async throws -> MacPerformanceHarnessReport {
         var metrics: [MacPerformanceMetricResult] = []
@@ -912,6 +983,66 @@ public enum MacPerformanceHarness {
             unit: "MB",
             strictlyLessThan: true,
             note: "write-ahead log high-water mark, measured with a passive checkpoint",
+            context: context
+        ))
+
+        // 7. Badge/menubar surface sync (the pending-card scan)
+        //
+        // The badge, the menubar and the sidebar row all answer "is anything
+        // waiting for the person?" by looking for a pending card in the
+        // thread.  The scan stops at the newest pending card, so it is cheap
+        // whenever something is waiting and walks the whole transcript when
+        // nothing is.  The worst case is therefore one large thread with
+        // nothing pending, and that is the shape measured here.
+        //
+        // The first size in the sweep is the product shape and it is the one
+        // the budget judges.  The larger sizes are measured too and carried
+        // in the note, because a budget that hides the tail is how a linear
+        // scan passes a gate and still stalls the app.
+        //
+        // The surfaces rebuild on a throttle rather than on every streamed
+        // frame, so this number is the cost of one rebuild and not the cost
+        // per streamed token.
+        let surfaceSyncSignpost = signposter.beginInterval("SurfaceSync")
+        let surfaceBot = try surfaceSyncBot(id: "perf-bot", threadId: "perf-thread")
+        var surfaceSyncBySize: [(size: Int, medianMs: Double)] = []
+        for size in surfaceSyncTranscriptSizes {
+            var surfaceState = CompanionState()
+            surfaceState.bots = [surfaceBot]
+            surfaceState.messages[surfaceBot.threadId] = (0..<size).map { index in
+                Message(
+                    id: "perf-msg-\(index)",
+                    role: .bot,
+                    kind: .text,
+                    at: 1,
+                    text: "transcript line"
+                )
+            }
+            var samplesMs: [Double] = []
+            for _ in 0..<surfaceSyncRepeats {
+                let begin = DispatchTime.now().uptimeNanoseconds
+                _ = MacUnreadBadgeSummary.from(state: surfaceState)
+                _ = MacMenubarState.from(state: surfaceState, isConnected: true)
+                let end = DispatchTime.now().uptimeNanoseconds
+                samplesMs.append(Double(end - begin) / 1_000_000.0)
+            }
+            let sorted = samplesMs.sorted()
+            surfaceSyncBySize.append((size: size, medianMs: sorted[sorted.count / 2]))
+        }
+        signposter.endInterval("SurfaceSync", surfaceSyncSignpost)
+        guard let surfaceSyncProduct = surfaceSyncBySize.first else {
+            throw MacPerformanceHarnessError.missingSurfaceSyncMeasurement
+        }
+        let surfaceSyncCurve = surfaceSyncBySize
+            .map { "\($0.size) msgs: \(String(format: "%.2f", $0.medianMs)) ms" }
+            .joined(separator: ", ")
+        metrics.append(metric(
+            name: "Badge/menubar surface sync",
+            measuredValue: surfaceSyncProduct.medianMs,
+            productBudget: MacPerformanceBudget.maxSurfaceSyncMs,
+            unit: "ms",
+            wallClockSensitive: true,
+            note: "median of \(surfaceSyncRepeats) rebuilds over a thread with nothing pending, by transcript size — \(surfaceSyncCurve); the budget judges the \(surfaceSyncProduct.size)-message product shape",
             context: context
         ))
 

@@ -804,6 +804,12 @@ struct Phase1StoreImporterAndPerfTests {
         let report = try await MacPerformanceHarness.runFullSuite(
             messageCount: 1_000,
             walInsertCount: 10_000,
+            // The surface-sync sweep is measured at a smaller transcript here
+            // so the suite does not pay for a 50,000-message transcript it
+            // does not judge.  The metric is reported and not gated in the
+            // test runner, so the shape it runs at changes nothing but the
+            // time the suite takes.
+            surfaceSyncTranscriptSizes: [1_000, 5_000],
             context: .testRunner
         )
         #expect(report.fts5StemmingVerified == true)
@@ -831,7 +837,8 @@ struct Phase1StoreImporterAndPerfTests {
             "100 tok/s streaming CPU": 6.0,
             "CUA 60fps memory drift": 10.0,
             "FTS5 search latency (p95)": 10.0,
-            "SQLite WAL size after checkpoint": 64.0
+            "SQLite WAL size after checkpoint": 64.0,
+            "Badge/menubar surface sync": 10.0
         ]
         #expect(MacPerformanceBudget.maxColdStartMs == 50.0)
         #expect(Double(MacPerformanceBudget.maxIdleMemoryBytes) / (1024.0 * 1024.0) == 80.0)
@@ -841,6 +848,7 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(Double(MacPerformanceBudget.maxCuaMemoryDriftBytes) / (1024.0 * 1024.0) == 10.0)
         #expect(MacPerformanceBudget.maxFts5P95LatencyMs == 10.0)
         #expect(Double(MacPerformanceBudget.maxWalSizeBytes) / (1024.0 * 1024.0) == 64.0)
+        #expect(MacPerformanceBudget.maxSurfaceSyncMs == 10.0)
 
         // The harness also prints the FTS5 latency including the caller's round
         // trip, and the pooled percentile over every raw sample.  Both are
@@ -890,7 +898,8 @@ struct Phase1StoreImporterAndPerfTests {
         // carry their product budget, and still say why they are not gated.
         let wallClockNames: Set<String> = [
             "Cold start time",
-            "FTS5 search latency (p95)"
+            "FTS5 search latency (p95)",
+            "Badge/menubar surface sync"
         ]
         for metric in report.metrics where wallClockNames.contains(metric.name) {
             #expect(metric.enforced == false)
@@ -905,9 +914,55 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(summary.contains("[PENDING] App visual surface:"))
     }
 
+    @Test("The badge/menubar surface-sync budget still fails a regression, and the tail stays visible")
+    func surfaceSyncBudgetStillFailsAndCarriesTheTail() async throws {
+        // The badge, the menubar and the sidebar row answer "is anything
+        // waiting?" by scanning the thread for a pending card, so the scan is
+        // the thing the budget is about.  A rebuild over the budget has to
+        // fail, or the gate could not catch the regression it exists for.
+        let breach = MacPerformanceHarness.surfaceSyncMetric(measuredMs: 12.0, context: .standalone)
+        #expect(breach.passed == false)
+        #expect(breach.enforced == true)
+        #expect(breach.name == "Badge/menubar surface sync")
+        #expect(breach.specBudgetLimit == 10.0)
+
+        let within = MacPerformanceHarness.surfaceSyncMetric(measuredMs: 1.0, context: .standalone)
+        #expect(within.passed == true)
+        #expect(within.enforced == true)
+
+        // A duration measured inside the test runner describes the runner, so
+        // the budget is reported there and enforced by the standalone
+        // executable, which is where CI runs it.
+        let inTestRunner = MacPerformanceHarness.surfaceSyncMetric(measuredMs: 1.0, context: .testRunner)
+        #expect(inTestRunner.enforced == false)
+        #expect(inTestRunner.reportNote != nil)
+        #expect(inTestRunner.specBudgetLimit == 10.0)
+
+        // The measurement itself has to describe the surfaces rather than a
+        // private copy of their logic, so the harness builds a real state and
+        // reads the real summaries off it.
+        let report = try await MacPerformanceHarness.runFullSuite(
+            messageCount: 200,
+            walInsertCount: 100,
+            surfaceSyncTranscriptSizes: [500],
+            surfaceSyncRepeats: 2,
+            context: .testRunner
+        )
+        let surfaceSync = try #require(
+            report.metrics.first { $0.name == "Badge/menubar surface sync" },
+            "The harness did not report the badge/menubar surface sync metric."
+        )
+        #expect(surfaceSync.measuredValue.isFinite == true)
+        #expect(surfaceSync.measuredValue >= 0)
+        #expect(surfaceSync.unit == "ms")
+        #expect(surfaceSync.specBudgetLimit == MacPerformanceBudget.maxSurfaceSyncMs)
+        // The note carries the whole curve, because a budget that hides the
+        // tail is how a linear scan passes a gate and still stalls the app.
+        #expect(surfaceSync.reportNote?.contains("500 msgs") == true)
+    }
+
     @Test("The active streaming CPU budget is measured over the streaming second and still catches a regression")
-    func streamingCpuBudgetIsMeasuredOverTheStreamingSecond() async throws {
-        // The shape the P-BF-6 budget is written against: five bots, one
+    func streamingCpuBudgetIsMeasuredOverTheStreamingSecond() async throws {        // The shape the P-BF-6 budget is written against: five bots, one
         // hundred tokens each, at one hundred tokens per second, so one
         // window covers exactly one simulated second of streaming.
         let shape = MacStreamingCpuShape.product
