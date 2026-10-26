@@ -425,41 +425,20 @@ export function validateManifestAgainstFrames(
   }
 
   if (frameSize) {
-    // The manifest declares the size the avatar is DELIVERED at, so the build
-    // scales the art down to it.  That is how the shipped examples were made:
-    // the TV-Face art is 480 x 480 and the files are 256 x 256.  What the
-    // build will not do is invent pixels by scaling up, or squash a drawing
-    // whose shape does not match, because either would change what the author
-    // drew without saying so.
-    if (frameSize.width < manifest.frame.width || frameSize.height < manifest.frame.height) {
+    // The manifest declares the size of the file the player draws, so the
+    // frames the build is handed have to be that size.  The comparison is
+    // against the frames that are really there, not against the manifest
+    // itself, which is the only way the check can say anything at all.
+    if (frameSize.width !== manifest.frame.width || frameSize.height !== manifest.frame.height) {
       problems.push(
         `the source frames are ${frameSize.width}x${frameSize.height} but the manifest declares ` +
-          `${manifest.frame.width}x${manifest.frame.height}; the build scales art down to the ` +
-          "declared size, but it will not make pixels that are not there",
-      );
-    } else if (!sameAspect(frameSize, manifest.frame)) {
-      problems.push(
-        `the source frames are ${frameSize.width}x${frameSize.height} but the manifest declares ` +
-          `${manifest.frame.width}x${manifest.frame.height}; scaling them to the declared size ` +
-          "would change the proportions of the art, so declare the size that matches it",
+          `${manifest.frame.width}x${manifest.frame.height}; the manifest describes the file the ` +
+          "player draws, so the frames have to be the size it declares",
       );
     }
   }
 
   return problems;
-}
-
-/**
- * Whether art of one size has the same proportions as another.
- *
- * The build scales the art to the declared size, and a scale that is not the
- * same in both directions would squash the drawing.  One pixel of difference
- * is not a different proportion, so the comparison allows about a percent.
- */
-function sameAspect(size: FrameSize, frame: { width: number; height: number }): boolean {
-  const source = size.width / size.height;
-  const declared = frame.width / frame.height;
-  return Math.abs(source - declared) / declared <= 0.01;
 }
 
 function run(command: string, args: string[]): void {
@@ -575,9 +554,8 @@ export function buildAvatar(options: BuildOptions): BuildResult {
     mkdirSync(scaled);
 
     // The frames are scaled to the size the manifest declares.  The check
-    // above has made sure that this scales down rather than up, and that it
-    // keeps the shape of the art, so the encoder is always handed the shape
-    // the player is going to draw.
+    // above has already made sure that they are that size, so the encoder is
+    // always handed the shape the player is going to draw.
     const scaledPattern = join(scaled, "%0" + String(frames.length).length + "d.png");
     run("ffmpeg", [
       "-y",
