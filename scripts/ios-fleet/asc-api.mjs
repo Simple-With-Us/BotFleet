@@ -1847,7 +1847,7 @@ async function main() {
           version,
           internalBuildState: state,
           usesNonExemptEncryption: attrs.usesNonExemptEncryption,
-          externalInstallable: reach.ok ? reach.installable : null
+          externalInstallPath: reach.ok ? reach.installable : null
         }));
         // 5 = read and nobody can install; 6 = could not be read, so installability is unverified.
         process.exit(nobody ? 5 : reach.ok ? 0 : 6);
