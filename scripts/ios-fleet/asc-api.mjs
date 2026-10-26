@@ -460,7 +460,7 @@ export function maskEmail(email) {
 // every record that email has across the team's apps, and adding another app's
 // record to this app's group answers 409 STATE_ERROR "Tester(s) cannot be
 // assigned" (seen live on 2026-10-09 for the owner's own address).  So:
-//   - createFirst (the internal group path): POST /v1/betaTesters with the group
+//   - createFirst (standing-tester paths, internal and external): POST /v1/betaTesters with the group
 //     relationship.  For an existing address on THIS app Apple answers with that
 //     app's own record, and for an App Store Connect user it makes an internal
 //     tester.  Falls back to the lookup below if the create is refused.
@@ -1563,7 +1563,7 @@ async function main() {
         console.error(`${prefix}: ${mask(email)} already in group`);
         continue;
       }
-      const added = await addTesterToGroup({ api, appId, groupId: group.id, email });
+      const added = await addTesterToGroup({ api, appId, groupId: group.id, email, createFirst: true });
       const res = added.res;
       const existing = added.existing;
       if (res.ok || res.status === 204) {

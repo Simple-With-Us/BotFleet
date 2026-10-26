@@ -808,9 +808,19 @@ test("the ship readiness is external installability, and never prints a false su
   assert.equal(sh.split("TestFlight external testers can install this build after Beta App Review").length - 1, 1);
   assert.doesNotMatch(sh, /TestFlight internal testers can install this build/);
   // The sync step must NOT re-create the internal group; it deletes leftovers.
-  const syncBranch = mjs.slice(mjs.indexOf('method === "ensure-standing-testers"'), mjs.indexOf('method === "ensure-tf-ready"'));
+  const syncStart = mjs.indexOf('method === "ensure-standing-testers"');
+  const syncEnd = mjs.indexOf('method === "ensure-tf-ready"');
+  assert.ok(syncStart >= 0, 'ensure-standing-testers dispatch marker exists');
+  assert.ok(syncEnd > syncStart, 'ensure-tf-ready dispatch marker follows it');
+  const syncBranch = mjs.slice(syncStart, syncEnd);
+  // The branch comments name ensureInternalTesterGroup on purpose; only an
+  // awaited call would re-create the group.
   assert.doesNotMatch(syncBranch, /await ensureInternalTesterGroup\(/);
   assert.match(syncBranch, /await deleteInternalGroups\(/);
+  // Standing testers join the external group with createFirst so an email
+  // whose only tester record belongs to another app still gets an app-scoped
+  // record (the cross-app 409 path cannot recover one that does not exist).
+  assert.match(syncBranch, /createFirst: true/);
   // ensureInternalTesterGroup stays exported: this repo's own suite is its
   // living consumer (see the behavior tests above).
   assert.match(mjs, /export async function ensureInternalTesterGroup\(/);
