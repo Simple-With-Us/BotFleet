@@ -21,7 +21,7 @@ import {
   type BotMotion,
   type BotState,
 } from "@/lib/mascot";
-import { useSpeech } from "@/lib/tts/useSpeech";
+import { useSpeakingBotId } from "@/lib/tts/useSpeech";
 import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
 import { AnimatedFileAvatar } from "./avatar-file/AnimatedFileAvatar";
 import {
@@ -257,8 +257,14 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
   // because a moving mouth is the thing a listener is watching.  The speaker
   // is a window-wide singleton, so this is the one place that can tell
   // whether this bot is the one talking.
-  const speech = useSpeech();
-  const state = stateWithSpeech(mascotProps.state, speech, bot.id);
+  //
+  // The subscription is narrow on purpose.  A screen can hold a long list of
+  // avatars, and the speech snapshot is replaced on every caption, so every
+  // avatar that read all of it re-rendered on every line of a spoken reply.
+  // Reading only the name of the speaking bot means an avatar re-renders
+  // when its own bot starts or stops talking, and not otherwise.
+  const speakingBotId = useSpeakingBotId();
+  const state = stateWithSpeech(mascotProps.state, speakingBotId, bot.id);
 
   useEffect(() => setImageFailed(false), [profile.avatarUrl]);
 
