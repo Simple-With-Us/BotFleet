@@ -4,7 +4,13 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Cocoa's default release identity is bundle-id@marketing-version+build-number.
-// This receipt proves TestFlight availability, not installation on a device.
+// This receipt proves exactly two things: the specific build finished App Store
+// Connect processing (READY_FOR_BETA_TESTING / IN_BETA_TESTING) and the app has
+// a live external TestFlight install path (an external group with testers or an
+// enabled public link).  It is NOT proof that this build is assigned to the
+// external group, that Beta App Review approved it, or that it is installed on
+// any device: the ship job's standing-testers sync assigns the build after this
+// receipt is emitted and logs the group-side membership verification.
 //
 // Hand-written boundary checks rather than zod, on purpose: hosted ios-ship
 // runs this with plain `node` before any `pnpm install`, so `import "zod"`
@@ -34,7 +40,7 @@ function isString(value) {
 export function parseReadyFile(value) {
   if (!isPlainObject(value) || value.ok !== true || !isString(value.version) || !BUILD_NUMBER_PATTERN.test(value.version) ||
       !isString(value.buildId) || !/^[A-Za-z0-9-]{1,64}$/.test(value.buildId) ||
-      !READY_STATES.has(value.internalBuildState)) {
+      !READY_STATES.has(value.internalBuildState) || value.externalInstallPath !== true) {
     throw new Error("Invalid verified TestFlight receipt");
   }
   return {
@@ -42,13 +48,15 @@ export function parseReadyFile(value) {
     version: value.version,
     buildId: value.buildId,
     internalBuildState: value.internalBuildState,
+    externalInstallPath: true,
   };
 }
 
 export function validateReceipt(receipt) {
   const strings = ["bundleId", "marketingVersion", "buildNumber", "sourceCommit", "ascBuildId", "state", "confirmedAt", "release"];
   if (!isPlainObject(receipt) || receipt.schema !== 1 || strings.some((key) => !isString(receipt[key])) ||
-      receipt.milestone !== "testflight-ready" ||
+      receipt.milestone !== "testflight-processed" ||
+      receipt.externalInstallPath !== true ||
       receipt.bundleId !== BUNDLE_ID ||
       !/^1\.0\.\d+$/.test(receipt.marketingVersion) ||
       !BUILD_NUMBER_PATTERN.test(receipt.buildNumber) ||
@@ -64,7 +72,8 @@ export function validateReceipt(receipt) {
   if (receipt.release !== release) throw new Error("Receipt release identity mismatch");
   return {
     schema: 1,
-    milestone: "testflight-ready",
+    milestone: "testflight-processed",
+    externalInstallPath: receipt.externalInstallPath,
     bundleId: receipt.bundleId,
     marketingVersion: receipt.marketingVersion,
     buildNumber: receipt.buildNumber,
@@ -85,7 +94,7 @@ export function createReceipt({ archive, readiness, sourceCommit, expectedCommit
     throw new Error("Archive, source commit, and confirmed App Store Connect build must agree");
   }
   return validateReceipt({
-    schema: 1, milestone: "testflight-ready", bundleId, marketingVersion, buildNumber,
+    schema: 1, milestone: "testflight-processed", externalInstallPath: true, bundleId, marketingVersion, buildNumber,
     sourceCommit, ascBuildId: ready.buildId, state: ready.internalBuildState,
     confirmedAt: now.toISOString(), release: `${bundleId}@${marketingVersion}+${buildNumber}`,
   });

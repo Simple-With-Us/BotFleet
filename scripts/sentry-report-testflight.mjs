@@ -14,7 +14,8 @@ const REPOSITORY = "Simple-With-Us/BotFleet";
 
 const ReceiptSchema = z.object({
   schema: z.literal(1),
-  milestone: z.literal("testflight-ready"),
+  milestone: z.literal("testflight-processed"),
+  externalInstallPath: z.literal(true),
   bundleId: z.literal("app.botfleet.ios"),
   marketingVersion: z.string().regex(/^1\.0\.\d+$/),
   // Imported, not re-declared: see BUILD_NUMBER_PATTERN in sentry-testflight-receipt.mjs.
@@ -123,7 +124,10 @@ export async function reportTestFlight(receipt, { token, runId, fetchImpl = fetc
   await request(existing ? "PUT" : "POST", existing ? releaseUrl : API, writeBody);
 
   // Use the environment already emitted by SentryTelemetry.swift.  The name
-  // explicitly identifies distribution readiness, never device installation.
+  // identifies a processed build with a live external install path; it is
+  // never a claim of group assignment, Beta App Review approval, or device
+  // installation.  Group membership proof is the ship job's standing-testers
+  // sync ("verified ... is in group").
   const name = `ios-testflight:${receipt.buildNumber}`;
   const deploys = parseApi(z.array(SentryDeploySchema), await request("GET", `${releaseUrl}deploys/`));
   const match = deploys.find((deploy) => deploy.environment === "production" && deploy.name === name);
@@ -146,7 +150,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     }
     const result = await reportTestFlight(parsed, {
       token: process.env.SENTRY_AUTH_TOKEN, runId: process.env.GITHUB_RUN_ID });
-    const summary = `Sentry recorded ${result.release}: TestFlight ready for internal testers.  This is not proof of installation on a device.\n`;
+    const summary = `Sentry recorded ${result.release}: build processed in App Store Connect and the app has a live external TestFlight install path.  The ship job's tester sync assigns this build to the external group and verifies membership (see its "verified ... is in group" line).  This is not proof of Beta App Review approval or installation on a device.\n`;
     console.log(summary.trim());
     if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
   } catch (error) {

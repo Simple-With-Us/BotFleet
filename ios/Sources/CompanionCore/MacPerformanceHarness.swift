@@ -46,6 +46,66 @@ public enum MacPerformanceBudget {
     }
 }
 
+// MARK: - Streaming CPU Shape and Measurement
+
+/// The simulated streaming load the active CPU budget is measured against.
+///
+/// The budget is written as a percentage of one core while a bot streams at
+/// 100 tokens per second, so a measurement that answers it has to hold the
+/// token rate and report the CPU that streaming costs.  A shape says how many
+/// bots stream, how many tokens each one emits, at what rate, and how many
+/// measured windows the median is taken over.
+public struct MacStreamingCpuShape: Sendable, Equatable {
+    /// How many bots stream at the same time.
+    public let botCount: Int
+    /// How many tokens each bot emits in one window.
+    public let tokensPerBot: Int
+    /// The rate each bot streams at, in tokens per second.
+    public let tokensPerSecond: Int
+    /// How many measured windows the median is taken over.
+    public let repeats: Int
+
+    public init(botCount: Int, tokensPerBot: Int, tokensPerSecond: Int, repeats: Int) {
+        self.botCount = botCount
+        self.tokensPerBot = tokensPerBot
+        self.tokensPerSecond = tokensPerSecond
+        self.repeats = repeats
+    }
+
+    /// The shape the product budget is written against: five bots, one
+    /// hundred tokens each, streaming at one hundred tokens per second.
+    public static let product = MacStreamingCpuShape(
+        botCount: 5,
+        tokensPerBot: 100,
+        tokensPerSecond: 100,
+        repeats: 3
+    )
+
+    /// How long one simulated window lasts, in seconds.
+    ///
+    /// This is the denominator of the budget, and it is fixed by the token
+    /// rate rather than by how fast the host happens to be, so the measured
+    /// number does not move when the machine gets faster or busier.
+    public var simulatedSeconds: Double {
+        guard tokensPerSecond > 0, tokensPerBot > 0 else { return 0 }
+        return Double(tokensPerBot) / Double(tokensPerSecond)
+    }
+}
+
+/// What the streaming CPU measurement saw.
+public struct MacStreamingCpuMeasurement: Sendable, Equatable {
+    /// The CPU seconds each measured window cost.
+    public let samples: [Double]
+    /// The CPU seconds the median window cost.
+    public let medianCpuSeconds: Double
+    /// The CPU cost of a window, in percent of one core.
+    public let cpuPercent: Double
+    /// The simulated streaming time one window covers, in seconds.
+    public let simulatedSeconds: Double
+    /// How much the process footprint grew across the first measured window.
+    public let memoryDeltaBytes: UInt64
+}
+
 // MARK: - Individual Metric Result
 
 public struct MacPerformanceMetricResult: Sendable, Codable, Equatable {
@@ -375,6 +435,117 @@ public enum MacPerformanceHarness {
         return totalSeconds
     }
 
+    // MARK: Streaming CPU Measurement
+
+    /// Converts a measured CPU cost into the percentage of one core that the
+    /// active streaming budget is written in.
+    ///
+    /// The denominator is the simulated streaming time, so the number answers
+    /// the question the budget asks: how much of one core does streaming at
+    /// this rate cost.  A host that is slow or busy stretches the wall clock
+    /// and leaves this number alone.
+    public static func streamingCpuPercent(cpuSeconds: Double, simulatedSeconds: Double) -> Double {
+        guard simulatedSeconds > 0 else { return 0 }
+        return (max(0.0, cpuSeconds) / simulatedSeconds) * 100.0
+    }
+
+    /// Builds the active streaming CPU metric from a measured CPU cost.
+    ///
+    /// The gate compares this result against the product budget, so the test
+    /// suite can prove that a window which costs too much fails the budget,
+    /// rather than only proving that the arithmetic adds up.
+    public static func streamingCpuMetric(
+        cpuSeconds: Double,
+        shape: MacStreamingCpuShape = .product,
+        context: Context
+    ) -> MacPerformanceMetricResult {
+        metric(
+            name: "100 tok/s streaming CPU",
+            measuredValue: streamingCpuPercent(cpuSeconds: cpuSeconds, simulatedSeconds: shape.simulatedSeconds),
+            productBudget: MacPerformanceBudget.maxStreamingCpuPercent,
+            unit: "%",
+            processScoped: true,
+            note: streamingCpuNote(shape),
+            context: context
+        )
+    }
+
+    /// The note printed beside the active streaming CPU number.
+    ///
+    /// It says how the number was produced, because a percentage of one core
+    /// means different things depending on the window it was measured over.
+    private static func streamingCpuNote(_ shape: MacStreamingCpuShape) -> String {
+        "the median of \(shape.repeats) windows of \(String(format: "%.0f", shape.simulatedSeconds)) simulated seconds at \(shape.tokensPerSecond) tok/s per bot, measured after a warm-up window, so the number is the CPU that streaming costs rather than the cost of starting the process"
+    }
+
+    /// Measures the CPU cost of the simulated streaming load.
+    ///
+    /// The window is paced to the token rate the budget names, so the CPU is
+    /// measured over one simulated second of streaming rather than over
+    /// however long the machine took to finish a burst.  One warm-up window
+    /// runs first, because the first task group in a process pays to start
+    /// its threads and that one-time cost is not streaming cost.  The median
+    /// of the measured windows is the number, so one noisy window cannot
+    /// decide the gate.
+    public static func measureStreamingCpu(
+        shape: MacStreamingCpuShape = .product
+    ) async -> MacStreamingCpuMeasurement {
+        _ = await runStreamingWindow(shape: shape, measureMemory: false)
+        var samples: [Double] = []
+        var memoryDeltaBytes: UInt64 = 0
+        for index in 0..<max(1, shape.repeats) {
+            let window = await runStreamingWindow(shape: shape, measureMemory: index == 0)
+            samples.append(window.cpuSeconds)
+            if index == 0 {
+                memoryDeltaBytes = window.memoryDeltaBytes
+            }
+        }
+        let ordered = samples.sorted()
+        let median = ordered[ordered.count / 2]
+        return MacStreamingCpuMeasurement(
+            samples: samples,
+            medianCpuSeconds: median,
+            cpuPercent: streamingCpuPercent(cpuSeconds: median, simulatedSeconds: shape.simulatedSeconds),
+            simulatedSeconds: shape.simulatedSeconds,
+            memoryDeltaBytes: memoryDeltaBytes
+        )
+    }
+
+    /// Runs one simulated streaming window and reports what it cost.
+    private static func runStreamingWindow(
+        shape: MacStreamingCpuShape,
+        measureMemory: Bool
+    ) async -> (cpuSeconds: Double, memoryDeltaBytes: UInt64) {
+        let cpuStart = currentTaskCpuTimeSeconds()
+        let memoryBefore = measureMemory ? currentPhysicalFootprintBytes() : 0
+        let tokenIntervalNanoseconds = shape.tokensPerSecond > 0
+            ? UInt64(1_000_000_000 / shape.tokensPerSecond)
+            : 0
+        await withTaskGroup(of: Int.self) { group in
+            for botIndex in 0..<shape.botCount {
+                group.addTask {
+                    var buffer = ""
+                    buffer.reserveCapacity(4096)
+                    for tokenIndex in 0..<shape.tokensPerBot {
+                        if tokenIndex > 0, tokenIntervalNanoseconds > 0 {
+                            try? await Task.sleep(nanoseconds: tokenIntervalNanoseconds)
+                        }
+                        buffer.append("bot-\(botIndex)-tok-\(tokenIndex) ")
+                    }
+                    return buffer.count
+                }
+            }
+            for await _ in group {}
+        }
+        let cpuSeconds = max(0.0, currentTaskCpuTimeSeconds() - cpuStart)
+        var memoryDeltaBytes: UInt64 = 0
+        if measureMemory {
+            let memoryAfter = currentPhysicalFootprintBytes()
+            memoryDeltaBytes = memoryAfter > memoryBefore ? (memoryAfter - memoryBefore) : 0
+        }
+        return (cpuSeconds, memoryDeltaBytes)
+    }
+
     // MARK: Visual Parity Verification
 
     /// Verifies the shared visual design contract against the pinned
@@ -522,30 +693,10 @@ public enum MacPerformanceHarness {
 
         // 3. 5-bot concurrent streaming simulation (100 tok/s per bot)
         let streamSignpost = signposter.beginInterval("FiveBotStreaming")
-        let streamCpuStart = currentTaskCpuTimeSeconds()
-        let streamWallStart = DispatchTime.now().uptimeNanoseconds
-        let memBeforeStream = currentPhysicalFootprintBytes()
-
-        await withTaskGroup(of: Int.self) { group in
-            for botIndex in 0..<5 {
-                group.addTask {
-                    var buffer = ""
-                    buffer.reserveCapacity(4096)
-                    for tokenIndex in 0..<100 {
-                        buffer.append("bot-\(botIndex)-tok-\(tokenIndex) ")
-                    }
-                    return buffer.count
-                }
-            }
-            for await _ in group {}
-        }
-
-        let memAfterStream = currentPhysicalFootprintBytes()
-        let streamWallSec = max(0.016, Double(DispatchTime.now().uptimeNanoseconds - streamWallStart) / 1_000_000_000.0)
-        let streamCpuSec = max(0.0, currentTaskCpuTimeSeconds() - streamCpuStart)
+        let streamingMeasurement = await measureStreamingCpu(shape: .product)
         signposter.endInterval("FiveBotStreaming", streamSignpost)
 
-        let streamDeltaBytes = memAfterStream > memBeforeStream ? (memAfterStream - memBeforeStream) : 0
+        let streamDeltaBytes = streamingMeasurement.memoryDeltaBytes
         let streamEffectiveMb = idleMemoryMb + (Double(streamDeltaBytes) / (1024.0 * 1024.0))
         let budgetStreamMb = Double(MacPerformanceBudget.maxStreamingMemoryBytes) / (1024.0 * 1024.0)
         metrics.append(metric(
@@ -557,13 +708,9 @@ public enum MacPerformanceHarness {
             context: context
         ))
 
-        let rawStreamCpuPct = (streamCpuSec / streamWallSec) * 100.0
-        metrics.append(metric(
-            name: "100 tok/s streaming CPU",
-            measuredValue: rawStreamCpuPct,
-            productBudget: MacPerformanceBudget.maxStreamingCpuPercent,
-            unit: "%",
-            processScoped: true,
+        metrics.append(streamingCpuMetric(
+            cpuSeconds: streamingMeasurement.medianCpuSeconds,
+            shape: .product,
             context: context
         ))
 

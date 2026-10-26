@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { parse as parseYaml } from "yaml";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = readFileSync(join(ROOT, ".github/workflows/native-mac-release.yml"), "utf8");
@@ -247,4 +248,72 @@ test("the notarization credentials are resolved in the approved order", () => {
   assert.ok(resolver !== -1 && call !== -1, "the resolver must run before notarization");
   // The keychain profile is the fallback, never the first choice.
   assert.match(localScript, /--keychain-profile/);
+});
+
+// XcodeGen REWRITES the Mac Info.plist and the Mac entitlements file from
+// the target's `info:` and `entitlements:` blocks in ios/project.yml.  A key
+// that lives only in the generated file is therefore dropped the next time
+// `xcodegen generate` runs, and both the release script and the native
+// release workflow run that before the archive is built.  macOS TERMINATES an
+// app that asks for a permission whose usage description is missing, so a
+// privacy string that only lives in the plist takes the Mac app down with a
+// crash instead of a permission refusal.  These tests pin the declarations
+// to the project file, which is the only place that survives a regeneration.
+const projectYml = parseYaml(readFileSync(join(ROOT, "ios/project.yml"), "utf8"));
+const macTarget = projectYml.targets.BotFleetMac;
+const macInfoProperties = macTarget?.info?.properties ?? {};
+const macEntitlementProperties = macTarget?.entitlements?.properties ?? {};
+const macPlist = readFileSync(join(ROOT, "ios/MacApp/Info.plist"), "utf8");
+const macEntitlements = readFileSync(join(ROOT, "ios/MacApp/BotFleetMac.entitlements"), "utf8");
+
+/** A plist entry, matched with the whitespace XcodeGen actually writes. */
+function plistHas(document, key, value) {
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // A boolean is written as a self-closing tag, a string as an open/close pair.
+  const selfClosing = new RegExp(`<key>${key}</key>\\s*<(?:string|true|false)\\s*/>`);
+  const withValue = new RegExp(
+    `<key>${key}</key>\\s*<(?:string|true|false)>[^<]*${escaped}[^<]*</(?:string|true|false)>`,
+  );
+  return selfClosing.test(document) || withValue.test(document);
+}
+
+test("the Mac app declares its privacy strings in the project, not only in the generated plist", () => {
+  for (const key of ["NSMicrophoneUsageDescription", "NSSpeechRecognitionUsageDescription"]) {
+    const declared = macInfoProperties[key];
+    assert.equal(
+      typeof declared,
+      "string",
+      `${key} must be declared under targets.BotFleetMac.info.properties, or xcodegen drops it`,
+    );
+    assert.ok(declared.trim().length > 0, `${key} must not be empty`);
+    assert.ok(
+      plistHas(macPlist, key, declared.trim()),
+      `the generated plist must carry the declared ${key}`,
+    );
+  }
+});
+
+test("the Mac app declares the audio-input entitlement in the project", () => {
+  assert.equal(
+    macEntitlementProperties["com.apple.security.device.audio-input"],
+    true,
+    "the audio-input entitlement must be declared under targets.BotFleetMac.entitlements.properties",
+  );
+  assert.ok(
+    plistHas(macEntitlements, "com.apple.security.device.audio-input", ""),
+    "the generated entitlements file must carry the declared audio-input entitlement",
+  );
+});
+
+test("the Mac app declares its version keys in the project", () => {
+  assert.equal(macInfoProperties.CFBundleShortVersionString, "$(MARKETING_VERSION)");
+  assert.equal(macInfoProperties.CFBundleVersion, "$(CURRENT_PROJECT_VERSION)");
+});
+
+test("the release path regenerates the Mac plist, so the plist cannot be the only home of a key", () => {
+  // This is the reason the declarations above exist.  If the release stopped
+  // regenerating the plist, the declarations would be redundant rather than
+  // wrong, so assert the regeneration is still there.
+  assert.match(localScript, /xcodegen generate/);
+  assert.match(workflow, /xcodegen generate/);
 });

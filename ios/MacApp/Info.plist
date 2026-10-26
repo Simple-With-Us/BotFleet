@@ -18,5 +18,9 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>BotFleet uses the microphone for dictation and voice calls with bots.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>BotFleet converts your speech into text for messaging bots.</string>
 </dict>
 </plist>
