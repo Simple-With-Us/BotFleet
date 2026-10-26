@@ -607,13 +607,14 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         // Deep-link routing to all 6 settings sections.
         for section in MacSettingsSection.allCases {
             guard let url = URL(string: "botfleet://settings/\(section.rawValue)") else {
-                XCTFail("Failed to construct the settings deep-link URL for \(section.rawValue)")
+                XCTFail("Failed to construct settings deep-link URL for section \(section)")
                 continue
             }
             XCTAssertEqual(MacSettingsDeepLinkRouter.section(for: url), section)
         }
         guard let queryURL = URL(string: "botfleet://settings?section=permissions") else {
-            return XCTFail("Failed to construct the query-form settings deep-link URL")
+            XCTFail("Failed to construct settings query deep-link URL")
+            return
         }
         XCTAssertEqual(MacSettingsDeepLinkRouter.section(for: queryURL), .permissions)
         XCTAssertEqual(
@@ -670,10 +671,9 @@ final class MacPhase3VoiceSystemUITests: XCTestCase {
         XCTAssertEqual(secondTap, .cancelledPendingStart)
         XCTAssertEqual(engine.state, .idle)
 
-        // The engine's own snapshot still holds the pre-tap text.
-        XCTAssertEqual(engine.currentDraft, "Typed before")
-        // The composer keeps what the user actually has: the stale snapshot
-        // must never overwrite it.
+        // The engine's snapshot is refreshed with the caller's text, so the
+        // stale pre-tap snapshot can never overwrite what the user typed.
+        XCTAssertEqual(engine.currentDraft, "Typed before and after")
         XCTAssertEqual(
             engine.composerDraftAfterTap(incomingDraft: "Typed before and after"),
             "Typed before and after"

@@ -265,6 +265,9 @@ public final class MacVoiceEngine: @unchecked Sendable {
         switch state {
         case .starting:
             cancelPendingStart()
+            // The pending start is cancelled with the caller's current text,
+            // so the engine's snapshot never stays behind the composer.
+            self.currentDraft = currentDraft
             lastTapOutcome = .cancelledPendingStart
             return .cancelledPendingStart
         case .recording:
