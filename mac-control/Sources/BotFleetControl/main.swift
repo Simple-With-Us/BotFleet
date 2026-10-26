@@ -15,7 +15,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func api(for host: ServerHost) -> ControlAPI {
-        if let existing = hostApis[host.id] { return existing }
+        if let existing = hostApis[host.id], existing.host == host { return existing }
         let client = ControlAPI(host: host)
         hostApis[host.id] = client
         return client
@@ -507,7 +507,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func stopHostSharedVM(_ sender: NSMenuItem) {
         guard let host = sender.representedObject as? ServerHost else { return }
-        guard confirm("Stop Shared VM on \(host.name)?", "Running tasks and bot turns on this VM will be interrupted.") else { return }
+        guard confirm("Stop Shared and Local VMs on \(host.name)?", "Running local and per-bot VMs on this host will stop.  The server will refuse while active bots or leases are busy.") else { return }
         let client = api(for: host)
         run { try await client.stopSharedVM() }
     }

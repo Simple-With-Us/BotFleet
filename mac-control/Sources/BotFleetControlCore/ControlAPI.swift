@@ -160,15 +160,16 @@ public final class ControlAPI {
         let data = try await send("/api/health", method: "GET")
         guard let value = try? decoder.decode(Health.self, from: data),
               value.app == "botfleet",
-              (!host.isLocal || value.pid > 0),
+              (!host.isLocal || (value.pid ?? 0) > 0),
               value.ready == true else {
             throw ControlAPIError.foreignService
         }
     }
 
     private func send(_ path: String, method: String, body: Data? = nil, timeout: TimeInterval = 3) async throws -> Data {
+        let isLocalLoopback = (baseURL.host == "127.0.0.1" || baseURL.host == "localhost")
         let validScheme = host.isLocal ? (baseURL.scheme == "http") : (baseURL.scheme == "http" || baseURL.scheme == "https")
-        let validHost = host.isLocal ? (baseURL.host == "127.0.0.1") : (baseURL.host != nil && !baseURL.host!.isEmpty)
+        let validHost = host.isLocal ? isLocalLoopback : (baseURL.host != nil && !baseURL.host!.isEmpty)
         guard validScheme, validHost,
               let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else {
             throw ControlAPIError.invalidResponse
@@ -179,7 +180,11 @@ public final class ControlAPI {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let token = host.authToken, !token.isEmpty {
+            if !host.isLocal && !isLocalLoopback && baseURL.scheme != "https" {
+                throw ControlAPIError.refused("Remote servers configured with authentication tokens must use HTTPS.")
+            }
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.setValue(token, forHTTPHeaderField: "x-botfleet-gate-token")
         }
         if let body {
             request.httpBody = body
@@ -191,7 +196,8 @@ public final class ControlAPI {
         catch { throw ControlAPIError.unavailable }
         guard let http = response as? HTTPURLResponse else { throw ControlAPIError.invalidResponse }
         if host.isLocal {
-            guard http.url?.scheme == "http", http.url?.host == "127.0.0.1",
+            guard http.url?.scheme == "http",
+                  (http.url?.host == "127.0.0.1" || http.url?.host == "localhost"),
                   http.url?.port == baseURL.port else { throw ControlAPIError.foreignService }
         }
         if !(200..<300).contains(http.statusCode) {
@@ -208,7 +214,7 @@ public final class ControlAPI {
 
 private struct Health: Decodable {
     let app: String
-    let pid: Int
+    let pid: Int?
     let ready: Bool?
 }
 

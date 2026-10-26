@@ -144,6 +144,7 @@ public final class ServerHostStore: @unchecked Sendable {
             } else {
                 try FileManager.default.moveItem(at: tempURL, to: fileURL)
             }
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         } catch {
             try? FileManager.default.removeItem(at: tempURL)
         }
