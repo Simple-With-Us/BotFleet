@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
@@ -484,6 +484,49 @@ describe("the whole build", () => {
         expect(result.sourceFrameCount).toBe(4);
         expect(result.outputSize).toEqual({ width: 256, height: 256 });
         expect(inspectAvatar(out)).toMatch(/frames: 4 at 256x256/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!toolchain)(
+    "writes the file's own manifest beside the file",
+    async () => {
+      // The sidecar is the manifest from inside the file, not the one the
+      // author wrote: the two count different frames when the encoder folded
+      // identical frames together.  Writing it here is what keeps it true.
+      const { buildAvatar } = await import("./avatar-build.ts");
+      const dir = mkdtempSync(join(tmpdir(), "avatar-build-sidecar-"));
+      try {
+        const frames = join(dir, "frames");
+        mkdirSync(frames);
+        // The third and the fourth frame are the same, so the encoder folds
+        // them together and the file holds fewer frames than the folder did.
+        const tints = [20, 40, 60, 60, 100];
+        tints.forEach((tint, index) => {
+          writeFileSync(
+            join(frames, `${String(index + 1).padStart(2, "0")}.png`),
+            png(256, 256, tint),
+          );
+        });
+        const manifestPath = join(dir, "avatar.json");
+        writeFileSync(
+          manifestPath,
+          JSON.stringify({
+            ...MANIFEST,
+            frame: { ...MANIFEST.frame, count: 5 },
+            states: { "*": { hold: { from: 0, to: 4 } } },
+          }),
+        );
+        const out = join(dir, "out.webp");
+        const result = buildAvatar({ framesDir: frames, manifestPath, out });
+
+        const sidecar = join(dir, "out.manifest.json");
+        expect(existsSync(sidecar)).toBe(true);
+        const written = JSON.parse(readFileSync(sidecar, "utf8"));
+        expect(written).toEqual(result.manifest);
+        expect(written.frame.count).toBe(4);
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
