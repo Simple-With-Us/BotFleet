@@ -18,7 +18,7 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@12.14.0",
+  "packageManager": "pnpm@12.15.0",
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "lint": "node scripts/check-lint-baseline.mjs",
@@ -34,7 +34,7 @@
     "dev:desktop": "node scripts/prepare-cloudflared.mjs --current && electron .",
     "build": "tsc -b && tsc -p tsconfig.server.json && vite build",
     "typecheck": "tsc -b && tsc -p tsconfig.server.json",
-    "test": "node --test electron/server-controls.node-test.mjs && node scripts/test-floor.mjs && node --test scripts/probe-path-scrub.node-test.mjs && pnpm broker:test && pnpm test:updater && pnpm test:mac-updater && pnpm test:config-lock && pnpm test:credential-patch && pnpm test:desktop-viewer && pnpm test:package-link && pnpm test:save-file && pnpm test:app-paths && pnpm test:server-boot-probe && pnpm test:packaged-server && pnpm test:ios-ship && pnpm test:ci-scope && pnpm test:mac-package-gate && pnpm test:lint-gate && pnpm test:infisical-fetch && pnpm test:release-workflow && pnpm test:board-audit && pnpm test:cred-sync && pnpm test:server-start && pnpm test:vm-cli && pnpm test:kody-autofix && pnpm test:work-labels && pnpm test:smoke-runtime-mode && node --test scripts/html-sentence-gap.node-test.mjs",
+    "test": "node --test electron/server-controls.node-test.mjs && node scripts/test-floor.mjs && node --test scripts/probe-path-scrub.node-test.mjs && pnpm broker:test && pnpm test:updater && pnpm test:mac-updater && pnpm test:config-lock && pnpm test:credential-patch && pnpm test:desktop-viewer && pnpm test:package-link && pnpm test:save-file && pnpm test:app-paths && pnpm test:server-boot-probe && pnpm test:packaged-server && pnpm test:ios-ship && pnpm test:ci-scope && pnpm test:mac-package-gate && pnpm test:lint-gate && pnpm test:infisical-fetch && pnpm test:release-workflow && pnpm test:board-audit && pnpm test:cred-sync && pnpm test:server-start && pnpm test:vm-cli && pnpm test:kody-autofix && pnpm test:work-labels && pnpm test:native-release && pnpm test:smoke-runtime-mode && node --test scripts/html-sentence-gap.node-test.mjs",
     "test:ci-scope": "node --test scripts/ci-change-scope.node-test.mjs",
     "test:mac-package-gate": "node --test scripts/mac-package-gate.node-test.mjs",
     "test:lint-gate": "node --test scripts/lint-pr-gate.node-test.mjs scripts/check-lint-baseline.node-test.mjs",
@@ -87,7 +87,6 @@
     "package:linux:dir": "pnpm package:prepare && pnpm build:cua:linux && electron-builder --linux dir --x64 --publish never",
     "package": "pnpm package:mac",
     "test:packaged-server": "pnpm build:shared && pnpm build:server && node scripts/smoke-packaged-server.mjs",
-    "test:smoke-runtime-mode": "node --test scripts/smoke-runtime-mode.node-test.mjs",
     "broker:types": "wrangler types --config cloudflare/composio-broker/wrangler.jsonc cloudflare/composio-broker/worker-configuration.d.ts",
     "broker:check": "pnpm broker:types && tsc -p cloudflare/composio-broker/tsconfig.json",
     "broker:test": "vitest run --config cloudflare/composio-broker/vitest.config.ts",
@@ -98,7 +97,9 @@
     "test:cred-sync": "node --test scripts/sync-cli-credentials.node-test.mjs",
     "test:kody-autofix": "node --test .github/autofix/kody-pilot.node-test.mjs scripts/autofix-workflows.node-test.mjs",
     "build:shared": "tsc -p tsconfig.shared.build.json --emitDeclarationOnly --outDir dist-shared-types && node scripts/bundle-shared.mjs",
-    "test:work-labels": "node --test scripts/blocking-work-labels.node-test.mjs"
+    "test:work-labels": "node --test scripts/blocking-work-labels.node-test.mjs",
+    "test:smoke-runtime-mode": "node --test scripts/smoke-runtime-mode.node-test.mjs",
+    "test:native-release": "node --test scripts/native-appcast.node-test.mjs scripts/native-release-workflow.node-test.mjs scripts/decommission-gates.node-test.mjs"
   },
   "dependencies": {
     "@openfeature/server-sdk": "^1.23.0",

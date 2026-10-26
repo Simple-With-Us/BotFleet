@@ -327,11 +327,23 @@ public final class MacCuaDriver: @unchecked Sendable {
     /// physically held.
     var mouseDownPrePostHook: (() -> Void)?
 
-    /// Test seam invoked right after a synthesized mouse event reaches the window
-    /// server, so a test can assert the real post order of the events.
+    /// Test seam invoked right after a synthesized mouse event reaches the event
+    /// sink, so a test can assert delivery order without real desktop input.
     var mouseEventPostedHook: ((CGEventType, CuaMouseButton) -> Void)?
 
-    public init() {}
+    /// The sink owns event delivery.  Inject a recording sink in tests; observers
+    /// alone do not prevent events from reaching the active desktop.
+    private let eventSink: @Sendable (CGEvent) -> Void
+
+    public convenience init() {
+        self.init(eventSink: { $0.post(tap: .cghidEventTap) })
+    }
+
+    /// Internal so ordinary tests can exercise synthesis and safety bookkeeping
+    /// without sending keyboard or pointer input to the window server.
+    init(eventSink: @escaping @Sendable (CGEvent) -> Void) {
+        self.eventSink = eventSink
+    }
 
     // MARK: - Emergency Stop State
 
@@ -398,7 +410,7 @@ public final class MacCuaDriver: @unchecked Sendable {
                 mouseCursorPosition: releasePoint,
                 mouseButton: cgButton
             ) {
-                upEvent.post(tap: .cghidEventTap)
+                eventSink(upEvent)
                 mouseEventPostedHook?(upType, button)
             }
             observer?(upType, releasePoint, button)
@@ -567,7 +579,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         ) else {
             return false
         }
-        event.post(tap: .cghidEventTap)
+        eventSink(event)
         mouseEventObserver?(.mouseMoved, point, .left)
         return true
     }
@@ -602,7 +614,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         // post.  Otherwise the stop would release the button first and the
         // later down event would leave it physically held, with no record left
         // to release it.
-        downEvent.post(tap: .cghidEventTap)
+        eventSink(downEvent)
         mouseEventPostedHook?(downType, button)
         stateLock.unlock()
 
@@ -630,7 +642,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         let observer = mouseEventObserver
         stateLock.unlock()
 
-        upEvent.post(tap: .cghidEventTap)
+        eventSink(upEvent)
         mouseEventPostedHook?(upType, button)
         observer?(upType, point, button)
         return true
@@ -715,7 +727,7 @@ public final class MacCuaDriver: @unchecked Sendable {
                 mouseCursorPosition: currentPoint,
                 mouseButton: mouseButton
             ) {
-                dragEvent.post(tap: .cghidEventTap)
+                eventSink(dragEvent)
                 observer?(draggedType, currentPoint, button)
             }
             onStep?(i, currentPoint)
@@ -742,7 +754,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         ) else {
             return false
         }
-        event.post(tap: .cghidEventTap)
+        eventSink(event)
         return true
     }
 
@@ -776,8 +788,8 @@ public final class MacCuaDriver: @unchecked Sendable {
             upEvent.flags = modifiers.cgEventFlags
         }
 
-        downEvent.post(tap: .cghidEventTap)
-        upEvent.post(tap: .cghidEventTap)
+        eventSink(downEvent)
+        eventSink(upEvent)
         return true
     }
 
@@ -819,8 +831,8 @@ public final class MacCuaDriver: @unchecked Sendable {
             downEvent.keyboardSetUnicodeString(stringLength: utf16Units.count, unicodeString: &utf16Units)
             upEvent.keyboardSetUnicodeString(stringLength: utf16Units.count, unicodeString: &utf16Units)
 
-            downEvent.post(tap: .cghidEventTap)
-            upEvent.post(tap: .cghidEventTap)
+            eventSink(downEvent)
+            eventSink(upEvent)
         }
         return true
     }
