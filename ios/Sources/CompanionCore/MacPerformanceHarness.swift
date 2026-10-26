@@ -68,6 +68,11 @@ public enum MacPerformanceHarnessError: Error, Equatable {
     /// The surface-sync benchmark was asked to measure no transcript size, so
     /// it had nothing to report and a budget could not be judged.
     case missingSurfaceSyncMeasurement
+    /// The surface-sync benchmark was asked for a sweep it cannot run: no
+    /// rebuild to average, or a transcript size that is not a message count.
+    /// Without this the sweep indexed an empty sample array and trapped
+    /// instead of reporting a bad configuration.
+    case invalidSurfaceSyncConfiguration
 }
 
 // MARK: - Streaming CPU Shape and Measurement
@@ -672,6 +677,21 @@ public enum MacPerformanceHarness {
         surfaceSyncRepeats: Int = 5,
         context: Context = .standalone
     ) async throws -> MacPerformanceHarnessReport {
+        // The surface-sync sweep is configured by its caller, so a bad
+        // configuration is rejected before the suite spends time measuring
+        // anything else.  Zero repeats would leave the sample array empty and
+        // the median index out of bounds, and a negative transcript size is
+        // not a message count at all.
+        guard surfaceSyncRepeats >= 1 else {
+            throw MacPerformanceHarnessError.invalidSurfaceSyncConfiguration
+        }
+        guard !surfaceSyncTranscriptSizes.isEmpty else {
+            throw MacPerformanceHarnessError.missingSurfaceSyncMeasurement
+        }
+        guard surfaceSyncTranscriptSizes.allSatisfy({ $0 >= 0 }) else {
+            throw MacPerformanceHarnessError.invalidSurfaceSyncConfiguration
+        }
+
         var metrics: [MacPerformanceMetricResult] = []
 
         // 1. Cold start benchmark (`DatabaseService` + initial state hydration)
@@ -1026,10 +1046,15 @@ public enum MacPerformanceHarness {
                 let end = DispatchTime.now().uptimeNanoseconds
                 samplesMs.append(Double(end - begin) / 1_000_000.0)
             }
+            // The suite rejects a zero-repeat sweep before it reaches this
+            // loop, so the sample array is never empty and the median index
+            // is always in bounds.
             let sorted = samplesMs.sorted()
             surfaceSyncBySize.append((size: size, medianMs: sorted[sorted.count / 2]))
         }
         signposter.endInterval("SurfaceSync", surfaceSyncSignpost)
+        // The size list was checked to be non-empty above, so this is the
+        // compiler-required unwrap rather than a runtime path.
         guard let surfaceSyncProduct = surfaceSyncBySize.first else {
             throw MacPerformanceHarnessError.missingSurfaceSyncMeasurement
         }

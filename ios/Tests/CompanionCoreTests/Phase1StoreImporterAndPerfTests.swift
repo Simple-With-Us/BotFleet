@@ -961,6 +961,44 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(surfaceSync.reportNote?.contains("500 msgs") == true)
     }
 
+    @Test("The badge/menubar surface-sync sweep refuses an impossible configuration instead of trapping")
+    func surfaceSyncSweepRefusesImpossibleConfiguration() async throws {
+        // A zero-repeat sweep leaves the sample array empty, so the median
+        // index would run off the end of it.  The suite has to reject the
+        // configuration it cannot measure, not crash on it.
+        await #expect(throws: MacPerformanceHarnessError.invalidSurfaceSyncConfiguration) {
+            try await MacPerformanceHarness.runFullSuite(
+                messageCount: 50,
+                walInsertCount: 50,
+                surfaceSyncTranscriptSizes: [200],
+                surfaceSyncRepeats: 0,
+                context: .testRunner
+            )
+        }
+
+        // A sweep with no transcript size has nothing to report, and a
+        // negative size is not a message count at all.
+        await #expect(throws: MacPerformanceHarnessError.missingSurfaceSyncMeasurement) {
+            try await MacPerformanceHarness.runFullSuite(
+                messageCount: 50,
+                walInsertCount: 50,
+                surfaceSyncTranscriptSizes: [],
+                surfaceSyncRepeats: 2,
+                context: .testRunner
+            )
+        }
+
+        await #expect(throws: MacPerformanceHarnessError.invalidSurfaceSyncConfiguration) {
+            try await MacPerformanceHarness.runFullSuite(
+                messageCount: 50,
+                walInsertCount: 50,
+                surfaceSyncTranscriptSizes: [-1],
+                surfaceSyncRepeats: 2,
+                context: .testRunner
+            )
+        }
+    }
+
     @Test("The active streaming CPU budget is measured over the streaming second and still catches a regression")
     func streamingCpuBudgetIsMeasuredOverTheStreamingSecond() async throws {        // The shape the P-BF-6 budget is written against: five bots, one
         // hundred tokens each, at one hundred tokens per second, so one
