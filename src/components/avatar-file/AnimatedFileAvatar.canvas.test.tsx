@@ -11,7 +11,7 @@
 import { createElement } from "react";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { embedAvatarManifest, type AvatarManifest } from "../../../shared/avatar-manifest";
 import { AnimatedFileAvatar } from "./AnimatedFileAvatar";
@@ -182,5 +182,69 @@ describe("the animated file path", () => {
     expect(container.querySelector("canvas")).not.toBeNull();
     expect(decoded.length).toBeGreaterThan(0);
     expect(new Set(decoded)).toEqual(new Set([MANIFEST.restingFrame]));
+  });
+
+  it("does not keep the old file's canvas when the file changes", async () => {
+    const { decoder } = fakeDecoder();
+    await act(async () => {
+      root.render(
+        createElement(AnimatedFileAvatar, {
+          src: "/api/attachments/a.webp",
+          alt: "Scout avatar",
+          size: 44,
+          state: "idle",
+          loadBytes: async () => webpWithManifest(MANIFEST),
+          createDecoder: async () => decoder,
+        }),
+      );
+    });
+    await settle();
+    expect(container.querySelector("canvas")).not.toBeNull();
+
+    // The bot's avatar is replaced by a file with no manifest.  The canvas
+    // of the previous file must not stay on screen, showing a picture that
+    // belongs to a file that is no longer there.
+    await act(async () => {
+      root.render(
+        createElement(AnimatedFileAvatar, {
+          src: "/api/attachments/b.webp",
+          alt: "Scout avatar",
+          size: 44,
+          state: "idle",
+          loadBytes: async () => new Uint8Array(Buffer.from("RIFF....WEBPVP8 ", "latin1")),
+          createDecoder: async () => decoder,
+        }),
+      );
+    });
+    await settle();
+    expect(container.querySelector("img")).not.toBeNull();
+    expect(container.querySelector("canvas")).toBeNull();
+  });
+
+  it("does not leave a failed decoder as an unhandled rejection", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await act(async () => {
+        root.render(
+          createElement(AnimatedFileAvatar, {
+            src: "/api/attachments/a.webp",
+            alt: "Scout avatar",
+            size: 44,
+            state: "idle",
+            loadBytes: async () => webpWithManifest(MANIFEST),
+            // A decoder that gives up is a browser that cannot play the
+            // file.  It must be reported, not thrown into the void.
+            createDecoder: async () => {
+              throw new Error("the decoder gave up");
+            },
+          }),
+        );
+      });
+      await settle();
+      expect(warn).toHaveBeenCalled();
+      expect(String(warn.mock.calls[0]?.[0])).toMatch(/avatar/i);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

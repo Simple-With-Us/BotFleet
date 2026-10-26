@@ -16,9 +16,9 @@
  *     range that points past the end plays nothing;
  *   - every frame must be the same size, because the player draws one frame
  *     at a time and a ragged sequence would jump;
- *   - the file is scaled to the size the manifest declares, so a 1408x1408
- *     source does not become a 1408x1408 avatar that nobody will ever see
- *     larger than 44 pixels.
+ *   - the frames must be the size the manifest declares, because the manifest
+ *     is what tells the player how big a frame is, and a manifest that says
+ *     256x256 for 1408x1408 art describes a file that does not exist.
  *
  * The manifest that goes inside the file describes the FILE, not the folder.
  * Those are usually the same thing, and they are not the same when the
@@ -68,6 +68,150 @@ export function readPngSize(path: string): FrameSize {
     throw new Error(`${basename(path)}: no IHDR chunk`);
   }
   return { width: handle.readUInt32BE(16), height: handle.readUInt32BE(20) };
+}
+
+/**
+ * The dimensions of a JPEG, read from its first frame header.
+ *
+ * A JPEG is a list of segments, and the one that says how big the picture is
+ * is the frame header: two bytes of length, one of precision, and then the
+ * height and the width.  The scan that follows it does not matter.
+ */
+export function readJpegSize(path: string): FrameSize {
+  const handle = readFileSync(path);
+  const name = basename(path);
+  if (handle.length < 4 || handle.readUInt16BE(0) !== 0xffd8) {
+    throw new Error(`${name}: not a JPEG`);
+  }
+  return jpegSize(handle, name);
+}
+
+/**
+ * The dimensions of a WebP, read from its canvas or from its frame.
+ *
+ * An extended WebP says how big the canvas is in its VP8X chunk, and a plain
+ * one says it in the header of the frame it holds.  Both are read here, so a
+ * WebP is a source frame the build understands.
+ */
+export function readWebpSize(path: string): FrameSize {
+  const handle = readFileSync(path);
+  const name = basename(path);
+  if (
+    handle.length < 16 ||
+    handle.subarray(0, 4).toString("latin1") !== "RIFF" ||
+    handle.subarray(8, 12).toString("latin1") !== "WEBP"
+  ) {
+    throw new Error(`${name}: not a WebP file`);
+  }
+  return webpSize(handle, name);
+}
+
+/**
+ * The dimensions of any image the build accepts.
+ *
+ * The build reads the size out of the file itself rather than trusting the
+ * name, so the formats the collector picks up are the formats this reads.
+ * A file whose size cannot be read is refused here, with a message that
+ * says what it is, instead of turning up later as a frame of the wrong
+ * size.
+ */
+export function readImageSize(path: string): FrameSize {
+  const handle = readFileSync(path);
+  const name = basename(path);
+  if (handle.length >= 8 && handle.readUInt32BE(0) === 0x89504e47) {
+    if (handle.length < 24 || handle.subarray(12, 16).toString("latin1") !== "IHDR") {
+      throw new Error(`${name}: no IHDR chunk`);
+    }
+    return { width: handle.readUInt32BE(16), height: handle.readUInt32BE(20) };
+  }
+  if (handle.length >= 3 && handle.readUInt16BE(0) === 0xffd8) return jpegSize(handle, name);
+  if (
+    handle.length >= 16 &&
+    handle.subarray(0, 4).toString("latin1") === "RIFF" &&
+    handle.subarray(8, 12).toString("latin1") === "WEBP"
+  ) {
+    return webpSize(handle, name);
+  }
+  throw new Error(`${name}: not a PNG, a JPEG or a WebP`);
+}
+
+/**
+ * The dimensions of a JPEG, from its bytes.
+ *
+ * A JPEG is a list of segments, and the one that says how big the picture is
+ * is the frame header: two bytes of length, one of precision, and then the
+ * height and the width.  The scan that follows it does not matter.
+ */
+function jpegSize(handle: Buffer, name: string): FrameSize {
+  let at = 2;
+  while (at + 4 <= handle.length) {
+    if (handle[at] !== 0xff) {
+      at += 1;
+      continue;
+    }
+    const marker = handle[at + 1];
+    // The markers with nothing after them: the start of the image, and the
+    // restart markers that carry no length.
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      at += 2;
+      continue;
+    }
+    const length = handle.readUInt16BE(at + 2);
+    // The frame headers run from SOF0 to SOF15, except the three that are
+    // not a frame: the Huffman tables, the arithmetic coder and the
+    // progressive frame.
+    const isFrame =
+      marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+    if (isFrame) {
+      if (at + 9 > handle.length) throw new Error(`${name}: truncated JPEG frame header`);
+      // length (2), precision (1), height (2), width (2).
+      return { width: handle.readUInt16BE(at + 7), height: handle.readUInt16BE(at + 5) };
+    }
+    at += 2 + length;
+  }
+  throw new Error(`${name}: no JPEG frame header`);
+}
+
+/**
+ * The dimensions of a WebP, from its bytes.
+ *
+ * An extended WebP says how big the canvas is in its VP8X chunk, and a plain
+ * one says it in the header of the frame it holds.  Both are read here, so a
+ * WebP is a source frame the build understands.
+ */
+function webpSize(handle: Buffer, name: string): FrameSize {
+  let at = 12;
+  while (at + 8 <= handle.length) {
+    const fourcc = handle.subarray(at, at + 4).toString("latin1");
+    const size = handle.readUInt32LE(at + 4);
+    const start = at + 8;
+    if (start + size > handle.length) break;
+    if (fourcc === "VP8X") {
+      // The canvas size, minus one, in three bytes each.
+      return {
+        width: (handle[start + 4] | (handle[start + 5] << 8) | (handle[start + 6] << 16)) + 1,
+        height: (handle[start + 7] | (handle[start + 8] << 8) | (handle[start + 9] << 16)) + 1,
+      };
+    }
+    if (fourcc === "VP8 ") {
+      // A lossy frame: a three byte tag, the sync code, and then fourteen
+      // bits of width and fourteen bits of height.
+      if (size < 10) break;
+      return {
+        width: handle.readUInt16LE(start + 6) & 0x3fff,
+        height: handle.readUInt16LE(start + 8) & 0x3fff,
+      };
+    }
+    if (fourcc === "VP8L") {
+      // A lossless frame: a byte of signature, then fourteen bits of width
+      // and fourteen bits of height, both of them minus one.
+      if (size < 5) break;
+      const bits = handle.readUInt32LE(start + 1);
+      return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+    }
+    at = start + size + (size % 2);
+  }
+  throw new Error(`${name}: no WebP frame header`);
 }
 
 /** Every image in the folder, in name order. */
@@ -260,8 +404,8 @@ export function validateManifestAgainstFrames(
     if (frameSize.width !== manifest.frame.width || frameSize.height !== manifest.frame.height) {
       problems.push(
         `the source frames are ${frameSize.width}x${frameSize.height} but the manifest declares ` +
-          `${manifest.frame.width}x${manifest.frame.height}; the frames are scaled to the manifest's size, ` +
-          `so declare the size you want the avatar to be`,
+          `${manifest.frame.width}x${manifest.frame.height}; the manifest describes the file the ` +
+          "player draws, so the frames have to be the size it declares",
       );
     }
   }
@@ -317,7 +461,10 @@ export interface BuildResult {
 export function buildAvatar(options: BuildOptions): BuildResult {
   const frames = collectFrameFiles(options.framesDir);
   if (frames.length === 0) {
-    throw new Error(`no images in ${options.framesDir}`);
+    throw new Error(
+      `no PNG, JPEG or WebP frames in ${options.framesDir}; the build reads the size of every ` +
+        "frame out of the file itself, so it has to be a file it can read",
+    );
   }
 
   const manifest = parseAvatarManifest(readFileSync(options.manifestPath, "utf8"));
@@ -325,9 +472,9 @@ export function buildAvatar(options: BuildOptions): BuildResult {
     throw new Error(`${options.manifestPath}: not a valid avatar manifest`);
   }
 
-  const sourceSize = readPngSize(frames[0]);
+  const sourceSize = readImageSize(frames[0]);
   for (const frame of frames.slice(1)) {
-    const size = readPngSize(frame);
+    const size = readImageSize(frame);
     if (size.width !== sourceSize.width || size.height !== sourceSize.height) {
       throw new Error(
         `${basename(frame)} is ${size.width}x${size.height} but the first frame is ` +
@@ -336,10 +483,11 @@ export function buildAvatar(options: BuildOptions): BuildResult {
     }
   }
 
-  const problems = validateManifestAgainstFrames(manifest, frames.length, {
-    width: manifest.frame.width,
-    height: manifest.frame.height,
-  });
+  // The size the manifest declares is checked against the size the frames
+  // really have.  Comparing the manifest with itself would never say
+  // anything, and the manifest is what tells the player how big the frames
+  // are.
+  const problems = validateManifestAgainstFrames(manifest, frames.length, sourceSize);
   if (problems.length > 0) {
     throw new Error(`the manifest does not fit the frames:\n  - ${problems.join("\n  - ")}`);
   }
@@ -350,9 +498,10 @@ export function buildAvatar(options: BuildOptions): BuildResult {
     const scaled = join(scratch, "scaled");
     mkdirSync(scaled);
 
-    // Scale to the declared size.  The source art is usually far larger than
-    // the avatar ever renders, and carrying that cost is what made the old
-    // packs weigh hundreds of megabytes.
+    // The frames are scaled to the size the manifest declares.  The check
+    // above has already made sure that they are that size, and the scale is
+    // kept so the encoder is always handed the same shape whatever the
+    // source folder held.
     const scaledPattern = join(scaled, "%0" + String(frames.length).length + "d.png");
     run("ffmpeg", [
       "-y",

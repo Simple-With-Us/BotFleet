@@ -119,6 +119,7 @@ async function flush(): Promise<void> {
 function makePlayer(options: {
   bytes?: Buffer;
   decoder?: AvatarFrameDecoder | null;
+  createDecoder?: (bytes: Uint8Array) => Promise<AvatarFrameDecoder | null>;
   clock: FakeClock;
   painted: number[];
   reducedMotion?: boolean;
@@ -127,7 +128,9 @@ function makePlayer(options: {
   const modes: string[] = [];
   const player = new AvatarFilePlayer({
     loadBytes: async () => options.bytes ?? webpWithManifest(MANIFEST),
-    createDecoder: async () => (options.decoder === undefined ? null : options.decoder),
+    createDecoder:
+      options.createDecoder ??
+      (async () => (options.decoder === undefined ? null : options.decoder)),
     sink: fakeSink(options.painted),
     now: options.clock.now,
     schedule: options.clock.schedule,
@@ -300,5 +303,136 @@ describe("AvatarFilePlayer", () => {
     await flush();
     expect(decoded.every((index) => index >= 0 && index < 4)).toBe(true);
     expect(decoded.at(-1)).toBe(3);
+  });
+
+  it("plays on through a transition that covers a single frame", async () => {
+    const clock = new FakeClock();
+    const painted: number[] = [];
+    // The enter lands on one pose, which is how a lot of avatars are drawn.
+    // The transition still has to be moved past, or the avatar stops on it
+    // and never reaches the hold behind it.
+    const oneFrameEnter: AvatarManifest = {
+      ...MANIFEST,
+      states: {
+        idle: { hold: { from: 0, to: 1 } },
+        working: { enter: { from: 2, to: 2 }, hold: { from: 3, to: 4 } },
+      },
+    };
+    const { decoder, decoded } = fakeDecoder(8);
+    const { player } = makePlayer({
+      clock,
+      decoder,
+      painted,
+      bytes: webpWithManifest(oneFrameEnter),
+    });
+    await player.load("/api/attachments/a.webp");
+    player.setState("working");
+    clock.advance(0);
+    await flush();
+    expect(decoded.at(-1)).toBe(2);
+
+    // The transition is one frame long, so the next tick is already the hold.
+    clock.advance(100);
+    await flush();
+    expect(decoded.at(-1)).toBe(3);
+  });
+
+  it("resumes at a sane position when the plan was rebuilt while it was hidden", async () => {
+    const clock = new FakeClock();
+    const { decoder, decoded } = fakeDecoder(8);
+    const painted: number[] = [];
+    const { player } = makePlayer({ clock, decoder, painted });
+    await player.load("/api/attachments/a.webp");
+    player.setState("idle");
+    clock.advance(0);
+    await flush();
+
+    // The row scrolled out of the list, and the bot changed state while it
+    // was away, so the plan was rebuilt while the avatar was hidden.
+    player.setVisible(false);
+    clock.advance(500);
+    player.setState("working");
+    clock.advance(500);
+
+    // The avatar comes back.  The plan that was built while it was away
+    // starts at its own first frame, and it has to move on from there.
+    player.setVisible(true);
+    await flush();
+    clock.advance(0);
+    await flush();
+    expect(decoded.at(-1)).toBe(2);
+    clock.advance(100);
+    await flush();
+    expect(decoded.at(-1)).toBe(3);
+  });
+
+  it("gives the decoder back while the avatar is off screen", async () => {
+    const clock = new FakeClock();
+    const painted: number[] = [];
+    let opened = 0;
+    let closed = 0;
+    const { player } = makePlayer({
+      clock,
+      painted,
+      createDecoder: async () => {
+        opened += 1;
+        return {
+          frameCount: 8,
+          async decode(frameIndex: number) {
+            return { index: frameIndex, draw() {}, close() {} };
+          },
+          close() {
+            closed += 1;
+          },
+        };
+      },
+    });
+    await player.load("/api/attachments/a.webp");
+    player.setState("idle");
+    clock.advance(0);
+    await flush();
+    expect(opened).toBe(1);
+    expect(closed).toBe(0);
+
+    // The decoder holds the file in memory for as long as it is open, and an
+    // avatar that is not on screen is not drawing anything, so the decoder is
+    // given back rather than held on to.
+    player.setVisible(false);
+    expect(closed).toBe(1);
+
+    // And the avatar plays again when it comes back.
+    player.setVisible(true);
+    await flush();
+    expect(opened).toBe(2);
+    clock.advance(100);
+    await flush();
+    expect(painted.length).toBeGreaterThan(0);
+  });
+
+  it("does not start a loop for a still avatar that comes back on screen", async () => {
+    const clock = new FakeClock();
+    const { decoder, decoded } = fakeDecoder(8);
+    const painted: number[] = [];
+    const { player } = makePlayer({ clock, decoder, painted });
+    await player.load("/api/attachments/a.webp");
+    player.setState("idle");
+    clock.advance(0);
+    await flush();
+
+    // The caller does not want an animated avatar, so it holds its resting
+    // frame and there is nothing to loop.
+    player.setAnimated(false);
+    await flush();
+    expect(player.currentMode).toBe("still-frame");
+    const before = decoded.length;
+
+    // The row scrolled away and came back.  A still avatar must not get a
+    // frame loop, or it starts moving again behind the caller's back.
+    player.setVisible(false);
+    player.setVisible(true);
+    await flush();
+    expect(clock.waiting).toBe(0);
+    // The only frame the still avatar draws is its resting frame.
+    expect(decoded.slice(before).every((index) => index === MANIFEST.restingFrame)).toBe(true);
   });
 });

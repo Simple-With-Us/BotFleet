@@ -10,6 +10,7 @@ import {
   inspectAvatar,
   mapSourceFramesToEncoded,
   readEncodedFrames,
+  readImageSize,
   readPngSize,
   translateManifestToEncoded,
   validateManifestAgainstFrames,
@@ -77,6 +78,40 @@ function hasTool(name) {
   }
 }
 
+/* A minimal JPEG, so the test does not need a real photo to check that the
+ * build can read the size of a JPEG.  The frame header is the segment that
+ * says how big the picture is. */
+function jpeg(width, height) {
+  const sof = Buffer.alloc(19);
+  sof.writeUInt16BE(0xffc0, 0);
+  sof.writeUInt16BE(17, 2);
+  sof[4] = 8; // the precision
+  sof.writeUInt16BE(height, 5);
+  sof.writeUInt16BE(width, 7);
+  return Buffer.concat([
+    Buffer.from([0xff, 0xd8]),
+    Buffer.from("ffe000104a46494600010100000100010000", "hex"),
+    sof,
+    Buffer.from([0xff, 0xd9]),
+  ]);
+}
+
+/* A minimal extended WebP: the VP8X chunk says how big the canvas is. */
+function webp(width, height) {
+  const vp8x = Buffer.alloc(10);
+  vp8x.writeUIntLE(width - 1, 4, 3);
+  vp8x.writeUIntLE(height - 1, 7, 3);
+  const payload = 4 + 8 + vp8x.length;
+  const out = Buffer.alloc(8 + payload);
+  out.write("RIFF", 0, "latin1");
+  out.writeUInt32LE(payload, 4);
+  out.write("WEBP", 8, "latin1");
+  out.write("VP8X", 12, "latin1");
+  out.writeUInt32LE(vp8x.length, 16);
+  vp8x.copy(out, 20);
+  return out;
+}
+
 const MANIFEST = {
   formatVersion: 1,
   name: "demo",
@@ -118,6 +153,65 @@ describe("collectFrameFiles", () => {
       writeFileSync(join(dir, "notes.txt"), "hello");
       const files = collectFrameFiles(dir).map((path) => path.split("/").pop());
       expect(files).toEqual(["01.png", "02.png"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps every format the size reader can read", () => {
+    // The collector and the reader have to agree: a file the build collects
+    // is a file whose size the build can read.
+    const dir = mkdtempSync(join(tmpdir(), "avatar-test-"));
+    try {
+      writeFileSync(join(dir, "01.png"), png(2, 2));
+      writeFileSync(join(dir, "02.jpg"), jpeg(3, 4));
+      writeFileSync(join(dir, "03.jpeg"), jpeg(5, 6));
+      writeFileSync(join(dir, "04.webp"), webp(7, 8));
+      const files = collectFrameFiles(dir).map((path) => path.split("/").pop());
+      expect(files).toEqual(["01.png", "02.jpg", "03.jpeg", "04.webp"]);
+      expect(readImageSize(join(dir, "01.png"))).toEqual({ width: 2, height: 2 });
+      expect(readImageSize(join(dir, "02.jpg"))).toEqual({ width: 3, height: 4 });
+      expect(readImageSize(join(dir, "03.jpeg"))).toEqual({ width: 5, height: 6 });
+      expect(readImageSize(join(dir, "04.webp"))).toEqual({ width: 7, height: 8 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readImageSize", () => {
+  it("reads the size of a PNG, a JPEG and a WebP", () => {
+    const dir = mkdtempSync(join(tmpdir(), "avatar-test-"));
+    try {
+      const pngPath = join(dir, "a.png");
+      writeFileSync(pngPath, png(320, 240));
+      expect(readImageSize(pngPath)).toEqual({ width: 320, height: 240 });
+
+      const jpegPath = join(dir, "b.jpg");
+      writeFileSync(jpegPath, jpeg(160, 120));
+      expect(readImageSize(jpegPath)).toEqual({ width: 160, height: 120 });
+
+      const webpPath = join(dir, "c.webp");
+      writeFileSync(webpPath, webp(64, 48));
+      expect(readImageSize(webpPath)).toEqual({ width: 64, height: 48 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reads the size of a real built WebP", () => {
+    // A committed example, built by the tool itself: the reader has to
+    // understand the files the build writes.
+    const path = new URL("../tests/fixtures/avatar/tvface-working-demo.webp", import.meta.url);
+    expect(readImageSize(path.pathname)).toEqual({ width: 256, height: 256 });
+  });
+
+  it("says plainly that a file it cannot read is not an image it knows", () => {
+    const dir = mkdtempSync(join(tmpdir(), "avatar-test-"));
+    try {
+      const path = join(dir, "a.png");
+      writeFileSync(path, "not an image at all");
+      expect(() => readImageSize(path)).toThrow(/not a PNG, a JPEG or a WebP/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -250,6 +344,36 @@ describe("readEncodedFrames", () => {
 
 describe("the whole build", () => {
   const toolchain = hasTool("ffmpeg") && hasTool("img2webp");
+
+  it("refuses a manifest that declares a size the frames do not have", async () => {
+    // The manifest says 256x256 and the frames are 64x64.  The size check
+    // has to compare the manifest with the frames that are really there: a
+    // check that compares the manifest with itself can never say anything.
+    const { buildAvatar } = await import("./avatar-build.ts");
+    const dir = mkdtempSync(join(tmpdir(), "avatar-build-size-"));
+    try {
+      const frames = join(dir, "frames");
+      mkdirSync(frames);
+      for (let i = 1; i <= 3; i++) {
+        writeFileSync(join(frames, `${String(i).padStart(2, "0")}.png`), png(64, 64, i * 20));
+      }
+      const manifestPath = join(dir, "avatar.json");
+      writeFileSync(
+        manifestPath,
+        JSON.stringify({
+          ...MANIFEST,
+          frame: { ...MANIFEST.frame, count: 3 },
+          states: { "*": { hold: { from: 0, to: 2 } } },
+        }),
+      );
+      expect(() =>
+        buildAvatar({ framesDir: frames, manifestPath, out: join(dir, "out.webp") }),
+      ).toThrow(/the source frames are 64x64 but the manifest declares 256x256/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(!toolchain)(
     "turns a folder of frames into one animated file with the manifest inside",
     async () => {
@@ -259,7 +383,7 @@ describe("the whole build", () => {
         const frames = join(dir, "frames");
         mkdirSync(frames);
         for (let i = 1; i <= 6; i++) {
-          writeFileSync(join(frames, `${String(i).padStart(2, "0")}.png`), png(64, 64, i * 20));
+          writeFileSync(join(frames, `${String(i).padStart(2, "0")}.png`), png(256, 256, i * 20));
         }
         const manifestPath = join(dir, "avatar.json");
         writeFileSync(
@@ -302,7 +426,7 @@ describe("the whole build", () => {
         tints.forEach((tint, index) => {
           writeFileSync(
             join(frames, `${String(index + 1).padStart(2, "0")}.png`),
-            png(64, 64, tint),
+            png(256, 256, tint),
           );
         });
         const manifestPath = join(dir, "avatar.json");

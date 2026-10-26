@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 
 import {
   AVATAR_MANIFEST_CHUNK,
+  AVATAR_MANIFEST_MAX_BYTES,
   avatarStateFor,
   embedAvatarManifest,
   extractAvatarManifest,
@@ -101,6 +102,28 @@ describe("the manifest chunk", () => {
     expect(extractAvatarManifest(broken)).toBeNull();
   });
 
+  it("reads a manifest chunk that is just under the cap, and refuses one over it", () => {
+    // The chunk is whatever bytes an upload carries, so it can be any size.
+    // The reader caps it before it decodes and parses it, which is the only
+    // place a cap can actually save the work.
+    const text = JSON.stringify(MANIFEST);
+    const under = text + " ".repeat(AVATAR_MANIFEST_MAX_BYTES - 1 - text.length);
+    const over = text + " ".repeat(AVATAR_MANIFEST_MAX_BYTES + 1 - text.length);
+    const withChunk = (data: string): Buffer =>
+      webp([
+        { fourcc: "VP8X", data: Buffer.alloc(10, 1) },
+        { fourcc: AVATAR_MANIFEST_CHUNK, data: Buffer.from(data, "utf8") },
+      ]);
+
+    expect(Buffer.byteLength(under)).toBe(AVATAR_MANIFEST_MAX_BYTES - 1);
+    expect(extractAvatarManifest(withChunk(under))?.name).toBe(MANIFEST.name);
+
+    // The oversized chunk holds a manifest that would parse perfectly well,
+    // so the only thing that can refuse it is the cap.
+    expect(Buffer.byteLength(over)).toBe(AVATAR_MANIFEST_MAX_BYTES + 1);
+    expect(extractAvatarManifest(withChunk(over))).toBeNull();
+  });
+
   it("reads the manifest out of a real built file", () => {
     // A committed example, built by scripts/avatar-build.ts from the shipped
     // TV-Face art.  Reading it back is the proof that the format survives a
@@ -188,6 +211,19 @@ describe("planAvatarSteps", () => {
     const steps = planAvatarSteps(over, null, "thinking");
     expect(steps[0].range).toEqual({ from: 0, to: 129 });
   });
+
+  it("clamps a resting frame that points past the last frame", () => {
+    // The resting frame is a frame number like any other, so it is clamped
+    // the same way the enter, the hold and the return are.
+    const over: AvatarManifest = {
+      ...MANIFEST,
+      restingFrame: 900,
+      states: { working: { enter: { from: 31, to: 70 } } },
+    };
+    const steps = planAvatarSteps(over, null, "thinking");
+    const rest = steps.find((step) => step.reason === "resting");
+    expect(rest?.range).toEqual({ from: 129, to: 129 });
+  });
 });
 
 describe("the animated crop", () => {
@@ -221,9 +257,11 @@ describe("the built examples", () => {
 
   it("matches the manifest written next to it", () => {
     for (const name of ["tvface-working-demo", "tvface-three-part-demo"]) {
-      const beside = JSON.parse(
-        fixture(`${name}.manifest.json`).toString("utf8"),
-      ) as AvatarManifest;
+      // The manifest beside the file is read through the real parser rather
+      // than asserted into shape, so the fixture is checked by the same code
+      // path production uses: a fixture that does not parse cannot pass.
+      const beside = parseAvatarManifest(fixture(`${name}.manifest.json`).toString("utf8"));
+      expect(beside).not.toBeNull();
       expect(extractAvatarManifest(fixture(`${name}.webp`))).toEqual(beside);
     }
   });

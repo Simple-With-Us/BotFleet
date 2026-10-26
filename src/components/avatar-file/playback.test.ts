@@ -22,6 +22,8 @@ import {
 
 /** A transition that plays once, three frames long. */
 const ENTER: AvatarStep = { range: { from: 4, to: 6 }, mode: "once", reason: "enter" };
+/** A transition that lands on a single pose, one frame long. */
+const ENTER_ONE: AvatarStep = { range: { from: 4, to: 4 }, mode: "once", reason: "enter" };
 /** A hold that loops forever, four frames long. */
 const HOLD: AvatarStep = { range: { from: 0, to: 3 }, mode: "loop", reason: "hold" };
 /** The static resting frame a plan falls back to. */
@@ -74,6 +76,18 @@ describe("step measurements", () => {
     // loop alive for it would burn CPU on a picture that never changes.
     expect(isSettledStep(RESTING)).toBe(true);
     expect(isSettledStep(HOLD)).toBe(false);
+  });
+
+  it("does not call a one-frame transition settled", () => {
+    // A transition that lands on a single pose is still a transition: the
+    // plan has to move past it and on to the hold behind it.  Calling it
+    // settled stops the loop on its first frame.
+    expect(isSettledStep(ENTER_ONE)).toBe(false);
+    const playback = new AvatarPlayback([ENTER_ONE, HOLD], 100);
+    expect(playback.settled).toBe(false);
+    playback.advance(100);
+    expect(playback.step?.reason).toBe("hold");
+    expect(playback.settled).toBe(false);
   });
 });
 
@@ -168,5 +182,26 @@ describe("AvatarPlayback", () => {
     playback.skip(1000);
     expect(playback.frame(1100)).toBe(1);
     expect(playback.frame(1200)).toBe(2);
+  });
+
+  it("does not freeze when the plan was rebuilt while it was hidden", () => {
+    // The plan was rebuilt while the avatar was off screen, so the plan
+    // begins after the moment the avatar was hidden.  Skipping the whole
+    // hidden time from there would push the clock past the present, and the
+    // avatar would sit on frame zero for ever.
+    const playback = new AvatarPlayback([HOLD], 100, 500);
+    playback.skipHidden(0, 1000);
+    // The plan starts where the avatar comes back, and it moves on from there.
+    expect(playback.frame(1000)).toBe(0);
+    expect(playback.frame(1100)).toBe(1);
+  });
+
+  it("keeps the place it had reached when the plan was not rebuilt", () => {
+    // The plan began before the avatar was hidden and was not rebuilt, so
+    // the time it had already played is kept and only the hidden time goes.
+    const playback = new AvatarPlayback([HOLD], 100, 0);
+    playback.skipHidden(200, 1000);
+    expect(playback.frame(1000)).toBe(2);
+    expect(playback.frame(1100)).toBe(3);
   });
 });

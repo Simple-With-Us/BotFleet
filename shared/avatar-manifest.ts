@@ -84,6 +84,18 @@ export type AvatarManifest = z.infer<typeof avatarManifestSchema>;
 export const AVATAR_ANY_STATE = "*";
 
 /**
+ * The largest manifest chunk the reader will look at, in bytes.
+ *
+ * A manifest names a handful of frame ranges, so a real one is a few kilobytes
+ * at most.  The chunk is not under the author's control at read time though:
+ * it is whatever bytes an upload happens to carry, and turning a huge chunk
+ * into text and parsing it as JSON would cost the browser far more than a
+ * manifest can ever be worth.  The cap is checked on the bytes, before they
+ * are decoded, so an oversized chunk costs nothing at all.
+ */
+export const AVATAR_MANIFEST_MAX_BYTES = 64 * 1024;
+
+/**
  * Read a manifest from its JSON text.
  *
  * The text is the boundary: the JSON is parsed and the shape is checked here,
@@ -172,11 +184,14 @@ export function planAvatarSteps(
   if (to?.hold) {
     steps.push({ range: clampRange(to.hold, manifest.frame.count), mode: "loop", reason: "hold" });
   } else {
-    steps.push({
-      range: { from: manifest.restingFrame, to: manifest.restingFrame },
-      mode: "loop",
-      reason: "resting",
-    });
+    // The resting frame is clamped like every other range.  A manifest that
+    // names a frame the file does not have would otherwise point the player
+    // at a frame that is not there.
+    const resting = clampRange(
+      { from: manifest.restingFrame, to: manifest.restingFrame },
+      manifest.frame.count,
+    );
+    steps.push({ range: resting, mode: "loop", reason: "resting" });
   }
   return steps;
 }
@@ -279,6 +294,10 @@ export function extractAvatarManifest(bytes: Buffer): AvatarManifest | null {
   if (!chunks) return null;
   const chunk = chunks.find((entry) => entry.fourcc === AVATAR_MANIFEST_CHUNK);
   if (!chunk) return null;
+  // The cap is checked on the bytes, before they are turned into text: an
+  // oversized chunk is refused without being decoded and without being
+  // parsed, so a crafted upload cannot make the browser do the work.
+  if (chunk.data.length > AVATAR_MANIFEST_MAX_BYTES) return null;
   try {
     return parseAvatarManifest(chunk.data.toString("utf8"));
   } catch {

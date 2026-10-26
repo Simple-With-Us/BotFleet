@@ -56,14 +56,20 @@ export function frameForStep(step: AvatarStep, elapsedMs: number, delayMs: numbe
 }
 
 /**
- * A step with a single frame has nothing to animate.
+ * A step that has nothing left to animate.
  *
- * The plan's resting step is exactly this: the manifest's resting frame, on
- * its own.  A player that keeps a requestAnimationFrame loop alive for it
- * would burn a frame of CPU per avatar for a picture that never changes.
+ * A single-frame LOOP is settled: the plan's resting step is exactly this,
+ * and a player that keeps a requestAnimationFrame loop alive for it would burn
+ * a frame of CPU per avatar for a picture that never changes.
+ *
+ * A single-frame TRANSITION is not settled.  It covers one frame, but it is
+ * still a step the plan has to move past, and calling it settled would stop
+ * the loop on the transition's first frame and never reach the hold behind
+ * it.  A transition that covers one frame is ordinary: an enter that lands on
+ * a single pose is how a lot of avatars are drawn.
  */
 export function isSettledStep(step: AvatarStep): boolean {
-  return stepFrameCount(step) <= 1;
+  return step.mode === "loop" && stepFrameCount(step) <= 1;
 }
 
 /**
@@ -146,8 +152,10 @@ export class AvatarPlayback {
   /**
    * True when the current step cannot animate any further.
    *
-   * A single-frame step is settled, and so is the end of the plan: there is
-   * nothing left to draw, and the caller can stop asking for frames.
+   * A single-frame loop is settled, and so is the end of the plan: there is
+   * nothing left to draw, and the caller can stop asking for frames.  A
+   * single-frame transition is not settled, because the plan still has to
+   * move past it.
    */
   get settled(): boolean {
     const step = this.step;
@@ -197,5 +205,20 @@ export class AvatarPlayback {
    */
   skip(ms: number): void {
     if (ms > 0) this.startedAt += ms;
+  }
+
+  /**
+   * Push the clock forward over the time the avatar was hidden.
+   *
+   * The plan may have been rebuilt while the avatar was away, and a rebuilt
+   * plan starts at the moment it was built.  Skipping the whole hidden time
+   * from a plan that began later would push the clock past the present, and
+   * the avatar would sit on the first frame forever.  So the skip starts at
+   * whichever is later: the moment the avatar was hidden, or the moment the
+   * plan began.
+   */
+  skipHidden(hiddenAt: number, now: number): void {
+    const from = Math.max(hiddenAt, this.startedAt);
+    if (now > from) this.startedAt += now - from;
   }
 }

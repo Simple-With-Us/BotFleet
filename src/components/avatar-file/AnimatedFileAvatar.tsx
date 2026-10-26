@@ -68,6 +68,15 @@ export function AnimatedFileAvatar({
   prefersReducedMotion = defaultPrefersReducedMotion,
 }: AnimatedFileAvatarProps) {
   const [mode, setMode] = useState<AvatarPlaybackMode>("plain-image");
+  // The mode belongs to the file that is on screen.  A new file is a new
+  // avatar, so the mode of the old one cannot outlive it: without this the
+  // canvas of the previous file stays on screen, showing its last frame,
+  // while the new file has not even been read yet.
+  const [modeSrc, setModeSrc] = useState(src);
+  if (modeSrc !== src) {
+    setModeSrc(src);
+    setMode("plain-image");
+  }
   const playerRef = useRef<AvatarFilePlayer | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -112,7 +121,11 @@ export function AnimatedFileAvatar({
     });
     playerRef.current = player;
     player.setState(stateRef.current);
-    void player.load(src);
+    // A file that cannot be read leaves the plain image path to report it,
+    // so a rejected read must not become an unhandled rejection.
+    void player.load(src).catch((error) => {
+      console.warn("avatar file could not be played", error);
+    });
     return () => {
       player.dispose();
       if (playerRef.current === player) playerRef.current = null;

@@ -173,6 +173,10 @@ export class AvatarFilePlayer {
   private readonly options: AvatarFilePlayerOptions;
   private manifest: AvatarManifest | null = null;
   private decoder: AvatarFrameDecoder | null = null;
+  /** Whether the browser can hand out frames, even while the decoder is closed. */
+  private canDecode = false;
+  /** The file's bytes, kept so the decoder can be opened again. */
+  private bytes: Uint8Array | null = null;
   private mode: AvatarPlaybackMode = "plain-image";
   private reducedMotion: boolean;
   private animated: boolean;
@@ -218,6 +222,10 @@ export class AvatarFilePlayer {
     const manifest = extractAvatarManifest(toManifestBytes(bytes));
     if (!manifest) return;
     this.manifest = manifest;
+    // The bytes are kept because they are far smaller than the decoded frames
+    // and the decoder has to be opened again every time the avatar comes back
+    // on screen.
+    this.bytes = bytes;
     const decoder = await this.options.createDecoder(bytes);
     if (this.disposed) {
       decoder?.close();
@@ -229,6 +237,7 @@ export class AvatarFilePlayer {
       return;
     }
     this.decoder = decoder;
+    this.canDecode = true;
     this.applyMode();
   }
 
@@ -270,12 +279,61 @@ export class AvatarFilePlayer {
     if (!visible) {
       this.hiddenAt = this.options.now();
       this.stopLoop();
+      // The decoder holds the file in memory for as long as it is open, and
+      // an avatar that is off screen is not drawing anything.  The bytes are
+      // kept, so the decoder is cheap to open again when the avatar comes
+      // back.
+      this.releaseDecoder();
       return;
     }
     const hiddenAt = this.hiddenAt;
     this.hiddenAt = null;
-    if (hiddenAt !== null) this.playback?.skip(this.options.now() - hiddenAt);
-    this.startLoop();
+    // The plan may have been rebuilt while the avatar was away, so the skip
+    // starts at the later of the two moments and the clock cannot end up in
+    // the future.
+    if (hiddenAt !== null) this.playback?.skipHidden(hiddenAt, this.options.now());
+    // A still avatar has nothing to animate, so it gets no loop.
+    if (this.mode === "animated" && this.decoder) this.startLoop();
+    void this.restoreDecoder();
+  }
+
+  /**
+   * Open the decoder again after the avatar came back on screen.
+   *
+   * The decoder was given back when the avatar went off screen, so it has to
+   * be opened again before anything can be drawn.  A browser that will not
+   * hand out frames any more is the plain-image path, which is where the
+   * file has always played when it cannot be taken apart.
+   */
+  private async restoreDecoder(): Promise<void> {
+    if (this.disposed || this.decoder) return;
+    const bytes = this.bytes;
+    if (!bytes) return;
+    const decoder = await this.options.createDecoder(bytes);
+    if (this.disposed) {
+      decoder?.close();
+      return;
+    }
+    if (!decoder) {
+      this.canDecode = false;
+      this.applyMode();
+      return;
+    }
+    this.decoder = decoder;
+    this.canDecode = true;
+    if (this.mode === "still-frame") {
+      this.requestFrame(this.manifest?.restingFrame ?? 0);
+      return;
+    }
+    if (this.mode === "animated") this.startLoop();
+  }
+
+  /** Give the decoder back, because it holds the file in memory while it is open. */
+  private releaseDecoder(): void {
+    const decoder = this.decoder;
+    if (!decoder) return;
+    this.decoder = null;
+    decoder.close();
   }
 
   /** Draw the current frame again, after the surface changed. */
@@ -300,8 +358,9 @@ export class AvatarFilePlayer {
   dispose(): void {
     this.disposed = true;
     this.stopLoop();
-    this.decoder?.close();
-    this.decoder = null;
+    this.releaseDecoder();
+    this.canDecode = false;
+    this.bytes = null;
     this.manifest = null;
     this.playback = null;
   }
@@ -309,7 +368,7 @@ export class AvatarFilePlayer {
   private computeMode(): AvatarPlaybackMode {
     return playbackModeFor({
       hasManifest: this.manifest !== null,
-      hasDecoder: this.decoder !== null,
+      hasDecoder: this.canDecode,
       reducedMotion: this.reducedMotion,
       animated: this.animated,
     });
@@ -403,7 +462,13 @@ export class AvatarFilePlayer {
       } finally {
         this.decoding = false;
       }
-    })();
+    })().catch((error) => {
+      // A decode that rejects must not become an unhandled rejection: the
+      // avatar keeps the last frame it managed to draw, and the queue is
+      // emptied so a later tick starts from a clean state.
+      this.pendingFrame = null;
+      console.warn("avatar frame could not be decoded", error);
+    });
   }
 
   private async drawFrame(frameIndex: number): Promise<void> {
