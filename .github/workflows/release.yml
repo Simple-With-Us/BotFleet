@@ -226,16 +226,25 @@ jobs:
             echo "::error::cloudflared is not signed by the app's Developer ID team in $app"; exit 1; }
           echo "ok: $app"
 
-      - name: "Gate: the packaged server starts and every helper path resolves"
+      - name: "Gate: the packaged server starts and every helper path resolves (runtime pass or bundle check)"
         env:
           MAC_APP: ${{ matrix.app }}
           CLOUDFLARED_ARCH: ${{ matrix.cloudflared_arch }}
         run: |
           app="$MAC_APP"
           res="$app/Contents/Resources"
-          # the server tree is plain JS — runnable on the runner's node
-          # regardless of the app binary's arch
-          OMB_SMOKE_DIST="$res/server" node scripts/smoke-packaged-server.mjs \
+          # BF-1991: the server tree is plain JS, so it starts on the runner's
+          # Node whatever the app binary's arch -- but that is a BUNDLE CHECK,
+          # not a runtime pass.  When this host can exec the packaged binary
+          # (the arm64 entry on an arm64 runner) the gate boots it under
+          # ELECTRON_RUN_AS_NODE=1, which is the runtime the shipped app uses.
+          # The x64 entry cannot exec its own binary here, so it runs and is
+          # LABELLED a bundle check.  Never read a bundle check as a runtime
+          # pass.
+          node scripts/smoke-runtime-mode.mjs gate \
+            --app "$app" \
+            --dist "$res/server" \
+            --summary "$GITHUB_STEP_SUMMARY" \
             || { echo "::error::packaged server in $app failed to start"; exit 1; }
           node --input-type=module - "$res/server" <<'EOF'
           import { existsSync } from "node:fs";
