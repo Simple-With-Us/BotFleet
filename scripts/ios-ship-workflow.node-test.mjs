@@ -784,28 +784,88 @@ test("every ship submits the newest build for Beta App Review to the external gr
   assert.match(branch, /submitted \$\{buildLabel\} for Beta App Review/);
 });
 
-test("the ship no longer claims internal testers can install when none exist", () => {
+test("the ship readiness is external installability, and never prints a false success line", () => {
   const sh = read("scripts/ios-fleet/ship-testflight.sh");
   const mjs = read("scripts/ios-fleet/asc-api.mjs");
-  // asc-api exits 5 only when the count was READ and is zero.
-  assert.match(mjs, /process\.exit\(nobody \? 5 : internalTesters\.ok \? 0 : 6\)/);
-  assert.match(mjs, /const nobody = internalTesters\.ok && internalTesters\.testers === 0;/);
+  // Owner directive 2026-10-18/19: public external testing only, so there is no
+  // internal group to count.  ensure-tf-ready decides rc=0/5/6 from the shipped
+  // build's external-group assignment and public-link state instead.
+  const readyBranch = mjs.slice(mjs.indexOf('method === "ensure-tf-ready"'));
+  assert.doesNotMatch(readyBranch, /countInternalTesters\(/);
+  assert.match(readyBranch, /externalInstallability\(/);
+  assert.match(readyBranch, /process\.exit\(nobody \? 5 : reach\.ok \? 0 : 6\)/);
   // The wrapper turns rc=5 into a warning plus a CI annotation, not a success line.
-  const rc5 = sh.slice(sh.indexOf("if [[ $rc -eq 5 ]]"), sh.indexOf("if [[ $rc -eq 3 ]]"));
-  assert.match(rc5, /has no internal TestFlight tester/);
-  assert.match(rc5, /::warning title=TestFlight has no internal tester::/);
-  assert.doesNotMatch(rc5, /internal testers can install this build/);
-  // An unreadable count (rc=6) must not print the success line either.
+  const rc5 = sh.slice(sh.indexOf("if [[ $rc -eq 5 ]]"), sh.indexOf("if [[ $rc -eq 6 ]]"));
+  assert.match(rc5, /no external TestFlight group with testers or a public link/);
+  assert.match(rc5, /::warning title=TestFlight has no reachable external tester::/);
+  assert.doesNotMatch(rc5, /can install this build/);
+  // An unreadable read (rc=6) must not print the success line either.
   const rc6 = sh.slice(sh.indexOf("if [[ $rc -eq 6 ]]"), sh.indexOf("if [[ $rc -eq 3 ]]"));
   assert.match(rc6, /installability is unverified/);
   assert.match(rc6, /::warning title=TestFlight installability unverified::/);
-  assert.doesNotMatch(rc6, /internal testers can install this build/);
-  // The only place the success line is printed is the rc=0 branch.
-  assert.equal(sh.split("TestFlight internal testers can install this build").length - 1, 1);
-  // Owner directive 2026-10-18/19: public external testing only.  The sync
-  // step must NOT re-create the internal group; the function itself stays
-  // for flows that need an internal group on purpose.
+  assert.doesNotMatch(rc6, /can install this build/);
+  // The only success line is the rc=0 branch, and it names external testing.
+  assert.equal(sh.split("TestFlight external testers can install this build after Beta App Review").length - 1, 1);
+  assert.doesNotMatch(sh, /TestFlight internal testers can install this build/);
+  // The sync step must NOT re-create the internal group; it deletes leftovers.
   const syncBranch = mjs.slice(mjs.indexOf('method === "ensure-standing-testers"'), mjs.indexOf('method === "ensure-tf-ready"'));
   assert.doesNotMatch(syncBranch, /await ensureInternalTesterGroup\(/);
+  assert.match(syncBranch, /await deleteInternalGroups\(/);
+  // ensureInternalTesterGroup stays exported: this repo's own suite is its
+  // living consumer (see the behavior tests above).
   assert.match(mjs, /export async function ensureInternalTesterGroup\(/);
+});
+
+test("deleteInternalGroups deletes only internal groups, tolerates 404, and warns instead of throwing on failure", async () => {
+  const { deleteInternalGroups } = await import("./ios-fleet/asc-api.mjs");
+  const logs = [];
+  const log = (m) => logs.push(m);
+  const warn = (m) => logs.push("WARN " + m);
+  const group = (id, name, internal) => ({ id, type: "betaGroups", attributes: { name, isInternalGroup: internal } });
+  const listRes = (data) => ({ status: 200, ok: true, parsed: { data }, text: "" });
+
+  const deleted = [];
+  const api = async (method, path) => {
+    if (method === "GET") return listRes([group("g-int", "Internal Testers", true), group("g-ext", "Public Beta", false)]);
+    if (method === "DELETE") { deleted.push(path); return { status: 204, ok: true, parsed: {}, text: "" }; }
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  assert.deepEqual(await deleteInternalGroups({ api, appId: "1", log, warn }), { deleted: 1, failed: 0 });
+  assert.deepEqual(deleted, ["/v1/betaGroups/g-int"], "the external group is untouched");
+
+  const gone = async (method) => method === "GET" ? listRes([group("g1", "Internal Testers", true)]) : { status: 404, ok: false, parsed: {}, text: "" };
+  assert.deepEqual(await deleteInternalGroups({ api: gone, appId: "1", log, warn }), { deleted: 1, failed: 0 }, "an already-gone group counts as deleted");
+
+  const failing = async (method) => method === "GET" ? listRes([group("g1", "Internal Testers", true)]) : { status: 500, ok: false, parsed: { errors: [{ detail: "boom" }] }, text: "" };
+  assert.deepEqual(await deleteInternalGroups({ api: failing, appId: "1", log, warn }), { deleted: 0, failed: 1 }, "a failed delete warns, never throws");
+});
+
+test("externalInstallability follows the external-group/public-link policy", async () => {
+  const { externalInstallability } = await import("./ios-fleet/asc-api.mjs");
+  const group = (id, name, internal, publicLink = false) => ({ id, type: "betaGroups", attributes: { name, isInternalGroup: internal, publicLinkEnabled: publicLink } });
+  const listRes = (data) => ({ status: 200, ok: true, parsed: { data }, text: "" });
+
+  // A public link alone makes the build installable, even with zero testers.
+  let calls = 0;
+  const linkOnly = async () => { calls += 1; return listRes([group("g1", "Public Beta", false, true)]); };
+  assert.deepEqual(await externalInstallability({ api: linkOnly, buildId: "b1" }).then((o) => ({ ok: o.ok, installable: o.installable })), { ok: true, installable: true });
+  assert.equal(calls, 1, "the public link short-circuits the tester read");
+
+  // Testers without a public link are installable; an empty group is not.
+  const withTesters = async (method, path) => path.includes("/betaTesters")
+    ? listRes([{ id: "t1", type: "betaTesters", attributes: { email: "a@b.c" } }])
+    : listRes([group("g1", "Public Beta", false, false)]);
+  assert.deepEqual(await externalInstallability({ api: withTesters, buildId: "b1" }).then((o) => ({ ok: o.ok, installable: o.installable })), { ok: true, installable: true });
+  const emptyGroup = async (method, path) => path.includes("/betaTesters") ? listRes([]) : listRes([group("g1", "Public Beta", false, false)]);
+  assert.deepEqual(await externalInstallability({ api: emptyGroup, buildId: "b1" }).then((o) => ({ ok: o.ok, installable: o.installable })), { ok: true, installable: false });
+
+  // Internal groups never count, even with testers.
+  const internalOnly = async () => listRes([group("g-int", "Internal Testers", true)]);
+  assert.deepEqual(await externalInstallability({ api: internalOnly, buildId: "b1" }).then((o) => ({ ok: o.ok, installable: o.installable })), { ok: true, installable: false });
+
+  // A failed read is ok:false, which is not the same as uninstallable.
+  const failing = async () => ({ status: 401, ok: false, parsed: { errors: [{ detail: "denied" }] }, text: "" });
+  const out = await externalInstallability({ api: failing, buildId: "b1" });
+  assert.equal(out.ok, false);
+  assert.equal(out.installable, false);
 });
