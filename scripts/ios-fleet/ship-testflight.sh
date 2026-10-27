@@ -826,6 +826,52 @@ project_marketing_seq() {
 # App Store versions AND the TestFlight trains, drift trains ignored.
 # Returns 1 (and prints nothing) when ASC cannot be consulted:  the caller
 # must distinguish "no versions yet" (0) from "unknown" (failure).
+asc_next_dotted_build() {
+  local version="$1" plat="${2:-}" out rc
+  command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
+  # Not load_secrets: both helpers run inside command substitutions, where a
+  # secrets temp dir and its EXIT trap die with the subshell and leave the
+  # key behind.  asc-api.mjs resolves its own credential.
+  asc_credential_available || return 1
+  set +e
+  out=$(asc_client next-dotted-build "$BUNDLE_ID" "$version" "$plat" "${APPLE_ID:-}")
+  rc=$?
+  set -e
+  [[ $rc -eq 0 && "$out" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  printf '%s' "$out"
+}
+
+asc_released_store_version() {
+  local plat="${1:-}" out rc
+  command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
+  # Not load_secrets: both helpers run inside command substitutions, where a
+  # secrets temp dir and its EXIT trap die with the subshell and leave the
+  # key behind.  asc-api.mjs resolves its own credential.
+  asc_credential_available || return 1
+  # Keep the client's stderr: it carries the reason (HTTP status, unknown
+  # state).  Only the labelled lines are logged, never key material, and an
+  # auth failure keeps its own status 4.
+  local errf errf_root
+  errf_root="$(asc_temp_root)" || {
+    logerr "asc-released: TMPDIR resolves to the filesystem root; refusing to write there"
+    return 1
+  }
+  errf="$(mktemp "${errf_root}/asc-released-err.XXXXXX")"
+  set +e
+  out=$(asc_client released-store-version "$BUNDLE_ID" "$plat" "${APPLE_ID:-}" 2>"$errf")
+  rc=$?
+  set -e
+  if [[ -s "$errf" ]]; then
+    while IFS= read -r _pl; do
+      case "$_pl" in asc-auth:*|released-store-version:*) logerr "asc-released: ${_pl}" ;; esac
+    done <"$errf"
+  fi
+  rm -f "$errf" >/dev/null 2>&1 || true
+  [[ $rc -eq 4 ]] && return 4
+  [[ $rc -eq 0 ]] || return 1
+  printf '%s' "$out"
+}
+
 asc_latest_marketing_patch() {
   local prefix="$1" plat="${2:-}" out rc errf
   if ! command -v "$ASC_NODE" >/dev/null 2>&1; then
@@ -1155,6 +1201,12 @@ PROJECT_REL="$(json_get "$APP_KEY" projectRel)"
 PROJECT_REL_ALT="$(json_get "$APP_KEY" projectRelAlt)"
 XCODEGEN_DIR="$(json_get "$APP_KEY" xcodegenDir)"
 DEFAULT_MARKETING="$(json_get "$APP_KEY" marketingVersionDefault)"
+# Optional fixed-version policy (owner, 2026-10-26): the marketing version does
+# not count up per TestFlight ship; the build is a dotted M.m.<n> (see
+# asc-api.mjs next-dotted-build) that goes up inside the fixed train.  apps.json
+# key: fixedMarketingVersion ("1.1.2").  Absent key keeps the next-patch
+# behaviour.  Not used on macOS (builds must grow across all trains).
+FIXED_MARKETING="$(json_get "$APP_KEY" fixedMarketingVersion)"
 
 if [[ -z "$PLATFORM" ]]; then
   if [[ "$APP_KEY" == *-mac || "$SCHEME" == *[Mm]ac* ]]; then
@@ -1278,6 +1330,7 @@ PLAN_FLOOR="n/a"
 PLAN_TRAIN_FLOOR="n/a"
 PLAN_APP_FLOOR="n/a"
 PLAN_COMMIT_COUNT="n/a"
+FIXED_MODE=0
 PLAN_READY=0
 
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
@@ -1306,6 +1359,29 @@ else
   # ---- the marketing version ---------------------------------------------
   # --version is an exact override.  Otherwise the version is the next patch
   # on the default train, and P comes from App Store Connect.
+  FIXED_MODE=0
+  if [[ -n "$FIXED_MARKETING" && ( -z "$FORCE_VERSION" || "$FORCE_VERSION" == "$FIXED_MARKETING" ) ]]; then
+    [[ "$FIXED_MARKETING" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+      || die "fixedMarketingVersion '${FIXED_MARKETING}' for ${APP_KEY} in apps.json is not M.m.p (three dot-separated integers).  Nothing was shipped."
+    if [[ "$(printf '%s' "${ASC_PLATFORM:-}" | tr a-z A-Z)" == "MAC_OS" ]]; then
+      die "fixedMarketingVersion is not supported on macOS:  Mac builds must grow across every train, so a dotted build under a fixed version cannot be ordered safely.  Nothing was shipped."
+    fi
+    FORCE_VERSION="$FIXED_MARKETING"
+    FIXED_MODE=1
+    log "version: fixed marketing version ${FIXED_MARKETING} from apps.json; it does not count up per ship"
+    # A released App Store version closes its train:  a fixed version at or
+    # below one is refused, never silently bumped.
+    _rel="$(asc_released_store_version "$ASC_PLATFORM")" \
+      || die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
+    if [[ -n "$_rel" ]]; then
+      if ! python3 -c 'import sys
+a=[int(x) for x in sys.argv[1].split(".")]; b=[int(x) for x in sys.argv[2].split(".")]
+n=max(len(a),len(b)); a+= [0]*(n-len(a)); b+=[0]*(n-len(b))
+sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
+        die "fixedMarketingVersion ${FIXED_MARKETING} is at or below the released App Store version ${_rel}.  Apple requires each new version to be greater than the last released one.  Nothing was bumped.  Pick a version above ${_rel} in apps.json."
+      fi
+    fi
+  fi
   if [[ -n "$FORCE_VERSION" ]]; then
     MARKETING="$FORCE_VERSION"
     # The patch the operator pinned, on its own train ("2.0.5" -> 5).
@@ -1358,6 +1434,9 @@ else
 
   # ---- the build number ---------------------------------------------------
   if [[ -n "$FORCE_BUILD" ]]; then
+    if [[ "$FIXED_MODE" -eq 1 && ! "$FORCE_BUILD" =~ ^${MARKETING%.*}\.[0-9]+$ ]]; then
+      die "--build ${FORCE_BUILD} is not ${MARKETING%.*}.<n>:  in fixed-version mode the train holds only dotted builds of that shape, and a different one would block every later ship.  Pass --build ${MARKETING%.*}.<n> or leave --build off.  Nothing was shipped."
+    fi
     # An explicit --build is honoured exactly, and it does NOT move the
     # marketing version:  the two numbers are independent.
     BUILD_NUM="$FORCE_BUILD"
@@ -1368,6 +1447,16 @@ else
       die "--build ${BUILD_NUM} equals the patch of ${MARKETING}, which would ship ${MARKETING} (${BUILD_NUM}): the 1.0.N (N) form the owner retired (AFC-517).  Pass a different --build."
     fi
     log "version: operator override (--build/--version); the local build-seq counter is not consulted"
+  elif [[ "$FIXED_MODE" -eq 1 ]]; then
+    if [[ "$(printf '%s' "${ASC_PLATFORM:-}" | tr a-z A-Z)" == "MAC_OS" ]]; then
+      die "fixedMarketingVersion is not supported on macOS:  Mac builds must grow across every train, so a dotted build under a fixed version cannot be ordered safely.  Nothing was shipped."
+    fi
+    # The build reads like the version it ships under (1.1.2 (1.1.2)) and goes
+    # up inside the fixed train (1.1.3, 1.1.4, ...).  No floor, seed, count or
+    # patch bump applies:  the train itself is the only record.
+    BUILD_NUM="$(asc_next_dotted_build "$MARKETING" "$ASC_PLATFORM")" \
+      || die "cannot work out the next dotted build for ${MARKETING}: App Store Connect could not be read, or the train holds a build that is not ${MARKETING%.*}.<n>.  Nothing was shipped or guessed."
+    log "build: dotted build ${BUILD_NUM} for fixed version ${MARKETING}"
   else
     [[ "$PLAN_COMMIT_COUNT" =~ ^[0-9]+$ ]] || die "could not read the commit count from ${REPO_ROOT}; CFBundleVersion is the repo commit count and UTC timestamps are retired"
 
@@ -1423,7 +1512,7 @@ else
     # count -- so the log line names the floor rather than asserting the
     # commit count was shipped.
     BUILD_NUM="$PLAN_COMMIT_COUNT"
-    if [[ "$BUILD_NUM" -le "$PLAN_FLOOR" ]]; then
+    if [[ "$FIXED_MODE" -ne 1 && "$BUILD_NUM" -le "$PLAN_FLOOR" ]]; then
       BUILD_NUM="$((PLAN_FLOOR + 1))"
       log "build: floor ${PLAN_FLOOR} is at or above the commit count ${PLAN_COMMIT_COUNT}; using ${BUILD_NUM} instead"
     fi
