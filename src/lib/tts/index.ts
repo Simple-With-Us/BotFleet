@@ -90,6 +90,18 @@ export const MAX_SPEECH_QUEUE = 8;
 
 const IDLE: SpeechSnapshot = { status: "idle" };
 
+/**
+ * The bot whose voice is playing, or undefined when nobody's voice is.
+ *
+ * Narrow on purpose.  The snapshot is a window-wide singleton and it changes
+ * identity on every caption, so a screen full of avatars that subscribed to
+ * the whole of it would re-render on every line of a spoken reply.  A bot
+ * that is being prepared has not said anything yet, so it is not speaking.
+ */
+export function speakingBotId(snapshot: SpeechSnapshot): string | undefined {
+  return snapshot.status === "speaking" ? snapshot.botId : undefined;
+}
+
 /** One helper call speaks this much text.  Each call spawns the speech
  * helper once, so a reply is sent as a few paragraph-sized calls rather than
  * one per sentence, and stop still lands between them. */

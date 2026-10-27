@@ -9,7 +9,7 @@ import { createReceipt, validateReceipt } from './sentry-testflight-receipt.mjs'
 import { reportTestFlight } from './sentry-report-testflight.mjs';
 const sha = 'a'.repeat(40);
 const fixture = () => ({ archive: { bundleId:'app.botfleet.ios', marketingVersion:'1.0.79', buildNumber:'2126' },
-  readiness:{ok:true,version:'2126',buildId:'asc-build-123',internalBuildState:'IN_BETA_TESTING'},
+  readiness:{ok:true,version:'2126',buildId:'asc-build-123',internalBuildState:'IN_BETA_TESTING',externalInstallPath:true},
   sourceCommit:sha,expectedCommit:sha,bundleId:'app.botfleet.ios',marketingVersion:'1.0.79',buildNumber:'2126',now:new Date('2026-10-06T02:30:00.000Z') });
 const receipt = () => createReceipt(fixture());
 const root = new URL('../', import.meta.url);
@@ -20,7 +20,13 @@ const shellPath = path => path.replaceAll('\\', '/');
 
 test('receipt matches Cocoa SDK identity and exact archive, source, ASC build', () => {
   assert.equal(receipt().release, 'app.botfleet.ios@1.0.79+2126');
-  assert.equal(receipt().milestone, 'testflight-ready');
+  assert.equal(receipt().milestone, 'testflight-processed');
+  assert.equal(receipt().externalInstallPath, true);
+  // The receipt carries the app-level install path predicate it was gated on;
+  // a readiness file without it is not deployment evidence.
+  for (const bad of [false, null, undefined]) {
+    const f = fixture(); f.readiness.externalInstallPath = bad; assert.throws(() => createReceipt(f));
+  }
   for (const field of ['bundleId','marketingVersion','buildNumber']) {
     const f = fixture(); f.archive[field] = 'different'; assert.throws(() => createReceipt(f));
   }
