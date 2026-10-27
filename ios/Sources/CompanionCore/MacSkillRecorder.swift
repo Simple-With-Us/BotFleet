@@ -14,7 +14,7 @@ public enum MacSkillRecorder {
     public static let maxAudioBytes = 100_000_000
 
     private static let safeSlugRegex = try! NSRegularExpression(pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$")
-    private static let controlCharsRegex = try! NSRegularExpression(pattern: "[\\u0000-\\u001f]+")
+    private static let controlCharsRegex = try! NSRegularExpression(pattern: "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+")
     private static let nonAlphanumericRegex = try! NSRegularExpression(pattern: "[^a-z0-9]+")
 
     public enum EventType: String, Codable, Sendable {
@@ -222,7 +222,7 @@ public enum MacSkillRecorder {
         case .download:
             let filename = cleanText(event.filename, maxLen: 200)
             let origins = event.whereFroms ?? []
-            let originDesc = origins.first.map { " from \($0)" } ?? ""
+            let originDesc = origins.first.map { " from \(sanitizeDownloadOrigin($0))" } ?? ""
             return "A file (\(filename.isEmpty ? "unnamed" : filename)) was downloaded\(originDesc). Treat the file's origin as untrusted context."
         }
     }
@@ -330,9 +330,18 @@ public enum MacSkillRecorder {
         try FileManager.default.createDirectory(at: skillsDir, withIntermediateDirectories: true)
 
         let (targetId, targetDir) = try uniqueSkillDirectory(root: skillsDir, requestedName: name)
-        let tempDir = skillsDir.appendingPathComponent("\(targetId).creating-\(ProcessInfo.processInfo.processIdentifier)")
+        let tempDir = skillsDir.appendingPathComponent(".\(targetId).creating-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: tempDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
         let referencesDir = tempDir.appendingPathComponent("references", isDirectory: true)
-        try FileManager.default.createDirectory(at: referencesDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: referencesDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
 
         do {
             let incoming = payload.events
@@ -371,7 +380,15 @@ public enum MacSkillRecorder {
             var audioRef: String?
             if let audioBase64 = payload.audioBase64, let audioData = Data(base64Encoded: audioBase64) {
                 guard audioData.count <= maxAudioBytes else { throw RecorderError.audioExceedsLimit }
-                let ext = payload.audioMime == "audio/mp4" ? "m4a" : "webm"
+                let mime = payload.audioMime ?? ""
+                let ext: String
+                switch mime {
+                case "audio/mp4", "audio/m4a": ext = "m4a"
+                case "audio/webm", "audio/webm;codecs=opus": ext = "webm"
+                case "audio/mpeg", "audio/mp3": ext = "mp3"
+                case "": throw RecorderError.invalidAudioFormat
+                default: throw RecorderError.invalidAudioFormat
+                }
                 let audioFilename = "narration.\(ext)"
                 let audioUrl = referencesDir.appendingPathComponent(audioFilename)
                 try writePrivateFile(url: audioUrl, data: audioData)
@@ -388,7 +405,7 @@ public enum MacSkillRecorder {
                 "createdAt": ISO8601DateFormatter().string(from: Date()),
                 "durationMs": max(0, payload.durationMs),
                 "transcript": transcript,
-                "audio": audioRef as Any,
+                "audio": audioRef as Any? ?? NSNull(),
                 "truncated": truncated,
                 "omittedEvents": omittedEvents,
                 "privacy": [
@@ -436,12 +453,22 @@ public enum MacSkillRecorder {
     }
 
     private static func writePrivateFile(url: URL, data: Data) throws {
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        let created = FileManager.default.createFile(
+            atPath: url.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        )
+        guard created else {
+            throw NSError(domain: "MacSkillRecorder", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "could not create private file with 0600 permissions"
+            ])
+        }
     }
 
     private static func escapeYaml(_ string: String) -> String {
-        let escaped = string.replacingOccurrences(of: "\"", with: "\\\"")
+        let escaped = string
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
         return "\"\(escaped)\""
     }
 }

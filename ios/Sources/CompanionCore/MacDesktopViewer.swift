@@ -221,14 +221,10 @@ public enum MacDesktopViewer {
     }
 
     private static func originString(for raw: String) -> String? {
-        if let url = try? validateViewerUrl(raw) {
-            return originString(for: url)
-        }
-        if let u = URL(string: raw), let scheme = u.scheme, let host = u.host {
-            let portString = u.port.map { ":\($0)" } ?? ""
-            return "\(scheme.lowercased())://\(host.lowercased())\(portString)"
-        }
-        return nil
+        // Only validated origins match: no loose URL(string:) fallback that could
+        // accept http remotes outside the viewer lock.
+        guard let url = try? validateViewerUrl(raw) else { return nil }
+        return originString(for: url)
     }
 }
 
@@ -299,7 +295,10 @@ public actor NativeDesktopWorkspaceManager {
         partitionCounter += 1
         let partitionId = "botfleet-desktop-partition-\(partitionCounter)"
 
-        let origin = validatedUrl.scheme! + "://" + validatedUrl.host! + (validatedUrl.port.map { ":\($0)" } ?? "")
+        guard let scheme = validatedUrl.scheme, let host = validatedUrl.host else {
+            throw MacDesktopViewer.ViewerError.addressInvalid
+        }
+        let origin = scheme + "://" + host + (validatedUrl.port.map { ":\($0)" } ?? "")
         let entry = Entry(
             contextId: contextId,
             identity: identity,
@@ -334,18 +333,26 @@ public actor NativeDesktopWorkspaceManager {
         guard items.count <= MacDesktopViewer.maxWorkspaceViews else {
             throw MacDesktopViewer.ViewerError.tooManyViews
         }
+        // Validate every item before mutating entries so a bad rect cannot leave
+        // a half-applied layout.
         var seen = Set<String>()
+        var pending: [(String, CGRect, Bool)] = []
         for item in items {
             let contextId = try MacDesktopViewer.validateContextId(item.contextId)
             guard !seen.contains(contextId) else {
                 throw MacDesktopViewer.ViewerError.invalidContextId
             }
             seen.insert(contextId)
-            guard var entry = entries[contextId] else {
+            guard entries[contextId] != nil else {
                 throw MacDesktopViewer.ViewerError.slotNotOpen
             }
-            entry.bounds = try MacDesktopViewer.normalizeBounds(raw: item.bounds, ownerSize: ownerSize)
-            entry.isVisible = item.isVisible
+            let bounds = try MacDesktopViewer.normalizeBounds(raw: item.bounds, ownerSize: ownerSize)
+            pending.append((contextId, bounds, item.isVisible))
+        }
+        for (contextId, bounds, isVisible) in pending {
+            guard var entry = entries[contextId] else { continue }
+            entry.bounds = bounds
+            entry.isVisible = isVisible
             entries[contextId] = entry
         }
     }
