@@ -238,13 +238,13 @@ final class DesktopViewerAndSkillRecorderTests: XCTestCase {
             omittedEvents: 0
         )
 
-        XCTAssertTrue(md.contains("name: build-botfleet"))
+        XCTAssertTrue(md.contains("name: \"build-botfleet\""))
         XCTAssertTrue(md.contains("description: \"Demonstration of building BotFleet in Xcode\""))
         XCTAssertTrue(md.contains("# Build BotFleet"))
         XCTAssertTrue(md.contains("## User narration"))
         XCTAssertTrue(md.contains("Click the build button to trigger compilation."))
         XCTAssertTrue(md.contains("1. Open or focus Xcode — BotFleet.xcodeproj."))
-        XCTAssertTrue(md.contains("2. Click \"Build\" (AXButton) in Xcode. Review the recorded frame under the skill root at references/step-002.png"))
+        XCTAssertTrue(md.contains("2. Click \"Build\" (AXButton) in Xcode. Review the recorded frame under the skill root at references/step-002.png when visual context is useful."))
     }
 
     func testSaveSkillRecordingAtomicPackageCreationAnd0600Permissions() throws {
