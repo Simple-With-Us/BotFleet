@@ -141,8 +141,9 @@ jobs:
       - name: Fleet iOS version manifest publisher tests
         if: needs.changes.outputs.docs_only != 'true'
         run: |
-          node --test scripts/ios-fleet/publish-ios-versions.test.mjs
+          node --test scripts/ios-fleet/publish-ios-versions.node-test.mjs
           bash -n scripts/ios-fleet/publish-ios-versions.sh
+          bash scripts/ios-fleet/test-ipa-manifest-versions.sh
       - if: needs.changes.outputs.docs_only != 'true'
         run: pnpm check:electron
       - name: production UI build

@@ -1045,6 +1045,29 @@ evaluate_ship_gate() {
   log "ship-gate: ok — ${elapsed}s since last ship (min ${min_sec}s from ${min_src}); HEAD ${head_sha:0:10}"
 }
 
+# "<marketing> <build>" from an IPA's Info.plist, only when its bundle id is the
+# expected one.  Fails (prints nothing) on anything else.  Never guesses.
+ipa_manifest_versions() {
+  local ipa="$1" want="$2"
+  [[ -f "$ipa" && -n "$want" ]] || return 1
+  python3 - "$ipa" "$want" <<'PY'
+import plistlib, re, sys, zipfile
+ipa, want = sys.argv[1:3]
+try:
+    z = zipfile.ZipFile(ipa)
+    names = [n for n in z.namelist() if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", n)]
+    if len(names) != 1:
+        sys.exit(1)
+    info = plistlib.loads(z.read(names[0]))
+except Exception:
+    sys.exit(1)
+ver, build, bid = info.get("CFBundleShortVersionString"), info.get("CFBundleVersion"), info.get("CFBundleIdentifier")
+if bid != want or not ver or not build or re.search(r"\s", ver + build):
+    sys.exit(1)
+print(ver, build)
+PY
+}
+
 record_successful_ship() {
   local path head_sha now
   path="$(ship_state_path)"
@@ -1057,6 +1080,22 @@ record_successful_ship() {
   log "ship-gate: recorded success ts=${now} sha=${head_sha:0:10} -> ${path}"
   # Public version manifest for the in-app update prompt.  Best-effort —
   # a publish miss must never fail a ship that already uploaded.
+  # --upload-only reuses an IPA whose versions this run never read, so
+  # MARKETING and BUILD_NUM hold a placeholder.  The placeholder must never
+  # reach the manifest:  read the real versions out of the IPA's Info.plist,
+  # and skip the publish when that cannot be done or names another app.
+  if [[ "${MARKETING:-}" == "(from IPA)" || "${BUILD_NUM:-}" == "(from IPA)" ]]; then
+    local ipa_ver
+    if [[ -n "${UPLOAD_ONLY_IPA:-}" ]] && ipa_ver="$(ipa_manifest_versions "$UPLOAD_ONLY_IPA" "${BUNDLE_ID:-}")" && [[ -n "$ipa_ver" ]]; then
+      MARKETING="${ipa_ver%% *}"
+      BUILD_NUM="${ipa_ver#* }"
+      log "version-manifest: --upload-only versions read from the IPA (${MARKETING} build ${BUILD_NUM})"
+    else
+      MARKETING=""
+      BUILD_NUM=""
+      log "version-manifest: skipped (--upload-only and the IPA's versions could not be read for ${BUNDLE_ID:-?})"
+    fi
+  fi
   if [[ -n "${BUNDLE_ID:-}" && -n "${MARKETING:-}" ]]; then
     local apple_id display pub_out pr_url
     local -a pub_args
