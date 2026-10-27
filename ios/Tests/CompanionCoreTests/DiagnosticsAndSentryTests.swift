@@ -10,7 +10,7 @@ final class DiagnosticsAndSentryTests: XCTestCase {
         XCTAssertTrue(DiagnosticsReporter.credentialEnvNames.contains("MINIMAX_API_KEY"))
         XCTAssertTrue(DiagnosticsReporter.credentialEnvNames.contains("INFISICAL_CLIENT_SECRET"))
         XCTAssertTrue(DiagnosticsReporter.credentialEnvNames.contains("INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"))
-        XCTAssertEqual(DiagnosticsReporter.credentialEnvNames.count, 25)
+        XCTAssertEqual(DiagnosticsReporter.credentialEnvNames.count, 27)
     }
 
     func testRedactsCredentialEnvVarsInText() {
