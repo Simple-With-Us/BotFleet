@@ -128,6 +128,7 @@ public enum MacSkillRecorder {
         case tooManySkillsWithSameName
         case invalidAudioFormat
         case imageExceedsLimit
+        case invalidImageData
         case audioExceedsLimit
 
         public var errorDescription: String? {
@@ -142,13 +143,14 @@ public enum MacSkillRecorder {
                 return "The audio attachment format is invalid"
             case .imageExceedsLimit:
                 return "Screenshot frame exceeds 2 MB limit"
+            case .invalidImageData:
+                return "Screenshot frame could not be decoded"
             case .audioExceedsLimit:
                 return "Audio recording exceeds 100 MB limit"
             }
         }
     }
 
-    /// Sanitizes plain text by collapsing control characters into spaces and trimming.
     /// Keep only http(s) origins without userinfo/query/fragment for SKILL.md.
     public static func sanitizeDownloadOrigin(_ raw: String, maxLen: Int = 200) -> String {
         let cleaned = cleanText(raw, maxLen: maxLen)
@@ -156,8 +158,10 @@ public enum MacSkillRecorder {
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
               url.user == nil,
+              url.password == nil,
               let host = url.host, !host.isEmpty else {
-            return cleanText(cleaned, maxLen: 80)
+            // Never persist a raw fallback that may still carry userinfo.
+            return ""
         }
         var components = URLComponents()
         components.scheme = scheme
@@ -390,14 +394,14 @@ public enum MacSkillRecorder {
                     // Reject oversized encoded payloads before allocating a decoded buffer.
                     let maxEncoded = (maxImageBytes * 4) / 3 + 8
                     guard base64.utf8.count <= maxEncoded else { throw RecorderError.imageExceedsLimit }
-                    guard let imageData = Data(base64Encoded: base64) else {
-                        throw RecorderError.imageExceedsLimit
+                    if let imageData = Data(base64Encoded: base64) {
+                        guard imageData.count <= maxImageBytes else { throw RecorderError.imageExceedsLimit }
+                        let filename = String(format: "step-%03d.png", index + 1)
+                        let fileUrl = referencesDir.appendingPathComponent(filename)
+                        try writePrivateFile(url: fileUrl, data: imageData)
+                        event.reference = "references/\(filename)"
                     }
-                    guard imageData.count <= maxImageBytes else { throw RecorderError.imageExceedsLimit }
-                    let filename = String(format: "step-%03d.png", index + 1)
-                    let fileUrl = referencesDir.appendingPathComponent(filename)
-                    try writePrivateFile(url: fileUrl, data: imageData)
-                    event.reference = "references/\(filename)"
+                    // Corrupt base64: keep the event, omit only the screenshot reference.
                 }
                 processedEvents.append(event)
             }
