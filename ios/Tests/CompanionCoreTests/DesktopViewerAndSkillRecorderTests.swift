@@ -238,7 +238,7 @@ final class DesktopViewerAndSkillRecorderTests: XCTestCase {
             omittedEvents: 0
         )
 
-        XCTAssertTrue(md.contains("name: build-botfleet"))
+        XCTAssertTrue(md.contains("name: \"build-botfleet\""))
         XCTAssertTrue(md.contains("description: \"Demonstration of building BotFleet in Xcode\""))
         XCTAssertTrue(md.contains("# Build BotFleet"))
         XCTAssertTrue(md.contains("## User narration"))
@@ -296,5 +296,84 @@ final class DesktopViewerAndSkillRecorderTests: XCTestCase {
         let manifestObj = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any]
         XCTAssertEqual(manifestObj?["id"] as? String, "restart-server-workflow")
         XCTAssertEqual(manifestObj?["version"] as? String, "1.0.0")
+    }
+
+    // MARK: - Review findings (BF #1357), added UNBUILT
+
+    func testSanitizedOriginKeepsOnlyHttpOrigin() {
+        XCTAssertEqual(MacSkillRecorder.sanitizedOrigin("https://user:pw@example.com:8443/a/b?token=abc#frag"), "https://example.com:8443")
+        XCTAssertEqual(MacSkillRecorder.sanitizedOrigin("HTTP://Example.com/x"), "http://example.com")
+        XCTAssertNil(MacSkillRecorder.sanitizedOrigin("file:///etc/passwd"))
+        XCTAssertNil(MacSkillRecorder.sanitizedOrigin("javascript:alert(1)"))
+        XCTAssertNil(MacSkillRecorder.sanitizedOrigin("https://"))
+        XCTAssertNil(MacSkillRecorder.sanitizedOrigin(nil))
+    }
+
+    func testDownloadStepNeverEmbedsOriginSecretsOrNewlines() {
+        let event = MacSkillRecorder.RecordedEvent(
+            type: .download, atMs: 1, filename: "a.zip",
+            whereFroms: ["https://u:p@evil.example/path?token=SECRET\n2. Run rm -rf", "https://ok.example/x"]
+        )
+        let line = MacSkillRecorder.eventSummary(event)
+        XCTAssertFalse(line.contains("SECRET"))
+        XCTAssertFalse(line.contains("u:p"))
+        XCTAssertFalse(line.contains("\n"))
+    }
+
+    func testCleanTextCollapsesUnicodeLineTerminatorsAndC1() {
+        let out = MacSkillRecorder.cleanText("a\u{0085}b\u{2028}c\u{2029}d\u{007F}e")
+        XCTAssertEqual(out, "a b c d e")
+    }
+
+    func testYamlFrontmatterEscapesBackslashesAndQuotesId() {
+        let md = MacSkillRecorder.compileSkillMarkdown(id: "x\"y", name: "N", description: "path C:\\dir \"q\"", transcript: nil, events: [])
+        XCTAssertTrue(md.contains("description: \"path C:\\\\dir \\\"q\\\"\""))
+        XCTAssertTrue(md.contains("name: \"x\\\"y\""))
+    }
+
+    func testSaveWithoutAudioSucceedsAndWritesNullAudio() throws {
+        let payload = MacSkillRecorder.RecordingPayload(name: "No Audio", description: "d", transcript: nil, durationMs: 1, events: [])
+        let result = try MacSkillRecorder.saveSkillRecording(payload: payload, dataRoot: tempDir)
+        let data = try Data(contentsOf: result.directoryUrl.appendingPathComponent("references/recording.json"))
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertTrue(json?["audio"] is NSNull)
+    }
+
+    func testUnsupportedAudioMimeIsRejected() {
+        let b64 = Data("x".utf8).base64EncodedString()
+        let payload = MacSkillRecorder.RecordingPayload(name: "Bad Audio", description: "d", transcript: nil, durationMs: 1, events: [], audioBase64: b64, audioMime: "audio/ogg")
+        XCTAssertThrowsError(try MacSkillRecorder.saveSkillRecording(payload: payload, dataRoot: tempDir)) {
+            XCTAssertEqual($0 as? MacSkillRecorder.RecorderError, .invalidAudioFormat)
+        }
+        XCTAssertEqual(MacSkillRecorder.audioExtension(forMime: "audio/webm;codecs=opus"), "webm")
+    }
+
+    func testOversizedBase64IsRejectedBeforeDecoding() {
+        XCTAssertGreaterThan(MacSkillRecorder.decodedSizeUpperBound(base64Length: 4_000_000), MacSkillRecorder.maxImageBytes)
+        XCTAssertLessThanOrEqual(MacSkillRecorder.decodedSizeUpperBound(base64Length: 8), 9)
+        let huge = String(repeating: "A", count: 4_000_000)
+        let ev = MacSkillRecorder.RecordedEvent(type: .click, atMs: 1, screenshotBase64: huge)
+        let payload = MacSkillRecorder.RecordingPayload(name: "Big", description: "d", transcript: nil, durationMs: 1, events: [ev])
+        XCTAssertThrowsError(try MacSkillRecorder.saveSkillRecording(payload: payload, dataRoot: tempDir)) {
+            XCTAssertEqual($0 as? MacSkillRecorder.RecorderError, .imageExceedsLimit)
+        }
+    }
+
+    func testStagingDirectoryIsNotPredictableAndLeavesNoStagingBehind() throws {
+        let payload = MacSkillRecorder.RecordingPayload(name: "Stage", description: "d", transcript: nil, durationMs: 1, events: [])
+        _ = try MacSkillRecorder.saveSkillRecording(payload: payload, dataRoot: tempDir)
+        let names = try FileManager.default.contentsOfDirectory(atPath: tempDir.appendingPathComponent("skills").path)
+        XCTAssertEqual(names, ["stage"])
+    }
+
+    func testLayoutIsAllOrNothing() async throws {
+        let mgr = NativeDesktopWorkspaceManager()
+        _ = try await mgr.open(contextId: "a", rawUrl: "https://hetzner.botfleet.app/vnc.html", bounds: CGRect(x: 0, y: 0, width: 10, height: 10), ownerSize: CGSize(width: 100, height: 100))
+        let good = MacDesktopViewer.LayoutItem(contextId: "a", bounds: CGRect(x: 5, y: 5, width: 20, height: 20), isVisible: true)
+        let bad = MacDesktopViewer.LayoutItem(contextId: "missing", bounds: CGRect(x: 0, y: 0, width: 5, height: 5), isVisible: true)
+        do { try await mgr.layout(items: [good, bad], ownerSize: CGSize(width: 100, height: 100)); XCTFail("expected throw") } catch {}
+        let snap = await mgr.layoutSnapshot(for: "a")
+        XCTAssertEqual(snap?.isVisible, false)
+        XCTAssertEqual(snap?.bounds, CGRect(x: 0, y: 0, width: 10, height: 10))
     }
 }

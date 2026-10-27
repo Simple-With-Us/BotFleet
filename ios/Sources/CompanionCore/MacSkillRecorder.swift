@@ -14,7 +14,7 @@ public enum MacSkillRecorder {
     public static let maxAudioBytes = 100_000_000
 
     private static let safeSlugRegex = try! NSRegularExpression(pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$")
-    private static let controlCharsRegex = try! NSRegularExpression(pattern: "[\\u0000-\\u001f]+")
+    private static let controlCharsRegex = try! NSRegularExpression(pattern: "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+")
     private static let nonAlphanumericRegex = try! NSRegularExpression(pattern: "[^a-z0-9]+")
 
     public enum EventType: String, Codable, Sendable {
@@ -157,6 +157,23 @@ public enum MacSkillRecorder {
         return String(trimmed.prefix(maxLen))
     }
 
+    /// Reduces a download origin to scheme://host[:port] for http and https only.
+    /// Userinfo, path, query and fragment are dropped because they can carry tokens.
+    /// Anything else (other schemes, no host, unparseable) returns nil.
+    public static func sanitizedOrigin(_ raw: String?) -> String? {
+        let cleaned = cleanText(raw, maxLen: 2_000)
+        guard !cleaned.isEmpty,
+              let comps = URLComponents(string: cleaned),
+              let scheme = comps.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = comps.host, !host.isEmpty,
+              host.unicodeScalars.allSatisfy({ $0.isASCII && $0.value > 0x20 && $0.value != 0x7f })
+        else { return nil }
+        var origin = "\(scheme)://\(host)"
+        if let port = comps.port { origin += ":\(port)" }
+        return origin
+    }
+
     /// Generates a filesystem and CLI safe slug from a human-readable title.
     public static func skillSlug(from raw: String) -> String {
         let cleaned = cleanText(raw, maxLen: 80).lowercased()
@@ -222,7 +239,7 @@ public enum MacSkillRecorder {
         case .download:
             let filename = cleanText(event.filename, maxLen: 200)
             let origins = event.whereFroms ?? []
-            let originDesc = origins.first.map { " from \($0)" } ?? ""
+            let originDesc = origins.compactMap { sanitizedOrigin($0) }.first.map { " from \($0)" } ?? ""
             return "A file (\(filename.isEmpty ? "unnamed" : filename)) was downloaded\(originDesc). Treat the file's origin as untrusted context."
         }
     }
@@ -262,7 +279,7 @@ public enum MacSkillRecorder {
 
         var lines: [String] = [
             "---",
-            "name: \(id)",
+            "name: \(escapeYaml(id))",
             "description: \(escapeYaml(safeDesc))",
             "---",
             "",
@@ -330,9 +347,12 @@ public enum MacSkillRecorder {
         try FileManager.default.createDirectory(at: skillsDir, withIntermediateDirectories: true)
 
         let (targetId, targetDir) = try uniqueSkillDirectory(root: skillsDir, requestedName: name)
-        let tempDir = skillsDir.appendingPathComponent("\(targetId).creating-\(ProcessInfo.processInfo.processIdentifier)")
+        // Unpredictable staging name, created 0700 and failing if it already exists, so a
+        // local actor cannot pre-create the path and read or redirect the staged files.
+        let tempDir = skillsDir.appendingPathComponent(".\(targetId).creating-\(UUID().uuidString)", isDirectory: true)
         let referencesDir = tempDir.appendingPathComponent("references", isDirectory: true)
-        try FileManager.default.createDirectory(at: referencesDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: referencesDir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
 
         do {
             let incoming = payload.events
@@ -355,27 +375,33 @@ public enum MacSkillRecorder {
                     ancestry: raw.ancestry?.compactMap { cleanText($0, maxLen: 120).isEmpty ? nil : cleanText($0, maxLen: 120) },
                     op: raw.op == "copy" || raw.op == "cut" || raw.op == "paste" ? raw.op : nil,
                     filename: cleanText(raw.filename, maxLen: 200).isEmpty ? nil : cleanText(raw.filename, maxLen: 200),
-                    whereFroms: raw.whereFroms?.compactMap { cleanText($0, maxLen: 200).isEmpty ? nil : cleanText($0, maxLen: 200) }
+                    whereFroms: raw.whereFroms?.compactMap { sanitizedOrigin($0) }
                 )
 
-                if let base64 = raw.screenshotBase64, let imageData = Data(base64Encoded: base64) {
+                if let base64 = raw.screenshotBase64, !base64.isEmpty {
+                    guard decodedSizeUpperBound(base64Length: base64.utf8.count) <= maxImageBytes else { throw RecorderError.imageExceedsLimit }
+                    if let imageData = Data(base64Encoded: base64) {
                     guard imageData.count <= maxImageBytes else { throw RecorderError.imageExceedsLimit }
                     let filename = String(format: "step-%03d.png", index + 1)
                     let fileUrl = referencesDir.appendingPathComponent(filename)
                     try writePrivateFile(url: fileUrl, data: imageData)
                     event.reference = "references/\(filename)"
+                    }
                 }
                 processedEvents.append(event)
             }
 
             var audioRef: String?
-            if let audioBase64 = payload.audioBase64, let audioData = Data(base64Encoded: audioBase64) {
+            if let audioBase64 = payload.audioBase64, !audioBase64.isEmpty {
+                guard decodedSizeUpperBound(base64Length: audioBase64.utf8.count) <= maxAudioBytes else { throw RecorderError.audioExceedsLimit }
+                guard let ext = audioExtension(forMime: payload.audioMime) else { throw RecorderError.invalidAudioFormat }
+                if let audioData = Data(base64Encoded: audioBase64) {
                 guard audioData.count <= maxAudioBytes else { throw RecorderError.audioExceedsLimit }
-                let ext = payload.audioMime == "audio/mp4" ? "m4a" : "webm"
                 let audioFilename = "narration.\(ext)"
                 let audioUrl = referencesDir.appendingPathComponent(audioFilename)
                 try writePrivateFile(url: audioUrl, data: audioData)
                 audioRef = "references/\(audioFilename)"
+                }
             }
 
             let transcript = cleanText(payload.transcript, maxLen: 12_000)
@@ -388,7 +414,7 @@ public enum MacSkillRecorder {
                 "createdAt": ISO8601DateFormatter().string(from: Date()),
                 "durationMs": max(0, payload.durationMs),
                 "transcript": transcript,
-                "audio": audioRef as Any,
+                "audio": audioRef ?? NSNull(),
                 "truncated": truncated,
                 "omittedEvents": omittedEvents,
                 "privacy": [
@@ -435,13 +461,35 @@ public enum MacSkillRecorder {
         }
     }
 
+    /// Largest number of bytes a base64 string of this length can decode to.
+    /// Checked before decoding so an oversized payload is rejected without allocating it.
+    static func decodedSizeUpperBound(base64Length: Int) -> Int {
+        (base64Length / 4) * 3 + 3
+    }
+
+    /// Allowlist of narration formats. Anything else is rejected, not renamed to webm.
+    static func audioExtension(forMime mime: String?) -> String? {
+        let base = (mime ?? "").split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+        switch base {
+        case "audio/mp4": return "m4a"
+        case "audio/webm": return "webm"
+        default: return nil
+        }
+    }
+
+    /// Creates the file 0600 from the start (no window at the default umask), then writes.
     private static func writePrivateFile(url: URL, data: Data) throws {
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { throw CocoaError(.fileWriteUnknown) }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        try handle.write(contentsOf: data)
+        try handle.close()
     }
 
     private static func escapeYaml(_ string: String) -> String {
-        let escaped = string.replacingOccurrences(of: "\"", with: "\\\"")
+        let escaped = string
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
         return "\"\(escaped)\""
     }
 }

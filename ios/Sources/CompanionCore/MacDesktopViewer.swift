@@ -224,10 +224,7 @@ public enum MacDesktopViewer {
         if let url = try? validateViewerUrl(raw) {
             return originString(for: url)
         }
-        if let u = URL(string: raw), let scheme = u.scheme, let host = u.host {
-            let portString = u.port.map { ":\($0)" } ?? ""
-            return "\(scheme.lowercased())://\(host.lowercased())\(portString)"
-        }
+        // No lenient fallback: an origin that fails HTTPS/loopback validation never compares equal.
         return nil
     }
 }
@@ -274,6 +271,11 @@ public actor NativeDesktopWorkspaceManager {
         )
     }
 
+    /// Layout state of one slot, for tests of the all-or-nothing layout contract.
+    func layoutSnapshot(for contextId: String) -> (bounds: CGRect, isVisible: Bool)? {
+        entries[contextId].map { ($0.bounds, $0.isVisible) }
+    }
+
     /// Opens a new desktop workspace slot with a dedicated isolated session partition.
     public func open(
         contextId rawContextId: String,
@@ -299,7 +301,10 @@ public actor NativeDesktopWorkspaceManager {
         partitionCounter += 1
         let partitionId = "botfleet-desktop-partition-\(partitionCounter)"
 
-        let origin = validatedUrl.scheme! + "://" + validatedUrl.host! + (validatedUrl.port.map { ":\($0)" } ?? "")
+        guard let scheme = validatedUrl.scheme, let host = validatedUrl.host else {
+            throw MacDesktopViewer.ViewerError.addressInvalid
+        }
+        let origin = scheme + "://" + host + (validatedUrl.port.map { ":\($0)" } ?? "")
         let entry = Entry(
             contextId: contextId,
             identity: identity,
@@ -335,6 +340,8 @@ public actor NativeDesktopWorkspaceManager {
             throw MacDesktopViewer.ViewerError.tooManyViews
         }
         var seen = Set<String>()
+        // Validate every item first and stage the result; `entries` changes only if all pass.
+        var staged: [String: Entry] = [:]
         for item in items {
             let contextId = try MacDesktopViewer.validateContextId(item.contextId)
             guard !seen.contains(contextId) else {
@@ -346,8 +353,9 @@ public actor NativeDesktopWorkspaceManager {
             }
             entry.bounds = try MacDesktopViewer.normalizeBounds(raw: item.bounds, ownerSize: ownerSize)
             entry.isVisible = item.isVisible
-            entries[contextId] = entry
+            staged[contextId] = entry
         }
+        for (contextId, entry) in staged { entries[contextId] = entry }
     }
 
     /// Switches which slot is interactive, strictly upholding the one-interactive-pane invariant.
