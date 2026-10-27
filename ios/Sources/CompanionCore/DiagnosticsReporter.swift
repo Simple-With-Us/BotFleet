@@ -84,9 +84,10 @@ public enum DiagnosticsReporter {
         options: [.caseInsensitive]
     )
 
-    private static let compiledTokenRegexes: [NSRegularExpression] = {
-        credentialTokenPatterns.compactMap { try? NSRegularExpression(pattern: $0, options: []) }
-    }()
+    private static let compiledTokenRegexes: [NSRegularExpression] = credentialTokenPatterns.map {
+        // Fail fast: a bad pattern must crash in development, not silently skip redaction.
+        try! NSRegularExpression(pattern: $0, options: [])
+    }
 
     private static let valuePartPattern = #"("[^"]*"|'[^']*'|[^\s"',;)\]}]+)"#
 
@@ -116,6 +117,8 @@ public enum DiagnosticsReporter {
                 guard let keyRange = Range(match.range(at: 1), in: out),
                       let valRange = Range(match.range(at: 2), in: out),
                       let fullRange = Range(match.range, in: out) else { continue }
+                let matched = String(out[fullRange])
+                if matched.contains(alreadyMaskedMarker) { continue }
                 let key = String(out[keyRange])
                 let val = unquote(String(out[valRange]))
                 let replacement = "\(key)=\(mask(val))"
@@ -230,15 +233,16 @@ public enum DiagnosticsReporter {
 
         for (key, value) in input {
             let path = prefix.isEmpty ? key : "\(prefix).\(key)"
-            if let boolVal = value as? Bool {
-                out[path] = boolVal ? "true" : "false"
-            } else if let numVal = value as? NSNumber {
-                // In ObjC/Foundation, Bool is also an NSNumber (CFBoolean)
+            // Check NSNumber before Bool: JSONSerialization yields NSNumber for 0/1,
+            // and those bridge to Bool under `as? Bool` on Darwin.
+            if let numVal = value as? NSNumber {
                 if CFGetTypeID(numVal) == CFBooleanGetTypeID() {
                     out[path] = numVal.boolValue ? "true" : "false"
-                } else {
+                } else if numVal.doubleValue.isFinite {
                     out[path] = "\(numVal)"
                 }
+            } else if let boolVal = value as? Bool {
+                out[path] = boolVal ? "true" : "false"
             } else if let dict = value as? [String: Any] {
                 let nested = flattenAndFilterConfigSummary(dict, prefix: path, depth: depth + 1)
                 for (k, v) in nested { out[k] = v }
@@ -267,7 +271,7 @@ public enum DiagnosticsReporter {
         let appKeys = ["version", "platform", "arch", "osVersion", "buildCommit", "packaged", "uptimeSeconds"]
         for key in appKeys {
             if let val = appInfo[key] {
-                lines.append("\(key)=\(val)")
+                lines.append("\(key)=\(redactSecrets(in: val))")
             }
         }
 
@@ -315,16 +319,30 @@ public enum DiagnosticsReporter {
         let content = buildDiagnosticsReport(appInfo: appInfo, configSummary: configSummary, logTail: logTail, now: now)
         let data = content.data(using: .utf8) ?? Data()
 
-        let tempURL = destinationURL.deletingLastPathComponent().appendingPathComponent(".\(destinationURL.lastPathComponent).tmp")
-        try data.write(to: tempURL, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempURL.path)
-
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            _ = try FileManager.default.replaceItemAt(destinationURL, withItemAt: tempURL)
-        } else {
-            try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+        let unique = ".\(destinationURL.lastPathComponent).\(UUID().uuidString).tmp"
+        let tempURL = destinationURL.deletingLastPathComponent().appendingPathComponent(unique)
+        // Create with 0600 atomically so a chmod failure cannot leave a world-readable file.
+        let created = FileManager.default.createFile(
+            atPath: tempURL.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        )
+        guard created else {
+            throw NSError(domain: "DiagnosticsReporter", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "could not create diagnostics temp file with 0600 permissions"
+            ])
         }
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destinationURL.path)
+        do {
+            if FileManager.default.fileExists(atPath: destinationURL.path) {
+                _ = try FileManager.default.replaceItemAt(destinationURL, withItemAt: tempURL)
+            } else {
+                try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+            }
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destinationURL.path)
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            throw error
+        }
 
         return destinationURL
     }

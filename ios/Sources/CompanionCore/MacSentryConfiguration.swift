@@ -14,7 +14,8 @@ public enum MacSentryPolicy {
     public static let releaseShaRegex = try! NSRegularExpression(pattern: #"^[0-9a-f]{7,40}$"#, options: [.caseInsensitive])
 
     public static let sensitiveQueryParamRegex = try! NSRegularExpression(
-        pattern: #"([?&])(token|key|secret|authorization|auth|password)=[^&#\s]*"#,
+        // Match the full parameter name containing a sensitive keyword (api_key, access_token, …).
+        pattern: #"([?&])([^=?&#\s]*(?:token|key|secret|authorization|auth|password)[^=?&#\s]*)=[^&#\s]*"#,
         options: [.caseInsensitive]
     )
 
