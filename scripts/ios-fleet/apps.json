@@ -2,6 +2,7 @@
   "teamId": "CC8UTF7ATG",
   "apps": {
     "botfleet": {
+      "fixedMarketingVersion": "0.1.0",
       "displayName": "BotFleet",
       "bundleId": "app.botfleet.ios",
       "appleId": 6820175685,
