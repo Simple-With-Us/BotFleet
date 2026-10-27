@@ -149,6 +149,25 @@ public enum MacSkillRecorder {
     }
 
     /// Sanitizes plain text by collapsing control characters into spaces and trimming.
+    /// Keep only http(s) origins without userinfo/query/fragment for SKILL.md.
+    public static func sanitizeDownloadOrigin(_ raw: String, maxLen: Int = 200) -> String {
+        let cleaned = cleanText(raw, maxLen: maxLen)
+        guard let url = URL(string: cleaned),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.user == nil,
+              let host = url.host, !host.isEmpty else {
+            return cleanText(cleaned, maxLen: 80)
+        }
+        var components = URLComponents()
+        components.scheme = scheme
+        components.host = host
+        components.port = url.port
+        components.path = url.path
+        let safe = components.string ?? "\(scheme)://\(host)"
+        return cleanText(safe, maxLen: maxLen)
+    }
+
     public static func cleanText(_ value: String?, maxLen: Int = 500) -> String {
         guard let value else { return "" }
         let range = NSRange(location: 0, length: value.utf16.count)
@@ -262,7 +281,7 @@ public enum MacSkillRecorder {
 
         var lines: [String] = [
             "---",
-            "name: \(id)",
+            "name: \(escapeYaml(cleanText(id, maxLen: 100)))",
             "description: \(escapeYaml(safeDesc))",
             "---",
             "",
@@ -364,10 +383,16 @@ public enum MacSkillRecorder {
                     ancestry: raw.ancestry?.compactMap { cleanText($0, maxLen: 120).isEmpty ? nil : cleanText($0, maxLen: 120) },
                     op: raw.op == "copy" || raw.op == "cut" || raw.op == "paste" ? raw.op : nil,
                     filename: cleanText(raw.filename, maxLen: 200).isEmpty ? nil : cleanText(raw.filename, maxLen: 200),
-                    whereFroms: raw.whereFroms?.compactMap { cleanText($0, maxLen: 200).isEmpty ? nil : cleanText($0, maxLen: 200) }
+                    whereFroms: raw.whereFroms?.compactMap { let s = sanitizeDownloadOrigin($0); return s.isEmpty ? nil : s }
                 )
 
-                if let base64 = raw.screenshotBase64, let imageData = Data(base64Encoded: base64) {
+                if let base64 = raw.screenshotBase64 {
+                    // Reject oversized encoded payloads before allocating a decoded buffer.
+                    let maxEncoded = (maxImageBytes * 4) / 3 + 8
+                    guard base64.utf8.count <= maxEncoded else { throw RecorderError.imageExceedsLimit }
+                    guard let imageData = Data(base64Encoded: base64) else {
+                        throw RecorderError.imageExceedsLimit
+                    }
                     guard imageData.count <= maxImageBytes else { throw RecorderError.imageExceedsLimit }
                     let filename = String(format: "step-%03d.png", index + 1)
                     let fileUrl = referencesDir.appendingPathComponent(filename)
@@ -378,7 +403,12 @@ public enum MacSkillRecorder {
             }
 
             var audioRef: String?
-            if let audioBase64 = payload.audioBase64, let audioData = Data(base64Encoded: audioBase64) {
+            if let audioBase64 = payload.audioBase64 {
+                let maxEncoded = (maxAudioBytes * 4) / 3 + 8
+                guard audioBase64.utf8.count <= maxEncoded else { throw RecorderError.audioExceedsLimit }
+                guard let audioData = Data(base64Encoded: audioBase64) else {
+                    throw RecorderError.audioExceedsLimit
+                }
                 guard audioData.count <= maxAudioBytes else { throw RecorderError.audioExceedsLimit }
                 let mime = payload.audioMime ?? ""
                 let ext: String
