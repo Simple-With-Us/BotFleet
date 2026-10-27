@@ -223,4 +223,47 @@ final class DiagnosticsAndSentryTests: XCTestCase {
         XCTAssertFalse(MacSentryPolicy.shouldActivateSentry(dsn: "http://insecure.com/123", env: [:]))
         XCTAssertTrue(MacSentryPolicy.shouldActivateSentry(dsn: "https://key@o1.ingest.sentry.io/123", env: [:]))
     }
+
+    // MARK: - Review findings (unbuilt until a Swift runner executes them)
+
+    func testNumericZeroAndOneStayNumbersNotBooleans() throws {
+        let json = try JSONSerialization.jsonObject(with: Data(#"{"count":1,"zero":0,"on":true,"off":false}"#.utf8)) as! [String: Any]
+        let flat = DiagnosticsReporter.flattenAndFilterConfigSummary(json)
+        XCTAssertEqual(flat["count"], "1")
+        XCTAssertEqual(flat["zero"], "0")
+        XCTAssertEqual(flat["on"], "true")
+        XCTAssertEqual(flat["off"], "false")
+    }
+
+    func testNonFiniteNumbersAreDropped() {
+        let flat = DiagnosticsReporter.flattenAndFilterConfigSummary(["nan": NSNumber(value: Double.nan), "inf": NSNumber(value: Double.infinity), "ok": NSNumber(value: 2.5)])
+        XCTAssertNil(flat["nan"])
+        XCTAssertNil(flat["inf"])
+        XCTAssertEqual(flat["ok"], "2.5")
+    }
+
+    func testAppInfoValuesAreRedacted() {
+        let secret = "ghp_" + String(repeating: "a", count: 24)
+        let report = DiagnosticsReporter.buildDiagnosticsReport(appInfo: ["version": secret])
+        XCTAssertFalse(report.contains(secret))
+    }
+
+    func testRedactionDoesNotMaskItsOwnMarker() {
+        let once = DiagnosticsReporter.redactSecrets(in: "XAI_" + "API_KEY=supersecretvalue123")
+        XCTAssertEqual(DiagnosticsReporter.redactSecrets(in: once), once)
+    }
+
+    func testExportRemovesTheFileWhenItCannotBeSecured() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("diag-missing-\(UUID().uuidString)")
+        XCTAssertThrowsError(try DiagnosticsReporter.exportDiagnostics(to: dir.appendingPathComponent("x.txt")))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("x.txt").path))
+    }
+
+    func testCompoundSecretQueryParamsAreRedacted() {
+        let out = MacSentryPolicy.redactQueryStringTokens(in: "https://a.example/p?api_key=abc&x_auth_token=def&session_secret=ghi&page=2")
+        XCTAssertFalse(out.contains("abc"))
+        XCTAssertFalse(out.contains("def"))
+        XCTAssertFalse(out.contains("ghi"))
+        XCTAssertTrue(out.contains("page=2"))
+    }
 }

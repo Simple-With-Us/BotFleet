@@ -85,7 +85,9 @@ public enum DiagnosticsReporter {
     )
 
     private static let compiledTokenRegexes: [NSRegularExpression] = {
-        credentialTokenPatterns.compactMap { try? NSRegularExpression(pattern: $0, options: []) }
+        // A pattern that does not compile is a programming error. Dropping it
+        // would silently stop redacting that credential shape, so crash instead.
+        credentialTokenPatterns.map { try! NSRegularExpression(pattern: $0, options: []) }
     }()
 
     private static let valuePartPattern = #"("[^"]*"|'[^']*'|[^\s"',;)\]}]+)"#
@@ -117,7 +119,9 @@ public enum DiagnosticsReporter {
                       let valRange = Range(match.range(at: 2), in: out),
                       let fullRange = Range(match.range, in: out) else { continue }
                 let key = String(out[keyRange])
-                let val = unquote(String(out[valRange]))
+                let rawEnvVal = String(out[valRange])
+                if rawEnvVal.contains(alreadyMaskedMarker) { continue }
+                let val = unquote(rawEnvVal)
                 let replacement = "\(key)=\(mask(val))"
                 out.replaceSubrange(fullRange, with: replacement)
             }
@@ -133,6 +137,7 @@ public enum DiagnosticsReporter {
                       let fullRange = Range(match.range, in: out) else { continue }
                 let key = String(out[keyRange])
                 let val = String(out[valRange])
+                if val.contains(alreadyMaskedMarker) { continue }
                 let replacement = "\(key)=\(mask(val))"
                 out.replaceSubrange(fullRange, with: replacement)
             }
@@ -148,6 +153,7 @@ public enum DiagnosticsReporter {
                       let fullRange = Range(match.range, in: out) else { continue }
                 let lead = String(out[leadRange])
                 let token = String(out[tokenRange])
+                if token.contains(alreadyMaskedMarker) { continue }
                 let replacement = "\(lead)\(mask(token))"
                 out.replaceSubrange(fullRange, with: replacement)
             }
@@ -230,15 +236,18 @@ public enum DiagnosticsReporter {
 
         for (key, value) in input {
             let path = prefix.isEmpty ? key : "\(prefix).\(key)"
-            if let boolVal = value as? Bool {
-                out[path] = boolVal ? "true" : "false"
-            } else if let numVal = value as? NSNumber {
-                // In ObjC/Foundation, Bool is also an NSNumber (CFBoolean)
+            if let numVal = value as? NSNumber {
+                // Inspect the NSNumber before any Bool bridge: JSON numbers 0 and 1
+                // also bridge to Bool, which would turn a count into "false"/"true".
+                // Only a real CFBoolean is a boolean.
                 if CFGetTypeID(numVal) == CFBooleanGetTypeID() {
                     out[path] = numVal.boolValue ? "true" : "false"
-                } else {
+                } else if numVal.doubleValue.isFinite {
                     out[path] = "\(numVal)"
                 }
+                // NaN and Infinity are dropped, like every other non-finite value.
+            } else if let boolVal = value as? Bool {
+                out[path] = boolVal ? "true" : "false"
             } else if let dict = value as? [String: Any] {
                 let nested = flattenAndFilterConfigSummary(dict, prefix: path, depth: depth + 1)
                 for (k, v) in nested { out[k] = v }
@@ -267,7 +276,7 @@ public enum DiagnosticsReporter {
         let appKeys = ["version", "platform", "arch", "osVersion", "buildCommit", "packaged", "uptimeSeconds"]
         for key in appKeys {
             if let val = appInfo[key] {
-                lines.append("\(key)=\(val)")
+                lines.append("\(key)=\(redactSecrets(in: val))")
             }
         }
 
@@ -316,15 +325,27 @@ public enum DiagnosticsReporter {
         let data = content.data(using: .utf8) ?? Data()
 
         let tempURL = destinationURL.deletingLastPathComponent().appendingPathComponent(".\(destinationURL.lastPathComponent).tmp")
-        try data.write(to: tempURL, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempURL.path)
-
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            _ = try FileManager.default.replaceItemAt(destinationURL, withItemAt: tempURL)
-        } else {
-            try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+        // The temp file is created already 0600, so it is never readable by others,
+        // and a permission failure aborts the export instead of leaving a
+        // world-readable diagnostics file behind.
+        let fm = FileManager.default
+        try? fm.removeItem(at: tempURL)
+        guard fm.createFile(atPath: tempURL.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown)
         }
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destinationURL.path)
+        do {
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempURL.path)
+            if fm.fileExists(atPath: destinationURL.path) {
+                _ = try fm.replaceItemAt(destinationURL, withItemAt: tempURL)
+            } else {
+                try fm.moveItem(at: tempURL, to: destinationURL)
+            }
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destinationURL.path)
+        } catch {
+            try? fm.removeItem(at: tempURL)
+            try? fm.removeItem(at: destinationURL)
+            throw error
+        }
 
         return destinationURL
     }
