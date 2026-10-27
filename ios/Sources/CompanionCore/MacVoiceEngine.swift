@@ -46,6 +46,31 @@ public enum MacVoiceMode: Equatable, Sendable {
     }
 }
 
+/// What a tap on the microphone button actually did.
+public enum MacMicTapOutcome: Equatable, Sendable {
+    /// A new capture attempt started; the attempt token completes it.
+    case startedCapture(attemptId: UUID)
+    /// A pending start was cancelled before the microphone ever opened.
+    case cancelledPendingStart
+    /// An active capture stopped cleanly and kept its draft.
+    case stoppedCapture
+}
+
+/// Why a capture ended without the user asking for it.
+///
+/// The capture stack reports its own endings, because a recognizer that
+/// fails or finishes leaves the microphone closed on its own:  nobody taps
+/// the button, so nobody else would notice that the recording state is
+/// stale.
+public enum MacVoiceCaptureEnd: Equatable, Sendable {
+    /// The recognizer failed mid-session.  The engine reports the voice
+    /// failure and releases the microphone.
+    case recognitionFailed
+    /// The recognizer produced its final transcript and ended the session.
+    /// The engine returns to idle and keeps the transcript.
+    case completed
+}
+
 /// Recoverable and unrecoverable voice failures with exact product copy.
 public enum MacVoiceFailure: Equatable, Sendable {
     case microphoneRefused(isCall: Bool)
@@ -196,6 +221,12 @@ public final class MacVoiceEngine: @unchecked Sendable {
     public private(set) var committedLiveCallTurns: [String] = []
     /// Messages that fell back to text display because voice playback failed.
     public private(set) var textFallbackMessageIds: [String] = []
+    /// The most recent recognizer partial, kept separately from `currentDraft`
+    /// so a pause can resume without rebasing the frozen draft on itself.
+    public private(set) var lastPartialTranscript: String = ""
+    /// What the last microphone tap did, so the caller can decide what the
+    /// composer should show next.
+    public private(set) var lastTapOutcome: MacMicTapOutcome?
 
     private var activeStartAttemptId: UUID?
     private var pendingMode: MacVoiceMode = .composerDictation
@@ -214,31 +245,81 @@ public final class MacVoiceEngine: @unchecked Sendable {
 
     // MARK: - Capture Lifecycle & Permission Race Guard
 
-    /// Handles a tap on the microphone / call button.
-    ///
-    /// - When `.idle`, `.paused`, or `.failed`: transitions to `.starting`,
-    ///   freezes `currentDraft`, and returns the new attempt token.
-    /// - When `.starting`: a second tap cancels the pending start immediately
-    ///   and returns `nil`.  A late permission grant arriving for that
-    ///   cancelled attempt will NEVER open the microphone.
-    /// - When `.recording`: stops capture cleanly and keeps `currentDraft`
-    ///   in the composer without auto-sending.
+    /// Handles a tap on the microphone / call button and returns the new
+    /// attempt token, or `nil` when the tap cancelled a pending start or
+    /// stopped an active capture.
     @discardableResult
     public func tapMicrophoneButton(
         mode: MacVoiceMode = .composerDictation,
         currentDraft: String = ""
     ) -> UUID? {
+        guard case .startedCapture(let attemptId) = tapMicrophoneButtonReportingOutcome(
+            mode: mode,
+            currentDraft: currentDraft
+        ) else {
+            return nil
+        }
+        return attemptId
+    }
+
+    /// Handles a tap on the microphone / call button and reports what it did.
+    ///
+    /// - When `.idle`, `.paused`, or `.failed`: transitions to `.starting`,
+    ///   freezes `currentDraft`, and reports `.startedCapture`.
+    /// - When `.starting`: a second tap cancels the pending start immediately
+    ///   and reports `.cancelledPendingStart`.  A late permission grant
+    ///   arriving for that cancelled attempt will NEVER open the microphone.
+    /// - When `.recording`: stops capture cleanly and reports
+    ///   `.stoppedCapture`, keeping `currentDraft` in the composer without
+    ///   auto-sending.
+    @discardableResult
+    public func tapMicrophoneButtonReportingOutcome(
+        mode: MacVoiceMode = .composerDictation,
+        currentDraft: String = ""
+    ) -> MacMicTapOutcome {
         switch state {
         case .starting:
             cancelPendingStart()
-            self.currentDraft = currentDraft
-            return nil
+            lastTapOutcome = .cancelledPendingStart
+            return .cancelledPendingStart
         case .recording:
             stopCapture()
-            return nil
+            lastTapOutcome = .stoppedCapture
+            return .stoppedCapture
         case .idle, .paused, .failed:
-            return beginStart(mode: mode, currentDraft: currentDraft, isExplicitUserTap: true)
+            let attemptId = beginStart(mode: mode, currentDraft: currentDraft, isExplicitUserTap: true)
+            lastTapOutcome = .startedCapture(attemptId: attemptId)
+            return .startedCapture(attemptId: attemptId)
         }
+    }
+
+    /// The composer text to show after a microphone tap.
+    ///
+    /// The caller's draft is the truth, because the composer is live while
+    /// dictation runs:  the partials stream into it, and anything the user
+    /// typed after the last partial belongs to them.  The engine's own draft
+    /// is rebased on the frozen base, so returning it would silently discard
+    /// the text typed during dictation — the same reason a cancelled pending
+    /// start keeps the caller's draft verbatim.
+    public func composerDraftAfterTap(incomingDraft: String) -> String {
+        switch lastTapOutcome {
+        case .cancelledPendingStart, .stoppedCapture:
+            return incomingDraft
+        case .startedCapture, .none:
+            return currentDraft
+        }
+    }
+
+    /// The composer text to show right now while composer dictation runs,
+    /// and `nil` in every other mode.
+    ///
+    /// The Electron composer streams partials into the input as they arrive
+    /// (the text typed before the microphone went on, then the latest
+    /// partial), so the Mac mirrors the same text into its composer while
+    /// the microphone is open.
+    public var liveComposerDraft: String? {
+        guard case .recording(_, _, .composerDictation) = state else { return nil }
+        return currentDraft
     }
 
     /// Enters `.starting` while permissions and audio hardware warm up.
@@ -261,6 +342,7 @@ public final class MacVoiceEngine: @unchecked Sendable {
         pendingMode = mode
         frozenBaseDraft = currentDraft
         self.currentDraft = currentDraft
+        lastPartialTranscript = ""
         routeBanner = nil
         isMicrophoneHardwareOpen = false
         state = .starting
@@ -365,6 +447,7 @@ public final class MacVoiceEngine: @unchecked Sendable {
         guard case .recording(_, _, let mode) = state else { return }
         let clampedLevel = min(max(audioLevel, 0.0), 1.0)
         state = .recording(level: clampedLevel, partialTranscript: partial, mode: mode)
+        lastPartialTranscript = partial
 
         switch mode {
         case .composerDictation:
@@ -392,6 +475,7 @@ public final class MacVoiceEngine: @unchecked Sendable {
             guard !trimmed.isEmpty else { return nil }
             committedLiveCallTurns.append(trimmed)
             currentDraft = ""
+            lastPartialTranscript = ""
             state = .recording(
                 level: 0.0,
                 partialTranscript: "",
@@ -447,13 +531,28 @@ public final class MacVoiceEngine: @unchecked Sendable {
     }
 
     /// Resumes capture from `.paused` only when the user explicitly taps to resume.
+    ///
+    /// The frozen base draft is NEVER rebased here:  it still holds the text
+    /// from before dictation started, and rebasing it on the current draft
+    /// would append the next cumulative recognizer result to text that already
+    /// contains the spoken words, duplicating them.
     @discardableResult
     public func resumeFromPause() -> Bool {
         guard case .paused = state else { return false }
-        frozenBaseDraft = currentDraft
         isMicrophoneHardwareOpen = true
-        state = .recording(level: 0.0, partialTranscript: "", mode: pendingMode)
+        state = .recording(level: 0.0, partialTranscript: lastPartialTranscript, mode: pendingMode)
+        currentDraft = draftFromFrozenBaseAndLastPartial()
         return true
+    }
+
+    /// Rebuilds the composer draft from the frozen base and the last partial.
+    private func draftFromFrozenBaseAndLastPartial() -> String {
+        switch pendingMode {
+        case .composerDictation:
+            return Dictation.draft(base: frozenBaseDraft, transcript: lastPartialTranscript)
+        case .liveCall:
+            return lastPartialTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
     /// Handles a speech recognizer error mid-session.  Restores `currentDraft`
@@ -463,6 +562,21 @@ public final class MacVoiceEngine: @unchecked Sendable {
         isMicrophoneHardwareOpen = false
         currentDraft = frozenBaseDraft
         state = .failed(.recognitionFailedMidSession)
+    }
+
+    /// Leaves the recording state when the capture stack ends on its own.
+    ///
+    /// A recognizer that fails or finishes closes the microphone without a
+    /// tap, so the engine has to hear about it:  otherwise the UI keeps
+    /// showing a recording that no longer exists, with the microphone
+    /// hardware still marked open.
+    public func handleCaptureEnded(_ end: MacVoiceCaptureEnd) {
+        switch end {
+        case .recognitionFailed:
+            handleMidSessionRecognitionFailure()
+        case .completed:
+            stopCapture()
+        }
     }
 
     // MARK: - Audio Route Changes
@@ -506,11 +620,19 @@ public final class MacVoiceEngine: @unchecked Sendable {
     /// Handles a TTS synthesis or audio playback failure by surfacing
     /// `"Couldn't play the voice.  The reply is shown as text instead."` and
     /// recording the message ID so the transcript shows the text reply.
+    ///
+    /// A playback failure during an active capture NEVER clobbers the capture
+    /// state machine:  the microphone stays open and later partials keep
+    /// arriving.
     public func handlePlaybackFailure(forMessageId messageId: String? = nil) {
         isBotPlaybackActive = false
         if let messageId {
             textFallbackMessageIds.append(messageId)
         }
+        if case .recording = state {
+            return
+        }
+        isMicrophoneHardwareOpen = false
         state = .failed(.playbackFailed)
     }
 
@@ -607,3 +729,227 @@ public final class MacVoiceEngine: @unchecked Sendable {
         }
     }
 }
+
+#if os(macOS)
+/// Bridges the deterministic `MacVoiceEngine` state machine to the real macOS
+/// capture stack:  `AVAudioEngine` opens the input node and `SFSpeechRecognizer`
+/// produces the partial transcripts.
+///
+/// The engine itself stays synchronous and testable;  every hardware and
+/// permission question is answered here and reported back as a plain outcome,
+/// so the state machine never has to know about AVFoundation.
+public final class MacVoiceCaptureCoordinator: @unchecked Sendable {
+    /// What the system said about microphone, speech, and hardware access.
+    public struct PermissionOutcome: Sendable {
+        public var micGranted: Bool
+        public var speechGranted: Bool
+        public var hasInputDevice: Bool
+        public var localeSupported: Bool
+        public var micBusy: Bool
+
+        public init(
+            micGranted: Bool,
+            speechGranted: Bool,
+            hasInputDevice: Bool,
+            localeSupported: Bool = true,
+            micBusy: Bool = false
+        ) {
+            self.micGranted = micGranted
+            self.speechGranted = speechGranted
+            self.hasInputDevice = hasInputDevice
+            self.localeSupported = localeSupported
+            self.micBusy = micBusy
+        }
+    }
+
+    private let audioEngine = AVAudioEngine()
+    private var recognizer: SFSpeechRecognizer?
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var isInputTapInstalled = false
+    private let onPartialTranscript: @Sendable (String, Float) -> Void
+    private let onRecognitionEnded: @Sendable (MacVoiceCaptureEnd) -> Void
+    /// Guards the one-shot ending, so the cancellation an ending triggers
+    /// never reports a second one.
+    private let endLock = NSLock()
+    private var hasEnded = false
+
+    public init(
+        onPartialTranscript: @escaping @Sendable (String, Float) -> Void,
+        onRecognitionEnded: @escaping @Sendable (MacVoiceCaptureEnd) -> Void = { _ in }
+    ) {
+        self.onPartialTranscript = onPartialTranscript
+        self.onRecognitionEnded = onRecognitionEnded
+    }
+
+    /// Whether the running bundle declares the microphone usage description
+    /// macOS requires before it will show the permission prompt.
+    ///
+    /// A bundle without it is TERMINATED by the system the moment capture is
+    /// requested, so the coordinator refuses to ask and reports a refusal
+    /// instead of taking the whole app down with it.
+    public static var microphoneUsageDescriptionDeclared: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") != nil
+    }
+
+    /// Whether the running bundle declares the speech-recognition usage
+    /// description macOS requires before it will show the permission prompt.
+    public static var speechUsageDescriptionDeclared: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "NSSpeechRecognitionUsageDescription") != nil
+    }
+
+    /// Requests microphone and speech-recognition authorization.  Nothing is
+    /// asked before the user asks for dictation, and a bundle missing the
+    /// matching usage description is never asked at all.
+    public static func requestPermissions() async -> PermissionOutcome {
+        var micGranted = false
+        var speechGranted = false
+        if microphoneUsageDescriptionDeclared {
+            micGranted = await requestMicrophoneAccess()
+        }
+        if speechUsageDescriptionDeclared {
+            speechGranted = await requestSpeechAccess()
+        }
+        let hasInputDevice = AVCaptureDevice.default(for: .audio) != nil
+        let localeSupported = SFSpeechRecognizer(locale: Locale.current) != nil
+        return PermissionOutcome(
+            micGranted: micGranted,
+            speechGranted: speechGranted,
+            hasInputDevice: hasInputDevice,
+            localeSupported: localeSupported
+        )
+    }
+
+    private static func requestMicrophoneAccess() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return true
+        case .denied, .restricted:
+            return false
+        case .notDetermined:
+            return await withCheckedContinuation { continuation in
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    continuation.resume(returning: granted)
+                }
+            }
+        @unknown default:
+            return false
+        }
+    }
+
+    private static func requestSpeechAccess() async -> Bool {
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized:
+            return true
+        case .denied, .restricted:
+            return false
+        case .notDetermined:
+            return await withCheckedContinuation { continuation in
+                SFSpeechRecognizer.requestAuthorization { status in
+                    continuation.resume(returning: status == .authorized)
+                }
+            }
+        @unknown default:
+            return false
+        }
+    }
+
+    /// Opens the input node and starts streaming recognition.  Returns `false`
+    /// when the recognizer is unavailable or the input node refuses to start,
+    /// which the caller reports as a microphone failure.
+    public func start() -> Bool {
+        guard recognitionTask == nil else { return true }
+        guard let recognizer = SFSpeechRecognizer(locale: Locale.current), recognizer.isAvailable else {
+            return false
+        }
+        self.recognizer = recognizer
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.taskHint = .dictation
+        recognitionRequest = request
+
+        let inputNode = audioEngine.inputNode
+        let outputFormat = inputNode.outputFormat(forBus: 0)
+        // A device with no input reports a zero sample rate, which the tap
+        // rejects outright;  the input format is the usable fallback.
+        let format = outputFormat.sampleRate > 0 ? outputFormat : inputNode.inputFormat(forBus: 0)
+        guard format.sampleRate > 0 else { return false }
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            self?.recognitionRequest?.append(buffer)
+        }
+        isInputTapInstalled = true
+        audioEngine.prepare()
+        do {
+            try audioEngine.start()
+        } catch {
+            removeInputTap()
+            recognitionRequest = nil
+            self.recognizer = nil
+            return false
+        }
+
+        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+            if error != nil {
+                // The recognizer gave up:  the microphone is closed and the
+                // owner has to leave the recording state.
+                self.finishRecognition(.recognitionFailed)
+                return
+            }
+            if let result {
+                let text = result.bestTranscription.formattedString
+                self.onPartialTranscript(text, 0.5)
+                if result.isFinal {
+                    // The recognizer finished on its own:  the final
+                    // transcript is delivered above, and the session ends.
+                    self.finishRecognition(.completed)
+                }
+            }
+        }
+        return true
+    }
+
+    /// Ends the capture stack once the recognizer is done, and reports why.
+    ///
+    /// A deliberate `stop()` never reports an ending:  the user asked for
+    /// it, so it is not a failure.
+    private func finishRecognition(_ end: MacVoiceCaptureEnd) {
+        guard claimEnding() else { return }
+        stop()
+        onRecognitionEnded(end)
+    }
+
+    /// Claims the one-shot ending, so the cancellation the ending itself
+    /// triggers cannot report a second one.
+    private func claimEnding() -> Bool {
+        endLock.lock()
+        defer { endLock.unlock() }
+        if hasEnded { return false }
+        hasEnded = true
+        return true
+    }
+
+    /// Closes the input node and stops recognition.
+    public func stop() {
+        // A deliberate stop is not an ending the owner has to hear about:
+        // claiming it here keeps the cancellation error quiet.
+        _ = claimEnding()
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+        removeInputTap()
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        recognizer = nil
+    }
+
+    private func removeInputTap() {
+        guard isInputTapInstalled else { return }
+        isInputTapInstalled = false
+        audioEngine.inputNode.removeTap(onBus: 0)
+    }
+}
+#endif
