@@ -84,3 +84,8 @@ playwright-report/
 electron/resources/BotFleet Control.app/
 mac-control/.build/
 mac-control/.swiftpm/
+# The fleet iOS version manifest publisher writes a local cache next to
+# the script (scripts/ios-fleet/publish-ios-versions.sh).  It is a cache,
+# not source:  keeping it out of git stops it from tripping the ship's
+# dirty-worktree gate on the next local run.
+scripts/ios-fleet/ios-app-versions.json
