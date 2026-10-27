@@ -35,6 +35,8 @@ export interface InfisicalStatusView {
   secretPath: string;
   hasClientId: boolean;
   hasClientSecret: boolean;
+  hasToken: boolean;
+  hasWriteToken: boolean;
   refreshMinutes: number;
   lastSyncAt: string | null;
   lastAttemptAt: string | null;
@@ -88,6 +90,8 @@ const UNSET_SETTINGS: InfisicalSettings = {
   secretPath: "/",
   clientId: "",
   clientSecret: "",
+  token: "",
+  writeToken: "",
   refreshMinutes: DEFAULT_REFRESH_MINUTES,
 };
 
@@ -96,13 +100,32 @@ function bootCapMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_BOOT_CAP_MS;
 }
 
-/** All three parts are required: a project with no identity cannot be read,
- * and an identity with no project has nothing to read.  Mirrors
- * `config.ts`'s `infisicalConfigured`, restated over a resolved
- * `InfisicalSettings` rather than a raw `AppConfig` so this module never
- * needs to import the config shape as a value. */
+/** A project id and an identity are required: a project with no identity
+ * cannot be read, and an identity with no project has nothing to read.  The
+ * identity is a service token when one is configured and the machine identity
+ * otherwise.  Mirrors `config.ts`'s `infisicalConfigured`, restated over a
+ * resolved `InfisicalSettings` rather than a raw `AppConfig` so this module
+ * never needs to import the config shape as a value. */
 function isConfigured(settings: InfisicalSettings): boolean {
-  return Boolean(settings.projectId.trim() && settings.clientId.trim() && settings.clientSecret.trim());
+  return Boolean(
+    settings.projectId.trim() &&
+      (settings.token.trim() || (settings.clientId.trim() && settings.clientSecret.trim())),
+  );
+}
+
+/** The bearer credential for one call.  A service token is used as it is --
+ * no login, no machine identity -- and the universal-auth login stays for an
+ * install that has not migrated its tokens yet.  A write uses the write
+ * token; a read uses the read token. */
+async function bearerToken(settings: InfisicalSettings, mode: "read" | "write"): Promise<string> {
+  const configured = (mode === "write" ? settings.writeToken : settings.token).trim();
+  if (configured) return configured;
+  return login({
+    siteUrl: settings.siteUrl,
+    clientId: settings.clientId,
+    clientSecret: settings.clientSecret,
+    timeoutMs: callTimeoutMs(),
+  });
 }
 
 /** What `preload()`'s race resolves to when the boot cap wins.  A distinct
@@ -128,6 +151,8 @@ function afterDelay(ms: number): Promise<typeof BOOT_CAP_REACHED> {
  * was, rather than guessing from the resolved value. */
 function identitySource(configured: boolean): "env" | "config" | "none" {
   if (!configured) return "none";
+  const envToken = (process.env.INFISICAL_TOKEN || "").trim();
+  if (envToken) return "env";
   const envClientId = (process.env.INFISICAL_CLIENT_ID || process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || "").trim();
   const envClientSecret = (
     process.env.INFISICAL_CLIENT_SECRET || process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || ""
@@ -266,12 +291,7 @@ class InfisicalManager {
     const settings = this.settings();
     const start = Date.now();
     try {
-      const token = await login({
-        siteUrl: settings.siteUrl,
-        clientId: settings.clientId,
-        clientSecret: settings.clientSecret,
-        timeoutMs: callTimeoutMs(),
-      });
+      const token = await bearerToken(settings, "read");
       const { names, values } = await listSecrets({
         siteUrl: settings.siteUrl,
         token,
@@ -369,6 +389,8 @@ class InfisicalManager {
       secretPath: settings.secretPath || "/",
       hasClientId: Boolean(settings.clientId.trim()),
       hasClientSecret: Boolean(settings.clientSecret.trim()),
+      hasToken: Boolean(settings.token.trim()),
+      hasWriteToken: Boolean(settings.writeToken.trim()),
       refreshMinutes: settings.refreshMinutes,
       lastSyncAt: this.lastSyncAt,
       lastAttemptAt: this.lastAttemptAt,
@@ -391,15 +413,10 @@ class InfisicalManager {
   async probe(): Promise<{ ok: boolean; error: string | null; secretCount: number; names: string[] }> {
     const settings = this.settings();
     if (!isConfigured(settings)) {
-      return { ok: false, error: "Add a project id and machine identity first.", secretCount: 0, names: [] };
+      return { ok: false, error: "Add a project id and a service token (or a machine identity) first.", secretCount: 0, names: [] };
     }
     try {
-      const token = await login({
-        siteUrl: settings.siteUrl,
-        clientId: settings.clientId,
-        clientSecret: settings.clientSecret,
-        timeoutMs: callTimeoutMs(),
-      });
+      const token = await bearerToken(settings, "read");
       const { names } = await listSecrets({
         siteUrl: settings.siteUrl,
         token,
@@ -434,12 +451,7 @@ class InfisicalManager {
     if (!isConfigured(settings) || settings.enabled !== true) {
       throw new InfisicalError("Infisical is not configured and turned on for this workspace.", 409);
     }
-    const token = await login({
-      siteUrl: settings.siteUrl,
-      clientId: settings.clientId,
-      clientSecret: settings.clientSecret,
-      timeoutMs: callTimeoutMs(),
-    });
+    const token = await bearerToken(settings, "read");
     const { values } = await listSecrets({
       siteUrl: settings.siteUrl,
       token,
@@ -471,14 +483,9 @@ class InfisicalManager {
       throw new InfisicalError("Clearing a value managed by Infisical is not supported.\u00A0 Remove it in Infisical.", 409);
     }
     if (!isConfigured(settings)) {
-      throw new InfisicalError("Add a project id and machine identity first.", 409);
+      throw new InfisicalError("Add a project id and a service token (or a machine identity) first.", 409);
     }
-    const token = await login({
-      siteUrl: settings.siteUrl,
-      clientId: settings.clientId,
-      clientSecret: settings.clientSecret,
-      timeoutMs: callTimeoutMs(),
-    });
+    const token = await bearerToken(settings, "write");
     try {
       await upsertSecret({
         siteUrl: settings.siteUrl,

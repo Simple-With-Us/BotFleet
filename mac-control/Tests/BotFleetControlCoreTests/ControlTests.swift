@@ -314,7 +314,7 @@ private final class HelperCommands: CommandRunning {
     }
 }
 
-private final class MockURLProtocol: URLProtocol {
+final class MockURLProtocol: URLProtocol {
     static var requests: [URLRequest] = []
     static var handler: ((URLRequest) -> (Int, Data)) = { _ in (500, Data()) }
     /// When this returns an error for a request, that request fails instead

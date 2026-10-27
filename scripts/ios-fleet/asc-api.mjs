@@ -582,16 +582,19 @@ const DELETE_INTERNAL_GROUPS_APP_IDS = new Set([
   "6820881005", // UM Client
 ]);
 
-// Whether a processed build can reach anyone through external testing: it is
-// assigned to at least one external group that has testers or an enabled
-// public link.  Under the owner's external-only policy (2026-10-18/19) this
-// replaces the internal-tester count as the installability check; approval is
-// still Apple's gate after that.  Never throws; { ok:false } means the read
-// failed, which is not the same as uninstallable.
-export async function externalInstallability({ api, buildId }) {
+// Whether an app's builds can reach anyone through external testing: the app
+// has at least one external group that has testers or an enabled public link.
+// This is APP-LEVEL on purpose: Apple forbids GET on a build's betaGroups
+// relationship (403 FORBIDDEN_ERROR, observed live 2026-10-26), and the ship
+// assigns the build to the group in the sync step anyway - the same app-level
+// semantics the internal-tester count had.  Under the owner's external-only
+// policy (2026-10-18/19) this replaces that count as the installability
+// check; approval is still Apple's gate after that.  Never throws; { ok:false }
+// means the read failed, which is not the same as uninstallable.
+export async function externalInstallability({ api, appId }) {
   let groupsRes;
   try {
-    groupsRes = await ascAllRows({ api, url: `/v1/builds/${buildId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled` });
+    groupsRes = await ascAllRows({ api, url: `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled` });
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e), installable: false };
   }
@@ -630,7 +633,7 @@ export async function externalInstallability({ api, buildId }) {
     installable: false,
     detail: external.length
       ? "external groups have neither testers nor a public link"
-      : "build is assigned to no external group"
+      : "app has no external group"
   };
 }
 
@@ -1656,6 +1659,17 @@ async function main() {
       JSON.stringify({ data: [{ type: "builds", id: build.id }] }));
     if (link.ok || link.status === 204) {
       console.error(`${prefix}: ${buildLabel} assigned to group "${group.attributes?.name}"`);
+      // Independently verify the assignment took: Apple forbids reading a
+      // build's betaGroups (403 FORBIDDEN_ERROR, observed 2026-10-26), so read
+      // the group's builds (documented GET /v1/betaGroups/{id}/builds).
+      const inGroup = await ascAllRows({ api, url: `/v1/betaGroups/${group.id}/builds?limit=200&fields[builds]=version` });
+      if (!inGroup.ok) {
+        warn(`could not verify ${buildLabel} in group "${group.attributes?.name}" (${inGroup.error}); the assignment POST already succeeded`);
+      } else if (inGroup.rows.some((b) => b.id === build.id)) {
+        console.error(`${prefix}: verified ${buildLabel} is in group "${group.attributes?.name}"`);
+      } else {
+        warn(`${buildLabel} is not in group "${group.attributes?.name}" after a successful assignment POST; external testers cannot see it`);
+      }
     } else {
       warn(`could not assign ${buildLabel} to group (${errText(link)})`);
     }
@@ -1820,7 +1834,7 @@ async function main() {
         // policy (2026-10-18/19) there is no internal group, so installability
         // means the build sits in an external group that has testers or an
         // enabled public link.  This is how 14 green ships reached nobody (GH #1018).
-        const reach = await externalInstallability({ api, buildId });
+        const reach = await externalInstallability({ api, appId });
         if (reach.ok) {
           console.error(`ensure-tf-ready: external installability=${reach.installable} (${reach.detail})`);
         } else {
@@ -1833,7 +1847,7 @@ async function main() {
           version,
           internalBuildState: state,
           usesNonExemptEncryption: attrs.usesNonExemptEncryption,
-          externalInstallable: reach.ok ? reach.installable : null
+          externalInstallPath: reach.ok ? reach.installable : null
         }));
         // 5 = read and nobody can install; 6 = could not be read, so installability is unverified.
         process.exit(nobody ? 5 : reach.ok ? 0 : 6);
