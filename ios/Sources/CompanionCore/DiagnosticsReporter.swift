@@ -300,7 +300,12 @@ public enum DiagnosticsReporter {
             lines.append("## Server log tail — known credential patterns auto-masked")
             // Cap before regex redaction so a multi-MB tail cannot stall the UI thread.
             let maxTailChars = 200_000
-            let bounded = tail.count > maxTailChars ? String(tail.suffix(maxTailChars)) : tail
+            var bounded = tail.count > maxTailChars ? String(tail.suffix(maxTailChars)) : tail
+            // Drop a mid-line prefix so credentialEnvRegex still sees env-name=
+            // on every remaining line (mirror decodeLogTail's truncated path).
+            if let nl = bounded.firstIndex(of: "\n") {
+                bounded = String(bounded[bounded.index(after: nl)...])
+            }
             let redacted = redactSecrets(in: bounded)
             let logLines = redacted.components(separatedBy: .newlines)
             for line in logLines {
