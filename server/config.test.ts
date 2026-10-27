@@ -1535,7 +1535,7 @@ describe("the secret-store section", () => {
       join(DATA_DIR, "config.json"),
       JSON.stringify({
         infisical: {
-          projectId: "836aebe2-c8f7-4e09-978e-7e3e82500bce",
+          projectId: "fixture-project-id",
           token: "st.file-read-token",
           writeToken: "st.file-write-token",
         },

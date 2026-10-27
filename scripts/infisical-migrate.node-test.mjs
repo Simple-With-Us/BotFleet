@@ -13,7 +13,7 @@ import { resolveVaultTokens } from "./infisical-migrate.mjs";
 
 const SETTINGS = {
   siteUrl: "https://vault.example.test",
-  projectId: "836aebe2-c8f7-4e09-978e-7e3e82500bce",
+  projectId: "fixture-project-id",
   environment: "prod",
   secretPath: "/",
   clientId: "machine-id",
