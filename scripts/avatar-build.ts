@@ -425,20 +425,41 @@ export function validateManifestAgainstFrames(
   }
 
   if (frameSize) {
-    // The manifest declares the size of the file the player draws, so the
-    // frames the build is handed have to be that size.  The comparison is
-    // against the frames that are really there, not against the manifest
-    // itself, which is the only way the check can say anything at all.
-    if (frameSize.width !== manifest.frame.width || frameSize.height !== manifest.frame.height) {
+    // The manifest declares the size the avatar is DELIVERED at, so the build
+    // scales the art down to it.  That is how the shipped examples were made:
+    // the TV-Face art is 480 x 480 and the files are 256 x 256.  What the
+    // build will not do is invent pixels by scaling up, or squash a drawing
+    // whose shape does not match, because either would change what the author
+    // drew without saying so.
+    if (frameSize.width < manifest.frame.width || frameSize.height < manifest.frame.height) {
       problems.push(
         `the source frames are ${frameSize.width}x${frameSize.height} but the manifest declares ` +
-          `${manifest.frame.width}x${manifest.frame.height}; the manifest describes the file the ` +
-          "player draws, so the frames have to be the size it declares",
+          `${manifest.frame.width}x${manifest.frame.height}; the build scales art down to the ` +
+          "declared size, but it will not make pixels that are not there",
+      );
+    } else if (!sameAspect(frameSize, manifest.frame)) {
+      problems.push(
+        `the source frames are ${frameSize.width}x${frameSize.height} but the manifest declares ` +
+          `${manifest.frame.width}x${manifest.frame.height}; scaling them to the declared size ` +
+          "would change the proportions of the art, so declare the size that matches it",
       );
     }
   }
 
   return problems;
+}
+
+/**
+ * Whether art of one size has the same proportions as another.
+ *
+ * The build scales the art to the declared size, and a scale that is not the
+ * same in both directions would squash the drawing.  One pixel of difference
+ * is not a different proportion, so the comparison allows about a percent.
+ */
+function sameAspect(size: FrameSize, frame: { width: number; height: number }): boolean {
+  const source = size.width / size.height;
+  const declared = frame.width / frame.height;
+  return Math.abs(source - declared) / declared <= 0.01;
 }
 
 function run(command: string, args: string[]): void {
@@ -472,6 +493,22 @@ const FORMAT_EXTENSION = {
   jpeg: ".jpg",
   webp: ".webp",
 } satisfies Record<ImageFormat, string>;
+
+/**
+ * The resampling the encoder needs, if it needs any.
+ *
+ * Art bigger than the size the manifest declares is scaled down to it.
+ * Art that is already that size is left alone: a scale that resizes a
+ * picture to its own size is not an identity pass, so it would quietly
+ * touch pixels the author drew.
+ */
+export function frameScaleFilter(
+  source: FrameSize,
+  declared: { width: number; height: number },
+): string[] {
+  if (source.width === declared.width && source.height === declared.height) return [];
+  return ["-vf", `scale=${declared.width}:${declared.height}:flags=lanczos`];
+}
 
 export interface BuildOptions {
   framesDir: string;
@@ -553,16 +590,18 @@ export function buildAvatar(options: BuildOptions): BuildResult {
     const converted = join(scratch, "converted");
     mkdirSync(converted);
 
-    // The frames are handed to the encoder at the size they are.  The check
-    // above has already made sure that they are the size the manifest
-    // declares, and a resampling filter that scales a picture to its own
-    // size is not an identity pass: it quietly touches pixels the author
-    // drew.  The conversion to PNG is the only thing done to them here.
+    // The art is scaled down to the size the manifest declares when it is
+    // bigger, which is the ordinary case: the art is drawn large and the
+    // avatar is drawn small.  Art that is already that size is handed over
+    // untouched, because a scale that resizes a picture to its own size is
+    // not an identity pass and it quietly touches pixels the author drew.
+    const scale = frameScaleFilter(sourceSize, manifest.frame);
     const convertedPattern = join(converted, "%0" + String(frames.length).length + "d.png");
     run("ffmpeg", [
       "-y",
       "-framerate", "1",
       "-i", staged,
+      ...scale,
       "-pix_fmt", "rgba",
       convertedPattern,
     ]);
