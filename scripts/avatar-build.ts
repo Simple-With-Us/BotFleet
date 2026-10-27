@@ -431,7 +431,7 @@ export function validateManifestAgainstFrames(
     // build will not do is invent pixels by scaling up, or squash a drawing
     // whose shape does not match, because either would change what the author
     // drew without saying so.
-    if (frameSize.width < manifest.frame.width || frameSize.height < manifest.frame.height) {
+    if (!isBigEnough(frameSize, manifest.frame)) {
       problems.push(
         `the source frames are ${frameSize.width}x${frameSize.height} but the manifest declares ` +
           `${manifest.frame.width}x${manifest.frame.height}; the build scales art down to the ` +
@@ -460,6 +460,16 @@ function sameAspect(size: FrameSize, frame: { width: number; height: number }): 
   const source = size.width / size.height;
   const declared = frame.width / frame.height;
   return Math.abs(source - declared) / declared <= 0.01;
+}
+
+/**
+ * Whether the art is big enough to be scaled down to the declared size.
+ *
+ * Art that is smaller in either direction would need pixels that are not
+ * there, so it is never scaled: the build refuses it instead.
+ */
+function isBigEnough(size: FrameSize, frame: { width: number; height: number }): boolean {
+  return size.width >= frame.width && size.height >= frame.height;
 }
 
 function run(command: string, args: string[]): void {
@@ -497,16 +507,21 @@ const FORMAT_EXTENSION = {
 /**
  * The resampling the encoder needs, if it needs any.
  *
- * Art bigger than the size the manifest declares is scaled down to it.
- * Art that is already that size is left alone: a scale that resizes a
- * picture to its own size is not an identity pass, so it would quietly
- * touch pixels the author drew.
+ * Art bigger than the size the manifest declares is scaled down to it, and
+ * only when the shape matches, because that is the one case the build can
+ * do honestly.  Art that is already that size is left alone: a scale that
+ * resizes a picture to its own size is not an identity pass, so it would
+ * quietly touch pixels the author drew.
  */
 export function frameScaleFilter(
   source: FrameSize,
   declared: { width: number; height: number },
 ): string[] {
   if (source.width === declared.width && source.height === declared.height) return [];
+  // The same rule the check uses: art is only scaled down when it is big
+  // enough and the shape matches.  Anything else is left alone rather than
+  // being upscaled or squashed, which the build refuses outright anyway.
+  if (!isBigEnough(source, declared) || !sameAspect(source, declared)) return [];
   return ["-vf", `scale=${declared.width}:${declared.height}:flags=lanczos`];
 }
 

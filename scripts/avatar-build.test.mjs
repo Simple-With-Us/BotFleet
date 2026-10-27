@@ -255,6 +255,18 @@ describe("frameScaleFilter", () => {
     expect(filter[0]).toBe("-vf");
     expect(filter[1]).toMatch(/scale=256:256/);
   });
+
+  it("does not upscale art that is smaller than the declared size", () => {
+    // Scaling up would invent pixels the author never drew, and the build
+    // refuses such art outright, so the filter must not ask for it either.
+    expect(frameScaleFilter({ width: 128, height: 128 }, { width: 256, height: 256 })).toEqual([]);
+  });
+
+  it("does not squash art whose shape does not match", () => {
+    // A wide drawing scaled into a square changes what the author drew, and
+    // the build refuses such art, so the filter must not ask for it either.
+    expect(frameScaleFilter({ width: 512, height: 256 }, { width: 256, height: 256 })).toEqual([]);
+  });
 });
 
 describe("validateManifestAgainstFrames", () => {
