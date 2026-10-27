@@ -4,7 +4,23 @@ import ServiceManagement
 
 @main
 final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private let api = ControlAPI()
+    private let hostStore = ServerHostStore()
+    private var hosts: [ServerHost] = []
+    private var hostApis: [String: ControlAPI] = [:]
+    private var hostStatuses: [String: ControlStatus] = [:]
+    private var hostErrors: [String: String] = [:]
+
+    private var api: ControlAPI {
+        api(for: .defaultLocal)
+    }
+
+    private func api(for host: ServerHost) -> ControlAPI {
+        if let existing = hostApis[host.id], existing.host == host { return existing }
+        let client = ControlAPI(host: host)
+        hostApis[host.id] = client
+        return client
+    }
+
     private let startup = StartupPolicy()
     private let persistence = PersistencePolicy()
     private let offlineDocker = OfflineDockerVM()
@@ -50,6 +66,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        hosts = hostStore.loadHosts()
         menu.autoenablesItems = false
         menu.delegate = self
         showIcon()
@@ -82,48 +99,85 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         guard !isBusy, !isLoading else { return }
         isLoading = true
+        hosts = hostStore.loadHosts()
         rebuildMenu()
         Task { @MainActor in
+            // 1. Probe local server
             do {
-                status = try await api.status()
-                persistOnExit = status?.persistOnExit
-                installedServerState = .running
-                apiUnavailable = false
-                serverPresence = .present
-                offlineVMs = .unavailable
-                helperVMs = nil
-                vmProblem = nil
-                problem = nil
+                let localStatus = try await self.api.status()
+                self.status = localStatus
+                self.hostStatuses[ServerHost.defaultLocal.id] = localStatus
+                self.hostErrors[ServerHost.defaultLocal.id] = nil
+                self.persistOnExit = localStatus.persistOnExit
+                self.installedServerState = .running
+                self.apiUnavailable = false
+                self.serverPresence = .present
+                self.offlineVMs = .unavailable
+                self.helperVMs = nil
+                self.vmProblem = nil
+                self.problem = nil
             } catch {
-                status = nil
-                installedServerState = await Task.detached(priority: .userInitiated) { self.startup.installedServerState }.value
-                apiUnavailable = (error as? ControlAPIError) == .unavailable
+                self.status = nil
+                self.hostStatuses.removeValue(forKey: ServerHost.defaultLocal.id)
+                self.hostErrors[ServerHost.defaultLocal.id] = error.localizedDescription
+                self.installedServerState = await Task.detached(priority: .userInitiated) { self.startup.installedServerState }.value
+                self.apiUnavailable = (error as? ControlAPIError) == .unavailable
                 // The API did not answer.  That is not proof that the server
                 // is gone, so ask the port itself.
-                serverPresence = await Task.detached(priority: .userInitiated) { self.presenceProbe.presence() }.value
-                persistOnExit = installedServerState == .stopped && apiUnavailable ? persistence.value : nil
-                if installedServerState == .stopped && apiUnavailable {
-                    if offlineVMHelper.available {
+                self.serverPresence = await Task.detached(priority: .userInitiated) { self.presenceProbe.presence() }.value
+                self.persistOnExit = self.installedServerState == .stopped && self.apiUnavailable ? self.persistence.value : nil
+                if self.installedServerState == .stopped && self.apiUnavailable {
+                    if self.offlineVMHelper.available {
                         do {
-                            helperVMs = try await Task.detached(priority: .userInitiated) { try self.offlineVMHelper.status() }.value
-                            vmProblem = nil
+                            self.helperVMs = try await Task.detached(priority: .userInitiated) { try self.offlineVMHelper.status() }.value
+                            self.vmProblem = nil
                         } catch {
-                            helperVMs = nil
-                            vmProblem = error.localizedDescription
+                            self.helperVMs = nil
+                            self.vmProblem = error.localizedDescription
                         }
-                    } else { helperVMs = nil; vmProblem = nil }
-                    offlineVMs = helperVMs == nil
+                    } else { self.helperVMs = nil; self.vmProblem = nil }
+                    self.offlineVMs = self.helperVMs == nil
                         ? await Task.detached(priority: .userInitiated) { self.offlineDocker.inspect() }.value
                         : .unavailable
-                } else { offlineVMs = .unavailable; helperVMs = nil; vmProblem = nil }
-                problem = apiUnavailable && installedServerState == .stopped ? nil : error.localizedDescription
+                } else { self.offlineVMs = .unavailable; self.helperVMs = nil; self.vmProblem = nil }
+                self.problem = self.apiUnavailable && self.installedServerState == .stopped ? nil : error.localizedDescription
             }
-            isLoading = false
-            rebuildMenu()
+
+            // Clear loading immediately so local controls and status render without waiting for remote hosts
+            self.isLoading = false
+            self.rebuildMenu()
+
+            // 2. Concurrently probe remote hosts with 5s timeout and update incrementally
+            await withTaskGroup(of: (String, Result<ControlStatus, Error>).self) { group in
+                for host in self.hosts where !host.isLocal {
+                    let client = self.api(for: host)
+                    group.addTask {
+                        do {
+                            let st = try await client.status(timeout: 5.0)
+                            return (host.id, .success(st))
+                        } catch {
+                            return (host.id, .failure(error))
+                        }
+                    }
+                }
+                for await (id, result) in group {
+                    switch result {
+                    case .success(let st):
+                        self.hostStatuses[id] = st
+                        self.hostErrors[id] = nil
+                    case .failure(let err):
+                        self.hostStatuses.removeValue(forKey: id)
+                        self.hostErrors[id] = err.localizedDescription
+                    }
+                    self.rebuildMenu()
+                }
+            }
+
+            self.rebuildMenu()
             // The wheelhouse is reconciled behind the menu.  pm2 can take
             // seconds to start or stop a service, and a menu that waits for
             // it looks broken long before it is.
-            reconcileWheelhouseInBackground()
+            self.reconcileWheelhouseInBackground()
         }
     }
 
@@ -192,22 +246,38 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func add(_ title: String, selector: Selector? = nil, enabled: Bool = true, state: NSControl.StateValue = .off) {
+    private func add(_ title: String, selector: Selector? = nil, enabled: Bool = true, state: NSControl.StateValue = .off, representedObject: Any? = nil) {
         let entry = NSMenuItem(title: title, action: selector, keyEquivalent: "")
         entry.target = self
         entry.isEnabled = selector != nil && enabled
         entry.state = state
+        entry.representedObject = representedObject
         menu.addItem(entry)
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
         let ready = !isLoading && !isBusy
-        if isLoading { add("Server: Loading…") }
-        else if let status {
+
+        // 1. LOCAL SERVER (Mac)
+        if hosts.count > 1 {
+            let localHeader = NSMenuItem(title: "LOCAL MAC SERVER", action: nil, keyEquivalent: "")
+            localHeader.isEnabled = false
+            menu.addItem(localHeader)
+        }
+
+        if isLoading {
+            add("Server: Loading…")
+        } else if let status {
             add("Server: running (\(status.activeBotCount) active bots)")
-            add("Local VMs: \(status.runningVMCount) running of \(status.localVms.count)")
-            for vm in status.localVms { add("  \(vm.name): \(vm.state ?? (vm.running ? "running" : "unknown"))") }
+            let vmState = status.isSharedVMRunning ? "Running 🟢" : "Off ⚪️ (\(status.sharedVM?.state ?? "stopped"))"
+            add("Shared VM: \(vmState)")
+            if status.localVms.count > 1 {
+                add("Local VMs: \(status.runningVMCount) running of \(status.localVms.count)")
+                for vm in status.localVms where vm.key != "shared" {
+                    add("  \(vm.name): \(vm.state ?? (vm.running ? "running" : "unknown"))")
+                }
+            }
         } else {
             if apiUnavailable && installedServerState == .stopped { add("Server: stopped") }
             else if installedServerState == .notInstalled { add("Server: not installed") }
@@ -215,6 +285,9 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else { add("Server: unknown") }
             if apiUnavailable && installedServerState == .stopped, let helperVMs {
                 let running = helperVMs.filter(\.running).count
+                let shared = helperVMs.first(where: { $0.key == "shared" })
+                let vmState = (shared?.running == true) ? "Running 🟢" : "Off ⚪️ (\(shared?.state ?? "unknown"))"
+                add("Shared VM: \(vmState)")
                 add("Local VMs: \(running) running of \(helperVMs.count)")
                 for vm in helperVMs { add("  \(vm.name): \(vm.state ?? "unknown")") }
             } else if apiUnavailable && installedServerState == .stopped,
@@ -222,32 +295,101 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 add("Local VMs (Docker): \(offlineVMs.runningCount) running of \(vms.count)")
                 if vms.isEmpty { add("  Managed Docker VMs: none found") }
                 for vm in vms { add("  \(vm.name): \(vm.running ? "running" : "stopped")") }
-            } else if apiUnavailable { add("Local VMs: unknown while server is offline") }
-            else { add("Local VMs: unknown while server is busy") }
+            } else if apiUnavailable { add("Shared VM: Off ⚪️ (server offline)") }
+            else { add("Shared VM: unknown while server is busy") }
         }
         if let problem { add("Error: \(problem)") }
         if let vmProblem { add("Local VM: \(vmProblem)") }
         if status?.sharedVM?.state == "stopped" { add("Local VM requires recreation in BotFleet") }
         if !startup.supportsPolicy { add("Update BotFleet to manage server startup") }
+
         let wheelhouse = Wheelhouse(serverState: serverState(),
                                     mcpServerState: mcpServerState)
         if !wheelhouse.entries.isEmpty {
             menu.addItem(.separator())
             for entry in wheelhouse.entries { add("\(entry.title): \(entry.summary)") }
         }
+
         menu.addItem(.separator())
         add("Start Server", selector: #selector(startServer), enabled: ready && startup.supportsPolicy && apiUnavailable && installedServerState == .stopped)
         add("Stop Server And Local VMs…", selector: #selector(stopServer), enabled: ready && status != nil)
-        add("Start Local VM", selector: #selector(startVM), enabled: ready && status?.canStartSharedVM == true)
+        add("Start Shared VM", selector: #selector(startVM), enabled: ready && status?.canStartSharedVM == true)
         let canCreateOffline = apiUnavailable && installedServerState == .stopped
             && offlineVMHelper.available && helperVMs?.first(where: { $0.key == "shared" })?.state == "missing"
         add("Create Local VM (Stopped)…", selector: #selector(createStoppedVM), enabled: ready && canCreateOffline)
         let offlineRunning = helperVMs?.contains(where: \.running) == true
-        add("Stop Local VMs…", selector: #selector(stopVMs), enabled: ready && (((status?.runningVMCount ?? 0) > 0) ||
+        add("Stop Shared VM…", selector: #selector(stopVMs), enabled: ready && (((status?.runningVMCount ?? 0) > 0) ||
             (apiUnavailable && installedServerState == .stopped && offlineVMHelper.available && offlineRunning)))
         if status == nil && apiUnavailable && installedServerState == .stopped {
             if !offlineVMHelper.available { add("Update BotFleet Control to manage Local VMs offline") }
         }
+
+        // 2. REMOTE CONNECTED SERVERS (e.g. Hetzner Server, or custom servers)
+        for host in hosts where !host.isLocal {
+            menu.addItem(.separator())
+            let header = NSMenuItem(title: host.name.uppercased(), action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+
+            if let st = hostStatuses[host.id] {
+                add("Server: running (\(st.activeBotCount) active bots)")
+                let vmState = st.isSharedVMRunning ? "Running 🟢" : "Off ⚪️ (\(st.sharedVM?.state ?? "stopped"))"
+                add("Shared VM: \(vmState)")
+                if st.localVms.count > 1 {
+                    add("VMs: \(st.runningVMCount) running of \(st.localVms.count)")
+                }
+                if let err = hostErrors[host.id] { add("Notice: \(err)") }
+
+                add("Start Shared VM (\(host.name))", selector: #selector(startHostSharedVM), enabled: ready && st.canStartSharedVM, representedObject: host)
+                add("Stop Shared & Local VMs (\(host.name))…", selector: #selector(stopHostSharedVM), enabled: ready && st.canStopSharedVM, representedObject: host)
+                add("Stop Server (\(host.name))…", selector: #selector(stopRemoteServer), enabled: ready, representedObject: host)
+            } else {
+                let err = hostErrors[host.id] ?? "unreachable"
+                add("Server: offline (\(err))")
+                add("Shared VM: Off ⚪️ (server offline)")
+                add("Retry Connection (\(host.name))", selector: #selector(retryHostConnection), enabled: ready, representedObject: host)
+            }
+        }
+
+        // 3. CONNECTED SERVERS SUBMENU
+        menu.addItem(.separator())
+        let serversMenu = NSMenu()
+        for host in hosts {
+            let isOnline = host.isLocal ? (status != nil) : (hostStatuses[host.id] != nil)
+            let badge = isOnline ? "🟢" : "⚪️"
+            let item = NSMenuItem(title: "\(badge) \(host.name) (\(host.baseURL.absoluteString))", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            serversMenu.addItem(item)
+        }
+        serversMenu.addItem(.separator())
+        let addItem = NSMenuItem(title: "Add Connected Server…", action: #selector(promptAddServer), keyEquivalent: "")
+        addItem.target = self
+        addItem.isEnabled = ready
+        serversMenu.addItem(addItem)
+
+        let removable = hosts.filter { !$0.isLocal }
+        if !removable.isEmpty {
+            let removeMenu = NSMenu()
+            for host in removable {
+                let rItem = NSMenuItem(title: "Remove \(host.name)", action: #selector(removeServerAction), keyEquivalent: "")
+                rItem.target = self
+                rItem.representedObject = host
+                removeMenu.addItem(rItem)
+            }
+            let removeParent = NSMenuItem(title: "Remove Server", action: nil, keyEquivalent: "")
+            removeParent.submenu = removeMenu
+            serversMenu.addItem(removeParent)
+        }
+        let refreshItem = NSMenuItem(title: "Refresh All Servers", action: #selector(refreshHosts), keyEquivalent: "")
+        refreshItem.target = self
+        refreshItem.isEnabled = ready
+        serversMenu.addItem(refreshItem)
+
+        let parentServersItem = NSMenuItem(title: "Connected Servers (\(hosts.count))", action: nil, keyEquivalent: "")
+        parentServersItem.submenu = serversMenu
+        menu.addItem(parentServersItem)
+
+        // 4. PERSISTENCE & LOGIN SETTINGS
         menu.addItem(.separator())
         add("Keep Server Running After Quitting BotFleet", selector: #selector(togglePersist),
             enabled: ready && persistOnExit != nil && (status != nil || (apiUnavailable && installedServerState == .stopped)),
@@ -359,6 +501,88 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 _ = try await Task.detached(priority: .userInitiated) { try self.offlineVMHelper.stop() }.value
             }
         }
+    }
+
+    @objc private func startHostSharedVM(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? ServerHost else { return }
+        let client = api(for: host)
+        run { try await client.startSharedVM() }
+    }
+
+    @objc private func stopHostSharedVM(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? ServerHost else { return }
+        guard confirm("Stop Shared and Local VMs on \(host.name)?", "Running local and per-bot VMs on this host will stop.  The server will refuse while active bots or leases are busy.") else { return }
+        let client = api(for: host)
+        run { try await client.stopSharedVM() }
+    }
+
+    @objc private func stopRemoteServer(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? ServerHost else { return }
+        guard confirm("Stop Server on \(host.name)?", "This stops the remote BotFleet server.") else { return }
+        let client = api(for: host)
+        run { try await client.stopServer() }
+    }
+
+    @objc private func retryHostConnection(_ sender: NSMenuItem) {
+        menuWillOpen(menu)
+    }
+
+    @objc private func refreshHosts() {
+        menuWillOpen(menu)
+    }
+
+    @objc private func promptAddServer() {
+        let alert = NSAlert()
+        alert.messageText = "Add Connected BotFleet Server"
+        alert.informativeText = "Enter the server name, base URL (e.g. https://hetzner.botfleet.app or http://192.168.1.50:8799), and optional Bearer auth token."
+        alert.addButton(withTitle: "Add Server")
+        alert.addButton(withTitle: "Cancel")
+
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 300, height: 110))
+        stack.orientation = .vertical
+        stack.spacing = 8
+
+        let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        nameField.placeholderString = "Server Name (e.g. Hetzner Server)"
+
+        let urlField = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        urlField.placeholderString = "https://hetzner.botfleet.app"
+
+        let tokenField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        tokenField.placeholderString = "Auth Token (optional)"
+
+        stack.addArrangedSubview(nameField)
+        stack.addArrangedSubview(urlField)
+        stack.addArrangedSubview(tokenField)
+        alert.accessoryView = stack
+
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else { return }
+
+        let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let urlStr = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !name.isEmpty, let url = URL(string: urlStr), url.scheme == "http" || url.scheme == "https" else {
+            showError("Invalid server URL. Please provide a valid HTTP or HTTPS URL.")
+            return
+        }
+
+        let newHost = ServerHost(name: name, baseURL: url, authToken: token.isEmpty ? nil : token, isLocal: false)
+        hostStore.upsertHost(newHost)
+        hosts = hostStore.loadHosts()
+        menuWillOpen(menu)
+    }
+
+    @objc private func removeServerAction(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? ServerHost else { return }
+        guard confirm("Remove \(host.name)?", "BotFleet Control will stop monitoring \(host.baseURL.absoluteString).") else { return }
+        hostStore.removeHost(id: host.id)
+        hostStatuses.removeValue(forKey: host.id)
+        hostErrors.removeValue(forKey: host.id)
+        hostApis.removeValue(forKey: host.id)
+        hosts = hostStore.loadHosts()
+        rebuildMenu()
     }
 
     @objc private func togglePersist() {

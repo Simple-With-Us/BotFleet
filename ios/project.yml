@@ -26,7 +26,7 @@ packages:
     path: .
   Sentry:
     url: https://github.com/getsentry/sentry-cocoa.git
-    from: 9.30.2
+    from: 9.31.0
 targets:
   BotFleet:
     type: application
@@ -52,8 +52,12 @@ targets:
         # the ship script passes both values on the xcodebuild command line, and
         # reads this one as the build-number FLOOR, so it must stay below the
         # commit count of any commit that can ship.
-        MARKETING_VERSION: "1.0.2132"
-        CURRENT_PROJECT_VERSION: "2132"
+        # RECORD OF WHAT SHIPPED, not the source of truth for what ships next:
+        # the ship script passes both values on the xcodebuild command line, and
+        # reads this one as the build-number FLOOR, so it must stay below the
+        # commit count of any commit that can ship.
+        MARKETING_VERSION: "1.0.2222"
+        CURRENT_PROJECT_VERSION: "2222"
         SWIFT_VERSION: '5.9'
         TARGETED_DEVICE_FAMILY: '1,2'
         SUPPORTS_MACCATALYST: false
@@ -146,8 +150,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.botfleet.ios.widgets
         DEVELOPMENT_TEAM: CC8UTF7ATG
         CODE_SIGN_STYLE: Automatic
-        MARKETING_VERSION: "1.0.2132"
-        CURRENT_PROJECT_VERSION: "2132"
+        MARKETING_VERSION: "1.0.2222"
+        CURRENT_PROJECT_VERSION: "2222"
         SWIFT_VERSION: '5.9'
         TARGETED_DEVICE_FAMILY: '1,2'
         ENABLE_ON_DEMAND_RESOURCES: false
@@ -187,20 +191,70 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.botfleet.macos
+        # The product is BotFleet.app: it is the app this target replaces in
+        # /Applications, and it carries the same bundle id the Electron
+        # shell did, so it installs over it.  The TARGET is named BotFleetMac
+        # only to tell it apart from the iOS app inside the project file; the
+        # release assets keep the BotFleetMac- prefix so the Sparkle and
+        # electron-updater feeds never share a name.
+        PRODUCT_NAME: BotFleet
         DEVELOPMENT_TEAM: CC8UTF7ATG
         CODE_SIGN_STYLE: Automatic
-        MARKETING_VERSION: "1.0.2132"
-        CURRENT_PROJECT_VERSION: "2132"
+        MARKETING_VERSION: "1.0.2222"
+        CURRENT_PROJECT_VERSION: "2222"
         SWIFT_VERSION: '5.9'
         MACOSX_DEPLOYMENT_TARGET: '14.0'
+        # Notarization refuses a bundle without the Hardened Runtime, and
+        # Phase 6 ships this target only as a notarized Developer ID build
+        # (scripts/mac-package.sh, native-mac-release.yml).
+        ENABLE_HARDENED_RUNTIME: YES
         ENABLE_ON_DEMAND_RESOURCES: false
         COMBINE_HIDPI_IMAGES: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_CFBundleDisplayName: BotFleet
     info:
       path: MacApp/Info.plist
+      properties:
+        # These two keys must be declared here, not hand-edited into the
+        # plist: `xcodegen generate` REWRITES ios/MacApp/Info.plist, and a
+        # key it does not know about is reset to its default (1.0 / 1).  A
+        # release stamped 1.0.<commit_count> would then ship as CFBundleVersion
+        # 1, which disagrees with the appcast and starts a Sparkle update
+        # loop.  Declaring them here makes the generated plist carry the
+        # build settings.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # The same rewrite rule applies to the privacy strings: the Mac app
+        # requests the microphone and speech recognition for voice capture, and
+        # macOS TERMINATES an app that asks for a permission whose usage
+        # description is missing.  Hand-editing them into the plist does not
+        # survive `xcodegen generate`, which scripts/mac-package.sh and the
+        # native release workflow both run before archiving, so the shipped
+        # bundle would have no usage descriptions at all.  Declaring them here
+        # makes the generated plist carry them into the archive.
+        NSMicrophoneUsageDescription: BotFleet uses the microphone for dictation
+          and voice calls with bots.
+        NSSpeechRecognitionUsageDescription: BotFleet converts your speech into
+          text for messaging bots.
+        # Same rewrite rule again:  `xcodegen generate` REWRITES the plist, so a
+        # hand-added CFBundleURLTypes is dropped before the archive is built and
+        # macOS never delivers a botfleet:// URL to the app.  Without the scheme
+        # the whole deep-link router is dead code, because the voice failure
+        # recovery URL points at botfleet://settings/voice and the Application
+        # menu routes the same way.  Declaring the scheme here makes the
+        # generated plist register it.
+        CFBundleURLTypes:
+        - CFBundleURLName: app.botfleet.macos
+          CFBundleURLSchemes:
+          - botfleet
     entitlements:
       path: MacApp/BotFleetMac.entitlements
+      properties:
+        # Same rewrite rule as the Info.plist above: `xcodegen generate`
+        # REWRITES ios/MacApp/BotFleetMac.entitlements, so a hand-edited
+        # entitlement is dropped before the archive is built.  The Mac app
+        # captures audio for voice, so declare the input entitlement here.
+        com.apple.security.device.audio-input: true
 schemes:
   BotFleet:
     build:

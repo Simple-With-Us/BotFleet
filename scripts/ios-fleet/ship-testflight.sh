@@ -1681,7 +1681,7 @@ ensure_tf_ready() {
     while IFS= read -r line; do log "tf-ready: $line"; done <"${LOG_DIR}/ensure-tf-ready.err"
   fi
   if [[ $rc -eq 0 ]]; then
-    log "TestFlight external testers can install this build after Beta App Review"
+    log "TestFlight external install path is live for ${BUNDLE_ID} (an external group has testers or an enabled public link); the standing-testers sync assigns and verifies this build next"
     TF_READY_CONFIRMED=1
     return 0
   fi
