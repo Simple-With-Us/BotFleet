@@ -216,15 +216,21 @@ PY
 }
 MERGED="$(merge_doc "$BASE_JSON")"
 
-if [[ "$SKIP_LOCAL_WRITE" -eq 0 ]]; then
-  printf '%s\n' "$MERGED" >"$LOCAL_JSON"
-  echo "local-manifest-updated ${BUNDLE_ID} ${VERSION}"
-fi
+# The local cache is written only once the document is out (or for a
+# --skip-push run, where local is the whole point), never before:  a failed
+# publish must not leave a cache that says the version is recorded.
+write_local() {
+  if [[ "$SKIP_LOCAL_WRITE" -eq 0 ]]; then
+    printf '%s\n' "$1" >"$LOCAL_JSON"
+    echo "local-manifest-updated ${BUNDLE_ID} ${VERSION}"
+  fi
+}
 if [[ -n "$OUT_JSON" ]]; then
   printf '%s\n' "$MERGED" >"$OUT_JSON"
 fi
 
 if [[ "$SKIP_PUSH" -eq 1 ]]; then
+  write_local "$MERGED"
   echo "skip-push ${BUNDLE_ID} ${VERSION} apps=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("apps") or {}))' <<<"$MERGED")"
   exit 0
 fi
@@ -436,6 +442,8 @@ else
     exit 1
   }
 fi
+
+write_local "$MERGED_B"
 
 # 4.  Arm the merge with the same elevated credential.  GitHub raises no
 #     workflow events for a merge made with the repository's own

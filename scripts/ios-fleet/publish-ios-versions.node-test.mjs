@@ -550,3 +550,27 @@ test("the sheet sync runs after the publish, a failure fails the run, a missing 
   rmSync(ok.dir, { recursive: true, force: true });
   rmSync(bad.dir, { recursive: true, force: true });
 });
+
+test("the local cache is written only after the publish, never before a failed one", () => {
+  const copy = mkdtempSync(join(tmpdir(), "afc-ios-copy-"));
+  const script = join(copy, "publish-ios-versions.sh");
+  writeFileSync(script, readFileSync(SCRIPT));
+  const cache = join(copy, "ios-app-versions.json");
+  const args = ["--bundle-id", "com.socratictrade.ios", "--version", "1.0.69"];
+  const thin = { schemaVersion: 1, apps: { "com.socratictrade.ios": { marketingVersion: "1.0.68" } } };
+  const bad = stubDir({ branch: { doc: thin } });
+  const failed = spawnSync("bash", [script, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, FLEET_ICON_AUDIT: "off", PATH: `${bad}:${process.env.PATH}`, FAKE_GH_DIR: bad, GH_TOKEN: "ghp_notarealtoken", GITHUB_TOKEN: "" },
+  });
+  assert.notEqual(failed.status, 0);
+  assert.ok(!existsSync(cache), "a failed publish must not write the local cache");
+  const good = stubDir();
+  const done = spawnSync("bash", [script, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, FLEET_ICON_AUDIT: "off", PATH: `${good}:${process.env.PATH}`, FAKE_GH_DIR: good, GH_TOKEN: "ghp_notarealtoken", GITHUB_TOKEN: "" },
+  });
+  assert.equal(done.status, 0, done.stderr);
+  assert.equal(JSON.parse(readFileSync(cache, "utf8")).apps["com.socratictrade.ios"].marketingVersion, "1.0.69");
+  for (const d of [copy, bad, good]) rmSync(d, { recursive: true, force: true });
+});
