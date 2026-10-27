@@ -16,21 +16,54 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { assertRuntimeExecutable, resolveRuntime } from "./smoke-runtime-mode.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const port = 21000 + Math.floor(Math.random() * 9000);
+
+// BF-1991: run the gate on the runtime production uses.  OMB_SMOKE_RUNTIME
+// names the packaged binary, and it is booted with ELECTRON_RUN_AS_NODE=1
+// exactly the way the shipped harness boots it.  An unnamed runtime is a
+// bundle check against the runner's Node, and it is labelled as one.  A NAMED
+// runtime that cannot be executed is an error, never a fallback: silently
+// falling back would let a bundle check's result pass as a runtime pass.
+//
+// Resolved BEFORE the copy, so a broken runtime fails the gate without
+// leaving a staging tree behind, and before the spawn, so the mode is in the
+// log even when the gate fails.
+const runtime = (() => {
+  try {
+    const resolved = resolveRuntime(process.env.OMB_SMOKE_RUNTIME);
+    console.log(`smoke mode: ${resolved.mode} (${resolved.label})`);
+    console.log(`smoke gate kind: ${resolved.kind}`);
+    console.log(`smoke runtime: ${resolved.command}`);
+    if (resolved.mode === "runtime") {
+      // Existence and the executable bit are not enough -- a binary built for
+      // another architecture exists, is executable, and still dies with "Bad
+      // CPU type in executable".  Exec it once before the gate claims
+      // anything about it.
+      assertRuntimeExecutable(resolved.command, { env: resolved.env });
+    }
+    return resolved;
+  } catch (error) {
+    console.error(`packaged server smoke failed: ${error.message}`);
+    process.exit(1);
+  }
+})();
+
 const staging = mkdtempSync(join(tmpdir(), "omb-smoke-"));
 const home = mkdtempSync(join(tmpdir(), "omb-smoke-home-"));
-const port = 21000 + Math.floor(Math.random() * 9000);
 
 // OMB_SMOKE_DIST lets the release workflow aim this at a packaged app's
 // Resources/server tree instead of the repo build.
 cpSync(process.env.OMB_SMOKE_DIST ?? join(root, "dist-server"), join(staging, "server"), { recursive: true });
 
-const child = spawn(process.execPath, [join(staging, "server", "index.js")], {
+const child = spawn(runtime.command, [join(staging, "server", "index.js")], {
   cwd: staging,
   env: {
     ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
     ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+    ...runtime.env,
     HOME: home,
     USERPROFILE: home,
     OMB_PORT: String(port),
@@ -142,7 +175,13 @@ writeFileSync(
 
 let proxyReport = null;
 try {
-  const { stdout } = await promisify(execFile)(process.execPath, [probe], { cwd: staging });
+  const { stdout } = await promisify(execFile)(runtime.command, [probe], {
+    cwd: staging,
+    // The same runtime the server booted on.  The probe asks where the server
+    // would resolve its siblings, so it has to answer from the same tree AND
+    // the same runtime that resolved them.
+    env: { ...process.env, ...runtime.env },
+  });
   proxyReport = JSON.parse(stdout);
 } catch (error) {
   proxyReport = { error: String((error && error.message) || error) };
@@ -153,11 +192,12 @@ try {
 // dependencies and that shutdown lets the final JSON-RPC frame drain.
 let mcpReport = null;
 if (listening) {
-  const mcp = spawn(process.execPath, [join(staging, "server", "mcp-server.js")], {
+  const mcp = spawn(runtime.command, [join(staging, "server", "mcp-server.js")], {
     cwd: staging,
     env: {
       ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+      ...runtime.env,
       HOME: home,
       USERPROFILE: home,
       OMB_PORT: String(port),
@@ -245,3 +285,4 @@ const count = Object.keys(proxyReport.resolved).length;
 console.log(`packaged server started with no node_modules in reach (port ${port}) ✓`);
 console.log(`all ${count} spawned proxy paths resolve inside the packaged server dir ✓`);
 console.log("packaged MCP stdio server reached the API and flushed its final frames ✓");
+console.log(`smoke gate result: ${runtime.mode} (${runtime.label}) on ${runtime.command}`);

@@ -8,8 +8,9 @@ name: iOS TestFlight ship (GitHub-hosted macOS)
 # Signing + ASC keys come from Infisical prod (BotFleet project, type=shared)
 # through .github/actions/infisical-secrets (scripts/infisical-fetch.mjs --
 # no CLI install, no dependency). Identity stays on GitHub only:
-#   INFISICAL_PROJECT_ID, INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/SECRET
-#   (fallback INFISICAL_CLIENT_ID/SECRET).
+#   INFISICAL_PROJECT_ID and INFISICAL_IOS_SHIP_READ_TOKEN -- a read-only
+#   service token scoped to this project, environment and folder, in place
+#   of the machine identity this pipeline used to hold.
 # After should_ship=1 the job loads into GITHUB_ENV (masked):
 #   APPLE_API_KEY_ID, APPLE_API_ISSUER_ID, APPLE_API_KEY_P8_BASE64,
 #   IOS_CERT_P12_BASE64, IOS_CERT_PASSWORD (all required -- the ship fails
@@ -165,8 +166,7 @@ jobs:
             APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
             IOS_CERT_P12_BASE64 IOS_CERT_PASSWORD
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+          token: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
         env:
           GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}

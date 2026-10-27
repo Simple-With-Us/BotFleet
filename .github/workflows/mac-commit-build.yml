@@ -100,8 +100,7 @@ jobs:
           names: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
           required: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+          token: ${{ secrets.INFISICAL_MAC_COMMIT_BUILD_READ_TOKEN }}
         env:
           GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
           GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
@@ -135,7 +134,7 @@ jobs:
             -c.mac.timestamp=none \
             -c.extraMetadata.version="$BOTFLEET_BUILD_VERSION"
 
-      - name: "Gate: signature, team, and a packaged server that starts"
+      - name: "Gate: signature, team, and a packaged server that starts (runtime pass or bundle check)"
         run: |
           app=release/mac-arm64/BotFleet.app
           codesign --verify --deep --strict "$app"
@@ -148,7 +147,16 @@ jobs:
           echo "::notice::signed by ${identity} (team ${team})"
           # The same gate release.yml applies, and the same bug it exists for:
           # 0.1.24 passed every signature check and died on launch.
-          OMB_SMOKE_DIST="$app/Contents/Resources/server" node scripts/smoke-packaged-server.mjs
+          #
+          # BF-1991: the gate boots the PACKAGED binary under
+          # ELECTRON_RUN_AS_NODE=1 -- the runtime the shipped app uses -- when
+          # this host can exec it, and labels the run a bundle check when it
+          # cannot.  The runner's own Node used to be the only runtime here, so
+          # the gate could pass a build that died under the packaged runtime.
+          node scripts/smoke-runtime-mode.mjs gate \
+            --app "$app" \
+            --dist "$app/Contents/Resources/server" \
+            --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Record the build manifest
         id: manifest

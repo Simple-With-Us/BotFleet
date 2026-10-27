@@ -804,6 +804,12 @@ struct Phase1StoreImporterAndPerfTests {
         let report = try await MacPerformanceHarness.runFullSuite(
             messageCount: 1_000,
             walInsertCount: 10_000,
+            // The surface-sync sweep is measured at a smaller transcript here
+            // so the suite does not pay for a 50,000-message transcript it
+            // does not judge.  The metric is reported and not gated in the
+            // test runner, so the shape it runs at changes nothing but the
+            // time the suite takes.
+            surfaceSyncTranscriptSizes: [1_000, 5_000],
             context: .testRunner
         )
         #expect(report.fts5StemmingVerified == true)
@@ -831,7 +837,8 @@ struct Phase1StoreImporterAndPerfTests {
             "100 tok/s streaming CPU": 6.0,
             "CUA 60fps memory drift": 10.0,
             "FTS5 search latency (p95)": 10.0,
-            "SQLite WAL size after checkpoint": 64.0
+            "SQLite WAL size after checkpoint": 64.0,
+            "Badge/menubar surface sync": 10.0
         ]
         #expect(MacPerformanceBudget.maxColdStartMs == 50.0)
         #expect(Double(MacPerformanceBudget.maxIdleMemoryBytes) / (1024.0 * 1024.0) == 80.0)
@@ -841,6 +848,7 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(Double(MacPerformanceBudget.maxCuaMemoryDriftBytes) / (1024.0 * 1024.0) == 10.0)
         #expect(MacPerformanceBudget.maxFts5P95LatencyMs == 10.0)
         #expect(Double(MacPerformanceBudget.maxWalSizeBytes) / (1024.0 * 1024.0) == 64.0)
+        #expect(MacPerformanceBudget.maxSurfaceSyncMs == 10.0)
 
         // The harness also prints the FTS5 latency including the caller's round
         // trip, and the pooled percentile over every raw sample.  Both are
@@ -890,7 +898,8 @@ struct Phase1StoreImporterAndPerfTests {
         // carry their product budget, and still say why they are not gated.
         let wallClockNames: Set<String> = [
             "Cold start time",
-            "FTS5 search latency (p95)"
+            "FTS5 search latency (p95)",
+            "Badge/menubar surface sync"
         ]
         for metric in report.metrics where wallClockNames.contains(metric.name) {
             #expect(metric.enforced == false)
@@ -903,6 +912,165 @@ struct Phase1StoreImporterAndPerfTests {
         let summary = report.formattedSummary()
         #expect(summary.contains("[PASS] Visual design contract:"))
         #expect(summary.contains("[PENDING] App visual surface:"))
+    }
+
+    @Test("The badge/menubar surface-sync budget still fails a regression, and the tail stays visible")
+    func surfaceSyncBudgetStillFailsAndCarriesTheTail() async throws {
+        // The badge, the menubar and the sidebar row answer "is anything
+        // waiting?" by scanning the thread for a pending card, so the scan is
+        // the thing the budget is about.  A rebuild over the budget has to
+        // fail, or the gate could not catch the regression it exists for.
+        let breach = MacPerformanceHarness.surfaceSyncMetric(measuredMs: 12.0, context: .standalone)
+        #expect(breach.passed == false)
+        #expect(breach.enforced == true)
+        #expect(breach.name == "Badge/menubar surface sync")
+        #expect(breach.specBudgetLimit == 10.0)
+
+        let within = MacPerformanceHarness.surfaceSyncMetric(measuredMs: 1.0, context: .standalone)
+        #expect(within.passed == true)
+        #expect(within.enforced == true)
+
+        // A duration measured inside the test runner describes the runner, so
+        // the budget is reported there and enforced by the standalone
+        // executable, which is where CI runs it.
+        let inTestRunner = MacPerformanceHarness.surfaceSyncMetric(measuredMs: 1.0, context: .testRunner)
+        #expect(inTestRunner.enforced == false)
+        #expect(inTestRunner.reportNote != nil)
+        #expect(inTestRunner.specBudgetLimit == 10.0)
+
+        // The measurement itself has to describe the surfaces rather than a
+        // private copy of their logic, so the harness builds a real state and
+        // reads the real summaries off it.
+        let report = try await MacPerformanceHarness.runFullSuite(
+            messageCount: 200,
+            walInsertCount: 100,
+            surfaceSyncTranscriptSizes: [500],
+            surfaceSyncRepeats: 2,
+            context: .testRunner
+        )
+        let surfaceSync = try #require(
+            report.metrics.first { $0.name == "Badge/menubar surface sync" },
+            "The harness did not report the badge/menubar surface sync metric."
+        )
+        #expect(surfaceSync.measuredValue.isFinite == true)
+        #expect(surfaceSync.measuredValue >= 0)
+        #expect(surfaceSync.unit == "ms")
+        #expect(surfaceSync.specBudgetLimit == MacPerformanceBudget.maxSurfaceSyncMs)
+        // The note carries the whole curve, because a budget that hides the
+        // tail is how a linear scan passes a gate and still stalls the app.
+        #expect(surfaceSync.reportNote?.contains("500 msgs") == true)
+    }
+
+    @Test("The badge/menubar surface-sync sweep refuses an impossible configuration instead of trapping")
+    func surfaceSyncSweepRefusesImpossibleConfiguration() async throws {
+        // A zero-repeat sweep leaves the sample array empty, so the median
+        // index would run off the end of it.  The suite has to reject the
+        // configuration it cannot measure, not crash on it.
+        await #expect(throws: MacPerformanceHarnessError.invalidSurfaceSyncConfiguration) {
+            try await MacPerformanceHarness.runFullSuite(
+                messageCount: 50,
+                walInsertCount: 50,
+                surfaceSyncTranscriptSizes: [200],
+                surfaceSyncRepeats: 0,
+                context: .testRunner
+            )
+        }
+
+        // A sweep with no transcript size has nothing to report, and a
+        // negative size is not a message count at all.
+        await #expect(throws: MacPerformanceHarnessError.missingSurfaceSyncMeasurement) {
+            try await MacPerformanceHarness.runFullSuite(
+                messageCount: 50,
+                walInsertCount: 50,
+                surfaceSyncTranscriptSizes: [],
+                surfaceSyncRepeats: 2,
+                context: .testRunner
+            )
+        }
+
+        await #expect(throws: MacPerformanceHarnessError.invalidSurfaceSyncConfiguration) {
+            try await MacPerformanceHarness.runFullSuite(
+                messageCount: 50,
+                walInsertCount: 50,
+                surfaceSyncTranscriptSizes: [-1],
+                surfaceSyncRepeats: 2,
+                context: .testRunner
+            )
+        }
+    }
+
+    @Test("The active streaming CPU budget is measured over the streaming second and still catches a regression")
+    func streamingCpuBudgetIsMeasuredOverTheStreamingSecond() async throws {        // The shape the P-BF-6 budget is written against: five bots, one
+        // hundred tokens each, at one hundred tokens per second, so one
+        // window covers exactly one simulated second of streaming.
+        let shape = MacStreamingCpuShape.product
+        #expect(shape.botCount == 5)
+        #expect(shape.tokensPerBot == 100)
+        #expect(shape.tokensPerSecond == 100)
+        #expect(shape.repeats == 3)
+        #expect(shape.simulatedSeconds == 1.0)
+
+        // The budget's own arithmetic: the CPU a window costs over the
+        // simulated second it covers.  A window that costs more than 6% of
+        // one core breaches the 6% budget and one that costs less passes,
+        // so the budget still fails a regression that makes streaming
+        // expensive.
+        let atBudget = MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.060, simulatedSeconds: 1.0)
+        #expect(abs(atBudget - 6.0) < 0.0001)
+        #expect(atBudget <= MacPerformanceBudget.maxStreamingCpuPercent)
+        let overBudget = MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.0601, simulatedSeconds: 1.0)
+        #expect(overBudget > MacPerformanceBudget.maxStreamingCpuPercent)
+        let underBudget = MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.010, simulatedSeconds: 1.0)
+        #expect(underBudget < MacPerformanceBudget.maxStreamingCpuPercent)
+
+        // A window that covers no simulated time cannot be converted, and it
+        // must not turn into an infinite percentage that passes or fails at
+        // random.
+        #expect(MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.060, simulatedSeconds: 0) == 0)
+
+        // The gate's own verdict.  A window that costs more than 6% of one
+        // core over its simulated second fails the budget, and the same
+        // metric built from a cheap window passes, so the budget is still
+        // able to fail a regression.
+        let breach = MacPerformanceHarness.streamingCpuMetric(
+            cpuSeconds: 0.0601,
+            shape: shape,
+            context: .standalone
+        )
+        #expect(breach.passed == false)
+        #expect(breach.enforced == true)
+        #expect(breach.name == "100 tok/s streaming CPU")
+        #expect(breach.specBudgetLimit == 6.0)
+        let within = MacPerformanceHarness.streamingCpuMetric(
+            cpuSeconds: 0.010,
+            shape: shape,
+            context: .standalone
+        )
+        #expect(within.passed == true)
+        #expect(within.enforced == true)
+
+        // The measurement itself.  The concurrency pool is warmed before the
+        // measured windows, so the one-time cost of starting the process's
+        // threads is not charged to streaming, and the reported number is
+        // the median of the windows rather than one sample.
+        let smallShape = MacStreamingCpuShape(botCount: 2, tokensPerBot: 4, tokensPerSecond: 40, repeats: 2)
+        let measurement = await MacPerformanceHarness.measureStreamingCpu(shape: smallShape)
+        #expect(measurement.samples.count == smallShape.repeats)
+        #expect(measurement.simulatedSeconds == smallShape.simulatedSeconds)
+        #expect(measurement.cpuPercent.isFinite == true)
+
+        // The reported number is the median of the windows, divided by the
+        // simulated second and not by the wall clock the host took.  The
+        // conversion takes no wall-clock input at all, so a host that
+        // finishes the window slowly cannot move the number.
+        let ordered = measurement.samples.sorted()
+        let median = ordered[ordered.count / 2]
+        #expect(abs(measurement.medianCpuSeconds - median) < 0.000000001)
+        let expected = MacPerformanceHarness.streamingCpuPercent(
+            cpuSeconds: median,
+            simulatedSeconds: smallShape.simulatedSeconds
+        )
+        #expect(abs(measurement.cpuPercent - expected) < 0.000001)
     }
 
     // MARK: - Visual parity against the legacy source and the app (BF-2496)

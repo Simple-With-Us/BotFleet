@@ -1,0 +1,21 @@
+{
+  "formatVersion": 1,
+  "name": "tvface-working-demo",
+  "version": "1.0.0",
+  "author": "BotFleet",
+  "frame": {
+    "width": 256,
+    "height": 256,
+    "count": 36,
+    "delayMs": 83
+  },
+  "restingFrame": 0,
+  "states": {
+    "*": {
+      "hold": {
+        "from": 0,
+        "to": 35
+      }
+    }
+  }
+}

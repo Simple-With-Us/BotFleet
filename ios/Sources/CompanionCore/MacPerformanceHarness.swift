@@ -25,6 +25,23 @@ public enum MacPerformanceBudget {
     public static let maxFts5P95LatencyMs: Double = 10.0
     /// SQLite WAL file size after checkpoint: < 64 MB.
     public static let maxWalSizeBytes: UInt64 = 64 * 1024 * 1024
+    /// Badge, menubar and sidebar surface rebuild: < 10 ms.
+    ///
+    /// The surfaces answer "is anything waiting for the person?" by looking
+    /// for a pending card in the thread, and the scan stops at the newest
+    /// pending card.  The cost this budget is about is therefore the worst
+    /// case: one rebuild over a thread with nothing pending, which is the
+    /// only shape in which the scan walks the whole transcript.
+    ///
+    /// The budget is measured over the product shape, the 2,000-message
+    /// transcript the rest of this harness seeds, and it is measured in the
+    /// debug build the harness runs in.  A release build of the same scan is
+    /// roughly twenty-five times cheaper, so the budget describes the gate,
+    /// not the app's worst case on a loaded machine.
+    ///
+    /// The surfaces rebuild on a throttle rather than on every streamed frame,
+    /// so this is the cost of one rebuild and not the cost per token.
+    public static let maxSurfaceSyncMs: Double = 10.0
 
     /// True when the harness runs inside a CI job.
     public static var isRunningInCI: Bool {
@@ -44,6 +61,78 @@ public enum MacPerformanceBudget {
     public static func effectiveLimit(forProductBudget productBudget: Double) -> Double {
         productBudget
     }
+}
+
+/// A reason the harness could not produce a measurement at all.
+public enum MacPerformanceHarnessError: Error, Equatable {
+    /// The surface-sync benchmark was asked to measure no transcript size, so
+    /// it had nothing to report and a budget could not be judged.
+    case missingSurfaceSyncMeasurement
+    /// The surface-sync benchmark was asked for a sweep it cannot run: no
+    /// rebuild to average, or a transcript size that is not a message count.
+    /// Without this the sweep indexed an empty sample array and trapped
+    /// instead of reporting a bad configuration.
+    case invalidSurfaceSyncConfiguration
+}
+
+// MARK: - Streaming CPU Shape and Measurement
+
+/// The simulated streaming load the active CPU budget is measured against.
+///
+/// The budget is written as a percentage of one core while a bot streams at
+/// 100 tokens per second, so a measurement that answers it has to hold the
+/// token rate and report the CPU that streaming costs.  A shape says how many
+/// bots stream, how many tokens each one emits, at what rate, and how many
+/// measured windows the median is taken over.
+public struct MacStreamingCpuShape: Sendable, Equatable {
+    /// How many bots stream at the same time.
+    public let botCount: Int
+    /// How many tokens each bot emits in one window.
+    public let tokensPerBot: Int
+    /// The rate each bot streams at, in tokens per second.
+    public let tokensPerSecond: Int
+    /// How many measured windows the median is taken over.
+    public let repeats: Int
+
+    public init(botCount: Int, tokensPerBot: Int, tokensPerSecond: Int, repeats: Int) {
+        self.botCount = botCount
+        self.tokensPerBot = tokensPerBot
+        self.tokensPerSecond = tokensPerSecond
+        self.repeats = repeats
+    }
+
+    /// The shape the product budget is written against: five bots, one
+    /// hundred tokens each, streaming at one hundred tokens per second.
+    public static let product = MacStreamingCpuShape(
+        botCount: 5,
+        tokensPerBot: 100,
+        tokensPerSecond: 100,
+        repeats: 3
+    )
+
+    /// How long one simulated window lasts, in seconds.
+    ///
+    /// This is the denominator of the budget, and it is fixed by the token
+    /// rate rather than by how fast the host happens to be, so the measured
+    /// number does not move when the machine gets faster or busier.
+    public var simulatedSeconds: Double {
+        guard tokensPerSecond > 0, tokensPerBot > 0 else { return 0 }
+        return Double(tokensPerBot) / Double(tokensPerSecond)
+    }
+}
+
+/// What the streaming CPU measurement saw.
+public struct MacStreamingCpuMeasurement: Sendable, Equatable {
+    /// The CPU seconds each measured window cost.
+    public let samples: [Double]
+    /// The CPU seconds the median window cost.
+    public let medianCpuSeconds: Double
+    /// The CPU cost of a window, in percent of one core.
+    public let cpuPercent: Double
+    /// The simulated streaming time one window covers, in seconds.
+    public let simulatedSeconds: Double
+    /// How much the process footprint grew across the first measured window.
+    public let memoryDeltaBytes: UInt64
 }
 
 // MARK: - Individual Metric Result
@@ -254,7 +343,8 @@ public enum MacPerformanceHarness {
         "100 tok/s streaming CPU",
         "CUA 60fps memory drift",
         "FTS5 search latency (p95)",
-        "SQLite WAL size after checkpoint"
+        "SQLite WAL size after checkpoint",
+        "Badge/menubar surface sync"
     ]
 
     /// Builds one performance metric.
@@ -313,6 +403,31 @@ public enum MacPerformanceHarness {
             enforced: enforced,
             reportNote: reportNote
         )
+    }
+
+    // MARK: Surface Sync Fixture
+
+    /// A bot for the badge/menubar surface-sync benchmark.
+    ///
+    /// `Bot` carries too many fields to spell out at a call site, and the
+    /// fields this benchmark does not care about have no bearing on the
+    /// pending-card scan, so the fixture is decoded from the smallest payload
+    /// that still produces a valid bot.
+    private static func surfaceSyncBot(id: String, threadId: String) throws -> Bot {
+        let object: [String: Any] = [
+            "id": id,
+            "threadId": threadId,
+            "name": "Perf",
+            "title": "",
+            "description": "",
+            "notifications": true,
+            "color": "blue",
+            "unread": false,
+            "modelSelection": ["instanceId": "claude", "model": "default"],
+            "createdAt": 1
+        ]
+        let data = try JSONSerialization.data(withJSONObject: object)
+        return try JSONDecoder().decode(Bot.self, from: data)
     }
 
     // MARK: Mach Process Telemetry
@@ -375,6 +490,136 @@ public enum MacPerformanceHarness {
         return totalSeconds
     }
 
+    // MARK: Streaming CPU Measurement
+
+    /// Converts a measured CPU cost into the percentage of one core that the
+    /// active streaming budget is written in.
+    ///
+    /// The denominator is the simulated streaming time, so the number answers
+    /// the question the budget asks: how much of one core does streaming at
+    /// this rate cost.  A host that is slow or busy stretches the wall clock
+    /// and leaves this number alone.
+    public static func streamingCpuPercent(cpuSeconds: Double, simulatedSeconds: Double) -> Double {
+        guard simulatedSeconds > 0 else { return 0 }
+        return (max(0.0, cpuSeconds) / simulatedSeconds) * 100.0
+    }
+
+    /// Builds the active streaming CPU metric from a measured CPU cost.
+    ///
+    /// The gate compares this result against the product budget, so the test
+    /// suite can prove that a window which costs too much fails the budget,
+    /// rather than only proving that the arithmetic adds up.
+    public static func streamingCpuMetric(
+        cpuSeconds: Double,
+        shape: MacStreamingCpuShape = .product,
+        context: Context
+    ) -> MacPerformanceMetricResult {
+        metric(
+            name: "100 tok/s streaming CPU",
+            measuredValue: streamingCpuPercent(cpuSeconds: cpuSeconds, simulatedSeconds: shape.simulatedSeconds),
+            productBudget: MacPerformanceBudget.maxStreamingCpuPercent,
+            unit: "%",
+            processScoped: true,
+            note: streamingCpuNote(shape),
+            context: context
+        )
+    }
+
+    /// The note printed beside the active streaming CPU number.
+    ///
+    /// It says how the number was produced, because a percentage of one core
+    /// means different things depending on the window it was measured over.
+    private static func streamingCpuNote(_ shape: MacStreamingCpuShape) -> String {
+        "the median of \(shape.repeats) windows of \(String(format: "%.0f", shape.simulatedSeconds)) simulated seconds at \(shape.tokensPerSecond) tok/s per bot, measured after a warm-up window, so the number is the CPU that streaming costs rather than the cost of starting the process"
+    }
+
+    /// Builds the badge/menubar surface-sync metric from a measured duration.
+    ///
+    /// The gate compares this result against the product budget, so the test
+    /// suite can prove that a rebuild which costs too much fails the budget,
+    /// rather than only proving that the arithmetic adds up.
+    public static func surfaceSyncMetric(
+        measuredMs: Double,
+        context: Context
+    ) -> MacPerformanceMetricResult {
+        metric(
+            name: "Badge/menubar surface sync",
+            measuredValue: measuredMs,
+            productBudget: MacPerformanceBudget.maxSurfaceSyncMs,
+            unit: "ms",
+            wallClockSensitive: true,
+            context: context
+        )
+    }
+
+    /// Measures the CPU cost of the simulated streaming load.
+    ///
+    /// The window is paced to the token rate the budget names, so the CPU is
+    /// measured over one simulated second of streaming rather than over
+    /// however long the machine took to finish a burst.  One warm-up window
+    /// runs first, because the first task group in a process pays to start
+    /// its threads and that one-time cost is not streaming cost.  The median
+    /// of the measured windows is the number, so one noisy window cannot
+    /// decide the gate.
+    public static func measureStreamingCpu(
+        shape: MacStreamingCpuShape = .product
+    ) async -> MacStreamingCpuMeasurement {
+        _ = await runStreamingWindow(shape: shape, measureMemory: false)
+        var samples: [Double] = []
+        var memoryDeltaBytes: UInt64 = 0
+        for index in 0..<max(1, shape.repeats) {
+            let window = await runStreamingWindow(shape: shape, measureMemory: index == 0)
+            samples.append(window.cpuSeconds)
+            if index == 0 {
+                memoryDeltaBytes = window.memoryDeltaBytes
+            }
+        }
+        let ordered = samples.sorted()
+        let median = ordered[ordered.count / 2]
+        return MacStreamingCpuMeasurement(
+            samples: samples,
+            medianCpuSeconds: median,
+            cpuPercent: streamingCpuPercent(cpuSeconds: median, simulatedSeconds: shape.simulatedSeconds),
+            simulatedSeconds: shape.simulatedSeconds,
+            memoryDeltaBytes: memoryDeltaBytes
+        )
+    }
+
+    /// Runs one simulated streaming window and reports what it cost.
+    private static func runStreamingWindow(
+        shape: MacStreamingCpuShape,
+        measureMemory: Bool
+    ) async -> (cpuSeconds: Double, memoryDeltaBytes: UInt64) {
+        let cpuStart = currentTaskCpuTimeSeconds()
+        let memoryBefore = measureMemory ? currentPhysicalFootprintBytes() : 0
+        let tokenIntervalNanoseconds = shape.tokensPerSecond > 0
+            ? UInt64(1_000_000_000 / shape.tokensPerSecond)
+            : 0
+        await withTaskGroup(of: Int.self) { group in
+            for botIndex in 0..<shape.botCount {
+                group.addTask {
+                    var buffer = ""
+                    buffer.reserveCapacity(4096)
+                    for tokenIndex in 0..<shape.tokensPerBot {
+                        if tokenIndex > 0, tokenIntervalNanoseconds > 0 {
+                            try? await Task.sleep(nanoseconds: tokenIntervalNanoseconds)
+                        }
+                        buffer.append("bot-\(botIndex)-tok-\(tokenIndex) ")
+                    }
+                    return buffer.count
+                }
+            }
+            for await _ in group {}
+        }
+        let cpuSeconds = max(0.0, currentTaskCpuTimeSeconds() - cpuStart)
+        var memoryDeltaBytes: UInt64 = 0
+        if measureMemory {
+            let memoryAfter = currentPhysicalFootprintBytes()
+            memoryDeltaBytes = memoryAfter > memoryBefore ? (memoryAfter - memoryBefore) : 0
+        }
+        return (cpuSeconds, memoryDeltaBytes)
+    }
+
     // MARK: Visual Parity Verification
 
     /// Verifies the shared visual design contract against the pinned
@@ -428,8 +673,25 @@ public enum MacPerformanceHarness {
     public static func runFullSuite(
         messageCount: Int = 2_000,
         walInsertCount: Int = 10_000,
+        surfaceSyncTranscriptSizes: [Int] = [2_000, 10_000, 50_000],
+        surfaceSyncRepeats: Int = 5,
         context: Context = .standalone
     ) async throws -> MacPerformanceHarnessReport {
+        // The surface-sync sweep is configured by its caller, so a bad
+        // configuration is rejected before the suite spends time measuring
+        // anything else.  Zero repeats would leave the sample array empty and
+        // the median index out of bounds, and a negative transcript size is
+        // not a message count at all.
+        guard surfaceSyncRepeats >= 1 else {
+            throw MacPerformanceHarnessError.invalidSurfaceSyncConfiguration
+        }
+        guard !surfaceSyncTranscriptSizes.isEmpty else {
+            throw MacPerformanceHarnessError.missingSurfaceSyncMeasurement
+        }
+        guard surfaceSyncTranscriptSizes.allSatisfy({ $0 >= 0 }) else {
+            throw MacPerformanceHarnessError.invalidSurfaceSyncConfiguration
+        }
+
         var metrics: [MacPerformanceMetricResult] = []
 
         // 1. Cold start benchmark (`DatabaseService` + initial state hydration)
@@ -522,30 +784,10 @@ public enum MacPerformanceHarness {
 
         // 3. 5-bot concurrent streaming simulation (100 tok/s per bot)
         let streamSignpost = signposter.beginInterval("FiveBotStreaming")
-        let streamCpuStart = currentTaskCpuTimeSeconds()
-        let streamWallStart = DispatchTime.now().uptimeNanoseconds
-        let memBeforeStream = currentPhysicalFootprintBytes()
-
-        await withTaskGroup(of: Int.self) { group in
-            for botIndex in 0..<5 {
-                group.addTask {
-                    var buffer = ""
-                    buffer.reserveCapacity(4096)
-                    for tokenIndex in 0..<100 {
-                        buffer.append("bot-\(botIndex)-tok-\(tokenIndex) ")
-                    }
-                    return buffer.count
-                }
-            }
-            for await _ in group {}
-        }
-
-        let memAfterStream = currentPhysicalFootprintBytes()
-        let streamWallSec = max(0.016, Double(DispatchTime.now().uptimeNanoseconds - streamWallStart) / 1_000_000_000.0)
-        let streamCpuSec = max(0.0, currentTaskCpuTimeSeconds() - streamCpuStart)
+        let streamingMeasurement = await measureStreamingCpu(shape: .product)
         signposter.endInterval("FiveBotStreaming", streamSignpost)
 
-        let streamDeltaBytes = memAfterStream > memBeforeStream ? (memAfterStream - memBeforeStream) : 0
+        let streamDeltaBytes = streamingMeasurement.memoryDeltaBytes
         let streamEffectiveMb = idleMemoryMb + (Double(streamDeltaBytes) / (1024.0 * 1024.0))
         let budgetStreamMb = Double(MacPerformanceBudget.maxStreamingMemoryBytes) / (1024.0 * 1024.0)
         metrics.append(metric(
@@ -557,13 +799,9 @@ public enum MacPerformanceHarness {
             context: context
         ))
 
-        let rawStreamCpuPct = (streamCpuSec / streamWallSec) * 100.0
-        metrics.append(metric(
-            name: "100 tok/s streaming CPU",
-            measuredValue: rawStreamCpuPct,
-            productBudget: MacPerformanceBudget.maxStreamingCpuPercent,
-            unit: "%",
-            processScoped: true,
+        metrics.append(streamingCpuMetric(
+            cpuSeconds: streamingMeasurement.medianCpuSeconds,
+            shape: .product,
             context: context
         ))
 
@@ -765,6 +1003,71 @@ public enum MacPerformanceHarness {
             unit: "MB",
             strictlyLessThan: true,
             note: "write-ahead log high-water mark, measured with a passive checkpoint",
+            context: context
+        ))
+
+        // 7. Badge/menubar surface sync (the pending-card scan)
+        //
+        // The badge, the menubar and the sidebar row all answer "is anything
+        // waiting for the person?" by looking for a pending card in the
+        // thread.  The scan stops at the newest pending card, so it is cheap
+        // whenever something is waiting and walks the whole transcript when
+        // nothing is.  The worst case is therefore one large thread with
+        // nothing pending, and that is the shape measured here.
+        //
+        // The first size in the sweep is the product shape and it is the one
+        // the budget judges.  The larger sizes are measured too and carried
+        // in the note, because a budget that hides the tail is how a linear
+        // scan passes a gate and still stalls the app.
+        //
+        // The surfaces rebuild on a throttle rather than on every streamed
+        // frame, so this number is the cost of one rebuild and not the cost
+        // per streamed token.
+        let surfaceSyncSignpost = signposter.beginInterval("SurfaceSync")
+        let surfaceBot = try surfaceSyncBot(id: "perf-bot", threadId: "perf-thread")
+        var surfaceSyncBySize: [(size: Int, medianMs: Double)] = []
+        for size in surfaceSyncTranscriptSizes {
+            var surfaceState = CompanionState()
+            surfaceState.bots = [surfaceBot]
+            surfaceState.messages[surfaceBot.threadId] = (0..<size).map { index in
+                Message(
+                    id: "perf-msg-\(index)",
+                    role: .bot,
+                    kind: .text,
+                    at: 1,
+                    text: "transcript line"
+                )
+            }
+            var samplesMs: [Double] = []
+            for _ in 0..<surfaceSyncRepeats {
+                let begin = DispatchTime.now().uptimeNanoseconds
+                _ = MacUnreadBadgeSummary.from(state: surfaceState)
+                _ = MacMenubarState.from(state: surfaceState, isConnected: true)
+                let end = DispatchTime.now().uptimeNanoseconds
+                samplesMs.append(Double(end - begin) / 1_000_000.0)
+            }
+            // The suite rejects a zero-repeat sweep before it reaches this
+            // loop, so the sample array is never empty and the median index
+            // is always in bounds.
+            let sorted = samplesMs.sorted()
+            surfaceSyncBySize.append((size: size, medianMs: sorted[sorted.count / 2]))
+        }
+        signposter.endInterval("SurfaceSync", surfaceSyncSignpost)
+        // The size list was checked to be non-empty above, so this is the
+        // compiler-required unwrap rather than a runtime path.
+        guard let surfaceSyncProduct = surfaceSyncBySize.first else {
+            throw MacPerformanceHarnessError.missingSurfaceSyncMeasurement
+        }
+        let surfaceSyncCurve = surfaceSyncBySize
+            .map { "\($0.size) msgs: \(String(format: "%.2f", $0.medianMs)) ms" }
+            .joined(separator: ", ")
+        metrics.append(metric(
+            name: "Badge/menubar surface sync",
+            measuredValue: surfaceSyncProduct.medianMs,
+            productBudget: MacPerformanceBudget.maxSurfaceSyncMs,
+            unit: "ms",
+            wallClockSensitive: true,
+            note: "median of \(surfaceSyncRepeats) rebuilds over a thread with nothing pending, by transcript size — \(surfaceSyncCurve); the budget judges the \(surfaceSyncProduct.size)-message product shape",
             context: context
         ))
 
