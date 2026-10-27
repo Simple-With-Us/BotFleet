@@ -1011,4 +1011,16 @@ fi
 grep -q "ASC_KEY_ID /asc" "$FAKE_LOG" || fail "the diagnostic did not read the vault key id"
 unset out real_body real_mask real_b64
 
+# The version helpers run inside command substitutions, where load_secrets
+# would write a temp key whose cleanup trap dies with the subshell.  They must
+# check for a credential instead.
+for fn in asc_next_dotted_build asc_released_store_version; do
+  body="$(awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{" {g=1} g {print} g && /^}/ {exit}' "$script")"
+  [[ -n "$body" ]] || fail "could not read ${fn}"
+  if grep -v '^[[:space:]]*#' <<<"$body" | grep -q 'load_secrets'; then
+    fail "${fn} calls load_secrets inside a command substitution (leaks the temp key dir)"
+  fi
+  grep -q 'asc_credential_available' <<<"$body" || fail "${fn} does not check for a credential"
+done
+
 echo "ok: ASC credential resolution (environment first, then Infisical, a named path ignored, temp key removed)"

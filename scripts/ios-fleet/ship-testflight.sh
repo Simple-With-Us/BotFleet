@@ -829,7 +829,10 @@ project_marketing_seq() {
 asc_next_dotted_build() {
   local version="$1" plat="${2:-}" out rc
   command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
-  load_secrets >/dev/null || return 1
+  # Not load_secrets: both helpers run inside command substitutions, where a
+  # secrets temp dir and its EXIT trap die with the subshell and leave the
+  # key behind.  asc-api.mjs resolves its own credential.
+  asc_credential_available || return 1
   set +e
   out=$(asc_client next-dotted-build "$BUNDLE_ID" "$version" "$plat" "${APPLE_ID:-}")
   rc=$?
@@ -841,7 +844,10 @@ asc_next_dotted_build() {
 asc_released_store_version() {
   local plat="${1:-}" out rc
   command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
-  load_secrets >/dev/null || return 1
+  # Not load_secrets: both helpers run inside command substitutions, where a
+  # secrets temp dir and its EXIT trap die with the subshell and leave the
+  # key behind.  asc-api.mjs resolves its own credential.
+  asc_credential_available || return 1
   set +e
   out=$(asc_client released-store-version "$BUNDLE_ID" "$plat" "${APPLE_ID:-}" 2>/dev/null)
   rc=$?
