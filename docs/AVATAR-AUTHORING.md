@@ -82,9 +82,8 @@ have to ship it separately, but you do write it.
 
 `width` and `height` are the size the avatar is delivered at.  Use **256 x
 256**.  Avatars render between 28 and 44 pixels in the interface, so 256 is
-generous.  Your frames have to be that size as well: the manifest is
-what tells the player how big a frame is, and the build refuses art that is a
-different size rather than quietly changing it.
+generous, and the build scales your source art down to it.  The old packs
+shipped 1408 x 1408 art and that is most of why they weighed what they did.
 
 `count` is how many frames the file holds.  `delayMs` is how long each frame
 shows, so 83 ms is 12 frames a second.
@@ -236,10 +235,12 @@ the frames are not all the same size, and when the manifest does not parse.
 It also refuses to write a manifest that does not match the file it produced,
 which is the one mistake that would otherwise ship quietly.
 
-The frames have to be the size the manifest declares, because the manifest is
-what tells the player how big a frame is.  When the two disagree the build
-says what it found and what the manifest said, and it leaves the art alone
-rather than quietly changing it.
+Art that is bigger than the size the manifest declares is scaled down, which is
+how the shipped examples were made: the TV-Face art is 480 x 480 and the files
+are 256 x 256.  The build will not scale art up, because that would invent
+pixels, and it will not squash a drawing whose proportions do not match
+the declared size, because that would change what you drew.  In both cases it
+says what it found and what it would have had to do.
 
 ## Checking it
 
