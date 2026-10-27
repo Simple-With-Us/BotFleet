@@ -266,4 +266,10 @@ final class DiagnosticsAndSentryTests: XCTestCase {
         XCTAssertFalse(out.contains("ghi"))
         XCTAssertTrue(out.contains("page=2"))
     }
+
+    func testEveryCredentialTokenPatternCompiles() {
+        for pattern in DiagnosticsReporter.credentialTokenPatterns {
+            XCTAssertNoThrow(try NSRegularExpression(pattern: pattern, options: []), pattern)
+        }
+    }
 }

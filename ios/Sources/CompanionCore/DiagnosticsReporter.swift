@@ -84,10 +84,12 @@ public enum DiagnosticsReporter {
         options: [.caseInsensitive]
     )
 
-    private static let compiledTokenRegexes: [NSRegularExpression] = {
-        // A pattern that does not compile is a programming error. Dropping it
-        // would silently stop redacting that credential shape, so crash instead.
-        credentialTokenPatterns.map { try! NSRegularExpression(pattern: $0, options: []) }
+    /// Compiled once. A pattern that fails to compile is kept as `nil` rather than
+    /// dropped, so `redactSecrets` can fail closed instead of silently no longer
+    /// redacting that credential shape. `testEveryCredentialTokenPatternCompiles`
+    /// pins the list, so a bad pattern is caught by the test, not at runtime.
+    private static let compiledTokenRegexes: [NSRegularExpression?] = {
+        credentialTokenPatterns.map { try? NSRegularExpression(pattern: $0, options: []) }
     }()
 
     private static let valuePartPattern = #"("[^"]*"|'[^']*'|[^\s"',;)\]}]+)"#
@@ -192,7 +194,12 @@ public enum DiagnosticsReporter {
         }
 
         // 6. Token shapes
-        for regex in compiledTokenRegexes {
+        for compiled in compiledTokenRegexes {
+            guard let regex = compiled else {
+                // A token pattern that cannot be evaluated means this text cannot be
+                // proven clean. Fail closed: hide all of it.
+                return mask(text)
+            }
             let range = NSRange(out.startIndex..<out.endIndex, in: out)
             let matches = regex.matches(in: out, options: [], range: range).reversed()
             for match in matches {
