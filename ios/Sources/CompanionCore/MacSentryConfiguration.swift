@@ -36,8 +36,9 @@ public enum MacSentryPolicy {
             candidates.append(commit)
         }
 
+        let unknownCommit = String(repeating: "0", count: 40)
         for candidate in candidates {
-            if candidate != "unknown" && isValidReleaseSha(candidate) {
+            if candidate != "unknown", candidate != unknownCommit, isValidReleaseSha(candidate) {
                 return candidate
             }
         }

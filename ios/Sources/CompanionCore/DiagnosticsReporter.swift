@@ -37,6 +37,8 @@ public enum DiagnosticsReporter {
         "INFISICAL_CLIENT_SECRET",
         "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
         "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+        "INFISICAL_TOKEN",
+        "INFISICAL_WRITE_TOKEN",
     ]
 
     /// Unmistakable credential token prefix patterns mirroring `CREDENTIAL_TOKEN_FORMATS`.
@@ -57,6 +59,7 @@ public enum DiagnosticsReporter {
         #"\bAIza[0-9A-Za-z_-]{30,}"#,
         #"\bnpm_[A-Za-z0-9]{20,}"#,
         #"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?"#,
+        #"\bst\.[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{16,}){0,3}"#,
     ]
 
     private static let keyValuePairRegex = try! NSRegularExpression(
@@ -229,7 +232,9 @@ public enum DiagnosticsReporter {
     /// Flatten nested dictionary down to dot-separated keys, strictly preserving only booleans and finite numbers.
     public static func flattenAndFilterConfigSummary(_ input: [String: Any], prefix: String = "", depth: Int = 0) -> [String: String] {
         var out: [String: String] = [:]
-        guard depth < 3 else { return out }
+        // Match electron flattenSummary: emit bool/number leaves at depth 3,
+        // but do not recurse objects beyond depth 3.
+        guard depth <= 3 else { return out }
 
         for (key, value) in input {
             let path = prefix.isEmpty ? key : "\(prefix).\(key)"
@@ -243,7 +248,7 @@ public enum DiagnosticsReporter {
                 }
             } else if let boolVal = value as? Bool {
                 out[path] = boolVal ? "true" : "false"
-            } else if let dict = value as? [String: Any] {
+            } else if let dict = value as? [String: Any], depth < 3 {
                 let nested = flattenAndFilterConfigSummary(dict, prefix: path, depth: depth + 1)
                 for (k, v) in nested { out[k] = v }
             }
@@ -293,7 +298,10 @@ public enum DiagnosticsReporter {
         lines.append("")
         if let tail = logTail, !tail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             lines.append("## Server log tail — known credential patterns auto-masked")
-            let redacted = redactSecrets(in: tail)
+            // Cap before regex redaction so a multi-MB tail cannot stall the UI thread.
+            let maxTailChars = 200_000
+            let bounded = tail.count > maxTailChars ? String(tail.suffix(maxTailChars)) : tail
+            let redacted = redactSecrets(in: bounded)
             let logLines = redacted.components(separatedBy: .newlines)
             for line in logLines {
                 lines.append(line)
