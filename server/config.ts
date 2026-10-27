@@ -546,6 +546,13 @@ const appConfigSchema = z.object({
     secretPath: optionalText,
     clientId: optionalText,
     clientSecret: optionalText,
+    // The two service tokens.  They are declared here because the schema
+    // strips the keys it does not know: a token in the config file that
+    // the schema does not mention is dropped on the floor, and the file
+    // would look configured while the server fell back to the machine
+    // identity.  The environment names are the primary route.
+    token: optionalText,
+    writeToken: optionalText,
     credentialStorage: externalCredentialStorage,
     refreshMinutes: z.number().int().min(5).max(1440).optional(),
   }).optional(),
@@ -803,7 +810,13 @@ export interface AppConfig {
    * store, so they are the one pair of credentials in this file that never
    * resolves through the vault — a lock cannot hold its own key.  They are
    * read from this section or from `INFISICAL_CLIENT_ID` /
-   * `INFISICAL_CLIENT_SECRET`, and nowhere else. */
+   * `INFISICAL_CLIENT_SECRET`, and nowhere else.
+   *
+   * `token` and `writeToken` are service tokens: one read-only token for the
+   * folders this install reads and one write token for the folders it
+   * writes.  A token wins over the machine identity, and it is what every
+   * non-agent consumer uses.  They are read from this section or from
+   * `INFISICAL_TOKEN` / `INFISICAL_WRITE_TOKEN`. */
   infisical?: {
     enabled?: boolean;
     writeThrough?: boolean;
@@ -813,6 +826,8 @@ export interface AppConfig {
     secretPath?: string;
     clientId?: string;
     clientSecret?: string;
+    token?: string;
+    writeToken?: string;
     credentialStorage?: "external";
     refreshMinutes?: number;
   };
@@ -1165,6 +1180,8 @@ export interface InfisicalSettings {
   secretPath: string;
   clientId: string;
   clientSecret: string;
+  token: string;
+  writeToken: string;
   refreshMinutes: number;
 }
 
@@ -1174,7 +1191,9 @@ export interface InfisicalSettings {
  * request is ever made, and nothing about resolution changes. */
 export function infisicalConfigured(cfg: AppConfig): boolean {
   return Boolean(
-    cfg.infisical?.projectId?.trim() && cfg.infisical?.clientId?.trim() && cfg.infisical?.clientSecret?.trim(),
+    cfg.infisical?.projectId?.trim() &&
+      (cfg.infisical?.token?.trim() ||
+        (cfg.infisical?.clientId?.trim() && cfg.infisical?.clientSecret?.trim())),
   );
 }
 
@@ -1201,6 +1220,8 @@ export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
     secretPath: stored.secretPath?.trim() || DEFAULT_INFISICAL_SECRET_PATH,
     clientId: stored.clientId?.trim() ?? "",
     clientSecret: stored.clientSecret ?? "",
+    token: stored.token?.trim() ?? "",
+    writeToken: stored.writeToken?.trim() ?? "",
     refreshMinutes:
       refresh !== undefined && Number.isFinite(refresh)
         ? Math.min(Math.max(Math.trunc(refresh), 5), 1440)
@@ -1711,9 +1732,11 @@ export function loadConfig(): AppConfig {
   // First defined wins, and env beats the file here for the same reason it
   // does above: the desktop shell injects it at spawn.
   cfg.infisical = { ...cfg.infisical };
-  const identity: Array<[field: "clientId" | "clientSecret" | "projectId" | "siteUrl" | "environment" | "secretPath", names: string[]]> = [
+  const identity: Array<[field: "clientId" | "clientSecret" | "token" | "writeToken" | "projectId" | "siteUrl" | "environment" | "secretPath", names: string[]]> = [
     ["clientId", ["INFISICAL_CLIENT_ID", "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"]],
     ["clientSecret", ["INFISICAL_CLIENT_SECRET", "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"]],
+    ["token", ["INFISICAL_TOKEN"]],
+    ["writeToken", ["INFISICAL_WRITE_TOKEN"]],
     ["projectId", ["INFISICAL_PROJECT_ID"]],
     ["siteUrl", ["INFISICAL_SITE_URL", "INFISICAL_DOMAIN"]],
     ["environment", ["INFISICAL_ENVIRONMENT"]],
@@ -1884,6 +1907,8 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "INFISICAL_CLIENT_SECRET",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+  "INFISICAL_TOKEN",
+  "INFISICAL_WRITE_TOKEN",
 ] as const;
 
 /** Drop every workspace credential from a child-process env (in place). */

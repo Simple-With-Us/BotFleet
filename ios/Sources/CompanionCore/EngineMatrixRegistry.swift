@@ -107,7 +107,11 @@ public struct EngineTurnSpawnInput: Equatable, Sendable {
 }
 
 /// Concrete process spawn specification produced for a CLI-backed engine.
-public struct EngineSpawnSpec: Equatable, Sendable {
+///
+/// Named `EngineMatrixSpawnSpec` so it stays distinct from `EngineSpawnSpec`, the process-transport spec in
+/// `EngineDriver.swift`.
+/// That other spec carries the environment overlay and the keys a child CLI must never inherit.
+public struct EngineMatrixSpawnSpec: Equatable, Sendable {
     public let engineId: EngineMatrixID
     public let executable: String
     public let argv: [String]
@@ -405,7 +409,7 @@ public enum EngineMatrixRegistry {
     public static func buildSpawnSpec(
         for id: EngineMatrixID,
         input: EngineTurnSpawnInput
-    ) -> EngineSpawnSpec? {
+    ) -> EngineMatrixSpawnSpec? {
         let desc = descriptor(for: id)
         guard let executable = desc.executable else {
             return nil
@@ -442,7 +446,7 @@ public enum EngineMatrixRegistry {
             if let cursor = input.resumeCursor, !cursor.isEmpty {
                 argv.append(contentsOf: ["--conversation", cursor])
             }
-            return EngineSpawnSpec(
+            return EngineMatrixSpawnSpec(
                 engineId: id,
                 executable: executable,
                 argv: argv,
@@ -462,7 +466,7 @@ public enum EngineMatrixRegistry {
             if input.fullAuto && !input.controlsHostMac {
                 argv.append("--dangerously-skip-permissions")
             }
-            return EngineSpawnSpec(
+            return EngineMatrixSpawnSpec(
                 engineId: id,
                 executable: executable,
                 argv: argv,
@@ -471,7 +475,7 @@ public enum EngineMatrixRegistry {
             )
 
         case .codex, .grokAcp, .mcode, .muse, .cursor, .geminiCli, .dsh, .opencode:
-            return EngineSpawnSpec(
+            return EngineMatrixSpawnSpec(
                 engineId: id,
                 executable: executable,
                 argv: desc.baseArguments,
