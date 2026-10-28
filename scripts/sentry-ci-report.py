@@ -33,7 +33,7 @@ event), which is where unbounded-cardinality data belongs.
 The `app` tag + fingerprint component are required: fleet-infra is shared
 across repos, and this repo may share workflow names ("CI", "Security",
 "Effort Issues Sync") with peer apps, so without `app` a "CI" failure here
-would dedup into the same Sentry issue as one there.  Per AGENT-SYNC.md
+would dedup into the same Sentry issue as one there.  Per FLEET-PROTOCOL.md
 "Observability", every event is tagged with `app:<repo>`.
 
 Secrets: SENTRY_FLEET_DSN is read only from the environment (set by the
