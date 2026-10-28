@@ -88,7 +88,7 @@ Full decision: `docs/decisions/2026-10-15-kody-review-stop-rule.md`.
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` — Merge requirements
+- `/Users/jay/apps/FLEET-PROTOCOL.md` — Merge requirements
 - App `AGENTS.md` — Kody Review Rules; Pre-Commit / Handoff
 - `docs/decisions/2026-10-15-kody-review-stop-rule.md` — stop rule evidence
 - Skills: `unstick-pr`, `land-lane`
