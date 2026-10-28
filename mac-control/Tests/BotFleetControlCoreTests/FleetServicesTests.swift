@@ -476,11 +476,13 @@ final class FleetServicesTests: XCTestCase {
         // wrapper exits when the harness is already healthy, and the desktop
         // app forks its own harness when nothing answers on the port.  A
         // bootout can leave a server that is still serving.
+        let home = try makeHome(serverInstalled: true)
+        defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         let asked = Counter()
         let control = FleetServiceControl(
             pm2: pm2(FleetServiceCommands()),
-            startup: StartupPolicy(commands: commands, uid: 501, environment: [:]),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
             mcpServer: nil,
             stopServer: { asked.increment() })
         _ = try await control.perform(.stop, serviceID: FleetServiceRegistry.server.id)
@@ -492,11 +494,18 @@ final class FleetServicesTests: XCTestCase {
         // The server answers the stop request before it has exited, so the
         // state that is reported is the one that was observed after it and
         // not a constant that happens to be the expected one.
+        //
+        // The home is a directory of its own, because the state of the
+        // server is read from the LaunchAgent plist that is installed: a
+        // machine that has the BotFleet Server installed and a build
+        // machine that has none would otherwise answer differently.
+        let home = try makeHome(serverInstalled: true)
+        defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         commands.listing = "PID\tStatus\tLabel\n123\t0\tapp.botfleet.server"
         let control = FleetServiceControl(
             pm2: pm2(FleetServiceCommands()),
-            startup: StartupPolicy(commands: commands, uid: 501, environment: [:]),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
             mcpServer: nil,
             stopServer: { })
         let state = try await control.perform(.stop, serviceID: FleetServiceRegistry.server.id, attempts: 2)
@@ -504,8 +513,10 @@ final class FleetServicesTests: XCTestCase {
     }
 
     func testStoppingTheBotFleetServerIsRefusedWhenTheServerCannotBeAsked() async throws {
+        let home = try makeHome(serverInstalled: true)
+        defer { try? FileManager.default.removeItem(at: home) }
         let control = FleetServiceControl(pm2: pm2(FleetServiceCommands()),
-                                          startup: StartupPolicy(commands: LaunchAgentCommands(), uid: 501, environment: [:]),
+                                          startup: StartupPolicy(home: home, commands: LaunchAgentCommands(), uid: 501, environment: [:]),
                                           mcpServer: nil)
         do {
             _ = try await control.perform(.stop, serviceID: FleetServiceRegistry.server.id)
@@ -571,14 +582,14 @@ final class FleetServicesTests: XCTestCase {
         FleetServiceURLProtocol.handler = { _ in
             .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp"}"#.utf8))
         }
-        let control = makeControl(commands: FleetServiceCommands())
+        let control = try makeControl(commands: FleetServiceCommands())
         let states = await control.states(serverState: .running)
         XCTAssertEqual(states["botfleet-mcp"], .running)
     }
 
     func testTheMCPServerIsUnknownWhenItsHealthEndpointDoesNotAnswer() async throws {
         FleetServiceURLProtocol.handler = { _ in .failure(URLError(.timedOut)) }
-        let control = makeControl(commands: FleetServiceCommands())
+        let control = try makeControl(commands: FleetServiceCommands())
         let states = await control.states(serverState: .running)
         XCTAssertEqual(states["botfleet-mcp"], .unknown)
     }
@@ -590,7 +601,7 @@ final class FleetServicesTests: XCTestCase {
         [{"name": "shellular", "pm2_env": {"status": "online"}},
          {"name": "grok-acp", "pm2_env": {"status": "errored"}}]
         """
-        let control = makeControl(commands: commands)
+        let control = try makeControl(commands: commands)
         let states = await control.states(serverState: .running)
         XCTAssertEqual(states["shellular"], .running)
         XCTAssertEqual(states["grok-acp"], .failed)
@@ -614,23 +625,33 @@ final class FleetServicesTests: XCTestCase {
         PM2Client(commands: commands, nodePath: "/usr/bin/node", pm2Path: "/usr/bin/pm2", home: home)
     }
 
-    private func makeHome() throws -> URL {
+    /// A home directory of its own, with the LaunchAgents the fleet
+    /// services read.
+    ///
+    /// A test must not read the LaunchAgents of the machine it runs on: a
+    /// workstation that has the BotFleet Server installed answers a
+    /// different state from a build machine that has none.
+    private func makeHome(serverInstalled: Bool = false) throws -> URL {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"),
                                                 withIntermediateDirectories: true)
         try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.companion.plist"))
+        if serverInstalled {
+            try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        }
         return home
     }
 
-    private func makeControl(commands: FleetServiceCommands) -> FleetServiceControl {
-        FleetServiceControl(pm2: PM2Client(commands: commands, nodePath: "/usr/bin/node",
-                                           pm2Path: "/usr/bin/pm2"),
-                            startup: StartupPolicy(commands: LaunchAgentCommands(), uid: 501, environment: [:]),
-                            mcpServer: try? McpServerControl(session: mockSession(),
-                                                            baseURL: URL(string: "http://127.0.0.1:8794"),
-                                                            pm2: PM2Client(commands: commands,
-                                                                           nodePath: "/usr/bin/node",
-                                                                           pm2Path: "/usr/bin/pm2")))
+    private func makeControl(commands: FleetServiceCommands) throws -> FleetServiceControl {
+        let home = try makeHome(serverInstalled: true)
+        return FleetServiceControl(pm2: PM2Client(commands: commands, nodePath: "/usr/bin/node",
+                                                  pm2Path: "/usr/bin/pm2", home: home),
+                                   startup: StartupPolicy(home: home, commands: LaunchAgentCommands(), uid: 501, environment: [:]),
+                                   mcpServer: try? McpServerControl(session: mockSession(),
+                                                                   baseURL: URL(string: "http://127.0.0.1:8794"),
+                                                                   pm2: PM2Client(commands: commands,
+                                                                                  nodePath: "/usr/bin/node",
+                                                                                  pm2Path: "/usr/bin/pm2", home: home)))
     }
 
     private func mockSession() -> URLSession {
