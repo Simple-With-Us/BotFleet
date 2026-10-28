@@ -51,7 +51,7 @@ import {
   zulipToolArgsSchema,
   type ZulipTarget,
 } from "./outbound.ts";
-import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeVerdict } from "./router.ts";
+import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeReason, type WakeVerdict } from "./router.ts";
 import { HANDLED_RING_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
 import type { PluginEventEnvelope } from "../../shared/plugin-events.ts";
 import { ZULIP_OUTGOING_MAX_ATTEMPTS, ZulipOutgoingSpool } from "./outgoing-spool.ts";
@@ -298,6 +298,14 @@ function codeOf(error: unknown): string | undefined {
 // oxlint-disable-next-line anti-slop/no-unknown-parameters
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** The reason a queued item carries, and the reason the plugin platform is
+ *  told.  A broadcast is mention-like:  the bot was called out to the whole
+ *  channel and may answer, and neither the stored item nor the plugin
+ *  envelope has a "broadcast" reason of its own. */
+function queuedVia(via: WakeReason): "mention" | "dm" | "followed" {
+  return via === "broadcast" ? "mention" : via;
 }
 
 /** One BF bot's connection to Zulip. */
@@ -1075,9 +1083,9 @@ export class ZulipHub {
       conversationKey: originKey(origin),
       channel: origin.kind === "stream" ? origin.channel : undefined,
       topic: origin.kind === "stream" ? origin.topic : undefined,
-      mentions: verdict.via === "mention" ? [session.role] : [],
+      mentions: queuedVia(verdict.via) === "mention" ? [session.role] : [],
       contentText: String(message.content ?? ""),
-      wakeReason: verdict.via,
+      wakeReason: queuedVia(verdict.via),
       senderKind: verdict.wake,
       botId: session.botId,
     };
@@ -1231,7 +1239,7 @@ export class ZulipHub {
       ownerViaApi: c.ownerViaApi,
       content: String(message.content ?? ""),
       timestamp: typeof message.timestamp === "number" ? message.timestamp : Math.floor(now / 1000),
-      via: verdict.via,
+      via: queuedVia(verdict.via),
     };
     if (pluginRoute?.hint) item.pluginHint = pluginRoute.hint.slice(0, 2000);
     if (pluginRoute?.fromRole) item.routedFrom = pluginRoute.fromRole.slice(0, 128);
@@ -1239,7 +1247,8 @@ export class ZulipHub {
       session.markHandled([id]);
       this.log(
         `[zulip] ${session.role}: dry run — message ${id} would wake (${verdict.wake})` +
-          (verdict.via === "followed" ? " from a followed topic" : ""),
+          (verdict.via === "followed" ? " from a followed topic" : "") +
+          (verdict.via === "broadcast" ? " from an @all broadcast" : ""),
       );
       session.save(true);
       return;
