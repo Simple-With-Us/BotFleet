@@ -287,6 +287,15 @@ final class ProcessMonitorTests: XCTestCase {
         XCTAssertTrue(FleetProcessClassifier.isViteProcess(command: "/x/node_modules/.bin/vite preview"))
     }
 
+    func testACapitalisedCheckoutIsStillTheDevelopmentServer() {
+        // The checkout's name is the owner's choice, so a bare token in any
+        // case has to be recognised.
+        XCTAssertTrue(FleetProcessClassifier.isDevelopmentServer(command: "node BotFleet/node_modules/.bin/vite",
+                                                                 workingDirectory: nil))
+        XCTAssertTrue(FleetProcessClassifier.isDevelopmentServer(command: "node botfleet/node_modules/.bin/vite",
+                                                                 workingDirectory: nil))
+    }
+
     func testTheTestRunnerIsNotAskedAboutItsWorkingDirectory() {
         // Every extra candidate is another process in the `lsof` call, so a
         // machine full of test workers would slow every menu open down.
@@ -310,6 +319,30 @@ final class ProcessMonitorTests: XCTestCase {
         let monitor = FleetProcessMonitor(commands: commands, selfPID: 999)
         _ = monitor.snapshot()
         XCTAssertTrue(commands.askedForWorkingDirectories)
+    }
+
+    func testTheWorkingDirectoryIsKeptWhenLsofWarns() {
+        // `lsof` exits with 1 when it could not examine one of the processes
+        // it was asked about, which happens whenever a process has gone away
+        // or belongs to another user, and the answer for the ones it could
+        // examine is in its output all the same.  Losing that answer left the
+        // menu with no working directory at all, and a server that is
+        // started from a relative path cannot be found without one.
+        let commands = FakeFleetCommands()
+        commands.lsofWarns = true
+        let monitor = FleetProcessMonitor(commands: commands, selfPID: 999)
+        let snapshot = monitor.snapshot()
+        XCTAssertEqual(snapshot.processes.first { $0.pid == 101 }?.workingDirectory,
+                       "/Users/jay/Code/BotFleet")
+    }
+
+    func testThePortsAreKeptWhenLsofWarns() {
+        // The same warning must not empty the port list either.
+        let commands = FakeFleetCommands()
+        commands.lsofWarns = true
+        let monitor = FleetProcessMonitor(commands: commands, selfPID: 999)
+        let snapshot = monitor.snapshot()
+        XCTAssertTrue(snapshot.listeners.contains { $0.port == 6333 })
     }
 }
 
@@ -363,6 +396,9 @@ private final class RecordingFleetCommands: CommandRunning {
 /// A stand-in for the system commands the monitor runs.
 private final class FakeFleetCommands: CommandRunning {
     var killed: [Int32] = []
+    /// True when `lsof` warns about a process it could not examine and still
+    /// answers for the ones it could.
+    var lsofWarns = false
 
     func run(_ executable: String, _ arguments: [String]) throws -> String {
         try run(executable, arguments, timeout: 15)
@@ -385,11 +421,8 @@ private final class FakeFleetCommands: CommandRunning {
             """
         }
         if executable == "/usr/sbin/lsof", arguments.contains("cwd") {
-            return """
-            p101
-            fcwd
-            n/Users/jay/Code/BotFleet
-            """
+            if lsofWarns { throw CommandExitError(output: workingDirectoryListing) }
+            return workingDirectoryListing
         }
         if executable == "/usr/sbin/lsof" {
             return """
@@ -406,5 +439,19 @@ private final class FakeFleetCommands: CommandRunning {
             return ""
         }
         return ""
+    }
+
+    /// Keeps what the command printed, whatever it exited with.
+    func runKeepingOutput(_ executable: String, _ arguments: [String]) -> String {
+        if executable == "/usr/sbin/lsof", arguments.contains("cwd") { return workingDirectoryListing }
+        return (try? run(executable, arguments)) ?? ""
+    }
+
+    private var workingDirectoryListing: String {
+        """
+        p101
+        fcwd
+        n/Users/jay/Code/BotFleet
+        """
     }
 }

@@ -6,6 +6,15 @@ public protocol CommandRunning {
     /// Runs a command with an explicit environment.  A menu bar app inherits
     /// no shell PATH, so a command that needs one has to be given it.
     func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String
+    /// Runs a command and keeps what it printed, whatever its exit status.
+    ///
+    /// A command that warns and still answers is not a command that failed.
+    /// `lsof` exits with 1 when it could not examine one of the processes it
+    /// was asked about, and the answer for the ones it could examine is in
+    /// its output all the same.  Throwing that away would leave the caller
+    /// with nothing, and the caller cannot tell an empty answer from a lost
+    /// one.
+    func runKeepingOutput(_ executable: String, _ arguments: [String]) -> String
 }
 
 public struct CommandExitError: LocalizedError {
@@ -21,6 +30,11 @@ public extension CommandRunning {
     func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
         try run(executable, arguments, timeout: timeout)
     }
+
+    /// The default keeps what a successful command printed.
+    func runKeepingOutput(_ executable: String, _ arguments: [String]) -> String {
+        (try? run(executable, arguments)) ?? ""
+    }
 }
 
 public struct ProcessCommandRunner: CommandRunning {
@@ -32,6 +46,18 @@ public struct ProcessCommandRunner: CommandRunning {
         try run(executable, arguments, environment: ProcessInfo.processInfo.environment, timeout: timeout)
     }
     public func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
+        let (result, status) = try execute(executable, arguments, environment: environment, timeout: timeout)
+        guard status == 0 else { throw CommandExitError(output: result) }
+        return result
+    }
+    public func runKeepingOutput(_ executable: String, _ arguments: [String]) -> String {
+        runKeepingOutput(executable, arguments, environment: ProcessInfo.processInfo.environment, timeout: 15)
+    }
+    public func runKeepingOutput(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) -> String {
+        (try? execute(executable, arguments, environment: environment, timeout: timeout)).map { $0.0 } ?? ""
+    }
+    /// Runs a command and reports what it printed and how it ended.
+    private func execute(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> (String, Int32) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -57,8 +83,7 @@ public struct ProcessCommandRunner: CommandRunning {
         }
         guard readerDone.wait(timeout: .now() + 2) == .success else { throw StartupPolicyError.commandFailed }
         let result = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard process.terminationStatus == 0 else { throw CommandExitError(output: result) }
-        return result
+        return (result, process.terminationStatus)
     }
 }
 

@@ -267,7 +267,9 @@ public enum FleetProcessClassifier {
     /// orphan even when a shell still holds it open.
     public static func isDevelopmentServer(command: String, workingDirectory: String? = nil) -> Bool {
         guard isViteProcess(command: command) else { return false }
-        return isFleetPath(workingDirectory) || isFleetPath(command) || command.contains("botfleet")
+        // The checkout's name is the owner's choice, so the bare token is
+        // compared without regard to its case as well.
+        return isFleetPath(workingDirectory) || isFleetPath(command) || command.lowercased().contains("botfleet")
     }
 
     /// The fleet helper name in the command, when there is one.
@@ -332,8 +334,16 @@ public struct FleetProcessMonitor {
         // With no candidates there is nobody to ask about, and `lsof` without
         // a process list would dump the working directory of every process on
         // the machine.  The common case is a machine with no fleet in it.
+        //
+        // The output is kept whatever `lsof` exits with.  It exits with 1
+        // when it could not examine one of the processes it was asked about,
+        // which happens whenever a process has gone away or belongs to
+        // another user, and the answer for the ones it could examine is in
+        // its output all the same.  Throwing that away left the menu with no
+        // working directory at all, and a server that is started from a
+        // relative path cannot be found without one.
         let directories: [Int32: String] = candidates.isEmpty ? [:] : FleetProcessMonitor.parseWorkingDirectories(
-            (try? commands.run("/usr/sbin/lsof", ["-a", "-d", "cwd", "-Fn"] + candidates.map { "-p" + String($0) })) ?? ""
+            commands.runKeepingOutput("/usr/sbin/lsof", ["-a", "-d", "cwd", "-Fn"] + candidates.map { "-p" + String($0) })
         )
         let withPaths = raw.map { process in
             RawProcess(pid: process.pid,
@@ -342,7 +352,7 @@ public struct FleetProcessMonitor {
                        executablePath: paths[process.pid],
                        workingDirectory: directories[process.pid])
         }
-        let lsofOutput = (try? commands.run("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"])) ?? ""
+        let lsofOutput = commands.runKeepingOutput("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"])
         let listeners = FleetProcessMonitor.parseListeners(lsofOutput)
         var portsByPID: [Int32: [Int]] = [:]
         for listener in listeners {

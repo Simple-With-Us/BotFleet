@@ -62,6 +62,18 @@ final class VMProviderTests: XCTestCase {
         XCTAssertTrue(VMProviderStore(fileURL: url).loadConfigurations().isEmpty)
     }
 
+    func testAProviderThatWasNeverThereIsNotAFailure() {
+        // A server that never had a provider must still be removable, so
+        // removing one that was never saved is not an error and writes
+        // nothing.
+        let url = temporaryFile()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = VMProviderStore(fileURL: url)
+        XCTAssertNoThrow(try store.remove(id: "host-1"))
+        XCTAssertFalse(try store.remove(id: "host-1"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     // MARK: - Building the plugin
 
     func testEachProviderKindIsBuilt() {
