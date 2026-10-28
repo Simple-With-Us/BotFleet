@@ -103,24 +103,39 @@ final class FleetServicesTests: XCTestCase {
     // MARK: - The actions the owner may pick
 
     func testTheActionsForARunningServiceAreStopAndRestart() {
-        XCTAssertEqual(FleetServices.availableActions(for: .running), [.stop, .restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .running, policy: .alwaysOn), [.stop, .restart])
     }
 
     func testTheActionsForAStoppedServiceAreStartAndRestart() {
-        XCTAssertEqual(FleetServices.availableActions(for: .stopped), [.start, .restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .stopped, policy: .alwaysOn), [.start, .restart])
     }
 
     func testTheActionsForAFailedServiceAreStartAndRestart() {
-        XCTAssertEqual(FleetServices.availableActions(for: .failed), [.start, .restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .failed, policy: .alwaysOn), [.start, .restart])
     }
 
     func testAServiceThatIsNotInstalledHasNoActions() {
-        XCTAssertEqual(FleetServices.availableActions(for: .notInstalled), [])
+        XCTAssertEqual(FleetServices.availableActions(for: .notInstalled, policy: .alwaysOn), [])
     }
 
     func testAServiceTheAppCannotSeeCanOnlyBeRestarted() {
         // The Control app does not stop a service it cannot see.
-        XCTAssertEqual(FleetServices.availableActions(for: .unknown), [.restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .unknown, policy: .alwaysOn), [.restart])
+    }
+
+    func testAServiceThatFollowsTheServerCanOnlyBeRestarted() {
+        // The BotFleet MCP Server is wanted exactly while the BotFleet Server
+        // runs.  Offering Stop for it would offer an action the Control app
+        // takes back at once, so only Restart is offered.
+        XCTAssertEqual(FleetServices.availableActions(for: .running, policy: .whileServerRuns), [.restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .stopped, policy: .whileServerRuns), [.restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .failed, policy: .whileServerRuns), [.restart])
+    }
+
+    func testTheMcpServerRowInTheMenuOffersOnlyRestart() {
+        let services = FleetServices(serverState: .running, states: ["botfleet-mcp": .running])
+        let row = services.menuItems.first { $0.id == "botfleet-mcp" }
+        XCTAssertEqual(row?.actions, [.restart])
     }
 
     // MARK: - The menu
@@ -138,7 +153,9 @@ final class FleetServicesTests: XCTestCase {
         let mcpServer = services.menuItems.first { $0.id == "botfleet-mcp" }
         let shellular = services.menuItems.first { $0.id == "shellular" }
         XCTAssertEqual(mcpServer?.summary, "running")
-        XCTAssertEqual(mcpServer?.actions, [.stop, .restart])
+        // The MCP server's state follows the BotFleet Server, so it can only
+        // be restarted on its own.
+        XCTAssertEqual(mcpServer?.actions, [.restart])
         XCTAssertEqual(shellular?.summary, "stopped")
         XCTAssertEqual(shellular?.actions, [.start, .restart])
     }
@@ -212,6 +229,23 @@ final class FleetServicesTests: XCTestCase {
         let commands = FleetServiceCommands()
         try pm2(commands).restart(appName: "shellular")
         XCTAssertEqual(commands.calls, [["restart", "shellular"]])
+    }
+
+    func testRestartingAPM2ApplicationFallsBackToTheEcosystemFile() throws {
+        // pm2 no longer remembers the application, so the ecosystem file is
+        // the way back, exactly as it is for a start.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("apps/pm2-ecosystem.config.cjs"))
+        let commands = FleetServiceCommands()
+        commands.restartFailure = CommandExitError(output: "pm2 said no")
+        try pm2(commands, home: home).restart(appName: "shellular")
+        XCTAssertEqual(commands.calls.count, 2)
+        XCTAssertEqual(commands.calls[0], ["restart", "shellular"])
+        XCTAssertEqual(commands.calls[1], ["start",
+                                          home.appendingPathComponent("apps/pm2-ecosystem.config.cjs").path,
+                                          "--only", "shellular"])
     }
 
     func testTheStateAfterTheActionIsTheOneThatIsReported() async throws {
@@ -298,8 +332,31 @@ final class FleetServicesTests: XCTestCase {
         XCTAssertTrue(commands.calls.contains("/bin/launchctl kickstart gui/501/app.botfleet.companion"))
     }
 
-    // MARK: - The BotFleet MCP Server keeps its own health endpoint
+    // MARK: - Restarting the BotFleet Server
 
+    func testRestartingTheBotFleetServerClearsTheDeliberateStopMarker() async throws {
+        // The installed wrapper stays down while the deliberate-stop marker
+        // exists, so a restart that left the marker in place would report a
+        // server that never came back.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: LaunchAgentCommands(), uid: 501, environment: [:]),
+            mcpServer: nil)
+        _ = try await control.perform(.restart, serviceID: FleetServiceRegistry.server.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    // MARK: - The BotFleet MCP Server keeps its own health endpoint
     func testTheMCPServerIsObservedThroughItsOwnHealthEndpoint() async throws {
         FleetServiceURLProtocol.handler = { _ in
             .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp"}"#.utf8))
@@ -388,6 +445,8 @@ private final class FleetServiceCommands: CommandRunning {
     var failure: Error?
     /// The failure only `pm2 start` raises.
     var startFailure: Error?
+    /// The failure only `pm2 restart` raises.
+    var restartFailure: Error?
 
     func run(_ executable: String, _ arguments: [String]) throws -> String {
         let pm2Arguments = Array(arguments.dropFirst())
@@ -397,6 +456,12 @@ private final class FleetServiceCommands: CommandRunning {
             // back.
             self.startFailure = nil
             throw startFailure
+        }
+        if pm2Arguments.first == "restart", let restartFailure {
+            // pm2 refuses the first restart, so the ecosystem file is the way
+            // back.
+            self.restartFailure = nil
+            throw restartFailure
         }
         if let failure { throw failure }
         if pm2Arguments.first == "jlist" { return pm2Listing }
@@ -415,9 +480,12 @@ private final class LaunchAgentCommands: CommandRunning {
     var listing = "PID\tStatus\tLabel\n-\t0\tother.service"
     /// True when launchctl already knows the agent.
     var loaded = false
+    /// The boot id the startup policy records.
+    var boot = "4F9389E9-AFE4-42C8-AE2C-7FEEDBA31B6C"
 
     func run(_ executable: String, _ arguments: [String]) throws -> String {
         calls.append(([executable] + arguments).joined(separator: " "))
+        if executable == "/usr/sbin/sysctl" { return boot }
         if arguments == ["list"] { return listing }
         if arguments.first == "print" {
             if loaded { return "state = running" }

@@ -155,7 +155,14 @@ public final class FleetServiceControl {
                 self.pm2.state(ofApp: appName)
             }
         case .launchAgent(let label):
-            try startup.restartAgent(label: label)
+            if descriptor.id == FleetServiceRegistry.server.id {
+                // The BotFleet Server has a restart of its own: it clears the
+                // deliberate-stop marker first, because the installed wrapper
+                // stays down while that marker exists.
+                try startup.restartServer()
+            } else {
+                try startup.restartAgent(label: label)
+            }
             return startup.state(ofAgent: label).managedState
         }
     }

@@ -242,6 +242,29 @@ public final class StartupPolicy {
         }
     }
 
+    /// Restarts the BotFleet Server.
+    ///
+    /// A restart asks for a fresh copy of the server, so the deliberate-stop
+    /// marker is cleared first: the installed wrapper stays down while that
+    /// marker exists, and a restart that left it in place would report a
+    /// server that never came back.  The marker is put back when the restart
+    /// fails, so a refused restart does not lift a deliberate stop.
+    public func restartServer() throws {
+        guard supportsPolicy else { throw StartupPolicyError.updateRequired }
+        guard files.fileExists(atPath: agent.path) else { throw StartupPolicyError.launchAgentMissing }
+        let boot = try bootID()
+        try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+        try Data((boot + "\n").utf8).write(to: session, options: .atomic)
+        let wasStopped = files.fileExists(atPath: stopped.path)
+        if wasStopped { try files.removeItem(at: stopped) }
+        do {
+            try restartAgent(label: StartupPolicy.serverAgentLabel)
+        } catch {
+            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
+            throw error
+        }
+    }
+
     /// Starts a launchd agent: it is enabled, loaded if it is not loaded
     /// yet, and kickstarted.
     ///

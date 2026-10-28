@@ -121,7 +121,7 @@ public struct FleetServiceEntry: Equatable {
 
     /// The actions the owner may pick for this service right now.
     public var availableActions: [ManagedServiceAction] {
-        FleetServices.availableActions(for: state)
+        FleetServices.availableActions(for: state, policy: policy)
     }
 }
 
@@ -224,7 +224,16 @@ public struct FleetServices: Equatable {
     /// started at all.  A service the Control app cannot see is never
     /// stopped, but it can be restarted, because a restart only asks for a
     /// fresh copy of it.
-    public static func availableActions(for state: ManagedServiceState) -> [ManagedServiceAction] {
+    ///
+    /// The wanted policy is part of the answer as well.  A service whose
+    /// state follows another one cannot be stopped on its own: the BotFleet
+    /// MCP Server is wanted exactly while the BotFleet Server runs, so
+    /// offering Stop for it would offer an action the Control app takes
+    /// back at once.  It can still be restarted, and it is stopped by
+    /// stopping the server it follows.
+    public static func availableActions(for state: ManagedServiceState,
+                                        policy: FleetServiceWantedPolicy) -> [ManagedServiceAction] {
+        if policy == .whileServerRuns { return [.restart] }
         switch state {
         case .running: return [.stop, .restart]
         case .stopped: return [.start, .restart]

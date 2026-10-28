@@ -185,8 +185,17 @@ public struct PM2Client {
     }
 
     /// Restarts a pm2 application.
+    ///
+    /// The same fallback as a start: when pm2 no longer remembers the
+    /// application, the ecosystem file is the way back, so it is tried second.
     public func restart(appName: String) throws {
-        _ = try run(["restart", appName])
+        do {
+            _ = try run(["restart", appName])
+        } catch {
+            let ecosystem = home.appendingPathComponent(PM2Client.ecosystemPath)
+            guard FileManager.default.fileExists(atPath: ecosystem.path) else { throw error }
+            _ = try run(["start", ecosystem.path, "--only", appName])
+        }
     }
 
     /// Brings one pm2 application to the wanted state and reports what was
