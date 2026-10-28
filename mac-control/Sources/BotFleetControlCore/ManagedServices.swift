@@ -1,7 +1,7 @@
 import Foundation
 
-/// The observed state of one wheelhouse service.
-public enum WheelhouseState: Equatable {
+/// The observed state of one managed service.
+public enum ManagedServiceState: Equatable {
     case running
     case stopped
     case unknown
@@ -15,8 +15,8 @@ public enum WheelhouseState: Equatable {
     }
 }
 
-/// One managed BotFleet service in the Control app's wheelhouse.
-public struct WheelhouseEntry: Equatable {
+/// One managed BotFleet service in the Control app's managed service list.
+public struct ManagedServiceEntry: Equatable {
     public let id: String
     public let title: String
     /// The desired state.  This is derived from the BotFleet Server's own
@@ -25,9 +25,9 @@ public struct WheelhouseEntry: Equatable {
     /// either way.
     public let wanted: Bool?
     /// The observed state, probed rather than assumed.
-    public let state: WheelhouseState
+    public let state: ManagedServiceState
 
-    public init(id: String, title: String, wanted: Bool?, state: WheelhouseState) {
+    public init(id: String, title: String, wanted: Bool?, state: ManagedServiceState) {
         self.id = id
         self.title = title
         self.wanted = wanted
@@ -59,7 +59,7 @@ public struct WheelhouseEntry: Equatable {
 
 /// The change the Control app should make to bring one entry in line with
 /// its wanted state.
-public enum WheelhouseAction: Equatable {
+public enum ManagedServiceAction: Equatable {
     case start
     case stop
     case none
@@ -70,7 +70,7 @@ public enum WheelhouseAction: Equatable {
 ///
 /// The wanted state is derived from the server's own state, so it never has to
 /// be stored and it cannot drift away from the truth.
-public struct Wheelhouse: Equatable {
+public struct ManagedServices: Equatable {
     public static let mcpServerID = "botfleet-mcp"
     public static let mcpServerTitle = "BotFleet MCP Server"
 
@@ -82,9 +82,9 @@ public struct Wheelhouse: Equatable {
     }
 
     public let serverState: ServerState
-    public let mcpServerState: WheelhouseState
+    public let mcpServerState: ManagedServiceState
 
-    public init(serverState: ServerState, mcpServerState: WheelhouseState) {
+    public init(serverState: ServerState, mcpServerState: ManagedServiceState) {
         self.serverState = serverState
         self.mcpServerState = mcpServerState
     }
@@ -124,8 +124,8 @@ public struct Wheelhouse: Equatable {
         }
     }
 
-    public var entries: [WheelhouseEntry] {
-        [WheelhouseEntry(id: Self.mcpServerID, title: Self.mcpServerTitle,
+    public var entries: [ManagedServiceEntry] {
+        [ManagedServiceEntry(id: Self.mcpServerID, title: Self.mcpServerTitle,
                           wanted: mcpServerWanted, state: mcpServerState)]
     }
 
@@ -134,7 +134,7 @@ public struct Wheelhouse: Equatable {
     /// An unknown wanted state is never acted on, and an unknown observed
     /// state is never acted on either: the Control app does not stop a service
     /// it cannot see, and it does not start one it cannot prove is missing.
-    public static func action(for entry: WheelhouseEntry) -> WheelhouseAction {
+    public static func action(for entry: ManagedServiceEntry) -> ManagedServiceAction {
         switch (entry.wanted, entry.state) {
         case (.some(true), .stopped): return .start
         case (.some(false), .running): return .stop
