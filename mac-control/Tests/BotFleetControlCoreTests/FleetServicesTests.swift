@@ -142,12 +142,23 @@ final class FleetServicesTests: XCTestCase {
                        [.start, .restart])
     }
 
-    func testTheServerIsOfferedNothingWhenTheInstalledWrapperDoesNotSupportThePolicy() {
+    func testTheServerIsOfferedStopWhenTheInstalledWrapperDoesNotSupportThePolicy() {
         // The BotFleet Server's start and restart change its startup policy,
-        // so an older wrapper is offered nothing rather than an action that
-        // would always fail.
+        // so an older wrapper is offered neither of those rather than an
+        // action that would always fail.  A stop asks the server itself, so
+        // it works with any wrapper and stays on the row.
         let services = FleetServices(serverState: .running,
                                     states: ["app.botfleet.server": .running],
+                                    startupPolicySupported: false)
+        let row = services.menuItems.first { $0.id == "app.botfleet.server" }
+        XCTAssertEqual(row?.actions, [.stop])
+    }
+
+    func testAStoppedServerOnAnOldWrapperIsOfferedNothing() {
+        // There is nothing to offer a stopped server whose wrapper cannot
+        // carry the startup policy: a start and a restart both need it.
+        let services = FleetServices(serverState: .stopped,
+                                    states: ["app.botfleet.server": .stopped],
                                     startupPolicySupported: false)
         let row = services.menuItems.first { $0.id == "app.botfleet.server" }
         XCTAssertEqual(row?.actions, [])
@@ -538,6 +549,8 @@ final class FleetServicesTests: XCTestCase {
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
         try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
         try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
         let commands = LaunchAgentCommands()
         commands.loaded = false
         let control = FleetServiceControl(
@@ -550,6 +563,33 @@ final class FleetServicesTests: XCTestCase {
         } catch {
             XCTAssertTrue("\(error)".contains("not replaced"))
         }
+        // The restart did not replace the server, so the owner's deliberate
+        // stop stands: the marker has to be back where it was, or the
+        // wrapper would bring the server back at the next launchd run.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testAServerRestartWaitsNoLongerThanTheCallerAskedFor() async throws {
+        // The launchd path has to honour the caller's wait, the way the pm2
+        // path does, or a caller cannot bound the time it spends here.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let commands = LaunchAgentCommands()
+        commands.loaded = false
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil)
+        _ = try? await control.perform(.restart, serviceID: FleetServiceRegistry.server.id, attempts: 2)
+        // Two attempts and the look that follows them are three looks, and
+        // every one of them asks launchctl what the state is.
+        let looks = commands.calls.filter { $0.contains("launchctl list") }.count
+        XCTAssertEqual(looks, 3)
     }
 
     func testRestartingTheBotFleetServerClearsTheDeliberateStopMarker() async throws {

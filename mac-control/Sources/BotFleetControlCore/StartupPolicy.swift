@@ -249,7 +249,11 @@ public final class StartupPolicy {
     /// marker exists, and a restart that left it in place would report a
     /// server that never came back.  The marker is put back when the restart
     /// fails, so a refused restart does not lift a deliberate stop.
-    public func restartServer() throws {
+    ///
+    /// The returned handle puts the marker back as well, for a restart that
+    /// does not throw but does not replace the server either.
+    @discardableResult
+    public func restartServer() throws -> DeliberateStop {
         guard supportsPolicy else { throw StartupPolicyError.updateRequired }
         guard files.fileExists(atPath: agent.path) else { throw StartupPolicyError.launchAgentMissing }
         let boot = try bootID()
@@ -262,6 +266,37 @@ public final class StartupPolicy {
         } catch {
             if wasStopped { try? Data().write(to: stopped, options: .atomic) }
             throw error
+        }
+        return DeliberateStop(marker: stopped, files: files, wasStopped: wasStopped)
+    }
+
+    /// What a restart of the BotFleet Server did to the deliberate-stop
+    /// marker.
+    ///
+    /// A restart clears the marker so the installed wrapper can start the
+    /// server again.  When the restart does not replace the server, the
+    /// marker goes back, because a refused restart must not lift a
+    /// deliberate stop.
+    public struct DeliberateStop {
+        private let marker: URL
+        private let files: FileManager
+        private let wasStopped: Bool
+
+        fileprivate init(marker: URL, files: FileManager, wasStopped: Bool) {
+            self.marker = marker
+            self.files = files
+            self.wasStopped = wasStopped
+        }
+
+        /// True when the marker was there before the restart.
+        public var wasStoppedByOwner: Bool { wasStopped }
+
+        /// Puts the deliberate-stop marker back, when it was there before.
+        public func restore() {
+            guard wasStopped else { return }
+            try? files.createDirectory(at: marker.deletingLastPathComponent(),
+                                       withIntermediateDirectories: true)
+            try? Data().write(to: marker, options: .atomic)
         }
     }
 

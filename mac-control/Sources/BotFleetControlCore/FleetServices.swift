@@ -168,11 +168,18 @@ public struct FleetServiceEntry: Equatable {
 
     /// The actions the owner may pick for this service right now.
     public var availableActions: [ManagedServiceAction] {
-        guard canChangeStartupPolicy else { return [] }
-        return FleetServices.availableActions(for: state,
-                                             wanted: wanted,
-                                             policy: policy,
-                                             stoppedByOwner: stoppedByOwner)
+        let actions = FleetServices.availableActions(for: state,
+                                                    wanted: wanted,
+                                                    policy: policy,
+                                                    stoppedByOwner: stoppedByOwner)
+        // Only a start and a restart change the startup policy, and the
+        // installed wrapper has to carry the contract for those.  A stop
+        // asks the server itself, so it works with any wrapper and is
+        // never taken away.
+        guard canChangeStartupPolicy else {
+            return actions.filter { $0 != .start && $0 != .restart }
+        }
+        return actions
     }
 }
 
