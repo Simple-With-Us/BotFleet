@@ -21,7 +21,7 @@ This skill governs how autonomous AI agents collaborate across the entire applic
 
 ## Canonical Fleet App Acronyms
 
-Use these canonical acronyms in Apple Notes titles (`[APP, Agent] topic`), commit messages, PRs, and Slack `#Work-In-Progress` communications:
+Use these canonical acronyms in Apple Notes titles (`[APP, Agent] topic`), commit messages, PRs, and Zulip `#Work-In-Progress` communications:
 
 | Acronym | App / Scope | Repository |
 | :--- | :--- | :--- |
@@ -35,7 +35,7 @@ Use these canonical acronyms in Apple Notes titles (`[APP, Agent] topic`), commi
 | **`OPS`** | fleet-ops (sibling identity; do not invent a checkout here) | `Simple-With-Us/fleet-ops` |
 | **`PS`** | Personal-Site | `Simple-With-Us/Personal-Site` |
 | **`CTS`** | congress-trading-shared | `Simple-With-Us/congress-trading-shared` |
-| **`FLEET`** | Slack wake: every Grok Bot seat | Not a repo.  Not the coordinator.  `[SENDER->FLEET]` means every `[GB-<NAME>]` seat must spend time. |
+| **`FLEET`** | Zulip wake: every Grok Bot seat | Not a repo.  Not the coordinator.  `[SENDER->FLEET]` means every `[GB-<NAME>]` seat must spend time. |
 
 **Self-id:** this coordinator/ops system signs as **`AFL`**.  Never `[FLEET]`.  Never `[GB-FLEET]`.  Former aliases `AFC` / `AIFC` / `FC` are retired.  Sibling infra identity is **`OPS`**.
 
@@ -93,7 +93,7 @@ Before starting substantial work, reserve your lane on Linear and Zulip:
    - Do not edit archived effort logs (`~/apps/*-EFFORT-LOG.md` or repo `docs/EFFORT-LOG.md`).
 2. **GitHub Issue (when applicable):**
    - Link your branch to the corresponding GitHub Issue or create one.
-3. **Slack Channel `#Work-In-Progress`:**
+3. **Zulip Channel `#Work-In-Progress`:**
    Post a standardized claim header:
    ```text
    [<YOUR_TAG>] sync-1
@@ -196,7 +196,7 @@ Once PR merges to `main`:
 2. **Triple Closeout:**
    - Effort board: Update row to **Deployed** (or **Completed**) with live verification note.
    - GitHub Issue: Close issue.
-   - Slack `#Work-In-Progress`: Post `[<YOUR_TAG>] closeout` with deployed status and health check results.
+   - Zulip `#Work-In-Progress`: Post `[<YOUR_TAG>] closeout` with deployed status and health check results.
    - Apple Note: Add final verification stamp.
 
 ---
