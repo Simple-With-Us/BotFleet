@@ -27,6 +27,15 @@ const BASE_SETTINGS: InfisicalSettings = {
   refreshMinutes: 15,
 };
 
+/** The request headers as a plain string map, so a test can read the
+ * authorization header off a stubbed fetch. */
+function headerBag(init?: RequestInit): Record<string, string> {
+  // SAFETY: every stubbed fetch in this file is called with a plain object of
+  // string headers -- never a Headers instance and never an array of pairs --
+  // so reading a header off this map cannot be wrong.
+  return (init?.headers ?? {}) as Record<string, string>;
+}
+
 function withSettings(overrides: Partial<InfisicalSettings>): InfisicalSettings {
   const merged: InfisicalSettings = { ...BASE_SETTINGS, ...overrides };
   infisical.configure(() => merged);
@@ -38,7 +47,7 @@ function withSettings(overrides: Partial<InfisicalSettings>): InfisicalSettings 
 function listOnly(secrets: Array<{ secretKey: string; secretValue: string }>) {
   const calls: Array<{ url: string; authorization: string | undefined }> = [];
   const impl = vi.fn(async (url: string, init?: RequestInit) => {
-    const headers = (init?.headers ?? {}) as Record<string, string>;
+    const headers = headerBag(init);
     calls.push({ url: String(url), authorization: headers.authorization });
     return new Response(JSON.stringify({ secrets }), { status: 200 });
   });
@@ -172,7 +181,7 @@ describe("refresh: a good sync", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string, init?: RequestInit) => {
-        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const headers = headerBag(init);
         calls.push({
           url: String(url),
           method: init?.method ?? "GET",
@@ -882,7 +891,7 @@ describe("service token fallback", () => {
   }) {
     const calls: RecordedCall[] = [];
     const impl = vi.fn(async (url: string, init?: RequestInit) => {
-      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const headers = headerBag(init);
       calls.push({
         url: String(url),
         method: init?.method ?? "GET",
@@ -1131,7 +1140,7 @@ describe("service token fallback", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string, init?: RequestInit) => {
-        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const headers = headerBag(init);
         calls.push({
           url: String(url),
           method: init?.method ?? "GET",
@@ -1176,7 +1185,7 @@ describe("service token fallback", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string, init?: RequestInit) => {
-        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const headers = headerBag(init);
         calls.push({
           url: String(url),
           method: init?.method ?? "GET",
@@ -1220,7 +1229,7 @@ describe("service token refusal: scope and visibility", () => {
   function refusingFetch(status: number, secrets: Array<{ secretKey: string; secretValue: string }> = []) {
     const calls: RecordedCall[] = [];
     const impl = vi.fn(async (url: string, init?: RequestInit) => {
-      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const headers = headerBag(init);
       calls.push({ url: String(url), authorization: headers.authorization });
       if (String(url).includes("/login")) {
         return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
@@ -1288,7 +1297,7 @@ describe("service token refusal: scope and visibility", () => {
   }) {
     const calls: RecordedCall[] = [];
     const impl = vi.fn(async (url: string, init?: RequestInit) => {
-      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const headers = headerBag(init);
       calls.push({ url: String(url), authorization: headers.authorization });
       if (String(url).includes("/login")) {
         return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });

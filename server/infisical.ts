@@ -129,11 +129,20 @@ function isConfigured(settings: InfisicalSettings): boolean {
  * vault stays configured and the next refresh tries the same token again. */
 const DEFINITIVE_REJECTION_STATUSES: ReadonlySet<number> = new Set([401, 403, 404]);
 
-/** Whether the server refused the bearer outright.  Only an `InfisicalError`
- * carries a status;  anything else is a transport failure and counts as
- * transient. */
-function isDefinitiveRejection(err: unknown): boolean {
-  return err instanceof InfisicalError && DEFINITIVE_REJECTION_STATUSES.has(err.statusCode);
+/** The HTTP status the server answered with, or `undefined` when the call
+ * never got one:  a transport failure, a timeout, a dropped connection.
+ * Only an `InfisicalError` carries a status, and anything else is a
+ * transport failure and counts as transient.  The unknown value a catch
+ * block hands over is decoded here, at the boundary where it arrives, so
+ * everything downstream works with a number instead of an unparsed value. */
+function rejectionStatus(cause: unknown): number | undefined {
+  return cause instanceof InfisicalError ? cause.statusCode : undefined;
+}
+
+/** Whether a status the server actually returned is a definitive refusal:
+ * the bearer was refused outright. */
+function isDefinitiveRejection(status: number): boolean {
+  return DEFINITIVE_REJECTION_STATUSES.has(status);
 }
 
 /** What a refusal is remembered under:  the project, environment and path
@@ -353,8 +362,8 @@ class InfisicalManager {
     try {
       return await call(configured);
     } catch (err) {
-      if (!isDefinitiveRejection(err)) throw err;
-      const status = err instanceof InfisicalError ? err.statusCode : 0;
+      const status = rejectionStatus(err);
+      if (status === undefined || !isDefinitiveRejection(status)) throw err;
       this.rememberRefusal(mode, configured, refusalScope(status, scope));
       if (!hasMachineIdentity(settings)) throw err;
       return call(await this.machineIdentityToken(settings));
@@ -590,7 +599,8 @@ class InfisicalManager {
       return { ok: true, error: null, secretCount: names.length, names: [...names] };
     } catch (err) {
       let error = err instanceof InfisicalError ? err.message : err instanceof Error ? redactSecretsInText(err.message) : "unknown error";
-      if (configured && isDefinitiveRejection(err)) {
+      const status = rejectionStatus(err);
+      if (configured && status !== undefined && isDefinitiveRejection(status)) {
         error = `The configured read service token was refused by the server:  ${error}.  Save a rotated token in Settings and the next refresh will use it.`;
       }
       return { ok: false, error, secretCount: 0, names: [] };
