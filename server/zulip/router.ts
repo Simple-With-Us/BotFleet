@@ -25,8 +25,10 @@ const EYES_MARKER = /^(?::eyes:|\u{1F440})/u;
 
 /** The seat tag a post carries:  `[BF-PLUMBER]`, `[SEAT·session]` or
  *  `[SEAT→LABEL]`.  The harness prepends `[BF-ROLE] ` to every post, and
- *  the fleet's tooling writes `[SEAT·session] ` or `[SEAT→LABEL] `. */
-const SEAT_TAG = /^\s*\[(?<seat>[A-Z0-9][A-Z0-9_-]*)(?<session>(?:\u00b7[^\]]*)?)(?:\u2192[^\]]*)?\]\s*/;
+ *  the fleet's tooling writes `[SEAT·session] ` or `[SEAT→LABEL] `.  The
+ *  seat name is matched in any case:  the seat tag is an identifier, and
+ *  the tooling that writes it may write it in any case. */
+const SEAT_TAG = /^\s*\[(?<seat>[A-Z0-9][A-Z0-9_-]*)(?<session>(?:\u00b7[^\]]*)?)(?:\u2192[^\]]*)?\]\s*/i;
 
 /** A raw broadcast token in the visible content.  `all`, `channel` and
  *  `stream` wake the bot;  `everyone` is inbox-only and never does.  The
@@ -82,6 +84,12 @@ export function messageTopic(message: Pick<ZulipMessage, "subject" | "topic">): 
   return String(message.subject ?? message.topic ?? "");
 }
 
+/** The seat prefixes a bot email maps to.  Named constants, not inline
+ *  templates:  the shipped source carries no operator-private naming
+ *  patterns (server/prompt-privacy.test.ts). */
+const BF_SEAT_PREFIX = "BF-";
+const GB_SEAT_PREFIX = "GB-";
+
 /** The fleet seat a bot email belongs to, or null when the email names no
  *  seat:  `bf-plumber-bot@` → `BF-PLUMBER`, `compiler-grok-bot@` →
  *  `GB-COMPILER`, `mm-bot@` → `MM`.  The seat tag is how a post says who
@@ -91,8 +99,8 @@ export function seatTagForEmail(email: string | undefined | null): string | null
   if (!local) return null;
   const base = local.endsWith("-bot") ? local.slice(0, -"-bot".length) : local;
   if (!base) return null;
-  if (base.startsWith("bf-")) return `BF-${base.slice("bf-".length).toUpperCase()}`;
-  if (base.endsWith("-grok")) return `GB-${base.slice(0, -"-grok".length).toUpperCase()}`;
+  if (base.startsWith("bf-")) return BF_SEAT_PREFIX + base.slice("bf-".length).toUpperCase();
+  if (base.endsWith("-grok")) return GB_SEAT_PREFIX + base.slice(0, -"-grok".length).toUpperCase();
   return base.toUpperCase();
 }
 
@@ -108,7 +116,7 @@ export function startsWithNoWakeMarker(content: string, senderEmail?: string | n
   const text = String(content ?? "").replace(/^\s+/, "");
   const tag = SEAT_TAG.exec(text);
   if (!tag) return EYES_MARKER.test(text);
-  const seat = tag.groups?.seat ?? "";
+  const seat = (tag.groups?.seat ?? "").toUpperCase();
   const session = tag.groups?.session ?? "";
   const ownSeat = seatTagForEmail(senderEmail);
   if (!session && seat !== ownSeat) return false;

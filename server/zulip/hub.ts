@@ -1083,7 +1083,7 @@ export class ZulipHub {
       conversationKey: originKey(origin),
       channel: origin.kind === "stream" ? origin.channel : undefined,
       topic: origin.kind === "stream" ? origin.topic : undefined,
-      mentions: verdict.via === "mention" ? [session.role] : [],
+      mentions: queuedVia(verdict.via) === "mention" ? [session.role] : [],
       contentText: String(message.content ?? ""),
       wakeReason: queuedVia(verdict.via),
       senderKind: verdict.wake,

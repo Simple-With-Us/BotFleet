@@ -181,6 +181,21 @@ describe("the no-wake marker", () => {
     ).toEqual({ wake: null, reason: "no_wake" });
   });
 
+  it("takes the marker after the sender's own seat tag in any case", () => {
+    // the seat tag is an identifier:  the tooling that writes it may write
+    // it in any case, and the marker still silences the fleet
+    expect(
+      verdict(stream({ sender_email: "bf-plumber-bot@zulip.test", content: "[bf-plumber] :eyes: hi" })),
+    ).toEqual({ wake: null, reason: "no_wake" });
+    expect(
+      verdict(stream({ sender_email: "bf-plumber-bot@zulip.test", content: "[Bf-Plumber] :eyes: hi" })),
+    ).toEqual({ wake: null, reason: "no_wake" });
+    // another seat's tag in any case still cannot silence the fleet
+    expect(
+      refusal(stream({ sender_email: "bf-plumber-bot@zulip.test", content: "[bf-fixer] :eyes: hi" })),
+    ).not.toBe("no_wake");
+  });
+
   it("takes the marker after a tag that carries a session", () => {
     expect(verdict(stream({ sender_email: "other-bot@zulip.test", content: "[BF-PLUMBER\u00b7abc123] :eyes: hi" }))).toEqual({
       wake: null,
