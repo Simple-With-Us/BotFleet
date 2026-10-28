@@ -68,6 +68,13 @@ public struct PM2Client {
     public static let settleAttempts = 8
     public static let settleInterval: TimeInterval = 2.5
 
+    /// How long the MCP server's own health is waited for.
+    ///
+    /// The MCP server is observed through an HTTP health endpoint, so a look
+    /// at it costs no process, and its window stays the twenty seconds it
+    /// always was.
+    public static let mcpSettleAttempts = 40
+
     private let commands: CommandRunning
     private let environment: [String: String]
     private let nodePath: String?

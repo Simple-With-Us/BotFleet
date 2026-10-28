@@ -379,6 +379,33 @@ final class FleetServicesTests: XCTestCase {
         XCTAssertTrue(commands.calls.contains("/bin/launchctl kickstart gui/501/app.botfleet.companion"))
     }
 
+    // MARK: - Waiting for a change
+
+    func testAWaitWithAnImpossibleIntervalDoesNotTrap() async throws {
+        // A negative or an enormous interval would trap the conversion to
+        // nanoseconds, and this is public API.
+        var observations = 0
+        _ = await ManagedServices.settle(to: .running, attempts: 2, interval: -1) {
+            observations += 1
+            return .stopped
+        }
+        XCTAssertEqual(observations, 3)
+        var endless = 0
+        _ = await ManagedServices.settle(to: .running, attempts: 1, interval: .infinity) {
+            endless += 1
+            return .stopped
+        }
+        XCTAssertEqual(endless, 2)
+    }
+
+    func testAMCPChangeKeepsItsTwentySecondWindow() {
+        // The MCP server is observed through an HTTP health endpoint, so a
+        // look at it costs no process and its window stays the twenty
+        // seconds it always was.
+        XCTAssertEqual(PM2Client.mcpSettleAttempts, 40)
+        XCTAssertGreaterThanOrEqual(Double(PM2Client.mcpSettleAttempts) * 0.5, 20.0)
+    }
+
     // MARK: - A stop the owner asked for
 
     func testAStopIsRemembered() {
@@ -459,6 +486,21 @@ final class FleetServicesTests: XCTestCase {
         _ = try await control.perform(.stop, serviceID: FleetServiceRegistry.server.id)
         XCTAssertEqual(asked.value, 1)
         XCTAssertFalse(commands.calls.contains { $0.contains("bootout") })
+    }
+
+    func testTheServersStopReportsTheStateThatWasObserved() async throws {
+        // The server answers the stop request before it has exited, so the
+        // state that is reported is the one that was observed after it and
+        // not a constant that happens to be the expected one.
+        let commands = LaunchAgentCommands()
+        commands.listing = "PID\tStatus\tLabel\n123\t0\tapp.botfleet.server"
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil,
+            stopServer: { })
+        let state = try await control.perform(.stop, serviceID: FleetServiceRegistry.server.id, attempts: 2)
+        XCTAssertEqual(state, .running)
     }
 
     func testStoppingTheBotFleetServerIsRefusedWhenTheServerCannotBeAsked() async throws {

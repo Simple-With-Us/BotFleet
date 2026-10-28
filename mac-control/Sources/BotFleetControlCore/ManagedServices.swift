@@ -195,10 +195,14 @@ public struct ManagedServices: Equatable {
                                attempts: Int,
                                interval: TimeInterval = 0.5,
                                observe: () async -> ManagedServiceState) async -> ManagedServiceState {
+        // A negative or an enormous interval would trap the conversion to
+        // nanoseconds, and this is public API, so the value is clamped
+        // before it is used.
+        let seconds = interval.isFinite ? min(max(interval, 0), 60) : 0
         for _ in 0..<attempts {
             let next = await observe()
             if next == wanted { return next }
-            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
         }
         return await observe()
     }

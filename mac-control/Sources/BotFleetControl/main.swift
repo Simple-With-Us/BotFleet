@@ -394,7 +394,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// What stopping one fleet service does.
     private func stopBody(for service: FleetServiceMenuItem) -> String {
         if service.id == FleetServiceRegistry.server.id {
-            return "The BotFleet Server stops itself, and its Local VMs go down with it.  The server refuses while work is in flight, and macOS brings it back the next time you log in."
+            return "The BotFleet Server stops itself, and its Local VMs go down with it.  The server refuses while work is in flight.  The installed wrapper stays down while the deliberate-stop marker exists, so a login does not bring it back; Restart clears the marker."
         }
         if let descriptor = FleetServiceRegistry.descriptor(for: service.id),
            case .launchAgent = descriptor.kind {
