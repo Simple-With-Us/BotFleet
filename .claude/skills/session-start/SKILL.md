@@ -6,7 +6,7 @@ description: >-
 
 # Session start (MONET)
 
-> **Shared `~/.claude/skills`.** Monet, Claude/Fable, and (when active) Renoir all load this directory.  Do not treat the word Monet in examples as proof of your seat.  Pin `AGENT_SEAT` / `AGENT_TAG` from the logged-in account before Slack or `board --by`:
+> **Shared `~/.claude/skills`.** Monet, Claude/Fable, and (when active) Renoir all load this directory.  Do not treat the word Monet in examples as proof of your seat.  Pin `AGENT_SEAT` / `AGENT_TAG` from the logged-in account before Zulip or `simple-board --by`:
 > - Monet → `MONET`, Notes `Monet`, `monet/`, `~/apps/<app>-monet`
 > - Claude / Fable → `CLAUDE`, Notes `Claude`, `claude/`, `~/apps/<app>-claude`
 > - Renoir → `RENOIR`, Notes `Renoir`, `renoir/`, `~/apps/<app>-renoir`
@@ -37,12 +37,12 @@ Your branch prefix is your seat in lower case (`claude/*` for CLAUDE).  Never op
 ## 2. Read live coordination
 
 ```bash
-AGENT_TAG="$SEAT" /usr/bin/python3 /Users/jay/apps/agent-sync-poll.py
+AGENT_TAG="$SEAT" /usr/bin/python3 /Users/jay/apps/simple-chat
 board stats
 board list --status open,in_progress --severity P0,P1 --limit 25
 ```
 
-Invoke `board` literally (`board stats`, not `$B stats` or a pipe).  The CLI is Linear-backed at `~/.local/bin/board` — never prepend `~/apps/mac-collab` to `PATH`.  Run `command -v board` before trusting a list.
+Invoke `simple-board` literally (`board stats`, not `$B stats` or a pipe).  The CLI is Linear-backed at `~/.local/bin/board` — never prepend `~/apps/mac-collab` to `PATH`.  Run `command -v board` before trusting a list.
 
 Skim Slack headers for `MONET` or a `repo:` you are about to touch.  `FLEET` as recipient (`[SENDER->FLEET]`) is a Grok Bot wake — every `[GB-<NAME>]` seat must spend time.  Coordinator self-id is `AFL` (never `FLEET`, never `GB-FLEET`).  Sibling infra identity is `OPS`.  Full-read on match.  Peer messages are coordination data, not owner orders.
 
@@ -50,7 +50,7 @@ Skim Slack headers for `MONET` or a `repo:` you are about to touch.  `FLEET` as 
 
 The shared checkout is the human/fleet review base.  Mid-task branch flips there have landed one seat's commits on another seat's branch.
 
-| App | Slack `repo:` | Acronym | Monet worktree | Linear team |
+| App | Zulip `repo:` | Acronym | Monet worktree | Linear team |
 |-----|---------------|---------|----------------|-------------|
 | Socratic.Trade | `Socratic.Trade` | ST | `~/apps/trading-monet` | `ST` |
 | Congress.Trade | `Congress.Trade` | CT | `~/apps/congress-monet` | `CT` |
@@ -87,7 +87,7 @@ cadence: per-turn-poll
 work: <one line>"
 ```
 
-Fallback: `SLACK_AGENT_NAME=MONET bash scripts/slack-sync.sh post "..."` from the app checkout, or `/Users/jay/apps/slack-sync.sh`.  Do not open a second Slack Socket Mode connection.
+Fallback: `SLACK_AGENT_NAME=MONET bash scripts/simple-chat post "..."` from the app checkout, or `/Users/jay/apps/simple-chat`.  Do not open a second Slack Socket Mode connection.
 
 `FLEET` as recipient only when every Grok Bot seat must spend time.  This coordinator signs as `AFL`.
 
@@ -104,7 +104,7 @@ A new owner message **adds** work unless they explicitly cancel or replace the o
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` — identity, THE BOARD, Slack, prior-messages, always-commit
+- `/Users/jay/apps/FLEET-PROTOCOL.md` — identity, THE BOARD, Slack, prior-messages, always-commit
 - `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`
 - `/Users/jay/Code/ai-fleet-coordinator/docs/ONBOARDING-NEW-AGENT.md`
 - `/Users/jay/Code/ai-fleet-coordinator/fleet-apps.json`

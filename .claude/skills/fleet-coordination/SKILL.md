@@ -5,15 +5,15 @@ description: Comprehensive master skill for multi-agent fleet operations across 
 
 # Fleet Coordination Protocol (Universal)
 
-> **Shared `~/.claude/skills`.** Monet, Claude/Fable, and (when active) Renoir all load this directory.  Do not treat the word Monet in examples as proof of your seat.  Pin `AGENT_SEAT` / `AGENT_TAG` from the logged-in account before Slack or `board --by`:
+> **Shared `~/.claude/skills`.** Monet, Claude/Fable, and (when active) Renoir all load this directory.  Do not treat the word Monet in examples as proof of your seat.  Pin `AGENT_SEAT` / `AGENT_TAG` from the logged-in account before Zulip or `simple-board --by`:
 > - Monet → `MONET`, Notes `Monet`, `monet/`, `~/apps/<app>-monet`
 > - Claude / Fable → `CLAUDE`, Notes `Claude`, `claude/`, `~/apps/<app>-claude`
 > - Renoir → `RENOIR`, Notes `Renoir`, `renoir/`, `~/apps/<app>-renoir`
 > Cursor, Grok, Grok Bot, Codex, AG, DeepSeek, Kimi, and Fx have their own skill dirs and must not take identity from here.
 
 
-Canonical reference: `/Users/jay/apps/AGENT-SYNC.md` and `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`.  
-Slack Coordination Channel: `#agent-sync` (`C0BEZDJDNKV`).
+Canonical reference: `/Users/jay/apps/FLEET-PROTOCOL.md` and `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`.  
+Zulip Coordination Channel: `#Work-In-Progress`.
 
 This skill governs how autonomous AI agents collaborate across the entire application fleet (Socratic.Trade, Congress.Trade, Usage-Monitor, congress-trading-shared, DealDex, Personal-Site, Autorotate, ContactLogo, and ai-fleet-coordinator).
 
@@ -21,7 +21,7 @@ This skill governs how autonomous AI agents collaborate across the entire applic
 
 ## Canonical Fleet App Acronyms
 
-Use these canonical acronyms in Apple Notes titles (`[APP, Agent] topic`), commit messages, PRs, and Slack `#agent-sync` communications:
+Use these canonical acronyms in Apple Notes titles (`[APP, Agent] topic`), commit messages, PRs, and Slack `#Work-In-Progress` communications:
 
 | Acronym | App / Scope | Repository |
 | :--- | :--- | :--- |
@@ -60,7 +60,7 @@ Every agent session must start with systematic orientation before touching code:
 
 2. **Poll Coordination Channel:**
    ```bash
-   AGENT_TAG=<YOUR_TAG> /usr/bin/python3 /Users/jay/apps/agent-sync-poll.py
+   AGENT_TAG=<YOUR_TAG> /usr/bin/python3 /Users/jay/apps/simple-chat
    ```
    Skim for your agent tag or repositories you plan to touch.  Grok Bot seats also full-read `[SENDER->FLEET]` (every GB seat must spend time).  Coordinator self-id is `AFL`, not `FLEET`.
 
@@ -69,7 +69,7 @@ Every agent session must start with systematic orientation before touching code:
    board stats
    board list --status open,in_progress --limit 25
    ```
-   Effort logs are archived — use Linear (`board` or agent-sync `linear_list` when mounted), not `~/apps/*EFFORT-LOG.md` or `docs/EFFORT-LOG.md`, for open work.
+   Effort logs are archived — use Linear (`simple-board` or agent-sync `linear_list` when mounted), not `~/apps/*EFFORT-LOG.md` or `docs/EFFORT-LOG.md`, for open work.
 
 ---
 
@@ -93,7 +93,7 @@ Before starting substantial work, reserve your lane on Linear and Zulip:
    - Do not edit archived effort logs (`~/apps/*-EFFORT-LOG.md` or repo `docs/EFFORT-LOG.md`).
 2. **GitHub Issue (when applicable):**
    - Link your branch to the corresponding GitHub Issue or create one.
-3. **Slack Channel `#agent-sync`:**
+3. **Slack Channel `#Work-In-Progress`:**
    Post a standardized claim header:
    ```text
    [<YOUR_TAG>] sync-1
@@ -136,7 +136,7 @@ Visibly wider gap (two visible spaces) after terminal punctuation (`.`, `!`, `?`
 
 | Surface | Syntax | Why |
 | :--- | :--- | :--- |
-| **Every surface** (owner ruling 2026-10-23):  chat replies in any other pane, Zulip, GitHub PR and issue text, review comments, Linear, Slack, commit messages, repo docs, skills, agent instructions, rendered UI copy | A real U+00A0 plus a normal space, generated in the shell | One rule everywhere.  Two ASCII spaces collapse on rendered surfaces, and the `&nbsp;` entity shows literally in squash commits and plain text. |
+| **Every surface** (owner ruling 2026-10-23):  chat replies in any other pane, Zulip, GitHub PR and issue text, review comments, Linear, commit messages, repo docs, skills, agent instructions, rendered UI copy | A real U+00A0 plus a normal space, generated in the shell | One rule everywhere.  Two ASCII spaces collapse on rendered surfaces, and the `&nbsp;` entity shows literally in squash commits and plain text. |
 | **Claude Code Code tab and the MiniMax Code chat pane: chat replies** | The `&nbsp;` entity plus a normal space, outside code spans | The one exception (owner ruling 2026-10-23):  those two panes normalize a raw U+00A0 away, so the entity is the form that renders a real gap there.  The entity is never the form anywhere else. |
 | **HTML / JSX / Swift source for product copy** | Swift `"\u{00A0} "`, JS/TS strings `"\u00A0 "`, JSX text `{'\u00A0'}` plus a space or `&#160;`, HTML markup source `&#160;`, or a shared `SENTENCE_GAP` constant | Same rendered gap; never `&nbsp; ` |
 | **Code, identifiers, machine-readable config** | No gap character | Never put U+00A0 into code |
@@ -196,7 +196,7 @@ Once PR merges to `main`:
 2. **Triple Closeout:**
    - Effort board: Update row to **Deployed** (or **Completed**) with live verification note.
    - GitHub Issue: Close issue.
-   - Slack `#agent-sync`: Post `[<YOUR_TAG>] closeout` with deployed status and health check results.
+   - Slack `#Work-In-Progress`: Post `[<YOUR_TAG>] closeout` with deployed status and health check results.
    - Apple Note: Add final verification stamp.
 
 ---
