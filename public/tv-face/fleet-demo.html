@@ -54,7 +54,7 @@
   <p class="clock" id="clock">waiting for start…</p>
   <div class="grid" id="grid"></div>
   <p class="note">
-    Assets load from FleetLink transparent packs.  Enter and return are ~1s transitions from/to resting.
+    Assets load from this app's <code>/tv-face/skins</code> tree (same origin), so canvas decoding works without cross-origin CORS.  Enter and return are ~1s transitions from/to resting.
     Hold loops while a bot stays active.  Expressions that only ship stills (no hold GIF) use the still —
     that is what made Compiler/Designer “cut out” before (celebrate / curious / playful / proud / waking).
     Green uses red mouth glyphs.
@@ -62,8 +62,7 @@
 <script type="module">
 import { parseGIF, decompressFrames } from "https://cdn.jsdelivr.net/npm/gifuct-js@2.1.2/+esm";
 
-const CDN = "https://fleetlink.online/TV-Face/botfleet";
-const CDN_SKINS = "https://fleetlink.online/TV-Face/botfleet-skins";
+const SKINS = "/tv-face/skins";
 
 const HAS_ENTER_RETURN = new Set([
   "listening","thinking","typing","speaking","computer",
@@ -74,6 +73,24 @@ const HAS_HOLD = new Set([
   "alerting","angry","excited","happy","laughing","loading","notifying",
   "resting","searching","sleeping","surprised","working",
 ]);
+
+function skinDir(color) {
+  return color === "orange" ? "default" : color;
+}
+
+function assetUrl(color, state, kind) {
+  const base = `${SKINS}/${skinDir(color)}`;
+  if (kind === "still") return `${base}/stills/${state}.png`;
+  return `${base}/gifs/${state}_${kind}.gif`;
+}
+function resolveAsset(color, state, kind) {
+  if ((kind === "enter" || kind === "return") && !HAS_ENTER_RETURN.has(state)) {
+    kind = HAS_HOLD.has(state) ? "hold" : "still";
+  }
+  if (kind === "hold" && !HAS_HOLD.has(state)) kind = "still";
+  const url = assetUrl(color, state, kind);
+  return { state, kind, primary: url, fallback: url };
+}
 
 const bots = [
   { name: "Director",  color: "blue",   role: "coordinates the fleet",
@@ -195,27 +212,6 @@ const bots = [
       { t:59, state:"resting", kind:"still" },
     ]},
 ];
-
-function packBase(color) {
-  if (color === "orange") return CDN;
-  return `${CDN_SKINS}/${color}`;
-}
-function packBaseFallback(color) {
-  if (color === "orange") return CDN;
-  return `${CDN}/${color}`;
-}
-function assetUrl(color, state, kind, useFallback = false) {
-  const base = useFallback ? packBaseFallback(color) : packBase(color);
-  if (kind === "still") return `${base}/stills/${state}.png`;
-  return `${base}/gifs/${state}_${kind}.gif`;
-}
-function resolveAsset(color, state, kind) {
-  if ((kind === "enter" || kind === "return") && !HAS_ENTER_RETURN.has(state)) {
-    kind = HAS_HOLD.has(state) ? "hold" : "still";
-  }
-  if (kind === "hold" && !HAS_HOLD.has(state)) kind = "still";
-  return { state, kind, primary: assetUrl(color, state, kind, false), fallback: assetUrl(color, state, kind, true) };
-}
 
 const gifCache = new Map();
 async function loadGif(url) {
@@ -343,9 +339,8 @@ async function apply(card, step) {
     tryUrls.push({ url: resolved.primary, kind: resolved.kind });
     if (resolved.fallback !== resolved.primary) tryUrls.push({ url: resolved.fallback, kind: resolved.kind });
   }
-  tryUrls.push({ url: assetUrl(card.bot.color, resolved.state, "still", false), kind: "still" });
-  tryUrls.push({ url: assetUrl(card.bot.color, resolved.state, "still", true), kind: "still" });
-  tryUrls.push({ url: assetUrl(card.bot.color, "resting", "still", false), kind: "still" });
+  tryUrls.push({ url: assetUrl(card.bot.color, resolved.state, "still"), kind: "still" });
+  tryUrls.push({ url: assetUrl(card.bot.color, "resting", "still"), kind: "still" });
 
   for (const candidate of tryUrls) {
     try {

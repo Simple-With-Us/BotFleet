@@ -1,11 +1,25 @@
 import { existsSync } from "node:fs";
-import { chmod, lstat, readFile, readdir, writeFile } from "node:fs/promises";
+import { chmod, lstat, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { LICENSE_FILES } from "./cua-linux-release.mjs";
 import {
   executableTarget,
   verifyCloudflaredExecutable,
 } from "./prepare-cloudflared.mjs";
+
+/** Color TV-Face packs ship in the web build and can be fetched on demand;
+ *  the desktop bundle keeps only the default (orange) pack to avoid hundreds
+ *  of megabytes of GIFs in every install. */
+const DESKTOP_TVFACE_SKIN_DIRS = new Set(["default"]);
+
+async function trimDesktopTvFaceSkins(resources) {
+  const skinsRoot = path.join(resources, "ui", "tv-face", "skins");
+  if (!existsSync(skinsRoot)) return;
+  for (const entry of await readdir(skinsRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || DESKTOP_TVFACE_SKIN_DIRS.has(entry.name)) continue;
+    await rm(path.join(skinsRoot, entry.name), { recursive: true, force: true });
+  }
+}
 
 async function requireRealDirectory(directory, mode = 0o755) {
   const details = await lstat(directory);
@@ -79,6 +93,7 @@ export default async function afterPack(context) {
   ].filter(Boolean);
   const resources = candidateResources.find((dir) => existsSync(dir)) ?? candidateResources[0];
   await validateCloudflared(resources, context.electronPlatformName, Boolean(context.packager));
+  if (resources) await trimDesktopTvFaceSkins(resources);
 
   if (resources && existsSync(resources)) {
     const updateYml = path.join(resources, "app-update.yml");
