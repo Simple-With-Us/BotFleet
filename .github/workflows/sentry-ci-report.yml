@@ -18,7 +18,7 @@ name: Sentry CI Report
 #      across repos, and this repo shares workflow names ("CI", "Security",
 #      "Effort Issues Sync") with peer apps, so without `app` a "CI" failure
 #      here would dedup into the same Sentry issue as a "CI" failure there.
-#      See AGENT-SYNC.md "Observability".
+#      See FLEET-PROTOCOL.md "Observability".
 #   2. On event == schedule (i.e. the completed run was a cron-triggered
 #      run of a workflow that defines `schedule:`): a Sentry Crons check-in
 #      (ok on success, error on failure) with an upsert monitor_config whose
