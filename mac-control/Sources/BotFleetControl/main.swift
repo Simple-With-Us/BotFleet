@@ -45,12 +45,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 try await self.api.stopServer()
                             })
     }()
-    /// The services the owner stopped on purpose, by service id.
-    ///
-    /// A stop the owner asked for is not one the Control app undoes.  The
-    /// set lives in the app, so it lasts as long as the app does, and a
-    /// relaunch hands the fleet back to its own rules.
-    private var ownerStoppedServices: Set<String> = []
+    /// The services the owner stopped on purpose, and how that record changes.
+    private var ownerStops = OwnerStops()
     private var item: NSStatusItem?
     private let menu = NSMenu()
     private var status: ControlStatus?
@@ -116,6 +112,10 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.autoenablesItems = false
         menu.delegate = self
         showIcon()
+        // The fleet service control is resolved here, on the main thread and
+        // before any task can reach for it, so its first use cannot race
+        // with another one.
+        _ = fleetServiceControl
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -279,7 +279,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // A service the owner stopped on purpose is left alone until the
             // owner starts it again.  The set is the one place a stop of the
             // owner's own is remembered.
-            if ownerStoppedServices.contains(entry.id) { continue }
+            if ownerStops.ids.contains(entry.id) { continue }
             switch ManagedServices.action(for: entry) {
             case .start:
                 do { mcpServerState = try await mcpServer.setRunning(true) }
@@ -299,7 +299,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         await refreshFleetServiceStates()
         let fleetServices = FleetServices(serverState: serverState(),
                                          states: fleetServiceStates,
-                                         stoppedByOwner: ownerStoppedServices,
+                                         stoppedByOwner: ownerStops.ids,
                                          startupPolicySupported: startup.supportsPolicy)
         for entry in fleetServices.entries where entry.policy == .alwaysOn {
             let action = FleetServices.automaticAction(for: entry)
@@ -322,8 +322,11 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshFleetServiceStates() async {
         let generation = fleetServiceSequencer.begin()
         let serverState = self.serverState()
+        // The control is resolved here, on the main actor, so its first use
+        // cannot race with another one on a detached executor.
+        let control = fleetServiceControl
         let states = await Task.detached(priority: .userInitiated) { [self] in
-            await self.fleetServiceControl.states(serverState: serverState)
+            await control.states(serverState: serverState)
         }.value
         guard fleetServiceSequencer.isCurrent(generation) else { return }
         fleetServiceStates = states
@@ -350,29 +353,22 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let id = sender.representedObject as? String else { return }
         guard let service = FleetServices(serverState: serverState(),
                                          states: fleetServiceStates,
-                                         stoppedByOwner: ownerStoppedServices,
+                                         stoppedByOwner: ownerStops.ids,
                                          startupPolicySupported: startup.supportsPolicy).menuItems.first(where: { $0.id == id }) else { return }
         guard confirmFleetServiceAction(action, service: service) else { return }
         run { [self] in
             // A stop the owner asked for is remembered, so the reconciler
             // leaves the service alone until the owner starts it again.  The
             // intent is recorded before the change, because the reconciler
-            // runs as soon as the change is done, and it is taken back when
-            // the manager refuses the change.
-            if action == .stop {
-                ownerStoppedServices.insert(id)
-            } else if action == .start {
-                ownerStoppedServices.remove(id)
-            }
+            // runs as soon as the change is done, and it goes back exactly
+            // as it was when the manager refuses the change.
+            let previous = ownerStops.ids
+            ownerStops.record(action, id: id)
             do {
                 let observed = try await self.fleetServiceControl.perform(action, serviceID: id)
                 self.fleetServiceStates[id] = observed
             } catch {
-                if action == .stop {
-                    ownerStoppedServices.remove(id)
-                } else if action == .start {
-                    ownerStoppedServices.insert(id)
-                }
+                ownerStops.restore(previous)
                 throw error
             }
         }
@@ -521,7 +517,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let fleetServices = FleetServices(serverState: serverState(),
                                          states: fleetServiceStates,
-                                         stoppedByOwner: ownerStoppedServices,
+                                         stoppedByOwner: ownerStops.ids,
                                          startupPolicySupported: startup.supportsPolicy)
         if !fleetServices.entries.isEmpty {
             menu.addItem(.separator())

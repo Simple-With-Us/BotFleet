@@ -94,6 +94,42 @@ public enum FleetServiceRegistry {
     }
 }
 
+/// The services the owner stopped on purpose, and how that record changes.
+///
+/// A stop the owner asked for is not one the Control app undoes.  The record
+/// belongs to the app, so it lasts as long as the app does, and a relaunch
+/// hands the fleet back to its own rules.
+public struct OwnerStops: Equatable {
+    /// The services the owner stopped on purpose, by service id.
+    public private(set) var ids: Set<String>
+
+    public init(ids: Set<String> = []) {
+        self.ids = ids
+    }
+
+    /// Records what the owner asked for, before the change is made.
+    ///
+    /// The reconciler runs as soon as the change is done, so the intent has
+    /// to be recorded first.  A restart is a start as far as the record is
+    /// concerned: the owner asked for the service to be running.
+    public mutating func record(_ action: ManagedServiceAction, id: String) {
+        switch action {
+        case .stop: ids.insert(id)
+        case .start, .restart: ids.remove(id)
+        case .none: break
+        }
+    }
+
+    /// Puts the record back the way it was, for a change that was refused.
+    ///
+    /// A refused change is not a stop the owner asked for, so the record
+    /// goes back to what it was rather than to what the action would have
+    /// made of it.
+    public mutating func restore(_ previous: Set<String>) {
+        ids = previous
+    }
+}
+
 /// One fleet service as the Control app sees it right now.
 public struct FleetServiceEntry: Equatable {
     public let descriptor: FleetServiceDescriptor

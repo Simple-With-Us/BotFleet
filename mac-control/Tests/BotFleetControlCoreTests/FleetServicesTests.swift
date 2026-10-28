@@ -381,6 +381,48 @@ final class FleetServicesTests: XCTestCase {
 
     // MARK: - A stop the owner asked for
 
+    func testAStopIsRemembered() {
+        var stops = OwnerStops()
+        stops.record(.stop, id: "botfleet-mcp")
+        XCTAssertEqual(stops.ids, ["botfleet-mcp"])
+    }
+
+    func testAStartTakesTheRecordBack() {
+        var stops = OwnerStops(ids: ["botfleet-mcp"])
+        stops.record(.start, id: "botfleet-mcp")
+        XCTAssertEqual(stops.ids, [])
+    }
+
+    func testARestartTakesTheRecordBack() {
+        // A restart is a start as far as the record is concerned: the owner
+        // asked for the service to be running.
+        var stops = OwnerStops(ids: ["botfleet-mcp"])
+        stops.record(.restart, id: "botfleet-mcp")
+        XCTAssertEqual(stops.ids, [])
+    }
+
+    func testARefusedChangePutsTheRecordBackTheWayItWas() {
+        // A refused change is not a stop the owner asked for, so the record
+        // goes back to what it was rather than to what the action would have
+        // made of it.
+        var stops = OwnerStops()
+        stops.record(.stop, id: "botfleet-mcp")
+        let previous = stops.ids
+        stops.record(.start, id: "botfleet-mcp")
+        stops.restore(previous)
+        XCTAssertEqual(stops.ids, ["botfleet-mcp"])
+    }
+
+    func testARefusedStartDoesNotRecordAStop() {
+        // The owner asked for the service to run, so a start that was
+        // refused must not leave the service recorded as stopped on purpose.
+        var stops = OwnerStops()
+        let previous = stops.ids
+        stops.record(.start, id: "botfleet-mcp")
+        stops.restore(previous)
+        XCTAssertEqual(stops.ids, [])
+    }
+
     func testAServiceTheOwnerStoppedIsNotWanted() {
         // The BotFleet MCP Server is wanted exactly while the BotFleet
         // Server runs, but a stop the owner asked for is not one the Control
