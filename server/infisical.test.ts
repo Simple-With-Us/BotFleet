@@ -8,6 +8,8 @@ import { infisicalSnapshot, setInfisicalSnapshot, vaultNames } from "./secret-ma
 // assertions below have credential-shaped strings to look for. Every test
 // that could plausibly leak one asserts it is absent from what came back.
 const SENTINEL_CLIENT_SECRET = "sentinel-client-secret-not-real";
+const SENTINEL_READ_TOKEN = "sentinel-service-read-token-not-real";
+const SENTINEL_WRITE_TOKEN = "sentinel-service-write-token-not-real";
 const SENTINEL_TOKEN = "sentinel-bearer-token-not-real";
 const SENTINEL_VAULT_VALUE = "sentinel-vault-value-not-real";
 
@@ -20,6 +22,8 @@ const BASE_SETTINGS: InfisicalSettings = {
   secretPath: "/",
   clientId: "client-1",
   clientSecret: SENTINEL_CLIENT_SECRET,
+  token: "",
+  writeToken: "",
   refreshMinutes: 15,
 };
 
@@ -27,6 +31,18 @@ function withSettings(overrides: Partial<InfisicalSettings>): InfisicalSettings 
   const merged: InfisicalSettings = { ...BASE_SETTINGS, ...overrides };
   infisical.configure(() => merged);
   return merged;
+}
+
+/** A fetch that answers the secrets list and records every request, so a
+ * test can prove that no login call was made. */
+function listOnly(secrets: Array<{ secretKey: string; secretValue: string }>) {
+  const calls: Array<{ url: string; authorization: string | undefined }> = [];
+  const impl = vi.fn(async (url: string, init?: RequestInit) => {
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    calls.push({ url: String(url), authorization: headers.authorization });
+    return new Response(JSON.stringify({ secrets }), { status: 200 });
+  });
+  return { calls, impl };
 }
 
 function loginThenList(secrets: Array<{ secretKey: string; secretValue: string }>) {
@@ -43,6 +59,8 @@ const ENV_KEYS = [
   "INFISICAL_CLIENT_SECRET",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+  "INFISICAL_TOKEN",
+  "INFISICAL_WRITE_TOKEN",
   "OMB_INFISICAL_BOOT_TIMEOUT_MS",
   "OMB_INFISICAL_CALL_TIMEOUT_MS",
 ] as const;
@@ -121,6 +139,59 @@ describe("refresh: a good sync", () => {
     expect(status.stale).toBe(false);
     expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
     expect(infisicalSnapshot()?.has("PATH")).toBe(false);
+  });
+
+  it("reads with a service token and never logs in", async () => {
+    // Every non-agent consumer holds a token scoped to one project,
+    // environment and folder, so the read must not need a machine identity.
+    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
+    const { calls, impl } = listOnly([
+      { secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE },
+    ]);
+    vi.stubGlobal("fetch", impl);
+
+    const status = await infisical.refresh("manual");
+
+    expect(status.configured).toBe(true);
+    expect(status.hasToken).toBe(true);
+    expect(status.lastError).toBeNull();
+    expect(calls.some((call) => call.url.includes("/login"))).toBe(false);
+    expect(calls[0]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+  });
+
+  it("writes through with the write token, not the read token", async () => {
+    withSettings({
+      clientId: "",
+      clientSecret: "",
+      token: SENTINEL_READ_TOKEN,
+      writeToken: SENTINEL_WRITE_TOKEN,
+      writeThrough: true,
+    });
+    const calls: Array<{ url: string; method: string; authorization: string | undefined }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        calls.push({
+          url: String(url),
+          method: init?.method ?? "GET",
+          authorization: headers.authorization,
+        });
+        if (init?.method === "PATCH") return new Response("{}", { status: 200 });
+        return new Response(
+          JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: "new-value" }] }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    await infisical.writeSecret("COMPOSIO_API_KEY", "new-value");
+
+    const patch = calls.find((call) => call.method === "PATCH");
+    expect(patch?.authorization ?? "").toContain(SENTINEL_WRITE_TOKEN);
+    expect(patch?.authorization ?? "").not.toContain(SENTINEL_READ_TOKEN);
+    expect(calls.some((call) => call.url.includes("/login"))).toBe(false);
   });
 
   it("calls onApplied with the reason on a successful refresh", async () => {

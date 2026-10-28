@@ -839,8 +839,8 @@ unset bad got loc
 if grep -nE '\$\(asc_temp_root\)[^"]|"\$\(asc_temp_root\)/' "${here}/ship-testflight.sh" >&2; then
   fail "ship-testflight.sh expands asc_temp_root inline instead of reading its status"
 fi
-grep -cE '="\$\(asc_temp_root\)" \|\| \{' "${here}/ship-testflight.sh" | grep -qx 4 \
-  || fail "expected the four asc_temp_root callers to read its status"
+grep -cE '="\$\(asc_temp_root\)" \|\| \{' "${here}/ship-testflight.sh" | grep -qx 5 \
+  || fail "expected the five asc_temp_root callers to read its status"
 #     No mktemp may build its path from TMPDIR directly:  every temp file
 #     goes through asc_temp_root, so a root TMPDIR is refused everywhere.
 if grep -nE 'mktemp[^#]*\$\{TMPDIR' "${here}/ship-testflight.sh" >&2; then
@@ -1010,5 +1010,31 @@ if grep -q "ASC_KEY_P8 /asc" "$FAKE_LOG"; then
 fi
 grep -q "ASC_KEY_ID /asc" "$FAKE_LOG" || fail "the diagnostic did not read the vault key id"
 unset out real_body real_mask real_b64
+
+# The version helpers run inside command substitutions, where load_secrets
+# would write a temp key whose cleanup trap dies with the subshell.  They must
+# check for a credential instead.
+for fn in asc_next_dotted_build asc_released_store_version; do
+  body="$(awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{" {g=1} g {print} g && /^}/ {exit}' "$script")"
+  [[ -n "$body" ]] || fail "could not read ${fn}"
+  if grep -v '^[[:space:]]*#' <<<"$body" | grep -q 'load_secrets'; then
+    fail "${fn} calls load_secrets inside a command substitution (leaks the temp key dir)"
+  fi
+  grep -q 'asc_credential_available' <<<"$body" || fail "${fn} does not check for a credential"
+done
+
+# The released-version helper keeps the client's reason and its auth status:
+# a discarded stderr or a flattened status 4 hides a credential fault behind
+# a generic "cannot read the released version".
+body="$(awk '/^asc_released_store_version\(\) \{/ {g=1} g {print} g && /^}/ {exit}' "$script")"
+if grep -v '^[[:space:]]*#' <<<"$body" | grep -q '2>/dev/null'; then
+  fail "asc_released_store_version discards the client's stderr"
+fi
+grep -q 'return 4' <<<"$body" || fail "asc_released_store_version does not preserve the auth status 4"
+grep -q 'released-store-version:\*' <<<"$body" || fail "asc_released_store_version does not log the client's reason"
+if grep -q 'asc_released_store_version "\$ASC_PLATFORM" 2>/dev/null' "$script"; then
+  fail "the fixed-version caller discards the released-version reason"
+fi
+unset body
 
 echo "ok: ASC credential resolution (environment first, then Infisical, a named path ignored, temp key removed)"

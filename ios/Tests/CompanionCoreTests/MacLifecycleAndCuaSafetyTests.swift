@@ -453,7 +453,7 @@ struct MacLifecycleAndCuaSafetyTests {
 
     @Test("MacCuaDriver emergencyStop aborts mid-drag within < 100 ms and releases all held mouse buttons")
     func testEmergencyStopMidDragAndButtonRelease() throws {
-        let driver = MacCuaDriver()
+        let driver = RecordingCuaEventSink().makeDriver()
         driver.resetEmergencyStop()
 
         // Hold all three mouse buttons to verify emergencyStop releases every held button.
@@ -567,7 +567,7 @@ struct MacLifecycleAndCuaSafetyTests {
 
     @Test("CuaPermissionMonitor detects revoked TCC permission within < 2 seconds and triggers emergencyStop")
     func testPermissionMonitorDetectsRevocationAndStopsDriver() throws {
-        let driver = MacCuaDriver()
+        let driver = RecordingCuaEventSink().makeDriver()
         driver.resetEmergencyStop()
         _ = driver.mouseDown(at: CGPoint(x: 200, y: 200), button: .left)
 
@@ -613,7 +613,7 @@ struct MacLifecycleAndCuaSafetyTests {
     @available(macOS 14.0, *)
     @Test("ScreenStreamActor forwards stream errors immediately to CuaPermissionMonitor")
     func testScreenStreamActorErrorForwarding() async {
-        let driver = MacCuaDriver()
+        let driver = RecordingCuaEventSink().makeDriver()
         driver.resetEmergencyStop()
 
         let monitor = CuaPermissionMonitor(
@@ -690,7 +690,7 @@ struct MacLifecycleAndCuaSafetyTests {
     @available(macOS 14.0, *)
     @Test("A benign capture failure is not reported as a permission revocation")
     func testBenignStreamFailureIsNotReportedAsRevocation() {
-        let driver = MacCuaDriver()
+        let driver = RecordingCuaEventSink().makeDriver()
         driver.resetEmergencyStop()
 
         let monitor = CuaPermissionMonitor(
@@ -718,7 +718,7 @@ struct MacLifecycleAndCuaSafetyTests {
 
     @Test("A permission that was never granted is missing, not revoked")
     func testNeverGrantedAccessibilityIsMissingNotRevoked() {
-        let driver = MacCuaDriver()
+        let driver = RecordingCuaEventSink().makeDriver()
         driver.resetEmergencyStop()
 
         let monitor = CuaPermissionMonitor(
@@ -753,7 +753,7 @@ struct MacLifecycleAndCuaSafetyTests {
 
     @Test("An emergency stop cannot leave a mouse button held when it interleaves with a mouse-down")
     func testEmergencyStopCannotLeaveMouseButtonHeld() {
-        let driver = MacCuaDriver()
+        let driver = RecordingCuaEventSink().makeDriver()
         driver.resetEmergencyStop()
 
         let postedOrder = ThreadSafeEventLog()
@@ -798,7 +798,7 @@ struct MacLifecycleAndCuaSafetyTests {
         #expect(downFinished.wait(timeout: .now() + 5.0) == .success)
         #expect(stopFinished.wait(timeout: .now() + 5.0) == .success)
 
-        // The down event has to reach the window server before the release.
+        // The down event has to reach the recording sink before the release.
         // Otherwise the window server sees the release first, the physical
         // button stays held, and no later emergency stop can release it.
         #expect(postedOrder.entries.first == "down-left")

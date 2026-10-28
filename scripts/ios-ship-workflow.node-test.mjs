@@ -73,11 +73,14 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(yml, /--force-ship/);
   assert.match(yml, /ios-appstore-gm-prepare\.sh/);
   // Signing material comes from Infisical prod, through the shared
-  // composite action; identity stays on GitHub.
+  // composite action; identity stays on GitHub -- a read-only service token
+  // scoped to this project, environment and folder, NOT the machine
+  // identity this pipeline used to hold.
   assert.match(yml, /Load Infisical signing secrets/);
   assert.match(yml, /secrets\.INFISICAL_PROJECT_ID/);
-  assert.match(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/);
-  assert.match(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET/);
+  assert.match(yml, /secrets\.INFISICAL_IOS_SHIP_READ_TOKEN/);
+  assert.doesNotMatch(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/);
+  assert.doesNotMatch(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET/);
   assert.match(yml, /uses:\s*\.\/\.github\/actions\/infisical-secrets/);
   assert.match(yml, /APPLE_API_KEY_ID/);
   assert.match(yml, /IOS_CERT_P12_BASE64/);

@@ -1499,6 +1499,8 @@ describe("the secret-store section", () => {
       secretPath: DEFAULT_INFISICAL_SECRET_PATH,
       clientId: "",
       clientSecret: "",
+      token: "",
+      writeToken: "",
       refreshMinutes: DEFAULT_INFISICAL_REFRESH_MINUTES,
     });
     expect(
@@ -1509,6 +1511,43 @@ describe("the secret-store section", () => {
     expect(infisicalSettings({ infisical: { refreshMinutes: 0 } }).refreshMinutes).toBe(5);
     expect(infisicalSettings({ infisical: { refreshMinutes: 99_999 } }).refreshMinutes).toBe(1440);
     expect(infisicalSettings({ infisical: { writeThrough: true } }).writeThrough).toBe(true);
+  });
+
+  it("treats a service token as an identity, with or without the machine identity", () => {
+    // A token alone is enough to read the store: that is the shape every
+    // non-agent consumer runs with.
+    expect(infisicalConfigured({ infisical: { projectId: "p", token: "st.read" } })).toBe(true);
+    expect(infisicalConfigured({ infisical: { projectId: "p" } })).toBe(false);
+    expect(
+      infisicalConfigured({ infisical: { projectId: "p", clientId: "id", clientSecret: "secret" } }),
+    ).toBe(true);
+    expect(
+      infisicalSettings({ infisical: { projectId: "p", token: " st.read ", writeToken: " st.write " } }),
+    ).toMatchObject({ token: "st.read", writeToken: "st.write" });
+  });
+
+  it("keeps a service token that arrives in the config file or in a patch", () => {
+    // The schema strips the keys it does not know, so a token the schema
+    // does not mention is dropped on the floor: the file looks configured
+    // and the server falls back to the machine identity.  This pins the
+    // file route and the patch route, because both go through the schema.
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        infisical: {
+          projectId: "fixture-project-id",
+          token: "st.file-read-token",
+          writeToken: "st.file-write-token",
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.infisical?.token).toBe("st.file-read-token");
+    expect(cfg.infisical?.writeToken).toBe("st.file-write-token");
+
+    const patch = parseConfigPatch({ infisical: { token: "st.patched-token" } });
+    expect(patch).toMatchObject({ infisical: { token: "st.patched-token" } });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
   });
 
   it("rejects a site URL, path, environment, or project id that cannot be trusted in a query", () => {

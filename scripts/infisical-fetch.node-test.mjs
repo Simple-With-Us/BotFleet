@@ -54,6 +54,77 @@ function collectLines() {
   return { lines, log: (line) => lines.push(line) };
 }
 
+test("a service token replaces the universal-auth login", async () => {
+  // Every app and pipeline outside the agent seats reads the vault with a
+  // token scoped to one project, environment and folder, so the fetch must
+  // work with a token alone -- no machine identity, no login call.
+  const { dir, path } = tempGithubEnv();
+  const calls = [];
+  try {
+    const { lines, log } = collectLines();
+    await run({
+      env: {
+        INFISICAL_NAMES: "FOO",
+        INFISICAL_PROJECT_ID: "proj",
+        INFISICAL_TOKEN: "st.test-token",
+        GITHUB_ENV: path,
+      },
+      fetchImpl: async (url, init) => {
+        calls.push({ url: String(url), headers: init?.headers ?? {} });
+        return {
+          ok: true,
+          json: async () => ({
+            secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }],
+          }),
+        };
+      },
+      log,
+    });
+    assert.equal(calls.length, 1, "a service token must not trigger a login call");
+    assert.match(calls[0].url, /\/api\/v3\/secrets\/raw/);
+    assert.ok(
+      String(calls[0].headers.authorization ?? "").endsWith("st.test-token"),
+      "the service token must be the bearer credential",
+    );
+    assert.match(readFileSync(path, "utf8"), /FOO</);
+    assert.ok(lines.some((line) => line === `::add-mask::${SENTINEL_PRESENT}`));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the service token wins over a machine identity that is also configured", async () => {
+  const { dir, path } = tempGithubEnv();
+  const calls = [];
+  try {
+    const { log } = collectLines();
+    await run({
+      env: {
+        INFISICAL_NAMES: "FOO",
+        INFISICAL_PROJECT_ID: "proj",
+        INFISICAL_TOKEN: "st.test-token",
+        INFISICAL_CLIENT_ID: "id",
+        INFISICAL_CLIENT_SECRET: "secret",
+        GITHUB_ENV: path,
+      },
+      fetchImpl: async (url, init) => {
+        calls.push({ url: String(url), headers: init?.headers ?? {} });
+        return {
+          ok: true,
+          json: async () => ({
+            secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }],
+          }),
+        };
+      },
+      log,
+    });
+    assert.equal(calls.length, 1, "the token path must not also log in");
+    assert.ok(String(calls[0].headers.authorization ?? "").endsWith("st.test-token"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a name present in the vault is masked and written to GITHUB_ENV", async () => {
   const { dir, path } = tempGithubEnv();
   try {

@@ -72,6 +72,26 @@ struct BotFleetMacApp: App {
                 })
                 .onAppear {
                     #if os(macOS)
+                    // Every menubar row needs a handler, or the surface this
+                    // PR ships is a menu of dead buttons.
+                    session.menubarController.onOpenBotFleet = {
+                        session.activateMainWindow()
+                    }
+                    session.menubarController.onComposeNewMessage = {
+                        session.focusComposer()
+                    }
+                    session.menubarController.onDictateMessage = {
+                        session.beginMenubarDictation()
+                    }
+                    session.menubarController.onSelectWaitingBot = { item in
+                        session.selectWaitingBot(item)
+                    }
+                    session.menubarController.onTogglePauseResumeAll = {
+                        session.togglePauseResumeAll()
+                    }
+                    session.menubarController.onOpenSettings = {
+                        session.openSettings()
+                    }
                     session.menubarController.installIfNeeded()
                     #endif
                     appDelegate.session = session

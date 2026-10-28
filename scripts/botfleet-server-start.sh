@@ -521,7 +521,34 @@ first_fleet_secret() {
 }
 
 load_infisical_identity() {
-  local fetched_id="" fetched_secret=""
+  # A service token wins over the machine identity: one read-only token for
+  # the folders this install reads, one write token for the folders it
+  # writes.  Both come from Fleet-OPS, the fleet's credential store, and the
+  # machine identity stays as the fallback for an install that has not been
+  # provisioned with tokens yet.
+  local fetched_id="" fetched_secret="" fetched_token="" fetched_write_token=""
+  if [ -f "$HOME/.local/bin/fleet-secrets" ] && [ -x "$HOME/.local/bin/fleet-secrets" ]; then
+    fetched_token="$(first_fleet_secret BOTFLEET_HARNESS_INFISICAL_READ_TOKEN)"
+    fetched_write_token="$(first_fleet_secret BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN)"
+  fi
+  if [ -n "$fetched_token" ] && [ -z "${INFISICAL_TOKEN:-}" ]; then
+    INFISICAL_TOKEN="$fetched_token"
+  fi
+  if [ -n "$fetched_write_token" ] && [ -z "${INFISICAL_WRITE_TOKEN:-}" ]; then
+    INFISICAL_WRITE_TOKEN="$fetched_write_token"
+  fi
+  if [ -n "${INFISICAL_TOKEN:-}" ]; then
+    export INFISICAL_TOKEN
+  fi
+  if [ -n "${INFISICAL_WRITE_TOKEN:-}" ]; then
+    export INFISICAL_WRITE_TOKEN
+  fi
+  # No early return here.  The token is the PREFERRED identity, not the only
+  # one: the machine identity below stays as the fallback for the two cases
+  # a token cannot cover -- a write with no write token provisioned, and a
+  # read of another project than the token's own.  Returning as soon as the
+  # token is set would leave a token-only host with neither, and the write
+  # would fail at login with an error that reads like a broken vault.
   if [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
     export INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET
     return 0

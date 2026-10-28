@@ -100,7 +100,7 @@ The environment is built from the in-memory config the harness already holds (th
 
 ## What stays out (deliberately)
 
-- **The store's own machine identity** (`infisical.clientId` / `clientSecret`, env `INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET`): a lock cannot hold its own key.  It lives in Settings > Secrets or the environment, never in the vault.
+- **The store's own identity**: a service token (`INFISICAL_TOKEN` for reads, `INFISICAL_WRITE_TOKEN` for writes) or, for an install that has not migrated yet, the machine identity (`infisical.clientId` / `clientSecret`, env `INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET`): a lock cannot hold its own key.  It lives in the environment (`scripts/botfleet-server-start.sh` fetches the tokens from Fleet-OPS) or in Settings > Secrets, never in the vault.
 - **The store's own timeouts** (`OMB_INFISICAL_CALL_TIMEOUT_MS`, `OMB_INFISICAL_BOOT_TIMEOUT_MS`): they are read before the first login, so the vault they would come from does not exist yet.
 - **Per-user settings**: bot and room configuration, per-bot transports, notification and UI preferences, per-user API keys.  These live in BotFleet's own database, never in Infisical.
 - **Launch-time process parameters** (ports, data directories, updater paths, `BOTFLEET_TOKEN`): these shape the process before settings load and stay as env/flags.

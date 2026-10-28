@@ -8,8 +8,9 @@ name: iOS TestFlight ship (GitHub-hosted macOS)
 # Signing + ASC keys come from Infisical prod (BotFleet project, type=shared)
 # through .github/actions/infisical-secrets (scripts/infisical-fetch.mjs --
 # no CLI install, no dependency). Identity stays on GitHub only:
-#   INFISICAL_PROJECT_ID, INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/SECRET
-#   (fallback INFISICAL_CLIENT_ID/SECRET).
+#   INFISICAL_PROJECT_ID and INFISICAL_IOS_SHIP_READ_TOKEN -- a read-only
+#   service token scoped to this project, environment and folder, in place
+#   of the machine identity this pipeline used to hold.
 # After should_ship=1 the job loads into GITHUB_ENV (masked):
 #   APPLE_API_KEY_ID, APPLE_API_ISSUER_ID, APPLE_API_KEY_P8_BASE64,
 #   IOS_CERT_P12_BASE64, IOS_CERT_PASSWORD (all required -- the ship fails
@@ -165,8 +166,7 @@ jobs:
             APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
             IOS_CERT_P12_BASE64 IOS_CERT_PASSWORD
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+          token: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
         env:
           GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
@@ -199,6 +199,14 @@ jobs:
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
           IOS_MANUAL_SIGN: "1"  # 2026-10-07: API profiles; no Xcode provisioning service
+          # The fleet iOS version manifest lives in AI-Fleet-Coordinator, and
+          # that repository's ruleset refuses a direct write to its protected
+          # branch, so the publish is a branch plus a pull request.  The
+          # workflow's own GITHUB_TOKEN is read-only by declaration and cannot
+          # write to another repository, so the fleet's elevated token is
+          # passed for that one step.  The publisher refuses GITHUB_TOKEN
+          # outright, and it never arms auto-merge with one.
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: bash scripts/ios-ship-testflight.sh
 
       # Standing TestFlight testers (asc-standing-testers skill): make sure the

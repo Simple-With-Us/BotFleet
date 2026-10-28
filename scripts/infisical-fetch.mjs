@@ -1,4 +1,6 @@
-// CI-side Infisical fetch: universal-auth login, one bulk secrets list, then
+// CI-side Infisical fetch: a service token when one is configured (the
+// normal case for an app or a pipeline), otherwise a universal-auth login,
+// then one bulk secrets list, then
 // per requested name mask + export into $GITHUB_ENV -- falling back to a
 // same-named GH_FALLBACK_<NAME> step env var, warning when a name stays
 // empty everywhere, and failing only for a name listed in `required`.
@@ -141,14 +143,22 @@ export function isUnresolvedReference(value) {
 
 /** Resolves the vault snapshot (empty map when unconfigured or the fetch
  * failed) -- never throws; a failure is reported through `log` and the
- * caller proceeds on GH_FALLBACK_<NAME> alone. */
-async function resolveVaultValues({ siteUrl, projectId, clientId, clientSecret, environment, secretPath, fetchImpl, log }) {
-  if (!projectId || !clientId || !clientSecret) {
+ * caller proceeds on GH_FALLBACK_<NAME> alone.
+ *
+ * A service token wins over the machine identity when one is configured: a
+ * token is scoped to one project, environment and folder, and every
+ * non-agent consumer uses one.  The universal-auth login stays for the
+ * agent identities that still hold a machine identity. */
+async function resolveVaultValues({ siteUrl, projectId, clientId, clientSecret, token, environment, secretPath, fetchImpl, log }) {
+  const serviceToken = String(token ?? "").trim();
+  if (!projectId || (!serviceToken && (!clientId || !clientSecret))) {
     return new Map();
   }
   try {
-    const token = await loginUniversalAuth({ siteUrl, clientId, clientSecret, fetchImpl });
-    return await listSecretsRaw({ siteUrl, token, projectId, environment, secretPath, fetchImpl });
+    const bearer = serviceToken
+      ? serviceToken
+      : await loginUniversalAuth({ siteUrl, clientId, clientSecret, fetchImpl });
+    return await listSecretsRaw({ siteUrl, token: bearer, projectId, environment, secretPath, fetchImpl });
   } catch (err) {
     // Never interpolate the raw error body -- Infisical error payloads have
     // echoed request fields on some 4xx responses in the past, and none of
@@ -168,9 +178,10 @@ export async function run({ env = process.env, fetchImpl = fetch, log = (line) =
   const secretPath = env.INFISICAL_SECRET_PATH || "/";
   const clientId = env.INFISICAL_CLIENT_ID || "";
   const clientSecret = env.INFISICAL_CLIENT_SECRET || "";
+  const token = env.INFISICAL_TOKEN || "";
   const githubEnvPath = env.GITHUB_ENV || "";
 
-  const vaultValues = await resolveVaultValues({ siteUrl, projectId, clientId, clientSecret, environment, secretPath, fetchImpl, log });
+  const vaultValues = await resolveVaultValues({ siteUrl, projectId, clientId, clientSecret, token, environment, secretPath, fetchImpl, log });
 
   const missingRequired = [];
   const unresolved = [];

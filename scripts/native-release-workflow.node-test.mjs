@@ -310,6 +310,27 @@ test("the Mac app declares its version keys in the project", () => {
   assert.equal(macInfoProperties.CFBundleVersion, "$(CURRENT_PROJECT_VERSION)");
 });
 
+test("the Mac app declares the botfleet URL scheme in the project, not only in the generated plist", () => {
+  // The scheme is the whole route for a deep link.  Without it macOS never
+  // delivers a botfleet:// URL to the app, so the settings router and the
+  // voice failure recovery link are both unreachable.
+  const declared = macInfoProperties.CFBundleURLTypes;
+  assert.ok(
+    Array.isArray(declared) && declared.length > 0,
+    "CFBundleURLTypes must be declared under targets.BotFleetMac.info.properties, or xcodegen drops it",
+  );
+  const schemes = declared.flatMap((entry) => entry?.CFBundleURLSchemes ?? []);
+  assert.ok(
+    schemes.includes("botfleet"),
+    "the Mac bundle must register the botfleet scheme",
+  );
+  assert.match(
+    macPlist,
+    /<key>CFBundleURLTypes<\/key>[\s\S]*?<string>botfleet<\/string>/,
+    "the generated plist must carry the declared botfleet scheme",
+  );
+});
+
 test("the release path regenerates the Mac plist, so the plist cannot be the only home of a key", () => {
   // This is the reason the declarations above exist.  If the release stopped
   // regenerating the plist, the declarations would be redundant rather than

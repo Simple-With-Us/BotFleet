@@ -1,7 +1,14 @@
 import { z } from "zod";
 
 /** The mascot is a first-class avatar choice; the other values crop an image. */
-export const BOT_AVATAR_CROPS = ["mascot", "tvface", "circle", "rounded", "square"] as const;
+export const BOT_AVATAR_CROPS = [
+  "mascot",
+  "tvface",
+  "animated",
+  "circle",
+  "rounded",
+  "square",
+] as const;
 export const botAvatarCropSchema = z.enum(BOT_AVATAR_CROPS);
 export type BotAvatarCrop = z.infer<typeof botAvatarCropSchema>;
 
@@ -9,14 +16,18 @@ export type BotAvatarCrop = z.infer<typeof botAvatarCropSchema>;
  * renderer (a group carries no expression or color to animate), so offering
  * either would select a shape nothing can draw. */
 export const GROUP_AVATAR_CROPS = BOT_AVATAR_CROPS.filter(
-  (crop) => crop !== "mascot" && crop !== "tvface",
+  (crop) => crop !== "mascot" && crop !== "tvface" && crop !== "animated",
 );
 
 /** An uploaded image only shows if the current crop renders images at all.
  * Mascot and TV-Face ignore avatarUrl, so an upload under either must flip
- * to a plain circle — otherwise the new image saves but never displays. */
+ * to a plain circle — otherwise the new image saves but never displays.
+ * An animated avatar only plays if the file it points at carries a manifest,
+ * so a plain image uploaded over one flips to a circle too; the client
+ * overrides this back to `animated` when the file it just uploaded does
+ * carry a manifest. */
 export function avatarCropAfterUpload(crop: BotAvatarCrop): BotAvatarCrop {
-  return crop === "mascot" || crop === "tvface" ? "circle" : crop;
+  return crop === "mascot" || crop === "tvface" || crop === "animated" ? "circle" : crop;
 }
 
 /**

@@ -7,6 +7,13 @@ name: Sentry TestFlight
 on:
   workflow_call:
     inputs:
+      token:
+        description: >-
+          Infisical service token for the reporting app.  Optional: a caller
+          that has not migrated yet falls back to the machine identity.
+        required: false
+        default: ""
+        type: string
       receipt:
         description: Verified TestFlight distribution receipt from ios-ship
         required: false
@@ -63,6 +70,9 @@ jobs:
           names: SENTRY_AUTH_TOKEN
           required: SENTRY_AUTH_TOKEN
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          # A caller with a service token passes one; the machine identity
+          # stays for the callers that have not migrated yet.
+          token: ${{ inputs.token || secrets.INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN }}
           client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
           client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
         env:
