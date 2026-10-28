@@ -268,8 +268,23 @@ public enum FleetProcessClassifier {
     public static func isDevelopmentServer(command: String, workingDirectory: String? = nil) -> Bool {
         guard isViteProcess(command: command) else { return false }
         // The checkout's name is the owner's choice, so the bare token is
-        // compared without regard to its case as well.
-        return isFleetPath(workingDirectory) || isFleetPath(command) || command.lowercased().contains("botfleet")
+        // compared without regard to its case as well, and it has to stand on
+        // its own the way the path check requires it, so a directory whose
+        // name merely starts with the same letters is not a checkout.
+        return isFleetPath(workingDirectory)
+            || isFleetPath(command)
+            || namesFleetCheckout(command)
+    }
+
+    /// True when the command names a BotFleet checkout as a whole token.
+    ///
+    /// A token is separated from the rest by a space, a slash or a colon, so
+    /// a path or an argument that merely contains the same letters is not a
+    /// checkout and must never be stopped as one.
+    public static func namesFleetCheckout(_ command: String) -> Bool {
+        command.lowercased()
+            .components(separatedBy: CharacterSet(charactersIn: " /:"))
+            .contains("botfleet")
     }
 
     /// The fleet helper name in the command, when there is one.

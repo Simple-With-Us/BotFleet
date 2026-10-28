@@ -296,6 +296,18 @@ final class ProcessMonitorTests: XCTestCase {
                                                                  workingDirectory: nil))
     }
 
+    func testAPathThatMerelyContainsTheNameIsNotACheckout() {
+        // A directory whose name starts with the same letters is somebody
+        // else's project, and its development server must never be offered
+        // for stopping.
+        XCTAssertFalse(FleetProcessClassifier.isDevelopmentServer(
+            command: "node /Users/jay/projects/botfleet-tools/node_modules/.bin/vite",
+            workingDirectory: "/Users/jay/projects/botfleet-tools"))
+        XCTAssertFalse(FleetProcessClassifier.namesFleetCheckout("/Users/jay/projects/botfleet-tools"))
+        XCTAssertTrue(FleetProcessClassifier.namesFleetCheckout("/Users/jay/projects/botfleet/node_modules/.bin/vite"))
+        XCTAssertTrue(FleetProcessClassifier.namesFleetCheckout("node --root=/Users/jay/Code/BotFleet vite"))
+    }
+
     func testTheTestRunnerIsNotAskedAboutItsWorkingDirectory() {
         // Every extra candidate is another process in the `lsof` call, so a
         // machine full of test workers would slow every menu open down.
@@ -441,17 +453,41 @@ private final class FakeFleetCommands: CommandRunning {
         return ""
     }
 
-    /// Keeps what the command printed, whatever it exited with.
-    func runKeepingOutput(_ executable: String, _ arguments: [String]) -> String {
-        if executable == "/usr/sbin/lsof", arguments.contains("cwd") { return workingDirectoryListing }
-        return (try? run(executable, arguments)) ?? ""
-    }
-
+    /// The fake does not override `runKeepingOutput`, so the protocol's
+    /// default does the work.  The fake throws the way `lsof` does, and the
+    /// default has to keep the answer it printed.
     private var workingDirectoryListing: String {
         """
         p101
         fcwd
         n/Users/jay/Code/BotFleet
         """
+    }
+}
+
+/// A stand-in for a command that warned and still answered.
+private final class WarnedCommands: CommandRunning {
+    func run(_ executable: String, _ arguments: [String]) throws -> String {
+        throw CommandExitError(output: "p101\nfcwd\nn/Users/jay/Code/BotFleet")
+    }
+
+    func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
+        try run(executable, arguments)
+    }
+
+    func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
+        try run(executable, arguments)
+    }
+}
+
+final class CommandRunnerOutputTests: XCTestCase {
+    func testTheDefaultKeepsTheOutputOfACommandThatWarned() {
+        // A command that warns and still answers is not a command that
+        // failed, and the answer it printed is in the failure itself.  The
+        // default has to keep it, or the same probe comes back empty from
+        // one conformer and full from another.
+        let commands = WarnedCommands()
+        XCTAssertEqual(commands.runKeepingOutput("/usr/sbin/lsof", ["-a"]),
+                       "p101\nfcwd\nn/Users/jay/Code/BotFleet")
     }
 }

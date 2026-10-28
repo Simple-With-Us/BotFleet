@@ -31,9 +31,16 @@ public extension CommandRunning {
         try run(executable, arguments, timeout: timeout)
     }
 
-    /// The default keeps what a successful command printed.
+    /// The default keeps what the command printed, whatever it exited with.
+    ///
+    /// A command that warns and still answers is not a command that failed,
+    /// and the answer it printed is in the failure itself.  A conformer that
+    /// does not override this has to keep that answer too, or the same probe
+    /// would come back empty from one conformer and full from another.
     func runKeepingOutput(_ executable: String, _ arguments: [String]) -> String {
-        (try? run(executable, arguments)) ?? ""
+        do { return try run(executable, arguments) }
+        catch let failure as CommandExitError { return failure.output }
+        catch { return "" }
     }
 }
 
