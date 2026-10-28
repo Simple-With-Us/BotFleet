@@ -325,6 +325,24 @@ function writeIdentityNode(dir) {
   return stub;
 }
 
+// A stand-in for curl that answers the token liveness probe.  The real curl
+// reads its config from stdin, so the stub drains stdin and then prints the
+// status the fixture asked for.
+function writeProbeCurl(dir) {
+  const stub = join(dir, "probe-curl");
+  writeFileSync(
+    stub,
+    [
+      "#!/bin/sh",
+      "cat > /dev/null",
+      "printf '%s' \"${BOTFLEET_FIXTURE_PROBE_STATUS:-200}\"",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(stub, 0o755);
+  return stub;
+}
+
 function identityFixture() {
   const dir = mkdtempSync(join(tmpdir(), "botfleet-identity-"));
   const serverRoot = join(dir, "root");
@@ -339,6 +357,7 @@ function identityFixture() {
     home,
     keys: join(dir, "fake-store"),
     bin: join(home, ".local", "bin", "fleet-secrets"),
+    probe: writeProbeCurl(dir),
     report: join(dir, "env-report"),
     node: writeIdentityNode(dir),
     ledger: join(dir, "ledger"),
@@ -376,6 +395,7 @@ function runIdentity(fixture, extraEnv = {}) {
       ...extraEnv,
       HOME: fixture.home,
       BOTFLEET_ENV_REPORT: fixture.report,
+      BOTFLEET_INFISICAL_PROBE_CURL: fixture.probe,
       BOTFLEET_SERVER_ROOT: fixture.serverRoot,
       BOTFLEET_PORT: String(fixture.port),
       BOTFLEET_NODE: fixture.node,
@@ -462,6 +482,61 @@ test("a service token from the vault is the identity, and the machine identity s
     // login with an error that reads like a broken vault.
     assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
     assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a service token the server refuses is not preferred over the machine identity", () => {
+  // The token in the vault was revoked, or it has expired.  The launcher must
+  // not prefer it:  the server would use it as the bearer without validating
+  // it, and every read and every write would fail instead of falling back to
+  // the machine identity.
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      [
+        "BOTFLEET_HARNESS_INFISICAL_READ_TOKEN=fixture-read-token",
+        "BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN=fixture-write-token",
+        "INFISICAL_CLIENT_ID=fixture-canonical-id",
+        "INFISICAL_CLIENT_SECRET=fixture-canonical-secret",
+      ].join("\n"),
+    );
+    const got = identityReport(
+      fixture,
+      runIdentity(fixture, { BOTFLEET_FIXTURE_PROBE_STATUS: "404" }),
+    );
+    assert.equal(got.INFISICAL_TOKEN, "unset");
+    assert.equal(got.INFISICAL_WRITE_TOKEN, "unset");
+    // The machine identity is still exported, so the harness still works.
+    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a probe that cannot answer refuses the token too", () => {
+  // No curl, no network, a host that is down:  the probe cannot tell a live
+  // token from a dead one, so the token is not preferred and the machine
+  // identity carries the harness.
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      [
+        "BOTFLEET_HARNESS_INFISICAL_READ_TOKEN=fixture-read-token",
+        "INFISICAL_CLIENT_ID=fixture-canonical-id",
+        "INFISICAL_CLIENT_SECRET=fixture-canonical-secret",
+      ].join("\n"),
+    );
+    const got = identityReport(
+      fixture,
+      runIdentity(fixture, { BOTFLEET_FIXTURE_PROBE_STATUS: "000" }),
+    );
+    assert.equal(got.INFISICAL_TOKEN, "unset");
+    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }

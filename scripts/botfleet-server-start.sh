@@ -520,6 +520,34 @@ first_fleet_secret() {
   return 0
 }
 
+# A service token is only preferred when the server still accepts it.  A
+# token that was revoked in the registry leaves a dead value behind in
+# Fleet-OPS, and a dead preferred credential is worse than none at all:  the
+# server uses the configured token as the bearer without validating it, so
+# every read and every write fails instead of falling back to the machine
+# identity.  GET /api/v2/service-token answers 200 for a live token and 404
+# for one that was revoked or has expired, so it is a cheap one-call liveness
+# probe.  The token travels on curl's stdin config, never in argv, where ps
+# would show it to every other process on the machine.
+#
+# A probe that cannot answer at all -- no curl, no network, a host that is
+# down -- counts as "not accepted".  The machine identity is the credential
+# that always works, so refusing the token is the safe direction.
+#
+# INFISICAL_SITE_URL and INFISICAL_DOMAIN mean the site URL here, the same
+# as they do in server/config.ts, so the probe reaches the same instance the
+# server would.
+infisical_token_accepted() {
+  local token="$1" site status
+  [ -n "$token" ] || return 1
+  site="${INFISICAL_SITE_URL:-${INFISICAL_DOMAIN:-https://app.infisical.com}}"
+  site="${site%/}"
+  status="$(printf 'header = "Authorization: Bearer %s"\n' "$token" | \
+    "${BOTFLEET_INFISICAL_PROBE_CURL:-/usr/bin/curl}" -sS -o /dev/null \
+    -w '%{http_code}' -m 5 --config - "$site/api/v2/service-token" 2>/dev/null)" || status=000
+  [ "$status" = "200" ]
+}
+
 load_infisical_identity() {
   # A service token wins over the machine identity: one read-only token for
   # the folders this install reads, one write token for the folders it
@@ -532,10 +560,18 @@ load_infisical_identity() {
     fetched_write_token="$(first_fleet_secret BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN)"
   fi
   if [ -n "$fetched_token" ] && [ -z "${INFISICAL_TOKEN:-}" ]; then
-    INFISICAL_TOKEN="$fetched_token"
+    if infisical_token_accepted "$fetched_token"; then
+      INFISICAL_TOKEN="$fetched_token"
+    else
+      log "the fetched read service token is not accepted by the server; using the machine identity"
+    fi
   fi
   if [ -n "$fetched_write_token" ] && [ -z "${INFISICAL_WRITE_TOKEN:-}" ]; then
-    INFISICAL_WRITE_TOKEN="$fetched_write_token"
+    if infisical_token_accepted "$fetched_write_token"; then
+      INFISICAL_WRITE_TOKEN="$fetched_write_token"
+    else
+      log "the fetched write service token is not accepted by the server; using the machine identity"
+    fi
   fi
   if [ -n "${INFISICAL_TOKEN:-}" ]; then
     export INFISICAL_TOKEN
