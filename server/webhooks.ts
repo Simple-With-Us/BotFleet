@@ -12,6 +12,7 @@ import {
   asRecord,
   isGithubWebhookPayload,
   isMergedPullRequestPayload,
+  isPagerDutyWebhookPayload,
   isSentryWebhookPayload,
   pickStr,
   serializeWebhookPayload,
@@ -123,9 +124,6 @@ export type WebhookAttemptOutcome = "accepted" | "captured" | "duplicate" | "ign
 /** Sentry severity levels, ordered from least to most severe. */
 export type SentryLevel = "debug" | "info" | "warning" | "error" | "fatal";
 
-/** PagerDuty incident urgency. */
-export type PagerDutyUrgency = "high" | "low";
-
 export interface WebhookAttempt {
   id: string;
   webhookId: string;
@@ -229,10 +227,12 @@ const runOnSchema = z
   .transform((value): "bot" | "cloud" => (value === "maus" ? "bot" : value));
 const eventTypesSchema = z.array(z.string()).max(20).optional();
 /** A list filter: action allowlist, required labels, conclusions, excluded
- *  Sentry projects.  Same caps as the event-type list. */
-const filterListSchema = z.array(z.string()).max(20).optional();
+ *  Sentry projects.  Length is capped in cleanFilterList, not rejected here. */
+const filterListSchema = z.array(z.string()).optional();
 const sentryLevelSchema = z.enum(["debug", "info", "warning", "error", "fatal"]);
 const pagerDutyUrgencySchema = z.enum(["high", "low"]);
+/** PagerDuty incident urgency. */
+export type PagerDutyUrgency = z.infer<typeof pagerDutyUrgencySchema>;
 /** A whole number of minutes.  A day is the ceiling — past that a person
  * wants a schedule, not a trigger. */
 const minGapSchema = z.number().int().min(0).max(1440).optional();
@@ -1189,8 +1189,7 @@ function sentryLevelOf(payload: JsonValue): SentryLevelReading {
   const issue = asRecord(data?.issue) ?? asRecord(root.issue);
   const event = asRecord(data?.event) ?? asRecord(root.event);
   const level = pickStr(issue, "level") ?? pickStr(event, "level") ?? pickStr(root, "level");
-  const isSentry = isSentryWebhookPayload(payload) || Boolean(issue ?? event);
-  return { level, isSentry };
+  return { level, isSentry: isSentryWebhookPayload(payload) };
 }
 
 /** The head branch a GitHub delivery belongs to, for the event kinds the
@@ -1291,11 +1290,11 @@ export function triggerFilterDecision(
     }
   }
 
-  // 5. Sentry minimum level.  A Sentry delivery below the floor is dropped;
-  //    a Sentry delivery with an unknown level is dropped too, because the
-  //    filter cannot be satisfied.
-  if (trigger.minSentryLevel) {
-    const { level, isSentry: sentryPayload } = sentryLevelOf(payload);
+  // 5. Sentry minimum level.  Only verified Sentry payloads are judged; GitHub
+  //    issues and other senders can carry issue/event shapes without hitting
+  //    this filter.
+  if (trigger.minSentryLevel && isSentryWebhookPayload(payload)) {
+    const { level } = sentryLevelOf(payload);
     if (level) {
       const rank = SENTRY_LEVEL_ORDER.findIndex((known) => known === level.toLowerCase());
       const floor = SENTRY_LEVEL_ORDER.indexOf(trigger.minSentryLevel);
@@ -1303,7 +1302,7 @@ export function triggerFilterDecision(
       if (rank < floor) {
         return { ignore: true, reason: `Sentry level “${level}” is below ${trigger.minSentryLevel}` };
       }
-    } else if (sentryPayload) {
+    } else {
       return { ignore: true, reason: "Sentry level is missing" };
     }
   }
@@ -1318,15 +1317,16 @@ export function triggerFilterDecision(
     }
   }
 
-  // 7. PagerDuty urgency.
-  if (trigger.pagerdutyUrgency) {
+  // 7. PagerDuty urgency.  A generic top-level `event` field must not be
+  //    treated as PagerDuty.
+  if (trigger.pagerdutyUrgency && isPagerDutyWebhookPayload(payload)) {
     const eventData = asRecord(asRecord(root.event)?.data);
     const urgency = pickStr(eventData, "urgency") ?? pickStr(asRecord(eventData?.incident), "urgency");
     if (urgency) {
       if (urgency.toLowerCase() !== trigger.pagerdutyUrgency.toLowerCase()) {
         return { ignore: true, reason: `PagerDuty urgency “${urgency}” is not ${trigger.pagerdutyUrgency}` };
       }
-    } else if (root.event) {
+    } else {
       return { ignore: true, reason: "PagerDuty urgency is missing" };
     }
   }

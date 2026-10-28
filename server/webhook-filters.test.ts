@@ -224,6 +224,7 @@ describe("per-trigger Sentry filters", () => {
     eventName: "sentry",
     payload: {
       action,
+      actor: { type: "application", id: "sentry", name: "Sentry" },
       data: { issue: { level, project: { slug: project } } },
     },
   });
@@ -237,9 +238,28 @@ describe("per-trigger Sentry filters", () => {
     expect(decide({ minSentryLevel: "error" }, sentry("fatal", "app"))).toEqual({ ignore: false });
   });
 
-  it("ignores a Sentry delivery with no level when a floor is set", () => {
-    const event = { eventName: "sentry", payload: { action: "created", data: { issue: { id: "1" } } } };
+  it("ignores a verified Sentry delivery with no level when a floor is set", () => {
+    const event = {
+      eventName: "sentry",
+      payload: {
+        action: "created",
+        actor: { type: "application", id: "sentry", name: "Sentry" },
+        data: { issue: { id: "1" } },
+      },
+    };
     expect(decide({ minSentryLevel: "error" }, event)).toMatchObject({ ignore: true });
+  });
+
+  it("does not apply the Sentry floor to GitHub issue deliveries", () => {
+    const event = {
+      eventName: "issues",
+      payload: {
+        action: "opened",
+        repository,
+        issue: { number: 1, labels: [] },
+      },
+    };
+    expect(decide({ minSentryLevel: "error" }, event)).toEqual({ ignore: false });
   });
 
   it("ignores an excluded Sentry project and runs for every other one", () => {
@@ -256,7 +276,17 @@ describe("per-trigger Sentry filters", () => {
 describe("per-trigger PagerDuty urgency filter", () => {
   const pagerduty = (urgency?: string): DeliveryEvent => ({
     eventName: "incident.triggered",
-    payload: { event: { event_type: "incident.triggered", data: urgency ? { urgency } : {} } },
+    payload: {
+      event: {
+        event_type: "incident.triggered",
+        resource_type: "incident",
+        data: {
+          type: "incident",
+          status: "triggered",
+          ...(urgency ? { urgency } : {}),
+        },
+      },
+    },
   });
 
   it("runs for the wanted urgency and ignores another", () => {
@@ -270,13 +300,31 @@ describe("per-trigger PagerDuty urgency filter", () => {
   it("reads the urgency from the incident object", () => {
     const event: DeliveryEvent = {
       eventName: "incident.triggered",
-      payload: { event: { event_type: "incident.triggered", data: { incident: { urgency: "low" } } } },
+      payload: {
+        event: {
+          event_type: "incident.triggered",
+          resource_type: "incident",
+          data: {
+            type: "incident",
+            status: "triggered",
+            incident: { urgency: "low" },
+          },
+        },
+      },
     };
     expect(decide({ pagerdutyUrgency: "high" }, event)).toMatchObject({ ignore: true });
   });
 
   it("ignores a PagerDuty delivery with no urgency", () => {
     expect(decide({ pagerdutyUrgency: "high" }, pagerduty())).toMatchObject({ ignore: true });
+  });
+
+  it("does not apply the PagerDuty urgency filter to a generic event field", () => {
+    const event: DeliveryEvent = {
+      eventName: "review_queue.entered",
+      payload: { event: "review_queue.entered" },
+    };
+    expect(decide({ pagerdutyUrgency: "high" }, event)).toEqual({ ignore: false });
   });
 });
 
@@ -584,6 +632,20 @@ describe("filter patch semantics", () => {
       actions: [" created ", "created", "triggered"],
     });
     expect(webhook.actions).toEqual(["created", "triggered"]);
+  });
+
+  it("caps an over-long filter list instead of rejecting it", () => {
+    const h = harness();
+    const actions = Array.from({ length: 25 }, (_, index) => `action-${index}`);
+    const { webhook } = h.manager.create({
+      name: "Fixer",
+      prompt: "Fix it.",
+      botId: "maus-1",
+      actions,
+    });
+    expect(webhook.actions).toHaveLength(20);
+    expect(webhook.actions?.[0]).toBe("action-0");
+    expect(webhook.actions?.[19]).toBe("action-19");
   });
 });
 
