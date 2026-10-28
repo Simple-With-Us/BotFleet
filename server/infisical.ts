@@ -310,7 +310,7 @@ class InfisicalManager {
   }
 
   /** Remember a refusal for this token and scope.  The list stays short:
-   * one entry per refused scope, and the oldest is dropped once it grows
+   * one entry per refused scope, and one entry is dropped once it grows
    * past the cap, so a long-lived install cannot accumulate them without
    * end. */
   private rememberRefusal(mode: "read" | "write", token: string, scope: string): void {
@@ -318,8 +318,25 @@ class InfisicalManager {
     if (!remembered.some((entry) => entry.token === token && entry.scope === scope)) {
       remembered.push({ token, scope });
     }
-    while (remembered.length > 16) remembered.shift();
+    while (remembered.length > 16) this.forgetOneRefusal(remembered);
     this.rejectedTokens.set(mode, remembered);
+  }
+
+  /** Drop one remembered refusal to make room under the cap.  A
+   * credential-wide refusal -- a 401, remembered against every scope -- is
+   * the one worth keeping:  it is what stops a revoked bearer from being
+   * tried again, and evicting it would let a dead token look alive for one
+   * more request.  A scope-scoped refusal -- a 403 or a 404 -- says only
+   * that one request was refused, so it is the cheap one to lose.  The
+   * oldest credential-wide entry goes only when there is no scoped one left
+   * to drop, and the cap always holds either way. */
+  private forgetOneRefusal(remembered: Array<{ token: string; scope: string }>): void {
+    const scoped = remembered.findIndex((entry) => entry.scope !== CREDENTIAL_REFUSAL_SCOPE);
+    if (scoped >= 0) {
+      remembered.splice(scoped, 1);
+      return;
+    }
+    remembered.shift();
   }
 
   /** The machine-identity session token for one call.  The universal-auth

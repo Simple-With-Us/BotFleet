@@ -1299,6 +1299,72 @@ describe("service token refusal: scope and visibility", () => {
     expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(2);
   });
 
+  /** A fetch that refuses each named bearer with its own status and
+   * answers every other request with the secrets list.  The login endpoint
+   * is answered with a session token when the machine identity is in play. */
+  function perBearerRefusingFetch(statuses: Record<string, number>) {
+    const calls: RecordedCall[] = [];
+    const impl = vi.fn(async (url: string, init?: RequestInit) => {
+      const headers = headerBag(init);
+      calls.push({ url: String(url), authorization: headers.authorization });
+      if (String(url).includes("/login")) {
+        return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
+      }
+      const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
+      const status = statuses[bearer];
+      if (status !== undefined) {
+        return new Response("refused", { status });
+      }
+      return new Response(JSON.stringify({ secrets: [] }), { status: 200 });
+    });
+    return { calls, impl };
+  }
+
+  it("keeps the credential-wide refusal when scope-scoped refusals fill the cap", async () => {
+    // A 401 is remembered against EVERY scope, because the bearer is refused
+    // however it is used.  That entry is the one worth keeping under the
+    // cap:  dropping it would let a revoked token be tried again, which is
+    // the whole thing the memory exists to prevent.  Sixteen scope-scoped
+    // refusals for another token must not push it out.
+    const ROTATED_TOKEN = "sentinel-rotated-token-not-real";
+    const settings = {
+      ...BASE_SETTINGS,
+      projectId: "proj-1",
+      clientId: "",
+      clientSecret: "",
+      token: REFUSED_TOKEN,
+    };
+    infisical.configure(() => settings);
+    const { calls, impl } = perBearerRefusingFetch({
+      [REFUSED_TOKEN]: 401,
+      [ROTATED_TOKEN]: 404,
+    });
+    vi.stubGlobal("fetch", impl);
+
+    // One 401:  the credential-wide refusal, remembered against every scope.
+    await infisical.refresh("manual");
+    expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(1);
+
+    // Sixteen scope-scoped refusals for the rotated token, one per scope.
+    // Every one of them is a 404, so each is remembered against its own
+    // scope rather than against the credential.
+    settings.token = ROTATED_TOKEN;
+    for (let index = 0; index < 16; index += 1) {
+      settings.projectId = `proj-scoped-${index}`;
+      await infisical.refresh("manual");
+    }
+    expect(calls.filter((call) => bearerOf(call) === ROTATED_TOKEN)).toHaveLength(16);
+
+    // Back to the revoked token.  The credential-wide refusal survived the
+    // cap, so the token is not tried again -- no request carries it.
+    settings.token = REFUSED_TOKEN;
+    settings.projectId = "proj-1";
+    await infisical.refresh("manual");
+
+    expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(1);
+    expect(infisical.getStatus().readTokenRefused).toBe(true);
+  });
+
   it("reports a refused token in the status view and in the boot line", async () => {
     // A sync that succeeds on the machine identity must not look exactly
     // like a healthy token:  the refusal is the fact the operator needs.
