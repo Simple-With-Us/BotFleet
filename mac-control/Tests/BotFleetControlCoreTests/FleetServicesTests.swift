@@ -131,14 +131,34 @@ final class FleetServicesTests: XCTestCase {
     }
 
     func testAServiceThatFollowsTheServerCannotBeStartedWhileTheServerIsDown() {
-        // Starting it now would be undone at once, so only a restart is
-        // offered.
-        XCTAssertEqual(FleetServices.availableActions(for: .stopped, wanted: false, policy: .whileServerRuns), [.restart])
+        // Starting it now would be undone at once, so no action is offered
+        // that the reconciler would take straight back.
+        XCTAssertEqual(FleetServices.availableActions(for: .stopped, wanted: false, policy: .whileServerRuns), [])
+        XCTAssertEqual(FleetServices.availableActions(for: .running, wanted: false, policy: .whileServerRuns), [])
     }
 
     func testAServiceTheOwnerStoppedCanBeStartedAgain() {
         XCTAssertEqual(FleetServices.availableActions(for: .stopped, wanted: false, policy: .whileServerRuns, stoppedByOwner: true),
                        [.start, .restart])
+    }
+
+    func testTheServerIsOfferedNothingWhenTheInstalledWrapperDoesNotSupportThePolicy() {
+        // The BotFleet Server's start and restart change its startup policy,
+        // so an older wrapper is offered nothing rather than an action that
+        // would always fail.
+        let services = FleetServices(serverState: .running,
+                                    states: ["app.botfleet.server": .running],
+                                    startupPolicySupported: false)
+        let row = services.menuItems.first { $0.id == "app.botfleet.server" }
+        XCTAssertEqual(row?.actions, [])
+    }
+
+    func testTheServerIsOfferedItsActionsWhenTheInstalledWrapperSupportsThePolicy() {
+        let services = FleetServices(serverState: .running,
+                                    states: ["app.botfleet.server": .running],
+                                    startupPolicySupported: true)
+        let row = services.menuItems.first { $0.id == "app.botfleet.server" }
+        XCTAssertEqual(row?.actions, [.stop, .restart])
     }
 
     func testTheMcpServerRowInTheMenuOffersStopWhileTheServerRuns() {
@@ -412,6 +432,31 @@ final class FleetServicesTests: XCTestCase {
     }
 
     // MARK: - Restarting the BotFleet Server
+    func testARestartThatDoesNotReplaceTheServerIsNotReportedAsASuccess() async throws {
+        // A kickstart replaces the process the launchd job owns.  When the
+        // job owns no process, the server that is running was started by
+        // something else and the restart changed nothing.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let commands = LaunchAgentCommands()
+        commands.loaded = false
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil)
+        do {
+            _ = try await control.perform(.restart, serviceID: FleetServiceRegistry.server.id, attempts: 2)
+            XCTFail("a restart that replaced nothing should not be reported as a success")
+        } catch {
+            XCTAssertTrue("\(error)".contains("not replaced"))
+        }
+    }
+
     func testRestartingTheBotFleetServerClearsTheDeliberateStopMarker() async throws {
         // The installed wrapper stays down while the deliberate-stop marker
         // exists, so a restart that left the marker in place would report a
@@ -426,9 +471,12 @@ final class FleetServicesTests: XCTestCase {
         let marker = home.appendingPathComponent(".botfleet/stopped.marker")
         try Data().write(to: marker)
 
+        let commands = LaunchAgentCommands()
+        commands.loaded = true
+        commands.listing = "PID\tStatus\tLabel\n123\t0\tapp.botfleet.server"
         let control = FleetServiceControl(
             pm2: pm2(FleetServiceCommands()),
-            startup: StartupPolicy(home: home, commands: LaunchAgentCommands(), uid: 501, environment: [:]),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
             mcpServer: nil)
         _ = try await control.perform(.restart, serviceID: FleetServiceRegistry.server.id)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))

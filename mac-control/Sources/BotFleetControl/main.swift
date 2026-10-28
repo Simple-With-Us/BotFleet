@@ -299,7 +299,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         await refreshFleetServiceStates()
         let fleetServices = FleetServices(serverState: serverState(),
                                          states: fleetServiceStates,
-                                         stoppedByOwner: ownerStoppedServices)
+                                         stoppedByOwner: ownerStoppedServices,
+                                         startupPolicySupported: startup.supportsPolicy)
         for entry in fleetServices.entries where entry.policy == .alwaysOn {
             let action = FleetServices.automaticAction(for: entry)
             guard action != .none else { continue }
@@ -349,7 +350,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let id = sender.representedObject as? String else { return }
         guard let service = FleetServices(serverState: serverState(),
                                          states: fleetServiceStates,
-                                         stoppedByOwner: ownerStoppedServices).menuItems.first(where: { $0.id == id }) else { return }
+                                         stoppedByOwner: ownerStoppedServices,
+                                         startupPolicySupported: startup.supportsPolicy).menuItems.first(where: { $0.id == id }) else { return }
         guard confirmFleetServiceAction(action, service: service) else { return }
         run { [self] in
             // A stop the owner asked for is remembered, so the reconciler
@@ -519,7 +521,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let fleetServices = FleetServices(serverState: serverState(),
                                          states: fleetServiceStates,
-                                         stoppedByOwner: ownerStoppedServices)
+                                         stoppedByOwner: ownerStoppedServices,
+                                         startupPolicySupported: startup.supportsPolicy)
         if !fleetServices.entries.isEmpty {
             menu.addItem(.separator())
             let servicesMenu = NSMenu()

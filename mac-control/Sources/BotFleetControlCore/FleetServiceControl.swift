@@ -178,9 +178,22 @@ public final class FleetServiceControl {
                 // deliberate-stop marker first, because the installed wrapper
                 // stays down while that marker exists.
                 try startup.restartServer()
-            } else {
-                try startup.restartAgent(label: label)
+                // A restart replaces the process the launchd job owns.  When
+                // the job owns no process - the server was started by
+                // something else, such as the desktop app's own fork - a
+                // kickstart cannot replace it, and the restart is not
+                // reported as a success.
+                let observed = await ManagedServices.settle(to: .running,
+                                                            attempts: 8,
+                                                            interval: 0.25) {
+                    startup.state(ofAgent: label).managedState
+                }
+                if observed != .running {
+                    throw FleetServiceError.refused("The BotFleet Server was not replaced: its LaunchAgent owns no process, so the server that is running was not started by launchd.")
+                }
+                return observed
             }
+            try startup.restartAgent(label: label)
             return startup.state(ofAgent: label).managedState
         }
     }

@@ -104,15 +104,20 @@ public struct FleetServiceEntry: Equatable {
     public let state: ManagedServiceState
     /// True when the owner stopped this service on purpose.
     public let stoppedByOwner: Bool
+    /// False when the service's start and restart would change a startup
+    /// policy the installed wrapper does not carry.
+    public let canChangeStartupPolicy: Bool
 
     public init(descriptor: FleetServiceDescriptor,
                 wanted: Bool?,
                 state: ManagedServiceState,
-                stoppedByOwner: Bool = false) {
+                stoppedByOwner: Bool = false,
+                canChangeStartupPolicy: Bool = true) {
         self.descriptor = descriptor
         self.wanted = wanted
         self.state = state
         self.stoppedByOwner = stoppedByOwner
+        self.canChangeStartupPolicy = canChangeStartupPolicy
     }
 
     public var id: String { descriptor.id }
@@ -127,10 +132,11 @@ public struct FleetServiceEntry: Equatable {
 
     /// The actions the owner may pick for this service right now.
     public var availableActions: [ManagedServiceAction] {
-        FleetServices.availableActions(for: state,
-                                      wanted: wanted,
-                                      policy: policy,
-                                      stoppedByOwner: stoppedByOwner)
+        guard canChangeStartupPolicy else { return [] }
+        return FleetServices.availableActions(for: state,
+                                             wanted: wanted,
+                                             policy: policy,
+                                             stoppedByOwner: stoppedByOwner)
     }
 }
 
@@ -165,13 +171,21 @@ public struct FleetServices: Equatable {
     /// set belongs to the app, so it lasts as long as the app does, and a
     /// relaunch hands the fleet back to its own rules.
     public let stoppedByOwner: Set<String>
+    /// True when the installed wrapper carries the startup policy contract.
+    ///
+    /// The BotFleet Server's start and restart change that policy, so an
+    /// older wrapper is offered nothing at all rather than an action that
+    /// would always fail.
+    public let startupPolicySupported: Bool
 
     public init(serverState: ManagedServices.ServerState,
                 states: [String: ManagedServiceState],
-                stoppedByOwner: Set<String> = []) {
+                stoppedByOwner: Set<String> = [],
+                startupPolicySupported: Bool = true) {
         self.serverState = serverState
         self.states = states
         self.stoppedByOwner = stoppedByOwner
+        self.startupPolicySupported = startupPolicySupported
     }
 
     /// The wanted state of one service.
@@ -204,10 +218,12 @@ public struct FleetServices: Equatable {
     /// Every fleet service, in the order the menu shows them.
     public var entries: [FleetServiceEntry] {
         FleetServiceRegistry.all.map { descriptor in
-            FleetServiceEntry(descriptor: descriptor,
-                             wanted: wanted(for: descriptor),
-                             state: states[descriptor.id] ?? .unknown,
-                             stoppedByOwner: stoppedByOwner.contains(descriptor.id))
+            let isServer = descriptor.id == FleetServiceRegistry.server.id
+            return FleetServiceEntry(descriptor: descriptor,
+                                     wanted: wanted(for: descriptor),
+                                     state: states[descriptor.id] ?? .unknown,
+                                     stoppedByOwner: stoppedByOwner.contains(descriptor.id),
+                                     canChangeStartupPolicy: startupPolicySupported || !isServer)
         }
     }
 
@@ -257,6 +273,18 @@ public struct FleetServices: Equatable {
                                         wanted: Bool?,
                                         policy: FleetServiceWantedPolicy,
                                         stoppedByOwner: Bool = false) -> [ManagedServiceAction] {
+        if policy == .whileServerRuns {
+            // A service the owner stopped on purpose can always be started
+            // again, because that is how the owner says they want it.
+            if stoppedByOwner {
+                return state == .running ? [.stop, .restart] : [.start, .restart]
+            }
+            // A service that follows another one is wanted exactly while the
+            // one it follows runs.  While it is not wanted the reconciler
+            // decides what happens to it, so no action is offered that the
+            // reconciler would take straight back.
+            if wanted == false { return [] }
+        }
         switch state {
         case .running: return [.stop, .restart]
         case .stopped:
