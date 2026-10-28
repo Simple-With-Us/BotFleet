@@ -84,12 +84,133 @@ public enum InfisicalKeychainReadStatus: Equatable, Sendable, CustomStringConver
     public var debugDescription: String { description }
 }
 
+/// A read-only Infisical service token.
+///
+/// A service token is the credential the fleet moved to: it authenticates a
+/// request by itself, with no login step and no machine identity.  The value
+/// never appears in a description, a log line or an error message.
+public struct InfisicalServiceToken: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    /// Every service token starts with this prefix.
+    public static let prefix = "st."
+    /// The shortest service token this resolver accepts, prefix included.
+    public static let minimumLength = 20
+    /// The longest service token this resolver accepts, prefix included.
+    public static let maximumLength = 2048
+
+    private let rawValue: String
+
+    public init(_ rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    /// Whether a value is an Infisical service token.
+    ///
+    /// This mirrors `validateServiceToken()` in `electron/infisical-read.mjs`:
+    /// the value starts with `st.`, is between 20 and 2048 characters long and
+    /// carries no whitespace.  A value that fails the test is refused, so a
+    /// truncated or mistyped credential never reaches the vault.
+    public static func isValid(_ value: String) -> Bool {
+        let token = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard token.hasPrefix(prefix) else { return false }
+        let length = token.count
+        guard length >= minimumLength, length <= maximumLength else { return false }
+        return !token.unicodeScalars.contains { $0.properties.isWhitespace }
+    }
+
+    /// Whether this token is usable.
+    public var isValid: Bool { InfisicalServiceToken.isValid(rawValue) }
+
+    /// Deliberately named so call sites acknowledge they are unwrapping secret material.
+    public func exposeSecret() -> String {
+        rawValue
+    }
+
+    public var description: String { "[REDACTED]" }
+    public var debugDescription: String { "[REDACTED]" }
+}
+
+/// Four-way Keychain read status for the Infisical service token.
+///
+/// `empty`, `ok` and `invalid` are facts about what is stored.  `unavailable`
+/// is ignorance (a locked or busy Keychain, or bytes that could not be read)
+/// and must never be treated as `empty`, or the app acts as though no
+/// credential was ever configured.
+public enum InfisicalServiceTokenReadStatus: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    /// Nothing is stored under the service-token item.
+    case empty
+    /// A well-formed service token is stored.
+    case ok(InfisicalServiceToken)
+    /// Something is stored, but it is not a usable service token.  It is
+    /// refused, never used.
+    case invalid
+    /// The credential store could not be read.
+    case unavailable(status: OSStatus, message: String)
+
+    public var description: String {
+        switch self {
+        case .empty:
+            return "InfisicalServiceTokenReadStatus.empty"
+        case .ok:
+            return "InfisicalServiceTokenReadStatus.ok([REDACTED])"
+        case .invalid:
+            return "InfisicalServiceTokenReadStatus.invalid"
+        case .unavailable(let status, let message):
+            return "InfisicalServiceTokenReadStatus.unavailable(status: \(status), message: \(message))"
+        }
+    }
+
+    public var debugDescription: String { description }
+}
+
+/// The part of the vault a read is scoped to: the site, the project, the
+/// environment and the path inside the project.
+///
+/// The scope is explicit and configurable because a service token carries no
+/// scope of its own: the token says WHO may read, the scope says WHAT is read.
+public struct InfisicalVaultScope: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let siteUrl: String
+    public let projectId: String
+    public let environment: String
+    public let secretPath: String
+
+    /// The BotFleet project, the prod environment and the path the server's
+    /// own secrets live under.  It is the scope `electron/infisical-read.mjs`
+    /// reads.
+    public static let botFleetServer = InfisicalVaultScope(
+        siteUrl: "https://app.infisical.com",
+        projectId: "836aebe2-c8f7-4e09-978e-7e3e82500bce",
+        environment: "prod",
+        secretPath: "/botfleet-server"
+    )
+
+    public init(siteUrl: String, projectId: String, environment: String, secretPath: String) {
+        self.siteUrl = siteUrl
+        self.projectId = projectId
+        self.environment = environment
+        self.secretPath = secretPath
+    }
+
+    public var description: String {
+        "Infisical scope (environment: \(environment), path: \(secretPath))"
+    }
+
+    public var debugDescription: String { description }
+}
+
 /// Errors thrown by `NativeInfisicalResolver`.  Error descriptions never echo
 /// upstream response bodies or raw secret material.
 public enum InfisicalResolverError: LocalizedError, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    /// No usable vault credential is available: the Keychain holds neither a
+    /// read-only service token nor a valid machine identity.
+    ///
+    /// The name is the original one and is kept because the direct LLM client
+    /// maps it; the message names both credentials that can open the vault.
     case missingMachineIdentity
     case keychainUnavailable(status: OSStatus, message: String)
     case keychainWriteFailed(status: OSStatus)
+    /// The stored credential is not a service token.  The value never appears
+    /// in the message.
+    case invalidServiceToken
     case loginFailed(statusCode: Int)
     case invalidLoginResponse
     case secretsFetchFailed(statusCode: Int)
@@ -100,11 +221,13 @@ public enum InfisicalResolverError: LocalizedError, Equatable, Sendable, CustomS
     public var errorDescription: String? {
         switch self {
         case .missingMachineIdentity:
-            return "Infisical machine identity is missing from Keychain.  Configure machine identity credentials before making requests."
+            return "No Infisical credential is available: the macOS Keychain holds neither a read-only service token nor a valid machine identity."
         case .keychainUnavailable(let status, let message):
             return "macOS Keychain is unavailable (OSStatus \(status)): \(message)"
         case .keychainWriteFailed(let status):
             return "macOS Keychain write failed (OSStatus \(status))."
+        case .invalidServiceToken:
+            return "The stored Infisical credential is not a service token.  Store a read-only service token (st. ...) in the Keychain."
         case .loginFailed(let statusCode):
             return "Infisical login failed: HTTP \(statusCode)"
         case .invalidLoginResponse:
@@ -151,6 +274,17 @@ public protocol InfisicalKeychainStoreProtocol: Sendable {
 public struct MacKeychainInfisicalStore: InfisicalKeychainStoreProtocol {
     public static let defaultService = "app.botfleet.macos.infisical"
     public static let defaultAccount = "machine-identity"
+
+    /// The Keychain item the read-only Infisical service token lives in.
+    ///
+    /// It is the same item the Electron main process reads, so the token is
+    /// stored once on this Mac and both halves of the app read the same copy.
+    /// It is `KEYCHAIN_SERVICE` in `electron/server-target.mjs`.
+    public static let serviceTokenService = "BotFleet Infisical read token"
+
+    /// The account of that Keychain item.  It is `KEYCHAIN_ACCOUNT` in
+    /// `electron/server-target.mjs`.
+    public static let serviceTokenAccount = "botfleet"
 
     public let serviceName: String
     public let accountName: String
@@ -258,16 +392,26 @@ public struct URLSessionInfisicalTransport: InfisicalHTTPTransportProtocol {
     }
 }
 
-/// In-memory-only Infisical secret resolver with Keychain machine-identity storage.
+/// In-memory-only Infisical secret resolver with Keychain credential storage.
+///
+/// Two credentials can open the vault and the service token wins.  A read-only
+/// Infisical service token is the credential the fleet moved to: it is the
+/// bearer token itself, so the service-token path sends NO Universal Auth
+/// login request at all.  The machine identity is the fallback for an install
+/// that has not been provisioned with a token yet.
 ///
 /// Security invariants:
-/// 1. Machine identity lives in macOS Keychain under `app.botfleet.macos.infisical`.
-/// 2. Keychain reads distinguish `.empty`, `.ok`, and `.unavailable`, retrying busy
-///    keychain errors across `[100, 200, 400, 800]` ms before reporting `.unavailable`.
+/// 1. The service token lives in the macOS Keychain under the same item the
+///    Electron main process reads (`BotFleet Infisical read token` /
+///    `botfleet`), and the machine identity under `app.botfleet.macos.infisical`.
+/// 2. Keychain reads distinguish `.empty`, `.ok`, `.invalid` and `.unavailable`,
+///    retrying busy keychain errors across `[100, 200, 400, 800]` ms before
+///    reporting `.unavailable`.
 /// 3. Resolved secrets live exclusively in actor-isolated memory with a TTL and are
 ///    never persisted to SQLite, `UserDefaults`, disk files, or log lines.
-/// 4. Fails closed (`InfisicalResolverError.missingMachineIdentity`) before opening
-///    any network request if the machine identity is missing or empty.
+/// 4. Fails closed before opening any network request if no credential is
+///    available, if the stored token is not a service token, or if the
+///    credential store cannot be read.
 public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugStringConvertible {
     /// Retry schedule matching `CREDENTIAL_READ_DELAYS_MS` in `electron/secure-credentials.mjs`.
     public static let credentialReadDelaysMs: [UInt64] = [100, 200, 400, 800]
@@ -288,7 +432,17 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
         var debugDescription: String { "[REDACTED]" }
     }
 
+    private struct CachedServiceToken: Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+        let token: InfisicalServiceToken
+        let expiresAt: Date
+
+        var description: String { "[REDACTED]" }
+        var debugDescription: String { "[REDACTED]" }
+    }
+
     private let keychain: InfisicalKeychainStoreProtocol
+    private let serviceTokenStore: InfisicalKeychainStoreProtocol?
+    private let scope: InfisicalVaultScope
     private let transport: InfisicalHTTPTransportProtocol
     private let ttlSeconds: TimeInterval
     private let now: @Sendable () -> Date
@@ -296,9 +450,28 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
 
     private var secretCache: [String: CachedSecretEntry] = [:]
     private var cachedBearer: CachedBearerToken?
+    private var cachedServiceToken: CachedServiceToken?
 
+    /// - Parameters:
+    ///   - keychain: Where the machine identity lives.
+    ///   - serviceTokenStore: Where the read-only service token lives.  `nil`
+    ///     means the production Keychain item the Electron main process reads,
+    ///     but only when `keychain` is the production machine-identity item as
+    ///     well.  A caller that hands the resolver its own credential store has
+    ///     taken over the resolver's credentials, so the resolver then uses
+    ///     only the stores it was given and never reaches into the operator's
+    ///     login Keychain behind the caller's back.  That is what keeps every
+    ///     unit test deterministic on any machine.
+    ///   - scope: The site, project, environment and path a service-token read
+    ///     is scoped to.  A service token carries no scope of its own.
+    ///   - transport: How requests leave the process.
+    ///   - ttlSeconds: How long a resolved secret or a bearer stays in memory.
+    ///   - now: The clock, injectable for tests.
+    ///   - sleepMs: The backoff sleep, injectable for tests.
     public init(
         keychain: InfisicalKeychainStoreProtocol = MacKeychainInfisicalStore(),
+        serviceTokenStore: InfisicalKeychainStoreProtocol? = nil,
+        scope: InfisicalVaultScope = .botFleetServer,
         transport: InfisicalHTTPTransportProtocol = URLSessionInfisicalTransport(),
         ttlSeconds: TimeInterval = 300,
         now: @escaping @Sendable () -> Date = { Date() },
@@ -307,10 +480,33 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
         }
     ) {
         self.keychain = keychain
+        self.serviceTokenStore = serviceTokenStore ?? NativeInfisicalResolver.productionServiceTokenStore(for: keychain)
+        self.scope = scope
         self.transport = transport
         self.ttlSeconds = ttlSeconds
         self.now = now
         self.sleepMs = sleepMs
+    }
+
+    /// The service-token store the resolver falls back to when the caller did
+    /// not hand it one.
+    ///
+    /// The production store reads the login Keychain item the Electron main
+    /// process reads, so the token is stored once on this Mac and both halves
+    /// of the app read the same copy.  A caller that supplies its own
+    /// machine-identity store owns the resolver's credentials, so the resolver
+    /// does not silently reach for the operator's login Keychain.
+    private static func productionServiceTokenStore(
+        for keychain: InfisicalKeychainStoreProtocol
+    ) -> InfisicalKeychainStoreProtocol? {
+        guard keychain.serviceName == MacKeychainInfisicalStore.defaultService,
+              keychain.accountName == MacKeychainInfisicalStore.defaultAccount else {
+            return nil
+        }
+        return MacKeychainInfisicalStore(
+            serviceName: MacKeychainInfisicalStore.serviceTokenService,
+            accountName: MacKeychainInfisicalStore.serviceTokenAccount
+        )
     }
 
     public nonisolated var description: String {
@@ -361,6 +557,50 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
         return .unavailable(status: lastStatus, message: lastMessage)
     }
 
+    /// Reads the Infisical service token from the Keychain with
+    /// `[100, 200, 400, 800]` ms backoff when the OS credential store is
+    /// temporarily busy or locked.
+    ///
+    /// A stored value that is not a service token is refused: the store holds
+    /// something, so the read is `.invalid` and never `.empty`, and the caller
+    /// must not treat it as "no credential was ever configured".
+    public func readServiceToken(
+        delaysMs: [UInt64] = NativeInfisicalResolver.credentialReadDelaysMs
+    ) async -> InfisicalServiceTokenReadStatus {
+        guard let serviceTokenStore else {
+            return .empty
+        }
+
+        var lastStatus: OSStatus = errSecNotAvailable
+        var lastMessage = "the operating-system credential store is unavailable"
+
+        for attempt in 0...delaysMs.count {
+            if attempt > 0 {
+                await sleepMs(delaysMs[attempt - 1])
+            }
+            switch serviceTokenStore.queryRaw() {
+            case .itemNotFound:
+                return .empty
+            case .itemData(let data):
+                guard let text = String(data: data, encoding: .utf8) else {
+                    return .unavailable(status: errSecDecode, message: "the credential store is not readable")
+                }
+                let token = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard InfisicalServiceToken.isValid(token) else {
+                    return .invalid
+                }
+                return .ok(InfisicalServiceToken(token))
+            case .statusError(let status):
+                lastStatus = status
+                lastMessage = "the operating-system credential store is unavailable (OSStatus \(status))"
+                if status == errSecDecode {
+                    return .unavailable(status: status, message: "the credential store is not readable")
+                }
+            }
+        }
+        return .unavailable(status: lastStatus, message: lastMessage)
+    }
+
     /// Saves a machine identity into Keychain and clears any cached tokens/secrets.
     public func saveMachineIdentity(_ identity: InfisicalMachineIdentity) throws {
         guard identity.isValid else {
@@ -381,20 +621,22 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
     public func invalidateCache() {
         secretCache.removeAll()
         cachedBearer = nil
+        cachedServiceToken = nil
     }
 
     // MARK: - Secret Resolution (In-Memory Only, Fail-Closed)
 
     /// Resolves a secret by name (`secretKey`), returning its value from the
     /// process environment first, then from the in-memory TTL cache, and
-    /// finally by fetching a fresh snapshot from Infisical via Universal Auth.
+    /// finally by fetching a fresh snapshot from Infisical.
     ///
     /// The process environment takes precedence over the vault so an operator
     /// can override a secret for one run without touching the vault.  The value
     /// is never logged or echoed.
     ///
-    /// Fails closed before making any network request if the Keychain machine identity
-    /// is `.empty` or `.unavailable`.
+    /// Fails closed before making any network request when the Keychain holds
+    /// no usable credential: the service token is `.empty`, `.invalid` or
+    /// `.unavailable`, and so is the machine identity.
     public func resolveSecret(forKey key: String) async throws -> RedactedSecret {
         let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedKey.isEmpty else {
@@ -422,11 +664,37 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
         return resolved.secret
     }
 
-    /// Exchanges the Keychain machine identity for a Universal Auth bearer token and
-    /// populates the in-memory secret cache from `/api/v3/secrets/raw`.
-    /// Returns only the list of secret names present in the vault, never raw values.
+    /// Reads the secrets in scope and populates the in-memory secret cache from
+    /// `/api/v3/secrets/raw`.  Returns only the list of secret names present in
+    /// the vault, never raw values.
+    ///
+    /// Two credentials can open the vault, and the service token wins:
+    ///
+    /// 1. A read-only service token, when one is stored.  It is the bearer
+    ///    token itself, so this path sends NO Universal Auth login request.
+    /// 2. Otherwise the machine identity, which is exchanged for a bearer token
+    ///    through `/api/v1/auth/universal-auth/login`.
+    ///
+    /// Fails closed before any network request is opened: an unreadable
+    /// credential store, a stored value that is not a service token, and a
+    /// missing credential are all reported, never worked around.
     @discardableResult
     public func refreshSecretsSnapshot() async throws -> [String] {
+        switch await serviceTokenStatus() {
+        case .ok(let token):
+            return try await fetchSecretsRaw(
+                scope: scope,
+                bearerToken: token.exposeSecret(),
+                expandSecretReferences: true
+            )
+        case .empty:
+            break
+        case .invalid:
+            throw InfisicalResolverError.invalidServiceToken
+        case .unavailable(let status, let message):
+            throw InfisicalResolverError.keychainUnavailable(status: status, message: message)
+        }
+
         let identity: InfisicalMachineIdentity
         switch await readMachineIdentity() {
         case .empty:
@@ -441,7 +709,38 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
         }
 
         let token = try await obtainBearerToken(for: identity)
-        return try await fetchSecretsRaw(identity: identity, bearerToken: token.exposeSecret())
+        let identityScope = InfisicalVaultScope(
+            siteUrl: identity.siteUrl,
+            projectId: identity.projectId,
+            environment: identity.environment,
+            secretPath: identity.secretPath
+        )
+        return try await fetchSecretsRaw(
+            scope: identityScope,
+            bearerToken: token.exposeSecret(),
+            expandSecretReferences: false
+        )
+    }
+
+    /// The service token to authenticate with, when one is available.
+    ///
+    /// The token is cached for the TTL so a refresh inside the window reads
+    /// the credential store once, and so `redactSecrets(in:)` can scrub it out
+    /// of a log line.
+    private func serviceTokenStatus() async -> InfisicalServiceTokenReadStatus {
+        let currentTime = now()
+        if let cached = cachedServiceToken, cached.expiresAt > currentTime {
+            return .ok(cached.token)
+        }
+
+        let status = await readServiceToken()
+        if case .ok(let token) = status {
+            cachedServiceToken = CachedServiceToken(
+                token: token,
+                expiresAt: now().addingTimeInterval(ttlSeconds)
+            )
+        }
+        return status
     }
 
     /// Scrubs any known in-memory secret values from an arbitrary string so logs or
@@ -457,6 +756,11 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
         }
         if let bearer = cachedBearer?.token.exposeSecret(), bearer.count >= 4, output.contains(bearer) {
             output = output.replacingOccurrences(of: bearer, with: "[REDACTED]")
+        }
+        if let serviceToken = cachedServiceToken?.token.exposeSecret(),
+           serviceToken.count >= 4,
+           output.contains(serviceToken) {
+            output = output.replacingOccurrences(of: serviceToken, with: "[REDACTED]")
         }
         return output
     }
@@ -512,22 +816,31 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
         return redacted
     }
 
-    private func fetchSecretsRaw(identity: InfisicalMachineIdentity, bearerToken: String) async throws -> [String] {
+    /// Reads the secrets in `scope` and caches them in memory.
+    ///
+    /// `expandSecretReferences` mirrors `electron/infisical-read.mjs`, which
+    /// asks the vault to expand a stored `${...}` reference; the machine
+    /// identity path keeps the value it has always sent.
+    private func fetchSecretsRaw(
+        scope: InfisicalVaultScope,
+        bearerToken: String,
+        expandSecretReferences: Bool
+    ) async throws -> [String] {
         let trimmedBearer = bearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedBearer.isEmpty else {
             throw InfisicalResolverError.missingMachineIdentity
         }
 
-        let base = identity.siteUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let base = scope.siteUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard var components = URLComponents(string: "\(base)/api/v3/secrets/raw") else {
             throw InfisicalResolverError.transportFailure(operation: "secrets list")
         }
         components.queryItems = [
-            URLQueryItem(name: "workspaceId", value: identity.projectId),
-            URLQueryItem(name: "environment", value: identity.environment),
-            URLQueryItem(name: "secretPath", value: identity.secretPath),
+            URLQueryItem(name: "workspaceId", value: scope.projectId),
+            URLQueryItem(name: "environment", value: scope.environment),
+            URLQueryItem(name: "secretPath", value: scope.secretPath),
             URLQueryItem(name: "viewSecretValue", value: "true"),
-            URLQueryItem(name: "expandSecretReferences", value: "false"),
+            URLQueryItem(name: "expandSecretReferences", value: expandSecretReferences ? "true" : "false"),
             URLQueryItem(name: "include_imports", value: "false"),
         ]
         guard let url = components.url else {
