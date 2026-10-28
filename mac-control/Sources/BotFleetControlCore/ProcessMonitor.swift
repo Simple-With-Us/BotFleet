@@ -230,7 +230,7 @@ public enum FleetProcessClassifier {
         if fleetServerMarkers.contains(where: { command.contains($0) }) { return true }
         guard command.contains(serverEntryMarker) else { return false }
         if isFleetPath(workingDirectory) { return true }
-        return command.contains("/BotFleet/")
+        return isFleetPath(command)
     }
 
     /// True when the command is this app.
@@ -239,25 +239,35 @@ public enum FleetProcessClassifier {
     }
 
     /// True when the path is inside a BotFleet checkout.
+    ///
+    /// The comparison is case-insensitive, because a checkout is a directory
+    /// name and the case of it is the owner's choice.
     public static func isFleetPath(_ path: String?) -> Bool {
         guard let path, !path.isEmpty else { return false }
-        return path.contains("/BotFleet/") || path.hasSuffix("/BotFleet")
+        let lower = path.lowercased()
+        return lower.contains("/botfleet/") || lower.hasSuffix("/botfleet")
+    }
+
+    /// True when the command is a Vite development server.
+    ///
+    /// The name has to be the development server and not something else that
+    /// starts with the same letters, so a test runner is never mistaken for
+    /// one.
+    public static func isViteProcess(command: String) -> Bool {
+        let tokens = command.split(whereSeparator: { $0 == " " || $0 == "/" })
+        return tokens.contains { token in
+            let name = String(token)
+            return name == "vite" || name.hasPrefix("vite.") || name.hasPrefix("vite-")
+        }
     }
 
     /// True when the command is a development server out of a BotFleet checkout.
     ///
     /// A development server is never part of the running fleet, so it is an
-    /// orphan even when a shell still holds it open.  The name has to be the
-    /// development server and not something else that starts with the same
-    /// letters, so a test runner is never mistaken for one.
+    /// orphan even when a shell still holds it open.
     public static func isDevelopmentServer(command: String, workingDirectory: String? = nil) -> Bool {
-        let tokens = command.split(whereSeparator: { $0 == " " || $0 == "/" })
-        let isVite = tokens.contains { token in
-            let name = String(token)
-            return name == "vite" || name.hasPrefix("vite.") || name.hasPrefix("vite-")
-        }
-        guard isVite else { return false }
-        return isFleetPath(workingDirectory) || command.contains("/BotFleet/") || command.contains("botfleet")
+        guard isViteProcess(command: command) else { return false }
+        return isFleetPath(workingDirectory) || isFleetPath(command) || command.contains("botfleet")
     }
 
     /// The fleet helper name in the command, when there is one.
@@ -319,7 +329,10 @@ public struct FleetProcessMonitor {
         let raw = FleetProcessMonitor.parseProcesses((try? commands.run("/bin/ps", ["-axo", "pid=,ppid=,command="])) ?? "")
         let paths = FleetProcessMonitor.parseExecutablePaths((try? commands.run("/bin/ps", ["-axo", "pid=,comm="])) ?? "")
         let candidates = FleetProcessMonitor.candidatePIDs(in: raw)
-        let directories = FleetProcessMonitor.parseWorkingDirectories(
+        // With no candidates there is nobody to ask about, and `lsof` without
+        // a process list would dump the working directory of every process on
+        // the machine.  The common case is a machine with no fleet in it.
+        let directories: [Int32: String] = candidates.isEmpty ? [:] : FleetProcessMonitor.parseWorkingDirectories(
             (try? commands.run("/usr/sbin/lsof", ["-a", "-d", "cwd", "-Fn"] + candidates.map { "-p" + String($0) })) ?? ""
         )
         let withPaths = raw.map { process in
@@ -403,9 +416,9 @@ public struct FleetProcessMonitor {
                 ?? FleetProcessClassifier.executableName(in: process.command)
             let looksLikeFleet = FleetProcessClassifier.fleetHelperNames.contains(name)
                 || process.command.contains(FleetProcessClassifier.serverEntryMarker)
-                || process.command.contains("vite")
+                || FleetProcessClassifier.isViteProcess(command: process.command)
                 || FleetProcessClassifier.isControlApp(command: process.command)
-                || process.command.contains("/BotFleet/")
+                || FleetProcessClassifier.isFleetPath(process.command)
             guard looksLikeFleet else { continue }
             candidates.insert(process.pid)
             // Walk up to the parent that could be driving it.

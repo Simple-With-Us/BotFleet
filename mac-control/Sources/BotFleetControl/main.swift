@@ -46,6 +46,14 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The fleet's processes and the ports they hold, read fresh each time the
     /// menu opens.
     private var fleetSnapshot = FleetProcessSnapshot.empty
+    /// The read that is in flight, so a newer one can take its place.
+    private var fleetSnapshotTask: Task<Void, Never>?
+    /// Keeps the newest read of the fleet's processes.
+    ///
+    /// Only the newest read may write the snapshot.  A slower older read that
+    /// finished later would otherwise overwrite a newer one and leave the
+    /// menu showing what was true before.
+    private let fleetSnapshotSequencer = FleetSnapshotSequencer()
     /// The remote machine providers the owner configured, by server id.
     private var vmProviderConfigs: [String: VMProviderConfiguration] = [:]
     /// The state of each remote machine, by server id.
@@ -158,8 +166,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             // The fleet's processes and ports change on their own, so they are
             // read fresh every time the menu opens.
-            self.fleetSnapshot = await Task.detached(priority: .userInitiated) { self.processMonitor.snapshot() }.value
-            self.rebuildMenu()
+            let fleetGeneration = self.fleetSnapshotSequencer.begin()
+            await self.readFleetSnapshot(generation: fleetGeneration)
             await self.refreshVMStates()
 
             // 2. Concurrently probe remote hosts with 5s timeout and update incrementally
@@ -563,12 +571,27 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Re-reads the fleet's processes and ports.
     ///
     /// The read is off the main thread, so the menu never waits for `ps` and
-    /// `lsof` to finish.
+    /// `lsof` to finish.  Rapid actions ask for a read each time, so the
+    /// newest read wins: the one before it is cancelled and its generation is
+    /// stale, and a stale read never writes the snapshot.
     private func refreshFleetSnapshot() {
-        Task { @MainActor in
-            self.fleetSnapshot = await Task.detached(priority: .userInitiated) { self.processMonitor.snapshot() }.value
-            self.rebuildMenu()
+        let generation = fleetSnapshotSequencer.begin()
+        fleetSnapshotTask?.cancel()
+        fleetSnapshotTask = Task { @MainActor in
+            await self.readFleetSnapshot(generation: generation)
         }
+    }
+
+    /// Reads the fleet's processes and ports, and puts them in the menu.
+    ///
+    /// Only the newest read writes the snapshot.  A slower older read that
+    /// finished later would otherwise overwrite a newer one and leave the menu
+    /// showing what was true before.
+    private func readFleetSnapshot(generation: Int) async {
+        let snapshot = await Task.detached(priority: .userInitiated) { self.processMonitor.snapshot() }.value
+        guard !Task.isCancelled, fleetSnapshotSequencer.isCurrent(generation) else { return }
+        self.fleetSnapshot = snapshot
+        self.rebuildMenu()
     }
 
     /// Stops one fleet process, after saying which one.
@@ -898,13 +921,21 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func removeServerAction(_ sender: NSMenuItem) {
         guard let host = sender.representedObject as? ServerHost else { return }
         guard confirm("Remove \(host.name)?", "BotFleet Control will stop monitoring \(host.baseURL.absoluteString).") else { return }
+        // The server's provider goes with it, so the menu never offers to
+        // stop a remote machine that belongs to a server that is gone.  The
+        // write has to land first: a failed write would leave the provider on
+        // disk, and clearing the memory would make it look deleted now and
+        // come back on the next launch.
+        do {
+            try vmProviderStore.remove(id: host.id)
+        } catch {
+            showError(error.localizedDescription)
+            return
+        }
         hostStore.removeHost(id: host.id)
         hostStatuses.removeValue(forKey: host.id)
         hostErrors.removeValue(forKey: host.id)
         hostApis.removeValue(forKey: host.id)
-        // The server's provider goes with it, so the menu never offers to
-        // stop a remote machine that belongs to a server that is gone.
-        _ = try? vmProviderStore.remove(id: host.id)
         vmProviderConfigs.removeValue(forKey: host.id)
         vmStates.removeValue(forKey: host.id)
         hosts = hostStore.loadHosts()

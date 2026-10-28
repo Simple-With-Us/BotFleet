@@ -109,7 +109,7 @@ public final class HetznerCloudVMProvider: VMProviderPlugin {
     }
 
     public func remoteVMState() async throws -> RemoteVMState {
-        let data = try await send(path: "servers/\(serverID)", method: "GET", timeout: 15)
+        let data = try await send(path: "servers/\(try validatedServerID())", method: "GET", timeout: 15)
         guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let server = payload["server"] as? [String: Any],
               let status = server["status"] as? String else {
@@ -135,7 +135,20 @@ public final class HetznerCloudVMProvider: VMProviderPlugin {
     }
 
     private func action(_ name: String) async throws {
-        _ = try await send(path: "servers/\(serverID)/actions/\(name)", method: "POST", timeout: 30)
+        _ = try await send(path: "servers/\(try validatedServerID())/actions/\(name)", method: "POST", timeout: 30)
+    }
+
+    /// The server's identifier, checked before it reaches the URL.
+    ///
+    /// A Hetzner server id is a number.  A stored value with a `/`, a `?` or a
+    /// `..` in it would change the path or the query that the bearer token is
+    /// sent with, so anything that is not a number is refused.
+    private func validatedServerID() throws -> String {
+        guard !serverID.isEmpty,
+              serverID.range(of: "[^0-9]", options: .regularExpression) == nil else {
+            throw VMProviderError.refused("The Hetzner server ID is not a number.")
+        }
+        return serverID
     }
 
     private func send(path: String, method: String, timeout: TimeInterval) async throws -> Data {

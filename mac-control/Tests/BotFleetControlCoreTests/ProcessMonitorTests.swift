@@ -252,6 +252,112 @@ final class ProcessMonitorTests: XCTestCase {
         try monitor.terminate(pid: 101)
         XCTAssertTrue(commands.killed.contains(101))
     }
+
+    // MARK: - The checkout's own spelling
+
+    func testALowercaseCheckoutIsStillTheFleet() {
+        // The case of a checkout directory is the owner's choice, so the
+        // fleet's own processes are found whichever way it is spelled.
+        XCTAssertTrue(FleetProcessClassifier.isFleetPath("/Users/jay/Code/botfleet"))
+        XCTAssertTrue(FleetProcessClassifier.isFleetPath("/Users/jay/Code/botfleet/server"))
+        XCTAssertTrue(FleetProcessClassifier.isFleetPath("/Users/jay/Code/BotFleet"))
+        XCTAssertFalse(FleetProcessClassifier.isFleetPath("/Users/jay/Code/botfleet-other"))
+        XCTAssertFalse(FleetProcessClassifier.isFleetPath(nil))
+    }
+
+    func testTheFleetServerIsFoundInALowercaseCheckout() {
+        XCTAssertTrue(FleetProcessClassifier.isFleetServer(command: "node server/index.ts",
+                                                           workingDirectory: "/Users/jay/Code/botfleet"))
+        XCTAssertTrue(FleetProcessClassifier.isFleetServer(command: "node /Users/jay/Code/botfleet/server/index.ts"))
+    }
+
+    func testALowercaseCheckoutIsACandidateForTheWorkingDirectory() {
+        let rows = [RawProcess(pid: 10, parentPID: 1, command: "node server/index.ts")]
+        XCTAssertTrue(FleetProcessMonitor.candidatePIDs(in: rows).contains(10))
+    }
+
+    // MARK: - The development server's own name
+
+    func testTheTestRunnerIsNotMistakenForTheDevelopmentServer() {
+        // "vitest" starts with the same letters, but it is not the
+        // development server.
+        XCTAssertFalse(FleetProcessClassifier.isViteProcess(command: "node /x/node_modules/.bin/vitest run"))
+        XCTAssertFalse(FleetProcessClassifier.isViteProcess(command: "node /x/invite"))
+        XCTAssertTrue(FleetProcessClassifier.isViteProcess(command: "node /x/node_modules/.bin/vite"))
+        XCTAssertTrue(FleetProcessClassifier.isViteProcess(command: "/x/node_modules/.bin/vite preview"))
+    }
+
+    func testTheTestRunnerIsNotAskedAboutItsWorkingDirectory() {
+        // Every extra candidate is another process in the `lsof` call, so a
+        // machine full of test workers would slow every menu open down.
+        let rows = [RawProcess(pid: 10, parentPID: 1, command: "node /x/node_modules/.bin/vitest run")]
+        XCTAssertFalse(FleetProcessMonitor.candidatePIDs(in: rows).contains(10))
+    }
+
+    // MARK: - The working directory probe
+
+    func testTheWorkingDirectoryProbeIsSkippedWhenThereIsNothingToAskAbout() {
+        // `lsof` without a process list would read the working directory of
+        // every process on the machine.
+        let commands = RecordingFleetCommands(systemHasFleet: false)
+        let monitor = FleetProcessMonitor(commands: commands, selfPID: 999)
+        _ = monitor.snapshot()
+        XCTAssertFalse(commands.askedForWorkingDirectories)
+    }
+
+    func testTheWorkingDirectoryProbeStillRunsForTheFleet() {
+        let commands = RecordingFleetCommands(systemHasFleet: true)
+        let monitor = FleetProcessMonitor(commands: commands, selfPID: 999)
+        _ = monitor.snapshot()
+        XCTAssertTrue(commands.askedForWorkingDirectories)
+    }
+}
+
+/// A stand-in for the system commands the monitor runs.
+private final class RecordingFleetCommands: CommandRunning {
+    /// True when the working directory of a process was asked about.
+    var askedForWorkingDirectories = false
+    /// True when the machine is running something of the fleet's.
+    private let systemHasFleet: Bool
+
+    init(systemHasFleet: Bool) {
+        self.systemHasFleet = systemHasFleet
+    }
+
+    func run(_ executable: String, _ arguments: [String]) throws -> String {
+        try run(executable, arguments, timeout: 15)
+    }
+
+    func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
+        try run(executable, arguments, environment: [:], timeout: timeout)
+    }
+
+    func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
+        if executable == "/usr/sbin/lsof", arguments.contains("cwd") {
+            askedForWorkingDirectories = true
+            return """
+            p101
+            fcwd
+            n/Users/jay/Code/BotFleet
+            """
+        }
+        if executable == "/usr/sbin/lsof" {
+            return ""
+        }
+        if executable == "/bin/ps", arguments.contains("pid=,comm=") {
+            return """
+            101 /usr/local/bin/node
+            """
+        }
+        if executable == "/bin/ps" {
+            guard systemHasFleet else { return "   1     0 /sbin/launchd" }
+            return """
+                   1     0 /sbin/launchd
+                 101     1 node /Users/jay/apps/BotFleet/agents/qdrant-proxy.js --port 6333
+            """
+        }
+        return ""
+    }
 }
 
 /// A stand-in for the system commands the monitor runs.

@@ -182,6 +182,29 @@ final class VMProviderTests: XCTestCase {
         }
     }
 
+    func testTheHetznerProviderRefusesAnIdentifierThatIsNotANumber() async throws {
+        // A stored identifier with a `/`, a `?` or a `..` in it would change
+        // the path the bearer token is sent to.
+        for identifier in ["../admin", "42/actions/shutdown", "42?x=1", ""] {
+            let session = makeSession { _ in (200, Data("{}".utf8)) }
+            let provider = HetznerCloudVMProvider(serverID: identifier, token: "secret", session: session)
+            do {
+                _ = try await provider.remoteVMState()
+                XCTFail("Expected the provider to refuse \(identifier)")
+            } catch let error as VMProviderError {
+                guard case .refused = error else { return XCTFail("Expected a refusal, got \(error)") }
+            }
+        }
+    }
+
+    func testTheHetznerProviderSendsNoRequestForAnIdentifierThatIsNotANumber() async throws {
+        StubbedRequests.last = nil
+        let session = makeSession { _ in (200, Data("{}".utf8)) }
+        let provider = HetznerCloudVMProvider(serverID: "42/../admin", token: "secret", session: session)
+        _ = try? await provider.startRemoteVM()
+        XCTAssertNil(StubbedRequests.last)
+    }
+
     func testTheStateLabelsAreReadable() {
         XCTAssertEqual(RemoteVMState.running.label, "Running 🟢")
         XCTAssertEqual(RemoteVMState.off.label, "Off ⚪")
