@@ -4,12 +4,19 @@ import Foundation
 public enum ManagedServiceState: Equatable {
     case running
     case stopped
+    /// The service is not running and nothing asked it to stop, so it
+    /// failed.
+    case failed
+    /// The service is not installed on this Mac.
+    case notInstalled
     case unknown
 
     public var label: String {
         switch self {
         case .running: return "running"
         case .stopped: return "stopped"
+        case .failed: return "failed"
+        case .notInstalled: return "not installed"
         case .unknown: return "unknown"
         }
     }
@@ -35,25 +42,8 @@ public struct ManagedServiceEntry: Equatable {
     }
 
     /// A short description of the entry for the menu.
-    ///
-    /// The wanted state is optional, so the patterns spell out `.some` and
-    /// `.none` rather than leaning on a bare `true` or `nil`.  A literal
-    /// pattern matched against an `Optional` is only understood as exhaustive
-    /// by newer Swift compilers; the explicit form is understood by every one
-    /// of them, so the same source builds on the CI's toolchain and on a
-    /// developer's Mac.
     public var summary: String {
-        switch (wanted, state) {
-        case (.some(true), .running): return "running"
-        case (.some(true), .stopped): return "stopped — wanted running"
-        case (.some(true), .unknown): return "unknown — wanted running"
-        case (.some(false), .running): return "running — not wanted"
-        case (.some(false), .stopped): return "stopped"
-        case (.some(false), .unknown): return "unknown"
-        case (.none, .running): return "running — wanted state unknown"
-        case (.none, .stopped): return "stopped — wanted state unknown"
-        case (.none, .unknown): return "unknown"
-        }
+        ManagedServices.summary(wanted: wanted, state: state)
     }
 }
 
@@ -62,6 +52,10 @@ public struct ManagedServiceEntry: Equatable {
 public enum ManagedServiceAction: Equatable {
     case start
     case stop
+    /// The service is stopped and started again.  This is never an
+    /// automatic action: a wanted state says whether a service runs, not that
+    /// it has to run again.
+    case restart
     case none
 }
 
@@ -79,6 +73,15 @@ public struct ManagedServices: Equatable {
         case running
         case stopped
         case unknown
+
+        /// The state as the fleet services list shows it.
+        public var managedState: ManagedServiceState {
+            switch self {
+            case .running: return .running
+            case .stopped: return .stopped
+            case .unknown: return .unknown
+            }
+        }
     }
 
     public let serverState: ServerState
@@ -135,10 +138,67 @@ public struct ManagedServices: Equatable {
     /// state is never acted on either: the Control app does not stop a service
     /// it cannot see, and it does not start one it cannot prove is missing.
     public static func action(for entry: ManagedServiceEntry) -> ManagedServiceAction {
-        switch (entry.wanted, entry.state) {
+        action(wanted: entry.wanted, state: entry.state)
+    }
+
+    /// The action that brings one service in line with its wanted state.
+    ///
+    /// A service that failed is brought back up when it is wanted: it is not
+    /// running and nothing asked it to stop.  A service that was stopped is
+    /// not brought back: something did ask it to stop, and the Control app
+    /// does not undo that on its own.
+    public static func action(wanted: Bool?, state: ManagedServiceState) -> ManagedServiceAction {
+        switch (wanted, state) {
         case (.some(true), .stopped): return .start
+        case (.some(true), .failed): return .start
         case (.some(false), .running): return .stop
         default: return .none
         }
+    }
+
+    /// A short description of a service for the menu.
+    ///
+    /// The wanted state is optional, so the patterns spell out `.some` and
+    /// `.none` rather than leaning on a bare `true` or `nil`.  A literal
+    /// pattern matched against an `Optional` is only understood as exhaustive
+    /// by newer Swift compilers; the explicit form is understood by every one
+    /// of them, so the same source builds on the CI's toolchain and on a
+    /// developer's Mac.
+    public static func summary(wanted: Bool?, state: ManagedServiceState) -> String {
+        switch (wanted, state) {
+        case (.some(true), .running): return "running"
+        case (.some(true), .stopped): return "stopped — wanted running"
+        case (.some(true), .failed): return "failed — wanted running"
+        case (.some(true), .notInstalled): return "not installed"
+        case (.some(true), .unknown): return "unknown — wanted running"
+        case (.some(false), .running): return "running — not wanted"
+        case (.some(false), .stopped): return "stopped"
+        case (.some(false), .failed): return "failed"
+        case (.some(false), .notInstalled): return "not installed"
+        case (.some(false), .unknown): return "unknown"
+        case (.none, .running): return "running — wanted state unknown"
+        case (.none, .stopped): return "stopped — wanted state unknown"
+        case (.none, .failed): return "failed — wanted state unknown"
+        case (.none, .notInstalled): return "not installed"
+        case (.none, .unknown): return "unknown"
+        }
+    }
+
+    /// Waits for a service to reach the wanted state and reports what was
+    /// seen.
+    ///
+    /// The observed state after a change is what is reported, so a manager
+    /// that refused the change is never reported as a success.  The state is
+    /// read again after every attempt, because the manager and the service
+    /// do not settle at the same moment.
+    public static func settle(to wanted: ManagedServiceState,
+                               attempts: Int,
+                               observe: () async -> ManagedServiceState) async -> ManagedServiceState {
+        for _ in 0..<attempts {
+            let next = await observe()
+            if next == wanted { return next }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return await observe()
     }
 }

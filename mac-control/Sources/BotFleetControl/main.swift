@@ -28,6 +28,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let presenceProbe = ServerPresenceProbe()
     private let mcpServer: McpServerControl?
     private let mcpServerProblem: String?
+    private let fleetServiceControl: FleetServiceControl
     private var item: NSStatusItem?
     private let menu = NSMenu()
     private var status: ControlStatus?
@@ -60,16 +61,25 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var vmStates: [String: RemoteVMState] = [:]
     private let processMonitor = FleetProcessMonitor()
     private let vmProviderStore = VMProviderStore()
+    /// The state of every fleet service, read fresh each time the menu
+    /// opens.
+    private var fleetServiceStates: [String: ManagedServiceState] = [:]
+    /// Keeps the newest read of the fleet services.
+    private let fleetServiceSequencer = FleetSnapshotSequencer()
 
     override init() {
+        let pm2 = PM2Client()
         do {
-            mcpServer = try McpServerControl()
+            let control = try McpServerControl(pm2: pm2)
+            mcpServer = control
             mcpServerProblem = nil
+            fleetServiceControl = FleetServiceControl(pm2: pm2, mcpServer: control)
         } catch {
             // The managed service list reports the problem in the menu instead of the
             // app refusing to start over it.
             mcpServer = nil
             mcpServerProblem = error.localizedDescription
+            fleetServiceControl = FleetServiceControl(pm2: pm2)
         }
         super.init()
     }
@@ -168,6 +178,10 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // read fresh every time the menu opens.
             let fleetGeneration = self.fleetSnapshotSequencer.begin()
             await self.readFleetSnapshot(generation: fleetGeneration)
+            // The fleet services are read the same way, so the menu shows
+            // what is true of them now.
+            await self.refreshFleetServiceStates()
+            self.rebuildMenu()
             await self.refreshVMStates()
 
             // 2. Concurrently probe remote hosts with 5s timeout and update incrementally
@@ -250,10 +264,100 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case .stop:
                 do { mcpServerState = try await mcpServer.setRunning(false) }
                 catch { problem = "BotFleet MCP Server: \(error.localizedDescription)" }
+            case .restart:
+                break
             case .none:
                 break
             }
         }
+        // The other fleet services are wanted on their own, so the Control
+        // app only brings one back when it failed.  One that was stopped on
+        // purpose stays stopped.
+        await refreshFleetServiceStates()
+        let fleetServices = FleetServices(serverState: serverState(), states: fleetServiceStates)
+        for entry in fleetServices.entries where entry.policy == .alwaysOn {
+            let action = FleetServices.automaticAction(for: entry)
+            guard action != .none else { continue }
+            do {
+                let observed = try await fleetServiceControl.perform(action, serviceID: entry.id)
+                fleetServiceStates[entry.id] = observed
+            } catch {
+                problem = "\(entry.title): \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Reads the state of every fleet service.
+    ///
+    /// The read is off the main thread, so the menu never waits for pm2 and
+    /// launchctl to answer.  Only the newest read may write the states, so a
+    /// slower older read does not leave the menu showing what was true
+    /// before the action the owner just took.
+    private func refreshFleetServiceStates() async {
+        let generation = fleetServiceSequencer.begin()
+        let serverState = self.serverState()
+        let states = await Task.detached(priority: .userInitiated) { [self] in
+            await self.fleetServiceControl.states(serverState: serverState)
+        }.value
+        guard fleetServiceSequencer.isCurrent(generation) else { return }
+        fleetServiceStates = states
+    }
+
+    /// Starts one fleet service.
+    @objc private func startFleetService(_ sender: NSMenuItem) {
+        performFleetServiceAction(.start, sender: sender)
+    }
+
+    /// Stops one fleet service.
+    @objc private func stopFleetService(_ sender: NSMenuItem) {
+        performFleetServiceAction(.stop, sender: sender)
+    }
+
+    /// Restarts one fleet service.
+    @objc private func restartFleetService(_ sender: NSMenuItem) {
+        performFleetServiceAction(.restart, sender: sender)
+    }
+
+    /// Changes one fleet service, and keeps what the Control app can see
+    /// afterwards.
+    private func performFleetServiceAction(_ action: ManagedServiceAction, sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        guard let service = FleetServices(serverState: serverState(),
+                                         states: fleetServiceStates).menuItems.first(where: { $0.id == id }) else { return }
+        guard confirmFleetServiceAction(action, service: service) else { return }
+        run { [self] in
+            let observed = try await self.fleetServiceControl.perform(action, serviceID: id)
+            self.fleetServiceStates[id] = observed
+        }
+    }
+
+    /// Asks before a fleet service is stopped or restarted.
+    ///
+    /// Stopping and restarting are the two actions that cut a running
+    /// process short, so the owner is told what they do before they happen.
+    private func confirmFleetServiceAction(_ action: ManagedServiceAction,
+                                           service: FleetServiceMenuItem) -> Bool {
+        switch action {
+        case .stop:
+            return confirm("Stop \(service.title)", stopBody(for: service))
+        case .restart:
+            return confirm("Restart \(service.title)",
+                           "It is stopped and started again right away.  Anything it was doing in the meantime is lost.")
+        default:
+            return true
+        }
+    }
+
+    /// What stopping one fleet service does.
+    private func stopBody(for service: FleetServiceMenuItem) -> String {
+        if service.id == FleetServiceRegistry.server.id {
+            return "The BotFleet Server stops right away.  Bot turns that are running are cut short, and macOS brings it back the next time you log in.  Use Stop Server And Local VMs… for a graceful stop."
+        }
+        if let descriptor = FleetServiceRegistry.descriptor(for: service.id),
+           case .launchAgent = descriptor.kind {
+            return "It stops right away.  macOS does not bring it back until the LaunchAgent is loaded again."
+        }
+        return "It stops right away, and pm2 leaves it stopped until you start it again."
     }
 
     /// Re-reads the server's own state after an action, and waits for that
@@ -276,6 +380,48 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         entry.state = state
         entry.representedObject = representedObject
         menu.addItem(entry)
+    }
+
+    /// The actions the owner may pick for one fleet service.
+    ///
+    /// The policy decides which actions there are, so the menu only draws
+    /// what the Control app is willing to do.
+    private func fleetServiceActions(for service: FleetServiceMenuItem, ready: Bool) -> NSMenu {
+        let actions = NSMenu()
+        for action in service.actions {
+            let entry = NSMenuItem(title: fleetServiceActionTitle(action),
+                                   action: fleetServiceActionSelector(action), keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = service.id
+            entry.isEnabled = ready && entry.action != nil
+            actions.addItem(entry)
+        }
+        if service.actions.isEmpty {
+            let empty = NSMenuItem(title: "No Action Is Available", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            actions.addItem(empty)
+        }
+        return actions
+    }
+
+    /// The title of one fleet service action.
+    private func fleetServiceActionTitle(_ action: ManagedServiceAction) -> String {
+        switch action {
+        case .start: return "Start"
+        case .stop: return "Stop"
+        case .restart: return "Restart"
+        case .none: return "No Action"
+        }
+    }
+
+    /// The action that carries out one fleet service action.
+    private func fleetServiceActionSelector(_ action: ManagedServiceAction) -> Selector? {
+        switch action {
+        case .start: return #selector(startFleetService(_:))
+        case .stop: return #selector(stopFleetService(_:))
+        case .restart: return #selector(restartFleetService(_:))
+        case .none: return nil
+        }
     }
 
     private func rebuildMenu() {
@@ -326,11 +472,18 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if status?.sharedVM?.state == "stopped" { add("Local VM requires recreation in BotFleet") }
         if !startup.supportsPolicy { add("Update BotFleet to manage server startup") }
 
-        let managedServices = ManagedServices(serverState: serverState(),
-                                    mcpServerState: mcpServerState)
-        if !managedServices.entries.isEmpty {
+        let fleetServices = FleetServices(serverState: serverState(), states: fleetServiceStates)
+        if !fleetServices.entries.isEmpty {
             menu.addItem(.separator())
-            for entry in managedServices.entries { add("\(entry.title): \(entry.summary)") }
+            let servicesMenu = NSMenu()
+            for service in fleetServices.menuItems {
+                let entry = NSMenuItem(title: "\(service.title): \(service.summary)", action: nil, keyEquivalent: "")
+                entry.submenu = fleetServiceActions(for: service, ready: ready)
+                servicesMenu.addItem(entry)
+            }
+            let header = NSMenuItem(title: fleetServices.menuTitle, action: nil, keyEquivalent: "")
+            header.submenu = servicesMenu
+            menu.addItem(header)
         }
 
         menu.addItem(.separator())

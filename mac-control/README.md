@@ -16,7 +16,11 @@ The bundled `botfleet-vm-control.mjs` helper reports managed Local VM state and 
 
 ## Managed Services
 
-The app calls the background services it keeps in line with the server the Managed Services list: the BotFleet MCP Server and anything else the server is supposed to be running.  The list is derived from what the server reports, so nothing about it is stored locally.  The MCP server is wanted exactly while the server is running, and the app reconciles the list in the background so a slow `pm2` call never holds the menu open.
+The “Fleet Services (12)” submenu lists every long-lived process BotFleet starts on this Mac, and what the Control app can see of each one right now.  The BotFleet MCP Server is first, then the BotFleet Server, the BotFleet Companion, and the pm2 applications the ecosystem file defines.  Each row opens into the actions that make sense for the state that was seen: Start, Stop and Restart.
+
+The state of a pm2 application is what `pm2 jlist` reports, and it is changed with `pm2 start`, `pm2 stop` and `pm2 restart`.  The ecosystem file is the way back when pm2 no longer remembers an application.  The state of a launchd agent is what `launchctl` reports, and it is changed with the same launchctl calls the startup policy already uses.  The BotFleet MCP Server keeps its own health endpoint at `127.0.0.1:8794/health` as the only authority on whether it is running.
+
+The wanted state of a service is derived and never stored.  The BotFleet MCP Server is wanted exactly while the BotFleet Server is running.  Every other service is wanted on its own: it is wanted unless something explicitly says otherwise, and the only thing that says otherwise is the service itself, so a service that was stopped on purpose stays stopped and one that failed is brought back up.  The list is reconciled in the background so a slow `pm2` call never holds the menu open.
 
 ## Monitored Processes & Ports
 

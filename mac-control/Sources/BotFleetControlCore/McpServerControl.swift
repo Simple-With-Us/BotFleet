@@ -22,6 +22,33 @@ public enum McpServerError: LocalizedError, Equatable {
     }
 }
 
+/// One pm2 application, as `pm2 jlist` reports it.
+struct PM2Application: Decodable {
+    let name: String
+    /// The state pm2 has for the application.
+    let status: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case environment = "pm2_env"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        if let environment = try? container.decode(PM2Environment.self, forKey: .environment) {
+            status = environment.status
+        } else {
+            status = nil
+        }
+    }
+}
+
+/// The part of a pm2 application the Control app reads.
+private struct PM2Environment: Decodable {
+    let status: String?
+}
+
 /// Runs the pm2 client that owns the BotFleet MCP server.
 ///
 /// The MCP server is a long-running pm2 job, so pm2 is the only thing that may
@@ -89,7 +116,104 @@ public struct PM2Client {
          "/usr/local/lib/node_modules/pm2/bin/pm2"].first { isExecutable($0) }
     }
 
-    private static func isExecutable(_ path: String) -> Bool {
+    /// The state of every pm2 application pm2 knows about, by name.
+    ///
+    /// `nil` means pm2 could not be asked at all, so nothing is known about
+    /// any application.  That is not the same as an empty answer, which
+    /// means pm2 knows about no application at all.
+    public func appStates() -> [String: ManagedServiceState]? {
+        guard isAvailable else { return nil }
+        guard let listing = try? run(["jlist"]) else { return nil }
+        return PM2Client.parseAppStates(listing)
+    }
+
+    /// The state of one pm2 application.
+    ///
+    /// An application pm2 has no record of is not running: it was never
+    /// started, and nothing asked it to stop.  A pm2 that cannot be reached
+    /// knows nothing, so the state is unknown.
+    public func state(ofApp name: String) -> ManagedServiceState {
+        guard let states = appStates() else { return .unknown }
+        return states[name] ?? .stopped
+    }
+
+    /// Reads the states out of what `pm2 jlist` printed.
+    ///
+    /// pm2 reports every application it knows about as JSON, with the state
+    /// of each one under its own environment.
+    public static func parseAppStates(_ listing: String) -> [String: ManagedServiceState] {
+        guard let data = listing.data(using: .utf8),
+              let applications = try? JSONDecoder().decode([PM2Application].self, from: data) else { return [:] }
+        var states: [String: ManagedServiceState] = [:]
+        for application in applications {
+            states[application.name] = state(forStatus: application.status)
+        }
+        return states
+    }
+
+    /// The state pm2's own status means.
+    ///
+    /// An application that errored is not running and nothing asked it to
+    /// stop, so it failed.  A status the Control app does not know is
+    /// unknown, and an unknown service is never acted on.
+    public static func state(forStatus status: String?) -> ManagedServiceState {
+        switch status {
+        case "online": return .running
+        case "stopped": return .stopped
+        case "errored": return .failed
+        default: return .unknown
+        }
+    }
+
+    /// Starts a pm2 application.
+    ///
+    /// `pm2 start <name>` only works while pm2 still remembers the job.  When
+    /// it does not, the ecosystem file is the way back, so it is tried second.
+    public func start(appName: String) throws {
+        do {
+            _ = try run(["start", appName])
+        } catch {
+            let ecosystem = home.appendingPathComponent(PM2Client.ecosystemPath)
+            guard FileManager.default.fileExists(atPath: ecosystem.path) else { throw error }
+            _ = try run(["start", ecosystem.path, "--only", appName])
+        }
+    }
+
+    /// Stops a pm2 application.
+    public func stop(appName: String) throws {
+        _ = try run(["stop", appName])
+    }
+
+    /// Restarts a pm2 application.
+    public func restart(appName: String) throws {
+        _ = try run(["restart", appName])
+    }
+
+    /// Brings one pm2 application to the wanted state and reports what was
+    /// seen.
+    ///
+    /// The observed state after the change is what is reported, so a manager
+    /// that refused the change is never reported as a success.  An unknown
+    /// observed state is never acted on: the Control app does not stop a
+    /// service it cannot see, and it does not start one it cannot prove is
+    /// missing.
+    @discardableResult
+    public func setRunning(_ running: Bool, appName: String, attempts: Int = 40) async throws -> ManagedServiceState {
+        let wanted: ManagedServiceState = running ? .running : .stopped
+        let current = state(ofApp: appName)
+        if current == wanted { return current }
+        if current == .unknown { return current }
+        if running {
+            try start(appName: appName)
+        } else {
+            try stop(appName: appName)
+        }
+        return await ManagedServices.settle(to: wanted, attempts: attempts) { self.state(ofApp: appName) }
+    }
+}
+
+private extension PM2Client {
+    static func isExecutable(_ path: String) -> Bool {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else { return false }
         return !isDirectory.boolValue
@@ -164,15 +288,15 @@ public final class McpServerControl {
     /// missing.
     @discardableResult
     public func setRunning(_ running: Bool, attempts: Int = 40) async throws -> ManagedServiceState {
+        let wanted: ManagedServiceState = running ? .running : .stopped
         let current = await state()
-        if current == (running ? .running : .stopped) { return current }
+        if current == wanted { return current }
         if current == .unknown { return current }
-        guard pm2.isAvailable else { throw McpServerError.managerMissing }
         do {
             if running {
-                try start()
+                try pm2.start(appName: PM2Client.mcpAppName)
             } else {
-                _ = try pm2.run(["stop", PM2Client.mcpAppName])
+                try pm2.stop(appName: PM2Client.mcpAppName)
             }
         } catch let error as McpServerError {
             throw error
@@ -188,26 +312,29 @@ public final class McpServerControl {
         } catch {
             throw McpServerError.refused("pm2 could not change the BotFleet MCP Server.")
         }
-        for _ in 0..<attempts {
-            let next = await state()
-            if next == (running ? .running : .stopped) { return next }
-            try? await Task.sleep(nanoseconds: 500_000_000)
-        }
-        return await state()
+        return await ManagedServices.settle(to: wanted, attempts: attempts) { await self.state() }
     }
 
-    /// Starts the MCP server through pm2.
+    /// Restarts the MCP server and reports what was seen.
     ///
-    /// `pm2 start <name>` only works while pm2 still remembers the job.  When
-    /// it does not, the ecosystem file is the way back, so it is tried second.
-    private func start() throws {
+    /// The MCP server keeps its own health endpoint as the only authority on
+    /// whether it is running, so the state that is reported is the one that
+    /// endpoint answers with.
+    @discardableResult
+    public func restart(attempts: Int = 40) async throws -> ManagedServiceState {
         do {
-            _ = try pm2.run(["start", PM2Client.mcpAppName])
+            try pm2.restart(appName: PM2Client.mcpAppName)
+        } catch let error as McpServerError {
+            throw error
+        } catch let error as CommandExitError {
+            throw McpServerError.refused(error.output.isEmpty
+                ? "pm2 could not restart the BotFleet MCP Server."
+                : error.output)
+        } catch StartupPolicyError.commandFailed {
+            throw McpServerError.refused("pm2 timed out before it could restart the BotFleet MCP Server.")
         } catch {
-            let ecosystem = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(PM2Client.ecosystemPath)
-            guard FileManager.default.fileExists(atPath: ecosystem.path) else { throw error }
-            _ = try pm2.run(["start", ecosystem.path, "--only", PM2Client.mcpAppName])
+            throw McpServerError.refused("pm2 could not restart the BotFleet MCP Server.")
         }
+        return await ManagedServices.settle(to: .running, attempts: attempts) { await self.state() }
     }
 }

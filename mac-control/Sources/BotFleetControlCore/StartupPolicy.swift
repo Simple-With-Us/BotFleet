@@ -99,6 +99,7 @@ public enum StartupPolicyError: LocalizedError {
     case bootIdentityUnavailable
     case launchAgentMissing
     case commandFailed
+    case refused(String)
 
     public var errorDescription: String? {
         switch self {
@@ -106,6 +107,7 @@ public enum StartupPolicyError: LocalizedError {
         case .bootIdentityUnavailable: return "Could not identify the current Mac boot session."
         case .launchAgentMissing: return "The BotFleet Server LaunchAgent is not installed.  Reinstall BotFleet."
         case .commandFailed: return "macOS could not change the BotFleet Server LaunchAgent.  Check its installation."
+        case .refused(let message): return message
         }
     }
 }
@@ -121,6 +123,16 @@ public enum InstalledServerState: Equatable {
     case stopped
     case running
     case unknown
+
+    /// The state as the fleet services list shows it.
+    public var managedState: ManagedServiceState {
+        switch self {
+        case .running: return .running
+        case .stopped: return .stopped
+        case .notInstalled: return .notInstalled
+        case .unknown: return .unknown
+        }
+    }
 }
 
 public final class StartupPolicy {
@@ -155,6 +167,14 @@ public final class StartupPolicy {
     private var session: URL { dataDirectory.appendingPathComponent("startup-session") }
     private var stopped: URL { dataDirectory.appendingPathComponent("stopped.marker") }
 
+    /// The label of the BotFleet Server LaunchAgent.
+    public static let serverAgentLabel = "app.botfleet.server"
+
+    /// The LaunchAgent plist that installs a label.
+    public func launchAgentPlist(label: String) -> URL {
+        home.appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
     public var supportsPolicy: Bool {
         guard let data = try? Data(contentsOf: wrapper),
               let source = String(data: data, encoding: .utf8) else { return false }
@@ -170,12 +190,22 @@ public final class StartupPolicy {
     public var startsAtLogin: Bool { loginPolicy == .enabled }
 
     public var installedServerState: InstalledServerState {
-        guard files.fileExists(atPath: agent.path) else { return .notInstalled }
+        state(ofAgent: StartupPolicy.serverAgentLabel)
+    }
+
+    /// The state of a launchd agent, by its label.
+    ///
+    /// An agent with a live process behind it is running.  An agent that is
+    /// loaded without one is stopped, and so is one that is not loaded at
+    /// all.  An agent whose plist is not installed is not installed, and a
+    /// launchctl that could not be asked is unknown.
+    public func state(ofAgent label: String) -> InstalledServerState {
+        guard files.fileExists(atPath: launchAgentPlist(label: label).path) else { return .notInstalled }
         let listing: String
         do { listing = try commands.run("/bin/launchctl", ["list"]) }
         catch { return .unknown }
         let row = listing.split(separator: "\n").first { line in
-            line.split(whereSeparator: \.isWhitespace).last == "app.botfleet.server"
+            line.split(whereSeparator: \.isWhitespace).last == Substring(label)
         }
         guard let row else { return .stopped }
         let pid = row.split(whereSeparator: \.isWhitespace).first ?? "-"
@@ -202,20 +232,62 @@ public final class StartupPolicy {
         let boot = try bootID()
         try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         try Data((boot + "\n").utf8).write(to: session, options: .atomic)
-        let domain = "gui/\(uid)"
-        let label = "\(domain)/app.botfleet.server"
-        _ = try commands.run("/bin/launchctl", ["enable", label])
-        if (try? commands.run("/bin/launchctl", ["print", label])) == nil {
-            _ = try commands.run("/bin/launchctl", ["bootstrap", domain, agent.path])
-        }
         let wasStopped = files.fileExists(atPath: stopped.path)
         if wasStopped { try files.removeItem(at: stopped) }
         do {
-            _ = try commands.run("/bin/launchctl", ["kickstart", label])
+            try startAgent(label: StartupPolicy.serverAgentLabel)
         } catch {
             if wasStopped { try? Data().write(to: stopped, options: .atomic) }
             throw error
         }
+    }
+
+    /// Starts a launchd agent: it is enabled, loaded if it is not loaded
+    /// yet, and kickstarted.
+    ///
+    /// The kickstart does not terminate a running instance, so starting an
+    /// agent that is already up leaves it alone.
+    public func startAgent(label: String) throws {
+        let plist = launchAgentPlist(label: label)
+        guard files.fileExists(atPath: plist.path) else {
+            throw StartupPolicyError.refused("The \(label) LaunchAgent is not installed on this Mac.")
+        }
+        let domain = "gui/\(uid)"
+        let full = "\(domain)/\(label)"
+        _ = try commands.run("/bin/launchctl", ["enable", full])
+        if (try? commands.run("/bin/launchctl", ["print", full])) == nil {
+            _ = try commands.run("/bin/launchctl", ["bootstrap", domain, plist.path])
+        }
+        _ = try commands.run("/bin/launchctl", ["kickstart", full])
+    }
+
+    /// Stops a launchd agent and leaves it stopped.
+    ///
+    /// The agent is booted out of the login domain, so launchd does not
+    /// bring it back on its own afterwards.
+    public func stopAgent(label: String) throws {
+        let full = "gui/\(uid)/\(label)"
+        do {
+            _ = try commands.run("/bin/launchctl", ["bootout", full])
+        } catch let error as CommandExitError {
+            throw StartupPolicyError.refused(error.output.isEmpty
+                ? "macOS could not stop the \(label) LaunchAgent."
+                : error.output)
+        }
+    }
+
+    /// Restarts a launchd agent.
+    ///
+    /// An agent that is not loaded is started instead, because there is
+    /// nothing to replace.  A loaded one is kickstarted with the running
+    /// instance replaced, so the agent comes back fresh.
+    public func restartAgent(label: String) throws {
+        let full = "gui/\(uid)/\(label)"
+        if (try? commands.run("/bin/launchctl", ["print", full])) == nil {
+            try startAgent(label: label)
+            return
+        }
+        _ = try commands.run("/bin/launchctl", ["kickstart", "-k", full])
     }
 
     private func bootID() throws -> String {
