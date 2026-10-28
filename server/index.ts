@@ -17063,6 +17063,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
       providerConfigBusy = true;
       try {
+        // A Sync Now is the operator asking for the configured token to be
+        // tried again:  a grant widened or a path created in the vault
+        // changes nothing about the token, so a token remembered as refused
+        // has to come back on an explicit retry.
+        infisical.retryRefusedTokens();
         await infisical.refresh("manual");
         await applyResolvedSecrets("manual");
       } finally {
@@ -19064,6 +19069,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // diagnostics re-apply below, so a DSN the store holds is already in
       // `cfg` when Sentry is reconfigured.
       if (patch.infisical !== undefined) {
+        // The same escape hatch as Sync Now:  a save that touches the
+        // Infisical settings is an explicit ask to try the configured token
+        // again, whatever the vault said about it last time.
+        infisical.retryRefusedTokens();
         await infisical.refresh("settings");
         await applyResolvedSecrets("settings");
         // Re-arm the poller: `start()` reads Refresh Minutes when it creates
