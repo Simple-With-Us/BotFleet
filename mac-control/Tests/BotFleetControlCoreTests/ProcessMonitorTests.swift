@@ -39,10 +39,47 @@ final class ProcessMonitorTests: XCTestCase {
         XCTAssertEqual(listeners[1].processName, "Python")
     }
 
+    func testAProcessWithNoNameDoesNotInheritThePreviousOne() {
+        // The name belongs to the process it was read with, so a record
+        // without one is not credited with the last record's name.
+        let listing = """
+        p76463
+        cnode
+        n*:6333
+        p76464
+        n*:8799
+        """
+        let listeners = FleetProcessMonitor.parseListeners(listing)
+        XCTAssertEqual(listeners.count, 2)
+        XCTAssertEqual(listeners[0].processName, "node")
+        XCTAssertNil(listeners[1].processName)
+    }
+
     func testThePortNumberIsTakenFromTheEnd() {
         XCTAssertEqual(FleetProcessMonitor.portNumber(from: "*:6333"), 6333)
         XCTAssertEqual(FleetProcessMonitor.portNumber(from: "127.0.0.1:8799"), 8799)
         XCTAssertNil(FleetProcessMonitor.portNumber(from: "*"))
+    }
+
+    func testTheExecutablePathIsReadSeparately() {
+        let listing = """
+               45222 /Users/jay/Applications/BotFleet Control.app/Contents/MacOS/BotFleetControl
+               101   /usr/local/bin/node
+        """
+        let paths = FleetProcessMonitor.parseExecutablePaths(listing)
+        XCTAssertEqual(paths[45222], "/Users/jay/Applications/BotFleet Control.app/Contents/MacOS/BotFleetControl")
+        XCTAssertEqual(paths[101], "/usr/local/bin/node")
+    }
+
+    func testAnApplicationPathWithASpaceStillGetsItsOwnName() {
+        // The command line is split on spaces, so the name has to come from
+        // the executable's own path.
+        let rows = [RawProcess(pid: 45222, parentPID: 1,
+                               command: "/Users/jay/Applications/BotFleet Control.app/Contents/MacOS/BotFleetControl",
+                               executablePath: "/Users/jay/Applications/BotFleet Control.app/Contents/MacOS/BotFleetControl")]
+        let classified = FleetProcessClassifier.classify(processes: rows, portsByPID: [:], selfPID: 999)
+        XCTAssertEqual(classified[0].name, "BotFleetControl")
+        XCTAssertTrue(classified[0].isFleetProcess)
     }
 
     // MARK: - Telling the fleet's processes from everyone else's
@@ -72,6 +109,35 @@ final class ProcessMonitorTests: XCTestCase {
         let helper = classified.first { $0.pid == 101 }
         XCTAssertEqual(helper?.isFleetProcess, true)
         XCTAssertEqual(helper?.isOrphan, false)
+    }
+
+    func testAServerStartedFromARelativePathStillDrivesItsHelpers() {
+        // The launcher starts the server with `server/index.ts` and a working
+        // directory, so the command line alone says nothing about which
+        // repository it is from.  The working directory does.
+        let rows = [
+            RawProcess(pid: 100, parentPID: 1,
+                       command: "node --experimental-strip-types server/index.ts",
+                       workingDirectory: "/Users/jay/Code/BotFleet"),
+            RawProcess(pid: 101, parentPID: 100,
+                       command: "node /Users/jay/Code/BotFleet/agents/qdrant-proxy.js",
+                       workingDirectory: "/Users/jay/Code/BotFleet"),
+        ]
+        let classified = FleetProcessClassifier.classify(processes: rows, portsByPID: [:], selfPID: 999)
+        XCTAssertEqual(classified.first { $0.pid == 100 }?.isFleetProcess, true)
+        XCTAssertEqual(classified.first { $0.pid == 100 }?.isOrphan, false)
+        XCTAssertEqual(classified.first { $0.pid == 101 }?.isOrphan, false)
+    }
+
+    func testARelativeServerPathOutsideAFleetCheckoutIsNotTheFleet() {
+        // The same relative path in somebody else's checkout is not the
+        // fleet's server.
+        let rows = [RawProcess(pid: 100, parentPID: 1,
+                               command: "node --experimental-strip-types server/index.ts",
+                               workingDirectory: "/Users/jay/Code/Congress.Trade")]
+        let classified = FleetProcessClassifier.classify(processes: rows, portsByPID: [:], selfPID: 999)
+        XCTAssertFalse(classified[0].isFleetProcess)
+        XCTAssertFalse(classified[0].isOrphan)
     }
 
     func testAHelperTheServerLeftBehindIsAnOrphan() {
@@ -148,9 +214,26 @@ final class ProcessMonitorTests: XCTestCase {
         XCTAssertEqual(snapshot.listeners[0].port, 6333)
     }
 
+    func testAPortHeldBySomethingOutsideTheFleetIsNotListed() {
+        // Port 8799 is one the fleet uses, but the app only offers to stop the
+        // ports the fleet's own processes hold.
+        let monitor = FleetProcessMonitor(commands: FakeFleetCommands(), selfPID: 999)
+        let snapshot = monitor.snapshot()
+        XCTAssertFalse(snapshot.listeners.contains { $0.port == 8799 })
+    }
+
     func testAPortNobodyHoldsCannotBeFreed() {
         let monitor = FleetProcessMonitor(commands: FakeFleetCommands(), selfPID: 999)
         XCTAssertThrowsError(try monitor.freePort(9999)) { error in
+            guard case FleetProcessError.notFound = error else {
+                return XCTFail("Expected a not-found error, got \(error)")
+            }
+        }
+    }
+
+    func testAPortHeldBySomethingOutsideTheFleetCannotBeFreed() {
+        let monitor = FleetProcessMonitor(commands: FakeFleetCommands(), selfPID: 999)
+        XCTAssertThrowsError(try monitor.freePort(8799)) { error in
             guard case FleetProcessError.notFound = error else {
                 return XCTFail("Expected a not-found error, got \(error)")
             }
@@ -184,10 +267,22 @@ private final class FakeFleetCommands: CommandRunning {
     }
 
     func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
+        if executable == "/bin/ps", arguments.contains("pid=,comm=") {
+            return """
+            101 /usr/local/bin/node
+            """
+        }
         if executable == "/bin/ps" {
             return """
                    1     0 /sbin/launchd
                    101     1 node /Users/jay/apps/BotFleet/agents/qdrant-proxy.js --port 6333
+            """
+        }
+        if executable == "/usr/sbin/lsof", arguments.contains("cwd") {
+            return """
+            p101
+            fcwd
+            n/Users/jay/Code/BotFleet
             """
         }
         if executable == "/usr/sbin/lsof" {
@@ -195,6 +290,9 @@ private final class FakeFleetCommands: CommandRunning {
             p101
             cnode
             n*:6333
+            p500
+            cpostgres
+            n*:8799
             """
         }
         if executable == "/bin/kill", let pid = Int32(arguments.last ?? "") {

@@ -561,9 +561,14 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Re-reads the fleet's processes and ports.
+    ///
+    /// The read is off the main thread, so the menu never waits for `ps` and
+    /// `lsof` to finish.
     private func refreshFleetSnapshot() {
-        fleetSnapshot = processMonitor.snapshot()
-        rebuildMenu()
+        Task { @MainActor in
+            self.fleetSnapshot = await Task.detached(priority: .userInitiated) { self.processMonitor.snapshot() }.value
+            self.rebuildMenu()
+        }
     }
 
     /// Stops one fleet process, after saying which one.
@@ -624,18 +629,28 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Reads the state of every configured remote machine.
+    ///
+    /// The machines are asked at the same time, so a slow provider does not
+    /// hold up the rest of them.
     private func refreshVMStates() async {
         let configs = await Task.detached(priority: .userInitiated) { self.vmProviderStore.loadConfigurations() }.value
         vmProviderConfigs = Dictionary(configs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        for config in configs {
-            guard let provider = VMProviderFactory.makeProvider(for: config, hosts: hosts) else {
-                vmStates[config.id] = .unknown
-                continue
+        await withTaskGroup(of: (String, RemoteVMState).self) { group in
+            for config in configs {
+                let hosts = self.hosts
+                group.addTask {
+                    guard let provider = VMProviderFactory.makeProvider(for: config, hosts: hosts) else {
+                        return (config.id, .unknown)
+                    }
+                    do {
+                        return (config.id, try await provider.remoteVMState())
+                    } catch {
+                        return (config.id, .unknown)
+                    }
+                }
             }
-            do {
-                vmStates[config.id] = try await provider.remoteVMState()
-            } catch {
-                vmStates[config.id] = .unknown
+            for await (id, state) in group {
+                vmStates[id] = state
             }
         }
     }
@@ -887,6 +902,11 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hostStatuses.removeValue(forKey: host.id)
         hostErrors.removeValue(forKey: host.id)
         hostApis.removeValue(forKey: host.id)
+        // The server's provider goes with it, so the menu never offers to
+        // stop a remote machine that belongs to a server that is gone.
+        _ = try? vmProviderStore.remove(id: host.id)
+        vmProviderConfigs.removeValue(forKey: host.id)
+        vmStates.removeValue(forKey: host.id)
         hosts = hostStore.loadHosts()
         rebuildMenu()
     }

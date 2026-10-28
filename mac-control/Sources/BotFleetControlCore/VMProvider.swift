@@ -90,7 +90,11 @@ public final class BotFleetServerVMProvider: VMProviderPlugin {
 ///
 /// The API token is the caller's; the app never keeps one of its own.
 public final class HetznerCloudVMProvider: VMProviderPlugin {
-    public static let apiBase = URL(string: "https://api.hetzner.cloud/v1")!
+    /// The provider's API endpoint.
+    ///
+    /// It is read at runtime rather than forced, because a parsing failure
+    /// here would otherwise take the menu down with it.
+    public static var apiBase: URL? { URL(string: "https://api.hetzner.cloud/v1") }
 
     public let providerID = "hetzner-cloud"
     public let displayName = "Hetzner Cloud VM"
@@ -105,8 +109,7 @@ public final class HetznerCloudVMProvider: VMProviderPlugin {
     }
 
     public func remoteVMState() async throws -> RemoteVMState {
-        let url = Self.apiBase.appendingPathComponent("servers/\(serverID)")
-        let data = try await send(url, method: "GET", timeout: 15)
+        let data = try await send(path: "servers/\(serverID)", method: "GET", timeout: 15)
         guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let server = payload["server"] as? [String: Any],
               let status = server["status"] as? String else {
@@ -132,11 +135,14 @@ public final class HetznerCloudVMProvider: VMProviderPlugin {
     }
 
     private func action(_ name: String) async throws {
-        let url = Self.apiBase.appendingPathComponent("servers/\(serverID)/actions/\(name)")
-        _ = try await send(url, method: "POST", timeout: 30)
+        _ = try await send(path: "servers/\(serverID)/actions/\(name)", method: "POST", timeout: 30)
     }
 
-    private func send(_ url: URL, method: String, timeout: TimeInterval) async throws -> Data {
+    private func send(path: String, method: String, timeout: TimeInterval) async throws -> Data {
+        guard let base = Self.apiBase else {
+            throw VMProviderError.refused("The Hetzner Cloud endpoint could not be read.")
+        }
+        let url = base.appendingPathComponent(path)
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = timeout
@@ -177,9 +183,11 @@ public final class CustomScriptVMProvider: VMProviderPlugin {
 
     public func remoteVMState() async throws -> RemoteVMState {
         let output = (try? commands.run(command, arguments + ["status"])) ?? ""
-        let text = output.lowercased()
-        if text.contains("running") { return .running }
-        if text.contains("off") || text.contains("stopped") { return .off }
+        // The script's answer is compared exactly, because a substring match
+        // would read "not running" as running.
+        let answer = output.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if answer == "running" { return .running }
+        if answer == "off" || answer == "stopped" { return .off }
         return .unknown
     }
 
@@ -290,7 +298,13 @@ public final class VMProviderStore {
         let data = try JSONEncoder().encode(configs)
         let tempURL = dir.appendingPathComponent("control-vm-plugins.\(UUID().uuidString).tmp")
         defer { try? FileManager.default.removeItem(at: tempURL) }
-        try data.write(to: tempURL, options: .atomic)
+        // The file holds an API token, so it is created with owner-only
+        // permissions rather than written wide and tightened afterwards.
+        guard FileManager.default.createFile(atPath: tempURL.path, contents: nil,
+                                             attributes: [.posixPermissions: 0o600]) else {
+            throw VMProviderError.refused("The provider configuration could not be written.")
+        }
+        try data.write(to: tempURL)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempURL.path)
         if FileManager.default.fileExists(atPath: fileURL.path) {
             _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: tempURL)
@@ -323,12 +337,16 @@ public final class VMProviderStore {
 /// Builds the plugin a configuration asks for.
 public enum VMProviderFactory {
     /// The plugin for one configuration, or nil when it cannot be built.
+    ///
+    /// A configuration whose server has been removed builds nothing.  Falling
+    /// back to the local server would mean that "Stop Remote VM" on a server
+    /// that is gone would stop the local machine's virtual machines instead.
     public static func makeProvider(for config: VMProviderConfiguration,
                                     hosts: [ServerHost],
                                     session: URLSession = .shared) -> VMProviderPlugin? {
         switch config.providerID {
         case "botfleet-server":
-            let host = hosts.first { $0.id == config.id } ?? .defaultLocal
+            guard let host = hosts.first(where: { $0.id == config.id }) else { return nil }
             return BotFleetServerVMProvider(api: ControlAPI(session: session, host: host))
         case "hetzner-cloud":
             guard let serverID = config.remoteVMID, !serverID.isEmpty,

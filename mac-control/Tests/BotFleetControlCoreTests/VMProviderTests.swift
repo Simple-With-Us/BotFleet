@@ -95,12 +95,36 @@ final class VMProviderTests: XCTestCase {
         XCTAssertNil(VMProviderFactory.makeProvider(for: unknown, hosts: hosts))
     }
 
+    func testAProviderForARemovedServerBuildsNothing() {
+        // Falling back to the local server would mean that stopping a remote
+        // machine that is gone would stop the local machine's virtual
+        // machines instead.
+        let removed = VMProviderConfiguration(id: "server-that-was-removed",
+                                              providerID: "botfleet-server",
+                                              displayName: "BotFleet Server VM")
+        XCTAssertNil(VMProviderFactory.makeProvider(for: removed, hosts: [ServerHost.defaultLocal]))
+    }
+
     // MARK: - Reading the machine
 
     func testTheScriptProviderReadsTheStateFromItsOutput() async throws {
         let provider = CustomScriptVMProvider(command: "/tmp/vm.sh", commands: ScriptCommands())
         let state = try await provider.remoteVMState()
         XCTAssertEqual(state, .running)
+    }
+
+    func testTheScriptProviderIsNotFooledByItsOwnWording() async throws {
+        // "not running" says the machine is not running, and a substring
+        // match would read it as running.
+        let provider = CustomScriptVMProvider(command: "/tmp/vm.sh", commands: ScriptCommands(answer: "not running"))
+        let state = try await provider.remoteVMState()
+        XCTAssertEqual(state, .unknown)
+    }
+
+    func testTheScriptProviderReadsAStoppedMachine() async throws {
+        let provider = CustomScriptVMProvider(command: "/tmp/vm.sh", commands: ScriptCommands(answer: "stopped"))
+        let state = try await provider.remoteVMState()
+        XCTAssertEqual(state, .off)
     }
 
     func testTheScriptProviderCallsTheScriptWithTheAction() async throws {
@@ -182,6 +206,11 @@ final class VMProviderTests: XCTestCase {
 /// A stand-in for the owner's script.
 private final class ScriptCommands: CommandRunning {
     var calls: [[String]] = []
+    private let answer: String
+
+    init(answer: String = "running") {
+        self.answer = answer
+    }
 
     func run(_ executable: String, _ arguments: [String]) throws -> String {
         try run(executable, arguments, timeout: 15)
@@ -193,7 +222,7 @@ private final class ScriptCommands: CommandRunning {
 
     func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
         calls.append([executable] + arguments)
-        if arguments.last == "status" { return "running\n" }
+        if arguments.last == "status" { return answer + "\n" }
         return ""
     }
 }

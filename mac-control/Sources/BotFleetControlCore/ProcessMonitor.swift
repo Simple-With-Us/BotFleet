@@ -5,11 +5,26 @@ public struct RawProcess: Equatable, Sendable {
     public let pid: Int32
     public let parentPID: Int32
     public let command: String
+    /// The executable's own path, when the system could name it.
+    ///
+    /// The command line is split on spaces, and an application path can hold
+    /// one, so the path is read separately instead of being guessed at from
+    /// the command.
+    public let executablePath: String?
+    /// The directory the process is working in, when the system could name it.
+    ///
+    /// The server is started from a relative path, so its command line says
+    /// nothing about which repository it is from.  The working directory does,
+    /// and it is what tells the fleet's own processes from everyone else's.
+    public let workingDirectory: String?
 
-    public init(pid: Int32, parentPID: Int32, command: String) {
+    public init(pid: Int32, parentPID: Int32, command: String,
+                executablePath: String? = nil, workingDirectory: String? = nil) {
         self.pid = pid
         self.parentPID = parentPID
         self.command = command
+        self.executablePath = executablePath
+        self.workingDirectory = workingDirectory
     }
 }
 
@@ -21,6 +36,8 @@ public struct FleetProcess: Equatable, Identifiable, Sendable {
     /// `qdrant-proxy` instead of `node`.
     public let name: String
     public let command: String
+    /// The directory the process is working in, when the system could name it.
+    public let workingDirectory: String?
     /// The TCP ports this process is listening on.
     public let ports: [Int]
     /// True when the process belongs to the fleet, whether or not it is wanted.
@@ -32,11 +49,13 @@ public struct FleetProcess: Equatable, Identifiable, Sendable {
     public var id: Int32 { pid }
 
     public init(pid: Int32, parentPID: Int32, name: String, command: String,
-                ports: [Int], isFleetProcess: Bool, isOrphan: Bool) {
+                workingDirectory: String? = nil, ports: [Int],
+                isFleetProcess: Bool, isOrphan: Bool) {
         self.pid = pid
         self.parentPID = parentPID
         self.name = name
         self.command = command
+        self.workingDirectory = workingDirectory
         self.ports = ports
         self.isFleetProcess = isFleetProcess
         self.isOrphan = isOrphan
@@ -50,7 +69,7 @@ public struct FleetProcess: Equatable, Identifiable, Sendable {
     }
 }
 
-/// One TCP port that something on this Mac is listening on.
+/// One TCP port that a fleet process is listening on.
 public struct PortListener: Equatable, Identifiable, Sendable {
     public let port: Int
     /// The process holding the port, when the system could name it.
@@ -128,8 +147,14 @@ public enum FleetProcessClassifier {
         "BotFleet.app",
         "app.botfleet.server",
         "botfleet-companion",
-        "BotFleet/server/index.",
     ]
+
+    /// The path inside a checkout that the server is started from.
+    ///
+    /// The launcher runs it as a relative path, so the command line is
+    /// `server/index.ts` with no repository in it.  The working directory is
+    /// what says which checkout it is.
+    public static let serverEntryMarker = "server/index"
 
     /// Markers that identify this app.
     public static let controlAppMarkers = [
@@ -143,9 +168,6 @@ public enum FleetProcessClassifier {
         "/pm2/",
         "pm2: ",
     ]
-
-    /// The ports the fleet uses.
-    public static let knownPorts: Set<Int> = [8799, 8800, 8810, 8820, 5173, 6333, 6334, 12419]
 
     /// Classifies the processes the system reported.
     ///
@@ -161,23 +183,20 @@ public enum FleetProcessClassifier {
         for process in processes {
             // PID 1 is launchd and this app is not a target of itself.
             guard process.pid > 1, process.pid != selfPID else { continue }
-            let name = helperName(in: process.command) ?? executableName(in: process.command)
+            let name = helperName(in: process.command)
+                ?? executableName(in: process.command, executablePath: process.executablePath)
             let ports = (portsByPID[process.pid] ?? []).sorted()
-            let isHelper = fleetHelperNames.contains(name)
-            let isServer = isFleetServer(command: process.command)
-            let isControlApp = isControlApp(command: process.command)
-            let isDevelopmentServer = isDevelopmentServer(command: process.command)
-            // Only the fleet's own processes are listed.  A checkout that is
-            // running somebody else's tests is not part of the fleet, so the
-            // app never offers to stop it.
-            let isFleet = isHelper || isServer || isControlApp || isDevelopmentServer
+            let isFleet = isFleetProcess(command: process.command,
+                                         name: name,
+                                         workingDirectory: process.workingDirectory)
             var isOrphan = false
-            if isHelper {
+            if fleetHelperNames.contains(name) {
                 // A helper the server or a process manager is driving is doing
                 // its job.  One that is not was left behind and is only
                 // holding a port.
                 isOrphan = !hasFleetAncestor(pid: process.pid, byPID: byPID)
-            } else if isDevelopmentServer {
+            } else if isDevelopmentServer(command: process.command,
+                                          workingDirectory: process.workingDirectory) {
                 // A development server is never part of the running fleet.
                 isOrphan = true
             }
@@ -185,6 +204,7 @@ public enum FleetProcessClassifier {
                                       parentPID: process.parentPID,
                                       name: name,
                                       command: process.command,
+                                      workingDirectory: process.workingDirectory,
                                       ports: ports,
                                       isFleetProcess: isFleet,
                                       isOrphan: isOrphan))
@@ -193,22 +213,35 @@ public enum FleetProcessClassifier {
     }
 
     /// True when the command belongs to the fleet.
-    public static func isFleetProcess(command: String, name: String) -> Bool {
+    public static func isFleetProcess(command: String, name: String, workingDirectory: String? = nil) -> Bool {
         if fleetHelperNames.contains(name) { return true }
-        if isFleetServer(command: command) { return true }
+        if isFleetServer(command: command, workingDirectory: workingDirectory) { return true }
         if isControlApp(command: command) { return true }
-        if isDevelopmentServer(command: command) { return true }
+        if isDevelopmentServer(command: command, workingDirectory: workingDirectory) { return true }
         return false
     }
 
-    /// True when the command is a BotFleet server process.
-    public static func isFleetServer(command: String) -> Bool {
-        fleetServerMarkers.contains(where: { command.contains($0) })
+    /// True when the command is the BotFleet server.
+    ///
+    /// The launcher runs it from a relative path, so the command line alone
+    /// cannot say which repository it is from.  The working directory can, and
+    /// an absolute path in the command line can as well.
+    public static func isFleetServer(command: String, workingDirectory: String? = nil) -> Bool {
+        if fleetServerMarkers.contains(where: { command.contains($0) }) { return true }
+        guard command.contains(serverEntryMarker) else { return false }
+        if isFleetPath(workingDirectory) { return true }
+        return command.contains("/BotFleet/")
     }
 
     /// True when the command is this app.
     public static func isControlApp(command: String) -> Bool {
         controlAppMarkers.contains(where: { command.contains($0) })
+    }
+
+    /// True when the path is inside a BotFleet checkout.
+    public static func isFleetPath(_ path: String?) -> Bool {
+        guard let path, !path.isEmpty else { return false }
+        return path.contains("/BotFleet/") || path.hasSuffix("/BotFleet")
     }
 
     /// True when the command is a development server out of a BotFleet checkout.
@@ -217,14 +250,14 @@ public enum FleetProcessClassifier {
     /// orphan even when a shell still holds it open.  The name has to be the
     /// development server and not something else that starts with the same
     /// letters, so a test runner is never mistaken for one.
-    public static func isDevelopmentServer(command: String) -> Bool {
+    public static func isDevelopmentServer(command: String, workingDirectory: String? = nil) -> Bool {
         let tokens = command.split(whereSeparator: { $0 == " " || $0 == "/" })
         let isVite = tokens.contains { token in
             let name = String(token)
             return name == "vite" || name.hasPrefix("vite.") || name.hasPrefix("vite-")
         }
         guard isVite else { return false }
-        return command.contains("/BotFleet/") || command.contains("botfleet")
+        return isFleetPath(workingDirectory) || command.contains("/BotFleet/") || command.contains("botfleet")
     }
 
     /// The fleet helper name in the command, when there is one.
@@ -237,7 +270,14 @@ public enum FleetProcessClassifier {
     }
 
     /// The executable's own name.
-    public static func executableName(in command: String) -> String {
+    ///
+    /// The executable's path is used when the system named it, because an
+    /// application path can hold a space and the command line is split on
+    /// spaces.
+    public static func executableName(in command: String, executablePath: String? = nil) -> String {
+        if let executablePath, !executablePath.isEmpty {
+            return URL(fileURLWithPath: executablePath).lastPathComponent
+        }
         let first = command.split(separator: " ", maxSplits: 1).first.map(String.init) ?? command
         return URL(fileURLWithPath: first).lastPathComponent
     }
@@ -253,7 +293,7 @@ public enum FleetProcessClassifier {
         while let parent = current, parent > 1, guard_ < 32 {
             guard_ += 1
             guard let row = byPID[parent] else { return false }
-            if isFleetServer(command: row.command) { return true }
+            if isFleetServer(command: row.command, workingDirectory: row.workingDirectory) { return true }
             if managerMarkers.contains(where: { row.command.contains($0) }) { return true }
             current = row.parentPID
         }
@@ -277,6 +317,18 @@ public struct FleetProcessMonitor {
     /// than guessed at, and a port with no listener is left out too.
     public func snapshot() -> FleetProcessSnapshot {
         let raw = FleetProcessMonitor.parseProcesses((try? commands.run("/bin/ps", ["-axo", "pid=,ppid=,command="])) ?? "")
+        let paths = FleetProcessMonitor.parseExecutablePaths((try? commands.run("/bin/ps", ["-axo", "pid=,comm="])) ?? "")
+        let candidates = FleetProcessMonitor.candidatePIDs(in: raw)
+        let directories = FleetProcessMonitor.parseWorkingDirectories(
+            (try? commands.run("/usr/sbin/lsof", ["-a", "-d", "cwd", "-Fn"] + candidates.map { "-p" + String($0) })) ?? ""
+        )
+        let withPaths = raw.map { process in
+            RawProcess(pid: process.pid,
+                       parentPID: process.parentPID,
+                       command: process.command,
+                       executablePath: paths[process.pid],
+                       workingDirectory: directories[process.pid])
+        }
         let lsofOutput = (try? commands.run("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"])) ?? ""
         let listeners = FleetProcessMonitor.parseListeners(lsofOutput)
         var portsByPID: [Int32: [Int]] = [:]
@@ -284,17 +336,18 @@ public struct FleetProcessMonitor {
             guard let pid = listener.pid else { continue }
             portsByPID[pid, default: []].append(listener.port)
         }
-        let classified = FleetProcessClassifier.classify(processes: raw, portsByPID: portsByPID, selfPID: selfPID)
+        let classified = FleetProcessClassifier.classify(processes: withPaths, portsByPID: portsByPID, selfPID: selfPID)
         // The menu is about the fleet and not about every process on the Mac.
         let fleet = classified.filter { $0.isFleetProcess }
         var fleetByPID: [Int32: FleetProcess] = [:]
         for process in fleet { fleetByPID[process.pid] = process }
-        // Only the ports the fleet is known to use are listed, so the menu is
-        // about the fleet and not about every port on the Mac.
+        // Only the ports the fleet's own processes hold are listed.  A port
+        // that something else on the Mac happens to use is not the fleet's,
+        // and the app never offers to stop it.
         let known = listeners
             .filter { listener in
-                guard let pid = listener.pid else { return FleetProcessClassifier.knownPorts.contains(listener.port) }
-                return fleetByPID[pid] != nil || FleetProcessClassifier.knownPorts.contains(listener.port)
+                guard let pid = listener.pid else { return false }
+                return fleetByPID[pid] != nil
             }
             .sorted { $0.port < $1.port }
         return FleetProcessSnapshot(processes: fleet, listeners: known)
@@ -318,15 +371,53 @@ public struct FleetProcessMonitor {
 
     /// Stops whatever is holding a port.
     ///
+    /// The holder has to be one of the fleet's own processes, and it is
+    /// checked again here, because the port may have been taken over by
+    /// something else since the menu was drawn.
+    ///
     /// - Returns: the PID that was stopped.
     @discardableResult
     public func freePort(_ port: Int) throws -> Int32 {
-        guard let listener = snapshot().listeners.first(where: { $0.port == port }),
+        let snapshot = snapshot()
+        guard let listener = snapshot.listeners.first(where: { $0.port == port }),
               let pid = listener.pid else {
             throw FleetProcessError.notFound("Nothing is holding port \(port).")
         }
+        guard snapshot.processes.contains(where: { $0.pid == pid }) else {
+            throw FleetProcessError.refused("Port \(port) is not held by a BotFleet process.")
+        }
         try terminate(pid: pid)
         return pid
+    }
+
+    /// The processes whose working directory is worth reading.
+    ///
+    /// The fleet's helpers, the server and the development servers are the
+    /// ones whose working directory says what they are, and their parents are
+    /// included because the server is what drives a helper.
+    public static func candidatePIDs(in processes: [RawProcess]) -> [Int32] {
+        let byPID = Dictionary(processes.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        var candidates = Set<Int32>()
+        for process in processes {
+            let name = FleetProcessClassifier.helperName(in: process.command)
+                ?? FleetProcessClassifier.executableName(in: process.command)
+            let looksLikeFleet = FleetProcessClassifier.fleetHelperNames.contains(name)
+                || process.command.contains(FleetProcessClassifier.serverEntryMarker)
+                || process.command.contains("vite")
+                || FleetProcessClassifier.isControlApp(command: process.command)
+                || process.command.contains("/BotFleet/")
+            guard looksLikeFleet else { continue }
+            candidates.insert(process.pid)
+            // Walk up to the parent that could be driving it.
+            var current: Int32? = process.parentPID
+            var depth = 0
+            while let parent = current, parent > 1, depth < 4, let row = byPID[parent] {
+                candidates.insert(parent)
+                current = row.parentPID
+                depth += 1
+            }
+        }
+        return candidates.sorted()
     }
 
     /// Parses the `ps` listing into raw processes.
@@ -345,6 +436,38 @@ public struct FleetProcessMonitor {
         return rows
     }
 
+    /// Parses the `ps` listing of executable paths into a PID lookup.
+    public static func parseExecutablePaths(_ output: String) -> [Int32: String] {
+        var paths: [Int32: String] = [:]
+        for line in output.split(separator: "\n") {
+            let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+            let fields = trimmed.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true).map(String.init)
+            guard fields.count >= 2, let pid = Int32(fields[0]) else { continue }
+            // The path is the rest of the line, and the listing pads it.
+            paths[pid] = fields[1].trimmingCharacters(in: .whitespaces)
+        }
+        return paths
+    }
+
+    /// Parses the `lsof` working directory listing into a PID lookup.
+    public static func parseWorkingDirectories(_ output: String) -> [Int32: String] {
+        var directories: [Int32: String] = [:]
+        var pid: Int32?
+        for line in output.split(separator: "\n") {
+            guard let field = line.first else { continue }
+            let value = String(line.dropFirst())
+            switch field {
+            case "p": pid = Int32(value)
+            case "n":
+                if let pid {
+                    directories[pid] = value
+                }
+            default: break
+            }
+        }
+        return directories
+    }
+
     /// Parses the `lsof` field output into port listeners.
     public static func parseListeners(_ output: String) -> [PortListener] {
         var pid: Int32?
@@ -354,7 +477,11 @@ public struct FleetProcessMonitor {
             guard let field = line.first else { continue }
             let value = String(line.dropFirst())
             switch field {
-            case "p": pid = Int32(value)
+            case "p":
+                pid = Int32(value)
+                // A new process starts without a name, so the previous one's
+                // name is never carried over to it.
+                name = nil
             case "c": name = value
             case "n":
                 if let port = portNumber(from: value), let pid {
