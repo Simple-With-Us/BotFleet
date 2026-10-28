@@ -455,8 +455,19 @@ function scopePattern(source: string, flags: string): RegExp {
   return pattern;
 }
 
+/** The `labeled` action is the moment a required label lands, so a trigger
+ *  that asks for labels must receive it.  The built-in pre-filters below keep
+ *  routine churn and not-ready pull requests out of the bot, so a
+ *  label-driven trigger opts out of the ones that would drop that delivery. */
+function isLabelSignal(
+  trigger: { requiredLabels?: string[] },
+  action: string | undefined,
+): boolean {
+  return action === "labeled" && (trigger.requiredLabels?.length ?? 0) > 0;
+}
+
 export function shouldIgnoreWebhookEvent(
-  trigger: { prompt?: string; name?: string; eventTypes?: string[] },
+  trigger: { prompt?: string; name?: string; eventTypes?: string[]; requiredLabels?: string[] },
   event: WebhookEvent,
 ): IngressIgnoreDecision {
   const payload = event.payload;
@@ -800,6 +811,7 @@ export function shouldIgnoreWebhookEvent(
     const eventName = event.eventName;
     const root = asRecord(payload);
     const action = pickStr(root, "action");
+    const labelSignal = isLabelSignal(trigger, action);
 
     if (eventName === "workflow_run") {
       const workflowRun = asRecord(root?.workflow_run);
@@ -870,7 +882,7 @@ export function shouldIgnoreWebhookEvent(
         };
       }
     } else if (eventName === "pull_request") {
-      if (!isMergedPullRequestPayload(payload)) {
+      if (!isMergedPullRequestPayload(payload) && !labelSignal) {
         const desc = action === "closed" ? "unmerged closed" : `action '${action ?? "unknown"}'`;
         return {
           ignore: true,
@@ -905,12 +917,16 @@ export function shouldIgnoreWebhookEvent(
     const action = pickStr(root, "action");
     const sender = asRecord(root?.sender);
     const senderLogin = pickStr(sender, "login") ?? "";
+    // A trigger that requires labels is waiting for the label to land, so the
+    // `labeled` delivery itself is the signal it asked for.  The pre-filters
+    // below keep routine churn out; they must not swallow that one action.
+    const labelSignal = isLabelSignal(trigger, action);
 
     // Issues: Deployer only handles direct user assignments, never routine bot churn or unassigned edits/closures
     if (eventName === "issues") {
       const isBotSender = /\[bot\]$/i.test(senderLogin) || senderLogin === "github-actions";
       const isAssigned = action === "assigned";
-      if (isBotSender || !isAssigned) {
+      if (isBotSender || (!isAssigned && !labelSignal)) {
         return {
           ignore: true,
           reason: `GitHub issues action '${action ?? "unknown"}' from '${senderLogin || "unknown"}' ignored: Deployer only handles direct issue assignments, not routine issue metadata churn`,
@@ -922,7 +938,7 @@ export function shouldIgnoreWebhookEvent(
     if (eventName === "pull_request") {
       const pr = asRecord(root?.pull_request);
       const isDraft = pr?.draft === true;
-      if (isDraft && action !== "ready_for_review") {
+      if (isDraft && action !== "ready_for_review" && !labelSignal) {
         return {
           ignore: true,
           reason: `GitHub draft pull_request action '${action ?? "unknown"}' ignored: Deployer waits for ready_for_review`,
@@ -938,10 +954,10 @@ export function shouldIgnoreWebhookEvent(
         }
       }
       if (
-        action === "labeled" ||
         action === "unlabeled" ||
         action === "review_requested" ||
-        action === "review_request_removed"
+        action === "review_request_removed" ||
+        (action === "labeled" && !labelSignal)
       ) {
         return {
           ignore: true,

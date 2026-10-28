@@ -362,6 +362,146 @@ describe("filters at webhook ingress", () => {
   });
 });
 
+describe("Deployer pre-filter and a requiredLabels trigger", () => {
+  // The Deployer pre-filter drops the pull request metadata actions, the
+  // `labeled` one included.  A trigger that requires labels is waiting for
+  // the label to land, so that one delivery must still reach the bot.
+  const deployerName = "BF-Deployer";
+
+  it("delivers the labeled action to a Deployer trigger that requires labels", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({
+      name: deployerName,
+      prompt: "Land merge-ready PRs.",
+      botId: "maus-1",
+      eventTypes: ["pull_request"],
+      actions: ["opened", "reopened", "ready_for_review", "labeled"],
+      requiredLabels: ["deployer", "post-deploy"],
+    });
+
+    const result = h.manager.receive(webhook.endpointId, secret, {
+      ...pullRequest("labeled", ["deployer"]),
+      deliveryId: "pr-labeled",
+    });
+    expect(result.ignored).toBeFalsy();
+    expect(result.runId).toBe("run-1");
+    expect(h.queued).toHaveLength(1);
+  });
+
+  it("still drops the labeled action for the same Deployer trigger without required labels", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({
+      name: deployerName,
+      prompt: "Land merge-ready PRs.",
+      botId: "maus-1",
+      eventTypes: ["pull_request"],
+    });
+
+    const result = h.manager.receive(webhook.endpointId, secret, {
+      ...pullRequest("labeled", ["deployer"]),
+      deliveryId: "pr-labeled",
+    });
+    expect(result).toMatchObject({ ignored: true, duplicate: false });
+    expect(result.runId).toBeUndefined();
+    expect(h.queued).toHaveLength(0);
+    expect(h.manager.listAttempts().at(-1)).toMatchObject({
+      outcome: "ignored",
+      reason: expect.stringContaining("metadata action"),
+    });
+  });
+
+  it("still drops the other pull request metadata actions for a requiredLabels trigger", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({
+      name: deployerName,
+      prompt: "Land merge-ready PRs.",
+      botId: "maus-1",
+      eventTypes: ["pull_request"],
+      actions: ["opened", "reopened", "ready_for_review", "labeled", "unlabeled", "review_requested", "review_request_removed"],
+      requiredLabels: ["deployer"],
+    });
+
+    for (const action of ["unlabeled", "review_requested", "review_request_removed"]) {
+      const result = h.manager.receive(webhook.endpointId, secret, {
+        ...pullRequest(action, ["deployer"]),
+        deliveryId: `pr-${action}`,
+      });
+      expect(result).toMatchObject({ ignored: true });
+      expect(h.manager.listAttempts().at(-1)).toMatchObject({
+        outcome: "ignored",
+        reason: expect.stringContaining("metadata action"),
+      });
+    }
+    expect(h.queued).toHaveLength(0);
+  });
+
+  it("drops a labeled delivery whose pull request does not carry a required label", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({
+      name: deployerName,
+      prompt: "Land merge-ready PRs.",
+      botId: "maus-1",
+      eventTypes: ["pull_request"],
+      actions: ["opened", "reopened", "ready_for_review", "labeled"],
+      requiredLabels: ["deployer"],
+    });
+
+    const result = h.manager.receive(webhook.endpointId, secret, {
+      ...pullRequest("labeled", ["api"]),
+      deliveryId: "pr-labeled-other",
+    });
+    expect(result).toMatchObject({ ignored: true });
+    expect(h.queued).toHaveLength(0);
+    expect(h.manager.listAttempts().at(-1)?.reason).toContain("No required label");
+  });
+
+  it("delivers the labeled action on an issue to a Deployer trigger that requires labels", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({
+      name: deployerName,
+      prompt: "Land merge-ready PRs.",
+      botId: "maus-1",
+      eventTypes: ["issues"],
+      actions: ["labeled"],
+      requiredLabels: ["deployer"],
+    });
+
+    const result = h.manager.receive(webhook.endpointId, secret, {
+      eventName: "issues",
+      deliveryId: "issue-labeled",
+      payload: {
+        action: "labeled",
+        repository,
+        sender: { login: "jaywedgeworth22" },
+        issue: { number: 3, labels: [{ name: "deployer" }] },
+      },
+    });
+    expect(result.ignored).toBeFalsy();
+    expect(result.runId).toBe("run-1");
+    expect(h.queued).toHaveLength(1);
+  });
+
+  it("delivers the labeled action to a compile gates trigger that requires labels", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({
+      name: "Compile Gates",
+      prompt: "Watch the checks.",
+      botId: "maus-1",
+      eventTypes: ["pull_request"],
+      actions: ["labeled"],
+      requiredLabels: ["compile"],
+    });
+
+    const result = h.manager.receive(webhook.endpointId, secret, {
+      ...pullRequest("labeled", ["compile"]),
+      deliveryId: "pr-labeled",
+    });
+    expect(result.ignored).toBeFalsy();
+    expect(result.runId).toBe("run-1");
+    expect(h.queued).toHaveLength(1);
+  });
+});
+
 describe("filter patch semantics", () => {
   it("sets and clears every filter through update, and keeps the rest", () => {
     const h = harness();
