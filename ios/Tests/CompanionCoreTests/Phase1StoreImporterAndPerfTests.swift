@@ -834,7 +834,7 @@ struct Phase1StoreImporterAndPerfTests {
             "Idle memory footprint": 80.0,
             "Idle CPU usage": 0.1,
             "5-bot streaming memory": 150.0,
-            "100 tok/s streaming CPU": 6.0,
+            "100 tok/s streaming CPU (per bot)": 6.0,
             "CUA 60fps memory drift": 10.0,
             "FTS5 search latency (p95)": 10.0,
             "SQLite WAL size after checkpoint": 64.0,
@@ -1000,7 +1000,8 @@ struct Phase1StoreImporterAndPerfTests {
     }
 
     @Test("The active streaming CPU budget is measured over the streaming second and still catches a regression")
-    func streamingCpuBudgetIsMeasuredOverTheStreamingSecond() async throws {        // The shape the P-BF-6 budget is written against: five bots, one
+    func streamingCpuBudgetIsMeasuredOverTheStreamingSecond() async throws {
+        // The shape the P-BF-6 budget is written against: five bots, one
         // hundred tokens each, at one hundred tokens per second, so one
         // window covers exactly one simulated second of streaming.
         let shape = MacStreamingCpuShape.product
@@ -1028,21 +1029,36 @@ struct Phase1StoreImporterAndPerfTests {
         // random.
         #expect(MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.060, simulatedSeconds: 0) == 0)
 
+        // The budget is written for one bot, so a measurement of several bots
+        // is divided by the bot count.  Five bots that cost 1.2% of a core
+        // each cost six percent in total, and each bot meets the six percent
+        // per-bot budget, so the reported number has to be the per-bot cost.
+        let fiveBotsAtOnePointTwo = MacPerformanceHarness.streamingCpuPercent(
+            cpuSeconds: 0.06,
+            simulatedSeconds: 1.0,
+            botCount: 5
+        )
+        #expect(abs(fiveBotsAtOnePointTwo - 1.2) < 0.0001)
+        #expect(fiveBotsAtOnePointTwo <= MacPerformanceBudget.maxStreamingCpuPercent)
+
         // The gate's own verdict.  A window that costs more than 6% of one
         // core over its simulated second fails the budget, and the same
         // metric built from a cheap window passes, so the budget is still
-        // able to fail a regression.
+        // able to fail a regression.  The window that breaches it is the
+        // per-bot cost multiplied by the bot count, because the metric
+        // divides the measured CPU by the bot count.
         let breach = MacPerformanceHarness.streamingCpuMetric(
-            cpuSeconds: 0.0601,
+            cpuSeconds: 0.0601 * Double(shape.botCount),
             shape: shape,
             context: .standalone
         )
         #expect(breach.passed == false)
         #expect(breach.enforced == true)
-        #expect(breach.name == "100 tok/s streaming CPU")
+        #expect(breach.name == "100 tok/s streaming CPU (per bot)")
         #expect(breach.specBudgetLimit == 6.0)
+        #expect(abs(breach.measuredValue - 6.01) < 0.0001)
         let within = MacPerformanceHarness.streamingCpuMetric(
-            cpuSeconds: 0.010,
+            cpuSeconds: 0.010 * Double(shape.botCount),
             shape: shape,
             context: .standalone
         )
@@ -1054,7 +1070,7 @@ struct Phase1StoreImporterAndPerfTests {
         // threads is not charged to streaming, and the reported number is
         // the median of the windows rather than one sample.
         let smallShape = MacStreamingCpuShape(botCount: 2, tokensPerBot: 4, tokensPerSecond: 40, repeats: 2)
-        let measurement = await MacPerformanceHarness.measureStreamingCpu(shape: smallShape)
+        let measurement = try await MacPerformanceHarness.measureStreamingCpu(shape: smallShape)
         #expect(measurement.samples.count == smallShape.repeats)
         #expect(measurement.simulatedSeconds == smallShape.simulatedSeconds)
         #expect(measurement.cpuPercent.isFinite == true)
@@ -1062,15 +1078,60 @@ struct Phase1StoreImporterAndPerfTests {
         // The reported number is the median of the windows, divided by the
         // simulated second and not by the wall clock the host took.  The
         // conversion takes no wall-clock input at all, so a host that
-        // finishes the window slowly cannot move the number.
+        // finishes the window slowly cannot move the number.  The sample
+        // count is even here, so the median is the average of the two middle
+        // windows rather than the upper one, which would be the largest
+        // sample and would let one noisy window decide the gate.
         let ordered = measurement.samples.sorted()
-        let median = ordered[ordered.count / 2]
+        let median = (ordered[ordered.count / 2 - 1] + ordered[ordered.count / 2]) / 2.0
         #expect(abs(measurement.medianCpuSeconds - median) < 0.000000001)
+        #expect(measurement.medianCpuSeconds >= ordered[ordered.count / 2 - 1] - 0.000000001)
+        #expect(measurement.medianCpuSeconds <= ordered[ordered.count / 2] + 0.000000001)
         let expected = MacPerformanceHarness.streamingCpuPercent(
             cpuSeconds: median,
-            simulatedSeconds: smallShape.simulatedSeconds
+            simulatedSeconds: smallShape.simulatedSeconds,
+            botCount: smallShape.botCount
         )
         #expect(abs(measurement.cpuPercent - expected) < 0.000001)
+    }
+
+    @Test("A shape with impossible counts is held at one bot instead of trapping")
+    func streamingCpuShapeHoldsImpossibleCounts() async throws {
+        // A negative count would build a Range whose lower bound is above its
+        // upper bound, and Swift's Range initializer traps on that, so the
+        // harness would die instead of producing a measurement.  A count of
+        // zero would be worse than a crash, because it would measure nothing
+        // and report a clean pass, which is a gate that cannot fail.
+        let shape = MacStreamingCpuShape(botCount: -3, tokensPerBot: 0, tokensPerSecond: -1, repeats: 0)
+        #expect(shape.botCount == 1)
+        #expect(shape.tokensPerBot == 1)
+        #expect(shape.tokensPerSecond == 1)
+        #expect(shape.repeats == 1)
+        #expect(shape.simulatedSeconds == 1.0)
+
+        // The measurement runs on the held shape, so the whole path is safe
+        // and a measurement is still produced.
+        let measurement = try await MacPerformanceHarness.measureStreamingCpu(shape: shape)
+        #expect(measurement.samples.count == 1)
+        #expect(measurement.cpuPercent.isFinite == true)
+    }
+
+    @Test("The streaming memory delta is measured from the footprint before the warm-up window")
+    func streamingCpuMemoryDeltaSpansTheWarmUp() async throws {
+        let shape = MacStreamingCpuShape(botCount: 2, tokensPerBot: 4, tokensPerSecond: 40, repeats: 2)
+        let measurement = try await MacPerformanceHarness.measureStreamingCpu(shape: shape)
+
+        // The baseline is the footprint from before the warm-up window ran,
+        // and the delta runs from that baseline to the footprint after the
+        // first measured window.  Measuring from the post-warm-up footprint
+        // would report about nothing, and the streaming memory budget could
+        // no longer fail however much the streaming load retained.
+        #expect(measurement.memoryBaselineBytes > 0)
+        #expect(measurement.memoryAfterBytes > 0)
+        let expected = measurement.memoryAfterBytes > measurement.memoryBaselineBytes
+            ? measurement.memoryAfterBytes - measurement.memoryBaselineBytes
+            : 0
+        #expect(measurement.memoryDeltaBytes == expected)
     }
 
     // MARK: - Visual parity against the legacy source and the app (BF-2496)

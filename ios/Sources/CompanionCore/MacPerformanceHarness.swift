@@ -94,11 +94,21 @@ public struct MacStreamingCpuShape: Sendable, Equatable {
     /// How many measured windows the median is taken over.
     public let repeats: Int
 
+    /// Builds a shape, and refuses to build an impossible one.
+    ///
+    /// Every count here reaches a `Range`, and Swift's `Range` initializer
+    /// traps when the lower bound exceeds the upper bound, so a negative
+    /// count would take the harness process down instead of producing a
+    /// measurement.  A count of zero would be worse than a crash, because it
+    /// would measure nothing and report a clean pass, which is a gate that
+    /// cannot fail.  Each count is therefore held at one or more, so a shape
+    /// always measures at least one bot, one token per bot, one token per
+    /// second and one window.
     public init(botCount: Int, tokensPerBot: Int, tokensPerSecond: Int, repeats: Int) {
-        self.botCount = botCount
-        self.tokensPerBot = tokensPerBot
-        self.tokensPerSecond = tokensPerSecond
-        self.repeats = repeats
+        self.botCount = max(1, botCount)
+        self.tokensPerBot = max(1, tokensPerBot)
+        self.tokensPerSecond = max(1, tokensPerSecond)
+        self.repeats = max(1, repeats)
     }
 
     /// The shape the product budget is written against: five bots, one
@@ -133,6 +143,14 @@ public struct MacStreamingCpuMeasurement: Sendable, Equatable {
     public let simulatedSeconds: Double
     /// How much the process footprint grew across the first measured window.
     public let memoryDeltaBytes: UInt64
+    /// The footprint before the warm-up window ran.
+    ///
+    /// The streaming delta is measured from here, so it covers everything the
+    /// streaming load made resident and not only the churn of the last
+    /// window.
+    public let memoryBaselineBytes: UInt64
+    /// The footprint after the first measured window finished.
+    public let memoryAfterBytes: UInt64
 }
 
 // MARK: - Individual Metric Result
@@ -340,7 +358,7 @@ public enum MacPerformanceHarness {
         "Idle memory footprint",
         "Idle CPU usage",
         "5-bot streaming memory",
-        "100 tok/s streaming CPU",
+        "100 tok/s streaming CPU (per bot)",
         "CUA 60fps memory drift",
         "FTS5 search latency (p95)",
         "SQLite WAL size after checkpoint",
@@ -499,9 +517,20 @@ public enum MacPerformanceHarness {
     /// the question the budget asks: how much of one core does streaming at
     /// this rate cost.  A host that is slow or busy stretches the wall clock
     /// and leaves this number alone.
-    public static func streamingCpuPercent(cpuSeconds: Double, simulatedSeconds: Double) -> Double {
+    ///
+    /// The budget is written for one bot, so a measurement of several bots is
+    /// divided by the bot count before it is converted.  Without that
+    /// division the number is the cost of every bot, and a per-bot cost that
+    /// meets the budget still fails the gate.
+    public static func streamingCpuPercent(
+        cpuSeconds: Double,
+        simulatedSeconds: Double,
+        botCount: Int = 1
+    ) -> Double {
         guard simulatedSeconds > 0 else { return 0 }
-        return (max(0.0, cpuSeconds) / simulatedSeconds) * 100.0
+        let bots = max(1, botCount)
+        let perBotCpuSeconds = max(0.0, cpuSeconds) / Double(bots)
+        return (perBotCpuSeconds / simulatedSeconds) * 100.0
     }
 
     /// Builds the active streaming CPU metric from a measured CPU cost.
@@ -515,8 +544,12 @@ public enum MacPerformanceHarness {
         context: Context
     ) -> MacPerformanceMetricResult {
         metric(
-            name: "100 tok/s streaming CPU",
-            measuredValue: streamingCpuPercent(cpuSeconds: cpuSeconds, simulatedSeconds: shape.simulatedSeconds),
+            name: "100 tok/s streaming CPU (per bot)",
+            measuredValue: streamingCpuPercent(
+                cpuSeconds: cpuSeconds,
+                simulatedSeconds: shape.simulatedSeconds,
+                botCount: shape.botCount
+            ),
             productBudget: MacPerformanceBudget.maxStreamingCpuPercent,
             unit: "%",
             processScoped: true,
@@ -530,7 +563,7 @@ public enum MacPerformanceHarness {
     /// It says how the number was produced, because a percentage of one core
     /// means different things depending on the window it was measured over.
     private static func streamingCpuNote(_ shape: MacStreamingCpuShape) -> String {
-        "the median of \(shape.repeats) windows of \(String(format: "%.0f", shape.simulatedSeconds)) simulated seconds at \(shape.tokensPerSecond) tok/s per bot, measured after a warm-up window, so the number is the CPU that streaming costs rather than the cost of starting the process"
+        "the per-bot cost, the median of \(shape.repeats) windows of \(String(format: "%.0f", shape.simulatedSeconds)) simulated seconds at \(shape.tokensPerSecond) tok/s per bot across \(shape.botCount) bots, divided by the bot count so the number answers the one-bot budget, measured after a warm-up window, so the number is the CPU that streaming costs rather than the cost of starting the process"
     }
 
     /// Builds the badge/menubar surface-sync metric from a measured duration.
@@ -563,61 +596,93 @@ public enum MacPerformanceHarness {
     /// decide the gate.
     public static func measureStreamingCpu(
         shape: MacStreamingCpuShape = .product
-    ) async -> MacStreamingCpuMeasurement {
-        _ = await runStreamingWindow(shape: shape, measureMemory: false)
+    ) async throws -> MacStreamingCpuMeasurement {
+        // The footprint is captured before the warm-up window, so the delta
+        // spans the allocations the streaming load makes resident and not
+        // only the transient churn of the last measured window.
+        let memoryBeforeStreaming = currentPhysicalFootprintBytes()
+        _ = try await runStreamingWindow(shape: shape, measureMemory: false)
         var samples: [Double] = []
         var memoryDeltaBytes: UInt64 = 0
+        var memoryAfterBytes: UInt64 = memoryBeforeStreaming
         for index in 0..<max(1, shape.repeats) {
-            let window = await runStreamingWindow(shape: shape, measureMemory: index == 0)
+            let window = try await runStreamingWindow(
+                shape: shape,
+                measureMemory: index == 0,
+                memoryBaselineBytes: memoryBeforeStreaming
+            )
             samples.append(window.cpuSeconds)
             if index == 0 {
                 memoryDeltaBytes = window.memoryDeltaBytes
+                memoryAfterBytes = window.memoryAfterBytes
             }
         }
         let ordered = samples.sorted()
-        let median = ordered[ordered.count / 2]
+        let median: Double
+        if ordered.count % 2 == 1 {
+            median = ordered[ordered.count / 2]
+        } else {
+            // An even number of windows has no middle sample, so the two
+            // middle ones are averaged.  Taking the upper one alone would
+            // make the reported number the largest sample, and a single
+            // noisy window would decide the gate.
+            median = (ordered[ordered.count / 2 - 1] + ordered[ordered.count / 2]) / 2.0
+        }
         return MacStreamingCpuMeasurement(
             samples: samples,
             medianCpuSeconds: median,
-            cpuPercent: streamingCpuPercent(cpuSeconds: median, simulatedSeconds: shape.simulatedSeconds),
+            cpuPercent: streamingCpuPercent(
+                cpuSeconds: median,
+                simulatedSeconds: shape.simulatedSeconds,
+                botCount: shape.botCount
+            ),
             simulatedSeconds: shape.simulatedSeconds,
-            memoryDeltaBytes: memoryDeltaBytes
+            memoryDeltaBytes: memoryDeltaBytes,
+            memoryBaselineBytes: memoryBeforeStreaming,
+            memoryAfterBytes: memoryAfterBytes
         )
     }
 
     /// Runs one simulated streaming window and reports what it cost.
+    ///
+    /// A cancelled window unwinds instead of running on.  `Task.sleep` throws
+    /// a `CancellationError` when the task is cancelled, and swallowing that
+    /// error would strip the pacing from the rest of the window, so the
+    /// remaining tokens would be emitted at full speed and the measured CPU
+    /// would describe a burst rather than streaming.
     private static func runStreamingWindow(
         shape: MacStreamingCpuShape,
-        measureMemory: Bool
-    ) async -> (cpuSeconds: Double, memoryDeltaBytes: UInt64) {
+        measureMemory: Bool,
+        memoryBaselineBytes: UInt64? = nil
+    ) async throws -> (cpuSeconds: Double, memoryDeltaBytes: UInt64, memoryAfterBytes: UInt64) {
         let cpuStart = currentTaskCpuTimeSeconds()
-        let memoryBefore = measureMemory ? currentPhysicalFootprintBytes() : 0
+        let memoryBefore = memoryBaselineBytes ?? (measureMemory ? currentPhysicalFootprintBytes() : 0)
         let tokenIntervalNanoseconds = shape.tokensPerSecond > 0
             ? UInt64(1_000_000_000 / shape.tokensPerSecond)
             : 0
-        await withTaskGroup(of: Int.self) { group in
+        try await withThrowingTaskGroup(of: Int.self) { group in
             for botIndex in 0..<shape.botCount {
                 group.addTask {
                     var buffer = ""
                     buffer.reserveCapacity(4096)
                     for tokenIndex in 0..<shape.tokensPerBot {
                         if tokenIndex > 0, tokenIntervalNanoseconds > 0 {
-                            try? await Task.sleep(nanoseconds: tokenIntervalNanoseconds)
+                            try await Task.sleep(nanoseconds: tokenIntervalNanoseconds)
                         }
                         buffer.append("bot-\(botIndex)-tok-\(tokenIndex) ")
                     }
                     return buffer.count
                 }
             }
-            for await _ in group {}
+            for try await _ in group {}
         }
         let cpuSeconds = max(0.0, currentTaskCpuTimeSeconds() - cpuStart)
+        let memoryAfterBytes = currentPhysicalFootprintBytes()
         var memoryDeltaBytes: UInt64 = 0
         if measureMemory {
-            let memoryAfter = currentPhysicalFootprintBytes()
-            memoryDeltaBytes = memoryAfter > memoryBefore ? (memoryAfter - memoryBefore) : 0
+            memoryDeltaBytes = memoryAfterBytes > memoryBefore ? (memoryAfterBytes - memoryBefore) : 0
         }
-        return (cpuSeconds, memoryDeltaBytes)
+        return (cpuSeconds, memoryDeltaBytes, memoryAfterBytes)
     }
 
     // MARK: Visual Parity Verification
@@ -784,7 +849,7 @@ public enum MacPerformanceHarness {
 
         // 3. 5-bot concurrent streaming simulation (100 tok/s per bot)
         let streamSignpost = signposter.beginInterval("FiveBotStreaming")
-        let streamingMeasurement = await measureStreamingCpu(shape: .product)
+        let streamingMeasurement = try await measureStreamingCpu(shape: .product)
         signposter.endInterval("FiveBotStreaming", streamSignpost)
 
         let streamDeltaBytes = streamingMeasurement.memoryDeltaBytes
