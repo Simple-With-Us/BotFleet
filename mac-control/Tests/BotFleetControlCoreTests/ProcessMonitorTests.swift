@@ -308,6 +308,17 @@ final class ProcessMonitorTests: XCTestCase {
         XCTAssertTrue(FleetProcessClassifier.namesFleetCheckout("node --root=/Users/jay/Code/BotFleet vite"))
     }
 
+    func testACheckoutNameAttachedToAnArgumentIsStillACheckout() {
+        // A bare directory attached with an equals sign, a quote or a bracket
+        // is a whole token too, and an orphan that is missed is an orphan
+        // that is never offered for cleanup.
+        XCTAssertTrue(FleetProcessClassifier.namesFleetCheckout("node --root=botfleet vite"))
+        XCTAssertTrue(FleetProcessClassifier.namesFleetCheckout("node --root='botfleet' vite"))
+        XCTAssertTrue(FleetProcessClassifier.namesFleetCheckout("node (botfleet) vite"))
+        XCTAssertTrue(FleetProcessClassifier.namesFleetCheckout("node\tbotfleet\tvite"))
+        XCTAssertFalse(FleetProcessClassifier.namesFleetCheckout("node --root=botfleet-tools vite"))
+    }
+
     func testTheTestRunnerIsNotAskedAboutItsWorkingDirectory() {
         // Every extra candidate is another process in the `lsof` call, so a
         // machine full of test workers would slow every menu open down.

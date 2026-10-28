@@ -278,12 +278,16 @@ public enum FleetProcessClassifier {
 
     /// True when the command names a BotFleet checkout as a whole token.
     ///
-    /// A token is separated from the rest by a space, a slash or a colon, so
-    /// a path or an argument that merely contains the same letters is not a
-    /// checkout and must never be stopped as one.
+    /// A token is separated from the rest by whitespace or by one of the
+    /// characters a path or an argument is built with, so a path or an
+    /// argument that merely contains the same letters is not a checkout and
+    /// must never be stopped as one.  A dash, a dot and an underscore stay
+    /// inside a token, so a name that starts with the same letters is still
+    /// one name and not a checkout.
     public static func namesFleetCheckout(_ command: String) -> Bool {
         command.lowercased()
-            .components(separatedBy: CharacterSet(charactersIn: " /:"))
+            .components(separatedBy: CharacterSet.whitespacesAndNewlines
+                .union(CharacterSet(charactersIn: " /:=\"'()[]{}")))
             .contains("botfleet")
     }
 
