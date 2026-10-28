@@ -227,7 +227,7 @@ public enum InfisicalResolverError: LocalizedError, Equatable, Sendable, CustomS
         case .keychainWriteFailed(let status):
             return "macOS Keychain write failed (OSStatus \(status))."
         case .invalidServiceToken:
-            return "The stored Infisical credential is not a service token.  Store a read-only service token (st. ...) in the Keychain."
+            return "The stored Infisical credential is not a service token.\u{00A0} Store a read-only service token (st. ...) in the Keychain."
         case .loginFailed(let statusCode):
             return "Infisical login failed: HTTP \(statusCode)"
         case .invalidLoginResponse:
