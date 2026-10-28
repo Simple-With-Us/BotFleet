@@ -37,6 +37,13 @@ export interface InfisicalStatusView {
   hasClientSecret: boolean;
   hasToken: boolean;
   hasWriteToken: boolean;
+  /** The server refused the configured read service token and the manager
+   * fell back to the machine identity.  The token is still configured and
+   * still in Settings:  it is the server's refusal of it that is reported
+   * here, so a dead token cannot hide behind a working sync. */
+  readTokenRefused: boolean;
+  /** The same for the write token. */
+  writeTokenRefused: boolean;
   refreshMinutes: number;
   lastSyncAt: string | null;
   lastAttemptAt: string | null;
@@ -113,19 +120,54 @@ function isConfigured(settings: InfisicalSettings): boolean {
   );
 }
 
-/** The bearer credential for one call.  A service token is used as it is --
- * no login, no machine identity -- and the universal-auth login stays for an
- * install that has not migrated its tokens yet.  A write uses the write
- * token; a read uses the read token. */
-async function bearerToken(settings: InfisicalSettings, mode: "read" | "write"): Promise<string> {
-  const configured = (mode === "write" ? settings.writeToken : settings.token).trim();
-  if (configured) return configured;
-  return login({
-    siteUrl: settings.siteUrl,
-    clientId: settings.clientId,
-    clientSecret: settings.clientSecret,
-    timeoutMs: callTimeoutMs(),
-  });
+/** The HTTP statuses that mean the BEARER itself was refused.  401 is a
+ * revoked or expired token, 403 is a grant that does not cover what was
+ * asked for, 404 is a project, environment or path that is gone.  Every
+ * other status -- 429, any 5xx, a timeout, a dropped connection -- is a
+ * transient condition and says nothing about whether the token is still
+ * good.  A transient condition must therefore never cost the token:  the
+ * vault stays configured and the next refresh tries the same token again. */
+const DEFINITIVE_REJECTION_STATUSES: ReadonlySet<number> = new Set([401, 403, 404]);
+
+/** Whether the server refused the bearer outright.  Only an `InfisicalError`
+ * carries a status;  anything else is a transport failure and counts as
+ * transient. */
+function isDefinitiveRejection(err: unknown): boolean {
+  return err instanceof InfisicalError && DEFINITIVE_REJECTION_STATUSES.has(err.statusCode);
+}
+
+/** What a refusal is remembered under:  the project, environment and path
+ * the call was made against.  Change one of them and the remembered
+ * refusal no longer applies, because the answer it was based on was about
+ * a different request. */
+function scopeSignature(projectId: string, environment: string, secretPath: string): string {
+  return [projectId.trim(), environment.trim(), secretPath.trim()].join("\u0000");
+}
+
+/** The scope of the whole vault:  the settings' project, environment and
+ * path.  A refresh reads exactly this, so a refusal has to match it to
+ * count against the configured token. */
+function vaultScope(settings: InfisicalSettings): string {
+  return scopeSignature(settings.projectId, settings.environment, settings.secretPath);
+}
+
+/** The scope a refusal is remembered under when the CREDENTIAL itself was
+ * rejected rather than the thing it was asked for.  A 401 says the bearer
+ * is revoked or expired, and that is true of every request the bearer
+ * makes, so the refusal applies everywhere the token goes.  A 403 (a grant
+ * that does not cover what was asked for) and a 404 (a project,
+ * environment or path that is gone) say something about ONE request, so
+ * they are remembered against that request's scope and no other. */
+const CREDENTIAL_REFUSAL_SCOPE = "*";
+
+/** The scope a refusal of `status` is remembered under. */
+function refusalScope(status: number, scope: string): string {
+  return status === 401 ? CREDENTIAL_REFUSAL_SCOPE : scope;
+}
+
+/** Whether this install has a machine identity to fall back to. */
+function hasMachineIdentity(settings: InfisicalSettings): boolean {
+  return Boolean(settings.clientId.trim() && settings.clientSecret.trim());
 }
 
 /** What `preload()`'s race resolves to when the boot cap wins.  A distinct
@@ -187,6 +229,15 @@ class InfisicalManager {
    * `bootLine()`'s own trailing `ms=NNN` timing stripped — see that
    * method for why. */
   private lastLoggedBootLineSignature: string | null = null;
+  /** The service tokens this manager has already seen refused, by mode.
+   * The VALUE is remembered, not a flag:  a rotated token is a new value
+   * from the same setting, and it has to be tried again rather than inherit
+   * the old token's rejection.  The SCOPE it was refused under is
+   * remembered with it, because a wrong project id answers 404 and looks
+   * exactly like a revoked token:  fixing the project id in Settings has to
+   * put the token back in play rather than leave it deprioritized forever. */
+  private rejectedTokens = new Map<"read" | "write", Array<{ token: string; scope: string }>>();
+
 
   /** Live view of app config, installed by the server at boot.  A getter
    * (not a snapshot) so a Settings save takes effect on the next refresh
@@ -198,6 +249,10 @@ class InfisicalManager {
     // question over — mainly so repeated test setup does not inherit a
     // signature from a previous manager configuration.
     this.lastLoggedBootLineSignature = null;
+    // The same goes for the refused-token memory:  a new settings source is
+    // a new credential, and it must be tried on its own merits rather than
+    // inherit the previous source's rejection.
+    this.rejectedTokens.clear();
   }
 
   private settings(): InfisicalSettings {
@@ -205,6 +260,104 @@ class InfisicalManager {
       return this.settingsGetter?.() ?? UNSET_SETTINGS;
     } catch {
       return UNSET_SETTINGS;
+    }
+  }
+
+  /** Whether the configured token for this mode is one the server refused
+   * for the CURRENT scope.  A scope change makes the old refusal about a
+   * different request, so it no longer counts.  A refusal of the
+   * credential itself (a 401) counts everywhere, because the bearer is
+   * refused however it is used. */
+  private refusedNow(settings: InfisicalSettings, mode: "read" | "write"): boolean {
+    const configured = (mode === "write" ? settings.writeToken : settings.token).trim();
+    if (!configured) return false;
+    return this.isRefused(mode, configured, vaultScope(settings));
+  }
+
+  /** Whether a refusal is remembered for this token and this scope. */
+  private isRefused(mode: "read" | "write", token: string, scope: string): boolean {
+    const remembered = this.rejectedTokens.get(mode) ?? [];
+    return remembered.some(
+      (entry) => entry.token === token && (entry.scope === CREDENTIAL_REFUSAL_SCOPE || entry.scope === scope),
+    );
+  }
+
+  /** Remember a refusal for this token and scope.  The list stays short:
+   * one entry per refused scope, and the oldest is dropped once it grows
+   * past the cap, so a long-lived install cannot accumulate them without
+   * end. */
+  private rememberRefusal(mode: "read" | "write", token: string, scope: string): void {
+    const remembered = this.rejectedTokens.get(mode) ?? [];
+    if (!remembered.some((entry) => entry.token === token && entry.scope === scope)) {
+      remembered.push({ token, scope });
+    }
+    while (remembered.length > 16) remembered.shift();
+    this.rejectedTokens.set(mode, remembered);
+  }
+
+  /** The machine-identity session token for one call.  The universal-auth
+   * login is the fallback for an install whose configured service token the
+   * server refuses, and the only credential for an install that has not
+   * migrated its tokens at all. */
+  private async machineIdentityToken(settings: InfisicalSettings): Promise<string> {
+    return login({
+      siteUrl: settings.siteUrl,
+      clientId: settings.clientId,
+      clientSecret: settings.clientSecret,
+      timeoutMs: callTimeoutMs(),
+    });
+  }
+
+  /** Run one vault call with the configured service token, falling back to
+   * the machine identity when the server refuses that token outright.
+   *
+   * The fallback fires on a DEFINITIVE refusal only.  A 401, a 403 and a 404
+   * are definitive;  everything else -- a 429, any 5xx, a timeout, a dropped
+   * connection -- is transient and leaves the token exactly where it was:
+   * it is not refused, it is not reachable right now, and falling back there
+   * would trade one credential for another over a network blip.  The token
+   * stays configured and the next refresh tries it again.
+   *
+   * A refused token is remembered BY VALUE, so a rotated token -- the same
+   * setting carrying a new value -- is tried again rather than inheriting
+   * the old token's rejection.
+   *
+   * A refusal is remembered against the SCOPE it was made under.  A 401 is
+   * a refusal of the credential itself and counts everywhere that token
+   * goes;  a 403 or a 404 is a refusal of one request and counts only
+   * there, so a missing folder cannot deprioritize a good token for the
+   * whole vault.
+   *
+   * With no machine identity to fall back to, the refusal itself is what the
+   * caller sees.  The token is not removed, the vault is not disabled, and
+   * the previous snapshot stays exactly as it was. */
+  private async withServiceTokenFallback<T>(
+    settings: InfisicalSettings,
+    mode: "read" | "write",
+    call: (token: string) => Promise<T>,
+    scope: string = vaultScope(settings),
+  ): Promise<T> {
+    const configured = (mode === "write" ? settings.writeToken : settings.token).trim();
+    const refused = Boolean(configured) && this.isRefused(mode, configured, scope);
+    if (!configured || refused) {
+      if (!hasMachineIdentity(settings)) {
+        throw new InfisicalError(
+          refused
+            ? `The configured Infisical ${mode} service token was refused by the server, and this install has no machine identity to fall back to.`
+            : "No Infisical credential is available:  there is no configured service token and no machine identity.",
+          401,
+        );
+      }
+      return call(await this.machineIdentityToken(settings));
+    }
+    try {
+      return await call(configured);
+    } catch (err) {
+      if (!isDefinitiveRejection(err)) throw err;
+      const status = err instanceof InfisicalError ? err.statusCode : 0;
+      this.rememberRefusal(mode, configured, refusalScope(status, scope));
+      if (!hasMachineIdentity(settings)) throw err;
+      return call(await this.machineIdentityToken(settings));
     }
   }
 
@@ -291,16 +444,17 @@ class InfisicalManager {
     const settings = this.settings();
     const start = Date.now();
     try {
-      const token = await bearerToken(settings, "read");
-      const { names, values } = await listSecrets({
-        siteUrl: settings.siteUrl,
-        token,
-        projectId: settings.projectId,
-        environment: settings.environment,
-        secretPath: settings.secretPath,
-        viewValues: true,
-        timeoutMs: callTimeoutMs(),
-      });
+      const { names, values } = await this.withServiceTokenFallback(settings, "read", (token) =>
+        listSecrets({
+          siteUrl: settings.siteUrl,
+          token,
+          projectId: settings.projectId,
+          environment: settings.environment,
+          secretPath: settings.secretPath,
+          viewValues: true,
+          timeoutMs: callTimeoutMs(),
+        }),
+      );
       setInfisicalSnapshot(values, names);
       this.lastSyncAt = new Date().toISOString();
       this.lastSyncMs = Date.now() - start;
@@ -391,6 +545,8 @@ class InfisicalManager {
       hasClientSecret: Boolean(settings.clientSecret.trim()),
       hasToken: Boolean(settings.token.trim()),
       hasWriteToken: Boolean(settings.writeToken.trim()),
+      readTokenRefused: this.refusedNow(settings, "read"),
+      writeTokenRefused: this.refusedNow(settings, "write"),
       refreshMinutes: settings.refreshMinutes,
       lastSyncAt: this.lastSyncAt,
       lastAttemptAt: this.lastAttemptAt,
@@ -415,8 +571,13 @@ class InfisicalManager {
     if (!isConfigured(settings)) {
       return { ok: false, error: "Add a project id and a service token (or a machine identity) first.", secretCount: 0, names: [] };
     }
+    // The probe tests the CONFIGURED credential, not the fallback this
+    // manager would reach for on its behalf:  a token the server refuses is
+    // exactly what the operator needs to hear about, and the remembered
+    // rejection must not turn a dead token into a green probe.
+    const configured = settings.token.trim();
     try {
-      const token = await bearerToken(settings, "read");
+      const token = configured ? configured : await this.machineIdentityToken(settings);
       const { names } = await listSecrets({
         siteUrl: settings.siteUrl,
         token,
@@ -428,7 +589,10 @@ class InfisicalManager {
       });
       return { ok: true, error: null, secretCount: names.length, names: [...names] };
     } catch (err) {
-      const error = err instanceof InfisicalError ? err.message : err instanceof Error ? redactSecretsInText(err.message) : "unknown error";
+      let error = err instanceof InfisicalError ? err.message : err instanceof Error ? redactSecretsInText(err.message) : "unknown error";
+      if (configured && isDefinitiveRejection(err)) {
+        error = `The configured read service token was refused by the server:  ${error}.  Save a rotated token in Settings and the next refresh will use it.`;
+      }
       return { ok: false, error, secretCount: 0, names: [] };
     }
   }
@@ -451,16 +615,28 @@ class InfisicalManager {
     if (!isConfigured(settings) || settings.enabled !== true) {
       throw new InfisicalError("Infisical is not configured and turned on for this workspace.", 409);
     }
-    const token = await bearerToken(settings, "read");
-    const { values } = await listSecrets({
-      siteUrl: settings.siteUrl,
-      token,
-      projectId: scope.projectId?.trim() || settings.projectId,
-      environment: scope.environment?.trim() || settings.environment,
-      secretPath,
-      viewValues: true,
-      timeoutMs: callTimeoutMs(),
-    });
+    // The scope this call is actually made against.  The caller's own
+    // project, environment and path decide what the server answers for,
+    // so a refusal of THIS call is remembered against THIS scope:  a
+    // folder that does not exist must not deprioritize a good token for
+    // the whole vault.
+    const projectId = scope.projectId?.trim() || settings.projectId;
+    const environment = scope.environment?.trim() || settings.environment;
+    const { values } = await this.withServiceTokenFallback(
+      settings,
+      "read",
+      (token) =>
+        listSecrets({
+          siteUrl: settings.siteUrl,
+          token,
+          projectId,
+          environment,
+          secretPath,
+          viewValues: true,
+          timeoutMs: callTimeoutMs(),
+        }),
+      scopeSignature(projectId, environment, secretPath),
+    );
     return new Map(values);
   }
 
@@ -485,18 +661,19 @@ class InfisicalManager {
     if (!isConfigured(settings)) {
       throw new InfisicalError("Add a project id and a service token (or a machine identity) first.", 409);
     }
-    const token = await bearerToken(settings, "write");
     try {
-      await upsertSecret({
-        siteUrl: settings.siteUrl,
-        token,
-        projectId: settings.projectId,
-        environment: settings.environment,
-        secretPath: settings.secretPath,
-        name,
-        value,
-        timeoutMs: callTimeoutMs(),
-      });
+      await this.withServiceTokenFallback(settings, "write", (token) =>
+        upsertSecret({
+          siteUrl: settings.siteUrl,
+          token,
+          projectId: settings.projectId,
+          environment: settings.environment,
+          secretPath: settings.secretPath,
+          name,
+          value,
+          timeoutMs: callTimeoutMs(),
+        }),
+      );
     } catch (err) {
       // When a timeout or network drop occurs during upsert, the write may
       // have already committed in Infisical before the connection severed.
@@ -556,7 +733,14 @@ class InfisicalManager {
       return `[infisical] unavailable: ${status.lastError}; using environment and config values`;
     }
     const fields = status.appliedFields.join(",");
-    return `[infisical] enabled env=${status.environment} path=${status.secretPath} vault=${status.vaultCount} applied=${status.appliedCount} fields=${fields} unused=${status.unusedVaultNames.length} ms=${status.lastSyncMs ?? 0}`;
+    // A refused token is a fact about the credential, not about the sync:
+    // the sync succeeded on the machine identity, so the line says both.
+    const refused = [
+      status.readTokenRefused ? "read-token-refused" : "",
+      status.writeTokenRefused ? "write-token-refused" : "",
+    ].filter(Boolean).join(",");
+    const refusedPart = refused ? ` ${refused}` : "";
+    return `[infisical] enabled env=${status.environment} path=${status.secretPath} vault=${status.vaultCount} applied=${status.appliedCount} fields=${fields} unused=${status.unusedVaultNames.length}${refusedPart} ms=${status.lastSyncMs ?? 0}`;
   }
 
   /** `bootLine()`'s text, or `null` when it is unchanged from the last time
