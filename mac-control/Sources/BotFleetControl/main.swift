@@ -28,7 +28,27 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let presenceProbe = ServerPresenceProbe()
     private let mcpServer: McpServerControl?
     private let mcpServerProblem: String?
-    private let fleetServiceControl: FleetServiceControl
+    /// The fleet services the Control app watches and changes.
+    ///
+    /// The BotFleet Server is stopped by asking the server itself, because
+    /// launchd does not always own the process: the installed wrapper exits
+    /// when the harness is already healthy, and the desktop app forks its
+    /// own harness when nothing answers on the port.  Booting the agent out
+    /// can leave a server that is still serving.
+    private lazy var fleetServiceControl: FleetServiceControl = {
+        FleetServiceControl(pm2: PM2Client(),
+                            mcpServer: mcpServer,
+                            stopServer: { [weak self] in
+                                guard let self else { return }
+                                try await self.api.stopServer()
+                            })
+    }()
+    /// The services the owner stopped on purpose, by service id.
+    ///
+    /// A stop the owner asked for is not one the Control app undoes.  The
+    /// set lives in the app, so it lasts as long as the app does, and a
+    /// relaunch hands the fleet back to its own rules.
+    private var ownerStoppedServices: Set<String> = []
     private var item: NSStatusItem?
     private let menu = NSMenu()
     private var status: ControlStatus?
@@ -68,18 +88,15 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let fleetServiceSequencer = FleetSnapshotSequencer()
 
     override init() {
-        let pm2 = PM2Client()
         do {
-            let control = try McpServerControl(pm2: pm2)
+            let control = try McpServerControl(pm2: PM2Client())
             mcpServer = control
             mcpServerProblem = nil
-            fleetServiceControl = FleetServiceControl(pm2: pm2, mcpServer: control)
         } catch {
             // The managed service list reports the problem in the menu instead of the
             // app refusing to start over it.
             mcpServer = nil
             mcpServerProblem = error.localizedDescription
-            fleetServiceControl = FleetServiceControl(pm2: pm2)
         }
         super.init()
     }
@@ -257,6 +274,10 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let managedServices = ManagedServices(serverState: serverState(), mcpServerState: mcpServerState)
         for entry in managedServices.entries {
+            // A service the owner stopped on purpose is left alone until the
+            // owner starts it again.  The set is the one place a stop of the
+            // owner's own is remembered.
+            if ownerStoppedServices.contains(entry.id) { continue }
             switch ManagedServices.action(for: entry) {
             case .start:
                 do { mcpServerState = try await mcpServer.setRunning(true) }
@@ -274,7 +295,9 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // app only brings one back when it failed.  One that was stopped on
         // purpose stays stopped.
         await refreshFleetServiceStates()
-        let fleetServices = FleetServices(serverState: serverState(), states: fleetServiceStates)
+        let fleetServices = FleetServices(serverState: serverState(),
+                                         states: fleetServiceStates,
+                                         stoppedByOwner: ownerStoppedServices)
         for entry in fleetServices.entries where entry.policy == .alwaysOn {
             let action = FleetServices.automaticAction(for: entry)
             guard action != .none else { continue }
@@ -323,11 +346,31 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func performFleetServiceAction(_ action: ManagedServiceAction, sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         guard let service = FleetServices(serverState: serverState(),
-                                         states: fleetServiceStates).menuItems.first(where: { $0.id == id }) else { return }
+                                         states: fleetServiceStates,
+                                         stoppedByOwner: ownerStoppedServices).menuItems.first(where: { $0.id == id }) else { return }
         guard confirmFleetServiceAction(action, service: service) else { return }
         run { [self] in
-            let observed = try await self.fleetServiceControl.perform(action, serviceID: id)
-            self.fleetServiceStates[id] = observed
+            // A stop the owner asked for is remembered, so the reconciler
+            // leaves the service alone until the owner starts it again.  The
+            // intent is recorded before the change, because the reconciler
+            // runs as soon as the change is done, and it is taken back when
+            // the manager refuses the change.
+            if action == .stop {
+                ownerStoppedServices.insert(id)
+            } else if action == .start {
+                ownerStoppedServices.remove(id)
+            }
+            do {
+                let observed = try await self.fleetServiceControl.perform(action, serviceID: id)
+                self.fleetServiceStates[id] = observed
+            } catch {
+                if action == .stop {
+                    ownerStoppedServices.remove(id)
+                } else if action == .start {
+                    ownerStoppedServices.insert(id)
+                }
+                throw error
+            }
         }
     }
 
@@ -351,7 +394,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// What stopping one fleet service does.
     private func stopBody(for service: FleetServiceMenuItem) -> String {
         if service.id == FleetServiceRegistry.server.id {
-            return "The BotFleet Server stops right away.  Bot turns that are running are cut short, and macOS brings it back the next time you log in.  Use Stop Server And Local VMs… for a graceful stop."
+            return "The BotFleet Server stops itself, and its Local VMs go down with it.  The server refuses while work is in flight, and macOS brings it back the next time you log in."
         }
         if let descriptor = FleetServiceRegistry.descriptor(for: service.id),
            case .launchAgent = descriptor.kind {
@@ -472,7 +515,9 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if status?.sharedVM?.state == "stopped" { add("Local VM requires recreation in BotFleet") }
         if !startup.supportsPolicy { add("Update BotFleet to manage server startup") }
 
-        let fleetServices = FleetServices(serverState: serverState(), states: fleetServiceStates)
+        let fleetServices = FleetServices(serverState: serverState(),
+                                         states: fleetServiceStates,
+                                         stoppedByOwner: ownerStoppedServices)
         if !fleetServices.entries.isEmpty {
             menu.addItem(.separator())
             let servicesMenu = NSMenu()

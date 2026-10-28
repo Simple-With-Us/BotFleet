@@ -193,11 +193,12 @@ public struct ManagedServices: Equatable {
     /// do not settle at the same moment.
     public static func settle(to wanted: ManagedServiceState,
                                attempts: Int,
+                               interval: TimeInterval = 0.5,
                                observe: () async -> ManagedServiceState) async -> ManagedServiceState {
         for _ in 0..<attempts {
             let next = await observe()
             if next == wanted { return next }
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         }
         return await observe()
     }

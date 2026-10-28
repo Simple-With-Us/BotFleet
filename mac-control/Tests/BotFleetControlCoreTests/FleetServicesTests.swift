@@ -103,39 +103,48 @@ final class FleetServicesTests: XCTestCase {
     // MARK: - The actions the owner may pick
 
     func testTheActionsForARunningServiceAreStopAndRestart() {
-        XCTAssertEqual(FleetServices.availableActions(for: .running, policy: .alwaysOn), [.stop, .restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .running, wanted: true, policy: .alwaysOn), [.stop, .restart])
     }
 
     func testTheActionsForAStoppedServiceAreStartAndRestart() {
-        XCTAssertEqual(FleetServices.availableActions(for: .stopped, policy: .alwaysOn), [.start, .restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .stopped, wanted: false, policy: .alwaysOn), [.start, .restart])
     }
 
     func testTheActionsForAFailedServiceAreStartAndRestart() {
-        XCTAssertEqual(FleetServices.availableActions(for: .failed, policy: .alwaysOn), [.start, .restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .failed, wanted: true, policy: .alwaysOn), [.start, .restart])
     }
 
     func testAServiceThatIsNotInstalledHasNoActions() {
-        XCTAssertEqual(FleetServices.availableActions(for: .notInstalled, policy: .alwaysOn), [])
+        XCTAssertEqual(FleetServices.availableActions(for: .notInstalled, wanted: false, policy: .alwaysOn), [])
     }
 
     func testAServiceTheAppCannotSeeCanOnlyBeRestarted() {
         // The Control app does not stop a service it cannot see.
-        XCTAssertEqual(FleetServices.availableActions(for: .unknown, policy: .alwaysOn), [.restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .unknown, wanted: nil, policy: .alwaysOn), [.restart])
     }
 
-    func testAServiceThatFollowsTheServerCanOnlyBeRestarted() {
-        // The BotFleet MCP Server is wanted exactly while the BotFleet Server
-        // runs.  Offering Stop for it would offer an action the Control app
-        // takes back at once, so only Restart is offered.
-        XCTAssertEqual(FleetServices.availableActions(for: .running, policy: .whileServerRuns), [.restart])
-        XCTAssertEqual(FleetServices.availableActions(for: .stopped, policy: .whileServerRuns), [.restart])
-        XCTAssertEqual(FleetServices.availableActions(for: .failed, policy: .whileServerRuns), [.restart])
+    func testAServiceThatFollowsTheServerCanBeStoppedWhileTheServerRuns() {
+        // The BotFleet MCP Server follows the BotFleet Server, and a stop the
+        // owner asked for is not one the Control app takes back.
+        XCTAssertEqual(FleetServices.availableActions(for: .running, wanted: true, policy: .whileServerRuns), [.stop, .restart])
+        XCTAssertEqual(FleetServices.availableActions(for: .stopped, wanted: true, policy: .whileServerRuns), [.start, .restart])
     }
 
-    func testTheMcpServerRowInTheMenuOffersOnlyRestart() {
+    func testAServiceThatFollowsTheServerCannotBeStartedWhileTheServerIsDown() {
+        // Starting it now would be undone at once, so only a restart is
+        // offered.
+        XCTAssertEqual(FleetServices.availableActions(for: .stopped, wanted: false, policy: .whileServerRuns), [.restart])
+    }
+
+    func testAServiceTheOwnerStoppedCanBeStartedAgain() {
+        XCTAssertEqual(FleetServices.availableActions(for: .stopped, wanted: false, policy: .whileServerRuns, stoppedByOwner: true),
+                       [.start, .restart])
+    }
+
+    func testTheMcpServerRowInTheMenuOffersStopWhileTheServerRuns() {
         let services = FleetServices(serverState: .running, states: ["botfleet-mcp": .running])
         let row = services.menuItems.first { $0.id == "botfleet-mcp" }
-        XCTAssertEqual(row?.actions, [.restart])
+        XCTAssertEqual(row?.actions, [.stop, .restart])
     }
 
     // MARK: - The menu
@@ -153,9 +162,9 @@ final class FleetServicesTests: XCTestCase {
         let mcpServer = services.menuItems.first { $0.id == "botfleet-mcp" }
         let shellular = services.menuItems.first { $0.id == "shellular" }
         XCTAssertEqual(mcpServer?.summary, "running")
-        // The MCP server's state follows the BotFleet Server, so it can only
-        // be restarted on its own.
-        XCTAssertEqual(mcpServer?.actions, [.restart])
+        // The MCP server's state follows the BotFleet Server, and a stop the
+        // owner asked for is kept.
+        XCTAssertEqual(mcpServer?.actions, [.stop, .restart])
         XCTAssertEqual(shellular?.summary, "stopped")
         XCTAssertEqual(shellular?.actions, [.start, .restart])
     }
@@ -257,6 +266,24 @@ final class FleetServicesTests: XCTestCase {
         XCTAssertTrue(commands.calls.contains { $0.first == "start" })
     }
 
+    func testAWaitForAPM2ChangeDoesNotSpawnAProcessForEveryHalfSecond() async throws {
+        // Every look at a pm2 application spawns a node client, so a wait
+        // that never settles has to be made of few wide looks rather than
+        // many narrow ones.
+        let commands = FleetServiceCommands()
+        commands.pm2Listing = #"[{"name": "shellular", "pm2_env": {"status": "stopped"}}]"#
+        _ = try await pm2(commands).setRunning(true, appName: "shellular", attempts: 3, interval: 0.01)
+        let looks = commands.calls.filter { $0.first == "jlist" }.count
+        // One look before the change, one for each attempt of the wait, and
+        // one after it.
+        XCTAssertLessThanOrEqual(looks, 5)
+        // The wait still covers the twenty seconds it always did, and it
+        // looks ten times at most, where the old one looked forty-two.
+        let window = Double(PM2Client.settleAttempts) * PM2Client.settleInterval
+        XCTAssertGreaterThanOrEqual(window, 20.0)
+        XCTAssertLessThanOrEqual(PM2Client.settleAttempts + 2, 10)
+    }
+
     func testAnApplicationThatIsAlreadyRunningIsNotStartedAgain() async throws {
         let commands = FleetServiceCommands()
         commands.pm2Listing = #"[{"name": "shellular", "pm2_env": {"status": "online"}}]"#
@@ -332,8 +359,59 @@ final class FleetServicesTests: XCTestCase {
         XCTAssertTrue(commands.calls.contains("/bin/launchctl kickstart gui/501/app.botfleet.companion"))
     }
 
-    // MARK: - Restarting the BotFleet Server
+    // MARK: - A stop the owner asked for
 
+    func testAServiceTheOwnerStoppedIsNotWanted() {
+        // The BotFleet MCP Server is wanted exactly while the BotFleet
+        // Server runs, but a stop the owner asked for is not one the Control
+        // app undoes.
+        let services = FleetServices(serverState: .running,
+                                    states: ["botfleet-mcp": .stopped],
+                                    stoppedByOwner: ["botfleet-mcp"])
+        let entry = services.entries.first { $0.id == "botfleet-mcp" }
+        XCTAssertEqual(entry?.wanted, false)
+        XCTAssertEqual(FleetServices.automaticAction(for: entry!), .none)
+    }
+
+    func testAServiceTheOwnerStoppedIsWantedAgainWhenTheOwnerStartsIt() {
+        let services = FleetServices(serverState: .running, states: ["botfleet-mcp": .stopped])
+        let entry = services.entries.first { $0.id == "botfleet-mcp" }
+        XCTAssertEqual(entry?.wanted, true)
+        XCTAssertEqual(FleetServices.automaticAction(for: entry!), .start)
+    }
+
+    // MARK: - Stopping the BotFleet Server
+
+    func testStoppingTheBotFleetServerAsksTheServerToStopItself() async throws {
+        // launchd does not always own the server process: the installed
+        // wrapper exits when the harness is already healthy, and the desktop
+        // app forks its own harness when nothing answers on the port.  A
+        // bootout can leave a server that is still serving.
+        let commands = LaunchAgentCommands()
+        let asked = Counter()
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil,
+            stopServer: { asked.increment() })
+        _ = try await control.perform(.stop, serviceID: FleetServiceRegistry.server.id)
+        XCTAssertEqual(asked.value, 1)
+        XCTAssertFalse(commands.calls.contains { $0.contains("bootout") })
+    }
+
+    func testStoppingTheBotFleetServerIsRefusedWhenTheServerCannotBeAsked() async throws {
+        let control = FleetServiceControl(pm2: pm2(FleetServiceCommands()),
+                                          startup: StartupPolicy(commands: LaunchAgentCommands(), uid: 501, environment: [:]),
+                                          mcpServer: nil)
+        do {
+            _ = try await control.perform(.stop, serviceID: FleetServiceRegistry.server.id)
+            XCTFail("the stop should not have been reported as a success")
+        } catch {
+            XCTAssertTrue("\(error)".contains("stop itself"))
+        }
+    }
+
+    // MARK: - Restarting the BotFleet Server
     func testRestartingTheBotFleetServerClearsTheDeliberateStopMarker() async throws {
         // The installed wrapper stays down while the deliberate-stop marker
         // exists, so a restart that left the marker in place would report a
@@ -428,6 +506,12 @@ final class FleetServicesTests: XCTestCase {
         configuration.protocolClasses = [FleetServiceURLProtocol.self]
         return URLSession(configuration: configuration)
     }
+}
+
+/// Counts how many times something was asked for.
+private final class Counter {
+    private(set) var value = 0
+    func increment() { value += 1 }
 }
 
 /// A stand-in for the pm2 client.

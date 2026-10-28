@@ -26,13 +26,23 @@ public final class FleetServiceControl {
     private let pm2: PM2Client
     private let startup: StartupPolicy
     private let mcpServer: McpServerControl?
+    /// How the BotFleet Server is asked to stop.
+    ///
+    /// The server stops itself.  launchd does not always own the process:
+    /// the installed wrapper exits when the harness is already healthy, and
+    /// the desktop app forks its own harness when nothing answers on the
+    /// port, so booting the agent out can leave a server that is still
+    /// serving.  Asking the server is the only stop that is the server's.
+    private let stopServer: (() async throws -> Void)?
 
     public init(pm2: PM2Client = PM2Client(),
                 startup: StartupPolicy = StartupPolicy(),
-                mcpServer: McpServerControl? = nil) {
+                mcpServer: McpServerControl? = nil,
+                stopServer: (() async throws -> Void)? = nil) {
         self.pm2 = pm2
         self.startup = startup
         self.mcpServer = mcpServer
+        self.stopServer = stopServer
     }
 
     /// Reads the state of every fleet service.
@@ -79,7 +89,7 @@ public final class FleetServiceControl {
     @discardableResult
     public func perform(_ action: ManagedServiceAction,
                         serviceID: String,
-                        attempts: Int = 40) async throws -> ManagedServiceState {
+                        attempts: Int = PM2Client.settleAttempts) async throws -> ManagedServiceState {
         guard let descriptor = FleetServiceRegistry.descriptor(for: serviceID) else {
             throw FleetServiceError.refused("That is not a fleet service.")
         }
@@ -116,15 +126,21 @@ public final class FleetServiceControl {
                 throw pm2Failure(error, action: "change", appName: appName)
             }
         case .launchAgent(let label):
-            if running {
-                if descriptor.id == FleetServiceRegistry.server.id {
-                    // The BotFleet Server has a start of its own: it checks
-                    // the installed wrapper and clears the deliberate-stop
-                    // marker, so the server stays up afterwards.
+            if descriptor.id == FleetServiceRegistry.server.id {
+                // The BotFleet Server has a start of its own: it checks
+                // the installed wrapper and clears the deliberate-stop
+                // marker, so the server stays up afterwards.
+                if running {
                     try startup.startServer()
                 } else {
-                    try startup.startAgent(label: label)
+                    guard let stopServer else {
+                        throw FleetServiceError.refused("The BotFleet Server has to stop itself, and the Control app could not ask it to.")
+                    }
+                    try await stopServer()
+                    return .stopped
                 }
+            } else if running {
+                try startup.startAgent(label: label)
             } else {
                 try startup.stopAgent(label: label)
             }
@@ -151,7 +167,9 @@ public final class FleetServiceControl {
             } catch {
                 throw pm2Failure(error, action: "restart", appName: appName)
             }
-            return await ManagedServices.settle(to: .running, attempts: attempts) {
+            return await ManagedServices.settle(to: .running,
+                                                attempts: attempts,
+                                                interval: PM2Client.settleInterval) {
                 self.pm2.state(ofApp: appName)
             }
         case .launchAgent(let label):

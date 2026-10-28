@@ -59,6 +59,15 @@ public struct PM2Client {
     /// The pm2 ecosystem file that defines it.
     public static let ecosystemPath = "apps/pm2-ecosystem.config.cjs"
 
+    /// How long a pm2 change is waited for, and how often it is looked at.
+    ///
+    /// Every look at a pm2 application spawns a node client, so the wait is
+    /// made of a few wide looks rather than many narrow ones.  The window is
+    /// the same twenty seconds the narrow looks gave, with a quarter of the
+    /// processes.
+    public static let settleAttempts = 8
+    public static let settleInterval: TimeInterval = 2.5
+
     private let commands: CommandRunning
     private let environment: [String: String]
     private let nodePath: String?
@@ -207,7 +216,10 @@ public struct PM2Client {
     /// service it cannot see, and it does not start one it cannot prove is
     /// missing.
     @discardableResult
-    public func setRunning(_ running: Bool, appName: String, attempts: Int = 40) async throws -> ManagedServiceState {
+    public func setRunning(_ running: Bool,
+                           appName: String,
+                           attempts: Int = PM2Client.settleAttempts,
+                           interval: TimeInterval = PM2Client.settleInterval) async throws -> ManagedServiceState {
         let wanted: ManagedServiceState = running ? .running : .stopped
         let current = state(ofApp: appName)
         if current == wanted { return current }
@@ -217,7 +229,11 @@ public struct PM2Client {
         } else {
             try stop(appName: appName)
         }
-        return await ManagedServices.settle(to: wanted, attempts: attempts) { self.state(ofApp: appName) }
+        return await ManagedServices.settle(to: wanted,
+                                            attempts: attempts,
+                                            interval: interval) {
+            self.state(ofApp: appName)
+        }
     }
 }
 

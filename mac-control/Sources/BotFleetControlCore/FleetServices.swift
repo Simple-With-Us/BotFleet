@@ -102,11 +102,17 @@ public struct FleetServiceEntry: Equatable {
     public let wanted: Bool?
     /// The observed state, probed rather than assumed.
     public let state: ManagedServiceState
+    /// True when the owner stopped this service on purpose.
+    public let stoppedByOwner: Bool
 
-    public init(descriptor: FleetServiceDescriptor, wanted: Bool?, state: ManagedServiceState) {
+    public init(descriptor: FleetServiceDescriptor,
+                wanted: Bool?,
+                state: ManagedServiceState,
+                stoppedByOwner: Bool = false) {
         self.descriptor = descriptor
         self.wanted = wanted
         self.state = state
+        self.stoppedByOwner = stoppedByOwner
     }
 
     public var id: String { descriptor.id }
@@ -121,7 +127,10 @@ public struct FleetServiceEntry: Equatable {
 
     /// The actions the owner may pick for this service right now.
     public var availableActions: [ManagedServiceAction] {
-        FleetServices.availableActions(for: state, policy: policy)
+        FleetServices.availableActions(for: state,
+                                      wanted: wanted,
+                                      policy: policy,
+                                      stoppedByOwner: stoppedByOwner)
     }
 }
 
@@ -150,10 +159,19 @@ public struct FleetServices: Equatable {
     public let serverState: ManagedServices.ServerState
     /// The observed state of every service, by service id.
     public let states: [String: ManagedServiceState]
+    /// The services the owner stopped on purpose, by service id.
+    ///
+    /// A stop the owner asked for is not one the Control app undoes.  The
+    /// set belongs to the app, so it lasts as long as the app does, and a
+    /// relaunch hands the fleet back to its own rules.
+    public let stoppedByOwner: Set<String>
 
-    public init(serverState: ManagedServices.ServerState, states: [String: ManagedServiceState]) {
+    public init(serverState: ManagedServices.ServerState,
+                states: [String: ManagedServiceState],
+                stoppedByOwner: Set<String> = []) {
         self.serverState = serverState
         self.states = states
+        self.stoppedByOwner = stoppedByOwner
     }
 
     /// The wanted state of one service.
@@ -164,6 +182,9 @@ public struct FleetServices: Equatable {
     public func wanted(for descriptor: FleetServiceDescriptor) -> Bool? {
         switch descriptor.policy {
         case .whileServerRuns:
+            // A service the owner stopped on purpose is not wanted, whatever
+            // the service it follows is doing.
+            if stoppedByOwner.contains(descriptor.id) { return false }
             switch serverState {
             case .running: return true
             case .stopped: return false
@@ -185,7 +206,8 @@ public struct FleetServices: Equatable {
         FleetServiceRegistry.all.map { descriptor in
             FleetServiceEntry(descriptor: descriptor,
                              wanted: wanted(for: descriptor),
-                             state: states[descriptor.id] ?? .unknown)
+                             state: states[descriptor.id] ?? .unknown,
+                             stoppedByOwner: stoppedByOwner.contains(descriptor.id))
         }
     }
 
@@ -225,18 +247,22 @@ public struct FleetServices: Equatable {
     /// stopped, but it can be restarted, because a restart only asks for a
     /// fresh copy of it.
     ///
-    /// The wanted policy is part of the answer as well.  A service whose
-    /// state follows another one cannot be stopped on its own: the BotFleet
-    /// MCP Server is wanted exactly while the BotFleet Server runs, so
-    /// offering Stop for it would offer an action the Control app takes
-    /// back at once.  It can still be restarted, and it is stopped by
-    /// stopping the server it follows.
+    /// The wanted policy and the owner's own stops are part of the answer as
+    /// well, because an action the Control app would take straight back is
+    /// not an action worth offering.  A service the owner stopped on
+    /// purpose can always be started again, and a service that cannot be
+    /// wanted yet - the BotFleet MCP Server while the BotFleet Server is
+    /// down - offers only a restart.
     public static func availableActions(for state: ManagedServiceState,
-                                        policy: FleetServiceWantedPolicy) -> [ManagedServiceAction] {
-        if policy == .whileServerRuns { return [.restart] }
+                                        wanted: Bool?,
+                                        policy: FleetServiceWantedPolicy,
+                                        stoppedByOwner: Bool = false) -> [ManagedServiceAction] {
         switch state {
         case .running: return [.stop, .restart]
-        case .stopped: return [.start, .restart]
+        case .stopped:
+            if stoppedByOwner { return [.start, .restart] }
+            if wanted == false && policy == .whileServerRuns { return [.restart] }
+            return [.start, .restart]
         case .failed: return [.start, .restart]
         case .notInstalled: return []
         case .unknown: return [.restart]
