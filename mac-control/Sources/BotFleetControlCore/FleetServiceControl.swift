@@ -23,11 +23,13 @@ public enum FleetServiceError: LocalizedError, Equatable {
 /// BotFleet MCP Server is the one exception, because its own health endpoint
 /// is the only authority on whether it is running.
 public final class FleetServiceControl {
-    /// How long the BotFleet Server's own stop is waited for.
+    /// How often the BotFleet Server's own stop is looked for.
     ///
     /// The server answers the stop request before it has exited, so the
-    /// Control app waits for it to go rather than assuming it did.
-    public static let settleAttempts = 20
+    /// Control app waits for it to go rather than assuming it did.  The
+    /// window is the same twenty seconds the pm2 wait gives: eight looks
+    /// two and a half seconds apart.
+    public static let settleInterval: TimeInterval = 2.5
 
     private let pm2: PM2Client
     private let startup: StartupPolicy
@@ -120,7 +122,7 @@ public final class FleetServiceControl {
             if descriptor.policy == .whileServerRuns {
                 guard let mcpServer else { throw FleetServiceError.managerMissing }
                 do {
-                    return try await mcpServer.setRunning(running, attempts: PM2Client.mcpSettleAttempts)
+                    return try await mcpServer.setRunning(running, within: PM2Client.mcpSettleWindow)
                 } catch let error as McpServerError {
                     throw FleetServiceError.refused(error.errorDescription
                         ?? "The BotFleet MCP Server could not be changed.")
@@ -148,7 +150,7 @@ public final class FleetServiceControl {
                     // a constant that happens to be the expected one.
                     return await ManagedServices.settle(to: .stopped,
                                                         attempts: attempts,
-                                                        interval: 1.0) {
+                                                        interval: FleetServiceControl.settleInterval) {
                         await self.state(of: descriptor)
                     }
                 }
@@ -169,7 +171,7 @@ public final class FleetServiceControl {
             if descriptor.policy == .whileServerRuns {
                 guard let mcpServer else { throw FleetServiceError.managerMissing }
                 do {
-                    return try await mcpServer.restart(attempts: PM2Client.mcpSettleAttempts)
+                    return try await mcpServer.restart(within: PM2Client.mcpSettleWindow)
                 } catch let error as McpServerError {
                     throw FleetServiceError.refused(error.errorDescription
                         ?? "The BotFleet MCP Server could not be restarted.")

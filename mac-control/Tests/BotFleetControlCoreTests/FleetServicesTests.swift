@@ -94,6 +94,18 @@ final class FleetServicesTests: XCTestCase {
         XCTAssertEqual(FleetServices.automaticAction(for: entry!), .start)
     }
 
+    func testAServiceTheOwnerStoppedIsLeftAloneByTheAutomaticAction() {
+        // A service the owner stopped on purpose can read as failed, and a
+        // failed service is wanted, so the automatic action would bring it
+        // back up and take the owner's stop away.
+        let services = FleetServices(serverState: .running,
+                                     states: ["shellular": .failed],
+                                     stoppedByOwner: ["shellular"])
+        let entry = services.entries.first { $0.id == "shellular" }
+        XCTAssertEqual(entry?.stoppedByOwner, true)
+        XCTAssertEqual(FleetServices.automaticAction(for: entry!), .none)
+    }
+
     func testAStoppedFleetServiceIsLeftAloneByTheAutomaticAction() {
         let services = FleetServices(serverState: .running, states: ["shellular": .stopped])
         let entry = services.entries.first { $0.id == "shellular" }
@@ -413,8 +425,25 @@ final class FleetServicesTests: XCTestCase {
         // The MCP server is observed through an HTTP health endpoint, so a
         // look at it costs no process and its window stays the twenty
         // seconds it always was.
-        XCTAssertEqual(PM2Client.mcpSettleAttempts, 40)
-        XCTAssertGreaterThanOrEqual(Double(PM2Client.mcpSettleAttempts) * 0.5, 20.0)
+        XCTAssertEqual(PM2Client.mcpSettleWindow, 20)
+    }
+
+    func testAWaitWithAWallClockBudgetStopsAtItsDeadline() async {
+        // A look at the MCP server is an HTTP probe, and a probe that hangs
+        // costs its whole request timeout.  A count of looks would let the
+        // app sit busy for far longer than the window it promises, so the
+        // wait is bounded by the time it is given.
+        var looks = 0
+        let start = Date()
+        let observed = await ManagedServices.settle(to: .running, within: 1.0, interval: 0.1) {
+            looks += 1
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            return .stopped
+        }
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertEqual(observed, .stopped)
+        XCTAssertGreaterThan(looks, 1)
+        XCTAssertLessThan(elapsed, 3.0)
     }
 
     // MARK: - A stop the owner asked for
@@ -499,6 +528,37 @@ final class FleetServicesTests: XCTestCase {
         _ = try await control.perform(.stop, serviceID: FleetServiceRegistry.server.id)
         XCTAssertEqual(asked.value, 1)
         XCTAssertFalse(commands.calls.contains { $0.contains("bootout") })
+    }
+
+    func testTheMCPWaitIsBoundedByItsWindowAndNotByTheCostOfALook() async throws {
+        // A look at the MCP server is an HTTP probe, and a probe that hangs
+        // costs its whole request timeout.  A count of looks would let the
+        // menu bar app sit busy for far longer than the window it
+        // promises, so the wait is bounded by the time it is given.
+        FleetServiceURLProtocol.handler = { _ in
+            Thread.sleep(forTimeInterval: 0.5)
+            return .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp"}"#.utf8))
+        }
+        let mcp = try McpServerControl(session: mockSession(),
+                                       baseURL: URL(string: "http://127.0.0.1:8794"),
+                                       pm2: PM2Client(commands: FleetServiceCommands(),
+                                                      nodePath: "/usr/bin/node",
+                                                      pm2Path: "/usr/bin/pm2"))
+        // The server never goes away, so the wait runs for the whole window
+        // instead of ending as soon as the wanted state is seen.
+        let start = Date()
+        let observed = try await mcp.setRunning(false, within: 2)
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertEqual(observed, .running)
+        XCTAssertLessThan(elapsed, 8.0)
+    }
+
+    func testTheServersStopIsWaitedForWithTheSameWindowAsThePM2Wait() {
+        // The window the stop promises has to be the window it gets, and it
+        // is the same twenty seconds the pm2 wait gives.
+        XCTAssertEqual(FleetServiceControl.settleInterval, 2.5)
+        XCTAssertEqual(Double(PM2Client.settleAttempts) * PM2Client.settleInterval, 20.0)
+        XCTAssertEqual(Double(PM2Client.settleAttempts) * FleetServiceControl.settleInterval, 20.0)
     }
 
     func testTheServersStopReportsTheStateThatWasObserved() async throws {
@@ -622,14 +682,18 @@ final class FleetServicesTests: XCTestCase {
         FleetServiceURLProtocol.handler = { _ in
             .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp"}"#.utf8))
         }
-        let control = try makeControl(commands: FleetServiceCommands())
+        let home = try makeHome(serverInstalled: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let control = makeControl(commands: FleetServiceCommands(), home: home)
         let states = await control.states(serverState: .running)
         XCTAssertEqual(states["botfleet-mcp"], .running)
     }
 
     func testTheMCPServerIsUnknownWhenItsHealthEndpointDoesNotAnswer() async throws {
         FleetServiceURLProtocol.handler = { _ in .failure(URLError(.timedOut)) }
-        let control = try makeControl(commands: FleetServiceCommands())
+        let home = try makeHome(serverInstalled: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let control = makeControl(commands: FleetServiceCommands(), home: home)
         let states = await control.states(serverState: .running)
         XCTAssertEqual(states["botfleet-mcp"], .unknown)
     }
@@ -641,7 +705,9 @@ final class FleetServicesTests: XCTestCase {
         [{"name": "shellular", "pm2_env": {"status": "online"}},
          {"name": "grok-acp", "pm2_env": {"status": "errored"}}]
         """
-        let control = try makeControl(commands: commands)
+        let home = try makeHome(serverInstalled: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let control = makeControl(commands: commands, home: home)
         let states = await control.states(serverState: .running)
         XCTAssertEqual(states["shellular"], .running)
         XCTAssertEqual(states["grok-acp"], .failed)
@@ -682,16 +748,20 @@ final class FleetServicesTests: XCTestCase {
         return home
     }
 
-    private func makeControl(commands: FleetServiceCommands) throws -> FleetServiceControl {
-        let home = try makeHome(serverInstalled: true)
-        return FleetServiceControl(pm2: PM2Client(commands: commands, nodePath: "/usr/bin/node",
-                                                  pm2Path: "/usr/bin/pm2", home: home),
-                                   startup: StartupPolicy(home: home, commands: LaunchAgentCommands(), uid: 501, environment: [:]),
-                                   mcpServer: try? McpServerControl(session: mockSession(),
-                                                                   baseURL: URL(string: "http://127.0.0.1:8794"),
-                                                                   pm2: PM2Client(commands: commands,
-                                                                                  nodePath: "/usr/bin/node",
-                                                                                  pm2Path: "/usr/bin/pm2", home: home)))
+    /// A control that reads the fleet services out of a home of its own.
+    ///
+    /// The home is the caller's, so it can be removed when the test is
+    /// done with it.
+    private func makeControl(commands: FleetServiceCommands,
+                             home: URL) -> FleetServiceControl {
+        FleetServiceControl(pm2: PM2Client(commands: commands, nodePath: "/usr/bin/node",
+                                           pm2Path: "/usr/bin/pm2", home: home),
+                            startup: StartupPolicy(home: home, commands: LaunchAgentCommands(), uid: 501, environment: [:]),
+                            mcpServer: try? McpServerControl(session: mockSession(),
+                                                            baseURL: URL(string: "http://127.0.0.1:8794"),
+                                                            pm2: PM2Client(commands: commands,
+                                                                           nodePath: "/usr/bin/node",
+                                                                           pm2Path: "/usr/bin/pm2", home: home)))
     }
 
     private func mockSession() -> URLSession {

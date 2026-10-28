@@ -206,4 +206,28 @@ public struct ManagedServices: Equatable {
         }
         return await observe()
     }
+
+    /// Waits for a service to reach the wanted state, with a wall-clock
+    /// budget, and reports what was seen.
+    ///
+    /// A number of looks is not a budget on its own: a look can cost a
+    /// whole request timeout, so forty looks can take far longer than the
+    /// twenty seconds they were meant to be.  This wait is bounded by the
+    /// time it is given, whatever each look costs.
+    public static func settle(to wanted: ManagedServiceState,
+                               within seconds: TimeInterval,
+                               interval: TimeInterval = 0.5,
+                               observe: () async -> ManagedServiceState) async -> ManagedServiceState {
+        // Both values are clamped, because this is public API and a caller
+        // must not be able to trap the app or wait forever.
+        let budget = seconds.isFinite ? max(seconds, 0) : 0
+        let step = interval.isFinite ? min(max(interval, 0), 60) : 0
+        let deadline = Date().addingTimeInterval(budget)
+        while true {
+            let next = await observe()
+            if next == wanted { return next }
+            if Date() >= deadline { return next }
+            try? await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
+        }
+    }
 }

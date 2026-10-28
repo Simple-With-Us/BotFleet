@@ -325,7 +325,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // The control is resolved here, on the main actor, so its first use
         // cannot race with another one on a detached executor.
         let control = fleetServiceControl
-        let states = await Task.detached(priority: .userInitiated) { [self] in
+        let states = await Task.detached(priority: .userInitiated) {
             await control.states(serverState: serverState)
         }.value
         guard fleetServiceSequencer.isCurrent(generation) else { return }

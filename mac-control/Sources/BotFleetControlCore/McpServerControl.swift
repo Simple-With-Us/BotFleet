@@ -72,8 +72,10 @@ public struct PM2Client {
     ///
     /// The MCP server is observed through an HTTP health endpoint, so a look
     /// at it costs no process, and its window stays the twenty seconds it
-    /// always was.
-    public static let mcpSettleAttempts = 40
+    /// always was.  The window is a wall-clock one, because a look that
+    /// hangs costs its whole request timeout: a count of looks would let
+    /// the menu bar app sit busy for far longer than twenty seconds.
+    public static let mcpSettleWindow: TimeInterval = 20
 
     private let commands: CommandRunning
     private let environment: [String: String]
@@ -319,7 +321,7 @@ public final class McpServerControl {
     /// service it cannot see, and it does not start one it cannot prove is
     /// missing.
     @discardableResult
-    public func setRunning(_ running: Bool, attempts: Int = 40) async throws -> ManagedServiceState {
+    public func setRunning(_ running: Bool, within: TimeInterval = PM2Client.mcpSettleWindow) async throws -> ManagedServiceState {
         let wanted: ManagedServiceState = running ? .running : .stopped
         let current = await state()
         if current == wanted { return current }
@@ -344,7 +346,7 @@ public final class McpServerControl {
         } catch {
             throw McpServerError.refused("pm2 could not change the BotFleet MCP Server.")
         }
-        return await ManagedServices.settle(to: wanted, attempts: attempts) { await self.state() }
+        return await ManagedServices.settle(to: wanted, within: within) { await self.state() }
     }
 
     /// Restarts the MCP server and reports what was seen.
@@ -353,7 +355,7 @@ public final class McpServerControl {
     /// whether it is running, so the state that is reported is the one that
     /// endpoint answers with.
     @discardableResult
-    public func restart(attempts: Int = 40) async throws -> ManagedServiceState {
+    public func restart(within: TimeInterval = PM2Client.mcpSettleWindow) async throws -> ManagedServiceState {
         do {
             try pm2.restart(appName: PM2Client.mcpAppName)
         } catch let error as McpServerError {
@@ -367,6 +369,6 @@ public final class McpServerControl {
         } catch {
             throw McpServerError.refused("pm2 could not restart the BotFleet MCP Server.")
         }
-        return await ManagedServices.settle(to: .running, attempts: attempts) { await self.state() }
+        return await ManagedServices.settle(to: .running, within: within) { await self.state() }
     }
 }

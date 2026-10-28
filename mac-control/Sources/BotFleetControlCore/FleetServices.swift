@@ -294,7 +294,12 @@ public struct FleetServices: Equatable {
     /// way it should be is brought back.  A service that was stopped on
     /// purpose is not one of those, because nothing asks it to stop.
     public static func automaticAction(for entry: FleetServiceEntry) -> ManagedServiceAction {
-        ManagedServices.action(wanted: entry.wanted, state: entry.state)
+        // A service the owner stopped on purpose is left alone whatever
+        // state it reads as now.  A service that was stopped can read as
+        // failed, and a failed service is wanted, so without this the
+        // reconciler would take the owner's stop back.
+        if entry.stoppedByOwner { return .none }
+        return ManagedServices.action(wanted: entry.wanted, state: entry.state)
     }
 
     /// The actions the owner may pick for a service in this state.
