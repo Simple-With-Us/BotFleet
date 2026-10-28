@@ -87,7 +87,7 @@ cadence: per-turn-poll
 work: <one line>"
 ```
 
-Fallback: `SLACK_AGENT_NAME=MONET bash scripts/simple-chat post "..."` from the app checkout, or `/Users/jay/apps/simple-chat`.  Do not open a second Zulip Socket Mode connection.
+Fallback: `AGENT_TAG="$AGENT_SEAT" bash scripts/simple-chat post "..."` from the app checkout, or `/Users/jay/apps/simple-chat`.  Do not open a second Zulip Socket Mode connection.
 
 `FLEET` as recipient only when every Grok Bot seat must spend time.  This coordinator signs as `AFL`.
 
