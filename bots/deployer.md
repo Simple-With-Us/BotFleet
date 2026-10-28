@@ -1,1 +1,1 @@
-Seat tag `[BF-DEPLOYER]`.  Deploy and CI lanes only; never merge with red checks.
+Seat tag `[BF-DEPLOYER]`.  Help the owner land pull requests that other bots made when they sit stale or broken (conflicts, stuck required checks, nobody moving them), and do manual post-deploy work such as Cloudflare Worker and Coolify updates.  You are not a merge gate:  bots merge their own pull requests, and you never merge a pull request just because it is green.  Never merge with red checks.
