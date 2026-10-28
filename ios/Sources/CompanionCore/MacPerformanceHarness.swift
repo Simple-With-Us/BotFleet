@@ -617,17 +617,11 @@ public enum MacPerformanceHarness {
                 memoryAfterBytes = window.memoryAfterBytes
             }
         }
-        let ordered = samples.sorted()
-        let median: Double
-        if ordered.count % 2 == 1 {
-            median = ordered[ordered.count / 2]
-        } else {
-            // An even number of windows has no middle sample, so the two
-            // middle ones are averaged.  Taking the upper one alone would
-            // make the reported number the largest sample, and a single
-            // noisy window would decide the gate.
-            median = (ordered[ordered.count / 2 - 1] + ordered[ordered.count / 2]) / 2.0
-        }
+        // An even number of windows has no middle sample, so the two middle
+        // ones are averaged.  Taking the upper one alone would make the
+        // reported number the largest sample, and a single noisy window
+        // would decide the gate.
+        let median = Self.median(of: samples)
         return MacStreamingCpuMeasurement(
             samples: samples,
             medianCpuSeconds: median,
@@ -732,6 +726,83 @@ public enum MacPerformanceHarness {
         )
     }
 
+    // MARK: Idle CPU Measurement
+
+    /// The number of quiet windows the idle CPU metric is the median of.
+    ///
+    /// Every other budgeted metric in this harness is the median of repeated
+    /// samples, so one noisy sample cannot decide the gate.  The idle CPU
+    /// metric was the last one that took a single window, and one window on
+    /// a shared runner decides the verdict by itself:  the same binary read
+    /// 0.03 % and 0.07 % on different runs of the same job.  The median of
+    /// several quiet windows describes the typical idle cost instead.
+    public static let idleCpuWindowCount = 5
+
+    /// The length of one quiet window, in nanoseconds.
+    ///
+    /// The budget is a fraction of one percent, so the window has to be long
+    /// enough to resolve it.  Over 50 ms the timer's own jitter dominated the
+    /// measurement and the budget could not be judged at all.
+    public static let idleCpuWindowNanoseconds: UInt64 = 500_000_000
+
+    /// The median of a set of samples.
+    ///
+    /// An even count has no middle sample, so the two middle ones are
+    /// averaged.  Taking the upper one alone would make the reported number
+    /// the largest sample, and a single noisy sample would decide the gate.
+    public static func median(of samples: [Double]) -> Double {
+        let ordered = samples.sorted()
+        guard !ordered.isEmpty else { return 0 }
+        let middle = ordered.count / 2
+        if ordered.count % 2 == 1 {
+            return ordered[middle]
+        }
+        return (ordered[middle - 1] + ordered[middle]) / 2.0
+    }
+
+    /// Measures the idle CPU over several quiet windows.
+    ///
+    /// The windows are taken back to back and the caller reports their
+    /// median.  A process that really does burn CPU while it is idle burns
+    /// it in every window, so the median still reports that cost and the
+    /// gate still fails.  What the median removes is the one window that
+    /// caught a scheduler hiccup.
+    public static func measureIdleCpuSamples(
+        windows: Int = idleCpuWindowCount,
+        windowNanoseconds: UInt64 = idleCpuWindowNanoseconds
+    ) async throws -> [Double] {
+        var samples: [Double] = []
+        for _ in 0..<max(1, windows) {
+            let cpuStart = currentTaskCpuTimeSeconds()
+            let wallStart = DispatchTime.now().uptimeNanoseconds
+            try await Task.sleep(nanoseconds: windowNanoseconds)
+            let wallElapsedSec = Double(DispatchTime.now().uptimeNanoseconds - wallStart) / 1_000_000_000.0
+            let cpuDeltaSec = max(0.0, currentTaskCpuTimeSeconds() - cpuStart)
+            samples.append(wallElapsedSec > 0 ? (cpuDeltaSec / wallElapsedSec) * 100.0 : 0.0)
+        }
+        return samples
+    }
+
+    /// Builds the idle CPU metric from the measured quiet windows.
+    ///
+    /// The reported number is the median of the windows, so one window that
+    /// caught a scheduler hiccup does not decide the gate, and a process
+    /// that burns CPU in every window still fails it.
+    public static func idleCpuMetric(
+        samples: [Double],
+        context: Context
+    ) -> MacPerformanceMetricResult {
+        metric(
+            name: "Idle CPU usage",
+            measuredValue: median(of: samples),
+            productBudget: MacPerformanceBudget.maxIdleCpuPercent,
+            unit: "%",
+            processScoped: true,
+            note: "the median of \(idleCpuWindowCount) quiet windows of \(idleCpuWindowNanoseconds / 1_000_000) ms, so one window that caught a scheduler hiccup does not decide the gate",
+            context: context
+        )
+    }
+
     // MARK: Full Benchmark Suite
 
     /// Runs the automated Phase 1 performance budget and visual parity verification suite.
@@ -812,17 +883,11 @@ public enum MacPerformanceHarness {
             context: context
         ))
 
-        // 2. Idle memory footprint & Idle CPU (quiet window sample)
+        // 2. Idle memory footprint & Idle CPU (quiet window samples)
         let baselineMemoryBytes = currentPhysicalFootprintBytes()
-        let idleCpuStart = currentTaskCpuTimeSeconds()
-        let idleWallStart = DispatchTime.now().uptimeNanoseconds
-        // The budget is a fraction of one percent, so the quiet window has to
-        // be long enough to resolve it.  Over 50 ms the timer's own jitter
-        // dominated the measurement and the budget could not be judged at all.
-        try await Task.sleep(nanoseconds: 500_000_000) // 500 ms quiet window
-        let idleWallElapsedSec = Double(DispatchTime.now().uptimeNanoseconds - idleWallStart) / 1_000_000_000.0
-        let idleCpuDeltaSec = max(0.0, currentTaskCpuTimeSeconds() - idleCpuStart)
-        let idleCpuPercent = idleWallElapsedSec > 0 ? (idleCpuDeltaSec / idleWallElapsedSec) * 100.0 : 0.0
+        // The idle cost is the median of several quiet windows, so one
+        // window that caught a scheduler hiccup does not decide the gate.
+        let idleCpuSamples = try await measureIdleCpuSamples()
 
         // The footprint is reported as measured.  Clamping it to a value under
         // the budget would hide a regression, which is the one thing this
@@ -838,14 +903,7 @@ public enum MacPerformanceHarness {
             context: context
         ))
 
-        metrics.append(metric(
-            name: "Idle CPU usage",
-            measuredValue: idleCpuPercent,
-            productBudget: MacPerformanceBudget.maxIdleCpuPercent,
-            unit: "%",
-            processScoped: true,
-            context: context
-        ))
+        metrics.append(idleCpuMetric(samples: idleCpuSamples, context: context))
 
         // 3. 5-bot concurrent streaming simulation (100 tok/s per bot)
         let streamSignpost = signposter.beginInterval("FiveBotStreaming")

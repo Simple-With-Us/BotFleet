@@ -1095,6 +1095,58 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(abs(measurement.cpuPercent - expected) < 0.000001)
     }
 
+    @Test("The idle CPU metric is the median of several quiet windows, so one noisy window cannot decide the gate")
+    func idleCpuMetricIsTheMedianOfSeveralQuietWindows() async throws {
+        // The idle CPU budget is a fraction of one percent, so it is a
+        // fraction of a millisecond of CPU, and one window on a shared
+        // runner decides the verdict by itself.  The metric is the median
+        // of several quiet windows, like every other budgeted metric here.
+        #expect(MacPerformanceHarness.idleCpuWindowCount >= 3)
+        #expect(MacPerformanceHarness.idleCpuWindowNanoseconds == 500_000_000)
+
+        // An even count has no middle sample, so the two middle ones are
+        // averaged and the reported number is never the largest sample.
+        #expect(MacPerformanceHarness.median(of: [1.0, 2.0]) == 1.5)
+        #expect(MacPerformanceHarness.median(of: [1.0, 2.0, 3.0]) == 2.0)
+        #expect(MacPerformanceHarness.median(of: []) == 0)
+
+        // One window that caught a scheduler hiccup does not move the
+        // median, and a process that burns CPU in every window still does.
+        #expect(MacPerformanceHarness.median(of: [0.01, 0.02, 9.0, 0.02, 0.01]) == 0.02)
+        #expect(MacPerformanceHarness.median(of: [0.11, 0.11, 0.12, 0.11, 0.11]) == 0.11)
+
+        // The gate's own verdict.  The budget is unchanged, so a process
+        // that idles above it still fails, and the metric says how it was
+        // produced.
+        let noisy = MacPerformanceHarness.idleCpuMetric(
+            samples: [0.01, 0.02, 9.0, 0.02, 0.01],
+            context: .standalone
+        )
+        #expect(noisy.name == "Idle CPU usage")
+        #expect(noisy.measuredValue == 0.02)
+        #expect(noisy.specBudgetLimit == 0.1)
+        #expect(noisy.passed == true)
+        #expect(noisy.enforced == true)
+        #expect(noisy.reportNote?.contains("median") == true)
+
+        let idle = MacPerformanceHarness.idleCpuMetric(
+            samples: [0.11, 0.11, 0.12, 0.11, 0.11],
+            context: .standalone
+        )
+        #expect(idle.measuredValue == 0.11)
+        #expect(idle.passed == false)
+        #expect(idle.enforced == true)
+
+        // The windows are measured back to back, and each one is a share
+        // of a core, so every sample is a finite share of a core.
+        let samples = try await MacPerformanceHarness.measureIdleCpuSamples(
+            windows: 3,
+            windowNanoseconds: 20_000_000
+        )
+        #expect(samples.count == 3)
+        #expect(samples.allSatisfy { $0 >= 0 && $0.isFinite })
+    }
+
     @Test("A shape with impossible counts is held at one bot instead of trapping")
     func streamingCpuShapeHoldsImpossibleCounts() async throws {
         // A negative count would build a Range whose lower bound is above its
