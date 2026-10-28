@@ -1020,9 +1020,11 @@ describe("service token fallback", () => {
     expect(loginCalls(calls)).toHaveLength(0);
   });
 
-  it("treats a 403 as a refusal of the credential, like a 401", async () => {
-    // A grant that does not cover what was asked for is as final about the
-    // bearer as a revoked token.
+  it("falls back to the machine identity on a 403, which refuses that request", async () => {
+    // A grant that does not cover what was asked for is final about THAT
+    // request, and the call falls back to the machine identity.  It is not
+    // final about the credential, so the token is not deprioritized for the
+    // rest of the vault:  the scope test below pins that.
     withSettings({ token: SENTINEL_READ_TOKEN });
     const { calls, impl } = refusingList({
       refused: [SENTINEL_READ_TOKEN],
@@ -1088,9 +1090,9 @@ describe("service token fallback", () => {
   });
 
   it("forgets a refused token when a new settings source is installed", async () => {
-    // `configure()` is what a Settings save calls, and it installs a new
-    // credential source:  that source's token has to be tried on its own
-    // merits rather than inherit the previous source's rejection.
+    // `configure()` installs a new credential source, and the server calls it
+    // at boot:  that source's token has to be tried on its own merits rather
+    // than inherit the previous source's rejection.
     withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
     const refused = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
     vi.stubGlobal("fetch", refused.impl);
@@ -1108,6 +1110,35 @@ describe("service token fallback", () => {
     const status = await infisical.refresh("manual");
 
     expect(status.lastError).toBeNull();
+    expect(listCalls(accepted.calls)[0]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+  });
+
+  it("forgets a refused token when the operator asks for a retry", async () => {
+    // A Sync Now and a Settings save are the operator asking for the
+    // configured token to be tried again.  A grant widened or a path created
+    // in the vault changes neither the token nor the scope, so the memory
+    // cannot notice it on its own:  without the explicit retry the token
+    // would stay deprioritized until the process restarted.
+    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
+    const refused = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
+    vi.stubGlobal("fetch", refused.impl);
+    const failed = await infisical.refresh("manual");
+    expect(failed.lastError).toMatch(/401/);
+    expect(infisical.getStatus().readTokenRefused).toBe(true);
+
+    const accepted = refusingList({
+      refused: [],
+      status: 401,
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", accepted.impl);
+
+    infisical.retryRefusedTokens();
+    const status = await infisical.refresh("manual");
+
+    expect(status.lastError).toBeNull();
+    expect(infisical.getStatus().readTokenRefused).toBe(false);
     expect(listCalls(accepted.calls)[0]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
     expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
   });
@@ -1338,6 +1369,51 @@ describe("service token refusal: scope and visibility", () => {
     const lists = calls.filter((call) => !call.url.includes("/login"));
     expect(bearerOf(lists.at(-1)!)).toBe(REFUSED_TOKEN);
     expect(infisical.getStatus().readTokenRefused).toBe(false);
+  });
+
+  it("does not let one 403 deprioritize the token for the whole vault", async () => {
+    // A 403 is a refusal of the REQUEST the same way a 404 is:  the grant
+    // does not cover what was asked for, and the token itself is still good.
+    // Remembering it against the whole vault would push a working token
+    // aside for the life of the process.
+    withSettings({ token: REFUSED_TOKEN });
+    const { calls, impl } = scopedRefusingFetch({
+      status: 403,
+      onlyPath: "/zulip",
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", impl);
+
+    const values = await infisical.readPath("/zulip");
+    expect(values.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+
+    const refreshed = await infisical.refresh("manual");
+    expect(refreshed.lastError).toBeNull();
+
+    // The refresh reads the vault's own scope, where the token was never
+    // refused, so the token is used again.
+    const lists = calls.filter((call) => !call.url.includes("/login"));
+    expect(bearerOf(lists.at(-1)!)).toBe(REFUSED_TOKEN);
+    expect(infisical.getStatus().readTokenRefused).toBe(false);
+  });
+
+  it("names a refused token on the boot line even when the sync failed", async () => {
+    // The case that matters most is a refused token with no machine identity
+    // to fall back to:  the sync errored, so the boot line reports the
+    // error, and it has to name the refusal as well or the operator cannot
+    // tell a revoked token from a broken vault.
+    withSettings({ clientId: "", clientSecret: "", token: REFUSED_TOKEN });
+    const { impl } = scopedRefusingFetch({
+      status: 401,
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", impl);
+
+    await infisical.refresh("manual");
+
+    const line = infisical.bootLine();
+    expect(line).toContain("unavailable");
+    expect(line).toContain("read-token-refused");
   });
 
   it("deprioritizes a revoked token everywhere, not only where it was refused", async () => {

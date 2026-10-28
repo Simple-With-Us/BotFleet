@@ -244,7 +244,14 @@ class InfisicalManager {
    * the old token's rejection.  The SCOPE it was refused under is
    * remembered with it, because a wrong project id answers 404 and looks
    * exactly like a revoked token:  fixing the project id in Settings has to
-   * put the token back in play rather than leave it deprioritized forever. */
+   * put the token back in play rather than leave it deprioritized forever.
+   *
+   * A refusal the operator can fix without touching the token -- a grant
+   * widened, a path created, a vault restored -- changes neither the value
+   * nor the scope, so the memory cannot notice it on its own.  The escape
+   * hatch is `retryRefusedTokens()`, which the Sync Now and the Settings
+   * save paths call:  an explicit ask for a retry is the operator saying
+   * the thing I fixed, try it again. */
   private rejectedTokens = new Map<"read" | "write", Array<{ token: string; scope: string }>>();
 
 
@@ -261,6 +268,17 @@ class InfisicalManager {
     // The same goes for the refused-token memory:  a new settings source is
     // a new credential, and it must be tried on its own merits rather than
     // inherit the previous source's rejection.
+    this.rejectedTokens.clear();
+  }
+
+  /** Forget every remembered refusal, so the configured tokens are tried
+   * again on the next call.  A Sync Now and a Settings save are the operator
+   * asking for exactly that:  a grant widened, a path created or a vault
+   * restored changes nothing about the token itself, so a token remembered
+   * as refused would otherwise stay deprioritized until the process
+   * restarted.  The background refreshes do not clear it, because a timer
+   * tick must not re-probe a token the server has already refused. */
+  retryRefusedTokens(): void {
     this.rejectedTokens.clear();
   }
 
@@ -739,17 +757,21 @@ class InfisicalManager {
     if (!status.enabled) {
       return "[infisical] disabled by settings";
     }
-    if (status.lastError) {
-      return `[infisical] unavailable: ${status.lastError}; using environment and config values`;
-    }
-    const fields = status.appliedFields.join(",");
-    // A refused token is a fact about the credential, not about the sync:
-    // the sync succeeded on the machine identity, so the line says both.
+    // A refused token is a fact about the credential, not about the sync.
+    // It is worked out BEFORE the error branch, because the case that
+    // matters most -- a refused token with no machine identity to fall back
+    // to -- IS an error case, and the line that reports the error has to
+    // name the refusal as well or the operator cannot tell a revoked token
+    // from a broken vault.
     const refused = [
       status.readTokenRefused ? "read-token-refused" : "",
       status.writeTokenRefused ? "write-token-refused" : "",
     ].filter(Boolean).join(",");
     const refusedPart = refused ? ` ${refused}` : "";
+    if (status.lastError) {
+      return `[infisical] unavailable: ${status.lastError}; using environment and config values${refusedPart}`;
+    }
+    const fields = status.appliedFields.join(",");
     return `[infisical] enabled env=${status.environment} path=${status.secretPath} vault=${status.vaultCount} applied=${status.appliedCount} fields=${fields} unused=${status.unusedVaultNames.length}${refusedPart} ms=${status.lastSyncMs ?? 0}`;
   }
 
