@@ -70,7 +70,10 @@ describe("fleet seat prompt composition", () => {
   it("reports byte counts for PR math", () => {
     const shared = fleetSharedPreambleBytes();
     expect(shared).toBeGreaterThan(900);
-    expect(shared).toBeLessThan(2500);
+    // The ceiling tracks the shared block's real size plus headroom: it grew
+    // past 2500 when the "Wakes and @all" paragraph landed, and past 3400 with
+    // the owner's @all-reply, one-line-note and merge-label rules (Oct 27 2026).
+    expect(shared).toBeLessThan(4000);
     const composed = fleetComposedPromptBytes("plumber");
     expect(composed).toBeGreaterThan(shared);
     expect(legacyDuplicatedSharedBytesPerTurn(2)).toBe(shared);
