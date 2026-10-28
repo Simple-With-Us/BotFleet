@@ -286,6 +286,28 @@ public struct FleetServices: Equatable {
         "Fleet Services (\(entries.count))"
     }
 
+    /// What stopping one fleet service does, for the confirmation.
+    ///
+    /// The copy has to promise only what the menu really offers.  On a
+    /// wrapper that cannot carry the startup policy the row has no
+    /// Restart, so the copy names the real recovery instead of a Restart
+    /// the owner cannot pick.
+    public static func stopBody(for service: FleetServiceMenuItem,
+                                startupPolicySupported: Bool) -> String {
+        if service.id == FleetServiceRegistry.server.id {
+            let common = "The BotFleet Server stops itself, and its Local VMs go down with it.  The server refuses while work is in flight.  The installed wrapper stays down while the deliberate-stop marker exists, so a login does not bring it back"
+            guard startupPolicySupported else {
+                return common + ".  This version of BotFleet cannot restart the server from here, so remove ~/.botfleet/stopped.marker yourself to bring it back."
+            }
+            return common + "; Restart clears the marker."
+        }
+        if let descriptor = FleetServiceRegistry.descriptor(for: service.id),
+           case .launchAgent = descriptor.kind {
+            return "It stops right away.  macOS does not bring it back until the LaunchAgent is loaded again."
+        }
+        return "It stops right away, and pm2 leaves it stopped until you start it again."
+    }
+
     /// The action the Control app takes on its own to bring one service in
     /// line with its wanted state.
     ///

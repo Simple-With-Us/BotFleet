@@ -629,6 +629,57 @@ final class FleetServicesTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
     }
 
+    func testARefusedRestartDoesNotPutTheMarkerBackWhenTheStateIsUnknown() async throws {
+        // launchctl could not be asked, so nothing is known about the
+        // server.  The marker must not be re-created on that, and the
+        // refusal must not claim the server was not replaced.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+        let commands = LaunchAgentCommands()
+        commands.loaded = false
+        commands.listingFails = true
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil)
+        do {
+            _ = try await control.perform(.restart, serviceID: FleetServiceRegistry.server.id, attempts: 2)
+            XCTFail("a restart that could not be checked should not be reported as a success")
+        } catch {
+            XCTAssertTrue("\(error)".contains("could not be checked"))
+            XCTAssertFalse("\(error)".contains("not replaced"))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testTheStopCopyPromisesOnlyWhatTheMenuOffers() {
+        // On a wrapper that cannot carry the startup policy the row has no
+        // Restart, so the copy must not point the owner at one.
+        let services = FleetServices(serverState: .running,
+                                    states: ["app.botfleet.server": .running],
+                                    startupPolicySupported: false)
+        let row = services.menuItems.first { $0.id == "app.botfleet.server" }
+        let body = FleetServices.stopBody(for: row!, startupPolicySupported: false)
+        XCTAssertFalse(body.contains("Restart clears the marker"))
+        XCTAssertTrue(body.contains("stopped.marker"))
+    }
+
+    func testTheStopCopyOnAWrapperThatCanRestartPromisesTheRestart() {
+        let services = FleetServices(serverState: .running,
+                                    states: ["app.botfleet.server": .running],
+                                    startupPolicySupported: true)
+        let row = services.menuItems.first { $0.id == "app.botfleet.server" }
+        let body = FleetServices.stopBody(for: row!, startupPolicySupported: true)
+        XCTAssertTrue(body.contains("Restart clears the marker"))
+    }
+
     func testAServerRestartWaitsNoLongerThanTheCallerAskedFor() async throws {
         // The launchd path has to honour the caller's wait, the way the pm2
         // path does, or a caller cannot bound the time it spends here.
@@ -827,13 +878,18 @@ private final class LaunchAgentCommands: CommandRunning {
     var listing = "PID\tStatus\tLabel\n-\t0\tother.service"
     /// True when launchctl already knows the agent.
     var loaded = false
+    /// True when launchctl cannot be asked at all.
+    var listingFails = false
     /// The boot id the startup policy records.
     var boot = "4F9389E9-AFE4-42C8-AE2C-7FEEDBA31B6C"
 
     func run(_ executable: String, _ arguments: [String]) throws -> String {
         calls.append(([executable] + arguments).joined(separator: " "))
         if executable == "/usr/sbin/sysctl" { return boot }
-        if arguments == ["list"] { return listing }
+        if arguments == ["list"] {
+            if listingFails { throw StartupPolicyError.commandFailed }
+            return listing
+        }
         if arguments.first == "print" {
             if loaded { return "state = running" }
             throw StartupPolicyError.commandFailed

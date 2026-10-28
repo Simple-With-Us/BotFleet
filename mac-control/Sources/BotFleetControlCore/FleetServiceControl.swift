@@ -204,11 +204,14 @@ public final class FleetServiceControl {
                     startup.state(ofAgent: label).managedState
                 }
                 if observed != .running {
-                    // The server was not replaced, so the restart did not
-                    // work: the owner's deliberate stop stands, and the
-                    // marker goes back where it was.
-                    deliberateStop.restore()
-                    throw FleetServiceError.refused("The BotFleet Server was not replaced: its LaunchAgent owns no process, so the server that is running was not started by launchd.")
+                    // Only an observation that proves the server is not
+                    // running puts the marker back.  An unknown state means
+                    // launchctl could not be asked, not that the restart
+                    // failed, and the marker must not be re-created on it.
+                    if observed != .unknown { deliberateStop.restore() }
+                    throw FleetServiceError.refused(observed == .unknown
+                        ? "The BotFleet Server could not be checked after the restart, so nothing can be said about it."
+                        : "The BotFleet Server was not replaced: its LaunchAgent owns no process, so the server that is running was not started by launchd.")
                 }
                 return observed
             }
