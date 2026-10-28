@@ -129,7 +129,7 @@ public final class McpServerControl {
     /// Nothing is assumed: the server is running only when it answers its own
     /// health endpoint as the BotFleet MCP server.  A port that nothing
     /// answers is stopped; a port that answers as something else is unknown.
-    public func state() async -> WheelhouseState {
+    public func state() async -> ManagedServiceState {
         guard let url = URL(string: "/health", relativeTo: baseURL)?.absoluteURL else { return .unknown }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -163,7 +163,7 @@ public final class McpServerControl {
     /// service it cannot see, and it does not start one it cannot prove is
     /// missing.
     @discardableResult
-    public func setRunning(_ running: Bool, attempts: Int = 40) async throws -> WheelhouseState {
+    public func setRunning(_ running: Bool, attempts: Int = 40) async throws -> ManagedServiceState {
         let current = await state()
         if current == (running ? .running : .stopped) { return current }
         if current == .unknown { return current }

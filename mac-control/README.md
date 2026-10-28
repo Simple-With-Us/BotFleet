@@ -13,3 +13,19 @@ The bundled `botfleet-vm-control.mjs` helper reports managed Local VM state and 
 “Start Server At Login” records `kern.bootsessionuuid` in `~/.botfleet/startup-session`, then writes either `startup-enabled.marker` or `startup-disabled.marker` and removes the opposite marker.  “Start Server” enables and bootstraps `app.botfleet.server` if needed, removes `~/.botfleet/stopped.marker`, and kickstarts without terminating a running instance; a failed kickstart restores a previous stopped marker.  Both controls require the installed `~/apps/botfleet-server-start.sh` wrapper to contain `BF_CONTROL_STARTUP_POLICY_V1`; unsupported installations show an update message.  The wrapper allows recovery during the current boot, honors disabled login startup on the next boot, and treats explicit enabled startup as authority to clear a stopped marker from an older boot.
 
 “Launch Control At Login” uses `SMAppService.mainApp`.  Hiding the icon leaves the process and server running; opening `BotFleet Control.app` again restores the icon.  Quitting Control never changes the server.  Closing the Electron BotFleet window releases Electron; the server's separate “Keep Server Running After Quitting BotFleet” setting determines whether it continues.
+
+## Managed Services
+
+The app calls the background services it keeps in line with the server the Managed Services list: the BotFleet MCP Server and anything else the server is supposed to be running.  The list is derived from what the server reports, so nothing about it is stored locally.  The MCP server is wanted exactly while the server is running, and the app reconciles the list in the background so a slow `pm2` call never holds the menu open.
+
+## Monitored Processes & Ports
+
+The “Monitored Processes & Ports” submenu reads the fleet’s own processes and the ports they hold every time the menu opens, using `ps` and `lsof`.  It lists each fleet process with its name, PID and port, and each port with the process holding it.  A process belongs to the fleet when it is one of the fleet helpers, the BotFleet server, this app, or a development server running out of a BotFleet checkout; a checkout running its own tests is not part of the fleet and is never offered for stopping.
+
+A helper is an orphan when nothing is driving it any more: neither the BotFleet server nor a process manager is anywhere in its parent chain, so it was left behind and is only holding a port.  A development server out of a BotFleet checkout is always an orphan, because it is never part of the running fleet.  “Terminate … (PID …)” stops one process, “Free Port …” stops whatever holds one port, and “Kill Orphan BotFleet Processes” stops every orphan at once.  Each one says what it will stop before it does, and the app refuses to stop PID 1 or itself.
+
+## Remote VM Provider Plugin
+
+The app does not know how a remote machine is hosted, so the owner picks a provider and the app asks that provider.  `VMProviderPlugin` is the whole contract: the machine’s state, and three actions — start, stop and shut down.  Three providers ship with it.  `BotFleetServerVMProvider` asks the BotFleet server’s own control API about the virtual machine it runs on.  `HetznerCloudVMProvider` asks the Hetzner Cloud API about a server id, with the owner’s own token.  `CustomScriptVMProvider` runs the owner’s script with one argument — `status`, `start`, `stop` or `shutdown` — where a status call prints `running` or `off`.  A new provider is a new type that implements the protocol; nothing else in the app has to change.
+
+The configuration lives in `~/.botfleet/control-vm-plugins.json`, written atomically with mode 0600 because it holds API tokens.  “Configure Remote VM Provider…” asks for the server, the provider, the machine’s id, the token, and the script, and “Remove Remote VM Provider” forgets the answer without touching the machine.

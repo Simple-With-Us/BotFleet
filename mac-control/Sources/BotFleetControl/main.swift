@@ -38,18 +38,27 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var offlineVMs: OfflineDockerState = .unavailable
     private var helperVMs: [LocalVM]?
     private var vmProblem: String?
-    private var mcpServerState: WheelhouseState = .unknown
+    private var mcpServerState: ManagedServiceState = .unknown
     private var isLoading = false
     private var isBusy = false
     private var isReconciling = false
     private var problem: String?
+    /// The fleet's processes and the ports they hold, read fresh each time the
+    /// menu opens.
+    private var fleetSnapshot = FleetProcessSnapshot.empty
+    /// The remote machine providers the owner configured, by server id.
+    private var vmProviderConfigs: [String: VMProviderConfiguration] = [:]
+    /// The state of each remote machine, by server id.
+    private var vmStates: [String: RemoteVMState] = [:]
+    private let processMonitor = FleetProcessMonitor()
+    private let vmProviderStore = VMProviderStore()
 
     override init() {
         do {
             mcpServer = try McpServerControl()
             mcpServerProblem = nil
         } catch {
-            // The wheelhouse reports the problem in the menu instead of the
+            // The managed service list reports the problem in the menu instead of the
             // app refusing to start over it.
             mcpServer = nil
             mcpServerProblem = error.localizedDescription
@@ -147,6 +156,12 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.isLoading = false
             self.rebuildMenu()
 
+            // The fleet's processes and ports change on their own, so they are
+            // read fresh every time the menu opens.
+            self.fleetSnapshot = await Task.detached(priority: .userInitiated) { self.processMonitor.snapshot() }.value
+            self.rebuildMenu()
+            await self.refreshVMStates()
+
             // 2. Concurrently probe remote hosts with 5s timeout and update incrementally
             await withTaskGroup(of: (String, Result<ControlStatus, Error>).self) { group in
                 for host in self.hosts where !host.isLocal {
@@ -174,38 +189,38 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             self.rebuildMenu()
-            // The wheelhouse is reconciled behind the menu.  pm2 can take
+            // The managed services are reconciled behind the menu.  pm2 can take
             // seconds to start or stop a service, and a menu that waits for
             // it looks broken long before it is.
-            self.reconcileWheelhouseInBackground()
+            self.reconcileManagedServicesInBackground()
         }
     }
 
     /// What the Control app knows about the BotFleet Server itself.
-    private func serverState() -> Wheelhouse.ServerState {
-        Wheelhouse.serverState(statusAvailable: status != nil,
+    private func serverState() -> ManagedServices.ServerState {
+        ManagedServices.serverState(statusAvailable: status != nil,
                                 installedServerState: installedServerState,
                                 serverPresence: serverPresence)
     }
 
-    /// Brings the wheelhouse in line with what is wanted, without holding the
+    /// Brings the managed services in line with what is wanted, without holding the
     /// menu open while pm2 does its work.
-    private func reconcileWheelhouseInBackground() {
+    private func reconcileManagedServicesInBackground() {
         guard !isReconciling else { return }
         isReconciling = true
         Task { @MainActor in
-            await reconcileWheelhouse()
+            await reconcileManagedServices()
             isReconciling = false
             rebuildMenu()
         }
     }
 
-    /// Brings the wheelhouse in line with what is wanted.
+    /// Brings the managed services in line with what is wanted.
     ///
     /// The wanted state is derived from the BotFleet Server's own state, so
     /// there is nothing to store and nothing to toggle.  The BotFleet MCP
     /// server is wanted exactly while the server is running.
-    private func reconcileWheelhouse() async {
+    private func reconcileManagedServices() async {
         guard let mcpServer else {
             problem = mcpServerProblem ?? "The BotFleet MCP Server could not be prepared."
             return
@@ -218,9 +233,9 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             serverPresence = .present
         }
-        let wheelhouse = Wheelhouse(serverState: serverState(), mcpServerState: mcpServerState)
-        for entry in wheelhouse.entries {
-            switch Wheelhouse.action(for: entry) {
+        let managedServices = ManagedServices(serverState: serverState(), mcpServerState: mcpServerState)
+        for entry in managedServices.entries {
+            switch ManagedServices.action(for: entry) {
             case .start:
                 do { mcpServerState = try await mcpServer.setRunning(true) }
                 catch { problem = "BotFleet MCP Server: \(error.localizedDescription)" }
@@ -234,7 +249,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Re-reads the server's own state after an action, and waits for that
-    /// state to settle, so the wheelhouse is reconciled against what is true
+    /// state to settle, so the managed services are reconciled against what is true
     /// now rather than against what was true before the action.
     private func refreshInstalledServerState(until settled: [InstalledServerState],
                                              attempts: Int = 40) async {
@@ -303,11 +318,11 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if status?.sharedVM?.state == "stopped" { add("Local VM requires recreation in BotFleet") }
         if !startup.supportsPolicy { add("Update BotFleet to manage server startup") }
 
-        let wheelhouse = Wheelhouse(serverState: serverState(),
+        let managedServices = ManagedServices(serverState: serverState(),
                                     mcpServerState: mcpServerState)
-        if !wheelhouse.entries.isEmpty {
+        if !managedServices.entries.isEmpty {
             menu.addItem(.separator())
-            for entry in wheelhouse.entries { add("\(entry.title): \(entry.summary)") }
+            for entry in managedServices.entries { add("\(entry.title): \(entry.summary)") }
         }
 
         menu.addItem(.separator())
@@ -351,7 +366,88 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        // 3. CONNECTED SERVERS SUBMENU
+        // 3. MONITORED PROCESSES & PORTS
+        menu.addItem(.separator())
+        let processMenu = NSMenu()
+        let fleetProcesses = fleetSnapshot.processes
+        if fleetProcesses.isEmpty {
+            let empty = NSMenuItem(title: "No BotFleet processes are running", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            processMenu.addItem(empty)
+        } else {
+            for process in fleetProcesses {
+                let badge = process.isOrphan ? "⚠️" : "🟢"
+                let info = NSMenuItem(title: "\(badge) \(process.summary)", action: nil, keyEquivalent: "")
+                info.isEnabled = false
+                processMenu.addItem(info)
+                let stop = NSMenuItem(title: "    Terminate \(process.name) (PID \(process.pid))…",
+                                      action: #selector(terminateProcess(_:)), keyEquivalent: "")
+                stop.target = self
+                stop.representedObject = Int(process.pid)
+                stop.isEnabled = ready
+                processMenu.addItem(stop)
+            }
+        }
+        if !fleetSnapshot.listeners.isEmpty {
+            processMenu.addItem(.separator())
+            for listener in fleetSnapshot.listeners {
+                let info = NSMenuItem(title: listener.summary, action: nil, keyEquivalent: "")
+                info.isEnabled = false
+                processMenu.addItem(info)
+                let free = NSMenuItem(title: "    Free Port \(listener.port)…",
+                                      action: #selector(freePort(_:)), keyEquivalent: "")
+                free.target = self
+                free.representedObject = listener.port
+                free.isEnabled = ready && listener.pid != nil
+                processMenu.addItem(free)
+            }
+        }
+        let killOrphans = NSMenuItem(title: "Kill Orphan BotFleet Processes…",
+                                     action: #selector(killOrphanProcesses), keyEquivalent: "")
+        killOrphans.target = self
+        killOrphans.isEnabled = ready && !fleetSnapshot.orphans.isEmpty
+        processMenu.addItem(killOrphans)
+        let processHeader = NSMenuItem(title: "Monitored Processes & Ports", action: nil, keyEquivalent: "")
+        processHeader.submenu = processMenu
+        menu.addItem(processHeader)
+
+        // 4. REMOTE MACHINES
+        if !vmProviderConfigs.isEmpty {
+            menu.addItem(.separator())
+            let vmHeader = NSMenuItem(title: "REMOTE MACHINES", action: nil, keyEquivalent: "")
+            vmHeader.isEnabled = false
+            menu.addItem(vmHeader)
+            for config in vmProviderConfigs.values.sorted(by: { $0.id < $1.id }) {
+                let name = hosts.first { $0.id == config.id }?.name ?? config.id
+                let state = vmStates[config.id] ?? .unknown
+                add("\(name) — \(config.displayName): \(state.label)")
+                let start = NSMenuItem(title: "Start Remote VM (\(name))",
+                                       action: #selector(startRemoteVM(_:)), keyEquivalent: "")
+                start.target = self
+                start.representedObject = config.id
+                start.isEnabled = ready && state != .running
+                menu.addItem(start)
+                let stop = NSMenuItem(title: "Stop Remote VM (\(name))…",
+                                      action: #selector(stopRemoteVM(_:)), keyEquivalent: "")
+                stop.target = self
+                stop.representedObject = config.id
+                stop.isEnabled = ready && state == .running
+                menu.addItem(stop)
+                let remove = NSMenuItem(title: "Remove Remote VM Provider (\(name))",
+                                        action: #selector(removeVMProvider(_:)), keyEquivalent: "")
+                remove.target = self
+                remove.representedObject = config.id
+                remove.isEnabled = ready
+                menu.addItem(remove)
+            }
+        }
+        let configureVM = NSMenuItem(title: "Configure Remote VM Provider…",
+                                     action: #selector(configureVMProvider), keyEquivalent: "")
+        configureVM.target = self
+        configureVM.isEnabled = ready
+        menu.addItem(configureVM)
+
+        // 5. CONNECTED SERVERS SUBMENU
         menu.addItem(.separator())
         let serversMenu = NSMenu()
         for host in hosts {
@@ -428,7 +524,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     offlineVMs = .unavailable
                 }
                 await refreshInstalledServerState(until: settled)
-                await reconcileWheelhouse()
+                await reconcileManagedServices()
             }
             catch { problem = error.localizedDescription; showError(error.localizedDescription) }
             isBusy = false
@@ -455,9 +551,219 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
+    /// Shows what an action did.
+    private func showMessage(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "BotFleet Control"
+        alert.informativeText = message
+        alert.runModal()
+    }
+
+    /// Re-reads the fleet's processes and ports.
+    private func refreshFleetSnapshot() {
+        fleetSnapshot = processMonitor.snapshot()
+        rebuildMenu()
+    }
+
+    /// Stops one fleet process, after saying which one.
+    @objc private func terminateProcess(_ sender: NSMenuItem) {
+        guard let pid = sender.representedObject as? Int,
+              let process = fleetSnapshot.processes.first(where: { Int($0.pid) == pid }) else { return }
+        guard confirm("Terminate Process",
+                      "Stop \(process.name) (PID \(process.pid))?\n\nIt will be stopped right away and nothing will start it again.") else { return }
+        do {
+            try processMonitor.terminate(pid: process.pid)
+            problem = nil
+        } catch {
+            showError(error.localizedDescription)
+        }
+        refreshFleetSnapshot()
+    }
+
+    /// Stops whatever is holding a port, after saying which port.
+    @objc private func freePort(_ sender: NSMenuItem) {
+        guard let port = sender.representedObject as? Int else { return }
+        let holder = fleetSnapshot.listeners.first { $0.port == port }?.processName ?? "the process holding it"
+        guard confirm("Free Port \(port)",
+                      "Stop \(holder) to free port \(port)?\n\nThe process holding the port will be stopped right away.") else { return }
+        do {
+            let pid = try processMonitor.freePort(port)
+            problem = nil
+            refreshFleetSnapshot()
+            showMessage("Port \(port) is free.  PID \(pid) was stopped.")
+        } catch {
+            showError(error.localizedDescription)
+        }
+    }
+
+    /// Stops every orphaned BotFleet process at once.
+    @objc private func killOrphanProcesses() {
+        let orphans = fleetSnapshot.orphans
+        guard !orphans.isEmpty else { return }
+        let list = orphans.map { "  • \($0.summary)" }.joined(separator: "\n")
+        guard confirm("Kill Orphan BotFleet Processes",
+                      "Stop these \(orphans.count) orphaned BotFleet process(es)?\n\n\(list)\n\nNothing is driving them, so they are only holding ports.") else { return }
+        var stopped = 0
+        var failures: [String] = []
+        for process in orphans {
+            do {
+                try processMonitor.terminate(pid: process.pid)
+                stopped += 1
+            } catch {
+                failures.append("\(process.name) (PID \(process.pid)): \(error.localizedDescription)")
+            }
+        }
+        problem = failures.isEmpty ? nil : failures.joined(separator: "\n")
+        refreshFleetSnapshot()
+        if failures.isEmpty {
+            showMessage("Stopped \(stopped) orphaned BotFleet process(es).")
+        } else {
+            showError("Stopped \(stopped), could not stop \(failures.count).\n\n" + failures.joined(separator: "\n"))
+        }
+    }
+
+    /// Reads the state of every configured remote machine.
+    private func refreshVMStates() async {
+        let configs = await Task.detached(priority: .userInitiated) { self.vmProviderStore.loadConfigurations() }.value
+        vmProviderConfigs = Dictionary(configs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for config in configs {
+            guard let provider = VMProviderFactory.makeProvider(for: config, hosts: hosts) else {
+                vmStates[config.id] = .unknown
+                continue
+            }
+            do {
+                vmStates[config.id] = try await provider.remoteVMState()
+            } catch {
+                vmStates[config.id] = .unknown
+            }
+        }
+    }
+
+    /// Powers a remote machine on.
+    @objc private func startRemoteVM(_ sender: NSMenuItem) {
+        guard let serverID = sender.representedObject as? String,
+              let config = vmProviderConfigs[serverID],
+              let provider = VMProviderFactory.makeProvider(for: config, hosts: hosts) else { return }
+        Task { @MainActor in
+            do {
+                try await provider.startRemoteVM()
+                self.problem = nil
+                await self.refreshVMStates()
+                self.rebuildMenu()
+            } catch {
+                self.showError(error.localizedDescription)
+            }
+        }
+    }
+
+    /// Powers a remote machine off.
+    @objc private func stopRemoteVM(_ sender: NSMenuItem) {
+        guard let serverID = sender.representedObject as? String,
+              let config = vmProviderConfigs[serverID],
+              let provider = VMProviderFactory.makeProvider(for: config, hosts: hosts) else { return }
+        let name = hosts.first { $0.id == serverID }?.name ?? serverID
+        guard confirm("Stop Remote VM",
+                      "Power off the remote machine for \(name)?\n\nAnything running on it will stop.") else { return }
+        Task { @MainActor in
+            do {
+                try await provider.stopRemoteVM()
+                self.problem = nil
+                await self.refreshVMStates()
+                self.rebuildMenu()
+            } catch {
+                self.showError(error.localizedDescription)
+            }
+        }
+    }
+
+    /// Forgets a remote machine's provider.
+    @objc private func removeVMProvider(_ sender: NSMenuItem) {
+        guard let serverID = sender.representedObject as? String else { return }
+        let name = hosts.first { $0.id == serverID }?.name ?? serverID
+        guard confirm("Remove Remote VM Provider",
+                      "Forget the remote machine provider for \(name)?\n\nThe machine itself is not touched.") else { return }
+        do {
+            try vmProviderStore.remove(id: serverID)
+            vmProviderConfigs.removeValue(forKey: serverID)
+            vmStates.removeValue(forKey: serverID)
+            rebuildMenu()
+        } catch {
+            showError(error.localizedDescription)
+        }
+    }
+
+    /// Asks which server and which provider, and remembers the answer.
+    @objc private func configureVMProvider() {
+        guard !hosts.isEmpty else {
+            showError("Add a connected server before configuring a remote machine provider.")
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Configure Remote VM Provider"
+        alert.informativeText = "Choose the server, then say how its remote machine is driven."
+
+        let serverPicker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
+        for host in hosts { serverPicker.addItem(withTitle: host.name) }
+        let providerPicker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
+        for id in VMProviderConfiguration.providerIDs {
+            providerPicker.addItem(withTitle: VMProviderConfiguration.displayName(for: id))
+        }
+        let vmField = NSTextField(string: "")
+        vmField.placeholderString = "Remote VM id (Hetzner server id)"
+        let tokenField = NSSecureTextField(string: "")
+        tokenField.placeholderString = "API token (Hetzner Cloud)"
+        let commandField = NSTextField(string: "")
+        commandField.placeholderString = "Script path (custom provider)"
+        let argumentsField = NSTextField(string: "")
+        argumentsField.placeholderString = "Script arguments, separated by spaces"
+        for field in [vmField, tokenField, commandField, argumentsField] {
+            field.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        }
+
+        let stack = NSStackView(views: [
+            labelled("Server", serverPicker),
+            labelled("Provider", providerPicker),
+            labelled("Remote VM id", vmField),
+            labelled("API token", tokenField),
+            labelled("Script", commandField),
+            labelled("Script arguments", argumentsField),
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let host = hosts[serverPicker.indexOfSelectedItem]
+        let providerID = VMProviderConfiguration.providerIDs[providerPicker.indexOfSelectedItem]
+        let config = VMProviderConfiguration(
+            id: host.id,
+            providerID: providerID,
+            displayName: VMProviderConfiguration.displayName(for: providerID),
+            remoteVMID: vmField.stringValue.nilIfEmpty,
+            apiToken: tokenField.stringValue.nilIfEmpty,
+            command: commandField.stringValue.nilIfEmpty,
+            arguments: argumentsField.stringValue.split(separator: " ").map(String.init)
+        )
+        Task { @MainActor in
+            do {
+                try self.vmProviderStore.upsert(config)
+                self.vmProviderConfigs[host.id] = config
+                await self.refreshVMStates()
+                self.rebuildMenu()
+            } catch {
+                self.showError(error.localizedDescription)
+            }
+        }
+    }
+
     @objc private func startServer() {
         // The server is wanted running, so wait for its process to appear
-        // before the wheelhouse decides what the MCP server should be doing.
+        // before the managed services decide what the MCP server should be doing.
         run(settlesWhen: [.running, .notInstalled]) { [self] in
             try await Task.detached(priority: .userInitiated) { try self.startup.startServer() }.value
         }
@@ -474,7 +780,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ?? "This stops the server and its local VMs.  \(status.activeBotCount) bot turn(s) are active; the server will refuse while bots or leases are busy."
         guard confirm("Stop BotFleet Server And Local VMs?", message) else { return }
         // The server is wanted stopped, so wait for its process to go away
-        // before the wheelhouse stops the services that only run with it.
+        // before the managed services stop the services that only run with it.
         run(refresh: false, settlesWhen: [.stopped, .notInstalled]) { [self] in
             try await api.stopServer()
         }
@@ -634,4 +940,23 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func quitControl() { NSApplication.shared.terminate(nil) }
+}
+
+/// A labelled row for the configuration dialog.
+private func labelled(_ title: String, _ view: NSView) -> NSView {
+    let label = NSTextField(labelWithString: title)
+    label.alignment = .right
+    label.widthAnchor.constraint(equalToConstant: 140).isActive = true
+    let row = NSStackView(views: [label, view])
+    row.orientation = .horizontal
+    row.spacing = 8
+    return row
+}
+
+private extension String {
+    /// The string without its spaces, or nil when there is nothing left.
+    var nilIfEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 }

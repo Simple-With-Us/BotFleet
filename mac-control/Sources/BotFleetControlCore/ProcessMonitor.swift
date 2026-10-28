@@ -1,0 +1,374 @@
+import Foundation
+
+/// One running process on this Mac, as the system reports it.
+public struct RawProcess: Equatable, Sendable {
+    public let pid: Int32
+    public let parentPID: Int32
+    public let command: String
+
+    public init(pid: Int32, parentPID: Int32, command: String) {
+        self.pid = pid
+        self.parentPID = parentPID
+        self.command = command
+    }
+}
+
+/// One running process that belongs to the BotFleet fleet.
+public struct FleetProcess: Equatable, Identifiable, Sendable {
+    public let pid: Int32
+    public let parentPID: Int32
+    /// The helper's own name, when the fleet has one, so the menu can say
+    /// `qdrant-proxy` instead of `node`.
+    public let name: String
+    public let command: String
+    /// The TCP ports this process is listening on.
+    public let ports: [Int]
+    /// True when the process belongs to the fleet, whether or not it is wanted.
+    public let isFleetProcess: Bool
+    /// True when the process belongs to the fleet but nothing is driving it
+    /// any more, so it is only holding a port.
+    public let isOrphan: Bool
+
+    public var id: Int32 { pid }
+
+    public init(pid: Int32, parentPID: Int32, name: String, command: String,
+                ports: [Int], isFleetProcess: Bool, isOrphan: Bool) {
+        self.pid = pid
+        self.parentPID = parentPID
+        self.name = name
+        self.command = command
+        self.ports = ports
+        self.isFleetProcess = isFleetProcess
+        self.isOrphan = isOrphan
+    }
+
+    /// A short description for the menu, with the PID and the port when there
+    /// is one: `qdrant-proxy (PID 76463, port 6333)`.
+    public var summary: String {
+        let portText = ports.first.map { ", port \($0)" } ?? ""
+        return "\(name) (PID \(pid)\(portText))"
+    }
+}
+
+/// One TCP port that something on this Mac is listening on.
+public struct PortListener: Equatable, Identifiable, Sendable {
+    public let port: Int
+    /// The process holding the port, when the system could name it.
+    public let pid: Int32?
+    public let processName: String?
+
+    public var id: Int { port }
+
+    public init(port: Int, pid: Int32?, processName: String?) {
+        self.port = port
+        self.pid = pid
+        self.processName = processName
+    }
+
+    /// A short description for the menu: `6333 — qdrant-proxy (PID 76463)`.
+    public var summary: String {
+        guard let pid, let processName else { return "\(port) — not held" }
+        return "\(port) — \(processName) (PID \(pid))"
+    }
+}
+
+/// Everything the Control app knows about the fleet's processes and ports.
+public struct FleetProcessSnapshot: Equatable, Sendable {
+    public let processes: [FleetProcess]
+    public let listeners: [PortListener]
+
+    public init(processes: [FleetProcess], listeners: [PortListener]) {
+        self.processes = processes
+        self.listeners = listeners
+    }
+
+    /// The fleet processes that nothing is driving any more.
+    public var orphans: [FleetProcess] { processes.filter(\.isOrphan) }
+
+    public static let empty = FleetProcessSnapshot(processes: [], listeners: [])
+}
+
+/// Why a process or port could not be changed.
+public enum FleetProcessError: LocalizedError, Equatable {
+    case refused(String)
+    case notFound(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .refused(let message): return message
+        case .notFound(let message): return message
+        }
+    }
+}
+
+/// Works out which processes belong to the BotFleet fleet.
+///
+/// The rules are deliberately conservative.  A process counts as an orphan only
+/// when the fleet is not driving it: a helper whose parent chain leads to
+/// neither a BotFleet server nor pm2 was left behind by a fleet that has
+/// stopped, and it is only holding a port.  A development server is never part
+/// of the running fleet, so one running out of a BotFleet checkout is always
+/// an orphan.
+public enum FleetProcessClassifier {
+    /// The helper processes the fleet runs, by name.
+    public static let fleetHelperNames: Set<String> = [
+        "qdrant-proxy",
+        "connector-proxy",
+        "agents-proxy",
+        "cua-driver",
+        "imessage-relay",
+        "speech-helper",
+        "recorder-helper",
+        "botfleet-mcp",
+    ]
+
+    /// Markers that identify the BotFleet server itself.
+    public static let fleetServerMarkers = [
+        "botfleet-server",
+        "BotFleet.app",
+        "app.botfleet.server",
+        "botfleet-companion",
+        "BotFleet/server/index.",
+    ]
+
+    /// Markers that identify this app.
+    public static let controlAppMarkers = [
+        "BotFleet Control.app",
+        "BotFleetControl",
+    ]
+
+    /// Markers that identify a process manager that owns a helper.
+    public static let managerMarkers = [
+        "PM2 v",
+        "/pm2/",
+        "pm2: ",
+    ]
+
+    /// The ports the fleet uses.
+    public static let knownPorts: Set<Int> = [8799, 8800, 8810, 8820, 5173, 6333, 6334, 12419]
+
+    /// Classifies the processes the system reported.
+    ///
+    /// - Parameters:
+    ///   - processes: every running process, as `ps` reported it.
+    ///   - portsByPID: the TCP ports each process is listening on.
+    ///   - selfPID: this app's own PID, which is never a target.
+    public static func classify(processes: [RawProcess],
+                                portsByPID: [Int32: [Int]],
+                                selfPID: Int32 = getpid()) -> [FleetProcess] {
+        let byPID = Dictionary(processes.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        var fleet: [FleetProcess] = []
+        for process in processes {
+            // PID 1 is launchd and this app is not a target of itself.
+            guard process.pid > 1, process.pid != selfPID else { continue }
+            let name = helperName(in: process.command) ?? executableName(in: process.command)
+            let ports = (portsByPID[process.pid] ?? []).sorted()
+            let isHelper = fleetHelperNames.contains(name)
+            let isServer = isFleetServer(command: process.command)
+            let isControlApp = isControlApp(command: process.command)
+            let isDevelopmentServer = isDevelopmentServer(command: process.command)
+            // Only the fleet's own processes are listed.  A checkout that is
+            // running somebody else's tests is not part of the fleet, so the
+            // app never offers to stop it.
+            let isFleet = isHelper || isServer || isControlApp || isDevelopmentServer
+            var isOrphan = false
+            if isHelper {
+                // A helper the server or a process manager is driving is doing
+                // its job.  One that is not was left behind and is only
+                // holding a port.
+                isOrphan = !hasFleetAncestor(pid: process.pid, byPID: byPID)
+            } else if isDevelopmentServer {
+                // A development server is never part of the running fleet.
+                isOrphan = true
+            }
+            fleet.append(FleetProcess(pid: process.pid,
+                                      parentPID: process.parentPID,
+                                      name: name,
+                                      command: process.command,
+                                      ports: ports,
+                                      isFleetProcess: isFleet,
+                                      isOrphan: isOrphan))
+        }
+        return fleet.sorted { ($0.name, $0.pid) < ($1.name, $1.pid) }
+    }
+
+    /// True when the command belongs to the fleet.
+    public static func isFleetProcess(command: String, name: String) -> Bool {
+        if fleetHelperNames.contains(name) { return true }
+        if isFleetServer(command: command) { return true }
+        if isControlApp(command: command) { return true }
+        if isDevelopmentServer(command: command) { return true }
+        return false
+    }
+
+    /// True when the command is a BotFleet server process.
+    public static func isFleetServer(command: String) -> Bool {
+        fleetServerMarkers.contains(where: { command.contains($0) })
+    }
+
+    /// True when the command is this app.
+    public static func isControlApp(command: String) -> Bool {
+        controlAppMarkers.contains(where: { command.contains($0) })
+    }
+
+    /// True when the command is a development server out of a BotFleet checkout.
+    ///
+    /// A development server is never part of the running fleet, so it is an
+    /// orphan even when a shell still holds it open.  The name has to be the
+    /// development server and not something else that starts with the same
+    /// letters, so a test runner is never mistaken for one.
+    public static func isDevelopmentServer(command: String) -> Bool {
+        let tokens = command.split(whereSeparator: { $0 == " " || $0 == "/" })
+        let isVite = tokens.contains { token in
+            let name = String(token)
+            return name == "vite" || name.hasPrefix("vite.") || name.hasPrefix("vite-")
+        }
+        guard isVite else { return false }
+        return command.contains("/BotFleet/") || command.contains("botfleet")
+    }
+
+    /// The fleet helper name in the command, when there is one.
+    ///
+    /// The helper is usually a Node script, so the process name is `node` and
+    /// only the script path says which helper it is.
+    public static func helperName(in command: String) -> String? {
+        let lower = command.lowercased()
+        return fleetHelperNames.first { lower.contains($0) }
+    }
+
+    /// The executable's own name.
+    public static func executableName(in command: String) -> String {
+        let first = command.split(separator: " ", maxSplits: 1).first.map(String.init) ?? command
+        return URL(fileURLWithPath: first).lastPathComponent
+    }
+
+    /// True when the process is driven by the fleet or by a process manager.
+    ///
+    /// The chain is followed through the parent PIDs, so a helper that the
+    /// server started, or that pm2 started, is managed even when the
+    /// intermediate process is gone.
+    private static func hasFleetAncestor(pid: Int32, byPID: [Int32: RawProcess]) -> Bool {
+        var current = byPID[pid]?.parentPID
+        var guard_ = 0
+        while let parent = current, parent > 1, guard_ < 32 {
+            guard_ += 1
+            guard let row = byPID[parent] else { return false }
+            if isFleetServer(command: row.command) { return true }
+            if managerMarkers.contains(where: { row.command.contains($0) }) { return true }
+            current = row.parentPID
+        }
+        return false
+    }
+}
+
+/// Reads the fleet's processes and ports, and changes them when asked.
+public struct FleetProcessMonitor {
+    private let commands: CommandRunning
+    private let selfPID: Int32
+
+    public init(commands: CommandRunning = ProcessCommandRunner(), selfPID: Int32 = getpid()) {
+        self.commands = commands
+        self.selfPID = selfPID
+    }
+
+    /// Reads the fleet's processes and the ports they hold.
+    ///
+    /// Nothing is assumed: a process the system cannot name is left out rather
+    /// than guessed at, and a port with no listener is left out too.
+    public func snapshot() -> FleetProcessSnapshot {
+        let raw = FleetProcessMonitor.parseProcesses((try? commands.run("/bin/ps", ["-axo", "pid=,ppid=,command="])) ?? "")
+        let lsofOutput = (try? commands.run("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"])) ?? ""
+        let listeners = FleetProcessMonitor.parseListeners(lsofOutput)
+        var portsByPID: [Int32: [Int]] = [:]
+        for listener in listeners {
+            guard let pid = listener.pid else { continue }
+            portsByPID[pid, default: []].append(listener.port)
+        }
+        let classified = FleetProcessClassifier.classify(processes: raw, portsByPID: portsByPID, selfPID: selfPID)
+        // The menu is about the fleet and not about every process on the Mac.
+        let fleet = classified.filter { $0.isFleetProcess }
+        var fleetByPID: [Int32: FleetProcess] = [:]
+        for process in fleet { fleetByPID[process.pid] = process }
+        // Only the ports the fleet is known to use are listed, so the menu is
+        // about the fleet and not about every port on the Mac.
+        let known = listeners
+            .filter { listener in
+                guard let pid = listener.pid else { return FleetProcessClassifier.knownPorts.contains(listener.port) }
+                return fleetByPID[pid] != nil || FleetProcessClassifier.knownPorts.contains(listener.port)
+            }
+            .sorted { $0.port < $1.port }
+        return FleetProcessSnapshot(processes: fleet, listeners: known)
+    }
+
+    /// Stops one process.
+    ///
+    /// PID 1 and this app's own PID are refused: killing either would take
+    /// down something the owner did not ask to stop.
+    public func terminate(pid: Int32) throws {
+        guard pid > 1 else { throw FleetProcessError.refused("That process cannot be stopped.") }
+        guard pid != selfPID else { throw FleetProcessError.refused("BotFleet Control cannot stop itself.") }
+        do {
+            _ = try commands.run("/bin/kill", ["-9", String(pid)])
+        } catch let error as CommandExitError {
+            throw FleetProcessError.refused(error.output.isEmpty
+                ? "The system refused to stop PID \(pid)."
+                : error.output)
+        }
+    }
+
+    /// Stops whatever is holding a port.
+    ///
+    /// - Returns: the PID that was stopped.
+    @discardableResult
+    public func freePort(_ port: Int) throws -> Int32 {
+        guard let listener = snapshot().listeners.first(where: { $0.port == port }),
+              let pid = listener.pid else {
+            throw FleetProcessError.notFound("Nothing is holding port \(port).")
+        }
+        try terminate(pid: pid)
+        return pid
+    }
+
+    /// Parses the `ps` listing into raw processes.
+    public static func parseProcesses(_ output: String) -> [RawProcess] {
+        var rows: [RawProcess] = []
+        for line in output.split(separator: "\n") {
+            // The listing is padded, so the leading space has to go before the
+            // fields are read.
+            let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+            let fields = trimmed.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true).map(String.init)
+            guard fields.count >= 3, let pid = Int32(fields[0]), let parent = Int32(fields[1]) else { continue }
+            let command = fields[2]
+            guard !command.isEmpty else { continue }
+            rows.append(RawProcess(pid: pid, parentPID: parent, command: command))
+        }
+        return rows
+    }
+
+    /// Parses the `lsof` field output into port listeners.
+    public static func parseListeners(_ output: String) -> [PortListener] {
+        var pid: Int32?
+        var name: String?
+        var listeners: [PortListener] = []
+        for line in output.split(separator: "\n") {
+            guard let field = line.first else { continue }
+            let value = String(line.dropFirst())
+            switch field {
+            case "p": pid = Int32(value)
+            case "c": name = value
+            case "n":
+                if let port = portNumber(from: value), let pid {
+                    listeners.append(PortListener(port: port, pid: pid, processName: name))
+                }
+            default: break
+            }
+        }
+        return listeners.sorted { $0.port < $1.port }
+    }
+
+    /// The port in a `lsof` name such as `*:6333` or `127.0.0.1:8799`.
+    public static func portNumber(from name: String) -> Int? {
+        guard let colon = name.lastIndex(of: ":") else { return nil }
+        return Int(name[name.index(after: colon)...])
+    }
+}
