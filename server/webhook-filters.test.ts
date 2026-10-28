@@ -274,20 +274,23 @@ describe("per-trigger Sentry filters", () => {
 });
 
 describe("per-trigger PagerDuty urgency filter", () => {
-  const pagerduty = (urgency?: string): DeliveryEvent => ({
-    eventName: "incident.triggered",
-    payload: {
-      event: {
-        event_type: "incident.triggered",
-        resource_type: "incident",
-        data: {
-          type: "incident",
-          status: "triggered",
-          ...(urgency ? { urgency } : {}),
+  const pagerduty = (urgency?: string): DeliveryEvent => {
+    const data: { type: string; status: string; urgency?: string } = {
+      type: "incident",
+      status: "triggered",
+    };
+    if (urgency !== undefined) data.urgency = urgency;
+    return {
+      eventName: "incident.triggered",
+      payload: {
+        event: {
+          event_type: "incident.triggered",
+          resource_type: "incident",
+          data,
         },
       },
-    },
-  });
+    };
+  };
 
   it("runs for the wanted urgency and ignores another", () => {
     expect(decide({ pagerdutyUrgency: "high" }, pagerduty("high"))).toEqual({ ignore: false });
