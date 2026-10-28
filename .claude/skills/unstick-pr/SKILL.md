@@ -5,7 +5,7 @@ description: Diagnose and repair a PR that will not merge — phantom vs real co
 
 # Unstick a blocked PR (MONET)
 
-> **Shared `~/.claude/skills`.** Monet, Claude/Fable, and (when active) Renoir all load this directory.  Do not treat the word Monet in examples as proof of your seat.  Pin `AGENT_SEAT` / `AGENT_TAG` from the logged-in account before Slack or `board --by`:
+> **Shared `~/.claude/skills`.** Monet, Claude/Fable, and (when active) Renoir all load this directory.  Do not treat the word Monet in examples as proof of your seat.  Pin `AGENT_SEAT` / `AGENT_TAG` from the logged-in account before Zulip or `simple-board --by`:
 > - Monet → `MONET`, Notes `Monet`, `monet/`, `~/apps/<app>-monet`
 > - Claude / Fable → `CLAUDE`, Notes `Claude`, `claude/`, `~/apps/<app>-claude`
 > - Renoir → `RENOIR`, Notes `Renoir`, `renoir/`, `~/apps/<app>-renoir`
@@ -47,7 +47,7 @@ git push origin <monet|claude|renoir>/<slug>
 
 GitHub recomputes in ~20–60s and re-dispatches CI.  If several PRs are stuck, push one at a time, ~10–15s apart.
 
-**Real conflict:** merge `origin/main` by hand in the worktree.  `STATUS.md`, `PLAN.md`, and `docs/EFFORT-LOG.md` often have `merge=union` — additive board prose combines.  Never delete another agent's row.  If code intent is unclear, abort and escalate on THE BOARD + `#agent-sync`.
+**Real conflict:** merge `origin/main` by hand in the worktree.  `STATUS.md`, `PLAN.md`, and `docs/EFFORT-LOG.md` often have `merge=union` — additive board prose combines.  Never delete another agent's row.  If code intent is unclear, abort and escalate on THE BOARD + `#Work-In-Progress`.
 
 ### B) BLOCKED, checks green
 
@@ -82,7 +82,7 @@ Repeat 1–3.  Comment on the matching board item.  Do not force-merge, do not d
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` — Merge requirements; CI runner policy
+- `/Users/jay/apps/FLEET-PROTOCOL.md` — Merge requirements; CI runner policy
 - App `AGENTS.md` Pull requests section
 - Skills: `codex-triage`, `land-lane`
 - ST flake origin: `docs/rollouts/2026-06-22-e2e-smoke-auth-fix.md`
