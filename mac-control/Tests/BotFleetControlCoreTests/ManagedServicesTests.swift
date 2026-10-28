@@ -202,7 +202,7 @@ final class ManagedServicesTests: XCTestCase {
         }
         let commands = PM2Commands()
         let control = try makeControl(commands: commands)
-        let state = try await control.setRunning(false, attempts: 2)
+        let state = try await control.setRunning(false, within: 2)
         XCTAssertEqual(state, .stopped)
         XCTAssertEqual(commands.calls.count, 1)
         XCTAssertTrue(commands.calls[0].contains("stop"))
@@ -219,7 +219,7 @@ final class ManagedServicesTests: XCTestCase {
         }
         let commands = PM2Commands()
         let control = try makeControl(commands: commands)
-        let state = try await control.setRunning(true, attempts: 2)
+        let state = try await control.setRunning(true, within: 2)
         XCTAssertEqual(state, .running)
         XCTAssertEqual(commands.calls.count, 1)
         XCTAssertTrue(commands.calls[0].contains("start"))
@@ -234,7 +234,7 @@ final class ManagedServicesTests: XCTestCase {
         commands.failure = CommandExitError(output: "pm2 said no")
         let control = try makeControl(commands: commands)
         do {
-            _ = try await control.setRunning(false, attempts: 1)
+            _ = try await control.setRunning(false, within: 1)
             XCTFail("Expected the refusal to be reported")
         } catch {
             XCTAssertEqual(error as? McpServerError, .refused("pm2 said no"))
@@ -249,7 +249,7 @@ final class ManagedServicesTests: XCTestCase {
         commands.failure = StartupPolicyError.commandFailed
         let control = try makeControl(commands: commands)
         do {
-            _ = try await control.setRunning(false, attempts: 1)
+            _ = try await control.setRunning(false, within: 1)
             XCTFail("Expected the timeout to be reported")
         } catch {
             XCTAssertEqual(error as? McpServerError,
