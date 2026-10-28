@@ -39,7 +39,9 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         FleetServiceControl(pm2: PM2Client(),
                             mcpServer: mcpServer,
                             stopServer: { [weak self] in
-                                guard let self else { return }
+                                guard let self else {
+                                    throw FleetServiceError.refused("The Control app is no longer running.")
+                                }
                                 try await self.api.stopServer()
                             })
     }()
