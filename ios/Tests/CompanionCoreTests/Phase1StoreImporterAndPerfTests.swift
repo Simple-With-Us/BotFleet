@@ -1108,7 +1108,7 @@ struct Phase1StoreImporterAndPerfTests {
         // averaged and the reported number is never the largest sample.
         #expect(MacPerformanceHarness.median(of: [1.0, 2.0]) == 1.5)
         #expect(MacPerformanceHarness.median(of: [1.0, 2.0, 3.0]) == 2.0)
-        #expect(MacPerformanceHarness.median(of: []) == 0)
+        #expect(MacPerformanceHarness.median(of: []) == nil)
 
         // One window that caught a scheduler hiccup does not move the
         // median, and a process that burns CPU in every window still does.
@@ -1136,6 +1136,24 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(idle.measuredValue == 0.11)
         #expect(idle.passed == false)
         #expect(idle.enforced == true)
+
+        // No window at all is a missing measurement, not a perfect one:  the
+        // metric fails and says so, so absent data can never pass the gate.
+        let missing = MacPerformanceHarness.idleCpuMetric(
+            samples: [],
+            context: .standalone
+        )
+        #expect(missing.passed == false)
+        #expect(missing.enforced == true)
+        #expect(missing.reportNote?.contains("no idle window could be measured") == true)
+
+        // The note says how many windows the median actually came from, so a
+        // caller that passes its own count is not credited with the default.
+        let three = MacPerformanceHarness.idleCpuMetric(
+            samples: [0.01, 0.02, 0.03],
+            context: .standalone
+        )
+        #expect(three.reportNote?.contains("the median of 3 quiet windows") == true)
 
         // The windows are measured back to back, and each one is a share
         // of a core, so every sample is a finite share of a core.

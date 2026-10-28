@@ -73,6 +73,10 @@ public enum MacPerformanceHarnessError: Error, Equatable {
     /// Without this the sweep indexed an empty sample array and trapped
     /// instead of reporting a bad configuration.
     case invalidSurfaceSyncConfiguration
+    /// A budgeted measurement produced no sample at all.  There is no number
+    /// to judge, so the gate fails on the missing data instead of passing on
+    /// it:  a zero would read as a perfect measurement.
+    case missingMeasurement
 }
 
 // MARK: - Streaming CPU Shape and Measurement
@@ -378,6 +382,9 @@ public enum MacPerformanceHarness {
     ///   - reportedOnly: true for metrics the harness measures but never
     ///     gates on.  They are printed so a number is never hidden, and the
     ///     overall verdict never turns on them.
+    ///   - forcingFailure: true for a metric whose measurement is missing.
+    ///     The metric reports a zero value but never passes, so absent data
+    ///     cannot decide the gate in the harness's favour.
     private static func metric(
         name: String,
         measuredValue: Double,
@@ -387,6 +394,7 @@ public enum MacPerformanceHarness {
         wallClockSensitive: Bool = false,
         reportedOnly: Bool = false,
         strictlyLessThan: Bool = false,
+        forcingFailure: Bool = false,
         note: String? = nil,
         context: Context
     ) -> MacPerformanceMetricResult {
@@ -394,9 +402,11 @@ public enum MacPerformanceHarness {
         // that cannot be measured meaningfully where it runs is reported
         // instead of gated, and it says so in its report note.
         let effectiveLimit = MacPerformanceBudget.effectiveLimit(forProductBudget: productBudget)
-        let passed = strictlyLessThan
+        // A metric that could not be measured at all has no value to judge,
+        // so it fails:  it must never pass because the data was missing.
+        let passed = !forcingFailure && (strictlyLessThan
             ? measuredValue < effectiveLimit
-            : measuredValue <= effectiveLimit
+            : measuredValue <= effectiveLimit)
         let measuredInSharedProcess = context == .testRunner && (processScoped || wallClockSensitive)
         let enforced = !reportedOnly && !measuredInSharedProcess
         var notes: [String] = []
@@ -621,7 +631,11 @@ public enum MacPerformanceHarness {
         // ones are averaged.  Taking the upper one alone would make the
         // reported number the largest sample, and a single noisy window
         // would decide the gate.
-        let median = Self.median(of: samples)
+        // The loop above always runs at least one window, so a median
+        // exists:  the guard keeps a missing sample from reading as zero.
+        guard let median = Self.median(of: samples) else {
+            throw MacPerformanceHarnessError.missingMeasurement
+        }
         return MacStreamingCpuMeasurement(
             samples: samples,
             medianCpuSeconds: median,
@@ -750,9 +764,13 @@ public enum MacPerformanceHarness {
     /// An even count has no middle sample, so the two middle ones are
     /// averaged.  Taking the upper one alone would make the reported number
     /// the largest sample, and a single noisy sample would decide the gate.
-    public static func median(of samples: [Double]) -> Double {
+    ///
+    /// An empty sample set has no median, and the result is nil:  a caller
+    /// has to be able to tell a missing measurement from a real one, and
+    /// zero is a real measurement.
+    public static func median(of samples: [Double]) -> Double? {
         let ordered = samples.sorted()
-        guard !ordered.isEmpty else { return 0 }
+        guard !ordered.isEmpty else { return nil }
         let middle = ordered.count / 2
         if ordered.count % 2 == 1 {
             return ordered[middle]
@@ -788,17 +806,25 @@ public enum MacPerformanceHarness {
     /// The reported number is the median of the windows, so one window that
     /// caught a scheduler hiccup does not decide the gate, and a process
     /// that burns CPU in every window still fails it.
+    ///
+    /// No window at all is a missing measurement, not a perfect one, so the
+    /// metric fails and says so in its note.
     public static func idleCpuMetric(
         samples: [Double],
         context: Context
     ) -> MacPerformanceMetricResult {
-        metric(
+        let measured = median(of: samples)
+        let notMeasured = measured == nil
+        return metric(
             name: "Idle CPU usage",
-            measuredValue: median(of: samples),
+            measuredValue: measured ?? 0,
             productBudget: MacPerformanceBudget.maxIdleCpuPercent,
             unit: "%",
             processScoped: true,
-            note: "the median of \(idleCpuWindowCount) quiet windows of \(idleCpuWindowNanoseconds / 1_000_000) ms, so one window that caught a scheduler hiccup does not decide the gate",
+            forcingFailure: notMeasured,
+            note: notMeasured
+                ? "no idle window could be measured, so the gate fails on the missing data instead of passing on it"
+                : "the median of \(samples.count) quiet windows of \(idleCpuWindowNanoseconds / 1_000_000) ms, so one window that caught a scheduler hiccup does not decide the gate",
             context: context
         )
     }
