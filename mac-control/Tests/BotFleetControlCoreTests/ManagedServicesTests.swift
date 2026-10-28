@@ -2,67 +2,67 @@ import XCTest
 import Darwin
 @testable import BotFleetControlCore
 
-final class WheelhouseTests: XCTestCase {
+final class ManagedServicesTests: XCTestCase {
     // MARK: - Wanted state derivation
 
     func testMCPServerIsWantedExactlyWhileTheServerRuns() {
-        let running = Wheelhouse(serverState: .running, mcpServerState: .stopped)
+        let running = ManagedServices(serverState: .running, mcpServerState: .stopped)
         XCTAssertEqual(running.mcpServerWanted, true)
-        let stopped = Wheelhouse(serverState: .stopped, mcpServerState: .running)
+        let stopped = ManagedServices(serverState: .stopped, mcpServerState: .running)
         XCTAssertEqual(stopped.mcpServerWanted, false)
-        let unknown = Wheelhouse(serverState: .unknown, mcpServerState: .running)
+        let unknown = ManagedServices(serverState: .unknown, mcpServerState: .running)
         XCTAssertNil(unknown.mcpServerWanted)
     }
 
     func testWantedStateIsNeverStoredOnTheEntry() {
-        let entry = WheelhouseEntry(id: Wheelhouse.mcpServerID, title: Wheelhouse.mcpServerTitle,
+        let entry = ManagedServiceEntry(id: ManagedServices.mcpServerID, title: ManagedServices.mcpServerTitle,
                                     wanted: nil, state: .running)
         XCTAssertNil(entry.wanted)
         XCTAssertEqual(entry.state, .running)
     }
 
     func testAServerThatAnswersOrHasALiveProcessIsRunning() {
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: true, installedServerState: .stopped,
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: true, installedServerState: .stopped,
                                                serverPresence: .absent), .running)
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .running,
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, installedServerState: .running,
                                                serverPresence: .absent), .running)
     }
 
     func testAnUnreachableServerThatStillHasAListenerIsUnknown() {
         // The API did not answer, but something is still listening on the
         // server's port: it is busy or booting, and it is not stopped.
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .stopped,
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, installedServerState: .stopped,
                                                serverPresence: .present), .unknown)
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .unknown,
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, installedServerState: .unknown,
                                                serverPresence: .present), .unknown)
     }
 
     func testTheServerIsStoppedOnlyWhenNothingIsListening() {
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .stopped,
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, installedServerState: .stopped,
                                                serverPresence: .absent), .stopped)
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .notInstalled,
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, installedServerState: .notInstalled,
                                                serverPresence: .absent), .stopped)
     }
 
     func testAnUnreachableServerIsNeverKnownToBeStopped() {
-        XCTAssertEqual(Wheelhouse.serverState(statusAvailable: false, installedServerState: .stopped,
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, installedServerState: .stopped,
                                                serverPresence: .unknown), .unknown)
     }
 
     func testAnUnreachableServerNeverAsksForTheMCPServerToBeStopped() {
         // The regression this guards: a transport error used to read as "the
         // server is stopped", which stopped the MCP server under a live one.
-        let wheelhouse = Wheelhouse(serverState: .unknown, mcpServerState: .running)
-        XCTAssertNil(wheelhouse.mcpServerWanted)
-        XCTAssertEqual(Wheelhouse.action(for: wheelhouse.entries[0]), .none)
+        let managedServices = ManagedServices(serverState: .unknown, mcpServerState: .running)
+        XCTAssertNil(managedServices.mcpServerWanted)
+        XCTAssertEqual(ManagedServices.action(for: managedServices.entries[0]), .none)
     }
 
-    func testWheelhouseListsTheBotFleetMCPServer() {
-        let wheelhouse = Wheelhouse(serverState: .running, mcpServerState: .running)
-        XCTAssertEqual(wheelhouse.entries.count, 1)
-        XCTAssertEqual(wheelhouse.entries.first?.id, "botfleet-mcp")
-        XCTAssertEqual(wheelhouse.entries.first?.title, "BotFleet MCP Server")
-        XCTAssertEqual(wheelhouse.entries.first?.wanted, true)
+    func testManagedServicesListsTheBotFleetMCPServer() {
+        let managedServices = ManagedServices(serverState: .running, mcpServerState: .running)
+        XCTAssertEqual(managedServices.entries.count, 1)
+        XCTAssertEqual(managedServices.entries.first?.id, "botfleet-mcp")
+        XCTAssertEqual(managedServices.entries.first?.title, "BotFleet MCP Server")
+        XCTAssertEqual(managedServices.entries.first?.wanted, true)
     }
 
     // MARK: - Proving whether the server is really there
@@ -87,21 +87,21 @@ final class WheelhouseTests: XCTestCase {
     // MARK: - Actions
 
     func testActionStartsAStoppedServiceAndStopsARunningOne() {
-        XCTAssertEqual(Wheelhouse.action(for: entry(wanted: true, state: .stopped)), .start)
-        XCTAssertEqual(Wheelhouse.action(for: entry(wanted: false, state: .running)), .stop)
+        XCTAssertEqual(ManagedServices.action(for: entry(wanted: true, state: .stopped)), .start)
+        XCTAssertEqual(ManagedServices.action(for: entry(wanted: false, state: .running)), .stop)
     }
 
     func testActionNeverActsOnAnUnknownWantedOrObservedState() {
-        XCTAssertEqual(Wheelhouse.action(for: entry(wanted: nil, state: .stopped)), .none)
-        XCTAssertEqual(Wheelhouse.action(for: entry(wanted: nil, state: .running)), .none)
-        XCTAssertEqual(Wheelhouse.action(for: entry(wanted: nil, state: .unknown)), .none)
-        XCTAssertEqual(Wheelhouse.action(for: entry(wanted: true, state: .unknown)), .none)
-        XCTAssertEqual(Wheelhouse.action(for: entry(wanted: false, state: .unknown)), .none)
+        XCTAssertEqual(ManagedServices.action(for: entry(wanted: nil, state: .stopped)), .none)
+        XCTAssertEqual(ManagedServices.action(for: entry(wanted: nil, state: .running)), .none)
+        XCTAssertEqual(ManagedServices.action(for: entry(wanted: nil, state: .unknown)), .none)
+        XCTAssertEqual(ManagedServices.action(for: entry(wanted: true, state: .unknown)), .none)
+        XCTAssertEqual(ManagedServices.action(for: entry(wanted: false, state: .unknown)), .none)
     }
 
     func testActionDoesNothingWhenTheServiceAlreadyMatchesTheWantedState() {
-        XCTAssertEqual(Wheelhouse.action(for: entry(wanted: true, state: .running)), .none)
-        XCTAssertEqual(Wheelhouse.action(for: entry(wanted: false, state: .stopped)), .none)
+        XCTAssertEqual(ManagedServices.action(for: entry(wanted: true, state: .running)), .none)
+        XCTAssertEqual(ManagedServices.action(for: entry(wanted: false, state: .stopped)), .none)
     }
 
     func testSummarySaysWhatIsWantedAndWhatIsSeen() {
@@ -141,7 +141,7 @@ final class WheelhouseTests: XCTestCase {
 
     func testMCPServerIsRunningOnlyWhenItAnswersAsTheBotFleetMCPServer() async throws {
         let control = try makeControl()
-        WheelhouseURLProtocol.handler = { _ in
+        ManagedServicesURLProtocol.handler = { _ in
             .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp","tools":26}"#.utf8))
         }
         let state = await control.state()
@@ -150,14 +150,14 @@ final class WheelhouseTests: XCTestCase {
 
     func testMCPServerIsStoppedWhenNothingAnswersIt() async throws {
         let control = try makeControl()
-        WheelhouseURLProtocol.handler = { _ in .failure(URLError(.cannotConnectToHost)) }
+        ManagedServicesURLProtocol.handler = { _ in .failure(URLError(.cannotConnectToHost)) }
         let state = await control.state()
         XCTAssertEqual(state, .stopped)
     }
 
     func testMCPServerIsUnknownWhenSomethingElseAnswersIt() async throws {
         let control = try makeControl()
-        WheelhouseURLProtocol.handler = { _ in
+        ManagedServicesURLProtocol.handler = { _ in
             .response(200, Data(#"{"status":"ok","app":"some-other-service"}"#.utf8))
         }
         let state = await control.state()
@@ -166,7 +166,7 @@ final class WheelhouseTests: XCTestCase {
 
     func testMCPServerIsUnknownWhenItAnswersWithSomethingBroken() async throws {
         let control = try makeControl()
-        WheelhouseURLProtocol.handler = { _ in .response(200, Data(#"{"status":"ok"}"#.utf8)) }
+        ManagedServicesURLProtocol.handler = { _ in .response(200, Data(#"{"status":"ok"}"#.utf8)) }
         let state = await control.state()
         XCTAssertEqual(state, .unknown)
     }
@@ -184,7 +184,7 @@ final class WheelhouseTests: XCTestCase {
     // MARK: - Changing the MCP server
 
     func testUnknownStateIsNeverChanged() async throws {
-        WheelhouseURLProtocol.handler = { _ in .failure(URLError(.timedOut)) }
+        ManagedServicesURLProtocol.handler = { _ in .failure(URLError(.timedOut)) }
         let commands = PM2Commands()
         let control = try makeControl(commands: commands)
         let state = try await control.setRunning(true)
@@ -194,7 +194,7 @@ final class WheelhouseTests: XCTestCase {
 
     func testStoppingTheMCPServerRunsPM2Stop() async throws {
         var probes = 0
-        WheelhouseURLProtocol.handler = { _ in
+        ManagedServicesURLProtocol.handler = { _ in
             probes += 1
             return probes <= 1
                 ? .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp"}"#.utf8))
@@ -202,7 +202,7 @@ final class WheelhouseTests: XCTestCase {
         }
         let commands = PM2Commands()
         let control = try makeControl(commands: commands)
-        let state = try await control.setRunning(false, attempts: 2)
+        let state = try await control.setRunning(false, within: 2)
         XCTAssertEqual(state, .stopped)
         XCTAssertEqual(commands.calls.count, 1)
         XCTAssertTrue(commands.calls[0].contains("stop"))
@@ -211,7 +211,7 @@ final class WheelhouseTests: XCTestCase {
 
     func testStartingTheMCPServerRunsPM2Start() async throws {
         var probes = 0
-        WheelhouseURLProtocol.handler = { _ in
+        ManagedServicesURLProtocol.handler = { _ in
             probes += 1
             return probes <= 1
                 ? .failure(URLError(.cannotConnectToHost))
@@ -219,7 +219,7 @@ final class WheelhouseTests: XCTestCase {
         }
         let commands = PM2Commands()
         let control = try makeControl(commands: commands)
-        let state = try await control.setRunning(true, attempts: 2)
+        let state = try await control.setRunning(true, within: 2)
         XCTAssertEqual(state, .running)
         XCTAssertEqual(commands.calls.count, 1)
         XCTAssertTrue(commands.calls[0].contains("start"))
@@ -227,14 +227,14 @@ final class WheelhouseTests: XCTestCase {
     }
 
     func testARefusedPM2IsReportedRatherThanClaimedAsSuccess() async throws {
-        WheelhouseURLProtocol.handler = { _ in
+        ManagedServicesURLProtocol.handler = { _ in
             .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp"}"#.utf8))
         }
         let commands = PM2Commands()
         commands.failure = CommandExitError(output: "pm2 said no")
         let control = try makeControl(commands: commands)
         do {
-            _ = try await control.setRunning(false, attempts: 1)
+            _ = try await control.setRunning(false, within: 1)
             XCTFail("Expected the refusal to be reported")
         } catch {
             XCTAssertEqual(error as? McpServerError, .refused("pm2 said no"))
@@ -242,14 +242,14 @@ final class WheelhouseTests: XCTestCase {
     }
 
     func testAPM2TimeoutIsReportedAsAPM2Problem() async throws {
-        WheelhouseURLProtocol.handler = { _ in
+        ManagedServicesURLProtocol.handler = { _ in
             .response(200, Data(#"{"status":"ok","app":"botfleet-admin-mcp"}"#.utf8))
         }
         let commands = PM2Commands()
         commands.failure = StartupPolicyError.commandFailed
         let control = try makeControl(commands: commands)
         do {
-            _ = try await control.setRunning(false, attempts: 1)
+            _ = try await control.setRunning(false, within: 1)
             XCTFail("Expected the timeout to be reported")
         } catch {
             XCTAssertEqual(error as? McpServerError,
@@ -259,8 +259,8 @@ final class WheelhouseTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func entry(wanted: Bool?, state: WheelhouseState) -> WheelhouseEntry {
-        WheelhouseEntry(id: Wheelhouse.mcpServerID, title: Wheelhouse.mcpServerTitle,
+    private func entry(wanted: Bool?, state: ManagedServiceState) -> ManagedServiceEntry {
+        ManagedServiceEntry(id: ManagedServices.mcpServerID, title: ManagedServices.mcpServerTitle,
                         wanted: wanted, state: state)
     }
 
@@ -274,7 +274,7 @@ final class WheelhouseTests: XCTestCase {
 
     private func mockSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [WheelhouseURLProtocol.self]
+        configuration.protocolClasses = [ManagedServicesURLProtocol.self]
         return URLSession(configuration: configuration)
     }
 
@@ -324,7 +324,7 @@ private final class PM2Commands: CommandRunning {
     }
 }
 
-private final class WheelhouseURLProtocol: URLProtocol {
+private final class ManagedServicesURLProtocol: URLProtocol {
     enum Reply {
         case response(Int, Data)
         case failure(Error)
