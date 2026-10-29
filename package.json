@@ -21,6 +21,7 @@
   "packageManager": "pnpm@12.15.0",
   "scripts": {
     "clean": "node scripts/clean.mjs",
+    "vendor:tv-face-gif": "node scripts/vendor-tv-face-gif-decoder.mjs",
     "lint": "node scripts/check-lint-baseline.mjs",
     "check:contrast": "node scripts/check-contrast.mjs",
     "dev": "vite",
@@ -125,8 +126,6 @@
     "zod": "4.6.7"
   },
   "devDependencies": {
-    "ajv": "8.20.0",
-    "ajv-formats": "3.0.1",
     "@assistant-ui/react": "^0.15.27",
     "@assistant-ui/react-markdown": "^0.14.20",
     "@assistant-ui/react-ui": "^0.2.1",
@@ -139,10 +138,13 @@
     "@types/react": "^19.1.9",
     "@types/react-dom": "^19.1.7",
     "@vitejs/plugin-react": "^6.0.0",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
     "electron": "^45.0.0",
     "electron-builder": "26.18.0",
     "electron-updater": "^6.8.9",
     "esbuild": "^0.28.2",
+    "gifuct-js": "2.1.2",
     "happy-dom": "^21.0.0",
     "oxlint": "1.89.0",
     "tailwindcss": "^4.1.11",

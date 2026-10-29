@@ -106,7 +106,69 @@ if [[ ! -f "$BASELINE" ]]; then
   exit 0
 fi
 
-echo "ios-tvface-screenshot: baseline present but pixel compare is not available in this job" >&2
-echo "  (rule: standalone CI entries carry no third-party runtime dependencies;" >&2
-echo "   compare returns with a dependency-free decoder when a baseline ships)" >&2
-exit 1
+python3 - "$BASELINE" "$OUT" <<'PNG_COMPARE'
+import struct
+import sys
+import zlib
+
+def load_rgba(path: str) -> tuple[tuple[int, int], list[int]]:
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise SystemExit(f"{path}: not a PNG")
+    pos = 8
+    width = height = None
+    raw = b""
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        pos += 4
+        chunk_type = data[pos : pos + 4]
+        pos += 4
+        chunk = data[pos : pos + length]
+        pos += length + 4
+        if chunk_type == b"IHDR":
+            width, height = struct.unpack(">II", chunk[:8])
+        elif chunk_type == b"IDAT":
+            raw += chunk
+        elif chunk_type == b"IEND":
+            break
+    if width is None or height is None:
+        raise SystemExit(f"{path}: missing IHDR")
+    inflated = zlib.decompress(raw)
+    stride = width * 4 + 1
+    pixels: list[int] = []
+    prev = [0] * (width * 4)
+    offset = 0
+    for _ in range(height):
+        filter_type = inflated[offset]
+        offset += 1
+        row = list(inflated[offset : offset + width * 4])
+        offset += width * 4
+        if filter_type == 1:
+            for i in range(4, len(row)):
+                row[i] = (row[i] + row[i - 4]) & 0xFF
+        elif filter_type == 2:
+            for i in range(len(row)):
+                row[i] = (row[i] + prev[i]) & 0xFF
+        elif filter_type == 0:
+            pass
+        else:
+            raise SystemExit(f"{path}: unsupported PNG filter {filter_type}")
+        pixels.extend(row)
+        prev = row
+    return (width, height), pixels
+
+baseline_path, capture_path = sys.argv[1], sys.argv[2]
+baseline_size, baseline_pixels = load_rgba(baseline_path)
+capture_size, capture_pixels = load_rgba(capture_path)
+if baseline_size != capture_size:
+    raise SystemExit(
+        f"TV-Face screenshot size mismatch: baseline {baseline_size}, capture {capture_size}"
+    )
+if baseline_pixels != capture_pixels:
+    mismatches = sum(1 for left, right in zip(baseline_pixels, capture_pixels) if left != right)
+    raise SystemExit(
+        f"TV-Face screenshot differs from baseline ({mismatches} RGBA byte mismatches)"
+    )
+print(f"TV-Face screenshot matches baseline {baseline_path}")
+PNG_COMPARE

@@ -77,6 +77,16 @@ public enum MacMascotExpression: String, CaseIterable, Sendable, Codable {
     case sneaking = "sneaking"
 }
 
+// MARK: - TV-Face render resolution
+
+/// Resolved TV-Face expression names for bot states that must not collapse when
+/// rendered as TV-Face (matches src/components/tv-face/manifest.ts).
+public enum MacMascotTvFaceRenderMap {
+    public static let expressionByBotState: [String: String] = [
+        "sneaking": "sneaking",
+    ]
+}
+
 // MARK: - Status Pills
 
 /// The status pills the Mac app can show next to a bot.

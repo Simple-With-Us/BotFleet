@@ -87,9 +87,14 @@ export function mapBotStateToCursorState(state: BotState): CursorState {
     computer: "working",
     typing: "writing",
     speaking: "dictating",
-    sneaking: "playful",
   };
   return (map[state] as CursorState) || (state as CursorState);
+}
+
+/** CursorAvatar-only fallback when a BotState has TV-Face art but no Cursor pool. */
+export function mapBotStateToCursorAvatarState(state: BotState): CursorState {
+  if (state === "sneaking") return "playful";
+  return mapBotStateToCursorState(state);
 }
 
 export const BOT_COLOR_NAMES = [

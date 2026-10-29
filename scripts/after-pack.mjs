@@ -6,17 +6,16 @@ import {
   executableTarget,
   verifyCloudflaredExecutable,
 } from "./prepare-cloudflared.mjs";
+import { DESKTOP_BUNDLED_TVFACE_SKIN_DIRS } from "../shared/tv-face-packaging.mjs";
 
 /** Color TV-Face packs ship in the web build and can be fetched on demand;
- *  the desktop bundle keeps only the default (orange) pack to avoid hundreds
- *  of megabytes of GIFs in every install. */
-const DESKTOP_TVFACE_SKIN_DIRS = new Set(["default"]);
-
+ *  the desktop bundle keeps only directories listed in DESKTOP_BUNDLED_TVFACE_SKIN_DIRS
+ *  so selectable desktop colors never 404 against trimmed packs. */
 async function trimDesktopTvFaceSkins(resources) {
   const skinsRoot = path.join(resources, "ui", "tv-face", "skins");
   if (!existsSync(skinsRoot)) return;
   for (const entry of await readdir(skinsRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory() || DESKTOP_TVFACE_SKIN_DIRS.has(entry.name)) continue;
+    if (!entry.isDirectory() || DESKTOP_BUNDLED_TVFACE_SKIN_DIRS.has(entry.name)) continue;
     await rm(path.join(skinsRoot, entry.name), { recursive: true, force: true });
   }
 }

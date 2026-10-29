@@ -1267,6 +1267,43 @@ struct Phase1StoreImporterAndPerfTests {
         return palette
     }
 
+    /// TV-Face manifest resolutions parsed from src/components/tv-face/manifest.ts.
+    private static func legacyTvFaceManifest(in source: String) throws -> [String: String] {
+        guard let start = source.range(of: "export const TVFACE_MANIFEST"),
+              let end = source.range(of: "};", range: start.lowerBound..<source.endIndex) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let block = String(source[start.lowerBound..<end.lowerBound])
+        let regex = try NSRegularExpression(pattern: "([a-z-]+):\\s*\"([a-z_]+)\"")
+        let nsRange = NSRange(block.startIndex..<block.endIndex, in: block)
+        var manifest: [String: String] = [:]
+        for match in regex.matches(in: block, range: nsRange) {
+            guard let stateRange = Range(match.range(at: 1), in: block),
+                  let exprRange = Range(match.range(at: 2), in: block) else { continue }
+            manifest[String(block[stateRange])] = String(block[exprRange])
+        }
+        return manifest
+    }
+
+    /// CursorAvatar alias map from src/lib/mascot.ts (GROK_ACTION remaps only).
+    private static func legacyCursorAvatarAliases(in source: String) throws -> [String: String] {
+        guard let start = source.range(of: "export function mapBotStateToCursorState"),
+              let mapStart = source.range(of: "const map:", range: start.lowerBound..<source.endIndex),
+              let end = source.range(of: "};", range: mapStart.lowerBound..<source.endIndex) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let block = String(source[mapStart.lowerBound..<end.lowerBound])
+        let regex = try NSRegularExpression(pattern: "([a-z-]+):\\s*\"([a-z-]+)\"")
+        let nsRange = NSRange(block.startIndex..<block.endIndex, in: block)
+        var aliases: [String: String] = [:]
+        for match in regex.matches(in: block, range: nsRange) {
+            guard let keyRange = Range(match.range(at: 1), in: block),
+                  let valueRange = Range(match.range(at: 2), in: block) else { continue }
+            aliases[String(block[keyRange])] = String(block[valueRange])
+        }
+        return aliases
+    }
+
     @Test("The visual design contract carries the legacy mascot vocabulary and palette")
     func visualDesignContractMatchesTheLegacySource() throws {
         let repoRoot = Self.repoRoot()
@@ -1293,6 +1330,16 @@ struct Phase1StoreImporterAndPerfTests {
         // against the pinned snapshot, so dropping an expression breaks it.
         let drifted = MacMascotExpression.allCases.dropLast()
         #expect(Set(drifted.map(\.rawValue)) != MacVisualParityExpectations.mascotExpressions)
+
+        let manifestSource = try String(
+            contentsOf: repoRoot.appendingPathComponent("src/components/tv-face/manifest.ts"),
+            encoding: .utf8
+        )
+        let tvFaceManifest = try Self.legacyTvFaceManifest(in: manifestSource)
+        let cursorAliases = try Self.legacyCursorAvatarAliases(in: source)
+        #expect(tvFaceManifest["sneaking"] == "sneaking")
+        #expect(MacMascotTvFaceRenderMap.expressionByBotState["sneaking"] == tvFaceManifest["sneaking"])
+        #expect(cursorAliases["sneaking"] == nil, "sneaking must not collapse in mapBotStateToCursorState; TV-Face uses manifest.ts")
     }
 
     @Test("The Mac app follows the system theme and its connection states map onto the shared status pills")
