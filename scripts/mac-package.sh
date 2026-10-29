@@ -26,6 +26,10 @@
 #   SPARKLE_EDDSA_KEY  sign_update private key file; without it (and
 #                       without sign_update on PATH) the appcast is an
 #                       unsigned draft and the output says so
+#   SENTRY_DSN         native Sentry DSN (BF-2541); environment first, then
+#                       Infisical through `fleet-secrets get`, never printed.
+#                       Empty is fine: the package ships with Sentry inert,
+#                       exactly like the release workflow.
 #
 # The API key never reaches argv and never stays at a path: it is written to
 # a private temporary file, that file is opened on a file descriptor and
@@ -116,6 +120,18 @@ if ! command -v xcodegen >/dev/null; then
 fi
 (cd "$ROOT/ios" && xcodegen generate)
 
+# Native Sentry (BF-2541): same stamping as native-mac-release.yml.  The DSN
+# resolves environment-first, then Infisical, and is never printed; an empty
+# DSN packages with Sentry inert rather than failing the build.
+if [ -z "${SENTRY_DSN:-}" ] && command -v fleet-secrets >/dev/null 2>&1; then
+  SENTRY_DSN="$(fleet-secrets get SENTRY_DSN 2>/dev/null || true)"
+fi
+SENTRY_DSN="${SENTRY_DSN:-}"
+SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [ -z "$SENTRY_DSN" ]; then
+  echo "note: SENTRY_DSN unset in env and Infisical; package ships with Sentry inert"
+fi
+
 mkdir -p "$OUT"
 xcodebuild archive \
   -project "$ROOT/ios/BotFleet.xcodeproj" \
@@ -124,6 +140,8 @@ xcodebuild archive \
   -archivePath "$WORK/BotFleetMac.xcarchive" \
   MARKETING_VERSION="$VERSION" \
   CURRENT_PROJECT_VERSION="$BUILD" \
+  SENTRY_DSN="$SENTRY_DSN" \
+  SOURCE_COMMIT="$SOURCE_COMMIT" \
   CODE_SIGN_STYLE=Manual \
   CODE_SIGN_IDENTITY="${MAC_SIGN_IDENTITY:-Developer ID Application}" \
   DEVELOPMENT_TEAM=CC8UTF7ATG
