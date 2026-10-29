@@ -288,8 +288,12 @@ struct MacLifecycleAndCuaSafetyTests {
         #expect(store.readPersistOnExit() == false)
     }
 
-    @Test("MacLifecycleClient shutDownServerAndLocalVM calls POST /api/system/shutdown and ensures stopped.marker")
+    @Test("MacLifecycleClient shutDownServerAndLocalVM asks the fenced stop route first and ensures stopped.marker")
     func testShutdownEndpointAndMarker() async throws {
+        // BotFleet Control stops the harness through POST /api/system/control/stop,
+        // which refuses while work is in flight.  The native app's stop has to
+        // be the same stop, or the same owner has one button that protects
+        // active bots and one that kills them mid-turn (BF-2584).
         let tempDir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
@@ -315,8 +319,218 @@ struct MacLifecycleAndCuaSafetyTests {
         let requests = MacLifecycleStubURLProtocol.recordedRequests()
         #expect(requests.count == 1)
         #expect(requests[0].method == "POST")
-        #expect(requests[0].path == "/api/system/shutdown")
+        #expect(requests[0].path == "/api/system/control/stop")
         #expect(requests[0].headers["Origin"] == "http://127.0.0.1:8799")
+        #expect(requests[0].headers["Content-Type"] == "application/json")
+    }
+
+    @Test("A busy server's refusal is reported with the work in flight, and no marker is written")
+    func testBusyServerRefusesTheShutdownAndNamesTheWork() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MacPersistencePolicyStore(dataDir: tempDir)
+        let client = MacLifecycleClient(
+            baseURL: URL(string: "http://127.0.0.1:8799")!,
+            session: makeStubbedSession(),
+            policyStore: store
+        )
+
+        MacLifecycleStubURLProtocol.configure { request, _ in
+            switch (request.httpMethod ?? "GET", request.url?.path ?? "") {
+            case ("POST", "/api/system/control/stop"):
+                return (409, Data(#"{"error":"BotFleet is busy with active bots or leases."}"#.utf8), nil)
+            case ("GET", "/api/system/control"):
+                let payload = #"{"activeBotCount":2,"persistOnExit":true,"localVms":[],"blockingWork":[{"count":2,"label":"bot turn"},{"count":1,"label":"VM lease"},{"count":0,"label":"setup change"}]}"#
+                return (200, Data(payload.utf8), nil)
+            default:
+                return (500, Data(#"{"error":"unexpected request"}"#.utf8), nil)
+            }
+        }
+
+        let outcome = await client.performDeliberateShutdown()
+        switch outcome {
+        case .stopped:
+            Issue.record("Expected a refusal, got a receipt")
+        case .failed(let message):
+            #expect(message.contains("refused to stop while work is in flight"))
+            #expect(message.contains("2 bot turns, 1 VM lease"))
+            #expect(message.contains("busy with active bots or leases"))
+        }
+
+        // The harness is still running, so the marker must not say it was
+        // deliberately stopped, and the unfenced route must not be tried:
+        // a refusal is an answer, not a missing route.
+        #expect(store.hasStoppedMarker(dataDir: tempDir) == false)
+        let requests = MacLifecycleStubURLProtocol.recordedRequests()
+        #expect(requests.map(\.path) == ["/api/system/control/stop", "/api/system/control"])
+        // The status read decorates a refusal that is already known: it
+        // carries the Origin the harness sees on every other call from this
+        // app, and it cannot hold the owner's answer for long.
+        #expect(requests.last?.headers["Origin"] == "http://127.0.0.1:8799")
+        #expect(MacLifecycleClient.blockingWorkTimeout <= 2)
+    }
+
+    @Test("A 404 that is not the harness's no-route answer is an error, never a fallback")
+    func testAnUnexplained404DoesNotFallBackToTheUnfencedStop() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MacPersistencePolicyStore(dataDir: tempDir)
+        let client = MacLifecycleClient(
+            baseURL: URL(string: "http://127.0.0.1:8799")!,
+            session: makeStubbedSession(),
+            policyStore: store
+        )
+
+        MacLifecycleStubURLProtocol.configure { request, _ in
+            switch request.url?.path ?? "" {
+            case "/api/system/control/stop":
+                return (404, Data(#"{"error":"no such bot"}"#.utf8), nil)
+            default:
+                return (200, Data(#"{"ok":true,"detail":{"markerWritten":true,"localVmStop":"not-running"}}"#.utf8), nil)
+            }
+        }
+
+        do {
+            _ = try await client.shutDownServerAndLocalVM()
+            Issue.record("Expected the 404 to be reported")
+        } catch let error as MacLifecycleError {
+            #expect(error == .httpError(statusCode: 404, message: "no such bot"))
+        }
+        // The unfenced route was never tried: it has no fence, and a 404 from
+        // a route that exists is not an older harness.
+        #expect(store.hasStoppedMarker(dataDir: tempDir) == false)
+        let paths = MacLifecycleStubURLProtocol.recordedRequests().map(\.path)
+        #expect(paths == ["/api/system/control/stop"])
+    }
+
+    @Test("An older harness without the fenced route falls back to POST /api/system/shutdown")
+    func testOlderHarnessFallsBackToTheUnfencedShutdown() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MacPersistencePolicyStore(dataDir: tempDir)
+        let client = MacLifecycleClient(
+            baseURL: URL(string: "http://127.0.0.1:8799")!,
+            session: makeStubbedSession(),
+            policyStore: store
+        )
+
+        MacLifecycleStubURLProtocol.configure { request, _ in
+            switch request.url?.path ?? "" {
+            case "/api/system/control/stop":
+                return (404, Data(#"{"error":"no route: POST /api/system/control/stop"}"#.utf8), nil)
+            case "/api/system/shutdown":
+                return (200, Data(#"{"ok":true,"detail":{"markerWritten":true,"localVmStop":"not-running"}}"#.utf8), nil)
+            default:
+                return (500, Data(#"{"error":"unexpected request"}"#.utf8), nil)
+            }
+        }
+
+        let receipt = try await client.shutDownServerAndLocalVM()
+        #expect(receipt.ok == true)
+        #expect(store.hasStoppedMarker(dataDir: tempDir) == true)
+        let paths = MacLifecycleStubURLProtocol.recordedRequests().map(\.path)
+        #expect(paths == ["/api/system/control/stop", "/api/system/shutdown"])
+    }
+
+    @Test("A busy refusal still reads as a refusal when the status route cannot be read")
+    func testBusyRefusalWithoutAStatusKeepsTheServersWords() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MacPersistencePolicyStore(dataDir: tempDir)
+        let client = MacLifecycleClient(
+            baseURL: URL(string: "http://127.0.0.1:8799")!,
+            session: makeStubbedSession(),
+            policyStore: store
+        )
+
+        MacLifecycleStubURLProtocol.configure { request, _ in
+            if request.url?.path == "/api/system/control/stop" {
+                return (409, Data(#"{"error":"Active bot turn"}"#.utf8), nil)
+            }
+            return (500, Data(#"{"error":"status unavailable"}"#.utf8), nil)
+        }
+
+        do {
+            _ = try await client.shutDownServerAndLocalVM()
+            Issue.record("Expected a refusal")
+        } catch let error as MacLifecycleError {
+            #expect(error == .busy(message: "Active bot turn", blockingWork: nil))
+            // The server's words end with a period the server did not send,
+            // and no breakdown is invented when the status could not be read.
+            #expect(error.errorDescription == "BotFleet Server refused to stop while work is in flight.\u{00A0} Active bot turn.\u{00A0} Try again when it finishes.")
+        }
+        #expect(store.hasStoppedMarker(dataDir: tempDir) == false)
+        let paths = MacLifecycleStubURLProtocol.recordedRequests().map(\.path)
+        #expect(paths == ["/api/system/control/stop", "/api/system/control"])
+    }
+
+    @Test("A refusal that already names the work is not told twice")
+    func testBusyRefusalDoesNotRepeatTheServersBreakdown() async throws {
+        // On the server's count path the 409 text already carries the
+        // breakdown, byte for byte the same as the status route's, so the
+        // parenthetical is left out rather than said twice.
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let client = MacLifecycleClient(
+            baseURL: URL(string: "http://127.0.0.1:8799")!,
+            session: makeStubbedSession(),
+            policyStore: MacPersistencePolicyStore(dataDir: tempDir)
+        )
+
+        MacLifecycleStubURLProtocol.configure { request, _ in
+            switch (request.httpMethod ?? "GET", request.url?.path ?? "") {
+            case ("POST", "/api/system/control/stop"):
+                return (409, Data(#"{"error":"2 active operation(s) must finish before the server can stop: 2 bot turns, 1 VM lease"}"#.utf8), nil)
+            case ("GET", "/api/system/control"):
+                return (200, Data(#"{"activeBotCount":2,"persistOnExit":true,"localVms":[],"blockingWork":[{"count":2,"label":"bot turn"},{"count":1,"label":"VM lease"}]}"#.utf8), nil)
+            default:
+                return (500, Data(#"{"error":"unexpected request"}"#.utf8), nil)
+            }
+        }
+
+        do {
+            _ = try await client.shutDownServerAndLocalVM()
+            Issue.record("Expected a refusal")
+        } catch let error as MacLifecycleError {
+            let text = error.errorDescription ?? ""
+            // The server's own words carry "(s)", so the check is that the
+            // breakdown was not added in parentheses, not that there are none.
+            #expect(text.contains("(2 bot turns, 1 VM lease)") == false)
+            #expect(text.components(separatedBy: "2 bot turns, 1 VM lease").count == 2)
+            #expect(text.hasSuffix("the server can stop: 2 bot turns, 1 VM lease.\u{00A0} Try again when it finishes."))
+        }
+    }
+
+    @Test("A harness with neither stop route is reported as needing an update")
+    func testNeitherStopRouteIsAnUpdateMessage() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MacPersistencePolicyStore(dataDir: tempDir)
+        let client = MacLifecycleClient(
+            baseURL: URL(string: "http://127.0.0.1:8799")!,
+            session: makeStubbedSession(),
+            policyStore: store
+        )
+
+        MacLifecycleStubURLProtocol.configure { request, _ in
+            (404, Data(#"{"error":"no route: POST \#(request.url?.path ?? "")"}"#.utf8), nil)
+        }
+
+        do {
+            _ = try await client.shutDownServerAndLocalVM()
+            Issue.record("Expected a 404 outcome")
+        } catch let error as MacLifecycleError {
+            #expect(error == .httpError(statusCode: 404, message: "BotFleet Server has no shutdown route.\u{00A0} Update BotFleet, then try again."))
+        }
+        #expect(store.hasStoppedMarker(dataDir: tempDir) == false)
+        let paths = MacLifecycleStubURLProtocol.recordedRequests().map(\.path)
+        #expect(paths == ["/api/system/control/stop", "/api/system/shutdown"])
     }
 
     @Test("A failed shutdown leaves no deliberate-stop marker behind")
@@ -347,6 +561,10 @@ struct MacLifecycleAndCuaSafetyTests {
         // The harness is still running, so the marker must not claim it was
         // deliberately stopped: launchd would then never revive it.
         #expect(store.hasStoppedMarker(dataDir: tempDir) == false)
+        // A 500 is the server's own failure, not a missing route, so the
+        // unfenced shutdown is never tried on the back of it.
+        let paths = MacLifecycleStubURLProtocol.recordedRequests().map(\.path)
+        #expect(paths == ["/api/system/control/stop"])
     }
 
     @Test("A reconnect never clears the deliberate-stop marker, a deliberate launch does")
