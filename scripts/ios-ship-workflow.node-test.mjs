@@ -111,7 +111,14 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(yml, /--allow-dirty/);
   assert.doesNotMatch(yml, /--allow-unverified-seq/);
   assert.doesNotMatch(yml, /--version /);
-  assert.doesNotMatch(yml, /--build /);
+  // The build is planned ONCE per release (owner 2026-10-29): the
+  // plan-build job computes one shared merge-timestamp build and the ship
+  // job takes it as its --build, never planning its own.
+  assert.match(yml, /needs: plan-build/);
+  assert.match(yml, /--build "\$\{\{ needs\.plan-build\.outputs\.build \}\}"/);
+  assert.match(yml, /--plan-build-only/);
+  assert.match(yml, /build: \$\{\{ steps\.plan\.outputs\.build \}\}/);
+  assert.match(yml, /runs-on: ubuntu-latest/);
 
   // CI invokes the complete package test chain; ci-change-scope checks that
   // workflow contract.  Keep this ship contract included in the same chain.
@@ -121,7 +128,8 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   const project = read("ios/project.yml");
   assert.match(project, /DEVELOPMENT_TEAM:\s*CC8UTF7ATG/);
   assert.match(project, /PRODUCT_BUNDLE_IDENTIFIER:\s*app\.botfleet\.ios/);
-  assert.match(project, /MARKETING_VERSION:\s*"1\.0\.\d+"/);
+  assert.match(project, /MARKETING_VERSION:\s*"0\.1\.0"/);
+  assert.match(project, /CURRENT_PROJECT_VERSION:\s*"202610290000"/);
   assert.match(project, /configs:\s*\n\s*Release:\s*\n\s*CODE_SIGN_STYLE:\s*Manual/);
   assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet iOS App Store \(API\)"/);
   assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet Widgets App Store \(API\)"/);
@@ -146,6 +154,11 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.match(wrapper, /exec bash "\$IN_REPO" botfleet --repo-root "\$ROOT"/);
   assert.match(wrapper, /botfleet --repo-root/);
   assert.doesNotMatch(wrapper, /--force-ship/);
+  // The plan-build job captures this wrapper's stdout as the 12-digit build,
+  // so every diagnostic it prints must go to stderr (PR #1404 review).
+  for (const line of wrapper.split("\n")) {
+    if (line.includes("[ios-ship]") && /(echo|\bsed\b)/.test(line)) assert.match(line, />&2/);
+  }
 
   assert.match(prepare, /APPLE_API_KEY_P8_BASE64/);
   assert.match(prepare, /IOS_CERT_P12_BASE64/);
@@ -153,6 +166,31 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(prepare, /echo "\$APPLE_API_KEY_P8/);
   assert.doesNotMatch(prepare, /echo "\$IOS_DIST_P12/);
   assert.doesNotMatch(prepare, /echo "\$IOS_CERT_P12/);
+});
+
+test("wrapper --plan-build-only keeps stdout clean for the plan-build capture", () => {
+  // Git bash on windows-latest may exist while /usr/bin/python3 does not.
+  if (process.platform === "win32") return;
+  // IOS_FLEET_NODE=/bin/false makes the ASC client fail immediately, so this
+  // proves the stdout/stderr split without touching the network: the wrapper
+  // must fail with empty stdout and the diagnosis on stderr.  Before the
+  // PR #1404 fix, the "using in-repo fleet script" line went to stdout and
+  // broke the workflow's 12-digit validation on every run.
+  const tmp = mkdtempSync(join(tmpdir(), "ios-plan-stdout-"));
+  try {
+    const run = spawnSync("bash", [join(ROOT, "scripts/ios-ship-testflight.sh"), "--plan-build-only"], {
+      encoding: "utf8",
+      env: { PATH: process.env.PATH || "", HOME: tmp, IOS_FLEET_NODE: "/bin/false" },
+    });
+    if (run.error && run.error.code === "ENOENT") {
+      return;
+    }
+    assert.notEqual(run.status, 0);
+    assert.equal(run.stdout, "");
+    assert.match(run.stderr, /using in-repo fleet script/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test("the shared Infisical action masks every value, warns rather than fails on a non-required empty name, and never prints one", () => {
@@ -198,6 +236,7 @@ test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   assert.equal(botfleet.appleId, 6820175685);
   assert.equal(botfleet.xcodegenDir, "ios");
   assert.match(botfleet.marketingVersionDefault, /^1\.0\.\d+$/);
+  assert.equal(botfleet.fixedMarketingVersion, "0.1.0");
   assert.deepEqual(botfleet.extraBundleIds, ["app.botfleet.ios.widgets"]);
   assert.equal(Object.keys(apps.apps).join(","), "botfleet");
 
