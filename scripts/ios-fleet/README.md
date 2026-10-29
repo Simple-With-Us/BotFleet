@@ -24,6 +24,15 @@ The rules live in `scripts/ios-fleet/version-plan.mjs` (pure, unit-tested by
 `version-plan.node-test.mjs`); `ship-testflight.sh` applies them and prints a
 `version plan:` line naming the patch and the floors it used.
 
+Fixed versions (owner 2026-10-29): an app with `fixedMarketingVersion` in
+`apps.json` (BotFleet: `0.1.0`) ships that version unchanged, and its build
+is one shared merge-timestamp build, max(S, M + 1): S is the committer date
+of HEAD in America/Chicago as YYYYMMDDHHMM, M is the highest build already
+in App Store Connect on either platform. The rule lives in `shared-build.mjs`
+(unit-tested by `shared-build.node-test.mjs`); the release workflow's
+plan-build job computes it once (`ship-testflight.sh --plan-build-only`,
+read-only) and every ship job of that release takes it as its `--build`.
+
 `scripts/ios-ship-testflight.sh` prefers this directory, then falls back
 to `/Users/jay/apps/ios-fleet` on Jay's Mac.
 

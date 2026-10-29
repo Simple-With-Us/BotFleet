@@ -33,7 +33,7 @@ if [[ -n "$resolved" ]] && is_beta "$resolved"; then
     echo "       beta-SDK binaries are rejected as INVALID_BINARY at submission." >&2
     exit 1
   fi
-  echo "[ios-ship] refusing beta toolchain at ${resolved}"
+  echo "[ios-ship] refusing beta toolchain at ${resolved}" >&2
   export DEVELOPER_DIR="$STABLE_DEV_DIR"
 elif [[ -n "$resolved" ]]; then
   export DEVELOPER_DIR="$resolved"
@@ -45,14 +45,16 @@ if [[ -n "${DEVELOPER_DIR:-}" ]] && is_beta "$DEVELOPER_DIR"; then
 fi
 
 if [[ -n "${DEVELOPER_DIR:-}" ]]; then
-  echo "[ios-ship] DEVELOPER_DIR=${DEVELOPER_DIR}"
-  xcodebuild -version 2>/dev/null | sed 's/^/[ios-ship] /' || true
+  echo "[ios-ship] DEVELOPER_DIR=${DEVELOPER_DIR}" >&2
+  xcodebuild -version 2>/dev/null | sed 's/^/[ios-ship] /' >&2 || true
 fi
 
 IN_REPO="${ROOT}/scripts/ios-fleet/ship-testflight.sh"
 MAC="/Users/jay/apps/ios-fleet/ship-testflight.sh"
 if [[ -f "$IN_REPO" ]]; then
-  echo "[ios-ship] using in-repo fleet script: ${IN_REPO}"
+  # Diagnostics stay on stderr: the plan-build job captures this wrapper's
+  # stdout as the 12-digit build, so any stdout line breaks its validation.
+  echo "[ios-ship] using in-repo fleet script: ${IN_REPO}" >&2
   exec bash "$IN_REPO" botfleet --repo-root "$ROOT" "$@"
 fi
 if [[ -f "$MAC" ]]; then
