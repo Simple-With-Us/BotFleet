@@ -181,7 +181,7 @@ export interface RequestLog {
   record: (entry: RequestLogEntry, metadata: WebhookRequestMetadata) => boolean;
   /** Drain any spool records a crash left behind.  Safe to call repeatedly. */
   replay: () => void;
-  routineSubscriber: (event: Record<string, unknown>) => void;
+  routineSubscriber: (event: { kind?: unknown; run?: unknown }) => void;
 }
 
 export function createRequestLog(options: RequestLogOptions): RequestLog {
