@@ -494,14 +494,101 @@ final class FleetServicesTests: XCTestCase {
                 .stopAgent(label: "app.botfleet.companion", unloadAttempts: 2, unloadInterval: 0)
         }) { error in
             XCTAssertTrue("\(error)".contains("did not answer"), "\(error)")
+            XCTAssertTrue("\(error)".contains("left enabled"), "\(error)")
+        }
+        // One look that launchd did not answer ends the wait: the runner's
+        // timeout was already spent, and another look would not change that.
+        XCTAssertEqual(commands.calls, [
+            "/bin/launchctl disable gui/501/app.botfleet.companion",
+            "/bin/launchctl bootout gui/501/app.botfleet.companion",
+            "/bin/launchctl print gui/501/app.botfleet.companion",
+            "/bin/launchctl enable gui/501/app.botfleet.companion"
+        ])
+    }
+
+    func testALateDisableThatFailsIsAReportedRefusalNotAHeldStop() async throws {
+        // The job went away just after the re-enable, so the disable goes
+        // back on.  When that disable fails, the agent is enabled and
+        // unloaded: launchd starts it again at the next login, which is the
+        // one state the extra look exists to prevent, so the owner reads a
+        // refusal rather than a stop reported as held.
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let commands = LaunchAgentCommands()
+        commands.loadedAnswers = [true, false]
+        commands.disableAnswers = [nil, CommandExitError(output: "", errorOutput: "Could not disable service")]
+        await assertThrowsAsync({
+            try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+                .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
+        }) { error in
+            XCTAssertTrue("\(error)".contains("next login"), "\(error)")
+            XCTAssertTrue("\(error)".contains("Repeat Stop"), "\(error)")
         }
         XCTAssertEqual(commands.calls, [
             "/bin/launchctl disable gui/501/app.botfleet.companion",
             "/bin/launchctl bootout gui/501/app.botfleet.companion",
             "/bin/launchctl print gui/501/app.botfleet.companion",
+            "/bin/launchctl enable gui/501/app.botfleet.companion",
             "/bin/launchctl print gui/501/app.botfleet.companion",
-            "/bin/launchctl enable gui/501/app.botfleet.companion"
+            "/bin/launchctl disable gui/501/app.botfleet.companion"
         ])
+    }
+
+    func testARefusalSaysWhenTheReEnableItselfFailed() async throws {
+        // The refusal says only what was checked: when the enable that puts
+        // the agent back failed, it must not claim the agent is left enabled.
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let commands = LaunchAgentCommands()
+        commands.loaded = true
+        commands.enableFailure = StartupPolicyError.commandFailed
+        await assertThrowsAsync({
+            try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+                .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
+        }) { error in
+            XCTAssertTrue("\(error)".contains("could not re-enable"), "\(error)")
+            XCTAssertTrue("\(error)".contains("until Start is used"), "\(error)")
+            XCTAssertFalse("\(error)".contains("left enabled"), "\(error)")
+        }
+    }
+
+    func testANonFiniteWaitCannotTrapTheStop() async throws {
+        // stopAgent is public API: a caller's interval is clamped before it
+        // is used, so an infinite or NaN interval waits nothing and the
+        // refusal still reads as a refusal instead of trapping the app.
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let commands = LaunchAgentCommands()
+        commands.loaded = true
+        await assertThrowsAsync({
+            try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+                .stopAgent(label: "app.botfleet.companion", unloadAttempts: 2, unloadInterval: .infinity)
+        }) { error in
+            XCTAssertTrue("\(error)".contains("still loaded"), "\(error)")
+        }
+        XCTAssertEqual(StartupPolicy.unloadStep(.nan), 0)
+        XCTAssertEqual(StartupPolicy.unloadStep(-3), 0)
+        XCTAssertEqual(StartupPolicy.unloadStep(600), 60)
+        XCTAssertEqual(StartupPolicy.unloadStep(0.5), 0.5)
+    }
+
+    func testStoppingTheCompanionThroughTheFleetServicesGoesThroughLaunchd() async throws {
+        // The fleet-service path is the one the menu uses, so the launchd
+        // stop is driven through it: disable, bootout, and a look that finds
+        // the job gone.
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let commands = LaunchAgentCommands()
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil)
+        let state = try await control.perform(.stop, serviceID: FleetServiceRegistry.companion.id)
+        XCTAssertNotEqual(state, .running)
+        XCTAssertTrue(commands.calls.contains("/bin/launchctl disable gui/501/app.botfleet.companion"))
+        XCTAssertTrue(commands.calls.contains("/bin/launchctl bootout gui/501/app.botfleet.companion"))
+        XCTAssertTrue(commands.calls.contains("/bin/launchctl print gui/501/app.botfleet.companion"))
+        XCTAssertFalse(commands.calls.contains("/bin/launchctl enable gui/501/app.botfleet.companion"))
     }
 
     func testAPrintThatFailedForAnotherReasonIsNotReadAsUnloaded() async throws {
@@ -1237,6 +1324,12 @@ private final class LaunchAgentCommands: CommandRunning {
     var bootoutFailure: Error?
     /// The failure `launchctl disable` raises, when it raises one.
     var disableFailure: Error?
+    /// What successive `launchctl disable` calls answer, nil for success,
+    /// when a test needs one disable to fail and not another; `disableFailure`
+    /// is used once this runs out.
+    var disableAnswers: [Error?] = []
+    /// The failure `launchctl enable` raises, when it raises one.
+    var enableFailure: Error?
     /// The failure every `launchctl print` raises, when the runner could not
     /// ask launchd at all (a timeout, not a "no such service").
     var printFailure: Error?
@@ -1250,7 +1343,14 @@ private final class LaunchAgentCommands: CommandRunning {
         calls.append(([executable] + arguments).joined(separator: " "))
         if executable == "/usr/sbin/sysctl" { return boot }
         if arguments.first == "bootout", let bootoutFailure { throw bootoutFailure }
-        if arguments.first == "disable", let disableFailure { throw disableFailure }
+        if arguments.first == "enable", let enableFailure { throw enableFailure }
+        if arguments.first == "disable" {
+            if disableAnswers.isEmpty {
+                if let disableFailure { throw disableFailure }
+            } else if let failure = disableAnswers.removeFirst() {
+                throw failure
+            }
+        }
         if arguments == ["list"] {
             if listingFails { throw StartupPolicyError.commandFailed }
             return listing

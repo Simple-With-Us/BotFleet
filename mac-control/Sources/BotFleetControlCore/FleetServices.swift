@@ -174,8 +174,9 @@ public enum OwnerStopsStoreError: LocalizedError, Equatable {
 /// `~/.botfleet` on purpose, like `control-hosts.json` and
 /// `control-vm-plugins.json`: it is Control's own, where the files the
 /// server, Electron and the installed wrapper also read follow the server's
-/// `OMB_DATA_DIR`.  A file that is missing or cannot be read is an empty
-/// record, so the fleet's own rules apply, and an unreadable file is moved
+/// `OMB_DATA_DIR`.  A file that is missing is an empty record, so the
+/// fleet's own rules apply; one that cannot be read is left as it is, and
+/// no save goes over it until it reads; one that does not decode is moved
 /// aside under a `.corrupt` name rather than erased, once.
 public final class OwnerStopsStore {
     /// The file name under the Control data directory.
@@ -190,12 +191,6 @@ public final class OwnerStopsStore {
             ?? files.homeDirectoryForCurrentUser.appendingPathComponent(".botfleet/\(OwnerStopsStore.fileName)")
     }
 
-    /// The services the owner stopped on purpose, as last saved.
-    ///
-    /// A file that cannot be read right now is not a corrupt one: it is left
-    /// exactly where it is, so a passing read error never costs the owner
-    /// their record, and this launch runs on the fleet's own rules.  Only a
-    /// file whose bytes were read and did not decode is moved aside.
     /// Whether the last load found a record it could not read.
     ///
     /// A record that could not be read is not an empty record: a save over
@@ -205,6 +200,13 @@ public final class OwnerStopsStore {
     /// launch.
     public private(set) var recordUnread = false
 
+    /// The services the owner stopped on purpose, as last saved.
+    ///
+    /// A file that cannot be read right now is not a corrupt one: it is left
+    /// exactly where it is, so a passing read error never costs the owner
+    /// their record, and this launch runs on the fleet's own rules with no
+    /// start made for the owner.  Only a file whose bytes were read and did
+    /// not decode is moved aside.
     public func load() -> Set<String> {
         guard files.fileExists(atPath: fileURL.path) else {
             recordUnread = false

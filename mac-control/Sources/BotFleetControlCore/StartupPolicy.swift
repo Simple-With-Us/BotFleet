@@ -101,10 +101,14 @@ public struct ProcessCommandRunner: CommandRunning {
             }
             throw StartupPolicyError.commandFailed
         }
-        guard readerDone.wait(timeout: .now() + 2) == .success,
-              errorReaderDone.wait(timeout: .now() + 2) == .success else { throw StartupPolicyError.commandFailed }
+        guard readerDone.wait(timeout: .now() + 2) == .success else { throw StartupPolicyError.commandFailed }
         let result = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        let errorText = String(decoding: errorData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        // A command that exited after handing its stderr to a background
+        // child keeps this pipe open.  The command still answered, so a late
+        // stderr is read as empty rather than as a failure.
+        let errorText = errorReaderDone.wait(timeout: .now() + 2) == .success
+            ? String(decoding: errorData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
         return (result, errorText, process.terminationStatus)
     }
 }
@@ -375,7 +379,8 @@ public final class StartupPolicy {
             throw StartupPolicyError.refused("launchctl did not answer while disabling the \(label) LaunchAgent, so nothing was stopped.")
         }
         _ = try? commands.run("/bin/launchctl", ["bootout", full])
-        switch await waitUntilUnloaded(full, attempts: unloadAttempts, interval: unloadInterval) {
+        let step = StartupPolicy.unloadStep(unloadInterval)
+        switch await waitUntilUnloaded(full, attempts: unloadAttempts, step: step) {
         case .unloaded:
             return
         case .loaded:
@@ -383,17 +388,49 @@ public final class StartupPolicy {
             // the owner's back.  A teardown that finishes between the last
             // look and the enable is caught by one more look: a job that is
             // gone now is a stop that took, and the disable goes back on.
-            _ = try? commands.run("/bin/launchctl", ["enable", full])
-            if case .unloaded = probeLoaded(full) {
-                _ = try? commands.run("/bin/launchctl", ["disable", full])
+            let enabled = (try? commands.run("/bin/launchctl", ["enable", full])) != nil
+            switch probeLoaded(full) {
+            case .unloaded:
+                do {
+                    _ = try commands.run("/bin/launchctl", ["disable", full])
+                } catch {
+                    // Enabled and unloaded is the one state this look exists
+                    // to prevent: launchd starts the agent again at the next
+                    // login.  It is a refusal the owner reads, never a stop
+                    // reported as held.
+                    throw StartupPolicyError.refused("The \(label) LaunchAgent stopped, but launchctl could not disable it again, so launchd starts it at the next login.  Repeat Stop once launchd answers.")
+                }
                 return
+            case .loaded:
+                let waited = Int((Double(max(unloadAttempts, 1)) * step).rounded())
+                throw StartupPolicyError.refused("The \(label) LaunchAgent is still loaded after \(waited) seconds.  \(StartupPolicy.enableOutcome(enabled, whileStopping: true))")
+            case .couldNotAsk:
+                throw StartupPolicyError.refused("The \(label) LaunchAgent was still loaded when the wait ran out, and launchctl did not answer the last look.  \(StartupPolicy.enableOutcome(enabled, whileStopping: false))  Try again once launchd answers.")
             }
-            let waited = Int((Double(max(unloadAttempts, 1)) * max(unloadInterval, 0)).rounded())
-            throw StartupPolicyError.refused("The \(label) LaunchAgent is still loaded after \(waited) seconds, so it is left enabled.  It may still be stopping; if it stops now, launchd starts it again at the next login until Stop is repeated.")
         case .couldNotAsk:
-            _ = try? commands.run("/bin/launchctl", ["enable", full])
-            throw StartupPolicyError.refused("launchctl did not answer while Control waited for the \(label) LaunchAgent to unload, so nothing can be said about it; it is left enabled.  Try again once launchd answers.")
+            let enabled = (try? commands.run("/bin/launchctl", ["enable", full])) != nil
+            throw StartupPolicyError.refused("launchctl did not answer while Control waited for the \(label) LaunchAgent to unload, so nothing can be said about it.  \(StartupPolicy.enableOutcome(enabled, whileStopping: false))  Try again once launchd answers.")
         }
+    }
+
+    /// What the refusal says about the agent's enable, after a stop that did
+    /// not take: only what was checked, never the outcome the code hoped for.
+    private static func enableOutcome(_ enabled: Bool, whileStopping: Bool) -> String {
+        if enabled {
+            return whileStopping
+                ? "It is left enabled, and it may still be stopping; if it stops now, launchd starts it again at the next login until Stop is repeated."
+                : "It is left enabled."
+        }
+        return whileStopping
+            ? "It may still be stopping, and Control could not re-enable it, so it stays disabled and will not start at the next login until Start is used."
+            : "Control could not re-enable it, so it stays disabled and will not start at the next login until Start is used."
+    }
+
+    /// The wait between looks, clamped so a caller cannot trap the app or
+    /// wait for ever: a non-finite or negative interval waits nothing, and a
+    /// long one waits a minute at most.
+    static func unloadStep(_ interval: TimeInterval) -> TimeInterval {
+        interval.isFinite ? min(max(interval, 0), 60) : 0
     }
 
     /// What one look at launchd said about a job.
@@ -436,19 +473,27 @@ public final class StartupPolicy {
     ///
     /// A job that is still being torn down answers for a while, so the
     /// question is asked more than once, with the wait between looks spent
-    /// suspended rather than holding a thread.  The last answer is what is
-    /// reported when the wait runs out.
-    private func waitUntilUnloaded(_ full: String, attempts: Int, interval: TimeInterval) async -> LoadedAnswer {
-        let step = interval.isFinite ? min(max(interval, 0), 60) : 0
-        var last: LoadedAnswer = .loaded
-        for attempt in 0..<max(attempts, 1) {
-            last = probeLoaded(full)
-            if case .unloaded = last { return .unloaded }
-            if attempt + 1 < max(attempts, 1), step > 0 {
+    /// suspended rather than holding a thread.  The window is a budget of
+    /// wall-clock time, not a number of looks: a look that was slow to answer
+    /// has spent the budget.  A look launchd did not answer ends the wait at
+    /// once, because the runner's own timeout has already been spent and
+    /// another look would not make launchd answer; the caller re-enables and
+    /// says so.
+    private func waitUntilUnloaded(_ full: String, attempts: Int, step: TimeInterval) async -> LoadedAnswer {
+        let looks = max(attempts, 1)
+        let deadline = Date().addingTimeInterval(Double(looks) * step)
+        for attempt in 0..<looks {
+            switch probeLoaded(full) {
+            case .unloaded: return .unloaded
+            case .couldNotAsk: return .couldNotAsk
+            case .loaded: break
+            }
+            if step > 0, Date() >= deadline { return .loaded }
+            if attempt + 1 < looks, step > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
             }
         }
-        return last
+        return .loaded
     }
 
     /// Stops a BotFleet Server that cannot be asked to stop itself.

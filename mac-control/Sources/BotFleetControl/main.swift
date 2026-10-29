@@ -134,6 +134,12 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // service the owner stopped before this launch is not started again
         // by it.
         ownerStops = OwnerStops(loadedFrom: ownerStopsStore)
+        if ownerStopsStore.recordUnread {
+            // The record is on disk but could not be read, so the stops it
+            // holds are unknown to this launch: nothing is started for the
+            // owner until it reads, and the menu says so from the start.
+            ownerStopsProblem = "The owner's stops could not be read when Control started, so no fleet service is started for you until they can be, and the record on disk is left as it was.  Relaunch Control to read it again."
+        }
         showIcon()
         // The fleet service control is resolved here, on the main thread and
         // before any task can reach for it, so its first use cannot race
@@ -311,6 +317,9 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if ownerStops.ids.contains(entry.id) { continue }
             switch ManagedServices.action(for: entry) {
             case .start:
+                // A record that could not be read may hold this very stop,
+                // so nothing is started for the owner while it is unread.
+                if ownerStopsStore.recordUnread { break }
                 do { mcpServerState = try await mcpServer.setRunning(true) }
                 catch { problem = "BotFleet MCP Server: \(error.localizedDescription)" }
             case .stop:
@@ -1096,6 +1105,14 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let refusal = ManagedServices.forceStopOutcome(answer: answer, launchdAsked: launchdAsked) {
             throw FleetServiceError.refused(refusal)
         }
+        // The server is gone, so what was known about its version no longer
+        // describes anything that is running.  Cleared here, on both the menu
+        // path and the Fleet Services path, so the reconcile that follows
+        // cannot derive a running server from a stale answer and start the
+        // MCP server against a server that is down.
+        serverOutdated = false
+        status = nil
+        apiUnavailable = true
     }
 
     @objc private func startVM() { run { [self] in try await api.startVM() } }
