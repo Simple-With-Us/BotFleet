@@ -330,11 +330,11 @@ test("every host runs the canonical complete test chain without masking failures
   const job = workflow.jobs.test;
   // The required contexts stay "typecheck + test (macos-latest)" and
   // "typecheck + test (ubuntu-latest)".  Hosted macos-latest does not
-  // allocate a runner (BF-2066), so the mac leg runs on macos-14.
-  // Ubuntu keeps its own label.
+  // allocate a runner (BF-2066) and macos-14 is retiring (BF-2587), so
+  // the mac leg runs on macos-15.  Ubuntu keeps its own label.
   assert.equal(job.name, "typecheck + test (${{ matrix.check }})");
   assert.deepEqual(job.strategy.matrix.include, [
-    { os: "macos-14", check: "macos-latest" },
+    { os: "macos-15", check: "macos-latest" },
     { os: "ubuntu-latest", check: "ubuntu-latest" },
   ]);
   assert.match(String(job["runs-on"]), /matrix\.os/);
