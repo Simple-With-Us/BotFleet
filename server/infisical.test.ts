@@ -27,6 +27,15 @@ const BASE_SETTINGS: InfisicalSettings = {
   refreshMinutes: 15,
 };
 
+/** The request headers as a plain string map, so a test can read the
+ * authorization header off a stubbed fetch. */
+function headerBag(init?: RequestInit): Record<string, string> {
+  // SAFETY: every stubbed fetch in this file is called with a plain object of
+  // string headers -- never a Headers instance and never an array of pairs --
+  // so reading a header off this map cannot be wrong.
+  return (init?.headers ?? {}) as Record<string, string>;
+}
+
 function withSettings(overrides: Partial<InfisicalSettings>): InfisicalSettings {
   const merged: InfisicalSettings = { ...BASE_SETTINGS, ...overrides };
   infisical.configure(() => merged);
@@ -38,7 +47,7 @@ function withSettings(overrides: Partial<InfisicalSettings>): InfisicalSettings 
 function listOnly(secrets: Array<{ secretKey: string; secretValue: string }>) {
   const calls: Array<{ url: string; authorization: string | undefined }> = [];
   const impl = vi.fn(async (url: string, init?: RequestInit) => {
-    const headers = (init?.headers ?? {}) as Record<string, string>;
+    const headers = headerBag(init);
     calls.push({ url: String(url), authorization: headers.authorization });
     return new Response(JSON.stringify({ secrets }), { status: 200 });
   });
@@ -172,7 +181,7 @@ describe("refresh: a good sync", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string, init?: RequestInit) => {
-        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const headers = headerBag(init);
         calls.push({
           url: String(url),
           method: init?.method ?? "GET",
@@ -296,6 +305,7 @@ describe("refresh: a failure after a good sync", () => {
     withSettings({});
     vi.stubGlobal("fetch", loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]));
     const good = await infisical.refresh("manual");
+    expect(good.lastError).toBeNull();
     expect(good.stale).toBe(false);
 
     vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 500 })));
@@ -852,5 +862,658 @@ describe("no secret ever leaves this module", () => {
       expect(serialized).not.toContain(sentinel);
       expect(line).not.toContain(sentinel);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The service-token fallback.  A configured token the server refuses (401,
+// 403, 404) is a definitive answer about the CREDENTIAL, and an install
+// that also has a machine identity falls back to it.  A transient answer
+// (429, any 5xx, a timeout) says nothing about the credential, so the token
+// stays exactly where it was and the next refresh tries it again.  The two
+// look identical from the outside unless the manager keeps them apart,
+// which is what these cases pin down.
+// ---------------------------------------------------------------------------
+describe("service token fallback", () => {
+  // A second fake token, distinct from the first:  "which bearer was used"
+  // has to be answerable without a substring reading as a match.
+  const ROTATED_READ_TOKEN = "sentinel-rotated-read-token-not-real";
+
+  type RecordedCall = { url: string; method: string; authorization: string | undefined };
+
+  /** A fetch that records every call, answers the login with a session
+   * token, refuses the named bearers with `status` and answers every other
+   * request with the secrets list. */
+  function refusingList(options: {
+    refused: string[];
+    status: number;
+    secrets?: Array<{ secretKey: string; secretValue: string }>;
+  }) {
+    const calls: RecordedCall[] = [];
+    const impl = vi.fn(async (url: string, init?: RequestInit) => {
+      const headers = headerBag(init);
+      calls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        authorization: headers.authorization,
+      });
+      if (String(url).includes("/login")) {
+        return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
+      }
+      const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
+      if (options.refused.includes(bearer)) {
+        return new Response("refused", { status: options.status });
+      }
+      return new Response(JSON.stringify({ secrets: options.secrets ?? [] }), { status: 200 });
+    });
+    return { calls, impl };
+  }
+
+  function listCalls(calls: RecordedCall[]): RecordedCall[] {
+    return calls.filter((call) => !call.url.includes("/login"));
+  }
+
+  function loginCalls(calls: RecordedCall[]): RecordedCall[] {
+    return calls.filter((call) => call.url.includes("/login"));
+  }
+
+  it("falls back to the machine identity when the server refuses the configured service token", async () => {
+    // A revoked service token used to break every vault call on the host.
+    // The install still has a machine identity, so the refresh has to land
+    // on it instead of reporting the vault as gone.
+    withSettings({ token: SENTINEL_READ_TOKEN });
+    const { calls, impl } = refusingList({
+      refused: [SENTINEL_READ_TOKEN],
+      status: 401,
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", impl);
+
+    const status = await infisical.refresh("manual");
+
+    expect(status.lastError).toBeNull();
+    expect(status.stale).toBe(false);
+    expect(status.appliedFields).toEqual(["composio.apiKey"]);
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+
+    // One login, two lists:  the refused one and the retry.
+    expect(loginCalls(calls)).toHaveLength(1);
+    const lists = listCalls(calls);
+    expect(lists).toHaveLength(2);
+    // The first list carried the configured token and was refused...
+    expect(lists[0]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
+    // ...and the retry carried the machine identity's session token.
+    expect(lists[1]?.authorization ?? "").toContain(SENTINEL_TOKEN);
+    expect(lists[1]?.authorization ?? "").not.toContain(SENTINEL_READ_TOKEN);
+  });
+
+  it("keeps the token configured and the last good snapshot when there is no machine identity", async () => {
+    // A token-only host has nothing to fall back to.  The refusal must not
+    // cost the operator their configuration, and it must not empty a vault
+    // that was already synced.
+    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
+    const good = listOnly([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
+    vi.stubGlobal("fetch", good.impl);
+    const synced = await infisical.refresh("manual");
+    expect(synced.stale).toBe(false);
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+
+    const { calls, impl } = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
+    vi.stubGlobal("fetch", impl);
+
+    const failed = await infisical.refresh("manual");
+
+    expect(failed.lastError).toMatch(/401/);
+    // The ORIGINAL error is what the caller sees, not a synthesized one.
+    expect(failed.lastError).toMatch(/secrets list failed/i);
+    expect(failed.stale).toBe(true);
+    // No machine identity means no login attempt at all.
+    expect(loginCalls(calls)).toHaveLength(0);
+
+    const status = infisical.getStatus();
+    expect(status.hasToken).toBe(true);
+    expect(status.configured).toBe(true);
+    expect(status.enabled).toBe(true);
+    // The vault that was already synced is still there.
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+  });
+
+  it("does not probe the server again for a token it already knows was refused", async () => {
+    // The remembered refusal answers the question on its own:  re-probing a
+    // credential the server already rejected costs a round trip per refresh
+    // and tells the operator nothing new.
+    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
+    const { calls, impl } = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
+    vi.stubGlobal("fetch", impl);
+
+    const first = await infisical.refresh("manual");
+    expect(first.lastError).toMatch(/401/);
+    expect(listCalls(calls)).toHaveLength(1);
+
+    const second = await infisical.refresh("manual");
+    expect(listCalls(calls)).toHaveLength(1);
+    expect(second.lastError).toMatch(/no machine identity to fall back to/i);
+  });
+
+  it("does not fall back on a transient failure and keeps trying the same token", async () => {
+    // A 503 says the server is unwell, not that the credential is dead.
+    // Falling back there would trade one credential for another over a
+    // network blip, and recording the token as refused would strand the
+    // install on the fallback for good.
+    withSettings({ token: SENTINEL_READ_TOKEN });
+    const { calls, impl } = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 503 });
+    vi.stubGlobal("fetch", impl);
+
+    const first = await infisical.refresh("manual");
+    expect(first.lastError).toMatch(/503/);
+    expect(first.stale).toBe(true);
+    // The token is not removed from the configuration either.
+    expect(first.hasToken).toBe(true);
+    expect(loginCalls(calls)).toHaveLength(0);
+
+    // The second refresh tries the SAME token again:  it was never refused.
+    const second = await infisical.refresh("manual");
+    expect(second.lastError).toMatch(/503/);
+    const lists = listCalls(calls);
+    expect(lists).toHaveLength(2);
+    expect(lists[1]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
+    expect(loginCalls(calls)).toHaveLength(0);
+  });
+
+  it("falls back to the machine identity on a 403, which refuses that request", async () => {
+    // A grant that does not cover what was asked for is final about THAT
+    // request, and the call falls back to the machine identity.  It is not
+    // final about the credential, so the token is not deprioritized for the
+    // rest of the vault:  the scope test below pins that.
+    withSettings({ token: SENTINEL_READ_TOKEN });
+    const { calls, impl } = refusingList({
+      refused: [SENTINEL_READ_TOKEN],
+      status: 403,
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", impl);
+
+    const status = await infisical.refresh("manual");
+
+    expect(status.lastError).toBeNull();
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+    expect(loginCalls(calls)).toHaveLength(1);
+    const lists = listCalls(calls);
+    expect(lists).toHaveLength(2);
+    expect(lists[1]?.authorization ?? "").toContain(SENTINEL_TOKEN);
+    expect(lists[1]?.authorization ?? "").not.toContain(SENTINEL_READ_TOKEN);
+  });
+
+  it("does not treat a 429 as a refusal of the credential", async () => {
+    // Rate limited is not refused:  the token is still the right one, and
+    // the next refresh has to try it again rather than log in instead.
+    withSettings({ token: SENTINEL_READ_TOKEN });
+    const { calls, impl } = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 429 });
+    vi.stubGlobal("fetch", impl);
+
+    const first = await infisical.refresh("manual");
+    expect(first.lastError).toMatch(/429/);
+    expect(loginCalls(calls)).toHaveLength(0);
+
+    const second = await infisical.refresh("manual");
+    expect(second.lastError).toMatch(/429/);
+    const lists = listCalls(calls);
+    expect(lists).toHaveLength(2);
+    expect(lists[1]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
+    expect(loginCalls(calls)).toHaveLength(0);
+  });
+
+  it("tries a rotated token again after the old one was refused", async () => {
+    // The memory holds the token VALUE, not a flag:  a rotation is a new
+    // value in the same setting, and it has to be tried on its own merits
+    // rather than inherit the old token's rejection.
+    let settings: InfisicalSettings = { ...BASE_SETTINGS, token: SENTINEL_READ_TOKEN };
+    infisical.configure(() => settings);
+    const { calls, impl } = refusingList({
+      refused: [SENTINEL_READ_TOKEN],
+      status: 401,
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", impl);
+
+    const first = await infisical.refresh("manual");
+    expect(first.lastError).toBeNull();
+
+    // The operator saves a rotated token.
+    settings = { ...settings, token: ROTATED_READ_TOKEN };
+
+    const second = await infisical.refresh("manual");
+    expect(second.lastError).toBeNull();
+    const lists = listCalls(calls);
+    expect(lists.at(-1)?.authorization ?? "").toContain(ROTATED_READ_TOKEN);
+    expect(lists.at(-1)?.authorization ?? "").not.toContain(SENTINEL_READ_TOKEN);
+  });
+
+  it("forgets a refused token when a new settings source is installed", async () => {
+    // `configure()` installs a new credential source, and the server calls it
+    // at boot:  that source's token has to be tried on its own merits rather
+    // than inherit the previous source's rejection.
+    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
+    const refused = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
+    vi.stubGlobal("fetch", refused.impl);
+    const failed = await infisical.refresh("manual");
+    expect(failed.lastError).toMatch(/401/);
+
+    const accepted = refusingList({
+      refused: [],
+      status: 401,
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", accepted.impl);
+    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
+
+    const status = await infisical.refresh("manual");
+
+    expect(status.lastError).toBeNull();
+    expect(listCalls(accepted.calls)[0]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+  });
+
+  it("forgets a refused token when the operator asks for a retry", async () => {
+    // A Sync Now and a Settings save are the operator asking for the
+    // configured token to be tried again.  A grant widened or a path created
+    // in the vault changes neither the token nor the scope, so the memory
+    // cannot notice it on its own:  without the explicit retry the token
+    // would stay deprioritized until the process restarted.
+    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
+    const refused = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
+    vi.stubGlobal("fetch", refused.impl);
+    const failed = await infisical.refresh("manual");
+    expect(failed.lastError).toMatch(/401/);
+    expect(infisical.getStatus().readTokenRefused).toBe(true);
+
+    const accepted = refusingList({
+      refused: [],
+      status: 401,
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", accepted.impl);
+
+    infisical.retryRefusedTokens();
+    const status = await infisical.refresh("manual");
+
+    expect(status.lastError).toBeNull();
+    expect(infisical.getStatus().readTokenRefused).toBe(false);
+    expect(listCalls(accepted.calls)[0]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+  });
+
+  it("reports a refused configured token as a failure, even when a machine identity would have worked", async () => {
+    // The probe is the operator's question about the CONFIGURED credential.
+    // Falling back inside it would answer a different question and turn a
+    // dead token into a green light.
+    withSettings({ token: SENTINEL_READ_TOKEN });
+    const { calls, impl } = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
+    vi.stubGlobal("fetch", impl);
+
+    const result = await infisical.probe();
+
+    expect(result.ok).toBe(false);
+    expect(result.error ?? "").toMatch(/^The configured read service token was refused by the server:/);
+    // No fallback inside a probe.
+    expect(loginCalls(calls)).toHaveLength(0);
+  });
+
+  it("falls back to the machine identity for a write when the write token is refused", async () => {
+    // The write token is refused the same way the read token is, and the
+    // write has to land on the machine identity rather than be lost.
+    withSettings({
+      token: SENTINEL_READ_TOKEN,
+      writeToken: SENTINEL_WRITE_TOKEN,
+      writeThrough: true,
+    });
+    const calls: RecordedCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const headers = headerBag(init);
+        calls.push({
+          url: String(url),
+          method: init?.method ?? "GET",
+          authorization: headers.authorization,
+        });
+        if (String(url).includes("/login")) {
+          return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
+        }
+        const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
+        if (init?.method === "PATCH") {
+          // The configured write token is refused;  the machine identity is not.
+          if (bearer === SENTINEL_WRITE_TOKEN) return new Response("refused", { status: 401 });
+          return new Response("{}", { status: 200 });
+        }
+        // The verification read after the upsert.
+        return new Response(
+          JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: "written-value" }] }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    await infisical.writeSecret("COMPOSIO_API_KEY", "written-value");
+
+    const patches = calls.filter((call) => call.method === "PATCH");
+    expect(patches).toHaveLength(2);
+    expect(patches[0]?.authorization ?? "").toContain(SENTINEL_WRITE_TOKEN);
+    // The upsert that landed is the one made with the machine identity.
+    expect(patches[1]?.authorization ?? "").toContain(SENTINEL_TOKEN);
+    expect(patches[1]?.authorization ?? "").not.toContain(SENTINEL_WRITE_TOKEN);
+    expect(loginCalls(calls)).toHaveLength(1);
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe("written-value");
+  });
+
+  it("does not probe the server again for a write token it already knows was refused", async () => {
+    withSettings({
+      token: SENTINEL_READ_TOKEN,
+      writeToken: SENTINEL_WRITE_TOKEN,
+      writeThrough: true,
+    });
+    const calls: RecordedCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const headers = headerBag(init);
+        calls.push({
+          url: String(url),
+          method: init?.method ?? "GET",
+          authorization: headers.authorization,
+        });
+        if (String(url).includes("/login")) {
+          return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
+        }
+        const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
+        if (init?.method === "PATCH") {
+          if (bearer === SENTINEL_WRITE_TOKEN) return new Response("refused", { status: 401 });
+          return new Response("{}", { status: 200 });
+        }
+        return new Response(
+          JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: "written-value" }] }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    await infisical.writeSecret("COMPOSIO_API_KEY", "written-value");
+    await infisical.writeSecret("COMPOSIO_API_KEY", "written-value");
+
+    const patches = calls.filter((call) => call.method === "PATCH");
+    // One refused probe, then the machine identity for both writes.
+    expect(patches).toHaveLength(3);
+    expect(patches.filter((call) => (call.authorization ?? "").includes(SENTINEL_WRITE_TOKEN))).toHaveLength(1);
+    expect(patches[2]?.authorization ?? "").toContain(SENTINEL_TOKEN);
+  });
+});
+
+
+describe("service token refusal: scope and visibility", () => {
+  const REFUSED_TOKEN = "sentinel-refused-token-not-real";
+
+  type RecordedCall = { url: string; authorization: string | undefined };
+
+  /** A fetch that refuses the named bearer with `status` and answers every
+   * other request with the secrets list.  The login endpoint is answered
+   * with a session token when the machine identity is in play. */
+  function refusingFetch(status: number, secrets: Array<{ secretKey: string; secretValue: string }> = []) {
+    const calls: RecordedCall[] = [];
+    const impl = vi.fn(async (url: string, init?: RequestInit) => {
+      const headers = headerBag(init);
+      calls.push({ url: String(url), authorization: headers.authorization });
+      if (String(url).includes("/login")) {
+        return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
+      }
+      const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
+      if (bearer === REFUSED_TOKEN) {
+        return new Response("refused", { status });
+      }
+      return new Response(JSON.stringify({ secrets }), { status: 200 });
+    });
+    return { calls, impl };
+  }
+
+  function bearerOf(call: RecordedCall): string {
+    return (call.authorization ?? "").replace(/^Bearer /, "");
+  }
+
+  it("forgets a refusal when the project it was refused under changes", async () => {
+    // A wrong project id answers 404 and looks exactly like a revoked
+    // token.  Fixing the project id in Settings has to put the token back
+    // in play, or the good token stays deprioritized for the life of the
+    // process.
+    const settings = { ...BASE_SETTINGS, projectId: "proj-1", clientId: "", clientSecret: "", token: REFUSED_TOKEN };
+    infisical.configure(() => settings);
+    const { calls, impl } = refusingFetch(404);
+    vi.stubGlobal("fetch", impl);
+
+    await infisical.refresh("manual");
+    expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(1);
+
+    // The same token, a different project:  the remembered refusal was
+    // about a different request, so the token is tried again.
+    settings.projectId = "proj-2";
+    await infisical.refresh("manual");
+
+    expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(2);
+  });
+
+  /** A fetch that refuses each named bearer with its own status and
+   * answers every other request with the secrets list.  The login endpoint
+   * is answered with a session token when the machine identity is in play. */
+  function perBearerRefusingFetch(statuses: Record<string, number>) {
+    const calls: RecordedCall[] = [];
+    const impl = vi.fn(async (url: string, init?: RequestInit) => {
+      const headers = headerBag(init);
+      calls.push({ url: String(url), authorization: headers.authorization });
+      if (String(url).includes("/login")) {
+        return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
+      }
+      const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
+      const status = statuses[bearer];
+      if (status !== undefined) {
+        return new Response("refused", { status });
+      }
+      return new Response(JSON.stringify({ secrets: [] }), { status: 200 });
+    });
+    return { calls, impl };
+  }
+
+  it("keeps the credential-wide refusal when scope-scoped refusals fill the cap", async () => {
+    // A 401 is remembered against EVERY scope, because the bearer is refused
+    // however it is used.  That entry is the one worth keeping under the
+    // cap:  dropping it would let a revoked token be tried again, which is
+    // the whole thing the memory exists to prevent.  Sixteen scope-scoped
+    // refusals for another token must not push it out.
+    const ROTATED_TOKEN = "sentinel-rotated-token-not-real";
+    const settings = {
+      ...BASE_SETTINGS,
+      projectId: "proj-1",
+      clientId: "",
+      clientSecret: "",
+      token: REFUSED_TOKEN,
+    };
+    infisical.configure(() => settings);
+    const { calls, impl } = perBearerRefusingFetch({
+      [REFUSED_TOKEN]: 401,
+      [ROTATED_TOKEN]: 404,
+    });
+    vi.stubGlobal("fetch", impl);
+
+    // One 401:  the credential-wide refusal, remembered against every scope.
+    await infisical.refresh("manual");
+    expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(1);
+
+    // Sixteen scope-scoped refusals for the rotated token, one per scope.
+    // Every one of them is a 404, so each is remembered against its own
+    // scope rather than against the credential.
+    settings.token = ROTATED_TOKEN;
+    for (let index = 0; index < 16; index += 1) {
+      settings.projectId = `proj-scoped-${index}`;
+      await infisical.refresh("manual");
+    }
+    expect(calls.filter((call) => bearerOf(call) === ROTATED_TOKEN)).toHaveLength(16);
+
+    // Back to the revoked token.  The credential-wide refusal survived the
+    // cap, so the token is not tried again -- no request carries it.
+    settings.token = REFUSED_TOKEN;
+    settings.projectId = "proj-1";
+    await infisical.refresh("manual");
+
+    expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(1);
+    expect(infisical.getStatus().readTokenRefused).toBe(true);
+  });
+
+  it("reports a refused token in the status view and in the boot line", async () => {
+    // A sync that succeeds on the machine identity must not look exactly
+    // like a healthy token:  the refusal is the fact the operator needs.
+    withSettings({ token: REFUSED_TOKEN });
+    const { impl } = refusingFetch(401, [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
+    vi.stubGlobal("fetch", impl);
+
+    await infisical.refresh("manual");
+
+    const status = infisical.getStatus();
+    expect(status.readTokenRefused).toBe(true);
+    expect(status.writeTokenRefused).toBe(false);
+    // The token is still configured:  it was refused, not removed.
+    expect(status.hasToken).toBe(true);
+    expect(status.enabled).toBe(true);
+    expect(infisical.bootLine()).toContain("read-token-refused");
+  });
+
+  /** A fetch that refuses the named bearer, optionally only for one
+   * secret path, and answers every other request with the secrets list.
+   * The login endpoint answers with a session token when the machine
+   * identity is in play. */
+  function scopedRefusingFetch(options: {
+    status: number;
+    onlyPath?: string;
+    secrets?: Array<{ secretKey: string; secretValue: string }>;
+  }) {
+    const calls: RecordedCall[] = [];
+    const impl = vi.fn(async (url: string, init?: RequestInit) => {
+      const headers = headerBag(init);
+      calls.push({ url: String(url), authorization: headers.authorization });
+      if (String(url).includes("/login")) {
+        return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
+      }
+      const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
+      if (bearer === REFUSED_TOKEN) {
+        const asked = new URL(String(url)).searchParams.get("secretPath") ?? "";
+        if (!options.onlyPath || asked === options.onlyPath) {
+          return new Response("refused", { status: options.status });
+        }
+      }
+      return new Response(JSON.stringify({ secrets: options.secrets ?? [] }), { status: 200 });
+    });
+    return { calls, impl };
+  }
+
+  it("does not let one missing folder deprioritize the token for the whole vault", async () => {
+    // A 404 is a refusal of the REQUEST, not of the credential:  the
+    // folder the caller asked for does not exist, and the token itself is
+    // still good.  Remembering that refusal against the whole vault would
+    // push a working token aside for the life of the process.
+    withSettings({ token: REFUSED_TOKEN });
+    const { calls, impl } = scopedRefusingFetch({
+      status: 404,
+      onlyPath: "/missing",
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", impl);
+
+    const values = await infisical.readPath("/missing");
+    expect(values.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+
+    const refreshed = await infisical.refresh("manual");
+    expect(refreshed.lastError).toBeNull();
+
+    // The refresh reads the vault's own scope, where the token was never
+    // refused, so the token is used again.
+    const lists = calls.filter((call) => !call.url.includes("/login"));
+    expect(bearerOf(lists.at(-1)!)).toBe(REFUSED_TOKEN);
+    expect(infisical.getStatus().readTokenRefused).toBe(false);
+  });
+
+  it("does not let one 403 deprioritize the token for the whole vault", async () => {
+    // A 403 is a refusal of the REQUEST the same way a 404 is:  the grant
+    // does not cover what was asked for, and the token itself is still good.
+    // Remembering it against the whole vault would push a working token
+    // aside for the life of the process.
+    withSettings({ token: REFUSED_TOKEN });
+    const { calls, impl } = scopedRefusingFetch({
+      status: 403,
+      onlyPath: "/zulip",
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", impl);
+
+    const values = await infisical.readPath("/zulip");
+    expect(values.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+
+    const refreshed = await infisical.refresh("manual");
+    expect(refreshed.lastError).toBeNull();
+
+    // The refresh reads the vault's own scope, where the token was never
+    // refused, so the token is used again.
+    const lists = calls.filter((call) => !call.url.includes("/login"));
+    expect(bearerOf(lists.at(-1)!)).toBe(REFUSED_TOKEN);
+    expect(infisical.getStatus().readTokenRefused).toBe(false);
+  });
+
+  it("names a refused token on the boot line even when the sync failed", async () => {
+    // The case that matters most is a refused token with no machine identity
+    // to fall back to:  the sync errored, so the boot line reports the
+    // error, and it has to name the refusal as well or the operator cannot
+    // tell a revoked token from a broken vault.
+    withSettings({ clientId: "", clientSecret: "", token: REFUSED_TOKEN });
+    const { impl } = scopedRefusingFetch({
+      status: 401,
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", impl);
+
+    await infisical.refresh("manual");
+
+    const line = infisical.bootLine();
+    expect(line).toContain("unavailable");
+    expect(line).toContain("read-token-refused");
+  });
+
+  it("deprioritizes a revoked token everywhere, not only where it was refused", async () => {
+    // A 401 is a refusal of the CREDENTIAL:  the bearer itself was
+    // rejected, so it is rejected however it is used.  The next refresh
+    // must not try it again.
+    withSettings({ token: REFUSED_TOKEN });
+    const { calls, impl } = scopedRefusingFetch({
+      status: 401,
+      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+    });
+    vi.stubGlobal("fetch", impl);
+
+    const values = await infisical.readPath("/zulip");
+    expect(values.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+
+    const refreshed = await infisical.refresh("manual");
+    expect(refreshed.lastError).toBeNull();
+
+    const lists = calls.filter((call) => !call.url.includes("/login"));
+    expect(lists.at(-1)?.authorization ?? "").not.toContain(REFUSED_TOKEN);
+    expect(infisical.getStatus().readTokenRefused).toBe(true);
+  });
+
+  it("reports no refusal for a token the server never refused", async () => {
+    withSettings({ token: REFUSED_TOKEN });
+    const { impl } = refusingFetch(200, [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
+    vi.stubGlobal("fetch", impl);
+
+    await infisical.refresh("manual");
+
+    const status = infisical.getStatus();
+    expect(status.readTokenRefused).toBe(false);
+    expect(status.writeTokenRefused).toBe(false);
+    expect(infisical.bootLine()).not.toContain("token-refused");
   });
 });

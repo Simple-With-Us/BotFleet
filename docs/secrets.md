@@ -174,6 +174,14 @@ Returns `{ infisical: InfisicalStatusView, fields: FieldRow[] }` — booleans,
 counts, names and ids.  `fields` walks the secret map; a `secret: true`
 field's `value` is always `null`, never the real value.
 
+`readTokenRefused` and `writeTokenRefused` say the server refused the
+configured service token and the manager fell back to the machine identity.
+The token is still configured and still in Settings, so these flags — not the
+token's absence — are what tell an operator that a dead token is hiding behind
+a working sync.  The same refusal rides the boot line as `read-token-refused`
+and `write-token-refused`.  Neither flag is read by the Secrets card, so the
+status payload and the boot line are where a refusal shows today.
+
 ```
 POST /api/infisical/sync
 ```
@@ -191,6 +199,12 @@ Logs in and lists secret **names** only (`viewSecretValue=false` on the
 wire) — proves the identity and project id are correct without ever
 populating the snapshot.  Returns `{ ok, error, secretCount, names }`.  This
 is what **Test Connection** calls.
+
+The probe tests the **configured** credential rather than the fallback the
+manager would reach for on its behalf, so a token the server refuses is
+reported as a failure instead of going green on the machine identity.  A
+refused token comes back as `ok: false` with an error that says the token was
+refused, and the next refresh uses a token rotated in Settings.
 
 `GET /api/config` separately carries a small `infisical` block —
 `configured`, `enabled`, `writeThrough`, `environment`, `hasClientSecret`,
