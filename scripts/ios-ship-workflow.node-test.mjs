@@ -154,6 +154,11 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.match(wrapper, /exec bash "\$IN_REPO" botfleet --repo-root "\$ROOT"/);
   assert.match(wrapper, /botfleet --repo-root/);
   assert.doesNotMatch(wrapper, /--force-ship/);
+  // The plan-build job captures this wrapper's stdout as the 12-digit build,
+  // so every diagnostic it prints must go to stderr (PR #1404 review).
+  for (const line of wrapper.split("\n")) {
+    if (line.includes("[ios-ship]") && /(echo|\bsed\b)/.test(line)) assert.match(line, />&2/);
+  }
 
   assert.match(prepare, /APPLE_API_KEY_P8_BASE64/);
   assert.match(prepare, /IOS_CERT_P12_BASE64/);
@@ -161,6 +166,31 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(prepare, /echo "\$APPLE_API_KEY_P8/);
   assert.doesNotMatch(prepare, /echo "\$IOS_DIST_P12/);
   assert.doesNotMatch(prepare, /echo "\$IOS_CERT_P12/);
+});
+
+test("wrapper --plan-build-only keeps stdout clean for the plan-build capture", () => {
+  // Git bash on windows-latest may exist while /usr/bin/python3 does not.
+  if (process.platform === "win32") return;
+  // IOS_FLEET_NODE=/bin/false makes the ASC client fail immediately, so this
+  // proves the stdout/stderr split without touching the network: the wrapper
+  // must fail with empty stdout and the diagnosis on stderr.  Before the
+  // PR #1404 fix, the "using in-repo fleet script" line went to stdout and
+  // broke the workflow's 12-digit validation on every run.
+  const tmp = mkdtempSync(join(tmpdir(), "ios-plan-stdout-"));
+  try {
+    const run = spawnSync("bash", [join(ROOT, "scripts/ios-ship-testflight.sh"), "--plan-build-only"], {
+      encoding: "utf8",
+      env: { PATH: process.env.PATH || "", HOME: tmp, IOS_FLEET_NODE: "/bin/false" },
+    });
+    if (run.error && run.error.code === "ENOENT") {
+      return;
+    }
+    assert.notEqual(run.status, 0);
+    assert.equal(run.stdout, "");
+    assert.match(run.stderr, /using in-repo fleet script/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test("the shared Infisical action masks every value, warns rather than fails on a non-required empty name, and never prints one", () => {
