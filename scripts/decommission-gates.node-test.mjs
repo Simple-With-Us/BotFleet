@@ -25,7 +25,12 @@ import {
   retainedFiles,
   trackedFiles,
 } from "./audit-node-decommission.mjs";
-import { buildGateState, collectLinearNodes, unwrapNodes } from "./decommission-gate-state.mjs";
+import {
+  HUMAN_ONLY_EVIDENCE,
+  buildGateState,
+  collectLinearNodes,
+  unwrapNodes,
+} from "./decommission-gate-state.mjs";
 
 const ALL_DONE = {
   issues: {
@@ -405,15 +410,37 @@ test("generated state passes the gate's schema and blocks on the human-only halv
   const state = buildGateState(linearNodes(ALL_DONE_STATES), { inventoryClean: true });
   assert.equal(StateSchema.safeParse(state).success, true);
   // Even with every issue Done and the inventory clean, the generated file
-  // blocks: the soak, the replays, the final import and the Mac harness
-  // check all need a human to assert them.
+  // blocks: all human-only evidence and the Mac harness check need a human.
   assert.equal(evaluateGates(state).ok, false);
-  assert.ok(
-    evaluateGates(state).blockers.some((blocker) => blocker.startsWith("evidence soak-24h-no-node")),
-  );
+  for (const id of HUMAN_ONLY_EVIDENCE) {
+    assert.equal(state.evidence[id], false, `${id} must remain false in generated state`);
+    assert.ok(evaluateGates(state).blockers.some((blocker) => blocker.startsWith(`evidence ${id}`)));
+  }
   assert.ok(
     evaluateGates(state).blockers.some((blocker) => blocker.startsWith("macLocalHarness")),
   );
+});
+
+test("state generator CLI names every human-only item and writes Linux evidence false", () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const cli = join(repoRoot, "scripts/decommission-gate-state.mjs");
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-gate-state-"));
+  try {
+    const input = join(directory, "issues.json");
+    const output = join(directory, "state.json");
+    writeFileSync(input, JSON.stringify(linearNodes(ALL_DONE_STATES)));
+    const result = spawnSync("node", [cli, "--board-json", input, "--out", output], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    for (const id of HUMAN_ONLY_EVIDENCE) assert.ok(result.stdout.includes(id), `${id} must be called out`);
+    const generated = JSON.parse(readFileSync(output, "utf8"));
+    assert.equal(generated.evidence["linux-server-preservation"], false);
+    assert.equal(generated.evidence["control-disposition"], false);
+    assert.equal(generated.macLocalHarness.present, true);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("an issue Linear did not mention is recorded as Unknown, not omitted", () => {
@@ -431,12 +458,19 @@ test("a dirty inventory blocks the gate even when every issue is Done", () => {
   );
 });
 
-test("the Mac-only evidence is never filled in by a script", () => {
-  const state = buildGateState(linearNodes(ALL_DONE_STATES), { inventoryClean: true });
-  for (const id of ["soak-24h-no-node", "replay-parity", "final-import-parity"]) {
-    assert.equal(state.evidence[id], false, `${id} must stay false unless a human asserts it`);
+test("explicit human assertions are preserved while the Mac harness stays blocking", () => {
+  const humanEvidence = Object.fromEntries(HUMAN_ONLY_EVIDENCE.map((id) => [id, true]));
+  const state = buildGateState(linearNodes(ALL_DONE_STATES), { inventoryClean: true, humanEvidence });
+  for (const id of HUMAN_ONLY_EVIDENCE) {
+    assert.equal(state.evidence[id], true, `${id} must preserve an explicit true assertion`);
   }
   assert.equal(state.macLocalHarness.present, true);
+  assert.equal(evaluateGates(state).ok, false);
+  const unverified = buildGateState(linearNodes(ALL_DONE_STATES), {
+    inventoryClean: true,
+    humanEvidence: { "linux-server-preservation": "yes" },
+  });
+  assert.equal(unverified.evidence["linux-server-preservation"], false);
 });
 
 test("identifiers outside the required set do not leak into the state", () => {

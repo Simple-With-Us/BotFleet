@@ -14,14 +14,12 @@
 //   - `inventory-clean` comes from running the audit against the committed
 //     tree, so it is a measurement rather than somebody's belief about one.
 //
-// Everything else stays blocking on purpose.  The three evidence items that
-// live on the Mac (the soak, replay parity and the final import) stay false:
-// no command on this host can observe them, and a script that guessed would
-// be worse than a human who has to say so.  `macLocalHarness.present` likewise
-// stays true: only somebody on the Mac can verify the harness is gone, and
-// the gate treats a missing or true value as unmet.  The optional server
-// deployment is pre-filled as retained because it is the one approved
-// exclusion, not a finding.
+// The CLI leaves everything else blocking.  The five human-only evidence
+// items (Mac soak, replay parity, final import, Control disposition, and
+// Linux preservation) stay false: no command on this host can establish them.  `macLocalHarness.present` likewise stays true: only somebody on the Mac can
+// verify the harness is gone, and the gate treats a missing or true value as
+// unmet.  The optional server deployment is pre-filled as retained because
+// it is the one approved exclusion, not a finding.
 //
 //   node scripts/decommission-gate-state.mjs --out /tmp/phase6-state.json
 //   node scripts/decommission-gate-state.mjs --board-json <nodes.json> --out out.json
@@ -116,6 +114,8 @@ export const HUMAN_ONLY_EVIDENCE = [
   "soak-24h-no-node",
   "replay-parity",
   "final-import-parity",
+  "control-disposition",
+  "linux-server-preservation",
 ];
 
 /**
