@@ -166,6 +166,7 @@ export function generateAppcast({
   const edSignature = readEdSignature(releaseDir, zip);
   const appcast = buildAppcast({
     version,
+    feedBaseUrl,
     pubDate,
     items: [
       {

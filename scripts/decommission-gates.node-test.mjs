@@ -21,7 +21,7 @@ import {
   retainedFiles,
   trackedFiles,
 } from "./audit-node-decommission.mjs";
-import { buildGateState } from "./decommission-gate-state.mjs";
+import { buildGateState, collectLinearNodes, unwrapNodes } from "./decommission-gate-state.mjs";
 
 const ALL_DONE = {
   issues: {
@@ -370,4 +370,46 @@ test("a malformed Linear node fails the refresh instead of writing a guess", () 
         inventoryClean: true,
       }),
   );
+});
+
+test("a saved CLI dump unwraps like the live query does", () => {
+  const nodes = linearNodes(ALL_DONE_STATES);
+  assert.deepEqual(unwrapNodes(nodes), nodes);
+  assert.deepEqual(unwrapNodes({ data: { issues: { nodes } } }), nodes);
+  assert.deepEqual(unwrapNodes({ issues: { nodes } }), nodes);
+  assert.throws(() => unwrapNodes({ data: { issues: { nodes: null } } }), /no Linear issues array/);
+});
+
+test("pagination stops as soon as every required issue has been seen", () => {
+  let calls = 0;
+  const nodes = collectLinearNodes(() => {
+    calls += 1;
+    return { nodes: linearNodes(ALL_DONE_STATES), pageInfo: { hasNextPage: true, endCursor: "cursor-1" } };
+  });
+  assert.equal(calls, 1);
+  assert.equal(nodes.length, Object.keys(ALL_DONE_STATES).length);
+});
+
+test("pagination follows cursors until the required set is complete", () => {
+  const first = linearNodes({ "BF-2510": "Done" });
+  const rest = linearNodes({ ...ALL_DONE_STATES, "BF-2510": "Done" });
+  const seen = [];
+  const nodes = collectLinearNodes((after) => {
+    seen.push(after);
+    return after === null
+      ? { nodes: first, pageInfo: { hasNextPage: true, endCursor: "cursor-1" } }
+      : { nodes: rest, pageInfo: { hasNextPage: false, endCursor: null } };
+  });
+  assert.deepEqual(seen, [null, "cursor-1"]);
+  const state = buildGateState(nodes, { inventoryClean: true });
+  assert.equal(state.issues["BF-2514"], "Done");
+});
+
+test("pagination is capped so a broken cursor cannot loop forever", () => {
+  let calls = 0;
+  collectLinearNodes(() => {
+    calls += 1;
+    return { nodes: [], pageInfo: { hasNextPage: true, endCursor: `cursor-${calls}` } };
+  });
+  assert.equal(calls, 4);
 });
