@@ -181,6 +181,15 @@ describe("the no-wake marker", () => {
     ).toEqual({ wake: null, reason: "no_wake" });
   });
 
+  it("takes the marker when a legacy bot posts under its canonical seat tag", () => {
+    // A legacy-bound session posts as [BF-ENGINEER] from its bf-builder
+    // address: the eyes marker still silences the fleet.
+    expect(seatTagForEmail("bf-builder-bot@zulip.test")).toBe("BF-ENGINEER");
+    expect(
+      verdict(stream({ sender_email: "bf-builder-bot@zulip.test", content: "[BF-ENGINEER] :eyes: hi" })),
+    ).toEqual({ wake: null, reason: "no_wake" });
+  });
+
   it("takes the marker after the sender's own seat tag in any case", () => {
     // the seat tag is an identifier:  the tooling that writes it may write
     // it in any case, and the marker still silences the fleet
