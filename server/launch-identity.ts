@@ -80,17 +80,47 @@ const BF_PREFIX = /^BF[-_\s]+(.+)$/i;
 const DESC_SEAT = /@fleet-seat:\s*([a-z0-9_-]+)/i;
 
 /** Old role slugs that still resolve, so a bot named for a renamed role keeps
- *  its seat.  `builder` became `engineer` on 2026-10-28 (owner). */
-const LEGACY_ROLE_ALIASES: Partial<Record<string, string>> = { builder: "engineer" };
+ *  its seat.  `builder` became `engineer` on 2026-10-28 (owner).  The target
+ *  is a real role id, so a typo is a compile error instead of a silently
+ *  seatless bot.  Inferred, not annotated, so the table keeps its literal
+ *  keys; `canonicalZulipRole` folds the same table over Zulip bindings. */
+export const LEGACY_ROLE_ALIASES = {
+  builder: "engineer",
+} as const satisfies Record<string, KnownBotfleetRole["id"]>;
+
+/** An old slug in `LEGACY_ROLE_ALIASES`. */
+type LegacyRoleAlias = keyof typeof LEGACY_ROLE_ALIASES;
+
+/** True when `slug` is an old slug with a current target. */
+function isLegacyRoleAlias(slug: string): slug is LegacyRoleAlias {
+  return Object.hasOwn(LEGACY_ROLE_ALIASES, slug);
+}
+
+/** A role name as the alias table keys it: trimmed, lower-cased, spaces
+ *  dashed, and any `BF-` prefix stripped.  One normalization for the seat
+ *  and the Zulip binding, so the two can never fold different names. */
+function roleSlug(raw: string): string {
+  return raw.trim().toLowerCase().replace(/\s+/g, "-").replace(/^bf[-_]/, "");
+}
 
 function roleFromSlug(raw: string): KnownBotfleetRole | null {
-  const slug = raw
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "-")
-    .replace(/^bf[-_]/, "");
-  const id = LEGACY_ROLE_ALIASES[slug] ?? slug;
+  const slug = roleSlug(raw);
+  const id = isLegacyRoleAlias(slug) ? LEGACY_ROLE_ALIASES[slug] : slug;
   return BOTFLEET_ROLES.find((role) => role.id === id) ?? null;
+}
+
+/** A configured Zulip role with legacy aliases folded to the current role
+ *  name, so a bot bound under an old name posts and wakes under its seat's
+ *  current name (`BF-Builder` reads as `BF-Engineer`, in any case).  Anything
+ *  that is not a legacy alias is returned unchanged.  The credential keeps
+ *  the configured name (docs/launch-identity.md):  only the posting and wake
+ *  identity is folded here. */
+export function canonicalZulipRole(role: string): string {
+  const trimmed = role.trim();
+  const slug = roleSlug(trimmed);
+  if (!isLegacyRoleAlias(slug)) return trimmed;
+  const current = BOTFLEET_ROLES.find((candidate) => candidate.id === LEGACY_ROLE_ALIASES[slug]);
+  return current ? "BF-" + current.name : trimmed;
 }
 
 /** The role a bot record names, or null when it names none.  In order:

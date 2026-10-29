@@ -4,11 +4,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   applyLaunchIdentity,
   BOTFLEET_ROLES,
+  canonicalZulipRole,
   codexShellPolicyArgs,
   fleetSeatPromptsEnabled,
   isLaunchIdentityName,
   launchEnvironment,
   launchIdentityFor,
+  LEGACY_ROLE_ALIASES,
   resolveBotfleetRole,
 } from "./launch-identity.ts";
 import { zulipTag } from "./zulip/format.ts";
@@ -81,6 +83,22 @@ describe("resolveBotfleetRole", () => {
     }
     expect(resolveBotfleetRole({ name: "Kiwi", description: "@fleet-seat: claude" })).toBeNull();
     expect(resolveBotfleetRole({ name: "Kiwi", description: null })).toBeNull();
+  });
+});
+
+describe("canonicalZulipRole", () => {
+  it("folds a legacy BF-Builder binding to BF-Engineer, in any case", () => {
+    expect(LEGACY_ROLE_ALIASES).toEqual({ builder: "engineer" });
+    for (const role of ["BF-Builder", "Builder", "bf-builder", "BF_BUILDER", "BF Builder", "  BF-Builder  "]) {
+      expect(canonicalZulipRole(role), role).toBe("BF-Engineer");
+    }
+  });
+
+  it("leaves a binding that is not a legacy alias unchanged", () => {
+    for (const role of ["BF-Engineer", "BF-Plumber", "BF-Trader", "engineer", "BF-Builder2", "Plumber 2"]) {
+      expect(canonicalZulipRole(role), role).toBe(role);
+    }
+    expect(canonicalZulipRole("  BF-Plumber  ")).toBe("BF-Plumber");
   });
 });
 
