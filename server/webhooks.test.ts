@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { JsonValue } from "./schema.ts";
-import { WebhookManager, type WebhookManagerOptions } from "./webhooks.ts";
+import { WebhookManager, type WebhookManagerOptions, type WebhookManagerEvent } from "./webhooks.ts";
 
 const dirs: string[] = [];
 
@@ -18,7 +18,7 @@ function harness() {
   let pending = 0;
   const queued: Array<Record<string, unknown>> = [];
   const cancelled: Array<{ id: string; message: string }> = [];
-  const emitted: unknown[] = [];
+  const emitted: WebhookManagerEvent[] = [];
   const options: WebhookManagerOptions = {
     file,
     now: () => now,
@@ -1865,5 +1865,35 @@ describe("WebhookManager merged pull requests only", () => {
     const { webhook } = h.manager.create({ ...compiler, ignoredCount: 99 });
     expect(webhook.ignoredCount).toBeUndefined();
     expect(h.manager.update(webhook.id, { ignoredCount: 99, lastIgnoredAt: 1 })?.ignoredCount).toBeUndefined();
+  });
+});
+
+describe("request metadata on attempt events", () => {
+  it("carries repo/actor/action/number for accepted and duplicate deliveries, never titles", () => {
+    const h = harness();
+    const { webhook, secret } = create(h.manager);
+    const payload = {
+      action: "opened",
+      repository: { full_name: "Simple-With-Us/BotFleet" },
+      pull_request: { number: 901, title: "titles never leak" },
+      sender: { login: "jaywedgeworth22" },
+    };
+    const input = { payload, contentType: "application/json", eventName: "pull_request", deliveryId: "d-1" };
+    h.manager.receive(webhook.endpointId, secret, input);
+    h.manager.receive(webhook.endpointId, secret, input);
+    const attempts = h.emitted.filter((e) => e.kind === "webhook.attempt");
+    expect(attempts).toHaveLength(2);
+    for (const e of attempts) {
+      const meta = e.requestMetadata;
+      expect(meta).toMatchObject({
+        repository: "Simple-With-Us/BotFleet",
+        number: 901,
+        actor: "jaywedgeworth22",
+        action: "opened",
+      });
+      expect(JSON.stringify(meta)).not.toContain("titles never leak");
+    }
+    expect(attempts[0]?.attempt.outcome).toBe("accepted");
+    expect(attempts[1]?.attempt.outcome).toBe("duplicate");
   });
 });
