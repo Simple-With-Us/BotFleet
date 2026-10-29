@@ -1203,7 +1203,9 @@ export class ZulipHub {
   async applyLatePluginDecision(event: PluginEventEnvelope, decision: ZulipPluginDecision): Promise<void> {
     try {
       if (event.type !== "zulip.message" || event.source.platform !== "zulip") return;
-      const role = event.source.accountId;
+      // Fold both sides: a persisted envelope may carry the pre-rename
+      // account id ("BF-Builder"), which reads as the canonical role.
+      const role = canonicalZulipRole(event.source.accountId);
       const botId = Object.entries(this.settings()?.bots ?? {}).find(
         ([id, binding]) =>
           canonicalZulipRole(binding.role) === role && (binding.enabled ?? true) && this.deps.botExists(id),

@@ -436,6 +436,41 @@ describe("legacy role bindings", () => {
     expect(turns[0]!.text).toContain("from BF-Engineer");
   });
 
+  it("matches a late plugin decision's legacy account to a legacy-bound bot", async () => {
+    fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
+    writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
+    settings.bots = {
+      "bot-plumber": { role: "BF-Plumber" },
+      "bot-builder": { role: "BF-Builder" },
+    };
+    const hub = makeHub();
+    await connected(hub);
+    await connected(hub, "bot-builder");
+    // The mentioned bot is busy, so the native wake waits and the late
+    // decision's route to the plumber is the only turn that can start.
+    busy.add("bot-builder");
+    const id = fake.postStream(JAY, "builds", "Late legacy route", "@**BF-Builder** late legacy decision", "website");
+    // A persisted envelope recovered after the upgrade carries the pre-rename
+    // account id: it still finds its bot.
+    await hub.applyLatePluginDecision(
+      {
+        eventId: `zulip:BF-Builder:${id}`,
+        type: "zulip.message",
+        source: { platform: "zulip", accountId: "BF-Builder" },
+        occurredAt: "2026-10-28T00:00:00.000Z",
+        receivedAt: "2026-10-28T00:00:01.000Z",
+        refs: { messageId: id, conversationKey: "stream:builds/Late legacy route" },
+        mentions: ["BF-Builder"],
+        context: { botId: "bot-builder", wakeReason: "mention", senderKind: "owner" },
+      },
+      { targetBotId: "bot-plumber", hint: "the plumber takes the legacy late route" },
+    );
+    await waitFor(() => turns.length === 1, "a legacy late-routed turn");
+    expect(turns[0]!.botId).toBe("bot-plumber");
+    expect(turns[0]!.text).toContain("the plumber takes the legacy late route");
+    expect(turns[0]!.text).toContain("from BF-Engineer");
+  });
+
   it("keeps a BF-Builder state file across the canonical fold, relabelled to BF-Engineer", async () => {
     fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
     writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
