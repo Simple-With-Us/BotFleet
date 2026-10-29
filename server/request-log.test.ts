@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,6 +6,7 @@ import type { WebhookAttempt } from "./webhooks.ts";
 
 import {
   createRequestLog,
+  readRequestLogRange,
   extractRequestMetadata,
   formatRequestLogLine,
   type RequestLogOptions,
@@ -150,7 +151,7 @@ describe("createRequestLog", () => {
     log.record(entry, { repository: "o/r", number: 7, actor: "kody-ai[bot]", action: "submitted" });
     expect(errors.length).toBeGreaterThan(0);
     // The spool holds the record even though the Markdown write failed.
-    expect(readFileSync(p.spoolPath, "utf8")).toContain("deliv-1");
+    expect(readFileSync(join(p.spoolPath + ".pending", readdirSync(p.spoolPath + ".pending")[0]!), "utf8")).toContain("deliv-1");
 
     rmSync(blocker, { recursive: true });
     const recovered = createRequestLog({ ...p, onError: (m) => errors.push(m) });
@@ -231,7 +232,7 @@ it("returns durable success when the fsynced spool survives a failed log flush",
   const errors: string[] = [];
   const log = createRequestLog({ ...p, onError: (message) => errors.push(message) });
   expect(log.record(entry, {})).toBe(true);
-  expect(readFileSync(p.spoolPath, "utf8")).toContain(entry.deliveryId);
+  expect(readFileSync(join(p.spoolPath + ".pending", readdirSync(p.spoolPath + ".pending")[0]!), "utf8")).toContain(entry.deliveryId);
   expect(errors).toHaveLength(1);
 });
 
@@ -265,4 +266,42 @@ it("isolates routine lifecycle identities even when IDs share prefixes", () => {
     log.routineSubscriber({ kind: "routine.run", run: { id, botId: "b", status: "completed", createdAt: entry.receivedAt } });
   }
   expect(readFileSync(p.filePath, "utf8").trim().split("\n")).toHaveLength(2);
+});
+
+it("durably retains routine events during a shared log commit lock and replays once", () => {
+  const p = paths(tmp()); mkdirSync(p.filePath + ".lock");
+  const log = createRequestLog(p);
+  log.routineSubscriber({ kind: "routine.run", run: { id: "busy", botId: "b", status: "completed", createdAt: entry.receivedAt } });
+  const files = readdirSync(p.spoolPath + ".pending"); expect(files).toHaveLength(1);
+  expect(statSync(join(p.spoolPath + ".pending", files[0]!)).mode & 0o777).toBe(0o600);
+  rmSync(p.filePath + ".lock", { recursive: true });
+  createRequestLog(p).replay(); createRequestLog(p).replay();
+  expect(readFileSync(p.filePath, "utf8").trim().split("\n")).toHaveLength(1);
+  expect(readdirSync(p.spoolPath + ".pending")).toHaveLength(0);
+});
+it("incrementally incorporates external appends and resets dedupe after file replacement", () => {
+  const p = paths(tmp());const log = createRequestLog(p);
+  log.record(entry, {});
+  writeFileSync(p.filePath, readFileSync(p.filePath, "utf8") + "- external (delivery external)\n");
+  log.record({ ...entry, deliveryId: "external" }, {});
+  expect(readFileSync(p.filePath, "utf8").match(/delivery external/g)).toHaveLength(1);
+  rmSync(p.filePath); writeFileSync(p.filePath, "");
+  log.record(entry, {}); expect(readFileSync(p.filePath, "utf8")).toContain("delivery deliv-1");
+});
+it("neutralizes all Unicode line terminators in dispatch metadata", () => {
+  const line = formatRequestLogLine(entry, { actor: "a\u0085b\u2028c\u2029d" }, "hook");
+  expect(line).not.toMatch(/[\u0085\u2028\u2029]/u);
+});
+
+it("reads historical Markdown only once, then only newly appended bytes", () => {
+  const p = paths(tmp()); writeFileSync(p.filePath, "x".repeat(200000) + "\n");
+  const lengths: number[] = [];
+  const log = createRequestLog({ ...p, readLogRange: (path, offset, length) => {
+    lengths.push(length); return readRequestLogRange(path, offset, length);
+  } });
+  log.record(entry, {});
+  expect(lengths.some((length) => length >= 200000)).toBe(true);
+  lengths.length = 0; log.record({ ...entry, deliveryId: "second" }, {});
+  expect(lengths.length).toBeGreaterThan(0);
+  expect(lengths.every((length) => length < 1000)).toBe(true);
 });

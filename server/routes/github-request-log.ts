@@ -22,6 +22,8 @@ export interface GitHubRequestLogRouteOptions {
   now?: () => number;
 }
 
+const GitHubWebhookPayloadSchema = z.object({}).passthrough();
+
 const MAX_BODY_BYTES = 1024 * 1024;
 class BodyTooLargeError extends Error {}
 
@@ -87,6 +89,8 @@ export async function readGitHubRequestLog(
   let validJson = true;
   try { payload = JSON.parse(rawBody.toString("utf8")); }
   catch { validJson = false; }
+  const parsedPayload = GitHubWebhookPayloadSchema.safeParse(payload);
+  const validPayload = validJson && parsedPayload.success;
   const release = options.beginAdmission();
   if (!release) {
     json(res, 503, { ok: false, reason: "quiescing_for_update" });
@@ -98,16 +102,16 @@ export async function readGitHubRequestLog(
         deliveryId: deliveryId.data,
         eventName: eventName.data,
         receivedAt: (options.now ?? Date.now)(),
-        outcome: validJson ? "received" : "invalid_json",
+        outcome: !validJson ? "invalid_json" : validPayload ? "received" : "invalid_payload",
         webhookId: options.webhookName ?? "github-request-log",
       },
-      extractRequestMetadata({ eventName: eventName.data, payload }),
+      extractRequestMetadata({ eventName: eventName.data, payload: parsedPayload.success ? parsedPayload.data : {} }),
     );
     if (!durable) {
       json(res, 503, { ok: false, reason: "log_not_durable" });
       return;
     }
-    json(res, validJson ? 200 : 400, validJson ? { ok: true } : { ok: false, reason: "bad_json" });
+    json(res, validPayload ? 200 : 400, validPayload ? { ok: true } : { ok: false, reason: validJson ? "bad_payload" : "bad_json" });
   } finally {
     release();
   }

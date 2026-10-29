@@ -32,9 +32,11 @@ export function loggedDeliveryIds(path) {
   try { return new Set([...readFileSync(path,'utf8').matchAll(/\(delivery ([^)\r\n]+)\)/g)].map(m=>m[1])); }
   catch(e) { if(e.code==='ENOENT') return new Set();throw e; }
 }
-function clean(s,max=200) { return Array.from(String(s??''),c=>c.charCodeAt(0)<=31||c.charCodeAt(0)===127?' ':c).join('').replace(/[()]/g,'').slice(0,max); }
+function clean(s,max=200) { return Array.from(String(s??''),c=>c.charCodeAt(0)<=31||c.charCodeAt(0)===127||c.charCodeAt(0)===133||c.charCodeAt(0)===8232||c.charCodeAt(0)===8233?' ':c).join('').replace(/[()]/g,'').slice(0,max); }
+// oxlint-disable-next-line anti-slop/no-runtime-typeof -- external JSON text fields are accepted only as strings in this dependency-free CLI.
+function text(value) { return typeof value==='string'?value:undefined; }
 function sourceUrl(value) {
-  if (!value) return undefined;
+  if (!text(value)) return undefined;
   try {
     const url=new URL(value);
     if(url.origin!=='https://github.com'||url.username||url.password||url.search) return undefined;
@@ -47,9 +49,9 @@ export function extractMetadata(p) {
   // External JSON boundary: reject primitive payloads before metadata field reads.
   // oxlint-disable-next-line anti-slop/no-runtime-typeof -- JSON payloads are untyped in this dependency-free CLI.
   const x=p&&typeof p==='object'?p:{};const m={};
-  if(x.action) m.action=clean(x.action,64);
-  if(x.repository?.full_name) m.repository=clean(x.repository.full_name);
-  if(x.sender?.login) m.actor=clean(x.sender.login,100);
+  if(text(x.action)) m.action=clean(x.action,64);
+  if(text(x.repository?.full_name)) m.repository=clean(x.repository.full_name);
+  if(text(x.sender?.login)) m.actor=clean(x.sender.login,100);
   for(const k of ['pull_request','issue','discussion']) if(Number.isSafeInteger(x[k]?.number)) { m.number=x[k].number;break; }
   const link=sourceUrl(x.comment?.html_url??x.review?.html_url);if(link)m.sourceUrl=link;
   return m;
@@ -68,7 +70,7 @@ function ghGet(path) {
 }
 export function reconcile(options) {
   mkdirSync(dirname(options.log), {recursive:true});
-  const lock=options.log+'.lock';mkdirSync(lock,{mode:0o700});
+  const lock=options.cursor+'.lock';mkdirSync(lock,{mode:0o700});
   try {return reconcileLocked(options);} finally {rmdirSync(lock);}
 }
 function reconcileLocked({org,repo,hook,log,cursor,get=ghGet,now=()=>new Date(),maxPages=100}) {
@@ -76,7 +78,11 @@ function reconcileLocked({org,repo,hook,log,cursor,get=ghGet,now=()=>new Date(),
   let state={version:1,through:null,pending:{},gaps:{}};
   try { state=JSON.parse(readFileSync(cursor,'utf8')); if(state.version!==1||!state.pending||!state.gaps) throw Error('invalid reconcile checkpoint'); }
   catch(e) { if(e.code!=='ENOENT') throw e; }
-  const stamp=now();const seen=loggedDeliveryIds(log);const pages=[];let path=prefix+'?per_page=100';let complete=false;
+  const stamp=now();const pages=[];
+  const snapshotLock=log+'.lock';mkdirSync(snapshotLock,{mode:0o700});
+  let snapshot;
+  try {snapshot=loggedDeliveryIds(log);} finally {rmdirSync(snapshotLock);}
+  let path=prefix+'?per_page=100';let complete=false;
   for(let page=0;page<maxPages;page++) {
     const response=get(path);if(!Array.isArray(response.data)) throw Error('invalid delivery listing');
     pages.push(...response.data);
@@ -86,19 +92,30 @@ function reconcileLocked({org,repo,hook,log,cursor,get=ghGet,now=()=>new Date(),
     path=u.pathname.slice(1)+u.search;
   }
   if(!complete) throw Error('delivery pagination limit: checkpoint unchanged');
+  const details=new Map();
   // Every retained delivery is inspected. through records successful full-list
   // coverage, not a numeric-id ordering assumption. Pending failures survive runs.
-  for(const d of pages) if(!seen.has(String(d.guid))) state.pending[String(d.id)]={id:d.id,guid:d.guid,delivered_at:d.delivered_at,event:d.event};
-  for(const [id,d] of Object.entries(state.pending)) if(seen.has(String(d.guid))) delete state.pending[id];
-  let recovered=0;const errors=[];
+  for(const d of pages) if(!state.gaps[String(d.id)]) state.pending[String(d.id)]={id:d.id,guid:d.guid,delivered_at:d.delivered_at,event:d.event};
+  for(const id of Object.keys(state.pending)) if(state.gaps[id]) delete state.pending[id];
+  for(const [id,d] of Object.entries(state.pending)) if(snapshot.has(String(d.guid))) delete state.pending[id];
+  const errors=[];
   for(const [id,d] of Object.entries(state.pending)) {
     try {
       const detail=get(prefix+'/'+encodeURIComponent(id)).data;
       // oxlint-disable-next-line anti-slop/no-runtime-typeof -- provider detail must have an object payload before recovery can be claimed.
-      if(!detail.request?.payload||typeof detail.request.payload!=='object') throw Error('payload unavailable');
+      if(!detail.request?.payload||(typeof detail.request.payload!=='object'||Array.isArray(detail.request.payload))) throw Error('payload unavailable');
       const line=formatRecoveredLine({ts:new Date(d.delivered_at),eventName:detail.event??d.event,meta:extractMetadata(detail.request.payload),deliveryId:d.guid});
-      append(log,line+'\n');seen.add(String(d.guid));delete state.pending[id];recovered++;
+      details.set(id,line);
     } catch { errors.push(id); }
+  }
+  // Network is complete. Re-read dedupe under the short shared commit lock;
+  // another reconciler/server may have appended while GETs were in flight.
+  const lock=log+'.lock';mkdirSync(lock,{mode:0o700});
+  try {
+  const seen=loggedDeliveryIds(log);let recovered=0;
+  for(const [id,d] of Object.entries(state.pending)) {
+    if(seen.has(String(d.guid))) {delete state.pending[id];continue;}
+    if(details.has(id)) {append(log,details.get(id)+'\n');seen.add(String(d.guid));delete state.pending[id];recovered++;}
   }
   // A failed GET is retryable, never proof of permanent loss. Only elapsed
   // retention creates a potential-gap marker, with unknown count if history
@@ -108,10 +125,11 @@ function reconcileLocked({org,repo,hook,log,cursor,get=ghGet,now=()=>new Date(),
     if(!state.gaps[key]) { append(log,`- ${stamp.toISOString()} reconcile [potential-gap] history older than 3 days; missing count unknown; since ${clean(key)}\n`);state.gaps[key]=true; }
   }
   for(const [id,d] of Object.entries(state.pending)) if(stamp-new Date(d.delivered_at)>3*86400000&&!state.gaps[id]) {
-    append(log,`- ${stamp.toISOString()} reconcile [potential-gap] delivery ${clean(d.guid)} outside 3-day history; recovery unverified\n`);state.gaps[id]=true;
+    append(log,`- ${stamp.toISOString()} reconcile [potential-gap] delivery ${clean(d.guid)} outside 3-day history; recovery unverified\n`);state.gaps[id]=true;delete state.pending[id];
   }
   state.through=stamp.toISOString();checkpoint(cursor,state);
-  return {scanned:pages.length,recovered,pending:Object.keys(state.pending).length,ok:errors.length===0};
+  return {scanned:pages.length,recovered,pending:Object.keys(state.pending).length,ok:errors.every(id=>!state.pending[id])};
+  } finally {rmdirSync(lock);}
 }
 if(import.meta.url===`file://${process.argv[1]}`) {
   try {const r=reconcile(parseArgs(process.argv));console.log(JSON.stringify(r));if(!r.ok)process.exitCode=1;}

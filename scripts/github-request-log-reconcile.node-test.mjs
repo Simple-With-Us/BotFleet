@@ -1,6 +1,6 @@
 import {mkdirSync,statSync,mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';import {join} from 'node:path';import {test} from 'node:test';import assert from 'node:assert/strict';
-import {reconcile,loggedDeliveryIds} from './github-request-log-reconcile.mjs';
+import {reconcile,loggedDeliveryIds,extractMetadata} from './github-request-log-reconcile.mjs';
 function fixture(fn) {const dir=mkdtempSync(join(tmpdir(),'reconcile-'));try{return fn({org:'Org',hook:'9',log:join(dir,'log'),cursor:join(dir,'cursor')});}finally{rmSync(dir,{recursive:true,force:true});}}
 const stamp=()=>new Date('2026-10-24T07:00:00Z');
 const d=(id)=>({id,guid:'g-'+id,event:'issue_comment',delivered_at:'2026-10-24T06:00:00Z'});
@@ -38,4 +38,28 @@ test('recovery retains an exact GitHub comment permalink but never its prose',()
  const data={request:{payload:{...detail.request.payload,comment:{html_url:'https://github.com/o/r/issues/1#issuecomment-99',body:'never log me'}}}};
  reconcile({...p,get:path=>({data:path.includes('?')?[d(1)]:data}),now:stamp});
  const text=readFileSync(p.log,'utf8');assert.match(text,/source https:\/\/github.com\/o\/r\/issues\/1#issuecomment-99/);assert.ok(!text.includes('never log me'));
+}));
+
+test('expired failures become terminal potential gaps without endless errors or retries',()=>fixture(p=>{
+ const old={...d(1),delivered_at:'2026-10-19T00:00:00Z'}; let gets=0;
+ const get=path=>{if(path.includes('?'))return {data:[old]};gets++;throw Error('expired');};
+ const first=reconcile({...p,get,now:stamp});assert.equal(first.ok,true);assert.equal(first.pending,0);assert.equal(gets,1);
+ const before=readFileSync(p.log,'utf8');const second=reconcile({...p,get,now:stamp});assert.equal(second.ok,true);assert.equal(gets,1);assert.equal(readFileSync(p.log,'utf8'),before);
+}));
+test('network phase never holds shared log lock and commit rechecks concurrent append',()=>fixture(p=>{
+ const get=path=>{
+   mkdirSync(p.log+'.lock');rmSync(p.log+'.lock',{recursive:true});
+   if(path.includes('?'))return {data:[d(1)]};
+   writeFileSync(p.log,'- concurrent (delivery g-1)\n');return {data:detail};
+ };
+ assert.equal(reconcile({...p,get,now:stamp}).recovered,0);
+ assert.equal(readFileSync(p.log,'utf8'),'- concurrent (delivery g-1)\n');
+}));
+test('separate reconcile cursor lock serializes reconciliation state',()=>fixture(p=>{
+ mkdirSync(p.cursor+'.lock');assert.throws(()=>reconcile({...p,get:()=>({data:[]}),now:stamp}),/EEXIST/);
+}));
+test('malformed metadata is dropped and Unicode separators cannot split a recovered record',()=>fixture(p=>{
+ assert.deepEqual(extractMetadata({action:{},repository:{full_name:[]},sender:{login:9},comment:{html_url:[]}}),{});
+ const data={request:{payload:{action:'a\u0085b',repository:{full_name:'o\u2028r'},sender:{login:'u\u2029v'}}}};
+ reconcile({...p,get:path=>({data:path.includes('?')?[d(1)]:data}),now:stamp});assert.doesNotMatch(readFileSync(p.log,'utf8'),/[\u0085\u2028\u2029]/u);
 }));

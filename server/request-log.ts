@@ -3,9 +3,9 @@
  *
  * Durability: metadata is fsynced to a spool before the normal response when
  * the write succeeds. Failed writes need GET-only source reconciliation.
- * Replay reads the whole spool and deduplicates against the full durable log,
+ * Replay drains legacy spool and immutable inbox files, deduplicating against the durable log,
  * then truncates only after all valid records have landed. Malformed records
- * preserve the spool and report an error. Server and reconciler share a mkdir
+ * preserve the spool and report an error. Dispatch fsyncs inbox records before attempting the short shared mkdir
  * lock at filePath + ".lock". A crash-held lock fails visibly, never reclaimed
  * automatically; recovery must verify writer liveness before removing it.
  *
@@ -15,8 +15,8 @@
  * dispatch, but is reported through onError so the gap is visible.
  */
 
-import { createHash } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, rmdirSync, writeSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmdirSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
 
@@ -35,7 +35,7 @@ type LogAtomValue = string | number | null | undefined;
 export function logAtom(value: LogAtomValue, limit = 200): string {
   return Array.from(String(value ?? ""), (char) => {
     const code = char.charCodeAt(0);
-    return code <= 31 || code === 127 ? " " : char;
+    return code <= 31 || code === 127 || code === 133 || code === 8232 || code === 8233 ? " " : char;
   }).join("").replace(/[()]/g, "").slice(0, limit);
 }
 
@@ -113,7 +113,24 @@ export function formatRequestLogLine(
   return `- ${ts} ${action}${target ? ` ${target}` : ""}${actor} [${logAtom(entry.outcome, 64)}] via ${logAtom(webhookName)}${reason}${source} (delivery ${logAtom(entry.deliveryId, 100)})`;
 }
 
+/** Read a byte range from the real Markdown ledger. */
+export function readRequestLogRange(path: string, offset: number, length: number): Buffer {
+  const fd = openSync(path, "r");
+  try {
+    const bytes = Buffer.alloc(length);
+    let count = 0;
+    while (count < length) {
+      const n = readSync(fd, bytes, count, length - count, offset + count);
+      if (!n) break;
+      count += n;
+    }
+    return bytes.subarray(0, count);
+  } finally { closeSync(fd); }
+}
+
 export interface RequestLogOptions {
+  /** Real byte-range reader seam, also used to measure incremental I/O. */
+  readLogRange?: typeof readRequestLogRange;
   /** Markdown log Jay opens on demand. */
   filePath: string;
   /** Append-only JSONL crash spool (mode 600). */
@@ -160,21 +177,6 @@ function writeFsync(path: string, text: string): void {
 
 
 
-/** Delivery ids already in the Markdown full log (crash-window dedupe). */
-function loggedDeliveries(filePath: string): Set<string> {
-  try {
-    const text = readFileSync(filePath, "utf8");
-    const tail = text;
-    const ids = new Set<string>();
-    for (const match of tail.matchAll(/\(delivery ([^)]+)\)/g)) ids.add(match[1]!);
-    return ids;
-  } catch (error) {
-    const parsedError = z.object({ code: z.string() }).safeParse(error);
-    if (parsedError.success && parsedError.data.code === "ENOENT") return new Set();
-    throw error;
-  }
-}
-
 export interface RequestLog {
   subscriber: (event: WebhookManagerEvent) => void;
   /** True only after the record is fsynced to the spool. Never throws into dispatch. */
@@ -185,27 +187,58 @@ export interface RequestLog {
 }
 
 export function createRequestLog(options: RequestLogOptions): RequestLog {
+  // Immutable per-record inbox files let dispatch fsync without contending with
+  // the short shared Markdown commit lock. Only a lock holder removes files.
+  const inbox = options.spoolPath + ".pending";
+  let cachedIds = new Set<string>();
+  let cachedOffset = 0;
+  let cachedFile = "";
+  const deliveryIds = (): Set<string> => {
+    try {
+      const stat = statSync(options.filePath);
+      const identity = `${stat.dev}:${stat.ino}`;
+      if (identity !== cachedFile || stat.size < cachedOffset) {
+        cachedIds = new Set(); cachedOffset = 0; cachedFile = identity;
+      }
+      if (stat.size > cachedOffset) {
+        const bytes = (options.readLogRange ?? readRequestLogRange)(options.filePath, cachedOffset, stat.size - cachedOffset);
+        const end = bytes.lastIndexOf(10) + 1;
+        for (const match of bytes.subarray(0, end).toString("utf8").matchAll(/\(delivery ([^)]+)\)/g)) cachedIds.add(match[1]!);
+        cachedOffset += end;
+      }
+      return cachedIds;
+    } catch (error) {
+      if (z.object({ code: z.literal("ENOENT") }).safeParse(error).success) {
+        cachedIds = new Set(); cachedOffset = 0; cachedFile = ""; return new Set();
+      }
+      throw error;
+    }
+  };
   const flush = (): void => {
     let spool: string;
     try {
       spool = readFileSync(options.spoolPath, "utf8");
     } catch (error) {
       const missing = z.object({ code: z.literal("ENOENT") }).safeParse(error);
-      if (missing.success) return;
-      throw error;
+      if (missing.success) spool = "";
+      else throw error;
     }
+    mkdirSync(inbox, { recursive: true, mode: 0o700 });
+    const files = readdirSync(inbox).filter((name) => /^[0-9a-f-]+\.json$/.test(name));
     const pending = spool
       .split("\n")
-      .filter((line) => line.length > 0);
+      .filter((line) => line.length > 0)
+      .concat(files.map((name) => readFileSync(inbox + "/" + name, "utf8")));
     if (pending.length > 0) {
-      const seen = loggedDeliveries(options.filePath);
+      const seen = deliveryIds();
       const lines: string[] = [];
+      const batchIds = new Set<string>();
       for (const record of pending) {
         try {
           const parsed = z.object({ line: z.string(), delivery: z.string().optional() }).parse(JSON.parse(record));
-          if (parsed.delivery && seen.has(parsed.delivery)) continue;
+          if (parsed.delivery && (seen.has(parsed.delivery) || batchIds.has(parsed.delivery))) continue;
           lines.push(parsed.line);
-          if (parsed.delivery) seen.add(parsed.delivery);
+          if (parsed.delivery) batchIds.add(parsed.delivery);
         } catch {
           // Preserve the entire spool and cursor for recovery. Never silently
           // discard malformed or partially-written records.
@@ -222,6 +255,7 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
     // Fully drained: the spool's crash-recovery job is done; start it empty.
     writeFsync(options.spoolPath, "");
     writeFsync(options.cursorPath, "0");
+    for (const name of files) unlinkSync(inbox + "/" + name);
   };
 
   const record = (entry: RequestLogEntry, metadata: WebhookRequestMetadata): boolean => {
@@ -231,15 +265,27 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
       const line = formatRequestLogLine(entry, metadata, name);
       mkdirSync(dirname(options.spoolPath), { recursive: true });
       mkdirSync(dirname(options.filePath), { recursive: true });
+      mkdirSync(inbox, { recursive: true, mode: 0o700 });
+      // Preserve legacy spool health checks: a directory/unreadable spool is
+      // an operational failure, not a silently bypassed recovery record.
+      try { readFileSync(options.spoolPath, "utf8"); }
+      catch (error) { if (!z.object({ code: z.literal("ENOENT") }).safeParse(error).success) throw error; }
+      const pendingPath = inbox + "/" + randomUUID();
+      writeFsync(pendingPath + ".tmp", JSON.stringify({ line, delivery: logAtom(entry.deliveryId, 100) }));
+      renameSync(pendingPath + ".tmp", pendingPath + ".json");
+      const directory = openSync(inbox, "r");
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+      durable = true;
       const lock = options.filePath + ".lock";
-      mkdirSync(lock, { mode: 0o700 });
-      try {
-        appendFsync(options.spoolPath, JSON.stringify({ line, delivery: logAtom(entry.deliveryId, 100) }) + "\n");
-        durable = true; // The fsynced spool owns recovery even if flush fails.
-        flush();
-      } finally {
-        rmdirSync(lock);
+      try { mkdirSync(lock, { mode: 0o700 }); }
+      catch (error) {
+        if (z.object({ code: z.literal("EEXIST") }).safeParse(error).success) {
+          options.onError?.("request-log commit lock busy; durable inbox awaits replay");
+          return durable;
+        }
+        throw error;
       }
+      try { flush(); } finally { rmdirSync(lock); }
     } catch (error) {
       options.onError?.(error instanceof Error ? error.message : String(error));
     }

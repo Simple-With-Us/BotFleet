@@ -119,7 +119,7 @@ describe("readGitHubRequestLog", () => {
   });
 });
 
-it("returns 503 when the shared writer lock prevents durable admission", async () => {
+it("acknowledges durable inbox admission during shared writer contention", async () => {
   const dir = tmp();
   const { options } = setup(dir);
   const { mkdirSync } = await import("node:fs");
@@ -127,8 +127,13 @@ it("returns 503 when the shared writer lock prevents durable admission", async (
   const { req, res, result } = fixture(PAYLOAD, signed(PAYLOAD));
   // SAFETY: HTTP doubles implement the fields consumed by the route.
   await readGitHubRequestLog(req as never, res as never, options);
-  expect(result().status).toBe(503);
-  expect(result().body).toContain("log_not_durable");
+  expect(result().status).toBe(200);
+  const { readdirSync, rmSync } = await import("node:fs");
+  const inbox = join(dir, "github-request-log.spool.pending");
+  expect(readdirSync(inbox)).toHaveLength(1);
+  rmSync(join(dir, "github-request-log.md.lock"), { recursive: true });
+  options.requestLog.replay(); options.requestLog.replay();
+  expect(readFileSync(join(dir, "github-request-log.md"), "utf8").trim().split("\n")).toHaveLength(1);
 });
 it("records authenticated malformed JSON metadata before returning 400", async () => {
   const dir = tmp();
@@ -157,4 +162,13 @@ it("rejects same-character-count non-ASCII signatures without throwing", async (
   // SAFETY: HTTP doubles implement the fields consumed by the route.
   await readGitHubRequestLog(req as never, res as never, options);
   expect(result().status).toBe(401);
+});
+
+it.each(["null", "[]", "42", '"text"'])("rejects authenticated non-object payload %s with a metadata-only receipt", async (body) => {
+  const dir = tmp(); const { options } = setup(dir);
+  const { req, res, result } = fixture(body, signed(body));
+  // SAFETY: HTTP doubles implement the fields consumed by the route.
+  await readGitHubRequestLog(req as never, res as never, options);
+  expect(result().status).toBe(400); expect(result().body).toContain("bad_payload");
+  expect(readFileSync(join(dir, "github-request-log.md"), "utf8")).toContain("[invalid_payload]");
 });
