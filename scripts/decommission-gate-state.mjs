@@ -14,8 +14,9 @@
 //   - `inventory-clean` comes from running the audit against the committed
 //     tree, so it is a measurement rather than somebody's belief about one.
 //
-// Everything else stays blocking on purpose.  The three evidence items that
-// live on the Mac (the soak, replay parity and the final import) stay false:
+// Everything else stays blocking on purpose.  The evidence items that live
+// on the Mac (the soak, replay parity, the final import, the Control
+// disposition, and whatever human-only keys later PRs add) stay false:
 // no command on this host can observe them, and a script that guessed would
 // be worse than a human who has to say so.  `macLocalHarness.present` likewise
 // stays true: only somebody on the Mac can verify the harness is gone, and
@@ -116,6 +117,7 @@ export const HUMAN_ONLY_EVIDENCE = [
   "soak-24h-no-node",
   "replay-parity",
   "final-import-parity",
+  "control-disposition",
 ];
 
 /**

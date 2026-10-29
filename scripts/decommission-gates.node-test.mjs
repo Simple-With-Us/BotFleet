@@ -25,7 +25,12 @@ import {
   retainedFiles,
   trackedFiles,
 } from "./audit-node-decommission.mjs";
-import { buildGateState, collectLinearNodes, unwrapNodes } from "./decommission-gate-state.mjs";
+import {
+  HUMAN_ONLY_EVIDENCE,
+  buildGateState,
+  collectLinearNodes,
+  unwrapNodes,
+} from "./decommission-gate-state.mjs";
 
 const ALL_DONE = {
   issues: {
@@ -397,8 +402,12 @@ test("a dirty inventory blocks the gate even when every issue is Done", () => {
 });
 
 test("the Mac-only evidence is never filled in by a script", () => {
+  // The list under test is the generator's own: a later PR that adds a
+  // human-only key (control-disposition arrived this way in #1398) is
+  // covered here without touching this file.
+  assert.ok(HUMAN_ONLY_EVIDENCE.includes("control-disposition"));
   const state = buildGateState(linearNodes(ALL_DONE_STATES), { inventoryClean: true });
-  for (const id of ["soak-24h-no-node", "replay-parity", "final-import-parity"]) {
+  for (const id of HUMAN_ONLY_EVIDENCE) {
     assert.equal(state.evidence[id], false, `${id} must stay false unless a human asserts it`);
   }
   assert.equal(state.macLocalHarness.present, true);
