@@ -780,15 +780,33 @@ test("a shell that carries XPC_SERVICE_NAME=0 is still a person, not launchd", (
   }
 });
 
-test("the job's own label is still launchd", () => {
+test("a shell inside a GUI app is still a person, not launchd", () => {
+  // A shell inside VS Code or another GUI app inherits that app's own
+  // launchd name, so "any value but 0" would class it as a tick too.  Only
+  // the BotFleet Server's own job labels are launchd.
   const fixture = makeFixture();
   try {
     writeFileSync(fixture.marker, "stopped on purpose\n");
-    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
-    assert.equal(result.status, 0, result.stderr);
-    assert.ok(existsSync(fixture.marker), "the tick must leave a deliberate stop in place");
+    const result = run(fixture, { xpcServiceName: "application.com.microsoft.VSCode.13961144.13961150" });
+    assert.ok(!existsSync(fixture.marker), "a person asking for the server must not be blocked by the sentinel");
+    assert.match(result.stdout + result.stderr, /treating it as a deliberate start/);
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the job's own labels are launchd, current and legacy", () => {
+  for (const label of ["app.botfleet.server", "com.jay.botfleet-server"]) {
+    const fixture = makeFixture();
+    try {
+      writeFileSync(fixture.marker, "stopped on purpose\n");
+      const result = run(fixture, { xpcServiceName: label });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout + result.stderr, /shut down on purpose/);
+      assert.ok(existsSync(fixture.marker), `${label}: the tick must leave a deliberate stop in place`);
+    } finally {
+      rmSync(fixture.dir, { recursive: true, force: true });
+    }
   }
 });
 

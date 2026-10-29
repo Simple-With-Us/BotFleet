@@ -155,15 +155,20 @@ honour_startup_policy() {
   fi
 }
 
-# True when launchd invoked us rather than a person.
+# True when launchd invoked us as the BotFleet Server job rather than a person.
 #
-# launchd sets XPC_SERVICE_NAME to the job's label.  A shell sets it too, to
-# the string 0 (Terminal.app and the agents' command shells both do), so a
-# non-empty value alone is not launchd: a person starting the server from such
-# a shell was classed as a tick, and the deliberate start that is supposed to
-# clear stopped.marker left it in place (BF-2527, BF-2528).
+# launchd sets XPC_SERVICE_NAME to the job's label.  A shell carries a value
+# too: Terminal.app and the agents' command shells set the string 0, and a
+# shell inside a GUI app such as VS Code inherits that app's own launchd name.
+# So a non-empty value is not launchd, and neither is "anything but 0": only
+# our own job labels are.  Anything else is a person, and a person starting
+# the server is the deliberate start that clears stopped.marker (BF-2527,
+# BF-2528, BF-2582).
 invoked_by_launchd() {
-  [ -n "$LAUNCHD_SERVICE_NAME" ] && [ "$LAUNCHD_SERVICE_NAME" != "0" ]
+  case "$LAUNCHD_SERVICE_NAME" in
+    app.botfleet.server|com.jay.botfleet-server) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Exit 0 if the harness was stopped on purpose.  Returns 1 to carry on.
