@@ -35,6 +35,26 @@ public struct ServerPresenceProbe {
     /// Whether anything is listening on the server's port.
     public func presence() -> ServerPresence { connect(port) }
 
+    /// Waits until nothing answers on the port, and reports the last answer.
+    ///
+    /// `.absent` is the only answer that proves the server is gone, so it is
+    /// the only one that ends the wait early.  At the deadline the last
+    /// answer is returned as it was: `.present` means something still
+    /// listens, and `.unknown` means the probe could not tell, which the
+    /// caller must not report as a listener.
+    public func waitUntilAbsent(within seconds: TimeInterval,
+                                interval: TimeInterval = 2.5) async -> ServerPresence {
+        let budget = seconds.isFinite ? max(seconds, 0) : 0
+        let step = interval.isFinite ? min(max(interval, 0), 60) : 0
+        let deadline = Date().addingTimeInterval(budget)
+        while true {
+            let answer = presence()
+            if answer == .absent { return .absent }
+            if Date() >= deadline { return answer }
+            try? await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
+        }
+    }
+
     /// Opens a loopback connection to the port.
     ///
     /// A refused connection means nothing is listening there.  An accepted

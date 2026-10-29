@@ -116,6 +116,36 @@ public struct ManagedServices: Equatable {
         }
     }
 
+    /// The line the menu shows for the local server when its status route
+    /// did not answer.
+    ///
+    /// A server that answered the health check but has no control routes is
+    /// running and older than Control, and that is said first: calling it
+    /// unresponsive, or offering to start it, is what left the owner with a
+    /// greyed-out menu over a server that was up (BF-2527).  Only a refused
+    /// connection is proof of a stopped server; a loaded job with no answer
+    /// is unresponsive, a missing plist is not installed, and anything else
+    /// is unknown.
+    public static func serverStatusLine(apiUnavailable: Bool,
+                                        serverOutdated: Bool,
+                                        installedServerState: InstalledServerState) -> String {
+        if serverOutdated { return "Server: running, but older than Control" }
+        if apiUnavailable && installedServerState == .stopped { return "Server: stopped" }
+        if installedServerState == .notInstalled { return "Server: not installed" }
+        if installedServerState == .running { return "Server: unresponsive" }
+        return "Server: unknown"
+    }
+
+    /// Whether the menu offers to stop the local server.
+    ///
+    /// A server that answered its status can be asked to stop.  A server
+    /// that is older than Control cannot be asked, but it can still be
+    /// stopped through the deliberate-stop marker and launchd, so the offer
+    /// stays.
+    public static func canStopServer(statusAvailable: Bool, serverOutdated: Bool) -> Bool {
+        statusAvailable || serverOutdated
+    }
+
     /// The MCP server proxies every tool call to the BotFleet Server, so it
     /// has nothing to offer while that server is down.  It is wanted exactly
     /// while the server is running.

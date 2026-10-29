@@ -74,6 +74,115 @@ final class ControlTests: XCTestCase {
         catch { XCTAssertEqual(error as? ControlAPIError, .unresponsive) }
     }
 
+    /// A server that answers the health check as BotFleet but has no control
+    /// route is running and older than this app.  Reporting that as a refusal
+    /// left the menu calling an up server unresponsive, with every action
+    /// greyed out (BF-2527).
+    func testAServerWithoutTheControlRouteIsOutdatedRatherThanRefused() async {
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
+            return (404, Data(#"{"error":"no route: GET /api/system/control"}"#.utf8))
+        }
+        do { _ = try await ControlAPI(session: mockSession()).status(); XCTFail("Expected outdated server") }
+        catch { XCTAssertEqual(error as? ControlAPIError, .outdatedServer) }
+        XCTAssertEqual(MockURLProtocol.requests.map(\.url!.path), ["/api/health", "/api/system/control"])
+    }
+
+    /// A server older than Control cannot be asked to stop, so the marker is
+    /// written and the LaunchAgent is booted out.  The agent is not disabled:
+    /// the marker is the server's durable stop, and a disabled agent would
+    /// defeat Start Server At Login.
+    func testForceStopWritesTheMarkerAndBootsTheAgentOutWithoutDisablingIt() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let runner = MockCommands()
+        let launchdAsked = try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).forceStopServer()
+        XCTAssertTrue(launchdAsked)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/stopped.marker").path))
+        XCTAssertEqual(runner.calls, ["/bin/launchctl bootout gui/501/app.botfleet.server"])
+    }
+
+    func testForceStopWithoutTheAgentWritesTheMarkerAndAsksLaunchdNothing() throws {
+        // A server the desktop app forked has no plist.  The marker still
+        // records the owner's stop, launchd is not asked, and the caller's
+        // port check is what finds out whether the server is gone.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let runner = MockCommands()
+        let launchdAsked = try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).forceStopServer()
+        XCTAssertFalse(launchdAsked)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/stopped.marker").path))
+        XCTAssertTrue(runner.calls.isEmpty)
+    }
+
+    func testANonzeroBootoutDoesNotFailTheForceStop() throws {
+        // launchctl bootout exits nonzero when the job was already gone and
+        // while a teardown is still in progress, so its exit status proves
+        // nothing.  The marker stays, nothing is thrown, and the caller's
+        // port check decides.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let runner = MockCommands()
+        runner.failBootout = true
+        let launchdAsked = try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).forceStopServer()
+        XCTAssertTrue(launchdAsked)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/stopped.marker").path))
+    }
+
+    /// The outdated mapping covers every control route, not only the status
+    /// read, so the Fleet Services stop path reads the same server the same
+    /// way; a 404 on the health check itself is still a foreign service.
+    func testEveryLocalControlRouteReadsA404AsAnOutdatedServer() async {
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
+            return (404, Data(#"{"error":"no route: POST /api/system/control/stop"}"#.utf8))
+        }
+        do { try await ControlAPI(session: mockSession()).stopServer(); XCTFail("Expected outdated server") }
+        catch { XCTAssertEqual(error as? ControlAPIError, .outdatedServer) }
+        MockURLProtocol.handler = { _ in (404, Data(#"{"error":"no route: GET /api/health"}"#.utf8)) }
+        do { _ = try await ControlAPI(session: mockSession()).status(); XCTFail("Expected foreign service") }
+        catch { XCTAssertEqual(error as? ControlAPIError, .foreignService) }
+    }
+
+    /// A remote host sits behind a gateway that can answer 404 for reasons of
+    /// its own, so its 404 stays a refusal that carries the server's text.
+    func testARemoteHostsMissingRouteStaysARefusal() async {
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","ready":true}"#.utf8)) }
+            return (404, Data(#"{"error":"no route: GET /api/system/control"}"#.utf8))
+        }
+        let remote = ServerHost(name: "Remote", baseURL: URL(string: "https://remote.example")!, isLocal: false)
+        do { _ = try await ControlAPI(session: mockSession(), host: remote).status(); XCTFail("Expected refusal") }
+        catch { XCTAssertEqual(error as? ControlAPIError, .refused("no route: GET /api/system/control")) }
+    }
+
+    /// The menu's server line and its Stop offer, as pure functions of what
+    /// the probe found.
+    func testTheServerLineSaysOlderThanControlBeforeAnythingElse() {
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: false, serverOutdated: true, installedServerState: .running),
+                       "Server: running, but older than Control")
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: false, serverOutdated: true, installedServerState: .notInstalled),
+                       "Server: running, but older than Control")
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: true, serverOutdated: false, installedServerState: .stopped),
+                       "Server: stopped")
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: false, serverOutdated: false, installedServerState: .notInstalled),
+                       "Server: not installed")
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: false, serverOutdated: false, installedServerState: .running),
+                       "Server: unresponsive")
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: false, serverOutdated: false, installedServerState: .unknown),
+                       "Server: unknown")
+    }
+
+    func testStopIsOfferedForAnAnsweringServerAndForAnOutdatedOne() {
+        XCTAssertTrue(ManagedServices.canStopServer(statusAvailable: true, serverOutdated: false))
+        XCTAssertTrue(ManagedServices.canStopServer(statusAvailable: false, serverOutdated: true))
+        XCTAssertFalse(ManagedServices.canStopServer(statusAvailable: false, serverOutdated: false))
+    }
+
     /// A server that does not answer the health check at all really is gone.
     func testUnreachableServerIsStillUnavailable() async {
         MockURLProtocol.failure = { _ in URLError(.cannotConnectToHost) }
@@ -313,12 +422,15 @@ private final class MockCommands: CommandRunning {
     let boot = "4F9389E9-AFE4-42C8-AE2C-7FEEDBA31B6C"
     var calls: [String] = []
     var failKickstart = false
+    /// True when `launchctl bootout` fails the way launchctl fails.
+    var failBootout = false
     var launchctlListing = "PID\tStatus\tLabel\n-\t0\tother.service"
     /// True when launchctl already knows the agent.
     var agentIsLoaded = false
     func run(_ executable: String, _ arguments: [String]) throws -> String {
         calls.append(([executable] + arguments).joined(separator: " "))
         if executable == "/usr/sbin/sysctl" { return boot }
+        if failBootout && arguments.first == "bootout" { throw CommandExitError(output: "Boot-out failed: 5: Input/output error") }
         if arguments == ["list"] { return launchctlListing }
         if arguments.first == "print" {
             if agentIsLoaded { return "state = running" }

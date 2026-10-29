@@ -371,13 +371,83 @@ final class FleetServicesTests: XCTestCase {
         ])
     }
 
-    func testStoppingALaunchAgentBootsItOut() throws {
+    func testStoppingALaunchAgentDisablesItBootsItOutAndChecksItIsGone() throws {
+        // A bootout alone holds only until the next login: the plist carries
+        // RunAtLoad, so launchd loads the agent again.  The disable is what
+        // makes the owner's stop hold across logins and restarts, and the
+        // start's enable is what undoes it.  Whether the stop took is read
+        // from launchd, not from the bootout's exit status.
         let home = try makeHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
-            .stopAgent(label: "app.botfleet.companion")
-        XCTAssertEqual(commands.calls, ["/bin/launchctl bootout gui/501/app.botfleet.companion"])
+            .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
+        XCTAssertEqual(commands.calls, [
+            "/bin/launchctl disable gui/501/app.botfleet.companion",
+            "/bin/launchctl bootout gui/501/app.botfleet.companion",
+            "/bin/launchctl print gui/501/app.botfleet.companion"
+        ])
+    }
+
+    func testANonzeroBootoutWhoseJobIsGoneIsAStopThatHeld() throws {
+        // launchctl bootout exits nonzero while a teardown is in progress and
+        // when the job was already gone, so its exit status says nothing.
+        // The job being unloaded is what proves the stop, and the agent stays
+        // disabled.
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let commands = LaunchAgentCommands()
+        commands.bootoutFailure = CommandExitError(output: "Boot-out failed: 3: No such process")
+        try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+            .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
+        XCTAssertFalse(commands.calls.contains("/bin/launchctl enable gui/501/app.botfleet.companion"))
+        XCTAssertEqual(commands.calls.last, "/bin/launchctl print gui/501/app.botfleet.companion")
+    }
+
+    func testABootoutThatTimesOutStillCountsWhenTheJobIsGone() throws {
+        // The command runner reports a timeout as a generic failure, which is
+        // not a CommandExitError.  It must not be read as a failed stop
+        // either: launchd is asked, and the answer decides.
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let commands = LaunchAgentCommands()
+        commands.bootoutFailure = StartupPolicyError.commandFailed
+        try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+            .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
+        XCTAssertFalse(commands.calls.contains { $0.contains("enable") })
+    }
+
+    func testAStopWhoseJobStaysLoadedPutsTheEnableBack() throws {
+        // An agent that is still running must not be left disabled behind
+        // the owner's back, so when launchd still has the job after the
+        // bootout, the enable goes back and the refusal says so.
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let commands = LaunchAgentCommands()
+        commands.loaded = true
+        XCTAssertThrowsError(try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+            .stopAgent(label: "app.botfleet.companion", unloadAttempts: 2, unloadInterval: 0)) { error in
+            XCTAssertTrue("\(error)".contains("did not unload"), "\(error)")
+        }
+        XCTAssertEqual(commands.calls, [
+            "/bin/launchctl disable gui/501/app.botfleet.companion",
+            "/bin/launchctl bootout gui/501/app.botfleet.companion",
+            "/bin/launchctl print gui/501/app.botfleet.companion",
+            "/bin/launchctl print gui/501/app.botfleet.companion",
+            "/bin/launchctl enable gui/501/app.botfleet.companion"
+        ])
+    }
+
+    func testADisableThatFailsStopsNothing() throws {
+        // The disable is what makes the stop durable, so a disable that
+        // fails is a stop that must not proceed to the bootout.
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let commands = LaunchAgentCommands()
+        commands.disableFailure = CommandExitError(output: "Could not find service")
+        XCTAssertThrowsError(try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+            .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0))
+        XCTAssertEqual(commands.calls, ["/bin/launchctl disable gui/501/app.botfleet.companion"])
     }
 
     func testRestartingALaunchAgentReplacesTheRunningInstance() throws {
@@ -507,6 +577,101 @@ final class FleetServicesTests: XCTestCase {
         let entry = services.entries.first { $0.id == "botfleet-mcp" }
         XCTAssertEqual(entry?.wanted, true)
         XCTAssertEqual(FleetServices.automaticAction(for: entry!), .start)
+    }
+
+    // MARK: - The owner's stops outlive the app
+
+    func testTheOwnersStopsAreKeptOnDiskWithPrivatePermissions() throws {
+        // A stop the owner asked for has to hold past a relaunch of Control,
+        // a login and a restart, so it is written down, and the file is the
+        // owner's alone.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent(".botfleet/control-owner-stops.json")
+        let store = OwnerStopsStore(fileURL: file)
+        try store.save(["botfleet-mcp", "app.botfleet.companion"])
+        XCTAssertEqual(OwnerStopsStore(fileURL: file).load(), ["botfleet-mcp", "app.botfleet.companion"])
+        let mode = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(mode?.intValue, 0o600)
+    }
+
+    func testAMissingRecordIsAnEmptyOne() {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathComponent("control-owner-stops.json")
+        XCTAssertEqual(OwnerStopsStore(fileURL: file).load(), [])
+    }
+
+    func testSavingAgainReplacesTheRecord() throws {
+        // A start takes a service out of the record, and the file has to say
+        // so, or the next launch would stop a service the owner started.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("control-owner-stops.json")
+        let store = OwnerStopsStore(fileURL: file)
+        try store.save(["botfleet-mcp", "shellular"])
+        try store.save(["shellular"])
+        XCTAssertEqual(store.load(), ["shellular"])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path).count, 1)
+    }
+
+    func testAnUnreadableRecordIsAnEmptyOneAndIsMovedAsideOnce() throws {
+        // A record that cannot be read is not the owner's stops, so the
+        // fleet's own rules apply, and the file is moved aside under another
+        // name rather than erased.  Moved, not copied: a second launch must
+        // not make a second backup.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("control-owner-stops.json")
+        try Data("not json".utf8).write(to: file)
+        let store = OwnerStopsStore(fileURL: file)
+        XCTAssertEqual(store.load(), [])
+        XCTAssertEqual(store.load(), [])
+        let kept = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        XCTAssertEqual(kept.count, 1, "\(kept)")
+        XCTAssertTrue(kept[0].contains("corrupt"), "\(kept)")
+        XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent(kept[0])), "not json")
+    }
+
+    func testARecordedStopIsWrittenDownAndReadBackByTheNextLaunch() throws {
+        // What the app does at launch and after every action, in one place:
+        // record and save, then a fresh record from the same store carries
+        // the stop; a refused change restored and saved takes it back out.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OwnerStopsStore(fileURL: directory.appendingPathComponent("control-owner-stops.json"))
+        var stops = OwnerStops(loadedFrom: store)
+        XCTAssertEqual(stops.ids, [])
+        try stops.record(.stop, id: "botfleet-mcp", saving: store)
+        XCTAssertEqual(OwnerStops(loadedFrom: store).ids, ["botfleet-mcp"])
+        let previous = stops.ids
+        try stops.record(.start, id: "botfleet-mcp", saving: store)
+        XCTAssertEqual(OwnerStops(loadedFrom: store).ids, [])
+        try stops.restore(previous, saving: store)
+        XCTAssertEqual(OwnerStops(loadedFrom: store).ids, ["botfleet-mcp"])
+    }
+
+    // MARK: - Waiting for the server's port to close
+
+    func testTheWaitForAnAbsentPortEndsAtTheFirstRefusedConnection() async {
+        var answers: [ServerPresence] = [.present, .present, .absent, .present]
+        let probe = ServerPresenceProbe(port: 8799, connect: { _ in answers.removeFirst() })
+        let answer = await probe.waitUntilAbsent(within: 5, interval: 0.01)
+        XCTAssertEqual(answer, .absent)
+        XCTAssertEqual(answers, [.present])
+    }
+
+    func testTheWaitReportsWhatItLastSawAtTheDeadline() async {
+        // A port that still answers and a probe that could not tell are
+        // different answers, and the caller must be able to tell them apart:
+        // one is a listener to point the owner at, the other is nothing.
+        let listening = ServerPresenceProbe(port: 8799, connect: { _ in .present })
+        let stillThere = await listening.waitUntilAbsent(within: 0.05, interval: 0.01)
+        XCTAssertEqual(stillThere, .present)
+        let blind = ServerPresenceProbe(port: 8799, connect: { _ in .unknown })
+        let couldNotTell = await blind.waitUntilAbsent(within: 0.05, interval: 0.01)
+        XCTAssertEqual(couldNotTell, .unknown)
     }
 
     // MARK: - Stopping the BotFleet Server
@@ -678,6 +843,29 @@ final class FleetServicesTests: XCTestCase {
         let row = services.menuItems.first { $0.id == "app.botfleet.server" }
         let body = FleetServices.stopBody(for: row!, startupPolicySupported: true)
         XCTAssertTrue(body.contains("Restart clears the marker"))
+        XCTAssertFalse(body.contains("older than Control"))
+    }
+
+    func testTheStopCopyForAnOutdatedServerSaysTheWorkCheckIsUnavailable() {
+        // The in-flight-work check belongs to the stop route the old server
+        // does not have, so the copy must say that the check is gone rather
+        // than promise a refusal the server cannot make.
+        let services = FleetServices(serverState: .running,
+                                    states: ["app.botfleet.server": .running],
+                                    startupPolicySupported: true)
+        let row = services.menuItems.first { $0.id == "app.botfleet.server" }
+        let body = FleetServices.stopBody(for: row!, startupPolicySupported: true, serverOutdated: true)
+        XCTAssertTrue(body.contains("older than Control"))
+        XCTAssertTrue(body.contains("not protected"))
+        XCTAssertFalse(body.contains("The server refuses while work is in flight"))
+    }
+
+    func testTheStopCopyForALaunchAgentPromisesItStaysStopped() {
+        let services = FleetServices(serverState: .running,
+                                    states: ["app.botfleet.companion": .running])
+        let row = services.menuItems.first { $0.id == "app.botfleet.companion" }
+        let body = FleetServices.stopBody(for: row!, startupPolicySupported: true)
+        XCTAssertTrue(body.contains("across logins and restarts"))
     }
 
     func testAServerRestartWaitsNoLongerThanTheCallerAskedFor() async throws {
@@ -880,12 +1068,18 @@ private final class LaunchAgentCommands: CommandRunning {
     var loaded = false
     /// True when launchctl cannot be asked at all.
     var listingFails = false
+    /// The failure `launchctl bootout` raises, when it raises one.
+    var bootoutFailure: Error?
+    /// The failure `launchctl disable` raises, when it raises one.
+    var disableFailure: Error?
     /// The boot id the startup policy records.
     var boot = "4F9389E9-AFE4-42C8-AE2C-7FEEDBA31B6C"
 
     func run(_ executable: String, _ arguments: [String]) throws -> String {
         calls.append(([executable] + arguments).joined(separator: " "))
         if executable == "/usr/sbin/sysctl" { return boot }
+        if arguments.first == "bootout", let bootoutFailure { throw bootoutFailure }
+        if arguments.first == "disable", let disableFailure { throw disableFailure }
         if arguments == ["list"] {
             if listingFails { throw StartupPolicyError.commandFailed }
             return listing

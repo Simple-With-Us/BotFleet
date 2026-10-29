@@ -97,8 +97,9 @@ public enum FleetServiceRegistry {
 /// The services the owner stopped on purpose, and how that record changes.
 ///
 /// A stop the owner asked for is not one the Control app undoes.  The record
-/// belongs to the app, so it lasts as long as the app does, and a relaunch
-/// hands the fleet back to its own rules.
+/// belongs to the owner, not to the app: `OwnerStopsStore` keeps it on disk,
+/// so a relaunch of Control, a login or a restart does not hand a service
+/// the owner stopped back to the fleet's own rules.
 public struct OwnerStops: Equatable {
     /// The services the owner stopped on purpose, by service id.
     public private(set) var ids: Set<String>
@@ -127,6 +128,94 @@ public struct OwnerStops: Equatable {
     /// made of it.
     public mutating func restore(_ previous: Set<String>) {
         ids = previous
+    }
+
+    /// The record as last saved in a store.
+    public init(loadedFrom store: OwnerStopsStore) {
+        self.ids = store.load()
+    }
+
+    /// Records what the owner asked for and writes it down, so the record
+    /// outlives this launch.
+    ///
+    /// The record is changed before the store is written, so a store that
+    /// cannot be written still leaves the right answer in memory for this
+    /// launch; the error tells the caller that it will not hold past it.
+    public mutating func record(_ action: ManagedServiceAction, id: String, saving store: OwnerStopsStore) throws {
+        record(action, id: id)
+        try store.save(ids)
+    }
+
+    /// Puts the record back the way it was and writes it down.
+    public mutating func restore(_ previous: Set<String>, saving store: OwnerStopsStore) throws {
+        restore(previous)
+        try store.save(ids)
+    }
+}
+
+/// Keeps the owner's stops on disk, so they outlive the Control app.
+///
+/// The record is a small JSON file next to the other Control files in
+/// `~/.botfleet`, written atomically with mode 0600.  It stays in
+/// `~/.botfleet` on purpose, like `control-hosts.json` and
+/// `control-vm-plugins.json`: it is Control's own, where the files the
+/// server, Electron and the installed wrapper also read follow the server's
+/// `OMB_DATA_DIR`.  A file that is missing or cannot be read is an empty
+/// record, so the fleet's own rules apply, and an unreadable file is moved
+/// aside under a `.corrupt` name rather than erased, once.
+public final class OwnerStopsStore {
+    /// The file name under the Control data directory.
+    public static let fileName = "control-owner-stops.json"
+
+    private let fileURL: URL
+    private let files: FileManager
+
+    public init(fileURL: URL? = nil, files: FileManager = .default) {
+        self.files = files
+        self.fileURL = fileURL
+            ?? files.homeDirectoryForCurrentUser.appendingPathComponent(".botfleet/\(OwnerStopsStore.fileName)")
+    }
+
+    /// The services the owner stopped on purpose, as last saved.
+    public func load() -> Set<String> {
+        guard files.fileExists(atPath: fileURL.path) else { return [] }
+        guard let data = try? Data(contentsOf: fileURL),
+              let record = try? JSONDecoder().decode(Record.self, from: data) else {
+            // Moved, not copied: a copy would leave the unreadable file in
+            // place and make a new backup on every launch.
+            let backup = fileURL.deletingPathExtension()
+                .appendingPathExtension("corrupt.\(Int(Date().timeIntervalSince1970)).json")
+            try? files.moveItem(at: fileURL, to: backup)
+            return []
+        }
+        return Set(record.stoppedByOwner)
+    }
+
+    /// Saves the services the owner stopped on purpose.
+    public func save(_ ids: Set<String>) throws {
+        let directory = fileURL.deletingLastPathComponent()
+        try files.createDirectory(at: directory, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(Record(stoppedByOwner: ids.sorted()))
+        let temporary = directory.appendingPathComponent("control-owner-stops.\(UUID().uuidString).tmp")
+        do {
+            try data.write(to: temporary, options: .atomic)
+            try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+            if files.fileExists(atPath: fileURL.path) {
+                _ = try files.replaceItemAt(fileURL, withItemAt: temporary)
+            } else {
+                try files.moveItem(at: temporary, to: fileURL)
+            }
+            try? files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        } catch {
+            try? files.removeItem(at: temporary)
+            throw error
+        }
+    }
+
+    private struct Record: Codable {
+        let stoppedByOwner: [String]
     }
 }
 
@@ -211,8 +300,8 @@ public struct FleetServices: Equatable {
     /// The services the owner stopped on purpose, by service id.
     ///
     /// A stop the owner asked for is not one the Control app undoes.  The
-    /// set belongs to the app, so it lasts as long as the app does, and a
-    /// relaunch hands the fleet back to its own rules.
+    /// set is loaded from and saved to `OwnerStopsStore`, so it outlives a
+    /// relaunch of Control.
     public let stoppedByOwner: Set<String>
     /// True when the installed wrapper carries the startup policy contract.
     ///
@@ -293,9 +382,16 @@ public struct FleetServices: Equatable {
     /// Restart, so the copy names the real recovery instead of a Restart
     /// the owner cannot pick.
     public static func stopBody(for service: FleetServiceMenuItem,
-                                startupPolicySupported: Bool) -> String {
+                                startupPolicySupported: Bool,
+                                serverOutdated: Bool = false) -> String {
         if service.id == FleetServiceRegistry.server.id {
-            let common = "The BotFleet Server stops itself, and its Local VMs go down with it.  The server refuses while work is in flight.  The installed wrapper stays down while the deliberate-stop marker exists, so a login does not bring it back"
+            // A server older than Control has no stop route, so the only
+            // stop left is the marker and a bootout.  The copy says what is
+            // lost: the in-flight-work check belongs to the route that is
+            // missing.
+            let common = serverOutdated
+                ? "This server is older than Control and has no stop route, so Control writes the deliberate-stop marker, boots the LaunchAgent out when it is installed, and watches port 8799 until nothing answers.  The in-flight-work check is unavailable on this server, so active bots are not protected.  The installed wrapper stays down while the marker exists, so a login does not bring it back"
+                : "The BotFleet Server stops itself, and its Local VMs go down with it.  The server refuses while work is in flight.  The installed wrapper stays down while the deliberate-stop marker exists, so a login does not bring it back"
             guard startupPolicySupported else {
                 return common + ".  This version of BotFleet cannot restart the server from here, so remove ~/.botfleet/stopped.marker yourself to bring it back."
             }
@@ -303,7 +399,7 @@ public struct FleetServices: Equatable {
         }
         if let descriptor = FleetServiceRegistry.descriptor(for: service.id),
            case .launchAgent = descriptor.kind {
-            return "It stops right away.  macOS does not bring it back until the LaunchAgent is loaded again."
+            return "It stops right away, and launchd keeps it disabled across logins and restarts until you start it again."
         }
         return "It stops right away, and pm2 leaves it stopped until you start it again."
     }

@@ -319,19 +319,86 @@ public final class StartupPolicy {
         _ = try commands.run("/bin/launchctl", ["kickstart", full])
     }
 
-    /// Stops a launchd agent and leaves it stopped.
+    /// How long a stop waits for launchd to unload the agent before it
+    /// decides the stop did not take.
+    public static let unloadAttempts = 20
+    public static let unloadInterval: TimeInterval = 0.5
+
+    /// Stops a launchd agent and leaves it stopped, across logins and
+    /// restarts.
     ///
-    /// The agent is booted out of the login domain, so launchd does not
-    /// bring it back on its own afterwards.
-    public func stopAgent(label: String) throws {
+    /// The agent is disabled in launchd's own record first, so a plist with
+    /// `RunAtLoad` does not bring it back at the next login, and then booted
+    /// out of the login domain, so it stops now and its `StartInterval`
+    /// cannot fire.  `startAgent` enables it again, so the owner's start
+    /// undoes exactly this.
+    ///
+    /// Whether the stop took is read from launchd, never from the bootout's
+    /// exit status: `launchctl bootout` exits nonzero while a teardown is
+    /// still in progress and when the job was already gone, and a command
+    /// that outlives the runner's timeout is not a bootout that failed.  So
+    /// the bootout is run for its effect, and `launchctl print` is asked
+    /// until the job is no longer loaded.  An agent that is still loaded
+    /// after that is put back to enabled, because an agent that is still
+    /// running must not be left disabled behind the owner's back, and the
+    /// refusal says so.
+    public func stopAgent(label: String,
+                          unloadAttempts: Int = StartupPolicy.unloadAttempts,
+                          unloadInterval: TimeInterval = StartupPolicy.unloadInterval) throws {
         let full = "gui/\(uid)/\(label)"
         do {
-            _ = try commands.run("/bin/launchctl", ["bootout", full])
+            _ = try commands.run("/bin/launchctl", ["disable", full])
         } catch let error as CommandExitError {
             throw StartupPolicyError.refused(error.output.isEmpty
-                ? "macOS could not stop the \(label) LaunchAgent."
+                ? "macOS could not disable the \(label) LaunchAgent."
                 : error.output)
         }
+        _ = try? commands.run("/bin/launchctl", ["bootout", full])
+        if waitUntilUnloaded(full, attempts: unloadAttempts, interval: unloadInterval) { return }
+        _ = try? commands.run("/bin/launchctl", ["enable", full])
+        throw StartupPolicyError.refused("macOS did not unload the \(label) LaunchAgent, so it is left enabled and still running.  Try again once it has settled.")
+    }
+
+    /// True once launchd no longer has the job loaded.
+    ///
+    /// `launchctl print` fails for a job that is not loaded, which is the
+    /// one answer that proves the bootout took.  A job that is still being
+    /// torn down answers for a while, so the question is asked more than
+    /// once.
+    private func waitUntilUnloaded(_ full: String, attempts: Int, interval: TimeInterval) -> Bool {
+        let step = interval.isFinite ? min(max(interval, 0), 60) : 0
+        for attempt in 0..<max(attempts, 1) {
+            if (try? commands.run("/bin/launchctl", ["print", full])) == nil { return true }
+            if attempt + 1 < max(attempts, 1), step > 0 { Thread.sleep(forTimeInterval: step) }
+        }
+        return false
+    }
+
+    /// Stops a BotFleet Server that cannot be asked to stop itself.
+    ///
+    /// The server's own stop route is the right stop: it refuses while work
+    /// is in flight and drains before it exits.  A server older than this
+    /// app has no such route, so the only stop left is the one launchd
+    /// offers.  The deliberate-stop marker is written first, so the installed
+    /// wrapper does not start the server again on its next tick, and the
+    /// LaunchAgent, when it is installed, is then booted out, which sends the
+    /// server a termination signal.  The agent is not disabled: the marker is
+    /// the durable stop for the server, and a disabled agent would defeat
+    /// Start Server At Login.
+    ///
+    /// Nothing here is trusted as proof that the server is gone.  launchd
+    /// does not always own the server process, the plist is not always
+    /// installed, and `launchctl bootout` exits nonzero even when it worked,
+    /// so the bootout's exit status is ignored and the caller asks the port
+    /// afterwards.  The method reports whether launchd was asked at all, so
+    /// the caller can say what happened.
+    @discardableResult
+    public func forceStopServer() throws -> Bool {
+        try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+        try Data().write(to: stopped, options: .atomic)
+        guard files.fileExists(atPath: agent.path) else { return false }
+        _ = try? commands.run("/bin/launchctl", ["bootout", "gui/\(uid)/\(StartupPolicy.serverAgentLabel)"])
+        return true
     }
 
     /// Restarts a launchd agent.

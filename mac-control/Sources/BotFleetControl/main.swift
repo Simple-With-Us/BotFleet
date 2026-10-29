@@ -42,17 +42,29 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 guard let self else {
                                     throw FleetServiceError.refused("The Control app is no longer running.")
                                 }
-                                try await self.api.stopServer()
+                                // A server older than Control has no stop
+                                // route, so the marker-and-bootout stop is
+                                // the only one left for it.
+                                if self.serverOutdated {
+                                    try await self.forceStopOutdatedServer()
+                                } else {
+                                    try await self.api.stopServer()
+                                }
                             })
     }()
     /// The services the owner stopped on purpose, and how that record changes.
     private var ownerStops = OwnerStops()
+    /// Where the owner's stops are kept between launches.
+    private let ownerStopsStore = OwnerStopsStore()
     private var item: NSStatusItem?
     private let menu = NSMenu()
     private var status: ControlStatus?
     private var persistOnExit: Bool?
     private var installedServerState: InstalledServerState = .unknown
     private var apiUnavailable = false
+    /// True when the local server answered the health check as BotFleet but
+    /// has no control routes: it is running, and it is older than this app.
+    private var serverOutdated = false
     private var serverPresence: ServerPresence = .unknown
     private var offlineVMs: OfflineDockerState = .unavailable
     private var helperVMs: [LocalVM]?
@@ -111,6 +123,10 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hosts = hostStore.loadHosts()
         menu.autoenablesItems = false
         menu.delegate = self
+        // The owner's stops are read back before the first reconcile, so a
+        // service the owner stopped before this launch is not started again
+        // by it.
+        ownerStops = OwnerStops(ids: ownerStopsStore.load())
         showIcon()
         // The fleet service control is resolved here, on the main thread and
         // before any task can reach for it, so its first use cannot race
@@ -157,6 +173,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.persistOnExit = localStatus.persistOnExit
                 self.installedServerState = .running
                 self.apiUnavailable = false
+                self.serverOutdated = false
                 self.serverPresence = .present
                 self.offlineVMs = .unavailable
                 self.helperVMs = nil
@@ -168,6 +185,10 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.hostErrors[ServerHost.defaultLocal.id] = error.localizedDescription
                 self.installedServerState = await Task.detached(priority: .userInitiated) { self.startup.installedServerState }.value
                 self.apiUnavailable = (error as? ControlAPIError) == .unavailable
+                // A server that answered as BotFleet but has no control
+                // routes is running and older than this app.  It is not
+                // offline, and the menu must not call it unresponsive.
+                self.serverOutdated = (error as? ControlAPIError) == .outdatedServer
                 // The API did not answer.  That is not proof that the server
                 // is gone, so ask the port itself.
                 self.serverPresence = await Task.detached(priority: .userInitiated) { self.presenceProbe.presence() }.value
@@ -363,14 +384,30 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // runs as soon as the change is done, and it goes back exactly
             // as it was when the manager refuses the change.
             let previous = ownerStops.ids
-            ownerStops.record(action, id: id)
+            recordOwnerStop { try ownerStops.record(action, id: id, saving: ownerStopsStore) }
             do {
                 let observed = try await self.fleetServiceControl.perform(action, serviceID: id)
                 self.fleetServiceStates[id] = observed
             } catch {
-                ownerStops.restore(previous)
+                recordOwnerStop { try ownerStops.restore(previous, saving: ownerStopsStore) }
                 throw error
             }
+        }
+    }
+
+    /// Changes the owner's stops and writes them down, so they outlive this
+    /// launch.
+    ///
+    /// The record itself always changes; only the write can fail.  A record
+    /// that could not be written is reported in the menu rather than hidden:
+    /// the stop still holds for this launch, and the owner can read that it
+    /// will not hold past it.  No alert, because the action's own outcome
+    /// is what the owner is waiting on.
+    private func recordOwnerStop(_ change: () throws -> Void) {
+        do {
+            try change()
+        } catch {
+            problem = "The owner's stops could not be saved, so they last only until Control quits: \(error.localizedDescription)"
         }
     }
 
@@ -393,7 +430,9 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// What stopping one fleet service does.
     private func stopBody(for service: FleetServiceMenuItem) -> String {
-        FleetServices.stopBody(for: service, startupPolicySupported: startup.supportsPolicy)
+        FleetServices.stopBody(for: service,
+                               startupPolicySupported: startup.supportsPolicy,
+                               serverOutdated: serverOutdated)
     }
 
     /// Re-reads the server's own state after an action, and waits for that
@@ -484,10 +523,9 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         } else {
-            if apiUnavailable && installedServerState == .stopped { add("Server: stopped") }
-            else if installedServerState == .notInstalled { add("Server: not installed") }
-            else if installedServerState == .running { add("Server: unresponsive") }
-            else { add("Server: unknown") }
+            add(ManagedServices.serverStatusLine(apiUnavailable: apiUnavailable,
+                                                 serverOutdated: serverOutdated,
+                                                 installedServerState: installedServerState))
             if apiUnavailable && installedServerState == .stopped, let helperVMs {
                 let running = helperVMs.filter(\.running).count
                 let shared = helperVMs.first(where: { $0.key == "shared" })
@@ -501,6 +539,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if vms.isEmpty { add("  Managed Docker VMs: none found") }
                 for vm in vms { add("  \(vm.name): \(vm.running ? "running" : "stopped")") }
             } else if apiUnavailable { add("Shared VM: Off ⚪️ (server offline)") }
+            else if serverOutdated { add("Shared VM: unknown until BotFleet is updated") }
             else { add("Shared VM: unknown while server is busy") }
         }
         if let problem { add("Error: \(problem)") }
@@ -527,7 +566,10 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         add("Start Server", selector: #selector(startServer), enabled: ready && startup.supportsPolicy && apiUnavailable && installedServerState == .stopped)
-        add("Stop Server And Local VMs…", selector: #selector(stopServer), enabled: ready && status != nil)
+        // A server older than Control cannot be asked to stop, but it can
+        // still be stopped: the marker-and-bootout path is offered for it.
+        add("Stop Server And Local VMs…", selector: #selector(stopServer),
+            enabled: ready && ManagedServices.canStopServer(statusAvailable: status != nil, serverOutdated: serverOutdated))
         add("Start Shared VM", selector: #selector(startVM), enabled: ready && status?.canStartSharedVM == true)
         let canCreateOffline = apiUnavailable && installedServerState == .stopped
             && offlineVMHelper.available && helperVMs?.first(where: { $0.key == "shared" })?.state == "missing"
@@ -720,6 +762,10 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     status = nil
                     persistOnExit = nil
                     apiUnavailable = true
+                    // The server was just asked to stop, so what was known
+                    // about its version no longer describes anything that
+                    // is running.
+                    serverOutdated = false
                     helperVMs = nil
                     offlineVMs = .unavailable
                 }
@@ -1000,6 +1046,14 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func stopServer() {
+        if status == nil && serverOutdated {
+            guard confirm("Stop BotFleet Server And Local VMs?",
+                          "This server is older than Control and has no stop route.  Control writes the deliberate-stop marker, boots the LaunchAgent out when it is installed, and then watches port 8799 until nothing answers.  The in-flight-work check is unavailable on this server, so active bots are not protected.") else { return }
+            run(refresh: false, settlesWhen: [.stopped, .notInstalled]) { [self] in
+                try await forceStopOutdatedServer()
+            }
+            return
+        }
         guard let status else { return }
         // Say what will actually block the stop, not just the bot turns.  The
         // server refuses on any kind of in-flight work, so a dialog that
@@ -1013,6 +1067,30 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // before the managed services stop the services that only run with it.
         run(refresh: false, settlesWhen: [.stopped, .notInstalled]) { [self] in
             try await api.stopServer()
+        }
+    }
+
+    /// Stops a server that has no stop route of its own, and checks that it
+    /// is gone.
+    ///
+    /// Neither the bootout nor the plist is trusted as proof: launchd does
+    /// not always own the server process, and the plist is not always
+    /// installed.  The port is asked until nothing answers on it, and the
+    /// error says exactly what was found.  Free Port is named only when
+    /// something is proven to be listening, because it is a hard kill.
+    private func forceStopOutdatedServer() async throws {
+        let launchdAsked = try await Task.detached(priority: .userInitiated) { try self.startup.forceStopServer() }.value
+        let probe = presenceProbe
+        let answer = await Task.detached(priority: .userInitiated) { await probe.waitUntilAbsent(within: 20, interval: 2.5) }.value
+        switch answer {
+        case .absent:
+            return
+        case .present:
+            throw FleetServiceError.refused(launchdAsked
+                ? "The deliberate-stop marker is written and the LaunchAgent is booted out, but something still answers on port 8799 twenty seconds later, so launchd did not own that server or it has not finished leaving.  Free Port 8799 in Monitored Processes & Ports stops whatever holds the port, and it is a hard kill."
+                : "The deliberate-stop marker is written, but the BotFleet Server LaunchAgent is not installed, so launchd was not asked, and something still answers on port 8799.  Free Port 8799 in Monitored Processes & Ports stops whatever holds the port, and it is a hard kill.")
+        case .unknown:
+            throw FleetServiceError.refused("The deliberate-stop marker is written\(launchdAsked ? " and the LaunchAgent is booted out" : ""), but Control could not check port 8799, so nothing can be said about whether the server is gone.  Open the menu again to re-probe.")
         }
     }
 
