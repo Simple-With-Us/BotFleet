@@ -633,18 +633,17 @@ describe("filter patch semantics", () => {
     expect(webhook.actions).toEqual(["created", "triggered"]);
   });
 
-  it("caps an over-long filter list instead of rejecting it", () => {
+  it("rejects an over-long filter list with a clear error", () => {
     const h = harness();
     const actions = Array.from({ length: 25 }, (_, index) => `action-${index}`);
-    const { webhook } = h.manager.create({
-      name: "Fixer",
-      prompt: "Fix it.",
-      botId: "maus-1",
-      actions,
-    });
-    expect(webhook.actions).toHaveLength(20);
-    expect(webhook.actions?.[0]).toBe("action-0");
-    expect(webhook.actions?.[19]).toBe("action-19");
+    expect(() =>
+      h.manager.create({
+        name: "Fixer",
+        prompt: "Fix it.",
+        botId: "maus-1",
+        actions,
+      }),
+    ).toThrow("You can add up to 20 filters.");
   });
 });
 

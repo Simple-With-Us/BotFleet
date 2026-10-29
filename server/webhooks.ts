@@ -227,7 +227,7 @@ const runOnSchema = z
   .transform((value): "bot" | "cloud" => (value === "maus" ? "bot" : value));
 const eventTypesSchema = z.array(z.string()).max(20).optional();
 /** A list filter: action allowlist, required labels, conclusions, excluded
- *  Sentry projects.  Length is capped in cleanFilterList, not rejected here. */
+ *  Sentry projects.  Length is validated in cleanFilterList after trim and de-dupe. */
 const filterListSchema = z.array(z.string()).optional();
 const sentryLevelSchema = z.enum(["debug", "info", "warning", "error", "fatal"]);
 const pagerDutyUrgencySchema = z.enum(["high", "low"]);
@@ -346,14 +346,20 @@ function newSecret(): string {
   return `whsec_${randomBytes(32).toString("base64url")}`;
 }
 
-/** A filter list: trimmed, de-duplicated, and capped like the event-type list.
- *  An empty list means "no filter", so it is dropped by the caller. */
+const MAX_FILTER_LIST = 20;
+
+/** A filter list: trimmed and de-duplicated.  An empty list means "no filter",
+ *  so it is dropped by the caller. */
 function cleanFilterList(values: string[] | undefined): string[] {
-  return Array.from(new Set(
+  const cleaned = Array.from(new Set(
     (values ?? [])
       .map((value) => value.trim().slice(0, 200))
       .filter(Boolean),
-  )).slice(0, 20);
+  ));
+  if (cleaned.length > MAX_FILTER_LIST) {
+    fail(400, "You can add up to 20 filters.");
+  }
+  return cleaned;
 }
 
 function cleanInput(input: WebhookTriggerInput): CleanWebhookInput {

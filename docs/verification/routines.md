@@ -62,7 +62,7 @@ Every filter below is optional and is configured on the trigger itself, with `PA
 | `excludeSentryProjects` | Sentry | The delivery's project slug must not be listed.  This check runs before the fleet-infra reroute, so an excluded project never reaches the bot it would have been rerouted to. |
 | `pagerdutyUrgency` | PagerDuty | The incident urgency (`event.data.urgency`, or `event.data.incident.urgency`) must equal this value.  A missing urgency is ignored. |
 
-A list filter is trimmed, de-duplicated and capped at 20 entries of 200 characters.  Setting a list to `[]`, setting `defaultBranchOnly` to `false`, or sending `null` for `minSentryLevel` or `pagerdutyUrgency` clears that filter; every other filter on the trigger survives the edit.
+A list filter is trimmed and de-duplicated; each entry may be up to 200 characters and a list may hold at most 20 entries (more than that returns HTTP 400 with a plain-language error).  Setting a list to `[]`, setting `defaultBranchOnly` to `false`, or sending `null` for `minSentryLevel` or `pagerdutyUrgency` clears that filter; every other filter on the trigger survives the edit.
 
 ### Fleet Examples
 
