@@ -10,7 +10,7 @@ Four gaps remain, and all four were confirmed by an adversarial second pass over
 
 The larger finding is structural.  Every local capability of Control depends on the Node harness that Phase 6 retires: the six HTTP routes it calls live only in `server/index.ts`, it supervises the `app.botfleet.server` and `app.botfleet.companion` LaunchAgents and the `pm2 botfleet-mcp` job that BF-2514 and BF-2515 remove, its offline VM helper is compiled from `server/local-vm-offline-cli.ts`, and its only build, test and install path is the Electron packaging pipeline that the decommission runbook deletes in Step 6.  The rewrite documents say Control is kept (`docs/native-rewrite-port-inventory.md:129`, `docs/native-rewrite-decommission-runbook.md:183`) and also that its markers are retired at BF-2514 (`docs/native-rewrite-port-inventory.md:156`), and neither `scripts/check-decommission-gates.mjs` nor `scripts/audit-node-decommission.mjs` mentions `mac-control/` at all.  Nothing stops BF-2514 and BF-2515 from landing with Control broken.  The native app cannot take over yet: today it is a pure client of port 8799, it cannot start the harness, its menubar has no lifecycle rows, and its shutdown route has no in-flight-work fence.
 
-Three decisions belong to Jay and are drafted below.  The code I will build now is the part that holds under every answer: durable stops for the companion and the MCP server, an honest `too old` state for the harness with a stop that still works, a health probe for the companion row, and the version stamp fix for the Control bundle.
+Three decisions belong to Jay and are drafted below.  The code I will build now is the part that holds under every answer: durable stops for the companion and the MCP server, an honest `too old` state for the harness with a stop that still works, and the version stamp fix for the Control bundle.
 
 ## What BF-2528 Asked For, And What Main Already Has
 
@@ -52,7 +52,7 @@ The fix is a distinct `routeMissing` error for a 404 on the control route, a `Se
 
 ### The Companion Row Is Presence Only
 
-The companion row reads `running` whenever `launchctl list` shows a PID, whether or not anything serves port 8810 (`StartupPolicy.swift:202-213`); no code in `mac-control` mentions 8810 or 8811.  The MCP row already does this properly with an HTTP identity probe.  The companion wrapper's own health check is `curl 127.0.0.1:8810/api/health` (`scripts/botfleet-companion-start.sh:63-66`), so the same probe in Control gives the row a real state.
+The companion row reads `running` whenever `launchctl list` shows a PID, whether or not anything serves port 8810 (`StartupPolicy.swift:202-213`); no code in `mac-control` mentions 8810 or 8811.  The MCP row already does this properly with an HTTP identity probe.  The companion wrapper's own health check is `curl 127.0.0.1:8810/api/health` (`scripts/botfleet-companion-start.sh:63-66`), but the supervisor deliberately serves nothing while the harness is down (`electron/managed-companion-supervisor.mjs:362-370`), so a port probe alone would call the idle sidecar failed and restart it.  A true health row needs the supervisor's own state, and that supervisor is retired at BF-2514, so this gap is recorded rather than patched.
 
 ### Nothing Starts After An Unattended Reboot
 
@@ -109,7 +109,7 @@ These hold under every answer above and ship in `mac-control/` with tests.
 - Durable companion stop: Stop issues `launchctl disable` before `bootout`; Start keeps `enable`, bootstrap and `kickstart`.  Covered by the existing launchctl fakes in `FleetServicesTests`.
 - Persistent owner stops: `OwnerStops` is loaded from and written to a 0600 file under the Control data directory, so a deliberate MCP or companion stop survives a Control relaunch and a login.
 - Honest too-old state: a 404 on `/api/system/control` becomes `routeMissing`, the status line reads `Server: running, but older than Control`, the error line names the remedy, and `Stop Server And Local VMs…` stays enabled through a marker-and-bootout fallback whose confirmation says the in-flight-work check is unavailable on this server.
-- Companion health: the companion row probes `127.0.0.1:8810/api/health` and reports `failed` when the job is loaded but not serving.
+- Companion health: deferred, with the reason recorded.  The companion supervisor waits for the harness before it serves port 8810 (`electron/managed-companion-supervisor.mjs:362-370`), so a loaded job with nothing on the port is the normal idle state while the harness is stopped, and a port probe would report that idle state as a failure and make the reconciler restart a service that is doing what it should.  A real health signal needs the supervisor's own state, which BF-2514 retires with the sidecar.
 - Version stamp: `electron/build-control-app.mjs` stamps the bundle through `scripts/stamp-commit-version.mjs`, so Control and the app share a number and a shallow checkout refuses to build.
 
 Not in this slice: the version handshake and `Update Control` action (Decision 2), any change to the companion wrapper or pm2 configuration on the Mac, any launchd or plist change on a live machine, and anything that depends on Decision 1.
