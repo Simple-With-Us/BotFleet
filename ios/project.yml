@@ -224,6 +224,13 @@ targets:
         # build settings.
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # Same rewrite rule for the Sentry DSN (BF-2541):  MacSentryTelemetry
+        # reads SENTRY_DSN from the Info.plist, and the key must be declared
+        # here or `xcodegen generate` drops it before the archive is built.
+        # The base setting above defaults to empty, which keeps shipped
+        # builds inert unless a build passes SENTRY_DSN=... the way the iOS
+        # ship stamps it.
+        SENTRY_DSN: $(SENTRY_DSN)
         # The same rewrite rule applies to the privacy strings: the Mac app
         # requests the microphone and speech recognition for voice capture, and
         # macOS TERMINATES an app that asks for a permission whose usage
