@@ -8,9 +8,9 @@
 // SCOPE: the deletion target is the Mac-local Node stack; BotFleet may also
 // run with the server as the primary BotFleet server (BF-2544), and
 // deploy/linux-server/ ships the SAME server/ code as that optional
-// deployment.  The deployment path is retained, but its dependency on shared
+// deployment; the deployment path is retained, but its dependency on shared
 // source has a separate preservation-evidence gate before that source can be
-// deleted.  The Linux path is named in RETAINED_OPTIONAL_SERVER_PATHS, and
+// deleted; the Linux path is named in RETAINED_OPTIONAL_SERVER_PATHS, and
 // scripts/audit-node-decommission.mjs records it as retained rather than as
 // an uncovered file.
 //
@@ -64,7 +64,7 @@ export const RETAINED_OPTIONAL_SERVER_PATHS = ["deploy/linux-server/"];
 /**
  * Surfaces that are not part of the Mac-local Node stack, or whose source is
  * deliberately retained, but still depend on parts of the stack being
- * removed.  BotFleet Control (mac-control/) is Swift, so no inventory row
+ * removed: BotFleet Control (mac-control/) is Swift, so no inventory row
  * retires it, yet every local thing it does goes through that stack: its
  * six HTTP routes live only in server/index.ts, it supervises the
  * app.botfleet.server and app.botfleet.companion LaunchAgents and pm2

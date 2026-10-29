@@ -14,11 +14,12 @@
 //   - `inventory-clean` comes from running the audit against the committed
 //     tree, so it is a measurement rather than somebody's belief about one.
 //
-// The CLI leaves everything else blocking.  The five human-only evidence
+// The CLI leaves everything else blocking; the five human-only evidence
 // items (Mac soak, replay parity, final import, Control disposition, and
-// Linux preservation) stay false: no command on this host can establish them.  `macLocalHarness.present` likewise stays true: only somebody on the Mac can
-// verify the harness is gone, and the gate treats a missing or true value as
-// unmet.  The optional server deployment is pre-filled as retained because
+// Linux preservation) stay false because no command on this host can establish
+// them; `macLocalHarness.present` likewise stays true because only somebody on
+// the Mac can verify the harness is gone, and the gate treats a missing or true
+// value as unmet; the optional server deployment is pre-filled as retained because
 // it is the one approved exclusion, not a finding.
 //
 //   node scripts/decommission-gate-state.mjs --out /tmp/phase6-state.json

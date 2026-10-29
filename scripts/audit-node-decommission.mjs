@@ -18,7 +18,7 @@
 // The optional server deployment is audited and remains retained, but it is
 // also a dependent surface: BF-2544 runs the shared server/ source and its UI
 // build, so BF-2515 needs separate preservation evidence before deleting that
-// source.  deploy/linux-server/ is inside the audited deploy/ root, retained
+// source; deploy/linux-server/ is inside the audited deploy/ root, retained
 // from inventory findings, and listed in DEPENDENT_PATHS so the dependency is
 // visible in this audit without treating the deployment files as Node ports.
 import { execFileSync } from "node:child_process";
@@ -46,10 +46,10 @@ export const RETAINED_PATHS = [
 ];
 
 /**
- * Surfaces whose operation depends on audited code targeted for removal.  Control
+ * Surfaces whose operation depends on audited code targeted for removal: Control
  * is outside the audited roots; Linux deployment files are inside deploy/ and
- * retained from inventory findings.  Listing both here makes their
- * dependencies visible without changing the inventory's file ownership.
+ * retained from inventory findings; listing both here makes their dependencies
+ * visible without changing the inventory's file ownership.
  */
 export const DEPENDENT_PATHS = [
   {
