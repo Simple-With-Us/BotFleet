@@ -74,6 +74,7 @@ public enum MacMascotExpression: String, CaseIterable, Sendable, Codable {
     case computer = "computer"
     case typing = "typing"
     case speaking = "speaking"
+    case sneaking = "sneaking"
 }
 
 // MARK: - Status Pills
@@ -151,5 +152,7 @@ public enum MacMascotPalette {
         "yellow": "#D8A729",
         "teal": "#01A492",
         "coral": "#E5634E",
+        "white": "#E8EAED",
+        "black": "#2D3036",
     ]
 }

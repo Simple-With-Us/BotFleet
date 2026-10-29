@@ -1277,8 +1277,8 @@ struct Phase1StoreImporterAndPerfTests {
         let legacyStates = try Self.legacyMascotStates(in: source)
         let legacyPalette = try Self.legacyMascotPalette(in: source)
 
-        #expect(legacyStates.count == 50)
-        #expect(legacyPalette.count == 10)
+        #expect(legacyStates.count == 51)
+        #expect(legacyPalette.count == 12)
 
         // The native contract is the legacy vocabulary, verbatim.
         #expect(Set(MacMascotExpression.allCases.map(\.rawValue)) == Set(legacyStates))
