@@ -362,8 +362,47 @@ struct MacLifecycleAndCuaSafetyTests {
         // deliberately stopped, and the unfenced route must not be tried:
         // a refusal is an answer, not a missing route.
         #expect(store.hasStoppedMarker(dataDir: tempDir) == false)
+        let requests = MacLifecycleStubURLProtocol.recordedRequests()
+        #expect(requests.map(\.path) == ["/api/system/control/stop", "/api/system/control"])
+        // The status read decorates a refusal that is already known: it
+        // carries the Origin the harness sees on every other call from this
+        // app, and it cannot hold the owner's answer for long.
+        #expect(requests.last?.headers["Origin"] == "http://127.0.0.1:8799")
+        #expect(MacLifecycleClient.blockingWorkTimeout <= 2)
+    }
+
+    @Test("A 404 that is not the harness's no-route answer is an error, never a fallback")
+    func testAnUnexplained404DoesNotFallBackToTheUnfencedStop() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MacPersistencePolicyStore(dataDir: tempDir)
+        let client = MacLifecycleClient(
+            baseURL: URL(string: "http://127.0.0.1:8799")!,
+            session: makeStubbedSession(),
+            policyStore: store
+        )
+
+        MacLifecycleStubURLProtocol.configure { request, _ in
+            switch request.url?.path ?? "" {
+            case "/api/system/control/stop":
+                return (404, Data(#"{"error":"no such bot"}"#.utf8), nil)
+            default:
+                return (200, Data(#"{"ok":true,"detail":{"markerWritten":true,"localVmStop":"not-running"}}"#.utf8), nil)
+            }
+        }
+
+        do {
+            _ = try await client.shutDownServerAndLocalVM()
+            Issue.record("Expected the 404 to be reported")
+        } catch let error as MacLifecycleError {
+            #expect(error == .httpError(statusCode: 404, message: "no such bot"))
+        }
+        // The unfenced route was never tried: it has no fence, and a 404 from
+        // a route that exists is not an older harness.
+        #expect(store.hasStoppedMarker(dataDir: tempDir) == false)
         let paths = MacLifecycleStubURLProtocol.recordedRequests().map(\.path)
-        #expect(paths == ["/api/system/control/stop", "/api/system/control"])
+        #expect(paths == ["/api/system/control/stop"])
     }
 
     @Test("An older harness without the fenced route falls back to POST /api/system/shutdown")
@@ -459,7 +498,9 @@ struct MacLifecycleAndCuaSafetyTests {
             Issue.record("Expected a refusal")
         } catch let error as MacLifecycleError {
             let text = error.errorDescription ?? ""
-            #expect(text.contains("(") == false)
+            // The server's own words carry "(s)", so the check is that the
+            // breakdown was not added in parentheses, not that there are none.
+            #expect(text.contains("(2 bot turns, 1 VM lease)") == false)
             #expect(text.components(separatedBy: "2 bot turns, 1 VM lease").count == 2)
             #expect(text.hasSuffix("the server can stop: 2 bot turns, 1 VM lease.\u{00A0} Try again when it finishes."))
         }

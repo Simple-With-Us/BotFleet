@@ -460,6 +460,9 @@ public final class MacLifecycleClient: @unchecked Sendable {
     public static let legacyShutdownPath = "/api/system/shutdown"
     /// Where the fenced route's refusal explains itself.
     public static let controlStatusPath = "/api/system/control"
+    /// How long the busy refusal waits for the work breakdown before it is
+    /// reported as the server worded it.
+    public static let blockingWorkTimeout: TimeInterval = 2
 
     /// How the server answered a stop request.
     private enum StopAnswer {
@@ -473,9 +476,10 @@ public final class MacLifecycleClient: @unchecked Sendable {
     ///
     /// The fenced route is asked first.  A 409 is a refusal, not a failure:
     /// the harness is still running, nothing is written, and the error names
-    /// the work in flight.  Only a 404, an older harness with no fenced route,
-    /// falls back to the unfenced shutdown, so the two stops the owner has,
-    /// this one and BotFleet Control's, protect active work the same way.
+    /// the work in flight.  Only the harness's own no-route 404, an older
+    /// harness with no fenced route, falls back to the unfenced shutdown, so
+    /// the two stops the owner has, this one and BotFleet Control's, protect
+    /// active work the same way.
     public func shutDownServerAndLocalVM() async throws -> MacShutdownReceipt {
         switch try await requestStop(path: Self.fencedStopPath) {
         case .accepted(let data):
@@ -522,8 +526,20 @@ public final class MacLifecycleClient: @unchecked Sendable {
         if (200..<300).contains(http.statusCode) { return .accepted(data) }
         let message = parseServerErrorMessage(from: data, statusCode: http.statusCode)
         if http.statusCode == 409 { return .busy(message) }
-        if http.statusCode == 404 { return .routeMissing }
+        if http.statusCode == 404 && Self.isUnknownRouteAnswer(message) { return .routeMissing }
         throw MacLifecycleError.httpError(statusCode: http.statusCode, message: message)
+    }
+
+    /// Whether a 404 is the harness saying it has no such route.
+    ///
+    /// The harness answers a path it has no handler for with
+    /// `{"error":"no route: POST /api/system/control/stop"}`, and that is the
+    /// only 404 that means an older server without the fenced stop.  Any other
+    /// 404 came from a route that exists, so it is an error to report, never a
+    /// reason to fall back to the unfenced shutdown: that fallback has no fence
+    /// and would stop bots mid-turn, the very thing the fenced route protects.
+    static func isUnknownRouteAnswer(_ message: String) -> Bool {
+        message.lowercased().hasPrefix("no route")
     }
 
     /// Reads the receipt and makes sure the deliberate-stop marker exists.
@@ -551,9 +567,12 @@ public final class MacLifecycleClient: @unchecked Sendable {
         guard let url = URL(string: Self.controlStatusPath, relativeTo: baseURL)?.absoluteURL else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.timeoutInterval = 10
+        // The refusal is already known; this read only decorates it, so a
+        // slow status route must not hold the owner's answer for long.
+        request.timeoutInterval = Self.blockingWorkTimeout
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(originHeaderValue(), forHTTPHeaderField: "Origin")
         guard let answer = try? await session.data(for: request),
               let http = answer.1 as? HTTPURLResponse, (200..<300).contains(http.statusCode),
               let root = (try? JSONSerialization.jsonObject(with: answer.0)) as? [String: Any],
