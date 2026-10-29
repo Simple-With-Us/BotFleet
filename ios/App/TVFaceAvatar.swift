@@ -114,6 +114,7 @@ final class TVFacePlayer: ObservableObject {
             for step in steps {
                 if Task.isCancelled { return }
                 await self.show(expression: step.expression, kind: step.kind)
+                if Task.isCancelled { return }
                 self.expressionLabel = step.expression.rawValue
                 if step.delayAfterMs > 0 {
                     try? await Task.sleep(nanoseconds: UInt64(step.delayAfterMs) * 1_000_000)
@@ -144,10 +145,19 @@ final class TVFacePlayer: ObservableObject {
         Self.sharedCache.setObject(data as NSData, forKey: url as NSURL, cost: data.count)
     }
 
+    /// Puts frame bytes on screen.  Any successful frame clears `failed`, so
+    /// one bad fetch can never pin the fallback mascot over a good image.
+    /// `rendered` advances `previous`; nil leaves it as it was.
+    private func render(_ data: Data, as rendered: TVFaceExpression?) {
+        imageData = data
+        failed = false
+        if let rendered { previous = rendered }
+    }
+
     private func show(expression: TVFaceExpression, kind: TVFaceFrameKind) async {
         let url = source.url(color: color, expression: expression, kind: kind == .still ? .still : kind)
         if let cached = cachedData(for: url) {
-            imageData = cached
+            render(cached, as: nil)
             return
         }
         // Fallback chain: requested → still of same expression → resting still.
@@ -158,11 +168,15 @@ final class TVFacePlayer: ObservableObject {
         // otherwise pin the wrong bytes process-wide).
         var primaryFailed = false
         if !recentlyMissed(url) {
-            switch await fetch(url) {
+            let result = await fetch(url)
+            // A play() that superseded this one cancelled us: its task owns
+            // the view now, so a late result (or URLSession's cancellation
+            // error) must not touch imageData, previous or failed.
+            if Task.isCancelled { return }
+            switch result {
             case .hit(let data):
                 storeCache(url: url, data: data)
-                imageData = data
-                previous = expression
+                render(data, as: expression)
                 return
             case .missing:
                 markMissed(url)
@@ -172,17 +186,17 @@ final class TVFacePlayer: ObservableObject {
         }
         let still = source.url(color: color, expression: expression, kind: .still)
         if let cached = cachedData(for: still) {
-            imageData = cached
-            previous = expression
+            render(cached, as: expression)
             return
         }
         var stillFailed = false
         if !recentlyMissed(still) {
-            switch await fetch(still) {
+            let result = await fetch(still)
+            if Task.isCancelled { return }
+            switch result {
             case .hit(let data):
                 storeCache(url: still, data: data)
-                imageData = data
-                previous = expression
+                render(data, as: expression)
                 return
             case .missing:
                 markMissed(still)
@@ -193,20 +207,23 @@ final class TVFacePlayer: ObservableObject {
         // Both fetches failing means we are offline or the CDN is down;
         // trying the resting still would just burn another timeout.
         if primaryFailed && stillFailed {
+            if Task.isCancelled { return }
             failed = true
             return
         }
         let rest = source.url(color: color, expression: .resting, kind: .still)
         if let cached = cachedData(for: rest) {
-            imageData = cached
-            previous = .resting
+            render(cached, as: .resting)
             return
         }
-        if !recentlyMissed(rest), case .hit(let data) = await fetch(rest) {
-            storeCache(url: rest, data: data)
-            imageData = data
-            previous = .resting
-            return
+        if !recentlyMissed(rest) {
+            let result = await fetch(rest)
+            if Task.isCancelled { return }
+            if case .hit(let data) = result {
+                storeCache(url: rest, data: data)
+                render(data, as: .resting)
+                return
+            }
         }
         // Every fallback exhausted: surface the failure so the view can
         // render the deterministic mascot instead of spinning forever.

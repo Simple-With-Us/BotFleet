@@ -34,10 +34,13 @@ extension BotState {
                 profile.range(of: "\\b\(NSRegularExpression.escapedPattern(for: word))\\b", options: .regularExpression) != nil
             }
         }
-        // Prefer super-specific TV-Face sheet faces when the role is clear.
+        // Same tiers, same order as ROLE_TIERS in src/lib/mascot.ts
+        // (src/lib/mascot.test.ts fails if they drift).  Whole words only,
+        // so list every form that should match.  Super-specific TV-Face
+        // sheet faces come first when the role is clear.
         if matches(["git", "github", "pull request", "pr", "commit", "merge", "deploy", "compiler", "build", "ci", "testflight"]) { return .git }
         if matches(["webhook", "hooks", "callback", "event stream"]) { return .webhook }
-        if matches(["fleet", "director", "coordinator", "orchestrat"]) { return .fleet }
+        if matches(["fleet", "director", "coordinator", "orchestrator", "orchestration", "orchestrate"]) { return .fleet }
         if matches(["sneak", "stealth", "quiet"]) { return .sneaking }
         if matches(["memory", "rag", "vector", "embedding", "recall"]) { return .memory }
         if matches(["tool", "tools", "adapter", "plumber", "connector", "skill"]) { return .tools }
