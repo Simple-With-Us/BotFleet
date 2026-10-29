@@ -25,9 +25,10 @@ import type { BotVoices } from "../shared/bot-voice.ts";
 import type { SignInRequestCardData } from "../shared/sign-in-request.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
+import { interruptedHelper, type HelperTranscript } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextInjectionRef } from "../shared/context-injection.ts";
-import { taskWorkspaceContextsMatch, type TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
+import { taskWorkspaceContextsMatch, taskWorkspaceMergeSkipReason, type TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
 import {
   applyOwnerDirective,
   classifyModel,
@@ -198,6 +199,9 @@ export interface Message {
      * interleaving parallel helpers' steps with the bot's own. */
     parentItemId?: string;
   };
+  /** The helper card for the row that started an engine-native helper
+   * (jobs P3).  Absent on an ordinary step. */
+  helper?: HelperTranscript;
   /** What the harness put in front of the model for THIS turn that the person
    * did not type — memory, selected skills, a quoted reply, a replayed
    * conversation (shared/context-injection.ts).  One short record each: a
@@ -212,6 +216,21 @@ export interface Message {
   /** screen messages: a frame of the bot's computer (base64 image) */
   png?: string;
   mime?: string;
+  /** Marks a row that belongs to a slash command rather than to the
+   * conversation.  `id` ties together the rows of one invocation: the
+   * `invocation` (what was typed), the `reply` (what BotFleet answered) and the
+   * `output` (what the engine's own command printed).  A marked row is drawn as
+   * a command chip or card, and is never replayed to a model: it is left out of
+   * the transcript a turn is built from.  Clients that predate the marker show
+   * a plain bubble. */
+  command?: {
+    id: string;
+    name: string;
+    source: "botfleet" | "engine";
+    role: "invocation" | "reply" | "output";
+    surface: "desktop" | "ios" | "imessage" | "linq";
+    ok?: boolean;
+  };
   at: number;
   /** the message this one follows; null = thread root. Edited messages
    * share a parentId with the version they replace — that's a fork. */
@@ -376,6 +395,11 @@ export interface TaskUsage {
    * written by builds before cost existed lack the field; read as null. */
   costUsd: number | null;
   turns: number;
+  /** The input tokens of the most recent settled turn that reported any, which
+   * is how full the model's context window was after it (cache reads count:
+   * they fill the window).  Unlike `input`, it is not a running total.  Absent
+   * until a turn reports input. */
+  lastInput?: number;
 }
 
 /** Running timing aggregate for one task, banked at each settled turn from
@@ -580,6 +604,7 @@ export const ACTIVITY_BUSY: ReadonlySet<BotActivity> = new Set(["working", "wait
 
 export type StoreChange =
   | { type: "message"; threadId: string; message: Message }
+  | { type: "messages"; threadId: string; messages: Message[] }
   | { type: "message.patch"; threadId: string; message: Message }
   | { type: "thread"; threadId: string; activeLeafId: string }
   | { type: "thread.deleted"; threadId: string }
@@ -661,6 +686,15 @@ export interface BotRecord {
    * which DEFAULT_TURN_LOOP_BUDGET.maxRounds is derived from.
    * Integer 1..200; invalid values are treated as absent at dispatch. */
   maxToolRounds?: number;
+  /** Cap on replayed history turns in a budgeted prompt (ACP engines):
+   * older turns are dropped and summarized even when the byte budget would
+   * fit them.  Unset keeps every turn the byte budget fits.
+   * Integer 0..MAX_HISTORY_TURNS; invalid values are treated as absent. */
+  maxHistoryTurns?: number;
+  /** When true, dropped history turns are summarized by the bot's model
+   * (cached and rolled forward), falling back to the extractive note on
+   * error.  Absent or false is the extractive default. */
+  historySummaryModel?: boolean;
   /** Speak this bot's replies aloud as they settle, without being asked.
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */
@@ -956,6 +990,18 @@ class ThreadCache {
     while (this.map.size > this.limit || this.retained > this.maxMessages) {
       const oldest = this.map.keys().next().value;
       if (oldest === undefined) break;
+      const victim = this.map.get(oldest);
+      if (victim) this.retained -= victim.messages.length;
+      this.map.delete(oldest);
+    }
+  }
+
+  recordAppend(threadId: string): void {
+    if (!this.map.has(threadId)) return;
+    this.retained += 1;
+    while (this.map.size > 1 && (this.map.size > this.limit || this.retained > this.maxMessages)) {
+      const oldest = this.map.keys().next().value;
+      if (oldest === undefined || oldest === threadId) break;
       const victim = this.map.get(oldest);
       if (victim) this.retained -= victim.messages.length;
       this.map.delete(oldest);
@@ -1573,15 +1619,17 @@ export class Store {
     const incoming = this.messagesFor(fromThreadId);
     if (incoming.length > 0) {
       const label = from.title?.trim() || "Merged thread";
-      this.appendMessage(intoThreadId, {
-        role: "user",
-        kind: "text",
-        text: `Merged “${label}” into this thread.`,
-      });
-      for (const message of incoming) {
-        const { id: _id, parentId: _parent, ...rest } = message;
-        this.appendMessage(intoThreadId, rest);
-      }
+      // The divider and the copied messages land as one write and one
+      // frame.  A conversation that holds thousands of messages would
+      // otherwise mean thousands of commits and thousands of redraws on
+      // every client watching it.
+      this.appendMessages(intoThreadId, [
+        { role: "user", kind: "text", text: `Merged “${label}” into this thread.` },
+        ...incoming.map((message) => {
+          const { id: _id, parentId: _parent, ...rest } = message;
+          return rest;
+        }),
+      ]);
     }
 
     // The source task's automation key (and any it already collected from
@@ -1620,15 +1668,17 @@ export class Store {
     const incoming = this.messagesFor(fromThreadId);
     if (incoming.length > 0) {
       const label = from.title?.trim() || "Merged thread";
-      this.appendMessage(intoThreadId, {
-        role: "user",
-        kind: "text",
-        text: `Merged “${label}” into this thread.`,
-      });
-      for (const message of incoming) {
-        const { id: _id, parentId: _parent, ...rest } = message;
-        this.appendMessage(intoThreadId, rest);
-      }
+      // The divider and the copied messages land as one write and one
+      // frame.  A conversation that holds thousands of messages would
+      // otherwise mean thousands of commits and thousands of redraws on
+      // every client watching it.
+      this.appendMessages(intoThreadId, [
+        { role: "user", kind: "text", text: `Merged “${label}” into this thread.` },
+        ...incoming.map((message) => {
+          const { id: _id, parentId: _parent, ...rest } = message;
+          return rest;
+        }),
+      ]);
     }
 
     return this.deleteGroupTask(groupId, fromThreadId);
@@ -1675,6 +1725,85 @@ export class Store {
       }
     }
     return { bots, groups, threads };
+  }
+
+  /** Fold every other conversation of ONE bot into the chosen destination.
+   *
+   * Scoped to a single bot, and unlike the workspace-wide
+   * `mergeAllExtraThreads`, a source that cannot merge does not abort the
+   * rest: a thread bound to a different App is left alone and reported, so
+   * a person sees exactly what stayed behind instead of a refusal that
+   * merged nothing.  The workspace switch has to refuse outright, because
+   * it would otherwise hide a task whose binding prevented the merge.
+   *
+   * Sources fold oldest first, so the destination's own transcript stays at
+   * the front and the merged text reads in chronological order. */
+  mergeAllBotTasks(botId: string, intoThreadId: string): {
+    bot: BotRecord | null;
+    merged: string[];
+    skipped: Array<{ threadId: string; title: string; reason: string }>;
+  } | null {
+    const bot = this.bot(botId);
+    if (!bot || !bot.tasks || bot.tasks.length < 2) return null;
+    const into = bot.tasks.find((entry) => entry.threadId === intoThreadId);
+    if (!into) return null;
+
+    const merged: string[] = [];
+    const skipped: Array<{ threadId: string; title: string; reason: string }> = [];
+    // Each source's start is read ONCE, before the sort: a comparator that
+    // reads it hydrates the whole transcript — base64 captures included —
+    // again and again, and a long conversation is the case that hurts most.
+    const sources = bot.tasks
+      .filter((task) => task.threadId !== intoThreadId)
+      .map((task) => ({ task, start: this.threadStart(task) }))
+      .sort((a, b) => a.start - b.start || a.task.createdAt - b.task.createdAt)
+      .map((entry) => entry.task);
+
+    // The bot's live conversation must not move while the fold runs:
+    // `deleteTask` hands the active thread to whatever is left first, so
+    // without this the bot would briefly point at another conversation and
+    // every frame the client receives mid-merge would name the wrong one.
+    bot.threadId = intoThreadId;
+
+    for (const source of sources) {
+      if (!taskWorkspaceContextsMatch(source.workspaceContext, into.workspaceContext)) {
+        skipped.push({
+          threadId: source.threadId,
+          title: source.title || UNTITLED_TASK,
+          reason: taskWorkspaceMergeSkipReason(source.workspaceContext, into.workspaceContext),
+        });
+        continue;
+      }
+      if (this.mergeBotTasks(botId, source.threadId, intoThreadId)) merged.push(source.threadId);
+      // The merge deletes the source, and a deletion can hand the active
+      // thread to another conversation; the destination is the one that
+      // has to stay live.
+      bot.threadId = intoThreadId;
+    }
+
+    // Deleting a task can move the bot's active thread, so the destination
+    // is set explicitly: the merged conversation is the one to read next.
+    const fresh = this.bot(botId);
+    if (fresh && fresh.tasks?.some((task) => task.threadId === intoThreadId)) {
+      const destination = fresh.tasks.find((task) => task.threadId === intoThreadId)!;
+      fresh.threadId = intoThreadId;
+      fresh.resumeCursors = { ...destination.resumeCursors };
+      this.saveBots();
+      this.emit({ type: "bot", botId: fresh.id });
+    }
+    return { bot: fresh ?? null, merged, skipped };
+  }
+
+  /** When a conversation started, for ordering a merge.  The first message is
+   * the honest start; the task's own creation time stands in for a thread
+   * that has not spoken yet, and breaks a tie between two that did.
+   *
+   * The timestamp is read at the SQL boundary, not through the transcript:
+   * a long conversation would otherwise be pulled into memory — with every
+   * base64 capture in it — just to learn when it began. */
+  private threadStart(task: TaskRecord): number {
+    const first = mdb.firstMessageAt(task.threadId, messagesFile(task.threadId));
+    return first ?? task.createdAt;
   }
 
   /** Move one of a bot's conversations into a channel, where the channel's
@@ -1897,6 +2026,7 @@ export class Store {
     const full: Message = { id: newId(), at: Date.now(), parentId: t.activeLeafId, ...redactBotAuthored(message) };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);
+    this.threads.recordAppend(threadId);
     t.activeLeafId = full.id;
     if (full.kind === "screen") {
       for (const pruned of this.pruneScreenFrames(t)) {
@@ -1918,6 +2048,57 @@ export class Store {
     // bubble for them) — a thread that opens with one of those should not
     // leave the onboarding card stuck forever either.
     if ((full.role === "user" || full.role === "system") && full.kind === "text") this.dismissOnboardingCard(threadId);
+    return full;
+  }
+
+  /** Append a WHOLE transcript to a thread in one write and one frame.
+   *
+   * Folding a long conversation into another copies every message it holds.
+   * One transaction per message meant thousands of commits, and one frame
+   * per message meant a client redrawing the conversation thousands of
+   * times; both are the wrong shape for a bulk copy.  The rows land
+   * together, the branch head moves to the last one, and the client gets
+   * the batch in a single piece. */
+  appendMessages(
+    threadId: string,
+    messages: Array<Omit<Message, "id" | "at" | "parentId"> & { id?: string; at?: number; parentId?: string }>,
+  ): Message[] {
+    const t = this.thread(threadId);
+    const full: Message[] = [];
+    let parentId = t.activeLeafId;
+    for (const message of messages) {
+      const { id, at, parentId: wanted, ...rest } = message;
+      const entry: Message = {
+        id: id ?? newId(),
+        at: at ?? Date.now(),
+        parentId: wanted ?? parentId,
+        ...redactBotAuthored(rest),
+      };
+      parentId = entry.id;
+      full.push(entry);
+    }
+    if (full.length === 0) return full;
+    mdb.appendMessages(threadId, full);
+    t.messages.push(...full);
+    this.threads.recordAppend(threadId);
+    t.activeLeafId = full[full.length - 1]!.id;
+    // The first-run quiz is not a live ask, and talking past it hides it.
+    // A bulk copy carries the same user or system text a single message
+    // would, so it talks past it too — otherwise a merged conversation that
+    // starts with the greeting leaves the quiz on screen forever.
+    if (full.some((message) => (message.role === "user" || message.role === "system") && message.kind === "text")) {
+      this.dismissOnboardingCard(threadId);
+    }
+    if (full.some((message) => message.kind === "screen")) {
+      for (const pruned of this.pruneScreenFrames(t)) {
+        mdb.updateMessage(threadId, pruned);
+        this.emit({ type: "message.patch", threadId, message: pruned });
+      }
+    }
+    this.emit({ type: "messages", threadId, messages: full });
+    // A bulk copy is activity on the thread, same as a message that arrived
+    // on its own, so an until-activity snooze waits on it too.
+    if (this.threadsAwaitingActivity.has(threadId)) this.wakeThreadOnActivity(threadId);
     return full;
   }
 
@@ -1981,6 +2162,7 @@ export class Store {
     };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);
+    this.threads.recordAppend(threadId);
     t.activeLeafId = full.id;
     this.emit({ type: "message", threadId, message: full });
     return full;
@@ -2001,6 +2183,20 @@ export class Store {
     mdb.setActiveLeaf(threadId, cur);
     this.emit({ type: "thread", threadId, activeLeafId: cur });
     return cur;
+  }
+
+  /** A restart drops the in-memory helper tracker.  Any card still marked
+   * running is settled failed, so the header stops counting it and the
+   * duration stops ticking. */
+  settleInterruptedHelpers(now = Date.now()): number {
+    let settled = 0;
+    for (const row of mdb.runningHelperRows()) {
+      if (!row.message.helper) continue;
+      const helper = interruptedHelper(row.message.helper, now);
+      if (!helper) continue;
+      if (this.patchMessage(row.threadId, row.message.id, { helper })) settled += 1;
+    }
+    return settled;
   }
 
   patchMessage(threadId: string, messageId: string, patch: Partial<Message>): Message | null {
@@ -2268,7 +2464,12 @@ export class Store {
   ): TaskUsage | null {
     const task = this.taskByThread(botId, threadId);
     if (!task) return null;
+    const previousLastInput = task.usage?.lastInput;
     task.usage = mergeTaskUsage(task.usage, turn);
+    // Context fullness is the LAST turn's input, not a running sum.  A turn
+    // that reports no input says nothing about it, so the earlier figure stands.
+    if (turn.input !== undefined && Number.isFinite(turn.input) && turn.input >= 0) task.usage.lastInput = Math.trunc(turn.input);
+    else if (previousLastInput !== undefined) task.usage.lastInput = previousLastInput;
     if (turn.stats) task.stats = mergeTaskStats(task.stats, turn.stats);
     if (instanceId) {
       const byInstance = (task.usageByInstance ??= {});

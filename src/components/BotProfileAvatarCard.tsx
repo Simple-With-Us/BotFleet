@@ -18,6 +18,8 @@ import {
   botAvatarUrlFromStoredPath,
   type BotAvatarCrop,
 } from "../../shared/bot-avatar";
+import { extractAvatarManifest } from "../../shared/avatar-manifest";
+import { toManifestBytes } from "./avatar-file/bytes";
 import { BotAvatar, BotMascot } from "./Avatar";
 import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
 
@@ -28,6 +30,7 @@ type AvatarPatch = Partial<
 const CROP_LABEL = {
   mascot: "Mascot",
   tvface: "TV-Face",
+  animated: "Animated",
   circle: "Circle",
   rounded: "Rounded",
   square: "Square",
@@ -58,17 +61,30 @@ export function BotProfileAvatarCard({
     setError(null);
     try {
       const mime = guessImageMime(file);
+      // The bytes are read here, before the upload, because a one-file
+      // animated avatar carries its manifest inside the file and only this
+      // side of the wire can see them.  The file that goes up is the file
+      // that came out of the picker, so the two always agree.
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const carriesManifest = extractAvatarManifest(toManifestBytes(bytes)) !== null;
       const saved = await imageAttachmentFromFile({
         name: file.name,
         size: file.size,
         type: mime ?? file.type,
-        arrayBuffer: () => file.arrayBuffer(),
+        arrayBuffer: async () => bytes.slice().buffer,
       });
       if (!saved) throw new Error("Drop a PNG, JPEG, GIF, WebP, HEIC, BMP, or SVG image");
       const avatarUrl = botAvatarUrlFromStoredPath(saved.path);
       if (!avatarUrl) throw new Error("The uploaded image could not be used as an avatar");
       const latestCrop = cropRef.current;
-      onPatch({ avatarUrl, avatarCrop: avatarCropAfterUpload(latestCrop) });
+      // A file that carries a manifest IS an animated avatar, so the crop
+      // follows the file.  Anything else keeps the crop an upload would
+      // have had, which is what stops a plain picture from being left in a
+      // crop that cannot draw it.
+      onPatch({
+        avatarUrl,
+        avatarCrop: carriesManifest ? "animated" : avatarCropAfterUpload(latestCrop),
+      });
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
     } finally {
@@ -169,11 +185,12 @@ export function BotProfileAvatarCard({
           )}
         </div>
         <div className="mt-1.5 text-[11.5px] text-ink-secondary">Drop an image onto the avatar.  PNG, JPEG, GIF, WebP, HEIC, BMP, or SVG · up to 10 MB</div>
+        <div className="mt-1 text-[11.5px] text-ink-secondary">An animated WebP that carries its own manifest plays as one avatar file.</div>
 
         <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
           Shape
         </div>
-        <div className="grid grid-cols-5 overflow-hidden rounded-lg border border-hairline/40">
+        <div className="grid grid-cols-6 overflow-hidden rounded-lg border border-hairline/40">
           {BOT_AVATAR_CROPS.map((candidate, index) => (
             <button
               key={candidate}

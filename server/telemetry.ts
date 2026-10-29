@@ -4,6 +4,13 @@ import { basename, join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 import type { TurnBillingMode } from "./contracts.ts";
+import {
+  aiTokensFromTurn,
+  aiUsageTotalTokens,
+  cleanAiUsage,
+  tokenCount,
+  type AiUsageBlock,
+} from "./ai-usage.ts";
 import { FailureLogDedup } from "./log-dedup.ts";
 import { getSentry, isSentryActive } from "./sentry.ts";
 import {
@@ -22,9 +29,30 @@ export interface TelemetryTurnParams {
   cwd?: string | null;
   instanceId: string;
   modelId?: string;
+  /** The whole context the turn sent: cache reads and cache writes are
+   * INCLUDED (the driver contract, server/contracts.ts).  Telemetry splits
+   * them back out. */
   inputTokens?: number;
   outputTokens?: number;
+  /** The cache-read share of `inputTokens`. */
   cachedInputTokens?: number;
+  /** The cache-write shares of `inputTokens`, by TTL.  A driver that cannot
+   * tell the TTL reports its one figure as 5 minutes, as the shared usage
+   * schema does. */
+  cacheWrite5mTokens?: number;
+  cacheWrite1hTokens?: number;
+  /** The reasoning share of `outputTokens`, for engines that report it. */
+  reasoningTokens?: number;
+  /** The model the provider says answered, when it says (`modelId` is the one
+   * that was asked for). */
+  servedModelId?: string;
+  /** Turn start to the first streamed token, when anything streamed. */
+  ttftMs?: number;
+  /** The fleet seat the bot ran as, when the install assigns seats. */
+  seat?: string;
+  /** Why the turn ended (`end_turn`, `interrupted`, a terminal reason).  Only
+   * read for a turn that reported no usage, to say why it did not. */
+  stopReason?: string | null;
   costUsd?: number | null;
   /** Classifies costUsd as cash spend or a provider-reported equivalent. */
   billingMode?: TurnBillingMode;
@@ -111,12 +139,16 @@ export interface TelemetryV2Event {
   billingMode: "actual" | "estimated";
   metricType: "usage";
   quantity: number;
-  unit: "token";
+  unit: "request" | "token";
   requests: number;
   costUsd?: number;
   confidence: "actual" | "estimated";
   occurredAt: string;
   metadata: TelemetryMetadata;
+  /** The canonical AI usage block (UM-1592).  Strict on the receiving side:
+   * built only by `cleanAiUsage` so it never carries a key or value the
+   * schema would refuse. */
+  ai?: AiUsageBlock;
   // Durable outbox events are an open bag; this keeps v2 events assignable.
   [key: string]: unknown;
 }
@@ -300,31 +332,48 @@ function clip(value: string, max: number): string {
   return value.length > max ? value.slice(0, max) : value;
 }
 
-/** Which slice of a turn's tokens an event is reporting.  Usage Monitor's
- * cost derivation reads exactly these strings out of `metadata.tokenType`;
- * `unknown` is the honest answer for a turn that reported no usage at all. */
-type TokenType = "input" | "cacheRead" | "output" | "unknown";
+/** Which slice of a turn's tokens a LEGACY event reports.  Only the
+ * unreported-turn event still carries one (`unknown`, which Usage Monitor's
+ * legacy mapping treats as inert): a turn that reported usage is one event
+ * with the `ai` block, not a slice per token type. */
+type TokenType = "unknown";
 
-/** Exactly the metadata one turn stamps on every event it emits.  Named
- * rather than the open `TelemetryMetadata` bag so the keys are a contract:
- * the nine that have always ridden along, the four this split adds, the two
- * room fields a room turn adds on top, and the two prompt-byte figures a
- * split system prompt adds (flat numbers, because the v2 bag accepts only
- * primitives). */
+/** Why a turn that reported no usage reported none.  Read it against
+ * `stopReason`: a failed turn (a rate limit, a cancel, a spawn error) ends
+ * before any usage frame, and an engine that streams only a context
+ * occupancy figure (DSH's ACP server) can end a good turn without one. */
+type UsageGap = "failed" | "unreported";
+
+/** Exactly the metadata one turn stamps on its event.  Named rather than the
+ * open `TelemetryMetadata` bag so the keys are a contract: the nine that have
+ * always ridden along, the room fields a room turn adds, the two prompt-byte
+ * figures a split system prompt adds (flat numbers, because the v2 bag
+ * accepts only primitives), and the ones BF-2435 adds.  The canonical figures
+ * live in the `ai` block;  the legacy keys stay so a reader that predates
+ * the block still sees the turn. */
 type TurnMetadata = {
   botName: string;
   botId: string;
   threadId: string;
+  /** The whole context sent, cache reads and writes included. */
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
+  cacheWriteTokens?: number;
+  cacheWriteOneHourTokens?: number;
+  reasoningTokens?: number;
   cwd: string | null;
   latencyMs?: number;
+  ttftMs?: number;
   success: boolean;
-  tokenType: TokenType;
+  tokenType?: TokenType;
   model: string | null;
+  servedModel?: string;
+  seat?: string;
   instanceId: string;
   usageReported: boolean;
+  usageGap?: UsageGap;
+  stopReason?: string;
   estimatedCostUsd?: number;
   roomId?: string;
   roomName?: string;
@@ -334,28 +383,30 @@ type TurnMetadata = {
 
 /** Turn one completed turn into the events that go on the wire.
  *
- * Three rules earn their keep here.
+ * One event per turn, carrying the canonical `ai` block (UM-1592, BF-2435).
+ * It replaces the three `tokenType` slice events this used to emit, which
+ * each repeated the turn's totals in metadata and which had no place for a
+ * cache write.  Usage Monitor sums `ai.tokens` across events, so a turn is
+ * reported ONCE.
  *
- * No cache double count.  A driver's `input` figure already includes the
- * cached tokens (`drivers/claude.ts` sums `input_tokens`,
- * `cache_read_input_tokens`, and `cache_creation_input_tokens` into one
- * number), so splitting naively would bill the cache twice.  The `input`
- * event carries `inputTokens - cachedInputTokens`, the `cacheRead` event
- * carries the cache, and the quantities still sum to what a single event
- * reported before this split existed.
+ * No cache double count.  A driver's `input` figure is the whole context,
+ * cache reads and cache writes included (`drivers/claude.ts` sums
+ * `input_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`
+ * into one number, and names the cached shares beside it).  The `ai` block
+ * wants UNCACHED input, so the cache shares are subtracted back out and
+ * reported in their own buckets, each priced at its own rate: reads at the
+ * read rate, 5 minute and 1 hour writes at the write rates.  The event
+ * `quantity` is the sum of the buckets, which is what the slices summed to.
  *
- * Actual money lands once.  The turn's `costUsd` and its `requests: 1` go
- * on the first event; the remaining slices carry `costUsd: 0`, not no cost.
- * Usage Monitor sums producer `costUsd` into the pool that drives budget
- * spend, so repeating the figure across the split would treble reported
- * spend — but it also counts pricing coverage by how many events have a
- * `costUsd` at all, so omitting the key would report a priced turn as
- * partly unpriced.  An explicit zero satisfies both.  Subscription-equivalent
- * estimates instead ride metadata and never enter that actual-spend pool.
+ * Actual money lands once, on the event: `costUsd` is the turn's cash
+ * charge.  A subscription-equivalent estimate rides metadata
+ * (`estimatedCostUsd`) and never enters Usage Monitor's actual-spend pool;
+ * `ai.billingMode` and `ai.costSource` say which kind of figure it is.
  *
  * An unreported turn says so.  A turn with no token figures at all emits one
- * `quantity: 0` event flagged `usageReported: false`, rather than a phantom
- * one-token row that reads as real usage. */
+ * `quantity: 0` event flagged `usageReported: false` and no `ai` block (an
+ * `ai` block on it would put a tokenless row in the per-request view), with
+ * `usageGap` and `stopReason` saying why there is nothing to count. */
 export function buildTurnEvents(
   params: TelemetryTurnParams,
   opts: { projects?: UsageProjectRule[]; now?: number } = {},
@@ -365,19 +416,23 @@ export function buildTurnEvents(
   const service = clip(inferred.service, 120);
   const project = clip(inferProject(params.cwd, params.botName, params.taskTitle, opts.projects), 120);
 
-  const inTokens = Math.max(0, Math.round(params.inputTokens || 0));
-  const outTokens = Math.max(0, Math.round(params.outputTokens || 0));
-  const cachedTokens = Math.max(0, Math.round(params.cachedInputTokens || 0));
-  const inputBillable = Math.max(0, inTokens - cachedTokens);
+  const inTokens = tokenCount(params.inputTokens);
+  const outTokens = tokenCount(params.outputTokens);
+  const cachedTokens = tokenCount(params.cachedInputTokens);
+  const cacheWrite5m = tokenCount(params.cacheWrite5mTokens);
+  const cacheWrite1h = tokenCount(params.cacheWrite1hTokens);
+  const reasoningTokens = Math.min(tokenCount(params.reasoningTokens), outTokens);
 
   const now = opts.now ?? Date.now();
   const occurredAt = new Date(now).toISOString();
-  // `:cache` is the longest suffix, so reserving six characters keeps every
-  // id under the schema's 200-character cap.
-  const prefix = clip(`bf:${provider}:${params.botId}:${now}:${randomUUID().slice(0, 8)}`, 194);
+  // `:none` and `:turn` are the longest suffixes, so reserving five characters
+  // keeps every id under the schema's 200-character cap.
+  const prefix = clip(`bf:${provider}:${params.botId}:${now}:${randomUUID().slice(0, 8)}`, 195);
   const label = clip(params.taskTitle || params.botName || "turn", 160);
   const environment = process.env.NODE_ENV === "production" ? "production" : "operator";
   const keyRef = clip((params.modelId || "").trim(), 160);
+  const servedModel = clip((params.servedModelId || "").trim(), 160);
+  const seat = clip((params.seat || "").trim(), 80);
   const roomId = (params.roomId || "").trim();
   const roomName = (params.roomName || "").trim();
 
@@ -395,77 +450,194 @@ export function buildTurnEvents(
     ? { stable: Math.max(0, Math.round(params.promptBytes.stable)), volatile: Math.max(0, Math.round(params.promptBytes.volatile)) }
     : null;
 
-  const allSlices: Array<{ suffix: string; tokenType: TokenType; quantity: number }> = [
-    { suffix: "in", tokenType: "input", quantity: inputBillable },
-    { suffix: "cache", tokenType: "cacheRead", quantity: cachedTokens },
-    { suffix: "out", tokenType: "output", quantity: outTokens },
-  ];
-  const slices = allSlices.filter((slice) => slice.quantity > 0);
-
-  const usageReported = slices.length > 0;
-  const emitted: Array<{ suffix: string; tokenType: TokenType; quantity: number }> = usageReported
-    ? slices
-    : [{ suffix: "none", tokenType: "unknown", quantity: 0 }];
-
-  return emitted.map((slice, index) => {
-    // The producer priced this turn, so every event of it is priced: the
-    // money rides the first one and the rest carry an explicit zero.  Usage
-    // Monitor counts pricing coverage by non-null `costUsd` (`_count.costUsd`
-    // against `_count._all`), so leaving the other slices with the key absent
-    // would report every priced turn as "partial" coverage — a pricing gap
-    // that does not exist — and invite the monitor's own cost derivation to
-    // estimate a figure for two thirds of a turn whose real cost it already
-    // has.  Adding zeros changes no sum.
-    const priced = cost != null;
-
-    const metadata: TurnMetadata = {
-      botName: params.botName,
-      botId: params.botId,
-      threadId: params.threadId,
-      inputTokens: inTokens,
-      outputTokens: outTokens,
-      cachedInputTokens: cachedTokens,
-      cwd: params.cwd || null,
-      success: params.success !== false,
-      tokenType: slice.tokenType,
-      model: keyRef || null,
-      instanceId: params.instanceId,
-      usageReported,
-    };
-    if (params.latencyMs !== undefined && Number.isFinite(params.latencyMs) && params.latencyMs >= 0) {
-      metadata.latencyMs = params.latencyMs;
-    }
-    if (roomId) {
-      metadata.roomId = roomId;
-      if (roomName) metadata.roomName = roomName;
-    }
-    if (estimatedCost != null) metadata.estimatedCostUsd = index === 0 ? estimatedCost : 0;
-    if (promptBytes) {
-      metadata.promptStableBytes = promptBytes.stable;
-      metadata.promptVolatileBytes = promptBytes.volatile;
-    }
-
-    const event: TelemetryV2Event = {
-      eventId: `${prefix}:${slice.suffix}`,
-      environment,
-      provider,
-      service,
-      project,
-      label,
-      billingMode: priced ? "actual" : "estimated",
-      metricType: "usage",
-      quantity: slice.quantity,
-      unit: "token",
-      // The turn is one request no matter how many slices report it.
-      requests: index === 0 ? 1 : 0,
-      confidence: priced ? "actual" : "estimated",
-      occurredAt,
-      metadata,
-    };
-    if (keyRef) event.producerKeyRef = keyRef;
-    if (cost != null) event.costUsd = index === 0 ? cost : 0;
-    return event;
+  const tokens = aiTokensFromTurn({
+    input: inTokens,
+    output: outTokens,
+    cachedInput: cachedTokens,
+    cacheWrite5m,
+    cacheWrite1h,
+    reasoning: reasoningTokens,
   });
+  const total = aiUsageTotalTokens(tokens);
+  const usageReported = total > 0;
+  const success = params.success !== false;
+
+  const metadata: TurnMetadata = {
+    botName: params.botName,
+    botId: params.botId,
+    threadId: params.threadId,
+    inputTokens: inTokens,
+    outputTokens: outTokens,
+    cachedInputTokens: cachedTokens,
+    cwd: params.cwd || null,
+    success,
+    model: keyRef || null,
+    instanceId: params.instanceId,
+    usageReported,
+  };
+  if (cacheWrite5m > 0) metadata.cacheWriteTokens = cacheWrite5m;
+  if (cacheWrite1h > 0) metadata.cacheWriteOneHourTokens = cacheWrite1h;
+  if (reasoningTokens > 0) metadata.reasoningTokens = reasoningTokens;
+  if (params.latencyMs !== undefined && Number.isFinite(params.latencyMs) && params.latencyMs >= 0) {
+    metadata.latencyMs = params.latencyMs;
+  }
+  if (params.ttftMs !== undefined && Number.isFinite(params.ttftMs) && params.ttftMs >= 0) {
+    metadata.ttftMs = params.ttftMs;
+  }
+  if (servedModel) metadata.servedModel = servedModel;
+  if (seat) metadata.seat = seat;
+  if (roomId) {
+    metadata.roomId = roomId;
+    if (roomName) metadata.roomName = roomName;
+  }
+  if (estimatedCost != null) metadata.estimatedCostUsd = estimatedCost;
+  if (promptBytes) {
+    metadata.promptStableBytes = promptBytes.stable;
+    metadata.promptVolatileBytes = promptBytes.volatile;
+  }
+  if (!usageReported) {
+    metadata.tokenType = "unknown";
+    metadata.usageGap = success ? "unreported" : "failed";
+    const stopReason = (params.stopReason ?? "").trim();
+    if (stopReason) metadata.stopReason = clip(stopReason, 80);
+  }
+
+  const priced = cost != null;
+  const event: TelemetryV2Event = {
+    eventId: `${prefix}:${usageReported ? "turn" : "none"}`,
+    environment,
+    provider,
+    service,
+    project,
+    label,
+    billingMode: priced ? "actual" : "estimated",
+    metricType: "usage",
+    quantity: total,
+    unit: "token",
+    // The turn is one request.
+    requests: 1,
+    confidence: priced ? "actual" : "estimated",
+    occurredAt,
+    metadata,
+  };
+  if (keyRef) event.producerKeyRef = keyRef;
+  if (cost != null) event.costUsd = cost;
+  if (usageReported) {
+    const ai = cleanAiUsage({
+      model: { requested: keyRef, served: servedModel },
+      harness: "botfleet",
+      seat,
+      tokens,
+      durationMs: params.latencyMs,
+      ttftMs: params.ttftMs,
+      // The engine bills a subscription seat (`estimated`: the equivalent API
+      // price) or pay-as-you-go (`actual`).  An engine that priced nothing
+      // says nothing rather than guessing a mode.
+      billingMode: params.billingMode === "estimated" ? "subscription" : params.billingMode === "actual" ? "payg" : undefined,
+      costSource:
+        params.billingMode === "estimated" ? "estimated" : params.billingMode === "actual" && cost != null ? "billed" : undefined,
+    });
+    if (ai) event.ai = ai;
+  }
+  return [event];
+}
+
+/** Spend that is not a chat turn: a synthesized clip, a generated avatar, a
+ * speech summary, a voice-call token.  Nothing here carries prompt text, a
+ * key, or a task title. */
+export interface TelemetryAuxParams {
+  kind: "tts" | "avatar-image" | "speech-summary" | "sts-session";
+  /** Usage Monitor's provider name for who was paid. */
+  provider: string;
+  /** The model, voice engine or surface inside that provider. */
+  service: string;
+  label: string;
+  /** `token` when the provider reported tokens (then `ai.tokens` is the
+   * measure), else `request`: a count of calls, with the real measure
+   * (characters, images) in `metadata`. */
+  unit?: "request" | "token";
+  /** How many units; defaults to 1 request. */
+  quantity?: number;
+  costUsd?: number | null;
+  /** Whether `costUsd` is a charge or an estimate.  Absent means unpriced. */
+  billingMode?: "actual" | "estimated";
+  latencyMs?: number;
+  success?: boolean;
+  ai?: AiUsageBlock;
+  /** Flat primitives only; the outbox keeps just the keys it allowlists. */
+  metadata?: TelemetryMetadata;
+}
+
+/** One v2 event for non-turn spend.  The same envelope as a turn event, so
+ * Usage Monitor attributes it to the same producer and the same idempotency
+ * rules apply. */
+export function buildAuxEvent(params: TelemetryAuxParams, opts: { now?: number } = {}): TelemetryV2Event {
+  const now = opts.now ?? Date.now();
+  const provider = clip(params.provider.trim() || "custom", 80);
+  const service = clip(params.service.trim() || "unknown", 120);
+  const ai = params.ai ? cleanAiUsage({ harness: "botfleet", ...params.ai }) : undefined;
+  const unit = params.unit ?? "request";
+  const quantity = unit === "token" ? aiUsageTotalTokens(ai?.tokens) : Math.max(0, Math.round(params.quantity ?? 1));
+  const cost =
+    params.costUsd != null && Number.isFinite(params.costUsd) && params.costUsd >= 0 ? params.costUsd : null;
+  const priced = cost != null && params.billingMode !== undefined;
+  const metadata: TelemetryMetadata = {
+    kind: params.kind,
+    success: params.success !== false,
+    ...params.metadata,
+  };
+  if (params.latencyMs !== undefined && Number.isFinite(params.latencyMs) && params.latencyMs >= 0) {
+    metadata.latencyMs = params.latencyMs;
+  }
+  const event: TelemetryV2Event = {
+    eventId: clip(`bf:${provider}:${params.kind}:${now}:${randomUUID().slice(0, 8)}`, 200),
+    environment: process.env.NODE_ENV === "production" ? "production" : "operator",
+    provider,
+    service,
+    project: "general",
+    label: clip(params.label, 160),
+    producerKeyRef: service,
+    billingMode: priced && params.billingMode === "actual" ? "actual" : "estimated",
+    metricType: "usage",
+    quantity,
+    unit,
+    requests: 1,
+    confidence: priced && params.billingMode === "actual" ? "actual" : "estimated",
+    occurredAt: new Date(now).toISOString(),
+    metadata,
+  };
+  if (cost != null && params.billingMode === "actual") event.costUsd = cost;
+  if (cost != null && params.billingMode === "estimated") event.metadata.estimatedCostUsd = cost;
+  if (ai) event.ai = ai;
+  return event;
+}
+
+/** The BF-2435 details of a settled turn, read off its `turn.completed`: the
+ * cache writes by TTL, the reasoning share, the served model, time to first
+ * token, the seat, and why it ended.  Spread into `trackTurn` so the 1:1 and
+ * room sites cannot report different things.  Each key is present only when
+ * the turn actually said it, never a fabricated zero. */
+export function turnUsageDetail(
+  event: {
+    usage?: { cacheWrite5m?: number; cacheWrite1h?: number; reasoning?: number };
+    servedModel?: string;
+    stopReason?: string | null;
+  },
+  timing: { ttftMs?: number } | undefined,
+  seat: string | null | undefined,
+): Pick<
+  TelemetryTurnParams,
+  "cacheWrite5mTokens" | "cacheWrite1hTokens" | "reasoningTokens" | "servedModelId" | "ttftMs" | "seat" | "stopReason"
+> {
+  const detail: ReturnType<typeof turnUsageDetail> = {};
+  if (event.usage?.cacheWrite5m !== undefined) detail.cacheWrite5mTokens = event.usage.cacheWrite5m;
+  if (event.usage?.cacheWrite1h !== undefined) detail.cacheWrite1hTokens = event.usage.cacheWrite1h;
+  if (event.usage?.reasoning !== undefined) detail.reasoningTokens = event.usage.reasoning;
+  if (event.servedModel) detail.servedModelId = event.servedModel;
+  if (timing?.ttftMs !== undefined) detail.ttftMs = timing.ttftMs;
+  if (seat) detail.seat = seat;
+  if (event.stopReason !== undefined) detail.stopReason = event.stopReason;
+  return detail;
 }
 
 export class UsageTelemetryManager {
@@ -666,8 +838,23 @@ export class UsageTelemetryManager {
   trackTurn(params: TelemetryTurnParams): void {
     const config = this.getIngestConfig();
     if (!config) return;
+    this.enqueueEvents(config, buildTurnEvents(params, { projects: this.settings().projects }));
+  }
 
-    const events = buildTurnEvents(params, { projects: this.settings().projects });
+  /** Report spend that is not a chat turn.  Best effort and silent when no
+   * Usage Monitor is configured, like `trackTurn`: accounting must never
+   * make a clip, an avatar or a call fail. */
+  trackAux(params: TelemetryAuxParams): void {
+    const config = this.getIngestConfig();
+    if (!config) return;
+    try {
+      this.enqueueEvents(config, [buildAuxEvent(params)]);
+    } catch (error) {
+      this.failureLog.report("aux-build", `could not build a ${params.kind} event: ${error instanceof Error ? error.name : "error"}`);
+    }
+  }
+
+  private enqueueEvents(config: { baseUrl: string; token: string }, events: TelemetryV2Event[]): void {
     if (events.length === 0) return;
 
     const batch: TelemetryV2Batch = {

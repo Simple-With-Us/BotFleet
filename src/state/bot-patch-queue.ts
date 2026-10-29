@@ -26,6 +26,8 @@ export type BotUpdatePatch = Partial<
     | "speakReplies"
     | "speechDevices"
     | "maxToolRounds"
+    | "maxHistoryTurns"
+    | "historySummaryModel"
     | "voice"
     | "voiceSummaryMode"
     | "pinned"

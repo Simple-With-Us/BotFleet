@@ -1592,9 +1592,10 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           phoneMcp: true,
           qdrantMcp: true,
           // Jobs matrix: BotFleet jobs are gated until their fixtures pass
-          // (P2b); `invoke_subagent` rows come with named helpers in P3.
+          // (P2b).  `invoke_subagent` is the tool name on the row, and the
+          // chat draws that row as a named helper card (jobs P3).
           backgroundJobs: "none",
-          helpers: "none",
+          helpers: "named",
           // Print mode has no permission hook (see the header), but every
           // step streams as a tool_use event, so review can watch it.
           reviewHook: "after",

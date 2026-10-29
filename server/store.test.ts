@@ -144,6 +144,7 @@ describe("Store", () => {
       output: 300,
       cachedInput: 1000,
       costUsd: null,
+      lastInput: 1200,
       turns: 1,
     });
     // a driver that never reports the cached share leaves it unchanged
@@ -162,6 +163,7 @@ describe("Store", () => {
       output: 400,
       cachedInput: 1010,
       costUsd: null,
+      lastInput: 10,
       turns: 4,
     });
   });
@@ -1019,15 +1021,23 @@ describe("Store task usage", () => {
       input: 100,
       output: 20,
       costUsd: 0.01,
+      lastInput: 100,
       turns: 1,
     });
     expect(store.addTaskUsage(bot.id, bot.threadId, { input: 50, output: 5, costUsd: 0.005 })).toEqual({
       input: 150,
       output: 25,
       costUsd: 0.015,
+      lastInput: 50,
       turns: 2,
     });
-    expect(store.taskByThread(bot.id, bot.threadId)?.usage).toEqual({ input: 150, output: 25, costUsd: 0.015, turns: 2 });
+    expect(store.taskByThread(bot.id, bot.threadId)?.usage).toEqual({
+      input: 150,
+      output: 25,
+      costUsd: 0.015,
+      lastInput: 50,
+      turns: 2,
+    });
   });
 
   it("keeps cost null until some turn reports one, then sums only reported costs", () => {
@@ -1048,7 +1058,7 @@ describe("Store task usage", () => {
       output: 2,
       costUsd: 0.03,
       billingMode: "estimated",
-    })).toEqual({ input: 30, output: 3, costUsd: 0.02, turns: 2 });
+    })).toEqual({ input: 30, output: 3, costUsd: 0.02, lastInput: 20, turns: 2 });
   });
 
   it("counts a turn that reported no tokens at all", () => {
@@ -1445,6 +1455,27 @@ describe("Store thread cache", () => {
     // durable across a full restart, not just this process's cache
     const reloaded = new Store(selection);
     expect(reloaded.messagesFor(target.threadId).map((m) => m.text)).toEqual(["before eviction", "after eviction"]);
+  });
+
+  it("appendMessage on a warm thread updates retained message count and evicts older cached threads", () => {
+    const store = new Store(selection, { threadCacheLimit: 8, threadCacheMaxMessages: 4 });
+    const older = store.createBot({ name: "Older" }, { seedMessages: false });
+    const active = store.createBot({ name: "Active" }, { seedMessages: false });
+
+    store.appendMessage(older.threadId, { role: "user", kind: "text", text: "o1" });
+    store.appendMessage(older.threadId, { role: "bot", kind: "text", text: "o2" });
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(true);
+
+    store.appendMessage(active.threadId, { role: "user", kind: "text", text: "a1" });
+    store.appendMessage(active.threadId, { role: "bot", kind: "text", text: "a2" });
+    // 2 + 2 = 4 retained (at the bound of 4)
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(true);
+    expect(store.threadIsCachedForTests(active.threadId)).toBe(true);
+
+    // 5th retained message across the cache via in-place appendMessage evicts older
+    store.appendMessage(active.threadId, { role: "user", kind: "text", text: "a3" });
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(false);
+    expect(store.threadIsCachedForTests(active.threadId)).toBe(true);
   });
 });
 

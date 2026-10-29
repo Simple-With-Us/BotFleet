@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ensureDirs } from "../config.ts";
-import type { ProviderInstance } from "../contracts.ts";
+import type { ProviderInstance, RuntimeEvent } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import {
@@ -23,6 +23,7 @@ import {
   CLAUDE_CONTAINMENT_SETTINGS,
   ClaudeDriver,
   claudeDisallowedTools,
+  helperUsageDelta,
   claudeUnsolicitedFrameStats,
   permissionSocketPath,
   withVolatileNote,
@@ -92,6 +93,25 @@ function answerQueue(conn: ReturnType<typeof connect>) {
   });
   return () => new Promise<any>((resolve) => waiters.push(resolve));
 }
+
+describe("helper usage", () => {
+  it("counts one assistant message once, and a later increase only as the difference", () => {
+    const seen = new Map<string, number>();
+    expect(helperUsageDelta(seen, "msg-1", 1098)).toBe(1098);
+    expect(helperUsageDelta(seen, "msg-1", 1098)).toBe(0);
+    expect(helperUsageDelta(seen, "msg-1", 1108)).toBe(10);
+    expect(helperUsageDelta(seen, "msg-2", 4)).toBe(4);
+    expect(helperUsageDelta(seen, undefined, 7)).toBe(7);
+    expect(helperUsageDelta(undefined, "msg-3", 3)).toBe(3);
+  });
+
+  it("accepts an engine reset floor before counting the next increase", () => {
+    const seen = new Map<string, number>();
+    expect(helperUsageDelta(seen, "msg-1", 500)).toBe(500);
+    expect(helperUsageDelta(seen, "msg-1", 100)).toBe(0);
+    expect(helperUsageDelta(seen, "msg-1", 150)).toBe(50);
+  });
+});
 
 describe("ClaudeDriver.decodeConfig", () => {
   it("defaults to the claude binary with acceptEdits", () => {
@@ -220,6 +240,8 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_PROMPTS;
     delete process.env.FAKE_CLAUDE_LIFECYCLE;
     delete process.env.FAKE_CLAUDE_RESULT_MARK;
+    delete process.env.FAKE_CLAUDE_CACHE_WRITE;
+    delete process.env.FAKE_CLAUDE_SERVED_MODEL;
     delete process.env.FAKE_CLAUDE_GATE;
     delete process.env.FAKE_CLAUDE_COST_DIR;
     delete process.env.ANTHROPIC_API_KEY;
@@ -270,6 +292,47 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       usage: { input: 12, output: 5, cachedInput: 2 },
     });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("names the cache writes by TTL and the served model, inside an input that still reads whole", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "ttl";
+    process.env.FAKE_CLAUDE_SERVED_MODEL = "claude-sonnet-5-20261001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-ttl", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    // 10 plain + 2 cache read + 7 cache write = 19 context tokens; the writes
+    // stay inside `input` (the context meter) and are named for telemetry
+    expect(recorder.events.at(-1)).toMatchObject({
+      type: "turn.completed",
+      usage: { input: 19, output: 5, cachedInput: 2, cacheWrite5m: 3, cacheWrite1h: 4 },
+      servedModel: "claude-sonnet-5-20261001",
+    });
+  });
+
+  it("keeps the writes inside input when a CLI sends only the TTL split and no flat total", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "split";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-split", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    // 10 plain + 2 cache read + (3 + 4) cache write: without the writes in
+    // `input`, telemetry would subtract them from an input that never held them
+    expect((recorder.events.at(-1) as Extract<RuntimeEvent, { type: "turn.completed" }>).usage).toEqual({
+      input: 19,
+      output: 5,
+      cachedInput: 2,
+      cacheWrite5m: 3,
+      cacheWrite1h: 4,
+    });
+  });
+
+  it("files a flat cache-creation figure from an older CLI under the 5 minute cache", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "flat";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-flat", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const done = recorder.events.at(-1) as Extract<RuntimeEvent, { type: "turn.completed" }>;
+    expect(done.usage).toEqual({ input: 19, output: 5, cachedInput: 2, cacheWrite5m: 7 });
+    expect(done.servedModel).toBeUndefined();
   });
 
   it("attaches a step's whole input and output to its events, and leaves the headline the row shows alone", async () => {
@@ -2240,10 +2303,14 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       await instance.adapter.sendTurn({ threadId: "t-helpers", text: "survey" });
       await recorder.until((e) => e.type === "turn.completed");
 
-      const started = recorder.events.filter((e) => e.type === "item.started" && e.itemType === "tool");
-      expect(started.map((e) => (e as { itemId?: string }).itemId)).toEqual(["task-1", "helper-read-1"]);
-      expect((started[0] as { parentItemId?: string }).parentItemId).toBeUndefined();
-      expect(started[1]).toMatchObject({ title: "Read", parentItemId: "task-1" });
+      const started = recorder.events.filter(
+        (e): e is Extract<RuntimeEvent, { type: "item.started" }> =>
+          e.type === "item.started" && e.itemType === "tool",
+      );
+      expect(started.map((e) => e.itemId)).toEqual(["task-1", "helper-read-1"]);
+      expect(started[0]?.parentItemId).toBeUndefined();
+      expect(started[0]?.subagentId).toBeUndefined();
+      expect(started[1]).toMatchObject({ title: "Read", parentItemId: "task-1", subagentId: "task-1" });
       // the helper's step still completes like any other
       expect(recorder.events.some((e) => e.type === "item.completed" && e.itemType === "tool" && e.itemId === "helper-read-1")).toBe(true);
       // the helper talking to its parent is not the bot talking to anyone
@@ -2253,6 +2320,15 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       // nor is the helper's context the bot's: no usage report carries it
       const usage = recorder.events.filter((e) => e.type === "thread.token-usage.updated");
       expect(usage.some((e) => (e as { input: number }).input === 999)).toBe(false);
+      // the helper's own bill lands on its card, not on the bot's meter.
+      // the fake repeats the assistant frame, and both carry message id
+      // msg-helper-1, so the card is billed once
+      const billed = recorder.events.filter((e) => e.type === "item.updated" && e.itemId === "task-1");
+      expect(billed).toHaveLength(1);
+      expect(billed[0]).toMatchObject({
+        subagentId: "task-1",
+        tokens: 1098,
+      });
     });
   });
 });

@@ -10,6 +10,7 @@ export const QueuedSendBodySchema = z
     text: z.string().optional(),
     replyToId: z.string().nullish(),
     threadId: z.string().optional(),
+    busyDelivery: z.enum(["queue", "steer"]).optional(),
   })
   .strict();
 // Inferred from the schema so the runtime check and the static type cannot
@@ -20,9 +21,9 @@ export type QueuedSendBody = z.infer<typeof QueuedSendBodySchema>;
 //
 // A busy conversation holds what the person typed but could not send yet, and
 // each held message gets its own row above the composer: a MessageSquare
-// glyph, the queued text as `queuedChipLabel` words it, and three actions —
-// edit, cancel, steer now.  The rows stack instead of collapsing into one
-// chip, so the layout that matters here is "many rows, composer still
+// glyph, the queued text as `queuedChipLabel` words it, and three labeled
+// actions — steer, edit, cancel.  The rows stack instead of collapsing into
+// one chip, so the layout that matters here is "many rows, composer still
 // reachable", which no behavioural assertion would catch.
 //
 // The harness is the real app against a mocked server, the way
@@ -135,7 +136,25 @@ async function mockServer(page: Page) {
         json({ ok: true, queued: true, queueId: `q-${sends.length}`, threadId: QUEUE }, 202),
       );
     }
-    if (pathname === '/api/instances') return route.fulfill(json({ instances: [], describedAt: Date.now() }));
+    if (pathname === '/api/config' && method === 'GET') {
+      return route.fulfill(json({ busySendDefault: 'queue', terminology: 'channels' }));
+    }
+    if (pathname === '/api/instances') {
+      return route.fulfill(
+        json({
+          instances: [
+            {
+              instanceId: 'codex',
+              driverKind: 'codex',
+              snapshot: { state: 'available' },
+              models: { default: 'gpt', options: [] },
+              capabilities: { queueing: true },
+            },
+          ],
+          describedAt: Date.now(),
+        }),
+      );
+    }
     if (pathname === '/api/routines') return route.fulfill(json({ routines: [], runs: [] }));
     if (pathname === '/api/webhooks') return route.fulfill(json({ webhooks: [], attempts: [], ingress: {} }));
     if (pathname === '/api/resource-triggers') return route.fulfill(json({ triggers: [] }));
@@ -201,7 +220,25 @@ async function mockServerWithRoom(page: Page) {
         json({ ok: true, queued: true, queueId: `q-${sends.length}`, threadId: QUEUE }, 202),
       );
     }
-    if (pathname === '/api/instances') return route.fulfill(json({ instances: [], describedAt: Date.now() }));
+    if (pathname === '/api/config' && method === 'GET') {
+      return route.fulfill(json({ busySendDefault: 'queue', terminology: 'channels' }));
+    }
+    if (pathname === '/api/instances') {
+      return route.fulfill(
+        json({
+          instances: [
+            {
+              instanceId: 'codex',
+              driverKind: 'codex',
+              snapshot: { state: 'available' },
+              models: { default: 'gpt', options: [] },
+              capabilities: { queueing: true },
+            },
+          ],
+          describedAt: Date.now(),
+        }),
+      );
+    }
     if (pathname === '/api/routines') return route.fulfill(json({ routines: [], runs: [] }));
     if (pathname === '/api/webhooks') return route.fulfill(json({ webhooks: [], attempts: [], ingress: {} }));
     if (pathname === '/api/resource-triggers') return route.fulfill(json({ triggers: [] }));
@@ -240,7 +277,7 @@ test('visual: one queued steer pill carries its label and three actions', async 
     page.getByText(`Queued — sends when ${bot.name} finishes`, { exact: false }),
   ).toBeVisible();
 
-  // Three actions ride the row: undo the queue, drop it, or send it now.
+  // Three actions ride the row: send it now, undo the queue, or drop it.
   await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Cancel Queued Message' })).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Steer Now' })).toHaveCount(1);
@@ -250,6 +287,14 @@ test('visual: one queued steer pill carries its label and three actions', async 
   // span is a direct child of the row, so one level up from it is the row
   // itself — glyph, words and all three actions.
   const pillRow = page.locator('span[title^="Queued"]').first().locator('xpath=..');
+
+  // The three actions are labeled text buttons, not bare glyphs: a row of
+  // 24px icons was easy to mis-tap.  The order is the product decision —
+  // Steer, Edit, Cancel, with Edit in the middle — and the accessible names
+  // above still answer to the old ones, so the visible words and the spoken
+  // names are separate things and both are pinned here.
+  await expect(pillRow.locator('button')).toHaveText(['Steer', 'Edit', 'Cancel']);
+
   await expect(pillRow).toHaveScreenshot('composer-queued-pill.png', {
     ...stableShot,
     maxDiffPixelRatio: 0.02,
@@ -288,6 +333,21 @@ test('visual: several queued pills stack without crowding out the composer', asy
     maxDiffPixelRatio: 0.02,
     threshold: 0.2,
     mask: queuedMask(page),
+  });
+});
+
+test('visual: busy send button shows queue affordance when default is queue', async ({ page }) => {
+  await mockServer(page);
+  const box = await openBusyBot(page);
+  await pinFonts(page);
+
+  await box.fill('hold this until the turn finishes');
+  const send = page.getByRole('button', { name: 'Queue Message (Alt+Click to Steer Now)' });
+  await expect(send).toBeVisible();
+  await expect(send).toHaveScreenshot('composer-busy-send-queue-default.png', {
+    ...stableShot,
+    maxDiffPixelRatio: 0.02,
+    threshold: 0.2,
   });
 });
 

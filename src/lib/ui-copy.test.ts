@@ -34,11 +34,14 @@ const FILES = sourceFiles(SRC).map((path) => ({
 }));
 
 /** JSX text nodes plus the three attributes that reach a person: a tooltip,
- * a screen-reader name, and the grey text inside an empty field. */
+ * a screen-reader name, and the grey text inside an empty field.  String
+ * literals inside a JSX expression ({"..."}) reach a person the same way,
+ * so they are scanned too. */
 function userFacingStrings(text: string): string[] {
   const found: string[] = [];
   for (const match of text.matchAll(/(?:title|aria-label|placeholder)="([^"]+)"/g)) found.push(match[1]!);
   for (const match of text.matchAll(/>\s*([A-Za-z][^<>{}\n]{1,120}?)\s*</g)) found.push(match[1]!);
+  for (const match of text.matchAll(/\{"([^"{}]{2,200})"\}/g)) found.push(match[1]!);
   return found;
 }
 
@@ -119,7 +122,15 @@ describe("Settings Models layout", () => {
     expect(models!.text).toContain("flex-[1_1_16rem]");
     expect(models!.text).not.toContain("grid-cols-[minmax(0,1.1fr)");
     expect(models!.text).not.toContain("&nbsp;");
-    expect(picker!.text).toContain('contained && !label && "w-full min-w-0 justify-between"');
+    // Settings stacks the picker: label on its own line, trigger full width
+    // beneath it. The row layout this replaced squeezed the label and its
+    // subtitle into a narrow column beside the trigger, so "Primary Model"
+    // wrapped to two lines and the subtitle broke into a five-word ribbon at
+    // every desktop width. Assert the STACK, not the old className string, so
+    // the guard survives a restyle of either half.
+    expect(picker!.text).toContain("flex flex-col gap-3");
+    expect(picker!.text).toContain('contained ? "w-full min-w-0 justify-between');
+    expect(picker!.text).not.toContain('flex items-center justify-between gap-4');
     // picking a new primary keeps the bot's fallback chain: the picker commits
     // pickedSelection, which builds on selectionForPick and copies the
     // fallbacks across. The behavior itself is covered in model-pick.test.ts

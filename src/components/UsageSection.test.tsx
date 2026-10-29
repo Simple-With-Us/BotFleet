@@ -11,7 +11,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { UsageWhatIfProjection, apiEquivalentCost, projectionRows } from "./UsageWhatIfProjection.tsx";
 import { ENGINE_CAPABILITIES, uniqueModelToEngineId } from "@/lib/engine-capabilities.tsx";
-import { DoomedPairArraySchema, hasEngineSpendActivity, hidesIdleUnavailableEngineRow, unpricedTurnCount } from "./UsageSection.tsx";
+import { DoomedPairArraySchema, buildClutchDetailLines, hasEngineSpendActivity, hidesIdleUnavailableEngineRow, unpricedTurnCount } from "./UsageSection.tsx";
 import type { DoomedPair, RedundantChain } from "./UsageSection.tsx";
 
 describe("uniqueModelToEngineId", () => {
@@ -212,52 +212,58 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
     expect(plans.grok).toEqual({ planName: "xAI SuperGrok Heavy", costPerMonth: 99 });
   });
 
-  it("detects engine plans from CodeCaps / Usage Monitor quota windows", () => {
+  it("does not claim to auto-detect subscription billing plans from quota windows", () => {
     const windows = [
-      { providerKey: "cursor", planName: "ultra", label: "Cursor Ultra" },
-      { providerKey: "anthropic", planName: "pro", label: "Claude Pro" },
+      { providerKey: "cursor", planName: "ultra", label: "Cursor Ultra", planMetadata: { detectedPlanName: "Ultra", userPlanName: "My Pro", hasMismatch: true } },
+      { providerKey: "anthropic", planName: "Max", label: "5-Hour" },
       { providerKey: "openai", planName: "plus", label: "ChatGPT Plus" },
       { providerKey: "xai", planName: "super", label: "xAI SuperGrok" },
       { providerKey: "minimax", planName: "starter", label: "MiniMax Token Plan Starter" },
       { providerKey: "google", planName: "ultra", label: "Google AI Ultra" },
     ];
 
-    expect(detectEnginePlanFromWindows("cursor", windows)).toEqual({
-      label: "Cursor Ultra",
-      planName: "Cursor Ultra",
-      costPerMonth: null,
-    });
-    expect(detectEnginePlanFromWindows("claude", windows)).toEqual({
-      label: "Claude Pro ($20/mo)",
-      planName: "Claude Pro",
-      costPerMonth: 20,
-    });
-    expect(detectEnginePlanFromWindows("codex", windows)).toEqual({
-      label: "ChatGPT Plus ($20/mo)",
-      planName: "ChatGPT Plus",
-      costPerMonth: 20,
-    });
-    expect(detectEnginePlanFromWindows("grok", windows)).toEqual({
-      label: "xAI SuperGrok ($30/mo)",
-      planName: "xAI SuperGrok",
-      costPerMonth: 30,
-    });
-    expect(detectEnginePlanFromWindows("minimax", windows)).toEqual({
-      label: "Token Plan Starter ($15/mo)",
-      planName: "MiniMax Token Plan Starter",
-      costPerMonth: 15,
-    });
-    expect(detectEnginePlanFromWindows("antigravity", windows)).toEqual({
-      label: "Google AI Ultra ($105.79/mo)",
-      planName: "Google AI Ultra",
-      costPerMonth: 105.79,
-    });
+    expect(detectEnginePlanFromWindows("cursor", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("claude", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("codex", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("grok", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("minimax", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("antigravity", windows)).toBeNull();
+    expect(autoDetectAllEnginePlans(windows)).toEqual({});
+  });
+});
 
-    const all = autoDetectAllEnginePlans(windows);
-    expect(all.cursor.planName).toBe("Cursor Ultra");
-    expect(all.claude.planName).toBe("Claude Pro");
-    expect(all.codex.planName).toBe("ChatGPT Plus");
-    expect(all.grok.planName).toBe("xAI SuperGrok");
+describe("Clutch / DeepSeek remaining balance and MiniMax subscription note", () => {
+  it("verifies DeepSeek Remaining Balance and Subscription (not API) for MiniMax (MM & MC)", () => {
+    const lines = buildClutchDetailLines({
+      balanceUsd: 12.34,
+      availability: "available",
+      grantedUsd: 10,
+      toppedUpUsd: 5,
+    });
+    expect(lines).toContainEqual({
+      label: "DeepSeek Remaining Balance",
+      value: "$12.34 remaining",
+      exhausted: false,
+      group: "external",
+    });
+    expect(lines).toContainEqual({
+      label: "MiniMax (MM & MC)",
+      value: "Subscription (not API)",
+      exhausted: false,
+      group: "external",
+    });
+  });
+
+  it("includes MiniMax (MM & MC) subscription note when DeepSeek balance is missing", () => {
+    const lines = buildClutchDetailLines(null);
+    expect(lines).toEqual([
+      {
+        label: "MiniMax (MM & MC)",
+        value: "Subscription (not API)",
+        exhausted: false,
+        group: "external",
+      },
+    ]);
   });
 });
 

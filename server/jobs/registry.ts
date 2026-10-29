@@ -1086,6 +1086,13 @@ export class JobRegistry {
     return strays.length;
   }
 
+  private hasRunningJob(): boolean {
+    for (const record of this.records.values()) {
+      if (record.status === "running") return true;
+    }
+    return false;
+  }
+
   /** Start the tick and the sweep, and stop every job if the process exits. */
   startTimers(sweepMs: number = this.deps.sweepMs ?? 5 * 60_000): void {
     this.lastTick = this.awakeNow();
@@ -1094,7 +1101,7 @@ export class JobRegistry {
     this.tickTimer.unref?.();
     // One stat per running job; nothing at all while none runs.
     this.logTimer ??= setInterval(() => {
-      if (this.records.size > 0 && [...this.records.values()].some((record) => record.status === "running")) this.checkLogs();
+      if (this.hasRunningJob()) this.checkLogs();
     }, this.deps.logCheckMs ?? 500);
     this.logTimer.unref?.();
     this.sweepTimer ??= setInterval(() => {

@@ -7,8 +7,9 @@
 
 import type { ComputerMount } from "./computer-grants.ts";
 import type { ToolPolicy } from "./tool-policy.ts";
+import type { SubagentSnapshot } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
-import type { ContextSource } from "../shared/context-injection.ts";
+import type { ContextInjectionRef, ContextSource } from "../shared/context-injection.ts";
 import type { ItemIoCapture } from "../shared/item-io.ts";
 import type { ReviewHook, ReviewPrompt } from "../shared/auto-review.ts";
 import type { ToolScope } from "../shared/tool-scope.ts";
@@ -44,7 +45,7 @@ export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 
 /** Narrow untrusted API/config input before it becomes a model selection. */
 export function isEffortLevel(value: unknown): value is EffortLevel {
-  return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
+  return (EFFORT_LEVELS as readonly unknown[]).includes(value);
 }
 
 // ── model selection ────────────────────────────────────────────────────
@@ -55,6 +56,14 @@ export interface ModelSelection {
   model: string;
   /** Optional: no effort means no flag, and the CLI keeps its own default. */
   effort?: EffortLevel;
+  /** Optional working-context cap in tokens (for example 524288 for 512K).
+   *  Absent means the model's full window.  Only honored for a model whose
+   *  catalog row lists it in `contextCaps`. */
+  contextCap?: number;
+  /** Optional output limit in tokens, sent to the provider only when set and
+   *  only for a model whose row has `supportsMaxOutput`.  Absent means the
+   *  model's own limit. */
+  maxOutputTokens?: number;
   /** Optional: a model class this entry floats on ("Latest Sonnet" is
    *  `latest: "sonnet"`).  `model` is still the real slug that runs — the
    *  harness keeps it pointed at the newest member of the class the
@@ -155,7 +164,24 @@ export type RuntimeEvent = RuntimeEventBase &
          * context-occupancy figure (session/update `usage_update`), never a
          * real input/output split, so a driver that only knows one side
          * omits the other rather than reporting a fabricated 0. */
-        usage?: { input: number; output?: number; cachedInput?: number };
+        usage?: {
+          input: number;
+          output?: number;
+          cachedInput?: number;
+          /** Cache writes, 5 minute TTL (or a TTL the engine did not break
+           * down).  Like `cachedInput`, a SUBSET of `input`: a driver that
+           * names them keeps `input` the whole context sent, and telemetry
+           * subtracts them back out to price them at the cache-write rate. */
+          cacheWrite5m?: number;
+          /** Cache writes to the 1 hour cache; a subset of `input` as well. */
+          cacheWrite1h?: number;
+          /** The reasoning share of `output` (already inside it, never added
+           * again), for the engines that report it. */
+          reasoning?: number;
+        };
+        /** The model the provider says served the turn, when it says (an
+         * alias or a fallback can differ from the one requested). */
+        servedModel?: string;
       }
     | {
         type: "item.started";
@@ -183,12 +209,17 @@ export type RuntimeEvent = RuntimeEventBase &
          * steps.  The transcript nests the row under its parent instead of
          * interleaving parallel helpers' steps with the bot's. */
         parentItemId?: string;
+        /** Set when this step belongs to a helper.  The same id as
+         * `parentItemId` for a typed engine.  A named engine has none. */
+        subagentId?: string;
       }
-    | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null }
+    | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null; subagentId?: string }
     | {
         type: "item.completed";
         itemType: "tool";
         ok: boolean;
+        /** The helper this step ran inside, when the engine named one. */
+        subagentId?: string;
         /** One line of what came back — rows read, the failure's message.
          * A failure's detail is the whole reason the row is worth reading. */
         detail?: string;
@@ -197,7 +228,7 @@ export type RuntimeEvent = RuntimeEventBase &
         arguments?: string;
       }
     | { type: "item.completed"; itemType: "assistant_text"; text: string }
-    | { type: "content.delta"; streamKind: "assistant_text" | "reasoning_text"; delta: string }
+    | { type: "content.delta"; streamKind: "assistant_text" | "reasoning_text"; delta: string; subagentId?: string }
     | {
         type: "request.opened";
         requestType: "permission" | "question";
@@ -236,6 +267,13 @@ export type RuntimeEvent = RuntimeEventBase &
      * type (`shared/context-injection.ts`).  `itemId` keys the full text in the
      * side store; `preview` is one redacted, clipped line. */
     | { type: "context.injected"; source: ContextSource; preview: string; bytes: number }
+    /** A helper's card changed.  At most once a second while it runs, and
+     * again the moment it finishes.  Output stays off this frame. */
+    | { type: "subagent.updated"; subagent: SubagentSnapshot }
+    /** The slash commands the engine says it has, as it announced them: names
+     *  only, lowercase, no slash, deduped.  The bus hands it to the command
+     *  cache and nowhere else, so it never reaches a transcript or a client. */
+    | { type: "engine.commands"; names: string[]; origin: "claude-init" | "acp-available-commands" }
   );
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;
@@ -263,11 +301,36 @@ export interface LaunchIdentity {
 // becomes onEvent(listener) → unsubscribe; sessions start implicitly on
 // the first turn (the agentcal per-turn-process model) with resumeCursor
 // carrying the provider-native continuation (e.g. a claude session id).
+/** A slash command of the engine's own that BotFleet runs as a turn: `/compact`,
+ *  `/context`.  The name is lowercase, has no slash, and is already
+ *  allowlisted (server/drivers/engine-commands.ts).  `args` is one line of at
+ *  most 500 characters and never starts with a slash. */
+export interface TurnCommand {
+  name: string;
+  args?: string;
+}
+
 export interface SendTurnInput {
   threadId: ThreadId;
   text: string;
   model?: string;
   effort?: EffortLevel;
+  /** The bot's chosen context cap in tokens, when its model offers one.  A
+   *  driver that budgets the prompt sizes it from this (see `contextCapTokens`
+   *  in the driver config, which this overrides for the turn). */
+  contextCapTokens?: number;
+  /** The bot's output limit in tokens, when its model supports one. */
+  maxOutputTokens?: number;
+  /** The bot's cap on replayed history turns: older turns are dropped (and
+   *  summarized) even when the byte budget would fit them.  Absent keeps
+   *  every turn the byte budget fits.  Only a driver that budgets the
+   *  prompt honours it. */
+  maxHistoryTurns?: number;
+  /** When true, dropped history turns are summarized by the bot's model —
+   *  cached and rolled forward across turns — falling back to the
+   *  extractive note on any error.  Absent or false is the extractive
+   *  default.  Only a driver that can run a side session honours it. */
+  historySummaryModel?: boolean;
   resumeCursor?: unknown;
   /** The turn with the conversation so far replayed inline, attached only
    * alongside resumeCursor. A cursor-resuming driver sends it once, on a
@@ -287,6 +350,17 @@ export interface SendTurnInput {
    * that cannot rebuild does not call it, and a throw here must not fail the
    * turn. */
   onReplayRecovered?: () => void;
+  /** Called by a driver that cut older context to fit the prompt budget
+   * (the ACP driver), right after it publishes the `context.injected`
+   * event for the cut.  The ref is the row's own record: the harness hangs
+   * it under the message that started this turn, which only it knows.
+   * A relaunch after a transient failure does not call it again.
+   * It may be called a second time with the SAME id and a new reading —
+   * a row posted while the model writes a history summary resolves to the
+   * finished numbers — and the harness replaces the row in place
+   * (server/context-injection.ts addInjectionRef).  Never required, and a
+   * throw here must not fail the turn. */
+  onContextCompressed?: (ref: ContextInjectionRef) => void;
   /** Prior turns for transcript-replay providers (API-backed drivers).
    *  Each entry may carry tool call and result metadata so the executor
    *  can replay a multi-step turn that has already been settled: the
@@ -339,6 +413,12 @@ export interface SendTurnInput {
    *  from the previous turn, so digest-based delivery must not suppress the
    *  note. */
   mentionTurn?: boolean;
+  /** Set only for a turn that runs one of the engine's own slash commands.
+   *  The driver writes exactly `/name args` and nothing else: no persona, no
+   *  volatile note, no replayed conversation.  Every other turn leaves it
+   *  unset, and its text is shielded so a leading slash cannot become a
+   *  command (`neutralizeLeadingSlash`). */
+  command?: TurnCommand;
   /** Tool definitions the agent may call this turn, in OpenAI function-calling
    * shape.  An HTTP driver (MiniMax, OpenAI-compatible) hands these to the
    * model verbatim; a CLI driver that mounts MCP servers is free to ignore
@@ -618,6 +698,11 @@ export interface ProviderAdapter {
      * `SendTurnInput.toolHost` only to such a driver, and dispatches it on
      * the same one-line path it uses for a CLI engine. */
     toolLoop?: boolean;
+    /** True when the driver trims an over-budget prompt itself and can
+     *  substitute a summary note for the replayed history it drops (the ACP
+     *  prompt budget), so the per-bot `maxHistoryTurns` and
+     *  `historySummaryModel` settings apply to it. */
+    historySummary?: boolean;
     /** True when the driver builds its own message history from
      * `SendTurnInput.transcript` every turn — every chat-completions driver
      * does this, the way a CLI driver replays its own native session.  A
@@ -656,6 +741,12 @@ export interface ProviderAdapter {
      *  refuses it when the engine instance cannot be held).  Absent: the
      *  harness never sends this driver an allowlist turn. */
     toolPolicy?: boolean;
+    /** True when the engine announces its own slash commands (the Claude init
+     *  frame's `slash_commands`, ACP's `available_commands_update`) and runs
+     *  an allowlisted one when a turn carries `command`.  Absent reads as
+     *  false, and such an engine never gets an engine group in the command
+     *  menu. */
+    engineCommands?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
@@ -795,7 +886,15 @@ export interface ModelCatalog {
     /** Effort levels this specific model supports, if any.
      * When defined, only models with non-empty effortLevels support effort. */
     effortLevels?: readonly EffortLevel[];
+    /** The default effort level for this model when none is explicitly selected. */
+    defaultEffort?: EffortLevel;
     supportsEffort?: boolean;
+    /** Working-context caps (tokens) the picker offers besides the full
+     * window, for a model that is useful below it.  Absent means no choice. */
+    contextCaps?: readonly number[];
+    /** The driver sends a per-bot output limit for this model
+     * (`maxOutputTokens`).  Absent means it does not, and the picker hides it. */
+    supportsMaxOutput?: boolean;
     /** Whether this model can interpret an attached image. Absent inherits the engine gate. */
     images?: boolean;
   }>;

@@ -25,10 +25,13 @@ import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import type { Attachment } from "@/lib/composer-attachments";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
+import type { HelperTranscript } from "../../shared/helpers";
 import type { ToolKind } from "../../shared/tool-activity";
 import type { ReviewHook } from "../../shared/auto-review";
+import type { BusySendDefault } from "../../shared/busy-send-default.ts";
 import type { ContextInjectionRef } from "../../shared/context-injection";
 import { taskWorkspaceContextsMatch, type TaskAppRef, type TaskWorkspaceContext } from "../../shared/task-workspace-context";
+import { MergeAllBotTasksResponseSchema } from "../../shared/merge-threads";
 import { eligibleTaskApps } from "@/lib/task-app-context";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
@@ -155,6 +158,9 @@ export interface Message {
      * interleaving parallel helpers' steps with the bot's own. */
     parentItemId?: string;
   };
+  /** The helper card for the row that started an engine-native helper
+   * (jobs P3).  Absent on an ordinary step. */
+  helper?: HelperTranscript;
   /** What the harness put in front of the model for THIS turn that the person
    * did not type — memory, selected skills, a quoted reply, a replayed
    * conversation (shared/context-injection.ts).  One short record each: a
@@ -256,6 +262,13 @@ export interface ModelSelection {
   /** Always the real slug that runs, also for a "Latest <Class>" entry. */
   model: string;
   effort?: EffortLevel;
+  /** Working-context cap in tokens; absent is the model's full window.  `null`
+   *  is how a write clears a saved cap (an absent key keeps it for older
+   *  clients), and the harness never sends it back. */
+  contextCap?: number | null;
+  /** Output limit in tokens; absent leaves the model's own limit.  `null`
+   *  clears a saved limit, like `contextCap`. */
+  maxOutputTokens?: number | null;
   /** The model class this entry floats on ("sonnet" = Latest Sonnet); see
    *  shared/model-lineage.ts.  The picker sends `null` when a person picks
    *  a pinned model, so the harness does not carry an older float forward. */
@@ -271,6 +284,13 @@ export interface Task {
   createdAt: number;
   /** Last message in this task's thread; falls back to createdAt. */
   lastActivity?: number;
+  /** How many messages this task's thread holds.  Absent on frames from
+   * before the harness counted them. */
+  messageCount?: number;
+  /** When the conversation first spoke.  Absent on frames from before the
+   * harness stamped it.  A merge folds transcripts in the order they
+   * began, which is not always the order the tasks were created. */
+  startedAt?: number;
   /** what this task has spent, banked once per settled turn */
   usage?: TaskUsage;
   /** Timing aggregate banked with `usage`; absent on tasks from before it
@@ -383,6 +403,13 @@ export interface Bot {
    *  Unset or null uses DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts) — the
    *  same number the turn's prompt names and the loop stops at. */
   maxToolRounds?: number | null;
+  /** Cap on replayed history turns before older turns are dropped and
+   *  summarized (ACP engines).  Unset or null keeps every turn the byte
+   *  budget fits. */
+  maxHistoryTurns?: number | null;
+  /** Let the bot's model write the dropped-history summary (cached and
+   *  rolled forward), falling back to the extractive note on error. */
+  historySummaryModel?: boolean;
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
   speechDevices?: Array<"mac" | "iphone">;
@@ -553,6 +580,7 @@ export interface ConfigStatus {
     voice: string;
     provider?: "minimax" | "system" | "xai" | "azure";
     optimizedSummary?: boolean;
+    audioRetentionDays?: number;
     pronunciations?: Pronunciation[];
   };
   /** Call-mode STT preference + global vocabulary, mirrored from AppConfig.
@@ -590,6 +618,8 @@ export interface ConfigStatus {
   /** Simple (Grok-style bots + group threads) or Projects (categories of
    * threads).  Absent means simple. */
   conversationMode?: ConversationMode;
+  /** Default delivery while a bot turn is busy.  Absent means steer-first. */
+  busySendDefault?: BusySendDefault;
   /** Shared Qdrant Bot RAG vector database status. `url` and `collection`
    * are empty until the operator sets them — BotFleet ships no endpoint. */
   qdrant?: {
@@ -823,7 +853,10 @@ export interface InstanceInfo {
        * without a tooltip and a screen-reader hint. */
       badgeTitle?: string;
       effortLevels?: readonly EffortLevel[];
+      defaultEffort?: EffortLevel;
       supportsEffort?: boolean;
+      contextCaps?: readonly number[];
+      supportsMaxOutput?: boolean;
       /** Absent inherits the instance-wide image capability. */
       images?: boolean;
       contextWindow?: number;
@@ -852,6 +885,8 @@ export interface InstanceInfo {
     bypassCoverage?: "asks" | "native" | "none";
     /** The harness runs this engine's tool loop, so Maximum Tool Rounds applies. */
     toolLoop?: boolean;
+    /** ACP prompt budget: the per-bot history cap/summary settings apply. */
+    historySummary?: boolean;
   };
   /** Which computer destinations this engine can be given at all, derived
    *  server-side in `server/computer-capability.ts` and shipped whole.  The
@@ -1083,6 +1118,20 @@ export type Action =
   | { type: "moveTaskToBot"; botId: string; threadId: string; toBotId: string }
   | { type: "moveTaskToGroup"; botId: string; threadId: string; toGroupId: string }
   | { type: "mergeTasks"; botId: string; threadId: string; intoThreadId: string }
+  | {
+      type: "mergeAllBotTasks";
+      botId: string;
+      intoThreadId: string;
+      /** What the server did, so a caller can say what was folded in and what
+       * was left behind.  `error` is set instead when the merge failed. */
+      onSettled?: (
+        result: {
+          merged: string[];
+          skipped: Array<{ threadId: string; title: string; reason: string }>;
+        } | null,
+        error: string | null,
+      ) => void;
+    }
   | { type: "deleteGroupTask"; groupId: string; threadId: string }
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
@@ -1114,6 +1163,8 @@ export type Action =
        * reason, after the error banner is set, so a caller that cleared its
        * input can put it back. */
       onError?: (message: string) => void;
+      /** Per-send override while the bot is busy.  Omitted uses the workspace default. */
+      busyDelivery?: BusySendDefault;
     }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string; rawText?: string; at?: number; reply?: Message; attachments?: Attachment[] }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
@@ -1161,6 +1212,8 @@ export type Action =
   | { type: "markUnread"; botId: string }
   | { type: "botPatched"; bot: BotAnnouncement }
   | { type: "messageAdded"; threadId: string; message: Message }
+  | { type: "messagesAdded"; threadId: string; messages: Message[] }
+  | { type: "mergeApplied"; botId: string; threadId: string; tasks: Task[] }
   | { type: "messagePatched"; threadId: string; message: Message }
   | { type: "screenFrame"; botId: string; png: string; mime: string }
   | { type: "provisioning"; botId: string; on: boolean }
@@ -1704,6 +1757,49 @@ export function reducer(state: AppState, action: Action): AppState {
       const animated = motion ? withMascotMotion(next, bot.id, motion) : next;
       return animated;
     }
+    case "messagesAdded": {
+      // A bulk copy — a merge folding one conversation into another — writes
+      // a whole transcript at once, so it arrives in one piece instead of
+      // thousands of single-message frames.
+      //
+      // The frame belongs to a CONVERSATION, and the bot that shows it is
+      // the one whose active thread it is.  A merge can land in a
+      // background conversation — a single pair folded while another one is
+      // open — and that frame is not the conversation on screen, so it is
+      // not painted into it: the reader would see one conversation's words
+      // under another conversation's title.  The conversation that was
+      // merged into gets its own page when the bot moves to it.
+      const bot = state.bots.find((b) => b.threadId === action.threadId);
+      if (!bot) {
+        const group = state.groups.find((g) => g.threadId === action.threadId);
+        if (!group) return state;
+        const known = new Set(group.messages.map((m) => m.id));
+        const fresh = action.messages.filter((m) => !known.has(m.id));
+        if (fresh.length === 0) return state;
+        return {
+          ...state,
+          groups: state.groups.map((g) =>
+            g.id === group.id ? { ...g, messages: [...g.messages, ...fresh] } : g,
+          ),
+        };
+      }
+      const known = new Set(bot.messages.map((m) => m.id));
+      const fresh = action.messages.filter((m) => !known.has(m.id));
+      if (fresh.length === 0) return state;
+      return updateBot(state, bot.id, (b) => {
+        let messages = [...b.messages, ...fresh];
+        // base64 screen frames are big; a long computer-use session would
+        // grow memory without bound. Keep the newest few frames' pixels and
+        // strip the rest (the message row survives as a placeholder).
+        const withPng = messages.filter((m) => m.kind === "screen" && m.png);
+        const excess = withPng.length - MAX_KEPT_SCREEN_FRAMES;
+        if (excess > 0) {
+          const dropIds = new Set(withPng.slice(0, excess).map((m) => m.id));
+          messages = messages.map((m) => (dropIds.has(m.id) ? { ...m, png: undefined } : m));
+        }
+        return { ...b, messages, activeLeafId: messages.at(-1)?.id ?? b.activeLeafId };
+      });
+    }
     case "messagePatched": {
       const bot = state.bots.find((b) => b.threadId === action.threadId);
       if (!bot) {
@@ -2107,6 +2203,70 @@ export function reducer(state: AppState, action: Action): AppState {
         ),
       };
     }
+    case "mergeAllBotTasks": {
+      const source = state.bots.find((bot) => bot.id === action.botId);
+      if (!source) return state;
+      const into = (source.tasks ?? []).find((task) => task.threadId === action.intoThreadId);
+      if (!into) return state;
+      // A conversation bound to a different App cannot merge, so it stays:
+      // the server skips it and names it, and the roster agrees with that
+      // instead of briefly hiding a conversation that is still there.
+      const remaining = (source.tasks ?? []).filter(
+        (task) => task.threadId === action.intoThreadId
+          || !taskWorkspaceContextsMatch(task.workspaceContext, into.workspaceContext),
+      );
+      if (remaining.length === (source.tasks ?? []).length) return state;
+      // The bot keeps one conversation after the merge, and it is the one the
+      // person chose, so the roster and the open chat agree immediately.
+      return {
+        ...state,
+        bots: state.bots.map((bot) => {
+          if (bot.id !== action.botId) return bot;
+          const next: Bot = { ...bot, tasks: remaining, threadId: action.intoThreadId };
+          // The transcript on screen belongs to the conversation the bot was
+          // showing.  A merge moves the bot to another conversation, so the
+          // old transcript is dropped here rather than left on screen under
+          // the new conversation's name; the merged one arrives on its own
+          // frame.
+          if (bot.threadId !== action.intoThreadId) {
+            next.messages = [];
+            next.activeLeafId = undefined;
+          }
+          return next;
+        }),
+      };
+    }
+    case "mergeApplied": {
+      // The server's own answer about what is left: the conversations that
+      // stayed behind, and the one that is now live.
+      //
+      // Two kinds of truth meet here.  The server's record carries the
+      // counters it reads from the live transcript — how many messages a
+      // conversation holds, when it last spoke, when it began — and those
+      // are the fresh ones after a merge.  The client's record carries what
+      // only the client knows: what a conversation cost, whether it is
+      // asleep, which folder it runs in.  So the server's counters win and
+      // the client's own fields are kept.
+      return {
+        ...state,
+        bots: state.bots.map((bot) => {
+          if (bot.id !== action.botId) return bot;
+          const held = new Map((bot.tasks ?? []).map((task) => [task.threadId, task]));
+          const tasks = action.tasks.map((task) => {
+            const previous = held.get(task.threadId);
+            if (!previous) return task;
+            return {
+              ...previous,
+              title: task.title,
+              messageCount: task.messageCount ?? previous.messageCount,
+              lastActivity: task.lastActivity ?? previous.lastActivity,
+              startedAt: task.startedAt ?? previous.startedAt,
+            };
+          });
+          return { ...bot, tasks, threadId: action.threadId };
+        }),
+      };
+    }
     case "moveTaskToBot": {
       const source = state.bots.find((bot) => bot.id === action.botId);
       const moving = (source?.tasks ?? []).find((task) => task.threadId === action.threadId);
@@ -2284,6 +2444,60 @@ export const MessagePostResponseSchema = z.union([
     replayed: replayedFlag,
   }).strict(),
 ]);
+
+/** What a message must be for the store and the renderer to trust it.
+ *
+ * A transcript carries far more than the renderer reads, so the rest passes
+ * through; what is checked is the identity, the role and the kind, because
+ * a row of the wrong form is what breaks a conversation view. */
+export const transcriptMessageSchema = z
+  .object({
+    id: z.string(),
+    role: z.enum(["bot", "user", "system"]),
+    kind: z.enum(["text", "options", "activity", "screen", "connector", "secret", "sign-in"]),
+    at: z.number(),
+    parentId: z.string().nullable().optional(),
+  })
+  .catchall(z.unknown());
+export type TranscriptMessage = z.infer<typeof transcriptMessageSchema>;
+
+/** One conversation's page of messages, and whether older ones are waiting. */
+export const threadMessagesPageSchema = z.object({
+  messages: z.array(transcriptMessageSchema).optional(),
+  hasMore: z.boolean().optional(),
+});
+export type ThreadMessagesPage = z.infer<typeof threadMessagesPageSchema>;
+
+/** The fleet list, read only far enough to pick one bot out of it.
+ *
+ * Every bot and every group ride along with their full transcripts, so one
+ * record that does not fit must not cancel the whole list: the entries are
+ * read as opaque rows and the one bot is validated on its own. */
+export const botListSchema = z.object({
+  bots: z.array(z.object({ id: z.string() }).catchall(z.unknown())).optional(),
+});
+export type BotList = z.infer<typeof botListSchema>;
+
+/** The bot a failed merge has to put back, narrowed to what it needs. */
+export const botRestoreSchema = z
+  .object({
+    id: z.string(),
+    threadId: z.string(),
+    messages: z.array(transcriptMessageSchema).optional(),
+    tasks: z
+      .array(
+        z
+          .object({
+            threadId: z.string(),
+            title: z.string(),
+            createdAt: z.number(),
+          })
+          .catchall(z.unknown()),
+      )
+      .optional(),
+  })
+  .catchall(z.unknown());
+export type BotRestore = z.infer<typeof botRestoreSchema>;
 
 // ── API client ─────────────────────────────────────────────────────────
 /** Thrown by `api()` on a non-2xx response.  Carries the parsed JSON body
@@ -2587,6 +2801,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Apply their local projection only after the server accepts the change.
       const confirmTaskMutation = action.type === "moveGroupTask"
         || action.type === "moveGroupTaskToBot" || action.type === "mergeTasks"
+        || action.type === "mergeAllBotTasks"
         || action.type === "moveTaskToBot" || action.type === "moveTaskToGroup";
       if (action.type !== "cancelQueued" && !confirmTaskMutation) rawDispatch(action);
       switch (action.type) {
@@ -2682,13 +2897,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // the server then 409s instead of delivering. Omitting it lets the
           // server use the active thread.
           const postMessage = (threadId?: string) => {
+            const body: {
+              text: string;
+              replyToId?: string;
+              threadId?: string;
+              busyDelivery?: BusySendDefault;
+            } = {
+              text: action.text,
+              replyToId: action.replyToId,
+            };
+            if (threadId) body.threadId = threadId;
+            if (action.busyDelivery) body.busyDelivery = action.busyDelivery;
             void api(`/api/bots/${action.botId}/messages`, {
               method: "POST",
-              body: JSON.stringify({
-                text: action.text,
-                replyToId: action.replyToId,
-                ...(threadId ? { threadId } : {}),
-              }),
+              body: JSON.stringify(body),
             })
               .then((body: unknown) => {
                 const parsed = MessagePostResponseSchema.safeParse(body);
@@ -3032,6 +3254,93 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             body: JSON.stringify({ mergeInto: action.intoThreadId }),
           }).then(() => rawDispatch(action)).catch(showError);
           break;
+        case "mergeAllBotTasks":
+          api(`/api/bots/${action.botId}/merge-threads`, {
+            method: "POST",
+            body: JSON.stringify({ intoThreadId: action.intoThreadId }),
+          })
+            .then((body) => {
+              // The answer crosses the HTTP boundary through a deliberately
+              // generic helper, so it is narrowed before anything in it is
+              // believed.
+              const parsed = MergeAllBotTasksResponseSchema.safeParse(body);
+              if (!parsed.success) throw new Error("The merge answer was not in the expected shape.");
+              const { bot, merged, skipped } = parsed.data;
+              rawDispatch(action);
+              // The server's own list of conversations is the truth about
+              // what stayed behind, so the roster takes it rather than the
+              // guess the optimistic paint made.
+              dispatch({
+                type: "mergeApplied",
+                botId: bot.id,
+                threadId: bot.threadId,
+                tasks: bot.tasks ?? [],
+              });
+              // The merge folded conversations into the destination, so the
+              // destination's own transcript is the one on screen now, and
+              // it is in none of what arrived: the answer carries the
+              // roster, and the frames carry only the folded-in batch.  So
+              // the destination's page is fetched here, and it lands with
+              // its pagination flag, so the older messages of a long
+              // conversation stay reachable.
+              void api(`/api/threads/${action.intoThreadId}/messages?limit=${PAGE_SIZE}`)
+                .then((pageBody) => {
+                  const page = threadMessagesPageSchema.safeParse(pageBody);
+                  if (!page.success) throw new Error("The conversation page was not in the expected shape.");
+                  rawDispatch({
+                    type: "earlierLoaded",
+                    threadId: action.intoThreadId,
+                    messages: page.data.messages ?? [],
+                    hasMore: page.data.hasMore === true,
+                  });
+                })
+                .catch((error) => {
+                  console.warn(
+                    "Failed to load the merged conversation",
+                    error instanceof Error ? error.message : "unknown error",
+                  );
+                });
+              action.onSettled?.({ merged, skipped }, null);
+            })
+            .catch((error) => {
+              showError(error);
+              action.onSettled?.(null, error instanceof Error ? error.message : String(error));
+              // The optimistic paint moved the bot to the chosen conversation
+              // and dropped the transcript it was showing, so a merge that
+              // failed has to put the server's own state back rather than
+              // leave an empty chat under a conversation that never changed.
+              api("/api/bots")
+                .then((body) => {
+                  const list = botListSchema.safeParse(body);
+                  if (!list.success) throw new Error("The bot list was not in the expected shape.");
+                  // One record that does not fit must not cancel the whole
+                  // list: the bot that failed is picked out first and
+                  // validated on its own.
+                  const candidate = list.data.bots?.find((entry) => entry.id === action.botId);
+                  if (!candidate) return;
+                  const restored = botRestoreSchema.safeParse(candidate);
+                  if (!restored.success) throw new Error("The bot was not in the expected shape.");
+                  const current = stateRef.current.bots.find((entry) => entry.id === action.botId);
+                  if (!current) return;
+                  // the server's own conversation list and transcript win; the
+                  // rest of the bot is what this client already holds
+                  rawDispatch({
+                    type: "botPatched",
+                    bot: {
+                      ...current,
+                      ...restored.data,
+                      messages: restored.data.messages ?? current.messages,
+                    },
+                  });
+                })
+                .catch((restoreError) => {
+                  console.warn(
+                    "Failed to restore the bot after a merge did not work",
+                    restoreError instanceof Error ? restoreError.message : "unknown error",
+                  );
+                });
+            });
+          break;
         case "moveTaskToBot":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
@@ -3254,6 +3563,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 // This Mac's own voice: its override, else the shared one.
                 voiceId: voiceForDevice(owner, "mac"),
                 scriptKind: voiceScriptKind(owner),
+                enqueue: true,
               });
             }
           }
@@ -3261,6 +3571,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
         case "message.patch":
           rawDispatch({ type: "messagePatched", threadId: frame.threadId, message: frame.message });
+          break;
+        case "messages":
+          rawDispatch({ type: "messagesAdded", threadId: frame.threadId, messages: frame.messages });
           break;
         // An update runs detached and takes minutes; the harness pushes a
         // new status on every step so the Updates card and the floating
@@ -3354,6 +3667,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // the Trajectory tab's door: free unless that thread's tab is open
           publishRuntimeEvent(event);
           if (event.type === "content.delta") {
+            // A helper's prose belongs on its card, not in the bot's bubble.
+            if (event.subagentId) break;
             // Batch token deltas per animation frame (t3code-style): a fast
             // stream dispatches once per frame instead of once per token, so
             // the app tree re-renders at most ~60x/s while streaming.

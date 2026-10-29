@@ -7,6 +7,8 @@ import {
   BOT_OFF_SKIPPED,
   BOT_OFF_TURN_ON_LABEL,
   botIsOff,
+  botOffPeerRefusal,
+  botOffPeersRefusal,
   botOffQueuedNotSent,
   botOffRoomNotice,
 } from "../shared/bot-power.ts";
@@ -61,6 +63,26 @@ describe("Off copy", () => {
   it("counts the dropped queued messages", () => {
     expect(botOffQueuedNotSent(1)).toContain("queued message was dropped");
     expect(botOffQueuedNotSent(2)).toContain("2 queued messages were dropped");
+  });
+
+  it("names the bot when a handoff to it is turned away, and does not borrow the composer's words", () => {
+    // One handoff can name several bots, so a bare "that bot is off" cannot
+    // be told apart.  The composer's line tells a person to turn the bot on
+    // to chat, which a bot asking for a handoff can do neither of.
+    expect(botOffPeerRefusal("Plumber")).toBe("Plumber is switched off");
+    expect(botOffPeerRefusal("Plumber")).not.toBe(BOT_OFF_REFUSAL);
+    expect(botOffPeerRefusal("Plumber")).not.toMatch(/chat|turn it on/i);
+  });
+
+  it("names every Off bot a handoff named, once each, and says when the rest were refused with them", () => {
+    expect(botOffPeersRefusal(["Plumber"], false)).toBe("Plumber is switched off");
+    expect(botOffPeersRefusal(["Plumber", "Welder"], false)).toBe("Plumber is switched off; Welder is switched off");
+    expect(botOffPeersRefusal(["Plumber", "Plumber"], false)).toBe("Plumber is switched off");
+    // The refusal covers the whole request, so a handoff that named other bots too must not read as handed to them.
+    const withOthers = botOffPeersRefusal(["Plumber"], true);
+    // Rendered copy, so the gap is the real non-breaking space plus a space, never the entity.
+    expect(withOthers).toBe("Plumber is switched off.  Nothing was handed off.");
+    expect(withOthers).not.toContain("&nbsp;");
   });
 });
 
@@ -164,6 +186,13 @@ describe("the peer roster (list_bots)", () => {
     expect(awake.off).toBeUndefined();
     // and nothing about it reaches the wire
     expect(JSON.stringify(awake)).not.toContain("off");
+  });
+
+  it("carries off through JSON, which is the form the MCP proxy receives and renders", () => {
+    const rows = selectPeerBots("self", [bot("self"), bot("sleepy", { off: true }), bot("awake")])!;
+    const wire = JSON.parse(JSON.stringify(rows)) as Array<{ id: string; off?: boolean }>;
+    expect(wire.find((row) => row.id === "sleepy")?.off).toBe(true);
+    expect(wire.find((row) => row.id === "awake")).not.toHaveProperty("off");
   });
 });
 

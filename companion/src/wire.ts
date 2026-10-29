@@ -24,9 +24,20 @@ const asJsonValue = <T>(value: T): JsonValue => value as JsonValue;
 /** Keys that are the harness's business, never a device's. */
 const WITHHELD_KEYS = new Set(["resumeCursors", "sshAlias"]);
 
+const SURROGATE_RANGE_REGEX = /[\uD800-\uDFFF]/;
+
+/** Fast test for whether a string holds surrogate code units. */
+export function hasSurrogates(str: string): boolean {
+  return SURROGATE_RANGE_REGEX.test(str);
+}
+
 /** Recursively drop the withheld keys, wherever they appear. */
 export function scrub<T>(value: T): T {
-  if (Array.isArray(value)) return value.map(scrub) as unknown as T;
+  if (value === null || value === undefined) return value;
+  if (Array.isArray(value)) {
+    // SAFETY: scrub only rewrites JSON-shaped trees; output matches input shape.
+    return value.map(scrub) as unknown as T;
+  }
   const jsonValue = asJsonValue(value);
   if (isJsonObject(jsonValue)) {
     const out: JsonObject = {};
@@ -38,6 +49,22 @@ export function scrub<T>(value: T): T {
     return out as T;
   }
   return value;
+}
+
+/**
+ * Fast-path JSON string scrubber.  If the input string does not contain
+ * any withheld keys, returns the original string immediately without
+ * parsing or cloning.
+ */
+export function scrubWireJson(jsonString: string): string {
+  if (!jsonString.includes("resumeCursors") && !jsonString.includes("sshAlias")) {
+    return jsonString;
+  }
+  try {
+    return JSON.stringify(scrub(JSON.parse(jsonString)));
+  } catch {
+    return jsonString;
+  }
 }
 
 /** True when a body is worth parsing at all. Anything else passes through
@@ -139,13 +166,7 @@ function scrubEvent(event: string): string {
       if (!line.startsWith("data:")) return line;
       const raw = line.slice(5).trimStart();
       if (!raw) return line;
-      try {
-        return `data: ${JSON.stringify(scrub(JSON.parse(raw)))}`;
-      } catch {
-        // not JSON: pass it through rather than dropping it. A frame this
-        // code does not understand is still the harness's to send.
-        return line;
-      }
+      return `data: ${scrubWireJson(raw)}`;
     })
     .join(eol);
 }

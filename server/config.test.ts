@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -47,6 +47,10 @@ import {
   infisicalConfigured,
   infisicalEnabled,
   infisicalSettings,
+  agentProxyEnabled,
+  agentProxySettings,
+  applyAgentProxyEnv,
+  DEFAULT_AGENT_PROXY_ADDRESS,
   isHttpsUrl,
   type AppConfig,
 } from "./config.ts";
@@ -190,6 +194,11 @@ describe("configuration boundaries", () => {
     expect(() => parseConfigPatch({ features: { skillRecorder: "yes" } })).toThrow(
       "features.skillRecorder",
     );
+  });
+
+  it("accepts busySendDefault queue or steer", () => {
+    expect(parseConfigPatch({ busySendDefault: "queue" })).toEqual({ busySendDefault: "queue" });
+    expect(() => parseConfigPatch({ busySendDefault: "hold" })).toThrow("busySendDefault");
   });
 
   it("shows tool steps by default and accepts an explicit opt-out", () => {
@@ -847,9 +856,33 @@ describe("saveConfig section merge", () => {
   beforeEach(() => {
     mkdirSync(DATA_DIR, { recursive: true });
     rmSync(join(DATA_DIR, "config.json"), { force: true });
+    rmSync(join(DATA_DIR, "persist-on-exit.policy"), { force: true });
   });
   afterEach(() => {
     rmSync(join(DATA_DIR, "config.json"), { force: true });
+    rmSync(join(DATA_DIR, "persist-on-exit.policy"), { force: true });
+  });
+
+  it("persists server quit policy and retains it through another server setting", () => {
+    saveConfig({ server: { persistOnExit: false } });
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+    expect(readFileSync(join(DATA_DIR, "persist-on-exit.policy"), "utf8")).toBe("false\n");
+
+    saveConfig({ server: { allowRemoteDesktopLaunch: true } });
+    expect(loadConfig().server).toMatchObject({ persistOnExit: false, allowRemoteDesktopLaunch: true });
+  });
+
+  it("uses the strict offline policy and replaces it on an online save", () => {
+    saveConfig({ server: { persistOnExit: true } });
+    writeFileSync(join(DATA_DIR, "persist-on-exit.policy"), "false\n");
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+
+    saveConfig({ server: { persistOnExit: true } });
+    expect(readFileSync(join(DATA_DIR, "persist-on-exit.policy"), "utf8")).toBe("true\n");
+    expect(loadConfig().server?.persistOnExit).toBe(true);
+
+    writeFileSync(join(DATA_DIR, "persist-on-exit.policy"), "true\ntrailing");
+    expect(loadConfig().server?.persistOnExit).toBe(true);
   });
 
   it("persists usage URL and token, and a later URL-only patch keeps the token", () => {
@@ -1466,6 +1499,8 @@ describe("the secret-store section", () => {
       secretPath: DEFAULT_INFISICAL_SECRET_PATH,
       clientId: "",
       clientSecret: "",
+      token: "",
+      writeToken: "",
       refreshMinutes: DEFAULT_INFISICAL_REFRESH_MINUTES,
     });
     expect(
@@ -1476,6 +1511,43 @@ describe("the secret-store section", () => {
     expect(infisicalSettings({ infisical: { refreshMinutes: 0 } }).refreshMinutes).toBe(5);
     expect(infisicalSettings({ infisical: { refreshMinutes: 99_999 } }).refreshMinutes).toBe(1440);
     expect(infisicalSettings({ infisical: { writeThrough: true } }).writeThrough).toBe(true);
+  });
+
+  it("treats a service token as an identity, with or without the machine identity", () => {
+    // A token alone is enough to read the store: that is the shape every
+    // non-agent consumer runs with.
+    expect(infisicalConfigured({ infisical: { projectId: "p", token: "st.read" } })).toBe(true);
+    expect(infisicalConfigured({ infisical: { projectId: "p" } })).toBe(false);
+    expect(
+      infisicalConfigured({ infisical: { projectId: "p", clientId: "id", clientSecret: "secret" } }),
+    ).toBe(true);
+    expect(
+      infisicalSettings({ infisical: { projectId: "p", token: " st.read ", writeToken: " st.write " } }),
+    ).toMatchObject({ token: "st.read", writeToken: "st.write" });
+  });
+
+  it("keeps a service token that arrives in the config file or in a patch", () => {
+    // The schema strips the keys it does not know, so a token the schema
+    // does not mention is dropped on the floor: the file looks configured
+    // and the server falls back to the machine identity.  This pins the
+    // file route and the patch route, because both go through the schema.
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        infisical: {
+          projectId: "fixture-project-id",
+          token: "st.file-read-token",
+          writeToken: "st.file-write-token",
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.infisical?.token).toBe("st.file-read-token");
+    expect(cfg.infisical?.writeToken).toBe("st.file-write-token");
+
+    const patch = parseConfigPatch({ infisical: { token: "st.patched-token" } });
+    expect(patch).toMatchObject({ infisical: { token: "st.patched-token" } });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
   });
 
   it("rejects a site URL, path, environment, or project id that cannot be trusted in a query", () => {
@@ -1796,3 +1868,180 @@ describe("legacy voice provider migration", () => {
     }
   });
 });
+
+describe("agentProxy settings and environment", () => {
+  it("defaults to disabled", () => {
+    expect(agentProxyEnabled({})).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: {} })).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: { enabled: false } })).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: { enabled: true } })).toBe(true);
+  });
+
+  it("resolves defaults and falls back to infisical project settings when unconfigured", () => {
+    const defaultSettings = agentProxySettings({});
+    expect(defaultSettings).toEqual({
+      enabled: false,
+      address: DEFAULT_AGENT_PROXY_ADDRESS,
+      projectId: "",
+      environment: "prod",
+      secretPath: "/",
+      caCertPath: undefined,
+    });
+
+    const withInfisical = agentProxySettings({
+      infisical: { projectId: "proj-inf-99", environment: "staging", secretPath: "/backend" },
+    });
+    expect(withInfisical.projectId).toBe("proj-inf-99");
+    expect(withInfisical.environment).toBe("staging");
+    expect(withInfisical.secretPath).toBe("/backend");
+
+    const explicit = agentProxySettings({
+      infisical: { projectId: "proj-inf-99" },
+      agentProxy: {
+        enabled: true,
+        address: "proxy.local:18000",
+        projectId: "custom-proj",
+        environment: "dev",
+        secretPath: "/agents",
+        caCertPath: "/tmp/proxy-ca.crt",
+      },
+    });
+    expect(explicit).toEqual({
+      enabled: true,
+      address: "proxy.local:18000",
+      projectId: "custom-proj",
+      environment: "dev",
+      secretPath: "/agents",
+      caCertPath: "/tmp/proxy-ca.crt",
+    });
+  });
+
+  it("returns base environment untouched when agent proxy is disabled", () => {
+    const baseEnv = { FOO: "bar" };
+    expect(applyAgentProxyEnv({}, baseEnv)).toBe(baseEnv);
+    expect(applyAgentProxyEnv({ agentProxy: { enabled: false } }, baseEnv)).toBe(baseEnv);
+    expect(applyAgentProxyEnv({}, undefined)).toBeUndefined();
+  });
+
+  it("injects proxy environment variables when enabled", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+        projectId: "proj-xyz",
+        environment: "prod",
+        secretPath: "/app",
+        caCertPath: "/certs/proxy.pem",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, { EXISTING: "true" });
+    expect(env).toMatchObject({
+      EXISTING: "true",
+      HTTP_PROXY: "http://127.0.0.1:17322",
+      HTTPS_PROXY: "http://127.0.0.1:17322",
+      http_proxy: "http://127.0.0.1:17322",
+      https_proxy: "http://127.0.0.1:17322",
+      ALL_PROXY: "http://127.0.0.1:17322",
+      all_proxy: "http://127.0.0.1:17322",
+      NO_PROXY: "localhost,127.0.0.1",
+      no_proxy: "localhost,127.0.0.1",
+      INFISICAL_AGENT_PROXY_ADDRESS: "127.0.0.1:17322",
+      INFISICAL_PROJECT_ID: "proj-xyz",
+      INFISICAL_ENVIRONMENT: "prod",
+      INFISICAL_SECRET_PATH: "/app",
+      SSL_CERT_FILE: "/certs/proxy.pem",
+      NODE_EXTRA_CA_CERTS: "/certs/proxy.pem",
+    });
+  });
+
+  it("preserves explicitly set proxy variables when injecting", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, {
+      HTTP_PROXY: "http://corp-proxy:8080",
+      NO_PROXY: "intranet.example.com",
+    });
+    expect(env?.HTTP_PROXY).toBe("http://corp-proxy:8080");
+    expect(env?.NO_PROXY).toBe("intranet.example.com");
+    expect(env?.HTTPS_PROXY).toBe("http://127.0.0.1:17322");
+  });
+
+  it("lets explicitly configured routing and CA settings win over inherited INFISICAL_* and TLS variables", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "proxy.local:18000",
+        projectId: "explicit-proj",
+        environment: "dev",
+        secretPath: "/agents",
+        caCertPath: "/certs/proxy.pem",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, {
+      INFISICAL_AGENT_PROXY_ADDRESS: "stale.local:1",
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+      SSL_CERT_FILE: "/etc/ssl/ambient.pem",
+      NODE_EXTRA_CA_CERTS: "/etc/ssl/ambient-extra.pem",
+    });
+    expect(env).toMatchObject({
+      HTTPS_PROXY: "http://proxy.local:18000",
+      INFISICAL_AGENT_PROXY_ADDRESS: "proxy.local:18000",
+      INFISICAL_PROJECT_ID: "explicit-proj",
+      INFISICAL_ENVIRONMENT: "dev",
+      INFISICAL_SECRET_PATH: "/agents",
+      SSL_CERT_FILE: "/certs/proxy.pem",
+      NODE_EXTRA_CA_CERTS: "/certs/proxy.pem",
+    });
+  });
+
+  it("keeps an inherited routing id when the proxy only fell back to BotFleet's own Infisical settings", () => {
+    const cfg: AppConfig = {
+      infisical: { projectId: "fallback-proj", environment: "staging", secretPath: "/backend" },
+      agentProxy: { enabled: true },
+    };
+    const inherited = applyAgentProxyEnv(cfg, {
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+    });
+    expect(inherited).toMatchObject({
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+    });
+    const bare = applyAgentProxyEnv(cfg, {});
+    expect(bare).toMatchObject({
+      INFISICAL_PROJECT_ID: "fallback-proj",
+      INFISICAL_ENVIRONMENT: "staging",
+      INFISICAL_SECRET_PATH: "/backend",
+    });
+  });
+
+  it("rejects unknown agentProxy keys at the config boundary", () => {
+    expect(() => parseConfigPatch({ agentProxy: { enabled: true, typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ agentProxy: { allowReadableBrokeredSecrets: true } })).toThrow(/Unrecognized key/);
+  });
+
+  it("persists agentProxy in saveConfig and merges correctly", () => {
+    saveConfig({
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+        projectId: "saved-project",
+      },
+    });
+    const loaded = loadConfig();
+    expect(loaded.agentProxy).toMatchObject({
+      enabled: true,
+      address: "127.0.0.1:17322",
+      projectId: "saved-project",
+    });
+  });
+});
+

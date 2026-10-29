@@ -18,7 +18,7 @@ name: Sentry CI Report
 #      across repos, and this repo shares workflow names ("CI", "Security",
 #      "Effort Issues Sync") with peer apps, so without `app` a "CI" failure
 #      here would dedup into the same Sentry issue as a "CI" failure there.
-#      See AGENT-SYNC.md "Observability".
+#      See FLEET-PROTOCOL.md "Observability".
 #   2. On event == schedule (i.e. the completed run was a cron-triggered
 #      run of a workflow that defines `schedule:`): a Sentry Crons check-in
 #      (ok on success, error on failure) with an upsert monitor_config whose
@@ -36,10 +36,12 @@ name: Sentry CI Report
 # pipeline):
 #   CI,
 #   iOS TestFlight ship (GitHub-hosted macOS),
-#   Package Ubuntu,
-#   Validate Desktop Packages,
 #   Release,
 #   Sentry Deploy
+#
+# `Package Ubuntu` (`package-linux.yml`) and `Validate Desktop Packages`
+# (`package-win.yml`) were entries here until BF-2500 deleted both workflows;
+# the list now names only workflows that exist on `main`.
 #
 # `iOS TestFlight Release` (`ios-testflight.yml`) was the entry here through
 # 2026-09-04; that workflow was deleted the same day and replaced by
@@ -71,12 +73,11 @@ name: Sentry CI Report
 on:
   workflow_run:
     workflows:
+      - Vercel production catch-up
       # Names must match the `name:` field of workflow files exactly —
       # a stale entry here silently disables alerting for that pipeline.
       - CI
       - iOS TestFlight ship (GitHub-hosted macOS)
-      - Package Ubuntu
-      - Validate Desktop Packages
       - Release
       - Sentry Deploy
     types: [completed]
@@ -122,8 +123,7 @@ jobs:
         with:
           names: SENTRY_FLEET_DSN
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+          token: ${{ secrets.INFISICAL_SENTRY_CI_REPORT_READ_TOKEN }}
         env:
           GH_FALLBACK_SENTRY_FLEET_DSN: ${{ secrets.SENTRY_FLEET_DSN }}
 

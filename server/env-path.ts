@@ -290,11 +290,11 @@ const CLI_ALIAS_LIMIT = 64;
  * tarball) collapse to one row: the picker shows one row for the actual binary
  * the user has.
  *
- * A path-shaped HEAD is echoed back exactly as the scalar form has always
- * echoed it, list or no list — `?name=/opt/dsh` must answer with that path
- * whether or not an alias widened the query.  Later path-shaped entries are
- * dropped instead: the caller asked about command names, and a row the user
- * cannot re-pick is worse than no row. */
+ * A head that is already a location is echoed back exactly as the scalar form
+ * has always echoed it, list or no list — `?name=/opt/dsh` must answer with
+ * that path whether or not an alias widened the query.  Later entries that
+ * are already locations are dropped instead: the caller asked about command
+ * names, and a row the user cannot re-pick is worse than no row. */
 export function findCliCandidates(name: string | string[]): string[] {
   const exts = candidateExts();
   if (Array.isArray(name)) {
@@ -416,7 +416,9 @@ function nodeExe(near: string): string | null {
   // make a stray node.cmd hide the real node.exe beside it.
   const onPath = whichWin("node.exe");
   if (onPath && extname(onPath).toLowerCase() === ".exe") return onPath;
-  return (process.versions as Record<string, string | undefined>).electron ? null : process.execPath;
+  // SAFETY: `process.versions.electron` is set only when this process is Electron, not plain Node.
+  const versions = process.versions as Record<string, string | undefined>;
+  return versions.electron ? null : process.execPath;
 }
 
 /** npm/pnpm .cmd shims all spell their target as "%dp0%\..." (or

@@ -7,7 +7,7 @@ import { useTranscriptionAvailability } from "@/lib/use-transcription-availabili
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { currentCall, useOnCall } from "@/lib/call";
-import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, Zap, Hash, AppWindow, MessageSquare, Pencil, Trash2 } from "lucide-react";
+import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, Zap, Hash, AppWindow, MessageSquare, Pencil, Trash2, Terminal } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
@@ -36,6 +36,11 @@ import { instanceSupportsLocalComputer } from "@/lib/local-computer";
 import { queuedChipLabel, useUpdateDrain } from "@/lib/update-control";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { resolveRoomLabels } from "../../shared/terminology";
+import {
+  parseBusySendDefault,
+  shouldInterruptForBusySteer,
+  type BusySendDefault,
+} from "../../shared/busy-send-default.ts";
 import { readCachedInventory } from "@/lib/connected-apps-cache";
 import {
   autocompleteQueryAt,
@@ -43,6 +48,11 @@ import {
   applyAutocomplete,
   type AutocompleteChoice,
 } from "@/lib/composer-autocomplete";
+import {
+  botCommandAutocompleteChoices,
+  fetchBotCommands,
+} from "@/lib/bot-commands-client";
+import type { BotCommandsResponse } from "../../shared/bot-commands.ts";
 
 function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto: boolean) => void }) {
   const [open, setOpen] = useState(false);
@@ -285,10 +295,37 @@ function ComposerInner({
   };
   const engineSupportsImages = imageTargetsSupport(text);
 
-  // ── Autocomplete picker (@ for bots, # for apps/channels/etc) ──
+  // ── Autocomplete picker (@ bots, # apps/channels, / slash commands) ──
+  const [botCommands, setBotCommands] = useState<BotCommandsResponse | null>(null);
+  useEffect(() => {
+    if (!bot || group) {
+      setBotCommands(null);
+      return;
+    }
+    const botId = bot.id;
+    const threadId = bot.threadId;
+    setBotCommands(null);
+    let cancelled = false;
+    void fetchBotCommands(botId, threadId)
+      .then((menu) => {
+        if (cancelled) return;
+        setBotCommands(menu);
+      })
+      .catch(() => {
+        if (!cancelled) setBotCommands(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bot?.id, bot?.threadId, group]);
+
   const triggerInfo = autocompleteQueryAt(text, caret);
   const candidates = useMemo(() => {
     if (!triggerInfo || triggerInfo.start === dismissedAt) return [];
+    if (triggerInfo.trigger === "/") {
+      if (!bot || group || !botCommands) return [];
+      return botCommandAutocompleteChoices(botCommands, triggerInfo.query);
+    }
     const connectedApps = readCachedInventory()?.services;
     const terminology = resolveRoomLabels(state.config?.terminology);
     return getAutocompleteCandidates(triggerInfo, {
@@ -301,10 +338,36 @@ function ComposerInner({
       members,
       terminologySingular: terminology.singular,
     });
-  }, [triggerInfo, dismissedAt, state.bots, state.groups, state.routines, state.config?.terminology, bot?.id, group, members]);
+  }, [
+    triggerInfo,
+    dismissedAt,
+    state.bots,
+    state.groups,
+    state.routines,
+    state.config?.terminology,
+    bot?.id,
+    group,
+    members,
+    botCommands,
+  ]);
   const pickerOpen = candidates.length > 0;
+  const pickerLabel =
+    triggerInfo?.trigger === "@"
+      ? "Tag a Bot"
+      : triggerInfo?.trigger === "/"
+        ? "Slash Commands"
+        : "Link an App or Channel";
+  const pickerHeading =
+    triggerInfo?.trigger === "@"
+      ? "Bots"
+      : triggerInfo?.trigger === "/"
+        ? "Commands"
+        : "Apps & Channels";
 
-  useEffect(() => setHighlight(0), [triggerInfo?.start, triggerInfo?.query]);
+  useEffect(() => {
+    const firstPickable = candidates.findIndex((candidate) => !candidate.disabled);
+    setHighlight(firstPickable >= 0 ? firstPickable : 0);
+  }, [triggerInfo?.start, triggerInfo?.query, candidates]);
 
   // one line at rest, then grow with the draft — hard cap at six lines
   useEffect(() => {
@@ -317,7 +380,7 @@ function ComposerInner({
   }, [text]);
 
   const pickCandidate = (choice: AutocompleteChoice) => {
-    if (!triggerInfo) return;
+    if (!triggerInfo || choice.disabled) return;
     const { text: nextText, caret: newCaret } = applyAutocomplete(text, caret, triggerInfo, choice);
     setText(nextText);
     setCaret(newCaret);
@@ -470,7 +533,8 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
   };
 
   const hasContent = Boolean(text.trim()) || attachments.length > 0;
-  const send = (opts?: { steerNow?: boolean }) => {
+  const busySendDefault = parseBusySendDefault(state.config?.busySendDefault);
+  const send = (opts?: { steerNow?: boolean; queueOnly?: boolean }) => {
     if (locked) return;
     if (attachments.some((attachment) => attachment.kind === "image")) {
       if (!imageTargetsSupport(text)) {
@@ -505,6 +569,11 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
       dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       track("message_sent", { room: true });
     } else if (bot) {
+      let busyDelivery: BusySendDefault | undefined;
+      if (opts?.queueOnly) busyDelivery = "queue";
+      else if (opts?.steerNow) busyDelivery = "steer";
+      else if (busy) busyDelivery = busySendDefault;
+      const interruptForSteer = shouldInterruptForBusySteer(busy, busyDelivery, canSteer);
       dispatch({
         type: "send",
         botId: bot.id,
@@ -515,11 +584,16 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
         reply: replyTo ?? undefined,
         attachments,
         onError,
+        busyDelivery,
       });
-      if (busy && opts?.steerNow) {
+      if (interruptForSteer) {
         dispatch({ type: "interrupt", botId: bot.id });
       }
-      track("message_sent", { driver: bot.modelSelection?.instanceId, queued: busy && !canSteer, steerNow: opts?.steerNow });
+      track("message_sent", {
+        driver: bot.modelSelection?.instanceId,
+        queued: busy && busyDelivery === "queue",
+        steerNow: busyDelivery === "steer" && interruptForSteer,
+      });
     }
     setText("");
     setAttachments([]);
@@ -563,7 +637,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
     let session: STTSession | null = sttSessionRef.current;
 
     const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
-      if (acceptComposerTranscript(detached, finalizing, Boolean(currentCall())) && typeof line.text === "string") {
+      if (acceptComposerTranscript(detached, finalizing, Boolean(currentCall())) && line.text) {
         const base = baseText.current;
         setText(base ? `${base} ${line.text}` : line.text);
       }
@@ -759,33 +833,51 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                 >
                   {queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
                 </span>
-                <div className="flex shrink-0 items-center gap-1">
+                {/* Labeled actions, not bare glyphs: three 24px icons in a row were
+                    easy to mis-tap, and "Steer" beside "Cancel" says which one
+                    ends the wait.  The order is Steer, Edit, Cancel — Edit sits in
+                    the middle so neither neighbour reads as its default.  The
+                    accessible names stay the ones the screen readers and the
+                    tests already use. */}
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSteerQueued}
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-accent/30 bg-accent/10 text-accent hover:bg-accent/15",
+                    )}
+                    title="Stops the current turn and sends this now."
+                    aria-label="Steer Now"
+                  >
+                    <ArrowUp size={12} strokeWidth={2.5} aria-hidden="true" />
+                    Steer
+                  </button>
                   <button
                     type="button"
                     onClick={() => handleEditQueued(entry)}
-                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink transition-colors"
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-hairline/40 bg-inset/30 text-ink-secondary hover:bg-raised hover:text-ink",
+                    )}
                     title="Puts the message back in the composer to edit."
                     aria-label="Edit Queued Message"
                   >
-                    <Pencil size={12} strokeWidth={2} />
+                    <Pencil size={12} strokeWidth={2} aria-hidden="true" />
+                    Edit
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCancelQueued(entry.queueId)}
-                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-danger transition-colors"
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-hairline/40 bg-inset/30 text-ink-secondary hover:bg-raised hover:text-danger",
+                    )}
                     title="Cancel Queued Message"
                     aria-label="Cancel Queued Message"
                   >
-                    <Trash2 size={12} strokeWidth={2} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleSteerQueued}
-                    className="flex size-6 items-center justify-center rounded-md text-accent hover:bg-accent/15 transition-colors"
-                    title="Stops the current turn and sends this now."
-                    aria-label="Steer Now"
-                  >
-                    <ArrowUp size={13} strokeWidth={2.5} />
+                    <Trash2 size={12} strokeWidth={2} aria-hidden="true" />
+                    Cancel
                   </button>
                 </div>
               </div>
@@ -795,22 +887,24 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
         {pickerOpen && (
           <div
             role="listbox"
-            aria-label={triggerInfo?.trigger === "@" ? "Tag a Bot" : "Link an App or Channel"}
+            aria-label={pickerLabel}
             className="absolute bottom-full left-2 z-20 mb-2 w-80 max-h-72 overflow-y-auto rounded-xl border border-hairline/40 bg-raised shadow-lg"
           >
             <div className="border-b border-hairline/20 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider text-ink-secondary">
-              {triggerInfo?.trigger === "@" ? "Bots" : "Apps & Channels"}
+              {pickerHeading}
             </div>
             {candidates.map((item, i) => (
               <button
                 key={item.id}
                 role="option"
                 aria-selected={i === highlight}
+                disabled={item.disabled}
                 onClick={() => pickCandidate(item)}
                 onMouseEnter={() => setHighlight(i)}
                 className={cn(
                   "flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors",
                   i === highlight ? "bg-raised-hover" : "",
+                  item.disabled ? "cursor-not-allowed opacity-50" : "",
                 )}
               >
                 {item.kind === "bot" ? (
@@ -833,6 +927,10 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                   <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
                     <Zap size={14} aria-hidden="true" />
                   </span>
+                ) : item.kind === "command" ? (
+                  <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
+                    <Terminal size={14} aria-hidden="true" />
+                  </span>
                 ) : (
                   <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
                     <AppWindow size={14} aria-hidden="true" />
@@ -841,7 +939,9 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
                     <span className="truncate text-[14px] font-medium text-ink" title={item.name}>
-                      {triggerInfo?.trigger}{item.name}
+                      {item.kind === "command" && item.command
+                        ? item.command.label
+                        : `${triggerInfo?.trigger ?? ""}${item.name}`}
                     </span>
                   </div>
                   {item.description && (
@@ -963,13 +1063,24 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
               if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                 e.preventDefault();
                 const delta = e.key === "ArrowDown" ? 1 : -1;
-                setHighlight((h) => (h + delta + candidates.length) % candidates.length);
+                if (candidates.length === 0) return;
+                let next = highlight;
+                for (let step = 0; step < candidates.length; step += 1) {
+                  next = (next + delta + candidates.length) % candidates.length;
+                  if (!candidates[next]?.disabled) {
+                    setHighlight(next);
+                    break;
+                  }
+                }
                 return;
               }
               if (e.key === "Enter" || e.key === "Tab") {
-                e.preventDefault();
-                pickCandidate(candidates[highlight]);
-                return;
+                const choice = candidates[highlight];
+                if (choice && !choice.disabled) {
+                  e.preventDefault();
+                  pickCandidate(choice);
+                  return;
+                }
               }
               if (e.key === "Escape") {
                 e.preventDefault();
@@ -992,8 +1103,9 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             // Shift+Enter inserts a newline; plain Enter sends; Alt/Cmd+Enter steers immediately when busy
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
-              if (busy && !canSteer && (e.altKey || e.metaKey)) {
-                send({ steerNow: true });
+              if (busy && (e.altKey || e.metaKey)) {
+                if (group) send({ steerNow: true });
+                else send(busySendDefault === "queue" ? { steerNow: true } : { queueOnly: true });
               } else {
                 send();
               }
@@ -1010,12 +1122,14 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
               ? "Listening…"
               : pendingItems.length > 0
               ? "Cmd/Ctrl+Enter steers all queued messages"
-              : busy && canSteer
+              : busy && busySendDefault === "steer" && canSteer
                 ? `${busyName} is working — Enter sends this into the running turn`
               : busy
                 ? group
                   ? `${busyName} is working — Enter queues your message`
-                  : `${busyName} is working — sends when this turn finishes`
+                  : busySendDefault === "steer"
+                    ? `${busyName} is working — Enter steers after stopping the turn`
+                    : `${busyName} is working — sends when this turn finishes`
                 : group
                   ? `Message ${group.name} — ${groupComposerHint(group, members ?? [])}`
                   : `Message ${bot?.name ?? ""}`
@@ -1052,7 +1166,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             <Mic size={18} />
           </button>
         )}
-        {hasContent && !locked && busy && !canSteer && (
+        {hasContent && !locked && busy && busySendDefault === "queue" && (
           <button
             type="button"
             onClick={() => send({ steerNow: true })}
@@ -1068,20 +1182,37 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
           <button
             type="button"
             onClick={(e) => {
-              if (busy && !canSteer && e.altKey) {
-                send({ steerNow: true });
+              if (busy && e.altKey) {
+                if (group) send({ steerNow: true });
+                else send(busySendDefault === "queue" ? { steerNow: true } : { queueOnly: true });
               } else {
                 send();
               }
             }}
-            aria-label={busy && canSteer ? "Send into the running turn" : busy ? "Queue Message (Alt+Click to Steer Now)" : "Send Message"}
-            title={busy && canSteer ? "Send into the running turn" : busy ? "Sends when the current turn finishes (Alt+Click to Steer Now)" : "Send"}
+            aria-label={
+              busy && busySendDefault === "steer" && canSteer
+                ? "Send into the running turn"
+                : busy
+                  ? busySendDefault === "queue"
+                    ? "Queue Message (Alt+Click to Steer Now)"
+                    : "Steer after stopping the turn (Alt+Click to queue)"
+                  : "Send Message"
+            }
+            title={
+              busy && busySendDefault === "steer" && canSteer
+                ? "Send into the running turn"
+                : busy
+                  ? busySendDefault === "queue"
+                    ? "Sends when the current turn finishes (Alt+Click to Steer Now)"
+                    : "Stops the turn and sends now (Alt+Click to queue)"
+                  : "Send"
+            }
             className={cn(
               "flex size-8 shrink-0 items-center justify-center rounded-full text-white",
-              busy && !canSteer ? "bg-raised text-ink-secondary hover:bg-raised-hover" : "bg-accent hover:brightness-110",
+              busy && busySendDefault === "queue" ? "bg-raised text-ink-secondary hover:bg-raised-hover" : "bg-accent hover:brightness-110",
             )}
           >
-            {busy && !canSteer ? <Clock size={15} /> : <ArrowUp size={17} />}
+            {busy && busySendDefault === "queue" ? <Clock size={15} /> : <ArrowUp size={17} />}
           </button>
         )}
           </div>

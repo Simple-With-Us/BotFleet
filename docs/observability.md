@@ -163,9 +163,9 @@ the field leaves the stored value untouched).
    inert.` and the ship continues — a missing DSN never fails a TestFlight
    upload.  `scripts/ios-fleet/ship-testflight.sh` logs the same condition
    locally and, under `GITHUB_ACTIONS`, emits its own `::warning::` too.
-4. **Public desktop releases** (`release.yml`'s `mac` / `windows` / `linux`
-   jobs, plus the standalone `package-win.yml` and `package-linux.yml`
-   workflows).  Each package job runs a "Resolve the Sentry DSN" step before
+4. **Public desktop releases** (`release.yml`'s `mac` jobs; BF-2500 removed
+   the `windows` and `linux` jobs and the standalone `package-win.yml` and
+   `package-linux.yml` workflows).  Each package job runs a "Resolve the Sentry DSN" step before
    its `pnpm package:*` step: Infisical prod for both `SENTRY_DSN` and
    `VITE_SENTRY_DSN`, the GitHub secret as `SENTRY_DSN`'s fallback, and
    `VITE_SENTRY_DSN` copied from whichever `SENTRY_DSN` resolved to when
@@ -189,11 +189,10 @@ the field leaves the stored value untouched).
    fails the build.
 5. **Local desktop packaging.**  `scripts/with-sentry-dsn.sh` wraps a local
    `pnpm package:mac:local` (or any other `package:*` script) with the same
-   three-tier resolution — already-exported environment, Infisical (only if
-   already logged in; this script never calls `infisical login`), then the
-   handoff file `~/.secrets/botfleet-sentry.env` via
-   an `awk` read that produces only the value after the first `NAME=`, never
-   the whole `NAME=value` row — and exports both `SENTRY_DSN` and
+   three-tier resolution — already-exported environment, then
+   `fleet-secrets get NAME --path /botfleet-sentry` (Infisical Fleet-OPS),
+   then the `infisical` CLI (only if already logged in; this script never
+   calls `infisical login`) — and exports both `SENTRY_DSN` and
    `VITE_SENTRY_DSN` before executing the wrapped command.  It turns xtrace
    off before it reads anything, so neither `bash -x` nor an inherited
    `SHELLOPTS` can echo a resolved value, and it never prints one in any

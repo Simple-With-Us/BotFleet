@@ -17,6 +17,7 @@
 
 import { z } from "zod";
 
+import { joinRefusals } from "../../shared/peer-refusals.ts";
 import { inboundText, signInReason, signInSite } from "../../shared/sign-in-request.ts";
 import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
 import { sectionKey } from "../store.ts";
@@ -337,10 +338,17 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       const list = await roster(ctx);
       if (typeof list === "string") return failed(JSON.stringify({ error: list }), list);
       const botIds: string[] = [];
+      const unmatched: string[] = [];
       for (const token of tokens) {
         const peer = list.rows.find((row) => row.id === token || `@${row.name}` === token || row.name === token.replace(/^@/, ""));
-        if (!peer) return failed(JSON.stringify({ error: `no bot matches ${token}` }), "no such bot");
-        botIds.push(peer.id);
+        if (peer) botIds.push(peer.id);
+        else unmatched.push(`no bot matches ${token}`);
+      }
+      // Every token that matched nobody is named, not only the first, so one
+      // retry can fix them all.
+      if (unmatched.length > 0) {
+        const errorMessage = joinRefusals(unmatched);
+        return failed(JSON.stringify({ error: errorMessage }), errorMessage);
       }
       const reason = typeof call.arguments.reason === "string" ? call.arguments.reason.trim() : "";
       const thread = call.arguments.thread === "new" || call.arguments.thread === "standing" ? call.arguments.thread : undefined;

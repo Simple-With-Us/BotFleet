@@ -7,6 +7,7 @@ import type { RuntimeEvent } from "./contracts.ts";
 import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
+import { wantsEphemeralDispatch } from "./ephemeral-dispatch.ts";
 import { BUSY_DEFER_NOTE, DEFAULT_WEBHOOK_HOT_DEFER_MS, nextOccurrence, RoutineManager, type RoutineManagerOptions, type RoutineRunOn, type RoutineSchedule } from "./routines.ts";
 
 type TurnCompletedEvent = Extract<RuntimeEvent, { type: "turn.completed" }>;
@@ -1171,6 +1172,41 @@ describe("RoutineManager", () => {
     expect(h.taskActivations.filter(Boolean)).toHaveLength(1);
   });
 
+  it("classifies a UI-pass webhook as one-shot and leaves a payload mention on another webhook alone", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.oneShotWakeForRun = (run) => wantsEphemeralDispatch({
+      triggerSource: run.triggerSource,
+      name: run.routineName,
+      id: run.webhookId,
+    });
+    h.manager.enqueueWebhook({
+      webhookId: "ui-pass",
+      webhookName: "GitHub UI Pass",
+      prompt: "Review PR #4",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "ui-1",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent(turnCompletedFixture(h.started.at(-1)!.threadId));
+
+    h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "check failed on a commit titled UI pass",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "cg-1",
+      receivedAt: new Date(2026, 7, 17, 8, 3).getTime(),
+    });
+    await h.manager.tick();
+
+    expect(h.ephemeralFlags).toEqual([true, false]);
+    expect(h.started[0]?.threadId).not.toBe(h.started[1]?.threadId);
+  });
+
   it("keeps every delivery of ONE webhook on that webhook's own thread", async () => {
     // it used to mint a task per delivery — a real fleet ended up with 146
     // one-message tasks on a single bot, most of them uptime pings
@@ -1892,7 +1928,7 @@ describe("RoutineManager", () => {
       expect(h.started).toHaveLength(0);
     });
 
-    it("closes a Sentry check-in when a scheduled run is skipped because the bot is stopped", async () => {
+    it("opens and closes the Sentry check-in non-ok when a scheduled run is skipped because the bot is stopped (BF-2476)", async () => {
       const h = harness();
       const routine = h.manager.create({
         name: "Housekeeper sweep",
@@ -1903,10 +1939,14 @@ describe("RoutineManager", () => {
       h.manager.snoozeBot("compiler-bot");
       h.setNow(routine.nextRunAt!);
       await h.manager.tick();
+      // A stopped bot is a deliberate pause, never a success: the check-in
+      // opens and closes non-ok (BF-2476).  Emitting nothing would let Sentry
+      // synthesize a `missed` check-in at the deadline with no context.
       expect(h.checkInStarts).toHaveLength(1);
       expect(h.checkInFinishes).toHaveLength(1);
-      expect(h.checkInFinishes[0]).toMatchObject({ checkInId: "check-in-1", ok: true });
+      expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
       expect(h.started).toHaveLength(0);
+      expect(h.manager.listRuns()[0]).toMatchObject({ outcomeCode: "bot_stopped" });
     });
 
     it("cancels all queued, running, and waiting runs for a bot", async () => {
@@ -1964,6 +2004,10 @@ describe("RoutineManager", () => {
       });
       expect(webhookRun.status).toBe("cancelled");
       expect(webhookRun.outcomeCode).toBe("cancelled");
+      // BF-2462: never persisted — no run row, no prompt copy.
+      expect(webhookRun.prompt).toBe("");
+      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.skippedDeliveryCount()).toBe(1);
 
       const resourceRun = h.manager.enqueueResource({
         triggerId: "res-1",
@@ -1975,6 +2019,29 @@ describe("RoutineManager", () => {
         receivedAt: Date.now(),
       });
       expect(resourceRun.status).toBe("cancelled");
+      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.skippedDeliveryCount()).toBe(2);
+      h.manager.flushNow();
+      expect(readFileSync(h.options.file!, "utf8")).not.toContain("Run while snoozed");
+    });
+
+    it("does not persist or rewrite routines.json for repeated snoozed webhooks (BF-2462)", () => {
+      const h = harness();
+      h.manager.snoozeBot("compiler-bot");
+      h.manager.flushNow();
+      const before = readFileSync(h.options.file!, "utf8");
+      for (let i = 0; i < 5; i++) {
+        h.manager.enqueueWebhook({
+          webhookId: "wh-1", webhookName: "Hook 1", prompt: `secret-prompt-${i}`,
+          botId: "compiler-bot", runOn: "bot", deliveryId: `d-${i}`, receivedAt: Date.now(),
+        });
+      }
+      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.skippedDeliveryCount("wh-1", "webhook")).toBe(5);
+      h.manager.flushNow();
+      const after = readFileSync(h.options.file!, "utf8");
+      expect(after).toBe(before);
+      expect(after).not.toContain("secret-prompt");
     });
 
     it("requeues cancelled runs and clears snooze on runNow", async () => {
@@ -2715,7 +2782,9 @@ describe("bot on/off switch", () => {
     h.setBot("ready");
     await h.manager.tick();
     expect(h.started).toHaveLength(0);
-    expect(h.manager.listRuns()[0]?.status).toBe("cancelled");
+    // BF-2462: skipped webhook is not persisted as a run.
+    expect(h.manager.listRuns()).toHaveLength(0);
+    expect(h.manager.skippedDeliveryCount()).toBe(1);
   });
 
   it("skips a webhook even while the bot is busy, instead of folding it into a deferred backlog", () => {
@@ -2740,7 +2809,7 @@ describe("bot on/off switch", () => {
     expect(run).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED });
   });
 
-  it("skips a scheduled run, advances the schedule, and closes the Sentry check-in as ok", async () => {
+  it("skips a scheduled run, advances the schedule, and closes the Sentry check-in non-ok (BF-2476)", async () => {
     const h = harness();
     const routine = h.manager.create({ name: "Morning sweep", prompt: "sweep", botId: "sweeper", schedule: daily });
     const due = routine.nextRunAt!;
@@ -2755,8 +2824,14 @@ describe("bot on/off switch", () => {
     // Advanced, so turning the bot on resumes at the NEXT occurrence rather
     // than replaying a backlog.
     expect(h.manager.listRoutines()[0]!.nextRunAt).toBeGreaterThan(due);
+    // BF-2476: a bot that is off never ran, so the check-in opens and
+    // closes non-ok — never `ok`, and never missing (Sentry would
+    // synthesize `missed`).  The start payload carries the populated
+    // `bot_off` outcome so the pause reads as deliberate in Sentry.
+    expect(h.checkInStarts).toHaveLength(1);
+    expect(h.checkInStarts[0].run).toMatchObject({ outcomeCode: "bot_off" });
     expect(h.checkInFinishes).toHaveLength(1);
-    expect(h.checkInFinishes[0]).toMatchObject({ ok: true });
+    expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
     expect(h.failed).toHaveLength(0);
   });
 
@@ -2767,7 +2842,8 @@ describe("bot on/off switch", () => {
     const routine = h.manager.create({ name: "Sweep", prompt: "sweep", botId: "sweeper", schedule: daily });
     h.setNow(routine.nextRunAt! + 1000);
     await h.manager.tick();
-    expect(h.manager.listRuns().length).toBeGreaterThanOrEqual(2);
+    // BF-2462: only the scheduled skipped run is persisted; the webhook is not.
+    expect(h.manager.listRuns().length).toBeGreaterThanOrEqual(1);
     for (const run of h.manager.listRuns()) {
       expect(ROUTINE_ATTENTION_STATUSES.some((status) => status === run.status)).toBe(false);
     }

@@ -235,9 +235,42 @@ function bucketFor(window: string | null | undefined): string {
   const raw = window.toLowerCase();
   if (raw.includes("week")) return "weekly";
   if (raw.includes("month")) return "monthly";
-  if (raw === "5h" || raw.includes("5-h") || raw.includes("5 hour") || raw.includes("session")) return "5h";
+  // "5hr" and "5hrs" are the 5-hour window spelled without the dash, and are
+  // exactly what `server/antigravity-quota.ts` and `server/minimax-balance.ts`
+  // emit.  Left out of this test they reach the compact-duration branch below
+  // and come back "hourly", which paints a 5-hour session window as an hourly
+  // allowance -- a different quota with a similar name.
+  if (
+    raw === "5h" ||
+    raw === "5hr" ||
+    raw === "5hrs" ||
+    raw.includes("5-h") ||
+    raw.includes("5 hour") ||
+    raw.includes("session")
+  ) {
+    return "5h";
+  }
   if (raw.includes("day")) return "daily";
   if (raw.includes("hour")) return "hourly";
+  // Several engines report the window as a bare duration instead of a name
+  // ("7d", "30d", "2w").  Those used to fall through as their own bucket,
+  // which left `windowsLabelFromHeadlines` with nothing it recognised and the
+  // panel painting the SECONDARY window as the word "Longer" — a length
+  // comparison standing in for a timeframe the reader could have been told.
+  // Classify the compact forms so the label resolves to a real period.
+  const duration = /^(\d+)\s*(h|hr|hrs|d|day|days|w|wk|wks|m|mo|mos)$/.exec(raw);
+  if (duration) {
+    const amount = Number(duration[1]);
+    const unit = duration[2][0];
+    if (unit === "h" || unit === "d") {
+      if (unit === "h") return amount >= 20 && amount <= 24 ? "daily" : "hourly";
+      if (amount >= 28) return "monthly";
+      if (amount >= 6) return "weekly";
+      return "daily";
+    }
+    if (unit === "w") return "weekly";
+    return "monthly";
+  }
   return raw;
 }
 

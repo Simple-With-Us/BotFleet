@@ -21,7 +21,7 @@ public struct PushSenderHealth: Codable, Hashable, Sendable {
     /// Apple's status plus its reason, e.g. `403 ExpiredProviderToken`.
     public let lastError: String?
     /// Set when Apple refused the signing key itself.  Sending is off until
-    /// the key file changes — a fresh signature from the same key cannot
+    /// the signing key changes — a fresh signature from the same key cannot
     /// help.
     public let keyRejected: String?
     /// Notifications dropped because a device's queue was already full.
@@ -119,7 +119,7 @@ public enum PushSenderHealthView {
             // Apple's reason is technical, but it tells the owner whether
             // to ask Apple or rotate the key, so surface it verbatim and
             // explain the fix in plain English below.
-            return "\(rejected) — the key file needs replacing."
+            return "\(rejected) — the signing key needs replacing."
         }
         // A latched-off sender is a real "not woken" state that `lastSentAt`
         // alone cannot see — a past successful send says nothing about

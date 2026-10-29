@@ -1,8 +1,11 @@
 # Trusted autofix policy for this repository (read from the default branch only).
 # PR-branch .autofix.yml may still narrow allowed_bots; it must not change model,
 # turn budget, iteration cap, or verify commands.
-
-model: MiniMax-M3.1-Flash-Preview
+#
+# No model pin here on purpose (Kody on #1289):  while the callers pin the
+# org-switch revision of the reusable,  a model id in this file would have to
+# move in lockstep with every fleet switch.  The reusable's input default
+# carries the live id,  and the org variable outranks any file pin anyway.
 max_turns: 60
 max_iterations: 5
 verify_command: |

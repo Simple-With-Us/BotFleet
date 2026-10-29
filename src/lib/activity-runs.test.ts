@@ -140,6 +140,16 @@ describe("describeRun", () => {
     ).toBe("3 steps · Read ×3 — a.ts, b.ts +1");
   });
 
+  it("does not fold a helper card into a run of ordinary steps", () => {
+    const items = groupActivityRuns([
+      ...stretch("Read"),
+      tool("Task"),
+      ...stretch("Edit"),
+    ]);
+    expect(items.some((item) => item.kind === "message" && item.message.tool?.name === "Task")).toBe(true);
+    expect(items.filter((item) => item.kind === "run")).toHaveLength(2);
+  });
+
   it("says how many steps failed, because that is the reason to open it", () => {
     expect(describeRun([tool("Edit"), tool("Bash", false)])).toBe("2 steps · Edit, Run · 1 failed");
   });

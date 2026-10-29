@@ -79,6 +79,8 @@ export function pronunciations(cfg: AppConfig): readonly Pronunciation[] {
   return effectivePronunciations(cfg.tts?.pronunciations);
 }
 
+import { DEFAULT_AUDIO_RETENTION_DAYS } from "../attachments.ts";
+
 /** What the settings panel needs. Never includes the key — same write-only
  * rule as every other credential.  `voice` is the workspace default voice
  * (every bot without a voice of its own speaks with it); it is a setting,
@@ -91,6 +93,7 @@ export function describeVoice(cfg: AppConfig) {
     voice: cfg.tts?.voice || "",
     provider: voiceProvider(cfg),
     optimizedSummary: cfg.tts?.optimizedSummary === true,
+    audioRetentionDays: cfg.tts?.audioRetentionDays ?? DEFAULT_AUDIO_RETENTION_DAYS,
     pronunciations: pronunciations(cfg).map((entry) => ({ term: entry.term, say: entry.say })),
   };
 }

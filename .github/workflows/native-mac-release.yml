@@ -1,0 +1,362 @@
+# The native BotFleetMac release path (BF-2486, Phase 6): archive, Developer
+# ID sign, notarize, staple, DMG, and the Sparkle appcast, from ONE pinned
+# commit.  The default run only uploads a private Actions artifact.  A draft
+# GitHub release is a separate explicit input, and this workflow never
+# publishes: publishing stays the owner's click, exactly as in release.yml.
+#
+# Why a second workflow instead of a release.yml job: the two apps share the
+# bundle identifier app.botfleet.macos, and their feeds are different formats
+# (latest-mac.yml for electron-updater, appcast.xml for Sparkle) over
+# disjoint asset names (BotFleet-* vs BotFleetMac-*).  One workflow per feed
+# keeps either pipeline runnable while the other shell still ships, and the
+# Phase 6 milestone retires release.yml only when the Electron shell does.
+#
+# Every gate below mirrors scripts/mac-package.sh, which see for the local
+# path: codesign BEFORE notarization (notarization accepts invalid
+# signatures), hashes and lengths AFTER stapling (stapling rewrites bytes),
+# and the version stamped once in `prepare` from a full-history checkout.
+#
+# When this workflow gains push triggers, their paths must cover
+# ios/MacApp/**, ios/Sources/**, ios/project.yml and this file, or a
+# native-only change becomes unshippable (the C-86 lesson BF-2486 records).
+name: Native Mac Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit/tag/branch to release (defaults to the branch this runs from)"
+        required: false
+        type: string
+      draft:
+        description: "Attach the verified native assets to the v<version> draft release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASES_REPO: Simple-With-Us/BotFleet
+  # The native assets live on their OWN release tag, never on the Electron
+  # pipeline's v<version> release.  release.yml verifies that release's asset
+  # set is exactly the Electron set and deletes every asset it does not
+  # recognise, so a shared tag either fails the Electron release ("release
+  # asset set differs: unexpected [...]") or deletes the native ZIP, DMG and
+  # appcast.  The suffix keeps the two feeds on separate releases; the
+  # end state where both asset sets share one release is BF-2559's work and
+  # needs release.yml and scripts/verify-release-assets.mjs.
+  NATIVE_TAG_SUFFIX: "-native"
+
+jobs:
+  prepare:
+    name: Pin the release commit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+      version: ${{ steps.pin.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # fetch-depth: 0 is REQUIRED: the version is 1.0.<commit_count>,
+          # and a depth-1 clone counts 1.  The stamp script refuses shallow.
+          fetch-depth: 0
+          persist-credentials: false
+      - id: pin
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # The stamp script exits 1 on a shallow clone or a git error, and
+          # `echo "$(...)"` would return echo's status and publish an EMPTY
+          # version, which then fails much later with an unrelated error.
+          version="$(node scripts/stamp-commit-version.mjs .)" || exit 1
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Refuse to overwrite a published release
+        if: ${{ inputs.draft }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Read this job's own pin output here, never the needs context:
+          # inside the job that produces an output, needs is still empty,
+          # which is how the release.yml guard silently never fired before
+          # PR #1315 fixed it there.
+          v="v${{ steps.pin.outputs.version }}${NATIVE_TAG_SUFFIX}"
+          if gh release view "$v" --repo "$RELEASES_REPO" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
+            echo "::error::$v is already published on $RELEASES_REPO; refusing to add native assets to it"
+            exit 1
+          fi
+
+  mac-native:
+    name: BotFleetMac (sign, notarize, staple)
+    needs: prepare
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Refuse a beta Xcode
+        run: |
+          xcodebuild -version
+          if xcodebuild -version | grep -qi beta; then
+            echo "::error::xcodebuild reports a beta Xcode toolchain"
+            exit 1
+          fi
+      - name: Load the Developer ID certificate
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
+          required: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+        env:
+          GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+      - name: Import the Developer ID certificate into a throwaway keychain
+        env:
+          MAC_CERT_P12_BASE64: ${{ env.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ env.MAC_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/release.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "$MAC_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MAC_CERT_PASSWORD" -A \
+            -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          rm "$RUNNER_TEMP/cert.p12"
+      - name: Generate the Xcode project
+        run: |
+          bash scripts/ios-install-xcodegen.sh
+          cd ios
+          xcodegen generate
+      - name: Archive BotFleetMac
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          build="${VERSION##*.}"
+          xcodebuild archive \
+            -project ios/BotFleet.xcodeproj \
+            -scheme BotFleetMac \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/BotFleetMac.xcarchive" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$build" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM=CC8UTF7ATG
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/BotFleetMac.xcarchive" \
+            -exportOptionsPlist ios/ExportOptions-DeveloperID.plist \
+            -exportPath "$RUNNER_TEMP/export"
+      - name: "Gate: the signature must verify BEFORE notarization"
+        run: |
+          app="$RUNNER_TEMP/export/BotFleet.app"
+          [ -d "$app" ] || { echo "::error::the export produced no BotFleet.app"; exit 1; }
+          codesign --verify --deep --strict "$app"
+          team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          test "$team" = "CC8UTF7ATG" || {
+            echo "::error::BotFleet.app is signed by team '${team:-none}', not CC8UTF7ATG"; exit 1; }
+          echo "ok: $app"
+      - name: Load the notarization credentials
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID
+          required: APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+        env:
+          GH_FALLBACK_APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          GH_FALLBACK_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          GH_FALLBACK_APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      - name: Notarize and staple the app
+        env:
+          APPLE_API_KEY_P8_BASE64: ${{ env.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ env.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ env.APPLE_API_ISSUER_ID }}
+        run: |
+          # The key never stays at a path: it is decoded into a private
+          # temporary file, that file is opened on a file descriptor and
+          # unlinked at once, and notarytool reads it through the
+          # descriptor.
+          p8="$RUNNER_TEMP/notary.p8"
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$p8"
+          exec 3< "$p8"
+          rm -f "$p8"
+          app="$RUNNER_TEMP/export/BotFleet.app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/submit.zip"
+          # The notary's own output is the only place the reason is written
+          # down, so it is printed before the failure instead of being
+          # swallowed by `set -e`.
+          out=$(xcrun notarytool submit "$RUNNER_TEMP/submit.zip" \
+            --key /dev/fd/3 \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait 2>&1) || {
+              echo "$out"
+              echo "::error::notarization failed for the app ZIP"; exit 1; }
+          echo "$out" | tail -2
+          echo "$out" | grep -q "status: Accepted" || { echo "::error::notarization not Accepted for the app ZIP"; exit 1; }
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute "$app"
+          echo "ok: notarized, stapled, Gatekeeper-clean"
+      - name: Package the final ZIP and DMG from the stapled app
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          APPLE_API_KEY_P8_BASE64: ${{ env.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ env.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ env.APPLE_API_ISSUER_ID }}
+        run: |
+          mkdir -p native-upload
+          app="$RUNNER_TEMP/export/BotFleet.app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "native-upload/BotFleetMac-$VERSION.zip"
+          hdiutil create -volname "BotFleet" -srcfolder "$app" -ov -format UDZO \
+            "native-upload/BotFleetMac-$VERSION.dmg" > /dev/null
+          p8="$RUNNER_TEMP/notary.p8"
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$p8"
+          exec 3< "$p8"
+          rm -f "$p8"
+          out=$(xcrun notarytool submit "native-upload/BotFleetMac-$VERSION.dmg" \
+            --key /dev/fd/3 \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait 2>&1) || {
+              echo "$out"
+              echo "::error::notarization failed for the DMG"; exit 1; }
+          echo "$out" | tail -2
+          echo "$out" | grep -q "status: Accepted" || { echo "::error::notarization not Accepted for the DMG"; exit 1; }
+          xcrun stapler staple "native-upload/BotFleetMac-$VERSION.dmg"
+          xcrun stapler validate "native-upload/BotFleetMac-$VERSION.dmg"
+      # Best-effort by design: until the owner provisions the EdDSA key in
+      # Infisical (Phase 6 owner action), the appcast ships unsigned and the
+      # verify step below runs without --require-signature.  An app carrying
+      # SUPublicEDKey refuses unsigned items, so this fails closed.
+      - name: Load the Sparkle EdDSA key (optional)
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: SPARKLE_EDDSA_PRIVATE_KEY_B64
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+      - name: Generate and verify the appcast over the final bytes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SPARKLE_EDDSA_PRIVATE_KEY_B64: ${{ env.SPARKLE_EDDSA_PRIVATE_KEY_B64 }}
+        run: |
+          zip="native-upload/BotFleetMac-$VERSION.zip"
+          if [ -n "${SPARKLE_EDDSA_PRIVATE_KEY_B64:-}" ]; then
+            # sign_update is NOT part of the macOS runner image, so without
+            # this install the signing branch can never run and a
+            # provisioned key would still produce an unsigned feed.  The
+            # install is best effort, but a key with no tool is a hard
+            # error: an unsigned appcast that looks signed is the failure
+            # this pipeline exists to prevent.
+            brew install sparkle || echo "::warning::brew install sparkle failed"
+            sparkle_bin="$(brew --prefix 2>/dev/null)/bin"
+            if [ -x "$sparkle_bin/sign_update" ]; then
+              echo "$sparkle_bin" >> "$GITHUB_PATH"
+              export PATH="$sparkle_bin:$PATH"
+            fi
+            command -v sign_update > /dev/null || {
+              echo "::error::sign_update is not installed; cannot sign the appcast"; exit 1; }
+            key="$RUNNER_TEMP/sparkle-ed-key"
+            echo "$SPARKLE_EDDSA_PRIVATE_KEY_B64" | base64 --decode > "$key"
+            signature=$(sign_update --ed-key-file "$key" "$zip" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
+            test -n "$signature" || { echo "::error::sign_update produced no signature"; exit 1; }
+            printf '%s' "$signature" > "$zip.edsig"
+            rm "$key"
+            echo "Sparkle update signed"
+          else
+            echo "::warning::no Sparkle EdDSA signing (key unprovisioned); appcast is an unsigned draft"
+          fi
+          node scripts/native-appcast.mjs native-upload "$VERSION" "v$VERSION${NATIVE_TAG_SUFFIX}"
+          if [ -f "$zip.edsig" ]; then
+            node scripts/verify-native-release.mjs native-upload "$VERSION" --require-signature
+            rm "$zip.edsig"
+          else
+            node scripts/verify-native-release.mjs native-upload "$VERSION"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-mac-release
+          path: native-upload/
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Verify the native asset set
+    needs: [prepare, mac-native]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: native-mac-release
+          path: assets
+      - name: Verify the appcast against the actual bytes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: node scripts/verify-native-release.mjs assets "$VERSION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: botfleet-native-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.sha }}
+          path: assets
+          if-no-files-found: error
+          retention-days: 14
+
+  draft:
+    name: Attach the native assets to the draft release
+    if: ${{ inputs.draft }}
+    needs: [prepare, assemble]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: botfleet-native-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.sha }}
+          path: assets
+      - name: Create or update the draft with the native asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          cd assets
+          tag="v$VERSION${NATIVE_TAG_SUFFIX}"
+          if existing=$(gh api "repos/$RELEASES_REPO/releases/tags/$tag" 2>/dev/null); then
+            is_draft=$(jq -r .draft <<< "$existing")
+            if [ "$is_draft" != true ]; then
+              echo "::error::$tag is already published; refusing to replace its assets"
+              exit 1
+            fi
+          else
+            gh release create "$tag" --repo "$RELEASES_REPO" \
+              --draft --target "$SHA" --title "BotFleet $VERSION (native)" \
+              --notes "Draft assembled by the native release workflow. Edit these notes, then publish."
+          fi
+          # Native names never collide with the Electron set, so --clobber
+          # here can only replace this workflow's own earlier uploads.
+          for f in BotFleetMac-*.zip BotFleetMac-*.dmg appcast.xml; do
+            gh release upload "$tag" "$f" --repo "$RELEASES_REPO" --clobber
+          done
+          echo "native assets on $tag: $(gh release view "$tag" --repo "$RELEASES_REPO" --json assets --jq '[.assets[].name | select(startswith("BotFleetMac") or . == "appcast.xml")] | join(", ")')"

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { Routine } from "./routines";
 import {
@@ -63,8 +63,31 @@ describe("routine calendar timezone", () => {
 
   it("names both the Central calendar policy and a preserved legacy host zone", () => {
     expect(timeZoneLabel("America/Chicago", Date.parse("2026-07-01T12:00:00Z"))).toBe("Central Time (CDT)");
-    const legacy = routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" });
+    //  The zone name follows the instant the label is built from, so the
+    //  fixture pins one.  Europe/Athens is GMT+3 in July and GMT+2 in
+    //  winter, so an unpinned label flips with the daylight-saving switch
+    //  and fails every run on one side of it.
+    const legacy = {
+      ...routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" }),
+      nextRunAt: Date.parse("2026-07-01T09:00:00Z"),
+    };
     expect(routineScheduleLabel(legacy)).toMatch(/^Mon at 9:00 AM (GMT\+3|EEST)$/);
+  });
+
+  it("keeps the disabled-routine label on a pinned winter instant", () => {
+    //  A disabled routine carries no next run, so the label falls back to
+    //  the current instant, and the zone abbreviation it prints follows that
+    //  instant.  Pin the clock, or the assertion flips with the
+    //  daylight-saving switch exactly like the fixture above did.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.parse("2026-01-15T09:00:00Z"));
+      const disabled = routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" });
+      expect(disabled.nextRunAt).toBeNull();
+      expect(routineScheduleLabel(disabled)).toMatch(/^Mon at 9:00 AM (GMT\+2|EET)$/);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("omits a display-only host zone when an existing legacy recurrence is edited", () => {

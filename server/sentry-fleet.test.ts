@@ -76,7 +76,7 @@ describe("fleet export", () => {
       conversationId: "task-1",
       threadId: "thread-1",
       provider: "minimax",
-      model: "MiniMax-M3.1-Flash-Preview",
+      model: "MiniMax-M3.1-Flash",
       ok: true,
       durationMs: 1200,
       inputTokens: 100,
@@ -86,11 +86,11 @@ describe("fleet export", () => {
       toolNames: ["bash", "read"],
       botName: "Coder",
     });
-    expect(event.message).toBe("botfleet gen_ai minimax MiniMax-M3.1-Flash-Preview");
+    expect(event.message).toBe("botfleet gen_ai minimax MiniMax-M3.1-Flash");
     expect(event.tags.signal).toBe("agent");
     expect(event.tags.platform).toBe("botfleet");
     expect(event.tags["gen_ai.system"]).toBe("minimax");
-    expect(event.tags["gen_ai.request.model"]).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(event.tags["gen_ai.request.model"]).toBe("MiniMax-M3.1-Flash");
     expect(event.extra["gen_ai.usage.cost"]).toBe(0.09);
     expect(event.extra["botfleet.cost.estimated_usd"]).toBeUndefined();
     expect(event.extra["botfleet.tool.names"]).toBe("bash,read");

@@ -107,6 +107,10 @@ const webhookResponse = z.object({
     verificationPending: z.boolean().optional(), verifiedAt: z.number().optional(),
     verificationSample: z.object({ receivedAt: z.number(), eventName: z.string().optional(), contentType: z.string().optional(), preview: z.string() }).strict().optional(),
     eventTypes: z.array(z.string()).optional(), minGapMinutes: z.number().optional(), oneShotWake: z.boolean().optional(),
+    actions: z.array(z.string()).optional(), requiredLabels: z.array(z.string()).optional(), conclusions: z.array(z.string()).optional(),
+    defaultBranchOnly: z.boolean().optional(), minSentryLevel: z.enum(["debug", "info", "warning", "error", "fatal"]).optional(),
+    excludeSentryProjects: z.array(z.string()).optional(), pagerdutyUrgency: z.enum(["high", "low"]).optional(),
+    mergedPullRequestsOnly: z.boolean().optional(), ignoredCount: z.number().optional(), lastIgnoredAt: z.number().optional(),
   }).strict(),
 }).strict();
 

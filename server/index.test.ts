@@ -544,6 +544,93 @@ beforeAll(async () => {
     expect(back.body.conversationMode).toBe("projects");
   });
 
+  it("folds every extra thread of one bot into the chosen one", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    const destination = bot.threadId;
+    expect((await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Second" })).status).toBe(201);
+    expect((await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Third" })).status).toBe(201);
+
+    const merged = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: destination });
+    expect(merged.status).toBe(200);
+    expect(merged.body.merged).toHaveLength(2);
+    expect(merged.body.skipped).toEqual([]);
+    // one conversation is left, and it is the one that was chosen
+    expect(merged.body.bot.tasks).toHaveLength(1);
+    expect(merged.body.bot.tasks[0].threadId).toBe(destination);
+    expect(merged.body.bot.threadId).toBe(destination);
+
+    const after = await api("GET", "/api/bots");
+    const fresh = after.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    expect(fresh.tasks).toHaveLength(1);
+  });
+
+  it("refuses a merge-all with no destination, a foreign destination, or an unknown bot", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Side work" });
+    const other = (await api("POST", "/api/bots")).body.bot;
+
+    const missing = await api("POST", `/api/bots/${bot.id}/merge-threads`, {});
+    expect(missing.status).toBe(400);
+    const foreign = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: other.threadId });
+    expect(foreign.status).toBe(400);
+    const unknown = await api("POST", "/api/bots/no-such-bot/merge-threads", { intoThreadId: bot.threadId });
+    expect(unknown.status).toBe(404);
+
+    // none of those refusals moved anything
+    const after = await api("GET", "/api/bots");
+    const fresh = after.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    expect(fresh.tasks.length).toBeGreaterThan(1);
+  });
+
+  it("validates the merge request before it reaches the store", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+
+    // an unknown key is a typo, not a field to carry along
+    const unknown = await api("POST", `/api/bots/${bot.id}/merge-threads`, {
+      intoThreadId: bot.threadId,
+      also: "x",
+    });
+    expect(unknown.status).toBe(400);
+    // a thread id that is not a string, and one far longer than any id
+    const wrongType = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: 42 });
+    expect(wrongType.status).toBe(400);
+    const tooLong = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: "x".repeat(200) });
+    expect(tooLong.status).toBe(400);
+
+    // and none of those refusals moved anything
+    const after = await api("GET", "/api/bots");
+    const fresh = after.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    expect(fresh.tasks).toHaveLength(1);
+  });
+
+  it("answers a merge with the roster, not the whole transcript", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Second" });
+
+    const merged = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: bot.threadId });
+    expect(merged.status).toBe(200);
+    expect(merged.body.merged).toHaveLength(1);
+    // A merged conversation can hold far more than one event frame
+    // carries, so the answer carries the roster and leaves the transcript
+    // to the paged endpoint.
+    expect(merged.body.bot.messages).toBeUndefined();
+    expect(merged.body.bot.tasks).toHaveLength(1);
+  });
+
+  it("tells a person how much conversation each thread holds", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    const listed = await api("GET", "/api/bots");
+    const fresh = listed.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    for (const task of fresh.tasks) {
+      expect(typeof task.messageCount).toBe("number");
+    }
+  });
+
 afterAll(async () => {
   boxStub?.close();
   // Upstream fixed this same Linux scratch-cleanup flake with an inline
@@ -555,7 +642,9 @@ afterAll(async () => {
 
 describe("harness HTTP API", () => {
   it("restores encrypted workspace credentials only through authenticated runtime memory", async () => {
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const owner = z.object({ nonce: z.string().min(1) }).parse(
+      JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")),
+    );
     const restore = (body: unknown, nonce = owner.nonce) => fetch(`${BASE}/api/runtime/credentials`, {
       method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${nonce}` },
       body: JSON.stringify(body),
@@ -684,6 +773,58 @@ describe("harness HTTP API", () => {
     expect(body.app).toBe("botfleet");
     expect(typeof body.pid).toBe("number");
     expect(body.static).toBe(true);
+  });
+
+  it("native server controls expose VM state without configuration secrets", async () => {
+    const response = await api("GET", "/api/system/control");
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ activeBotCount: 0, persistOnExit: expect.any(Boolean) });
+    expect(response.body.localVms).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: "shared", running: false, state: "missing" }),
+    ]));
+    // The response also carries the work that is holding a stop, so the
+    // Control app can name it instead of reporting a bare total.  Each entry
+    // is a count and a plain label, and nothing else.
+    z.array(z.object({ count: z.number(), label: z.string() }).strict()).parse(response.body.blockingWork);
+    expect(Object.keys(response.body).sort()).toEqual(["activeBotCount", "blockingWork", "localVms", "persistOnExit"]);
+  });
+
+  it("native server controls reject companion replays and non-JSON shutdowns", async () => {
+    expect((await fetch(`${BASE}/api/system/control`, {
+      headers: { "x-botfleet-companion": "1" },
+    })).status).toBe(403);
+    expect((await fetch(`${BASE}/api/system/control/stop`, { method: "POST" })).status).toBe(415);
+    expect((await fetch(`${BASE}/api/system/control/stop`, {
+      method: "POST", headers: { "content-type": "application/json", "x-botfleet-companion": "1" }, body: "{}",
+    })).status).toBe(403);
+    expect((await api("GET", "/api/health")).status).toBe(200);
+  });
+
+  it("native server controls refuse another admission before writing a shutdown marker", async () => {
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { authorization: `Bearer ${owner.nonce}` };
+    const held = request({ hostname: "127.0.0.1", port: PORT, path: "/api/bots", method: "POST",
+      headers: { "content-type": "application/json", "content-length": "2" } });
+    held.on("error", () => {});
+    held.write("{");
+    const active = async () => {
+      const runtime = await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json();
+      return z.object({ activeWorkCount: z.number() }).parse(runtime).activeWorkCount;
+    };
+    try {
+      await expect.poll(active).toBe(1);
+      const refused = await api("POST", "/api/system/control/stop", {});
+      expect(refused.status).toBe(409);
+      // The refusal names the work that is holding the stop, so the owner can
+      // act on it instead of being told only that something is busy.
+      expect(refused.body.error).toContain("active operation(s) must finish before the server can stop");
+      expect(refused.body.error).toContain("in-flight request");
+      expect(existsSync(join(home, ".botfleet", "stopped.marker"))).toBe(false);
+      expect((await api("GET", "/api/health")).status).toBe(200);
+    } finally {
+      held.destroy();
+      await expect.poll(active).toBe(0);
+    }
   });
 
   it("returns 400 for a doubled-slash request target without killing the harness", async () => {
@@ -2913,7 +3054,7 @@ describe("harness HTTP API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }).toBe(true);
+      }, { timeout: winSettleMs(10_000) }).toBe(true);
 
       // the record still names the engine that is NOT running the turn
       const midFlight = (await api("GET", "/api/bots?messages=0")).body.bots.find(
@@ -2926,17 +3067,24 @@ describe("harness HTTP API", () => {
       // hasSession found claude, the real owner; a modelSelection lookup would
       // have asked crasher, which owns nothing, and reported success anyway
       expect(stop.body).toMatchObject({ ok: true, stopped: true });
-      await expect.poll(async () => {
-        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
-          (candidate: { id: string }) => candidate.id === bot.id,
-        );
-        return state?.busy;
-      }).toBe(false);
+      // On windows-latest the failover owner can take longer to clear busy after
+      // interrupt; the default expect.poll window is a coin flip there (#867).
+      await settlesWithin(
+        async ({ signal }) => {
+          const state = (await api("GET", "/api/bots?messages=0", undefined, { signal })).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          );
+          return state?.busy === false;
+        },
+        winSettleMs(20_000),
+        200,
+        "bot clearing busy after interrupt on the failover owner",
+      );
     } finally {
       await api("POST", `/api/bots/${bot.id}/interrupt`, {});
       await api("DELETE", `/api/bots/${bot.id}`);
     }
-  });
+  }, winSettleMs(60_000));
 
   it("the mid-turn fail-over skips a chain entry the doomed breaker is refusing", async () => {
     // Regression: selectTurnFallback only skipped a doomed engine when its
@@ -3552,7 +3700,38 @@ describe("harness HTTP API", () => {
         }
 
         if (queueSuccessor) {
-          expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" }))).toEqual({
+          // The POST must land while the bot is still busy; on windows-latest a
+          // fast reload can clear busy between the reload tool frame and here.
+          // Poll for the queued response in one step: wait for busy, POST once,
+          // and stop — never spin on busy alone while the bot is already idle.
+          type MessageSendResult = { status: number; body: unknown };
+          const queuedSendBodySchema = z.object({ queued: z.literal(true) }).passthrough();
+          const isQueuedSend = (result: MessageSendResult | undefined): boolean =>
+            !!result
+            && result.status === 202
+            && queuedSendBodySchema.safeParse(result.body).success;
+          let successorSend: MessageSendResult | undefined;
+          await expect
+            .poll(
+              async () => {
+                if (isQueuedSend(successorSend)) return true;
+                if (successorSend) return false;
+                const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+                  (candidate: { id: string }) => candidate.id === bot.id,
+                );
+                if (!state?.busy) return false;
+                successorSend = await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" });
+                return isQueuedSend(successorSend);
+              },
+              {
+                timeout: winSettleMs(15_000),
+                interval: 100,
+                message:
+                  "queued successor send while the reload-held bot is busy (idle here means the reload window closed early)",
+              },
+            )
+            .toBe(true);
+          expect(successorSend).toEqual({
             status: 202,
             body: expect.objectContaining({ ok: true, queued: true }),
           });
@@ -3590,7 +3769,7 @@ describe("harness HTTP API", () => {
                 (message: { text?: string }) => message.text?.includes("You've hit your session limit"),
               ).length,
             };
-          }, { timeout: 10_000 }).toEqual({
+          }, { timeout: winSettleMs(10_000) }).toEqual({
             launchedQueuedPrompt: true,
             queuedUserVisible: true,
             quotaReplies: 2,
@@ -3606,7 +3785,7 @@ describe("harness HTTP API", () => {
                 message.tool?.name?.startsWith("Fell over to"),
               ),
             };
-          }, { timeout: 10_000 }).toEqual({ busy: true, fellOver: true });
+          }, { timeout: winSettleMs(10_000) }).toEqual({ busy: true, fellOver: true });
         }
 
         const beforeStop = (await api("GET", "/api/bots?messages=0")).body.bots.find(
@@ -3652,12 +3831,12 @@ describe("harness HTTP API", () => {
           }
           return true;
         },
-        6_000,
+        winSettleMs(6_000),
         200,
         "instance cleanup writes",
       );
     }
-  }, 40_000);
+  }, winSettleMs(40_000));
 
   it("reports stopped:false when the stop matched no live turn", async () => {
     // An idle bot has no session on any instance. The old endpoint answered a
@@ -5373,6 +5552,71 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("narrows a webhook to merged pull requests through PATCH and filters the rest without starting a run", async () => {
+    const bots = await api("GET", "/api/bots");
+    const created = await api("POST", "/api/webhooks", {
+      name: "Compiler",
+      prompt: "Verify the merge.",
+      botId: bots.body.bots[0].id,
+      runOn: "bot",
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.webhook.mergedPullRequestsOnly).toBeUndefined();
+    const webhookId: string = created.body.webhook.id;
+    const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet" };
+    const deliver = (event: string, deliveryId: string, body: string) => fetch(created.body.credential.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-github-event": event, "x-github-delivery": deliveryId },
+      body,
+    });
+
+    const patched = await api("PATCH", `/api/webhooks/${webhookId}`, { mergedPullRequestsOnly: true });
+    expect(patched.status).toBe(200);
+    expect(patched.body.webhook).toMatchObject({ id: webhookId, name: "Compiler", mergedPullRequestsOnly: true });
+
+    const checkRun = await deliver(
+      "check_run",
+      "gh-check-run",
+      JSON.stringify({ repository, action: "completed", check_run: { status: "completed", conclusion: "failure" } }),
+    );
+    expect(checkRun.status).toBe(202);
+    expect(await checkRun.json()).toMatchObject({ accepted: true, ignored: true });
+    const unmerged = await deliver(
+      "pull_request",
+      "gh-pr-unmerged",
+      JSON.stringify({ repository, action: "closed", pull_request: { number: 7, merged: false, merged_at: null } }),
+    );
+    expect(await unmerged.json()).toMatchObject({ accepted: true, ignored: true });
+    const beforeMerge = await api("GET", "/api/routines");
+    expect(beforeMerge.body.runs.filter((run: { webhookId?: string }) => run.webhookId === webhookId)).toEqual([]);
+
+    const merged = await deliver(
+      "pull_request",
+      "gh-pr-merged",
+      JSON.stringify({ repository, action: "closed", pull_request: { number: 7, merged: true, merged_at: "2026-10-18T21:00:00Z" } }),
+    );
+    expect(merged.status).toBe(202);
+    const mergedBody = await merged.json();
+    expect(mergedBody).toMatchObject({ accepted: true, duplicate: false, runId: expect.any(String) });
+    expect(mergedBody).not.toHaveProperty("ignored");
+    const receipts = await api("GET", "/api/routines");
+    const run = receipts.body.runs.find((candidate: { deliveryId?: string }) => candidate.deliveryId === "gh-pr-merged");
+    expect(run).toMatchObject({ triggerSource: "webhook", webhookId, routineName: "Compiler" });
+    // This test is about filtering, not about what the bot does with the run.
+    await api("POST", `/api/routine-runs/${run.id}/cancel`);
+
+    const listed = await api("GET", "/api/webhooks");
+    expect(listed.body.webhooks.find((webhook: { id: string }) => webhook.id === webhookId)).toMatchObject({
+      mergedPullRequestsOnly: true,
+      deliveryCount: 1,
+      ignoredCount: 2,
+    });
+
+    const cleared = await api("PATCH", `/api/webhooks/${webhookId}`, { mergedPullRequestsOnly: false });
+    expect(cleared.body.webhook.mergedPullRequestsOnly).toBeUndefined();
+    expect((await api("DELETE", `/api/webhooks/${webhookId}`)).status).toBe(200);
+  });
+
   it("stores OpenCode Go credentials as a configured-only status", async () => {
     const put = await api("PUT", "/api/config", { opencodeGo: { apiKey: "opencode-secret" } });
     expect(put.status).toBe(200);
@@ -6275,7 +6519,8 @@ describe("instance CLI override API", () => {
       await api("DELETE", `/api/bots/${bot.id}`);
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI })).status).toBe(200);
     }
-  }, winSettleMs(60_000));
+    // Three interrupt idle polls (each up to winSettleMs(30_000)) plus setup polls must fit inside the case budget.
+  }, winSettleMs(120_000));
 
   it("does not let setup from before a provider reload dispatch or clear its successor", async () => {
     const launchLog = join(home, "fake-claude-setup-race-launches");
@@ -6348,7 +6593,7 @@ describe("instance CLI override API", () => {
           );
           return live?.busy === true;
         },
-        10_000,
+        winSettleMs(10_000),
         200,
         "successor dispatch persisting lastInstanceId and claude resume cursor without a stale launch",
       );
@@ -6373,7 +6618,7 @@ describe("instance CLI override API", () => {
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI, fullAuto: false })).status).toBe(200);
       expect((await api("PUT", "/api/config", { box: { token: "" } })).status).toBe(200);
     }
-  }, 30_000);
+  }, winSettleMs(30_000));
 
   it("rejects overlapping provider configuration writes", async () => {
     const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
@@ -8896,7 +9141,7 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
 });
 
 describe("model lineage over HTTP: saved selections move forward, never aliased", () => {
-  type Saved = { instanceId: string; model: string; latest?: string; fallbacks?: Saved[] };
+  type Saved = { instanceId: string; model: string; latest?: string; contextCap?: number; maxOutputTokens?: number; fallbacks?: Saved[] };
   // A describe records each engine's CLI version; until the Claude CLI has
   // reported one, nothing on a Claude engine is moved.  The fixture CLI
   // reports 2.1.232, older than 2.1.280 (Opus 5.5) and 2.1.284 (Sonnet 5.5),
@@ -9009,6 +9254,87 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       });
       expect(bad.status).toBe(400);
       expect(bad.body.error).toMatch(/latest/);
+    });
+  });
+
+  it("refuses a context cap or output limit that is not a whole number of tokens from 1 to 10,000,000", async () => {
+    await withBot("Limits Refused", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      for (const bad of [0, -5, 1.5, "8k", 10_000_001, true]) {
+        const cap = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { ...sonnet, contextCap: bad } });
+        expect(cap.status, `contextCap ${String(bad)}`).toBe(400);
+        expect(cap.body.error).toMatch(/contextCap/);
+        const out = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { ...sonnet, maxOutputTokens: bad } });
+        expect(out.status, `maxOutputTokens ${String(bad)}`).toBe(400);
+        expect(out.body.error).toMatch(/maxOutputTokens/);
+      }
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 1, maxOutputTokens: 10_000_000 },
+      })).status).toBe(200);
+    });
+  });
+
+  it("keeps a saved context cap and output limit when an older client re-sends the selection without them", async () => {
+    await withBot("Limits Older Client", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          ...sonnet,
+          contextCap: 524_288,
+          maxOutputTokens: 8192,
+          fallbacks: [{ instanceId: "claude2", model: "claude-opus-5", maxOutputTokens: 4096 }],
+        },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ contextCap: 524_288, maxOutputTokens: 8192 });
+
+      // The shipped iOS app decodes instanceId, model, effort and fallbacks
+      // only, so an effort edit from the phone re-sends exactly that.
+      const phone = await api("PATCH", `/api/bots/${bot.id}/profile`, {
+        modelSelection: { ...sonnet, effort: "high", fallbacks: [{ instanceId: "claude2", model: "claude-opus-5" }] },
+      });
+      expect(phone.status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({
+        effort: "high",
+        contextCap: 524_288,
+        maxOutputTokens: 8192,
+        fallbacks: [{ instanceId: "claude2", model: "claude-opus-5", maxOutputTokens: 4096 }],
+      });
+    });
+  });
+
+  it("clears a context cap and output limit on an explicit null, and drops them on another model", async () => {
+    await withBot("Limits Cleared", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 524_288, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+
+      // The desktop picker's "No Limit" and an emptied Max Output field.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: null, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+      const capCleared = await selectionOf(bot.id);
+      expect(capCleared?.contextCap).toBeUndefined();
+      expect(capCleared).toMatchObject({ maxOutputTokens: 8192 });
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: null, maxOutputTokens: null },
+      })).status).toBe(200);
+      const bothCleared = await selectionOf(bot.id);
+      expect(bothCleared?.contextCap).toBeUndefined();
+      expect(bothCleared?.maxOutputTokens).toBeUndefined();
+
+      // Limits belong to the model they were set on.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 524_288, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5" },
+      })).status).toBe(200);
+      const moved = await selectionOf(bot.id);
+      expect(moved).toMatchObject({ model: "claude-opus-5" });
+      expect(moved?.contextCap).toBeUndefined();
+      expect(moved?.maxOutputTokens).toBeUndefined();
     });
   });
 
@@ -10015,6 +10341,21 @@ describe("CSRF security hardening", () => {
     });
     expect(result.status).toBe(403);
     expect(result.body).toContain("forbidden: cross-origin request");
+  });
+
+  it("refuses mutating API requests that carry Cloudflare tunnel markers", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "content-type": "application/json",
+        "content-length": "2",
+        "cf-ray": "fixture-ray",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(403);
+    expect(result.body).toContain("named tunnel");
   });
 
   it("accepts Origin from the server's own port", async () => {

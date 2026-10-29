@@ -1044,7 +1044,13 @@ final class Session: ObservableObject {
     }
 
     @discardableResult
-    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> MessageSendOutcome {
+    func send(
+        _ text: String,
+        to chat: Chat,
+        attachments: [PendingChatAttachment] = [],
+        recording: (data: Data, transcript: String)? = nil,
+        busyDelivery: String? = nil
+    ) async -> MessageSendOutcome {
         guard let client else { return MessageSendOutcome(ok: false, clientNonce: "") }
         var clientNonce = ""
         do {
@@ -1093,7 +1099,8 @@ final class Session: ObservableObject {
                         toBot: bot.id,
                         threadId: threadId,
                         idempotencyKey: localId,
-                        recording: savedRecording
+                        recording: savedRecording,
+                        busyDelivery: busyDelivery
                     )
                     if result.queued == true, let queueId = result.queueId, !queueId.isEmpty {
                         let dest = result.threadId ?? bot.threadId
@@ -1215,6 +1222,23 @@ final class Session: ObservableObject {
             choice: choice,
             isPermission: card.isPermission
         )
+    }
+
+    /// What this computer can do for a voice call: which providers hold a
+    /// key and which one a call would take.  Booleans and a choice, never a
+    /// key -- the permanent credentials stay on the computer.  Throws so a
+    /// voice call can tell "unreachable" from "no provider" and say so.
+    func voiceCallStatus() async throws -> StsStatus {
+        guard let client else { throw APIError.transport("Not connected to your computer.") }
+        return try await client.stsStatus()
+    }
+
+    /// One short-lived call token.  Spent opening a single realtime session;
+    /// it is not the provider's permanent key and it is not a credential for
+    /// anything else.
+    func voiceCallToken(provider: String) async throws -> StsSessionToken {
+        guard let client else { throw APIError.transport("Not connected to your computer.") }
+        return try await client.stsToken(provider: provider)
     }
 
     /// Allow every permission request waiting in this conversation (the
@@ -2636,6 +2660,21 @@ final class Session: ObservableObject {
     }
 
     @MainActor
+    func updateBusySendDefault(_ busySendDefault: String) async -> ConfigStatus? {
+        guard let client else { return nil }
+        do {
+            let status = try await client.updateBusySendDefault(busySendDefault)
+            config = status
+            return status
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+            return nil
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+    }
+
     func updateConversationMode(_ conversationMode: String, mergeThreads: Bool = false) async -> ConfigStatus? {
         pendingConversationMode = conversationMode
         pendingConversationMergeThreads = mergeThreads
@@ -3931,7 +3970,7 @@ extension CompanionState {
                 return ChatSummary(
                     chat: chat,
                     preview: Self.preview(of: last),
-                    lastActivity: latestActivity(for: chat),
+                    lastActivity: latestActivity(for: chat, newest: last),
                     pinned: Self.pinned(chat)
                 )
             }
@@ -3949,18 +3988,28 @@ extension CompanionState {
 
     /// Newest loaded message across this chat's threads. Other tasks may
     /// not be hydrated yet; `latestActivity` still reads their stamps.
+    ///
+    /// Runs for every chat on every chat-list render, so it resolves the
+    /// active leaf from the bot already in hand instead of letting
+    /// `visibleTranscript(forThread:)` scan the whole roster per thread
+    /// (BOTFLEET-3R). Rooms have no branching leaf.
     func newestLoadedMessage(for chat: Chat) -> Message? {
         var candidates = [Message]()
         switch chat {
         case let .bot(bot):
-            if let last = visibleTranscript(forThread: bot.threadId).last { candidates.append(last) }
+            let leaf = bot.activeLeafId
+            if let last = visibleTranscript(forThread: bot.threadId, activeLeafId: leaf).last {
+                candidates.append(last)
+            }
             for task in bot.tasks ?? [] {
-                if let last = visibleTranscript(forThread: task.threadId).last ?? task.lastMessage {
+                if let last = visibleTranscript(forThread: task.threadId, activeLeafId: leaf).last ?? task.lastMessage {
                     candidates.append(last)
                 }
             }
         case let .room(room):
-            if let last = visibleTranscript(forThread: room.threadId).last { candidates.append(last) }
+            if let last = visibleTranscript(forThread: room.threadId, activeLeafId: nil).last {
+                candidates.append(last)
+            }
         }
         return candidates.max { $0.at < $1.at }
     }
@@ -3969,7 +4018,13 @@ extension CompanionState {
     /// `lastActivity`, so an unread update on a background task does not
     /// keep showing yesterday from the currently selected thread.
     func latestActivity(for chat: Chat) -> Double {
-        let fromMessages = newestLoadedMessage(for: chat)?.at
+        latestActivity(for: chat, newest: newestLoadedMessage(for: chat))
+    }
+
+    /// `latestActivity(for:)` with the newest loaded message already found,
+    /// so `chatSummaries` walks each chat's transcripts once, not twice.
+    func latestActivity(for chat: Chat, newest: Message?) -> Double {
+        let fromMessages = newest?.at
         switch chat {
         case let .bot(bot):
             let taskActivities = (bot.tasks ?? []).map { $0.lastActivity ?? $0.createdAt }

@@ -110,11 +110,27 @@ type SkillRecordingPayload = {
     code?: "load-failed" | "renderer-gone";
   }
 
+  /** The build the running process reports.  There is deliberately no build
+   *  number field: the Mac app carries a hand-maintained semver, so its patch
+   *  component is not a build anyone can look up.  `version` is the truth. */
+  interface AppRuntimeInfo {
+    version: string;
+    platform: string;
+    arch: string;
+    electron: string;
+    node: string;
+    packaged: boolean;
+    harness: string | null;
+    /** The same fields on one line, ready to copy into a bug report. */
+    summary: string;
+  }
+
   interface Window {
     ogb?: {
       platform: NodeJS.Platform;
       getCapabilities(): Promise<DesktopCapabilities>;
       onCapabilitiesChanged(cb: (capabilities: DesktopCapabilities) => void): () => void;
+      appInfo?(): Promise<AppRuntimeInfo>;
       companionAccount?: {
         state(): Promise<CompanionAccountState>;
         requestCode(email: string): Promise<CompanionAccountState>;

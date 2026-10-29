@@ -317,15 +317,27 @@ posixOnly("the bot On/Off switch", () => {
       body: JSON.stringify({ level: "error" }),
     });
     expect(delivered.status).toBe(202);
-    const accepted = z.object({ runId: z.string() }).parse(await delivered.json());
+    // A webhook delivery for an Off bot creates no run at all: the delivery
+    // is filtered at ingress and recorded as ignored.
+    const accepted = z.object({ ignored: z.literal(true), runId: z.string().optional() }).parse(await delivered.json());
+    expect(accepted.runId).toBeUndefined();
 
     const runNow = await api("POST", `/api/routines/${routine.body.routine.id}/run`);
     expect(runNow.status).toBe(201);
     expect(runNow.body.run).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", manual: true });
 
     const runs: WireRun[] = (await api("GET", "/api/routines")).body.runs ?? [];
-    const hookRun = runs.find((run) => run.id === accepted.runId);
-    expect(hookRun).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED });
+    // No run row (and no prompt copy) is stored for the delivery, so it is
+    // absent from the routine history.
+    expect(JSON.stringify(runs)).not.toContain("Triage the alert");
+    // The webhook activity log still records the delivery, as ignored with the
+    // Off reason, never as accepted.
+    const activityLog: Array<{ webhookId: string; runId?: string; outcome: string; reason?: string }> = (
+      await api("GET", "/api/webhooks")
+    ).body.attempts;
+    const attempt = activityLog.find((entry) => entry.webhookId === hook.body.webhook.id);
+    expect(attempt).toMatchObject({ webhookId: hook.body.webhook.id, outcome: "ignored", reason: "Bot is Off" });
+    expect(attempt?.runId).toBeUndefined();
     const manualRun = runs.find((run) => run.manual === true && run.botId === bot.id);
     expect(manualRun).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED });
 

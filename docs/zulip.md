@@ -4,10 +4,16 @@ BotFleet's role bots can live on the fleet's Zulip realm (`https://simplewithus.
 
 The code is `server/zulip/` (client, router, state, outbound rules, the tool mount rule, hub), `server/tools/zulip.ts` (the HTTP-lane tool executors) and the `zulip_reply`, `zulip_post` and `zulip_follow_topic` records in `server/tools/registry.ts`.
 
+## Native Outgoing Webhook Wake
+
+Zulip may also POST a configured bot's direct-message or direct-mention event to the public webhook listener at `/zulip/outgoing/<ROLE>` (for example `/zulip/outgoing/BF-PLUMBER`).  The route requires the role's `ZULIP_OUTGOING_<ROLE>_TOKEN` and the exact configured `bot_email`; it is served by the existing webhook listener on port 8800.  Keep the native event queue enabled as well: Zulip does not send outgoing-webhook callbacks for messages sent by bots, and the queue remains the coverage path for those messages and other events.
+
+The callback is only a wake hint.  BotFleet discards callback message text, durably queues the authenticated bot and message ID, promptly returns `response_not_required: true`, then fetches that message through the bot's own Zulip REST client and sends it through the same router and message-ID deduplication as the native listener.  Queue state is stored under the existing data directory at `zulip/outgoing`; no message body or webhook token is written there or logged.  The token is optional in Infisical so native listening continues before webhook setup.  Put each role's outgoing token beside its existing Zulip credentials in the shared secret store's `/zulip` folder; the receiver is deny-by-default until that secret is present.
+
 ## What Happens
 
 1. On boot (after `booting = false`), the hub starts one session per bot listed in `zulip.bots`.  A session loads that bot's key, checks `GET /users/me` (the email must match the credentials, and only member or moderator roles are accepted: an admin or owner key is refused), registers an unnarrowed event queue and long-polls it.  Nothing is dispatched until boot recovery has claimed the turns the last stop interrupted, and a bot that still holds an interrupted turn's marker takes no Zulip work, so a wake can never bury a turn that was promised a resume.
-2. A message wakes a bot only when it is a direct `@**BF-Role**` mention outside code and quotes, a 1:1 DM, or a new message in a topic the bot follows (see Following Topics).  Wildcard mentions outside a followed topic, group DMs, incoming-webhook bots (Sentry, Linear, …) and the bot's own posts never wake.  A peer bot's mention or 1:1 DM wakes the bot like anyone else's: peer requests are screened, not refused (AGENT-SYNC.md, Precedence rule 3), and what holds a peer back is the loop guard and the peer budgets below, plus the screen the woken turn is told to apply.
+2. A message wakes a bot only when it is a direct `@**BF-Role**` mention outside code and quotes, a 1:1 DM, a new message in a topic the bot follows (see Following Topics), or an `@all`, `@channel` or `@stream` broadcast in a channel.  Jay's broadcast is an owner wake, and a peer bot's broadcast is a peer wake on the same budgets and the same loop guard as a mention.  `@all` is mostly Jay's (owner, Oct 27 2026):  a bot uses it only when Jay asks or approves, or in an extremely serious situation, and then messages Jay why.  A bot woken only by `@all` replies only when it has something to add, unless Jay asked for a confirmation or an opt-in.  `@everyone` never wakes (it lands unread in every bot's inbox), and neither does `@topic`.  Wildcard mentions outside a followed topic, group DMs, incoming-webhook bots (Sentry, Linear, …) and the bot's own posts never wake.  A message that starts with the eyes marker (`:eyes:` or the literal 👀, optionally right after the seat tag, as in `[BF-PLUMBER] :eyes:`) wakes nobody at all.  A peer bot's mention or 1:1 DM wakes the bot like anyone else's: peer requests are screened, not refused (AGENT-SYNC.md, Precedence rule 3), and what holds a peer back is the loop guard and the peer budgets below, plus the screen the woken turn is told to apply.
 3. Wake-worthy messages are queued per bot, one unit per conversation (channel + topic, or the DM).  Messages for the same conversation that arrive while the bot is busy join that unit; two conversations never share a turn.
 4. When the bot is free, the unit starts one turn as the `zulip` automation source, in a task of its own for that conversation (`Zulip #channel > topic`, or `Zulip DM with user N`), created the way a routine's task is and never switched to.  It never runs in the owner's active thread, so a peer cannot ask the bot to read Jay's conversation back out, and one conversation cannot read another's.  The turn text is a `[ZULIP INBOUND]` header followed by the messages between `BEGIN_UNTRUSTED_ZULIP` and `END_UNTRUSTED_ZULIP` markers, one JSON object per message, with a per-turn nonce on both markers.  The header holds the sender ids and the listener's verdicts, an `Owner items:` line naming the message ids verified as Jay's (the only place owner status is stated), and the channel and topic on a line of their own labelled as names someone typed: a topic is chosen by whoever posts, so it is text to read, never a verdict.  Message text, and a channel or topic name, cannot add to the `Owner items:` line.
 5. The bot answers with `zulip_reply`, which posts to the conversation that woke the turn.  If the turn ends without calling it and `zulip.autoReply` is `"final"` (the default), the turn's last reply is posted there instead.  The reply target belongs to that turn alone (and to its model fallbacks and card continuations, which reuse its starting message): a later turn in the same task, such as Jay typing there, neither replies to the Zulip sender nor changes whether the Zulip turn's answer is posted.
@@ -76,7 +82,7 @@ Do these in order.  Nothing below runs until `zulip.enabled` is `true`.
    site=https://simplewithus.zulipchat.com
    ```
 
-   On Jay's Mac these files are in `~/.secrets/Zulip/`.  BotFleet does not read that folder until the owner names it in `zulip.credentialDir`, and `AGENTS.md` does not allow it today (D0).
+   On Jay's Mac the keys live in Infisical Fleet-OPS `/zulip` (`<BOT>_ZULIP_EMAIL`, `_KEY`, `_SITE`) and the fleet CLI reads them there;  nothing keeps zuliprc files in `~/.secrets` any more (AFC-359).  The file source is for a host with no vault, and BotFleet reads a folder only when the owner names it in `zulip.credentialDir`.
 
    With `credentialSource` unset, a `credentialDir` means the file source and nothing else means no source.  `"credentialSource": "infisical"` wins over a `credentialDir`; `OMB_ZULIP_CREDENTIAL_DIR` (tests and soak rigs) wins over both.
 2. **Subscriptions.**  An event queue delivers only channels the bot is subscribed to.  Subscribe each BF bot to the channels where it should be woken (the fleet guide's Bot Setup step 5).  BotFleet does not subscribe bots itself.
@@ -134,6 +140,34 @@ Zulip delivers every event to every queue registered for a user.  If two process
 
 All three are offered only to a bot whose Zulip session is connected, never in a dry run, and only on a turn that may speak for the bot: a Zulip turn (or a continuation of one), a scheduled owner-authored routine, or a turn Jay is attending in BotFleet.  Webhook, manually replayed routine, iMessage, Linq, resource and job turns, and a peer-invoked (`ask_bot`) turn, get none of them (`server/zulip/mount.ts`).  On the MCP lane the agents proxy publishes them when the harness sets `OMB_ZULIP=1`, the turn's comms grant carries the same bit, and `/api/internal/zulip/{reply,post,follow}` refuses a grant without it and takes the caller's identity from the grant, never from the arguments.  On the HTTP lane the tool host bakes the identity in at dispatch.
 
+## Dispatcher Routing via the Plugin Platform
+
+The hub can route qualifying DMs and mentions through an installed
+integration instead of waking the mentioned bot directly.  The
+reference integration is the optional `zulip-wake` plugin
+(`docs/plugins/zulip-plugin/`); the framework is
+`docs/plugins/EVENT-PLATFORM.md`.
+
+- With no Zulip plugin installed and enabled, everything above runs
+  unchanged: the mentioned bot wakes directly.
+- With `zulip-wake` enabled, a qualifying message is offered to the
+  plugin as a typed envelope (already authenticated, canonically
+  fetched, deduplicated).  The plugin returns a dispatcher target —
+  usually the Director bot's inbox — with source context and the
+  scoped chat listing, and the host starts the dispatcher turn on the
+  dispatcher's own session, reusing the unit machinery (coalescing,
+  budgets, retries, bindings, auto-reply).  The dispatcher decides
+  where the message belongs and replies through the connector under
+  the correct identity.
+- A declined, timed-out, or unknown-target decision falls back to the
+  legacy direct wake.  Nothing is queued twice and nothing is dropped:
+  ownership is claimed before the decision awaits, and late retry
+  decisions re-fetch canonically and queue exactly once.
+- Configure the dispatcher bot id, peer routing, and followed-topic
+  routing in Plugins → Configure and health.  Health shows pending,
+  dead-letter, and recent outcomes as reason codes; Send test event
+  exercises the full path without touching Zulip.
+
 ## Tests
 
 `server/zulip/*.test.ts` run against `server/testing/fake-zulip-server.ts`, a `node:http` fake with real event queues, Basic auth, `BAD_EVENT_QUEUE_ID`, mention flags computed outside code and quotes, channel ids, subscriptions, `user_topics` with `user_topic` events, member deactivation, and 429 injection.  `pnpm vitest run server/zulip` runs them; `pnpm test` picks them up with the rest.
@@ -143,10 +177,10 @@ All three are offered only to a bot whose Zulip session is connected, never in a
 - **D0, credentials (resolved by the owner 2026-10-09:  one source of truth, linked, not copied).**  BotFleet reads the BF keys where the fleet keeps them, Infisical project "AI Fleet Coordinator" (`9bf7417a-fbbb-42ca-870c-2b45207233f5`), environment `prod`, folder `/zulip`, through `infisicalProjectId` and `infisicalEnv` (Setup, step 1).  A change there reaches BotFleet with no copy to update.
   - **Why not an Infisical link.**  Infisical's cross-project references (`${@project-slug.env.KEY}`) and cross-project imports would do this inside Infisical, but they are a paid Enterprise feature that the fleet's plan does not have (`crossProjectSecretSharing` is off), and a same-project import or reference cannot reach another project.  A Secret Sync into BotFleet's project would be a second copy of the whole folder, every seat's key included.
   - **Access.**  BotFleet's machine identity is the organization's one machine identity ("automation"), which can already read AI Fleet Coordinator, so no grant was added.  A narrower read-only identity limited to `prod`, `/zulip` and `ZULIP_BF_*` needs custom roles or additional privileges, which the plan does not have either (`rbac` is off).  Until then the source narrows what it keeps instead:  Infisical's API returns the whole folder (there is no name filter), so another seat's key is in memory while the read is in flight, and only the bound roles' names are kept once it returns.
-  - **What stays.**  The runtime copies in `~/.secrets/Zulip/BF-<Role>-zuliprc` are for the fleet CLI on Jay's Mac, not for BotFleet.  The file source stays built and off, and `AGENTS.md` ("Secret Handoff") and `docs/secrets.md` still keep the product server away from fleet handoff files.  The Infisical source reads the folder directly rather than through `server/secret-map.ts`'s table, because the names are per role and the values must stay out of `cfg`.
+  - **What stays.**  The fleet CLI on Jay's Mac reads the BF keys from Infisical Fleet-OPS `/zulip`, not from files.  The file source stays built and off, and `AGENTS.md` ("Secret Handoff") and `docs/secrets.md` still keep the product server away from fleet handoff files.  The Infisical source reads the folder directly rather than through `server/secret-map.ts`'s table, because the names are per role and the values must stay out of `cfg`.
 - **Tag casing (owner).**  The harness writes `[BF-PLUMBER]` per the seat-tag rule; the fleet guide's example shows `[BF-Deployer]`.
 - **Model downgrade (owner).**  Zulip turns are unattended, so `unattendedModelDowngrade` moves them to the cheaper model, as it does for webhooks.  Background jobs have an owner ruling that exempts them; Zulip has none yet.
 - **Owner messages and stopped bots.**  Jay's Zulip messages run unattended and do not wake a bot he stopped in BotFleet.  Lifting either needs an owner ruling.
 - **Routine posts (owner, resolved 2026-10-13).**  Scheduled routine runs get the Zulip tools when that bot's session is connected.  `zulip_post` remains limited to configured outbound channels and every post still passes the secret scan.  Manual replay, webhook, resource, iMessage, job and peer-invoked turns remain excluded because the local sidecar can reach those entry points without an owner-bound proof.
 - **Not built yet.**  Rollover for long-lived Zulip conversation tasks (routine tasks have it), topic re-keying on resolve, a Settings panel, `zulip_read_topic`, ack reactions, Zulip knobs in `server/knob-map.ts` (the budgets are config-file settings today), and keeping a reply binding across a harness restart (a turn recovered after a restart does not auto-reply).
-- **Director** has no Zulip bot, so it cannot be bound.
+- **Director** has a Zulip identity (`BF-Director`) and may be bound like the other configured roles.

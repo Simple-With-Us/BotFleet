@@ -21,9 +21,12 @@ import {
   dshSpawnArgs as clutchDshSpawnArgs,
   dshSupport as clutchDshSupport,
   dshVersionCompatibilityReason,
+  parseAdvertisedDshModels,
+  type DshAdvertisedModel,
 } from "clutch/dsh/acp";
 
 import type { ModelCatalog, ProviderErrorCode, SendTurnInput } from "../../contracts.ts";
+import { isJsonString } from "../../schema.ts";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -34,11 +37,11 @@ import { dshWrapSpawn } from "./dsh-mcp.ts";
 export { dshWrapSpawn, isDshEngineCli, isStockDshCli } from "./dsh-mcp.ts";
 /** BotFleet DSH model catalog.  The Clutch package still publishes
  * MiniMax-M2.7, but it is dropped here per the product decision (M3.1 Flash
- * Preview dominates on context and is the canonical DSH-hosted MiniMax row). */
+ * dominates on context and is the canonical DSH-hosted MiniMax row). */
 /** BotFleet DSH model catalog.
  *
  *  Owner-facing list (2026-09-27): DeepSeek V4 Pro, DeepSeek V4 Flash, then
- *  MiniMax M3.1 Flash Preview and M2.7 Highspeed.  DeepSeek's catalog is
+ *  MiniMax M3.1 Flash and M2.7 Highspeed.  DeepSeek's catalog is
  *  only two models — `deepseek-flash` IS the image+video model, billed at the
  *  same rate as text (its image tokens bill "together with your text tokens"),
  *  so there is deliberately no third DeepSeek row for the multimodal variant.
@@ -58,9 +61,9 @@ export { dshWrapSpawn, isDshEngineCli, isStockDshCli } from "./dsh-mcp.ts";
  *  onto it through `RETIRED_MODEL_REPLACEMENTS` so saved bots keep working.
  *
  *  `MiniMax-M2.7` and `MiniMax-M3` are dropped per the product decision (M3.1
- *  Flash Preview dominates on context and is the canonical DSH-hosted MiniMax
- *  row); both sit in `DSH_EXCLUDED_MODEL_IDS` so the live-catalog union with
- *  an older settings file cannot re-add them.
+ *  Flash dominates on context and is the canonical DSH-hosted MiniMax row);
+ *  both sit in `DSH_EXCLUDED_MODEL_IDS` so the live-catalog union with an
+ *  older settings file cannot re-add them.
  *
  *  Badges are price/speed facts the picker renders as chips, so the cost
  *  tradeoff is visible before a model is picked. */
@@ -75,6 +78,23 @@ export { dshWrapSpawn, isDshEngineCli, isStockDshCli } from "./dsh-mcp.ts";
  *  there silently stops an image from routing off Pro, with nothing failing. */
 export const DSH_DEEPSEEK_PRO_MODEL = "DeepSeek-V4-Pro";
 export const DSH_DEEPSEEK_FLASH_MODEL = "DeepSeek-V4.1-Flash";
+
+/** The DSH-hosted MiniMax M3.1 Flash row.  The installed dsh engine dropped
+ *  the `-Preview` suffix (it now declares `minimax/MiniMax-M3.1-Flash`), and
+ *  Clutch's model matching has no MiniMax alias family, so sending the old
+ *  `MiniMax-M3.1-Flash-Preview` spelling failed every turn with "unknown
+ *  model".  The retired spelling is excluded below and saved selections are
+ *  rewritten onto this id by `retired-model-ids.ts`.  Every engine that
+ *  serves M3.1 now spells it this way, the native MiniMax HTTP driver
+ *  included. */
+export const DSH_MINIMAX_M31_FLASH_MODEL = "MiniMax-M3.1-Flash";
+/** The pre-rename spelling of {@link DSH_MINIMAX_M31_FLASH_MODEL}.
+ *
+ *  Still needed in two places, neither of them a catalog row: the exclusion
+ *  list below drops a stale settings entry that declares it, and the Clutch
+ *  package keys its per-model effort table by it, so the settings view below
+ *  has to present the live entry under that id for Clutch to answer. */
+export const DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL = "MiniMax-M3.1-Flash-Preview";
 
 export const STATIC_DSH_MODELS: ModelCatalog = {
   default: DSH_DEEPSEEK_FLASH_MODEL,
@@ -98,13 +118,19 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
         `Text and reasoning only — lacks vision. Switch to ${DSH_DEEPSEEK_FLASH_MODEL} to attach an image.`,
     },
     {
-      id: "MiniMax-M3.1-Flash-Preview",
-      label: "MiniMax-M3.1-Flash-Preview",
+      id: DSH_MINIMAX_M31_FLASH_MODEL,
+      label: DSH_MINIMAX_M31_FLASH_MODEL,
       images: true,
       contextWindow: 1_000_000,
-      badge: "Preview",
+      badge: "Token Plan",
       badgeTitle:
         "Frontier multimodal coding model with a 1M context window. MiniMax offers it through Token Plan and MiniMax Code, so it needs a Token Plan key.",
+      // Clutch's per-model effort table still keys M3.1 by the retired
+      // Preview id, so the static map cannot vouch for any level on this id.
+      // `readDshModelCatalog` fills in what the install's settings entry
+      // declares; this explicit `[]` keeps the engine-wide DeepSeek levels off
+      // the row when nothing reads the file.
+      effortLevels: [],
     },
     {
       id: "MiniMax-M2.7-highspeed",
@@ -123,7 +149,7 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
  *  the live read below and the static fallback agree on what is excluded. */
 const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   "MiniMax-M2.7",
-  // Superseded by MiniMax-M3.1-Flash-Preview.  Dropping it from the static
+  // Superseded by MiniMax-M3.1-Flash.  Dropping it from the static
   // options is not enough: a settings file written while M3 shipped still
   // declares it, and the live-catalog union below would re-add it.
   "MiniMax-M3",
@@ -133,6 +159,10 @@ const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   // `deepseek-v4-pro` is deliberately absent: it is still declared, and
   // `dshSameModel` folds it onto `DeepSeek-V4-Pro` row without a duplicate.
   "deepseek-v4-flash",
+  // Renamed to MiniMax-M3.1-Flash by the installed engine.  A settings file
+  // written before the rename still declares it, and the union below would
+  // re-add a row the engine refuses at turn time.
+  DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL,
 ];
 
 /** The installed engine declares the models it can actually serve in its own
@@ -218,7 +248,7 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
         // The declared entry type is a promise the hand-edited file may break,
         // so the id is re-checked as a string here: a numeric or object id
         // would otherwise reach the picker and fail at turn time instead.
-        if (typeof id !== "string" || !id) continue;
+        if (!isJsonString(id) || !id) continue;
         if (seen.has(id)) continue;
         seen.add(id);
         if (isExcludedModelId(id)) continue;
@@ -260,6 +290,49 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
  *  models; it cannot retire them.  Removals need an explicit exclusion in
  *  `DSH_EXCLUDED_MODEL_IDS`, which is how `MiniMax-M2.7` and the retired
  *  pre-rename `deepseek-v4-flash` id are handled. */
+/** Whether a settings entry's id names `model`, ignoring case.  The declared
+ *  `string | undefined` is a promise a hand-edited file may break, so the id
+ *  is re-checked as a string before it is lowercased. */
+function isM31FlashEntryId(id: string | undefined, model: string): boolean {
+  return isJsonString(id) && id.toLowerCase() === model.toLowerCase();
+}
+
+/** One provider map with the renamed M3.1 entry answering to the retired
+ *  Preview id, and any stale Preview entry dropped so it cannot shadow the
+ *  live one.  Every other entry, and every field of the renamed one
+ *  (`reasoningEfforts`, `compat`), is carried through untouched. */
+function m31EffortProviders(
+  providers: Readonly<Record<string, DshProviderBlock>> | undefined,
+): Readonly<Record<string, DshProviderBlock>> | undefined {
+  if (!providers) return undefined;
+  return Object.fromEntries(
+    Object.entries(providers).map(([route, block]): [string, DshProviderBlock] => {
+      if (!block || !Array.isArray(block.models)) return [route, block];
+      const models = block.models
+        .filter((entry) => !isM31FlashEntryId(entry?.id, DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL))
+        .map((entry) =>
+          isM31FlashEntryId(entry?.id, DSH_MINIMAX_M31_FLASH_MODEL)
+            ? { ...entry, id: DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL }
+            : entry,
+        );
+      return [route, { ...block, models }];
+    }),
+  );
+}
+
+/** The parsed settings as Clutch's Preview-keyed effort table needs to see
+ *  them, so the `MiniMax-M3.1-Flash` entry's declared levels reach the
+ *  renamed row.  `undefined` stays `undefined`: no file still answers `[]`. */
+function m31EffortView(settings: DshSettings | undefined): DshSettings | undefined {
+  if (!settings) return undefined;
+  const piAi = settings["llm-pi-ai"];
+  return {
+    ...settings,
+    "llm-pi-ai": piAi ? { ...piAi, providers: m31EffortProviders(piAi.providers) } : piAi,
+    providers: m31EffortProviders(settings.providers),
+  };
+}
+
 export function readDshModelCatalog(
   environment: Record<string, string | undefined> = process.env,
 ): ModelCatalog {
@@ -300,8 +373,11 @@ export function readDshModelCatalog(
   // offers a level this dsh would refuse.  A missing or unreadable file
   // answers `[]` for those rows too.
   const installedLevels = dshInstalledEffortLevels(settings);
+  // Clutch still keys M3.1 by the retired Preview id, so ask it about the
+  // renamed entry through a view where that entry answers to the old id.
+  const m31Levels = dshInstalledEffortLevels(m31EffortView(settings))[DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL];
   for (const option of options) {
-    const levels = installedLevels[option.id];
+    const levels = option.id === DSH_MINIMAX_M31_FLASH_MODEL ? m31Levels : installedLevels[option.id];
     if (levels) option.effortLevels = [...levels];
   }
   // The static default is always in the union, so a refresh cannot move a
@@ -325,6 +401,27 @@ export {
 
 export function dshSpawnArgs(config: AcpConfig, turn: Pick<SendTurnInput, "integrations">): string[] {
   return clutchDshSpawnArgs(config, turn);
+}
+
+const DSH_FLASH_WIRE_MODEL_ID = "deepseek-flash";
+const dshSelectModel = clutchDshSupport.selectModel;
+
+/** Switch a resolved model value whose id is a non-canonical spelling of
+ * DeepSeek Flash (for example the settings alias `deepseek-v4.1-flash`) to the
+ * stock `deepseek-flash` option, but only when the session advertises that
+ * option on the same provider route.  dsh refuses any option it did not
+ * advertise ("unknown model option"), so a session that offers only the alias
+ * keeps the declared value.  Without an advertisement Clutch already builds the
+ * stock wire id, so the value is returned unchanged. */
+export function dshCanonicalFlashWireValue(value: string, advertised: readonly DshAdvertisedModel[] | null): string {
+  const resolved = advertised?.find((entry) => entry.value === value);
+  if (!resolved || resolved.id === DSH_FLASH_WIRE_MODEL_ID || !dshSameModel(resolved.id, DSH_FLASH_WIRE_MODEL_ID)) {
+    return value;
+  }
+  const canonical = advertised?.find(
+    (entry) => entry.provider === resolved.provider && entry.id === DSH_FLASH_WIRE_MODEL_ID,
+  );
+  return canonical?.value ?? value;
 }
 
 /**
@@ -358,6 +455,18 @@ export const dshSupport = {
   images: true,
   models: STATIC_DSH_MODELS,
   resolveModels: (environment) => readDshModelCatalog(environment),
+  // The installed settings can declare Flash as `deepseek-v4.1-flash`, but
+  // DeepSeek's API accepts only the stock `deepseek-flash` id.  Resolve every
+  // model through Clutch first, so the advertised route and the not-offered
+  // check (DshModelNotOfferedError) still apply, then prefer the advertised
+  // `deepseek-flash` option on the same route when the session offers it.
+  selectModel: dshSelectModel && {
+    ...dshSelectModel,
+    valueForModel: (model, advertised) => {
+      const value = dshSelectModel.valueForModel?.(model, advertised);
+      return value ? dshCanonicalFlashWireValue(value, parseAdvertisedDshModels(advertised)) : value;
+    },
+  },
   loginNote: clutchDshSupport.loginNote ?? "DSH CLI auth missing — add ~/.dsh/.credentials.yaml",
   resumeMethod: "session/resume" as const,
   spawnArgs: dshSpawnArgs,

@@ -6,8 +6,10 @@
 #
 # Options:
 #   --repo-root PATH   Repo root (default: cwd)
-#   --build N          Force CURRENT_PROJECT_VERSION (default: UTC YYYYMMDDHHMM)
-#   --version X.Y.Z    Force MARKETING_VERSION (optional)
+#   --build N          Force CURRENT_PROJECT_VERSION (exact; default: the repo
+#                      commit count, raised above the App Store Connect floor)
+#   --version X.Y.Z    Force MARKETING_VERSION (exact; default: the next patch
+#                      on the app's train)
 #   --export-only      Build IPA only; do not upload
 #   --upload-only IPA  Skip archive; upload an existing IPA via ASC API key
 #   --dry-run          Print plan and exit
@@ -16,16 +18,35 @@
 #   --force-ship       Bypass min-interval + same-HEAD skip (emergency / owner)
 #   --sync-project-version  Write the resolved version into project.pbxproj
 #   --allow-unverified-seq  Ship even if App Store Connect cannot be consulted
-#                           AND no local/project sequence exists (dangerous:
-#                           may reuse a build number ASC rejects as duplicate)
+#                           (dangerous: the marketing version and the build
+#                           number are then planned from unverified state)
 #
-# Version numbering (owner directive 2026-08-12, revised same day):
-#   MARKETING_VERSION       = 1.0.<seq>          +1 on EVERY rebuild
-#   CURRENT_PROJECT_VERSION = <UTC YYYYMMDDHHMM> when the build was cut
-# App Store Connect renders "<marketing> (<build>)", so a ship shows
-# "1.0.8 (202609012215)". Marketing +1 every rebuild; build is the cut time.
-# The sequence is max(local cache, App Store Connect, project.pbxproj) + 1, so a
-# lost or reset local counter cannot silently reuse a shipped version.
+# Version numbering (owner directive 2026-10-24, AFC-517; replaces the
+# 1.0.<commit_count> scheme unified in #2801 on 2026-10-18):
+#   MARKETING_VERSION       = <prefix>.<P+1>
+#       <prefix> is the train from marketingVersionDefault (1.0).  P is the
+#       highest patch already used on that train in App Store Connect, counting
+#       BOTH the App Store versions (appStoreVersions.versionString) AND the
+#       TestFlight trains (preReleaseVersions.version) for the app's platform.
+#       A TestFlight train that holds a build named after its own patch (the
+#       "1.0.2358 (2358)" drift trains) is IGNORED, so those uploads no longer
+#       push the version forward.  App Store versions are never ignored.
+#   CURRENT_PROJECT_VERSION = the repo commit count (git rev-list --count
+#       HEAD), raised when needed so that it is strictly greater than every
+#       build already in the TARGET marketing train (old 12-digit UTC stamps
+#       included:  Apple requires build numbers to grow inside one train) and
+#       than the app's highest plain-integer build below 1000000000 on that
+#       platform.  On macOS EVERY build counts, because macOS build numbers
+#       have to grow across all trains.
+#   The two numbers are INDEPENDENT:  the build number never names the
+#       marketing version, and the marketing version never names the build.  The
+#       only coupling is a safety rule:  a ship must never look like "1.0.N (N)",
+#       so a build that happens to equal the patch number moves one up.
+#   --version X.Y.Z is an exact marketing override and --build N an exact build
+#       override.  With --version only the build is still automatic (the commit
+#       count, floored against that train);  with --build only the marketing
+#       version is still the automatic next patch.
+#   App Store Connect renders "<marketing> (<build>)", e.g. "1.0.237 (2360)".
 #
 # ---------------------------------------------------------------------------
 # WHAT IS HOLDING BACK AUTOMATIC SHIPPING: THE MIN-INTERVAL RATE LIMIT
@@ -42,7 +63,7 @@
 #
 #   Also skips when git HEAD matches the last successful ship (no new commits).
 #   Skip exits 0 ("nothing to do") so agent loops stay quiet, and a skipped run
-#   does NOT consume a build sequence number (see the ship-gate ordering note
+#   does NOT resolve or consume a version (see the ship-gate ordering note
 #   at the call site).
 #   State: ~/.cache/ios-fleet/last-ship-<app>.txt  (unix_ts + space + git_sha)
 #
@@ -60,7 +81,7 @@
 #                              (record_successful_ship must still run or the rate
 #                              gate never advances)
 #
-# It also renders the mandatory AGENT-SYNC "What to Test" release note from the
+# It also renders the mandatory FLEET-PROTOCOL "What to Test" release note from the
 # commit range since the last successful ship. THIS IS OPT-IN, because it writes
 # copy every TestFlight tester reads:
 #   IOS_TF_RELEASE_NOTES=1     publish to App Store Connect
@@ -72,9 +93,12 @@
 # fleet runners).
 #
 # Secrets (never printed):
-#   ~/.secrets/appstore-connect.env  (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_PATH)
+#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8  (env first; else Infisical via
+#   `fleet-secrets get`: /asc ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8, written to a
+#   0600 temp file and deleted on exit).  A path in ASC_KEY_PATH is NOT a
+#   credential source:  it is ignored wherever it appears.
 #   or Xcode-signed-in session for destination=upload export
-#   SENTRY_AUTH_TOKEN  (dSYM + Size Analysis upload; env or ~/.secrets/global-api-keys)
+#   SENTRY_AUTH_TOKEN  (dSYM + Size Analysis upload; env or `fleet-secrets get`)
 #   SENTRY_DSN         (injected into xcodebuild so Cocoa plist $(SENTRY_DSN) is set)
 #
 # Sentry after a successful archive (2026-09-01):
@@ -87,13 +111,32 @@
 set -euo pipefail
 
 # LaunchAgents inherit a tiny PATH (no Homebrew). Node is required for
-# ensure-tf-ready. Keep this before any `node` / `xcodegen` call.
+# ensure-tf-ready and for the App Store Connect queries. Keep this before any
+# `node` / `xcodegen` call.
 export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+# The node that runs asc-api.mjs.  IOS_FLEET_NODE lets an offline test
+# answer App Store Connect from a stub;  a real ship leaves it unset and
+# uses node from PATH.
+ASC_NODE="${IOS_FLEET_NODE:-node}"
 
 FLEET_DIR="$(cd "$(dirname "$0")" && pwd)"
 APPS_JSON="${FLEET_DIR}/apps.json"
 TEAM_ID="CC8UTF7ATG"
-SECRETS_ENV="${HOME}/.secrets/appstore-connect.env"
+# AFC-359: App Store Connect credentials come from the environment (CI sets them) or
+# Infisical Fleet-OPS via fleet-secrets.  Nothing is read from the old secrets folder.
+FLEET_SECRETS_BIN="${FLEET_SECRETS:-${HOME}/.local/bin/fleet-secrets}"
+ASC_TMP_DIR=""
+# "staging" means a credential was resolved and the staging path was refused.
+# Anything else, including empty, means no credential was resolved.  The upload
+# step has to say which one it is.  A path refusal is not a missing key.
+ASC_AUTH_FAILURE=""
+cleanup_asc_tmp() {
+  if [[ -n "${ASC_TMP_DIR:-}" ]]; then
+    rm -rf "$ASC_TMP_DIR" 2>/dev/null || true
+  fi
+  ASC_TMP_DIR=""
+}
+trap cleanup_asc_tmp EXIT
 # 1 hour — owner 2026-08-14: ship unbuilt iOS updates as often as once per hour.
 # Not Apple compute; local/process hygiene. Cron ticks twice an hour so a
 # trailing merge inside the window is picked up on the next eligible tick.
@@ -162,62 +205,398 @@ resolve_project() {
   return 1
 }
 
-# Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
-# exported ASC_* vars are discarded with the subshell). Sets AUTH_MODE to
-# "api_key" or "none". Never prints secret values.
-load_secrets() {
-  AUTH_MODE="none"
-  if [[ -f "$SECRETS_ENV" ]]; then
-    # shellcheck disable=SC1090
-    set -a
-    # shellcheck source=/dev/null
-    source "$SECRETS_ENV"
-    set +a
-  fi
-  # CI FALLBACK (2026-10-02). A GitHub-hosted macos-latest runner has no
-  # ~/.secrets directory, so ios-appstore-gm-prepare.sh normally synthesises
-  # the env file from the APPLE_API_* names it exported from Infisical. When
-  # that file is missing or its ASC_KEY_PATH points at a file that is not
-  # there, fall back to those names directly: decode the base64 p8 into a 0600
-  # file under ~/.secrets and export the ASC_* trio that altool (and
-  # asc-api.mjs) expect. Never prints a value.
-  if [[ -z "${ASC_KEY_ID:-}" || -z "${ASC_ISSUER_ID:-}" || -z "${ASC_KEY_PATH:-}" || ! -f "${ASC_KEY_PATH:-/nonexistent}" ]]; then
-    if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
-      local ci_dir="${HOME}/.secrets" ci_key="${HOME}/.secrets/AuthKey.p8"
-      mkdir -p "$ci_dir"
-      chmod 700 "$ci_dir"
-      local decoded=1
-      case "$APPLE_API_KEY_P8_BASE64" in
-        *BEGIN*) printf '%s\n' "$APPLE_API_KEY_P8_BASE64" > "$ci_key" ;;
-        *) printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$ci_key" 2>/dev/null || decoded=0 ;;
-      esac
-      if [[ "$decoded" -eq 1 ]] && grep -q "BEGIN " "$ci_key" 2>/dev/null; then
-        chmod 600 "$ci_key"
-        export ASC_KEY_ID="$APPLE_API_KEY_ID"
-        export ASC_ISSUER_ID="$APPLE_API_ISSUER_ID"
-        export ASC_KEY_PATH="$ci_key"
-      else
-        logerr "ASC_KEY_* unusable and APPLE_API_KEY_P8_BASE64 did not decode to a PEM"
-      fi
-    fi
-  fi
-  if [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" ]]; then
-    if [[ -f "$ASC_KEY_PATH" ]]; then
-      AUTH_MODE="api_key"
-      return 0
-    fi
-    log "ASC_KEY_PATH set but file missing (not printing path contents)"
+# fs_get NAME FOLDER -> value on stdout (never logged); non-zero when absent.
+fs_get() {
+  local v bin="$FLEET_SECRETS_BIN"
+  [[ -x "$bin" ]] || bin="$(command -v fleet-secrets 2>/dev/null || true)"
+  [[ -n "$bin" && -x "$bin" ]] || return 1
+  v="$("$bin" get "$1" --path "$2" 2>/dev/null </dev/null)" || return 1
+  [[ -n "$v" ]] || return 1
+  printf '%s' "$v"
+}
+
+# A directory mktemp may use.  macOS TMPDIR ends in a slash, and joining
+# another slash onto it produces a doubled slash.  resolveStagingTarget
+# refuses a path that is not normal, so every trailing slash is stripped
+# here.  A TMPDIR of "/" strips down to nothing, and nothing is not a
+# directory:  the root of the filesystem is refused rather than turned into
+# a path that can be written, because a key staged there would land in "/".
+asc_temp_root() {
+  local root="${TMPDIR:-/tmp}"
+  while [[ "$root" == */ ]]; do
+    root="${root%/}"
+  done
+  #  An empty root is the filesystem root:  a key staged there would land in
+  #  "/", so it is refused instead of being turned into a writable path.
+  [[ -n "$root" ]] || return 1
+  printf '%s' "$root"
+}
+
+# Make the temp directory that holds a materialised .p8 (0700), once.
+# A directory that cannot be created is a path failure and not a crash:  the
+# caller classifies it.  A root TMPDIR reaches it, because asc_temp_root
+# refuses the root of the filesystem before mktemp is ever called.
+asc_tmp_dir() {
+  if [[ -z "$ASC_TMP_DIR" ]]; then
+    local root
+    root="$(asc_temp_root)" || { ASC_TMP_DIR=""; return 1; }
+    ASC_TMP_DIR="$(umask 077; mktemp -d "${root}/asc-key.XXXXXX")" || {
+      ASC_TMP_DIR=""
+      return 1
+    }
   fi
   return 0
 }
 
+# Why an upload has no usable staged key.  "staging" is a path or file refusal
+# after a credential was resolved.  "credential" is a resolved credential that
+# is not a usable PEM private key.  "writer" is the key writer itself failing
+# (a crash, a missing node, or a signal), which classifies neither the key nor
+# the path.  "missing" is no credential.  The owner handoff for a missing key
+# applies to none of the other three.
+asc_upload_block() {
+  case "${ASC_AUTH_FAILURE:-}" in
+    staging) printf '%s\n' "staging" ;;
+    credential) printf '%s\n' "credential" ;;
+    writer) printf '%s\n' "writer" ;;
+    *) printf '%s\n' "missing" ;;
+  esac
+}
+
+# A rejected credential is named by its SOURCE, its KEY ID and its ISSUER ID:
+#  the id and the issuer id are public labels that travel in every App Store
+# Connect request header, and together they say exactly WHICH key was
+# refused.  The id is printed only when it looks like one:  anything else is
+# reported as "unrecognized", so a mis-set id that happens to hold the key, or
+# a line break, can never reach the log.
+#
+# NOTHING taken out of the key itself is printed.  A PEM body is the base64
+# of the DER of the private key, so every byte of it is secret and a
+# first-eight/last-four slice of it is a slice of the key's own encoding;
+# there is no non-secret prefix of a private key the way there is for a
+# provider API key, where the prefix is a public label.  A review rule cannot
+# authorize exposing a value, and a body mask could not even identify the
+# credential:  two different keys share a first eight and a last four.  The
+# key id and the issuer id are the public labels that do identify it.
+key_label() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    printf '%s' "missing"
+  elif [[ "${#v}" -le 32 && "$v" =~ ^[A-Za-z0-9]+$ ]]; then
+    printf '%s' "$v"
+  else
+    printf '%s' "unrecognized"
+  fi
+}
+
+# The ISSUER ID is the other public label of the credential:  it travels in
+# every request header beside the key id, so it identifies the key exactly.
+# It is a UUID, so it carries dashes, and key_label would report it as
+# unrecognized;  it is printed when it looks like one, and anything else is
+# reported as "unrecognized", so a mis-set issuer id or a line break can
+# never reach the log.
+key_issuer_label() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    printf '%s' "missing"
+  elif [[ "${#v}" -le 64 && "$v" =~ ^[A-Za-z0-9-]+$ ]]; then
+    printf '%s' "$v"
+  else
+    printf '%s' "unrecognized"
+  fi
+}
+
+# The credential the App Store Connect client used, for the rejection paths
+# where the shell has not resolved it yet.  The source selection mirrors
+# asc-api.mjs exactly:  a source counts only when its WHOLE trio is present
+# and its key decodes to a PEM, so a diagnostic never names a key the client
+# skipped.
+#
+# Only material the ENVIRONMENT already holds is read.  The vault is never
+# asked for the key material here:  a diagnostic must not cause a secret
+# read.  The vault's KEY ID and ISSUER ID are read when no environment source
+# qualifies, because both are public labels that travel in every request
+# header.
+#
+# The result is the public key id in ASC_DIAG_KEY_ID and the public issuer id
+# in ASC_DIAG_ISSUER_ID.  NOTHING taken out of the key is reported:  a masked
+# preview of a private-key body is not printed anywhere, because every byte
+# of that body is secret (see the comment above key_label).
+ASC_DIAG_KEY_ID=""
+ASC_DIAG_ISSUER_ID=""
+asc_resolve_diagnostic_credential() {
+  local v="" id="" issuer=""
+  if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
+    case "$APPLE_API_KEY_P8_BASE64" in
+      *BEGIN*) v="$APPLE_API_KEY_P8_BASE64" ;;
+      *) v="$(base64 --decode <<< "$APPLE_API_KEY_P8_BASE64" 2>/dev/null)" || v="" ;;
+    esac
+    if [[ -n "$v" ]] && node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$v"; then
+      id="$APPLE_API_KEY_ID"
+      issuer="$APPLE_API_ISSUER_ID"
+    else
+      #  The client skips a source whose key is not a usable PEM and goes on
+      #  to the NEXT source, so this diagnostic must not name it -- and must
+      #  not stop looking for the source the client did use.
+      v=""
+    fi
+  fi
+  #  The client falls through to the environment source when the CI trio is
+  #  absent or unusable, so this branch is evaluated on its own and NOT as an
+  #  alternative to the CI branch:  an elif would leave a valid ASC_*
+  #  credential unreported whenever an APPLE_* trio is present but invalid.
+  if [[ -z "$id" && -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]]; then
+    if node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8"; then
+      v="$ASC_KEY_P8"
+      id="$ASC_KEY_ID"
+      issuer="$ASC_ISSUER_ID"
+    fi
+  fi
+  if [[ -z "$id" ]]; then
+    #  The client's last source is Infisical /asc.  Only the KEY ID and the
+    #  ISSUER ID are read from it:  both are public labels, not key
+    #  material.
+    id="${ASC_KEY_ID:-}"
+    [[ -n "$id" ]] || id="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
+    issuer="${ASC_ISSUER_ID:-}"
+    [[ -n "$issuer" ]] || issuer="$(fs_get ASC_ISSUER_ID /asc 2>/dev/null || true)"
+  fi
+  v=""
+  ASC_DIAG_KEY_ID="$id"
+  ASC_DIAG_ISSUER_ID="$issuer"
+}
+
+# Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
+# exported ASC_* vars are discarded with the subshell). Sets AUTH_MODE to
+# "api_key" or "none". Never prints secret values.
+#
+# WHY THE KEY IS HANDED OVER IN THE ENVIRONMENT (AFC-459, Kody rule 42 on the
+# CodeCaps PR #271 review):  the private key is a secret, and the approved
+# secret sources are the process environment, a captured `fleet-secrets get
+# NAME` and bootstrap-only Keychain credentials.  A caller-supplied file is not
+# one of them, so the node client never reads a key file.  This shell layer
+# owns the credential for altool and Xcode, so it hands the key to the client
+# in the environment, which is where the client looks for it.
+#
+# THE CREDENTIAL IS RESOLVED FROM THREE PLACES:
+#   1. CI: the APPLE_API_* names the ship workflow exports from Infisical
+#   2. ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 already in the environment
+#   3. Mac: Infisical Fleet-OPS through fleet-secrets, /asc ASC_KEY_ID,
+#      ASC_ISSUER_ID and ASC_KEY_P8.
+# A disk credential is not a source at all:  a named ASC_KEY_PATH is ignored,
+# so a stale or foreign path in an operator's shell can never sign the upload
+# with the wrong key.  The key material never enters a command argument and
+# never reaches a log line.
+load_secrets() {
+  AUTH_MODE="none"
+  ASC_AUTH_FAILURE=""
+  #  A named ASC_KEY_PATH is not a credential source.  It is remembered only
+  #  so the run can say that it ignored it, and it is cleared here:  an
+  #  inherited path must never reach xcodebuild when the resolution below
+  #  fails, because then it would be a credential this run never resolved.
+  #  Only the staging copy written from the resolved credential is exported.
+  local named_path="${ASC_KEY_PATH:-}"
+  unset ASC_KEY_PATH
+  local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" key_pem="" rc=0
+  local key_path="" asc_kid="" key_src=""
+
+  # 1. CI: the APPLE_API_* names the ship workflow exports from Infisical.
+  #    The p8 is base64 there, so it is decoded here, and it never travels in
+  #    an argument:  the here-string hands it to the decoder on stdin.
+  if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
+    case "$APPLE_API_KEY_P8_BASE64" in
+      *BEGIN*) key_pem="$APPLE_API_KEY_P8_BASE64" ;;
+      *) key_pem="$(base64 --decode <<< "$APPLE_API_KEY_P8_BASE64" 2>/dev/null)" || key_pem="" ;;
+    esac
+    if [[ -n "$key_pem" ]]; then
+      rc=0
+      node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$key_pem" || rc=$?
+      if [[ "$rc" -eq 3 ]]; then
+        #  The credential was resolved and then rejected.  That is a
+        #  credential failure, not a missing key:  the owner has to fix the
+        #  value that is there, not create a key that already exists.
+        #  The rejected value is named by its SOURCE, its KEY ID and its
+        #  ISSUER ID, and by nothing that came out of the key:  every byte of
+        #  a private-key body is secret, so there is no fragment of it that
+        #  may be shown.
+        log "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), issuer id $(key_issuer_label "${APPLE_API_ISSUER_ID:-}"))"
+        key_pem=""
+        ASC_AUTH_FAILURE="credential"
+      elif [[ "$rc" -ne 0 ]]; then
+        #  The validator itself failed (a crash, a missing node):  it never
+        #  classified the credential, so this run must not classify it
+        #  either.  Calling it a bad credential would send the owner to
+        #  re-export a key that is perfectly fine.
+        log "could not check APPLE_API_KEY_P8_BASE64; the key validator failed with status ${rc}"
+        key_pem=""
+        ASC_AUTH_FAILURE="writer"
+      else
+        kid="$APPLE_API_KEY_ID"
+        iss="$APPLE_API_ISSUER_ID"
+        key_src="APPLE_API_KEY_P8_BASE64"
+      fi
+    else
+      #  The value did not decode at all, so it failed local validation
+      #  before it could be looked at:  it is named by its source, its key
+      #  id and its issuer id, and by nothing taken out of the key.
+      logerr "APPLE_API_KEY_P8_BASE64 did not decode to a PEM private key; ignoring it (source APPLE_API_KEY_P8_BASE64, key id $(key_label "${APPLE_API_KEY_ID:-}"), issuer id $(key_issuer_label "${APPLE_API_ISSUER_ID:-}"))"
+      #  Same class as the validate refusal above:  a credential that was
+      #  resolved and cannot be used.
+      ASC_AUTH_FAILURE="credential"
+    fi
+    if [[ -z "$key_pem" ]]; then
+      #  An unusable source is removed from the environment.  The client looks
+      #  for these names first, so leaving them behind would have it resolve a
+      #  broken credential instead of the one this shell layer resolved.
+      unset APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+    fi
+  fi
+
+  # 2. An ambient ASC_KEY_P8.  It is only usable when it really is a PEM
+  #    private key and comes with the key id and issuer it belongs to.
+  if [[ -z "$key_pem" && -n "${ASC_KEY_P8:-}" ]]; then
+    if [[ -z "$kid" || -z "$iss" ]]; then
+      #  A credential without the id and issuer it belongs to is unusable
+      #  here, so it failed local validation:  it is named by its source and
+      #  by its public labels, and by nothing taken out of the key.
+      log "ASC_KEY_P8 is set without ASC_KEY_ID and ASC_ISSUER_ID; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
+      unset ASC_KEY_P8
+    else
+      rc=0
+      node "${FLEET_DIR}/asc-key.mjs" validate >/dev/null 2>&1 <<< "$ASC_KEY_P8" || rc=$?
+      if [[ "$rc" -eq 3 ]]; then
+        #  The credential failed local validation:  it is named by its
+        #  source, its key id and its issuer id, and by nothing taken out of
+        #  the key.
+        log "ASC_KEY_P8 is set but does not hold a PEM private key; ignoring it (source ASC_KEY_P8, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
+        #  The client would refuse this value, so it is removed from the
+        #  environment:  the client has to see the credential this shell layer
+        #  resolved, not one that cannot be used.
+        unset ASC_KEY_P8
+        #  Resolved and then rejected, so it is a credential failure and not a
+        #  missing key.
+        ASC_AUTH_FAILURE="credential"
+      elif [[ "$rc" -ne 0 ]]; then
+        #  The validator itself failed (a crash, a missing node):  it never
+        #  classified the credential, so this run must not classify it
+        #  either.  Calling it a bad credential would send the owner to
+        #  re-export a key that is perfectly fine.
+        log "could not check ASC_KEY_P8; the key validator failed with status ${rc}"
+        unset ASC_KEY_P8
+        ASC_AUTH_FAILURE="writer"
+      else
+        key_pem="$ASC_KEY_P8"
+        key_src="ASC_KEY_P8"
+        #  A usable credential was found, so an earlier rejection of another
+        #  source no longer describes this run.
+        ASC_AUTH_FAILURE=""
+      fi
+    fi
+  fi
+
+  # 3. The Mac: Infisical Fleet-OPS through fleet-secrets.  Nothing is read
+  #    from the old secrets folder (AFC-359) and nothing is read from a named
+  #    path (AFC-459).
+  if [[ -z "$key_pem" ]]; then
+    asc_kid="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
+    [[ -n "$kid" ]] || kid="$asc_kid"
+    [[ -n "$iss" ]] || iss="$(fs_get ASC_ISSUER_ID /asc)" || iss=""
+    if [[ -z "$kid" || -z "$iss" ]]; then
+      log "ASC credentials missing: set ASC_KEY_ID/ASC_ISSUER_ID/ASC_KEY_P8 in the environment, or add ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 to Infisical /asc"
+      return 0
+    fi
+    # /asc holds one key.  A key id from the environment that differs from it
+    # has no Infisical copy:  fail with a clear message rather than guess.
+    if [[ "$kid" == "$asc_kid" ]]; then
+      key_pem="$(fs_get ASC_KEY_P8 /asc)" || key_pem=""
+      key_src="Infisical /asc"
+    fi
+    if [[ -z "$key_pem" ]]; then
+      log "no .p8 for key ${kid}: Infisical /asc ASC_KEY_P8 holds a different key (or is unreadable);  export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this key"
+      return 0
+    fi
+    #  A usable credential was found, so an earlier rejection of another
+    #  source no longer describes this run.
+    ASC_AUTH_FAILURE=""
+  fi
+
+  # The key has to be in a mode-600 file for altool and Xcode, and in the
+  # environment for the node client, which never reads a file.  The file is
+  # written FROM the resolved credential, so it is never read back as one.
+  asc_tmp_dir || {
+    # The credential was resolved and the directory it has to be staged in
+    # could not be created.  That is a path failure and not a crash.
+    log "could not stage the ASC key; the credential was resolved and the staging directory could not be created"
+    ASC_AUTH_FAILURE="staging"
+    key_pem=""
+    return 0
+  }
+  key_path="${ASC_TMP_DIR}/AuthKey_${kid}.p8"
+  #  The writer says WHICH failure it was through its exit code:  3 is a value
+  #  the Apple tools cannot use, 2 is a path or a file that could not be used.
+  #  The two are reported differently, so the code is kept rather than folded
+  #  into "something went wrong".
+  #
+  #  Only the exit code is read.  The helper's own message is never captured
+  #  into a shell variable, because the repo's key-capture guard refuses a
+  #  `$( ... )` that mentions asc-key.mjs, and a captured message could carry
+  #  the key into a trace.
+  rc=0
+  node "${FLEET_DIR}/asc-key.mjs" write "$key_path" <<< "$key_pem" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    # Leaving AUTH_MODE as none is correct in every case, and calling any of
+    # them a missing key is not.
+    if [[ "$rc" -eq 3 ]]; then
+      # The credential was resolved and it is not a usable PEM private key.
+      # It is named by its source, by its key id and by its issuer id -- both
+      # public labels that travel in every request header and are not part of
+      # the key -- and by NOTHING taken from the key itself:  every byte of a
+      # private-key body is secret, so there is no fragment of it that may be
+      # shown.
+      log "could not stage the ASC key; the credential was resolved but it is not a usable PEM private key (source ${key_src:-unknown}, key id $(key_label "$kid"), issuer id $(key_issuer_label "$iss"))"
+      ASC_AUTH_FAILURE="credential"
+    elif [[ "$rc" -eq 2 ]]; then
+      # The credential was resolved.  The staging path was refused.
+      log "could not stage the ASC key; the credential was resolved and the staging path was refused"
+      ASC_AUTH_FAILURE="staging"
+    else
+      # The writer itself failed:  a crash, a missing node, a signal.  It
+      # classified neither the key nor the path, so this must not be reported
+      # as either one.
+      log "could not stage the ASC key; the key writer failed with status ${rc}"
+      ASC_AUTH_FAILURE="writer"
+    fi
+    key_pem=""
+    return 0
+  fi
+  # altool searches API_PRIVATE_KEYS_DIR first, so no symlink into ~/.appstoreconnect is needed.
+  export API_PRIVATE_KEYS_DIR="$ASC_TMP_DIR"
+  export ASC_KEY_ID="$kid" ASC_ISSUER_ID="$iss" ASC_KEY_P8="$key_pem"
+  # The staged path is a materialisation for the Apple tools, not a credential
+  # source:  the client takes the key from the environment.
+  export ASC_KEY_PATH="$key_path"
+  key_pem=""
+  if [[ -n "$named_path" && "$named_path" != "$key_path" ]]; then
+    log "ASC_KEY_PATH is not a credential source; the credential came from the environment or from Infisical"
+  fi
+  AUTH_MODE="api_key"
+  return 0
+}
+
+# The App Store Connect client.  It runs under $ASC_NODE (see the PATH seam at
+# the top), so an offline test can answer the ASC queries from a stub.
+asc_client() {
+  "$ASC_NODE" "${FLEET_DIR}/asc-api.mjs" "$@"
+}
+
 # Is an ASC credential obtainable AT ALL? load_secrets() has not run yet when
-# resolve_seq_floor() calls asc_latest_seq(), so this cannot rely on the
-# exported ASC_* names -- it checks each source asc-api.mjs knows about.
+# the version queries below run, so this cannot rely on the exported ASC_*
+# names -- it checks each source asc-api.mjs knows about.
 asc_credential_available() {
-  [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" && -f "${ASC_KEY_PATH:-/nonexistent}" ]] && return 0
-  [[ -f "$SECRETS_ENV" ]] && return 0
   [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]] && return 0
+  [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_P8:-}" ]] && return 0
+  [[ -x "$FLEET_SECRETS_BIN" ]] && return 0
+  command -v fleet-secrets >/dev/null 2>&1 && return 0
   return 1
 }
 
@@ -238,16 +617,19 @@ sentry_project_for_app() {
   esac
 }
 
-# Pull SENTRY_AUTH_TOKEN from the handoff file if the environment does not
-# already have it.  Names-only grep trap: extract into a var, never echo.
+# Pull SENTRY_AUTH_TOKEN from the environment, else from `fleet-secrets get`
+# when that helper is installed (Mac).  Extract into a var, never echo.
 load_sentry_auth() {
   if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
     return 0
   fi
-  local keys="${HOME}/.secrets/global-api-keys"
-  if [[ -f "$keys" ]]; then
-    SENTRY_AUTH_TOKEN="$(grep -m1 '^SENTRY_AUTH_TOKEN=' "$keys" | cut -d= -f2- | tr -d '"' | tr -d '\r')"
-    export SENTRY_AUTH_TOKEN
+  if command -v fleet-secrets &>/dev/null; then
+    local token
+    token="$(fleet-secrets get SENTRY_AUTH_TOKEN 2>/dev/null | tr -d '\r')" || token=""
+    if [[ -n "$token" ]]; then
+      SENTRY_AUTH_TOKEN="$token"
+      export SENTRY_AUTH_TOKEN
+    fi
   fi
 }
 
@@ -351,68 +733,71 @@ sentry_org_mismatch_hint() {
 }
 
 link_private_key() {
-  # altool / iTMSTransporter look for AuthKey_<id>.p8 in standard dirs.
+  # altool / iTMSTransporter look for AuthKey_<id>.p8 in standard dirs.  When
+  # load_secrets wrote a temp key it also set API_PRIVATE_KEYS_DIR, so there is
+  # nothing to link (and a symlink to a deleted temp file would dangle).
   local key_path="$1" key_id="$2"
+  if [[ -n "${ASC_TMP_DIR:-}" && "$key_path" == "${ASC_TMP_DIR}/"* ]]; then
+    return 0
+  fi
   local dest_dir="${HOME}/.appstoreconnect/private_keys"
   mkdir -p "$dest_dir"
   chmod 700 "$dest_dir"
   local dest="${dest_dir}/AuthKey_${key_id}.p8"
+  if [[ -L "$dest" && ! -e "$dest" ]]; then
+    rm -f "$dest"
+  fi
   if [[ ! -e "$dest" ]]; then
     ln -sf "$key_path" "$dest"
   fi
   chmod 600 "$key_path" 2>/dev/null || true
 }
 
-# Owner directive: version naming is 1.0.# (timestamp).
-# EVERY rebuild — including a tiny tweak — adds exactly 1 to the last number.
-# MARKETING_VERSION (CFBundleShortVersionString) is 1.0.<seq>.
-# CURRENT_PROJECT_VERSION (CFBundleVersion) is a UTC timestamp YYYYMMDDHHMM.
-# ASC shows "1.0.8 (202608121315)".
+# ---------------------------------------------------------------------------
+# THE VERSION NUMBERS (owner directive 2026-10-24, AFC-517)
+# ---------------------------------------------------------------------------
+# The rule itself is in the header comment above; this is where it is applied.
+# The readable, unit-tested copy of it is scripts/ios-fleet/version-plan.mjs.
 #
-# Apple requires CFBundleVersion to be strictly increasing WITHIN a marketing
-# train, and trade.congress.ios has builds numbered 202608070253 through
-# 202608120521 sitting in the 1.0.0 train.
-#
-# So CFBundleVersion is a UTC timestamp, YYYYMMDDHHMM:
-#   - the parenthetical says WHEN the build was cut, which is the useful
-#     information the owner asked for: "1.0.8 (202608121315)"
+# The commit count is the base for CFBundleVersion:
+#   - it names the EXACT commit a build came from, so a TestFlight or Sparkle
+#     build can be traced to source without a second lookup
 #   - it is monotonic by construction, so it can never regress
-#   - it is greater than every existing timestamp build, so it stays legal even
-#     if a ship ever lands back in an older train
-#   - it is demonstrably a legal CFBundleVersion for ASC: those builds
-#     were all accepted in exactly this format
-# Collisions are not a concern: two ships in the same UTC minute would need to
-# beat both the archive lock and the 1h min interval, and they would carry
-# different marketing versions anyway (Apple's uniqueness is per version+build).
+#   - it is raised above the App Store Connect floor when it has to be (a
+#     shallow checkout understates the count, and the retired UTC stamps are
+#     still higher than a fresh commit count)
 #
-# Sequence state: ${STATE_DIR}/build-seq-<app>.txt (atomic-mkdir-guarded).
-# NOTE: flock(1) does not exist on macOS — under `set -e` a flock call would
-# kill the subshell and yield an EMPTY sequence ("1.0."), so the mutex is an
-# atomic mkdir instead (portable to Apple bash 3.2, per the header contract).
+# MARKETING_VERSION (CFBundleShortVersionString) is <prefix>.<P+1>:
+#   <prefix> is the train from marketingVersionDefault, and P is the highest
+#   patch App Store Connect already holds on that train (App Store versions
+#   AND TestFlight trains, drift trains ignored).  The marketing version is
+#   the next patch, so it never collides with an existing one.
 #
-# That local file is a CACHE, not the source of truth. It is one unbacked file
-# on one machine: if it is lost, reset, or a ship runs from a second machine,
-# a bare "+1" reuses a build number and App Store Connect rejects the upload as
-# a duplicate. So the next sequence is
-#     max(local cache, App Store Connect, project.pbxproj) + 1
-# which is monotonic against every record we have. Taking the max can skip a
-# number (harmless — numbers are free); reusing one is fatal.
-local_seq() {
-  local n
-  n=$(cat "${STATE_DIR}/build-seq-${APP_KEY}.txt" 2>/dev/null || echo 0)
-  [[ "$n" =~ ^[0-9]+$ ]] || n=0
-  printf '%s' "$n"
-}
-
-# CFBundleVersion: UTC minute stamp. UTC (not local) so the value cannot go
-# backwards across a daylight-saving fall-back, which would break Apple's
-# strictly-increasing rule for an hour twice a year.
-utc_build_stamp() {
-  date -u +%Y%m%d%H%M
-}
+# CURRENT_PROJECT_VERSION (CFBundleVersion) is the repo commit count, raised
+# above the floor of the TARGET train:  every build already in that train (an
+# old 12-digit UTC stamp included) plus the app's plain-integer builds below
+# 1000000000 (EVERY build of any size on macOS, where build numbers have to
+# grow across trains).
+#
+# The two numbers are independent.  The build number is NEVER derived from
+# the marketing version, and the marketing version is never derived from the
+# build number:  that is what stopped App Store Connect from showing
+# "1.0.2358 (2358)".
+#
+# App Store Connect is the only record that shipping advances, so it is the
+# only record that can answer "which patches does this train hold?" and
+# "which build numbers are taken?".  The local build-seq counter
+# (~/.cache/ios-fleet/build-seq-<app>.txt) and the MARKETING_VERSION in
+# project.pbxproj are NOT sources any more:  the counter is never written,
+# and the project file is only read to print the agreement NOTICE.
 
 # Highest N in MARKETING_VERSION = <prefix>.N across the project's build
 # configurations. 0 when the file is unreadable or holds no on-train value.
+#
+# NOT A SEQUENCING INPUT.  project.pbxproj does not feed the marketing
+# version or the build number any more (AFC-517); this only backs the
+# agreement NOTICE below, so a stale value in the project file is visible
+# instead of silently steering a ship.
 project_marketing_seq() {
   local proj_file="$1" prefix="$2" quiet="${3:-}" best=0 v n off_train=""
   if [[ ! -f "$proj_file" ]]; then
@@ -437,144 +822,186 @@ project_marketing_seq() {
   printf '%s' "$best"
 }
 
-# Highest N already uploaded to App Store Connect for the <prefix>.N train.
-# Returns 1 (and prints nothing) when ASC cannot be consulted — the caller must
-# distinguish "no builds yet" (0) from "unknown" (failure).
-asc_latest_seq() {
+# Highest patch already used on the <prefix>.N train in App Store Connect:  the
+# App Store versions AND the TestFlight trains, drift trains ignored.
+# Returns 1 (and prints nothing) when ASC cannot be consulted:  the caller
+# must distinguish "no versions yet" (0) from "unknown" (failure).
+asc_next_dotted_build() {
+  local version="$1" plat="${2:-}" out rc
+  command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
+  # Not load_secrets: both helpers run inside command substitutions, where a
+  # secrets temp dir and its EXIT trap die with the subshell and leave the
+  # key behind.  asc-api.mjs resolves its own credential.
+  asc_credential_available || return 1
+  set +e
+  out=$(asc_client next-dotted-build "$BUNDLE_ID" "$version" "$plat" "${APPLE_ID:-}")
+  rc=$?
+  set -e
+  [[ $rc -eq 0 && "$out" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  printf '%s' "$out"
+}
+
+asc_released_store_version() {
+  local plat="${1:-}" out rc
+  command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
+  # Not load_secrets: both helpers run inside command substitutions, where a
+  # secrets temp dir and its EXIT trap die with the subshell and leave the
+  # key behind.  asc-api.mjs resolves its own credential.
+  asc_credential_available || return 1
+  # Keep the client's stderr: it carries the reason (HTTP status, unknown
+  # state).  Only the labelled lines are logged, never key material, and an
+  # auth failure keeps its own status 4.
+  local errf errf_root
+  errf_root="$(asc_temp_root)" || {
+    logerr "asc-released: TMPDIR resolves to the filesystem root; refusing to write there"
+    return 1
+  }
+  errf="$(mktemp "${errf_root}/asc-released-err.XXXXXX")"
+  set +e
+  out=$(asc_client released-store-version "$BUNDLE_ID" "$plat" "${APPLE_ID:-}" 2>"$errf")
+  rc=$?
+  set -e
+  if [[ -s "$errf" ]]; then
+    while IFS= read -r _pl; do
+      case "$_pl" in asc-auth:*|released-store-version:*) logerr "asc-released: ${_pl}" ;; esac
+    done <"$errf"
+  fi
+  rm -f "$errf" >/dev/null 2>&1 || true
+  [[ $rc -eq 4 ]] && return 4
+  [[ $rc -eq 0 ]] || return 1
+  printf '%s' "$out"
+}
+
+asc_latest_marketing_patch() {
   local prefix="$1" plat="${2:-}" out rc errf
-  if ! command -v node >/dev/null 2>&1; then
-    logerr "asc-seq: node not on PATH; cannot verify against App Store Connect"
+  if ! command -v "$ASC_NODE" >/dev/null 2>&1; then
+    logerr "asc-patch: node not on PATH; cannot verify against App Store Connect"
     return 1
   fi
   if ! asc_credential_available; then
-    logerr "asc-seq: no App Store Connect credential available; cannot verify against App Store Connect"
+    logerr "asc-patch: no App Store Connect credential available; cannot verify against App Store Connect"
     return 1
   fi
   # DO NOT discard asc-api.mjs's stderr. It used to be piped to /dev/null,
   # which threw away the one line that says WHY -- "apps query failed (HTTP
   # 401)" -- and turned every auth or app-resolution fault into the same
-  # contentless "query failed (rc=2)". Surfaced here so an UNVERIFIED floor is
+  # contentless "query failed (rc=2)". Surfaced here so an UNVERIFIED plan is
   # self-diagnosing in the run log.
-  errf="$(mktemp "${TMPDIR:-/tmp}/asc-seq-err.XXXXXX")"
+  #  asc_temp_root refuses the filesystem root with a status, so the status
+  #  is read here:  expanding its empty output would build "/asc-patch-err.*".
+  local errf_root
+  errf_root="$(asc_temp_root)" || {
+    logerr "asc-patch: TMPDIR resolves to the filesystem root; refusing to write there, so App Store Connect cannot be verified"
+    return 1
+  }
+  errf="$(mktemp "${errf_root}/asc-patch-err.XXXXXX")"
   set +e
-  out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" "${APPLE_ID:-}" 2>"$errf")
+  out=$(asc_client latest-marketing-patch "$BUNDLE_ID" "$prefix" "$plat" "${APPLE_ID:-}" 2>"$errf")
   rc=$?
+  if [[ $rc -eq 4 ]]; then
+    set -e
+    logerr "asc-patch: App Store Connect rejected the credential (HTTP 401/403)"
+    # Forward the client's own lines first:  they carry Apple's status and code,
+    # and the asc-auth line names WHICH credential source was used (env or
+    # Infisical) and the key id length -- never any key material.
+    if [[ -s "$errf" ]]; then
+      while IFS= read -r _pl; do
+        case "$_pl" in asc-auth:*|latest-marketing-patch:*|latest-build-seq:*) logerr "asc-patch: ${_pl}" ;; esac
+      done <"$errf"
+    fi
+    rm -f "$errf" >/dev/null 2>&1 || true
+    return 4
+  fi
   set -e
   if [[ -s "$errf" ]]; then
     while IFS= read -r line; do
-      [[ -n "$line" ]] && logerr "asc-seq: ${line}"
+      [[ -n "$line" ]] && logerr "asc-patch: ${line}"
     done < "$errf"
   fi
   # Discard stdout as well as stderr: anything printed here would land in the
   # command substitution that captures this function's value and corrupt the
-  # sequence number. (A `rm` wrapper that reports what it removed on stdout is
+  # patch number. (A `rm` wrapper that reports what it removed on stdout is
   # enough to turn a correct 74 into an arithmetic error.)
   rm -f "$errf" >/dev/null 2>&1 || true
   if [[ $rc -ne 0 || ! "$out" =~ ^[0-9]+$ ]]; then
-    logerr "asc-seq: query failed (rc=${rc}); cannot verify against App Store Connect"
+    logerr "asc-patch: query failed (rc=${rc}); cannot verify against App Store Connect"
     return 1
   fi
   printf '%s' "$out"
 }
 
-# The floor the next sequence must exceed: the highest N any record knows about.
-resolve_seq_floor() {
-  local prefix="$1" proj_file="$2" plat="${3:-}"
-  local l p a floor
-  l="$(local_seq)"
-  p="$(project_marketing_seq "$proj_file" "$prefix")"
-  floor="$l"
-  [[ "$p" -gt "$floor" ]] && floor="$p"
-
-  set +e
-  a="$(asc_latest_seq "$prefix" "$plat")"
-  set -e
-  if [[ -n "${a:-}" ]]; then
-    [[ "$a" -gt "$floor" ]] && floor="$a"
-    logerr "seq sources: local=${l} asc=${a} project=${p} -> floor=${floor}"
-  else
-    # ASC unknown. The local cache alone is exactly the silent-duplicate
-    # failure mode; refuse to guess when it is missing too.
-    logerr "seq sources: local=${l} asc=UNVERIFIED project=${p} -> floor=${floor}"
-    # ASC is the ONLY record that is advanced by shipping. The local cache can
-    # be lost (cache purge, re-imaged runner, a run under a different HOME) and
-    # project.pbxproj is NEVER advanced by this script -- .github/workflows/
-    # ios-ship.yml invokes the wrapper with no arguments, so --sync-project-version
-    # never runs, and that job holds `contents: read` so it could not commit the
-    # value back anyway. Gating the abort on `p -eq 0` therefore made it
-    # unreachable: p is 4 today and stays 4 forever, so the guard never fired and
-    # a lost cache + unreachable ASC would silently reuse a build number.
-    # Treat "ASC unverified" as fatal on its own.
-    if [[ "$ALLOW_UNVERIFIED_SEQ" -eq 0 ]]; then
-      die "cannot determine the next build number.
-  App Store Connect could not be reached AND there is no local sequence
-  (${STATE_DIR}/build-seq-${APP_KEY}.txt) and no ${prefix}.N in project.pbxproj.
-  Shipping now would very likely reuse a build number and be rejected as a duplicate.
-  Fix one of these, then re-run:
-    1) restore ASC access: check ${SECRETS_ENV} and that 'node' is on PATH, then
-       run: node ${FLEET_DIR}/asc-api.mjs latest-build-seq ${BUNDLE_ID} ${prefix} ${PLATFORM} ${APPLE_ID}
-     2) or pass the number explicitly:  --version ${prefix}.<N>   (NOT --build <N>:
-        --version picks the marketing version and lets CFBundleVersion stay an
-        auto UTC timestamp, which is always higher than every build already
-        uploaded. A bare --build leaves MARKETING at ${DEFAULT_MARKETING}, which
-        re-enters an old train where Apple requires a strictly greater build than
-        everything in it -- rejected after the full archive+upload.)
-    3) or, only if you are certain this train is empty, re-run with --allow-unverified-seq"
-    fi
-    if [[ "$ALLOW_UNVERIFIED_SEQ" -eq 1 ]]; then
-      logerr "WARNING: --allow-unverified-seq set; proceeding without ASC confirmation"
-    fi
+# The build number the next ship has to exceed, and the two floors it is made
+# of:  every build already in the target train (train floor) and the app's
+# plain-integer builds below 1000000000 (app floor;  on macOS every build of
+# any size counts, because macOS build numbers grow across trains).
+#
+# Prints "<floor> <train_floor> <app_floor>".  Returns 1 (and prints nothing)
+# when ASC cannot be consulted.
+asc_build_floor() {
+  local version="$1" plat="${2:-}" out rc errf err train app
+  if ! command -v "$ASC_NODE" >/dev/null 2>&1; then
+    logerr "asc-floor: node not on PATH; cannot verify against App Store Connect"
+    return 1
   fi
-  printf '%s' "$floor"
+  if ! asc_credential_available; then
+    logerr "asc-floor: no App Store Connect credential available; cannot verify against App Store Connect"
+    return 1
+  fi
+  #  Read asc_temp_root's refusal here too:  a root TMPDIR would otherwise
+  #  build "/asc-floor-err.*".
+  local errf_root
+  errf_root="$(asc_temp_root)" || {
+    logerr "asc-floor: TMPDIR resolves to the filesystem root; refusing to write there, so App Store Connect cannot be verified"
+    return 1
+  }
+  errf="$(mktemp "${errf_root}/asc-floor-err.XXXXXX")"
+  set +e
+  out=$(asc_client build-floor "$BUNDLE_ID" "$version" "$plat" "${APPLE_ID:-}" 2>"$errf")
+  rc=$?
+  if [[ $rc -eq 4 ]]; then
+    set -e
+    logerr "asc-floor: App Store Connect rejected the credential (HTTP 401/403)"
+    # Keep the client's build-floor lines:  they carry Apple's HTTP status.
+    # Only this path forwards them here;  every other path forwards the
+    # whole client output once, below.
+    if [[ -s "$errf" ]]; then
+      while IFS= read -r _fl; do
+        case "$_fl" in asc-auth:*|build-floor:*|latest-build-seq:*) logerr "asc-floor: ${_fl}" ;; esac
+      done <"$errf"
+    fi
+    rm -f "$errf" >/dev/null 2>&1 || true
+    return 4
+  fi
+  set -e
+  err="$(cat "$errf" 2>/dev/null || true)"
+  if [[ -s "$errf" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && logerr "asc-floor: ${line}"
+    done < "$errf"
+  fi
+  rm -f "$errf" >/dev/null 2>&1 || true
+  if [[ $rc -ne 0 || ! "$out" =~ ^[0-9]+$ ]]; then
+    logerr "asc-floor: query failed (rc=${rc}); cannot verify against App Store Connect"
+    return 1
+  fi
+  # asc-api.mjs notes the two floors on stderr ("build-floor: train=N app=N
+  # -> floor=N");  the note is machine-readable, so the version-plan log line
+  # can name where the build number came from.
+  train="$(printf '%s\n' "$err" | sed -n 's/.*[^a-z]train=\([0-9][0-9]*\).*/\1/p' | tail -n 1)"
+  app="$(printf '%s\n' "$err" | sed -n 's/.*[^a-z]app=\([0-9][0-9]*\).*/\1/p' | tail -n 1)"
+  printf '%s %s %s' "$out" "${train:-$out}" "${app:-$out}"
 }
 
-# Commit floor+1 to the cache under the lock and return it.
-next_build_seq() {
-  local floor="$1"
-  local seq_file="${STATE_DIR}/build-seq-${APP_KEY}.txt"
-  local lock_dir="${seq_file}.lockdir"
-  mkdir -p "$STATE_DIR"
-  local tries=0
-  until mkdir "$lock_dir" 2>/dev/null; do
-    # Reclaim a stale lock. Without this, ANY abnormal exit between mkdir and
-    # rmdir below (a cancelled CI job, the 90-minute workflow timeout, or a
-    # failed seq-file write under `set -e` on a full disk) leaves the lockdir
-    # behind permanently and wedges every future ship with no self-heal.
-    if [[ -d "$lock_dir" ]]; then
-      local age
-      age=$(( $(date +%s) - $(stat -f %m "$lock_dir" 2>/dev/null || stat -c %Y "$lock_dir" 2>/dev/null || date +%s) ))
-      if [[ "$age" -gt 900 ]]; then
-        echo "next_build_seq: reclaiming stale lock (${age}s old) at ${lock_dir}" >&2
-        rmdir "$lock_dir" 2>/dev/null || true
-        continue
-      fi
-    fi
-    tries=$((tries + 1))
-    if [[ "$tries" -gt 300 ]]; then
-      echo "next_build_seq: lock timeout on ${lock_dir}" >&2
-      return 1
-    fi
-    sleep 0.1
-  done
-  # Release on ANY exit path, not just the happy one.
-  trap 'rmdir "'"$lock_dir"'" 2>/dev/null || true' EXIT
-  # Re-read under the lock: a concurrent ship may have advanced it since the
-  # floor was computed.
-  local n
-  n=$(cat "$seq_file" 2>/dev/null || echo 0)
-  [[ "$n" =~ ^[0-9]+$ ]] || n=0
-  [[ "$floor" -gt "$n" ]] && n="$floor"
-  n=$((n + 1))
-  printf '%s' "$n" > "$seq_file"
-  rmdir "$lock_dir" 2>/dev/null || true
-  trap - EXIT
-  printf '%s' "$n"
+# The major.minor train a marketing version belongs to: "2.0.123" -> "2.0",
+# "3" -> "3.0".  The floor is per-train, so the train has to come from the
+# version actually being shipped rather than always from the default.
+version_prefix() {
+  printf '%s' "${1:-1.0}" | awk -F. '{ if (NF >= 2) print $1"."$2; else print $1".0" }'
 }
 
 marketing_prefix() {
   # "1.0" from marketingVersionDefault (1.0 or 1.0.x both yield 1.0).
-  local d="${DEFAULT_MARKETING:-1.0}"
-  printf '%s' "$d" | awk -F. '{ if (NF >= 2) print $1"."$2; else print $1".0" }'
+  version_prefix "${DEFAULT_MARKETING:-1.0}"
 }
 
 ship_state_path() {
@@ -591,11 +1018,11 @@ repo_head_sha() {
 #
 # This function DECIDES and LOGS; it does not exit. That separation is the fix
 # for the ordering bug observed live on 2026-08-12: the gate used to be
-# evaluated after next_build_seq() had already committed floor+1 to the counter,
-# so a rate-limited attempt still burned a build number. The sequence advanced
+# evaluated after the build counter had already committed floor+1 to it, so a
+# rate-limited attempt still burned a build number. The sequence advanced
 # 5 -> 6 while the run skipped, leaving 1.0.6 existing nowhere and the local
 # counter drifting further from App Store Connect. The caller now evaluates the
-# gate BEFORE any sequence is consumed.
+# gate BEFORE any version is resolved, so a skipped run consumes nothing.
 #
 # Sets SHIP_GATE_DECISION to "proceed" or "skip".
 SHIP_GATE_DECISION="proceed"
@@ -664,6 +1091,29 @@ evaluate_ship_gate() {
   log "ship-gate: ok — ${elapsed}s since last ship (min ${min_sec}s from ${min_src}); HEAD ${head_sha:0:10}"
 }
 
+# "<marketing> <build>" from an IPA's Info.plist, only when its bundle id is the
+# expected one.  Fails (prints nothing) on anything else.  Never guesses.
+ipa_manifest_versions() {
+  local ipa="$1" want="$2"
+  [[ -f "$ipa" && -n "$want" ]] || return 1
+  python3 - "$ipa" "$want" <<'PY'
+import plistlib, re, sys, zipfile
+ipa, want = sys.argv[1:3]
+try:
+    z = zipfile.ZipFile(ipa)
+    names = [n for n in z.namelist() if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", n)]
+    if len(names) != 1:
+        sys.exit(1)
+    info = plistlib.loads(z.read(names[0]))
+except Exception:
+    sys.exit(1)
+ver, build, bid = info.get("CFBundleShortVersionString"), info.get("CFBundleVersion"), info.get("CFBundleIdentifier")
+if bid != want or not ver or not build or re.search(r"\s", ver + build):
+    sys.exit(1)
+print(ver, build)
+PY
+}
+
 record_successful_ship() {
   local path head_sha now
   path="$(ship_state_path)"
@@ -676,8 +1126,24 @@ record_successful_ship() {
   log "ship-gate: recorded success ts=${now} sha=${head_sha:0:10} -> ${path}"
   # Public version manifest for the in-app update prompt.  Best-effort —
   # a publish miss must never fail a ship that already uploaded.
+  # --upload-only reuses an IPA whose versions this run never read, so
+  # MARKETING and BUILD_NUM hold a placeholder.  The placeholder must never
+  # reach the manifest:  read the real versions out of the IPA's Info.plist,
+  # and skip the publish when that cannot be done or names another app.
+  if [[ "${MARKETING:-}" == "(from IPA)" || "${BUILD_NUM:-}" == "(from IPA)" ]]; then
+    local ipa_ver
+    if [[ -n "${UPLOAD_ONLY_IPA:-}" ]] && ipa_ver="$(ipa_manifest_versions "$UPLOAD_ONLY_IPA" "${BUNDLE_ID:-}")" && [[ -n "$ipa_ver" ]]; then
+      MARKETING="${ipa_ver%% *}"
+      BUILD_NUM="${ipa_ver#* }"
+      log "version-manifest: --upload-only versions read from the IPA (${MARKETING} build ${BUILD_NUM})"
+    else
+      MARKETING=""
+      BUILD_NUM=""
+      log "version-manifest: skipped (--upload-only and the IPA's versions could not be read for ${BUNDLE_ID:-?})"
+    fi
+  fi
   if [[ -n "${BUNDLE_ID:-}" && -n "${MARKETING:-}" ]]; then
-    local apple_id display
+    local apple_id display pub_out pr_url
     local -a pub_args
     apple_id="$(json_get "$APP_KEY" appleId || true)"
     display="$(json_get "$APP_KEY" displayName || true)"
@@ -685,10 +1151,22 @@ record_successful_ship() {
     [[ -n "${BUILD_NUM:-}" ]] && pub_args+=(--build "$BUILD_NUM")
     [[ -n "${apple_id:-}" ]] && pub_args+=(--apple-id "$apple_id")
     [[ -n "${display:-}" ]] && pub_args+=(--display-name "$display")
-    if bash "${FLEET_DIR}/publish-ios-versions.sh" "${pub_args[@]}" >/dev/null 2>&1; then
-      log "version-manifest: published ${BUNDLE_ID} ${MARKETING}"
+    # The publisher opens a pull request against AI-Fleet-Coordinator, so its
+    # result is a pull request URL, not a silent write.  The URL is logged,
+    # so a ship leaves a reviewable trace instead of one warning line.
+    if pub_out="$(bash "${FLEET_DIR}/publish-ios-versions.sh" "${pub_args[@]}" 2>&1)"; then
+      # `|| true` keeps the no-URL case (the publisher's no-op path) from
+      # tripping `set -e` through pipefail:  a ship that already uploaded must
+      # never die on a missing pull request URL.
+      pr_url="$(printf '%s\n' "$pub_out" | grep -Eo 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 || true)"
+      if [[ -n "$pr_url" ]]; then
+        log "version-manifest: opened ${pr_url}"
+      else
+        log "version-manifest: ${BUNDLE_ID} ${MARKETING} recorded (${pub_out%%$'\n'*})"
+      fi
     else
       log "warning: version-manifest publish failed (non-fatal)"
+      printf '%s\n' "$pub_out" | sed 's/^/  /' >&2
     fi
   fi
 }
@@ -774,6 +1252,12 @@ PROJECT_REL="$(json_get "$APP_KEY" projectRel)"
 PROJECT_REL_ALT="$(json_get "$APP_KEY" projectRelAlt)"
 XCODEGEN_DIR="$(json_get "$APP_KEY" xcodegenDir)"
 DEFAULT_MARKETING="$(json_get "$APP_KEY" marketingVersionDefault)"
+# Optional fixed-version policy (owner, 2026-10-26): the marketing version does
+# not count up per TestFlight ship; the build is a dotted M.m.<n> (see
+# asc-api.mjs next-dotted-build) that goes up inside the fixed train.  apps.json
+# key: fixedMarketingVersion ("1.1.2").  Absent key keeps the next-patch
+# behaviour.  Not used on macOS (builds must grow across all trains).
+FIXED_MARKETING="$(json_get "$APP_KEY" fixedMarketingVersion)"
 
 if [[ -z "$PLATFORM" ]]; then
   if [[ "$APP_KEY" == *-mac || "$SCHEME" == *[Mm]ac* ]]; then
@@ -815,22 +1299,24 @@ fi
 # SHIP GATE FIRST, THEN THE BUILD NUMBER.
 # ---------------------------------------------------------------------------
 # Ordering matters and used to be wrong. The gate was evaluated ~60 lines below
-# the point where next_build_seq() commits floor+1 to the counter, so every
+# the point where the build counter committed floor+1, so every
 # rate-limited attempt burned a version that never shipped (observed live
 # 2026-08-12: skipped at 4392s of a 9000s interval, sequence still went 5 -> 6).
 #
 # Everything the gate needs is already resolved above: APP_KEY, REPO_ROOT (for
 # HEAD), EXPORT_ONLY, FORCE_SHIP, STATE_DIR. Nothing between here and the old
 # call site set up anything it reads, so moving it earlier drops no step. What
-# it now runs BEFORE is: PBXPROJ resolution, resolve_seq_floor (an App Store
-# Connect round trip), next_build_seq (the consuming step), the project-version
-# agreement check, --sync-project-version, load_secrets, and the output dirs.
+# it now runs BEFORE is: PBXPROJ resolution, the App Store Connect queries
+# (the marketing patch and the build floor), the project-version agreement
+# check, --sync-project-version, load_secrets, and the output dirs.  No
+# number is consumed from a local cache any more:  App Store Connect is the
+# only record that shipping advances.
 # The dirty-worktree check stays ahead of the gate so a dirty tree still fails
 # loudly rather than being masked by a quiet rate-limit skip.
 #
 # --force-ship and --export-only still bypass the gate exactly as before, and
 # --dry-run still reports the gate outcome alongside the version plan (it peeks
-# at the sequence without consuming it, so evaluating early changes nothing for
+# at the version without shipping it, so evaluating early changes nothing for
 # it beyond ordering the log lines).
 evaluate_ship_gate
 
@@ -853,6 +1339,23 @@ if [[ "$SHIP_GATE_DECISION" == "skip" && "$DRY_RUN" -eq 0 ]]; then
   exit 0
 fi
 
+#  A root TMPDIR is a PATH failure, and it has to be classified as one before
+#  any App Store Connect query runs.  The two version queries below write
+#  their scratch files through asc_temp_root, so a root TMPDIR makes them
+#  fail, and their failure is indistinguishable from an unreachable App Store
+#  Connect:  the run would die telling the owner to fix ASC_* credentials for
+#  what is a path refusal.  Classify it once, here, before the version plan,
+#  and exit with the path-failure status.  The classification needs no
+#  credential and no STAMP, so it can sit this early.
+#  asc_temp_root refuses the filesystem root with a status.  Read it with
+#  that status:  under errexit a bare assignment would end the run with
+#  status 1 and no log line, before the owner handoff could classify it.
+SHIP_TMP_ROOT="$(asc_temp_root)" || {
+  log "Ship blocked: TMPDIR resolves to the filesystem root, so the staging path was refused."
+  log "This is a path failure, not a missing key."
+  exit 3
+}
+
 # Where the version the project itself declares lives. Best-effort: for
 # XcodeGen apps the .xcodeproj may not exist until it is generated below, in
 # which case the project contributes 0 to the floor and says so.
@@ -863,45 +1366,225 @@ fi
 
 MARKETING_PREFIX="$(marketing_prefix)"
 
+# The App Store Connect platform key.  "macOS" in apps.json is MAC_OS there.
+ASC_PLATFORM="IOS"
+if [[ "$PLATFORM" == "macOS" ]]; then
+  ASC_PLATFORM="MAC_OS"
+fi
+
+# What the version plan is built from.  Printed in the "version plan:" log
+# line so the log answers "where did that build number come from?" without
+# anyone reading the script.
+PLAN_ASC_PATCH="n/a"
+PLAN_TARGET_PATCH=""
+PLAN_FLOOR="n/a"
+PLAN_TRAIN_FLOOR="n/a"
+PLAN_APP_FLOOR="n/a"
+PLAN_COMMIT_COUNT="n/a"
+FIXED_MODE=0
+PLAN_READY=0
+
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
-  # The IPA already carries the versions it was built with. Resolving — let
-  # alone consuming — a sequence here would burn a marketing version on a run
+  # The IPA already carries the versions it was built with. Resolving -- let
+  # alone consuming -- a version here would burn a marketing version on a run
   # that cannot possibly use it, which is the same defect as the gate-ordering
-  # bug above. It would also drag in resolve_seq_floor's hard failure when ASC
-  # is unreachable, blocking a legitimate retry of an already-built IPA.
+  # bug above. It would also drag in the App Store Connect queries' hard
+  # failure when ASC is unreachable, blocking a legitimate retry of an
+  # already-built IPA.
   MARKETING="(from IPA)"
   BUILD_NUM="(from IPA)"
   log "version: taken from the existing IPA (--upload-only); sequence neither consulted nor consumed"
-elif [[ -n "$FORCE_BUILD" || -n "$FORCE_VERSION" ]]; then
-  # Explicit operator override: honour exactly what was asked. A bare --version
-  # still gets an auto timestamp build number, which is always higher than
-  # anything already uploaded — that is the whole point of the scheme, so an
-  # operator picking the marketing version does not have to reason about it.
-  MARKETING="${FORCE_VERSION:-$DEFAULT_MARKETING}"
-  BUILD_NUM="${FORCE_BUILD:-$(utc_build_stamp)}"
-  log "version: operator override (--build/--version); sequence not consulted"
 else
-  # resolve_seq_floor runs in a subshell, so its die() cannot exit this script
-  # on its own — check explicitly rather than leaning on set -e.
-  SEQ_FLOOR="$(resolve_seq_floor "$MARKETING_PREFIX" "$PBXPROJ" "$PLATFORM")" || exit 1
-  [[ "$SEQ_FLOOR" =~ ^[0-9]+$ ]] || die "could not resolve a build sequence floor (got '${SEQ_FLOOR}')"
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    # Dry-run must not consume a sequence number — peek only.
-    SEQ=$((SEQ_FLOOR + 1))
-  else
-    # The only remaining consumer. A gated run exited above; a dry-run peeks;
-    # an --upload-only run never gets here. So the counter advances only on a
-    # run that is really about to archive, and by exactly 1.
-    SEQ="$(next_build_seq "$SEQ_FLOOR")"
+  PLAN_READY=1
+
+  # The repo commit count:  the build number names the exact commit a build
+  # came from, so it is the starting point for CFBundleVersion.  It is not
+  # enough on its own -- the App Store Connect floor below raises it when it
+  # has to be -- but it is never invented:  a checkout with no readable git
+  # history cannot be numbered at all.
+  COMMIT_COUNT="$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || true)"
+  if [[ "$COMMIT_COUNT" =~ ^[0-9]+$ ]]; then
+    PLAN_COMMIT_COUNT="$COMMIT_COUNT"
   fi
-  MARKETING="${MARKETING_PREFIX}.${SEQ}"
-  # NOT "$MARKETING" — see the CFBundleVersion note above utc_build_stamp.
-  BUILD_NUM="$(utc_build_stamp)"
+
+  # ---- the marketing version ---------------------------------------------
+  # --version is an exact override.  Otherwise the version is the next patch
+  # on the default train, and P comes from App Store Connect.
+  FIXED_MODE=0
+  if [[ -n "$FIXED_MARKETING" && ( -z "$FORCE_VERSION" || "$FORCE_VERSION" == "$FIXED_MARKETING" ) ]]; then
+    [[ "$FIXED_MARKETING" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+      || die "fixedMarketingVersion '${FIXED_MARKETING}' for ${APP_KEY} in apps.json is not M.m.p (three dot-separated integers).  Nothing was shipped."
+    if [[ "$(printf '%s' "${ASC_PLATFORM:-}" | tr a-z A-Z)" == "MAC_OS" ]]; then
+      die "fixedMarketingVersion is not supported on macOS:  Mac builds must grow across every train, so a dotted build under a fixed version cannot be ordered safely.  Nothing was shipped."
+    fi
+    FORCE_VERSION="$FIXED_MARKETING"
+    FIXED_MODE=1
+    log "version: fixed marketing version ${FIXED_MARKETING} from apps.json; it does not count up per ship"
+    # A released App Store version closes its train:  a fixed version at or
+    # below one is refused, never silently bumped.
+    _rel="$(asc_released_store_version "$ASC_PLATFORM")" \
+      || die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
+    if [[ -n "$_rel" ]]; then
+      if ! python3 -c 'import sys
+a=[int(x) for x in sys.argv[1].split(".")]; b=[int(x) for x in sys.argv[2].split(".")]
+n=max(len(a),len(b)); a+= [0]*(n-len(a)); b+=[0]*(n-len(b))
+sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
+        die "fixedMarketingVersion ${FIXED_MARKETING} is at or below the released App Store version ${_rel}.  Apple requires each new version to be greater than the last released one.  Nothing was bumped.  Pick a version above ${_rel} in apps.json."
+      fi
+    fi
+  fi
+  if [[ -n "$FORCE_VERSION" ]]; then
+    MARKETING="$FORCE_VERSION"
+    # The patch the operator pinned, on its own train ("2.0.5" -> 5).
+    _pinned="${FORCE_VERSION##*.}"
+    if [[ "$_pinned" =~ ^[0-9]+$ ]]; then
+      PLAN_ASC_PATCH="pinned"
+      PLAN_TARGET_PATCH="$_pinned"
+    fi
+  else
+    set +e
+    _patch="$(asc_latest_marketing_patch "$MARKETING_PREFIX" "$ASC_PLATFORM")"
+    _rc=$?
+    if [[ $_rc -eq 4 ]]; then
+      # The rejected credential is named by its key id and its issuer id:
+      # both are public labels that travel in every request header, and
+      # together they say exactly WHICH key App Store Connect refused.  No
+      # part of the key is printed:  every byte of a private-key body is
+      # secret, so there is no fragment of it that may be shown.
+      asc_resolve_diagnostic_credential
+      _rejected_key="$(key_label "$ASC_DIAG_KEY_ID")"
+      _rejected_issuer="$(key_issuer_label "$ASC_DIAG_ISSUER_ID")"
+      die "App Store Connect rejected the API key (HTTP 401/403) while reading the next marketing version (key id ${_rejected_key}, issuer id ${_rejected_issuer}).
+  Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
+  --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
+    fi
+    set -e
+    if [[ $_rc -ne 0 || ! "$_patch" =~ ^[0-9]+$ ]]; then
+      if [[ "$ALLOW_UNVERIFIED_SEQ" -eq 0 ]]; then
+        die "cannot determine the next marketing version.
+  App Store Connect could not be consulted.  The marketing version is the next
+  patch on the ${MARKETING_PREFIX} train, and App Store Connect is the only
+  record of which patches that train already holds:  guessing would ship a
+  version that already exists (or skip one that does not).
+  Fix one of these, then re-run:
+    1) restore ASC access: check ASC_* in env or Infisical /asc (fleet-secrets doctor) and that 'node' is on PATH, then
+       run: node ${FLEET_DIR}/asc-api.mjs latest-marketing-patch ${BUNDLE_ID} ${MARKETING_PREFIX} ${ASC_PLATFORM}
+     2) or pin the version explicitly:  --version <X.Y.Z>
+        --version is honoured exactly, so the marketing version no longer needs
+        App Store Connect.  The build number is still automatic:  the repo
+        commit count, raised above the floor of that train.
+    3) or, only if you are certain, re-run with --allow-unverified-seq"
+      fi
+      logerr "WARNING: --allow-unverified-seq set; the marketing version is planned from an UNVERIFIED patch (P=0)"
+      _patch=0
+    fi
+    PLAN_ASC_PATCH="$_patch"
+    PLAN_TARGET_PATCH="$((_patch + 1))"
+    MARKETING="${MARKETING_PREFIX}.${PLAN_TARGET_PATCH}"
+  fi
+
+  # ---- the build number ---------------------------------------------------
+  if [[ -n "$FORCE_BUILD" ]]; then
+    if [[ "$FIXED_MODE" -eq 1 && ! "$FORCE_BUILD" =~ ^${MARKETING%.*}\.[0-9]+$ ]]; then
+      die "--build ${FORCE_BUILD} is not ${MARKETING%.*}.<n>:  in fixed-version mode the train holds only dotted builds of that shape, and a different one would block every later ship.  Pass --build ${MARKETING%.*}.<n> or leave --build off.  Nothing was shipped."
+    fi
+    # An explicit --build is honoured exactly, and it does NOT move the
+    # marketing version:  the two numbers are independent.
+    BUILD_NUM="$FORCE_BUILD"
+    # An explicit --build is honoured exactly, but never as the retired
+    # "1.0.N (N)" pair (AFC-517):  refuse rather than silently change it.
+    # Compared as numbers, so "--build 0236" is caught for 1.0.236 too.
+    if [[ -n "$PLAN_TARGET_PATCH" && "$BUILD_NUM" =~ ^[0-9]+$ ]] && (( 10#$BUILD_NUM == 10#$PLAN_TARGET_PATCH )); then
+      die "--build ${BUILD_NUM} equals the patch of ${MARKETING}, which would ship ${MARKETING} (${BUILD_NUM}): the 1.0.N (N) form the owner retired (AFC-517).  Pass a different --build."
+    fi
+    log "version: operator override (--build/--version); the local build-seq counter is not consulted"
+  elif [[ "$FIXED_MODE" -eq 1 ]]; then
+    if [[ "$(printf '%s' "${ASC_PLATFORM:-}" | tr a-z A-Z)" == "MAC_OS" ]]; then
+      die "fixedMarketingVersion is not supported on macOS:  Mac builds must grow across every train, so a dotted build under a fixed version cannot be ordered safely.  Nothing was shipped."
+    fi
+    # The build reads like the version it ships under (1.1.2 (1.1.2)) and goes
+    # up inside the fixed train (1.1.3, 1.1.4, ...).  No floor, seed, count or
+    # patch bump applies:  the train itself is the only record.
+    BUILD_NUM="$(asc_next_dotted_build "$MARKETING" "$ASC_PLATFORM")" \
+      || die "cannot work out the next dotted build for ${MARKETING}: App Store Connect could not be read, or the train holds a build that is not ${MARKETING%.*}.<n>.  Nothing was shipped or guessed."
+    log "build: dotted build ${BUILD_NUM} for fixed version ${MARKETING}"
+  else
+    [[ "$PLAN_COMMIT_COUNT" =~ ^[0-9]+$ ]] || die "could not read the commit count from ${REPO_ROOT}; CFBundleVersion is the repo commit count and UTC timestamps are retired"
+
+    # The floor:  every build already in the TARGET train, plus the app's own
+    # plain-integer builds.  It is per-train, so it is read from the train
+    # this run actually ships to -- reading 1.0's floor for a 2.0 ship is what
+    # produced stale builds like "2.0 (build 202510190002)".
+    set +e
+    _floor_line="$(asc_build_floor "$MARKETING" "$ASC_PLATFORM")"
+    _rc=$?
+    if [[ $_rc -eq 4 ]]; then
+      # The same public labels as the marketing-version rejection above:  the
+      # key id and the issuer id, and nothing that came out of the key.
+      asc_resolve_diagnostic_credential
+      _rejected_key="$(key_label "$ASC_DIAG_KEY_ID")"
+      _rejected_issuer="$(key_issuer_label "$ASC_DIAG_ISSUER_ID")"
+      die "App Store Connect rejected the API key (HTTP 401/403) while reading the build floor (key id ${_rejected_key}, issuer id ${_rejected_issuer}).
+  Fix the key (ASC_* in env or Infisical /asc; fleet-secrets doctor) and re-run.
+  --allow-unverified-seq does not cover a rejected credential:  the upload would fail with it too."
+    fi
+    set -e
+    if [[ $_rc -ne 0 || -z "$_floor_line" ]]; then
+      if [[ "$ALLOW_UNVERIFIED_SEQ" -eq 0 ]]; then
+        die "cannot determine the build floor for ${MARKETING}.
+  App Store Connect could not be consulted.  The build number must be greater
+  than every build already in that train and greater than the app's own
+  builds, and App Store Connect is the only record of them:  a build number
+  that is not greater is rejected as a duplicate.
+  Fix one of these, then re-run:
+    1) restore ASC access: check ASC_* in env or Infisical /asc (fleet-secrets doctor) and that 'node' is on PATH, then
+       run: node ${FLEET_DIR}/asc-api.mjs build-floor ${BUNDLE_ID} ${MARKETING} ${ASC_PLATFORM}
+     2) or pass the build number explicitly:  --build <N>
+        --build is honoured exactly:  CFBundleVersion becomes N.  It must be
+        greater than every build already in that train.  --build does NOT move
+        the marketing version any more:  the two numbers are independent.
+     3) or, only if you are certain this train is empty, re-run with --allow-unverified-seq"
+      fi
+      logerr "WARNING: --allow-unverified-seq set; the build floor is UNVERIFIED (0)"
+      _floor_line="0 0 0"
+    fi
+    # "<floor> <train> <app>":  the two parts of the floor, and the result.
+    PLAN_FLOOR="$(printf '%s' "$_floor_line" | awk '{print $1}')"
+    PLAN_TRAIN_FLOOR="$(printf '%s' "$_floor_line" | awk '{print $2}')"
+    PLAN_APP_FLOOR="$(printf '%s' "$_floor_line" | awk '{print $3}')"
+    [[ "$PLAN_FLOOR" =~ ^[0-9]+$ ]] || PLAN_FLOOR=0
+    [[ "$PLAN_TRAIN_FLOOR" =~ ^[0-9]+$ ]] || PLAN_TRAIN_FLOOR=0
+    [[ "$PLAN_APP_FLOOR" =~ ^[0-9]+$ ]] || PLAN_APP_FLOOR=0
+
+    # Strictly-increasing guard:  ASC rejects a repeated (version, build)
+    # pair, so never ship at or below the known floor.  The guard fires when
+    # the floor is at or above the commit count -- because App Store Connect
+    # already holds it, or because a shallow checkout understates the commit
+    # count -- so the log line names the floor rather than asserting the
+    # commit count was shipped.
+    BUILD_NUM="$PLAN_COMMIT_COUNT"
+    if [[ "$FIXED_MODE" -ne 1 && "$BUILD_NUM" -le "$PLAN_FLOOR" ]]; then
+      BUILD_NUM="$((PLAN_FLOOR + 1))"
+      log "build: floor ${PLAN_FLOOR} is at or above the commit count ${PLAN_COMMIT_COUNT}; using ${BUILD_NUM} instead"
+    fi
+    # A ship must never look like "1.0.N (N)":  if the build number happens
+    # to be the patch number of the marketing version, move it one up.
+    # Both sides are compared as base-10 digit strings:  a pinned patch such
+    # as "0237" would otherwise be read as octal and slip past this guard.
+    if [[ "$PLAN_TARGET_PATCH" =~ ^[0-9]+$ && "$BUILD_NUM" =~ ^[0-9]+$ ]] \
+      && (( 10#$BUILD_NUM == 10#$PLAN_TARGET_PATCH )); then
+      _bumped="$((BUILD_NUM + 1))"
+      log "build: ${BUILD_NUM} equals the patch number; using ${_bumped} so the ship does not read ${MARKETING} (${BUILD_NUM})"
+      BUILD_NUM="$_bumped"
+    fi
+  fi
 fi
 
 # The project file and the shipped version must never disagree silently. The
 # version above is passed on the xcodebuild command line and overrides whatever
 # project.pbxproj says, so a stale value there is invisible without this check.
+# The project file is NOT a sequencing input any more (AFC-517):  this only
+# reports the disagreement.
 PROJECT_SEQ_NOW="$(project_marketing_seq "$PBXPROJ" "$MARKETING_PREFIX" quiet)"
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
   : # no version was resolved for --upload-only; nothing to compare against
@@ -919,10 +1602,10 @@ fi
 # shipped. Opt-in: it dirties the worktree, and the ship path itself requires a
 # clean one.
 if [[ "$SYNC_PROJECT_VERSION" -eq 1 ]]; then
-  # A dry-run only peeks; the sequence is not consumed, so the next real ship
+  # A dry-run only peeks; nothing is consumed, so the next real ship
   # would exceed whatever we wrote here and the file would be stale again.
   [[ "$DRY_RUN" -eq 0 ]] || die "--sync-project-version cannot be combined with --dry-run.
-  A dry-run does not consume a sequence number, so writing ${MARKETING} now would be
+  A dry-run does not ship anything, so writing ${MARKETING} now would be
   superseded by the next real ship. Pass --sync-project-version on the real ship instead."
   [[ -z "$UPLOAD_ONLY_IPA" ]] || die "--sync-project-version cannot be combined with --upload-only.
   An upload-only run resolves no version of its own — the IPA already carries one — so
@@ -939,7 +1622,11 @@ AUTH_MODE="none"
 load_secrets
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-OUT_ROOT="${TMPDIR:-/tmp}/ios-ship-${APP_KEY}-${STAMP}"
+#  SHIP_TMP_ROOT was classified above, before the version plan, so a root
+#  TMPDIR is reported as the path failure it is instead of as an
+#  unreachable App Store Connect.  It is the same value here:  nothing
+#  between the two points changes TMPDIR.
+OUT_ROOT="${SHIP_TMP_ROOT}/ios-ship-${APP_KEY}-${STAMP}"
 ARCHIVE_PATH="${OUT_ROOT}/${SCHEME}.xcarchive"
 EXPORT_DIR="${OUT_ROOT}/export"
 LOG_DIR="${OUT_ROOT}/logs"
@@ -949,6 +1636,9 @@ log "app=${DISPLAY_NAME} key=${APP_KEY}"
 log "bundleId=${BUNDLE_ID}"
 log "scheme=${SCHEME}"
 log "repo=${REPO_ROOT}"
+if [[ "$PLAN_READY" -eq 1 ]]; then
+  log "version plan: asc_patch=${PLAN_ASC_PATCH} -> marketing=${MARKETING}; build floors: train=${PLAN_TRAIN_FLOOR} app=${PLAN_APP_FLOOR} commit_count=${PLAN_COMMIT_COUNT} -> build=${BUILD_NUM}"
+fi
 log "marketing=${MARKETING} build=${BUILD_NUM}"
 log "App Store Connect will show this as: ${MARKETING} (${BUILD_NUM})"
 log "auth=${AUTH_MODE} export_only=${EXPORT_ONLY} force_ship=${FORCE_SHIP}"
@@ -968,7 +1658,18 @@ fi
 
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
   [[ -f "$UPLOAD_ONLY_IPA" ]] || die "package not found: $UPLOAD_ONLY_IPA"
-  [[ "$AUTH_MODE" == "api_key" ]] || die "upload-only requires ~/.secrets/appstore-connect.env with ASC_KEY_*"
+  if [[ "$AUTH_MODE" != "api_key" ]]; then
+    if [[ "$(asc_upload_block)" == "staging" ]]; then
+      die "upload-only: the App Store Connect credential was resolved, and the staging path was refused.  This is a path failure, not a missing key."
+    fi
+    if [[ "$(asc_upload_block)" == "credential" ]]; then
+      die "upload-only: the App Store Connect credential was resolved, but it is not a usable PEM private key.  This is a credential failure, not a missing key and not a path failure."
+    fi
+    if [[ "$(asc_upload_block)" == "writer" ]]; then
+      die "upload-only: the key writer itself failed.  It classified neither the credential nor the path, so this is not a missing key and not a path failure."
+    fi
+    die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
+  fi
   link_private_key "$ASC_KEY_PATH" "$ASC_KEY_ID"
   log "uploading existing package via altool (api key)"
   set +e
@@ -1089,7 +1790,7 @@ acquire_archive_lock() {
     sleep 10
   done
   # shellcheck disable=SC2064
-  trap "rmdir '$ARCHIVE_LOCK_DIR' 2>/dev/null || true" EXIT
+  trap "rmdir '$ARCHIVE_LOCK_DIR' 2>/dev/null || true; cleanup_asc_tmp" EXIT
 }
 release_archive_lock() {
   rmdir "$ARCHIVE_LOCK_DIR" 2>/dev/null || true
@@ -1120,29 +1821,29 @@ ensure_tf_ready() {
     while IFS= read -r line; do log "tf-ready: $line"; done <"${LOG_DIR}/ensure-tf-ready.err"
   fi
   if [[ $rc -eq 0 ]]; then
-    log "TestFlight internal testers can install this build"
+    log "TestFlight external install path is live for ${BUNDLE_ID} (an external group has testers or an enabled public link); the standing-testers sync assigns and verifies this build next"
     TF_READY_CONFIRMED=1
     return 0
   fi
   if [[ $rc -eq 5 ]]; then
-    # Apple finished processing the build, but the app has no internal tester
-    # with access to all builds, so nobody can install it.  This is not a failed
-    # upload (the build is in App Store Connect), so do not fail the job; make
-    # it impossible to miss instead.  A new bundle ID starts with no groups, and
-    # 14 green ships once reached nobody this way (GH #1018).
-    log "warning: build ${BUILD_NUM} is processed but ${BUNDLE_ID} has no internal TestFlight tester; nobody can install it yet"
-    log "warning: the Sync standing TestFlight testers step creates the internal group; otherwise add an App Store Connect user under TestFlight > Internal Testing"
+    # Apple finished processing the build, but it is assigned to no external
+    # group with testers or a public link, so nobody can install it.  This is
+    # not a failed upload (the build is in App Store Connect), so do not fail
+    # the job; make it impossible to miss instead.  A new bundle ID starts with
+    # no groups, and 14 green ships once reached nobody this way (GH #1018).
+    log "warning: build ${BUILD_NUM} is processed but ${BUNDLE_ID} has no external TestFlight group with testers or a public link; nobody can install it yet"
+    log "warning: the Sync standing TestFlight testers step assigns the external group; otherwise enable the public link under TestFlight > External Testing"
     if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-      echo "::warning title=TestFlight has no internal tester::${BUNDLE_ID} build ${BUILD_NUM} is processed but no internal tester can install it.  Check the Sync standing TestFlight testers step."
+      echo "::warning title=TestFlight has no reachable external tester::${BUNDLE_ID} build ${BUILD_NUM} is processed but no external tester can install it.  Check the Sync standing TestFlight testers step."
     fi
     return 0
   fi
   if [[ $rc -eq 6 ]]; then
-    # Processed, but the internal-tester count could not be read, so we cannot
-    # say anyone can install it.  Say so instead of printing the success line.
-    log "warning: build ${BUILD_NUM} is processed but the internal TestFlight tester count could not be read for ${BUNDLE_ID}; installability is unverified"
+    # Processed, but the external installability could not be read, so we
+    # cannot say anyone can install it.  Say so instead of printing the success line.
+    log "warning: build ${BUILD_NUM} is processed but the external TestFlight installability could not be read for ${BUNDLE_ID}; installability is unverified"
     if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-      echo "::warning title=TestFlight installability unverified::${BUNDLE_ID} build ${BUILD_NUM} is processed but the internal tester count could not be read.  Check TestFlight."
+      echo "::warning title=TestFlight installability unverified::${BUNDLE_ID} build ${BUILD_NUM} is processed but the external installability could not be read.  Check TestFlight."
     fi
     return 0
   fi
@@ -1335,12 +2036,34 @@ PACKAGE="$(ls -1 "$EXPORT_DIR"/*.ipa "$EXPORT_DIR"/*.pkg 2>/dev/null | head -1 |
 load_secrets
 if [[ "$AUTH_MODE" != "api_key" ]]; then
   log "Package ready at: $PACKAGE"
+  if [[ "$(asc_upload_block)" == "staging" ]]; then
+    log "Upload blocked: the App Store Connect credential was resolved, and the staging path was refused."
+    log "This is a path failure, not a missing key."
+    exit 3
+  fi
+  if [[ "$(asc_upload_block)" == "credential" ]]; then
+    log "Upload blocked: the App Store Connect credential was resolved, but it is not a usable PEM private key."
+    log "This is a credential failure, not a missing key and not a path failure."
+    log "The key exists; the value that came back from the vault cannot be used to sign an upload."
+    log "Owner handoff:"
+    log "  1) Export the .p8 again in App Store Connect (App Manager+)"
+    log "  2) Store that file as ASC_KEY_P8 in Infisical Fleet-OPS /asc"
+    log "  3) Or export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this run"
+    log "  4) Re-run: bash $0 $APP_KEY --upload-only \"$PACKAGE\""
+    exit 3
+  fi
+  if [[ "$(asc_upload_block)" == "writer" ]]; then
+    log "Upload blocked: the key tool itself failed."
+    log "It classified neither the credential nor the path, so this is not a missing key and not a path failure."
+    log "The credential was resolved; the tool that checks or stages it for the Apple tools did not finish."
+    exit 3
+  fi
   log "Upload blocked: no App Store Connect API key."
   log "Owner handoff:"
   log "  1) Create ASC API key (App Manager+) in App Store Connect"
-  log "  2) Save .p8 as ~/.secrets/AuthKey_<KEY_ID>.p8 (chmod 600)"
-  log "  3) Copy ${FLEET_DIR}/appstore-connect.env.example -> ~/.secrets/appstore-connect.env"
-  log "  4) Fill ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH; chmod 600 the env file"
+  log "  2) Store ASC_KEY_ID and ASC_ISSUER_ID in Infisical Fleet-OPS /asc"
+  log "  3) Store the .p8 as ASC_KEY_P8 in Infisical /asc"
+  log "  4) Or export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 for this run"
   log "  5) Re-run: bash $0 $APP_KEY --upload-only \"$PACKAGE\""
   log "Also ensure App Store Connect has an app record for ${BUNDLE_ID}."
   exit 3

@@ -49,6 +49,25 @@ async function failure(call: Promise<unknown>): Promise<ZulipApiError> {
 }
 
 describe("a malformed response is refused", () => {
+  it("recovers omitted mention flags from the authenticated messages endpoint", async () => {
+    const calls: string[] = [];
+    const client = new ZulipClient(creds, REALM, {
+      fetch: async (input) => {
+        const url = new URL(String(input));
+        calls.push(url.pathname);
+        if (url.pathname.endsWith("/messages/42")) {
+          return new Response(JSON.stringify({ result: "success", message: message(42) }), { status: 200 });
+        }
+        return new Response(JSON.stringify({
+          result: "success", messages: [{ ...message(42), flags: ["mentioned"] }],
+        }), { status: 200 });
+      },
+    });
+    const result = await client.message(42);
+    expect(result.flags).toEqual(["mentioned"]);
+    expect(calls).toEqual(["/api/v1/messages/42", "/api/v1/messages"]);
+  });
+
   it("register without a queue id fails as invalid_response, naming the field and not the body", async () => {
     const { client } = clientAnswering({ result: "success", last_event_id: 3, msg: "hostile text 7f3a" });
     const error = await failure(client.register());

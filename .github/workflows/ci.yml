@@ -30,7 +30,6 @@ jobs:
       docs_only: ${{ steps.scope.outputs.docs_only }}
       ios_changed: ${{ steps.scope.outputs.ios_changed }}
       packaging_changed: ${{ steps.scope.outputs.packaging_changed }}
-      control_plane_changed: ${{ steps.scope.outputs.control_plane_changed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'push' || github.event_name == 'pull_request'
@@ -53,7 +52,6 @@ jobs:
               echo "changed_count=0"
               echo "ios_changed=true"
               echo "packaging_changed=true"
-              echo "control_plane_changed=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -63,7 +61,6 @@ jobs:
               echo "changed_count=0"
               echo "ios_changed=true"
               echo "packaging_changed=true"
-              echo "control_plane_changed=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -82,18 +79,27 @@ jobs:
         run: node --test scripts/effort-log-integrity.node-test.mjs
 
   test:
-    name: typecheck + test (${{ matrix.os }})
+    # `check` is the required-context name.  Ruleset 21771270 matches
+    # "typecheck + test (macos-latest)", not the runner label.  Hosted
+    # macos-latest does not allocate a runner, so that leg stays queued
+    # with an empty runner and the run never finishes (BF-2066).  macos-14
+    # does allocate; the signed bundle and the package gate already use it.
+    name: typecheck + test (${{ matrix.check }})
     needs: changes
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
         # The harness and pure desktop capabilities stay portable across all
-        # supported host platforms. POSIX-only process tests self-skip.
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        # supported host platforms.  POSIX-only process tests self-skip.
+        include:
+          - os: macos-14
+            check: macos-latest
+          - os: ubuntu-latest
+            check: ubuntu-latest
     # Docs-only fast path still reports the required check names
-    # (typecheck + test (macos-latest) / windows-latest) but must not consume
-    # scarce free-plan macOS/Windows concurrent slots (2026-10-05 backlog).
+    # (typecheck + test (macos-latest) / ubuntu-latest) but must not consume
+    # scarce free-plan macOS concurrent slots (2026-10-05 backlog).
     runs-on: ${{ needs.changes.outputs.docs_only == 'true' && 'ubuntu-latest' || matrix.os }}
     # The test chain alone takes 10.5 to 13.5 minutes per host, and a full
     # job ran 14m49s on Ubuntu, so 15 cancelled healthy runs.  Keep this at
@@ -126,6 +132,18 @@ jobs:
       - name: Complete application test chain
         if: needs.changes.outputs.docs_only != 'true'
         run: pnpm test
+      # The fleet iOS version manifest publisher (AFC-540).  It publishes as a
+      # branch plus a pull request against AI-Fleet-Coordinator, because that
+      # repository's ruleset refuses a direct write to main.  The tests assert
+      # the merge keeps every sibling app, that the publish never names the
+      # default branch, and that the workflow's own read-only GITHUB_TOKEN is
+      # refused.
+      - name: Fleet iOS version manifest publisher tests
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          node --test scripts/ios-fleet/publish-ios-versions.node-test.mjs
+          bash -n scripts/ios-fleet/publish-ios-versions.sh
+          bash scripts/ios-fleet/test-ipa-manifest-versions.sh
       - if: needs.changes.outputs.docs_only != 'true'
         run: pnpm check:electron
       - name: production UI build
@@ -137,157 +155,50 @@ jobs:
     needs: changes
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - name: Documentation-only fast path
         if: needs.changes.outputs.docs_only == 'true'
         run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
-      - name: Control-plane-unrelated fast path
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed != 'true'
-        run: echo "No cloudflare/ paths changed; control-plane checks were skipped."
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
-        with:
-          persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
-        with:
-          node-version: 24
-          cache: pnpm
-      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
-        run: pnpm install --frozen-lockfile
-      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
-        run: pnpm control-plane:check
-      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
-        run: pnpm control-plane:test
-      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
-        run: pnpm control-plane:dry-run
+      - name: Retired @botfleet/control-plane package (ruleset shim)
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          echo "The @botfleet/control-plane workspace package was removed 2026-09-26 with cloudflare/control-plane/."
+          echo "This job satisfies ruleset 21771270 required context only; it does not run workerd or control-plane tests."
+          echo "For Cloudflare validation use: pnpm broker:check && pnpm broker:test"
 
-  package-linux:
-    name: package + smoke (Ubuntu 24.04 x64)
+  ios-build:
+    name: iOS Swift tests and unsigned build (xcode-27)
     needs: changes
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    steps:
-      - name: Documentation-only fast path
-        if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
-      - name: Packaging-unrelated fast path
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed != 'true'
-        run: echo "No electron/, third_party/, packaging script, or dependency paths changed; Linux packaging was skipped."
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        with:
-          persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        with:
-          node-version: 24
-          cache: pnpm
-      - name: Install package validation and native smoke tools
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: >-
-          sudo apt-get update && sudo apt-get install -y
-          at-spi2-core dbus-x11 desktop-file-utils libfuse2t64 libxi6 libxkbcommon0 squashfs-tools x11-utils xdotool xvfb
-        continue-on-error: false
-      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: pnpm install --frozen-lockfile
-      - name: Stage the pinned CUA runtime
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: pnpm build:cua:linux
-      - name: Prove overlay-free X11 input routing
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: dbus-run-session -- xvfb-run -a pnpm smoke:cua-x11-input
-      - name: Package from the verified offline CUA stage
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: pnpm package:linux:offline
-      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: node scripts/verify-linux-package.mjs
-      - name: Match a normal Ubuntu package parent on the ephemeral runner
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: |
-          test ! -L /opt
-          test "$(stat -c '%F %U:%G' /opt)" = "directory root:root"
-          case "$(stat -c '%a' /opt)" in
-            755) ;;
-            775|777) sudo chmod 0755 /opt ;;
-            *) echo "Unexpected /opt mode: $(stat -c '%a' /opt)" >&2; exit 1 ;;
-          esac
-          test "$(stat -c '%U:%G %a' /opt)" = "root:root 755"
-      - name: Reproduce and verify an in-place DEB upgrade
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: |
-          deb=(release/*.deb)
-          test "${#deb[@]}" -eq 1
-          sudo --preserve-env=CI,RUNNER_TEMP node scripts/smoke-deb-upgrade.mjs "${deb[0]}"
-      - name: Configure Chromium sandbox for the unpacked app
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        run: |
-          sudo chown root:root release/linux-unpacked/chrome-sandbox
-          sudo chmod 4755 release/linux-unpacked/chrome-sandbox
-          test "$(stat -c '%U:%G %a' release/linux-unpacked/chrome-sandbox)" = "root:root 4755"
-      - name: Launch packaged app and verify lifecycle
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
-        env:
-          OMB_KEEP_SMOKE_DIR: "1"
-          OMB_SMOKE_INSTALLED_DEB: "1"
-        run: pnpm smoke:linux-package
-      - name: Remove the installed upgrade fixture
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true' && always()
-        run: sudo dpkg --purge botfleet || true
-      - name: Upload smoke diagnostics on failure
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true' && failure()
-        with:
-          name: botfleet-ubuntu-smoke-diagnostics
-          path: |
-            /tmp/omb-linux-smoke-*
-            /tmp/omb-linux-smoke-runtime-*
-          if-no-files-found: warn
-          include-hidden-files: true
-          retention-days: 7
-
-  ios:
-    name: Swift tests + iOS build
-    needs: changes
-    if: ${{ !cancelled() }}
-    # Fast-path (docs-only or no ios/ changes) reports the required check on
-    # ubuntu-latest so we do not burn a macOS concurrent slot for an echo.
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true' }}
     # iOS 27 deployment floor needs the iOS 27 SDK.  macos-latest ships Xcode
     # 26.x only, so the full path runs on GitHub's hosted `xcode-27` image
     # (actions/runner-images#14404) pinned to stable Xcode 27.0, never a beta.
-    runs-on: ${{ (needs.changes.outputs.docs_only == 'true' || needs.changes.outputs.ios_changed != 'true') && 'ubuntu-latest' || 'xcode-27' }}
+    # This job is not a ruleset context.  It runs only when the classifier
+    # says iOS work is in scope, and every step is the real build.
+    runs-on: xcode-27
     timeout-minutes: 20
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
-      - name: Documentation-only fast path
-        if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
-      - name: iOS-unrelated fast path
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed != 'true'
-        run: echo "No ios/, ios script, or CI workflow paths changed; the iOS build was skipped."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
       - name: Assert stable Xcode 27.0
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: bash scripts/ios-assert-xcode.sh 27.0
       - name: Swift package tests
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: swift test --package-path ios
+      - name: Performance budget gate (standalone harness)
+        # The XCTest above runs the harness inside the test runner, where the
+        # memory and CPU budgets describe the runner rather than the app, so
+        # they are reported and not gated there.  The standalone executable is
+        # the only place those budgets are enforced, so CI runs it here or the
+        # process-scoped budgets are never gated at all.
+        run: swift run --package-path ios MacPerfHarness
       - name: Generate the Xcode project
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: |
           bash scripts/ios-install-xcodegen.sh
           cd ios
           xcodegen generate
       - name: Build the iOS app (unsigned)
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: |
           cd ios
           xcodebuild \
@@ -297,3 +208,46 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
+
+  ios:
+    name: Swift tests + iOS build
+    needs: [changes, ios-build]
+    # The ruleset context name stays.  Renaming it here would leave the
+    # required check unreported and block every merge until ruleset 21771270
+    # changed with it.  Success is no longer an echo: the step replays the
+    # diff and fails unless the unsigned build succeeded, or the replay
+    # proves the build was correctly skipped.  always() so a failed build
+    # still produces a failed required check instead of a skip.
+    if: ${{ always() && !cancelled() && needs.changes.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Literal 0.  An expression like `&& 0 || 1` collapses to 1 because
+          # GitHub treats 0 as false, and a depth-1 checkout does not contain
+          # the pull request base commit the replay has to diff.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove the iOS build ran or that no iOS paths changed
+        shell: bash
+        env:
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          IOS_CHANGED: ${{ needs.changes.outputs.ios_changed }}
+          IOS_BUILD_RESULT: ${{ needs.ios-build.result }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "push" && "$EVENT_NAME" != "pull_request" ]]; then
+            # Scheduled and manual runs have no base to replay.  The changes
+            # job already fail-opened every area, so this only accepts a
+            # successful ios-build.
+            printf '' | node scripts/ci-ios-gate.mjs
+            exit $?
+          fi
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$BASE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            echo "ERROR: Cannot replay changed paths for an auditable gate (missing base SHA)." >&2
+            exit 1
+          fi
+          git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" | node scripts/ci-ios-gate.mjs

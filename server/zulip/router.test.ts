@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { followKey } from "./format.ts";
-import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type RouterContext } from "./router.ts";
+import { DEFAULT_OWNER_CLIENTS, classify, seatTagForEmail, wakeVerdict, type RouterContext } from "./router.ts";
 import type { ZulipMessage, ZulipUser } from "./types.ts";
 
 const NOW = 1_790_000_000_000;
@@ -50,6 +50,12 @@ function dm(sender: number, others: number[], over: Partial<ZulipMessage> = {}):
 
 const verdict = (message: ZulipMessage) => wakeVerdict(classify(message, ctx));
 
+/** The reason a message did not wake the bot, or null when it did. */
+const refusal = (message: ZulipMessage): string | null => {
+  const v = verdict(message);
+  return v.wake === null ? v.reason : null;
+};
+
 describe("who wakes a BF bot", () => {
   it("drops the bot's own posts", () => {
     expect(verdict(stream({ sender_id: 101 }))).toEqual({ wake: null, reason: "own" });
@@ -75,7 +81,8 @@ describe("who wakes a BF bot", () => {
   it("does not wake on a mention inside code or without the flag, or on a wildcard", () => {
     expect(verdict(stream({ content: "`@**BF-Plumber**`" }))).toEqual({ wake: null, reason: "not_a_mention" });
     expect(verdict(stream({ flags: [] }))).toEqual({ wake: null, reason: "not_a_mention" });
-    expect(verdict(stream({ content: "@**all** heads up", flags: ["stream_wildcard_mentioned"] }))).toEqual({
+    // @everyone is inbox-only:  it never wakes, and it keeps the wildcard reason
+    expect(verdict(stream({ content: "@**everyone** heads up", flags: ["wildcard_mentioned"] }))).toEqual({
       wake: null,
       reason: "wildcard",
     });
@@ -133,5 +140,156 @@ describe("followed topics", () => {
     expect(fverdict(watch({ stream_id: undefined }))).toEqual({ wake: null, reason: "not_a_mention" });
     // and nothing is followed without the set
     expect(verdict(watch({}))).toEqual({ wake: null, reason: "not_a_mention" });
+  });
+});
+
+describe("the no-wake marker", () => {
+  const followed = new Set([followKey(7, "BF watch")]);
+  const fctx: RouterContext = { ...ctx, followed };
+  const watch = (over: Partial<ZulipMessage>) =>
+    stream({ stream_id: 7, subject: "BF watch", content: "deploy finished", flags: [], ...over });
+
+  it("wakes nobody when the message starts with the eyes marker", () => {
+    // Jay's DM
+    expect(verdict(dm(9, [101], { client: "website", content: ":eyes: hi" }))).toEqual({ wake: null, reason: "no_wake" });
+    // Jay's mention
+    expect(verdict(stream({ sender_id: 9, client: "website", content: ":eyes: @**BF-Plumber** look" }))).toEqual({
+      wake: null,
+      reason: "no_wake",
+    });
+    // a followed topic
+    expect(wakeVerdict(classify(watch({ content: ":eyes: hi" }), fctx))).toEqual({ wake: null, reason: "no_wake" });
+    // a peer's mention
+    expect(verdict(stream({ content: ":eyes: @**BF-Plumber** look" }))).toEqual({ wake: null, reason: "no_wake" });
+  });
+
+  it("takes the literal emoji as well as the shortcode", () => {
+    expect(verdict(stream({ content: "\u{1F440} hi" }))).toEqual({ wake: null, reason: "no_wake" });
+    expect(verdict(stream({ sender_id: 9, client: "website", content: "\u{1F440} @**BF-Plumber** look" }))).toEqual({
+      wake: null,
+      reason: "no_wake",
+    });
+  });
+
+  it("ignores leading whitespace", () => {
+    expect(verdict(stream({ content: "\n  :eyes: hi" }))).toEqual({ wake: null, reason: "no_wake" });
+  });
+
+  it("takes the marker after the sender's own seat tag", () => {
+    expect(
+      verdict(stream({ sender_email: "bf-plumber-bot@zulip.test", content: "[BF-PLUMBER] :eyes: hi" })),
+    ).toEqual({ wake: null, reason: "no_wake" });
+  });
+
+  it("takes the marker after the sender's own seat tag in any case", () => {
+    // the seat tag is an identifier:  the tooling that writes it may write
+    // it in any case, and the marker still silences the fleet
+    expect(
+      verdict(stream({ sender_email: "bf-plumber-bot@zulip.test", content: "[bf-plumber] :eyes: hi" })),
+    ).toEqual({ wake: null, reason: "no_wake" });
+    expect(
+      verdict(stream({ sender_email: "bf-plumber-bot@zulip.test", content: "[Bf-Plumber] :eyes: hi" })),
+    ).toEqual({ wake: null, reason: "no_wake" });
+    // another seat's tag in any case still cannot silence the fleet
+    expect(
+      refusal(stream({ sender_email: "bf-plumber-bot@zulip.test", content: "[bf-fixer] :eyes: hi" })),
+    ).not.toBe("no_wake");
+  });
+
+  it("takes the marker after a tag that carries a session", () => {
+    expect(verdict(stream({ sender_email: "other-bot@zulip.test", content: "[BF-PLUMBER\u00b7abc123] :eyes: hi" }))).toEqual({
+      wake: null,
+      reason: "no_wake",
+    });
+  });
+
+  it("does not take the marker after another seat's tag", () => {
+    expect(refusal(stream({ sender_email: "bf-plumber-bot@zulip.test", content: "[TODO] :eyes: hi" }))).not.toBe("no_wake");
+    // a tag for another seat with no session is not the sender's own
+    expect(
+      refusal(stream({ sender_email: "compiler-grok-bot@zulip.test", content: "[BF-PLUMBER] :eyes: hi" })),
+    ).not.toBe("no_wake");
+  });
+
+  it("does not take a marker mid-sentence, in a quote, or in code", () => {
+    expect(refusal(stream({ content: "heads up :eyes: hi" }))).not.toBe("no_wake");
+    expect(refusal(stream({ content: "> :eyes: hi" }))).not.toBe("no_wake");
+    expect(refusal(stream({ content: "`:eyes:` hi" }))).not.toBe("no_wake");
+  });
+
+  it("maps a bot email to its seat tag", () => {
+    expect(seatTagForEmail("bf-plumber-bot@zulip.test")).toBe("BF-PLUMBER");
+    expect(seatTagForEmail("compiler-grok-bot@zulip.test")).toBe("GB-COMPILER");
+    expect(seatTagForEmail("mm-bot@zulip.test")).toBe("MM");
+    expect(seatTagForEmail("")).toBeNull();
+  });
+});
+
+describe("@all broadcasts", () => {
+  const owner = { sender_id: 9, client: "website" };
+
+  it("wakes the bot when Jay broadcasts in a channel", () => {
+    expect(verdict(stream({ ...owner, content: "@**all** heads up", flags: ["stream_wildcard_mentioned"] }))).toEqual({
+      wake: "owner",
+      via: "broadcast",
+    });
+    expect(verdict(stream({ ...owner, content: "@**channel** heads up", flags: ["stream_wildcard_mentioned"] }))).toEqual({
+      wake: "owner",
+      via: "broadcast",
+    });
+    expect(verdict(stream({ ...owner, content: "@**stream** heads up", flags: ["stream_wildcard_mentioned"] }))).toEqual({
+      wake: "owner",
+      via: "broadcast",
+    });
+    // the bare forms count too
+    expect(verdict(stream({ ...owner, content: "@all heads up", flags: [] }))).toEqual({ wake: "owner", via: "broadcast" });
+  });
+
+  it("wakes a peer bot's broadcast as a peer, and not a stale one", () => {
+    expect(verdict(stream({ content: "@**all** heads up", flags: ["stream_wildcard_mentioned"] }))).toEqual({
+      wake: "peer",
+      via: "broadcast",
+    });
+    expect(verdict(stream({ content: "@**all** heads up", timestamp: NOW / 1000 - 3600 }))).toEqual({
+      wake: null,
+      reason: "stale",
+    });
+  });
+
+  it("does not wake on @everyone or @topic", () => {
+    expect(verdict(stream({ ...owner, content: "@**everyone** heads up", flags: ["wildcard_mentioned"] }))).toEqual({
+      wake: null,
+      reason: "wildcard",
+    });
+    expect(verdict(stream({ ...owner, content: "@**topic** heads up", flags: ["topic_wildcard_mentioned"] }))).toEqual({
+      wake: null,
+      reason: "wildcard",
+    });
+  });
+
+  it("does not wake on a silent mention, a webhook bot, or Jay's account from an API client", () => {
+    expect(verdict(stream({ ...owner, content: "@_**all** heads up", flags: [] }))).toEqual({
+      wake: null,
+      reason: "not_a_mention",
+    });
+    expect(verdict(stream({ sender_id: 60, content: "@**all** heads up" }))).toEqual({
+      wake: null,
+      reason: "webhook_sender",
+    });
+    expect(verdict(stream({ sender_id: 9, client: "ZulipPython", content: "@**all** heads up" }))).toEqual({
+      wake: null,
+      reason: "owner_via_api",
+    });
+  });
+
+  it("does not wake on a broadcast inside code", () => {
+    expect(verdict(stream({ ...owner, content: "`@**all**`", flags: [] }))).toEqual({
+      wake: null,
+      reason: "not_a_mention",
+    });
+    expect(verdict(stream({ ...owner, content: "```\n@**all**\n```", flags: [] }))).toEqual({
+      wake: null,
+      reason: "not_a_mention",
+    });
   });
 });

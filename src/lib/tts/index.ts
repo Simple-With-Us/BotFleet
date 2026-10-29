@@ -70,6 +70,10 @@ interface SpeakOptions {
    * Personal Voice fallback uses it (the harness decides for itself), to
    * pick the reply's voice half for a distilled bot; unset means "written". */
   scriptKind?: VoiceScriptKind;
+  /** When true (used by auto-speak on incoming bot replies), queue behind any
+   * utterance already preparing or playing instead of interrupting it.
+   * Manual clicks omit `enqueue` so they interrupt immediately. */
+  enqueue?: boolean;
 }
 
 export interface SpeakerOptions {
@@ -80,8 +84,23 @@ export interface SpeakerOptions {
 
 type TtsPrepareBody = { ready?: boolean; utterances?: string[]; error?: string };
 type Live = () => boolean;
+type QueuedSpeak = { text: string; opts: SpeakOptions; resolve: () => void };
+
+export const MAX_SPEECH_QUEUE = 8;
 
 const IDLE: SpeechSnapshot = { status: "idle" };
+
+/**
+ * The bot whose voice is playing, or undefined when nobody's voice is.
+ *
+ * Narrow on purpose.  The snapshot is a window-wide singleton and it changes
+ * identity on every caption, so a screen full of avatars that subscribed to
+ * the whole of it would re-render on every line of a spoken reply.  A bot
+ * that is being prepared has not said anything yet, so it is not speaking.
+ */
+export function speakingBotId(snapshot: SpeechSnapshot): string | undefined {
+  return snapshot.status === "speaking" ? snapshot.botId : undefined;
+}
 
 /** One helper call speaks this much text.  Each call spawns the speech
  * helper once, so a reply is sent as a few paragraph-sized calls rather than
@@ -212,6 +231,7 @@ export class Speaker {
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   private feed: ClipsKaraoke | LiveKaraoke | null = null;
   private feedWatchers = new Set<(feed: KaraokeFeed | null) => void>();
+  private queue: QueuedSpeak[] = [];
 
   constructor(options: SpeakerOptions = {}) {
     this.sleep = options.sleep ?? abortableSleep;
@@ -259,7 +279,13 @@ export class Speaker {
     return messageId ? this.snapshot.messageId === messageId : true;
   }
 
-  stop() {
+  private clearQueue() {
+    while (this.queue.length > 0) {
+      this.queue.shift()?.resolve();
+    }
+  }
+
+  private stopActivePlayback(setIdle: boolean) {
     this.token += 1;
     this.request?.abort();
     this.request = null;
@@ -272,7 +298,14 @@ export class Speaker {
     if (this.settlePlayback) this.settlePlayback(false);
     else this.teardownAudio();
     this.setFeed(null, "stopped");
-    if (this.snapshot.status !== "idle" || this.snapshot.error) this.set(IDLE);
+    if (setIdle && (this.snapshot.status !== "idle" || this.snapshot.error)) {
+      this.set(IDLE);
+    }
+  }
+
+  stop() {
+    this.clearQueue();
+    this.stopActivePlayback(true);
   }
 
   private teardownAudio() {
@@ -293,7 +326,29 @@ export class Speaker {
    * that should take a caller's turn down with it.
    */
   async speak(text: string, opts: SpeakOptions = {}): Promise<void> {
-    this.stop();
+    if (opts.enqueue && this.snapshot.status !== "idle") {
+      if (
+        opts.messageId &&
+        (this.snapshot.messageId === opts.messageId ||
+          this.queue.some((item) => item.opts.messageId === opts.messageId))
+      ) {
+        return;
+      }
+      while (this.queue.length >= MAX_SPEECH_QUEUE) {
+        this.queue.shift()?.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        this.queue.push({ text, opts, resolve });
+      });
+    }
+    if (!opts.enqueue) {
+      this.clearQueue();
+    }
+    return this.runSpeak(text, opts);
+  }
+
+  private async runSpeak(text: string, opts: SpeakOptions): Promise<void> {
+    this.stopActivePlayback(false);
     const mine = this.token;
     const controller = new AbortController();
     this.request = controller;
@@ -312,20 +367,26 @@ export class Speaker {
       }
       if (live()) {
         this.setFeed(null, "finished");
-        this.set(IDLE);
+        if (this.queue.length === 0) this.set(IDLE);
       }
     } catch (error) {
       if (live()) {
         this.setFeed(null, "stopped");
-        this.set({
-          status: "idle",
-          botId: opts.botId,
-          messageId: opts.messageId,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        if (this.queue.length === 0) {
+          this.set({
+            status: "idle",
+            botId: opts.botId,
+            messageId: opts.messageId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
     } finally {
       if (this.request === controller) this.request = null;
+      if (live() && this.queue.length > 0) {
+        const next = this.queue.shift()!;
+        void this.runSpeak(next.text, next.opts).then(next.resolve);
+      }
     }
   }
 
