@@ -60,7 +60,9 @@ public enum MacShutdownOutcome: Equatable, Sendable {
     case failed(message: String)
 }
 
-/// Structured receipt returned by `POST /api/system/shutdown`.
+/// Structured receipt returned by `POST /api/system/control/stop`, or by the
+/// legacy `POST /api/system/shutdown` on a harness without the fenced route.
+/// Both carry the same shutdown report.
 public struct MacShutdownReceipt: Codable, Equatable, Sendable {
     public let ok: Bool
     public let markerWritten: Bool
@@ -87,6 +89,10 @@ public enum MacLifecycleError: LocalizedError, Equatable, Sendable {
     case invalidPolicyValue
     case policyWriteFailed
     case httpError(statusCode: Int, message: String)
+    /// The server refused to stop because work is in flight.  The harness is
+    /// still running and nothing was written; `blockingWork` names what it
+    /// is waiting on, when the server said.
+    case busy(message: String, blockingWork: String?)
 
     public var errorDescription: String? {
         switch self {
@@ -100,6 +106,17 @@ public enum MacLifecycleError: LocalizedError, Equatable, Sendable {
             return "Could not save the local server persistence policy."
         case .httpError(_, let message):
             return message
+        case .busy(let message, let blockingWork):
+            // The server's refusal has no terminal punctuation, and on one of
+            // its two paths it already names the work in flight, so the
+            // breakdown is added only when the server did not say it.
+            let detail = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            let terminated = detail.hasSuffix(".") || detail.hasSuffix("!") || detail.hasSuffix("?")
+            let sentence = detail.isEmpty ? "" : (terminated ? detail : detail + ".") + "\u{00A0} "
+            if let blockingWork, !blockingWork.isEmpty, !detail.contains(blockingWork) {
+                return "BotFleet Server refused to stop while work is in flight (\(blockingWork)).\u{00A0} \(sentence)Try again when it finishes."
+            }
+            return "BotFleet Server refused to stop while work is in flight.\u{00A0} \(sentence)Try again when it finishes."
         }
     }
 }
@@ -431,10 +448,66 @@ public final class MacLifecycleClient: @unchecked Sendable {
         }
     }
 
-    /// Calls `POST /api/system/shutdown` to stop the local VM and harness cleanly, ensuring
+    /// The route a shutdown asks first, and the one it falls back to.
+    ///
+    /// `POST /api/system/control/stop` is fenced: the server refuses it with
+    /// 409 while bots, leases or admitted work are active, names that work,
+    /// and exits through its signal handler so logs, children and stores
+    /// drain.  `POST /api/system/shutdown` has no fence and exits the process
+    /// 250 ms after writing the marker, so a bot mid-turn loses its work; it
+    /// is kept only for a harness old enough to lack the fenced route.
+    public static let fencedStopPath = "/api/system/control/stop"
+    public static let legacyShutdownPath = "/api/system/shutdown"
+    /// Where the fenced route's refusal explains itself.
+    public static let controlStatusPath = "/api/system/control"
+    /// How long the busy refusal waits for the work breakdown before it is
+    /// reported as the server worded it.
+    public static let blockingWorkTimeout: TimeInterval = 2
+
+    /// How the server answered a stop request.
+    private enum StopAnswer {
+        case accepted(Data)
+        case busy(String)
+        case routeMissing
+    }
+
+    /// Stops the harness and the local VM cleanly, and ensures
     /// `~/.botfleet/stopped.marker` is written so launchd does not resurrect the server.
+    ///
+    /// The fenced route is asked first.  A 409 is a refusal, not a failure:
+    /// the harness is still running, nothing is written, and the error names
+    /// the work in flight.  Only the harness's own no-route 404, an older
+    /// harness with no fenced route, falls back to the unfenced shutdown, so
+    /// the two stops the owner has, this one and BotFleet Control's, protect
+    /// active work the same way.
     public func shutDownServerAndLocalVM() async throws -> MacShutdownReceipt {
-        guard let url = URL(string: "/api/system/shutdown", relativeTo: baseURL)?.absoluteURL else {
+        switch try await requestStop(path: Self.fencedStopPath) {
+        case .accepted(let data):
+            return try finishShutdown(with: data)
+        case .busy(let message):
+            throw MacLifecycleError.busy(message: message, blockingWork: await blockingWorkSummary())
+        case .routeMissing:
+            break
+        }
+        switch try await requestStop(path: Self.legacyShutdownPath) {
+        case .accepted(let data):
+            return try finishShutdown(with: data)
+        case .busy(let message):
+            throw MacLifecycleError.busy(message: message, blockingWork: nil)
+        case .routeMissing:
+            throw MacLifecycleError.httpError(
+                statusCode: 404,
+                message: "BotFleet Server has no shutdown route.\u{00A0} Update BotFleet, then try again."
+            )
+        }
+    }
+
+    /// Posts one stop request and classifies the answer.
+    ///
+    /// Any failure other than busy or a missing route is thrown as it always
+    /// was, so a 500 or a 403 still reads as the server's own words.
+    private func requestStop(path: String) async throws -> StopAnswer {
+        guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else {
             throw MacLifecycleError.invalidURL
         }
         var request = URLRequest(url: url)
@@ -450,13 +523,27 @@ public final class MacLifecycleClient: @unchecked Sendable {
         guard let http = response as? HTTPURLResponse else {
             throw MacLifecycleError.invalidResponse
         }
-        guard (200..<300).contains(http.statusCode) else {
-            throw MacLifecycleError.httpError(
-                statusCode: http.statusCode,
-                message: parseServerErrorMessage(from: data, statusCode: http.statusCode)
-            )
-        }
+        if (200..<300).contains(http.statusCode) { return .accepted(data) }
+        let message = parseServerErrorMessage(from: data, statusCode: http.statusCode)
+        if http.statusCode == 409 { return .busy(message) }
+        if http.statusCode == 404 && Self.isUnknownRouteAnswer(message) { return .routeMissing }
+        throw MacLifecycleError.httpError(statusCode: http.statusCode, message: message)
+    }
 
+    /// Whether a 404 is the harness saying it has no such route.
+    ///
+    /// The harness answers a path it has no handler for with
+    /// `{"error":"no route: POST /api/system/control/stop"}`, and that is the
+    /// only 404 that means an older server without the fenced stop.  Any other
+    /// 404 came from a route that exists, so it is an error to report, never a
+    /// reason to fall back to the unfenced shutdown: that fallback has no fence
+    /// and would stop bots mid-turn, the very thing the fenced route protects.
+    static func isUnknownRouteAnswer(_ message: String) -> Bool {
+        message.lowercased().hasPrefix("no route")
+    }
+
+    /// Reads the receipt and makes sure the deliberate-stop marker exists.
+    private func finishShutdown(with data: Data) throws -> MacShutdownReceipt {
         let receipt = try parseShutdownReceipt(from: data)
         if !policyStore.hasStoppedMarker() {
             try policyStore.writeStoppedMarker()
@@ -467,6 +554,35 @@ public final class MacLifecycleClient: @unchecked Sendable {
             localVmStop: receipt.localVmStop,
             localVmNote: receipt.localVmNote
         )
+    }
+
+    /// The work the server is waiting on, as one sentence, or nil when it
+    /// cannot be read.
+    ///
+    /// `GET /api/system/control` carries the same `blockingWork` breakdown the
+    /// server uses for its refusal, so the message and the refusal agree.  A
+    /// status that cannot be read leaves the refusal as the server worded it;
+    /// it never blocks or fails the stop on its own.
+    private func blockingWorkSummary() async -> String? {
+        guard let url = URL(string: Self.controlStatusPath, relativeTo: baseURL)?.absoluteURL else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        // The refusal is already known; this read only decorates it, so a
+        // slow status route must not hold the owner's answer for long.
+        request.timeoutInterval = Self.blockingWorkTimeout
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(originHeaderValue(), forHTTPHeaderField: "Origin")
+        guard let answer = try? await session.data(for: request),
+              let http = answer.1 as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let root = (try? JSONSerialization.jsonObject(with: answer.0)) as? [String: Any],
+              let work = root["blockingWork"] as? [[String: Any]] else { return nil }
+        let named = work.compactMap { item -> String? in
+            guard let count = item["count"] as? Int, count > 0,
+                  let label = item["label"] as? String, !label.isEmpty else { return nil }
+            return "\(count) \(label)\(count == 1 ? "" : "s")"
+        }
+        return named.isEmpty ? nil : named.joined(separator: ", ")
     }
 
     /// Evaluates whether quitting `BotFleetMac` should keep the server running or shut down

@@ -302,3 +302,12 @@ describe("the credential fingerprint", () => {
     expect(credentialFingerprint({})).not.toBe(digest);
   });
 });
+
+it("hydrates the request-log secret from the managed vault without exposing its value", () => {
+  const cfg: AppConfig = {};
+  const rows = resolveSecretFields(cfg, {}, new Map([["GITHUB_REQUEST_LOG_WEBHOOK_SECRET", SENTINEL_VAULT]]));
+  expect(cfg.githubRequestLog?.webhookSecret).toBe(SENTINEL_VAULT);
+  expect(rows.find((row) => row.id === "githubRequestLog.webhookSecret")).toMatchObject({ source: "infisical", hasValue: true });
+  expect(JSON.stringify(rows)).not.toContain(SENTINEL_VAULT);
+  expect(WORKSPACE_CREDENTIAL_ENV).toContain("GITHUB_REQUEST_LOG_WEBHOOK_SECRET");
+});

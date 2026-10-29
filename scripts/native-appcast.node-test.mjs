@@ -113,3 +113,36 @@ test("items must be newest-first so Sparkle offers the head build", () => {
     /newest-first/,
   );
 });
+
+test("a mirror feed base moves the channel link and the enclosure together", () => {
+  const appcast = buildAppcast({
+    version: VERSION,
+    feedBaseUrl: "https://mirror.invalid/botfleet/releases/download",
+    items: [
+      {
+        build: buildNumberFor(VERSION),
+        shortVersion: VERSION,
+        url: `https://mirror.invalid/botfleet/releases/download/v${VERSION}/BotFleetMac-${VERSION}.zip`,
+        length: 10,
+      },
+    ],
+  });
+  assert.match(appcast, /<link>https:\/\/mirror\.invalid\/botfleet\/releases<\/link>/);
+  assert.match(appcast, /https:\/\/mirror\.invalid\/botfleet\/releases\/download\/v/);
+});
+
+test("generateAppcast carries a mirror feed base into both the enclosure and the link", () => {
+  const directory = fixture();
+  try {
+    const mirror = "https://mirror.invalid/botfleet/releases/download";
+    generateAppcast({ releaseDir: directory, version: VERSION, feedBaseUrl: mirror });
+    const appcast = readFileSync(join(directory, "appcast.xml"), "utf8");
+    assert.match(
+      appcast,
+      new RegExp(`<enclosure url="${mirror}/v${VERSION}/BotFleetMac-${VERSION}\\.zip"`),
+    );
+    assert.match(appcast, /<link>https:\/\/mirror\.invalid\/botfleet\/releases<\/link>/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

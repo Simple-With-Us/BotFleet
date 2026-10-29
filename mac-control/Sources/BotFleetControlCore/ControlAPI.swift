@@ -72,6 +72,11 @@ public enum ControlAPIError: LocalizedError, Equatable {
     case foreignService
     case invalidResponse
     case refused(String)
+    /// The server answered the health check as BotFleet but has no such
+    /// route.  It is running, and it is older than this app: the control
+    /// routes were added to the server after this Control was built against
+    /// them.
+    case outdatedServer
 
     public var errorDescription: String? {
         switch self {
@@ -80,6 +85,7 @@ public enum ControlAPIError: LocalizedError, Equatable {
         case .foreignService: return "Port is not answering as BotFleet Server."
         case .invalidResponse: return "BotFleet Server returned an invalid response.  Update BotFleet and try again."
         case .refused(let message): return message
+        case .outdatedServer: return "BotFleet Server is running, but it is older than Control and has no control routes.  Update BotFleet, then try again."
         }
     }
 }
@@ -202,6 +208,15 @@ public final class ControlAPI {
         }
         if !(200..<300).contains(http.statusCode) {
             if path == "/api/health" { throw ControlAPIError.foreignService }
+            // The identity check has already proved this is a BotFleet
+            // Server, so a route it does not know is a route it predates.
+            // Reporting that as a refusal left the menu saying
+            // "unresponsive" about a server that was up, with every action
+            // greyed out (BF-2527).  Only the local server is read this way:
+            // a remote host sits behind a gateway that can answer 404 for
+            // reasons of its own, and its row already says what the server
+            // answered.
+            if http.statusCode == 404 && host.isLocal { throw ControlAPIError.outdatedServer }
             let message = (try? decoder.decode(ErrorResponse.self, from: data))?.message
             if http.statusCode == 409 {
                 throw ControlAPIError.refused(message ?? "BotFleet is busy with active bots or leases.  Try again after they finish.")

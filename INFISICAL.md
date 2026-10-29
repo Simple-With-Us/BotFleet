@@ -49,6 +49,7 @@ BotFleet is a single-user local harness: the server binds loopback-only (`127.0.
 | `OMB_RECALL_ACCESS_CLIENT_ID` | qdrant.accessClientId | config |
 | `OMB_RECALL_ACCESS_CLIENT_SECRET` | qdrant.accessClientSecret | secret |
 | `LINQ_API_TOKEN` | imessageLinq.apiToken | secret |
+| `GITHUB_REQUEST_LOG_WEBHOOK_SECRET` | githubRequestLog.webhookSecret | secret |
 | `LINQ_WEBHOOK_SECRET` | imessageLinq.webhookSecret | secret |
 | `SENTRY_DSN` | observability.sentryDsn | secret |
 | `SENTRY_FLEET_DSN` | observability.sentryFleetDsn | secret |
