@@ -5,7 +5,7 @@
  *  recorded through the shared durable RequestLog and never dispatched -
  *  no bot prompts, no state beyond the log. */
 
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 
@@ -48,7 +48,9 @@ function verifyGitHubSignature(rawBody: Buffer, header: string | undefined, secr
   if (!header || !header.startsWith("sha256=")) return false;
   const expected = `sha256=${createHmac("sha256", secret).update(rawBody).digest("hex")}`;
   if (header.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(header), Buffer.from(expected));
+  const supplied = Buffer.from(header);
+  const expectedBytes = Buffer.from(expected);
+  return supplied.length === expectedBytes.length && timingSafeEqual(supplied, expectedBytes);
 }
 
 export async function readGitHubRequestLog(
@@ -75,32 +77,37 @@ export async function readGitHubRequestLog(
     json(res, 401, { ok: false, reason: "bad_signature" });
     return;
   }
-  let payload: unknown;
-  try {
-    payload = JSON.parse(rawBody.toString("utf8"));
-  } catch {
-    json(res, 400, { ok: false, reason: "bad_json" });
+  const eventName = z.string().min(1).max(64).safeParse(req.headers["x-github-event"]);
+  const deliveryId = z.string().regex(/^[A-Za-z0-9_-]{1,100}$/).safeParse(req.headers["x-github-delivery"]);
+  if (!eventName.success || !deliveryId.success) {
+    json(res, 400, { ok: false, reason: "bad_delivery_headers" });
     return;
   }
+  let payload: unknown;
+  let validJson = true;
+  try { payload = JSON.parse(rawBody.toString("utf8")); }
+  catch { validJson = false; }
   const release = options.beginAdmission();
   if (!release) {
     json(res, 503, { ok: false, reason: "quiescing_for_update" });
     return;
   }
   try {
-    const eventName = z.string().catch("unknown").parse(req.headers["x-github-event"]).slice(0, 64);
-    const deliveryId = z.string().catch(() => randomUUID()).parse(req.headers["x-github-delivery"]).slice(0, 100);
-    options.requestLog.record(
+    const durable = options.requestLog.record(
       {
-        deliveryId,
-        eventName,
+        deliveryId: deliveryId.data,
+        eventName: eventName.data,
         receivedAt: (options.now ?? Date.now)(),
-        outcome: "received",
+        outcome: validJson ? "received" : "invalid_json",
         webhookId: options.webhookName ?? "github-request-log",
       },
-      extractRequestMetadata({ eventName, payload }),
+      extractRequestMetadata({ eventName: eventName.data, payload }),
     );
-    json(res, 200, { ok: true });
+    if (!durable) {
+      json(res, 503, { ok: false, reason: "log_not_durable" });
+      return;
+    }
+    json(res, validJson ? 200 : 400, validJson ? { ok: true } : { ok: false, reason: "bad_json" });
   } finally {
     release();
   }

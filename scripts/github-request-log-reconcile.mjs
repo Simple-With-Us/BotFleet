@@ -33,6 +33,16 @@ export function loggedDeliveryIds(path) {
   catch(e) { if(e.code==='ENOENT') return new Set();throw e; }
 }
 function clean(s,max=200) { return Array.from(String(s??''),c=>c.charCodeAt(0)<=31||c.charCodeAt(0)===127?' ':c).join('').replace(/[()]/g,'').slice(0,max); }
+function sourceUrl(value) {
+  if (!value) return undefined;
+  try {
+    const url=new URL(value);
+    if(url.origin!=='https://github.com'||url.username||url.password||url.search) return undefined;
+    if(!/^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(?:issues|pull|discussions)\/[0-9]+(?:\/files)?$/.test(url.pathname))return undefined;
+    if(url.hash&&!/^#(?:issuecomment-|discussion_r|pullrequestreview-|discussioncomment-)[0-9]+$/.test(url.hash))return undefined;
+    return url.href;
+  }catch{return undefined;}
+}
 export function extractMetadata(p) {
   // External JSON boundary: reject primitive payloads before metadata field reads.
   // oxlint-disable-next-line anti-slop/no-runtime-typeof -- JSON payloads are untyped in this dependency-free CLI.
@@ -41,11 +51,12 @@ export function extractMetadata(p) {
   if(x.repository?.full_name) m.repository=clean(x.repository.full_name);
   if(x.sender?.login) m.actor=clean(x.sender.login,100);
   for(const k of ['pull_request','issue','discussion']) if(Number.isSafeInteger(x[k]?.number)) { m.number=x[k].number;break; }
+  const link=sourceUrl(x.comment?.html_url??x.review?.html_url);if(link)m.sourceUrl=link;
   return m;
 }
 export function formatRecoveredLine({ts,eventName,meta,deliveryId}) {
   const target=(meta.repository??'')+(meta.number!==undefined?'#'+meta.number:'');
-  return `- ${ts.toISOString()} ${clean(eventName,64)}${meta.action?'.'+meta.action:''}${target?' '+target:''}${meta.actor?' by '+meta.actor:''} [recovered] via github-request-log-reconcile (delivery ${clean(deliveryId,100)})`;
+  return `- ${ts.toISOString()} ${clean(eventName,64)}${meta.action?'.'+meta.action:''}${target?' '+target:''}${meta.actor?' by '+meta.actor:''} [recovered] via github-request-log-reconcile${sourceUrl(meta.sourceUrl)?' source '+sourceUrl(meta.sourceUrl):''} (delivery ${clean(deliveryId,100)})`;
 }
 function ghGet(path) {
   // --include exposes Link cursors; no tokens or request headers are logged.

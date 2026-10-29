@@ -34,3 +34,8 @@ test('repeated recovery is idempotent with persisted log',()=>fixture(p=>{
 test('shared lock prevents a second writer and is never stolen',()=>fixture(p=>{
  const lock=p.log+'.lock';mkdirSync(lock);assert.throws(()=>reconcile({...p,get:()=>({data:[]}),now:stamp}),/EEXIST/);assert.ok(statSync(lock).isDirectory());
 }));
+test('recovery retains an exact GitHub comment permalink but never its prose',()=>fixture(p=>{
+ const data={request:{payload:{...detail.request.payload,comment:{html_url:'https://github.com/o/r/issues/1#issuecomment-99',body:'never log me'}}}};
+ reconcile({...p,get:path=>({data:path.includes('?')?[d(1)]:data}),now:stamp});
+ const text=readFileSync(p.log,'utf8');assert.match(text,/source https:\/\/github.com\/o\/r\/issues\/1#issuecomment-99/);assert.ok(!text.includes('never log me'));
+}));

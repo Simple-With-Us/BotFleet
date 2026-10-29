@@ -215,3 +215,54 @@ describe("log integrity", () => {
     expect(line).not.toContain("(delivery forged)");
   });
 });
+
+it("reports an unreadable spool and refuses a false durable success", () => {
+  const p = paths(tmp());
+  mkdirSync(p.spoolPath);
+  const errors: string[] = [];
+  const log = createRequestLog({ ...p, onError: (message) => errors.push(message) });
+  log.replay();
+  expect(errors).toHaveLength(1);
+  expect(log.record(entry, {})).toBe(false);
+});
+it("returns durable success when the fsynced spool survives a failed log flush", () => {
+  const p = paths(tmp());
+  mkdirSync(p.filePath);
+  const errors: string[] = [];
+  const log = createRequestLog({ ...p, onError: (message) => errors.push(message) });
+  expect(log.record(entry, {})).toBe(true);
+  expect(readFileSync(p.spoolPath, "utf8")).toContain(entry.deliveryId);
+  expect(errors).toHaveLength(1);
+});
+
+it("includes the original GitHub comment permalink without logging request prose", () => {
+  const meta = extractRequestMetadata({ payload: { comment: { html_url: "https://github.com/o/r/issues/42#issuecomment-123", body: "private request prose" } } });
+  expect(formatRequestLogLine(entry, meta, "hook")).toContain("source https://github.com/o/r/issues/42#issuecomment-123");
+  expect(JSON.stringify(meta)).not.toContain("private request prose");
+});
+it("does not preserve untrusted, credential-bearing or query-bearing links", () => {
+  for (const html_url of ["https://evil.invalid/o/r/issues/1", "https://github.com/o/r/issues/1?token=fake", "https://fake@github.com/o/r/issues/1"]) {
+    expect(extractRequestMetadata({ payload: { comment: { html_url } } }).sourceUrl).toBeUndefined();
+  }
+});
+it("logs internal routine lifecycle states once each, without prompts or outputs", () => {
+  const p = paths(tmp());
+  const log = createRequestLog(p);
+  const run = { id: "run-1", botId: "bot-1", status: "queued", triggerSource: "manual", createdAt: entry.receivedAt, prompt: "private request", output: "private output" };
+  log.routineSubscriber({ kind: "routine.run", run });
+  log.routineSubscriber({ kind: "routine.run", run });
+  log.routineSubscriber({ kind: "routine.run", run: { ...run, status: "completed" } });
+  const text = readFileSync(p.filePath, "utf8");
+  expect(text.trim().split("\n")).toHaveLength(2);
+  expect(text).toContain("botfleet_routine.manual");
+  expect(text).toContain("by bot-1");
+  expect(text).not.toContain("private request");
+  expect(text).not.toContain("private output");
+});
+it("isolates routine lifecycle identities even when IDs share prefixes", () => {
+  const p = paths(tmp());const log = createRequestLog(p);
+  for (const id of ["x".repeat(90)+"1", "x".repeat(90)+"2"]) {
+    log.routineSubscriber({ kind: "routine.run", run: { id, botId: "b", status: "completed", createdAt: entry.receivedAt } });
+  }
+  expect(readFileSync(p.filePath, "utf8").trim().split("\n")).toHaveLength(2);
+});

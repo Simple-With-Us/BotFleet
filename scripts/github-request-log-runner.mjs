@@ -10,7 +10,8 @@ function save(path,value) {
  renameSync(tmp,path);const d=openSync(dirname(path),'r');try{fsyncSync(d);}finally{closeSync(d);}
 }
 export function checkStatus(state,now=Date.now(),maxAgeMs=1800000) {
- return Boolean(state?.lastSuccess && now-Date.parse(state.lastSuccess)<=maxAgeMs && state.consecutiveFailures===0);
+ const age=now-Date.parse(state?.lastSuccess);
+ return Boolean(Number.isFinite(age) && age>=0 && age<=maxAgeMs && state.consecutiveFailures===0);
 }
 export function runConfigured(config,{run=reconcile,now=()=>new Date()}={}) {
  if(!config.statusPath||!Array.isArray(config.hooks)||!config.hooks.length)throw Error('statusPath and hook configuration required');

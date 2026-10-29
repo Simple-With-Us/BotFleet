@@ -15,6 +15,7 @@
  * dispatch, but is reported through onError so the gap is visible.
  */
 
+import { createHash } from "node:crypto";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, rmdirSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
@@ -27,6 +28,7 @@ export interface WebhookRequestMetadata {
   number?: number;
   actor?: string;
   ref?: string;
+  sourceUrl?: string;
 }
 
 type LogAtomValue = string | number | null | undefined;
@@ -46,7 +48,21 @@ const metadataPayload = z.object({
   pull_request: numberRecord, issue: numberRecord, discussion: numberRecord,
   release: numberRecord, check_run: numberRecord,
   ref: optionalText,
+  comment: z.object({ html_url: optionalText }).optional().catch(undefined),
+  review: z.object({ html_url: optionalText }).optional().catch(undefined),
 }).catch({});
+
+/** Preserve only GitHub content permalinks, never queries, credentials or arbitrary destinations. */
+export function requestSourceUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.origin !== "https://github.com" || url.username || url.password || url.search) return undefined;
+    if (!/^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(?:issues|pull|discussions)\/[0-9]+(?:\/files)?$/.test(url.pathname)) return undefined;
+    if (url.hash && !/^#(?:issuecomment-|discussion_r|pullrequestreview-|discussioncomment-)[0-9]+$/.test(url.hash)) return undefined;
+    return url.href;
+  } catch { return undefined; }
+}
 
 /** Decode untrusted webhook fields before reading metadata; never body/title text. */
 export function extractRequestMetadata(event: { eventName?: string; payload?: unknown }): WebhookRequestMetadata {
@@ -59,6 +75,8 @@ export function extractRequestMetadata(event: { eventName?: string; payload?: un
     const number = payload[key]?.number;
     if (number !== undefined) { meta.number = number; break; }
   }
+  const sourceUrl = requestSourceUrl(payload.comment?.html_url ?? payload.review?.html_url);
+  if (sourceUrl) meta.sourceUrl = sourceUrl;
   if (event.eventName === "push" && payload.ref) {
     meta.ref = logAtom(payload.ref, 200).replace(/^refs\/heads\//, "").slice(0, 100);
   }
@@ -89,8 +107,10 @@ export function formatRequestLogLine(
     (Number.isSafeInteger(metadata.number) ? `#${metadata.number}` : "") +
     (metadata.ref ? ` ${logAtom(metadata.ref)}` : "");
   const actor = metadata.actor ? ` by ${logAtom(metadata.actor, 100)}` : "";
+  const sourceUrl = requestSourceUrl(metadata.sourceUrl);
+  const source = sourceUrl ? ` source ${sourceUrl}` : "";
   const reason = entry.reason ? ` (${logAtom(entry.reason, 160)})` : "";
-  return `- ${ts} ${action}${target ? ` ${target}` : ""}${actor} [${logAtom(entry.outcome, 64)}] via ${logAtom(webhookName)}${reason} (delivery ${logAtom(entry.deliveryId, 100)})`;
+  return `- ${ts} ${action}${target ? ` ${target}` : ""}${actor} [${logAtom(entry.outcome, 64)}] via ${logAtom(webhookName)}${reason}${source} (delivery ${logAtom(entry.deliveryId, 100)})`;
 }
 
 export interface RequestLogOptions {
@@ -157,10 +177,11 @@ function loggedDeliveries(filePath: string): Set<string> {
 
 export interface RequestLog {
   subscriber: (event: WebhookManagerEvent) => void;
-  /** Record one delivery (spool-first, then flush).  Never throws. */
-  record: (entry: RequestLogEntry, metadata: WebhookRequestMetadata) => void;
+  /** True only after the record is fsynced to the spool. Never throws into dispatch. */
+  record: (entry: RequestLogEntry, metadata: WebhookRequestMetadata) => boolean;
   /** Drain any spool records a crash left behind.  Safe to call repeatedly. */
   replay: () => void;
+  routineSubscriber: (event: Record<string, unknown>) => void;
 }
 
 export function createRequestLog(options: RequestLogOptions): RequestLog {
@@ -168,8 +189,10 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
     let spool: string;
     try {
       spool = readFileSync(options.spoolPath, "utf8");
-    } catch {
-      return; // Nothing spooled.
+    } catch (error) {
+      const missing = z.object({ code: z.literal("ENOENT") }).safeParse(error);
+      if (missing.success) return;
+      throw error;
     }
     const pending = spool
       .split("\n")
@@ -201,7 +224,8 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
     writeFsync(options.cursorPath, "0");
   };
 
-  const record = (entry: RequestLogEntry, metadata: WebhookRequestMetadata): void => {
+  const record = (entry: RequestLogEntry, metadata: WebhookRequestMetadata): boolean => {
+    let durable = false;
     try {
       const name = options.webhookName?.(entry.webhookId) ?? entry.webhookId;
       const line = formatRequestLogLine(entry, metadata, name);
@@ -211,6 +235,7 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
       mkdirSync(lock, { mode: 0o700 });
       try {
         appendFsync(options.spoolPath, JSON.stringify({ line, delivery: logAtom(entry.deliveryId, 100) }) + "\n");
+        durable = true; // The fsynced spool owns recovery even if flush fails.
         flush();
       } finally {
         rmdirSync(lock);
@@ -218,9 +243,27 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
     } catch (error) {
       options.onError?.(error instanceof Error ? error.message : String(error));
     }
+    return durable;
   };
 
   return {
+    routineSubscriber: (event) => {
+      if (event.kind !== "routine.run") return;
+      const parsed = z.object({
+        id: z.string().min(1).max(100), botId: z.string().min(1).max(100),
+        status: z.enum(["queued", "running", "waiting", "completed", "failed", "cancelled", "missed"]), createdAt: z.number().min(0).max(8640000000000000),
+        triggerSource: z.string().max(64).optional(),
+        startedAt: z.number().min(0).max(8640000000000000).optional(), finishedAt: z.number().min(0).max(8640000000000000).optional(),
+      }).safeParse(event.run);
+      if (!parsed.success) return;
+      const run = parsed.data;
+      record({
+        deliveryId: `routine:${createHash("sha256").update(JSON.stringify([run.id, run.status])).digest("hex")}`,
+        eventName: "botfleet_routine", outcome: run.status,
+        receivedAt: run.finishedAt ?? run.startedAt ?? run.createdAt,
+        webhookId: "routine-manager",
+      }, { action: run.triggerSource ?? "unknown", actor: run.botId, ref: run.id });
+    },
     subscriber: (event) => {
       if (event.kind !== "webhook.attempt") return;
       const attempt: WebhookAttempt = event.attempt;

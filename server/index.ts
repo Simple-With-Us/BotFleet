@@ -8121,8 +8121,19 @@ let webhookEphemeralSource: ((webhookId: string) => {
   name: string;
   prompt: string;
 } | undefined) | undefined;
+const webhookRequestLog = createRequestLog({
+  filePath: process.env.BOTFLEET_REQUEST_LOG_PATH ?? join(DATA_DIR, "github-request-log.md"),
+  spoolPath: join(DATA_DIR, "github-request-log.spool"),
+  cursorPath: join(DATA_DIR, "github-request-log.cursor"),
+  // Stable record identifier avoids reading the later-created manager.
+  onError: (message) => console.warn(`[github-request-log] ${message}`),
+});
+webhookRequestLog.replay();
 routines = new RoutineManager({
-  emit: broadcast,
+  emit: (event) => {
+    webhookRequestLog.routineSubscriber(event);
+    broadcast(event);
+  },
   timeZone: routineTimeZone,
   incapableRun: routineIncapableForRun,
   // A restore route sets providerConfigBusy before its first await.  Keep
@@ -8309,6 +8320,8 @@ routines = new RoutineManager({
   checkInStart: checkInRoutineStart,
   checkInFinish: checkInRoutineFinish,
 });
+// Catch up retained durable receipts after restart; delivery IDs deduplicate states.
+for (const run of routines.listRuns()) webhookRequestLog.routineSubscriber({ kind: "routine.run", run });
 const recoveryOwners = routines.routineRequestReceiptOwners();
 if (recoveryOwners.length > 0) {
   // A normal launch has no crash-gap receipts, so it must not eagerly load
@@ -8486,14 +8499,6 @@ function resolveAndSendRoutine(
 // Webhook definitions are independent from calendar schedules, but every
 // delivery joins the same RoutineManager queue. That keeps unattended work
 // ordered behind a busy bot and gives webhook runs the same durable receipts.
-const webhookRequestLog = createRequestLog({
-  filePath: process.env.BOTFLEET_REQUEST_LOG_PATH ?? join(DATA_DIR, "github-request-log.md"),
-  spoolPath: join(DATA_DIR, "github-request-log.spool"),
-  cursorPath: join(DATA_DIR, "github-request-log.cursor"),
-  // Stable record identifier avoids reading the later-created manager.
-  onError: (message) => console.warn(`[github-request-log] ${message}`),
-});
-webhookRequestLog.replay();
 const webhooks = new WebhookManager({
   emit: (event) => {
     webhookRequestLog.subscriber(event);

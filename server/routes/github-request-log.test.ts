@@ -118,3 +118,43 @@ describe("readGitHubRequestLog", () => {
     expect(result().status).toBe(400);
   });
 });
+
+it("returns 503 when the shared writer lock prevents durable admission", async () => {
+  const dir = tmp();
+  const { options } = setup(dir);
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(join(dir, "github-request-log.md.lock"));
+  const { req, res, result } = fixture(PAYLOAD, signed(PAYLOAD));
+  // SAFETY: HTTP doubles implement the fields consumed by the route.
+  await readGitHubRequestLog(req as never, res as never, options);
+  expect(result().status).toBe(503);
+  expect(result().body).toContain("log_not_durable");
+});
+it("records authenticated malformed JSON metadata before returning 400", async () => {
+  const dir = tmp();
+  const { options } = setup(dir);
+  const body = "not json";
+  const { req, res, result } = fixture(body, signed(body));
+  // SAFETY: HTTP doubles implement the fields consumed by the route.
+  await readGitHubRequestLog(req as never, res as never, options);
+  expect(result().status).toBe(400);
+  const log = readFileSync(join(dir, "github-request-log.md"), "utf8");
+  expect(log).toContain("[invalid_json]");
+  expect(log).not.toContain(body);
+});
+it("rejects missing delivery identity rather than inventing one", async () => {
+  const dir = tmp();
+  const { options } = setup(dir);
+  const { req, res, result } = fixture(PAYLOAD, signed(PAYLOAD, { "x-github-delivery": "" }));
+  // SAFETY: HTTP doubles implement the fields consumed by the route.
+  await readGitHubRequestLog(req as never, res as never, options);
+  expect(result().status).toBe(400);
+});
+it("rejects same-character-count non-ASCII signatures without throwing", async () => {
+  const dir = tmp();
+  const { options } = setup(dir);
+  const { req, res, result } = fixture(PAYLOAD, signed(PAYLOAD, { "x-hub-signature-256": "sha256=" + "é".repeat(64) }));
+  // SAFETY: HTTP doubles implement the fields consumed by the route.
+  await readGitHubRequestLog(req as never, res as never, options);
+  expect(result().status).toBe(401);
+});

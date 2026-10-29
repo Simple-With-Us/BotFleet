@@ -391,7 +391,7 @@ const appConfigSchema = z.object({
    *  a stolen config.json does not hand an attacker a phone number.  Only
    *  the workspace phone + per-bot toggle + sender policy live on disk. */
   githubRequestLog: z.object({
-    /** Org request-log hook HMAC secret.  Prefer env/Infisical; kept optional on disk for sync only. */
+    /** Dedicated HMAC secret resolved through the canonical secret map. */
     webhookSecret: optionalText,
   }).optional(),
   imessageLinq: z.object({
@@ -1684,6 +1684,8 @@ export function loadConfig(): AppConfig {
   // store holds, the store wins; for every other name the ordering below —
   // env over file here, file over env in the per-call readers — is exactly
   // what it has always been.
+  cfg.githubRequestLog = { ...cfg.githubRequestLog };
+  if (process.env.GITHUB_REQUEST_LOG_WEBHOOK_SECRET !== undefined) cfg.githubRequestLog.webhookSecret = process.env.GITHUB_REQUEST_LOG_WEBHOOK_SECRET;
   cfg.xai = { ...cfg.xai };
   if (process.env.XAI_API_KEY !== undefined) cfg.xai.key = process.env.XAI_API_KEY;
   cfg.openaiCompat = { ...cfg.openaiCompat };
@@ -1873,6 +1875,7 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   // Linq webhook signing secret: the harness holds it to verify inbound
   // webhooks; no spawned engine CLI should inherit it.
   "LINQ_WEBHOOK_SECRET",
+  "GITHUB_REQUEST_LOG_WEBHOOK_SECRET",
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
   "OMB_TTS_KEY",
