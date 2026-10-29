@@ -144,6 +144,9 @@ jobs:
           node --test scripts/ios-fleet/publish-ios-versions.node-test.mjs
           bash -n scripts/ios-fleet/publish-ios-versions.sh
           bash scripts/ios-fleet/test-ipa-manifest-versions.sh
+      - name: Fleet shared build counter (offline)
+        if: needs.changes.outputs.docs_only != 'true'
+        run: node --test scripts/ios-fleet/shared-build.test.mjs
       - if: needs.changes.outputs.docs_only != 'true'
         run: pnpm check:electron
       - name: production UI build
