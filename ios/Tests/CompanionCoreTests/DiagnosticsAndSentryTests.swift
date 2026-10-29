@@ -223,4 +223,40 @@ final class DiagnosticsAndSentryTests: XCTestCase {
         XCTAssertFalse(MacSentryPolicy.shouldActivateSentry(dsn: "http://insecure.com/123", env: [:]))
         XCTAssertTrue(MacSentryPolicy.shouldActivateSentry(dsn: "https://key@o1.ingest.sentry.io/123", env: [:]))
     }
+
+    func testDesktopOptionsAssemblesRestrictiveContractWithReleaseStamp() {
+        let contract = MacSentryPolicy.desktopOptions(
+            dsn: " https://key@o1.ingest.sentry.io/123 ",
+            env: ["SENTRY_RELEASE": "724425968dcc"]
+        )
+
+        XCTAssertEqual(contract?.dsn, "https://key@o1.ingest.sentry.io/123")
+        XCTAssertEqual(contract?.environment, "production")
+        XCTAssertEqual(contract?.release, "724425968dcc")
+        XCTAssertEqual(contract?.sendDefaultPii, false)
+        XCTAssertEqual(contract?.attachScreenshot, false)
+        XCTAssertEqual(contract?.attachViewHierarchy, false)
+        XCTAssertEqual(contract?.sessionReplayMaskAllText, true)
+        XCTAssertEqual(contract?.sessionReplayMaskAllImages, true)
+    }
+
+    func testDesktopOptionsStaysInertWithoutUsableDSN() {
+        XCTAssertNil(MacSentryPolicy.desktopOptions(dsn: "", env: [:]))
+        XCTAssertNil(MacSentryPolicy.desktopOptions(dsn: nil, env: [:]))
+        XCTAssertNil(MacSentryPolicy.desktopOptions(dsn: "http://insecure.com/123", env: [:]))
+        XCTAssertNil(MacSentryPolicy.desktopOptions(
+            dsn: "https://key@o1.ingest.sentry.io/123",
+            env: ["XCTestConfigurationFilePath": "/tmp/Test.xctestconfiguration"]
+        ))
+    }
+
+    func testDesktopOptionsFallsBackToBundleCommitForRelease() {
+        let contract = MacSentryPolicy.desktopOptions(
+            dsn: "https://key@o1.ingest.sentry.io/123",
+            env: [:],
+            bundleCommit: "fedcba0987654321"
+        )
+
+        XCTAssertEqual(contract?.release, "fedcba0987654321")
+    }
 }

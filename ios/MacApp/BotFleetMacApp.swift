@@ -59,7 +59,10 @@ struct BotFleetMacApp: App {
     @NSApplicationDelegateAdaptor(BotFleetMacAppDelegate.self) private var appDelegate
 
     init() {
-        // Native macOS app startup; notifications are NEVER requested at launch.
+        // Sentry first, so a crash in session startup is captured; it stays
+        // inert without a stamped DSN (BF-2541).  Notifications are NEVER
+        // requested at launch.
+        MacSentryTelemetry.start()
     }
 
     var body: some Scene {
