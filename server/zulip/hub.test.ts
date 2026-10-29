@@ -1,7 +1,7 @@
 // The Zulip source end to end against a fake Zulip server: real HTTP, real
 // event queues, real files on disk, and a fake `startTurn` standing in for
 // the harness.  Each test boots its own fake realm and its own data folder.
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -434,6 +434,78 @@ describe("legacy role bindings", () => {
     expect(turns[0]!.botId).toBe("bot-plumber");
     expect(turns[0]!.text).toContain("the plumber takes the late route");
     expect(turns[0]!.text).toContain("from BF-Engineer");
+  });
+
+  it("keeps a BF-Builder state file across the canonical fold, relabelled to BF-Engineer", async () => {
+    fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
+    writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
+    // A state file saved before the rename, under the configured legacy name.
+    mkdirSync(join(dataDir, "zulip"), { recursive: true });
+    writeFileSync(join(dataDir, "zulip", "bot-builder.json"), JSON.stringify({
+      version: 1,
+      role: "BF-Builder",
+      cursor: 123,
+      handled: [11, 12, 13],
+      pending: [{
+        origin: { kind: "stream", channel: "builds", topic: "Before the rename" },
+        items: [{
+          id: 124, senderId: JAY, senderName: "Jay Wedgeworth", senderIsBot: false,
+          owner: true, ownerViaApi: false, content: "@**BF-Builder** finish this", timestamp: 1,
+        }],
+        createdAt: 1, updatedAt: 1, attempts: 0, notBefore: 0,
+      }],
+      wakes: [],
+      chains: {},
+      dms: [],
+    }));
+    settings.bots = {
+      "bot-builder": { role: "BF-Builder" },
+    };
+    // Busy, so the restored pending unit waits instead of starting a turn.
+    busy.add("bot-builder");
+    const hub = makeHub();
+    await connected(hub, "bot-builder");
+    const session = sessionOf(hub, "bot-builder");
+    expect(session.role).toBe("BF-Engineer");
+    expect(session.state.role).toBe("BF-Engineer");
+    expect(session.state.cursor).toBe(123);
+    expect(session.state.handled).toEqual([11, 12, 13]);
+    expect(session.state.pending).toHaveLength(1);
+    // The relabel persists: the next save writes the canonical role.
+    session.save(true);
+    const saved = JSON.parse(readFileSync(join(dataDir, "zulip", "bot-builder.json"), "utf8"));
+    expect(saved.role).toBe("BF-Engineer");
+    expect(saved.cursor).toBe(123);
+    expect(saved.handled).toEqual([11, 12, 13]);
+    expect(saved.pending).toHaveLength(1);
+  });
+
+  it("does not carry a BF-Plumber state file into a BF-Engineer session", async () => {
+    fake.addUser({ user_id: ENGINEER, full_name: "BF-Engineer", email: "bf-engineer-bot@zulip.test", key: "engineer-test-key" });
+    writeRc("BF-Engineer", "bf-engineer-bot@zulip.test", "engineer-test-key");
+    mkdirSync(join(dataDir, "zulip"), { recursive: true });
+    writeFileSync(join(dataDir, "zulip", "bot-engineer.json"), JSON.stringify({
+      version: 1,
+      role: "BF-Plumber",
+      cursor: 999,
+      handled: [7, 8],
+      pending: [],
+      wakes: [],
+      chains: {},
+      dms: [],
+    }));
+    settings.bots = {
+      "bot-engineer": { role: "BF-Engineer" },
+    };
+    const hub = makeHub();
+    await connected(hub, "bot-engineer");
+    const session = sessionOf(hub, "bot-engineer");
+    expect(session.state.role).toBe("BF-Engineer");
+    // Fresh, not carried: the first connection starts the cursor from now
+    // (the fake realm's newest id), and the Plumber ring stays behind.
+    expect(session.state.cursor).not.toBe(999);
+    expect(session.state.handled).toEqual([]);
+    expect(session.state.pending).toEqual([]);
   });
 });
 

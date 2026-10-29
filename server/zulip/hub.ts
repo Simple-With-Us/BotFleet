@@ -382,7 +382,7 @@ class ZulipSession {
     this.role = role;
     this.credentialRole = credentialRole ?? role;
     this.realm = realm;
-    this.state = hub.store.load(botId, role);
+    this.state = hub.store.load(botId, role, this.credentialRole);
     this.status = { botId, role, state: "starting", pending: this.state.pending.length, since: hub.now() };
     this.seedSeen();
   }
