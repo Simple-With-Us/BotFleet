@@ -110,65 +110,99 @@ python3 - "$BASELINE" "$OUT" <<'PNG_COMPARE'
 import struct
 import sys
 import zlib
+from collections.abc import Iterator
 
-def load_rgba(path: str) -> tuple[tuple[int, int], list[int]]:
+# Decodes one 8-bit PNG row at a time into a bytearray, with all five
+# filter types, so a full simulator capture is never held as Python ints.
+CHANNELS = {0: 1, 2: 3, 4: 2, 6: 4}
+
+
+def paeth(a: int, b: int, c: int) -> int:
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    return b if pb <= pc else c
+
+
+def read_png(path: str) -> tuple[tuple[int, int], int, bytes]:
     with open(path, "rb") as handle:
         data = handle.read()
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         raise SystemExit(f"{path}: not a PNG")
     pos = 8
-    width = height = None
-    raw = b""
-    while pos < len(data):
+    header = None
+    idat: list[bytes] = []
+    while pos + 8 <= len(data):
         length = struct.unpack(">I", data[pos : pos + 4])[0]
-        pos += 4
-        chunk_type = data[pos : pos + 4]
-        pos += 4
-        chunk = data[pos : pos + length]
-        pos += length + 4
+        chunk_type = data[pos + 4 : pos + 8]
+        chunk = data[pos + 8 : pos + 8 + length]
+        pos += length + 12
         if chunk_type == b"IHDR":
-            width, height = struct.unpack(">II", chunk[:8])
+            header = struct.unpack(">IIBBBBB", chunk[:13])
         elif chunk_type == b"IDAT":
-            raw += chunk
+            idat.append(chunk)
         elif chunk_type == b"IEND":
             break
-    if width is None or height is None:
+    if header is None:
         raise SystemExit(f"{path}: missing IHDR")
-    inflated = zlib.decompress(raw)
-    stride = width * 4 + 1
-    pixels: list[int] = []
-    prev = [0] * (width * 4)
-    offset = 0
-    for _ in range(height):
-        filter_type = inflated[offset]
-        offset += 1
-        row = list(inflated[offset : offset + width * 4])
-        offset += width * 4
-        if filter_type == 1:
-            for i in range(4, len(row)):
-                row[i] = (row[i] + row[i - 4]) & 0xFF
-        elif filter_type == 2:
-            for i in range(len(row)):
-                row[i] = (row[i] + prev[i]) & 0xFF
-        elif filter_type == 0:
-            pass
-        else:
-            raise SystemExit(f"{path}: unsupported PNG filter {filter_type}")
-        pixels.extend(row)
-        prev = row
-    return (width, height), pixels
+    width, height, depth, color, _, _, interlace = header
+    if depth != 8 or color not in CHANNELS or interlace != 0:
+        raise SystemExit(
+            f"{path}: unsupported PNG (bit depth {depth}, color type {color}, interlace {interlace})"
+        )
+    return (width, height), CHANNELS[color], zlib.decompress(b"".join(idat))
+
+
+def rows(path: str) -> tuple[tuple[int, int, int], Iterator[bytearray]]:
+    (width, height), bpp, inflated = read_png(path)
+    stride = width * bpp
+    if len(inflated) < height * (stride + 1):
+        raise SystemExit(f"{path}: truncated image data")
+
+    def generate() -> Iterator[bytearray]:
+        prev = bytearray(stride)
+        offset = 0
+        for _ in range(height):
+            filter_type = inflated[offset]
+            row = bytearray(inflated[offset + 1 : offset + 1 + stride])
+            offset += stride + 1
+            if filter_type == 1:
+                for i in range(bpp, stride):
+                    row[i] = (row[i] + row[i - bpp]) & 0xFF
+            elif filter_type == 2:
+                for i in range(stride):
+                    row[i] = (row[i] + prev[i]) & 0xFF
+            elif filter_type == 3:
+                for i in range(stride):
+                    left = row[i - bpp] if i >= bpp else 0
+                    row[i] = (row[i] + ((left + prev[i]) >> 1)) & 0xFF
+            elif filter_type == 4:
+                for i in range(stride):
+                    left = row[i - bpp] if i >= bpp else 0
+                    upper_left = prev[i - bpp] if i >= bpp else 0
+                    row[i] = (row[i] + paeth(left, prev[i], upper_left)) & 0xFF
+            elif filter_type != 0:
+                raise SystemExit(f"{path}: invalid PNG filter {filter_type}")
+            yield row
+            prev = row
+
+    return (width, height, bpp), generate()
+
 
 baseline_path, capture_path = sys.argv[1], sys.argv[2]
-baseline_size, baseline_pixels = load_rgba(baseline_path)
-capture_size, capture_pixels = load_rgba(capture_path)
+baseline_size, baseline_rows = rows(baseline_path)
+capture_size, capture_rows = rows(capture_path)
 if baseline_size != capture_size:
     raise SystemExit(
-        f"TV-Face screenshot size mismatch: baseline {baseline_size}, capture {capture_size}"
+        "TV-Face screenshot size mismatch (width, height, channels): "
+        f"baseline {baseline_size}, capture {capture_size}"
     )
-if baseline_pixels != capture_pixels:
-    mismatches = sum(1 for left, right in zip(baseline_pixels, capture_pixels) if left != right)
-    raise SystemExit(
-        f"TV-Face screenshot differs from baseline ({mismatches} RGBA byte mismatches)"
-    )
+mismatches = 0
+for left_row, right_row in zip(baseline_rows, capture_rows):
+    if left_row != right_row:
+        mismatches += sum(1 for left, right in zip(left_row, right_row) if left != right)
+if mismatches:
+    raise SystemExit(f"TV-Face screenshot differs from baseline ({mismatches} byte mismatches)")
 print(f"TV-Face screenshot matches baseline {baseline_path}")
 PNG_COMPARE
