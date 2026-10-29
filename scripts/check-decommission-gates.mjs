@@ -62,6 +62,26 @@ export const MAC_LOCAL_ROOTS = ["server", "companion", "shared", "electron"];
  */
 export const RETAINED_OPTIONAL_SERVER_PATHS = ["deploy/linux-server/"];
 
+/**
+ * Surfaces that are not part of the Mac-local Node stack but stop working
+ * when it goes.  BotFleet Control (mac-control/) is Swift, so no inventory
+ * row retires it, yet every local thing it does goes through that stack: its
+ * six HTTP routes live only in server/index.ts, it supervises the
+ * app.botfleet.server and app.botfleet.companion LaunchAgents and pm2
+ * botfleet-mcp, its offline VM helper is compiled from
+ * server/local-vm-offline-cli.ts, and its only build and install path is the
+ * Electron packaging that Step 6 deletes.  Deleting the stack with Control's
+ * future undecided leaves a menu bar app whose every row reads "not
+ * installed", so the decision is a gate (BF-2583).
+ */
+export const DEPENDENT_SURFACES = [
+  {
+    path: "mac-control/",
+    decision: "docs/plans/2026-10-29-botfleet-control-after-node.md",
+    why: "BotFleet Control's local half (:8799 routes, LaunchAgents, pm2, the offline VM helper, the Electron-side build) is the Mac-local Node stack; its post-Node disposition is Decision 1 of the plan and must be recorded and landed before the stack is deleted",
+  },
+];
+
 /** Issues that must be Done before any Node deletion lands. */
 export const REQUIRED_ISSUES = [
   {
@@ -111,6 +131,10 @@ export const REQUIRED_EVIDENCE = [
   {
     id: "inventory-clean",
     why: `scripts/audit-node-decommission.mjs reports no file in ${MAC_LOCAL_ROOTS.join(", ")} without a Swift owner or a retired reason; the optional deploy/linux-server/ server deployment is deliberately retained and is not part of this gate`,
+  },
+  {
+    id: "control-disposition",
+    why: `BotFleet Control's post-Node disposition (Decision 1 in ${DEPENDENT_SURFACES[0].decision}) is recorded by the owner and landed: Control is retired with the Electron shell, kept with a native control channel and its own build path, or split so the native app owns the lifecycle surface; until then mac-control/ stops working at cutover (BF-2583)`,
   },
 ];
 
@@ -198,7 +222,7 @@ if (isEntryModule()) {
   if (!statePath || !existsSync(statePath)) {
     console.error(
       "usage: node scripts/check-decommission-gates.mjs <state.json>\n" +
-        'state.json: {"issues": {"BF-2510": "Done", ...}, "evidence": {"soak-24h-no-node": true, ...}, "macLocalHarness": {"present": false, "retained": {"deploy/linux-server/": "optional server deployment (BF-2544)"}}}\n' +
+        'state.json: {"issues": {"BF-2510": "Done", ...}, "evidence": {"soak-24h-no-node": true, "control-disposition": true, ...}, "macLocalHarness": {"present": false, "retained": {"deploy/linux-server/": "optional server deployment (BF-2544)"}}}\n' +
         "the deletion order this gate protects: docs/native-rewrite-decommission-runbook.md",
     );
     process.exit(2);
@@ -238,6 +262,9 @@ if (isEntryModule()) {
   );
   for (const entry of verdict.retained) {
     console.log(`Retained on purpose: ${entry.path} — ${entry.why}`);
+  }
+  for (const entry of DEPENDENT_SURFACES) {
+    console.log(`Depends on the stack being deleted: ${entry.path} — disposition recorded per ${entry.decision} (evidence control-disposition)`);
   }
   console.log(
     "The Electron shell and its updater feed additionally need BF-2485 and BF-2486; see docs/native-rewrite-decommission-runbook.md steps 6 and 7.",
