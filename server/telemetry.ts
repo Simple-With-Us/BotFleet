@@ -73,6 +73,13 @@ export interface TelemetryTurnParams {
    * for the turn; read against `cachedInputTokens` to see whether the
    * prefix is actually being cached. */
   promptBytes?: { stable: number; volatile: number };
+  /** The child harness's own native session id for this turn (Claude
+   * Code's `--session-id`, an ACP session, a Codex thread), when the child
+   * reported one.  Stamped as `metadata.childSessionId` so Usage Monitor can
+   * pair this event with the child's own telemetry and count the turn once. */
+  childSessionId?: string;
+  /** When the turn was dispatched, in epoch milliseconds. */
+  turnStartedAtMs?: number;
 }
 
 export interface TelemetryStatus {
@@ -379,6 +386,13 @@ type TurnMetadata = {
   roomName?: string;
   promptStableBytes?: number;
   promptVolatileBytes?: number;
+  /** The engine that ran the turn, verbatim (`claudeAgent`, `codex`,
+   * `opencodeGo`, `mcodeAgent`, `dshAgent`, `minimax`, …). */
+  childHarness?: string;
+  /** The child's native session id; absent when unknown, never blank. */
+  childSessionId?: string;
+  /** ISO time the turn began, when known. */
+  turnStartedAt?: string;
 };
 
 /** Turn one completed turn into the events that go on the wire.
@@ -494,6 +508,20 @@ export function buildTurnEvents(
   if (promptBytes) {
     metadata.promptStableBytes = promptBytes.stable;
     metadata.promptVolatileBytes = promptBytes.volatile;
+  }
+  // De-duplication keys against the child harness's own telemetry.  Decided
+  // here, once, from the turn's own facts: the event is persisted as built
+  // and a replay must carry exactly the same content.
+  const childHarness = clip((params.driverKind || "").trim(), 80);
+  if (childHarness) metadata.childHarness = childHarness;
+  const childSessionId = clip((params.childSessionId || "").trim(), 200);
+  if (childSessionId) metadata.childSessionId = childSessionId;
+  if (
+    params.turnStartedAtMs !== undefined &&
+    Number.isFinite(params.turnStartedAtMs) &&
+    params.turnStartedAtMs > 0
+  ) {
+    metadata.turnStartedAt = new Date(params.turnStartedAtMs).toISOString();
   }
   if (!usageReported) {
     metadata.tokenType = "unknown";

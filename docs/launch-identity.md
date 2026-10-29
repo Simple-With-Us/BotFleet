@@ -15,6 +15,7 @@ Set per bot and per turn, in the environment of the process that runs the turn. 
 | `AGENT_SEAT` | The same value, for older readers. |
 | `AGENT_SESSION` | BotFleet's id for the thread the turn runs on (a room turn uses the room's thread). |
 | `AGENT_SYNC_ATTACH` | `0`.  The Claude hooks plugin never attaches a session BotFleet launched. |
+| `OTEL_RESOURCE_ATTRIBUTES` | The inherited value with `agent.launcher=botfleet` and `agent.launcher.session=<thread id>` appended (comma-joined, the thread id percent-encoded).  An inherited entry for either key is replaced, never duplicated.  A child that exports its own OpenTelemetry (Claude Code, Codex) carries them, so Usage Monitor can tell its native events belong to a BotFleet turn and count the turn once. |
 
 A bot whose name names no role still gets `AGENT_LAUNCHER`, `AGENT_SYNC_ATTACH` and `AGENT_SESSION`, and no seat.  The fleet tools then refuse to act, instead of falling back to a platform default.
 
