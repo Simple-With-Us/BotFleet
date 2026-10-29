@@ -81,9 +81,11 @@ jobs:
   test:
     # `check` is the required-context name.  Ruleset 21771270 matches
     # "typecheck + test (macos-latest)", not the runner label.  Hosted
-    # macos-latest does not allocate a runner, so that leg stays queued
-    # with an empty runner and the run never finishes (BF-2066).  macos-14
-    # does allocate; the signed bundle and the package gate already use it.
+    # macos-latest still does not allocate a runner, so that leg stays
+    # queued with an empty runner and the run never finishes (BF-2066).
+    # macos-14 allocated but is retiring (actions/runner-images#13518), so
+    # the mac leg runs on macos-15, the supported standard arm64 label
+    # (BF-2587, patch by Codex).
     name: typecheck + test (${{ matrix.check }})
     needs: changes
     if: ${{ !cancelled() }}
@@ -93,7 +95,7 @@ jobs:
         # The harness and pure desktop capabilities stay portable across all
         # supported host platforms.  POSIX-only process tests self-skip.
         include:
-          - os: macos-14
+          - os: macos-15
             check: macos-latest
           - os: ubuntu-latest
             check: ubuntu-latest
