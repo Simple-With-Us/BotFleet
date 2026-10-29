@@ -13,20 +13,21 @@ import {
 } from "./launch-identity.ts";
 import { zulipTag } from "./zulip/format.ts";
 
-describe("the eleven role seats", () => {
-  it("names exactly the eleven BotFleet roles, each with an upper-case BF seat", () => {
+describe("the twelve role seats", () => {
+  it("names exactly the twelve BotFleet roles, each with an upper-case BF seat", () => {
     expect(BOTFLEET_ROLES.map((role) => role.seat)).toEqual([
-      "BF-BUILDER",
       "BF-COMPILER",
       "BF-DEPLOYER",
       "BF-DESIGNER",
       "BF-DIRECTOR",
+      "BF-ENGINEER",
       "BF-FIXER",
       "BF-HOUSEKEEPER",
       "BF-MONITOR",
       "BF-ORACLE",
       "BF-PLUMBER",
       "BF-PUBLISHER",
+      "BF-TRADER",
     ]);
     for (const role of BOTFLEET_ROLES) {
       expect(role.seat).toBe(`BF-${role.id.toUpperCase()}`);
@@ -52,15 +53,26 @@ describe("resolveBotfleetRole", () => {
     expect(resolveBotfleetRole({ name: "Plumber" })?.seat).toBe("BF-PLUMBER");
     expect(resolveBotfleetRole({ name: "  oracle  " })?.seat).toBe("BF-ORACLE");
     // A description that names no known role falls through to the name.
-    expect(resolveBotfleetRole({ name: "Builder", description: "@fleet-seat: nobody" })?.seat).toBe("BF-BUILDER");
+    expect(resolveBotfleetRole({ name: "Builder", description: "@fleet-seat: nobody" })?.seat).toBe("BF-ENGINEER");
     // A description wins over a conflicting name.
     expect(resolveBotfleetRole({ name: "Builder", description: "@fleet-seat: fixer" })?.seat).toBe("BF-FIXER");
   });
 
-  it("resolves all eleven roles by their bare names", () => {
+  it("resolves all twelve roles by their bare names", () => {
     for (const role of BOTFLEET_ROLES) {
       expect(resolveBotfleetRole({ name: role.name })?.seat, role.name).toBe(role.seat);
     }
+  });
+
+  it("resolves the old Builder name and slug to the Engineer seat, and the new Trader role to its own", () => {
+    // Builder was renamed Engineer on 2026-10-28 (owner):  a bot still named
+    // for the old role keeps a seat instead of losing it.
+    expect(resolveBotfleetRole({ name: "BF-Builder" })?.seat).toBe("BF-ENGINEER");
+    expect(resolveBotfleetRole({ name: "Builder" })?.seat).toBe("BF-ENGINEER");
+    expect(resolveBotfleetRole({ name: "x", description: "@fleet-seat: builder" })?.seat).toBe("BF-ENGINEER");
+    // Trader is a role of its own.
+    expect(resolveBotfleetRole({ name: "BF-Trader" })?.seat).toBe("BF-TRADER");
+    expect(resolveBotfleetRole({ name: "Trader" })?.seat).toBe("BF-TRADER");
   });
 
   it("gives a bot that names no role no seat", () => {

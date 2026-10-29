@@ -48,21 +48,23 @@ export interface BotfleetRole {
   seat: string;
 }
 
-/** The eleven BotFleet role seats, in alphabetical order.  Director joined on
+/** The twelve BotFleet role seats, in alphabetical order.  Director joined on
  *  2026-10-11 (owner):  it has its own Zulip bot now, so it gets a seat like
- *  every other role. */
+ *  every other role.  Builder was renamed Engineer and Trader joined on
+ *  2026-10-28 (owner). */
 export const BOTFLEET_ROLES = [
-  { id: "builder", name: "Builder", seat: "BF-BUILDER" },
   { id: "compiler", name: "Compiler", seat: "BF-COMPILER" },
   { id: "deployer", name: "Deployer", seat: "BF-DEPLOYER" },
   { id: "designer", name: "Designer", seat: "BF-DESIGNER" },
   { id: "director", name: "Director", seat: "BF-DIRECTOR" },
+  { id: "engineer", name: "Engineer", seat: "BF-ENGINEER" },
   { id: "fixer", name: "Fixer", seat: "BF-FIXER" },
   { id: "housekeeper", name: "Housekeeper", seat: "BF-HOUSEKEEPER" },
   { id: "monitor", name: "Monitor", seat: "BF-MONITOR" },
   { id: "oracle", name: "Oracle", seat: "BF-ORACLE" },
   { id: "plumber", name: "Plumber", seat: "BF-PLUMBER" },
   { id: "publisher", name: "Publisher", seat: "BF-PUBLISHER" },
+  { id: "trader", name: "Trader", seat: "BF-TRADER" },
 ] as const satisfies readonly BotfleetRole[];
 
 export type KnownBotfleetRole = (typeof BOTFLEET_ROLES)[number];
@@ -77,13 +79,18 @@ export function fleetSeatPromptsEnabled(): boolean {
 const BF_PREFIX = /^BF[-_\s]+(.+)$/i;
 const DESC_SEAT = /@fleet-seat:\s*([a-z0-9_-]+)/i;
 
+/** Old role slugs that still resolve, so a bot named for a renamed role keeps
+ *  its seat.  `builder` became `engineer` on 2026-10-28 (owner). */
+const LEGACY_ROLE_ALIASES: Partial<Record<string, string>> = { builder: "engineer" };
+
 function roleFromSlug(raw: string): KnownBotfleetRole | null {
   const slug = raw
     .trim()
     .toLowerCase()
     .replace(/\s+/g, "-")
     .replace(/^bf[-_]/, "");
-  return BOTFLEET_ROLES.find((role) => role.id === slug) ?? null;
+  const id = LEGACY_ROLE_ALIASES[slug] ?? slug;
+  return BOTFLEET_ROLES.find((role) => role.id === id) ?? null;
 }
 
 /** The role a bot record names, or null when it names none.  In order:
