@@ -157,7 +157,7 @@ public final class FleetServiceControl {
             } else if running {
                 try startup.startAgent(label: label)
             } else {
-                try startup.stopAgent(label: label)
+                try await startup.stopAgent(label: label)
             }
             return startup.state(ofAgent: label).managedState
         }
