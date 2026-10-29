@@ -15,7 +15,7 @@ import {
 } from "react";
 import {
   BOT_COLORS,
-  mapBotStateToCursorState,
+  mapBotStateToCursorAvatarState,
   stateWithSpeech,
   type BotColor,
   type BotMotion,
@@ -212,7 +212,7 @@ function BotMascotComponent(
     >
       <CursorAvatar
         ref={inner}
-        state={mapBotStateToCursorState(motionState ?? state)}
+        state={mapBotStateToCursorAvatarState(motionState ?? state)}
         expression={expression}
         size={size}
         silhouette={GRADIENT_SILHOUETTE}

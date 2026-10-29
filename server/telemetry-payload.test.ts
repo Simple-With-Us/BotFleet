@@ -649,3 +649,55 @@ describe("provider naming stays inside Usage Monitor's canon", () => {
     expect(inferProviderAndService("grok", "grok-4")).toEqual({ provider: "xai", service: "grok-4" });
   });
 });
+
+describe("child harness de-duplication keys", () => {
+  // Usage Monitor pairs a BotFleet turn with the child harness's own
+  // telemetry by these three keys, so a turn is counted once.
+  it("names the engine, the child's native session and when the turn began", () => {
+    const [event] = build({
+      inputTokens: 10,
+      outputTokens: 5,
+      childSessionId: "8c0a8e0e-2a7f-4d1e-9a51-3f0b1c2d3e4f",
+      turnStartedAtMs: 1_756_999_990_000,
+    });
+    expect(event?.metadata.childHarness).toBe("claudeAgent");
+    expect(event?.metadata.childSessionId).toBe("8c0a8e0e-2a7f-4d1e-9a51-3f0b1c2d3e4f");
+    expect(event?.metadata.turnStartedAt).toBe(new Date(1_756_999_990_000).toISOString());
+  });
+
+  it("stamps them on a turn that reported no usage as well", () => {
+    const [event] = build({ driverKind: "opencodeGo", childSessionId: "ses_1", turnStartedAtMs: 1_756_999_990_000, success: false });
+    expect(event?.metadata.usageReported).toBe(false);
+    expect(event?.metadata.childHarness).toBe("opencodeGo");
+    expect(event?.metadata.childSessionId).toBe("ses_1");
+    expect(event?.metadata.turnStartedAt).toBe(new Date(1_756_999_990_000).toISOString());
+  });
+
+  it("omits a key it does not know rather than sending an empty value", () => {
+    const [event] = build({ driverKind: undefined, childSessionId: "   ", turnStartedAtMs: Number.NaN, inputTokens: 1 });
+    expect(event?.metadata).not.toHaveProperty("childHarness");
+    expect(event?.metadata).not.toHaveProperty("childSessionId");
+    expect(event?.metadata).not.toHaveProperty("turnStartedAt");
+    const [bare] = build({ inputTokens: 1 });
+    expect(bare?.metadata).not.toHaveProperty("childSessionId");
+    expect(bare?.metadata).not.toHaveProperty("turnStartedAt");
+  });
+
+  it("drops a start time past the Date range instead of throwing", () => {
+    const [event] = build({ inputTokens: 1, turnStartedAtMs: 9e15 });
+    expect(event?.metadata).not.toHaveProperty("turnStartedAt");
+  });
+
+  it("leaves the event id scheme and the occurrence time as they were", () => {
+    const [event] = build({ inputTokens: 10, childSessionId: "s", turnStartedAtMs: 1_756_999_990_000 });
+    expect(event?.eventId).toMatch(/^bf:anthropic:bot_1:1757000000000:[0-9a-f]{8}:turn$/);
+    expect(event?.occurredAt).toBe(new Date(1_757_000_000_000).toISOString());
+  });
+
+  it("is the same on every build of the same turn, so a replay never changes an event's content", () => {
+    const params = { ...BASE, inputTokens: 10, outputTokens: 5, childSessionId: "s-1", turnStartedAtMs: 1_756_999_990_000 };
+    const [a] = buildTurnEvents(params, { now: 1_757_000_000_000 });
+    const [b] = buildTurnEvents(params, { now: 1_757_000_000_000 });
+    expect({ ...a?.metadata }).toEqual({ ...b?.metadata });
+  });
+});

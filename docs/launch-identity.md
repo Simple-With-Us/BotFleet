@@ -15,6 +15,7 @@ Set per bot and per turn, in the environment of the process that runs the turn. 
 | `AGENT_SEAT` | The same value, for older readers. |
 | `AGENT_SESSION` | BotFleet's id for the thread the turn runs on (a room turn uses the room's thread). |
 | `AGENT_SYNC_ATTACH` | `0`.  The Claude hooks plugin never attaches a session BotFleet launched. |
+| `OTEL_RESOURCE_ATTRIBUTES` | The inherited value with `agent.launcher=botfleet` and `agent.launcher.session=<thread id>` appended (comma-joined, the thread id percent-encoded).  An inherited entry for either key is replaced, never duplicated.  A child that exports its own OpenTelemetry (Claude Code, Codex) carries them, so Usage Monitor can tell its native events belong to a BotFleet turn and count the turn once. |
 
 A bot whose name names no role still gets `AGENT_LAUNCHER`, `AGENT_SYNC_ATTACH` and `AGENT_SESSION`, and no seat.  The fleet tools then refuse to act, instead of falling back to a platform default.
 
@@ -46,13 +47,17 @@ BotFleet does not copy Linear credentials into an engine environment.  The CLI r
 
 ## Which Bots Get a Seat
 
-The eleven role seats are `BF-BUILDER`, `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-DIRECTOR`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER` and `BF-PUBLISHER`.  A bot's role comes from, in order:
+The twelve role seats are `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-DIRECTOR`, `BF-ENGINEER`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER`, `BF-PUBLISHER` and `BF-TRADER`.  A bot's role comes from, in order:
 
 1. An `@fleet-seat: <role>` line in the bot's description.
 2. A name with a `BF-` or `BF ` prefix (`BF-Plumber`).
 3. A name that is exactly a role, any case (`Plumber`).
 
 A name that only contains a role word (`Plumber 2`) names no role.  Director has been a role since 2026-10-11 (owner):  it has its own Zulip bot, `bf-director-bot@`, so `BF-Director` and `Director` resolve to `BF-DIRECTOR` like any other role.  This is by name, as the seat prompt has always resolved it.  The Zulip binding (`zulip.bots`, by bot id) is a separate setting:  keep the two in agreement, because the seat in the environment and the bot a native post is sent as come from different places.
+
+Builder was renamed Engineer and Trader joined on 2026-10-28 (owner):  a bot still named `BF-Builder`, `Builder`, or carrying `@fleet-seat: builder` resolves to `BF-ENGINEER` rather than losing its seat, and `BF-Trader` resolves to `BF-TRADER`.
+
+The Zulip credential still named `BF-Builder` keeps working through the same alias:  a `zulip.bots` binding of `BF-Builder` posts and wakes as `BF-Engineer`, while its key is still read from the configured name (`BF-Builder-zuliprc`, or `ZULIP_BF_BUILDER_*` in the vault).  Renaming the Zulip bot and its credential to `BF-Engineer` is an owner migration step, not something the harness does by itself.
 
 ## The Switch
 

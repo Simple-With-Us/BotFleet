@@ -14,6 +14,7 @@ export const GROK_ACTIONS = [
   "computer",
   "typing",
   "speaking",
+  "sneaking",
 ] as const;
 
 export type BotState = CursorState | typeof GROK_ACTIONS[number];
@@ -69,6 +70,7 @@ export const STATE_GROUPS: Record<string, BotState[]> = {
     "computer",
     "typing",
     "speaking",
+    "sneaking",
   ],
 };
 
@@ -89,6 +91,12 @@ export function mapBotStateToCursorState(state: BotState): CursorState {
   return (map[state] as CursorState) || (state as CursorState);
 }
 
+/** CursorAvatar-only fallback when a BotState has TV-Face art but no Cursor pool. */
+export function mapBotStateToCursorAvatarState(state: BotState): CursorState {
+  if (state === "sneaking") return "playful";
+  return mapBotStateToCursorState(state);
+}
+
 export const BOT_COLOR_NAMES = [
   "green",
   "blue",
@@ -100,6 +108,8 @@ export const BOT_COLOR_NAMES = [
   "yellow",
   "teal",
   "coral",
+  "white",
+  "black",
 ] as const;
 
 export type BotColor = (typeof BOT_COLOR_NAMES)[number];
@@ -115,6 +125,8 @@ export const BOT_COLORS = {
   yellow: "#D8A729",
   teal: "#01A492",
   coral: "#E5634E",
+  white: "#E8EAED",
+  black: "#2D3036",
 } satisfies Record<BotColor, string>;
 
 export const BOT_MOTIONS = [
@@ -208,9 +220,42 @@ export type MascotBotProfile = {
 };
 
 /**
+ * Role tiers, most specific first.  The first tier with a whole-word match
+ * wins.  The iOS app (`ios/App/MascotState.swift`) carries the same tiers in
+ * the same order, and `mascot.test.ts` fails if the two drift, so a bot wears
+ * the same face on the phone as on the laptop.  Keywords are whole words, so
+ * list every form that should match (`orchestrator`, not a stem).
+ */
+export const ROLE_TIERS: ReadonlyArray<readonly [BotState, readonly string[]]> = [
+  // Super-specific TV-Face sheet faces when the role is clear.
+  ["git", ["git", "github", "pull request", "pr", "commit", "merge", "deploy", "compiler", "build", "ci", "testflight"]],
+  ["webhook", ["webhook", "hooks", "callback", "event stream"]],
+  ["fleet", ["fleet", "director", "coordinator", "orchestrator", "orchestration", "orchestrate"]],
+  ["sneaking", ["sneak", "stealth", "quiet"]],
+  ["memory", ["memory", "rag", "vector", "embedding", "recall"]],
+  ["tools", ["tool", "tools", "adapter", "plumber", "connector", "skill"]],
+  ["computer", ["computer", "desktop", "shell", "terminal", "ssh"]],
+  ["routine", ["routine", "schedule", "cron", "recurring", "housekeeper"]],
+  ["screen", ["screen", "ui", "ux", "designer", "frontend"]],
+  ["crash", ["crash", "sentry", "pagerduty", "fixer", "incident response"]],
+  ["working", ["code", "coding", "developer", "development", "engineer", "engineering", "debug", "program", "software"]],
+  ["searching", ["research", "researcher", "search", "investigate", "strategy", "strategist", "study", "learn", "knowledge"]],
+  ["excited", ["marketing", "growth", "launch", "campaign", "social", "sales", "outreach", "brand"]],
+  ["drowsy", ["overnight", "night", "background", "async", "queue", "batch", "long-running"]],
+  ["radar", ["monitor", "monitoring", "incident", "alert", "watch", "status", "uptime"]],
+  ["suspicious", ["review", "reviewer", "audit", "critic", "critique", "quality", "qa", "test", "legal", "publisher"]],
+  ["scared", ["security", "secure", "compliance", "risk", "privacy", "finance", "financial"]],
+  ["playful", ["design", "creative", "brainstorm", "art", "illustration", "music", "story"]],
+  ["happy", ["support", "help", "success", "onboarding", "coach", "teacher", "guide", "welcome"]],
+];
+
+const escapeRegExp = (word: string) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const ROLE_MATCHERS = ROLE_TIERS.map(
+  ([state, words]) => [state, new RegExp(`\\b(?:${words.map(escapeRegExp).join("|")})\\b`)] as const,
+);
+
+/**
  * Selects a state from live state first, then from what the bot is about.
- * The keyword groups deliberately overlap as little as possible so a bot's
- * visual identity stays stable while its title and description are edited.
  */
 export function stateForBot(bot: MascotBotProfile): BotState {
   const pinned = normalizeState(bot.mascotExpression);
@@ -224,36 +269,9 @@ export function stateForBot(bot: MascotBotProfile): BotState {
   if (last?.kind === "options") return "curious";
 
   const profile = `${bot.name} ${bot.title ?? ""} ${bot.description ?? ""}`.toLowerCase();
-  const matches = (words: RegExp) => words.test(profile);
-
-  if (matches(/\b(code|coding|developer|development|engineer|engineering|build|debug|program|software)\b/)) {
-    return "working";
+  for (const [state, pattern] of ROLE_MATCHERS) {
+    if (pattern.test(profile)) return state;
   }
-  if (matches(/\b(research|researcher|search|investigate|strategy|strategist|study|learn|knowledge)\b/)) {
-    return "searching";
-  }
-  if (matches(/\b(marketing|growth|launch|campaign|social|sales|outreach|brand)\b/)) {
-    return "excited";
-  }
-  if (matches(/\b(overnight|night|background|async|queue|batch|long-running)\b/)) {
-    return "drowsy";
-  }
-  if (matches(/\b(monitor|monitoring|incident|alert|watch|status|uptime)\b/)) {
-    return "radar";
-  }
-  if (matches(/\b(review|reviewer|audit|critic|critique|quality|qa|test|legal)\b/)) {
-    return "suspicious";
-  }
-  if (matches(/\b(security|secure|compliance|risk|privacy|finance|financial)\b/)) {
-    return "scared";
-  }
-  if (matches(/\b(design|designer|creative|brainstorm|art|illustration|music|story)\b/)) {
-    return "playful";
-  }
-  if (matches(/\b(support|help|success|onboarding|coach|teacher|guide|welcome)\b/)) {
-    return "happy";
-  }
-
   return "idle";
 }
 

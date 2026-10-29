@@ -216,7 +216,7 @@ public enum MacVisualParityExpectations {
         "dictating", "writing", "sending", "receiving", "uploading", "notifying",
         "alerting", "dragging", "bouncing", "powering-down", "fleet", "crash",
         "memory", "tools", "routine", "screen", "git", "webhook", "computer",
-        "typing", "speaking"
+        "typing", "speaking", "sneaking"
     ]
 
     /// The status pills the Mac app shows.
@@ -235,7 +235,9 @@ public enum MacVisualParityExpectations {
         "pink": "#D84F8B",
         "yellow": "#D8A729",
         "teal": "#01A492",
-        "coral": "#E5634E"
+        "coral": "#E5634E",
+        "white": "#E8EAED",
+        "black": "#2D3036"
     ]
 
     /// The app follows the system appearance.

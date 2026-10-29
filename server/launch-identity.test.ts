@@ -4,29 +4,33 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   applyLaunchIdentity,
   BOTFLEET_ROLES,
+  canonicalZulipRole,
   codexShellPolicyArgs,
   fleetSeatPromptsEnabled,
   isLaunchIdentityName,
+  launcherResourceAttributes,
   launchEnvironment,
   launchIdentityFor,
+  LEGACY_ROLE_ALIASES,
   resolveBotfleetRole,
 } from "./launch-identity.ts";
 import { zulipTag } from "./zulip/format.ts";
 
-describe("the eleven role seats", () => {
-  it("names exactly the eleven BotFleet roles, each with an upper-case BF seat", () => {
+describe("the twelve role seats", () => {
+  it("names exactly the twelve BotFleet roles, each with an upper-case BF seat", () => {
     expect(BOTFLEET_ROLES.map((role) => role.seat)).toEqual([
-      "BF-BUILDER",
       "BF-COMPILER",
       "BF-DEPLOYER",
       "BF-DESIGNER",
       "BF-DIRECTOR",
+      "BF-ENGINEER",
       "BF-FIXER",
       "BF-HOUSEKEEPER",
       "BF-MONITOR",
       "BF-ORACLE",
       "BF-PLUMBER",
       "BF-PUBLISHER",
+      "BF-TRADER",
     ]);
     for (const role of BOTFLEET_ROLES) {
       expect(role.seat).toBe(`BF-${role.id.toUpperCase()}`);
@@ -52,15 +56,26 @@ describe("resolveBotfleetRole", () => {
     expect(resolveBotfleetRole({ name: "Plumber" })?.seat).toBe("BF-PLUMBER");
     expect(resolveBotfleetRole({ name: "  oracle  " })?.seat).toBe("BF-ORACLE");
     // A description that names no known role falls through to the name.
-    expect(resolveBotfleetRole({ name: "Builder", description: "@fleet-seat: nobody" })?.seat).toBe("BF-BUILDER");
+    expect(resolveBotfleetRole({ name: "Builder", description: "@fleet-seat: nobody" })?.seat).toBe("BF-ENGINEER");
     // A description wins over a conflicting name.
     expect(resolveBotfleetRole({ name: "Builder", description: "@fleet-seat: fixer" })?.seat).toBe("BF-FIXER");
   });
 
-  it("resolves all eleven roles by their bare names", () => {
+  it("resolves all twelve roles by their bare names", () => {
     for (const role of BOTFLEET_ROLES) {
       expect(resolveBotfleetRole({ name: role.name })?.seat, role.name).toBe(role.seat);
     }
+  });
+
+  it("resolves the old Builder name and slug to the Engineer seat, and the new Trader role to its own", () => {
+    // Builder was renamed Engineer on 2026-10-28 (owner):  a bot still named
+    // for the old role keeps a seat instead of losing it.
+    expect(resolveBotfleetRole({ name: "BF-Builder" })?.seat).toBe("BF-ENGINEER");
+    expect(resolveBotfleetRole({ name: "Builder" })?.seat).toBe("BF-ENGINEER");
+    expect(resolveBotfleetRole({ name: "x", description: "@fleet-seat: builder" })?.seat).toBe("BF-ENGINEER");
+    // Trader is a role of its own.
+    expect(resolveBotfleetRole({ name: "BF-Trader" })?.seat).toBe("BF-TRADER");
+    expect(resolveBotfleetRole({ name: "Trader" })?.seat).toBe("BF-TRADER");
   });
 
   it("gives a bot that names no role no seat", () => {
@@ -69,6 +84,22 @@ describe("resolveBotfleetRole", () => {
     }
     expect(resolveBotfleetRole({ name: "Kiwi", description: "@fleet-seat: claude" })).toBeNull();
     expect(resolveBotfleetRole({ name: "Kiwi", description: null })).toBeNull();
+  });
+});
+
+describe("canonicalZulipRole", () => {
+  it("folds a legacy BF-Builder binding to BF-Engineer, in any case", () => {
+    expect(LEGACY_ROLE_ALIASES).toEqual({ builder: "engineer" });
+    for (const role of ["BF-Builder", "Builder", "bf-builder", "BF_BUILDER", "BF Builder", "  BF-Builder  "]) {
+      expect(canonicalZulipRole(role), role).toBe("BF-Engineer");
+    }
+  });
+
+  it("leaves a binding that is not a legacy alias unchanged", () => {
+    for (const role of ["BF-Engineer", "BF-Plumber", "BF-Trader", "engineer", "BF-Builder2", "Plumber 2"]) {
+      expect(canonicalZulipRole(role), role).toBe(role);
+    }
+    expect(canonicalZulipRole("  BF-Plumber  ")).toBe("BF-Plumber");
   });
 });
 
@@ -156,7 +187,40 @@ describe("applyLaunchIdentity", () => {
       AGENT_LAUNCH_SEAT: "BF-ORACLE",
       AGENT_SEAT: "BF-ORACLE",
       AGENT_SESSION: "thread-9",
+      OTEL_RESOURCE_ATTRIBUTES: "agent.launcher=botfleet,agent.launcher.session=thread-9",
     });
+  });
+
+  it("marks the child's own OpenTelemetry as BotFleet-launched, keeping what it inherited", () => {
+    const out = applyLaunchIdentity(
+      { ...harness, OTEL_RESOURCE_ATTRIBUTES: "service.name=claude-code, team=ops" },
+      { seat: null, session: "thread-9" },
+    );
+    expect(out.OTEL_RESOURCE_ATTRIBUTES).toBe(
+      "service.name=claude-code,team=ops,agent.launcher=botfleet,agent.launcher.session=thread-9",
+    );
+  });
+
+  it("names each launcher key once, replacing an inherited value with this turn's", () => {
+    const out = applyLaunchIdentity(
+      { OTEL_RESOURCE_ATTRIBUTES: "agent.launcher=other,a=1,agent.launcher.session=old-thread,,agent.launcher.sessionx=keep" },
+      { seat: null, session: "thread-2" },
+    );
+    expect(out.OTEL_RESOURCE_ATTRIBUTES).toBe(
+      "a=1,agent.launcher.sessionx=keep,agent.launcher=botfleet,agent.launcher.session=thread-2",
+    );
+    // Applying it again (an environment built once and reused) changes nothing.
+    expect(applyLaunchIdentity(out, { seat: null, session: "thread-2" }).OTEL_RESOURCE_ATTRIBUTES).toBe(
+      out.OTEL_RESOURCE_ATTRIBUTES,
+    );
+  });
+
+  it("percent-encodes a thread id the attribute format could not carry, and omits a missing one", () => {
+    expect(launcherResourceAttributes(undefined, { seat: null, session: "a,b=c d" })).toBe(
+      "agent.launcher=botfleet,agent.launcher.session=a%2Cb%3Dc%20d",
+    );
+    expect(launcherResourceAttributes("", undefined)).toBe("agent.launcher=botfleet");
+    expect(launcherResourceAttributes(undefined, { seat: null, session: "" })).toBe("agent.launcher=botfleet");
   });
 
   it("leaves a bot with no role with no seat, not the harness's", () => {

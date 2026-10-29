@@ -73,4 +73,16 @@ describe.skipIf(process.platform === "win32")("Linux afterPack permissions", () 
     expect(fs.lstatSync(cua).mode & 0o777).toBe(0o775);
     expect(fs.lstatSync(path.join(cua, "cua-driver")).mode & 0o777).toBe(0o664);
   });
+
+  it("strips color TV-Face skin directories from the packaged UI", async () => {
+    const { appOutDir, resources } = fixture();
+    const skins = path.join(resources, "ui", "tv-face", "skins");
+    fs.mkdirSync(path.join(skins, "default"), { recursive: true });
+    fs.mkdirSync(path.join(skins, "blue"), { recursive: true });
+    fs.writeFileSync(path.join(skins, "default", "marker"), "keep");
+    fs.writeFileSync(path.join(skins, "blue", "marker"), "drop");
+    await afterPack({ electronPlatformName: "darwin", appOutDir });
+    expect(fs.existsSync(path.join(skins, "default", "marker"))).toBe(true);
+    expect(fs.existsSync(path.join(skins, "blue"))).toBe(false);
+  });
 });

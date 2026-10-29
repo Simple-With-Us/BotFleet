@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { BotState, BotColor } from "@/lib/mascot";
 import {
+  DESKTOP_BUNDLED_TVFACE_SKIN_DIRS,
+  tvFaceSkinDirForBundledDirs,
+} from "@/lib/tv-face-packaging";
+import {
   TVFACE_HAS_ENTER_RETURN,
   TVFACE_HAS_HOLD,
   TVFACE_MANIFEST,
@@ -64,7 +68,7 @@ export interface TVFaceAvatarProps {
  * is listed here; unlisted colors fall back to default so they never 404.
  *
  * Asserted against the real directory listing in tvFaceSkins.test.ts.
- * Packs: blue green purple pink red cyan yellow teal coral (enter/return = 1000ms).
+ * Packs: blue green purple pink red cyan yellow teal coral white black (enter/return = 1000ms).
  * Build with scripts/tv-face-build-color-skins.py or scripts/tv-face-fetch-skins.sh.
  */
 
@@ -79,10 +83,19 @@ export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>([
   "yellow",
   "teal",
   "coral",
+  "white",
+  "black",
 ]);
 
 /** The skins directory a color renders from.  `orange` IS the default skin. */
 export function tvFaceSkinDir(color: TVFaceSkin): string {
+  const bundledDirs =
+    globalThis.window && "ogb" in globalThis.window
+      ? DESKTOP_BUNDLED_TVFACE_SKIN_DIRS
+      : null;
+  if (bundledDirs) {
+    return tvFaceSkinDirForBundledDirs(color, bundledDirs);
+  }
   if (color === "orange" || color === "default") return "default";
   return SHIPPED_SKINS.has(color) ? color : "default";
 }

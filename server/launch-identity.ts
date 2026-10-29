@@ -48,21 +48,23 @@ export interface BotfleetRole {
   seat: string;
 }
 
-/** The eleven BotFleet role seats, in alphabetical order.  Director joined on
+/** The twelve BotFleet role seats, in alphabetical order.  Director joined on
  *  2026-10-11 (owner):  it has its own Zulip bot now, so it gets a seat like
- *  every other role. */
+ *  every other role.  Builder was renamed Engineer and Trader joined on
+ *  2026-10-28 (owner). */
 export const BOTFLEET_ROLES = [
-  { id: "builder", name: "Builder", seat: "BF-BUILDER" },
   { id: "compiler", name: "Compiler", seat: "BF-COMPILER" },
   { id: "deployer", name: "Deployer", seat: "BF-DEPLOYER" },
   { id: "designer", name: "Designer", seat: "BF-DESIGNER" },
   { id: "director", name: "Director", seat: "BF-DIRECTOR" },
+  { id: "engineer", name: "Engineer", seat: "BF-ENGINEER" },
   { id: "fixer", name: "Fixer", seat: "BF-FIXER" },
   { id: "housekeeper", name: "Housekeeper", seat: "BF-HOUSEKEEPER" },
   { id: "monitor", name: "Monitor", seat: "BF-MONITOR" },
   { id: "oracle", name: "Oracle", seat: "BF-ORACLE" },
   { id: "plumber", name: "Plumber", seat: "BF-PLUMBER" },
   { id: "publisher", name: "Publisher", seat: "BF-PUBLISHER" },
+  { id: "trader", name: "Trader", seat: "BF-TRADER" },
 ] as const satisfies readonly BotfleetRole[];
 
 export type KnownBotfleetRole = (typeof BOTFLEET_ROLES)[number];
@@ -77,13 +79,48 @@ export function fleetSeatPromptsEnabled(): boolean {
 const BF_PREFIX = /^BF[-_\s]+(.+)$/i;
 const DESC_SEAT = /@fleet-seat:\s*([a-z0-9_-]+)/i;
 
+/** Old role slugs that still resolve, so a bot named for a renamed role keeps
+ *  its seat.  `builder` became `engineer` on 2026-10-28 (owner).  The target
+ *  is a real role id, so a typo is a compile error instead of a silently
+ *  seatless bot.  Inferred, not annotated, so the table keeps its literal
+ *  keys; `canonicalZulipRole` folds the same table over Zulip bindings. */
+export const LEGACY_ROLE_ALIASES = {
+  builder: "engineer",
+} as const satisfies Record<string, KnownBotfleetRole["id"]>;
+
+/** An old slug in `LEGACY_ROLE_ALIASES`. */
+type LegacyRoleAlias = keyof typeof LEGACY_ROLE_ALIASES;
+
+/** True when `slug` is an old slug with a current target. */
+function isLegacyRoleAlias(slug: string): slug is LegacyRoleAlias {
+  return Object.hasOwn(LEGACY_ROLE_ALIASES, slug);
+}
+
+/** A role name as the alias table keys it: trimmed, lower-cased, spaces
+ *  dashed, and any `BF-` prefix stripped.  One normalization for the seat
+ *  and the Zulip binding, so the two can never fold different names. */
+function roleSlug(raw: string): string {
+  return raw.trim().toLowerCase().replace(/\s+/g, "-").replace(/^bf[-_]/, "");
+}
+
 function roleFromSlug(raw: string): KnownBotfleetRole | null {
-  const slug = raw
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "-")
-    .replace(/^bf[-_]/, "");
-  return BOTFLEET_ROLES.find((role) => role.id === slug) ?? null;
+  const slug = roleSlug(raw);
+  const id = isLegacyRoleAlias(slug) ? LEGACY_ROLE_ALIASES[slug] : slug;
+  return BOTFLEET_ROLES.find((role) => role.id === id) ?? null;
+}
+
+/** A configured Zulip role with legacy aliases folded to the current role
+ *  name, so a bot bound under an old name posts and wakes under its seat's
+ *  current name (`BF-Builder` reads as `BF-Engineer`, in any case).  Anything
+ *  that is not a legacy alias is returned unchanged.  The credential keeps
+ *  the configured name (docs/launch-identity.md):  only the posting and wake
+ *  identity is folded here. */
+export function canonicalZulipRole(role: string): string {
+  const trimmed = role.trim();
+  const slug = roleSlug(trimmed);
+  if (!isLegacyRoleAlias(slug)) return trimmed;
+  const current = BOTFLEET_ROLES.find((candidate) => candidate.id === LEGACY_ROLE_ALIASES[slug]);
+  return current ? "BF-" + current.name : trimmed;
 }
 
 /** The role a bot record names, or null when it names none.  In order:
@@ -158,7 +195,40 @@ export function applyLaunchIdentity(
   for (const [name, value] of Object.entries(env)) {
     if (!isLaunchIdentityName(name)) out[name] = value;
   }
-  return Object.assign(out, launchEnvironment(identity));
+  return Object.assign(out, launchEnvironment(identity), {
+    OTEL_RESOURCE_ATTRIBUTES: launcherResourceAttributes(out.OTEL_RESOURCE_ATTRIBUTES, identity),
+  });
+}
+
+/** The OpenTelemetry resource attributes that mark a child as one BotFleet
+ *  launched.  A child that exports its own telemetry (Claude Code, Codex)
+ *  carries them on every span and metric, so Usage Monitor can tell its
+ *  native events are a BotFleet turn's and count the turn once. */
+export const LAUNCHER_RESOURCE_ATTRIBUTE = "agent.launcher";
+export const LAUNCHER_SESSION_RESOURCE_ATTRIBUTE = "agent.launcher.session";
+
+/** `existing` (an inherited `OTEL_RESOURCE_ATTRIBUTES`) with
+ *  `agent.launcher=botfleet` and, when the turn has a thread,
+ *  `agent.launcher.session=<thread id>` appended.  An inherited entry for
+ *  either key is dropped first, like every other inherited identity, so each
+ *  key appears once and names this turn.  The thread id is percent-encoded,
+ *  as the OpenTelemetry environment format requires; every other entry is
+ *  kept as written. */
+export function launcherResourceAttributes(existing: string | undefined, identity?: LaunchIdentity): string {
+  const ours: string[] = [`${LAUNCHER_RESOURCE_ATTRIBUTE}=botfleet`];
+  if (identity?.session) {
+    ours.push(`${LAUNCHER_SESSION_RESOURCE_ATTRIBUTE}=${encodeURIComponent(identity.session)}`);
+  }
+  const kept = (existing ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => {
+      if (!entry) return false;
+      const eq = entry.indexOf("=");
+      const key = (eq < 0 ? entry : entry.slice(0, eq)).trim();
+      return key !== LAUNCHER_RESOURCE_ATTRIBUTE && key !== LAUNCHER_SESSION_RESOURCE_ATTRIBUTE;
+    });
+  return [...kept, ...ours].join(",");
 }
 
 /** Codex runs the model's shell commands under its own

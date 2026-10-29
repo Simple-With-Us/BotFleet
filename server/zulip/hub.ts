@@ -23,6 +23,8 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 
 import { BOT_OFF_CODE } from "../../shared/bot-power.ts";
 
+import { canonicalZulipRole } from "../launch-identity.ts";
+
 import {
   ZULIP_TOPIC_FOLLOWED,
   ZULIP_TOPIC_NONE,
@@ -61,6 +63,21 @@ import type { ZulipIdentity, ZulipInboundItem, ZulipMessage, ZulipOrigin, ZulipS
  *  owner (100) or admin (200) key is refused outright: a bot that can change
  *  the realm is not one the harness will drive. */
 const ALLOWED_ROLES = new Set([300, 400]);
+/** Legacy outgoing-webhook role URLs, kept live until every bot has been
+ *  re-pointed at its current role.  2026-10-28 (owner): the role BF-Builder
+ *  was renamed BF-Engineer, and anything still posting to
+ *  /zulip/outgoing/BF-BUILDER keeps reaching that bot.  The alias only chooses which
+ *  session answers the URL: the alias path still demands that session's own
+ *  outgoing token and its bot email, so it grants nothing the renamed bot's
+ *  own URL does not. */
+// The lookup key is a general `string` (a role read out of a webhook URL), so
+// this table genuinely needs an index signature rather than the narrow
+// literal-keyed type `satisfies` would infer.  An unmapped role reads back
+// `undefined`, which is exactly the "unknown" the caller answers.
+// oxlint-disable-next-line anti-slop/no-known-value-widening
+const LEGACY_OUTGOING_ROLE_ALIASES: Record<string, string> = {
+  "BF-BUILDER": "BF-ENGINEER",
+};
 const BACKOFF_MS = [5_000, 30_000, 60_000, 120_000];
 const PAGE = 100;
 const MAX_PAGES = 20;
@@ -350,14 +367,20 @@ class ZulipSession {
   private readonly hub: ZulipHub;
   readonly botId: string;
   readonly role: string;
+  /** The role the key is loaded under: the configured binding, which keeps a
+   *  legacy name (`BF-Builder-zuliprc`) while `role` carries the canonical
+   *  one.  Renaming the Zulip bot and its credential is an owner migration
+   *  step (docs/launch-identity.md). */
+  readonly credentialRole: string;
   readonly realm: string;
 
   // Plain fields, not constructor parameter properties: the server runs under
   // Node's strip-only TypeScript, which refuses those at load time.
-  constructor(hub: ZulipHub, botId: string, role: string, realm: string) {
+  constructor(hub: ZulipHub, botId: string, role: string, realm: string, credentialRole?: string) {
     this.hub = hub;
     this.botId = botId;
     this.role = role;
+    this.credentialRole = credentialRole ?? role;
     this.realm = realm;
     this.state = hub.store.load(botId, role);
     this.status = { botId, role, state: "starting", pending: this.state.pending.length, since: hub.now() };
@@ -547,7 +570,7 @@ class ZulipSession {
         "missing",
       );
     }
-    const creds = await source.load(this.role);
+    const creds = await source.load(this.credentialRole);
     verifyCredentialRealm(creds, this.realm);
     this.creds = creds;
     this.client = new ZulipClient(creds, this.realm, {
@@ -865,7 +888,7 @@ export class ZulipHub {
     if (this.stopped) return;
     const retryDisabled = opts.retryDisabled ?? true;
     const settings = this.settings();
-    const wanted = new Map<string, string>();
+    const wanted = new Map<string, { role: string; credentialRole: string }>();
     let realm = "";
     if (this.enabled()) {
       const resolved = resolveRealm(settings, this.env);
@@ -875,27 +898,36 @@ export class ZulipHub {
         realm = resolved.realm;
         const roles = new Set<string>();
         for (const [botId, entry] of Object.entries(settings?.bots ?? {})) {
-          const role = typeof entry?.role === "string" ? entry.role.trim() : "";
-          if (entry?.enabled === false || !role || !this.deps.botExists(botId)) continue;
-          if (!validZulipRole(role)) {
-            this.log(`[zulip] bot ${botId}: "${role}" is not a valid Zulip role name; skipped`);
+          const configured = typeof entry?.role === "string" ? entry.role.trim() : "";
+          if (entry?.enabled === false || !configured || !this.deps.botExists(botId)) continue;
+          if (!validZulipRole(configured)) {
+            this.log(`[zulip] bot ${botId}: "${configured}" is not a valid Zulip role name; skipped`);
             continue;
           }
+          // The session posts and wakes under the canonical role: a bot still
+          // bound as BF-Builder is BF-Engineer on Zulip.  Its key stays under
+          // the configured name until the owner migrates the credential.
+          const role = canonicalZulipRole(configured);
           // One Zulip identity, one session: two queues for the same bot
           // would answer every message twice.
           if (roles.has(role.toLowerCase())) {
-            this.log(`[zulip] bot ${botId}: ${role} is already bound to another bot; skipped`);
+            this.log(`[zulip] bot ${botId}: ${configured} is already bound to another bot; skipped`);
             continue;
           }
           roles.add(role.toLowerCase());
-          wanted.set(botId, role);
+          wanted.set(botId, { role, credentialRole: configured });
         }
       }
     }
     for (const [botId, session] of this.sessions) {
-      const role = wanted.get(botId);
+      const next = wanted.get(botId);
       const retry = retryDisabled && session.status.state === "disabled";
-      if (role !== session.role || session.realm !== realm || retry) {
+      // A changed credential name rebuilds the session too: same canonical
+      // role, but the key moves (the owner migrating BF-Builder to
+      // BF-Engineer re-points the binding at the renamed credential).
+      const changed =
+        next?.role !== session.role || next?.credentialRole !== session.credentialRole || session.realm !== realm || retry;
+      if (changed) {
         this.sessions.delete(botId);
         const stopped = session.stop().finally(() => {
           this.stopping.delete(botId);
@@ -908,9 +940,9 @@ export class ZulipHub {
         this.stopping.set(botId, stopped);
       }
     }
-    for (const [botId, role] of wanted) {
+    for (const [botId, next] of wanted) {
       if (this.sessions.has(botId) || this.stopping.has(botId)) continue;
-      const session = new ZulipSession(this, botId, role, realm);
+      const session = new ZulipSession(this, botId, next.role, realm, next.credentialRole);
       this.sessions.set(botId, session);
       session.start();
     }
@@ -967,18 +999,31 @@ export class ZulipHub {
     return out;
   }
 
+  /** The session a `/zulip/outgoing/<ROLE>` URL belongs to: an exact role
+   *  match first (the role as the settings write it, compared
+   *  case-insensitively), and only when there is none, the legacy alias for
+   *  that role.  An exact match always wins, so a bot that really is bound
+   *  to the legacy name keeps its own URL. */
+  private outgoingSessionFor(role: string): ZulipSession | undefined {
+    const normalized = role.trim().toUpperCase();
+    const sessions = [...this.sessions.values()];
+    const exact = sessions.find((candidate) => candidate.role.toUpperCase() === normalized);
+    if (exact) return exact;
+    const alias = LEGACY_OUTGOING_ROLE_ALIASES[normalized];
+    if (!alias) return undefined;
+    return sessions.find((candidate) => candidate.role.toUpperCase() === alias);
+  }
+
   /** Authenticate a native outgoing webhook against the configured role's
    *  cached credentials.  The POST body is never trusted as message content. */
   outgoingWebhookAvailability(role: string): "unknown" | "unavailable" | "ready" {
-    const normalized = role.trim().toUpperCase();
-    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    const session = this.outgoingSessionFor(role);
     if (!session) return "unknown";
     return session.creds?.outgoingWebhookToken ? "ready" : "unavailable";
   }
 
   authorizeOutgoingWebhook(role: string, botEmail: string, token: string): "ok" | "unknown" | "unavailable" | "unauthorized" {
-    const normalized = role.trim().toUpperCase();
-    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    const session = this.outgoingSessionFor(role);
     if (!session) return "unknown";
     const expected = session.creds?.outgoingWebhookToken;
     if (!session.creds || !expected) return "unavailable";
@@ -991,8 +1036,7 @@ export class ZulipHub {
 
   /** Add the authenticated bot/message pair to the durable inbound queue. */
   enqueueOutgoingWebhook(role: string, messageId: number): "accepted" | "duplicate" | "unknown" | "unavailable" {
-    const normalized = role.trim().toUpperCase();
-    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    const session = this.outgoingSessionFor(role);
     if (!session) return "unknown";
     if (!session.creds?.outgoingWebhookToken) return "unavailable";
     return this.outgoingSpool.add(session.botId, messageId) ? "accepted" : "duplicate";
@@ -1159,9 +1203,12 @@ export class ZulipHub {
   async applyLatePluginDecision(event: PluginEventEnvelope, decision: ZulipPluginDecision): Promise<void> {
     try {
       if (event.type !== "zulip.message" || event.source.platform !== "zulip") return;
-      const role = event.source.accountId;
+      // Fold both sides: a persisted envelope may carry the pre-rename
+      // account id ("BF-Builder"), which reads as the canonical role.
+      const role = canonicalZulipRole(event.source.accountId);
       const botId = Object.entries(this.settings()?.bots ?? {}).find(
-        ([id, binding]) => binding.role === role && (binding.enabled ?? true) && this.deps.botExists(id),
+        ([id, binding]) =>
+          canonicalZulipRole(binding.role) === role && (binding.enabled ?? true) && this.deps.botExists(id),
       )?.[0];
       if (!botId) return;
       const session = this.sessions.get(botId);

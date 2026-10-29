@@ -10,6 +10,8 @@
 // this catches honest API use and cannot stop someone holding his key: the
 // verdict labels a turn, it is never authority for a side effect.
 
+import { canonicalZulipRole } from "../launch-identity.ts";
+
 import { directlyMentions, followKey, outsideCode } from "./format.ts";
 import type { ZulipIdentity, ZulipMessage, ZulipOrigin, ZulipUser } from "./types.ts";
 
@@ -92,14 +94,19 @@ const GB_SEAT_PREFIX = "GB-";
 
 /** The fleet seat a bot email belongs to, or null when the email names no
  *  seat:  `bf-plumber-bot@` → `BF-PLUMBER`, `compiler-grok-bot@` →
- *  `GB-COMPILER`, `mm-bot@` → `MM`.  The seat tag is how a post says who
- *  wrote it, so the router can tell a post's own seat from another's. */
+ *  `GB-COMPILER`, `mm-bot@` → `MM`.  A legacy `bf-` address folds to its
+ *  canonical seat (`bf-builder-bot@` → `BF-ENGINEER`), so the email-derived
+ *  seat agrees with the tag a legacy-bound session posts under.  The seat
+ *  tag is how a post says who wrote it, so the router can tell a post's own
+ *  seat from another's. */
 export function seatTagForEmail(email: string | undefined | null): string | null {
   const local = String(email ?? "").split("@")[0]?.trim().toLowerCase() ?? "";
   if (!local) return null;
   const base = local.endsWith("-bot") ? local.slice(0, -"-bot".length) : local;
   if (!base) return null;
-  if (base.startsWith("bf-")) return BF_SEAT_PREFIX + base.slice("bf-".length).toUpperCase();
+  if (base.startsWith("bf-")) {
+    return canonicalZulipRole(BF_SEAT_PREFIX + base.slice("bf-".length).toUpperCase()).toUpperCase();
+  }
   if (base.endsWith("-grok")) return GB_SEAT_PREFIX + base.slice(0, -"-grok".length).toUpperCase();
   return base.toUpperCase();
 }
