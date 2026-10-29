@@ -74,6 +74,17 @@ public enum MacMascotExpression: String, CaseIterable, Sendable, Codable {
     case computer = "computer"
     case typing = "typing"
     case speaking = "speaking"
+    case sneaking = "sneaking"
+}
+
+// MARK: - TV-Face render resolution
+
+/// Resolved TV-Face expression names for bot states that must not collapse when
+/// rendered as TV-Face (matches src/components/tv-face/manifest.ts).
+public enum MacMascotTvFaceRenderMap {
+    public static let expressionByBotState: [String: String] = [
+        "sneaking": "sneaking",
+    ]
 }
 
 // MARK: - Status Pills
@@ -151,5 +162,7 @@ public enum MacMascotPalette {
         "yellow": "#D8A729",
         "teal": "#01A492",
         "coral": "#E5634E",
+        "white": "#E8EAED",
+        "black": "#2D3036",
     ]
 }

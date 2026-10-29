@@ -212,6 +212,24 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build
 
+      - name: TV-Face preview screenshot (simulator)
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
+        run: |
+          bash scripts/ios-tvface-screenshot.sh
+      # Capture-only until a baseline PNG is committed: the script's compare
+      # path is inert, so publish the capture for review on every run instead
+      # of a failure-only "diff" that could never fire.
+      - name: Upload TV-Face preview capture
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true' && always() && !cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-tvface-preview-capture
+          path: |
+            artifacts/ios-tvface-preview.png
+          retention-days: 7
+          if-no-files-found: ignore
+
+
   ios:
     name: Swift tests + iOS build
     needs: [changes, ios-build]
@@ -254,3 +272,4 @@ jobs:
             exit 1
           fi
           git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" | node scripts/ci-ios-gate.mjs
+

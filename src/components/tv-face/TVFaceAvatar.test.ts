@@ -38,7 +38,7 @@ describe("tvFaceSkinDir", () => {
   });
 
   it("maps every shipped BotColor to its own directory", () => {
-    for (const color of ["blue", "green", "purple", "pink", "red", "yellow", "cyan", "teal", "coral"] as const) {
+    for (const color of ["blue", "green", "purple", "pink", "red", "yellow", "cyan", "teal", "coral", "white", "black"] as const) {
       expect(SHIPPED_SKINS.has(color), `${color} should be shipped`).toBe(true);
       expect(tvFaceSkinDir(color)).toBe(color);
     }
@@ -46,6 +46,21 @@ describe("tvFaceSkinDir", () => {
 
   it("falls back to default for unshipped colors so they never 404", () => {
     expect(tvFaceSkinDir("chartreuse" as never)).toBe("default");
+  });
+
+  it("falls back to default on desktop for web-only skin packs", () => {
+    const prior = globalThis.window;
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { ...prior, ogb: {} },
+    });
+    try {
+      expect(tvFaceSkinDir("white")).toBe("default");
+      expect(tvFaceSkinDir("blue")).toBe("default");
+      expect(tvFaceSkinDir("orange")).toBe("default");
+    } finally {
+      Object.defineProperty(globalThis, "window", { configurable: true, value: prior });
+    }
   });
 });
 

@@ -23,6 +23,8 @@ const COLORS = [
   "yellow",
   "teal",
   "coral",
+  "white",
+  "black",
 ] as const satisfies readonly BotColor[];
 
 const requiredText = (max: number) =>
