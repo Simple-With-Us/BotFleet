@@ -521,7 +521,10 @@ export function buildTurnEvents(
     Number.isFinite(params.turnStartedAtMs) &&
     params.turnStartedAtMs > 0
   ) {
-    metadata.turnStartedAt = new Date(params.turnStartedAtMs).toISOString();
+    // A finite number past the Date range is an Invalid Date, whose
+    // toISOString throws; one optional key must never cost the turn's event.
+    const started = new Date(params.turnStartedAtMs);
+    if (!Number.isNaN(started.getTime())) metadata.turnStartedAt = started.toISOString();
   }
   if (!usageReported) {
     metadata.tokenType = "unknown";

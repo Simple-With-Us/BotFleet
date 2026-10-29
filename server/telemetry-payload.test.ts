@@ -683,6 +683,11 @@ describe("child harness de-duplication keys", () => {
     expect(bare?.metadata).not.toHaveProperty("turnStartedAt");
   });
 
+  it("drops a start time past the Date range instead of throwing", () => {
+    const [event] = build({ inputTokens: 1, turnStartedAtMs: 9e15 });
+    expect(event?.metadata).not.toHaveProperty("turnStartedAt");
+  });
+
   it("leaves the event id scheme and the occurrence time as they were", () => {
     const [event] = build({ inputTokens: 10, childSessionId: "s", turnStartedAtMs: 1_756_999_990_000 });
     expect(event?.eventId).toMatch(/^bf:anthropic:bot_1:1757000000000:[0-9a-f]{8}:turn$/);
