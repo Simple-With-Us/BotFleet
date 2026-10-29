@@ -112,10 +112,9 @@ export class ZulipStateStore {
   /** The saved state for this bot, or a fresh one.  A state saved for a
    *  different role (the bot was re-mapped to another Zulip identity) starts
    *  fresh: the old cursor and ring belong to someone else's mailbox.  The one
-   *  exception is a rename: a file saved under the session's credential role
-   *  (the configured legacy name) whose canonical fold is this role keeps its
+   *  exception is a rename: a file whose canonical fold is this role keeps its
    *  ledgers, relabelled, so the next save writes the canonical role. */
-  load(botId: string, role: string, credentialRole?: string): ZulipBotState {
+  load(botId: string, role: string): ZulipBotState {
     let text: string;
     try {
       text = readFileSync(join(this.dir, fileName(botId)), "utf8");
@@ -130,7 +129,7 @@ export class ZulipStateStore {
     }
     if (!parsed.success) return emptyState(role);
     const savedRole = parsed.data.role;
-    if (savedRole !== role && (savedRole !== credentialRole || canonicalZulipRole(savedRole) !== role)) {
+    if (savedRole !== role && canonicalZulipRole(savedRole) !== role) {
       return emptyState(role);
     }
     const { userId, dms, ...rest } = parsed.data;

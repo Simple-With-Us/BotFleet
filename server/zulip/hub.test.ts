@@ -515,6 +515,35 @@ describe("legacy role bindings", () => {
     expect(saved.pending).toHaveLength(1);
   });
 
+  it("keeps a BF-Builder state file after the credential migrates to BF-Engineer", async () => {
+    fake.addUser({ user_id: ENGINEER, full_name: "BF-Engineer", email: "bf-engineer-bot@zulip.test", key: "engineer-test-key" });
+    writeRc("BF-Engineer", "bf-engineer-bot@zulip.test", "engineer-test-key");
+    // The owner renamed the bot and its credential; the state file on disk
+    // still carries the pre-rename role.
+    mkdirSync(join(dataDir, "zulip"), { recursive: true });
+    writeFileSync(join(dataDir, "zulip", "bot-engineer.json"), JSON.stringify({
+      version: 1,
+      role: "BF-Builder",
+      cursor: 456,
+      handled: [21, 22],
+      pending: [],
+      wakes: [],
+      chains: {},
+      dms: [],
+    }));
+    settings.bots = {
+      "bot-engineer": { role: "BF-Engineer" },
+    };
+    const hub = makeHub();
+    await connected(hub, "bot-engineer");
+    const session = sessionOf(hub, "bot-engineer");
+    expect(session.role).toBe("BF-Engineer");
+    expect(session.credentialRole).toBe("BF-Engineer");
+    expect(session.state.role).toBe("BF-Engineer");
+    expect(session.state.cursor).toBe(456);
+    expect(session.state.handled).toEqual([21, 22]);
+  });
+
   it("does not carry a BF-Plumber state file into a BF-Engineer session", async () => {
     fake.addUser({ user_id: ENGINEER, full_name: "BF-Engineer", email: "bf-engineer-bot@zulip.test", key: "engineer-test-key" });
     writeRc("BF-Engineer", "bf-engineer-bot@zulip.test", "engineer-test-key");
