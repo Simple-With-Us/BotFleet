@@ -203,6 +203,15 @@ commit "ios/App/Real.swift" "// real" "fix(ios): real change" >/dev/null
 out="$(bash "$GATE" --event schedule --path-prefix "ios/**" --path-prefix "!ios/Generated/**" --repo-root "$REPO" --state-dir "$STATE" demo 2>&1)"
 check "non-excluded change alongside excluded -> should_ship" 1 "$(field "$out" should_ship)"
 
+echo "== 14. trailing '/**' spans directories without :(glob) magic =="
+# Pin git pathspec behavior the gate relies on: a trailing '/**' matches at
+# any depth with no magic prefix, so 'ios/**' needs no ':(glob)' to catch a
+# deeply nested change the push filter would have matched.
+set_state demo "$(git -C "$REPO" rev-parse HEAD)"
+commit "ios/A/B/Deep.swift" "// deep" "fix(ios): deeply nested change" >/dev/null
+out="$(bash "$GATE" --event schedule --path-prefix "ios/**" --repo-root "$REPO" --state-dir "$STATE" demo 2>&1)"
+check "3-level-deep ios change matches ios/**" 1 "$(field "$out" should_ship)"
+
 echo
 echo "passed=${PASS} failed=${FAIL}"
 [[ "$FAIL" -eq 0 ]] || exit 1
