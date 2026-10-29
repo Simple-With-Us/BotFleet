@@ -60,7 +60,9 @@ public enum MacShutdownOutcome: Equatable, Sendable {
     case failed(message: String)
 }
 
-/// Structured receipt returned by `POST /api/system/shutdown`.
+/// Structured receipt returned by `POST /api/system/control/stop`, or by the
+/// legacy `POST /api/system/shutdown` on a harness without the fenced route.
+/// Both carry the same shutdown report.
 public struct MacShutdownReceipt: Codable, Equatable, Sendable {
     public let ok: Bool
     public let markerWritten: Bool
@@ -105,10 +107,16 @@ public enum MacLifecycleError: LocalizedError, Equatable, Sendable {
         case .httpError(_, let message):
             return message
         case .busy(let message, let blockingWork):
-            if let blockingWork, !blockingWork.isEmpty {
-                return "BotFleet Server refused to stop while work is in flight (\(blockingWork)).  \(message)  Try again when it finishes."
+            // The server's refusal has no terminal punctuation, and on one of
+            // its two paths it already names the work in flight, so the
+            // breakdown is added only when the server did not say it.
+            let detail = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            let terminated = detail.hasSuffix(".") || detail.hasSuffix("!") || detail.hasSuffix("?")
+            let sentence = detail.isEmpty ? "" : (terminated ? detail : detail + ".") + "\u{00A0} "
+            if let blockingWork, !blockingWork.isEmpty, !detail.contains(blockingWork) {
+                return "BotFleet Server refused to stop while work is in flight (\(blockingWork)).\u{00A0} \(sentence)Try again when it finishes."
             }
-            return "BotFleet Server refused to stop while work is in flight.  \(message)  Try again when it finishes."
+            return "BotFleet Server refused to stop while work is in flight.\u{00A0} \(sentence)Try again when it finishes."
         }
     }
 }
@@ -485,7 +493,7 @@ public final class MacLifecycleClient: @unchecked Sendable {
         case .routeMissing:
             throw MacLifecycleError.httpError(
                 statusCode: 404,
-                message: "BotFleet Server has no shutdown route.  Update BotFleet, then try again."
+                message: "BotFleet Server has no shutdown route.\u{00A0} Update BotFleet, then try again."
             )
         }
     }
