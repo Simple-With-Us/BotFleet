@@ -63,6 +63,30 @@ run_gate() {
     "$@" 2>&1
 }
 
+run_gate_multi() {
+  # run_gate_multi <event> [extra args...] -> prints "key=value" lines
+  # Mirrors on.push.paths in .github/workflows/ios-ship.yml: the scheduled
+  # backstop must watch the same path set a push would have matched, or a
+  # merge that only touched ship tooling never ships when its push event is
+  # missed (workflow disabled at merge time, a dropped event, or a bot merge
+  # that fires no push run).
+  local event="$1"; shift
+  bash "$GATE" \
+    --event "$event" \
+    --path-prefix "ios/**" \
+    --path-prefix ".github/workflows/ios-ship.yml" \
+    --path-prefix ".github/workflows/sentry-testflight.yml" \
+    --path-prefix "scripts/sentry-report-testflight.mjs" \
+    --path-prefix "scripts/sentry-testflight-receipt.mjs" \
+    --path-prefix "scripts/ios-fleet/**" \
+    --path-prefix "scripts/ios-ship-testflight.sh" \
+    --path-prefix "scripts/ios-appstore-gm-prepare.sh" \
+    --path-prefix "scripts/ios-install-appstore-profiles.sh" \
+    --repo-root "$REPO" \
+    --state-dir "$STATE" \
+    "$@" 2>&1
+}
+
 field() {
   # field <output> <key>
   printf '%s\n' "$1" | awk -F= -v k="$2" '$1 == k {print $2}' | tail -1
@@ -140,6 +164,44 @@ set_state demo "$(git -C "$REPO" rev-parse HEAD)"
 echo "== 8. deciding 'skip' is never an error exit =="
 run_gate schedule demo >/dev/null
 check "exit code on skip" 0 "$?"
+
+echo "== 9. missed-push backstop: a tooling-only merge still ships =="
+set_state demo "$(git -C "$REPO" rev-parse HEAD)"
+commit "scripts/ios-fleet/ship-testflight.sh" "# tooling tweak" "chore(ios-fleet): tooling-only" >/dev/null
+out="$(run_gate_multi schedule demo)"
+check "tooling-only (scripts/ios-fleet) -> should_ship" 1 "$(field "$out" should_ship)"
+# The old single-prefix call watched ios/ alone and skipped this merge; pin
+# that contrast so the multi-prefix workflow call stays load-bearing (and the
+# old single-prefix form keeps working for its own narrower watch).
+out="$(run_gate schedule demo)"
+check "single-prefix ios/ call still skips tooling-only" 0 "$(field "$out" should_ship)"
+
+echo "== 10. missed-push backstop: a workflow-file-only merge still ships =="
+set_state demo "$(git -C "$REPO" rev-parse HEAD)"
+commit ".github/workflows/ios-ship.yml" "# workflow tweak" "ci(ios-ship): workflow-only" >/dev/null
+out="$(run_gate_multi schedule demo)"
+check "workflow-only -> should_ship" 1 "$(field "$out" should_ship)"
+
+echo "== 11. multi-prefix gate: unrelated-only changes still skip =="
+set_state demo "$(git -C "$REPO" rev-parse HEAD)"
+commit "README.md" "readme tweak" "docs: readme-only" >/dev/null
+commit "server/api.ts" "backend tweak" "feat(server): backend-only" >/dev/null
+out="$(run_gate_multi schedule demo)"
+check "unrelated-only -> should_ship" 0 "$(field "$out" should_ship)"
+
+echo "== 12. multi-prefix gate: HEAD already shipped still skips =="
+set_state demo "$(git -C "$REPO" rev-parse HEAD)"
+out="$(run_gate_multi schedule demo)"
+check "HEAD already shipped (multi-prefix) -> should_ship" 0 "$(field "$out" should_ship)"
+
+echo "== 13. a '!' pattern excludes like the push filter =="
+set_state demo "$(git -C "$REPO" rev-parse HEAD)"
+commit "ios/Generated/blob.txt" "generated" "chore(ios): generated-only" >/dev/null
+out="$(bash "$GATE" --event schedule --path-prefix "ios/**" --path-prefix "!ios/Generated/**" --repo-root "$REPO" --state-dir "$STATE" demo 2>&1)"
+check "excluded-only change -> should_ship" 0 "$(field "$out" should_ship)"
+commit "ios/App/Real.swift" "// real" "fix(ios): real change" >/dev/null
+out="$(bash "$GATE" --event schedule --path-prefix "ios/**" --path-prefix "!ios/Generated/**" --repo-root "$REPO" --state-dir "$STATE" demo 2>&1)"
+check "non-excluded change alongside excluded -> should_ship" 1 "$(field "$out" should_ship)"
 
 echo
 echo "passed=${PASS} failed=${FAIL}"

@@ -18,7 +18,27 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   const prepare = read("scripts/ios-appstore-gm-prepare.sh");
 
   assert.match(yml, /ios\/\*\*/);
-  assert.match(yml, /--path-prefix 'ios\/'/);
+  // The scheduled backstop must watch the same path set as on.push.paths:
+  // a merge that only touched ship tooling ships no push-filtered run when
+  // its push event is missed, so the gate is the only thing that ships it
+  // (owner rule 2026-10-29: "unless they built recently they should
+  // automatically build").
+  const pushBlock = yml.slice(yml.indexOf("\n    paths:"), yml.indexOf("\n  workflow_dispatch:"));
+  const pushPaths = [...pushBlock.matchAll(/- '([^']+)'/g)].map((m) => m[1]);
+  assert.ok(pushPaths.length >= 9, `expected the full push path set, got ${pushPaths.length}`);
+  const gateStep = yml.slice(
+    yml.indexOf("name: Scheduled ship gate"),
+    yml.indexOf("- name: Assert stable Xcode")
+  );
+  for (const p of pushPaths) {
+    assert.ok(gateStep.includes(`--path-prefix '${p}'`), `gate must watch push path ${p}`);
+  }
+  assert.equal(
+    (gateStep.match(/--path-prefix '/g) || []).length,
+    pushPaths.length,
+    "gate watches exactly the push path set (no fewer, no extras)"
+  );
+  assert.match(read("scripts/ios-fleet/scheduled-ship-gate.sh"), /repeatable/);
   assert.match(yml, /scripts\/ios-fleet\/\*\*/);
   assert.match(yml, /runs-on:\s*xcode-27\s*$/m);
   assert.doesNotMatch(yml, /runs-on:\s*macos-latest/);
