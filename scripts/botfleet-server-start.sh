@@ -156,8 +156,14 @@ honour_startup_policy() {
 }
 
 # True when launchd invoked us rather than a person.
+#
+# launchd sets XPC_SERVICE_NAME to the job's label.  A shell sets it too, to
+# the string 0 (Terminal.app and the agents' command shells both do), so a
+# non-empty value alone is not launchd: a person starting the server from such
+# a shell was classed as a tick, and the deliberate start that is supposed to
+# clear stopped.marker left it in place (BF-2527, BF-2528).
 invoked_by_launchd() {
-  [ -n "$LAUNCHD_SERVICE_NAME" ]
+  [ -n "$LAUNCHD_SERVICE_NAME" ] && [ "$LAUNCHD_SERVICE_NAME" != "0" ]
 }
 
 # Exit 0 if the harness was stopped on purpose.  Returns 1 to carry on.

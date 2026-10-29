@@ -760,6 +760,38 @@ test("a manual run clears the marker and starts, which is the way back", () => {
   }
 });
 
+test("a shell that carries XPC_SERVICE_NAME=0 is still a person, not launchd", () => {
+  // Terminal.app and the agents' command shells set XPC_SERVICE_NAME to the
+  // string 0; launchd sets it to the job's label.  Treating any non-empty
+  // value as launchd classed a manual start from such a shell as a tick, so
+  // the sentinel was never cleared and the server stayed down with nothing
+  // telling the owner why.
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.marker, "stopped on purpose\n");
+    writeFileSync(fixture.disabled, "disabled\n");
+    const result = run(fixture, { xpcServiceName: "0" });
+    assert.ok(!existsSync(fixture.marker), "a person asking for the server must not be blocked by the sentinel");
+    assert.match(result.stdout + result.stderr, /treating it as a deliberate start/);
+    assert.doesNotMatch(result.stdout, /startup is disabled at login/);
+    assert.equal(readFileSync(fixture.session, "utf8").trim(), "fixture-boot");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the job's own label is still launchd", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.marker, "stopped on purpose\n");
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(existsSync(fixture.marker), "the tick must leave a deliberate stop in place");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
 test("no marker means the tick behaves exactly as before", () => {
   const fixture = makeFixture();
   try {
