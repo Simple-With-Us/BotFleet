@@ -356,11 +356,12 @@ test("asc-api.mjs stays dependency-free: it runs from a bare directory with no n
   try {
     const copy = join(tmp, "asc-api.mjs");
     writeFileSync(copy, src);
-    // The client imports asc-key.mjs and version-plan.mjs, so the bare copy
+    // The client imports asc-key.mjs, version-plan.mjs and shared-build.mjs, so the bare copy
     // needs them too:  a missing sibling is ERR_MODULE_NOT_FOUND, which is
     // the same failure this test exists to catch.
     writeFileSync(join(tmp, "asc-key.mjs"), read("scripts/ios-fleet/asc-key.mjs"));
     writeFileSync(join(tmp, "version-plan.mjs"), read("scripts/ios-fleet/version-plan.mjs"));
+    writeFileSync(join(tmp, "shared-build.mjs"), read("scripts/ios-fleet/shared-build.mjs"));
     const run = spawnSync(process.execPath, [copy, "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: { PATH: process.env.PATH || "", HOME: tmp },
