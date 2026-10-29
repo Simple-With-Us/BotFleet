@@ -17,10 +17,37 @@ test('shared counter takes the max across iOS and macOS', () => {
   assert.deepEqual(next({...input, iosBuilds: ['1100'], macBuilds: ['1200']}), {build: '1201', ignoredIos: 0});
   assert.deepEqual(next({...input, iosBuilds: ['1300'], macBuilds: ['1200']}), {build: '1301', ignoredIos: 0});
 });
+test('next is one above the max of iOS builds, macOS builds and floors', () => {
+  assert.deepEqual(
+    next({iosBuilds: ['1200'], macBuilds: ['1300'], extraFloors: [1400], complete: true}),
+    {build: '1401', ignoredIos: 0}
+  );
+  assert.deepEqual(
+    next({iosBuilds: ['1500'], macBuilds: ['1300'], extraFloors: [1400], complete: true}),
+    {build: '1501', ignoredIos: 0}
+  );
+  assert.deepEqual(
+    next({iosBuilds: ['1200'], macBuilds: ['1500'], extraFloors: [1400], complete: true}),
+    {build: '1501', ignoredIos: 0}
+  );
+});
 test('extra floors raise the counter above 999', () => {
   assert.deepEqual(next({...input, extraFloors: [986]}), {build: '1000', ignoredIos: 0});
   assert.deepEqual(next({...input, extraFloors: [1500]}), {build: '1501', ignoredIos: 0});
   assert.deepEqual(next({...input, iosBuilds: ['1100'], extraFloors: [1500]}), {build: '1501', ignoredIos: 0});
+});
+test('both-app both-platform union: paired iOS and paired macOS each hold the counter', () => {
+  // iosBuilds = IOS(app) + IOS(paired), macBuilds = MAC_OS(app) + MAC_OS(paired).
+  // A high iOS build on the paired app raises the counter.
+  assert.deepEqual(
+    next({iosBuilds: ['1100', '1600'], macBuilds: ['1200', '1400'], complete: true}),
+    {build: '1601', ignoredIos: 0}
+  );
+  // A high macOS build on the paired app raises the counter too.
+  assert.deepEqual(
+    next({iosBuilds: ['1100', '1150'], macBuilds: ['1200', '1700'], complete: true}),
+    {build: '1701', ignoredIos: 0}
+  );
 });
 test('iOS timestamp builds are ignored and counted', () => {
   assert.deepEqual(

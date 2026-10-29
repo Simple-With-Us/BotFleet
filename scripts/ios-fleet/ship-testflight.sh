@@ -827,34 +827,117 @@ project_marketing_seq() {
 # every macOS build, every extra floor, 999) + 1, floored at 1000.  Prints the
 # build on stdout.  Returns 1 (and prints nothing) when it cannot be worked out.
 asc_next_shared_build() {
-  local out rc mac_id feed feed_xml max floor
+  local out rc paired_id feed feed_xml max floor curl_err curl_err_root curl_diag stripped
   command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
   # Not load_secrets: this helper runs inside command substitutions, where a
   # secrets temp dir and its EXIT trap die with the subshell and leave the
   # key behind.  asc-api.mjs resolves its own credential.
   asc_credential_available || return 1
-  mac_id="$(json_get "$APP_KEY" macBundleId 2>/dev/null || true)"
-  [[ "$mac_id" == "null" ]] && mac_id=""
+  # The paired app whose builds join the counter: pairedBundleId, with
+  # macBundleId as the accepted alias.  For a macOS entry this names the iOS
+  # app; for an iOS entry it names the Mac app.
+  paired_id="$(json_get "$APP_KEY" pairedBundleId 2>/dev/null || true)"
+  [[ "$paired_id" == "null" ]] && paired_id=""
+  if [[ -z "$paired_id" ]]; then
+    paired_id="$(json_get "$APP_KEY" macBundleId 2>/dev/null || true)"
+    [[ "$paired_id" == "null" ]] && paired_id=""
+  fi
+  # A macOS entry with no paired id borrows the iOS peer that points at it:
+  # the entry whose pairedBundleId or macBundleId equals this bundle id lends
+  # its own bundle id, so iOS builds join the counter.
+  if [[ -z "$paired_id" && "${PLATFORM:-}" == "macOS" && -n "${BUNDLE_ID:-}" ]]; then
+    paired_id="$(/usr/bin/python3 - "$APPS_JSON" "$BUNDLE_ID" 2>/dev/null <<'PY'
+import json, sys
+path, mine = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(path))
+except Exception:
+    sys.exit(0)
+apps = data.get("apps", {}) or {}
+for key in sorted(apps.keys()):
+    a = apps[key] or {}
+    if a.get("pairedBundleId") == mine or a.get("macBundleId") == mine:
+        b = a.get("bundleId") or ""
+        if b and b != mine:
+            print(b, end="")
+            sys.exit(0)
+PY
+)" || paired_id=""
+    [[ "$paired_id" == "null" ]] && paired_id=""
+  fi
   feed="$(json_get "$APP_KEY" pairedBuildFeed 2>/dev/null || true)"
   [[ "$feed" == "null" ]] && feed=""
   floor=""
   if [[ -n "$feed" ]]; then
-    command -v curl >/dev/null 2>&1 || return 1
+    case "$feed" in
+      https://*) ;;
+      *)
+        logerr "shared-build: paired build feed ${feed} is not an https URL; failing closed"
+        return 1
+        ;;
+    esac
+    if ! command -v curl >/dev/null 2>&1; then
+      logerr "shared-build: curl is not on PATH, so the paired build feed ${feed} cannot be read"
+      return 1
+    fi
+    curl_err_root="$(asc_temp_root)" || curl_err_root=""
+    if [[ -z "$curl_err_root" ]]; then
+      logerr "shared-build: TMPDIR resolves to the filesystem root; refusing to fetch the paired build feed ${feed}"
+      return 1
+    fi
+    curl_err="$(mktemp "${curl_err_root}/paired-feed-err.XXXXXX" 2>/dev/null)" || curl_err=""
+    if [[ -z "$curl_err" ]]; then
+      logerr "shared-build: cannot stage a scratch file, so the paired build feed ${feed} cannot be read"
+      return 1
+    fi
     set +e
-    feed_xml="$(curl -fsSL "$feed" 2>/dev/null)"
+    feed_xml="$(curl -fsSL --proto =https --proto-redir =https --connect-timeout 10 --max-time 30 --max-filesize 5000000 "$feed" 2>"$curl_err")"
     rc=$?
     set -e
-    [[ $rc -eq 0 && -n "$feed_xml" ]] || return 1
-    max="$(printf '%s' "$feed_xml" | grep -o -E '<sparkle:version>[0-9]+</sparkle:version>' 2>/dev/null | grep -o -E '[0-9]+' 2>/dev/null | /usr/bin/python3 -c 'import sys; ns=[int(x.strip()) for x in sys.stdin if x.strip().isdigit()]; print(max(ns) if ns else "")' 2>/dev/null || true)"
-    [[ "$max" =~ ^[0-9]+$ ]] || return 1
+    curl_diag=""
+    if [[ -s "$curl_err" ]]; then
+      curl_diag="$(cat "$curl_err" 2>/dev/null || true)"
+    fi
+    rm -f "$curl_err" >/dev/null 2>&1 || true
+    # A timeout is a feed failure: fail closed, never guess the floor.  The
+    # URL and curl's own stderr are logged so a feed failure is not reported
+    # as an App Store Connect failure.
+    if [[ $rc -ne 0 ]]; then
+      if [[ -n "$curl_diag" ]]; then
+        logerr "shared-build: paired build feed fetch failed for ${feed}: ${curl_diag}"
+      else
+        logerr "shared-build: paired build feed fetch failed for ${feed} (curl rc=${rc})"
+      fi
+      return 1
+    fi
+    max="$(printf '%s' "$feed_xml" | grep -o -E '<sparkle:version>[[:space:]]*[0-9]+[[:space:]]*</sparkle:version>' 2>/dev/null | grep -o -E '[0-9]+' 2>/dev/null | sort -n 2>/dev/null | tail -n 1 2>/dev/null || true)"
+    if [[ ! "$max" =~ ^[0-9]+$ ]]; then
+      logerr "shared-build: paired build feed ${feed} holds no numeric <sparkle:version>; failing closed"
+      return 1
+    fi
+    # A floor outside 1..9998 cannot yield a valid four-digit build (9999
+    # would need 10000), so it fails closed with the URL named.  The length
+    # check runs first so no arithmetic ever sees a huge value.
+    stripped="$max"
+    while [[ "$stripped" == 0* && "${#stripped}" -gt 1 ]]; do
+      stripped="${stripped#0}"
+    done
+    if [[ "${#stripped}" -gt 4 ]]; then
+      logerr "shared-build: paired build feed ${feed} version ${max} is outside 1..9998; failing closed"
+      return 1
+    fi
+    if [[ 10#$stripped -lt 1 || 10#$stripped -gt 9998 ]]; then
+      logerr "shared-build: paired build feed ${feed} version ${max} is outside 1..9998; failing closed"
+      return 1
+    fi
     floor="$max"
   fi
   set +e
-  if [[ -n "$mac_id" && -n "$floor" ]]; then
-    out=$(asc_client next-shared-build "$BUNDLE_ID" "$mac_id" "$floor")
+  if [[ -n "$paired_id" && -n "$floor" ]]; then
+    out=$(asc_client next-shared-build "$BUNDLE_ID" "$paired_id" "$floor")
     rc=$?
-  elif [[ -n "$mac_id" ]]; then
-    out=$(asc_client next-shared-build "$BUNDLE_ID" "$mac_id")
+  elif [[ -n "$paired_id" ]]; then
+    out=$(asc_client next-shared-build "$BUNDLE_ID" "$paired_id")
     rc=$?
   elif [[ -n "$floor" ]]; then
     out=$(asc_client next-shared-build "$BUNDLE_ID" "$floor")
@@ -1282,12 +1365,12 @@ DEFAULT_MARKETING="$(json_get "$APP_KEY" marketingVersionDefault)"
 # Optional fixed-version policy (owner, Oct 28 2026): the marketing version does
 # not count up per ship; the build is one shared four-digit counter per app
 # across iOS and macOS (see asc-api.mjs next-shared-build and shared-build.mjs).
-# apps.json keys: fixedMarketingVersion ("1.1.2"), optional macBundleId (the Mac
-# app whose builds join the counter), optional pairedBuildFeed (a Sparkle
-# appcast URL whose max <sparkle:version> joins the counter).  Absent
-# fixedMarketingVersion keeps the next-patch behaviour.  Fixed mode works on
-# both platforms: the counter sits above every Mac build, which is what macOS
-# needs.
+# apps.json keys: fixedMarketingVersion ("1.1.2"), optional pairedBundleId (the
+# paired app whose builds join the counter; macBundleId is the accepted alias),
+# optional pairedBuildFeed (a Sparkle appcast URL whose max <sparkle:version>
+# joins the counter).  Absent fixedMarketingVersion keeps the next-patch
+# behaviour.  Fixed mode works on both platforms: the counter sits above every
+# Mac build, which is what macOS needs.
 FIXED_MARKETING="$(json_get "$APP_KEY" fixedMarketingVersion)"
 
 if [[ -z "$PLATFORM" ]]; then

@@ -1329,7 +1329,8 @@ async function main() {
   // next = max(every iOS build on ALL trains, every macOS build on ALL trains,
   // every extra floor, 999) + 1, floored at 1000.  iOS UTC timestamp builds are
   // ignored by the planner (those trains are closed); macOS builds all count.
-  // READ ONLY.
+  // A paired bundle id (the second arg) joins BOTH platforms of the second
+  // app to the same counter.  READ ONLY.
   //
   // Two ships at once would read the same inventory and pick the same build.
   // The CI ship is serialised (ios-ship.yml concurrency group,
@@ -1376,16 +1377,41 @@ async function main() {
       }
       macAppId = macResolved.appId;
     }
+    // A non-null non-array object, in the same hand-written idiom as isAscRow
+    // (this client is dependency-free, so no zod; no typeof either, which the
+    // lint baseline refuses).
+    const isRecord = (v) => Object.prototype.toString.call(v) === "[object Object]";
     async function allBuilds(forAppId, platform) {
       const out = [];
       let url = `/v1/builds?filter[app]=${forAppId}&filter[preReleaseVersion.platform]=${platform}&limit=200`;
       for (let page = 0; page < 100 && url; page++) {
         const res = await ascGet(url);
-        if (!res.ok || !Array.isArray(res.parsed?.data)) {
+        if (!res.ok) {
+          console.error("next-shared-build: inventory unavailable");
+          failExit(res.status);
+        }
+        if (!isRecord(res.parsed)) {
+          console.error("next-shared-build: malformed pagination");
+          process.exit(2);
+        }
+        if (!Array.isArray(res.parsed.data)) {
           console.error("next-shared-build: inventory unavailable");
           failExit(res.status);
         }
         for (const b of res.parsed.data) out.push(b?.attributes?.version);
+        const links = res.parsed.links;
+        if (links !== undefined) {
+          if (!isRecord(links)) {
+            console.error("next-shared-build: malformed pagination");
+            process.exit(2);
+          }
+          const nextUrl = links.next;
+          // String(x) === x is true only for a string primitive (see isAscRow).
+          if (nextUrl !== undefined && nextUrl !== null && String(nextUrl) !== nextUrl) {
+            console.error("next-shared-build: malformed pagination");
+            process.exit(2);
+          }
+        }
         url = res.parsed.links?.next || "";
       }
       if (url) {
@@ -1394,9 +1420,30 @@ async function main() {
       }
       return out;
     }
-    const iosBuilds = await allBuilds(appId, "IOS");
-    let macBuilds = await allBuilds(appId, "MAC_OS");
-    if (macAppId) macBuilds = macBuilds.concat(await allBuilds(macAppId, "MAC_OS"));
+    // The paired app contributes BOTH platforms, like the app itself: the two
+    // records are one product, so an iOS build on either one holds the counter.
+    // The inventories are independent, so they are read concurrently.  Each
+    // read still pages to the same cap and fails closed when the list runs
+    // past it (see allBuilds), never truncated.
+    let iosBuilds;
+    let macBuilds;
+    if (macAppId) {
+      const [iosA, macA, iosB, macB] = await Promise.all([
+        allBuilds(appId, "IOS"),
+        allBuilds(appId, "MAC_OS"),
+        allBuilds(macAppId, "IOS"),
+        allBuilds(macAppId, "MAC_OS")
+      ]);
+      iosBuilds = iosA.concat(iosB);
+      macBuilds = macA.concat(macB);
+    } else {
+      const [iosA, macA] = await Promise.all([
+        allBuilds(appId, "IOS"),
+        allBuilds(appId, "MAC_OS")
+      ]);
+      iosBuilds = iosA;
+      macBuilds = macA;
+    }
     try {
       const planned = nextSharedBuild({ iosBuilds, macBuilds, extraFloors, complete: true });
       console.error(`next-shared-build: ${iosBuilds.length} iOS build(s) + ${macBuilds.length} macOS build(s) inspected; ignored ${planned.ignoredIos} iOS timestamp build(s); next is ${planned.build}`);
