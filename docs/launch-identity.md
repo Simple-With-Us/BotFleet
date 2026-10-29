@@ -56,6 +56,8 @@ A name that only contains a role word (`Plumber 2`) names no role.  Director has
 
 Builder was renamed Engineer and Trader joined on 2026-10-28 (owner):  a bot still named `BF-Builder`, `Builder`, or carrying `@fleet-seat: builder` resolves to `BF-ENGINEER` rather than losing its seat, and `BF-Trader` resolves to `BF-TRADER`.
 
+The Zulip credential still named `BF-Builder` keeps working through the same alias:  a `zulip.bots` binding of `BF-Builder` posts and wakes as `BF-Engineer`, while its key is still read from the configured name (`BF-Builder-zuliprc`, or `ZULIP_BF_BUILDER_*` in the vault).  Renaming the Zulip bot and its credential to `BF-Engineer` is an owner migration step, not something the harness does by itself.
+
 ## The Switch
 
 Seats and the seat sentence in the system prompt are on together, with `BOTFLEET_FLEET_SEAT_PROMPTS=1` in the harness's environment (the Mac operator fleet).  Off, every engine process is still marked as launched and cleaned of inherited identity, and has no seat, so the fleet tools refuse.  An install that has not turned the operator fleet on carries no seat names at all.

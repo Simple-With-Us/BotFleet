@@ -23,6 +23,8 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 
 import { BOT_OFF_CODE } from "../../shared/bot-power.ts";
 
+import { canonicalZulipRole } from "../launch-identity.ts";
+
 import {
   ZULIP_TOPIC_FOLLOWED,
   ZULIP_TOPIC_NONE,
@@ -365,14 +367,20 @@ class ZulipSession {
   private readonly hub: ZulipHub;
   readonly botId: string;
   readonly role: string;
+  /** The role the key is loaded under: the configured binding, which keeps a
+   *  legacy name (`BF-Builder-zuliprc`) while `role` carries the canonical
+   *  one.  Renaming the Zulip bot and its credential is an owner migration
+   *  step (docs/launch-identity.md). */
+  readonly credentialRole: string;
   readonly realm: string;
 
   // Plain fields, not constructor parameter properties: the server runs under
   // Node's strip-only TypeScript, which refuses those at load time.
-  constructor(hub: ZulipHub, botId: string, role: string, realm: string) {
+  constructor(hub: ZulipHub, botId: string, role: string, realm: string, credentialRole?: string) {
     this.hub = hub;
     this.botId = botId;
     this.role = role;
+    this.credentialRole = credentialRole ?? role;
     this.realm = realm;
     this.state = hub.store.load(botId, role);
     this.status = { botId, role, state: "starting", pending: this.state.pending.length, since: hub.now() };
@@ -562,7 +570,7 @@ class ZulipSession {
         "missing",
       );
     }
-    const creds = await source.load(this.role);
+    const creds = await source.load(this.credentialRole);
     verifyCredentialRealm(creds, this.realm);
     this.creds = creds;
     this.client = new ZulipClient(creds, this.realm, {
@@ -880,7 +888,7 @@ export class ZulipHub {
     if (this.stopped) return;
     const retryDisabled = opts.retryDisabled ?? true;
     const settings = this.settings();
-    const wanted = new Map<string, string>();
+    const wanted = new Map<string, { role: string; credentialRole: string }>();
     let realm = "";
     if (this.enabled()) {
       const resolved = resolveRealm(settings, this.env);
@@ -890,27 +898,36 @@ export class ZulipHub {
         realm = resolved.realm;
         const roles = new Set<string>();
         for (const [botId, entry] of Object.entries(settings?.bots ?? {})) {
-          const role = typeof entry?.role === "string" ? entry.role.trim() : "";
-          if (entry?.enabled === false || !role || !this.deps.botExists(botId)) continue;
-          if (!validZulipRole(role)) {
-            this.log(`[zulip] bot ${botId}: "${role}" is not a valid Zulip role name; skipped`);
+          const configured = typeof entry?.role === "string" ? entry.role.trim() : "";
+          if (entry?.enabled === false || !configured || !this.deps.botExists(botId)) continue;
+          if (!validZulipRole(configured)) {
+            this.log(`[zulip] bot ${botId}: "${configured}" is not a valid Zulip role name; skipped`);
             continue;
           }
+          // The session posts and wakes under the canonical role: a bot still
+          // bound as BF-Builder is BF-Engineer on Zulip.  Its key stays under
+          // the configured name until the owner migrates the credential.
+          const role = canonicalZulipRole(configured);
           // One Zulip identity, one session: two queues for the same bot
           // would answer every message twice.
           if (roles.has(role.toLowerCase())) {
-            this.log(`[zulip] bot ${botId}: ${role} is already bound to another bot; skipped`);
+            this.log(`[zulip] bot ${botId}: ${configured} is already bound to another bot; skipped`);
             continue;
           }
           roles.add(role.toLowerCase());
-          wanted.set(botId, role);
+          wanted.set(botId, { role, credentialRole: configured });
         }
       }
     }
     for (const [botId, session] of this.sessions) {
-      const role = wanted.get(botId);
+      const next = wanted.get(botId);
       const retry = retryDisabled && session.status.state === "disabled";
-      if (role !== session.role || session.realm !== realm || retry) {
+      // A changed credential name rebuilds the session too: same canonical
+      // role, but the key moves (the owner migrating BF-Builder to
+      // BF-Engineer re-points the binding at the renamed credential).
+      const changed =
+        next?.role !== session.role || next?.credentialRole !== session.credentialRole || session.realm !== realm || retry;
+      if (changed) {
         this.sessions.delete(botId);
         const stopped = session.stop().finally(() => {
           this.stopping.delete(botId);
@@ -923,9 +940,9 @@ export class ZulipHub {
         this.stopping.set(botId, stopped);
       }
     }
-    for (const [botId, role] of wanted) {
+    for (const [botId, next] of wanted) {
       if (this.sessions.has(botId) || this.stopping.has(botId)) continue;
-      const session = new ZulipSession(this, botId, role, realm);
+      const session = new ZulipSession(this, botId, next.role, realm, next.credentialRole);
       this.sessions.set(botId, session);
       session.start();
     }
@@ -1188,7 +1205,8 @@ export class ZulipHub {
       if (event.type !== "zulip.message" || event.source.platform !== "zulip") return;
       const role = event.source.accountId;
       const botId = Object.entries(this.settings()?.bots ?? {}).find(
-        ([id, binding]) => binding.role === role && (binding.enabled ?? true) && this.deps.botExists(id),
+        ([id, binding]) =>
+          canonicalZulipRole(binding.role) === role && (binding.enabled ?? true) && this.deps.botExists(id),
       )?.[0];
       if (!botId) return;
       const session = this.sessions.get(botId);

@@ -344,7 +344,7 @@ describe("outgoing webhook role aliases", () => {
     expect(hub.outgoingWebhookAvailability("BF-PLUMBER")).toBe("unknown");
   });
 
-  it("prefers an exact role match over the legacy alias", async () => {
+  it("binds BF-Builder and BF-Engineer once, under the canonical role", async () => {
     fake.addUser({ user_id: ENGINEER, full_name: "BF-Engineer", email: "bf-engineer-bot@zulip.test", key: "engineer-test-key" });
     fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
     writeRc("BF-Engineer", "bf-engineer-bot@zulip.test", "engineer-test-key");
@@ -355,19 +355,85 @@ describe("outgoing webhook role aliases", () => {
     };
     const hub = makeHub();
     await connected(hub, "bot-engineer");
-    await connected(hub, "bot-builder");
+    // Both bindings fold to BF-Engineer, so the second is a duplicate, not a
+    // second identity: one session answers, and the legacy webhook URL still
+    // reaches it.
+    expect(hub.sessionFor("bot-builder")).toBeUndefined();
+    expect(logs.some((line) => line.includes("already bound to another bot"))).toBe(true);
     const engineer = hub.sessionFor("bot-engineer")!;
-    const builder = hub.sessionFor("bot-builder")!;
     engineer.creds!.outgoingWebhookToken = "engineer-outgoing-token";
-    builder.creds!.outgoingWebhookToken = "builder-outgoing-token";
-
-    // BF-BUILDER names a real session, so the alias never applies to it.
-    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-builder-bot@zulip.test", "builder-outgoing-token")).toBe("ok");
-    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-engineer-bot@zulip.test", "engineer-outgoing-token")).toBe("unauthorized");
-    const message = fake.postStream(JAY, "builds", "Outgoing webhook", "builder wake", "website");
+    expect(hub.outgoingWebhookAvailability("BF-BUILDER")).toBe("ready");
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-engineer-bot@zulip.test", "engineer-outgoing-token")).toBe("ok");
+    const message = fake.postStream(JAY, "builds", "Outgoing webhook", "builder alias wake", "website");
     expect(hub.enqueueOutgoingWebhook("BF-BUILDER", message)).toBe("accepted");
-    // The row belongs to the exact-match session, not to the alias target.
-    expect(existsSync(join(dataDir, "zulip", "outgoing", `bot-builder-${message}.json`))).toBe(true);
+    expect(existsSync(join(dataDir, "zulip", "outgoing", `bot-engineer-${message}.json`))).toBe(true);
+  });
+});
+
+describe("legacy role bindings", () => {
+  it("posts and wakes a BF-Builder bot as BF-Engineer, on the BF-Builder credential", async () => {
+    fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
+    writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
+    settings.bots = {
+      "bot-builder": { role: "BF-Builder" },
+    };
+    const hub = makeHub();
+    await connected(hub, "bot-builder");
+    const session = sessionOf(hub, "bot-builder");
+    expect(session.role).toBe("BF-Engineer");
+    expect(session.credentialRole).toBe("BF-Builder");
+    expect(session.creds!.email).toBe("bf-builder-bot@zulip.test");
+
+    // A @BF-Builder mention still wakes it: mention matching is by the Zulip
+    // identity, not the canonical role.
+    fake.postStream(JAY, "builds", "Legacy mention", "@**BF-Builder** check the build", "website");
+    await waitFor(() => turns.length === 1, "a legacy-mention wake");
+    expect(turns[0]!.botId).toBe("bot-builder");
+    expect(turns[0]!.text).toContain("woken on Zulip as BF-Engineer");
+    expect(turns[0]!.text).toContain("[BF-ENGINEER]");
+
+    const result = await hub.send({
+      botId: "bot-builder",
+      threadId: "thread-bot-builder",
+      tool: "reply",
+      args: { content: "Build is green." },
+    });
+    expect(result.ok).toBe(true);
+    expect(result.text).toContain("as BF-Engineer");
+    expect(fake.postsBy(BUILDER).at(-1)!.content).toBe("[BF-ENGINEER] Build is green.");
+  });
+
+  it("matches a late plugin decision's canonical account to a legacy-bound bot", async () => {
+    fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
+    writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
+    settings.bots = {
+      "bot-plumber": { role: "BF-Plumber" },
+      "bot-builder": { role: "BF-Builder" },
+    };
+    const hub = makeHub();
+    await connected(hub);
+    await connected(hub, "bot-builder");
+    // The mentioned bot is busy, so the native wake waits and the late
+    // decision's route to the plumber is the only turn that can start.
+    busy.add("bot-builder");
+    const id = fake.postStream(JAY, "builds", "Late route", "@**BF-Builder** late decision", "website");
+    await hub.applyLatePluginDecision(
+      {
+        eventId: `zulip:BF-Engineer:${id}`,
+        type: "zulip.message",
+        source: { platform: "zulip", accountId: "BF-Engineer" },
+        occurredAt: "2026-10-28T00:00:00.000Z",
+        receivedAt: "2026-10-28T00:00:01.000Z",
+        refs: { messageId: id, conversationKey: "stream:builds/Late route" },
+        mentions: ["BF-Engineer"],
+        context: { botId: "bot-builder", wakeReason: "mention", senderKind: "owner" },
+      },
+      { targetBotId: "bot-plumber", hint: "the plumber takes the late route" },
+    );
+    await waitFor(() => turns.length === 1, "a late-routed turn");
+    expect(turns[0]!.botId).toBe("bot-plumber");
+    expect(turns[0]!.text).toContain("the plumber takes the late route");
+    expect(turns[0]!.text).toContain("from BF-Engineer");
   });
 });
 

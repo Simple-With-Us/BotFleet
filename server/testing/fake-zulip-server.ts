@@ -440,7 +440,9 @@ export class FakeZulip {
             return true;
           }),
         )
-        .slice(0, after)
+        // Like Zulip, the anchor itself is the first row when included, so a
+        // fetch of exactly one message asks num_after 0 with include_anchor.
+        .slice(0, after + (include ? 1 : 0))
         .map((message) => this.wireFor(message, user.user_id));
       return send(200, { result: "success", messages: found });
     }
