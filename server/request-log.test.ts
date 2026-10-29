@@ -92,6 +92,20 @@ describe("extractRequestMetadata", () => {
 });
 
 describe("metadata field validation", () => {
+  it("drops fractional release/check-run numbers before formatting", () => {
+    for (const key of ["release", "check_run"] as const) {
+      const meta = extractRequestMetadata({ eventName: key, payload: { [key]: { number: 7.5 } } });
+      expect(meta.number).toBeUndefined();
+      expect(formatRequestLogLine({ ...entry, eventName: key }, meta, "hooks")).not.toContain("#7.5");
+    }
+  });
+
+  it("skips invalid earlier numbers and preserves the next safe integer", () => {
+    expect(extractRequestMetadata({ eventName: "release", payload: {
+      pull_request: { number: 7.5 }, issue: { number: Number.MAX_SAFE_INTEGER + 1 }, release: { number: 8 },
+    } }).number).toBe(8);
+  });
+
   it("drops malformed fields while preserving independently valid metadata", () => {
     expect(extractRequestMetadata({ eventName: "pull_request", payload: {
       action: ["opened"], repository: { full_name: 3 }, sender: { login: "safe-bot" },

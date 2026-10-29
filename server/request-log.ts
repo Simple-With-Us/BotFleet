@@ -73,7 +73,7 @@ export function extractRequestMetadata(event: { eventName?: string; payload?: un
   if (payload.sender?.login) meta.actor = logAtom(payload.sender.login, 100);
   for (const key of ["pull_request", "issue", "discussion", "release", "check_run"] as const) {
     const number = payload[key]?.number;
-    if (number !== undefined) { meta.number = number; break; }
+    if (number !== undefined && Number.isSafeInteger(number)) { meta.number = number; break; }
   }
   const sourceUrl = requestSourceUrl(payload.comment?.html_url ?? payload.review?.html_url);
   if (sourceUrl) meta.sourceUrl = sourceUrl;
