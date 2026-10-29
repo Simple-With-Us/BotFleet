@@ -325,6 +325,16 @@ export const SECRET_FIELDS: readonly SecretFieldSpec[] = [
     reloadProviders: false,
   },
   {
+    id: "githubRequestLog.webhookSecret",
+    label: "GitHub request-log signing secret",
+    section: "githubRequestLog",
+    path: ["webhookSecret"],
+    env: ["GITHUB_REQUEST_LOG_WEBHOOK_SECRET"],
+    infisicalName: "GITHUB_REQUEST_LOG_WEBHOOK_SECRET",
+    secret: true,
+    reloadProviders: false,
+  },
+  {
     id: "imessageLinq.webhookSecret",
     label: "Linq webhook signing secret",
     section: "imessageLinq",

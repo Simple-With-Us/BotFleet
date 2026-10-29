@@ -50,12 +50,13 @@ Seven issues must be Done, four evidence items asserted, and the Mac-local harne
 
 Anything that is not a completed state counts as unmet, including `In Review`.  The gate exists to stop nearly-done from reading as done.  A cancelled or duplicate issue is not a completed state either: the replacement never landed, so deleting the code it was to replace stops the bots instead of cleaning up after a finished job.
 
-Refresh the state file from Linear at run time rather than editing it by hand.  A stale all-Done file is the one input that defeats the guard, so the CLI prints the age of the file it read:
+Refresh the state file from Linear at run time rather than editing it by hand.  A stale all-Done file is the one input that defeats the guard, so the gate prints the age of the file it read.
 
 ```
-board api query --max-chars 64000 \
-  'query { issues(filter: { team: { key: { eq: "BF" } } }, first: 250) { nodes { identifier state { name } } } }' --json
+node scripts/decommission-gate-state.mjs --out /tmp/phase6-state.json
 ```
+
+That reads the seven issue states through the board CLI, derives `inventory-clean` by running the audit against the committed tree, pre-fills the approved `deploy/linux-server/` retention, and leaves the three Mac-only evidence items and `macLocalHarness.present` blocking, because nothing on this host can observe a soak, a replay, a final import or the state of somebody's Mac.  A failed Linear read exits non-zero instead of writing a partial file, so a refresh that did not happen cannot read as one that did.  Somebody on the Mac then flips `macLocalHarness.present` to false after verifying the harness is gone, and asserts the three evidence items, before the deletion step.
 
 `inventory-clean` is checked for you.  `pnpm test:native-release` runs `scripts/decommission-gates.node-test.mjs`, whose last test audits the committed tree against both inventory documents, so inventory drift fails CI on the pull request that caused it rather than surfacing during a rebase months later.
 
@@ -84,7 +85,7 @@ So the sequence runs from the leaves inward: dev-only and already-superseded sur
 ### Step 0 — Prove The Gate
 
 ```
-node scripts/audit-node-decommission.mjs
+node scripts/decommission-gate-state.mjs --out /tmp/phase6-state.json
 node scripts/check-decommission-gates.mjs /tmp/phase6-state.json
 ```
 

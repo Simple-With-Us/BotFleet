@@ -390,6 +390,10 @@ const appConfigSchema = z.object({
   /** Linq transport credentials live in `process.env` — never on disk — so
    *  a stolen config.json does not hand an attacker a phone number.  Only
    *  the workspace phone + per-bot toggle + sender policy live on disk. */
+  githubRequestLog: z.object({
+    /** Dedicated HMAC secret resolved through the canonical secret map. */
+    webhookSecret: optionalText,
+  }).optional(),
   imessageLinq: z.object({
     /** Linq phone number that receives iMessage on this workspace's behalf
      *  — typically the Director bot's number.  Formatted E.164.  Stored
@@ -707,6 +711,7 @@ export interface AppConfig {
    *
    *  Tokens never live here: `LINQ_API_TOKEN` and `LINQ_WEBHOOK_SECRET`
    *  come from `process.env` (the runtime secret layer). */
+  githubRequestLog?: { webhookSecret?: string };
   imessageLinq?: {
     botNumber?: string;
     apiToken?: string;
@@ -1679,6 +1684,8 @@ export function loadConfig(): AppConfig {
   // store holds, the store wins; for every other name the ordering below —
   // env over file here, file over env in the per-call readers — is exactly
   // what it has always been.
+  cfg.githubRequestLog = { ...cfg.githubRequestLog };
+  if (process.env.GITHUB_REQUEST_LOG_WEBHOOK_SECRET !== undefined) cfg.githubRequestLog.webhookSecret = process.env.GITHUB_REQUEST_LOG_WEBHOOK_SECRET;
   cfg.xai = { ...cfg.xai };
   if (process.env.XAI_API_KEY !== undefined) cfg.xai.key = process.env.XAI_API_KEY;
   cfg.openaiCompat = { ...cfg.openaiCompat };
@@ -1868,6 +1875,7 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   // Linq webhook signing secret: the harness holds it to verify inbound
   // webhooks; no spawned engine CLI should inherit it.
   "LINQ_WEBHOOK_SECRET",
+  "GITHUB_REQUEST_LOG_WEBHOOK_SECRET",
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
   "OMB_TTS_KEY",
@@ -2046,7 +2054,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
+  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "githubRequestLog", "zulip", "autoReview", "sts"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
