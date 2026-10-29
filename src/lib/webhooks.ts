@@ -1,5 +1,11 @@
 import type { RoutineRunOn } from "@/lib/routines";
 
+/** Sentry severity levels, ordered from least to most severe. */
+export type SentryLevel = "debug" | "info" | "warning" | "error" | "fatal";
+
+/** PagerDuty incident urgency. */
+export type PagerDutyUrgency = "high" | "low";
+
 export interface WebhookTrigger {
   id: string;
   endpointId: string;
@@ -17,6 +23,21 @@ export interface WebhookTrigger {
   verifiedAt?: number;
   verificationSample?: WebhookVerificationSample;
   eventTypes?: string[];
+  /** Allowlist of the payload's action (GitHub/Sentry `action`, PagerDuty
+   *  `event.event_type`, or a top-level `event`/`type` string). */
+  actions?: string[];
+  /** GitHub only: the pull request or issue must carry one of these labels. */
+  requiredLabels?: string[];
+  /** GitHub only: a completed run must have one of these conclusions. */
+  conclusions?: string[];
+  /** GitHub only: run only for the repository's default branch. */
+  defaultBranchOnly?: boolean;
+  /** Sentry only: ignore issues and events below this level. */
+  minSentryLevel?: SentryLevel;
+  /** Sentry only: ignore every delivery from these projects. */
+  excludeSentryProjects?: string[];
+  /** PagerDuty only: require this incident urgency. */
+  pagerdutyUrgency?: PagerDutyUrgency;
   /** Runs only when a GitHub pull request is merged; every other delivery is
    * filtered before a run exists. */
   mergedPullRequestsOnly?: boolean;
@@ -37,6 +58,13 @@ export interface WebhookTriggerInput {
   enabled?: boolean;
   verificationPending?: boolean;
   eventTypes?: string[];
+  actions?: string[];
+  requiredLabels?: string[];
+  conclusions?: string[];
+  defaultBranchOnly?: boolean;
+  minSentryLevel?: SentryLevel;
+  excludeSentryProjects?: string[];
+  pagerdutyUrgency?: PagerDutyUrgency;
   mergedPullRequestsOnly?: boolean;
   minGapMinutes?: number;
   oneShotWake?: boolean;
