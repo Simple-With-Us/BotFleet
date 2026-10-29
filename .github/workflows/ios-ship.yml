@@ -28,6 +28,13 @@ name: iOS TestFlight ship (GitHub-hosted macOS)
 # /Users/jay/apps/ios-fleet. App key `botfleet`, bundle `app.botfleet.ios`,
 # team `CC8UTF7ATG`. Versioning is 1.0.<commit count>, and CFBundleVersion is
 # that same integer (owner 2026-10-18); UTC timestamps are retired.
+#
+# The build number is planned ONCE per release, by the plan-build job below
+# (owner 2026-10-29): one shared merge-timestamp build, max(S, M + 1), where
+# S is the committer date of HEAD in America/Chicago as YYYYMMDDHHMM and M
+# is the highest build already in App Store Connect. The ship job receives
+# that single value as its --build and never plans its own, so a release
+# cannot upload two different builds.
 
 on:
   push:
@@ -71,8 +78,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  plan-build:
+    name: Plan the shared release build (once)
+    if: github.event.repository.fork == false
+    # No Xcode here: --plan-build-only exits before the toolchain
+    # requirements, so this runs on a plain Ubuntu runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      # Default depth is enough: the plan reads only HEAD (its committer
+      # date is the merge stamp S), never the history behind it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same names the ship job loads: the plan consults App Store Connect,
+      # so it authenticates the same way. Values are masked, never printed.
+      - name: Load Infisical signing secrets
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: >-
+            APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+            IOS_CERT_P12_BASE64 IOS_CERT_PASSWORD SENTRY_DSN SENTRY_AUTH_TOKEN
+          required: >-
+            APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+            IOS_CERT_P12_BASE64 IOS_CERT_PASSWORD
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          token: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
+        env:
+          GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+
+      - name: Plan the shared release build
+        id: plan
+        run: |
+          build="$(bash scripts/ios-ship-testflight.sh --plan-build-only)"
+          if [[ ! "$build" =~ ^[1-9][0-9]{11}$ ]]; then
+            echo "::error::plan-build produced no 12-digit merge-timestamp build"
+            exit 1
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+
   ship:
     name: TestFlight archive + upload
+    needs: plan-build
     if: github.event.repository.fork == false
     # GitHub-hosted `xcode-27` image (actions/runner-images#14404): the iOS 27
     # deployment floor needs the iOS 27 SDK, which macos-latest (Xcode 26.x)
@@ -189,10 +240,11 @@ jobs:
       # execs scripts/ios-fleet/ship-testflight.sh (BotFleet apps.json is
       # app.botfleet.ios, 1.0.N).
       #
-      # No extra flags. Standing gate is DEFAULT_MIN_INTERVAL_SEC=3600
-      # (1 hour) in the fleet script. The 30-minute cron picks up an unbuilt
-      # merge on the next eligible hour; same-HEAD ticks still exit 0
-      # without shipping.
+      # The build comes from the plan-build job: one shared value per
+      # release, passed as --build and never re-planned here. Standing gate
+      # is DEFAULT_MIN_INTERVAL_SEC=3600 (1 hour) in the fleet script. The
+      # 30-minute cron picks up an unbuilt merge on the next eligible hour;
+      # same-HEAD ticks still exit 0 without shipping.
       - name: Ship BotFleet to TestFlight
         id: ship
         if: steps.gate.outputs.should_ship == '1'
@@ -207,7 +259,7 @@ jobs:
           # passed for that one step.  The publisher refuses GITHUB_TOKEN
           # outright, and it never arms auto-merge with one.
           GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: bash scripts/ios-ship-testflight.sh
+        run: bash scripts/ios-ship-testflight.sh --build "${{ needs.plan-build.outputs.build }}"
 
       # Standing TestFlight testers (asc-standing-testers skill): make sure the
       # three standing emails are in BotFleet's external beta group and the new

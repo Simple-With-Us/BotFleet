@@ -111,7 +111,14 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(yml, /--allow-dirty/);
   assert.doesNotMatch(yml, /--allow-unverified-seq/);
   assert.doesNotMatch(yml, /--version /);
-  assert.doesNotMatch(yml, /--build /);
+  // The build is planned ONCE per release (owner 2026-10-29): the
+  // plan-build job computes one shared merge-timestamp build and the ship
+  // job takes it as its --build, never planning its own.
+  assert.match(yml, /needs: plan-build/);
+  assert.match(yml, /--build "\$\{\{ needs\.plan-build\.outputs\.build \}\}"/);
+  assert.match(yml, /--plan-build-only/);
+  assert.match(yml, /build: \$\{\{ steps\.plan\.outputs\.build \}\}/);
+  assert.match(yml, /runs-on: ubuntu-latest/);
 
   // CI invokes the complete package test chain; ci-change-scope checks that
   // workflow contract.  Keep this ship contract included in the same chain.
@@ -121,7 +128,8 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   const project = read("ios/project.yml");
   assert.match(project, /DEVELOPMENT_TEAM:\s*CC8UTF7ATG/);
   assert.match(project, /PRODUCT_BUNDLE_IDENTIFIER:\s*app\.botfleet\.ios/);
-  assert.match(project, /MARKETING_VERSION:\s*"1\.0\.\d+"/);
+  assert.match(project, /MARKETING_VERSION:\s*"0\.1\.0"/);
+  assert.match(project, /CURRENT_PROJECT_VERSION:\s*"202610290000"/);
   assert.match(project, /configs:\s*\n\s*Release:\s*\n\s*CODE_SIGN_STYLE:\s*Manual/);
   assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet iOS App Store \(API\)"/);
   assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet Widgets App Store \(API\)"/);
@@ -198,6 +206,7 @@ test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   assert.equal(botfleet.appleId, 6820175685);
   assert.equal(botfleet.xcodegenDir, "ios");
   assert.match(botfleet.marketingVersionDefault, /^1\.0\.\d+$/);
+  assert.equal(botfleet.fixedMarketingVersion, "0.1.0");
   assert.deepEqual(botfleet.extraBundleIds, ["app.botfleet.ios.widgets"]);
   assert.equal(Object.keys(apps.apps).join(","), "botfleet");
 
