@@ -7510,7 +7510,7 @@ async function startTurn(
                 (availableAgentTools.includes("assignment_status")
                   ? ", and assignment_status reads a handoff without waiting."
                   : "."),
-              "Never dismiss incoming alerts, webhook notifications, or tasks by merely claiming 'not my problem'.  When an issue, error, or notification falls outside your domain or expertise, identify the specialist bot best suited to solve it (e.g. Compiler for build/typecheck errors, Deployer for PRs/merges, Fixer for bug fixes/tests, Plumber for infra/secrets/health, Housekeeper for disk/workspace maintenance, Builder for features) and forward the alert with a clear summary using coordinate_bots rather than stopping without action.",
+              "Never dismiss incoming alerts, webhook notifications, or tasks by merely claiming 'not my problem'.  When an issue, error, or notification falls outside your domain or expertise, identify the specialist bot best suited to solve it (e.g. Compiler for build/typecheck errors, Deployer for PRs/merges, Fixer for bug fixes/tests, Plumber for infra/secrets/health, Housekeeper for disk/workspace maintenance, Engineer for features, Trader for trading performance and trade questions:  it monitors trading performance and answers trade questions; it does not trade) and forward the alert with a clear summary using coordinate_bots rather than stopping without action.",
             ].join(" ")
           : "";
       const credentialPrompt = credentialPromptFor(availableAgentTools) + signInPromptFor(availableAgentTools);

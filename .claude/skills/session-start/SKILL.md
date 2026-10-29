@@ -20,7 +20,7 @@ This shared pack is for sessions that load `~/.claude/skills` or this repo's `.c
 Your fleet seat is the first of these that applies:
 
 1. A seat the owner names to you in this conversation.
-2. A seat your launcher assigned:  `AGENT_LAUNCH_SEAT` in your environment, with `AGENT_LAUNCHER` set.  A bot BotFleet started is one of these, and its seat is one of `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-ENGINEER`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER`, `BF-PUBLISHER`, or `BF-TRADER`.  It beats this file, whatever model or engine you run on.
+2. A seat your launcher assigned:  `AGENT_LAUNCH_SEAT` in your environment, with `AGENT_LAUNCHER` set.  A bot BotFleet started is one of these, and its seat is one of `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-DIRECTOR`, `BF-ENGINEER`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER`, `BF-PUBLISHER`, or `BF-TRADER`.  It beats this file, whatever model or engine you run on.
 3. Otherwise this is an ordinary Claude Code session, and your seat is **CLAUDE**.
 
 If `AGENT_LAUNCHER` is set with no `AGENT_LAUNCH_SEAT`, you have no seat:  do no fleet action, and say so.  Never write `AGENT_LAUNCH_SEAT` or `AGENT_LAUNCHER`, and never overwrite an `AGENT_SEAT` you found already set.
