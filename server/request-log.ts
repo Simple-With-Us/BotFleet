@@ -16,7 +16,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmdirSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmdirSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
 
@@ -113,19 +113,16 @@ export function formatRequestLogLine(
   return `- ${ts} ${action}${target ? ` ${target}` : ""}${actor} [${logAtom(entry.outcome, 64)}] via ${logAtom(webhookName)}${reason}${source} (delivery ${logAtom(entry.deliveryId, 100)})`;
 }
 
-/** Read a byte range from the real Markdown ledger. */
-export function readRequestLogRange(path: string, offset: number, length: number): Buffer {
-  const fd = openSync(path, "r");
-  try {
-    const bytes = Buffer.alloc(length);
-    let count = 0;
-    while (count < length) {
-      const n = readSync(fd, bytes, count, length - count, offset + count);
-      if (!n) break;
-      count += n;
-    }
-    return bytes.subarray(0, count);
-  } finally { closeSync(fd); }
+/** Read a byte range from the already-open ledger snapshot. Caller owns fd. */
+export function readRequestLogRange(fd: number, offset: number, length: number): Buffer {
+  const bytes = Buffer.alloc(length);
+  let count = 0;
+  while (count < length) {
+    const n = readSync(fd, bytes, count, length - count, offset + count);
+    if (!n) break;
+    count += n;
+  }
+  return bytes.subarray(0, count);
 }
 
 export interface RequestLogOptions {
@@ -193,20 +190,29 @@ export function createRequestLog(options: RequestLogOptions): RequestLog {
   let cachedIds = new Set<string>();
   let cachedOffset = 0;
   let cachedFile = "";
-  const deliveryIds = (): Set<string> => {
+  const deliveryIds = (attempt = 0): Set<string> => {
     try {
-      const stat = statSync(options.filePath);
+      const fd = openSync(options.filePath, "r");
+      try {
+      const stat = fstatSync(fd);
       const identity = `${stat.dev}:${stat.ino}`;
       if (identity !== cachedFile || stat.size < cachedOffset) {
         cachedIds = new Set(); cachedOffset = 0; cachedFile = identity;
       }
       if (stat.size > cachedOffset) {
-        const bytes = (options.readLogRange ?? readRequestLogRange)(options.filePath, cachedOffset, stat.size - cachedOffset);
+        const bytes = (options.readLogRange ?? readRequestLogRange)(fd, cachedOffset, stat.size - cachedOffset);
         const end = bytes.lastIndexOf(10) + 1;
         for (const match of bytes.subarray(0, end).toString("utf8").matchAll(/\(delivery ([^)]+)\)/g)) cachedIds.add(match[1]!);
         cachedOffset += end;
       }
+      const current = statSync(options.filePath);
+      if (`${current.dev}:${current.ino}` !== identity || current.size < cachedOffset) {
+        cachedIds = new Set(); cachedOffset = 0; cachedFile = "";
+        if (attempt >= 2) throw new Error("request-log changed repeatedly during dedupe");
+        return deliveryIds(attempt + 1);
+      }
       return cachedIds;
+      } finally { closeSync(fd); }
     } catch (error) {
       if (z.object({ code: z.literal("ENOENT") }).safeParse(error).success) {
         cachedIds = new Set(); cachedOffset = 0; cachedFile = ""; return new Set();

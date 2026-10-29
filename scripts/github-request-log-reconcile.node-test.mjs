@@ -63,3 +63,17 @@ test('malformed metadata is dropped and Unicode separators cannot split a recove
  const data={request:{payload:{action:'a\u0085b',repository:{full_name:'o\u2028r'},sender:{login:'u\u2029v'}}}};
  reconcile({...p,get:path=>({data:path.includes('?')?[d(1)]:data}),now:stamp});assert.doesNotMatch(readFileSync(p.log,'utf8'),/[\u0085\u2028\u2029]/u);
 }));
+
+test('recovery retains release/check_run number and push ref metadata without prose',()=>fixture(p=>{
+ const samples=[
+  {event:'release',payload:{release:{number:7,body:'private'}},target:'#7'},
+  {event:'check_run',payload:{check_run:{number:8,output:'private'}},target:'#8'},
+  {event:'push',payload:{ref:'refs/heads/topic',commits:[{message:'private'}]},target:'topic'},
+ ];
+ for(const [i,sample] of samples.entries()){
+  const id=20+i;reconcile({...p,get:path=>({data:path.includes('?')?[{...d(id),event:sample.event}]:{event:sample.event,request:{payload:{repository:{full_name:'o/r'},...sample.payload}}}}),now:stamp});
+ }
+ const text=readFileSync(p.log,'utf8');assert.match(text,/release o\/r#7/);assert.match(text,/check_run o\/r#8/);assert.match(text,/push o\/r topic/);assert.ok(!text.includes('private'));
+ assert.equal(extractMetadata({ref:12},'push').ref,undefined);assert.equal(extractMetadata({ref:'refs/heads/topic'},'issue_comment').ref,undefined);
+ assert.equal(extractMetadata({release:{number:7.5}},'release').number,undefined);
+}));

@@ -45,19 +45,20 @@ function sourceUrl(value) {
     return url.href;
   }catch{return undefined;}
 }
-export function extractMetadata(p) {
+export function extractMetadata(p,eventName) {
   // External JSON boundary: reject primitive payloads before metadata field reads.
   // oxlint-disable-next-line anti-slop/no-runtime-typeof -- JSON payloads are untyped in this dependency-free CLI.
   const x=p&&typeof p==='object'?p:{};const m={};
   if(text(x.action)) m.action=clean(x.action,64);
   if(text(x.repository?.full_name)) m.repository=clean(x.repository.full_name);
   if(text(x.sender?.login)) m.actor=clean(x.sender.login,100);
-  for(const k of ['pull_request','issue','discussion']) if(Number.isSafeInteger(x[k]?.number)) { m.number=x[k].number;break; }
+  for(const k of ['pull_request','issue','discussion','release','check_run']) if(Number.isSafeInteger(x[k]?.number)) { m.number=x[k].number;break; }
   const link=sourceUrl(x.comment?.html_url??x.review?.html_url);if(link)m.sourceUrl=link;
+  if(eventName==='push'&&text(x.ref))m.ref=clean(x.ref).replace(/^refs\/heads\//,'').slice(0,100);
   return m;
 }
 export function formatRecoveredLine({ts,eventName,meta,deliveryId}) {
-  const target=(meta.repository??'')+(meta.number!==undefined?'#'+meta.number:'');
+  const target=(meta.repository??'')+(Number.isSafeInteger(meta.number)?'#'+meta.number:'')+(meta.ref?' '+clean(meta.ref):'');
   return `- ${ts.toISOString()} ${clean(eventName,64)}${meta.action?'.'+meta.action:''}${target?' '+target:''}${meta.actor?' by '+meta.actor:''} [recovered] via github-request-log-reconcile${sourceUrl(meta.sourceUrl)?' source '+sourceUrl(meta.sourceUrl):''} (delivery ${clean(deliveryId,100)})`;
 }
 function ghGet(path) {
@@ -104,7 +105,7 @@ function reconcileLocked({org,repo,hook,log,cursor,get=ghGet,now=()=>new Date(),
       const detail=get(prefix+'/'+encodeURIComponent(id)).data;
       // oxlint-disable-next-line anti-slop/no-runtime-typeof -- provider detail must have an object payload before recovery can be claimed.
       if(!detail.request?.payload||(typeof detail.request.payload!=='object'||Array.isArray(detail.request.payload))) throw Error('payload unavailable');
-      const line=formatRecoveredLine({ts:new Date(d.delivered_at),eventName:detail.event??d.event,meta:extractMetadata(detail.request.payload),deliveryId:d.guid});
+      const line=formatRecoveredLine({ts:new Date(d.delivered_at),eventName:detail.event??d.event,meta:extractMetadata(detail.request.payload,detail.event??d.event),deliveryId:d.guid});
       details.set(id,line);
     } catch { errors.push(id); }
   }

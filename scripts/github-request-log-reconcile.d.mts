@@ -24,14 +24,18 @@ export interface GitHubRecoveryFields {
   pull_request?: { number?: unknown } | null;
   issue?: { number?: unknown } | null;
   discussion?: { number?: unknown } | null;
+  release?: { number?: unknown } | null;
+  check_run?: { number?: unknown } | null;
+  ref?: unknown;
   comment?: { html_url?: unknown } | null;
   review?: { html_url?: unknown } | null;
 }
 export type GitHubRecoveryPayload = GitHubRecoveryFields | string | number | boolean | null;
-export function extractMetadata(payload: GitHubRecoveryPayload): {
+export function extractMetadata(payload: GitHubRecoveryPayload, eventName?: string): {
   action?: string;
   repository?: string;
   actor?: string;
   number?: number;
   sourceUrl?: string;
+  ref?: string;
 };

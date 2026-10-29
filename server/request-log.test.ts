@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -296,12 +296,47 @@ it("neutralizes all Unicode line terminators in dispatch metadata", () => {
 it("reads historical Markdown only once, then only newly appended bytes", () => {
   const p = paths(tmp()); writeFileSync(p.filePath, "x".repeat(200000) + "\n");
   const lengths: number[] = [];
-  const log = createRequestLog({ ...p, readLogRange: (path, offset, length) => {
-    lengths.push(length); return readRequestLogRange(path, offset, length);
+  const log = createRequestLog({ ...p, readLogRange: (fd, offset, length) => {
+    lengths.push(length); return readRequestLogRange(fd, offset, length);
   } });
   log.record(entry, {});
   expect(lengths.some((length) => length >= 200000)).toBe(true);
   lengths.length = 0; log.record({ ...entry, deliveryId: "second" }, {});
   expect(lengths.length).toBeGreaterThan(0);
   expect(lengths.every((length) => length < 1000)).toBe(true);
+});
+
+it("keeps inode, size and range reads on one fd when the ledger path rotates mid-read", () => {
+  const p = paths(tmp());
+  const rotated = p.filePath + ".old";
+  writeFileSync(p.filePath, "- old (delivery old)\n");
+  let rotate = true;
+  const log = createRequestLog({ ...p, readLogRange: (fd, offset, length) => {
+    if (rotate) {
+      rotate = false;
+      renameSync(p.filePath, rotated);
+      writeFileSync(p.filePath, "- replacement (delivery already-new)\n");
+    }
+    return readRequestLogRange(fd, offset, length);
+  } });
+  log.record({ ...entry, deliveryId: "already-new" }, {});
+  log.record(entry, {});
+  expect(readFileSync(p.filePath, "utf8").match(/delivery already-new/g)).toHaveLength(1);
+  expect(readFileSync(rotated, "utf8")).toBe("- old (delivery old)\n");
+  expect(readFileSync(p.filePath, "utf8")).toContain("delivery deliv-1");
+});
+it("preserves the durable inbox instead of appending during repeated path rotation", () => {
+  const p = paths(tmp()); writeFileSync(p.filePath, "- start (delivery old)\n");
+  let serial = 0; const errors: string[] = [];
+  const log = createRequestLog({ ...p, onError: (message) => errors.push(message), readLogRange: (fd, offset, length) => {
+    renameSync(p.filePath, p.filePath + "." + serial++);
+    writeFileSync(p.filePath, "- current (delivery current)\n");
+    return readRequestLogRange(fd, offset, length);
+  } });
+  expect(log.record(entry, {})).toBe(true);
+  expect(errors).toContain("request-log changed repeatedly during dedupe");
+  expect(readFileSync(p.filePath, "utf8")).not.toContain("delivery deliv-1");
+  expect(readdirSync(p.spoolPath + ".pending")).toHaveLength(1);
+  createRequestLog(p).replay(); createRequestLog(p).replay();
+  expect(readFileSync(p.filePath, "utf8").match(/delivery deliv-1/g)).toHaveLength(1);
 });
