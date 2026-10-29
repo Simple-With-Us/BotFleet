@@ -61,6 +61,21 @@ import type { ZulipIdentity, ZulipInboundItem, ZulipMessage, ZulipOrigin, ZulipS
  *  owner (100) or admin (200) key is refused outright: a bot that can change
  *  the realm is not one the harness will drive. */
 const ALLOWED_ROLES = new Set([300, 400]);
+/** Legacy outgoing-webhook role URLs, kept live until every bot has been
+ *  re-pointed at its current role.  2026-10-28 (owner): the role BF-Builder
+ *  was renamed BF-Engineer, and anything still posting to
+ *  /zulip/outgoing/BF-BUILDER keeps reaching that bot.  The alias only chooses which
+ *  session answers the URL: the alias path still demands that session's own
+ *  outgoing token and its bot email, so it grants nothing the renamed bot's
+ *  own URL does not. */
+// The lookup key is a general `string` (a role read out of a webhook URL), so
+// this table genuinely needs an index signature rather than the narrow
+// literal-keyed type `satisfies` would infer.  An unmapped role reads back
+// `undefined`, which is exactly the "unknown" the caller answers.
+// oxlint-disable-next-line anti-slop/no-known-value-widening
+const LEGACY_OUTGOING_ROLE_ALIASES: Record<string, string> = {
+  "BF-BUILDER": "BF-ENGINEER",
+};
 const BACKOFF_MS = [5_000, 30_000, 60_000, 120_000];
 const PAGE = 100;
 const MAX_PAGES = 20;
@@ -967,18 +982,31 @@ export class ZulipHub {
     return out;
   }
 
+  /** The session a `/zulip/outgoing/<ROLE>` URL belongs to: an exact role
+   *  match first (the role as the settings write it, compared
+   *  case-insensitively), and only when there is none, the legacy alias for
+   *  that role.  An exact match always wins, so a bot that really is bound
+   *  to the legacy name keeps its own URL. */
+  private outgoingSessionFor(role: string): ZulipSession | undefined {
+    const normalized = role.trim().toUpperCase();
+    const sessions = [...this.sessions.values()];
+    const exact = sessions.find((candidate) => candidate.role.toUpperCase() === normalized);
+    if (exact) return exact;
+    const alias = LEGACY_OUTGOING_ROLE_ALIASES[normalized];
+    if (!alias) return undefined;
+    return sessions.find((candidate) => candidate.role.toUpperCase() === alias);
+  }
+
   /** Authenticate a native outgoing webhook against the configured role's
    *  cached credentials.  The POST body is never trusted as message content. */
   outgoingWebhookAvailability(role: string): "unknown" | "unavailable" | "ready" {
-    const normalized = role.trim().toUpperCase();
-    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    const session = this.outgoingSessionFor(role);
     if (!session) return "unknown";
     return session.creds?.outgoingWebhookToken ? "ready" : "unavailable";
   }
 
   authorizeOutgoingWebhook(role: string, botEmail: string, token: string): "ok" | "unknown" | "unavailable" | "unauthorized" {
-    const normalized = role.trim().toUpperCase();
-    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    const session = this.outgoingSessionFor(role);
     if (!session) return "unknown";
     const expected = session.creds?.outgoingWebhookToken;
     if (!session.creds || !expected) return "unavailable";
@@ -991,8 +1019,7 @@ export class ZulipHub {
 
   /** Add the authenticated bot/message pair to the durable inbound queue. */
   enqueueOutgoingWebhook(role: string, messageId: number): "accepted" | "duplicate" | "unknown" | "unavailable" {
-    const normalized = role.trim().toUpperCase();
-    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    const session = this.outgoingSessionFor(role);
     if (!session) return "unknown";
     if (!session.creds?.outgoingWebhookToken) return "unavailable";
     return this.outgoingSpool.add(session.botId, messageId) ? "accepted" : "duplicate";

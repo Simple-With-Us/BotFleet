@@ -19,6 +19,9 @@ const PEER = 50;
 const PLUMBER = 101;
 const FIXER = 102;
 const ADMIN = 103;
+const ENGINEER = 104;
+const TRADER = 105;
+const BUILDER = 106;
 const PLUMBER_THREAD = "thread-bot-plumber";
 // Shaped like a Zulip API key (32 mixed-case letters and digits) so the
 // outbound scan fires; built at runtime so no token-shaped literal is in the source.
@@ -296,6 +299,75 @@ describe("outgoing webhook convergence", () => {
     expect(hub.sessionFor("bot-plumber")).toBeUndefined();
     await hub.drain();
     expect(existsSync(rowFile)).toBe(false);
+  });
+});
+
+describe("outgoing webhook role aliases", () => {
+  it("serves a renamed role at its own URL and at the legacy URL, with the target bot's own token", async () => {
+    fake.addUser({ user_id: ENGINEER, full_name: "BF-Engineer", email: "bf-engineer-bot@zulip.test", key: "engineer-test-key" });
+    fake.addUser({ user_id: TRADER, full_name: "BF-Trader", email: "bf-trader-bot@zulip.test", key: "trader-test-key" });
+    writeRc("BF-Engineer", "bf-engineer-bot@zulip.test", "engineer-test-key");
+    writeRc("BF-Trader", "bf-trader-bot@zulip.test", "trader-test-key");
+    settings.bots = {
+      "bot-engineer": { role: "BF-Engineer" },
+      "bot-trader": { role: "BF-Trader" },
+    };
+    const hub = makeHub();
+    await connected(hub, "bot-engineer");
+    await connected(hub, "bot-trader");
+    const engineer = hub.sessionFor("bot-engineer")!;
+    const trader = hub.sessionFor("bot-trader")!;
+    engineer.creds!.outgoingWebhookToken = "engineer-outgoing-token";
+    trader.creds!.outgoingWebhookToken = "trader-outgoing-token";
+
+    // The renamed bot answers at its own URL.
+    expect(hub.outgoingWebhookAvailability("BF-ENGINEER")).toBe("ready");
+    expect(hub.authorizeOutgoingWebhook("BF-ENGINEER", "bf-engineer-bot@zulip.test", "engineer-outgoing-token")).toBe("ok");
+    expect(hub.authorizeOutgoingWebhook("BF-ENGINEER", "bf-engineer-bot@zulip.test", "wrong-token")).toBe("unauthorized");
+    // ...and at the legacy URL Zulip still calls.
+    expect(hub.outgoingWebhookAvailability("BF-BUILDER")).toBe("ready");
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-engineer-bot@zulip.test", "engineer-outgoing-token")).toBe("ok");
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-engineer-bot@zulip.test", "wrong-token")).toBe("unauthorized");
+    // The alias is not a second identity: another bot's token does not pass.
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-trader-bot@zulip.test", "trader-outgoing-token")).toBe("unauthorized");
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-trader-bot@zulip.test", "engineer-outgoing-token")).toBe("unauthorized");
+    const engineerMessage = fake.postStream(JAY, "builds", "Outgoing webhook", "engineer wake", "website");
+    expect(hub.enqueueOutgoingWebhook("BF-BUILDER", engineerMessage)).toBe("accepted");
+    expect(hub.enqueueOutgoingWebhook("BF-ENGINEER", engineerMessage)).toBe("duplicate");
+
+    // A role the alias does not name is untouched.
+    expect(hub.outgoingWebhookAvailability("BF-TRADER")).toBe("ready");
+    expect(hub.authorizeOutgoingWebhook("BF-TRADER", "bf-trader-bot@zulip.test", "trader-outgoing-token")).toBe("ok");
+    expect(hub.authorizeOutgoingWebhook("BF-TRADER", "bf-engineer-bot@zulip.test", "engineer-outgoing-token")).toBe("unauthorized");
+    const traderMessage = fake.postStream(JAY, "builds", "Outgoing webhook", "trader wake", "website");
+    expect(hub.enqueueOutgoingWebhook("BF-TRADER", traderMessage)).toBe("accepted");
+    expect(hub.outgoingWebhookAvailability("BF-PLUMBER")).toBe("unknown");
+  });
+
+  it("prefers an exact role match over the legacy alias", async () => {
+    fake.addUser({ user_id: ENGINEER, full_name: "BF-Engineer", email: "bf-engineer-bot@zulip.test", key: "engineer-test-key" });
+    fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
+    writeRc("BF-Engineer", "bf-engineer-bot@zulip.test", "engineer-test-key");
+    writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
+    settings.bots = {
+      "bot-engineer": { role: "BF-Engineer" },
+      "bot-builder": { role: "BF-Builder" },
+    };
+    const hub = makeHub();
+    await connected(hub, "bot-engineer");
+    await connected(hub, "bot-builder");
+    const engineer = hub.sessionFor("bot-engineer")!;
+    const builder = hub.sessionFor("bot-builder")!;
+    engineer.creds!.outgoingWebhookToken = "engineer-outgoing-token";
+    builder.creds!.outgoingWebhookToken = "builder-outgoing-token";
+
+    // BF-BUILDER names a real session, so the alias never applies to it.
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-builder-bot@zulip.test", "builder-outgoing-token")).toBe("ok");
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-engineer-bot@zulip.test", "engineer-outgoing-token")).toBe("unauthorized");
+    const message = fake.postStream(JAY, "builds", "Outgoing webhook", "builder wake", "website");
+    expect(hub.enqueueOutgoingWebhook("BF-BUILDER", message)).toBe("accepted");
+    // The row belongs to the exact-match session, not to the alias target.
+    expect(existsSync(join(dataDir, "zulip", "outgoing", `bot-builder-${message}.json`))).toBe(true);
   });
 });
 
