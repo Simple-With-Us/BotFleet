@@ -35,5 +35,7 @@
 	<string>BotFleet converts your speech into text for messaging bots.</string>
 	<key>SENTRY_DSN</key>
 	<string>$(SENTRY_DSN)</string>
+	<key>SOURCE_COMMIT</key>
+	<string>$(SOURCE_COMMIT)</string>
 </dict>
 </plist>
