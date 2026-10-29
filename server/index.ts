@@ -379,6 +379,7 @@ import {
   type TurnComputerInputs,
 } from "./turn-safety.ts";
 import { TurnStatsTracker } from "./turn-stats.ts";
+import { ChildSessionIds } from "./child-session-ids.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 // Read-only probe for the Secrets card: whether ~/.mmx/config.json holds a
@@ -4182,6 +4183,11 @@ const turnUsage = new Map<string, { input: number; output?: number; cachedInput?
 // turn.completed; dropped on every path that ends a turn without one.
 const turnStats = new TurnStatsTracker();
 
+// The native session id each engine child last reported, per thread and
+// instance, so a turn's Usage Monitor event can name it (childSessionId) and
+// be paired with the child harness's own telemetry.
+const childSessionIds = new ChildSessionIds();
+
 // UTF-8 bytes of the system prompt each in-flight turn was handed, split at
 // the volatile boundary (server/system-prompt.ts).  Booked at dispatch and
 // forwarded to Usage Monitor beside the turn's token figures at
@@ -5216,11 +5222,18 @@ bus.subscribe((event: RuntimeEvent) => {
 
   switch (event.type) {
     case "session.started":
+      // Room threads too: a room turn's event names its child session as well.
+      if (event.providerInstanceId) {
+        childSessionIds.note(event.threadId, event.providerInstanceId, event.sessionId, event.turnId);
+      }
       if (bot && event.sessionId && event.providerInstanceId) {
         store.setResumeCursor(bot.id, event.providerInstanceId, event.sessionId, event.threadId);
       }
       break;
     case "session.invalidated":
+      if (event.providerInstanceId) {
+        childSessionIds.forget(event.threadId, event.providerInstanceId, event.sessionId);
+      }
       if (bot && event.providerInstanceId) {
         store.clearResumeCursor(bot.id, event.providerInstanceId, event.sessionId, event.threadId);
       }
@@ -5818,6 +5831,21 @@ bus.subscribe((event: RuntimeEvent) => {
       const tokens = event.usage ?? lastReported;
       // Closes the turn's clock now, before any await below stretches it.
       const turnTiming = bot ? turnStats.settle(event.threadId, tokens?.output) : undefined;
+      // The child's own session id for the turn, read before any await (a
+      // later turn on the thread could report a new one meanwhile).
+      const turnChildSessionId = event.providerInstanceId
+        ? childSessionIds.forTurn(
+            event.threadId,
+            event.providerInstanceId,
+            event.turnId,
+            (tokens?.input ?? 0) > 0 || (tokens?.output ?? 0) > 0,
+          )
+        : undefined;
+      // When the turn began, on the wall clock.  `startedAtMs` is monotonic
+      // (performance.now), so it is not a date; the settled latency is the
+      // same interval on the same clock, counted back from now.
+      const turnStartedAtMs =
+        settledOwner?.latencyMs !== undefined ? Date.now() - settledOwner.latencyMs : undefined;
       // The turn that ended owns its failover: resolve the member from the
       // settled owner (this thread, this provider instance) before the
       // thread's speaker entry, which a crossed room can leave naming the
@@ -6118,6 +6146,8 @@ bus.subscribe((event: RuntimeEvent) => {
           latencyMs: settledOwner?.latencyMs,
           success: event.ok !== false,
           promptBytes,
+          childSessionId: turnChildSessionId,
+          turnStartedAtMs,
         });
         // settled → idle; a setup failure already marked it dead, keep that
         if (store.bot(bot.id)?.activity !== "dead") store.setActivity(bot.id, "idle");
@@ -6182,6 +6212,8 @@ bus.subscribe((event: RuntimeEvent) => {
             promptBytes,
             roomId: group.id,
             roomName: group.name,
+            childSessionId: turnChildSessionId,
+            turnStartedAtMs,
           });
           store.addRoomUsage(roomBot.id, actualSelection.instanceId, {
             input: tokens?.input,

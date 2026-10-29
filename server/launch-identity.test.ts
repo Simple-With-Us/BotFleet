@@ -7,6 +7,7 @@ import {
   codexShellPolicyArgs,
   fleetSeatPromptsEnabled,
   isLaunchIdentityName,
+  launcherResourceAttributes,
   launchEnvironment,
   launchIdentityFor,
   resolveBotfleetRole,
@@ -156,7 +157,40 @@ describe("applyLaunchIdentity", () => {
       AGENT_LAUNCH_SEAT: "BF-ORACLE",
       AGENT_SEAT: "BF-ORACLE",
       AGENT_SESSION: "thread-9",
+      OTEL_RESOURCE_ATTRIBUTES: "agent.launcher=botfleet,agent.launcher.session=thread-9",
     });
+  });
+
+  it("marks the child's own OpenTelemetry as BotFleet-launched, keeping what it inherited", () => {
+    const out = applyLaunchIdentity(
+      { ...harness, OTEL_RESOURCE_ATTRIBUTES: "service.name=claude-code, team=ops" },
+      { seat: null, session: "thread-9" },
+    );
+    expect(out.OTEL_RESOURCE_ATTRIBUTES).toBe(
+      "service.name=claude-code,team=ops,agent.launcher=botfleet,agent.launcher.session=thread-9",
+    );
+  });
+
+  it("names each launcher key once, replacing an inherited value with this turn's", () => {
+    const out = applyLaunchIdentity(
+      { OTEL_RESOURCE_ATTRIBUTES: "agent.launcher=other,a=1,agent.launcher.session=old-thread,,agent.launcher.sessionx=keep" },
+      { seat: null, session: "thread-2" },
+    );
+    expect(out.OTEL_RESOURCE_ATTRIBUTES).toBe(
+      "a=1,agent.launcher.sessionx=keep,agent.launcher=botfleet,agent.launcher.session=thread-2",
+    );
+    // Applying it again (an environment built once and reused) changes nothing.
+    expect(applyLaunchIdentity(out, { seat: null, session: "thread-2" }).OTEL_RESOURCE_ATTRIBUTES).toBe(
+      out.OTEL_RESOURCE_ATTRIBUTES,
+    );
+  });
+
+  it("percent-encodes a thread id the attribute format could not carry, and omits a missing one", () => {
+    expect(launcherResourceAttributes(undefined, { seat: null, session: "a,b=c d" })).toBe(
+      "agent.launcher=botfleet,agent.launcher.session=a%2Cb%3Dc%20d",
+    );
+    expect(launcherResourceAttributes("", undefined)).toBe("agent.launcher=botfleet");
+    expect(launcherResourceAttributes(undefined, { seat: null, session: "" })).toBe("agent.launcher=botfleet");
   });
 
   it("leaves a bot with no role with no seat, not the harness's", () => {

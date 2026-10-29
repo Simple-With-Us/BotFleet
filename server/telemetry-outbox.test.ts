@@ -499,6 +499,40 @@ describe("UsageTelemetryOutbox", () => {
     await outbox.dispose();
   });
 
+  it("keeps the child harness de-duplication keys in the queued batch, which is what gets sent", async () => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    const outbox = new UsageTelemetryOutbox({ path });
+    outbox.enqueue(destinationHash, {
+      schemaVersion: 2,
+      producerId: "botfleet",
+      producerInstanceId: "test-mac",
+      events: [{
+        eventId: "bf:anthropic:bot-1:1:abcd1234:turn",
+        provider: "anthropic",
+        service: "claude-sonnet-5",
+        quantity: 10,
+        unit: "token",
+        metadata: {
+          botId: "bot-1",
+          childHarness: "claudeAgent",
+          childSessionId: "8c0a8e0e-2a7f-4d1e-9a51-3f0b1c2d3e4f",
+          turnStartedAt: "2026-10-29T15:00:00.000Z",
+          cwd: "/should/strip",
+        },
+      }],
+    });
+
+    const persisted = JSON.parse(readFileSync(path, "utf8")).queue[0].batch.events[0];
+    expect(persisted.metadata).toEqual({
+      botId: "bot-1",
+      childHarness: "claudeAgent",
+      childSessionId: "8c0a8e0e-2a7f-4d1e-9a51-3f0b1c2d3e4f",
+      turnStartedAt: "2026-10-29T15:00:00.000Z",
+    });
+    await outbox.dispose();
+  });
+
   it("writes the retry file atomically and leaves no sibling temp files", async () => {
     const path = fixture();
     const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");

@@ -158,7 +158,40 @@ export function applyLaunchIdentity(
   for (const [name, value] of Object.entries(env)) {
     if (!isLaunchIdentityName(name)) out[name] = value;
   }
-  return Object.assign(out, launchEnvironment(identity));
+  return Object.assign(out, launchEnvironment(identity), {
+    OTEL_RESOURCE_ATTRIBUTES: launcherResourceAttributes(out.OTEL_RESOURCE_ATTRIBUTES, identity),
+  });
+}
+
+/** The OpenTelemetry resource attributes that mark a child as one BotFleet
+ *  launched.  A child that exports its own telemetry (Claude Code, Codex)
+ *  carries them on every span and metric, so Usage Monitor can tell its
+ *  native events are a BotFleet turn's and count the turn once. */
+export const LAUNCHER_RESOURCE_ATTRIBUTE = "agent.launcher";
+export const LAUNCHER_SESSION_RESOURCE_ATTRIBUTE = "agent.launcher.session";
+
+/** `existing` (an inherited `OTEL_RESOURCE_ATTRIBUTES`) with
+ *  `agent.launcher=botfleet` and, when the turn has a thread,
+ *  `agent.launcher.session=<thread id>` appended.  An inherited entry for
+ *  either key is dropped first, like every other inherited identity, so each
+ *  key appears once and names this turn.  The thread id is percent-encoded,
+ *  as the OpenTelemetry environment format requires; every other entry is
+ *  kept as written. */
+export function launcherResourceAttributes(existing: string | undefined, identity?: LaunchIdentity): string {
+  const ours: string[] = [`${LAUNCHER_RESOURCE_ATTRIBUTE}=botfleet`];
+  if (identity?.session) {
+    ours.push(`${LAUNCHER_SESSION_RESOURCE_ATTRIBUTE}=${encodeURIComponent(identity.session)}`);
+  }
+  const kept = (existing ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => {
+      if (!entry) return false;
+      const eq = entry.indexOf("=");
+      const key = (eq < 0 ? entry : entry.slice(0, eq)).trim();
+      return key !== LAUNCHER_RESOURCE_ATTRIBUTE && key !== LAUNCHER_SESSION_RESOURCE_ATTRIBUTE;
+    });
+  return [...kept, ...ours].join(",");
 }
 
 /** Codex runs the model's shell commands under its own
