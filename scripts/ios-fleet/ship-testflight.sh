@@ -929,19 +929,20 @@ PY
       logerr "shared-build: paired build feed ${feed} holds no numeric <sparkle:version>; failing closed"
       return 1
     fi
-    # The feed floor is numeric, at least 1, and at most 18 digits (an
-    # Apple build number is at most 18 characters).  Compared as a string, so
-    # no arithmetic ever sees a huge value.
+    # The feed floor is numeric, at least 1, and at most 12 digits: fixed
+    # mode plans a 12-digit merge-timestamp build, and a floor past that
+    # would plan a build the 12-digit gate rejects.  Compared as a string,
+    # so no arithmetic ever sees a huge value.
     stripped="$max"
     while [[ "$stripped" == 0* && "${#stripped}" -gt 1 ]]; do
       stripped="${stripped#0}"
     done
-    if [[ "${#stripped}" -gt 18 ]]; then
-      logerr "shared-build: paired build feed ${feed} version ${max} is outside 1..999999999999999999; failing closed"
+    if [[ "${#stripped}" -gt 12 ]]; then
+      logerr "shared-build: paired build feed ${feed} version ${max} exceeds 12 digits; failing closed"
       return 1
     fi
     if [[ "$stripped" == "0" ]]; then
-      logerr "shared-build: paired build feed ${feed} version ${max} is outside 1..999999999999999999; failing closed"
+      logerr "shared-build: paired build feed ${feed} version ${max} is outside 1..999999999999; failing closed"
       return 1
     fi
     floor="$max"
@@ -1687,6 +1688,15 @@ sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
       _thismax="$(asc_max_build_this_platform)" || die "cannot verify this platform's highest build; nothing shipped"
       if [[ -n "$_thismax" ]]; then
         digits_gt "$FORCE_BUILD" "$_thismax" || die "requested build is at or below this platform's highest build ${_thismax}; nothing shipped"
+      fi
+      # The value was planned for a commit: it must not predate the merge
+      # stamp of the HEAD being shipped, or it was planned for an older
+      # commit.  The plan and the ship check out the same SHA, so a
+      # correctly planned value always passes.
+      _ship_stamp="$(TZ=America/Chicago git -C "$REPO_ROOT" show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD 2>/dev/null)" || _ship_stamp=""
+      [[ "$_ship_stamp" =~ ^[1-9][0-9]{11}$ ]] || die "cannot read the merge stamp of the commit being shipped; nothing shipped"
+      if digits_gt "$_ship_stamp" "$FORCE_BUILD"; then
+        die "requested build ${FORCE_BUILD} is below the merge stamp ${_ship_stamp} of the commit being shipped (planned for an older commit); nothing shipped"
       fi
     fi
     # An explicit --build is honoured exactly, and it does NOT move the

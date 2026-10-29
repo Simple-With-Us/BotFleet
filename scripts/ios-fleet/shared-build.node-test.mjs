@@ -60,11 +60,21 @@ test('extra floors join the max as digit strings of any length', () => {
   assert.deepEqual(next({...input, extraFloors: ['986']}), {build: STAMP});
   assert.deepEqual(next({...input, extraFloors: ['202610290003']}), {build: '202610290004'});
   assert.deepEqual(next({...input, extraFloors: [986]}), {build: STAMP});
-  // An 18-digit Sparkle floor keeps full precision (a Number would not).
-  assert.deepEqual(
-    next({...input, extraFloors: ['999999999999999999']}),
-    {build: '1000000000000000000'}
-  );
+  // The 202610290003 floor above pins a 12-digit floor travelling exactly
+  // through the BigInt max; anything past 12 digits is covered by the cap
+  // test below.
+});
+
+test('a result past 12 digits fails closed instead of planning an unshippable build', () => {
+  // The ship's 12-digit gate rejects anything else, so the planner throws.
+  assert.throws(() => next({...input, extraFloors: ['999999999999']}), /planned build exceeds 12 digits/);
+  assert.throws(() => next({...input, iosBuilds: ['999999999999']}), /planned build exceeds 12 digits/);
+  assert.throws(() => next({...input, macBuilds: ['999999999999']}), /planned build exceeds 12 digits/);
+  // An 18-digit Sparkle floor (past Number's safe range, so still a string
+  // into the BigInt max) throws rather than emitting a 19-digit build.
+  assert.throws(() => next({...input, extraFloors: ['999999999999999999']}), /planned build exceeds 12 digits/);
+  // Twelve nines exactly still plans: the cap is on the result's digits.
+  assert.deepEqual(next({...input, extraFloors: ['999999999998']}), {build: '999999999999'});
 });
 
 test('dotted builds count by their first numeric component', () => {

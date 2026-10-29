@@ -5,8 +5,9 @@
 // the highest first numeric component among every iOS build, every macOS
 // build (expired included, all version trains, timestamp-style builds
 // included) and every extra floor.  A rebuild of the same commit goes up
-// because S itself is then taken.  There is no floor and no cap; an
-// incomplete or malformed inventory throws instead of guessing.
+// because S itself is then taken.  There is no floor; the result is capped
+// at 12 digits, and an incomplete or malformed inventory throws instead of
+// guessing.
 //
 // No typeof here: x === String(x) is true only for a string primitive and
 // x === Number(x) only for a number primitive (the idiom asc-api.mjs uses at
@@ -42,5 +43,9 @@ export function nextSharedBuild({iosBuilds, macBuilds, extraFloors = [], complet
   }
   const stamp = BigInt(mergeStamp);
   const next = max + 1n > stamp ? max + 1n : stamp;
+  // Fixed mode ships a 12-digit merge-timestamp build, and the ship's gate
+  // rejects anything else; a floor or an existing build past 12 digits
+  // fails closed here instead of planning a build that can never upload.
+  if (String(next).length > 12) throw new Error('planned build exceeds 12 digits');
   return {build: String(next)};
 }

@@ -745,39 +745,10 @@ FAKE_RELEASED="fail"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 check "fixed: an unreadable released App Store version stops the run (fail closed)" \
   "$(contains 'cannot read the released App Store version' && echo 0 || echo 1)"
-FAKE_SHARED="202610290001"; FAKE_RELEASED=""; FAKE_MAXTHIS="202610290000"
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 1.1.9
-check "fixed: a dotted --build is refused (fixed mode needs a 12-digit merge-timestamp build)" \
-  "$(contains 'fixed mode requires a 12-digit merge-timestamp build' && echo 0 || echo 1)"
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 999
-check "fixed: a three-digit --build is refused" \
-  "$(contains 'fixed mode requires a 12-digit merge-timestamp build' && echo 0 || echo 1)"
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 202610290000
-check "fixed: a --build equal to this platform's max is refused" \
-  "$(contains 'at or below this platform'"'"'s highest build 202610290000' && echo 0 || echo 1)"
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 202610270000
-check "fixed: a --build below this platform's max is refused" \
-  "$(contains 'at or below this platform'"'"'s highest build 202610290000' && echo 0 || echo 1)"
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 202610290001
-planned_pair
-check "fixed: a --build above this platform's max is honoured even when it equals the paired platform's build (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
-FAKE_MAXTHIS=""
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 202610290001
-check "fixed: an unreadable this-platform max stops --build (fail closed)" \
-  "$(contains 'cannot verify this platform'"'"'s highest build' && echo 0 || echo 1)"
-FAKE_MAXTHIS="empty"
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 202610290001
-planned_pair
-check "fixed: with no builds on this platform yet any 12-digit --build is honoured (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
-FAKE_MAXTHIS="202610290000"
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --version 1.1.2
-planned_pair
-check "fixed: --version equal to the fixed version stays in fixed mode (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
-# The merge stamp is the committer date of HEAD in Chicago time.  A temp repo
-# with a fixed committer date pins it exactly (Oct 29 2026 is CDT, UTC-5).
+# The --build runs below pin HEAD's committer date: the stamp check compares
+# the value against the merge stamp of the commit being shipped, and the
+# shared $REPO stamps "now", which would make these assertions time-dependent.
+# Oct 29 2026 is CDT (UTC-5), so this pins the stamp to 202610290000.
 STAMPREPO="${WORK}/stamp-repo"
 rm -rf "$STAMPREPO"; mkdir -p "$STAMPREPO"
 git -C "$STAMPREPO" init -q 2>/dev/null || git -C "$STAMPREPO" init >/dev/null
@@ -786,6 +757,48 @@ git -C "$STAMPREPO" config user.name "stamp test"
 echo seed >"${STAMPREPO}/README"
 git -C "$STAMPREPO" add README
 GIT_COMMITTER_DATE="2026-10-29 00:00:00 -0500" git -C "$STAMPREPO" -c commit.gpgsign=false commit -qm seed
+FAKE_SHARED="202610290001"; FAKE_RELEASED=""; FAKE_MAXTHIS="202610290000"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 1.1.9
+check "fixed: a dotted --build is refused (fixed mode needs a 12-digit merge-timestamp build)" \
+  "$(contains 'fixed mode requires a 12-digit merge-timestamp build' && echo 0 || echo 1)"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 999
+check "fixed: a three-digit --build is refused" \
+  "$(contains 'fixed mode requires a 12-digit merge-timestamp build' && echo 0 || echo 1)"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610290000
+check "fixed: a --build equal to this platform's max is refused" \
+  "$(contains 'at or below this platform'"'"'s highest build 202610290000' && echo 0 || echo 1)"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610270000
+check "fixed: a --build below this platform's max is refused" \
+  "$(contains 'at or below this platform'"'"'s highest build 202610290000' && echo 0 || echo 1)"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610290001
+planned_pair
+check "fixed: a --build above this platform's max is honoured even when it equals the paired platform's build (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
+FAKE_MAXTHIS=""
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610290001
+check "fixed: an unreadable this-platform max stops --build (fail closed)" \
+  "$(contains 'cannot verify this platform'"'"'s highest build' && echo 0 || echo 1)"
+FAKE_MAXTHIS="empty"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610290001
+planned_pair
+check "fixed: with no builds on this platform yet any 12-digit --build at or above the stamp is honoured (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
+# A --build below the merge stamp of the HEAD being shipped was planned for
+# an older commit: refused even when this platform's max would allow it.
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610280000
+check "fixed: a --build below the HEAD merge stamp is refused with no builds on this platform" \
+  "$(contains 'below the merge stamp 202610290000' && contains 'planned for an older commit' && echo 0 || echo 1)"
+FAKE_MAXTHIS="202610270000"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610280000
+check "fixed: a --build above this platform's max but below the HEAD merge stamp is refused" \
+  "$(contains 'below the merge stamp 202610290000' && echo 0 || echo 1)"
+FAKE_MAXTHIS="202610290000"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --version 1.1.2
+planned_pair
+check "fixed: --version equal to the fixed version stays in fixed mode (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
+# The planner receives HEAD's committer date as the merge stamp (STAMPREPO
+# above pins it to 202610290000).
 FAKE_ARGV_LOG="${WORK}/stamp-argv.log"; : >"$FAKE_ARGV_LOG"
 FAKE_SHARED="202610290000"
 run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run
@@ -955,22 +968,29 @@ check "feed: floor 9999 plans the stubbed build (got '${PLANNED_BUILD}')" \
   "$([[ "$PLANNED_BUILD" == "202610290005" ]] && echo 0 || echo 1)"
 check "feed: floor 9999 reaches the planner" \
   "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 9999 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
-# An 18-digit Sparkle floor is valid too and travels exactly, digit for digit.
-FAKE_CURL_BODY='<rss><channel><item><sparkle:version>202610290000000001</sparkle:version></item></channel></rss>'
+# A 12-digit Sparkle floor is valid and travels exactly, digit for digit.
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>202610290007</sparkle:version></item></channel></rss>'
 : >"$FAKE_ARGV_LOG"
 run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
-check "feed: an 18-digit floor reaches the planner exactly" \
-  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 202610290000000001 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+check "feed: a 12-digit floor reaches the planner exactly" \
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 202610290007 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+# Past 12 digits the floor fails closed: it would plan a build the 12-digit
+# gate rejects, so the run stops with the feed URL and the value.
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>202610290000000001</sparkle:version></item></channel></rss>'
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "feed: an 18-digit floor fails the run closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "feed: out-of-range 18-digit floor names the URL and the value" \
+  "$(contains "$FEED_URL" && contains '202610290000000001' && contains 'exceeds 12 digits' && echo 0 || echo 1)"
 FAKE_CURL_BODY='<rss><channel><item><sparkle:version>0</sparkle:version></item></channel></rss>'
 run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
 check "feed: floor 0 fails the run closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
 check "feed: out-of-range zero names the URL" \
-  "$(contains "$FEED_URL" && contains 'outside 1..999999999999999999' && echo 0 || echo 1)"
+  "$(contains "$FEED_URL" && contains 'outside 1..999999999999' && echo 0 || echo 1)"
 FAKE_CURL_BODY='<rss><channel><item><sparkle:version>1234567890123456789</sparkle:version></item></channel></rss>'
 run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
 check "feed: a 19-digit floor fails the run closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
-check "feed: out-of-range 19-digit floor names the URL" \
-  "$(contains "$FEED_URL" && contains 'outside 1..999999999999999999' && echo 0 || echo 1)"
+check "feed: out-of-range 19-digit floor names the URL and the value" \
+  "$(contains "$FEED_URL" && contains '1234567890123456789' && contains 'exceeds 12 digits' && echo 0 || echo 1)"
 FAKE_CURL_BODY='<rss><channel><item><sparkle:version>1500</sparkle:version></item><item><sparkle:version>1499</sparkle:version></item></channel></rss>'
 # Paired id and feed floor travel together, in that order.
 set_feed_keys "app.example.mac" "" "$FEED_URL"
