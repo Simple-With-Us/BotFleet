@@ -49,6 +49,49 @@ test('receipt rejects wrong app, forged release, SHA and output injection', () =
   }
 });
 
+// Every app moved to the fixed marketing version 0.1.0 with a 12-digit Central
+// Time merge stamp as the build (owner, Oct 29 2026).  The old /^1\.0\.\d+$/
+// literal rejected 0.1.0, so every BotFleet ship after the switch uploaded and
+// then went red in report-sentry-deployment (runs 40858792579, 40962361179).
+test('receipt accepts the fixed 0.1.0 marketing version with a merge-stamp build', () => {
+  const stamp = { archive:{ bundleId:'app.botfleet.ios', marketingVersion:'0.1.0', buildNumber:'202610291639' },
+    readiness:{...fixture().readiness, version:'202610291639'}, marketingVersion:'0.1.0', buildNumber:'202610291639' };
+  const r = createReceipt({...fixture(), ...stamp});
+  assert.equal(r.release, 'app.botfleet.ios@0.1.0+202610291639');
+  assert.deepEqual(validateReceipt(r), r);
+  assert.doesNotThrow(() => validateReceipt({...r, marketingVersion:'1.1.2', release:'app.botfleet.ios@1.1.2+202610291639'}));
+  for (const marketingVersion of ['0.1','01.1.0','0.1.0.1','v0.1.0','0.1.0\n']) {
+    assert.throws(() => validateReceipt({...r, marketingVersion, release:`app.botfleet.ios@${marketingVersion}+202610291639`}), /marketingVersion/);
+  }
+});
+
+test('a receipt failure names the fields that disagreed', () => {
+  const f = fixture(); f.archive.buildNumber = '2127'; f.readiness.version = '2125'; f.expectedCommit = 'b'.repeat(40);
+  assert.throws(() => createReceipt(f), (error) =>
+    /archive CFBundleVersion "2127" != build number "2126"/.test(error.message) &&
+    /App Store Connect build "2125" != build number "2126"/.test(error.message) &&
+    /source commit \(HEAD\) "a{40}" != archived commit "b{40}"/.test(error.message) &&
+    !/CFBundleShortVersionString/.test(error.message));
+  assert.throws(() => createReceipt({...fixture(), readiness:{...fixture().readiness, ok:false, internalBuildState:'PROCESSING'}}),
+    /readiness file: ok is false, expected true; internalBuildState "PROCESSING"/);
+  assert.throws(() => validateReceipt({...receipt(), ascBuildId:'x\n::error::forged'}), (error) =>
+    error.message.includes('ascBuildId "x\\n::error::forged"') && !error.message.includes('\n'));
+});
+
+test('the receipt CLI prints why it failed instead of a bare error', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sentry-receipt-cli-'));
+  try {
+    const out = join(dir, 'out'); writeFileSync(out, '');
+    const script = fileURLToPath(new URL('./sentry-testflight-receipt.mjs', import.meta.url));
+    const result = spawnSync(process.execPath, [script], { encoding:'utf8', env:{ PATH:process.env.PATH,
+      SENTRY_ARCHIVE_PATH:join(dir,'missing.xcarchive'), SENTRY_READY_FILE:join(dir,'missing.json'), SENTRY_REPO_ROOT:dir,
+      SENTRY_ARCHIVE_COMMIT:sha, SENTRY_BUNDLE_ID:'app.botfleet.ios', SENTRY_MARKETING_VERSION:'0.1.0', SENTRY_BUILD_NUMBER:'202610291639', GITHUB_OUTPUT:out } });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /::error::Could not verify TestFlight release receipt;.*Reason: Could not read ApplicationProperties:CFBundleIdentifier/);
+    assert.equal(readFileSync(out, 'utf8'), '');
+  } finally { rmSync(dir, { recursive:true, force:true }); }
+});
+
 function fakeAPI({exists=false, duplicate=false, failAt=0, failStatus=403, ref=sha}={}) {
   const calls=[];
   const fetchImpl=async (url,options) => {

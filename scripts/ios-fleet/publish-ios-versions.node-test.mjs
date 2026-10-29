@@ -257,7 +257,13 @@ def save():
 def blob(doc):
     return hashlib.md5(json.dumps(doc, sort_keys=True).encode()).hexdigest()
 def tsv(doc):
-    print(blob(doc) + "\\t" + base64.b64encode((json.dumps(doc, indent=2) + "\\n").encode()).decode())
+    # The real contents API: base64 wrapped every 60 characters with newlines,
+    # which is what broke the old --jq '@tsv' read.  A --jq filter on this
+    # call is refused so the script has to parse the raw response.
+    if "--jq" in args: sys.exit(1)
+    b64 = base64.b64encode((json.dumps(doc, indent=2) + "\\n").encode()).decode()
+    wrapped = "\\n".join(b64[i:i + 60] for i in range(0, len(b64), 60)) + "\\n"
+    print(json.dumps({"sha": blob(doc), "encoding": "base64", "content": wrapped}))
 def opt(name):
     return args[args.index(name) + 1] if name in args else None
 def flag(name):
