@@ -113,3 +113,20 @@ test("items must be newest-first so Sparkle offers the head build", () => {
     /newest-first/,
   );
 });
+
+test("a mirror feed base moves the channel link and the enclosure together", () => {
+  const appcast = buildAppcast({
+    version: VERSION,
+    feedBaseUrl: "https://mirror.invalid/botfleet/releases/download",
+    items: [
+      {
+        build: buildNumberFor(VERSION),
+        shortVersion: VERSION,
+        url: `https://mirror.invalid/botfleet/releases/download/v${VERSION}/BotFleetMac-${VERSION}.zip`,
+        length: 10,
+      },
+    ],
+  });
+  assert.match(appcast, /<link>https:\/\/mirror\.invalid\/botfleet\/releases<\/link>/);
+  assert.match(appcast, /https:\/\/mirror\.invalid\/botfleet\/releases\/download\/v/);
+});

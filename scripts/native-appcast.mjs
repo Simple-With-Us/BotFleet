@@ -70,6 +70,7 @@ function escapeXml(value) {
  */
 export function buildAppcast({
   version,
+  feedBaseUrl = DEFAULT_FEED_BASE_URL,
   pubDate = new Date(),
   minimumSystemVersion = "14.0",
   items,
@@ -95,7 +96,7 @@ export function buildAppcast({
     `<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">`,
     `  <channel>`,
     `    <title>BotFleet</title>`,
-    `    <link>https://github.com/Simple-With-Us/BotFleet/releases</link>`,
+    `    <link>${escapeXml(feedBaseUrl.replace(/\/download$/, ""))}</link>`,
     `    <description>BotFleet native macOS updates.</description>`,
     `    <language>en</language>`,
   ];

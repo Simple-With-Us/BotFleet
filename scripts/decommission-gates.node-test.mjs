@@ -21,6 +21,7 @@ import {
   retainedFiles,
   trackedFiles,
 } from "./audit-node-decommission.mjs";
+import { buildGateState } from "./decommission-gate-state.mjs";
 
 const ALL_DONE = {
   issues: {
@@ -295,5 +296,78 @@ test("the tree as committed is fully covered by the inventories", () => {
   assert.ok(
     retained.every((file) => file.startsWith("deploy/linux-server/")),
     `unexpected retained paths: ${retained.join(", ")}`,
+  );
+});
+
+// The refresh step is where a safety gate usually leaks: somebody reshapes a
+// GraphQL response by hand once, the file goes stale, and the guard reads a
+// memory instead of a fact.  These pin the two properties that make the
+// generated file trustworthy — a missing issue is visible rather than absent,
+// and only the two machine-checkable halves are filled in.
+const linearNodes = (states) =>
+  Object.entries(states).map(([identifier, name]) => ({ identifier, state: { name } }));
+
+const ALL_DONE_STATES = {
+  "BF-2510": "Done",
+  "BF-2511": "Done",
+  "BF-2512": "Done",
+  "BF-2513": "Done",
+  "BF-2503": "Done",
+  "BF-2504": "Done",
+  "BF-2514": "Done",
+};
+
+test("generated state passes the gate's schema and blocks on the human-only halves", () => {
+  const state = buildGateState(linearNodes(ALL_DONE_STATES), { inventoryClean: true });
+  assert.equal(StateSchema.safeParse(state).success, true);
+  // Even with every issue Done and the inventory clean, the generated file
+  // blocks: the soak, the replays, the final import and the Mac harness
+  // check all need a human to assert them.
+  assert.equal(evaluateGates(state).ok, false);
+  assert.ok(
+    evaluateGates(state).blockers.some((blocker) => blocker.startsWith("evidence soak-24h-no-node")),
+  );
+  assert.ok(
+    evaluateGates(state).blockers.some((blocker) => blocker.startsWith("macLocalHarness")),
+  );
+});
+
+test("an issue Linear did not mention is recorded as Unknown, not omitted", () => {
+  const { "BF-2504": _dropped, ...withoutOne } = ALL_DONE_STATES;
+  const state = buildGateState(linearNodes(withoutOne), { inventoryClean: true });
+  assert.equal(state.issues["BF-2504"], "Unknown");
+  assert.ok(evaluateGates(state).blockers.some((blocker) => blocker.startsWith("BF-2504: Unknown")));
+});
+
+test("a dirty inventory blocks the gate even when every issue is Done", () => {
+  const state = buildGateState(linearNodes(ALL_DONE_STATES), { inventoryClean: false });
+  assert.equal(state.evidence["inventory-clean"], false);
+  assert.ok(
+    evaluateGates(state).blockers.some((blocker) => blocker.startsWith("evidence inventory-clean")),
+  );
+});
+
+test("the Mac-only evidence is never filled in by a script", () => {
+  const state = buildGateState(linearNodes(ALL_DONE_STATES), { inventoryClean: true });
+  for (const id of ["soak-24h-no-node", "replay-parity", "final-import-parity"]) {
+    assert.equal(state.evidence[id], false, `${id} must stay false unless a human asserts it`);
+  }
+  assert.equal(state.macLocalHarness.present, true);
+});
+
+test("identifiers outside the required set do not leak into the state", () => {
+  const state = buildGateState(
+    linearNodes({ ...ALL_DONE_STATES, "BF-9999": "Done" }),
+    { inventoryClean: true },
+  );
+  assert.equal(Object.hasOwn(state.issues, "BF-9999"), false);
+});
+
+test("a malformed Linear node fails the refresh instead of writing a guess", () => {
+  assert.throws(
+    () =>
+      buildGateState([{ identifier: "BF-2510", state: { name: 7 } }], {
+        inventoryClean: true,
+      }),
   );
 });
