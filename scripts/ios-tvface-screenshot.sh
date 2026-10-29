@@ -114,6 +114,8 @@ from collections.abc import Iterator
 
 # Decodes one 8-bit PNG row at a time into a bytearray, with all five
 # filter types, so a full simulator capture is never held as Python ints.
+# Every row is compared as RGBA, so gray, RGB and RGBA encodings of the
+# same pixels match.
 CHANNELS = {0: 1, 2: 3, 4: 2, 6: 4}
 
 
@@ -133,9 +135,14 @@ def read_png(path: str) -> tuple[tuple[int, int], int, bytes]:
     pos = 8
     header = None
     idat: list[bytes] = []
+    ended = False
     while pos + 8 <= len(data):
         length = struct.unpack(">I", data[pos : pos + 4])[0]
         chunk_type = data[pos + 4 : pos + 8]
+        # A chunk is its 8-byte head, the data and a 4-byte CRC;  a short one
+        # means the capture was still being written.
+        if pos + 12 + length > len(data):
+            raise SystemExit(f"{path}: truncated PNG chunk {chunk_type!r}")
         chunk = data[pos + 8 : pos + 8 + length]
         pos += length + 12
         if chunk_type == b"IHDR":
@@ -143,7 +150,10 @@ def read_png(path: str) -> tuple[tuple[int, int], int, bytes]:
         elif chunk_type == b"IDAT":
             idat.append(chunk)
         elif chunk_type == b"IEND":
+            ended = True
             break
+    if not ended:
+        raise SystemExit(f"{path}: truncated PNG (missing IEND)")
     if header is None:
         raise SystemExit(f"{path}: missing IHDR")
     width, height, depth, color, _, _, interlace = header
@@ -154,7 +164,25 @@ def read_png(path: str) -> tuple[tuple[int, int], int, bytes]:
     return (width, height), CHANNELS[color], zlib.decompress(b"".join(idat))
 
 
-def rows(path: str) -> tuple[tuple[int, int, int], Iterator[bytearray]]:
+def to_rgba(row: bytearray, width: int, bpp: int) -> bytearray:
+    """One decoded row as RGBA, so a change of color type alone never differs."""
+    if bpp == 4:
+        return row
+    out = bytearray(width * 4)
+    if bpp == 3:
+        out[0::4], out[1::4], out[2::4] = row[0::3], row[1::3], row[2::3]
+        out[3::4] = b"\xff" * width
+    elif bpp == 2:
+        gray = row[0::2]
+        out[0::4], out[1::4], out[2::4] = gray, gray, gray
+        out[3::4] = row[1::2]
+    else:
+        out[0::4], out[1::4], out[2::4] = row, row, row
+        out[3::4] = b"\xff" * width
+    return out
+
+
+def rows(path: str) -> tuple[tuple[int, int], Iterator[bytearray]]:
     (width, height), bpp, inflated = read_png(path)
     stride = width * bpp
     if len(inflated) < height * (stride + 1):
@@ -184,10 +212,10 @@ def rows(path: str) -> tuple[tuple[int, int, int], Iterator[bytearray]]:
                     row[i] = (row[i] + paeth(left, prev[i], upper_left)) & 0xFF
             elif filter_type != 0:
                 raise SystemExit(f"{path}: invalid PNG filter {filter_type}")
-            yield row
+            yield to_rgba(row, width, bpp)
             prev = row
 
-    return (width, height, bpp), generate()
+    return (width, height), generate()
 
 
 baseline_path, capture_path = sys.argv[1], sys.argv[2]
@@ -195,7 +223,7 @@ baseline_size, baseline_rows = rows(baseline_path)
 capture_size, capture_rows = rows(capture_path)
 if baseline_size != capture_size:
     raise SystemExit(
-        "TV-Face screenshot size mismatch (width, height, channels): "
+        "TV-Face screenshot size mismatch (width, height): "
         f"baseline {baseline_size}, capture {capture_size}"
     )
 mismatches = 0

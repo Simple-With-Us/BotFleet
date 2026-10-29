@@ -36,9 +36,11 @@ const paeth = (a, b, c) => {
   return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
 };
 
-// Encodes RGBA pixels, choosing each row's filter from `filters` in turn.
-function png(width, height, pixels, filters) {
-  const bpp = 4, stride = width * bpp, out = [];
+// Encodes pixels of PNG color type `color` (6 = RGBA by default), choosing
+// each row's filter from `filters` in turn.
+const CHANNELS = { 0: 1, 2: 3, 4: 2, 6: 4 };
+function png(width, height, pixels, filters, color = 6) {
+  const bpp = CHANNELS[color], stride = width * bpp, out = [];
   let prev = Buffer.alloc(stride);
   for (let y = 0; y < height; y++) {
     const row = pixels.subarray(y * stride, (y + 1) * stride);
@@ -53,7 +55,7 @@ function png(width, height, pixels, filters) {
     prev = row;
   }
   const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4); ihdr[8] = 8; ihdr[9] = 6;
+  ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4); ihdr[8] = 8; ihdr[9] = color;
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     chunk("IHDR", ihdr), chunk("IDAT", deflateSync(Buffer.concat(out))), chunk("IEND", Buffer.alloc(0)),
@@ -100,4 +102,31 @@ test("a different size is refused before comparing", () => {
   const r = compare(png(W, H, pixels, [0]), png(W, H - 1, pixels.subarray(0, W * (H - 1) * 4), [0]));
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /size mismatch/);
+});
+
+// Drops channels from RGBA pixels:  RGB keeps r,g,b;  gray keeps r (all equal).
+const channels = (rgba, keep) => Buffer.from(rgba.filter((_, i) => keep.includes(i % 4)));
+
+test("the same pixels match across RGBA, RGB and gray color types", () => {
+  const opaque = Buffer.from(pixels); for (let i = 3; i < opaque.length; i += 4) opaque[i] = 0xff;
+  const rgb = channels(opaque, [0, 1, 2]);
+  let r = compare(png(W, H, opaque, [0]), png(W, H, rgb, [4], 2));
+  assert.equal(r.status, 0, r.stderr);
+  const grayRgba = Buffer.from(opaque);
+  for (let i = 0; i < grayRgba.length; i += 4) grayRgba[i + 1] = grayRgba[i + 2] = grayRgba[i];
+  r = compare(png(W, H, grayRgba, [0]), png(W, H, channels(grayRgba, [0]), [3], 0));
+  assert.equal(r.status, 0, r.stderr);
+  const changed = Buffer.from(rgb); changed[4] ^= 0x10;
+  r = compare(png(W, H, opaque, [0]), png(W, H, changed, [0], 2));
+  assert.match(r.stderr, /differs from baseline \(1 byte mismatches\)/);
+});
+
+test("a capture with no IEND or a short chunk is refused", () => {
+  const good = png(W, H, pixels, [0]);
+  let r = compare(good, good.subarray(0, good.length - 12));
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /missing IEND/);
+  r = compare(good, good.subarray(0, good.length - 20));
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /truncated PNG chunk/);
 });
