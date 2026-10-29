@@ -117,6 +117,18 @@ jobs:
         env:
           GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
           GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+      # Best-effort: an inert Sentry beats a red release.  The Mac app reads
+      # SENTRY_DSN from its Info.plist at launch (BF-2541, PR #1394), and the
+      # Archive step below passes whatever resolves here as a build setting.
+      - name: Load the Sentry DSN (optional)
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: SENTRY_DSN
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+        env:
+          GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       - name: Import the Developer ID certificate into a throwaway keychain
         env:
           MAC_CERT_P12_BASE64: ${{ env.MAC_CERT_P12_BASE64 }}
@@ -141,8 +153,15 @@ jobs:
       - name: Archive BotFleetMac
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          SENTRY_DSN: ${{ env.SENTRY_DSN }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.sha }}
         run: |
           build="${VERSION##*.}"
+          if [ -n "${SENTRY_DSN:-}" ]; then
+            echo "::add-mask::$SENTRY_DSN"
+          else
+            echo "::warning::SENTRY_DSN is empty after the Infisical prod export and the GitHub secret fallback.  This build ships with Sentry inert (BF-2541)."
+          fi
           xcodebuild archive \
             -project ios/BotFleet.xcodeproj \
             -scheme BotFleetMac \
@@ -150,6 +169,8 @@ jobs:
             -archivePath "$RUNNER_TEMP/BotFleetMac.xcarchive" \
             MARKETING_VERSION="$VERSION" \
             CURRENT_PROJECT_VERSION="$build" \
+            SENTRY_DSN="$SENTRY_DSN" \
+            SOURCE_COMMIT="$SOURCE_COMMIT" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Developer ID Application" \
             DEVELOPMENT_TEAM=CC8UTF7ATG

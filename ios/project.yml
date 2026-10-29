@@ -21,6 +21,9 @@ settings:
     # Native Sentry. Empty unless xcodebuild/CI passes SENTRY_DSN=...
     # Do not put a live DSN in this file or in Info.plist.
     SENTRY_DSN: ""
+    # Release stamp for native Sentry. Empty unless xcodebuild/CI passes
+    # SOURCE_COMMIT=...; MacSentryPolicy uses it as the release name.
+    SOURCE_COMMIT: ""
 packages:
   CompanionCore:
     path: .
@@ -231,6 +234,7 @@ targets:
         # builds inert unless a build passes SENTRY_DSN=... the way the iOS
         # ship stamps it.
         SENTRY_DSN: $(SENTRY_DSN)
+        SOURCE_COMMIT: $(SOURCE_COMMIT)
         # The same rewrite rule applies to the privacy strings: the Mac app
         # requests the microphone and speech recognition for voice capture, and
         # macOS TERMINATES an app that asks for a permission whose usage
