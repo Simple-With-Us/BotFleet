@@ -28,19 +28,20 @@ describe("fleet seat prompt composition", () => {
     }
   });
 
-  it("covers exactly the eleven BotFleet roles, none of them a platform seat or a Grok Bot tag", () => {
+  it("covers exactly the twelve BotFleet roles, none of them a platform seat or a Grok Bot tag", () => {
     expect([...FLEET_SEAT_IDS].sort()).toEqual([
-      "builder",
       "compiler",
       "deployer",
       "designer",
       "director",
+      "engineer",
       "fixer",
       "housekeeper",
       "monitor",
       "oracle",
       "plumber",
       "publisher",
+      "trader",
     ]);
     for (const seatId of FLEET_SEAT_IDS) {
       const composed = composeFleetSeatPrompt(seatId);
