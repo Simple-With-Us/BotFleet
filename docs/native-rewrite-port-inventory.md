@@ -127,7 +127,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | Node file(s) | Swift owner |
 |---|---|
 | `electron/main.mjs`, `server-boot-probe.mjs`, `harness-ownership.mjs`, `attached-ui-shim.mjs`, `single-instance.mjs` | App startup + harness attach/fork → `LifecycleService` BF-2497; shim retired (UI in-process) |
-| `electron/server-controls.mjs`, `mac-control/Sources/BotFleetControlCore/*` (`ControlAPI`, `StartupPolicy`, `PersistencePolicy`, `OfflineDockerVM`, `OfflineVMHelper`) | Start/stop/status → `LifecycleService` BF-2497; control surface already Swift, keep |
+| `electron/server-controls.mjs`, `mac-control/Sources/BotFleetControlCore/*` (`ControlAPI`, `StartupPolicy`, `PersistencePolicy`, `OfflineDockerVM`, `OfflineVMHelper`) | Start/stop/status → `LifecycleService` BF-2497; the Control surface is already Swift, but its local half calls only `:8799` routes in `server/index.ts`, the LaunchAgents and the wrapper markers, so its post-Node disposition is a Phase 6 gate (`control-disposition`, BF-2583; Decision 1 in `docs/plans/2026-10-29-botfleet-control-after-node.md`) |
 | `scripts/botfleet-server-start.sh`, `scripts/launchd/app.botfleet.server.plist`, `scripts/botfleet-server-healthcheck.sh`, `scripts/launchd/harness-watchdog.node-test.mjs` | Always-on supervision → retired Phase 5 BF-2514 |
 | `server/harness-lifecycle.ts`, `server/boot-recovery.ts`, `server/system-control.ts` | Deliberate-stop semantics + boot recovery → `LifecycleService` BF-2497, reused by BF-2514 cutover |
 | `server/static-files.ts`, `server/console-timestamps.ts`, `server/log-dedup.ts` | Packaged-UI serving + log hygiene → retired (native UI/logging: `os_log`) Phase 3 |
@@ -154,7 +154,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | Consumer | Uses | Native fate |
 |---|---|---|
 | iPhone app (`ios/`) | Companion `:8810` allowlisted routes + SSE; never `:8799` | Follows BF-2510 endpoint decision; build per BF-2511 |
-| `BotFleet Control` (`mac-control/`, already Swift) | `:8799` health/control/config + LaunchAgent state + `BF_CONTROL_STARTUP_POLICY_V1` markers | Drives `LifecycleService` BF-2497; markers retired at BF-2514 |
+| `BotFleet Control` (`mac-control/`, already Swift) | `:8799` health/control/config + LaunchAgent state + `BF_CONTROL_STARTUP_POLICY_V1` markers | Drives `LifecycleService` BF-2497; the markers, the LaunchAgents and the `:8799` routes it depends on retire at BF-2514, so Control's local half needs its replacement or retirement landed first (gate `control-disposition`, BF-2583) |
 | VM image (`scripts/computer-vm-cli/`, CI `vm-image-build.yml`) | `server/container-computer.ts` Dockerfile + `vm-cli-*.ts` | Keep image build (Local VM is Docker on Mac); thin CLI shims retire with Node Phase 6 |
 | `cloudflare/composio-broker/` | None (no `:8799`/`:8810` calls) | Unaffected; self-host key path re-targets `InfisicalResolver` BF-2506 |
 | `cloudflare/control-plane/` | Stub only, already removed | No action |

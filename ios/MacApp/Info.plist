@@ -33,5 +33,7 @@
 	<string>BotFleet uses the microphone for dictation and voice calls with bots.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>BotFleet converts your speech into text for messaging bots.</string>
+	<key>SENTRY_DSN</key>
+	<string>$(SENTRY_DSN)</string>
 </dict>
 </plist>
