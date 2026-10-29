@@ -56,6 +56,13 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var ownerStops = OwnerStops()
     /// Where the owner's stops are kept between launches.
     private let ownerStopsStore = OwnerStopsStore()
+    /// Why the owner's stops could not be written down, until a write
+    /// succeeds.
+    ///
+    /// Kept apart from `problem`, which every menu open rewrites from the
+    /// status probe: a stop that will not survive a relaunch has to stay
+    /// visible until the record is saved again.
+    private var ownerStopsProblem: String?
     private var item: NSStatusItem?
     private let menu = NSMenu()
     private var status: ControlStatus?
@@ -126,7 +133,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // The owner's stops are read back before the first reconcile, so a
         // service the owner stopped before this launch is not started again
         // by it.
-        ownerStops = OwnerStops(ids: ownerStopsStore.load())
+        ownerStops = OwnerStops(loadedFrom: ownerStopsStore)
         showIcon()
         // The fleet service control is resolved here, on the main thread and
         // before any task can reach for it, so its first use cannot race
@@ -261,6 +268,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// What the Control app knows about the BotFleet Server itself.
     private func serverState() -> ManagedServices.ServerState {
         ManagedServices.serverState(statusAvailable: status != nil,
+                                serverOutdated: serverOutdated,
                                 installedServerState: installedServerState,
                                 serverPresence: serverPresence)
     }
@@ -399,15 +407,17 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// launch.
     ///
     /// The record itself always changes; only the write can fail.  A record
-    /// that could not be written is reported in the menu rather than hidden:
-    /// the stop still holds for this launch, and the owner can read that it
-    /// will not hold past it.  No alert, because the action's own outcome
-    /// is what the owner is waiting on.
+    /// that could not be written is reported in the menu rather than hidden,
+    /// on its own line that stays until a later write succeeds: the stop
+    /// still holds for this launch, and the owner can read that it will not
+    /// hold past it.  No alert, because the action's own outcome is what the
+    /// owner is waiting on.
     private func recordOwnerStop(_ change: () throws -> Void) {
         do {
             try change()
+            ownerStopsProblem = nil
         } catch {
-            problem = "The owner's stops could not be saved, so they last only until Control quits: \(error.localizedDescription)"
+            ownerStopsProblem = "The owner's stops could not be saved, so they last only until Control quits: \(error.localizedDescription)"
         }
     }
 
@@ -543,6 +553,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else { add("Shared VM: unknown while server is busy") }
         }
         if let problem { add("Error: \(problem)") }
+        if let ownerStopsProblem { add("Fleet Services: \(ownerStopsProblem)") }
         if let vmProblem { add("Local VM: \(vmProblem)") }
         if status?.sharedVM?.state == "stopped" { add("Local VM requires recreation in BotFleet") }
         if !startup.supportsPolicy { add("Update BotFleet to manage server startup") }
@@ -1047,8 +1058,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func stopServer() {
         if status == nil && serverOutdated {
-            guard confirm("Stop BotFleet Server And Local VMs?",
-                          "This server is older than Control and has no stop route.  Control writes the deliberate-stop marker, boots the LaunchAgent out when it is installed, and then watches port 8799 until nothing answers.  The in-flight-work check is unavailable on this server, so active bots are not protected.") else { return }
+            guard confirm("Stop BotFleet Server?",
+                          "This server is older than Control and has no stop route.  Control writes the deliberate-stop marker, boots the LaunchAgent out when it is installed, and then watches port 8799 until nothing answers.  The in-flight-work check is unavailable on this server, so active bots are not protected, and its Local VMs are left running: stop them from this menu once the server reads as stopped.") else { return }
             run(refresh: false, settlesWhen: [.stopped, .notInstalled]) { [self] in
                 try await forceStopOutdatedServer()
             }
@@ -1082,15 +1093,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let launchdAsked = try await Task.detached(priority: .userInitiated) { try self.startup.forceStopServer() }.value
         let probe = presenceProbe
         let answer = await Task.detached(priority: .userInitiated) { await probe.waitUntilAbsent(within: 20, interval: 2.5) }.value
-        switch answer {
-        case .absent:
-            return
-        case .present:
-            throw FleetServiceError.refused(launchdAsked
-                ? "The deliberate-stop marker is written and the LaunchAgent is booted out, but something still answers on port 8799 twenty seconds later, so launchd did not own that server or it has not finished leaving.  Free Port 8799 in Monitored Processes & Ports stops whatever holds the port, and it is a hard kill."
-                : "The deliberate-stop marker is written, but the BotFleet Server LaunchAgent is not installed, so launchd was not asked, and something still answers on port 8799.  Free Port 8799 in Monitored Processes & Ports stops whatever holds the port, and it is a hard kill.")
-        case .unknown:
-            throw FleetServiceError.refused("The deliberate-stop marker is written\(launchdAsked ? " and the LaunchAgent is booted out" : ""), but Control could not check port 8799, so nothing can be said about whether the server is gone.  Open the menu again to re-probe.")
+        if let refusal = ManagedServices.forceStopOutcome(answer: answer, launchdAsked: launchdAsked) {
+            throw FleetServiceError.refused(refusal)
         }
     }
 

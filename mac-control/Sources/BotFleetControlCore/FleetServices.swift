@@ -177,10 +177,15 @@ public final class OwnerStopsStore {
     }
 
     /// The services the owner stopped on purpose, as last saved.
+    ///
+    /// A file that cannot be read right now is not a corrupt one: it is left
+    /// exactly where it is, so a passing read error never costs the owner
+    /// their record, and this launch runs on the fleet's own rules.  Only a
+    /// file whose bytes were read and did not decode is moved aside.
     public func load() -> Set<String> {
         guard files.fileExists(atPath: fileURL.path) else { return [] }
-        guard let data = try? Data(contentsOf: fileURL),
-              let record = try? JSONDecoder().decode(Record.self, from: data) else {
+        guard let data = try? Data(contentsOf: fileURL) else { return [] }
+        guard let record = try? JSONDecoder().decode(Record.self, from: data) else {
             // Moved, not copied: a copy would leave the unreadable file in
             // place and make a new backup on every launch.
             let backup = fileURL.deletingPathExtension()
@@ -390,7 +395,7 @@ public struct FleetServices: Equatable {
             // lost: the in-flight-work check belongs to the route that is
             // missing.
             let common = serverOutdated
-                ? "This server is older than Control and has no stop route, so Control writes the deliberate-stop marker, boots the LaunchAgent out when it is installed, and watches port 8799 until nothing answers.  The in-flight-work check is unavailable on this server, so active bots are not protected.  The installed wrapper stays down while the marker exists, so a login does not bring it back"
+                ? "This server is older than Control and has no stop route, so Control writes the deliberate-stop marker, boots the LaunchAgent out when it is installed, and watches port 8799 until nothing answers.  The in-flight-work check is unavailable on this server, so active bots are not protected, and its Local VMs are left running; stop them from this menu once the server reads as stopped.  The installed wrapper stays down while the marker exists, so a login does not bring it back"
                 : "The BotFleet Server stops itself, and its Local VMs go down with it.  The server refuses while work is in flight.  The installed wrapper stays down while the deliberate-stop marker exists, so a login does not bring it back"
             guard startupPolicySupported else {
                 return common + ".  This version of BotFleet cannot restart the server from here, so remove ~/.botfleet/stopped.marker yourself to bring it back."

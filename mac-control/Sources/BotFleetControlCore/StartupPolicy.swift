@@ -321,7 +321,11 @@ public final class StartupPolicy {
 
     /// How long a stop waits for launchd to unload the agent before it
     /// decides the stop did not take.
-    public static let unloadAttempts = 20
+    ///
+    /// launchd gives a job twenty seconds after SIGTERM before it kills it,
+    /// so the wait is longer than that: a teardown that is merely slow must
+    /// not be reported as a stop that failed.
+    public static let unloadAttempts = 50
     public static let unloadInterval: TimeInterval = 0.5
 
     /// Stops a launchd agent and leaves it stopped, across logins and
@@ -352,26 +356,70 @@ public final class StartupPolicy {
             throw StartupPolicyError.refused(error.output.isEmpty
                 ? "macOS could not disable the \(label) LaunchAgent."
                 : error.output)
+        } catch {
+            throw StartupPolicyError.refused("launchctl did not answer while disabling the \(label) LaunchAgent, so nothing was stopped.")
         }
         _ = try? commands.run("/bin/launchctl", ["bootout", full])
-        if waitUntilUnloaded(full, attempts: unloadAttempts, interval: unloadInterval) { return }
-        _ = try? commands.run("/bin/launchctl", ["enable", full])
-        throw StartupPolicyError.refused("macOS did not unload the \(label) LaunchAgent, so it is left enabled and still running.  Try again once it has settled.")
+        switch waitUntilUnloaded(full, attempts: unloadAttempts, interval: unloadInterval) {
+        case .unloaded:
+            return
+        case .stillLoaded:
+            // The agent is still running, so it must not stay disabled behind
+            // the owner's back.  A teardown that finishes between the last
+            // look and the enable is caught by one more look: a job that is
+            // gone now is a stop that took, and the disable goes back on.
+            _ = try? commands.run("/bin/launchctl", ["enable", full])
+            if case .unloaded = probeLoaded(full) {
+                _ = try? commands.run("/bin/launchctl", ["disable", full])
+                return
+            }
+            let waited = Int((Double(max(unloadAttempts, 1)) * max(unloadInterval, 0)).rounded())
+            throw StartupPolicyError.refused("The \(label) LaunchAgent is still loaded after \(waited) seconds, so it is left enabled.  It may still be stopping; if it stops now, launchd starts it again at the next login until Stop is repeated.")
+        case .couldNotAsk:
+            _ = try? commands.run("/bin/launchctl", ["enable", full])
+            throw StartupPolicyError.refused("launchctl did not answer while Control waited for the \(label) LaunchAgent to unload, so nothing can be said about it; it is left enabled.  Try again once launchd answers.")
+        }
     }
 
-    /// True once launchd no longer has the job loaded.
+    /// What one look at launchd said about a job.
+    private enum LoadedAnswer {
+        case loaded
+        case unloaded
+        case couldNotAsk
+    }
+
+    /// Asks launchd once whether the job is loaded.
     ///
-    /// `launchctl print` fails for a job that is not loaded, which is the
-    /// one answer that proves the bootout took.  A job that is still being
-    /// torn down answers for a while, so the question is asked more than
-    /// once.
-    private func waitUntilUnloaded(_ full: String, attempts: Int, interval: TimeInterval) -> Bool {
+    /// `launchctl print` exits nonzero for a job that is not loaded, which
+    /// is the one answer that proves a bootout took.  A print that the
+    /// command runner had to abandon is not an answer, and it must not be
+    /// read as "unloaded": that is the one way a running agent could be
+    /// left disabled.
+    private func probeLoaded(_ full: String) -> LoadedAnswer {
+        do {
+            _ = try commands.run("/bin/launchctl", ["print", full])
+            return .loaded
+        } catch is CommandExitError {
+            return .unloaded
+        } catch {
+            return .couldNotAsk
+        }
+    }
+
+    /// Asks launchd until the job is unloaded, or the wait is up.
+    ///
+    /// A job that is still being torn down answers for a while, so the
+    /// question is asked more than once.  The last answer is what is
+    /// reported when the wait runs out.
+    private func waitUntilUnloaded(_ full: String, attempts: Int, interval: TimeInterval) -> LoadedAnswer {
         let step = interval.isFinite ? min(max(interval, 0), 60) : 0
+        var last: LoadedAnswer = .loaded
         for attempt in 0..<max(attempts, 1) {
-            if (try? commands.run("/bin/launchctl", ["print", full])) == nil { return true }
+            last = probeLoaded(full)
+            if case .unloaded = last { return .unloaded }
             if attempt + 1 < max(attempts, 1), step > 0 { Thread.sleep(forTimeInterval: step) }
         }
-        return false
+        return last
     }
 
     /// Stops a BotFleet Server that cannot be asked to stop itself.

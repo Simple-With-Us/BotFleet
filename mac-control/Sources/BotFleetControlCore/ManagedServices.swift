@@ -105,9 +105,14 @@ public struct ManagedServices: Equatable {
     /// is the server stopped.  Anything else — booting, busy, or not
     /// installed — is unknown, and the Control app does not act on it.
     public static func serverState(statusAvailable: Bool,
+                                    serverOutdated: Bool = false,
                                     installedServerState: InstalledServerState,
                                     serverPresence: ServerPresence) -> ServerState {
-        if statusAvailable { return .running }
+        // A server that answered the health check but has no control routes
+        // is running: the identity check proved a live, ready process before
+        // the missing route was found.  Reading it as unknown would hide the
+        // server row's Stop and leave the MCP server unwanted.
+        if statusAvailable || serverOutdated { return .running }
         if installedServerState == .running { return .running }
         switch serverPresence {
         case .present: return .unknown
@@ -144,6 +149,26 @@ public struct ManagedServices: Equatable {
     /// stays.
     public static func canStopServer(statusAvailable: Bool, serverOutdated: Bool) -> Bool {
         statusAvailable || serverOutdated
+    }
+
+    /// What a forced stop of a too-old server has to say afterwards, or nil
+    /// when the port closed and there is nothing to say.
+    ///
+    /// Only a listener that is proven still there is pointed at Free Port,
+    /// because Free Port is a hard kill.  A probe that could not tell is
+    /// reported as exactly that.  Whether launchd was asked at all changes
+    /// what the owner is told happened.
+    public static func forceStopOutcome(answer: ServerPresence, launchdAsked: Bool) -> String? {
+        switch answer {
+        case .absent:
+            return nil
+        case .present:
+            return launchdAsked
+                ? "The deliberate-stop marker is written and the LaunchAgent is booted out, but something still answers on port 8799 twenty seconds later, so launchd did not own that server or it has not finished leaving.  Free Port 8799 in Monitored Processes & Ports stops whatever holds the port, and it is a hard kill."
+                : "The deliberate-stop marker is written, but the BotFleet Server LaunchAgent is not installed, so launchd was not asked, and something still answers on port 8799.  Free Port 8799 in Monitored Processes & Ports stops whatever holds the port, and it is a hard kill."
+        case .unknown:
+            return "The deliberate-stop marker is written\(launchdAsked ? " and the LaunchAgent is booted out" : ""), but Control could not check port 8799, so nothing can be said about whether the server is gone.  Open the menu again to re-probe."
+        }
     }
 
     /// The MCP server proxies every tool call to the BotFleet Server, so it

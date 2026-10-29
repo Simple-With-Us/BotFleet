@@ -116,8 +116,11 @@ test("every workflow job that packages the Mac app has the history the Control s
     const blocks = body.split(/\n(?=  [A-Za-z0-9_-]+:\s*\n)/);
     for (const block of blocks) {
       if (!block.includes("package:mac")) continue;
-      const pinned = block.includes("BOTFLEET_BUILD_VERSION");
-      const fullHistory = /fetch-depth:\s*0/.test(block);
+      // Comments are dropped first, so a job that only documents the
+      // requirement ("# fetch-depth: 0 is REQUIRED") does not pass on prose.
+      const code = block.split("\n").filter((line) => !/^\s*#/.test(line)).join("\n");
+      const pinned = code.includes("BOTFLEET_BUILD_VERSION");
+      const fullHistory = /fetch-depth:\s*0/.test(code);
       if (!pinned && !fullHistory) offenders.push(`${name}: ${block.trim().split("\n")[0]}`);
     }
   }

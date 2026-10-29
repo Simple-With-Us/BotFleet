@@ -9,7 +9,10 @@
 // the stamp script's answer otherwise, which refuses a shallow clone instead
 // of numbering the build 1.0.1.  BOTFLEET_SKIP_VERSION_STAMP=1, the local
 // bypass the stamp script's CLI honours, keeps the package.json version here
-// too, so an unstamped local build carries the same number in both bundles.
+// too.  So the two bundles agree on the pinned release and commit-build paths
+// and under the skip flag; a plain `pnpm package:mac:local` stamps Control
+// from the commit count while electron-builder leaves the app at package.json's
+// version, which is the gate builds' known state, not a shipped one.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveBuildVersion } from "../scripts/stamp-commit-version.mjs";

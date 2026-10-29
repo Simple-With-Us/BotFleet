@@ -183,6 +183,37 @@ final class ControlTests: XCTestCase {
         XCTAssertFalse(ManagedServices.canStopServer(statusAvailable: false, serverOutdated: false))
     }
 
+    /// An outdated server proved alive by the health check is running for
+    /// the fleet services too: the server row keeps its Stop and the MCP
+    /// server stays wanted, instead of both reading unknown.
+    func testAnOutdatedServerIsRunningForTheFleetServices() {
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, serverOutdated: true,
+                                                   installedServerState: .stopped, serverPresence: .present), .running)
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, serverOutdated: true,
+                                                   installedServerState: .notInstalled, serverPresence: .present), .running)
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, serverOutdated: false,
+                                                   installedServerState: .stopped, serverPresence: .present), .unknown)
+    }
+
+    /// What the forced stop says afterwards: nothing when the port closed,
+    /// Free Port only when something is proven to be listening, and a plain
+    /// "could not check" when the probe could not tell.
+    func testTheForcedStopNamesFreePortOnlyForAProvenListener() {
+        XCTAssertNil(ManagedServices.forceStopOutcome(answer: .absent, launchdAsked: true))
+        XCTAssertNil(ManagedServices.forceStopOutcome(answer: .absent, launchdAsked: false))
+        let listening = ManagedServices.forceStopOutcome(answer: .present, launchdAsked: true) ?? ""
+        XCTAssertTrue(listening.contains("Free Port 8799"))
+        XCTAssertTrue(listening.contains("hard kill"))
+        XCTAssertTrue(listening.contains("booted out"))
+        let noAgent = ManagedServices.forceStopOutcome(answer: .present, launchdAsked: false) ?? ""
+        XCTAssertTrue(noAgent.contains("not installed"))
+        XCTAssertTrue(noAgent.contains("Free Port 8799"))
+        let blind = ManagedServices.forceStopOutcome(answer: .unknown, launchdAsked: true) ?? ""
+        XCTAssertTrue(blind.contains("could not check port 8799"))
+        XCTAssertFalse(blind.contains("Free Port"))
+        XCTAssertFalse((ManagedServices.forceStopOutcome(answer: .unknown, launchdAsked: false) ?? "").contains("booted out"))
+    }
+
     /// A server that does not answer the health check at all really is gone.
     func testUnreachableServerIsStillUnavailable() async {
         MockURLProtocol.failure = { _ in URLError(.cannotConnectToHost) }
@@ -434,7 +465,8 @@ private final class MockCommands: CommandRunning {
         if arguments == ["list"] { return launchctlListing }
         if arguments.first == "print" {
             if agentIsLoaded { return "state = running" }
-            throw StartupPolicyError.commandFailed
+            // launchctl exits nonzero for a job that is not loaded.
+            throw CommandExitError(output: "Could not find service in domain for uid: 501")
         }
         if failKickstart && arguments.first == "kickstart" { throw StartupPolicyError.commandFailed }
         return ""
