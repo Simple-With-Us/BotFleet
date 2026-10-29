@@ -17,6 +17,13 @@ import CompanionCore
 /// in project.yml, empty by default), and `shouldActivateSentry` keeps test
 /// runners from ever activating.
 enum MacSentryTelemetry {
+    /// Redacts sensitive values inside a bare query component (no leading
+    /// `?`), reusing the policy redactor that expects a URL-shaped string.
+    private static func scrubQueryComponent(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return raw }
+        return String(MacSentryPolicy.redactQueryStringTokens(in: "?" + raw).dropFirst())
+    }
+
     static func start() {
         let dsn = (Bundle.main.object(forInfoDictionaryKey: "SENTRY_DSN") as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -55,6 +62,11 @@ enum MacSentryTelemetry {
                     )
                     request.url = scrubbed.sanitizedURL?.absoluteString
                     request.headers = scrubbed.scrubbedHeaders
+                    // sentry-cocoa also splits the query and fragment out of
+                    // the URL into their own fields on failed-request events,
+                    // so scrubbing the URL alone leaves both behind.
+                    request.queryString = scrubQueryComponent(request.queryString)
+                    request.fragment = nil
                 }
                 return event
             }
@@ -62,6 +74,12 @@ enum MacSentryTelemetry {
                 if let url = breadcrumb.data?["url"] as? String {
                     breadcrumb.data?["url"] = MacSentryPolicy.scrubBreadcrumbURL(url)
                 }
+                // Network breadcrumbs carry the split fields under these
+                // keys instead of inside the URL.
+                if let query = breadcrumb.data?["http.query"] as? String {
+                    breadcrumb.data?["http.query"] = scrubQueryComponent(query)
+                }
+                breadcrumb.data?["http.fragment"] = nil
                 return breadcrumb
             }
         }
