@@ -180,7 +180,9 @@ This is the irreversible one, and it is the step the whole gate exists for.
 
 ## What Stays
 
-The native app, `ios/`, `mac-control/` (already Swift), the VM image build, `apps/site`, `tools/`, `tv-face/`, and `cloudflare/composio-broker/` (self-hosted, no harness calls).  None of them is part of the decommission, and deleting any of them is a different issue.
+The native app, `ios/`, the VM image build, `apps/site`, `tools/`, `tv-face/`, and `cloudflare/composio-broker/` (self-hosted, no harness calls).  None of them is part of the decommission, and deleting any of them is a different issue.
+
+`mac-control/` is already Swift and is not deleted by this runbook either, but it is not simply kept: every local thing BotFleet Control does goes through the stack this runbook deletes (the `:8799` routes in `server/index.ts`, the two LaunchAgents, pm2 `botfleet-mcp`, the offline VM helper built from `server/local-vm-offline-cli.ts`, and the Electron-side build and install in Step 6).  The gate's `control-disposition` evidence (BF-2583) requires Control's post-Node disposition, Decision 1 in `docs/plans/2026-10-29-botfleet-control-after-node.md`, to be recorded and landed before Step 5, and `scripts/audit-node-decommission.mjs` reports `mac-control/` as a dependent of the audited roots so the dependency stays visible.
 
 ## Rollback
 

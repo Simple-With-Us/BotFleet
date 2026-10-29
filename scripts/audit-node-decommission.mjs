@@ -45,6 +45,34 @@ export const RETAINED_PATHS = [
   },
 ];
 
+/**
+ * Surfaces outside the audited roots that stop working when those roots go.
+ * They are not inventory rows, because nothing in them is Node to retire, and
+ * they are not retained paths, because keeping them as they are is not an
+ * option: BotFleet Control (mac-control/) calls only routes that live in
+ * server/index.ts, supervises the LaunchAgents and the pm2 job that Phase 5
+ * retires, and is built and installed only by the Electron packaging that
+ * Step 6 deletes.  The audit reports them so the dependency is visible in
+ * the same place as the inventory, and the gate requires their disposition
+ * (BF-2583).
+ */
+export const DEPENDENT_PATHS = [
+  {
+    path: "mac-control/",
+    why: "BotFleet Control's local half is the Mac-local Node stack; its post-Node disposition is Decision 1 in docs/plans/2026-10-29-botfleet-control-after-node.md and the gate's control-disposition evidence (BF-2583)",
+  },
+];
+
+/** The tracked files under each dependent surface, so the CLI can count them. */
+export function dependentFiles(repoRoot) {
+  const out = execFileSync(
+    "git",
+    ["-C", repoRoot, "ls-files", "--", ...DEPENDENT_PATHS.map((entry) => entry.path)],
+    { encoding: "utf8", timeout: 30_000 },
+  );
+  return out.split("\n").filter(Boolean).sort();
+}
+
 /** Expand one `dir/{a,b,c}.ts` claim into the files it names. */
 function expandBraces(token) {
   const open = token.indexOf("{");
@@ -217,6 +245,13 @@ if (isEntryModule()) {
     const count = files.filter((file) => file.startsWith(entry.path)).length;
     console.log(
       `retained on purpose: ${entry.path} (${count} tracked file(s)) — ${entry.why}`,
+    );
+  }
+  const dependents = dependentFiles(repoRoot);
+  for (const entry of DEPENDENT_PATHS) {
+    const count = dependents.filter((file) => file.startsWith(entry.path)).length;
+    console.log(
+      `depends on the stack being deleted: ${entry.path} (${count} tracked file(s)) — ${entry.why}`,
     );
   }
   if (uncovered.length > 0) {

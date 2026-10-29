@@ -6,7 +6,9 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  DEPENDENT_SURFACES,
   MAC_LOCAL_ROOTS,
+  REQUIRED_EVIDENCE,
   REQUIRED_ISSUES,
   RETAINED_OPTIONAL_SERVER_PATHS,
   StateSchema,
@@ -15,8 +17,10 @@ import {
 } from "./check-decommission-gates.mjs";
 import {
   AUDITED_ROOTS,
+  DEPENDENT_PATHS,
   INVENTORY_DOCS,
   RETAINED_PATHS,
+  dependentFiles,
   findUncovered,
   retainedFiles,
   trackedFiles,
@@ -37,6 +41,7 @@ const ALL_DONE = {
     "replay-parity": true,
     "final-import-parity": true,
     "inventory-clean": true,
+    "control-disposition": true,
   },
   // The Mac-local harness is gone, and the optional server deployment is
   // kept on purpose.
@@ -102,6 +107,26 @@ test("one unasserted evidence item blocks on its own", () => {
   });
   assert.deepEqual(verdict.blockers.length, 1);
   assert.match(verdict.blockers[0], /final-import-parity/);
+});
+
+// BF-2583: BotFleet Control is Swift, so no inventory row retires it, but
+// every local thing it does goes through the Mac-local Node stack.  Deleting
+// the stack before Control's future is decided and landed leaves a menu bar
+// app whose rows all read "not installed", so that decision is a gate of
+// its own, and a state file written before the gate existed must not pass.
+test("Control's disposition is a gate that an older state file cannot satisfy", () => {
+  assert.ok(
+    REQUIRED_EVIDENCE.some((gate) => gate.id === "control-disposition"),
+    "the gate must require Control's disposition",
+  );
+  assert.deepEqual(DEPENDENT_SURFACES.map((entry) => entry.path), ["mac-control/"]);
+  const { "control-disposition": _omitted, ...withoutControl } = ALL_DONE.evidence;
+  const verdict = evaluateGates({ ...ALL_DONE, evidence: withoutControl });
+  assert.equal(verdict.ok, false);
+  assert.deepEqual(verdict.blockers.length, 1);
+  assert.match(verdict.blockers[0], /^evidence control-disposition: not asserted/);
+  assert.match(verdict.blockers[0], /mac-control\//);
+  assert.match(verdict.blockers[0], /2026-10-29-botfleet-control-after-node\.md/);
 });
 
 // BF-2544: BotFleet may run with the server as the primary BotFleet server,
@@ -200,6 +225,9 @@ test("the CLI validates the state file before it decides", () => {
     assert.match(passed.stdout, /all green/);
     assert.match(passed.stdout, /Retained on purpose: deploy\/linux-server\//);
     assert.match(passed.stdout, /is deliberately retained and is not a decommission target/);
+    // Control's dependency is printed next to the retained path, so the
+    // reader sees in one place what is kept, and what stops working.
+    assert.match(passed.stdout, /Depends on the stack being deleted: mac-control\//);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -267,6 +295,27 @@ test("the audit covers deploy/ and records the optional server path as retained"
   assert.deepEqual(findUncovered(["deploy/windows/thing.ps1"], INVENTORY), [
     "deploy/windows/thing.ps1",
   ]);
+});
+
+// BF-2583: the audit reports mac-control/ as a dependent of the stack it
+// audits.  It is neither an audited root (nothing in it is Node to retire)
+// nor a retained path (keeping it as it is is not an option), so it has its
+// own list, and the CLI prints it beside the retained path.
+test("the audit names BotFleet Control as a dependent of the Mac-local stack", () => {
+  assert.deepEqual(DEPENDENT_PATHS.map((entry) => entry.path), ["mac-control/"]);
+  assert.ok(!AUDITED_ROOTS.includes("mac-control"), "mac-control/ is a dependent, not a retired root");
+  assert.ok(
+    !RETAINED_PATHS.some((entry) => entry.path.startsWith("mac-control")),
+    "mac-control/ is a dependent, not a retained path",
+  );
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const files = dependentFiles(repoRoot);
+  assert.ok(files.includes("mac-control/Package.swift"), `expected the Control package, got: ${files.slice(0, 5).join(", ")}`);
+  assert.ok(files.every((file) => file.startsWith("mac-control/")));
+  const cli = join(repoRoot, "scripts/audit-node-decommission.mjs");
+  const result = spawnSync("node", [cli], { encoding: "utf8" });
+  assert.match(result.stdout, /depends on the stack being deleted: mac-control\/ \(\d+ tracked file\(s\)\)/);
+  assert.match(result.stdout, /BF-2583/);
 });
 
 // The fixtures above prove the matcher works; this one proves the committed
