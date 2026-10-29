@@ -1,5 +1,5 @@
-/** Keep in sync with shared/tv-face-packaging.ts (TypeScript source for the app). */
-import type { BotColor } from "../src/lib/mascot";
+/** Keep in sync with shared/tv-face-packaging.mjs (after-pack trim). */
+import type { BotColor } from "@/lib/mascot";
 
 export type TvFaceSkinColor = BotColor | "default" | "orange";
 

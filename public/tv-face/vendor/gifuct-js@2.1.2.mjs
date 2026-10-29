@@ -1,4 +1,9 @@
+var __create = Object.create;
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
 var __commonJS = (cb, mod) => function __require() {
   try {
     return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
@@ -6,6 +11,22 @@ var __commonJS = (cb, mod) => function __require() {
     throw mod = 0, e;
   }
 };
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
 
 // node_modules/.pnpm/js-binary-schema-parser@2.0.3/node_modules/js-binary-schema-parser/lib/index.js
 var require_lib = __commonJS({
@@ -493,6 +514,7 @@ var require_lzw = __commonJS({
 // node_modules/.pnpm/gifuct-js@2.1.2/node_modules/gifuct-js/lib/index.js
 var require_lib2 = __commonJS({
   "node_modules/.pnpm/gifuct-js@2.1.2/node_modules/gifuct-js/lib/index.js"(exports) {
+    "use strict";
     Object.defineProperty(exports, "__esModule", {
       value: true
     });
@@ -505,11 +527,11 @@ var require_lib2 = __commonJS({
     function _interopRequireDefault(obj) {
       return obj && obj.__esModule ? obj : { "default": obj };
     }
-    var parseGIF = function parseGIF2(arrayBuffer) {
+    var parseGIF2 = function parseGIF3(arrayBuffer) {
       var byteData = new Uint8Array(arrayBuffer);
       return (0, _jsBinarySchemaParser.parse)((0, _uint.buildStream)(byteData), _gif["default"]);
     };
-    exports.parseGIF = parseGIF;
+    exports.parseGIF = parseGIF2;
     var generatePatch = function generatePatch2(image) {
       var totalPixels = image.pixels.length;
       var patchData = new Uint8ClampedArray(totalPixels * 4);
@@ -562,14 +584,22 @@ var require_lib2 = __commonJS({
       return resultImage;
     };
     exports.decompressFrame = decompressFrame;
-    var decompressFrames = function decompressFrames2(parsedGif, buildImagePatches) {
+    var decompressFrames2 = function decompressFrames3(parsedGif, buildImagePatches) {
       return parsedGif.frames.filter(function(f) {
         return f.image;
       }).map(function(f) {
         return decompressFrame(f, parsedGif.gct, buildImagePatches);
       });
     };
-    exports.decompressFrames = decompressFrames;
+    exports.decompressFrames = decompressFrames2;
   }
 });
-export default require_lib2();
+
+// scripts/tv-face-gif-decoder-entry.mjs
+var import_gifuct_js = __toESM(require_lib2(), 1);
+var export_decompressFrames = import_gifuct_js.decompressFrames;
+var export_parseGIF = import_gifuct_js.parseGIF;
+export {
+  export_decompressFrames as decompressFrames,
+  export_parseGIF as parseGIF
+};

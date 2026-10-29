@@ -3,7 +3,7 @@ import { BotState, BotColor } from "@/lib/mascot";
 import {
   DESKTOP_BUNDLED_TVFACE_SKIN_DIRS,
   tvFaceSkinDirForBundledDirs,
-} from "../../../shared/tv-face-packaging.ts";
+} from "@/lib/tv-face-packaging";
 import {
   TVFACE_HAS_ENTER_RETURN,
   TVFACE_HAS_HOLD,
@@ -90,7 +90,7 @@ export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>([
 /** The skins directory a color renders from.  `orange` IS the default skin. */
 export function tvFaceSkinDir(color: TVFaceSkin): string {
   const bundledDirs =
-    typeof window !== "undefined" && (window as Window & { ogb?: unknown }).ogb
+    globalThis.window && "ogb" in globalThis.window
       ? DESKTOP_BUNDLED_TVFACE_SKIN_DIRS
       : null;
   if (bundledDirs) {
