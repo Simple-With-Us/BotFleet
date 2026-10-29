@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,38 +6,13 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { buildMacFeed, regenerateMacFeed } from "./regenerate-mac-feed.mjs";
+import { buildMacFeed, macArtifactNames, regenerateMacFeed, resolveFeedVersion } from "./regenerate-mac-feed.mjs";
 import { verifyReleaseAssets } from "./verify-release-assets.mjs";
 import { verifyReleaseTag } from "./verify-release-tag.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const VERSION = "1.0.31";
 const builderRequire = createRequire(createRequire(import.meta.url).resolve("electron-builder"));
-
-function hash(file, algorithm, encoding) {
-  return createHash(algorithm).update(readFileSync(file)).digest(encoding);
-}
-
-function feed(directory, version, urls) {
-  const entries = urls.map((url) => ({
-    url,
-    sha512: hash(join(directory, url), "sha512", "base64"),
-    size: readFileSync(join(directory, url)).length,
-  }));
-  return [
-    `version: ${version}`,
-    "files:",
-    ...entries.flatMap((entry) => [
-      `  - url: ${entry.url}`,
-      `    sha512: ${entry.sha512}`,
-      `    size: ${entry.size}`,
-    ]),
-    `path: ${entries[0].url}`,
-    `sha512: ${entries[0].sha512}`,
-    "releaseDate: '2026-09-12T00:00:00.000Z'",
-    "",
-  ].join("\n");
-}
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-release-"));
@@ -47,12 +21,9 @@ function fixture() {
     `BotFleet-${VERSION}-x64.zip`,
     `BotFleet-${VERSION}-arm64.dmg`,
     `BotFleet-${VERSION}-x64.dmg`,
-    `BotFleet-${VERSION}-setup.exe`,
-    `BotFleet-${VERSION}-x86_64.AppImage`,
-    `BotFleet-${VERSION}-amd64.deb`,
   ];
   for (const file of files) writeFileSync(join(directory, file), `bytes:${file}`);
-  for (const file of files.slice(0, 5)) {
+  for (const file of files) {
     execFileSync(process.platform === "win32" ? "python" : "python3", ["-c", `
 import base64,gzip,hashlib,json,sys
 from pathlib import Path
@@ -63,18 +34,7 @@ Path(str(p)+".blockmap").write_bytes(gzip.compress(json.dumps(blockmap).encode()
   }
   cpSync(join(directory, files[2]), join(directory, "BotFleet.dmg"));
   cpSync(join(directory, files[3]), join(directory, "BotFleet-intel.dmg"));
-  cpSync(join(directory, files[4]), join(directory, "BotFleet-setup.exe"));
-  cpSync(join(directory, files[5]), join(directory, "BotFleet.AppImage"));
-  cpSync(join(directory, files[6]), join(directory, "BotFleet-amd64.deb"));
   writeFileSync(join(directory, "latest-mac.yml"), buildMacFeed(directory, VERSION, "2026-09-12T00:00:00.000Z"));
-  writeFileSync(join(directory, "latest.yml"), feed(directory, VERSION, [files[4]]));
-  writeFileSync(join(directory, "latest-linux.yml"), feed(directory, VERSION, [files[5], files[6]]));
-  writeFileSync(
-    join(directory, "SHA256SUMS-ubuntu-x64.txt"),
-    [files[6], files[5]]
-      .map((file) => `${hash(join(directory, file), "sha256", "hex")}  ${file}`)
-      .join("\n") + "\n",
-  );
   return { directory, files };
 }
 
@@ -102,24 +62,6 @@ test("the verifier rejects stale feed bytes and stale stable downloads", () => {
   }
 });
 
-test("the Linux feed must include and verify both generated package formats", () => {
-  const missingDeb = fixture();
-  const staleDeb = fixture();
-  try {
-    writeFileSync(join(missingDeb.directory, "latest-linux.yml"),
-      feed(missingDeb.directory, VERSION, [missingDeb.files[5]]));
-    assert.throws(() => verifyReleaseAssets(missingDeb.directory, VERSION),
-      /latest-linux.yml: expected .*amd64\.deb/);
-
-    writeFileSync(join(staleDeb.directory, staleDeb.files[6]), "changed deb after feed generation");
-    assert.throws(() => verifyReleaseAssets(staleDeb.directory, VERSION),
-      /latest-linux.yml: hash or size mismatch .*amd64\.deb/);
-  } finally {
-    rmSync(missingDeb.directory, { recursive: true, force: true });
-    rmSync(staleDeb.directory, { recursive: true, force: true });
-  }
-});
-
 test("mac feed regeneration replaces duplicate intermediate entries deterministically", () => {
   const { directory } = fixture();
   try {
@@ -132,6 +74,74 @@ test("mac feed regeneration replaces duplicate intermediate entries deterministi
     assert.doesNotThrow(() => verifyReleaseAssets(directory, VERSION));
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the mac feed names the stamped release, not the package.json floor", () => {
+  // package.json's version is the FLOOR of the stamp scheme, and it is also
+  // the version already installed on the owner's Mac.  The first unified
+  // release died regenerating the feed because the script fell back to it:
+  // the run looked for BotFleet-1.0.31-arm64.zip while the build had made
+  // BotFleet-1.0.2193-arm64.zip.
+  assert.equal(resolveFeedVersion({ env: { BOTFLEET_BUILD_VERSION: " 1.0.2193 " } }), "1.0.2193");
+  // An unset or blank stamp falls back to the floor, which is right for a
+  // local build that never stamped one.
+  assert.equal(resolveFeedVersion({ env: { BOTFLEET_BUILD_VERSION: "" } }), VERSION);
+  assert.equal(resolveFeedVersion({ env: {} }), VERSION);
+
+  // And the feed the release writes names the stamped version and its files.
+  const pinned = "1.0.2193";
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-feed-"));
+  try {
+    for (const file of macArtifactNames(pinned)) {
+      writeFileSync(join(directory, file), `bytes:${file}`);
+    }
+    const feedPath = join(directory, "latest-mac.yml");
+    regenerateMacFeed({
+      feedPath,
+      version: resolveFeedVersion({ env: { BOTFLEET_BUILD_VERSION: pinned } }),
+      releaseDate: "2026-10-24T00:00:00.000Z",
+    });
+    const feed = readFileSync(feedPath, "utf8");
+    assert.match(feed, new RegExp(`^version: ${pinned}$`, "m"));
+    for (const file of macArtifactNames(pinned)) {
+      assert.ok(feed.includes(file), `the feed lists ${file}`);
+    }
+    assert.doesNotMatch(feed, new RegExp(`^version: ${VERSION}$`, "m"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a missing release artifact names the version instead of failing bare", () => {
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-feed-missing-"));
+  try {
+    assert.throws(
+      () => buildMacFeed(directory, "1.0.2193"),
+      /missing release artifact BotFleet-1\.0\.2193-arm64\.zip for version 1\.0\.2193/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the release workflow hands the pinned version to every feed regeneration", () => {
+  const workflow = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8").replace(/\r\n/g, "\n");
+  const macMerge = workflow.slice(workflow.indexOf("\n  mac-merge:"), workflow.indexOf("\n  assemble:"));
+  assert.ok(macMerge.length > 0, "the workflow has a mac-merge job");
+
+  // The feed has to describe the release that was just built.  The script
+  // falls back to package.json's version when it is not told which release
+  // this is, and that fallback is the floor of the stamp scheme.
+  assert.match(macMerge, /node scripts\/regenerate-mac-feed\.mjs release\/latest-mac\.yml "\$v"/);
+  assert.match(macMerge, /v="\$\{\{ needs\.prepare\.outputs\.version \}\}"/);
+
+  // Every call in the workflow names the version, so no release can drift
+  // back onto the floor.
+  const calls = [...workflow.matchAll(/node scripts\/regenerate-mac-feed\.mjs[^\n]*/g)].map((match) => match[0]);
+  assert.ok(calls.length > 0, "the workflow regenerates the feed");
+  for (const call of calls) {
+    assert.match(call, /"\$v"/, `the feed regeneration names the version: ${call}`);
   }
 });
 
@@ -189,14 +199,30 @@ test("release workflow defaults to artifacts and requires explicit release mutat
   assert.match(workflow, /node scripts\/verify-release-assets\.mjs uploaded "\$VERSION"/);
 });
 
-test("the windows packaging gate asserts the owner as well as the repo it names", () => {
-  const workflow = readFileSync(join(ROOT, ".github/workflows/package-win.yml"), "utf8").replace(/\r\n/g, "\n");
-  const builder = readFileSync(join(ROOT, "electron-builder.yml"), "utf8").replace(/\r\n/g, "\n");
-  // The error text names Simple-With-Us/BotFleet, so the gate has to check both halves.
-  assert.match(workflow, /grep -q "\^owner: Simple-With-Us\$" "\$res\/app-update\.yml"/);
-  assert.match(workflow, /grep -q "\^repo: BotFleet\$" "\$res\/app-update\.yml"/);
-  // …and both halves have to match what electron-builder actually publishes.
-  assert.match(builder, /publish:\n\s+- provider: github\n\s+owner: Simple-With-Us\n\s+repo: BotFleet/);
+test("the publish guard compares the stamped version, not an empty needs context", () => {
+  const workflow = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8").replace(/\r\n/g, "\n");
+  const prepare = workflow.slice(workflow.indexOf("\n  prepare:"), workflow.indexOf("\n  mac:"));
+  assert.ok(prepare.length > 0, "the workflow has a prepare job");
+
+  // The release version is stamped from history, not read from package.json:
+  // package.json says 1.0.31, which is the version already installed on the
+  // owner's Mac, so a feed carrying it can never offer an update.
+  assert.match(prepare, /version=\$\(node scripts\/stamp-commit-version\.mjs \.\)/);
+  // The stamp is `git rev-list --count`, which answers 1 on a shallow clone,
+  // so the checkout has to be full depth or every release would number 1.0.1.
+  assert.match(prepare, /fetch-depth: 0/);
+  // Inside the prepare job the needs context is empty -- prepare is the first
+  // job and depends on nothing -- so needs.prepare.outputs.version rendered
+  // empty and the guard compared the literal tag "v".  That matched no
+  // release, so the gate never fired and a published release could be
+  // overwritten instead of stopping the run.  Comments may name the mistake;
+  // the code must not use it.
+  const prepareCode = prepare
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n");
+  assert.match(prepareCode, /v="v\$\{\{ steps\.pin\.outputs\.version \}\}"/);
+  assert.doesNotMatch(prepareCode, /needs\.prepare\.outputs\.version/);
 });
 
 test("release tags must resolve to the pinned build, including nested annotated tags", async () => {

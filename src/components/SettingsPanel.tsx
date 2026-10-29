@@ -1,10 +1,12 @@
 import { AlertTriangle, Bug, ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
 import { useState } from "react";
 import { api, useStore, type Bot } from "@/state/store";
+import type { BotUpdatePatch } from "@/state/bot-patch-queue";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { BotFallbackModels } from "./BotFallbackModels";
 import { ModelPicker } from "./ModelPicker";
+import { ModelSettings } from "./ModelSettings";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { railAsideClass } from "@/lib/layout-rails";
@@ -15,6 +17,14 @@ import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@
 import { computerDestinationDisabledReason, instanceSupportsLocalComputer, localComputerDisabledReason, localComputerSelectable } from "@/lib/local-computer";
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
 import { BotPowerToggle } from "./BotPowerToggle";
+import { ConfirmDialog } from "./ConfirmDialog";
+import {
+  BOT_OFF_AFTER_TURN,
+  BOT_OFF_KEEP_ON,
+  BOT_OFF_STOP_AND_POWER_OFF,
+  botOffWhileRunningBody,
+  botOffWhileRunningTitle,
+} from "../../shared/bot-power";
 import { BotSkillsPanel } from "./BotSkillsPanel";
 import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
 import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
@@ -29,8 +39,9 @@ import { bypassCoverageNote } from "../../shared/bypass-coverage";
 import { VoiceSettings } from "./VoiceSettings";
 import { AutoReviewCard } from "./AutoReviewCard";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
-import { botCapabilityGates, toolRoundsGate } from "@/lib/bot-settings-gates";
+import { botCapabilityGates, historySummaryGate, toolRoundsGate } from "@/lib/bot-settings-gates";
 import { MaxToolRoundsField } from "./MaxToolRoundsField";
+import { HistoryCompressionField } from "./HistoryCompressionField";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { effortLabel } from "@/lib/model-effort";
 import { selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
@@ -342,6 +353,9 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const providerSupportsLocal = instanceSupportsLocalComputer(state.instances, bot);
   const localSelectable = localComputerSelectable({ capabilities, providerSupportsLocal });
   const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | "bypassLocal" | null>(null);
+  // The switch is held open while this is true, so the bot is still On until
+  // the person has said what should happen to the turn it is running.
+  const [powerOffWhileRunning, setPowerOffWhileRunning] = useState(false);
   const localDisabledReason = localComputerDisabledReason({ capabilities, providerSupportsLocal });
   const autoWouldUseLocal = requiresLocalAutoConsent(
     bot.computers,
@@ -366,37 +380,16 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
     return null;
   };
   const patch = (
-    p: Partial<
-      Pick<
-        Bot,
-        | "name"
-        | "title"
-        | "description"
-        | "notifications"
-        | "computers"
-        | "cloudBackend"
-        | "autoStartVps"
-        | "color"
-        | "mascotExpression"
-        | "avatarUrl"
-        | "avatarCrop"
-        | "autoApprove"
-        | "autoReview"
-        | "bypassPermissions"
-        | "bypassLocalComputer"
-        | "speakReplies"
-        | "speechDevices"
-        | "voice"
-        | "voiceSummaryMode"
-        | "chiefOfStaff"
-        | "approvePeerComms"
-        | "alwaysAllow"
-        | "composio"
-        | "modelSelection"
-        | "maxToolRounds"
-        | "off"
-      >
-    > & { acknowledgeLocalAuto?: boolean; connectorTools?: Bot["connectorTools"] },
+    p: Partial<BotUpdatePatch> & {
+      // Panel-only fields the broad PATCH boundary (BotUpdatePatch) does not
+      // carry:  everything else derives from the canonical queue type, so a
+      // future whitelist on the queue cannot silently drop a setting the
+      // panel shows as saved.
+      autoReview?: Bot["autoReview"];
+      bypassLocalComputer?: Bot["bypassLocalComputer"];
+      alwaysAllow?: Bot["alwaysAllow"];
+      connectorTools?: Bot["connectorTools"];
+    },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
   const alwaysAllow = bot.alwaysAllow ?? [];
   const activeState = stateForBot(bot);
@@ -410,6 +403,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const engine = gates.engine;
   const { canCoordinate, canUseConnectedApps, canUseVps } = gates;
   const roundsGate = toolRoundsGate(state.instances, bot);
+  const historyGate = historySummaryGate(state.instances, bot);
   // Null when the engine asks and the broker answers, which is the common case.
   const bypassNote = bypassCoverageNote(engine?.capabilities?.bypassCoverage ?? "asks");
   const connectedAppsConfigured = state.config?.composio?.configured === true;
@@ -481,7 +475,20 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             />
           </Field>
 
-          <BotPowerToggle off={bot.off === true} onChange={(off) => patch({ off })} />
+          {/* Switching a working bot Off is really two decisions — stop the turn
+              now, or stop it starting from now — and the switch cannot tell
+              which one was meant.  Only a busy bot has a turn to decide about,
+              so only a busy bot is asked, and it stays On until they answer. */}
+          <BotPowerToggle
+            off={bot.off === true}
+            onChange={(off) => {
+              if (off && bot.busy) {
+                setPowerOffWhileRunning(true);
+                return;
+              }
+              patch({ off });
+            }}
+          />
 
           <div className={cn(
             "rounded-xl border p-4",
@@ -616,14 +623,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             <ModelPicker
               bot={bot}
               contained
-              label={
-                <div>
-                  <div className="text-[15px] font-medium text-ink">Primary Model</div>
-                  <div className="mt-0.5 text-[13px] text-ink-secondary">
-                    Which provider and model this bot runs on
-                  </div>
-                </div>
-              }
+              label={<div className="text-[15px] font-medium text-ink">Primary Model</div>}
             />
             
             <BotFallbackModels bot={bot} onChange={(modelSelection) => patch({ modelSelection })} />
@@ -676,11 +676,29 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             );
           })()}
 
+          <ModelSettings
+            instance={engine}
+            selection={bot.modelSelection}
+            showEffort={false}
+            disabled={Boolean(bot.busy)}
+            onChange={(modelSelection) => patch({ modelSelection })}
+          />
+
           {roundsGate.visible && (
             <MaxToolRoundsField
               value={bot.maxToolRounds}
               onChange={(maxToolRounds) => patch({ maxToolRounds })}
               gate={roundsGate}
+            />
+          )}
+
+          {historyGate.visible && (
+            <HistoryCompressionField
+              maxHistoryTurns={bot.maxHistoryTurns}
+              historySummaryModel={bot.historySummaryModel}
+              onMaxHistoryTurns={(maxHistoryTurns) => patch({ maxHistoryTurns })}
+              onHistorySummaryModel={(historySummaryModel) => patch({ historySummaryModel })}
+              gate={historyGate}
             />
           )}
 
@@ -996,6 +1014,30 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
       botName={bot.name}
       model={bot.modelSelection?.model ?? ""}
       engineId={bot.modelSelection?.instanceId}
+    />
+    <ConfirmDialog
+      open={powerOffWhileRunning}
+      title={botOffWhileRunningTitle(bot.name)}
+      body={botOffWhileRunningBody(bot.name)}
+      confirmLabel={BOT_OFF_STOP_AND_POWER_OFF}
+      cancelLabel={BOT_OFF_KEEP_ON}
+      altLabel={BOT_OFF_AFTER_TURN}
+      onCancel={() => setPowerOffWhileRunning(false)}
+      onAlt={() => {
+        // What Off means on its own: no turn is stopped here.
+        setPowerOffWhileRunning(false);
+        patch({ off: true });
+      }}
+      onConfirm={() => {
+        setPowerOffWhileRunning(false);
+        // Off first, then stop.  The flag is what stops anything else from
+        // starting in the gap, and it is safe to set while a turn runs:
+        // settleWorkForOffBot returns early for a busy bot.  The interrupt
+        // still works afterwards, because it acts on the turn in flight
+        // rather than on the bot being on or off.
+        patch({ off: true });
+        dispatch({ type: "interrupt", botId: bot.id });
+      }}
     />
     </>
   );

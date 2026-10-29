@@ -39,6 +39,11 @@ export const CREDENTIAL_ENV_NAMES = [
   // clear.
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+  // The service tokens: the read token and the write token are credentials
+  // too, and a bundle collected on an install that exports them would
+  // otherwise carry them in the clear.
+  "INFISICAL_TOKEN",
+  "INFISICAL_WRITE_TOKEN",
 ];
 
 // Credential-shaped tokens: unmistakable formats are masked wherever they
@@ -69,6 +74,7 @@ const CREDENTIAL_TOKEN_FORMATS = [
   /\bAIza[0-9A-Za-z_-]{30,}/g,
   /\bnpm_[A-Za-z0-9]{20,}/g,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g,
+  /\bst\.[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{16,}){0,3}/g,
 ];
 const KEY_VALUE_PAIR =
   /\b([A-Za-z0-9_.-]*(?:api[_-]?key|apikey|secret|token|password|passwd|authorization|auth[_-]?token|access[_-]?key|private[_-]?key)s?)\s*[:=]\s*("[^"]*"|'[^']*'|[^\s"',;)\]}]+)/gi;

@@ -25,7 +25,16 @@ import { hashStaticUi, readSourceBuildIdentity } from "../electron/runtime-ident
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const server = join(root, "server");
-const buildIdentity = { ...readSourceBuildIdentity(root, { requireGit: true }), uiHash: hashStaticUi(join(root, "dist")) };
+// A CI build passes its commit-count version here rather than editing
+// package.json.  The provenance gate requires a pristine checkout, so stamping
+// the source file would make every build report sourceDirty and fail the very
+// gate that proves it came from a committed tree.  Unset in local builds, where
+// package.json's own version is the truth.
+const buildVersion = process.env.BOTFLEET_BUILD_VERSION?.trim() || null;
+const buildIdentity = {
+  ...readSourceBuildIdentity(root, { requireGit: true, version: buildVersion }),
+  uiHash: hashStaticUi(join(root, "dist")),
+};
 
 // yaml's Node export is CommonJS and contains dynamic requires that cannot run
 // after it is inlined into our ESM-only packaged server. Its browser export is
@@ -56,6 +65,7 @@ const ENTRY_POINTS = [
   // package smoke probe also imports local-computer.js directly.
   "proxy-paths.ts",
   "local-computer.ts",
+  "local-vm-offline-cli.ts",
   "computer-proxy.ts",
   "container-mcp.ts",
   "vps-container-mcp.ts",

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
-import { classifyCIPaths, isControlPlanePath, isIosPath, isPackagingPath } from "./ci-change-scope.mjs";
+import { classifyCIPaths, isIosPath, isPackagingPath } from "./ci-change-scope.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -16,7 +17,6 @@ test("only the explicit non-executable documentation paths take the fast path", 
     docsOnly: true,
     iosChanged: false,
     packagingChanged: false,
-    controlPlaneChanged: false,
   });
   assert.equal(classifyCIPaths(["README.md", "SECURITY.md"]).docsOnly, true);
 
@@ -40,38 +40,35 @@ test("only the explicit non-executable documentation paths take the fast path", 
 
 test("per-area outputs gate the expensive jobs on the paths that actually affect them", () => {
   assert.deepEqual(
-    { ios: isIosPath("ios/App/BotFleetApp.swift"), pkg: isPackagingPath("ios/App/BotFleetApp.swift"), cp: isControlPlanePath("ios/App/BotFleetApp.swift") },
-    { ios: true, pkg: false, cp: false },
+    { ios: isIosPath("ios/App/BotFleetApp.swift"), pkg: isPackagingPath("ios/App/BotFleetApp.swift") },
+    { ios: true, pkg: false },
   );
   assert.equal(isIosPath("scripts/ios-fleet/ship-testflight.sh"), true);
   assert.equal(isIosPath(".github/workflows/ci.yml"), true);
+  assert.equal(isIosPath("scripts/ci-ios-gate.mjs"), true);
+  assert.equal(isIosPath("scripts/ci-change-scope.mjs"), true);
   assert.equal(isIosPath("server/index.ts"), false);
 
   for (const path of ["electron/main.mjs", "electron-builder.yml", "third_party/cloudflared/README.md",
-    "scripts/prepare-cloudflared.mjs", "scripts/package-linux.mjs", "package.json", "pnpm-lock.yaml"]) {
+    "scripts/prepare-cloudflared.mjs", "scripts/prepare-cua-linux.mjs", "package.json", "pnpm-lock.yaml"]) {
     assert.equal(isPackagingPath(path), true, path);
   }
   assert.equal(isPackagingPath(".github/workflows/ci.yml"), false);
   assert.equal(isPackagingPath("server/index.ts"), false);
 
-  assert.equal(isControlPlanePath("cloudflare/control-plane/wrangler.jsonc"), true);
-  assert.equal(isControlPlanePath("server/index.ts"), false);
-
   // A real diff picks exactly one area, and an unrelated change (like this
-  // WP-K PR touching a shell script) leaves the other two areas untouched.
+  // WP-K PR touching a shell script) leaves the other area untouched.
   assert.deepEqual(classifyCIPaths(["server/index.ts"]), {
     changedCount: 1,
     docsOnly: false,
     iosChanged: false,
     packagingChanged: false,
-    controlPlaneChanged: false,
   });
   assert.deepEqual(classifyCIPaths(["ios/App/BotFleetApp.swift", "server/index.ts"]), {
     changedCount: 2,
     docsOnly: false,
     iosChanged: true,
     packagingChanged: false,
-    controlPlaneChanged: false,
   });
 
   // No signal (an empty list, the same fallback the workflow's schedule,
@@ -82,7 +79,6 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
     docsOnly: false,
     iosChanged: true,
     packagingChanged: true,
-    controlPlaneChanged: true,
   });
 });
 
@@ -97,13 +93,13 @@ test("the CLI emits only GitHub outputs for a NUL-delimited path list", () => {
   assert.equal(result.stderr, "");
   assert.equal(
     result.stdout,
-    "docs_only=true\nchanged_count=2\nios_changed=false\npackaging_changed=false\ncontrol_plane_changed=false\n",
+    "docs_only=true\nchanged_count=2\nios_changed=false\npackaging_changed=false\n",
   );
 });
 
 test("every protected check stays present and takes the same fail-closed scope output", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
-  const requiredJobs = ["test", "control-plane", "package-linux", "ios"];
+  const requiredJobs = ["test"];
 
   assert.equal(Object.hasOwn(workflow.on, "workflow_dispatch"), true);
   assert.equal(Object.hasOwn(workflow.on, "schedule"), true);
@@ -132,47 +128,172 @@ test("every protected check stays present and takes the same fail-closed scope o
   assert.doesNotMatch(source, /paths-ignore:/);
 });
 
-test("the three expensive jobs also gate on their own area, the same way docs_only does", () => {
+test("no Linux packaging job remains in ci.yml (BF-2500 clean break)", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
-  const areaJobs = [
-    { jobId: "ios", output: "ios_changed", fastPathName: "iOS-unrelated fast path" },
-    { jobId: "package-linux", output: "packaging_changed", fastPathName: "Packaging-unrelated fast path" },
-    { jobId: "control-plane", output: "control_plane_changed", fastPathName: "Control-plane-unrelated fast path" },
-  ];
 
-  for (const { jobId, output, fastPathName } of areaJobs) {
-    const job = workflow.jobs[jobId];
-    const docsFastPath = job.steps.find((step) => step.name === "Documentation-only fast path");
-    const areaFastPath = job.steps.find((step) => step.name === fastPathName);
-    assert.ok(areaFastPath, `${jobId} is missing "${fastPathName}"`);
-    assert.equal(
-      areaFastPath.if,
-      `needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.${output} != 'true'`,
-      jobId,
-    );
-
-    const expensiveSteps = job.steps.filter((step) => step !== docsFastPath && step !== areaFastPath);
-    assert.ok(expensiveSteps.length > 0, jobId);
-    for (const step of expensiveSteps) {
-      assert.match(
-        step.if,
-        new RegExp(`needs\\.changes\\.outputs\\.${output} == 'true'`),
-        `${jobId}: ${step.name ?? step.run ?? step.uses}`,
-      );
-    }
+  // The Ubuntu desktop package job is gone with the Windows matrix leg; the
+  // mac gate lives in mac-package-gate.yml and the VM image in
+  // vm-image-build.yml, neither of which is a ci.yml job.
+  assert.equal(workflow.jobs["package-linux"], undefined);
+  for (const job of Object.values(workflow.jobs)) {
+    assert.doesNotMatch(JSON.stringify(job), /package-linux|windows-latest/);
   }
 
   // Neither the docs_only-only "test" job nor the changes job itself gained
-  // one of these three gates by accident.
+  // one of these area gates by accident.
   assert.equal(workflow.jobs.test.steps.some((step) => /_changed/.test(step.if ?? "")), false);
 
   const classifier = workflow.jobs.changes.steps.find((step) => step.id === "scope");
-  for (const output of ["ios_changed", "packaging_changed", "control_plane_changed"]) {
+  for (const output of ["ios_changed", "packaging_changed"]) {
     assert.equal(workflow.jobs.changes.outputs[output], `\${{ steps.scope.outputs.${output} }}`);
     // Scheduled/dispatched runs and an unresolvable base SHA both fall back
     // to the full gate -- every area reported changed, not skipped.
     const occurrences = classifier.run.match(new RegExp(`echo "${output}=true"`, "g")) ?? [];
     assert.equal(occurrences.length, 2, `${output} fallback branches`);
+  }
+});
+
+function runIosGate(paths, env, summaryFile) {
+  const childEnv = { ...process.env, ...env };
+  if (summaryFile) childEnv.GITHUB_STEP_SUMMARY = summaryFile;
+  return spawnSync(process.execPath, [join(ROOT, "scripts/ci-ios-gate.mjs")], {
+    cwd: ROOT,
+    input: Buffer.from(paths.join("\0")),
+    encoding: "utf8",
+    env: childEnv,
+  });
+}
+
+test("the required iOS check is a diff replay, not an echo, and the build job has no skip step", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const source = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
+  assert.doesNotMatch(source, /iOS-unrelated fast path/);
+
+  const iosBuild = workflow.jobs["ios-build"];
+  assert.ok(iosBuild, "ios-build job");
+  assert.equal(iosBuild.needs, "changes");
+  assert.match(
+    iosBuild.if,
+    /needs\.changes\.outputs\.docs_only != 'true' && needs\.changes\.outputs\.ios_changed == 'true'/,
+  );
+  assert.equal(iosBuild["runs-on"], "xcode-27");
+  assert.equal(iosBuild.steps.some((step) => /echo /.test(step.run ?? "")), false);
+  assert.equal(iosBuild.steps.some((step) => step.name === "Swift package tests"), true);
+  assert.equal(iosBuild.steps.some((step) => step.name === "Build the iOS app (unsigned)"), true);
+
+  const gate = workflow.jobs.ios;
+  // Ruleset 21771270 requires this context string.  A rename here would
+  // report a different check and leave the required one missing.
+  assert.equal(gate.name, "Swift tests + iOS build");
+  assert.deepEqual(gate.needs, ["changes", "ios-build"]);
+  assert.match(gate.if, /always\(\)/);
+  assert.match(gate.if, /needs\.changes\.result == 'success'/);
+  assert.equal(gate["runs-on"], "ubuntu-latest");
+  const checkout = gate.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+  assert.equal(checkout.with["fetch-depth"], 0);
+  const verify = gate.steps.find((step) => step.name === "Prove the iOS build ran or that no iOS paths changed");
+  assert.ok(verify);
+  assert.match(verify.run, /ci-ios-gate\.mjs/);
+  assert.match(verify.run, /git diff --no-renames --name-only -z/);
+  assert.doesNotMatch(verify.run, /^echo /m);
+});
+
+test("the iOS required gate accepts a skip only when the replay proves no iOS work", () => {
+  const skip = runIosGate(["server/index.ts"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "false",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.equal(skip.status, 0, skip.stderr);
+  assert.match(skip.stdout, /gate_verdict: skipped_no_ios_relevant_paths/);
+  assert.match(skip.stdout, /outcome: skipped_no_ios_relevant_paths/);
+  assert.doesNotMatch(skip.stdout, /server\/index\.ts/);
+
+  const docs = runIosGate(["docs/EFFORT-LOG.md"], {
+    DOCS_ONLY: "true",
+    IOS_CHANGED: "false",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.equal(docs.status, 0, docs.stderr);
+  assert.match(docs.stdout, /gate_verdict: skipped_docs_only/);
+
+  const built = runIosGate(["ios/project.yml"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "success",
+    EVENT_NAME: "pull_request",
+  });
+  assert.equal(built.status, 0, built.stderr);
+  assert.match(built.stdout, /gate_verdict: build_required/);
+  assert.match(built.stdout, /outcome: swift_tests_and_ios_build_ran/);
+
+  const missingBuild = runIosGate(["ios/project.yml"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.notEqual(missingBuild.status, 0);
+  assert.match(missingBuild.stderr, /require a successful ios-build/);
+
+  const mismatch = runIosGate(["server/index.ts"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.notEqual(mismatch.status, 0);
+  assert.match(mismatch.stderr, /do not match a fresh diff replay/);
+
+  const echoBypass = runIosGate(["scripts/ci-ios-gate.mjs"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "false",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.notEqual(echoBypass.status, 0);
+  assert.match(echoBypass.stderr, /do not match a fresh diff replay/);
+
+  const scheduled = runIosGate([], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "success",
+    EVENT_NAME: "schedule",
+  });
+  assert.equal(scheduled.status, 0, scheduled.stderr);
+  assert.match(scheduled.stdout, /outcome: swift_tests_and_ios_build_ran/);
+
+  const scheduledSkip = runIosGate([], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "workflow_dispatch",
+  });
+  assert.notEqual(scheduledSkip.status, 0);
+  assert.match(scheduledSkip.stderr, /require a successful ios-build/);
+});
+
+test("the iOS gate keeps changed paths out of workflow-command stdout", () => {
+  // The Windows runner has no /tmp, so a hardcoded path becomes D:\tmp and
+  // the summary write throws ENOENT.  Use the process temp directory.
+  const dir = mkdtempSync(join(tmpdir(), "ci-ios-gate-"));
+  const summaryFile = join(dir, "summary.md");
+  try {
+    const hostile = runIosGate(["::error::pwned"], {
+      DOCS_ONLY: "false",
+      IOS_CHANGED: "false",
+      IOS_BUILD_RESULT: "skipped",
+      EVENT_NAME: "pull_request",
+    }, summaryFile);
+    assert.equal(hostile.status, 0, hostile.stderr);
+    assert.doesNotMatch(hostile.stdout, /^::error::pwned/m);
+    const summary = readFileSync(summaryFile, "utf8");
+    assert.match(summary, /No iOS build ran/);
+    assert.match(summary, /- ::error::pwned/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -207,12 +328,24 @@ test("the weekly full run is registered with the Sentry cron reporter", () => {
 test("every host runs the canonical complete test chain without masking failures", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const job = workflow.jobs.test;
-  assert.deepEqual(job.strategy.matrix.os, ["macos-latest", "ubuntu-latest", "windows-latest"]);
+  // The required contexts stay "typecheck + test (macos-latest)" and
+  // "typecheck + test (ubuntu-latest)".  Hosted macos-latest does not
+  // allocate a runner (BF-2066), so the mac leg runs on macos-14.
+  // Ubuntu keeps its own label.
+  assert.equal(job.name, "typecheck + test (${{ matrix.check }})");
+  assert.deepEqual(job.strategy.matrix.include, [
+    { os: "macos-14", check: "macos-latest" },
+    { os: "ubuntu-latest", check: "ubuntu-latest" },
+  ]);
+  assert.match(String(job["runs-on"]), /matrix\.os/);
+  assert.doesNotMatch(String(job["runs-on"]), /macos-latest/);
   assert.notEqual(job["continue-on-error"], true);
   const gates = job.steps.filter((step) => step.run?.trim() === "pnpm test");
   assert.equal(gates.length, 1, "CI must call the package test chain, not a copied subset");
   assert.equal(gates[0].if, "needs.changes.outputs.docs_only != 'true'");
   assert.notEqual(gates[0]["continue-on-error"], true);
+  const vite = job.steps.find((step) => step.run?.includes("vite build"));
+  assert.equal(vite.if, "needs.changes.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'");
 });
 
 test("the test job checks out full history so the effort ledger guard can find its merge base", () => {

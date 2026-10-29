@@ -29,6 +29,7 @@ import type {
   ProviderInstance,
   ProviderSnapshot,
 } from "../contracts.ts";
+import { isJsonString } from "../schema.ts";
 
 /** The instance id the default fleet reserves for each driver whose reserved
  * id is not simply its own kind.  `isCustom` — which drives the delete button,
@@ -211,17 +212,10 @@ function cliDefaultOf(driver: AnyProviderDriver | undefined): string | undefined
  * no-op for everything but the engines that actually ship two names. */
 function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
   const aliases = driver?.cliAliases;
-  if (!Array.isArray(aliases)) return [];
+  if (!aliases?.length) return [];
   // A path or a newline is not a command name; findCliCandidates drops those
   // too, but keeping the list clean here keeps the cache key honest.
-  const out: string[] = [];
-  for (const entry of aliases) {
-    if (Object.prototype.toString.call(entry) !== "[object String]") continue;
-    const name = String(entry);
-    if (!name || /[\n\r/\\]/.test(name)) continue;
-    out.push(name);
-  }
-  return [...new Set(out)];
+  return [...new Set(aliases.filter((a): a is string => isJsonString(a) && Boolean(a) && !/[\n\r/\\]/.test(a)))];
 }
 
 /** Every name that runs this driver: the default first, then its aliases. */
@@ -292,6 +286,9 @@ export interface DescribedInstance {
     bypassCoverage?: BypassCoverage;
     /** True when this engine runs the harness HTTP tool loop. */
     toolLoop: boolean;
+    /** True when this engine drops and summarizes replayed history under its
+     *  own prompt budget (ACP), so the per-bot history settings apply. */
+    historySummary?: boolean;
   };
   /** Which computer destinations this engine can be given at all — the ONE
    *  answer, derived from the adapter's own flags in `computer-capability.ts`
@@ -836,6 +833,14 @@ export class ProviderRegistry {
     return promise;
   }
 
+  /** The last completed describe's answer for one engine, or null before any
+   *  sweep has finished.  Reads what is already known and never probes, which
+   *  is why the command menu uses it: asking for the menu must not start a
+   *  CLI. */
+  lastDescribed(instanceId: InstanceId): DescribedInstance | null {
+    return this.lastDone?.result.find((info) => info.instanceId === instanceId) ?? null;
+  }
+
   /** Make `result` the last completed describe and tell listeners if it
    * changed anything. */
   private commit(result: DescribedInstance[], answeredAt: number, persist: boolean): void {
@@ -1147,7 +1152,7 @@ export class ProviderRegistry {
       curr.snapshot.state === "available" &&
       curr.snapshot.authenticated === undefined &&
       prev.snapshot.state === "available" &&
-      typeof prev.snapshot.authenticated === "boolean" &&
+      (prev.snapshot.authenticated === true || prev.snapshot.authenticated === false) &&
       authFresh
     ) {
       return { ...curr, snapshot: { ...curr.snapshot, authenticated: prev.snapshot.authenticated } };
@@ -1189,6 +1194,7 @@ export class ProviderRegistry {
           agentsMcp: false,
           localComputerMcp: false,
           toolLoop: false,
+          historySummary: false,
           bypassCoverage: bypassCoverage(entry.shadow.driverKind),
         },
         // A shadow has no adapter to ask, so the derivation is fed the same
@@ -1235,6 +1241,7 @@ export class ProviderRegistry {
         reviewHook: inst.adapter.capabilities.reviewHook ?? "none",
         asksWhenHeld: inst.adapter.capabilities.asksWhenHeld === true,
         toolLoop: inst.adapter.capabilities.toolLoop === true,
+        historySummary: inst.adapter.capabilities.historySummary === true,
         bypassCoverage: bypassCoverage(inst.driverKind),
       },
       // Derived here, on the one wire where adapter capabilities already
@@ -1457,7 +1464,7 @@ export class ProviderRegistry {
         const allCatalogCapped =
           catalogIds.length > 0 && catalogIds.every((id) => mergedModels[id]?.capped === true);
         if (wildcard || Object.keys(mergedModels).length > 0 || windowsLabel || minimaxSummary) {
-          snapshot.quota = {
+          const mergedQuota = {
             ...driverQuota,
             capped: Boolean(wildcard)
               || allCatalogCapped
@@ -1467,10 +1474,11 @@ export class ProviderRegistry {
             // signal; the driver's is carried over when there is none.
             resetsAt: wildcard?.resetsAt ?? driverQuota?.resetsAt,
             error: wildcard?.error ?? driverQuota?.error,
-            ...(windowsLabel ? { windowsLabel } : {}),
-            ...(Object.keys(mergedModels).length > 0 ? { models: mergedModels } : {}),
-            ...(minimaxSummary ? { minimax: minimaxSummary } : {}),
           };
+          if (windowsLabel) mergedQuota.windowsLabel = windowsLabel;
+          if (Object.keys(mergedModels).length > 0) mergedQuota.models = mergedModels;
+          if (minimaxSummary) mergedQuota.minimax = minimaxSummary;
+          snapshot.quota = mergedQuota;
         }
       } catch (e) {
         snapshot = { state: "unavailable", reason: e instanceof Error ? e.message : String(e) };

@@ -39,7 +39,7 @@ import {
   findExecutable,
   runOrdinaryMcode,
   writeMcodeFixture,
-  writeZuliprc,
+  zulipCredentialEnv,
   type McodeFixture,
   type McpEntry,
   type ModelStep,
@@ -254,8 +254,8 @@ withMcodeAndAgentSync("the agent-sync MCP entry the owner registered (`--default
     await removeTempDir(scratch);
   });
 
-  /** The fixture:  a fake Zulip with the two bots, their credential files in
-   *  the engine child's home, and `mcp.json` registering agent-sync exactly as
+  /** The fixture:  a fake Zulip with the two bots, their credentials in
+   *  the MCP entry's environment, and `mcp.json` registering agent-sync exactly as
    *  ~/.minimax/mcp.json does (`mcp --default-seat MM`), plus the one variable
    *  that points it at the fake realm instead of the real one. */
   async function build(): Promise<McodeFixture> {
@@ -268,7 +268,16 @@ withMcodeAndAgentSync("the agent-sync MCP entry the owner registered (`--default
     const agentSync: McpEntry = {
       command: AGENT_SYNC!,
       args: ["mcp", "--default-seat", "MM"],
-      env: { AGENT_SYNC_REALM: zulip.url },
+      env: {
+        AGENT_SYNC_REALM: zulip.url,
+        ...zulipCredentialEnv({
+          site: zulip.url,
+          bots: [
+            { seat: "BF-MONITOR", email: MONITOR.email, key: MONITOR.key },
+            { seat: "MM", email: MINIMAX.email, key: MINIMAX.key },
+          ],
+        }),
+      },
     };
     const fixture = await writeMcodeFixture({
       mcode: MCODE!,
@@ -276,8 +285,6 @@ withMcodeAndAgentSync("the agent-sync MCP entry the owner registered (`--default
       modelUrl: model.url,
       mcpServers: { "agent-sync": agentSync },
     });
-    writeZuliprc({ home: fixture.home, fileName: "BF-Monitor-zuliprc", email: MONITOR.email, key: MONITOR.key, site: zulip.url });
-    writeZuliprc({ home: fixture.home, fileName: "MM-zuliprc", email: MINIMAX.email, key: MINIMAX.key, site: zulip.url });
     return fixture;
   }
 

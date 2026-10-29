@@ -49,6 +49,30 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "merge-all-threads") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/MergeAllThreadsVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "merge-all-threads-menu") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/MergeAllThreadsMenuVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "engine-callout") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
   // for in the real app boot path. The App render below is unchanged for any
@@ -79,6 +103,30 @@ if (fixtureParam === "tv-face") {
   // `ModelRow` at the pane widths where a slug used to break one character per
   // line, beside the usage block that replaced the per-row quota chip.
   void import("./components/ModelRowsVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "settings-model-picker") {
+  // Visual-spec harness (tests/e2e/settings-model-picker.visual.spec.ts): the
+  // real `ModelPicker` in its contained Settings form, at the panel width where
+  // "Primary Model" and the dropdown used to share one line and wrap.
+  void import("./components/SettingsModelPickerVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "power-off-confirm") {
+  // Visual-spec harness (tests/e2e/power-off-confirm.visual.spec.ts): the real
+  // ConfirmDialog with the three answers a working bot's power-off asks for, at
+  // the widths where those three long labels have to wrap.
+  void import("./components/PowerOffConfirmVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>
@@ -309,6 +357,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "delegation-card") {
+  // Visual-spec harness (tests/e2e/delegation-card.visual.spec.ts): bot-to-bot
+  // delegation card with the live progress row.
+  void import("./components/DelegationCardVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "sign-in-card") {
   // Visual-spec harness (tests/e2e/sign-in-card.visual.spec.ts): the Sign in
   // needed card, open, with a persistent error, and after Done.
@@ -335,6 +394,17 @@ if (fixtureParam === "tv-face") {
   // Visual-spec harness (tests/e2e/settings-always-allow.visual.spec.ts):
   // Agent settings Always allowed empty and populated revoke list.
   void import("./components/SettingsAlwaysAllowVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "history-compression") {
+  // Visual-spec harness (tests/e2e/history-compression.visual.spec.ts):
+  // History Compression controls, editable and read-only.
+  void import("./components/HistoryCompressionVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>

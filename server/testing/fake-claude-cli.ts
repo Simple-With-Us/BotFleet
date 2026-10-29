@@ -44,6 +44,9 @@
 //                        result reports it in queued_turn_count, and it then
 //                        runs as a turn of its own; FAKE_CLAUDE_GATE, when
 //                        set, holds each turn until that file exists)
+//   FAKE_CLAUDE_CACHE_WRITE  ttl | flat | split — adds cache-creation figures to the
+//                      happy-path result (see the usage block below);
+//                      FAKE_CLAUDE_SERVED_MODEL names the assistant frame's model
 //   FAKE_CLAUDE_LIFECYCLE  1 (default) | 0 — whether to report
 //                      `command_lifecycle` frames for messages that carry a
 //                      uuid (queued on read, started when a turn takes one,
@@ -70,6 +73,9 @@
 //   FAKE_CLAUDE_QUOTA_GATE  optional file whose creation releases quota mode,
 //                           so integration tests can queue work before settle
 //   FAKE_CLAUDE_REPLY  optional successful assistant text for prose-boundary tests
+//   FAKE_CLAUDE_SLASH_COMMANDS  optional comma-separated list the init frame
+//                        reports as `slash_commands`, the way the real CLI
+//                        lists its built-in, skill and plugin commands
 //   FAKE_CLAUDE_PROMPTS  optional path; every user message this process reads
 //                        from stdin is appended as one JSON line, so a test
 //                        can see what a REUSED process was sent (the dump
@@ -380,8 +386,11 @@ const playTurn = (prompt: JsonValue) => {
     }
   }
 
-  // the real CLI re-announces init on every turn of a live process
-  out({ type: "system", subtype: "init", session_id: sessionId, model });
+  // the real CLI re-announces init on every turn of a live process, with its
+  // catalog of slash commands (FAKE_CLAUDE_SLASH_COMMANDS, comma separated)
+  const init = { type: "system", subtype: "init", session_id: sessionId, model };
+  const slashCommands = process.env.FAKE_CLAUDE_SLASH_COMMANDS;
+  out(slashCommands ? { ...init, slash_commands: slashCommands.split(",") } : init);
 
   if (mode === "hang") {
     // stay alive until killed — lets tests exercise interrupt + the
@@ -504,15 +513,28 @@ const playTurn = (prompt: JsonValue) => {
         usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 4 },
       },
     });
+    const helperUsage = { input_tokens: 999, cache_read_input_tokens: 0, output_tokens: 99 };
     out({
       type: "assistant",
       parent_tool_use_id: "task-1",
       message: {
+        id: "msg-helper-1",
         content: [
           { type: "text", text: "HELPER NARRATION" },
           { type: "tool_use", id: "helper-read-1", name: "Read", input: { file_path: "/tmp/helper-target.txt" } },
         ],
-        usage: { input_tokens: 999, cache_read_input_tokens: 0, output_tokens: 99 },
+        usage: helperUsage,
+      },
+    });
+    // The CLI streams one assistant message as more than one frame, and the
+    // later frame repeats that message's usage.  The driver must count it once.
+    out({
+      type: "assistant",
+      parent_tool_use_id: "task-1",
+      message: {
+        id: "msg-helper-1",
+        content: [{ type: "text", text: "HELPER NARRATION" }],
+        usage: helperUsage,
       },
     });
     out({
@@ -585,6 +607,7 @@ const playTurn = (prompt: JsonValue) => {
         // input/output side store (the default step carries neither)
         { type: "tool_use", id: "tu-1", name: "Bash", ...(process.env.FAKE_CLAUDE_TOOL_IO ? { input: { command: "echo hi", stdin: "TAIL-INPUT-MARKER" } } : {}) },
       ],
+      model: process.env.FAKE_CLAUDE_SERVED_MODEL,
       usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 },
     },
   });
@@ -604,13 +627,23 @@ const playTurn = (prompt: JsonValue) => {
     },
   });
 
+  // FAKE_CLAUDE_CACHE_WRITE=ttl reports the split cache writes the CLI gives
+  // (3 in the 5 minute cache, 4 in the 1 hour cache); =flat reports only the
+  // old flat figure (7); =split reports ONLY the TTL split, no flat total.
+  const cacheWrite: Record<string, unknown> = {};
+  if (process.env.FAKE_CLAUDE_CACHE_WRITE === "ttl" || process.env.FAKE_CLAUDE_CACHE_WRITE === "flat") {
+    cacheWrite.cache_creation_input_tokens = 7;
+  }
+  if (process.env.FAKE_CLAUDE_CACHE_WRITE === "ttl" || process.env.FAKE_CLAUDE_CACHE_WRITE === "split") {
+    cacheWrite.cache_creation = { ephemeral_5m_input_tokens: 3, ephemeral_1h_input_tokens: 4 };
+  }
   const finish = () => {
     const result = {
       type: "result",
       is_error: false,
       stop_reason: "end_turn",
       total_cost_usd: 0.01,
-      usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 },
+      usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5, ...cacheWrite },
     };
     // 2.1.284 names where each turn came from; an older CLI does not
     out(lifecycleOn ? { ...result, origin: { kind: "human" }, queued_turn_count: 0 } : result);

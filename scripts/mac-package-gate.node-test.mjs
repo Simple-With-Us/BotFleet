@@ -28,6 +28,7 @@ test("runs on the paths that actually broke Mac packaging", () => {
     reason: "mac-packaging-path",
   });
   assert.deepEqual(run(["electron-builder.yml"]), { run: true, reason: "mac-packaging-path" });
+  assert.deepEqual(run(["mac-control/Sources/BotFleetControl/main.swift"]), { run: true, reason: "mac-packaging-path" });
   assert.deepEqual(run(["scripts/prepare-cua.mjs"]), { run: true, reason: "mac-packaging-path" });
   assert.deepEqual(run(["scripts/prepare-cua-linux.mjs"]), {
     run: true,
@@ -109,7 +110,7 @@ test("the workflow classifies cheaply and packages only when told to", () => {
   assert.doesNotMatch(body, /paths:/);
 
   assert.match(yml, /if: \$\{\{ needs\.scope\.outputs\.run == 'true' && !cancelled\(\) \}\}/);
-  assert.match(yml, /runs-on: macos-14/);
+  assert.match(yml, /runs-on: macos-26/);
 
   // Unsigned, and provably so.  Note that arm64 bundles are always ad-hoc
   // signed, so the assertion has to be about the Developer ID team, never

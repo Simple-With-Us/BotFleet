@@ -7,7 +7,9 @@ import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 
 import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
+import { readPersistOnExitPolicy, writePersistOnExitPolicy } from "../electron/persist-on-exit-policy.mjs";
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
+import { dataDir } from "./data-dir.ts";
 import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
@@ -18,6 +20,7 @@ import {
   STORED_CONVERSATION_MODES,
   type ConversationMode,
 } from "../shared/conversation-mode.ts";
+import { BUSY_SEND_DEFAULTS, type BusySendDefault } from "../shared/busy-send-default.ts";
 import {
   ROOM_LABEL_MAX_LENGTH,
   type CustomRoomLabels,
@@ -340,6 +343,7 @@ const appConfigSchema = z.object({
     provider: z.enum(TTS_PROVIDERS).optional(),
     ladder: z.array(z.enum(HOSTED_TTS_PROVIDERS)).max(HOSTED_TTS_PROVIDERS.length).optional(),
     optimizedSummary: z.boolean().optional(),
+    audioRetentionDays: z.number().int().min(0).max(3650).optional(),
     pronunciations: pronunciationListSchema.optional(),
     credentialStorage: externalCredentialStorage,
   }).strict().optional(),
@@ -538,11 +542,54 @@ const appConfigSchema = z.object({
     secretPath: optionalText,
     clientId: optionalText,
     clientSecret: optionalText,
+    // The two service tokens.  They are declared here because the schema
+    // strips the keys it does not know: a token in the config file that
+    // the schema does not mention is dropped on the floor, and the file
+    // would look configured while the server fell back to the machine
+    // identity.  The environment names are the primary route.
+    token: optionalText,
+    writeToken: optionalText,
     credentialStorage: externalCredentialStorage,
     refreshMinutes: z.number().int().min(5).max(1440).optional(),
   }).optional(),
+  // Infisical Agent Proxy settings. Off by default. When enabled, agent CLIs
+  // and child processes route through the local Infisical Agent Proxy
+  // daemon (HTTP_PROXY/HTTPS_PROXY/NO_PROXY and TLS CA certificate injection).
+  agentProxy: z.object({
+    enabled: z.boolean().optional(),
+    address: optionalText,
+    projectId: optionalText,
+    environment: optionalText,
+    secretPath: optionalText,
+    caCertPath: optionalText,
+  }).strict().optional(),
+  // Lifecycle policy for the always-on harness itself: who may wake it, who
+  // may raise the desktop, and what quitting the desktop app does to it.
+  //
+  // Every field is optional and every ABSENT field means the conservative
+  // choice, so an existing config file keeps its behaviour with no migration.
+  // `allowRemoteDesktopLaunch` defaults to false because the path it guards
+  // reaches this Mac from a phone: the Companion sidecar replays a device
+  // request to 127.0.0.1, which satisfies the loopback-only check in the
+  // harness by construction (companion/src/proxy.ts says so in its header).
+  // A named permission that is off until asked for is the only defensible
+  // default for that.
+  //
+  // `persistOnExit` defaults to TRUE, deliberately, and is the one place this
+  // section does not take the conservative option.  False means quitting the
+  // desktop app tears down the harness and the local VM.  The harness is
+  // launchd-supervised and is documented as always-on in MAC-LOCAL-PROCESSES,
+  // and every paired phone depends on it answering after the window closes;
+  // defaulting this to false would turn a normal quit into an outage.  The
+  // native Mac app is the thing that wants false, and it does not exist yet —
+  // when it lands it opts in here explicitly rather than inheriting it.
+  server: z.object({
+    allowRemoteDesktopLaunch: z.boolean().optional(),
+    persistOnExit: z.boolean().optional(),
+  }).strict().optional(),
   features: featureConfigSchema.optional(),
   conversationMode: z.enum(STORED_CONVERSATION_MODES).optional(),
+  busySendDefault: z.enum(BUSY_SEND_DEFAULTS).optional(),
   terminology: z
     .enum(["channels", "groups", "projects", "apps", "topics", "repos", "custom"])
     .optional(),
@@ -593,6 +640,7 @@ export interface AppConfig {
     provider?: (typeof TTS_PROVIDERS)[number];
     ladder?: Array<(typeof HOSTED_TTS_PROVIDERS)[number]>;
     optimizedSummary?: boolean;
+    audioRetentionDays?: number;
     pronunciations?: Pronunciation[];
     credentialStorage?: "external";
   };
@@ -757,7 +805,13 @@ export interface AppConfig {
    * store, so they are the one pair of credentials in this file that never
    * resolves through the vault — a lock cannot hold its own key.  They are
    * read from this section or from `INFISICAL_CLIENT_ID` /
-   * `INFISICAL_CLIENT_SECRET`, and nowhere else. */
+   * `INFISICAL_CLIENT_SECRET`, and nowhere else.
+   *
+   * `token` and `writeToken` are service tokens: one read-only token for the
+   * folders this install reads and one write token for the folders it
+   * writes.  A token wins over the machine identity, and it is what every
+   * non-agent consumer uses.  They are read from this section or from
+   * `INFISICAL_TOKEN` / `INFISICAL_WRITE_TOKEN`. */
   infisical?: {
     enabled?: boolean;
     writeThrough?: boolean;
@@ -767,8 +821,28 @@ export interface AppConfig {
     secretPath?: string;
     clientId?: string;
     clientSecret?: string;
+    token?: string;
+    writeToken?: string;
     credentialStorage?: "external";
     refreshMinutes?: number;
+  };
+  /** Infisical Agent Proxy settings. Off by default. */
+  agentProxy?: {
+    enabled?: boolean;
+    address?: string;
+    projectId?: string;
+    environment?: string;
+    secretPath?: string;
+    caCertPath?: string;
+  };
+  /** Lifecycle policy for the always-on harness.  Absent means the
+   *  conservative choice for every field; see the zod schema above for why
+   *  `persistOnExit` is the exception. */
+  server?: {
+    /** May a paired phone raise the BotFleet window on this Mac? */
+    allowRemoteDesktopLaunch?: boolean;
+    /** Does the harness outlive the desktop app's window? */
+    persistOnExit?: boolean;
   };
   /** Opt-in product experiments. Every flag defaults to disabled. */
   features?: {
@@ -779,6 +853,8 @@ export interface AppConfig {
   };
   /** How the roster and threads are laid out.  Absent means simple. */
   conversationMode?: ConversationMode;
+  /** Default delivery while a bot turn is busy.  Absent means steer-first. */
+  busySendDefault?: BusySendDefault;
   /** What this person calls a room: one of the presets, or "custom" with a
    * word of their own in `terminologyCustom`.  Absent means channels. */
   terminology?: RoomTerminology;
@@ -1099,6 +1175,8 @@ export interface InfisicalSettings {
   secretPath: string;
   clientId: string;
   clientSecret: string;
+  token: string;
+  writeToken: string;
   refreshMinutes: number;
 }
 
@@ -1108,7 +1186,9 @@ export interface InfisicalSettings {
  * request is ever made, and nothing about resolution changes. */
 export function infisicalConfigured(cfg: AppConfig): boolean {
   return Boolean(
-    cfg.infisical?.projectId?.trim() && cfg.infisical?.clientId?.trim() && cfg.infisical?.clientSecret?.trim(),
+    cfg.infisical?.projectId?.trim() &&
+      (cfg.infisical?.token?.trim() ||
+        (cfg.infisical?.clientId?.trim() && cfg.infisical?.clientSecret?.trim())),
   );
 }
 
@@ -1135,11 +1215,125 @@ export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
     secretPath: stored.secretPath?.trim() || DEFAULT_INFISICAL_SECRET_PATH,
     clientId: stored.clientId?.trim() ?? "",
     clientSecret: stored.clientSecret ?? "",
+    token: stored.token?.trim() ?? "",
+    writeToken: stored.writeToken?.trim() ?? "",
     refreshMinutes:
       refresh !== undefined && Number.isFinite(refresh)
         ? Math.min(Math.max(Math.trunc(refresh), 5), 1440)
         : DEFAULT_INFISICAL_REFRESH_MINUTES,
   };
+}
+
+export const DEFAULT_AGENT_PROXY_ADDRESS = "127.0.0.1:17322";
+export const DEFAULT_AGENT_PROXY_ENVIRONMENT = "prod";
+export const DEFAULT_AGENT_PROXY_SECRET_PATH = "/";
+
+export interface AgentProxySettings {
+  enabled: boolean;
+  address: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+  caCertPath?: string;
+}
+
+/** The explicit toggle for Infisical Agent Proxy.  Off by default. */
+export function agentProxyEnabled(cfg: AppConfig): boolean {
+  return cfg.agentProxy?.enabled === true;
+}
+
+/** May a paired phone raise the BotFleet window on this computer?
+ *
+ *  Off unless the owner turned it on.  This is the only thing standing
+ *  between a phone on someone else's network and a window appearing on this
+ *  Mac, because the sidecar replays the device request to 127.0.0.1 and the
+ *  harness's loopback-only check on `/api/desktop/open` is satisfied by
+ *  that replay rather than by the caller actually being local. */
+export function remoteDesktopLaunchAllowed(cfg: AppConfig): boolean {
+  return cfg.server?.allowRemoteDesktopLaunch === true;
+}
+
+/** Does the harness outlive the desktop app's window?
+ *
+ *  True when unset: the harness is launchd-supervised and documented as
+ *  always-on, so a quit that tore it down would strand every paired phone.
+ *
+ *  Deliberately not consumed by this file's callers.  The one place that has
+ *  to act on it is Electron's quit path, and `electron/main.mjs` is plain ESM
+ *  that cannot import this TypeScript module — so it reads the field from the
+ *  config file directly, with its own copy of the `!== false` default.  That
+ *  duplicated default is the thing to watch: if it is ever changed here it
+ *  must be changed there in the same commit, or quitting the app will quietly
+ *  do something other than what this comment says. */
+export const SERVER_PERSISTS_ON_EXIT_WHEN_UNSET = true;
+
+/** Resolve stored Agent Proxy settings against defaults. */
+export function agentProxySettings(cfg: AppConfig): AgentProxySettings {
+  const stored = cfg.agentProxy ?? {};
+  return {
+    enabled: agentProxyEnabled(cfg),
+    address: stored.address?.trim() || DEFAULT_AGENT_PROXY_ADDRESS,
+    projectId: stored.projectId?.trim() || cfg.infisical?.projectId?.trim() || "",
+    environment: stored.environment?.trim() || cfg.infisical?.environment?.trim() || DEFAULT_AGENT_PROXY_ENVIRONMENT,
+    secretPath: stored.secretPath?.trim() || cfg.infisical?.secretPath?.trim() || DEFAULT_AGENT_PROXY_SECRET_PATH,
+    caCertPath: stored.caCertPath?.trim() || undefined,
+  };
+}
+
+/**
+ * Injects proxy environment variables into a process environment when
+ * Agent Proxy is enabled.  When disabled, returns the input baseEnv untouched.
+ *
+ * Precedence: the proxy URL variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+ * `ALL_PROXY`, `NO_PROXY`) keep whatever the caller already set, so a
+ * deliberate corporate proxy is never silently replaced.  Everything the
+ * operator configured under `agentProxy` (address, routing ids, CA path) wins
+ * over an ambient `INFISICAL_*`, `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS` the
+ * harness happened to inherit.  A routing id that only fell back to
+ * BotFleet's own Infisical settings never displaces an inherited one.
+ */
+export function applyAgentProxyEnv(
+  cfg: AppConfig,
+  baseEnv?: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv | undefined {
+  if (!agentProxyEnabled(cfg)) return baseEnv;
+  const settings = agentProxySettings(cfg);
+  const stored = cfg.agentProxy ?? {};
+  const proxyUrl = `http://${settings.address}`;
+  const env: NodeJS.ProcessEnv = { ...(baseEnv ?? process.env) };
+  if (!env.HTTP_PROXY && !env.http_proxy) {
+    env.HTTP_PROXY = proxyUrl;
+    env.http_proxy = proxyUrl;
+  }
+  if (!env.HTTPS_PROXY && !env.https_proxy) {
+    env.HTTPS_PROXY = proxyUrl;
+    env.https_proxy = proxyUrl;
+  }
+  if (!env.ALL_PROXY && !env.all_proxy) {
+    env.ALL_PROXY = proxyUrl;
+    env.all_proxy = proxyUrl;
+  }
+  if (!env.NO_PROXY && !env.no_proxy) {
+    env.NO_PROXY = "localhost,127.0.0.1";
+    env.no_proxy = "localhost,127.0.0.1";
+  }
+  // The resolved address already folds in an ambient INFISICAL_AGENT_PROXY_ADDRESS
+  // (loadConfig) and the vault knob, and it is what the proxy URLs above are
+  // built from, so the two must never disagree.
+  env.INFISICAL_AGENT_PROXY_ADDRESS = settings.address;
+  const routing: Array<[key: string, resolved: string, explicit: string | undefined]> = [
+    ["INFISICAL_PROJECT_ID", settings.projectId, stored.projectId],
+    ["INFISICAL_ENVIRONMENT", settings.environment, stored.environment],
+    ["INFISICAL_SECRET_PATH", settings.secretPath, stored.secretPath],
+  ];
+  for (const [key, resolved, explicit] of routing) {
+    if (resolved && (explicit?.trim() || !env[key])) env[key] = resolved;
+  }
+  if (settings.caCertPath) {
+    env.SSL_CERT_FILE = settings.caCertPath;
+    env.NODE_EXTRA_CA_CERTS = settings.caCertPath;
+  }
+  return env;
 }
 
 export function localVmMaxInstances(cfg: AppConfig): number {
@@ -1195,8 +1389,10 @@ export function summarizeToolCallsEnabled(cfg: AppConfig): boolean {
   return cfg.features?.summarizeToolCalls !== false;
 }
 
-// OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
-export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet");
+// OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.  dataDir() applies the
+// same trim-and-blank rule the desktop app does (electron/app-paths.mjs), so both processes
+// resolve one directory.
+export const DATA_DIR = dataDir();
 const LEGACY_HOME_DATA_DIRS = [".openmausbot", ".opengrokbot"] as const;
 export const EVENTS_DIR = join(DATA_DIR, "events");
 export const NATIVE_DIR = join(DATA_DIR, "native");
@@ -1467,6 +1663,10 @@ export function loadConfig(): AppConfig {
   const stored = readStoredConfig(configPath);
   reportStoredConfig(configPath, stored.problem);
   const cfg: AppConfig = stored.config;
+  const persistOnExitPolicy = readPersistOnExitPolicy(DATA_DIR);
+  if (persistOnExitPolicy !== null) {
+    cfg.server = { ...cfg.server, persistOnExit: persistOnExitPolicy };
+  }
   // these secrets OS-encrypted and hands them to this process as env at
   // spawn, leaving config.json without the plaintext field — so the file
   // value is the dev-mode (no desktop shell) fallback, not the primary.
@@ -1527,9 +1727,11 @@ export function loadConfig(): AppConfig {
   // First defined wins, and env beats the file here for the same reason it
   // does above: the desktop shell injects it at spawn.
   cfg.infisical = { ...cfg.infisical };
-  const identity: Array<[field: "clientId" | "clientSecret" | "projectId" | "siteUrl" | "environment" | "secretPath", names: string[]]> = [
+  const identity: Array<[field: "clientId" | "clientSecret" | "token" | "writeToken" | "projectId" | "siteUrl" | "environment" | "secretPath", names: string[]]> = [
     ["clientId", ["INFISICAL_CLIENT_ID", "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"]],
     ["clientSecret", ["INFISICAL_CLIENT_SECRET", "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"]],
+    ["token", ["INFISICAL_TOKEN"]],
+    ["writeToken", ["INFISICAL_WRITE_TOKEN"]],
     ["projectId", ["INFISICAL_PROJECT_ID"]],
     ["siteUrl", ["INFISICAL_SITE_URL", "INFISICAL_DOMAIN"]],
     ["environment", ["INFISICAL_ENVIRONMENT"]],
@@ -1538,6 +1740,22 @@ export function loadConfig(): AppConfig {
   for (const [field, names] of identity) {
     const name = names.find((candidate) => process.env[candidate] !== undefined);
     if (name !== undefined) cfg.infisical[field] = process.env[name];
+  }
+  cfg.agentProxy = { ...cfg.agentProxy };
+  if (process.env.INFISICAL_AGENT_PROXY_ENABLED !== undefined) {
+    const raw = process.env.INFISICAL_AGENT_PROXY_ENABLED.trim().toLowerCase();
+    cfg.agentProxy.enabled = raw === "true" || raw === "1" || raw === "yes";
+  }
+  const proxyFields: Array<[field: "address" | "projectId" | "environment" | "secretPath" | "caCertPath", names: string[]]> = [
+    ["address", ["INFISICAL_AGENT_PROXY_ADDRESS"]],
+    ["projectId", ["INFISICAL_AGENT_PROXY_PROJECT_ID"]],
+    ["environment", ["INFISICAL_AGENT_PROXY_ENV", "INFISICAL_AGENT_PROXY_ENVIRONMENT"]],
+    ["secretPath", ["INFISICAL_AGENT_PROXY_PATH", "INFISICAL_AGENT_PROXY_SECRET_PATH"]],
+    ["caCertPath", ["INFISICAL_AGENT_PROXY_CA_CERT_PATH", "INFISICAL_AGENT_PROXY_CA_CERT"]],
+  ];
+  for (const [field, names] of proxyFields) {
+    const name = names.find((candidate) => process.env[candidate] !== undefined);
+    if (name !== undefined) cfg.agentProxy[field] = process.env[name];
   }
   // One resolution point, last: whatever the store holds for a mapped name
   // overwrites what env and file just agreed on, and the provenance of every
@@ -1684,6 +1902,8 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "INFISICAL_CLIENT_SECRET",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+  "INFISICAL_TOKEN",
+  "INFISICAL_WRITE_TOKEN",
 ] as const;
 
 /** Drop every workspace credential from a child-process env (in place). */
@@ -1779,6 +1999,9 @@ export function saveConfig(
     }
     return merged;
   }, { mode: 0o600, onSetAside: reportConfigSetAside });
+  if (checkedPatch.server?.persistOnExit !== undefined) {
+    writePersistOnExitPolicy(DATA_DIR, checkedPatch.server.persistOnExit);
+  }
 }
 
 /** updateConfigFile renamed an unusable config.json aside just before replacing it.  Say so in the
@@ -1823,7 +2046,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
+  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
@@ -1851,6 +2074,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   }
   if (checkedPatch.vps !== undefined) disk.vps = normalizeVpsConfig(checkedPatch.vps);
   if (checkedPatch.conversationMode !== undefined) disk.conversationMode = checkedPatch.conversationMode;
+  if (checkedPatch.busySendDefault !== undefined) disk.busySendDefault = checkedPatch.busySendDefault;
   if (checkedPatch.terminology !== undefined) disk.terminology = checkedPatch.terminology;
   if (checkedPatch.terminologyCustom !== undefined) disk.terminologyCustom = checkedPatch.terminologyCustom;
   if (checkedPatch.deleteInstance) {

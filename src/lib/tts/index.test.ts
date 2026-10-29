@@ -8,6 +8,7 @@ import {
   PERSONAL_VOICE_NOT_ON_THIS_MAC,
   REPLY_TOO_LONG,
   Speaker,
+  speakingBotId,
 } from "./index";
 import type { KaraokeFeed } from "./karaoke-feed";
 import type { TtsAudioBody } from "./schema";
@@ -533,6 +534,64 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
     });
 
     expect(speaker.state.error).toContain("Apple Personal Voice speaks on authorized Apple devices");
+  });
+
+  it("queues auto-spoken replies sequentially when enqueue: true is set instead of interrupting active speech", async () => {
+    const endpoint2 = "/api/threads/task_1/messages/msg_2/audio";
+    const clip2 = `${endpoint2}/0?device=mac`;
+    const calls = stubFetch((call) => {
+      if (call.url === endpoint || call.url === endpoint2) {
+        return json({ audio: [{ path: "/api/attachments/clip.mp3", mime: "audio/mpeg" }], total: 1, complete: true });
+      }
+      return mp3();
+    });
+    const speaker = new Speaker({ sleep: noSleep });
+    const first = speaker.speak("First reply", { ...messageOpts, enqueue: true });
+    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(1));
+
+    // Second auto-spoken reply arrives while first is still playing
+    const second = speaker.speak("Second reply", {
+      botId: "bot_1",
+      threadId: "task_1",
+      messageId: "msg_2",
+      enqueue: true,
+    });
+
+    // First clip must NOT be paused/aborted by the queued second reply
+    expect(FakeAudio.instances[0].pause).not.toHaveBeenCalled();
+    expect(speaker.state.messageId).toBe("msg_1");
+
+    // Finish first clip -> second reply starts automatically
+    await finishClip(1);
+    await first;
+    await vi.waitFor(() => expect(FakeAudio.instances).toHaveLength(2));
+    expect(speaker.state.messageId).toBe("msg_2");
+
+    await finishClip(2);
+    await second;
+    expect(calls.map((c) => c.url)).toEqual([endpoint, clip(0), endpoint2, clip2]);
+    expect(speaker.state).toEqual({ status: "idle" });
+  });
+});
+
+describe("speakingBotId", () => {
+  it("names the bot whose voice is playing", () => {
+    expect(speakingBotId({ status: "speaking", botId: "a" })).toBe("a");
+  });
+
+  it("names nobody while the voice is still being prepared", () => {
+    // The voice is on its way, but nothing has been said yet, so no mouth is
+    // moving and no avatar should claim to be talking.
+    expect(speakingBotId({ status: "preparing", botId: "a" })).toBeUndefined();
+  });
+
+  it("names nobody when the voice is idle", () => {
+    expect(speakingBotId({ status: "idle" })).toBeUndefined();
+  });
+
+  it("names nobody when a voice plays without saying whose it is", () => {
+    // A voice with no bot behind it belongs to no avatar.
+    expect(speakingBotId({ status: "speaking" })).toBeUndefined();
   });
 });
 

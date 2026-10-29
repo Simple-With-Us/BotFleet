@@ -48,7 +48,7 @@ export function readPackagedBuildIdentity(directory) {
  * real source commit, or the packaged app would ship a fabricated all-zeros
  * commit as provenance.  The server keeps the default for startup, where an
  * unavailable git is not a reason to refuse to boot. */
-export function readSourceBuildIdentity(root, { requireGit = false } = {}) {
+export function readSourceBuildIdentity(root, { requireGit = false, version = null } = {}) {
   // Git is not guaranteed to be on PATH: a checkout started from a GUI app, a
   // stripped container, or a test that scrubs PATH cannot run it.  That is not
   // a reason for the server to refuse to start, so an unavailable git reports
@@ -76,7 +76,13 @@ export function readSourceBuildIdentity(root, { requireGit = false } = {}) {
     /* commit stays unknown when HEAD never arrived; otherwise keep what we have */
   }
   const value = {
-    app: "botfleet", version: JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,
+    app: "botfleet",
+    // A build supplies its own version instead of editing package.json.  That
+    // matters because the provenance gate requires a pristine checkout: a
+    // version stamped into the source file would make every Mac build report
+    // sourceDirty and fail the very gate that proves the build came from a
+    // committed tree.
+    version: version ?? JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,
     apiVersion: HARNESS_API_VERSION, sourceCommit, sourceDirty, uiHash: null,
   };
   // A manifest stamped into a shipped bundle must name a real commit: git ran

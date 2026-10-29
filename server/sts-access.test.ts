@@ -10,6 +10,7 @@ import {
   StsMintThrottle,
   StsStatusSchema,
   stsKeyStatus,
+  stsSessionTelemetry,
   stsStatusBody,
   stsTokenRequest,
   stsUnavailableReason,
@@ -137,5 +138,22 @@ describe("mint throttle", () => {
     expect(throttle.take("xai")).toBe(false);
     throttle.reset();
     expect(throttle.take("xai")).toBe(true);
+  });
+});
+describe("a started voice-call session is reported to Usage Monitor (BF-2435)", () => {
+  it("names the vendor and the realtime model, and measures only that a session began", () => {
+    expect(stsSessionTelemetry("gemini")).toEqual({
+      kind: "sts-session",
+      provider: "google-ai",
+      service: "gemini-3.8-live",
+      label: "BotFleet voice call",
+    });
+    expect(stsSessionTelemetry("xai")).toMatchObject({ kind: "sts-session", provider: "xai", service: "grok-voice-latest" });
+  });
+
+  it("carries no key, token or price", () => {
+    for (const provider of ["xai", "gemini"] as const) {
+      expect(Object.keys(stsSessionTelemetry(provider)).sort()).toEqual(["kind", "label", "provider", "service"]);
+    }
   });
 });

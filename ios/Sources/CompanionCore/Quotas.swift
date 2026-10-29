@@ -53,6 +53,66 @@ public struct EngineSpend: Codable, Hashable, Sendable {
     public var unpricedTurns: Double { (unpricedTurns5h ?? 0) + (unpricedTurns7d ?? 0) }
 }
 
+/// Separate detected identity and user-entered display details from CodeCaps.
+public struct QuotaPlanMetadata: Codable, Hashable, Sendable {
+    public var detectedPlanName: String?
+    public var userPlanName: String?
+    public var userCostUsd: String?
+    public var userRenewalDateText: String?
+    public var userSubtitle: String?
+    public var showCostAndRenewal: Bool?
+    public var hasMismatch: Bool
+
+    public init(
+        detectedPlanName: String? = nil,
+        userPlanName: String? = nil,
+        userCostUsd: String? = nil,
+        userRenewalDateText: String? = nil,
+        userSubtitle: String? = nil,
+        showCostAndRenewal: Bool? = nil,
+        hasMismatch: Bool = false
+    ) {
+        self.detectedPlanName = detectedPlanName
+        self.userPlanName = userPlanName
+        self.userCostUsd = userCostUsd
+        self.userRenewalDateText = userRenewalDateText
+        self.userSubtitle = userSubtitle
+        self.showCostAndRenewal = showCostAndRenewal
+        self.hasMismatch = hasMismatch
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case detectedPlanName, userPlanName, userCostUsd, userRenewalDateText, userSubtitle, showCostAndRenewal, hasMismatch
+    }
+
+    /// Lenient per-field decode, matching shared/quota-plan-metadata.ts: one
+    /// missing or mistyped field defaults instead of discarding the whole
+    /// metadata block (Kody review, PR #1280).
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        detectedPlanName = try? container.decodeIfPresent(String.self, forKey: .detectedPlanName)
+        userPlanName = try? container.decodeIfPresent(String.self, forKey: .userPlanName)
+        userCostUsd = try? container.decodeIfPresent(String.self, forKey: .userCostUsd)
+        userRenewalDateText = try? container.decodeIfPresent(String.self, forKey: .userRenewalDateText)
+        userSubtitle = try? container.decodeIfPresent(String.self, forKey: .userSubtitle)
+        showCostAndRenewal = try? container.decodeIfPresent(Bool.self, forKey: .showCostAndRenewal)
+        hasMismatch = (try? container.decodeIfPresent(Bool.self, forKey: .hasMismatch)) ?? false
+    }
+
+    public var displayLines: [String] {
+        var lines: [String] = []
+        if let name = detectedPlanName, !name.isEmpty { lines.append("Detected Plan: \(name)") }
+        if let name = userPlanName, !name.isEmpty { lines.append("Entered Plan: \(name)") }
+        if let subtitle = userSubtitle, !subtitle.isEmpty { lines.append(subtitle) }
+        if showCostAndRenewal == true {
+            if let cost = userCostUsd, !cost.isEmpty { lines.append("Entered Cost (USD): \(cost)") }
+            if let renewal = userRenewalDateText, !renewal.isEmpty { lines.append("Entered Renewal: \(renewal)") }
+        }
+        if hasMismatch { lines.append("Detected and entered plans differ") }
+        return lines
+    }
+}
+
 /// One quota window from the native usage app's handoff: a percentage of an
 /// allowance left, and when it refills.
 public struct QuotaWindow: Codable, Hashable, Identifiable, Sendable {
@@ -68,10 +128,11 @@ public struct QuotaWindow: Codable, Hashable, Identifiable, Sendable {
     public var resetAt: String?
     public var skip: Bool
     public var planName: String?
+    public var planMetadata: QuotaPlanMetadata?
     public var isExhausted: Bool?
 
     private enum CodingKeys: String, CodingKey {
-        case id, provider, providerKey, providerLabel, sourceApp, via, label, remainingPercent, resetAt, skip, planName, isExhausted
+        case id, provider, providerKey, providerLabel, sourceApp, via, label, remainingPercent, resetAt, skip, planName, planMetadata, isExhausted
     }
 
     public init(
@@ -86,6 +147,7 @@ public struct QuotaWindow: Codable, Hashable, Identifiable, Sendable {
         resetAt: String? = nil,
         skip: Bool = false,
         planName: String? = nil,
+        planMetadata: QuotaPlanMetadata? = nil,
         isExhausted: Bool? = nil
     ) {
         self.id = id
@@ -99,6 +161,7 @@ public struct QuotaWindow: Codable, Hashable, Identifiable, Sendable {
         self.resetAt = resetAt
         self.skip = skip
         self.planName = planName
+        self.planMetadata = planMetadata
         self.isExhausted = isExhausted
     }
 
@@ -117,6 +180,7 @@ public struct QuotaWindow: Codable, Hashable, Identifiable, Sendable {
         resetAt = try? container.decodeIfPresent(String.self, forKey: .resetAt)
         skip = (try? container.decodeIfPresent(Bool.self, forKey: .skip)) ?? false
         planName = try? container.decodeIfPresent(String.self, forKey: .planName)
+        planMetadata = try? container.decodeIfPresent(QuotaPlanMetadata.self, forKey: .planMetadata)
         isExhausted = try? container.decodeIfPresent(Bool.self, forKey: .isExhausted)
     }
 }

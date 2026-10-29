@@ -61,7 +61,10 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.match(shipScript, /organization not found\|embedded in token/);
   assert.match(shipScript, /mint an org token for/);
   const ci = read(".github/workflows/ci.yml");
-  assert.match(ci, /\|\| 'xcode-27' \}\}/);
+  // The unsigned build is a literal xcode-27 job.  The old runner ternary
+  // (`ubuntu-latest` or `xcode-27`) was the echo fast path.
+  assert.match(ci, /^ {4}runs-on: xcode-27$/m);
+  assert.doesNotMatch(ci, /\|\| 'xcode-27' \}\}/);
   assert.match(ci, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
   assert.match(yml, /fetch-depth:\s*0/);
   assert.match(yml, /cancel-in-progress:\s*false/);
@@ -70,11 +73,14 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(yml, /--force-ship/);
   assert.match(yml, /ios-appstore-gm-prepare\.sh/);
   // Signing material comes from Infisical prod, through the shared
-  // composite action; identity stays on GitHub.
+  // composite action; identity stays on GitHub -- a read-only service token
+  // scoped to this project, environment and folder, NOT the machine
+  // identity this pipeline used to hold.
   assert.match(yml, /Load Infisical signing secrets/);
   assert.match(yml, /secrets\.INFISICAL_PROJECT_ID/);
-  assert.match(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/);
-  assert.match(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET/);
+  assert.match(yml, /secrets\.INFISICAL_IOS_SHIP_READ_TOKEN/);
+  assert.doesNotMatch(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/);
+  assert.doesNotMatch(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET/);
   assert.match(yml, /uses:\s*\.\/\.github\/actions\/infisical-secrets/);
   assert.match(yml, /APPLE_API_KEY_ID/);
   assert.match(yml, /IOS_CERT_P12_BASE64/);
@@ -196,15 +202,25 @@ test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   assert.equal(Object.keys(apps.apps).join(","), "botfleet");
 
   const ship = read("scripts/ios-fleet/ship-testflight.sh");
-  assert.match(ship, /MARKETING_VERSION\s+= 1\.0\.<seq>/);
-  assert.match(ship, /CURRENT_PROJECT_VERSION = <UTC YYYYMMDDHHMM>/);
+  // The scheme (owner directive 2026-10-24, AFC-517):  the marketing version
+  // is the next patch on the App Store Connect train, and the build number is
+  // the repo commit count raised above the App Store Connect floor.  The two
+  // numbers are independent, so assert the mechanism, not the retired
+  // 1.0.<commit_count> shape.
+  assert.match(ship, /MARKETING_VERSION\s+= <prefix>\.<P\+1>/);
+  assert.match(ship, /CURRENT_PROJECT_VERSION = the repo commit count/);
+  assert.match(ship, /rev-list --count HEAD/);
   assert.match(ship, /botfleet/);
   assert.match(ship, /DEFAULT_MIN_INTERVAL_SEC=3600/);
   assert.match(ship, /FORCE_SHIP=0/);
   assert.match(ship, /MANUAL_SIGN/);
   assert.match(ship, /ios-install-appstore-profiles\.sh/);
   assert.match(ship, /write_manual_export_plists/);
-  assert.match(ship, /date -u \+%Y%m%d%H%M/);
+  // The retired UTC stamp must not come back: no build number is minted from
+  // the clock, and there is no timestamp fallback for the case where the
+  // commit count cannot be read.
+  assert.doesNotMatch(ship, /date -u \+%Y%m%d%H%M/);
+  assert.doesNotMatch(ship, /utc_build_stamp/);
   assert.match(ship, /-allowProvisioningUpdates/);
 
   const profileMap = JSON.parse(read("ios/appstore-profiles.json"));
@@ -256,19 +272,22 @@ test("scheduled-ship-gate skips empty last-ship on schedule", () => {
   assert.match(run.stdout, /scheduled-ship-gate: all tests passed/);
 });
 
-// A GitHub-hosted macos-latest runner has no ~/.secrets directory. Before
-// 2026-10-02 asc-api.mjs read ONLY ~/.secrets/appstore-connect.env, so a
+// A GitHub-hosted macos-latest runner has no Infisical machine identity. Before
+// 2026-10-02 asc-api.mjs read ONLY the local credential file, so a
 // runner holding a perfectly good APPLE_API_* credential in the environment
 // still could not authenticate -- and ship-testflight.sh piped asc-api.mjs's
 // stderr to /dev/null, so the reason never reached the run log.
 test("asc-api.mjs resolves its credential from all three sources", () => {
   const asc = read("scripts/ios-fleet/asc-api.mjs");
   assert.match(asc, /function resolveCredential\(\)/);
-  // Source 1: ASC_* already exported.  Source 2: the local env file.
-  // Source 3: the APPLE_API_* names ios-ship.yml exports from Infisical.
-  assert.match(asc, /process\.env\.ASC_KEY_ID/);
-  assert.match(asc, /appstore-connect\.env/);
+  // Source 1: the APPLE_API_* names ios-ship.yml exports from Infisical.
+  // Source 2: ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 in the environment.
+  // Source 3: Infisical through fleet-secrets (AFC-359).
   assert.match(asc, /APPLE_API_KEY_P8_BASE64/);
+  assert.match(asc, /process\.env\.ASC_KEY_ID/);
+  assert.match(asc, /process\.env\.ASC_KEY_P8/);
+  assert.match(asc, /fleetSecretsGet\("ASC_KEY_ID", "\/asc"\)/);
+  assert.doesNotMatch(asc, /homedir\(\), "\.secrets"/);
   // The base64 p8 is materialized privately and unlinked on exit.
   assert.match(asc, /Buffer\.from\(cleaned, "base64"\)/);
   assert.match(asc, /mkdtempSync\(join\(tmpdir\(\), "asc-key-"\)\)/);
@@ -277,6 +296,21 @@ test("asc-api.mjs resolves its credential from all three sources", () => {
   // Never print a value -- only the source and the key-id LENGTH.
   assert.match(asc, /key id length \$\{cred\.keyId\.length\}/);
   assert.doesNotMatch(asc, /console\.(log|error)\([^)]*privateKeyPem/);
+});
+
+test("asc-api.mjs never reads a named path as a credential source", () => {
+  // AFC-459 (Kody rule 42 on the CodeCaps PR #271 review):  a path on disk
+  // is not an approved secret source, so the client never reads one.  The
+  // shell layer owns the credential and hands the key over in the environment.
+  const asc = read("scripts/ios-fleet/asc-api.mjs");
+  assert.doesNotMatch(asc, /process\.env\.ASC_KEY_PATH/);
+  assert.doesNotMatch(asc, /fromFile\(/);
+  // The message names the path as the wrong thing to reach for.
+  assert.match(asc, /A path in ASC_KEY_PATH is not a credential source/);
+  // Every environment PEM is parsed before it is accepted, so a truncated key
+  // is a credential error rather than a signer stack trace.
+  assert.match(asc, /normalizePrivateKey/);
+  assert.match(asc, /import \{ normalizePrivateKey \} from "\.\/asc-key\.mjs"/);
 });
 
 test("asc-api.mjs says what it tried instead of failing on a missing file", () => {
@@ -322,6 +356,11 @@ test("asc-api.mjs stays dependency-free: it runs from a bare directory with no n
   try {
     const copy = join(tmp, "asc-api.mjs");
     writeFileSync(copy, src);
+    // The client imports asc-key.mjs and version-plan.mjs, so the bare copy
+    // needs them too:  a missing sibling is ERR_MODULE_NOT_FOUND, which is
+    // the same failure this test exists to catch.
+    writeFileSync(join(tmp, "asc-key.mjs"), read("scripts/ios-fleet/asc-key.mjs"));
+    writeFileSync(join(tmp, "version-plan.mjs"), read("scripts/ios-fleet/version-plan.mjs"));
     const run = spawnSync(process.execPath, [copy, "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: { PATH: process.env.PATH || "", HOME: tmp },
@@ -333,18 +372,49 @@ test("asc-api.mjs stays dependency-free: it runs from a bare directory with no n
   }
 });
 
-test("asc_latest_seq surfaces asc-api stderr and does not require the env file", () => {
+test("the ASC version queries surface asc-api stderr and do not require the env file", () => {
   const ship = read("scripts/ios-fleet/ship-testflight.sh");
   // The old line threw away the only diagnostic that says WHY (HTTP 401).
   assert.doesNotMatch(ship, /asc-api\.mjs" latest-build-seq[^\n]*2>\/dev\/null/);
   assert.match(ship, /2>"\$errf"/);
-  assert.match(ship, /logerr "asc-seq: \$\{line\}"/);
-  // A missing ~/.secrets file is no longer an automatic UNVERIFIED.
+  assert.match(ship, /logerr "asc-patch: \$\{line\}"/);
+  assert.match(ship, /logerr "asc-floor: \$\{line\}"/);
+  // A missing local credential file is no longer an automatic UNVERIFIED.
   assert.match(ship, /asc_credential_available\(\)/);
   assert.doesNotMatch(ship, /if \[\[ ! -f "\$SECRETS_ENV" \]\]; then\n\s*logerr "asc-seq: no /);
   // Cleanup must not write to the captured-value stream: an `rm` wrapper that
   // reports on stdout once turned a correct sequence into an arithmetic error.
   assert.match(ship, /rm -f "\$errf" >\/dev\/null 2>&1 \|\| true/);
+});
+
+test("the version plan is independent:  the marketing version is the next patch, the build is the commit count", () => {
+  const ship = read("scripts/ios-fleet/ship-testflight.sh");
+  // The three log lines the owner asked for, verbatim.
+  assert.match(
+    ship,
+    /log "version plan: asc_patch=\$\{PLAN_ASC_PATCH\} -> marketing=\$\{MARKETING\}; build floors: train=\$\{PLAN_TRAIN_FLOOR\} app=\$\{PLAN_APP_FLOOR\} commit_count=\$\{PLAN_COMMIT_COUNT\} -> build=\$\{BUILD_NUM\}"/
+  );
+  assert.match(ship, /log "marketing=\$\{MARKETING\} build=\$\{BUILD_NUM\}"/);
+  assert.match(ship, /log "App Store Connect will show this as: \$\{MARKETING\} \(\$\{BUILD_NUM\}\)"/);
+  // --build no longer moves the marketing version:  the two numbers are
+  // independent, so the build can never be derived from the version.
+  assert.doesNotMatch(ship, /MARKETING="\$\{MARKETING_PREFIX\}\.\$\{BUILD_NUM\}"/);
+  // The retired floor paths are gone:  App Store Connect is the only record
+  // that shipping advances.
+  assert.doesNotMatch(ship, /resolve_seq_floor/);
+  assert.doesNotMatch(ship, /next_build_seq/);
+  assert.doesNotMatch(ship, /local_seq/);
+  assert.doesNotMatch(ship, /asc_latest_seq/);
+  // The two new App Store Connect queries, and the node seam they run under.
+  assert.match(ship, /asc_client latest-marketing-patch/);
+  assert.match(ship, /asc_client build-floor/);
+  assert.match(ship, /ASC_NODE="\$\{IOS_FLEET_NODE:-node\}"/);
+  assert.match(ship, /ASC_PLATFORM="IOS"/);
+  // An unreachable App Store Connect is fatal unless the operator opts out.
+  assert.match(ship, /die "cannot determine the next marketing version\./);
+  assert.match(ship, /die "cannot determine the build floor for \$\{MARKETING\}\./);
+  assert.match(ship, /--allow-unverified-seq set; the marketing version is planned from an UNVERIFIED patch \(P=0\)/);
+  assert.match(ship, /--allow-unverified-seq set; the build floor is UNVERIFIED \(0\)/);
 });
 
 // ---------------------------------------------------------------------------
@@ -717,24 +787,149 @@ test("every ship submits the newest build for Beta App Review to the external gr
   assert.match(branch, /submitted \$\{buildLabel\} for Beta App Review/);
 });
 
-test("the ship no longer claims internal testers can install when none exist", () => {
+test("the ship readiness is external installability, and never prints a false success line", () => {
   const sh = read("scripts/ios-fleet/ship-testflight.sh");
   const mjs = read("scripts/ios-fleet/asc-api.mjs");
-  // asc-api exits 5 only when the count was READ and is zero.
-  assert.match(mjs, /process\.exit\(nobody \? 5 : internalTesters\.ok \? 0 : 6\)/);
-  assert.match(mjs, /const nobody = internalTesters\.ok && internalTesters\.testers === 0;/);
+  // Owner directive 2026-10-18/19: public external testing only, so there is no
+  // internal group to count.  ensure-tf-ready decides rc=0/5/6 from the shipped
+  // build's external-group assignment and public-link state instead.
+  const readyBranch = mjs.slice(mjs.indexOf('method === "ensure-tf-ready"'));
+  assert.doesNotMatch(readyBranch, /countInternalTesters\(/);
+  assert.match(readyBranch, /externalInstallability\(/);
+  assert.match(readyBranch, /process\.exit\(nobody \? 5 : reach\.ok \? 0 : 6\)/);
   // The wrapper turns rc=5 into a warning plus a CI annotation, not a success line.
-  const rc5 = sh.slice(sh.indexOf("if [[ $rc -eq 5 ]]"), sh.indexOf("if [[ $rc -eq 3 ]]"));
-  assert.match(rc5, /has no internal TestFlight tester/);
-  assert.match(rc5, /::warning title=TestFlight has no internal tester::/);
-  assert.doesNotMatch(rc5, /internal testers can install this build/);
-  // An unreadable count (rc=6) must not print the success line either.
+  const rc5 = sh.slice(sh.indexOf("if [[ $rc -eq 5 ]]"), sh.indexOf("if [[ $rc -eq 6 ]]"));
+  assert.match(rc5, /no external TestFlight group with testers or a public link/);
+  assert.match(rc5, /::warning title=TestFlight has no reachable external tester::/);
+  assert.doesNotMatch(rc5, /can install this build/);
+  // An unreadable read (rc=6) must not print the success line either.
   const rc6 = sh.slice(sh.indexOf("if [[ $rc -eq 6 ]]"), sh.indexOf("if [[ $rc -eq 3 ]]"));
   assert.match(rc6, /installability is unverified/);
   assert.match(rc6, /::warning title=TestFlight installability unverified::/);
-  assert.doesNotMatch(rc6, /internal testers can install this build/);
-  // The only place the success line is printed is the rc=0 branch.
-  assert.equal(sh.split("TestFlight internal testers can install this build").length - 1, 1);
-  // The sync step creates the group, so the workflow must keep calling it.
-  assert.match(mjs, /await ensureInternalTesterGroup\(/);
+  assert.doesNotMatch(rc6, /can install this build/);
+  // The only success line is the rc=0 branch, and it names external testing.
+  // The readiness step runs before the sync assigns the build, so the rc=0
+  // line states exactly what was verified: the app's external install path.
+  assert.equal(sh.split("TestFlight external install path is live for ${BUNDLE_ID} (an external group has testers or an enabled public link); the standing-testers sync assigns and verifies this build next").length - 1, 1);
+  assert.doesNotMatch(sh, /TestFlight external testers can install this build/);
+  assert.doesNotMatch(sh, /TestFlight internal testers can install this build/);
+  // The sync step must NOT re-create the internal group; it deletes leftovers.
+  const syncStart = mjs.indexOf('method === "ensure-standing-testers"');
+  const syncEnd = mjs.indexOf('method === "ensure-tf-ready"');
+  assert.ok(syncStart >= 0, 'ensure-standing-testers dispatch marker exists');
+  assert.ok(syncEnd > syncStart, 'ensure-tf-ready dispatch marker follows it');
+  const syncBranch = mjs.slice(syncStart, syncEnd);
+  // The branch comments name ensureInternalTesterGroup on purpose; only an
+  // awaited call would re-create the group.
+  assert.doesNotMatch(syncBranch, /await ensureInternalTesterGroup\(/);
+  assert.match(syncBranch, /await deleteInternalGroups\(/);
+  // After assigning the build to the external group, the sync independently
+  // verifies membership through the group-side builds read (Apple forbids
+  // reading a build's betaGroups).
+  assert.match(syncBranch, /\/v1\/betaGroups\/\$\{group\.id\}\/builds/);
+  assert.match(syncBranch, /verified \$\{buildLabel\} is in group/);
+  // Standing testers join the external group with createFirst so an email
+  // whose only tester record belongs to another app still gets an app-scoped
+  // record (the cross-app 409 path cannot recover one that does not exist).
+  assert.match(syncBranch, /createFirst: true/);
+  // ensureInternalTesterGroup stays exported: this repo's own suite is its
+  // living consumer (see the behavior tests above).
+  assert.match(mjs, /export async function ensureInternalTesterGroup\(/);
+});
+
+test("externalInstallability defers tester-read failures behind public links and counts missing-flag groups as external", async () => {
+  const { externalInstallability } = await import("./ios-fleet/asc-api.mjs");
+  const grp = (id, name, internal, link) => {
+    const attributes = { name, publicLinkEnabled: link };
+    if (internal !== undefined) attributes.isInternalGroup = internal;
+    return { id, attributes };
+  };
+  const listRes = (data) => ({ status: 200, ok: true, parsed: { data }, text: "" });
+  const failRes = { status: 500, ok: false, parsed: { errors: [{ detail: "boom" }] }, text: "" };
+
+  // A later group's public link settles installability even when an earlier
+  // group's tester read fails transiently.
+  const api1 = async (m, path) => path.includes("/betaTesters") ? failRes
+    : listRes([grp("g-bad", "Public Beta", false, false), grp("g-link", "Beta Link", false, true)]);
+  const linked = await externalInstallability({ api: api1, buildId: "b1" });
+  assert.equal(linked.ok, true);
+  assert.equal(linked.installable, true);
+  assert.match(linked.detail, /Beta Link/);
+
+  // A missing isInternalGroup flag is not known-internal, so it counts as external.
+  const api2 = async () => listRes([grp("g1", "Public Beta", undefined, true)]);
+  const missingFlag = await externalInstallability({ api: api2, buildId: "b1" });
+  assert.equal(missingFlag.installable, true);
+
+  // A transport throw is unreadable, never a crash of ensure-tf-ready.
+  const apiThrow = async () => { throw new Error("socket hangup"); };
+  const thrown = await externalInstallability({ api: apiThrow, buildId: "b1" });
+  assert.equal(thrown.ok, false);
+  assert.equal(thrown.installable, false);
+  assert.match(thrown.error, /socket hangup/);
+
+  // Every tester read failing and no link anywhere is unverified, not uninstallable.
+  const api3 = async (m, path) => path.includes("/betaTesters") ? failRes : listRes([grp("g1", "Public Beta", false, false)]);
+  const unreadable = await externalInstallability({ api: api3, buildId: "b1" });
+  assert.equal(unreadable.ok, false);
+  assert.equal(unreadable.installable, false);
+});
+
+test("deleteInternalGroups deletes only internal groups, tolerates 404, and warns instead of throwing on failure", async () => {
+  const { deleteInternalGroups } = await import("./ios-fleet/asc-api.mjs");
+  const logs = [];
+  const log = (m) => logs.push(m);
+  const warn = (m) => logs.push("WARN " + m);
+  const group = (id, name, internal) => ({ id, type: "betaGroups", attributes: { name, isInternalGroup: internal } });
+  const listRes = (data) => ({ status: 200, ok: true, parsed: { data }, text: "" });
+
+  const deleted = [];
+  const api = async (method, path) => {
+    if (method === "GET") return listRes([group("g-int", "Internal Testers", true), group("g-ext", "Public Beta", false)]);
+    if (method === "DELETE") { deleted.push(path); return { status: 204, ok: true, parsed: {}, text: "" }; }
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  assert.deepEqual(await deleteInternalGroups({ api, appId: "6820175685", log, warn }), { deleted: 1, failed: 0 });
+  assert.deepEqual(deleted, ["/v1/betaGroups/g-int"], "the external group is untouched");
+
+  // Exception apps keep their internal groups: an appId outside the owner's
+  // external-only set must not even read the group list, let alone delete.
+  const uncovered = await deleteInternalGroups({ api: async () => { throw new Error("must not be called"); }, appId: "6798076688", log, warn });
+  assert.deepEqual(uncovered, { deleted: 0, failed: 0 });
+
+  const gone = async (method) => method === "GET" ? listRes([group("g1", "Internal Testers", true)]) : { status: 404, ok: false, parsed: {}, text: "" };
+  assert.deepEqual(await deleteInternalGroups({ api: gone, appId: "6820175685", log, warn }), { deleted: 1, failed: 0 }, "an already-gone group counts as deleted");
+
+  const failing = async (method) => method === "GET" ? listRes([group("g1", "Internal Testers", true)]) : { status: 500, ok: false, parsed: { errors: [{ detail: "boom" }] }, text: "" };
+  assert.deepEqual(await deleteInternalGroups({ api: failing, appId: "6820175685", log, warn }), { deleted: 0, failed: 1 }, "a failed delete warns, never throws");
+});
+
+test("externalInstallability follows the external-group/public-link policy", async () => {
+  const { externalInstallability } = await import("./ios-fleet/asc-api.mjs");
+  const group = (id, name, internal, publicLink = false) => ({ id, type: "betaGroups", attributes: { name, isInternalGroup: internal, publicLinkEnabled: publicLink } });
+  const listRes = (data) => ({ status: 200, ok: true, parsed: { data }, text: "" });
+
+  // A public link alone makes the build installable, even with zero testers.
+  let calls = 0;
+  const linkOnly = async () => { calls += 1; return listRes([group("g1", "Public Beta", false, true)]); };
+  assert.deepEqual(await externalInstallability({ api: linkOnly, buildId: "b1" }).then((o) => ({ ok: o.ok, installable: o.installable })), { ok: true, installable: true });
+  assert.equal(calls, 1, "the public link short-circuits the tester read");
+
+  // Testers without a public link are installable; an empty group is not.
+  const withTesters = async (method, path) => path.includes("/betaTesters")
+    ? listRes([{ id: "t1", type: "betaTesters", attributes: { email: "a@b.c" } }])
+    : listRes([group("g1", "Public Beta", false, false)]);
+  assert.deepEqual(await externalInstallability({ api: withTesters, buildId: "b1" }).then((o) => ({ ok: o.ok, installable: o.installable })), { ok: true, installable: true });
+  const emptyGroup = async (method, path) => path.includes("/betaTesters") ? listRes([]) : listRes([group("g1", "Public Beta", false, false)]);
+  assert.deepEqual(await externalInstallability({ api: emptyGroup, buildId: "b1" }).then((o) => ({ ok: o.ok, installable: o.installable })), { ok: true, installable: false });
+
+  // Internal groups never count, even with testers.
+  const internalOnly = async () => listRes([group("g-int", "Internal Testers", true)]);
+  assert.deepEqual(await externalInstallability({ api: internalOnly, buildId: "b1" }).then((o) => ({ ok: o.ok, installable: o.installable })), { ok: true, installable: false });
+
+  // A failed read is ok:false, which is not the same as uninstallable.
+  const failing = async () => ({ status: 401, ok: false, parsed: { errors: [{ detail: "denied" }] }, text: "" });
+  const out = await externalInstallability({ api: failing, buildId: "b1" });
+  assert.equal(out.ok, false);
+  assert.equal(out.installable, false);
 });

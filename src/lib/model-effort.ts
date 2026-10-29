@@ -10,6 +10,7 @@ export interface ModelEffortSubject {
 export interface ModelOptionEffortSubject {
   id?: string;
   effortLevels?: readonly EffortLevel[];
+  defaultEffort?: EffortLevel;
   supportsEffort?: boolean;
 }
 
@@ -87,3 +88,27 @@ export function effortLabel(level: EffortLevel | undefined): string {
   if (level === "xhigh") return "X-High";
   return level.charAt(0).toUpperCase() + level.slice(1);
 }
+
+/**
+ * Returns the default reasoning effort level for a model on an engine when one
+ * is defined, or undefined when the engine/model has no explicit default.
+ */
+export function modelDefaultEffort(
+  _engine: ModelEffortSubject | null | undefined,
+  modelOption: ModelOptionEffortSubject | null | undefined,
+  modelId?: string,
+): EffortLevel | undefined {
+  if (modelOption && modelOption.effortLevels !== undefined && modelOption.effortLevels.length === 0) {
+    return undefined;
+  }
+  if (modelOption?.defaultEffort !== undefined) {
+    return modelOption.defaultEffort;
+  }
+  const effectiveId = (modelOption?.id ?? modelId ?? "").trim().toLowerCase();
+  if (effectiveId.includes("m3.1")) {
+    return "max";
+  }
+  return undefined;
+}
+
+

@@ -23,6 +23,7 @@ import {
   Clock,
   CornerDownRight,
   ListChecks,
+  Minimize2,
   Quote,
   RotateCcw,
   Wand2,
@@ -49,6 +50,7 @@ const ICONS: Record<ContextSource, LucideIcon> = {
   rewind: RotateCcw,
   reply: Quote,
   continuation: CornerDownRight,
+  compression: Minimize2,
 };
 
 /** A plain-words line for what each source is, shown when a row is opened. */
@@ -62,6 +64,7 @@ const EXPLANATION: Record<ContextSource, string> = {
   rewind: "The surviving conversation, replayed after an edit or a version switch.",
   reply: "The earlier message your reply quotes.",
   continuation: "The note BotFleet sent so the bot could carry on once you finished a card.",
+  compression: "The prompt was over its budget, so older context was cut before it was sent.\u00A0 Sizes and names only.",
 };
 
 export function ContextInjectionRow({

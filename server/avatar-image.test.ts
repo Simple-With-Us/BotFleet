@@ -7,6 +7,7 @@ import {
   generateAvatarImage,
   snapshotAvatarGenerationState,
 } from "./avatar-image.ts";
+import { telemetry } from "./telemetry.ts";
 
 const BOT = { name: "Scout", title: "Research agent", description: "Finds evidence quickly." };
 
@@ -52,6 +53,29 @@ describe("avatar image generation", () => {
       image_size: "1024x1024",
       n: 1,
     });
+  });
+
+  it("reports one generated image to Usage Monitor, by provider and model, and nothing for a failed one (BF-2435)", async () => {
+    const track = vi.spyOn(telemetry, "trackAux").mockImplementation(() => {});
+    const bytes = Buffer.from("generated-png");
+    const ok = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      data: { image_base64: [bytes.toString("base64")] },
+    }), { status: 200 }));
+    await generateAvatarImage("sk-image", BOT, "blue robot", ok);
+    const okOpenAi = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      data: [{ b64_json: bytes.toString("base64") }],
+    }), { status: 200 }));
+    await generateAvatarImage("sk-image", BOT, "blue robot", okOpenAi, 120_000, "openai");
+
+    expect(track.mock.calls.map(([params]) => [params.kind, params.provider, params.service, params.metadata])).toEqual([
+      ["avatar-image", "minimax", "image-01", { images: 1 }],
+      ["avatar-image", "openai", "gpt-image-2", { images: 1 }],
+    ]);
+
+    track.mockClear();
+    const failing = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ error: { message: "nope" } }), { status: 500 }));
+    await expect(generateAvatarImage("sk-image", BOT, "blue robot", failing)).rejects.toThrow("nope");
+    expect(track).not.toHaveBeenCalled();
   });
 
   it("falls back to the OpenAI data[].b64_json shape if MiniMax ever returns it (defensive)", async () => {

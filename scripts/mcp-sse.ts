@@ -21,7 +21,7 @@ const PORT = Number(process.env.BOTFLEET_MCP_PORT || process.env.PORT || 8794);
 const HOST = process.env.BOTFLEET_MCP_HOST || "127.0.0.1";
 const HARNESS_URL = process.env.BOTFLEET_URL || "http://127.0.0.1:8799";
 function resolveAuthToken(): string | null {
-  // Runtime credentials must be injected through process.env; ~/.secrets is handoff-only.
+  // Runtime credentials must be injected through the process environment or read from Infisical.
   return (
     process.env.SEAT_MCP_TOKEN?.trim() ||
     process.env.BOTFLEET_MCP_TOKEN?.trim() ||

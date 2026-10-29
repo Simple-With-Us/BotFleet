@@ -675,7 +675,7 @@ export interface ContainerComputerStatus {
   image: boolean;
   imageMatches: boolean;
   managed: boolean;
-  container: "running" | "stopped" | "missing";
+  container: "running" | "created" | "stopped" | "missing";
   network: "loopback" | "unsafe" | "unknown";
   security: "hardened" | "unsafe" | "unknown";
   persistence: "durable" | "unsafe" | "unknown";
@@ -746,6 +746,7 @@ function statusProblem(status: ContainerComputerStatus): string | null {
   if (status.network === "unsafe") return "The existing Local VM exposes its viewer publicly; recreate it";
   if (status.security === "unsafe") return "The existing Local VM is missing safety limits; recreate it";
   if (status.persistence === "unsafe") return "The existing Local VM is missing its durable workspace; recreate it";
+  if (status.container === "created") return "Start the newly created Local VM";
   if (status.container === "stopped") return "This desktop image cannot safely resume; recreate the Local VM";
   if (status.desktopUnreachable) return "Couldn't reach the Local VM desktop just now; retrying";
   if (status.desktop_error) return `The Local VM desktop failed to start: ${status.desktop_error}`;
@@ -883,13 +884,61 @@ export function resetCuaShimHealGate(): void {
   shimHealedAt.clear();
 }
 
+/**
+ * A read-only snapshot of the things every target shares: which container
+ * runtime is usable, and whether the prepared image is there.
+ *
+ * Probing a list of N targets used to cost N runtime probes and N image
+ * probes, because each target repeated the same work.  One context, built
+ * once for the whole list, turns that into one of each.
+ */
+export interface ContainerProbeContext {
+  runtimeStatus: ContainerRuntimeStatus;
+  /** `present` means the prepared image is there AND still carries the pinned
+   * labels, which is what `ContainerComputerStatus.image` reports. */
+  image: { present: boolean; image_id: string | null };
+}
+
+/** Is the prepared BotFleet derivative image there, and does it still match
+ *  the pinned labels?  Read-only: it inspects the image store and changes
+ *  nothing. */
+async function probePreparedImage(
+  runner: CommandRunner,
+  runtime: Runtime,
+): Promise<{ present: boolean; image_id: string | null }> {
+  try {
+    const { stdout } = await runner(runtime, ["image", "inspect", IMAGE]);
+    const image = inspectedImage(stdout);
+    return { present: imageLabelsMatch(image.labels), image_id: image.id };
+  } catch {
+    // The prepared BotFleet derivative has not been built yet.
+    return { present: false, image_id: null };
+  }
+}
+
+/** Build the shared probe context.  Read-only: it inspects, it never changes.
+ *
+ *  The image is only inspected when a runtime is actually usable, because a
+ *  stopped or missing runtime cannot answer an image inspect either. */
+export async function containerProbeContext(
+  runner: CommandRunner = sh,
+  platform: NodeJS.Platform = process.platform,
+): Promise<ContainerProbeContext> {
+  const runtimeStatus = await containerRuntimeStatus(runner, platform);
+  const image = runtimeStatus.runtime && runtimeStatus.daemonUp
+    ? await probePreparedImage(runner, runtimeStatus.runtime)
+    : { present: false, image_id: null };
+  return { runtimeStatus, image };
+}
+
 export async function containerComputerStatus(
   runner: CommandRunner = sh,
   platform: NodeJS.Platform = process.platform,
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+  context?: ContainerProbeContext,
 ): Promise<ContainerComputerStatus> {
   const status = emptyStatus(platform, target);
-  const runtimeStatus = await containerRuntimeStatus(runner, platform);
+  const runtimeStatus = context ? context.runtimeStatus : await containerRuntimeStatus(runner, platform);
   status.available = runtimeStatus.available;
   status.runtime = runtimeStatus.runtime;
   status.daemonUp = runtimeStatus.daemonUp;
@@ -904,8 +953,12 @@ export async function containerComputerStatus(
     return status;
   }
 
+  // The container inspect is reused for the detail read below, so a target
+  // costs one inspect instead of two.  A legacy name that had to be renamed
+  // is the one case where the first inspect is stale.
+  let inspectedContainer: string | null = null;
   try {
-    await runner(status.runtime, ["inspect", target.containerName]);
+    inspectedContainer = (await runner(status.runtime, ["inspect", target.containerName])).stdout;
   } catch {
     for (const prefix of LEGACY_CONTAINER_PREFIXES) {
       const legacy =
@@ -915,6 +968,7 @@ export async function containerComputerStatus(
       try {
         await runner(status.runtime, ["inspect", legacy]);
         await runner(status.runtime, ["rename", legacy, target.containerName]);
+        inspectedContainer = null;
         break;
       } catch {
         /* predecessor missing, or rename lost the race — try the next name */
@@ -922,17 +976,17 @@ export async function containerComputerStatus(
     }
   }
 
-  try {
-    const { stdout } = await runner(status.runtime, ["image", "inspect", IMAGE]);
-    const image = inspectedImage(stdout);
-    status.image = imageLabelsMatch(image.labels);
-    status.image_id = image.id;
-  } catch {
-    // The prepared BotFleet derivative has not been built yet.
-  }
+  const image = context
+    ? context.image
+    : await probePreparedImage(runner, status.runtime);
+  status.image = image.present;
+  status.image_id = image.image_id;
 
   try {
-    const { stdout } = await runner(status.runtime, ["inspect", target.containerName]);
+    // The container inspect from above is reused here, so a target costs one
+    // inspect instead of two.  It is only re-read when the first inspect did
+    // not produce output to reuse.
+    const stdout = inspectedContainer ?? (await runner(status.runtime, ["inspect", target.containerName])).stdout;
     if (status.runtime === "container") {
       const inspected = JSON.parse(stdout) as Array<{
         configuration?: {
@@ -988,11 +1042,13 @@ export async function containerComputerStatus(
         }>;
         EffectiveCaps?: string[];
         BoundingCaps?: string[];
-        State?: { Running?: boolean };
+        State?: { Running?: boolean; Status?: string };
         Image?: string;
       }>;
       const detail = inspected[0];
-      status.container = detail?.State?.Running ? "running" : "stopped";
+      status.container = detail?.State?.Running
+        ? "running"
+        : detail?.State?.Status === "created" ? "created" : "stopped";
       status.network = dockerPortsAreLocal(detail?.HostConfig?.PortBindings) ? "loopback" : "unsafe";
       status.viewer_port = dockerViewerPort(detail?.NetworkSettings?.Ports, target.viewerPort);
       status.imageMatches =
@@ -1548,10 +1604,52 @@ export async function migrateVmWorkspace(
   return from;
 }
 
-async function ensureVmWorkspace(platform: NodeJS.Platform, target: LocalVmTarget): Promise<void> {
+export async function ensureVmWorkspace(platform: NodeJS.Platform, target: LocalVmTarget): Promise<void> {
   await migrateVmWorkspace(target);
   await mkdir(target.workspaceDir, { recursive: true, mode: 0o700 });
   if (platform !== "win32") await chmod(target.workspaceDir, 0o700);
+}
+
+/** Provision the shared desktop without starting it.  This is for a deliberate
+ * offline recovery: it uses the ordinary run contract, but Docker's `create`
+ * leaves the desktop off and never removes an existing container or image. */
+export async function createStoppedSharedLocalVm(
+  runner: CommandRunner = sh,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
+  if (loadConfig().localVm?.mode === "per-bot") {
+    throw Object.assign(new Error("Shared Local VM is disabled in per-bot Computer mode"), { status: 409 });
+  }
+  const { stdout } = await runner("docker", ["image", "inspect", "--format", "{{json .Config.Labels}}", IMAGE]);
+  const labels = z.record(z.string(), z.string()).safeParse(JSON.parse(stdout));
+  if (!labels.success || !imageLabelsMatch(labels.data)) {
+    throw Object.assign(new Error("The prepared BotFleet desktop image is missing or incompatible"), { status: 409 });
+  }
+  const host = await readRuntimeHost("docker", runner);
+  const runtimeLabel = await resolveRuntimeHostLabel("docker", runner);
+  const capacityError = localVmHostCapacityError(host, runtimeLabel);
+  if (capacityError) throw Object.assign(new Error(capacityError), { status: 409 });
+  const limits = await resolveContainerLimits("docker", runner, configuredContainerLimits());
+  await ensureVmWorkspace(platform, SHARED_LOCAL_VM_TARGET);
+  const target = SHARED_LOCAL_VM_TARGET.viewerPort && !(await loopbackPortFree(SHARED_LOCAL_VM_TARGET.viewerPort))
+    ? { ...SHARED_LOCAL_VM_TARGET, viewerPort: null }
+    : SHARED_LOCAL_VM_TARGET;
+  const runArgs = containerRunArgs(
+    "docker", randomBytes(6).toString("base64url"), target, platform,
+    {
+      shareCliCredentials: shareCliCredentialsConfigured(),
+      shareGpgPrivateKeys: shareGpgPrivateKeysConfigured(),
+      materializeCredentials: false,
+      limits,
+    },
+  );
+  try {
+    await runner("docker", ["create", ...runArgs.slice(2)], 2 * 60_000);
+  } catch {
+    // Docker errors may echo argv, including the private viewer password.
+    throw new Error("Docker could not create the stopped Local VM; check the local daemon and available resources");
+  }
+  forgetLocalVmGhToken(SHARED_LOCAL_VM_TARGET.containerName);
 }
 
 /** How long an image build may run.  The CLI layer downloads and installs
@@ -1631,9 +1729,12 @@ export async function containerComputerAction(
     throw Object.assign(new Error(before.problem ?? "This runtime cannot create a per-bot Local VM"), { status: 409 });
   }
   if (action === "start") {
-    throw Object.assign(new Error("This desktop image cannot safely resume; remove and recreate the Local VM"), {
-      status: 409,
-    });
+    if (before.container !== "created" || !before.imageMatches || !before.managed ||
+        before.network !== "loopback" || before.security !== "hardened" || before.persistence !== "durable") {
+      throw Object.assign(new Error("This desktop image cannot safely resume; recreate the Local VM in Computer settings"), {
+        status: 409,
+      });
+    }
   }
   if (action === "stop" && before.container !== "running") {
     throw Object.assign(new Error("The Local VM is not running"), { status: 409 });
@@ -1748,11 +1849,14 @@ export async function wakeContainerComputer(
 ): Promise<ContainerComputerStatus> {
   const canWake =
     Boolean(status.image && status.runtime && status.daemonUp && status.create_supported) &&
-    (status.container === "stopped" || status.container === "missing");
+    (status.container === "created" || status.container === "stopped" || status.container === "missing");
   if (!canWake) {
     return status;
   }
   try {
+    if (status.container === "created") {
+      return await containerComputerAction("start", runner, platform, target);
+    }
     if (status.container === "stopped") {
       await containerComputerAction("remove", runner, platform, target);
     }

@@ -42,7 +42,7 @@ All fleet repositories except `fleet-ops` are **public**.  To protect origin inf
    Always read values from environment variables (`INFISICAL_PROJECT_ID`, `COOLIFY_ST_APP_UUID`, `HETZNER_HOST_IP`, etc.) or query them dynamically via authenticated APIs.
 
 2. **Secrets Handoff Protection:**
-   Read credentials from `~/.secrets/global-api-keys` or Infisical.  Never `cat`, `grep -E '^[A-Z0-9_]+='`, or log secret values into transcripts.
+   Read credentials with `fleet-secrets get NAME` (Mac) or from Infisical.  Never `cat`, `grep -E '^[A-Z0-9_]+='`, or log secret values into transcripts.
 
 3. **Mock Data in Tests & Documentation:**
    Use RFC 5737 documentation ranges (`192.0.2.1`, `198.51.100.1`, `203.0.113.1`) and generic mock UUIDs (`mock-app-uuid`, `mock-project-id`) in test fixtures and public rollouts.

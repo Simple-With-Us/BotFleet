@@ -67,7 +67,7 @@ final class PushSenderHealthTests: XCTestCase {
 
     /// Apple refused the signing key itself.  We surface Apple's verbatim
     /// reason so a support engineer knows what to look for, plus the
-    /// plain-English fix: the key file needs replacing.  Without
+    /// plain-English fix: the signing key needs replacing.  Without
     /// surfacing the reason the user has to dig through logs.
     func testKeyRejectedSurfacesAppleReasonAndTheFix() {
         let health = PushSenderHealth(
@@ -84,7 +84,7 @@ final class PushSenderHealthTests: XCTestCase {
         )
         XCTAssertEqual(
             PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
-            "InvalidProviderToken — the key file needs replacing."
+            "InvalidProviderToken — the signing key needs replacing."
         )
     }
 
@@ -562,7 +562,7 @@ final class PushSenderHealthTests: XCTestCase {
         )
         XCTAssertEqual(
             PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
-            "InvalidProviderToken — the key file needs replacing."
+            "InvalidProviderToken — the signing key needs replacing."
         )
     }
 

@@ -60,6 +60,7 @@ import {
   resolveInjectId,
 } from "./local-inject.ts";
 import { appendNative } from "./native.ts";
+import { engineCommandText, neutralizeLeadingSlash, normalizeAnnouncedCommands } from "./engine-commands.ts";
 import {
   clearPromptSplitReceipt,
   EMPTY_FINGERPRINT,
@@ -264,8 +265,9 @@ export function claudeSignedIn(
  * - `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (default 20) asks for at most 3
  *   helpers at once.  It is ADVISORY: 2.1.284 skips the check when a
  *   server-side feature gate (`tengu_amber_kestrel`) or ultracode mode is
- *   on, and nothing outside the CLI can turn either off.  A hard bound
- *   belongs with the typed Helper cards (P3).
+ *   on, and nothing outside the CLI can turn either off.  The helper card
+ *   (P3) shows the ones that did start.  It does not add a second cap:
+ *   the CLI's own check is still the only one, and it stays advisory.
  *
  * Forced over any inherited value: these are a safety floor, not defaults. */
 export const CLAUDE_CONTAINMENT_ENV = {
@@ -373,14 +375,52 @@ function startsUnsolicitedTurn(frame: { type?: unknown; subtype?: unknown; state
   return frame.type === "system" && (frame.subtype === "init" || frame.subtype === "task_notification");
 }
 
-type TurnUsage = { input: number; output: number; cachedInput?: number };
+type TurnUsage = {
+  input: number;
+  output: number;
+  cachedInput?: number;
+  /** Cache writes (5 minute TTL, or a TTL the CLI did not break down).  Like
+   *  `cachedInput`, a subset of `input`, so `input` still reads as the whole
+   *  context the turn sent. */
+  cacheWrite5m?: number;
+  /** Cache writes to the 1 hour cache; also a subset of `input`. */
+  cacheWrite1h?: number;
+};
 
-/** Two reported usages as one, keeping the cache share when either has it. */
+/** The slice of the CLI's `usage` object the cache-write split reads. */
+type CliUsage = {
+  cache_creation_input_tokens?: number;
+  cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number };
+};
+
+/** The cache-write share of one Anthropic `usage` object, split by TTL.
+ * `cache_creation` carries the 5 minute and 1 hour figures.  An older CLI
+ * reports only the flat `cache_creation_input_tokens`, which files under 5
+ * minutes (the shared usage schema's rule for a TTL nobody reported).  Empty
+ * when the usage reported no cache write. */
+export function cacheWritesOf(usage: CliUsage | undefined): { cacheWrite5m?: number; cacheWrite1h?: number } {
+  const count = (value: number | undefined) => (value != null && Number.isFinite(value) && value > 0 ? Math.round(value) : 0);
+  const fiveMinutes = count(usage?.cache_creation?.ephemeral_5m_input_tokens);
+  const oneHour = count(usage?.cache_creation?.ephemeral_1h_input_tokens);
+  const writes: { cacheWrite5m?: number; cacheWrite1h?: number } = {};
+  if (fiveMinutes > 0 || oneHour > 0) {
+    if (fiveMinutes > 0) writes.cacheWrite5m = fiveMinutes;
+    if (oneHour > 0) writes.cacheWrite1h = oneHour;
+    return writes;
+  }
+  const flat = count(usage?.cache_creation_input_tokens);
+  if (flat > 0) writes.cacheWrite5m = flat;
+  return writes;
+}
+
+/** Two reported usages as one, keeping the cache shares when either has them. */
 function sumUsage(a: TurnUsage | undefined, b: TurnUsage | undefined): TurnUsage | undefined {
   if (!a) return b;
   if (!b) return a;
   const usage: TurnUsage = { input: a.input + b.input, output: a.output + b.output };
   if (a.cachedInput !== undefined || b.cachedInput !== undefined) usage.cachedInput = (a.cachedInput ?? 0) + (b.cachedInput ?? 0);
+  if (a.cacheWrite5m !== undefined || b.cacheWrite5m !== undefined) usage.cacheWrite5m = (a.cacheWrite5m ?? 0) + (b.cacheWrite5m ?? 0);
+  if (a.cacheWrite1h !== undefined || b.cacheWrite1h !== undefined) usage.cacheWrite1h = (a.cacheWrite1h ?? 0) + (b.cacheWrite1h ?? 0);
   return usage;
 }
 
@@ -416,9 +456,31 @@ const FrameMeta = z
     user_message_uuid: z.string().min(1).optional().catch(undefined),
     user_message_uuids: z.array(z.string()).optional().catch(undefined),
     parent_tool_use_id: z.string().min(1).optional().catch(undefined),
+    // the `system` `init` frame's catalog of the CLI's own slash commands
+    slash_commands: z.array(z.string()).optional().catch(undefined),
   })
   // a frame that is not an object at all carries none of them
   .catch({});
+
+const assistantMessageIdSchema = z.object({ id: z.string().min(1) }).passthrough();
+
+/** How many helper tokens this frame adds.  Frames of one assistant message
+ * repeat a running total, so a later frame with the same id contributes only
+ * the increase.  A frame with no id has nothing to dedupe against. */
+export function helperUsageDelta(seen: Map<string, number> | undefined, messageId: string | undefined, total: number): number {
+  if (total <= 0) return 0;
+  if (!seen || !messageId) return total;
+  const prior = seen.get(messageId) ?? 0;
+  if (total < prior) {
+    // Engine reset: accept the new floor so the next non-decreasing frame
+    // is compared against the post-reset value, not the pre-reset peak.
+    seen.set(messageId, total);
+    return 0;
+  }
+  if (total === prior) return 0;
+  seen.set(messageId, total);
+  return total - prior;
+}
 
 /** Lifecycle states after which a command will never run (it may have run
  * already, for `completed`). */
@@ -954,6 +1016,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         /** Usage summed over this turn's own CLI results (each result's
          *  usage is that CLI turn's alone). */
         usage?: TurnUsage;
+        /** The model the provider says answered (the assistant frame's
+         *  `model`), which can differ from the one requested: an alias, a
+         *  fallback, a dated snapshot.  Last non-helper frame wins. */
+        servedModel?: string;
+        /** Highest helper-token total already counted for one assistant
+         *  message id.  Streamed frames repeat that message's usage. */
+        helperUsage: Map<string, number>;
         /** How this turn's latest own CLI turn ended: what the settle
          *  reports, once nothing more of the turn is still to run. */
         outcome?: { ok: boolean; stopReason: string | null };
@@ -1035,10 +1104,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     /** Write a user message for the running turn.  It is stamped with a uuid
      *  the CLI reports back (`command_lifecycle`, `user_message_uuids`), and
      *  recorded as this turn's and as not yet taken BEFORE the write: the
-     *  CLI's answer can only be read after it. */
-    const writeUser = (s: Session, threadId: string, text: string): Promise<boolean> => {
+     *  CLI's answer can only be read after it.
+     *
+     *  This is the only place text reaches the CLI's stdin, so it is also the
+     *  one place a leading slash is shielded (`neutralizeLeadingSlash`): a
+     *  message that starts with "/advisor" or "/model" would otherwise run as
+     *  the CLI's own command and rewrite the owner's global settings.  Only a
+     *  command turn (`bare`) is written as typed. */
+    const writeUser = (s: Session, threadId: string, text: string, bare = false): Promise<boolean> => {
       const uuid = randomUUID();
-      const promptMsg = { type: "user", uuid, message: { role: "user", content: text } };
+      const promptMsg = { type: "user", uuid, message: { role: "user", content: bare ? text : neutralizeLeadingSlash(text) } };
       if (!s.child.stdin.writable || s.child.stdin.destroyed) return Promise.resolve(false);
       const turn = s.turn;
       turn?.sends.add(uuid);
@@ -1309,8 +1384,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // receipt this harness never wrote — and on a mention turn, whose note
       // describes this very message.  A legacy unsplit turn goes bare.  The
       // receipt is only pending here; the CLI's first frame commits it.
-      const planTurnText = (sessionKey: string): { text: string; pending: { key: string; receipt: PromptSplitReceipt } | null } => {
-        if (halves.stable === null) return { text: turn.text, pending: null };
+      //
+      // A command turn (`/compact`) is the exception: the CLI parses a slash
+      // command only at the very start of the message, so it is written alone,
+      // with no note and no receipt.  The note rides the next ordinary turn,
+      // which still finds the receipt missing.
+      const planTurnText = (sessionKey: string) => {
+        if (turn.command) return { text: engineCommandText(turn.command), pending: null, bare: true };
+        if (halves.stable === null) return { text: turn.text, pending: null, bare: false };
         const receipt = promptSplitFingerprints(halves.stable, halves.volatile);
         const previous = readPromptSplitReceipt(DRIVER_KIND, sessionKey);
         const carried = previous !== null && previous.volatile === receipt.volatile && !turn.mentionTurn;
@@ -1319,6 +1400,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             ? turn.text
             : withVolatileNote(turn.text, halves.volatile, previous !== null && previous.volatile !== EMPTY_FINGERPRINT),
           pending: { key: sessionKey, receipt },
+          bare: false,
         };
       };
 
@@ -1328,7 +1410,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const live = sessions.get(threadId);
       if (live && !live.turn && !live.unsolicited && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
-        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), input: turn, retry, retryAbort };
+        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), input: turn, retry, retryAbort };
         live.engaged = false;
         live.foreignRunning = false;
         // stderr feeds the crash message; a warm process still holds turn
@@ -1348,7 +1430,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         emit({ ...base(threadId, turnId), type: "turn.started" });
         const plan = planTurnText(live.sessionId ?? sessionId ?? newSessionId!);
         live.pendingReceipt = plan.pending;
-        const written = await writeUser(live, threadId, plan.text);
+        const written = await writeUser(live, threadId, plan.text, plan.bare);
         if (!written) {
           live.pendingReceipt = null;
           active.delete(threadId);
@@ -1436,7 +1518,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         argsKey,
         sessionId: sessionId ?? newSessionId,
         pendingReceipt: null,
-        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), input: turn, retry, retryAbort },
+        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), input: turn, retry, retryAbort },
         idleTimer: null,
         closing: false,
         stderr: "",
@@ -1483,6 +1565,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // A settled turn owns no retry budget. Retained CLI sessions may run
         // many later turns on this thread, and each must start fresh.
         retryState.delete(threadId);
+        // Spread as an object or as nothing: absent unless the provider said.
+        const servedModel = t.servedModel ? { servedModel: t.servedModel } : undefined;
         emit({
           ...base(threadId, t.turnId),
           type: "turn.completed",
@@ -1493,6 +1577,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // total_cost_usd is the equivalent API price, not a cash charge.
           ...(cost != null ? { billingMode: "estimated" as const } : {}),
           ...(usage ? { usage } : {}),
+          ...servedModel,
         });
         if (session.child.exitCode === null && !session.closing) armIdle(threadId);
       };
@@ -1648,6 +1733,18 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (!t) dropUnsolicited(frame, meta);
       };
 
+      /** The CLI's slash-command catalog, from its init frame: once per
+       *  process, and again if it ever changes.  Names only; what to show of
+       *  them is decided by the allowlist, not by this text. */
+      let announcedCommands = "";
+      const announceCommands = (raw: readonly string[]) => {
+        const names = normalizeAnnouncedCommands(raw);
+        const key = names.join(",");
+        if (key === announcedCommands) return;
+        announcedCommands = key;
+        emit({ ...base(threadId, currentTurnId()), type: "engine.commands", names, origin: "claude-init" });
+      };
+
       const handleLine = (line: string) => {
         let o: any;
         try {
@@ -1659,6 +1756,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // every stream-json frame is an object; anything else says nothing
         if (o === null || typeof o !== "object") return;
         const meta = FrameMeta.parse(o);
+        // Read before the turn-ownership gates below: a lifecycle-aware CLI's
+        // init frame can arrive while no BotFleet turn owns the process, and
+        // the gates would drop it before it reached the switch.
+        if (o.type === "system" && meta.subtype === "init" && meta.slash_commands) announceCommands(meta.slash_commands);
         if (o.type === "command_lifecycle") {
           onLifecycle(o, meta);
           return;
@@ -1711,6 +1812,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "assistant": {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
+            // `<synthetic>` is the CLI's own placeholder for an error reply,
+            // not a model that served anything.
+            if (!helperOf && session.turn && typeof msg.model === "string" && msg.model && msg.model !== "<synthetic>") {
+              session.turn.servedModel = msg.model;
+            }
             if (!helperOf && session.turn && isModelRejectionFrame(o, text)) {
               // Not an assistant reply: an error the turn failed on.  It must
               // reach the transcript as an error row, never as bot text, so
@@ -1746,6 +1852,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemId: b.id,
                   title: b.name,
                   parentItemId: helperOf,
+                  // The helper card keys on this.  The bot's own steps leave
+                  // it unset, so a missing parent is not a helper.
+                  subagentId: helperOf,
                   ...toolFields(b.name, b.input, { cwd: turn.cwd }),
                   ...captureInput(b.input),
                 });
@@ -1764,6 +1873,29 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   ? { cachedInput: msg.usage.cache_read_input_tokens }
                   : {}),
               });
+            } else if (msg.usage && helperOf) {
+              // The helper's own bill, for its card.  It is not the bot's
+              // context meter: that path is the branch above.  One assistant
+              // message is streamed as several frames that repeat the same
+              // usage, so only the increase since the last frame of that
+              // message id is new.
+              const tokens =
+                (msg.usage.input_tokens || 0) +
+                (msg.usage.cache_read_input_tokens || 0) +
+                (msg.usage.output_tokens || 0);
+              const parsedMessage = assistantMessageIdSchema.safeParse(msg);
+              const messageId = parsedMessage.success ? parsedMessage.data.id : undefined;
+              const delta = helperUsageDelta(session.turn?.helperUsage, messageId, tokens);
+              if (delta > 0) {
+                emit({
+                  ...base(threadId, currentTurnId()),
+                  type: "item.updated",
+                  itemType: "tool",
+                  itemId: helperOf,
+                  subagentId: helperOf,
+                  tokens: delta,
+                });
+              }
             }
             break;
           }
@@ -1778,19 +1910,30 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemId: b.tool_use_id,
                   ok: !b.is_error,
                   detail: describeResult(b.content),
+                  subagentId: helperOf,
                   ...captureOutput(b.content),
                 });
               }
             }
             break;
           case "result": {
+            // The cache writes by TTL (or the flat figure of an older CLI).
+            // `input` takes the sum of whichever form arrived, so a CLI that
+            // sends only the TTL split, with the flat total null or zero, does
+            // not leave the writes out of the context while still naming them.
+            const cacheWrites = o.usage ? cacheWritesOf(o.usage) : {};
+            const cacheWritten = (cacheWrites.cacheWrite5m ?? 0) + (cacheWrites.cacheWrite1h ?? 0);
             const resultUsage: TurnUsage | undefined = o.usage
               ? {
-                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + (o.usage.cache_creation_input_tokens || 0),
+                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + cacheWritten,
                   output: o.usage.output_tokens || 0,
                   ...(typeof o.usage.cache_read_input_tokens === "number"
                     ? { cachedInput: o.usage.cache_read_input_tokens }
                     : {}),
+                  // Cache writes stay inside `input` (the context meter reads
+                  // the whole figure) but are named, so telemetry can bill
+                  // them at the write rate instead of the plain input rate.
+                  ...cacheWrites,
                 }
               : undefined;
             const t = session.turn;
@@ -1918,6 +2061,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           const verdict = classifyError({ exitCode: code, stderr: message });
           if (
             !liveTurn.retry.cancelled &&
+            // a command turn is not replayed: relaunching would run `/compact`
+            // a second time on the resumed session
+            !liveTurn.input.command &&
             code !== 0 &&
             verdict.transient &&
             !liveTurn.producedOutput &&
@@ -2034,7 +2180,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // mid-turn steer or the next turn; closeSession() ends it.
       const plan = planTurnText(sessionId ?? newSessionId!);
       session.pendingReceipt = plan.pending;
-      if (!(await writeUser(session, threadId, plan.text))) {
+      if (!(await writeUser(session, threadId, plan.text, plan.bare))) {
         session.pendingReceipt = null;
         settle(false, "stdin_write_failed");
         closeSession(threadId, "stdin write failed");
@@ -2284,6 +2430,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // instance, which asks nothing unless a turn is held for review.
           reviewHook: config.permissionMode === "bypassPermissions" ? "after" : "before",
           asksWhenHeld: true,
+          // The init frame lists the CLI's slash commands; an allowlisted one
+          // runs as a turn of its own (server/drivers/engine-commands.ts).
+          engineCommands: true,
         },
         sendTurn,
         steer,

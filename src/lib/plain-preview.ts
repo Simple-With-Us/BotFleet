@@ -43,17 +43,21 @@ function lookupEntity(name: string): string | undefined {
   return ENTITIES[name as EntityName];
 }
 
+function isValidCodePoint(code: number): boolean {
+  return Number.isInteger(code) && code >= 1 && code <= 0x10ffff && (code < 0xd800 || code > 0xdfff);
+}
+
 function decodeEntities(text: string): string {
   return text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (whole, name: string) => {
     const known = lookupEntity(name.toLowerCase());
     if (known) return known;
     if (name.startsWith("#x") || name.startsWith("#X")) {
       const code = Number.parseInt(name.slice(2), 16);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : whole;
+      return isValidCodePoint(code) ? String.fromCodePoint(code) : whole;
     }
     if (name.startsWith("#")) {
       const code = Number.parseInt(name.slice(1), 10);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : whole;
+      return isValidCodePoint(code) ? String.fromCodePoint(code) : whole;
     }
     return whole;
   });

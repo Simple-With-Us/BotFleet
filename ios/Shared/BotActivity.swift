@@ -3,6 +3,7 @@
 //
 // One activity per bot that is doing something: needs you, working, or
 // has an unread message. Quiet, already-read bots have no activity.
+#if canImport(ActivityKit) && !os(macOS)
 import ActivityKit
 import AppIntents
 import Foundation
@@ -61,3 +62,5 @@ struct AnswerApprovalIntent: LiveActivityIntent {
         return .result()
     }
 }
+#endif
+

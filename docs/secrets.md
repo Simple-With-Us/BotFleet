@@ -174,6 +174,14 @@ Returns `{ infisical: InfisicalStatusView, fields: FieldRow[] }` — booleans,
 counts, names and ids.  `fields` walks the secret map; a `secret: true`
 field's `value` is always `null`, never the real value.
 
+`readTokenRefused` and `writeTokenRefused` say the server refused the
+configured service token and the manager fell back to the machine identity.
+The token is still configured and still in Settings, so these flags — not the
+token's absence — are what tell an operator that a dead token is hiding behind
+a working sync.  The same refusal rides the boot line as `read-token-refused`
+and `write-token-refused`.  Neither flag is read by the Secrets card, so the
+status payload and the boot line are where a refusal shows today.
+
 ```
 POST /api/infisical/sync
 ```
@@ -191,6 +199,12 @@ Logs in and lists secret **names** only (`viewSecretValue=false` on the
 wire) — proves the identity and project id are correct without ever
 populating the snapshot.  Returns `{ ok, error, secretCount, names }`.  This
 is what **Test Connection** calls.
+
+The probe tests the **configured** credential rather than the fallback the
+manager would reach for on its behalf, so a token the server refuses is
+reported as a failure instead of going green on the machine identity.  A
+refused token comes back as `ok: false` with an error that says the token was
+refused, and the next refresh uses a token rotated in Settings.
 
 `GET /api/config` separately carries a small `infisical` block —
 `configured`, `enabled`, `writeThrough`, `environment`, `hasClientSecret`,
@@ -281,6 +295,18 @@ The product server **never** reads a fleet secrets-handoff file itself —
 only these two paths feed it an identity — and `server/secret-map.ts` has
 no `infisical.*` row for exactly the reason above: the vault's own
 credentials cannot be one of the things the vault resolves.
+
+The environment path has exactly one sanctioned injector:
+`scripts/botfleet-server-start.sh`, the launchd entry point, which may
+extract `INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET` (canonical names
+first, `INFISICAL_AUTOMATION_*` aliases only as fallback) from the
+`chmod 600` handoff file at process start, and only for values the
+environment does not already set.  It reads the two names line by line and
+never sources the file, so the Node server still receives its identity
+through the environment alone — the handoff file is never opened by
+product code, and the pair is never moved into a LaunchAgent plist, where
+the client secret would sit same-user-readable in a new location for no
+reduction in exposure.
 
 ## The Migration Script
 

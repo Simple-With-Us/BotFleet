@@ -184,7 +184,7 @@ struct FleetModelsView: View {
     private func botSection(_ bot: Bot) -> some View {
         Section {
             HStack(spacing: 12) {
-                BotAvatarView(bot: bot, size: 32, state: .idle, animated: false)
+                BotAvatarWithProviderBadge(bot: bot, size: 32, state: .idle, animated: false)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(bot.name)
                         .font(.body.weight(.medium))

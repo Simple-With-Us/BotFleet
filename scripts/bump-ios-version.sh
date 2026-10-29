@@ -1,36 +1,54 @@
 #!/usr/bin/env bash
-# Bump the iOS marketing version, stamp a fresh build number, and regenerate
-# the Xcode project.
+# Bump the iOS version pair recorded in ios/project.yml to the repo's commit
+# count, and regenerate the Xcode project.
 #
-#   MARKETING_VERSION        X.Y.Z  ->  X.Y.(Z+1)
-#   CURRENT_PROJECT_VERSION  UTC yyyymmddHHMM, the minute the build was cut
+#   MARKETING_VERSION        1.0.<commit_count>   (the project's declared
+#                                                    default, NOT the shipped
+#                                                    marketing version)
+#   CURRENT_PROJECT_VERSION  <commit_count>       (the build number)
 #
 # Usage:
-#   scripts/bump-ios-version.sh            # build number = now (UTC)
-#   scripts/bump-ios-version.sh 202609021530
+#   scripts/bump-ios-version.sh
 #
 # The build-number scheme is shared with ios/project.yml and the fleet ship
-# script (scripts/ios-fleet/ship-testflight.sh).  An epoch-seconds
-# value (10 digits) sorts LOWER than every yyyymmddHHMM build already shipped
-# (12 digits), and App Store Connect rejects a CFBundleVersion that does not
-# increase, so this script refuses anything that is not a later 12-digit stamp.
+# script (scripts/ios-fleet/ship-testflight.sh).  Since the owner directive of
+# 2026-10-24 (AFC-517) the two numbers are INDEPENDENT:  the shipped marketing
+# version is the next patch on the app's App Store Connect train (the ship
+# script passes it to xcodebuild and overrides whatever is recorded here), and
+# the shipped build number is the commit count, raised above the App Store
+# Connect floor when it has to be.  UTC YYYYMMDDHHMM stamps are retired.
+#
+# What this script writes is therefore the PROJECT's declared value, not what
+# ships:  the project file is not a sequencing input any more, and the ship
+# script prints a NOTICE when the recorded value and the shipped value
+# disagree.
+#
+# The build number must strictly increase: App Store Connect rejects a
+# CFBundleVersion that does not increase, so this script refuses a commit count
+# that is not greater than the one already recorded.
+#
+# The recorded build number must stay below the commit count of any commit
+# that can ship, so it is never the build number a real ship would use.  It
+# does: this bump is committed ON TOP of the commit it names, so the shipping
+# commit always counts one higher.
 set -euo pipefail
 cd "$(dirname "$0")/../ios"
 
 die() { echo "error: $*" >&2; exit 1; }
 
+repo_root="$(cd .. && pwd)"
+commit_count="$(git -C "$repo_root" rev-list --count HEAD 2>/dev/null || true)"
+[[ "$commit_count" =~ ^[0-9]+$ ]] \
+  || die "cannot read the commit count of $repo_root"
+
 current_marketing=$(grep -m1 'MARKETING_VERSION:' project.yml | awk -F'"' '{print $2}')
 current_build=$(grep -m1 'CURRENT_PROJECT_VERSION:' project.yml | awk -F'"' '{print $2}')
 
-[[ "$current_marketing" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] \
-  || die "MARKETING_VERSION '$current_marketing' in project.yml is not X.Y.Z"
-next_marketing="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+next_marketing="1.0.${commit_count}"
+next_build="${commit_count}"
 
-next_build="${1:-$(date -u +%Y%m%d%H%M)}"
-[[ "$next_build" =~ ^[0-9]{12}$ ]] \
-  || die "build number '$next_build' must be UTC yyyymmddHHMM (12 digits)"
-if [[ "$current_build" =~ ^[0-9]+$ ]] && (( 10#$next_build <= 10#$current_build )); then
-  die "build number $next_build is not greater than the current $current_build; wait a minute or pass a later stamp"
+if [[ "$current_build" =~ ^[0-9]+$ ]] && (( commit_count <= 10#$current_build )); then
+  die "build number $next_build is not greater than the current $current_build; commit before bumping"
 fi
 
 echo "Bumping iOS version $current_marketing ($current_build) -> $next_marketing ($next_build)"

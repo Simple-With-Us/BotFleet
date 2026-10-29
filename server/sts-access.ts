@@ -6,9 +6,13 @@
 
 import { z } from "zod";
 
+import type { TelemetryAuxParams } from "./telemetry.ts";
+
 import {
+  GEMINI_LIVE_MODEL,
   pickStsProvider,
   STS_PROVIDERS,
+  XAI_REALTIME_MODEL,
   type StsChoiceReason,
   type StsKeyStatus,
   type StsProvider,
@@ -111,6 +115,21 @@ export function stsStatusBody(keys: StsKeyStatus, preference: StsProvider | null
     gemini: keys.gemini,
     provider: resolveStsProvider(keys, preference).provider,
   });
+}
+
+/** The Usage Monitor event for one voice-call session being started
+ * (BF-2435).  A speech-to-speech call is billed by the vendor per session
+ * minute and per audio token, and neither number comes back to this process:
+ * the token is minted here but the audio flows between the client and the
+ * vendor.  What is measurable is that a session was opened, so that is what is
+ * reported, as one request with no tokens and no price. */
+export function stsSessionTelemetry(provider: StsProvider): TelemetryAuxParams {
+  return {
+    kind: "sts-session",
+    provider: provider === "gemini" ? "google-ai" : "xai",
+    service: provider === "gemini" ? GEMINI_LIVE_MODEL : XAI_REALTIME_MODEL,
+    label: "BotFleet voice call",
+  };
 }
 
 /** A client may not mint tokens back to back.  Each mint is a real request to

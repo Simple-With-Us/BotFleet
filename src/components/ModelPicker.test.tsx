@@ -28,7 +28,7 @@ vi.mock("@/state/store", () => ({
 }));
 
 // Imported after the mock is registered (vitest hoists vi.mock above imports).
-import { EffortSection, LocalModelsPanel, ModelPicker, ModelRow } from "./ModelPicker";
+import { ContextSection, EffortSection, MaxOutputSection, LocalModelsPanel, ModelPicker, ModelRow } from "./ModelPicker";
 
 type Option = InstanceInfo["models"]["options"][number];
 
@@ -71,6 +71,7 @@ function render(
     initialRailId?: string | null;
     selection?: Bot["modelSelection"];
     contained?: boolean;
+    widePopover?: boolean;
     bot?: Bot;
   } = {},
 ): string {
@@ -190,8 +191,12 @@ describe("Local Models panel", () => {
   });
 
   it("opens on the engine itself for a bot on a cloud model, even with local models configured", () => {
+    // The pane header was the discriminator before: the hosted pane said
+    // "Choose a model for this bot" and the local pane said "Runs On <engine>".
+    // That line is gone — it only restated the list underneath it — so the
+    // engine's own name in the heading is what separates the two panes now.
     const text = words(menu(render([claude([QWEN])])));
-    expect(text).toContain("Choose a model for this bot");
+    expect(text).toContain("Claude");
     expect(text).not.toContain("Runs On Claude");
   });
 
@@ -361,6 +366,18 @@ describe("usage reads once at the top, naming the real window", () => {
   });
 });
 
+describe("fleet-wide model menus", () => {
+  it("opens wider than its trigger while the sidebar remains in flow", () => {
+    const wide = render([claude()], { widePopover: true });
+    expect(wide).toContain("w-[480px]");
+    expect(wide).toContain("max-w-[calc(100vw-24px)]");
+    expect(wide).toContain("fixed z-50");
+    const sidebar = render([claude()]);
+    expect(sidebar).toContain("relative mt-3 w-full");
+    expect(sidebar).not.toContain("w-[480px]");
+  });
+});
+
 describe("a model row keeps its name readable beside its tags", () => {
   // The owner's screenshots: "Highspeed" and "DeepSeek-V" rendered as a
   // vertical column of single characters because the label was `flex-1`
@@ -384,16 +401,34 @@ describe("a model row keeps its name readable beside its tags", () => {
     expect(html).toContain("flex-wrap");
   });
 
+  it("shows a context size only once without a redundant Context word", () => {
+    const html = renderToStaticMarkup(
+      <ModelRow option={{ id: "muse-spark-1.3", label: "Muse Spark 1.3", contextWindow: 1_048_576, badge: "1M Context" }}
+        current={false} defaultId="" onPick={() => {}} />,
+    );
+    expect(html.match(/>1M</g)).toHaveLength(1);
+    expect(html).not.toContain("1M Context");
+  });
+
+  it("keeps a badge-only context size compact", () => {
+    const html = renderToStaticMarkup(
+      <ModelRow option={{ id: "custom", label: "Custom", badge: "1M Context" }}
+        current={false} defaultId="" onPick={() => {}} />,
+    );
+    expect(html).toContain(">1M<");
+    expect(html).not.toContain("1M Context");
+  });
+
   it("renders the full slug in the title when the visible name is clipped", () => {
     const html = renderToStaticMarkup(
       <ModelRow
-        option={{ id: "m3.1", label: "MiniMax M3.1 Flash Preview · thinking" }}
+        option={{ id: "m3.1", label: "MiniMax M3.1 Flash · thinking" }}
         current={false}
         defaultId=""
         onPick={() => {}}
       />,
     );
-    expect(html).toContain('title="MiniMax M3.1 Flash Preview · thinking"');
+    expect(html).toContain('title="MiniMax M3.1 Flash · thinking"');
     expect(html).toContain("truncate");
   });
 });
@@ -596,8 +631,61 @@ describe("Effort section in the chat model menu", () => {
     const tree = EffortSection({ levels: ["low", "high"], current: "low", onPick });
     const choices = findElements(tree, (element) => element.type === "button");
     expect(choices).toHaveLength(3);
-    for (const choice of choices) (choice.props as { onClick: () => void }).onClick();
+    for (const choice of choices) {
+      // SAFETY: This section creates each button with its own onClick callback.
+      (choice.props as { onClick: () => void }).onClick();
+    }
     expect(onPick.mock.calls).toEqual([[undefined], ["low"], ["high"]]);
+  });
+
+  it("renders (default: max) in the header and omits the Default button when defaultEffort is provided", () => {
+    const onPick = vi.fn();
+    const props = {
+      // SAFETY: literal effort levels for test fixture.
+      levels: ["low", "medium", "high", "xhigh", "max"] as const,
+      // SAFETY: literal effort level for test fixture.
+      defaultEffort: "max" as const,
+      current: undefined,
+      onPick,
+    };
+    const element = createElement(EffortSection, props);
+    const html = renderToStaticMarkup(element);
+    expect(html).toContain("Effort");
+    expect(html).toContain("(default: max)");
+    const tree = EffortSection(props);
+    const choices = findElements(tree, (el) => el.type === "button");
+    expect(choices).toHaveLength(5);
+    // SAFETY: EffortSection renders buttons with aria-pressed boolean props.
+    const maxButton = choices.find((c) => (c.props as { "aria-pressed"?: boolean })["aria-pressed"] === true);
+    expect(maxButton).toBeDefined();
+    // SAFETY: EffortSection renders each button with an onClick callback.
+    (choices[0].props as { onClick: () => void }).onClick();
+    expect(onPick).toHaveBeenCalledWith("low");
+  });
+
+  it("Max Input Tokens: presets plus a custom field, No Limit first, hidden with no caps", () => {
+    const html = renderToStaticMarkup(
+      createElement(ContextSection, { caps: [524_288], windowTokens: 1_000_000, current: undefined, onPick: () => {} }),
+    );
+    expect(html).toContain("Max Input Tokens");
+    expect(html).toContain("No Limit (1M)");
+    expect(html).toContain(">512K<");
+    expect(html).toContain('placeholder="No limit"');
+    expect(html).toContain('aria-label="Max Input Tokens"');
+    expect(html).toContain("Empty is no limit.");
+    // A saved value that is not a preset shows in the custom field.
+    const custom = renderToStaticMarkup(
+      createElement(ContextSection, { caps: [524_288], windowTokens: 1_000_000, current: 300_000, onPick: () => {} }),
+    );
+    expect(custom).toContain('value="300000"');
+    expect(renderToStaticMarkup(createElement(ContextSection, { caps: [], current: undefined, onPick: () => {} }))).toBe("");
+  });
+
+  it("Max Output Tokens renders a group with an empty Default field", () => {
+    const html = renderToStaticMarkup(createElement(MaxOutputSection, { current: undefined, windowTokens: 1_000_000, onPick: () => {} }));
+    expect(html).toContain("Max Output Tokens");
+    expect(html).toContain('placeholder="Default"');
+    expect(html).toContain("Empty uses the model default.");
   });
 
   it("renders nothing for a model with no levels", () => {

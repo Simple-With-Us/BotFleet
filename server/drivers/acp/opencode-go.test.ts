@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ import {
   createOpenCodeDriver,
   discoverOpenCodeModels,
   normalizeLegacyOpenCodeModel,
+  openCodeModelProbeDeadline,
   openCodeModelProbeProblem,
   parseOpenCodeModelsOutput,
   resetOpenCodeModelCache,
@@ -452,6 +453,273 @@ describe("OpenCode catalog", () => {
       expect(child.env.ANTHROPIC_API_KEY).toBeUndefined();
       await instance.dispose();
     } finally {
+      await removeTempDir(scratch);
+    }
+  });
+});
+
+// The sign-in gate is `opencode models`, and the host that runs it is often at a
+// load many times its core count.  A probe that ran out of time there said
+// nothing about sign-in;  reading it as "no usable models" refused turns for a
+// CLI that works (BF-2469).
+describe("OpenCode sign-in probe on a busy host", () => {
+  // What execFile, then execCli on top of it, hand back when a deadline kills
+  // the child.
+  const execFileKill = () =>
+    Object.assign(new Error("Command failed: opencode models\n"), { killed: true, signal: "SIGTERM", code: null });
+  const execCliDeadline = () => Object.assign(execFileKill(), { timedOut: true });
+  // Three run-queue entries per core:  the stretched ceiling, 60 s.
+  const busyHost = openCodeModelProbeDeadline({ load1: 24, cores: 8 });
+
+  type Runner = (
+    cli: string,
+    env: Record<string, string | undefined>,
+    verbose: boolean,
+    timeoutMs?: number,
+  ) => Promise<string>;
+  const failing = (make: () => Error) =>
+    vi.fn<Runner>(async () => {
+      throw make();
+    });
+  const printing = (stdout: string) => vi.fn<Runner>(async () => stdout);
+
+  beforeEach(() => {
+    resetOpenCodeModelCache();
+  });
+  afterEach(() => {
+    resetOpenCodeModelCache();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("stretches the probe's budget with host load, from a 20 s floor", () => {
+    expect(openCodeModelProbeDeadline({ load1: 2, cores: 10 }).timeoutMs).toBe(20_000);
+    expect(openCodeModelProbeDeadline({ load1: 20, cores: 10 }).timeoutMs).toBe(40_000);
+    expect(openCodeModelProbeDeadline({ load1: 300, cores: 10 }).timeoutMs).toBe(60_000);
+    expect(openCodeModelProbeDeadline(null).timeoutMs).toBe(20_000);
+  });
+
+  it("hands the probe its budget, sized from the live load average when none is given", async () => {
+    const runModels = printing("opencode/x-preview-f-free\n");
+    await canListOpenCodeModels({}, "loaded-opencode", runModels, busyHost);
+    expect(runModels).toHaveBeenLastCalledWith("loaded-opencode", {}, false, 60_000);
+
+    await canListOpenCodeModels({ HOME: "/home/live" }, "live-opencode", runModels);
+    const budget = runModels.mock.lastCall?.[3];
+    expect(budget).toBeGreaterThanOrEqual(20_000);
+    expect(budget).toBeLessThanOrEqual(60_000);
+  });
+
+  // Unknown either way;  only execCli's own `timedOut` mark (or its hard-deadline
+  // text) lets the sentence say the budget ran out, as procs.ts's isProbeTimeout
+  // does.  A kill or signal without it is reported as stopped.
+  it.each([
+    ["execCli's deadline", execCliDeadline, "timed out after"],
+    ["execCli's hard deadline", () => Object.assign(new Error("`opencode` did not exit within 20000ms"), { killed: true }), "timed out after"],
+    ["the error runOpenCodeModels wraps it in", () => new Error("", { cause: execCliDeadline() }), "timed out after"],
+    ["an execFile kill", execFileKill, "was stopped by SIGTERM before it answered"],
+    ["a signal from outside", () => Object.assign(new Error("Command failed: opencode models\n"), { signal: "SIGKILL", code: null }), "was stopped by SIGKILL before it answered"],
+    ["a kill that names no signal", () => Object.assign(new Error("Command failed: opencode models\n"), { killed: true }), "was stopped before it answered"],
+  ])("reads %s as unknown, never as not signed in", async (_name, make, said) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(canListOpenCodeModels({}, "slow-opencode", failing(make))).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(said));
+  });
+
+  it("still reads a CLI that answered without a list as not signed in", async () => {
+    await expect(canListOpenCodeModels({}, "empty-opencode", printing(""))).resolves.toBe(false);
+    const exited = failing(() => Object.assign(new Error("ENOENT: no such binary"), { code: 127 }));
+    await expect(canListOpenCodeModels({}, "broken-opencode", exited)).resolves.toBe(false);
+    const missing = failing(() => Object.assign(new Error("spawn opencode ENOENT"), { code: "ENOENT" }));
+    await expect(canListOpenCodeModels({}, "missing-opencode", missing)).resolves.toBe(false);
+  });
+
+  it("never remembers a timeout, so the next look asks again", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let healthy = false;
+    const runModels = vi.fn<Runner>(async () => {
+      if (!healthy) throw execCliDeadline();
+      return "opencode/x-preview-f-free\n";
+    });
+
+    // Callers that arrive while the probe is running share its one process.
+    const together = await Promise.all([
+      canListOpenCodeModels({}, "recovering-opencode", runModels),
+      canListOpenCodeModels({}, "recovering-opencode", runModels),
+    ]);
+    expect(together).toEqual([undefined, undefined]);
+    expect(runModels).toHaveBeenCalledTimes(1);
+
+    // Once it has settled, nothing was kept:  the next look runs it again.
+    await expect(canListOpenCodeModels({}, "recovering-opencode", runModels)).resolves.toBeUndefined();
+    expect(runModels).toHaveBeenCalledTimes(2);
+
+    healthy = true;
+    await expect(canListOpenCodeModels({}, "recovering-opencode", runModels)).resolves.toBe(true);
+    expect(runModels).toHaveBeenCalledTimes(3);
+    await expect(canListOpenCodeModels({}, "recovering-opencode", runModels)).resolves.toBe(true);
+    expect(runModels).toHaveBeenCalledTimes(3);
+  });
+
+  it("remembers a list for ten minutes but an empty answer for thirty seconds", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const start = Date.UTC(2026, 9, 18, 12, 0, 0);
+    vi.setSystemTime(start);
+
+    const listed = printing("opencode/x-preview-f-free\n");
+    await canListOpenCodeModels({}, "listed-opencode", listed);
+    vi.setSystemTime(start + 9 * 60_000 + 59_000);
+    await canListOpenCodeModels({}, "listed-opencode", listed);
+    expect(listed).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(start + 10 * 60_000 + 1_000);
+    await canListOpenCodeModels({}, "listed-opencode", listed);
+    expect(listed).toHaveBeenCalledTimes(2);
+
+    vi.setSystemTime(start);
+    const empty = printing("");
+    await expect(canListOpenCodeModels({}, "empty-opencode", empty)).resolves.toBe(false);
+    vi.setSystemTime(start + 29_000);
+    await canListOpenCodeModels({}, "empty-opencode", empty);
+    expect(empty).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(start + 31_000);
+    await canListOpenCodeModels({}, "empty-opencode", empty);
+    expect(empty).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not share an answer between instances that read different logins", async () => {
+    const signedIn = printing("opencode/x-preview-f-free\n");
+    const signedOut = printing("");
+    await expect(canListOpenCodeModels({ HOME: "/home/a" }, "opencode", signedIn)).resolves.toBe(true);
+    await expect(canListOpenCodeModels({ HOME: "/home/b" }, "opencode", signedOut)).resolves.toBe(false);
+    expect(signedOut).toHaveBeenCalledOnce();
+  });
+
+  // One driver, one fake CLI for `--version` and `acp`, and `opencode models`
+  // answering however the test says:  the same gate a real turn goes through.
+  const busyInstance = async (scratch: string, runModels: Runner) => {
+    const driver = createOpenCodeDriver(async () => catalog("opencode/x-preview-f-free"), runModels);
+    return driver.create({
+      instanceId: "opencode-busy",
+      displayName: "OpenCode",
+      environment: {
+        HOME: scratch,
+        USERPROFILE: scratch,
+        XDG_DATA_HOME: join(scratch, "data"),
+        OPENCODE_API_KEY: "",
+        FAKE_ACP_MODELS: "opencode/x-preview-f-free",
+      },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+  };
+
+  it("does not refuse a turn when the sign-in probe runs out of time", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const runModels = failing(execCliDeadline);
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-busy-"));
+    const instance = await busyInstance(scratch, runModels);
+    const recorder = recordEvents(instance.adapter);
+    try {
+      // Inconclusive, which the engine row reads as "not known to be signed out".
+      expect((await instance.snapshot()).authenticated).toBeUndefined();
+
+      await instance.adapter.sendTurn({
+        threadId: "t-opencode-busy",
+        text: "hello",
+        model: "opencode/x-preview-f-free",
+      });
+      const done = await recorder.until((event) => event.type === "turn.completed");
+      expect(done).toMatchObject({ ok: true });
+      expect(recorder.events.map((event) => event.type)).not.toContain("runtime.error");
+
+      // Every probe was given a load-sized budget, and said why it gave no answer.
+      const budgets = runModels.mock.calls.map((call) => call[3]);
+      expect(budgets.length).toBeGreaterThan(0);
+      for (const budget of budgets) {
+        expect(budget).toBeGreaterThanOrEqual(20_000);
+        expect(budget).toBeLessThanOrEqual(60_000);
+      }
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/model probe timed out after \d+ s/));
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("still refuses a turn when the CLI answered with no models", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-signedout-"));
+    const instance = await busyInstance(scratch, printing(""));
+    const recorder = recordEvents(instance.adapter);
+    try {
+      expect((await instance.snapshot()).authenticated).toBe(false);
+
+      await instance.adapter.sendTurn({
+        threadId: "t-opencode-signedout",
+        text: "hello",
+        model: "opencode/x-preview-f-free",
+      });
+      const done = await recorder.until((event) => event.type === "turn.completed");
+      expect(done).toMatchObject({ ok: false, stopReason: "auth_required" });
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      await removeTempDir(scratch);
+    }
+  });
+
+  // Real children, so the error shapes are execFile's and execCli's own rather
+  // than ones this file made up.  `#!/bin/sh` fixtures, which Windows cannot run
+  // (same guard as the sibling suites above).
+  it.skipIf(process.platform === "win32")(
+    "times out a CLI that hangs, and says so apart from a CLI that lists nothing",
+    async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-hang-"));
+      const calls = join(scratch, "calls.log");
+      const hangs = join(scratch, "opencode-hangs");
+      writeFileSync(hangs, ["#!/bin/sh", `echo "$@" >> "${calls}"`, "exec sleep 30", ""].join("\n"));
+      const empty = join(scratch, "opencode-empty");
+      writeFileSync(empty, ["#!/bin/sh", "exit 0", ""].join("\n"));
+      chmodSync(hangs, 0o755);
+      chmodSync(empty, 0o755);
+      // The budget's own floor, so the hang is cut after 1 s instead of waiting out 20 s or more.
+      const quick = { ...busyHost, timeoutMs: 1_000 };
+      try {
+        await expect(canListOpenCodeModels({}, hangs, undefined, quick)).resolves.toBeUndefined();
+
+        const found = await discoverOpenCodeModels({}, hangs, quick);
+        expect(found.options).toEqual([]);
+        expect(openCodeModelProbeProblem()).toBe("OpenCode's model probe timed out after 1 s (host load 3.0 per core)");
+        // A timeout says nothing about the flag, so no second ask that would only double the wait.
+        expect(existsSync(calls) ? readFileSync(calls, "utf8") : "").not.toContain("--verbose");
+
+        await discoverOpenCodeModels({}, empty, quick);
+        expect(openCodeModelProbeProblem()).toContain("answered nothing");
+        expect(openCodeModelProbeProblem()).not.toContain("timed out");
+      } finally {
+        resetOpenCodeModelCache();
+        await removeTempDir(scratch);
+      }
+    },
+    // Two real one-second deadlines, on a host this suite is meant to survive
+    // being loaded.
+    30_000,
+  );
+
+  it.skipIf(process.platform === "win32")("reads a CLI that was stopped before it answered as unknown", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-stopped-"));
+    const cli = join(scratch, "opencode-stopped");
+    writeFileSync(cli, ["#!/bin/sh", "kill -TERM $$", ""].join("\n"));
+    chmodSync(cli, 0o755);
+    try {
+      await expect(canListOpenCodeModels({}, cli)).resolves.toBeUndefined();
+      await discoverOpenCodeModels({}, cli);
+      expect(openCodeModelProbeProblem()).toBe("OpenCode's model probe was stopped by SIGTERM before it answered");
+    } finally {
+      resetOpenCodeModelCache();
       await removeTempDir(scratch);
     }
   });

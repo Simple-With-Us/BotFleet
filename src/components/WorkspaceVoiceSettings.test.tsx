@@ -64,6 +64,7 @@ const baseTts = (): Tts => ({
 });
 
 import {
+  AudioRetentionPicker,
   DefaultVoicePicker,
   NO_DEFAULT_VOICE_HELP,
   PronunciationSettings,
@@ -215,5 +216,17 @@ describe("workspace voice settings", () => {
     await mount(list_({ ...baseTts(), pronunciations: undefined }));
     expect(container.textContent).toContain("Update the bot server on this computer to edit pronunciations.");
     expect(rows()).toHaveLength(0);
+  });
+
+  it("defaults audio retention to 7 days (1 week) and saves a new retention choice", async () => {
+    const saved = { tts: { ...baseTts(), audioRetentionDays: 30 } } as ConfigStatus;
+    saveAnswer = async () => saved;
+    await mount(createElement(AudioRetentionPicker, { tts: baseTts(), onConfig, deps }));
+    const select = container.querySelector<HTMLSelectElement>('select[aria-label="Keep audio files for"]')!;
+    expect(select.value).toBe("7");
+    await act(async () => setSelectValue(select, "30"));
+    await flush();
+    expect(saveCalls).toEqual([{ tts: { audioRetentionDays: 30 } }]);
+    expect(configs).toEqual([saved]);
   });
 });

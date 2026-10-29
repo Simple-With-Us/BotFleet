@@ -139,6 +139,14 @@ describe("peers", () => {
     expect(body.indexOf("botIsOff(target)")).toBeGreaterThan(-1);
     expect(body.indexOf("botIsOff(target)")).toBeLessThan(body.indexOf("jobHost.coordinate("));
   });
+
+  it("names every Off peer it refuses, in the shared wording, and not as a bare 'that bot'", () => {
+    // A handoff can name several bots; "that bot is off" cannot be told apart.
+    const body = functionBody("export function executeCoordinateBotsRequest(");
+    expect(body).toContain("botOffPeersRefusal([...offPeers.values()]");
+    expect(body.indexOf("botOffPeersRefusal(")).toBeLessThan(body.indexOf("jobHost.coordinate("));
+    expect(source).not.toContain("that bot is off");
+  });
 });
 
 describe("update readiness", () => {

@@ -3,12 +3,15 @@
 // the app never ships file bytes through the prompt itself.
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, extname } from "node:path";
 import { DATA_DIR } from "./config.ts";
 
 export const ATTACHMENTS_DIR = join(DATA_DIR, "attachments");
+
+/** Default retention for audio files in ATTACHMENTS_DIR (1 week).  0 keeps forever. */
+export const DEFAULT_AUDIO_RETENTION_DAYS = 7;
 
 /** Screenshots and photos stay at 10 MB.  Other chat files may be larger. */
 export const IMAGE_MAX_BYTES = 10 * 1024 * 1024;
@@ -40,6 +43,12 @@ const ATTACHMENT_MIMES: Record<string, string> = {
   "application/gzip": ".gz",
   "audio/mpeg": ".mp3",
   "audio/wav": ".wav",
+  "audio/ogg": ".ogg",
+  "audio/opus": ".opus",
+  "audio/mp4": ".m4a",
+  "audio/x-m4a": ".m4a",
+  "audio/aac": ".aac",
+  "audio/webm": ".webm",
   "video/mp4": ".mp4",
   "application/msword": ".doc",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
@@ -47,6 +56,8 @@ const ATTACHMENT_MIMES: Record<string, string> = {
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
   "application/octet-stream": ".bin",
 };
+
+const AUDIO_EXTENSIONS = new Set([".mp3", ".wav", ".ogg", ".opus", ".m4a", ".aac", ".webm"]);
 
 export function extensionForMime(mime: string | undefined): string | null {
   if (!mime) return null;
@@ -168,4 +179,51 @@ function mimeForExt(ext: string): string {
     if (mapped === ext) return mime;
   }
   return "application/octet-stream";
+}
+
+export interface AudioAttachmentSweepResult {
+  removedFiles: number;
+  freedBytes: number;
+  dryRun: boolean;
+}
+
+/** Remove audio files in ATTACHMENTS_DIR older than `retentionDays`.  Images,
+ * documents, and non-audio files are never touched.  When `retentionDays <= 0`,
+ * audio files are kept indefinitely. */
+export function sweepExpiredAudioAttachments(
+  retentionDays: number = DEFAULT_AUDIO_RETENTION_DAYS,
+  options: { dir?: string; nowMs?: number; dryRun?: boolean } = {},
+): AudioAttachmentSweepResult {
+  const dryRun = options.dryRun === true;
+  if (!Number.isFinite(retentionDays) || retentionDays <= 0) {
+    return { removedFiles: 0, freedBytes: 0, dryRun };
+  }
+  const dir = options.dir ?? ATTACHMENTS_DIR;
+  const cutoffMs = (options.nowMs ?? Date.now()) - retentionDays * 86_400_000;
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return { removedFiles: 0, freedBytes: 0, dryRun };
+  }
+  let removedFiles = 0;
+  let freedBytes = 0;
+  for (const name of names) {
+    if (!SAFE_NAME.test(name)) continue;
+    const ext = extname(name).toLowerCase();
+    if (!AUDIO_EXTENSIONS.has(ext)) continue;
+    const fullPath = join(dir, name);
+    try {
+      const st = statSync(fullPath);
+      if (!st.isFile() || st.mtimeMs > cutoffMs) continue;
+      if (!dryRun) {
+        unlinkSync(fullPath);
+      }
+      removedFiles += 1;
+      freedBytes += st.size;
+    } catch {
+      // Ignore concurrent removals.
+    }
+  }
+  return { removedFiles, freedBytes, dryRun };
 }

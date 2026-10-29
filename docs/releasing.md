@@ -1,8 +1,8 @@
 # Releasing
 
 One workflow builds everything: **Actions → Release → Run workflow**.  It
-builds macOS (arm64 + x64, signed, notarized, stapled), Windows, and Ubuntu
-from a single pinned commit, verifies every artifact the way a user would
+builds macOS (arm64 + x64, signed, notarized, stapled) from a single pinned
+commit, verifies every artifact the way a user would
 receive it, and preserves one complete artifact set in Actions.  That default
 mode does not create or change a GitHub Release.  Tick **draft** to upload the
 verified set to a draft on this repository's own
@@ -21,9 +21,23 @@ owner's rule (2026-09-02) is one repository per app, so the separate
 `botfleet-releases` repo is retired.  Nothing under `milind-soni/*` is ours to
 publish to.
 
-The workflow refuses to overwrite an already-published version, so the only
-prerequisite per release is that `package.json`'s version is bumped on the
-ref you run it against.
+## The Version of a Release
+
+The workflow refuses to overwrite an already-published version, and the version
+it compares is the one stamped from the released commit, not `package.json`'s.
+
+Every release version is `1.0.<commit_count>` of the commit being released,
+computed by `scripts/stamp-commit-version.mjs` from a full-history checkout. 
+`package.json`'s version is a floor rather than the release number: it only
+keeps a build from being numbered below what the tree already claims, and it is
+never edited to cut a release.  Because the commit count only grows, two
+releases cannot collide and a release cannot go backwards.
+
+So the prerequisite per release is a commit, not a version bump.  Run the
+workflow against a ref whose commit count is above the last published release,
+and the stamp, the `v<version>` tag, the version inside the app bundle, and the
+`version` field of `latest-mac.yml` are all one string, computed once in the
+`prepare` job and handed to every later job.
 
 ## What Auto-Update Needs on the Release
 
@@ -32,17 +46,14 @@ electron-updater reads a feed file, not the DMG:
 - **macOS:** `latest-mac.yml` plus the `BotFleet-<version>-arm64.zip` and
   `BotFleet-<version>-x64.zip` it lists (and their `.blockmap` files).
   The DMGs are for humans; the updater downloads the zips.
-- **Windows:** `latest.yml` plus `BotFleet-<version>-setup.exe` and its
-  `.blockmap`.
-- **Ubuntu:** `latest-linux.yml` plus the AppImage.
 
 A release that carries only DMGs, as
 [`v0.1.38`](https://github.com/Simple-With-Us/BotFleet/releases/tag/v0.1.38)
-did, cannot be found by any installed app: **Check for updates** fails
-on every platform.  `1.0.31` is the first desktop version prepared to ship
-with `latest-mac.yml` and both macOS zips from `release.yml`.  Never
-hand-edit or carry forward a feed file; it pins sha512 hashes of the exact
-bytes on the release.
+did, cannot be found by any installed app: **Check for updates** fails on every
+platform.  Every release cut from `release.yml` carries `latest-mac.yml` and
+both macOS zips, and the assemble gate fails the run when any of them is
+missing.  Never hand-edit or carry forward a feed file; it pins sha512 hashes of
+the exact bytes on the release.
 
 ## Why the Gates Exist
 
@@ -111,3 +122,15 @@ notarize with the local keychain profile (`xcrun notarytool submit …
 `node scripts/regenerate-mac-feed.mjs`, upload to the matching
 `Simple-With-Us/BotFleet` release, publish, and always verify the
 published bytes against the published feed by downloading them back.
+
+## The Native Mac Build (BF-2486, Phase 6)
+
+The native `BotFleetMac` app has its own pipeline, **Actions → Native Mac Release → Run workflow**, with `scripts/mac-package.sh` as the local equivalent.  Both produce the same asset names from the same pinned commit, and neither ever publishes: tick **draft** to attach the verified assets to the `v<version>-native` draft, then publish by hand after checking them.
+
+Native assets are `BotFleetMac-<version>.zip`, `BotFleetMac-<version>.dmg` and one `appcast.xml`, on their own `v<version>-native` release rather than on the Electron pipeline's `v<version>` one.  They cannot share that release: `release.yml` verifies that its release holds exactly the Electron asset set and deletes every asset it does not recognise, so a shared tag would either fail the Electron release or delete the native ZIP, DMG and appcast.  The names are disjoint on purpose as well: Sparkle reads the appcast, electron-updater reads `latest-mac.yml`, and a native ZIP wearing an Electron name would be offered to installed Electron apps as an update they cannot run.  `scripts/verify-native-release.mjs` fails the run if the two sets ever share a directory.
+
+The version is the same `1.0.<commit_count>` stamp as every other build, computed once in the `prepare` job.  Gates run in the Electron pipeline's order, for the same reasons: the signature verifies before anything is submitted to the notary service, and the ZIP, DMG, feed lengths and appcast are all produced after stapling rewrites the bundle.
+
+Sparkle signing waits on one owner action: create the EdDSA key and back it up in Infisical as `SPARKLE_EDDSA_PRIVATE_KEY_B64`.  The workflow installs Sparkle's `sign_update` itself, because that tool is not part of the runner image, and a key with no tool is a hard error rather than a quiet unsigned feed.  The local script still needs `sign_update` on the packaging path.  Until the key is provisioned the appcast is generated unsigned and the run says so; an app carrying `SUPublicEDKey` refuses unsigned items, so the gap fails closed rather than shipping an unverifiable feed.  The check schedule and probe-retry rules the eventual Sparkle controller must implement already live in `NativeUpdatePolicy.swift` (CompanionCore), with the Electron updater's constants resolved on BF-2486.
+
+Deleting the Node harness is a separate, later step (BF-2515).  `node scripts/audit-node-decommission.mjs` proves every file under `server/`, `companion/`, `shared/` and `electron/` still has an inventory row, and `node scripts/check-decommission-gates.mjs <state.json>` refuses the deletion until the Phase 5 issues are Done and the 24-hour no-Node evidence is asserted.  That gate covers the Mac-local harness only: the optional `deploy/linux-server/` server deployment is deliberately retained (BF-2544), is audited as a retained path rather than as a gap, and is never a decommission target.
