@@ -465,8 +465,8 @@ private final class MockCommands: CommandRunning {
         if arguments == ["list"] { return launchctlListing }
         if arguments.first == "print" {
             if agentIsLoaded { return "state = running" }
-            // launchctl exits nonzero for a job that is not loaded.
-            throw CommandExitError(output: "Could not find service in domain for uid: 501")
+            // launchctl exits nonzero for a job that is not loaded, saying so on stderr.
+            throw CommandExitError(output: "", errorOutput: "Could not find service in domain for uid: 501")
         }
         if failKickstart && arguments.first == "kickstart" { throw StartupPolicyError.commandFailed }
         return ""

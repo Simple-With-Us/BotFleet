@@ -153,6 +153,20 @@ public struct OwnerStops: Equatable {
     }
 }
 
+/// Why the owner's stops could not be written down.
+public enum OwnerStopsStoreError: LocalizedError, Equatable {
+    /// The record on disk could not be read when it was loaded, so a write
+    /// would replace stops that are still in it.
+    case recordUnread
+
+    public var errorDescription: String? {
+        switch self {
+        case .recordUnread:
+            return "the record on disk could not be read when Control started, so it is left as it was; relaunch Control to read it again"
+        }
+    }
+}
+
 /// Keeps the owner's stops on disk, so they outlive the Control app.
 ///
 /// The record is a small JSON file next to the other Control files in
@@ -182,9 +196,25 @@ public final class OwnerStopsStore {
     /// exactly where it is, so a passing read error never costs the owner
     /// their record, and this launch runs on the fleet's own rules.  Only a
     /// file whose bytes were read and did not decode is moved aside.
+    /// Whether the last load found a record it could not read.
+    ///
+    /// A record that could not be read is not an empty record: a save over
+    /// it would replace stops the owner made in an earlier launch with this
+    /// launch's view, which started from nothing.  Saves are refused until a
+    /// load succeeds, and the app reports that the stop holds only for this
+    /// launch.
+    public private(set) var recordUnread = false
+
     public func load() -> Set<String> {
-        guard files.fileExists(atPath: fileURL.path) else { return [] }
-        guard let data = try? Data(contentsOf: fileURL) else { return [] }
+        guard files.fileExists(atPath: fileURL.path) else {
+            recordUnread = false
+            return []
+        }
+        guard let data = try? Data(contentsOf: fileURL) else {
+            recordUnread = true
+            return []
+        }
+        recordUnread = false
         guard let record = try? JSONDecoder().decode(Record.self, from: data) else {
             // Moved, not copied: a copy would leave the unreadable file in
             // place and make a new backup on every launch.
@@ -197,7 +227,10 @@ public final class OwnerStopsStore {
     }
 
     /// Saves the services the owner stopped on purpose.
+    ///
+    /// A record that could not be read is left as it is: see `recordUnread`.
     public func save(_ ids: Set<String>) throws {
+        if recordUnread { throw OwnerStopsStoreError.recordUnread }
         let directory = fileURL.deletingLastPathComponent()
         try files.createDirectory(at: directory, withIntermediateDirectories: true)
         let encoder = JSONEncoder()

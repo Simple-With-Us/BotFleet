@@ -18,7 +18,12 @@ public protocol CommandRunning {
 }
 
 public struct CommandExitError: LocalizedError {
+    /// What the command printed on its standard output.
     public let output: String
+    /// What the command printed on its standard error, when the runner kept
+    /// it.  launchctl explains a refusal there, so a probe can tell "no such
+    /// service" from a request launchd could not answer.
+    public var errorOutput: String = ""
     public var errorDescription: String? { "The system command failed." }
 }
 
@@ -53,8 +58,8 @@ public struct ProcessCommandRunner: CommandRunning {
         try run(executable, arguments, environment: ProcessInfo.processInfo.environment, timeout: timeout)
     }
     public func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
-        let (result, status) = try execute(executable, arguments, environment: environment, timeout: timeout)
-        guard status == 0 else { throw CommandExitError(output: result) }
+        let (result, errorText, status) = try execute(executable, arguments, environment: environment, timeout: timeout)
+        guard status == 0 else { throw CommandExitError(output: result, errorOutput: errorText) }
         return result
     }
     public func runKeepingOutput(_ executable: String, _ arguments: [String]) -> String {
@@ -63,23 +68,31 @@ public struct ProcessCommandRunner: CommandRunning {
     public func runKeepingOutput(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) -> String {
         (try? execute(executable, arguments, environment: environment, timeout: timeout)).map { $0.0 } ?? ""
     }
-    /// Runs a command and reports what it printed and how it ended.
-    private func execute(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> (String, Int32) {
+    /// Runs a command and reports what it printed, what it complained, and
+    /// how it ended.
+    private func execute(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> (String, String, Int32) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.environment = environment
         let output = Pipe()
+        let errors = Pipe()
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errors
         let readerDone = DispatchSemaphore(value: 0)
+        let errorReaderDone = DispatchSemaphore(value: 0)
         let finished = DispatchSemaphore(value: 0)
         var data = Data()
+        var errorData = Data()
         process.terminationHandler = { _ in finished.signal() }
         try process.run()
         DispatchQueue.global(qos: .utility).async {
             data = output.fileHandleForReading.readDataToEndOfFile()
             readerDone.signal()
+        }
+        DispatchQueue.global(qos: .utility).async {
+            errorData = errors.fileHandleForReading.readDataToEndOfFile()
+            errorReaderDone.signal()
         }
         if finished.wait(timeout: .now() + timeout) == .timedOut {
             if process.isRunning { process.terminate() }
@@ -88,9 +101,11 @@ public struct ProcessCommandRunner: CommandRunning {
             }
             throw StartupPolicyError.commandFailed
         }
-        guard readerDone.wait(timeout: .now() + 2) == .success else { throw StartupPolicyError.commandFailed }
+        guard readerDone.wait(timeout: .now() + 2) == .success,
+              errorReaderDone.wait(timeout: .now() + 2) == .success else { throw StartupPolicyError.commandFailed }
         let result = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        return (result, process.terminationStatus)
+        let errorText = String(decoding: errorData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (result, errorText, process.terminationStatus)
     }
 }
 
@@ -348,7 +363,7 @@ public final class StartupPolicy {
     /// refusal says so.
     public func stopAgent(label: String,
                           unloadAttempts: Int = StartupPolicy.unloadAttempts,
-                          unloadInterval: TimeInterval = StartupPolicy.unloadInterval) throws {
+                          unloadInterval: TimeInterval = StartupPolicy.unloadInterval) async throws {
         let full = "gui/\(uid)/\(label)"
         do {
             _ = try commands.run("/bin/launchctl", ["disable", full])
@@ -360,10 +375,10 @@ public final class StartupPolicy {
             throw StartupPolicyError.refused("launchctl did not answer while disabling the \(label) LaunchAgent, so nothing was stopped.")
         }
         _ = try? commands.run("/bin/launchctl", ["bootout", full])
-        switch waitUntilUnloaded(full, attempts: unloadAttempts, interval: unloadInterval) {
+        switch await waitUntilUnloaded(full, attempts: unloadAttempts, interval: unloadInterval) {
         case .unloaded:
             return
-        case .stillLoaded:
+        case .loaded:
             // The agent is still running, so it must not stay disabled behind
             // the owner's back.  A teardown that finishes between the last
             // look and the enable is caught by one more look: a job that is
@@ -390,34 +405,48 @@ public final class StartupPolicy {
 
     /// Asks launchd once whether the job is loaded.
     ///
-    /// `launchctl print` exits nonzero for a job that is not loaded, which
-    /// is the one answer that proves a bootout took.  A print that the
-    /// command runner had to abandon is not an answer, and it must not be
-    /// read as "unloaded": that is the one way a running agent could be
-    /// left disabled.
+    /// `launchctl print` fails for a job that is not loaded, saying so on
+    /// its standard error, and that is the one answer that proves a bootout
+    /// took.  A print that failed for any other reason, or that the command
+    /// runner had to abandon, is not an answer, and it must not be read as
+    /// "unloaded": that is the one way a running agent could be left
+    /// disabled.
     private func probeLoaded(_ full: String) -> LoadedAnswer {
         do {
             _ = try commands.run("/bin/launchctl", ["print", full])
             return .loaded
-        } catch is CommandExitError {
-            return .unloaded
+        } catch let error as CommandExitError {
+            return StartupPolicy.saysServiceMissing(error) ? .unloaded : .couldNotAsk
         } catch {
             return .couldNotAsk
         }
     }
 
+    /// Whether a failed `launchctl print` said the job is not loaded.
+    ///
+    /// launchctl writes `Could not find service "<label>" in domain for uid:
+    /// <uid>` for a job that is not loaded.  A domain it could not print, or
+    /// a request it refused, is worded differently and says nothing about the
+    /// job.
+    static func saysServiceMissing(_ error: CommandExitError) -> Bool {
+        error.errorOutput.contains("Could not find service")
+    }
+
     /// Asks launchd until the job is unloaded, or the wait is up.
     ///
     /// A job that is still being torn down answers for a while, so the
-    /// question is asked more than once.  The last answer is what is
+    /// question is asked more than once, with the wait between looks spent
+    /// suspended rather than holding a thread.  The last answer is what is
     /// reported when the wait runs out.
-    private func waitUntilUnloaded(_ full: String, attempts: Int, interval: TimeInterval) -> LoadedAnswer {
+    private func waitUntilUnloaded(_ full: String, attempts: Int, interval: TimeInterval) async -> LoadedAnswer {
         let step = interval.isFinite ? min(max(interval, 0), 60) : 0
         var last: LoadedAnswer = .loaded
         for attempt in 0..<max(attempts, 1) {
             last = probeLoaded(full)
             if case .unloaded = last { return .unloaded }
-            if attempt + 1 < max(attempts, 1), step > 0 { Thread.sleep(forTimeInterval: step) }
+            if attempt + 1 < max(attempts, 1), step > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
+            }
         }
         return last
     }

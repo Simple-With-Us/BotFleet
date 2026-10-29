@@ -1,6 +1,21 @@
 import XCTest
 @testable import BotFleetControlCore
 
+/// Runs an operation that must throw, and hands the error to `check`.
+///
+/// XCTAssertThrowsError takes no async expression, and the launchd stop
+/// suspends between its looks at launchd.
+func assertThrowsAsync(_ operation: () async throws -> Void,
+                       file: StaticString = #filePath, line: UInt = #line,
+                       _ check: (Error) -> Void = { _ in }) async {
+    do {
+        try await operation()
+        XCTFail("Expected an error, got none", file: file, line: line)
+    } catch {
+        check(error)
+    }
+}
+
 final class FleetServicesTests: XCTestCase {
     // MARK: - The registry of fleet services
 
@@ -371,7 +386,7 @@ final class FleetServicesTests: XCTestCase {
         ])
     }
 
-    func testStoppingALaunchAgentDisablesItBootsItOutAndChecksItIsGone() throws {
+    func testStoppingALaunchAgentDisablesItBootsItOutAndChecksItIsGone() async throws {
         // A bootout alone holds only until the next login: the plist carries
         // RunAtLoad, so launchd loads the agent again.  The disable is what
         // makes the owner's stop hold across logins and restarts, and the
@@ -380,7 +395,7 @@ final class FleetServicesTests: XCTestCase {
         let home = try makeHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
-        try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+        try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
             .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
         XCTAssertEqual(commands.calls, [
             "/bin/launchctl disable gui/501/app.botfleet.companion",
@@ -389,7 +404,7 @@ final class FleetServicesTests: XCTestCase {
         ])
     }
 
-    func testANonzeroBootoutWhoseJobIsGoneIsAStopThatHeld() throws {
+    func testANonzeroBootoutWhoseJobIsGoneIsAStopThatHeld() async throws {
         // launchctl bootout exits nonzero while a teardown is in progress and
         // when the job was already gone, so its exit status says nothing.
         // The job being unloaded is what proves the stop, and the agent stays
@@ -398,13 +413,13 @@ final class FleetServicesTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         commands.bootoutFailure = CommandExitError(output: "Boot-out failed: 3: No such process")
-        try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+        try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
             .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
         XCTAssertFalse(commands.calls.contains("/bin/launchctl enable gui/501/app.botfleet.companion"))
         XCTAssertEqual(commands.calls.last, "/bin/launchctl print gui/501/app.botfleet.companion")
     }
 
-    func testABootoutThatTimesOutStillCountsWhenTheJobIsGone() throws {
+    func testABootoutThatTimesOutStillCountsWhenTheJobIsGone() async throws {
         // The command runner reports a timeout as a generic failure, which is
         // not a CommandExitError.  It must not be read as a failed stop
         // either: launchd is asked, and the answer decides.
@@ -412,12 +427,12 @@ final class FleetServicesTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         commands.bootoutFailure = StartupPolicyError.commandFailed
-        try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+        try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
             .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
         XCTAssertFalse(commands.calls.contains { $0.contains("enable") })
     }
 
-    func testAStopWhoseJobStaysLoadedPutsTheEnableBack() throws {
+    func testAStopWhoseJobStaysLoadedPutsTheEnableBack() async throws {
         // An agent that is still running must not be left disabled behind
         // the owner's back, so when launchd still has the job after the
         // bootout, the enable goes back, one more look confirms the job is
@@ -426,8 +441,10 @@ final class FleetServicesTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         commands.loaded = true
-        XCTAssertThrowsError(try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
-            .stopAgent(label: "app.botfleet.companion", unloadAttempts: 2, unloadInterval: 0)) { error in
+        await assertThrowsAsync({
+            try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+                .stopAgent(label: "app.botfleet.companion", unloadAttempts: 2, unloadInterval: 0)
+        }) { error in
             XCTAssertTrue("\(error)".contains("still loaded"), "\(error)")
             XCTAssertTrue("\(error)".contains("may still be stopping"), "\(error)")
         }
@@ -441,7 +458,7 @@ final class FleetServicesTests: XCTestCase {
         ])
     }
 
-    func testAJobThatUnloadsJustAfterTheReEnableIsDisabledAgain() throws {
+    func testAJobThatUnloadsJustAfterTheReEnableIsDisabledAgain() async throws {
         // A teardown that finishes between the last look and the enable
         // would otherwise leave the agent enabled and unloaded, which is a
         // stop that comes back at the next login.  The look after the enable
@@ -450,7 +467,7 @@ final class FleetServicesTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         commands.loadedAnswers = [true, true, false]
-        try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+        try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
             .stopAgent(label: "app.botfleet.companion", unloadAttempts: 2, unloadInterval: 0)
         XCTAssertEqual(commands.calls, [
             "/bin/launchctl disable gui/501/app.botfleet.companion",
@@ -463,7 +480,7 @@ final class FleetServicesTests: XCTestCase {
         ])
     }
 
-    func testAPrintThatCouldNotBeAskedIsNotReadAsUnloaded() throws {
+    func testAPrintThatCouldNotBeAskedIsNotReadAsUnloaded() async throws {
         // The runner's timeout is a generic failure, not launchctl's "no such
         // service".  Reading it as unloaded would leave a running agent
         // disabled, so it is "could not ask": the enable goes back and the
@@ -472,8 +489,10 @@ final class FleetServicesTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         commands.printFailure = StartupPolicyError.commandFailed
-        XCTAssertThrowsError(try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
-            .stopAgent(label: "app.botfleet.companion", unloadAttempts: 2, unloadInterval: 0)) { error in
+        await assertThrowsAsync({
+            try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+                .stopAgent(label: "app.botfleet.companion", unloadAttempts: 2, unloadInterval: 0)
+        }) { error in
             XCTAssertTrue("\(error)".contains("did not answer"), "\(error)")
         }
         XCTAssertEqual(commands.calls, [
@@ -485,6 +504,24 @@ final class FleetServicesTests: XCTestCase {
         ])
     }
 
+    func testAPrintThatFailedForAnotherReasonIsNotReadAsUnloaded() async throws {
+        // Only "Could not find service" proves the job is gone.  A print that
+        // failed with any other complaint, here a domain launchd would not
+        // print, says nothing about the job: the enable goes back and the
+        // refusal says launchd did not answer.
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let commands = LaunchAgentCommands()
+        commands.printFailure = CommandExitError(output: "", errorOutput: "Could not print domain: 1: Operation not permitted")
+        await assertThrowsAsync({
+            try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+                .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
+        }) { error in
+            XCTAssertTrue("\(error)".contains("did not answer"), "\(error)")
+        }
+        XCTAssertEqual(commands.calls.last, "/bin/launchctl enable gui/501/app.botfleet.companion")
+    }
+
     func testTheUnloadWindowOutlastsLaunchdsKillDeadline() {
         // launchd gives a job twenty seconds after SIGTERM before it kills
         // it, so a wait shorter than that would call a slow teardown a
@@ -492,40 +529,44 @@ final class FleetServicesTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(Double(StartupPolicy.unloadAttempts) * StartupPolicy.unloadInterval, 25)
     }
 
-    func testTheUnloadWaitReallySleepsBetweenLooks() throws {
+    func testTheUnloadWaitReallySleepsBetweenLooks() async throws {
         let home = try makeHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         commands.loaded = true
         let start = Date()
-        _ = try? StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+        _ = try? await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
             .stopAgent(label: "app.botfleet.companion", unloadAttempts: 3, unloadInterval: 0.1)
         // Three looks, two sleeps of a tenth of a second between them.
         XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(start), 0.15)
     }
 
-    func testADisableThatTimesOutStopsNothingAndNamesTheAgent() throws {
+    func testADisableThatTimesOutStopsNothingAndNamesTheAgent() async throws {
         let home = try makeHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         commands.disableFailure = StartupPolicyError.commandFailed
-        XCTAssertThrowsError(try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
-            .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)) { error in
+        await assertThrowsAsync({
+            try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+                .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
+        }) { error in
             XCTAssertTrue("\(error)".contains("app.botfleet.companion"), "\(error)")
             XCTAssertTrue("\(error)".contains("nothing was stopped"), "\(error)")
         }
         XCTAssertEqual(commands.calls, ["/bin/launchctl disable gui/501/app.botfleet.companion"])
     }
 
-    func testADisableThatFailsStopsNothing() throws {
+    func testADisableThatFailsStopsNothing() async throws {
         // The disable is what makes the stop durable, so a disable that
         // fails is a stop that must not proceed to the bootout.
         let home = try makeHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let commands = LaunchAgentCommands()
         commands.disableFailure = CommandExitError(output: "Could not find service")
-        XCTAssertThrowsError(try StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
-            .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0))
+        await assertThrowsAsync {
+            try await StartupPolicy(home: home, commands: commands, uid: 501, environment: [:])
+                .stopAgent(label: "app.botfleet.companion", unloadAttempts: 1, unloadInterval: 0)
+        }
         XCTAssertEqual(commands.calls, ["/bin/launchctl disable gui/501/app.botfleet.companion"])
     }
 
@@ -724,9 +765,21 @@ final class FleetServicesTests: XCTestCase {
         try Data(#"{"stoppedByOwner":["botfleet-mcp"]}"#.utf8).write(to: file)
         try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path) }
-        XCTAssertEqual(OwnerStopsStore(fileURL: file).load(), [])
+        let store = OwnerStopsStore(fileURL: file)
+        XCTAssertEqual(store.load(), [])
+        XCTAssertTrue(store.recordUnread)
         let kept = try FileManager.default.contentsOfDirectory(atPath: directory.path)
         XCTAssertEqual(kept, ["control-owner-stops.json"])
+        // A save would replace the stops still in the unread file with this
+        // launch's view of them, so it is refused and the file is untouched.
+        XCTAssertThrowsError(try store.save(["botfleet-companion"])) { error in
+            XCTAssertEqual(error as? OwnerStopsStoreError, .recordUnread)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        XCTAssertEqual(store.load(), ["botfleet-mcp"])
+        XCTAssertFalse(store.recordUnread)
+        try store.save(["botfleet-companion"])
+        XCTAssertEqual(OwnerStopsStore(fileURL: file).load(), ["botfleet-companion"])
     }
 
     func testAStopIsRecordedEvenWhenItCannotBeWrittenDown() throws {
@@ -1206,9 +1259,9 @@ private final class LaunchAgentCommands: CommandRunning {
             if let printFailure { throw printFailure }
             let isLoaded = loadedAnswers.isEmpty ? loaded : loadedAnswers.removeFirst()
             if isLoaded { return "state = running" }
-            // launchctl exits nonzero for a job that is not loaded; the
-            // runner reports that as a command that exited, with its text.
-            throw CommandExitError(output: "Could not find service \"\(arguments.last ?? "")\" in domain for uid: 501")
+            // launchctl exits nonzero for a job that is not loaded and says
+            // so on stderr; the runner reports both with the exit error.
+            throw CommandExitError(output: "", errorOutput: "Could not find service \"\(arguments.last ?? "")\" in domain for uid: 501")
         }
         return ""
     }
