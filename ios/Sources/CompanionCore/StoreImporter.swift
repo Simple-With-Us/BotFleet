@@ -270,11 +270,14 @@ public struct StoreImporter: Sendable {
     ]
 
     public static let knownWebhookKeys: Set<String> = [
-        "botId", "createdAt", "deliveryCount", "enabled", "endpointId",
-        "eventTypes", "id", "ignoredCount", "lastIgnoredAt", "lastReceivedAt",
-        "lastRunId", "mergedPullRequestsOnly", "minGapMinutes", "name",
-        "oneShotWake", "prompt", "runOn", "secretHash", "updatedAt",
-        "verificationPending", "verificationSample", "verifiedAt"
+        "actions", "botId", "conclusions", "createdAt", "defaultBranchOnly",
+        "deliveryCount", "enabled", "endpointId", "eventTypes",
+        "excludeSentryProjects", "id", "ignoredCount", "lastIgnoredAt",
+        "lastReceivedAt", "lastRunId", "mergedPullRequestsOnly",
+        "minGapMinutes", "minSentryLevel", "name", "oneShotWake",
+        "pagerdutyUrgency", "prompt", "requiredLabels", "runOn",
+        "secretHash", "updatedAt", "verificationPending",
+        "verificationSample", "verifiedAt"
     ]
 
     public static let knownWebhookAttemptKeys: Set<String> = [
