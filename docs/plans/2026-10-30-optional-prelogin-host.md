@@ -4,7 +4,7 @@ Status: design proposal for BF-2597.  This document defines an optional native 
 
 ## Owner Ruling And Scope
 
-Jay’s ruling for BF-2531 is: “should be able to do so before login but optionally” (chat `01a18e51-fa5e-77a3-8d7b-b5baa414ab98`, recorded in [Zulip message 636401337](https://simplewithus.zulipchat.com/#narrow/near/636401337)).  This selects capability, not automatic login, a security setting change, or permission to install a daemon.  No AutoLoginUser or FileVault change is part of this design.
+Jay’s ruling for BF-2531 is: “should be able to do so before login but optionally” (chat `01a18e51-fa5e-77a3-8d7b-b5baa414ab98`, recorded in [Zulip message 636401337](https://simplewithus.zulipchat.com/#narrow/near/636401337)).  In this chat the owner added: “used to have some things for Socratic Trade, or actually maybe for UM and CT too, working before login but then hosted by server. option 2”.  The selected identity direction is a dedicated service identity, separate data, and an approved service-accessible credential design.  The verified repository evidence below distinguishes those hosted workers from current per-user Mac LaunchAgents.  This selects capability and service architecture, not automatic login, a security setting change, or permission to install a daemon.  No AutoLoginUser or FileVault change is part of this design.
 
 The GUI app remains the interactive BotFleet surface.  A separate headless process may own host services before login, while the GUI later attaches locally and provides capabilities that require a logged-in desktop.  A service manager, shared state, credential policy, native service executable, and installation path still need implementation and review.
 
@@ -15,8 +15,19 @@ The GUI app remains the interactive BotFleet surface.  A separate headless proc
 - `ios/Sources/CompanionCore/NativeRuntimeServices.swift` is opt-in: construction starts no listener or polling.  `activate()` recovers waits and can start polling, but the current composition requires workspace and process-ownership sources, so it is not yet proven headless-safe.
 - `ios/Sources/CompanionCore/NativeCompanionServer.swift` is the native listener boundary.  `MacSession` lazily constructs it with a separate SQLite store under `<dataDir>/native/companion.sqlite`.
 - `ios/Sources/CompanionCore/MacLifecycleControls.swift` defaults lifecycle files to `$HOME/.botfleet`, unless an absolute `OMB_DATA_DIR` is set.  The tracked `scripts/launchd/app.botfleet.server.plist` and `app.botfleet.companion.plist` are per-user LaunchAgents with `HOME=/Users/jay`; they do not establish a pre-login native host.
+- `MacSession.handleAppTermination()` applies the existing `persistOnExit` policy (`ios/MacApp/MacSession.swift:896-912`); the default is `true` (`ios/Sources/CompanionCore/MacLifecycleControls.swift:19`).  The explicit “Shut Down Server & Local VM” action calls `shutDownServerAndLocalVM()` (`ios/MacApp/BotFleetMacApp.swift:139`, `MacSession.swift:865-889`), which requests the fenced stop first and writes the deliberate-stop marker only after a successful response (`MacLifecycleControls.swift:519-590`).
 - `docs/plans/2026-10-29-botfleet-control-after-node.md` describes a LaunchDaemon as unable to provide WindowServer/TCC desktop automation.  Its first-login-only recommendation predates and is superseded by the BF-2531 owner ruling above.
 - `docs/plans/2026-10-29-native-server-mode.md` says `MacSession` is a client today and native worker/runtime wiring remains future work.  Its proposed temporary Node worker bridge is not the target native host.
+
+## Related Service Patterns Checked
+
+- **Socratic.Trade:** production is hosted on Coolify (`Socratic-Trade/README.md`, `Socratic-Trade/docs/deployment.md`).  `Socratic-Trade/instrumentation.ts` calls `startServerBackgroundWorkers()`, and `Socratic-Trade/src/lib/background-worker-startup.ts` starts process-level workers in production.  This verifies server-hosted background work, not a local pre-login macOS daemon.
+- **Usage Monitor:** `Usage-Monitor/docs/runbooks/mac-collectors-install.md` installs Mac collectors in a copied runtime and uses per-user `~/Library/LaunchAgents`; its subscription wrapper reads the login Keychain.  The repo also documents separate Coolify-hosted services.  These sources do not establish a Mac pre-login daemon pattern.
+- **Congress.Trade:** `Congress.Trade/services/scan-cpu-worker/README.md` documents a Linux/Coolify worker, while `Congress.Trade/services/vision-worker/README.md` installs the Mac worker as a per-user LaunchAgent and requires the owner’s Grok CLI login.  This verifies a server-hosted worker alongside an interactive-user Mac worker, not a Mac pre-login daemon.
+
+These precedents support hosting background work in a service process and attaching a desktop client where needed.  They do not prove that any prior ST, UM, or CT Mac worker ran before login as a LaunchDaemon.  The prior local service type for any unspecified historical pre-login work remains unknown.
+
+A filtered, read-only check of `MAC-LOCAL-PROCESSES.md` found Usage Monitor LaunchAgent rows and Congress.Trade `pm2` rows, but no matching row identified a LaunchDaemon or asserted pre-login operation.  The Socratic.Trade service type is not stated in its matching rows.  This inventory does not establish the owner’s remembered pre-login arrangement, so its exact host and service type remain unknown.
 
 ## Architecture And Ownership
 
@@ -35,26 +46,24 @@ Treat screen capture, Accessibility/UI automation, `NSWorkspace` desktop state, 
 
 ## Service Identity And Credentials
 
-**Recommendation:** run the optional headless process as the same macOS user that owns BotFleet’s current data, but do not assume the login Keychain is unlocked at boot.  The service must report a distinct blocked state when a required credential is unavailable; it must not read another user’s store, copy credentials, prompt before login, or fall back to a different credential source.
+**Selected:** run the optional headless process as a dedicated service identity with a service-owned data root separate from the interactive user’s `$HOME/.botfleet`.  Do not share the interactive database, stop-marker directory, login Keychain, or file ownership across identities.  The exact service account, data-root location, permissions, and migration procedure are implementation details that must be specified and reviewed before installation.
 
-Two identity options remain for the owner:
+Provider credentials must use an owner-approved service-accessible credential design scoped to this service identity.  The owner selected that design direction; this document does not invent or provision the credential mechanism, authorize reading another store, or authorize a secret transfer.  Until the approved credential interface is available and unlocked for the service, affected work reports `credentialsUnavailable` and remains held.  Do not copy interactive Keychain items, prompt at the login window, or silently fall back to a different credential source.
 
-- **Same user (recommended):** preserves the existing `$HOME/.botfleet` ownership and avoids a service-account data migration.  Credentials that require the locked login Keychain stay unavailable until unlock, and work needing them reports `credentialsLocked` or `waitingForLogin`.
-- **Dedicated service identity:** isolates service files and permissions, but requires an explicit data migration, file ownership policy, and a separately approved service-accessible credential design.  It does not inherit the interactive user’s Keychain or BotFleet state automatically.
-
-No identity option authorizes an alternate secret store.  If unattended credential access is a requirement, the owner must explicitly choose and approve the service credential mechanism before implementation.
+The same-user design was considered and is not selected.  It would couple unattended service state to the interactive home and login Keychain, contrary to the owner’s selected separate-service model.
 
 ## Lifecycle Contract
 
 | Event | Headless owner | Interactive GUI | Required visible state |
 |---|---|---|---|
 | Boot, option disabled | Does not start | Starts at normal user login only | `stopped` until login launch |
-| Boot, option enabled | Starts once under the selected identity, acquires the exclusive runtime lock, opens the selected data root, and exposes local health | Not running before login | `starting`, then `headlessReady` or a concrete blocked/error state |
-| Service needs a locked credential | Keeps only credential-independent functions alive; does not retry by reading other stores | On login, may unlock its own user context and offer explicit attachment | `credentialsLocked`; affected work held with reason |
+| Boot, option enabled | Starts only after macOS and the configured data volume are available and unlocked; acquires the exclusive runtime lock and opens its separate service data root | Not running before login | `starting`, then `headlessReady` or a concrete blocked/error state |
+| OS or data volume locked/unavailable | Does not start against a missing or locked root and does not attempt to unlock it | May start only after normal macOS disk unlock and login | `waitingForVolume` or `waitingForLogin`; no claim that the service bypasses FileVault or disk unlock |
+| Service credential unavailable | Keeps only credential-independent functions alive; does not retry by reading another store | GUI attachment does not silently transfer credentials | `credentialsUnavailable`; affected work held with reason |
 | GUI login and attach | Remains the sole service/data owner; accepts an authenticated local attachment and current interactive capability set | Attaches, displays `headlessReady` plus interactive capability state | `attached`; desktop-only work is eligible only after capability proof |
 | GUI logout or detach | Releases GUI-only capability registration; may continue under the selected persistence policy | Detaches and stops desktop work cleanly | `headlessReady` or `waitingForLogin` |
-| Explicit GUI Quit | Uses the existing fenced shutdown and deliberate-stop semantics; startup before login does not override a deliberate Quit | Requests shutdown from the owner, then exits after the fence settles | `stoppedByOwner`, or the existing concrete shutdown refusal |
-| Owner Stop | Persists a stop marker before stopping service and releasing the runtime lock | Stop command routes to the owner; GUI does not start a competing service | `stoppedByOwner` remains across reboot until explicit Start |
+| GUI Quit | Applies the existing `persistOnExit` policy; with the default `true`, the server remains running, while `false` requests fenced shutdown and a deliberate-stop marker | Terminates after shutdown handling completes | `headlessReady` if persistence keeps the service running, or `stoppedByOwner` after successful shutdown |
+| Explicit Stop Server | Always requests the fenced server shutdown; on success writes the deliberate-stop marker and releases the runtime lock.  An in-flight-work refusal leaves the server running and reports the refusal. | Stop command routes to the owner; GUI does not start a competing service | `stoppedByOwner` remains across reboot until explicit Start |
 | Owner Start | Clears the stop marker, validates the configured root, acquires ownership, and starts | GUI reconnects to the owner | `starting`, then current service state |
 | Upgrade | Stops admission, drains or fences active work, checkpoints/closes the database, switches to a verified immutable release, then restarts | Reattaches only after service protocol/version check passes | `upgrading`, then `headlessReady`; failure rolls back and reports `upgradeFailed` |
 
@@ -62,7 +71,7 @@ One exclusive lock must cover the runtime database and dispatch ownership.  On 
 
 ## Stop Marker, Persistence, And Upgrade
 
-Use the existing stop-marker semantics as the product model, but put the marker and exclusive lock in the selected service data root.  Window close follows the existing persistence policy; an explicit Quit or Stop retains the existing fenced shutdown and persists the stop marker.  Startup before login is a boot policy, not permission to override a deliberate stop.  Reboot must not clear a deliberate Stop.  Explicit Start or an owner-confirmed startup-policy change clears it.
+Store the new service’s marker and exclusive lock in its separate service-owned data root.  Explicit Stop Server always uses a fenced shutdown and persists the stop marker only after success; a refusal leaves the process and work intact.  GUI Quit follows the existing `persistOnExit` setting: the default `true` keeps the service running, and `false` requests the fenced shutdown path.  Window close follows the same persistence setting and does not itself terminate the app.  Starting the optional host before login never overrides a deliberate-stop marker.  Reboot does not clear a deliberate Stop.  Explicit Start or an owner-confirmed startup-policy change clears it.
 
 Service installation must be opt-in, reversible, and separate from the app login item.  Before enabling it, validate executable signature/version, selected identity, absolute writable data root, ownership and permissions, free space, schema compatibility, local-only IPC permissions, and absence of another service owner.  Write the launchd definition atomically, retain the previous definition and release, then enable and start.  On failed health or version handshake, stop the new process, restore the previous definition and release pointer, and leave a diagnostic status; never delete user data as rollback.
 
@@ -82,6 +91,6 @@ Do not reuse the current Node LaunchAgent plists or `scripts/botfleet-server-sta
 
 Only after owner decisions, code review, signed packaging, and a separately authorized installation: verify a cold boot with the option off does not start the host; with it on, the headless status is healthy before login; locked credentials are visibly blocked; login attaches the GUI without a second listener or database owner; desktop work remains held until interactive capability checks pass; explicit Stop remains stopped after reboot; and an interrupted upgrade rolls back to the last healthy release.  Record the tested Mac OS version, selected identity, option state, and service version without recording credentials or private host paths.
 
-## Owner Decision Needed
+## Selected Direction And Remaining Work
 
-Should the first pre-login implementation use **same-user service identity with credentials blocked until that user’s login Keychain is available** (recommended), or a **dedicated service identity with an explicitly designed data migration and service-accessible credential mechanism**?  The second option changes file ownership and credential architecture; neither option enables automatic login or changes FileVault.
+The owner selected the dedicated service identity, separate data root, and approved service-accessible credential direction.  This is an architectural choice only; account provisioning, data migration, credential mechanism, code, packaging, installation, and any live acceptance remain future work.  Neither this selection nor the optional pre-login setting enables automatic login or changes FileVault.  A pre-login service starts only after macOS and its configured data volume are available and unlocked.
