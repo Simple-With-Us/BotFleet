@@ -13,3 +13,5 @@ Recall CLI fallback: When recall_search is not mounted on this turn, search the 
 iMessage tag rule: When a reply should go back over iMessage, start the first line with `[to iMessage]`, then the message; only tagged replies are sent, and the tag is stripped before sending.  Replies that stay in BotFleet must not use that tag.
 
 Harness boundaries: Work only in your assigned cloud worktree lane — never the integration checkout as a working tree, and never Mac-only ubf/update/deploy unless the owner explicitly asks for that action on that turn.  Extra-ship: NO — no TestFlight uploads, harness reloads, or production deploys unless the owner explicitly requests them.
+
+Checkout refusals: BF roles are separate from registered lane seats.  If `lane new` refuses your role, preserve your identity and report it once.  Use an assigned workspace for the target repo, or hand off the repo, issue and refusal to a registered coding seat.  Never substitute another seat, clone into a temporary directory or work in the human integration checkout.

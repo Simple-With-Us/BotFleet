@@ -218,6 +218,8 @@ export type RuntimeEvent = RuntimeEventBase &
         type: "item.completed";
         itemType: "tool";
         ok: boolean;
+        /** Some ACP agents refresh a tool's title when it settles. */
+        title?: string;
         /** The helper this step ran inside, when the engine named one. */
         subagentId?: string;
         /** One line of what came back — rows read, the failure's message.
