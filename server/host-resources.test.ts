@@ -92,6 +92,21 @@ describe("host capacity probe", () => {
 });
 
 describe("observed enforcement", () => {
+  it("keeps unreadable limits and missing volume identity unknown while distinguishing readable empty limits", () => {
+    const unreadable = deps();
+    const missingVolume = deps({ [file("io.max")]: "8:16 rbps=1024" });
+    missingVolume.probe = { ...missingVolume.probe, capacitySample: (path) => ({ ...probe().capacitySample(path), dataVolume: null }) };
+    const unresolvedDevice = deps({ [file("io.max")]: "8:16 rbps=1024", "/sys/dev/block/8:16/dev": "8:32" });
+    for (const d of [unreadable, missingVolume, unresolvedDevice]) {
+      const report = hostResourcesReport(d);
+      expect(report.enforcement.io).toMatchObject({ kind: "notApplied", restartRequired: false });
+      if (report.enforcement.io.kind !== "notApplied") throw new Error("expected unknown I/O enforcement");
+      expect(report.enforcement.io.reason).toContain("I/O enforcement is unknown");
+    }
+    expect(hostResourcesReport(deps({ [file("io.max")]: "" })).enforcement.io.kind).toBe("unsupported");
+    expect(hostResourcesReport(deps({ [file("io.max")]: "8:32 rbps=1024" })).enforcement.io.kind).toBe("unsupported");
+  });
+
   it("reads finite limits only from the current process's cgroup", () => {
     const d = deps({ [file("cpu.max")]: "200000 100000", [file("memory.max")]: "1073741824", [file("memory.high")]: "536870912", [file("memory.swap.max")]: "0", [file("io.max")]: "8:16 rbps=123456 wbps=max", [file("pids.max")]: "200" });
     const report = hostResourcesReport(d);

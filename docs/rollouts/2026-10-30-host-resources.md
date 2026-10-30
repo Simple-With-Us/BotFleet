@@ -42,6 +42,8 @@ Hosted lint identified an anonymous response type that discarded the status/body
 
 Kody findings 4429074733 and 4429074969 are addressed by the bounded snapshot and explicit null limit keys on macOS, without reading Linux files there.  Fourteen report/boot fixtures passed after this follow-up, including repeated requests, expiry, threshold invalidation and the owner fence; typecheck and the parent-ref lint gate also passed.
 
+The integrated foundation and current-main check passed typecheck, 22 resource/boot/host-identity fixtures and lint without a per-rule increase.  The second review's unreadable-I/O finding is fixed: missing limits, missing volume identity and unresolved block topology all remain unknown, while readable empty or unrelated-device limits report no observed rate cap.  The original full-suite failure record remains above.
+
 The full sixteen placement assertions remain false.  This report is only the harness half of recipe 1; the native host handshake, queue, leases, enforcement and authorized hand runs remain later slices.  The parent task records the required full-suite and Apple verification boundaries before publication.
 
 ## Update And Rollback

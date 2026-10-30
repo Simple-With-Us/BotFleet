@@ -119,14 +119,13 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
     }
     if (finiteLimit(observedLimits["memory.max"]!)) enforcement.memory = { kind: "kernelCap", mechanism: "cgroup v2 memory.max, whole server; a runaway job can stop the harness" };
     if (finiteLimit(observedLimits["memory.swap.max"]!)) enforcement.swap = { kind: "kernelCap", mechanism: "cgroup v2 memory.swap.max, whole server" };
-    const io = observedLimits["io.max"] ?? "";
+    const io = observedLimits["io.max"];
     const ioDevice = sample.dataVolume ? ioDeviceForVolume(sample.dataVolume.device, safeRead) : null;
-    if (ioDevice && io.split("\n").some((line) => line.split(/\s/)[0] === ioDevice && /(?:^|\s)(?:rbps|wbps|riops|wiops)=[1-9]\d*(?:\s|$)/.test(line))) {
+    if (io == null || !sample.dataVolume || ioDevice === null) {
+      enforcement.io = { kind: "notApplied", reason: "I/O limits or the data volume's whole block device could not be read; I/O enforcement is unknown", restartRequired: false };
+      limitations.push("I/O limits or the data volume's whole block device could not be read; I/O enforcement is unknown");
+    } else if (io.split("\n").some((line) => line.split(/\s/)[0] === ioDevice && /(?:^|\s)(?:rbps|wbps|riops|wiops)=[1-9]\d*(?:\s|$)/.test(line))) {
       enforcement.io = { kind: "kernelCap", mechanism: "cgroup v2 device I/O rate, whole server" };
-    }
-    if (sample.dataVolume && ioDevice === null) {
-      enforcement.io = { kind: "notApplied", reason: "The data volume's whole block device could not be resolved; I/O enforcement is unknown", restartRequired: false };
-      limitations.push("The data volume's whole block device could not be resolved; its I/O enforcement is unknown");
     }
     if (!directory) limitations.push("This process's cgroup v2 could not be resolved; kernel enforcement is unknown");
     limitations.push("Read-back covers this cgroup, not ancestor limits or a per-job cgroup");
