@@ -660,7 +660,9 @@ public actor NativeCompanionServer {
         var scalars = String.UnicodeScalarView()
         for scalar in (raw ?? "").unicodeScalars {
             let value = scalar.value
-            let isControl = value < 0x20 || (0x7F...0x9F).contains(value) || value == 0x2028 || value == 0x2029
+            let isControl = value < 0x20 || (0x7F...0x9F).contains(value) || value == 0x2028 || value == 0x2029 ||
+                (0x202A...0x202E).contains(value) || (0x2066...0x2069).contains(value) ||
+                value == 0x200E || value == 0x200F || value == 0xFEFF
             scalars.append(isControl ? space : scalar)
         }
         let trimmed = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)

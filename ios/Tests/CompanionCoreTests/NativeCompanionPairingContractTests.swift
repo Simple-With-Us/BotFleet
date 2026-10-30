@@ -652,6 +652,9 @@ struct NativeCompanionPairingContractTests {
     func deviceNameAndPairRequestIdRules() {
         #expect(NativeCompanionServer.cleanDeviceName("  Ada's\u{0007}iPhone\n ") == "Ada's iPhone")
         #expect(NativeCompanionServer.cleanDeviceName("A\u{007F}\u{0085}\u{009F}\u{2028}\u{2029}B") == "A     B")
+        let bidiFormatControls = "\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069}\u{200E}\u{200F}\u{FEFF}"
+        #expect(NativeCompanionServer.cleanDeviceName("A\(bidiFormatControls)B") == "A            B")
+        #expect(NativeCompanionServer.cleanDeviceName("ع\u{200C}👩\u{200D}💻") == "ع\u{200C}👩\u{200D}💻")
         #expect(NativeCompanionServer.cleanDeviceName(nil) == "Companion")
         #expect(NativeCompanionServer.cleanDeviceName(String(repeating: "x", count: 80)).count == 60)
 
