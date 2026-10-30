@@ -5,9 +5,9 @@
 // ones. Without this, an interrupted writeFileSync produces half-written JSON
 // that fails to parse on next boot and is silently treated as empty state.
 import { randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, fchmodSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 
-export function writeFileAtomic(path: string, data: string, options: { mode?: number } = {}): void {
+export function writeFileAtomic(path: string, data: string, options: { mode?: number; exactMode?: boolean } = {}): void {
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   let fd: number | null = null;
   try {
@@ -16,6 +16,8 @@ export function writeFileAtomic(path: string, data: string, options: { mode?: nu
     // config file visible between the write and a later chmod.
     fd = openSync(tmp, "w", options.mode);
     writeFileSync(fd, data);
+    // Explicit install permissions apply to the staged inode before publication.
+    if (options.exactMode && options.mode !== undefined) fchmodSync(fd, options.mode);
     fsyncSync(fd);
     closeSync(fd);
     fd = null;

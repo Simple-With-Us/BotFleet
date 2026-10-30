@@ -15,7 +15,7 @@
 import { execFile } from "node:child_process";
 import { readFileSync, realpathSync, statfsSync } from "node:fs";
 import { totalmem } from "node:os";
-import type { CapacitySample } from "../../shared/placement.ts";
+import type { CapacitySample, StorageState } from "../../shared/placement.ts";
 import { loadPerCore, readHostLoad, type HostLoad } from "../drivers/acp/init-deadline.ts";
 
 export interface AdmissionThresholds {
@@ -24,6 +24,8 @@ export interface AdmissionThresholds {
   maxSwapPercent: number;
   /** Refuse when the data folder's disk has less than this free. */
   minFreeDiskBytes: number;
+  /** Absent means no inode gate; inventory must precede a configured floor. */
+  minFreeInodes?: number;
 }
 
 export const DEFAULT_ADMISSION: AdmissionThresholds = {
@@ -38,6 +40,16 @@ export interface HostProbe {
   swapUsedPercent(): number | null;
   /** Bytes free to this user on the disk holding `path`, or null. */
   freeDiskBytes(path: string): number | null;
+  freeInodes?(path: string): number | null;
+  storageState?(): StorageState | null;
+  /** One bracketed device/statfs observation for an admission decision. */
+  admissionStorageSample?(path: string): AdmissionStorageSample;
+}
+
+interface AdmissionStorageSample {
+  storage: StorageState | null;
+  freeDiskBytes: number | null;
+  freeInodes: number | null;
 }
 
 /** `sysctl vm.swapusage` on macOS:
@@ -79,6 +91,7 @@ export interface HostProbeDeps {
   statfs?: (path: string) => Pick<ReturnType<typeof statfsSync>, "bsize" | "blocks" | "bavail" | "files" | "ffree">;
   readMountinfo?: () => string;
   realPath?: (path: string) => string;
+  storageState?: () => StorageState;
 }
 
 export interface CapacityHostProbe extends HostProbe {
@@ -150,7 +163,26 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       });
   };
   if (platform === "darwin") refreshDarwin();
+  const readDataStorage = (path: string) => {
+    const before = deps.storageState?.() ?? null;
+    let stats: ReturnType<typeof diskStats> | null = null;
+    if (before?.online !== false) {
+      try { stats = diskStats(path); } catch { /* Unreadable statistics remain unknown. */ }
+    }
+    const after = deps.storageState?.() ?? before;
+    const storage = before?.online === false ? before : after;
+    return { storage, stats: storage?.online === false ? null : stats };
+  };
   const probe: CapacityHostProbe = {
+    storageState: () => deps.storageState?.() ?? null,
+    admissionStorageSample(path) {
+      const { storage, stats } = readDataStorage(path);
+      return {
+        storage,
+        freeDiskBytes: stats ? nonnegative(Number(stats.bavail) * Number(stats.bsize)) : null,
+        freeInodes: stats && Number(stats.files) > 0 ? nonnegative(Number(stats.ffree)) : null,
+      };
+    },
     swapUsedPercent() {
       if (now() - swapAt < SWAP_CACHE_MS) return swapValue;
       if (platform === "darwin") {
@@ -174,12 +206,20 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       return swapValue;
     },
     freeDiskBytes(path) {
+      if (deps.storageState?.().online === false) return null;
       try {
         const stats = diskStats(path);
         return Number(stats.bavail) * Number(stats.bsize);
       } catch {
         return null;
       }
+    },
+    freeInodes(path) {
+      if (deps.storageState?.().online === false) return null;
+      try {
+        const stats = diskStats(path);
+        return Number(stats.files) > 0 ? nonnegative(Number(stats.ffree)) : null;
+      } catch { return null; }
     },
     capacitySample(path) {
       // The swap/cache read is shared with admission; there is no second sampler.
@@ -190,7 +230,9 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       const total = safe(memoryTotal);
       const ramTotalBytes = total !== null && total > 0 ? nonnegative(total) : null;
       const available = ramAvailableBytes !== null && (ramTotalBytes === null || ramAvailableBytes <= ramTotalBytes) ? ramAvailableBytes : null;
-      const stats = safe(() => diskStats(path));
+      const data = readDataStorage(path);
+      const online = data.storage?.online !== false;
+      const stats = data.stats;
       const root = safe(() => diskStats("/"));
       const usableDisk = stats && Number(stats.bsize) > 0 && Number(stats.blocks) > 0;
       const inodeTotal = stats && Number(stats.files) > 0 ? nonnegative(Number(stats.files)) : null;
@@ -204,7 +246,7 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
         diskFreeBytes,
         inodesTotal: inodeTotal,
         inodesFree: stats && inodeTotal !== null ? nonnegative(Number(stats.ffree)) : null,
-        dataVolume: platform === "linux" ? safe(() => mountForPath(mountinfo(), realPath(path))) : null,
+        dataVolume: online && platform === "linux" ? safe(() => mountForPath(mountinfo(), realPath(path))) : null,
         rootDiskFreeBytes: root && Number(root.bsize) > 0 && Number(root.blocks) > 0 ? nonnegative(Number(root.bavail) * Number(root.bsize)) : null,
       };
     },
@@ -224,6 +266,8 @@ export function admissionRefusal(
   dataDir: string,
   spendBlocked: boolean,
 ): string | null {
+  const storage = probe.admissionStorageSample?.(dataDir);
+  if ((storage ? storage.storage : probe.storageState?.())?.online === false) return "Server storage offline: no new background job can start until the data volume is available";
   if (spendBlocked) {
     return "The spend ceiling for unattended work has been reached, so no new background job can start.  Run the command with bash if it is short, or tell the user.";
   }
@@ -231,9 +275,13 @@ export function admissionRefusal(
   if (swap !== null && swap >= thresholds.maxSwapPercent) {
     return `This computer is short on memory (swap ${Math.round(swap)}% used), so no new background job can start right now.  Try again later, or tell the user.`;
   }
-  const free = probe.freeDiskBytes(dataDir);
+  const free = storage ? storage.freeDiskBytes : probe.freeDiskBytes(dataDir);
   if (free !== null && free < thresholds.minFreeDiskBytes) {
     return `This computer is short on disk space (${formatGb(free)} free), so no new background job can start right now.  Tell the user.`;
+  }
+  if (thresholds.minFreeInodes !== undefined) {
+    const inodes = storage ? storage.freeInodes : probe.freeInodes?.(dataDir) ?? null;
+    if (inodes !== null && inodes < thresholds.minFreeInodes) return "This computer is short on inodes, so no new background job can start right now";
   }
   return null;
 }

@@ -114,6 +114,7 @@ import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./run
 import { loadHostId } from "./host-id.ts";
 import { createHostResourcesResponder } from "./host-resources.ts";
 import { createHostProbe } from "./jobs/admission.ts";
+import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
 import {
   appendHeldWork,
   drainViewOf,
@@ -802,9 +803,14 @@ const MIME: Record<string, string> = {
 // Fence duplicate schedulers and database writers before config, providers,
 // SQLite, routines, or webhook receivers start.  Health timeouts never release it.
 // The parent startup lock also serializes the one-time legacy directory move.
+const storageGuard = process.platform === "linux" && process.argv.includes("--require-data-volume") ? storageDeviceGuard(DATA_DIR) : null;
+if (storageGuard && !storageGuard.initial.online) {
+  console.error(storageGuard.initial.reason);
+  process.exit(STORAGE_OFFLINE_EXIT_CODE);
+}
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 const hostId = loadHostId(DATA_DIR);
-const jobHostProbe = createHostProbe();
+const jobHostProbe = createHostProbe({ storageState: storageGuard?.sample });
 const hostResourcesResponse = createHostResourcesResponder({
   hostId, version: runtimeBuildIdentity.version, platform: process.platform,
   dataDir: DATA_DIR, probe: jobHostProbe, thresholds: () => jobSettings().admission,

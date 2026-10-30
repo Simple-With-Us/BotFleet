@@ -124,6 +124,14 @@ describe("parseKnobValue", () => {
 });
 
 describe("resolving knobs", () => {
+  it("leaves the inode floor unset until a file or vault explicitly supplies it", () => {
+    const cfg: AppConfig = {};
+    resolveKnobFields(cfg, new Map());
+    expect(readKnobField(cfg, spec("jobs.admission.minFreeInodes"))).toBeUndefined();
+    resolveKnobFields(cfg, new Map([["BOTFLEET_JOBS_MIN_FREE_INODES", "1250"]]));
+    expect(cfg.jobs?.admission?.minFreeInodes).toBe(1250);
+    expect(knobSource("jobs.admission.minFreeInodes")).toBe("infisical");
+  });
   it("applies a vault value over the file value", () => {
     const cfg: AppConfig = { jobs: { defaultMinutes: 60 } };
     setInfisicalSnapshot(new Map([["BOTFLEET_JOBS_DEFAULT_MINUTES", "30"]]), ["BOTFLEET_JOBS_DEFAULT_MINUTES"]);

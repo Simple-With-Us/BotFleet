@@ -3,6 +3,8 @@ Description=BotFleet harness server (headless, self-hosted on Linux)
 Documentation=https://github.com/Simple-With-Us/BotFleet
 After=network-online.target tailscaled.service
 Wants=network-online.target
+RequiresMountsFor=@BF_VOLUME@
+ConditionPathIsMountPoint=@BF_VOLUME@
 
 [Service]
 Type=simple
@@ -22,9 +24,12 @@ Environment="OMB_STATIC_DIR=@BF_CODE@/dist"
 Environment="OMB_PORT=8799"
 Environment="npm_config_cache=@BF_ROOT@/home/.npm"
 Environment="PATH=@BF_ROOT@/node/bin:@BF_ROOT@/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=@NODE_BIN@ --experimental-strip-types @BF_CODE@/server/index.ts
-StandardOutput=append:@BF_ROOT@/logs/server.log
-StandardError=append:@BF_ROOT@/logs/server.log
+ExecStartPre=@NODE_BIN@ @BF_ROOT@/bin/check-storage.mjs @BF_ROOT@/data
+ExecStart=@BF_ROOT@/bin/start.sh @BF_ROOT@ @BF_CODE@ @NODE_BIN@
+# Preflight diagnostics go to the journal; start.sh opens the append log
+# only after checking storage inside this process's pinned namespace.
+StandardOutput=journal
+StandardError=journal
 Restart=on-failure
 RestartSec=10
 KillMode=mixed
@@ -38,9 +43,14 @@ ProtectSystem=strict
 # /home and /root stay read-only.
 ProtectHome=read-only
 # The fleet volume is the only writable path.
-ReadWritePaths=/mnt/fleet-extra
-# A private /tmp for this unit.
-PrivateTmp=yes
+ReadWritePaths=@BF_VOLUME@
+# Pin the dedicated volume in this unit's namespace, including across host
+# unmounts; stopping the unit releases it and permits maintenance unmounts.
+BindPaths=@BF_VOLUME@
+MountFlags=private
+# Tool paths that ignore TMPDIR still write to the volume, not root disk.
+PrivateTmp=no
+BindPaths=@BF_ROOT@/tmp:/tmp @BF_ROOT@/var-tmp:/var/tmp
 # Kernel tunables stay read-only.
 ProtectKernelTunables=yes
 # The cgroup file system stays read-only.
