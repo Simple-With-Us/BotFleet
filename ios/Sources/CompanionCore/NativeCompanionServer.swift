@@ -132,6 +132,28 @@ public struct CompanionServerConfig: Codable, Sendable, Equatable {
     }
 }
 
+/// How phones can reach this computer, as the app knows it.  The companion
+/// server answers `GET /api/companion/endpoints` and the pairing response
+/// from this value only, never from a request's `Host` or `X-Forwarded-*`
+/// headers, which whoever sent the request controls.  The empty default
+/// advertises nothing, and the phone keeps the routes it already has.
+public struct CompanionEndpointAdvertisement: Sendable, Equatable {
+    /// What the phone calls this computer in its connection list.
+    public var serverName: String
+    /// Legacy host names, best first, for phone builds that predate typed
+    /// endpoints.  Sent only with the pairing response, as
+    /// `companion/src/proxy.ts` does.
+    public var hosts: [String]
+    /// Complete routes, each with its own scheme and port.
+    public var endpoints: [CompanionEndpoint]
+
+    public init(serverName: String = "", hosts: [String] = [], endpoints: [CompanionEndpoint] = []) {
+        self.serverName = serverName
+        self.hosts = hosts
+        self.endpoints = endpoints
+    }
+}
+
 /// Bot summary returned on `GET /api/bots` and `GET /api/fleet`.
 public struct CompanionBotRecord: Codable, Sendable, Equatable, Identifiable {
     public let id: String
@@ -459,11 +481,23 @@ public actor NativeCompanionServer {
     /// The injecting app composition owns this shared runtime; listener activation does not transfer lifetime ownership.
     private let nativeRuntime: NativeRuntimeServices?
     private var pairedTokens: Set<String>
+    /// The six-digit code a person types on the phone.
     private var pairingCode: String?
+    /// The high-entropy credential the Mac puts in its pairing QR code.  It
+    /// redeems the same window as `pairingCode`, and the two share one
+    /// wrong-guess budget, as in `companion/src/devices.ts` (`PairingWindow`).
+    private var pairingQRCredential: String?
     /// When the open pairing window closes.  `nil` means no window is open.
     private var pairingCodeExpiresAt: Date?
-    /// How many more wrong pairing codes the open window will accept.
+    /// How many more wrong pairing credentials the open window will accept,
+    /// counting both variants together.
     private var pairingAttemptsRemaining: Int = 0
+    /// The last successful redemption that named a `pairRequestId`, kept
+    /// until the window's original expiry so the same phone request can
+    /// recover a reply lost in transit.
+    private var pairingReplay: PairingReplay?
+    private var endpointAdvertisement: CompanionEndpointAdvertisement
+    private let clock: @Sendable () -> Date
     private var config: CompanionServerConfig
     private var bots: [CompanionBotRecord]
     private var pushTokens: Set<String> = []
@@ -481,6 +515,18 @@ public actor NativeCompanionServer {
     /// (`PAIRING_TTL_MS`, `MAX_PAIRING_ATTEMPTS`).
     public static let pairingWindowTTL: TimeInterval = 120
     public static let pairingMaxAttempts: Int = 5
+
+    /// The identity `GET /api/health` reports.  The phone probes health
+    /// before it sends a pairing credential and refuses any server that does
+    /// not name itself this way (`CompanionClient.healthy`).
+    public static let healthAppIdentity: String = "botfleet"
+
+    /// The most endpoints or hosts one answer carries, and the longest server
+    /// name, matching `companion/src/endpoints.ts` (`MAX_COMPANION_ENDPOINTS`)
+    /// and `companion/src/proxy.ts` (`endpointSnapshot`).
+    public static let maxAdvertisedEndpoints: Int = 8
+    public static let maxAdvertisedServerNameLength: Int = 200
+    public static let maxAdvertisedEndpointPriority: Int = 10_000
 
     /// The default and the maximum number of rows one search may return.  The
     /// limit is clamped before it reaches `sqlite3_bind_int`, which takes an
@@ -511,24 +557,34 @@ public actor NativeCompanionServer {
     private let listenerQueue = DispatchQueue(label: "app.botfleet.companion-server", qos: .userInitiated)
     #endif
 
+    /// `endpointAdvertisement` is what the app knows about its own routes;
+    /// the empty default advertises none.  `clock` is the time every pairing
+    /// window and replay is measured against; tests pass a manual one.
     public init(
         database: DatabaseService,
         pairedTokens: Set<String> = [],
         pairingCode: String? = nil,
+        pairingQRCredential: String? = nil,
         config: CompanionServerConfig = CompanionServerConfig(),
         bots: [CompanionBotRecord] = [],
         apnsProvider: NativeAPNsProvider? = nil,
         nativeRuntime: NativeRuntimeServices? = nil,
+        endpointAdvertisement: CompanionEndpointAdvertisement = CompanionEndpointAdvertisement(),
         onDesktopOpen: (@Sendable () async throws -> Void)? = nil,
-        onShutdown: (@Sendable () async -> Void)? = nil
+        onShutdown: (@Sendable () async -> Void)? = nil,
+        clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.database = database
         self.pairedTokens = pairedTokens
         self.pairingCode = pairingCode
-        self.pairingCodeExpiresAt = pairingCode.map { _ in
-            Date().addingTimeInterval(NativeCompanionServer.pairingWindowTTL)
-        }
-        self.pairingAttemptsRemaining = pairingCode == nil ? 0 : NativeCompanionServer.pairingMaxAttempts
+        self.pairingQRCredential = pairingQRCredential
+        let opensWindow = pairingCode != nil || pairingQRCredential != nil
+        self.pairingCodeExpiresAt = opensWindow
+            ? clock().addingTimeInterval(NativeCompanionServer.pairingWindowTTL)
+            : nil
+        self.pairingAttemptsRemaining = opensWindow ? NativeCompanionServer.pairingMaxAttempts : 0
+        self.endpointAdvertisement = NativeCompanionServer.sanitizedAdvertisement(endpointAdvertisement)
+        self.clock = clock
         self.config = config
         self.bots = bots
         self.apnsProvider = apnsProvider
@@ -569,6 +625,78 @@ public actor NativeCompanionServer {
         return cleaned == "127.0.0.1" || cleaned == "::1" || cleaned == "::ffff:127.0.0.1"
     }
 
+    /// True when `presented` is the non-empty `expected` credential, compared
+    /// in constant time.
+    static func matchesPairingCredential(_ presented: String, _ expected: String?) -> Bool {
+        guard let expected, !expected.isEmpty else { return false }
+        return constantTimeEquals(presented, expected)
+    }
+
+    /// The SHA-256 of a pairing credential, in hex.  A replay is matched on
+    /// this digest, so the raw credential is not kept once it is spent.
+    static func pairingCredentialDigest(_ credential: String) -> String {
+        SHA256.hash(data: Data(credential.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The pairing idempotency key, or `nil`.  The shape matches
+    /// `companion/src/devices.ts` (`^[A-Za-z0-9._-]{16,128}$`); anything else
+    /// counts as absent, so that request is redeemed exactly once.
+    static func validPairRequestId(_ raw: String?) -> String? {
+        guard let raw,
+              (16...128).contains(raw.utf8.count),
+              raw.utf8.allSatisfy({
+                  (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) ||
+                      $0 == 45 || $0 == 46 || $0 == 95
+              })
+        else { return nil }
+        return raw
+    }
+
+    /// A device name is untrusted display text from the phone.  Control
+    /// characters become spaces and the result is trimmed and clamped, as in
+    /// `companion/src/devices.ts` (`cleanDeviceName`).
+    static func cleanDeviceName(_ raw: String?) -> String {
+        let space: Unicode.Scalar = " "
+        var scalars = String.UnicodeScalarView()
+        for scalar in (raw ?? "").unicodeScalars {
+            let value = scalar.value
+            let isControl = value < 0x20 || (0x7F...0x9F).contains(value) || value == 0x2028 || value == 0x2029 ||
+                (0x202A...0x202E).contains(value) || (0x2066...0x2069).contains(value) ||
+                value == 0x200E || value == 0x200F || value == 0xFEFF
+            scalars.append(isControl ? space : scalar)
+        }
+        let trimmed = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = String(trimmed.prefix(60))
+        return name.isEmpty ? "Companion" : name
+    }
+
+    /// Mints the credential a pairing QR code carries: `omb_pair_` and 32
+    /// random bytes as unpadded base64url, the shape `companion/src/devices.ts`
+    /// mints and `PairingInvite` accepts.
+    public static func makePairingQRCredential() -> String {
+        let bytes = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
+        return "omb_pair_" + NativeAPNsProvider.base64URLEncode(bytes)
+    }
+
+    /// Bounds the app's advertisement at the network boundary, as
+    /// `companion/src/proxy.ts` (`endpointSnapshot`) does: a clamped name, no
+    /// duplicate or out-of-range routes, and at most eight of each list.
+    static func sanitizedAdvertisement(_ raw: CompanionEndpointAdvertisement) -> CompanionEndpointAdvertisement {
+        var seenURLs = Set<String>()
+        let endpoints = raw.endpoints.filter { endpoint in
+            (0...maxAdvertisedEndpointPriority).contains(endpoint.priority) && seenURLs.insert(endpoint.url).inserted
+        }
+        var seenHosts = Set<String>()
+        let hosts = raw.hosts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seenHosts.insert($0).inserted }
+        return CompanionEndpointAdvertisement(
+            serverName: String(raw.serverName.prefix(maxAdvertisedServerNameLength)),
+            hosts: Array(hosts.prefix(maxAdvertisedEndpoints)),
+            endpoints: Array(endpoints.prefix(maxAdvertisedEndpoints))
+        )
+    }
+
     private func isAuthenticated(_ request: CompanionHTTPRequest) -> Bool {
         guard let authHeader = request.headerValue(for: "Authorization") else {
             return false
@@ -604,25 +732,51 @@ public actor NativeCompanionServer {
         pairedTokens.insert(token)
     }
 
+    /// Replaces what `GET /api/companion/endpoints` and the pairing response
+    /// advertise, for when the app's routes change.
+    public func setEndpointAdvertisement(_ advertisement: CompanionEndpointAdvertisement) {
+        endpointAdvertisement = Self.sanitizedAdvertisement(advertisement)
+    }
+
     /// Opens a pairing window for the Mac side to show on its own loopback
-    /// page.  The code is a credential for `pairingWindowTTL` seconds and is
-    /// spent by the first device that redeems it.
+    /// page.  The code, and the QR credential when there is one, are
+    /// credentials for `pairingWindowTTL` seconds; the first device that
+    /// redeems either one spends both.  Opening a window replaces any earlier
+    /// window and forgets its replay, as `companion/src/devices.ts`
+    /// (`openPairing`) does.
     public func openPairingWindow(
         code: String,
+        qrCredential: String? = nil,
         ttl: TimeInterval = NativeCompanionServer.pairingWindowTTL,
         maxAttempts: Int = NativeCompanionServer.pairingMaxAttempts
     ) {
+        pairingReplay = nil
         pairingCode = code
-        pairingCodeExpiresAt = Date().addingTimeInterval(ttl)
+        pairingQRCredential = qrCredential
+        pairingCodeExpiresAt = clock().addingTimeInterval(ttl)
         pairingAttemptsRemaining = max(1, maxAttempts)
     }
 
     /// Closes the open pairing window, so a code that is still on screen stops
-    /// working at once.
+    /// working at once.  It also forgets the replay, so a cancelled pairing
+    /// cannot hand its token out again.
     public func closePairingWindow() {
+        discardPairingWindow()
+        pairingReplay = nil
+    }
+
+    /// Forgets the window's credentials and budget but keeps the replay, so
+    /// a redeemed window can still answer its own lost reply.
+    private func discardPairingWindow() {
         pairingCode = nil
+        pairingQRCredential = nil
         pairingCodeExpiresAt = nil
         pairingAttemptsRemaining = 0
+    }
+
+    /// True when the window holds at least one credential to check against.
+    private var hasPairingCredential: Bool {
+        !(pairingCode ?? "").isEmpty || !(pairingQRCredential ?? "").isEmpty
     }
 
     /// Subscribes to Server-Sent Events emitted by the companion server.
@@ -678,11 +832,17 @@ public actor NativeCompanionServer {
 
         // 1. Open routes (unauthenticated)
         if method == "GET" && path == "/api/health" {
+            // `app` and `ready` are what the phone checks before it sends a
+            // pairing credential (`CompanionClient.healthy`), the same pair
+            // `companion/src/proxy.ts` answers with.  This actor serves every
+            // route itself, so once it answers it is ready.
             struct HealthPayload: Encodable {
                 let ok: Bool
                 let status: String
+                let app: String
+                let ready: Bool
             }
-            return .json(200, HealthPayload(ok: true, status: "healthy"))
+            return .json(200, HealthPayload(ok: true, status: "healthy", app: Self.healthAppIdentity, ready: true))
         }
 
         if method == "POST" && path == "/api/pair" {
@@ -720,6 +880,9 @@ public actor NativeCompanionServer {
 
         case ("GET", "/api/companion/push-health"):
             return await handlePushHealth()
+
+        case ("GET", "/api/companion/endpoints"):
+            return handleCompanionEndpoints()
 
         case ("POST", "/api/desktop/open"):
             return await handleDesktopOpen(request)
@@ -761,35 +924,89 @@ public actor NativeCompanionServer {
 
     // MARK: - Route Handlers
 
+    /// A successful redemption that named a `pairRequestId`.  The credential
+    /// is kept only as its digest; the token is the one already in
+    /// `pairedTokens`.
+    private struct PairingReplay: Sendable {
+        let requestId: String
+        let credentialDigest: String
+        /// The redeemed window's original expiry, not redemption time plus
+        /// the TTL.
+        let expiresAt: Date
+        let token: String
+        let device: PairedDevice
+    }
+
+    /// Redeems either pairing credential for a device token, mirroring
+    /// `companion/src/devices.ts` (`redeem`) and `companion/src/proxy.ts`.
+    ///
+    /// A closed or expired window answers 401, as the Node sidecar does, not
+    /// 503: the phone reads 502-504 as a dead route and moves on
+    /// (`ConnectionAdvice.shouldTryAnotherRoute`), which turned "this window
+    /// is closed" into "couldn't reach this computer".
     private func handlePair(_ request: CompanionHTTPRequest) -> CompanionHTTPResponse {
+        // The phone sends a six-digit credential as `code` and the QR
+        // credential as `credential` (`CompanionClient.pair`).  Either one is
+        // checked against both of the window's credentials.
         struct PairRequest: Decodable {
-            let code: String
+            let code: String?
+            let credential: String?
             let deviceName: String?
+            let pairRequestId: String?
         }
         guard let body = request.body,
-              let payload = try? JSONDecoder().decode(PairRequest.self, from: body),
-              !payload.code.isEmpty else {
+              let payload = try? JSONDecoder().decode(PairRequest.self, from: body) else {
             return .error(400, "invalid_pair_request")
         }
-        guard payload.code.utf8.count <= CompanionFieldLimits.pairingCode else {
+        let presented = payload.credential ?? payload.code ?? ""
+        guard !presented.isEmpty else {
+            return .error(400, "invalid_pair_request")
+        }
+        guard presented.utf8.count <= CompanionFieldLimits.pairingCode else {
             return .error(400, "pairing_code_too_long")
         }
+        let requestId = Self.validPairRequestId(payload.pairRequestId)
+        let presentedDigest = Self.pairingCredentialDigest(presented)
+        let now = clock()
 
-        // Fail closed.  With no open pairing window there is no code to check
-        // against, and skipping the check would mint a working bearer token for
-        // the first unauthenticated caller on the socket.
-        guard let expectedCode = pairingCode, !expectedCode.isEmpty else {
-            return .error(503, "pairing_unavailable")
+        // A reply lost in transit is recoverable: the same request id with the
+        // same credential gets the same answer until the window's original
+        // expiry.  It spends no guess and touches no window.  A different
+        // credential falls through to the checks below, which refuse it.
+        if let replay = pairingReplay, now >= replay.expiresAt {
+            pairingReplay = nil
         }
-        if let expiry = pairingCodeExpiresAt, Date() >= expiry {
-            closePairingWindow()
-            return .error(503, "pairing_code_expired")
+        if let requestId,
+           let replay = pairingReplay,
+           Self.constantTimeEquals(replay.requestId, requestId),
+           Self.constantTimeEquals(replay.credentialDigest, presentedDigest) {
+            // A token taken away since must not come back through a replay.
+            guard pairedTokens.contains(replay.token) else {
+                pairingReplay = nil
+                return .error(401, "pairing_unavailable")
+            }
+            return pairResponse(token: replay.token, device: replay.device)
+        }
+
+        // Fail closed.  With no open pairing window there is no credential to
+        // check against, and skipping the check would mint a working bearer
+        // token for the first unauthenticated caller on the socket.
+        guard let expiry = pairingCodeExpiresAt, hasPairingCredential else {
+            return .error(401, "pairing_unavailable")
+        }
+        if now >= expiry {
+            discardPairingWindow()
+            return .error(401, "pairing_code_expired")
         }
         guard pairingAttemptsRemaining > 0 else {
             closePairingWindow()
             return .error(429, "pairing_attempts_exhausted")
         }
-        guard Self.constantTimeEquals(payload.code, expectedCode) else {
+        // Both comparisons always run, and a wrong guess at either variant
+        // spends the one shared budget.
+        let matchesCode = Self.matchesPairingCredential(presented, pairingCode)
+        let matchesQRCredential = Self.matchesPairingCredential(presented, pairingQRCredential)
+        guard matchesCode || matchesQRCredential else {
             pairingAttemptsRemaining -= 1
             if pairingAttemptsRemaining <= 0 {
                 closePairingWindow()
@@ -800,12 +1017,62 @@ public actor NativeCompanionServer {
 
         let issuedToken = "bf_tok_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())"
         pairedTokens.insert(issuedToken)
-        // One code, one device: redeeming the code spends the window.
-        closePairingWindow()
-        return .json(200, [
-            "token": issuedToken,
-            "deviceId": UUID().uuidString.lowercased(),
-        ])
+        let pairedAtMs = now.timeIntervalSince1970 * 1000.0
+        let device = PairedDevice(
+            id: UUID().uuidString.lowercased(),
+            name: Self.cleanDeviceName(payload.deviceName),
+            createdAt: pairedAtMs,
+            lastSeenAt: pairedAtMs
+        )
+        // One window, one device: redeeming either credential spends both.
+        // The replay outlives the window, but only to its original expiry.
+        discardPairingWindow()
+        if let requestId {
+            pairingReplay = PairingReplay(
+                requestId: requestId,
+                credentialDigest: presentedDigest,
+                expiresAt: expiry,
+                token: issuedToken,
+                device: device
+            )
+        }
+        return pairResponse(token: issuedToken, device: device)
+    }
+
+    /// The envelope the phone decodes as `PairResponse`: `token`, `device`
+    /// and `serverName`, with `hosts` and `endpoints` absent rather than
+    /// empty when there is nothing to advertise, as in `companion/src/proxy.ts`.
+    private func pairResponse(token: String, device: PairedDevice) -> CompanionHTTPResponse {
+        struct PairEnvelope: Encodable {
+            let token: String
+            let device: PairedDevice
+            let serverName: String
+            let hosts: [String]?
+            let endpoints: [CompanionEndpoint]?
+        }
+        let advertisement = endpointAdvertisement
+        return .json(200, PairEnvelope(
+            token: token,
+            device: device,
+            serverName: advertisement.serverName,
+            hosts: advertisement.hosts.isEmpty ? nil : advertisement.hosts,
+            endpoints: advertisement.endpoints.isEmpty ? nil : advertisement.endpoints
+        ))
+    }
+
+    /// Answers `GET /api/companion/endpoints` from the app's advertisement
+    /// alone, in the shape the phone decodes as `CompanionConnectionMetadata`.
+    /// Nothing here reads the request, so a forged `Host` or
+    /// `X-Forwarded-Host` cannot steer a phone to another address.
+    private func handleCompanionEndpoints() -> CompanionHTTPResponse {
+        struct EndpointSnapshot: Encodable {
+            let serverName: String
+            let endpoints: [CompanionEndpoint]
+        }
+        return .json(200, EndpointSnapshot(
+            serverName: endpointAdvertisement.serverName,
+            endpoints: endpointAdvertisement.endpoints
+        ))
     }
 
     private func handleGetFleet() -> CompanionHTTPResponse {
