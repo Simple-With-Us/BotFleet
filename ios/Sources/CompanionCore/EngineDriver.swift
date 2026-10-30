@@ -14,7 +14,25 @@ public struct TurnInput: Equatable, Sendable, Codable {
     public let workingDirectory: String?
     public let environment: [String: String]
     public let configOptions: [String: String]
+    /// Trusted in-process preparation is never accepted from or exported to serialized turn input.
     public let toolPreparation: NativeTurnToolPreparation?
+
+    private enum CodingKeys: String, CodingKey {
+        case threadId, botId, prompt, modelId, resumeSessionId, workingDirectory, environment, configOptions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        threadId = try values.decode(String.self, forKey: .threadId)
+        botId = try values.decode(String.self, forKey: .botId)
+        prompt = try values.decode(String.self, forKey: .prompt)
+        modelId = try values.decodeIfPresent(String.self, forKey: .modelId)
+        resumeSessionId = try values.decodeIfPresent(String.self, forKey: .resumeSessionId)
+        workingDirectory = try values.decodeIfPresent(String.self, forKey: .workingDirectory)
+        environment = try values.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
+        configOptions = try values.decodeIfPresent([String: String].self, forKey: .configOptions) ?? [:]
+        toolPreparation = nil
+    }
 
     public init(
         threadId: String,

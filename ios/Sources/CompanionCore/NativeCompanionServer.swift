@@ -456,6 +456,7 @@ private struct NativeWaitCreatePayload: Decodable {
 /// Bearer token verification, and both BF-2489 security gates on `POST /api/desktop/open`.
 public actor NativeCompanionServer {
     private let database: DatabaseService
+    /// The injecting app composition owns this shared runtime; listener activation does not transfer lifetime ownership.
     private let nativeRuntime: NativeRuntimeServices?
     private var pairedTokens: Set<String>
     private var pairingCode: String?
@@ -1326,7 +1327,6 @@ public actor NativeCompanionServer {
 
     public func stopListening() async {
         stopListenerSocket()
-        await nativeRuntime?.shutdown()
     }
 
     private func stopListenerSocket() {

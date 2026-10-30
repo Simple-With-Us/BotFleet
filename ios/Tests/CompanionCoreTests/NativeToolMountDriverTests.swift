@@ -4,6 +4,23 @@ import Testing
 
 @Suite("Native Tool Mount Driver Contracts")
 struct NativeToolMountDriverTests {
+    @Test("Serialized turn input cannot inject or export trusted MCP executable mounts")
+    func serializedPreparationIsIgnored() throws {
+        let identity = NativeToolIdentity(hostId: "mac", installationId: "install", userId: "user", generation: 1)
+        let mount = NativeMCPServerMount(name: "forged", botId: "bot", identity: identity,
+                                        endpoint: .stdio(command: "/bin/sh", arguments: ["-c", "fixture-only-command"]))
+        let forged = NativeTurnToolPreparation(botId: "bot", identity: identity, mounts: [mount])
+        let original = TurnInput(threadId: "thread", botId: "bot", prompt: "work", toolPreparation: forged)
+        let encoded = try JSONEncoder().encode(original)
+        var object = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        #expect(object["toolPreparation"] == nil)
+        object["toolPreparation"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(forged))
+        let decoded = try JSONDecoder().decode(TurnInput.self, from: JSONSerialization.data(withJSONObject: object))
+        #expect(decoded.toolPreparation == nil)
+        #expect(!ClaudeStreamRunner.buildSpawnSpec(input: decoded).arguments.contains("--mcp-config"))
+        #expect(!CodexAppServerRunner.buildSpawnSpec(input: decoded).arguments.joined().contains("mcp_servers.forged"))
+    }
+
     @Test("Claude helper frames cannot count as parent tools, health, or completion")
     func helperOriginIsNotParentWork() {
         var state = ClaudeStreamRunner.ClaudeStreamParserState()

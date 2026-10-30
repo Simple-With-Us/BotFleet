@@ -223,6 +223,9 @@ public actor NativeEventWaitRegistry {
     private var didRecover = false
     private var snapshotRevision: UInt64 = 0
     private var saveTask: Task<Void, Error>?
+    private struct DispatchTask { let token: UUID; let task: Task<Void, Never> }
+    private var dispatchTasks: [String: DispatchTask] = [:]
+    public private(set) var dispatchPersistenceFailed = false
 
     public init(
         probe: any NativeEventWaitProbe,
@@ -358,7 +361,7 @@ public actor NativeEventWaitRegistry {
         return activeWaits()
     }
 
-    /// Checks registered waits without starting model work while predicates remain false.
+    /// Checks predicates and returns newly scheduled wait ids without waiting for their model turns.
     @discardableResult
     public func tick(now: Double = Date().timeIntervalSince1970) async throws -> [String] {
         guard !stopped else { throw NativeEventWaitError.registryStopped }
@@ -368,6 +371,7 @@ public actor NativeEventWaitRegistry {
         var enqueued: [String] = []
         let candidateIds = activeWaits().map(\.id)
         for id in candidateIds {
+            if dispatchTasks[id] != nil { continue }
             guard !stopped, let snapshot = waitsById[id], snapshot.deadlineAt > max(now, clock()) else {
                 if let current = waitsById[id], current.deadlineAt <= max(now, clock()), Self.isActive(current) {
                     var expired = current
@@ -403,6 +407,7 @@ public actor NativeEventWaitRegistry {
                   let ready = waitsById[id],
                   ready.status == .ready,
                   ready.deadlineAt > max(now, clock()) else { continue }
+            guard dispatchTasks.count < limits.total else { continue }
             var dispatching = ready
             dispatching.status = .dispatching
             dispatching.revision &+= 1
@@ -419,48 +424,59 @@ public actor NativeEventWaitRegistry {
                 try await persistSnapshot()
                 continue
             }
-            do {
-                switch try await queue.enqueueFollowUp(dispatching) {
-                case .completed:
-                    break
-                case .held(let reason):
-                    guard var current = waitsById[id], current.status == .dispatching, current.revision == dispatching.revision else { continue }
-                    current.status = .held
-                    current.holdReason = reason
-                    current.revision &+= 1
-                    waitsById[id] = current
-                    try await persistSnapshot()
-                    continue
-                }
-            } catch {
-                if var current = waitsById[id], current.revision == dispatching.revision, current.status == .dispatching {
-                    current.status = .ready
-                    current.revision &+= 1
-                    waitsById[id] = current
-                    try await persistSnapshot()
-                }
-                continue
+            let token = UUID()
+            let task = Task<Void, Never> { [weak self] in
+                guard let self else { return }
+                await self.runDispatch(dispatching, token: token)
             }
-            guard var current = waitsById[id],
-                  current.status == .dispatching,
-                  current.revision == dispatching.revision else { continue }
-            current.status = .completed
-            current.revision &+= 1
-            waitsById[id] = current
+            dispatchTasks[id] = DispatchTask(token: token, task: task)
             enqueued.append(id)
-            try await persistSnapshot()
         }
         pruneTerminal(now: now)
         guard !stopped else { throw NativeEventWaitError.registryStopped }
         return enqueued
     }
 
+    /// Explicit fixture or graceful-drain barrier; ordinary polling and shutdown never wait for model turns.
+    public func waitForDispatches(ids: Set<String>? = nil) async {
+        let current = dispatchTasks.filter { ids == nil || ids!.contains($0.key) }.values.map(\.task)
+        for task in current { await task.value }
+    }
+
+    private func runDispatch(_ dispatching: NativeEventWait, token: UUID) async {
+        defer { if dispatchTasks[dispatching.id]?.token == token { dispatchTasks.removeValue(forKey: dispatching.id) } }
+        guard !stopped, !Task.isCancelled, var current = waitsById[dispatching.id],
+              current.status == .dispatching, current.revision == dispatching.revision else { return }
+        if current.deadlineAt <= clock() {
+            current.status = .expired; current.revision &+= 1; waitsById[current.id] = current
+        } else {
+            let result: NativeEventWaitQueueResult
+            do { result = try await queue.enqueueFollowUp(dispatching) }
+            catch { result = .held(reason: "Wait dispatch could not confirm completion") }
+            guard var latest = waitsById[dispatching.id], latest.status == .dispatching,
+                  latest.revision == dispatching.revision else { return }
+            if stopped || Task.isCancelled {
+                latest.status = .held; latest.holdReason = "Dispatch outcome unknown after shutdown"
+            } else {
+                switch result {
+                case .completed: latest.status = .completed
+                case .held(let reason): latest.status = .held; latest.holdReason = String(reason.prefix(512))
+                }
+            }
+            latest.revision &+= 1
+            waitsById[latest.id] = latest
+        }
+        do { try await persistSnapshot(); dispatchPersistenceFailed = false }
+        catch { dispatchPersistenceFailed = true }
+    }
+
     @discardableResult
     public func cancel(id: String) async throws -> NativeEventWait? {
-        guard var wait = waitsById[id], wait.status == .pending || wait.status == .ready || wait.status == .held else { return waitsById[id] }
+        guard var wait = waitsById[id], wait.status == .pending || wait.status == .ready || wait.status == .held || wait.status == .dispatching else { return waitsById[id] }
         wait.status = .cancelled
         wait.revision &+= 1
         waitsById[id] = wait
+        dispatchTasks[id]?.task.cancel()
         try await persistSnapshot()
         return wait
     }
@@ -468,6 +484,7 @@ public actor NativeEventWaitRegistry {
     /// Stops probes while keeping pending records available for recovery after restart.
     public func shutdown() {
         stopped = true
+        for scheduled in dispatchTasks.values { scheduled.task.cancel() }
     }
 
     private func pruneTerminal(now: Double) {
@@ -480,9 +497,10 @@ public actor NativeEventWaitRegistry {
     }
 
     private func persistSnapshot() async throws {
+        pruneTerminal(now: clock())
         snapshotRevision &+= 1
         let revision = snapshotRevision
-        let snapshot = waitsById.values.filter { Self.isActive($0) || $0.status == .held || $0.status == .accepted }.sorted { $0.id < $1.id }
+        let snapshot = waitsById.values.sorted { $0.id < $1.id }
         let previous = saveTask
         let persistence = self.persistence
         let task = Task<Void, Error> {

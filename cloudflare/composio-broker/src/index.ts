@@ -244,7 +244,9 @@ async function ensureSession(installation: InstallationRow, env: Env, ctx: Execu
     );
   };
   const sameSnapshot = (left: InstallationRow, right: InstallationRow) =>
-    left.composio_user_id === right.composio_user_id && left.session_id === right.session_id;
+    left.composio_user_id === right.composio_user_id
+    && left.session_id === right.session_id
+    && Number(left.session_upgrade_attempted ?? 0) === Number(right.session_upgrade_attempted ?? 0);
   let current = installation;
   const adoptCurrent = (row: InstallationRow) => {
     current = row;
@@ -267,8 +269,9 @@ async function ensureSession(installation: InstallationRow, env: Env, ctx: Execu
       adoptCurrent(afterLookup);
       continue;
     }
-    if (cached?.userId === expectedUserId && (cached.multiAccountConfigured || sessionUpgradeAttempted(current, cached))) {
-      touchLastSeen(current);
+    adoptCurrent(afterLookup);
+    if (cached?.userId === expectedUserId && (cached.multiAccountConfigured || sessionUpgradeAttempted(afterLookup, cached))) {
+      touchLastSeen(afterLookup);
       return cached;
     }
 

@@ -79,6 +79,7 @@ struct NativeRuntimeServicesTests {
 
         #expect(try await runtime.tick() == [wait.id])
         #expect(try await runtime.tick().isEmpty)
+        await runtime.waitRegistry.waitForDispatches()
         #expect(await engine.callCount == 1)
         #expect(await runtime.waitRegistry.wait(id: wait.id)?.status == .completed)
         await runtime.shutdown()
@@ -147,6 +148,50 @@ struct NativeRuntimeServicesTests {
         #expect(await engine.callCount == 0)
     }
 
+    @Test("Concurrent tick and cancel only returns a confirmed cancellation or conflict")
+    func concurrentTickAndCancelKeepsDurableOutcome() async throws {
+        let database = try DatabaseService(path: ":memory:")
+        try await insertBotAndThread(database)
+        let engine = RuntimeServicesFixtureEngine()
+        let coordinator = EngineCoordinatorActor(drivers: [engine], botFallbackChains: ["bot-a": ["fixture"]])
+        let engineSwitch = BotNativeEngineSwitchActor(database: database)
+        try await switchBotToNative(engineSwitch: engineSwitch)
+        let runtime = NativeRuntimeServices(
+            database: database,
+            engineCoordinator: coordinator,
+            engineSwitch: engineSwitch,
+            workspaceSource: EmptyRuntimeWorkspaceSource(),
+            processOwnershipSource: EmptyRuntimeProcessSource()
+        )
+        try await runtime.activate()
+        let wait = try await runtime.registerWait(
+            botId: "bot-a", threadId: "thread-a", prompt: "continue", predicate: .botIdle
+        )
+        let token = "bf_tok_wait_race"
+        let server = NativeCompanionServer(database: database, pairedTokens: [token], nativeRuntime: runtime)
+        let deleteTask = Task {
+            await server.handleRequest(CompanionHTTPRequest(
+                method: "DELETE",
+                path: "/api/waits/\(wait.id)",
+                headers: ["Authorization": "Bearer \(token)"]
+            ))
+        }
+        let tickTask = Task { try await runtime.tick() }
+
+        _ = try await tickTask.value
+        let response = await deleteTask.value
+        await runtime.waitRegistry.waitForDispatches()
+        let responseWait = try? response.decodeJSON(NativeEventWait.self)
+        let finalWait = await runtime.waitRegistry.wait(id: wait.id)
+        let persistedWait = try await database.loadNativeEventWaits().first { $0.id == wait.id }
+
+        #expect(response.statusCode == 409 || (response.statusCode == 200 && responseWait?.status == .cancelled))
+        #expect(finalWait != nil)
+        #expect(persistedWait == finalWait)
+        await server.stopListening()
+        await runtime.shutdown()
+    }
+
     @Test("Wait routes retain auth and stay absent when runtime composition is not injected")
     func waitRoutesRequireInjectedRuntimeAndBearer() async throws {
         let database = try DatabaseService(path: ":memory:")
@@ -162,7 +207,6 @@ struct NativeRuntimeServicesTests {
             workspaceSource: EmptyRuntimeWorkspaceSource(),
             processOwnershipSource: EmptyRuntimeProcessSource()
         )
-        try await runtime.activate()
         let server = NativeCompanionServer(database: database, pairedTokens: [token], nativeRuntime: runtime)
         let path = "/api/waits?botId=bot-a"
         let unauthorized = await server.handleRequest(CompanionHTTPRequest(method: "GET", path: path))
@@ -174,12 +218,14 @@ struct NativeRuntimeServicesTests {
         #expect(absent.statusCode == 404)
         #expect(absent.bodyString.contains("no_route"))
 
+        #expect(try await server.startListening(port: 0) != nil)
+
         let headers = ["Authorization": "Bearer \(token)"]
         let created = await server.handleRequest(CompanionHTTPRequest(
             method: "POST",
             path: "/api/waits",
             headers: headers,
-            jsonString: "{\"botId\":\"bot-a\",\"threadId\":\"thread-a\",\"prompt\":\"continue\",\"predicate\":{\"kind\":\"botIdle\"}}"
+            jsonString: "{\"botId\":\"bot-a\",\"threadId\":\"thread-a\",\"prompt\":\"continue\",\"predicate\":{\"kind\":\"fileExists\",\"relativePath\":\"output/complete.json\"}}"
         ))
         #expect(created.statusCode == 201)
         let wait = try created.decodeJSON(NativeEventWait.self)
@@ -188,6 +234,19 @@ struct NativeRuntimeServicesTests {
         let cancelled = await server.handleRequest(CompanionHTTPRequest(method: "DELETE", path: "/api/waits/\(wait.id)", headers: headers))
         #expect(cancelled.statusCode == 200)
         #expect(try cancelled.decodeJSON(NativeEventWait.self).status == .cancelled)
+
+        await server.stopListening()
+        #expect(try await server.startListening(port: 0) != nil)
+        let afterRestart = await server.handleRequest(CompanionHTTPRequest(
+            method: "POST",
+            path: "/api/waits",
+            headers: headers,
+            jsonString: "{\"botId\":\"bot-a\",\"threadId\":\"thread-a\",\"prompt\":\"continue after listener restart\",\"predicate\":{\"kind\":\"fileExists\",\"relativePath\":\"output/complete.json\"}}"
+        ))
+        #expect(afterRestart.statusCode == 201)
+        #expect(try afterRestart.decodeJSON(NativeEventWait.self).status == .pending)
+
+        await server.stopListening()
         await runtime.shutdown()
     }
 

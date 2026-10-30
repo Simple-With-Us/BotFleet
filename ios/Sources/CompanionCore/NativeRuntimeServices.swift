@@ -165,6 +165,9 @@ public actor NativeRuntimeServices {
             throw NativeRuntimeServicesError.unknownWait(id)
         }
         try requireActive()
+        guard cancelled.status == .cancelled else {
+            throw NativeRuntimeServicesError.waitAlreadyDispatched(id)
+        }
         return cancelled
     }
 
