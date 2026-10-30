@@ -16,7 +16,8 @@ The placement evidence checker and [sixteen recipes](../verification/placement.m
 - Focused Vitest run passed 54 tests across host identity, placement contract and job registry suites.
 - Node evidence/decommission run passed 36 tests.
 - The TypeScript contract test loads the same fixture bytes used by Swift `JobsTests`.
-- Swift tests and unsigned Apple builds require a Mac run; this Linux host has no Swift executable.
+- Isolated Mac validation passed 989 XCTest tests and 273 Swift Testing tests, including the shared jobs fixture, and an unsigned iOS Xcode build.
+- The full local `pnpm test` run failed: 61 failed, 12,171 passed and 33 skipped tests across 722 files.  The recorded env-path, credential and plugin groups account for 36 matching failure headers from the unchanged-base run; additional HTTP-state and ACP timeout failures are being rechecked.  This is not a green full-suite result, and hosted gates remain required.
 - No live host probes, inventory, installations, resource settings or deployments were performed.
 
 ## Update And Rollback
