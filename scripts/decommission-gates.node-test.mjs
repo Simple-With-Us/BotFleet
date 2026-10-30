@@ -43,6 +43,7 @@ const ALL_DONE = {
     "BF-2514": "Done",
   },
   evidence: {
+    "placement-evidence": true,
     "soak-24h-no-node": true,
     "replay-parity": true,
     "final-import-parity": true,
@@ -66,6 +67,14 @@ test("all gates green lets the decommission proceed", () => {
       { path: "deploy/linux-server/", why: "optional server deployment (BF-2544)" },
     ],
   });
+});
+
+test("placement evidence is human-only and never inferred from landed issues", () => {
+  assert.ok(HUMAN_ONLY_EVIDENCE.includes("placement-evidence"));
+  const state = buildGateState(linearNodes(ALL_DONE.issues), { inventoryClean: true });
+  assert.equal(state.evidence["placement-evidence"], false);
+  const { "placement-evidence": _removed, ...without } = ALL_DONE.evidence;
+  assert.deepEqual(evaluateGates({ ...ALL_DONE, evidence: without }).blockers.map((item) => item.split(":")[0]), ["evidence placement-evidence"]);
 });
 
 test("today's Phase 6 state is blocked, naming the unruled decision first", () => {

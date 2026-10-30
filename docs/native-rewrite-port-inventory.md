@@ -84,6 +84,8 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/env-path.ts` | GUI-launch PATH augmentation → app startup BF-2497 (Finder-launch env) |
 | `server/proxy-paths.ts`, `server/runtime-identity.ts` | Runtime path/identity → app startup BF-2497 |
 | `server/atomic.ts`, `server/store-guard.ts` | Atomic writes + corrupt-store guard → `DatabaseService` BF-2480 (SQLite transactions subsume both) |
+| `server/host-id.ts`, `shared/placement.ts` | Stable host identity and placement contracts → native host store / Swift worker under BF-2559 before Mac-local Node retirement; the optional Linux server retains its own identity and shared contract source under the Linux preservation gate.  Foundation fields and Swift job decoding land in BF-2596; `placement-evidence` stays human-only and unmet until the complete recipes pass. |
+| `server/opened-file.ts` | Root-owned path aliases and opened-file inode verification → native file-store validation alongside the BF-2559 host store; retained by the optional Linux server and placement evidence reader until replacement is verified. |
 | `electron/infisical-read.mjs`, `electron/server-target.mjs`, `electron/remote-credential-guard.mjs` + their `.node-test.mjs` twins | Out-of-harness vault read, the `local`/`remote` server target, and the remote-mode credential refusal (BF-2544) → `InfisicalResolver` + app settings BF-2506; the target choice becomes native settings and the refusal rule ports as a guard on the native credential path |
 
 ## 3. Storage → Phase 1 (BF-2480, BF-2495)

@@ -124,6 +124,10 @@ export const REQUIRED_ISSUES = [
 /** Evidence that lives outside Linear and must be asserted explicitly. */
 export const REQUIRED_EVIDENCE = [
   {
+    id: "placement-evidence",
+    why: "BF-2559's sixteen placement and headroom recipes pass scripts/check-placement-evidence.mjs, including Mac runs, authorized server fixture runs and both host inventories; a foundation contract or CI alone does not assert this evidence",
+  },
+  {
     id: "soak-24h-no-node",
     why: "Phase 5 exit: 24 hours with the Node harness stopped and its launchd job booted out, every bot answering",
   },

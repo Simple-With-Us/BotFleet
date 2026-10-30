@@ -1,0 +1,22 @@
+{
+  "evidence": {
+    "fresh-mac-only-install": false,
+    "server-first-placement": false,
+    "server-saturation-overflow": false,
+    "mac-high-cpu-accepted": false,
+    "both-hosts-pressure-queue": false,
+    "disconnect-no-duplicate": false,
+    "mode-change-fence": false,
+    "forced-takeover-and-return": false,
+    "settings-saved-vs-applied": false,
+    "headroom-enforced-mac": false,
+    "headroom-enforced-server": false,
+    "mount-loss-root-fallback": false,
+    "other-apps-unchanged": false,
+    "inventory-recorded": false,
+    "rollback-keeps-epoch": false,
+    "connect-and-revert-clean": false
+  },
+  "handRun": {},
+  "inventory": {}
+}
