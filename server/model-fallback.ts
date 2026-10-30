@@ -357,7 +357,7 @@ export function turnQuotaOrCapEvidence(
       const name = message.tool?.name ?? "";
       if (!/^error:/i.test(name)) continue;
       const text = name.replace(/^error:\s*/i, "").trim();
-      if (isTransientCapacityText(text)) return undefined;
+      if (isTransientCapacityProviderError(text)) continue;
       if (text && KNOWN_FAILURE_QUOTA_OR_CAP.test(text)) return { text, source: "provider-error" };
     }
   }
@@ -383,14 +383,19 @@ export function turnTransientCapacityEvidence(
   turnOk: boolean,
 ): TransientCapacityEvidence | undefined {
   if (!turnOk) {
+    let transientError: TransientCapacityEvidence | undefined;
     for (let i = messagesAfterUser.length - 1; i >= 0; i--) {
       const message = messagesAfterUser[i];
       if (message.role !== "bot" || message.kind !== "activity") continue;
       const name = message.tool?.name ?? "";
       if (!/^error:/i.test(name)) continue;
       const text = name.replace(/^error:\s*/i, "").trim();
-      return isTransientCapacityProviderError(text) ? { text, source: "provider-error" } : undefined;
+      if (EXPLICIT_HARD_QUOTA.test(text) || EXPLICIT_RESET_NOTICE.test(text) || isQuotaOrCapText(text)) return undefined;
+      if (!transientError && isTransientCapacityProviderError(text)) {
+        transientError = { text, source: "provider-error" };
+      }
     }
+    if (transientError) return transientError;
   }
   const botTexts = messagesAfterUser.filter(
     (message) => message.role === "bot" && message.kind === "text" && message.text !== undefined,
@@ -400,14 +405,14 @@ export function turnTransientCapacityEvidence(
 }
 
 /** Uses a provider's short retry hint when present and caps transient holds at
- * one minute so no rate signal becomes a durable quota cooldown. */
+ * five minutes so no rate signal becomes a durable quota cooldown. */
 export function transientCapacityRetryDelayMs(text: string): number {
-  const retry = text.match(/\b(?:retry[- ]after|try again in)\s*(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m)\b/i);
+  const retry = text.match(/\b(?:retry[- ]after:?|try again in)\s*(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m)?\b/i);
   if (!retry) return DEFAULT_TRANSIENT_CAPACITY_RETRY_MS;
   const amount = Number.parseInt(retry[1], 10);
-  const unit = retry[2].toLowerCase();
+  const unit = retry[2]?.toLowerCase() ?? "s";
   const milliseconds = amount * (unit.startsWith("m") ? 60_000 : 1_000);
-  return Math.max(0, Math.min(MAX_TRANSIENT_CAPACITY_RETRY_MS, milliseconds));
+  return Math.max(1_000, Math.min(MAX_TRANSIENT_CAPACITY_RETRY_MS, milliseconds));
 }
 
 /** The last message that actually started a turn — a human's "user" message,
@@ -906,7 +911,7 @@ export class TransientRouteHealthRegistry {
       return undefined;
     }
     const requestedDelay = Number.isFinite(retryAfterMs) ? retryAfterMs : DEFAULT_TRANSIENT_CAPACITY_RETRY_MS;
-    const boundedDelay = Math.max(0, Math.min(MAX_TRANSIENT_CAPACITY_RETRY_MS, requestedDelay));
+    const boundedDelay = Math.max(1_000, Math.min(MAX_TRANSIENT_CAPACITY_RETRY_MS, requestedDelay));
     const route: TransientRouteCapacity = { botId, instanceId, model, error, recordedAt: now, retryAt: now + boundedDelay };
     const holds = this.routes.get(key) ?? new Map<string, TransientRouteCapacity>();
     holds.set(botId, route);

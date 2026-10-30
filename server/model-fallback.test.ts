@@ -391,12 +391,42 @@ describe("quota and session-limit failover", () => {
     expect(transientCapacityRetryDelayMs("API request failed: 429 rate limit reached · retry after 45s")).toBe(45_000);
     expect(transientCapacityRetryDelayMs("concurrency limit reached; retry after 120s")).toBe(120_000);
     expect(transientCapacityRetryDelayMs("concurrency limit reached; try again in 10 minutes")).toBe(300_000);
+    expect(transientCapacityRetryDelayMs("concurrency limit reached; retry-after: 0")).toBe(1_000);
     expect(transientCapacityRetryDelayMs("concurrency limit reached")).toBe(5_000);
     expect(parseQuotaResetTime("API request failed: 429 rate limit reached · retry after 45s", 1_000, true)).toEqual({
       isQuotaOrCap: true,
       resetsAt: 46_000,
       rawTimeText: "retry after 45s",
     });
+  });
+
+  it("keeps an earlier transient error when a later generic error is not capacity evidence", () => {
+    const transient = "concurrency limit reached; retry after 10s";
+    const hardQuota = "quota exceeded for the plan";
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: "error: request failed: transport closed", ok: false } },
+    ], false)).toEqual({ text: transient, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toBeUndefined();
+    expect(turnQuotaOrCapEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+    ], false)).toEqual({ text: hardQuota, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+    ], false)).toBeUndefined();
+    expect(turnQuotaOrCapEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toEqual({ text: hardQuota, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toBeUndefined();
   });
 
   it("keeps an explicit hard quota ahead of concurrent-cap wording and treats reset chips as hard", () => {
@@ -1305,6 +1335,7 @@ describe("TransientRouteHealthRegistry", () => {
     expect(health.get("claude2", "claude-sonnet-5", 2_000)).toBeUndefined();
     expect(health.get("claude", "claude-opus-5", 2_000)).toBeUndefined();
     expect(health.get("claude", "claude-sonnet-5", 6_000)).toBeUndefined();
+    expect(health.recordFailure("bot-b", "claude", "claude-sonnet-5", "retry after 0", 7_000, 0)?.retryAt).toBe(8_000);
   });
 
   it("uses four other bots' recent same-route health to suppress transient holds, not hard quota", () => {

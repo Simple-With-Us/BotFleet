@@ -4,7 +4,7 @@ Refs BF-2589.
 
 Muse's ACP adapter exposes hooks, reminder children, workflows and subagents as public tool items.  Different items can share a title such as `hookRun: inProgress`, and a tool can arrive with its final status and output on the initial notification.  The harness previously counted those status-only titles as repeated calls, ignored initial terminal statuses and retained the initial title after completion.
 
-The ACP driver now completes initially terminal tools immediately, records their result and keeps them out of its open-call set.  A title supplied with a terminal update reaches the transcript row.  The repeat detector ignores the known status-only lifecycle titles in its title fallback while continuing to count actual tool arguments and commands.
+The ACP driver now completes initially terminal tools immediately, records their result and keeps them out of its open-call set.  A bounded per-prompt record suppresses redundant terminal notifications without reopening the call.  A title supplied with a terminal update reaches the transcript row.  The repeat detector ignores the known status-only lifecycle titles in its title fallback while continuing to count actual tool arguments and commands.
 
 The shared role prompt also explains the existing separation between BotFleet identities and registered lane seats.  A refused role preserves its identity, uses an existing assigned repository workspace when available, or hands off the exact blocker to a registered coding seat.  Repository and temporary-directory guards remain enforced.
 
@@ -13,6 +13,8 @@ Scheduled and webhook work with a saved fallback chain now stays queued while it
 Concurrency, in-flight session limits and ambiguous rate-limit refusals use a separate, short-lived capacity hold.  The default retry is five seconds; an explicit retry delay is respected up to five minutes.  Recent successful activity from another active bot on the same provider instance and exact model can prevent that hold, and subsequent healthy output, a successful real tool or a successful turn clears it.  A different model or connection does not count as evidence for that route.  Stream prefixes are accumulated before counting activity so fragmented error messages do not look like successful output.  Helper activity, generic lifecycle items and synthetic notices do not establish the parent model's health.
 
 Explicit plan, usage, spend, credit and billing exhaustion retain quota handling and reset times.  Healthy sibling activity clears only transient capacity holds; it does not erase a hard quota hold.  Existing provider-error cooldowns created from transient refusals are discarded when their saved reset was the synthetic default rather than an explicit provider reset.
+
+Hard quota evidence is retained regardless of provider-error order within a failed turn.  Generic follow-up errors do not hide an earlier concurrency refusal.  Retry hints have a one-second minimum, and saturated stream prefixes reuse their classification rather than repeating the error regexes for every later chunk.
 
 Status reporting does not cap a Muse workflow or prove that a long turn has finished.  The generic lifecycle labels alone do not identify repeated commands, so actual argument-based repeat detection remains enabled.  This change does not substitute another provider's model for a saved selection.
 

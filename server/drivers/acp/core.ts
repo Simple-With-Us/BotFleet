@@ -85,6 +85,8 @@ import { applyLaunchIdentity } from "../../launch-identity.ts";
 import { hostToolPrefix, turnComputerMounts } from "../../computer-grants.ts";
 import { augmentedPath } from "../../env-path.ts";
 
+const MAX_SETTLED_TOOL_CALLS_PER_PROMPT = 1_024;
+
 // Resolved from the server root, never relative to this file: bundling inlines
 // this module two directories up, so the `".."` pair here would climb past the
 // packaged server dir entirely. See server/proxy-paths.ts.
@@ -1134,6 +1136,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // fingerprint is held (never the text, which can be a whole file), and
         // it is dropped as the call ends.
         const toolInputs = new Map<string, string>();
+        // Adapters may repeat a terminal update after an initially terminal
+        // tool_call. Keep bounded IDs for this prompt so duplicates cannot
+        // create a second completion row.
+        const settledToolCalls = new Set<string>();
+        const rememberSettledToolCall = (toolCallId: string) => {
+          settledToolCalls.add(toolCallId);
+          if (settledToolCalls.size > MAX_SETTLED_TOOL_CALLS_PER_PROMPT) {
+            const oldest = settledToolCalls.values().next().value;
+            if (oldest !== undefined) settledToolCalls.delete(oldest);
+          }
+        };
         let nextId = 1;
         let sessionId: string | null = null;
         let interruptTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1690,11 +1703,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               const bypassedBy = gate?.bypassed(u);
               if (bypassedBy) return tripAllowlist(bypassedBy);
               const isTerminal = u.status === "completed" || u.status === "failed";
+              const parsedToolCallId = z.string().max(256).safeParse(u.toolCallId);
+              const toolCallId = parsedToolCallId.success ? parsedToolCallId.data : undefined;
+              if (toolCallId !== undefined && settledToolCalls.has(toolCallId)) break;
               // prepared once: the same text is filed with the event and
               // fingerprinted for the update that may follow
               const announced = "rawInput" in u ? prepareInput(u.rawInput) : undefined;
-              const parsedToolCallId = z.string().max(256).safeParse(u.toolCallId);
-              const toolCallId = parsedToolCallId.success ? parsedToolCallId.data : undefined;
               if (toolCallId !== undefined) {
                 if (isTerminal) {
                   openToolCalls.delete(toolCallId);
@@ -1741,6 +1755,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   title: parsedTerminalTitle.success ? parsedTerminalTitle.data : undefined,
                   ...capturePreparedBoth(undefined, output),
                 });
+                if (toolCallId !== undefined) rememberSettledToolCall(toolCallId);
               }
               break;
             }
@@ -1751,6 +1766,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // at any status: take it when it is new text for this call.
               const parsedToolCallId = z.string().max(256).safeParse(u.toolCallId);
               const toolCallId = parsedToolCallId.success ? parsedToolCallId.data : undefined;
+              if (toolCallId !== undefined && settledToolCalls.has(toolCallId)) break;
               const settled = toolCallId !== undefined && "rawInput" in u ? prepareInput(u.rawInput) : undefined;
               const settledSignature = settled === undefined ? undefined : textSignature(settled.text);
               const newInput = settled !== undefined && toolCallId !== undefined && toolInputs.get(toolCallId) !== settledSignature ? settled : undefined;
@@ -1759,6 +1775,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 if (toolCallId !== undefined) {
                   openToolCalls.delete(toolCallId);
                   toolInputs.delete(toolCallId);
+                  rememberSettledToolCall(toolCallId);
                 }
                 const parsedTerminalTitle = z.string().max(256).safeParse(u.title);
                 emit({

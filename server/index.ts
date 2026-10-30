@@ -1776,12 +1776,12 @@ function dispatchHoldFor(
 
   // A Box-backed run has its own executor and bypasses this model-route hold.
   if (!boxCloud && policy.fallbacks?.length && modelRoute?.transientCapacity && !modelRoute.cooldown && !modelRoute.isFallback) {
-    const hint = `No saved route currently has capacity; the queued run will retry automatically after a brief backoff or healthy activity on the same route`;
-    return { reason: `${engine} is temporarily at capacity — ${hint}`, hint };
+    const hint = `This queued run will start automatically when a model has room.`;
+    return { reason: `${engine} is temporarily at capacity.\u00a0 ${hint}`, hint };
   }
   if (!boxCloud && policy.fallbacks?.length && modelRoute?.cooldown && !modelRoute.isFallback) {
-    const hint = `The primary model is cooling down and no saved fallback is available; the queued run will retry automatically when the cooldown clears`;
-    return { reason: `${engine} is cooling down — ${hint}`, hint };
+    const hint = `This queued run will start automatically when a model becomes available.`;
+    return { reason: `${engine} is cooling down after reaching its limit.\u00a0 ${hint}`, hint };
   }
 
   // A (bot, engine) pair that has failed to START repeatedly is not going to
@@ -5964,7 +5964,9 @@ bus.subscribe((event: RuntimeEvent) => {
         const structuredQuotaOrCap = quotaOrCapFromErrorCode(providerErrorCodeFromStopReason(event.stopReason));
         const quotaEvidence = turnQuotaOrCapEvidence(afterUser, Boolean(event.ok));
         const capacityEvidence = turnTransientCapacityEvidence(afterUser, Boolean(event.ok));
-        const quotaOrCap = capacityEvidence ? false : structuredQuotaOrCap ?? Boolean(quotaEvidence);
+        // HTTP 429 shares a structured code with quota failures, so explicit
+        // hard-quota text takes precedence while a pure capacity refusal stays transient.
+        const quotaOrCap = capacityEvidence ? Boolean(quotaEvidence) : structuredQuotaOrCap ?? Boolean(quotaEvidence);
         const fallbackCapacityHit = quotaOrCap || Boolean(capacityEvidence);
         const quotaText = (quotaEvidence?.text ?? reply) || lastMsgText;
         const quotaInfo = parseQuotaResetTime(quotaText, Date.now(), quotaOrCap);

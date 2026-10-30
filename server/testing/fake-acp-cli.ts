@@ -5,7 +5,7 @@
 // session/prompt, and streams session/update notifications for a scripted
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
-//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | exit-with-lingering-child | happy-with-lingering-child | resume-fails | no-auth | auth-required | permission | initial-terminal-tool-call | refreshed-tool-title
+//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | exit-with-lingering-child | happy-with-lingering-child | resume-fails | no-auth | auth-required | permission | initial-terminal-tool-call | update-only-tool-call | refreshed-tool-title
 //                   | interleave (message → tool → message → tool → message)
 //                   | exit-with-lingering-child (the leader exits before the
 //                     prompt result while a SIGTERM-ignoring descendant stays
@@ -894,8 +894,7 @@ function handle(rawMsg: unknown, resumed = false) {
         return;
       }
       if (mode === "initial-terminal-tool-call") {
-        // Muse's public adapter can put the terminal state and output on the
-        // initial tool_call notification, without a later tool_call_update.
+        // Muse's public adapter can put terminal state/output on tool_call and repeat it in a terminal update.
         const status = process.env.FAKE_ACP_TERMINAL_STATUS === "failed" ? "failed" : "completed";
         const output = [{ type: "content", content: { type: "text", text: status === "failed" ? "hook rejected" : "hook ran" } }];
         out({
@@ -910,6 +909,38 @@ function handle(rawMsg: unknown, resumed = false) {
               status,
               rawInput: { hook: "Run" },
               content: output,
+            },
+          },
+        });
+        // Follow it with the adapter's redundant terminal update for the same toolCallId.
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "initial-terminal-1",
+              title: status === "failed" ? "hookRun: failed" : "hookRun: completed",
+              status,
+              content: output,
+            },
+          },
+        });
+        complete();
+        return;
+      }
+      if (mode === "update-only-tool-call") {
+        // Some ACP adapters only report the tool's terminal update.
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "update-only-1",
+              title: "hookRun: completed",
+              status: "completed",
+              content: [{ type: "content", content: { type: "text", text: "hook ran" } }],
             },
           },
         });

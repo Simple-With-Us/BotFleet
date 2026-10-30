@@ -1210,6 +1210,7 @@ describe("ACP turns (fake CLI)", () => {
     expect(doneTurn).toMatchObject({ ok: true });
     const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "initial-terminal-1");
     const completed = recorder.events.find((event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "initial-terminal-1");
+    expect(recorder.events.filter((event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "initial-terminal-1")).toHaveLength(1);
     expect(started).toMatchObject({ title: `hookRun: ${status}` });
     expect(started?.io?.input?.text).toContain('"hook": "Run"');
     expect(completed).toMatchObject({
@@ -1219,6 +1220,17 @@ describe("ACP turns (fake CLI)", () => {
       io: { output: { text: status === "completed" ? "hook ran" : "hook rejected" } },
     });
     expect(completed?.io?.input).toBeUndefined();
+  });
+
+  it("settles a tool_call_update that has no earlier tool_call", async () => {
+    await create(GrokAgentDriver, "update-only-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-update-only-tool-call", text: "run the hook" });
+
+    await expect(recorder.until((event) => event.type === "turn.completed", 3_000)).resolves.toMatchObject({ ok: true });
+    const completions = recorder.events.filter((event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "update-only-1");
+    expect(completions).toHaveLength(1);
+    expect(completions[0]).toMatchObject({ ok: true, title: "hookRun: completed", detail: "hook ran" });
+    expect(recorder.events.some((event) => event.type === "item.started" && event.itemId === "update-only-1")).toBe(false);
   });
 
   it("uses a truthful terminal title from tool_call_update", async () => {

@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ProviderRouteActivity } from "./provider-route-activity.ts";
 import { isTransientCapacityChip, transientCapacityRetryDelayMs } from "./model-fallback.ts";
+import * as modelFallback from "./model-fallback.ts";
 import type { RuntimeEvent } from "./contracts.ts";
 
 type ToolStart = Extract<RuntimeEvent, { type: "item.started" }>;
@@ -44,6 +45,45 @@ describe("provider route activity evidence", () => {
     expect(evidence.observe(sibling, "assistant_text", "The next test is running.")).toBe(true);
     expect(evidence.observe(failing, "assistant_text", "429: concurrency limit reached")).toBe(false);
     expect(evidence.observe(failing, "reasoning_text", "Checking the source.")).toBe(true);
+  });
+
+  it("reuses classification after a stream prefix fills without changing its verdict", () => {
+    const evidence = new ProviderRouteActivity();
+    const classifier = vi.spyOn(modelFallback, "isShortProviderErrorText");
+    try {
+      for (const [dispatchId, prefix, expected] of [
+        [1, "The build is running. ".padEnd(512, "x"), true],
+        [2, "HTTP 429: Too Many Requests".padEnd(512, "x"), false],
+      ] as const) {
+        const owner = { dispatchId };
+        classifier.mockClear();
+        expect(evidence.observe(owner, "assistant_text", prefix)).toBe(expected);
+        for (let index = 0; index < 20; index++) expect(evidence.observe(owner, "assistant_text", "more output")).toBe(expected);
+        expect(classifier).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      classifier.mockRestore();
+    }
+  });
+
+  it("reuses unchanged trimmed prefixes while still classifying new fragments", () => {
+    const evidence = new ProviderRouteActivity();
+    const owner = { dispatchId: 1 };
+    const classifier = vi.spyOn(modelFallback, "isShortProviderErrorText");
+    try {
+      expect(evidence.observe(owner, "assistant_text", "H")).toBe(false);
+      expect(evidence.observe(owner, "assistant_text", "")).toBe(false);
+      expect(classifier).toHaveBeenCalledTimes(1);
+      expect(evidence.observe(owner, "assistant_text", "ello")).toBe(true);
+      expect(classifier).toHaveBeenCalledTimes(2);
+      expect(evidence.observe(owner, "assistant_text", " \n")).toBe(true);
+      expect(classifier).toHaveBeenCalledTimes(2);
+      expect(evidence.observe(owner, "reasoning_text", "HTTP ")).toBe(false);
+      expect(evidence.observe(owner, "reasoning_text", "429: Too Many Requests")).toBe(false);
+      expect(classifier).toHaveBeenCalledTimes(4);
+    } finally {
+      classifier.mockRestore();
+    }
   });
 
   it("counts only a matching successful tool completion once on its dispatch", () => {
@@ -94,6 +134,29 @@ describe("provider route activity evidence", () => {
     evidence.observeTool(owner, toolStart());
     expect(evidence.observeTool(owner, toolCompletion({ itemId: "other" }))).toBe(false);
     expect(evidence.observeTool(owner, toolCompletion())).toBe(true);
+  });
+
+  it("accepts optional turn ids within the same dispatch and keeps helper collisions separate", () => {
+    const evidence = new ProviderRouteActivity();
+    const owner = { dispatchId: 1 };
+    evidence.observeTool(owner, toolStart({ turnId: undefined }));
+    expect(evidence.observeTool(owner, toolCompletion())).toBe(true);
+    evidence.observeTool(owner, toolStart());
+    expect(evidence.observeTool(owner, toolCompletion({ turnId: undefined }))).toBe(true);
+    evidence.observeTool(owner, toolStart());
+    evidence.observeTool(owner, toolStart({ parentItemId: "helper", subagentId: "helper" }));
+    expect(evidence.observeTool(owner, toolCompletion({ subagentId: "helper" }))).toBe(false);
+    expect(evidence.observeTool(owner, toolCompletion())).toBe(true);
+    evidence.observeTool(owner, toolStart());
+    evidence.observeTool(owner, toolStart({ toolKind: "notice" }));
+    expect(evidence.observeTool(owner, toolCompletion())).toBe(false);
+  });
+
+  it("counts real tool names that merely share a lifecycle prefix", () => {
+    const evidence = new ProviderRouteActivity();
+    const owner = { dispatchId: 1 };
+    evidence.observeTool(owner, toolStart({ title: "workflowSearch" }));
+    expect(evidence.observeTool(owner, toolCompletion({ title: "workflowSearch" }))).toBe(true);
   });
 
   it("bounds unfinished tool tracking per dispatch while retaining recent starts", () => {
