@@ -651,6 +651,7 @@ struct NativeCompanionPairingContractTests {
     @Test("Device names and pairRequestIds follow the Node sidecar's rules")
     func deviceNameAndPairRequestIdRules() {
         #expect(NativeCompanionServer.cleanDeviceName("  Ada's\u{0007}iPhone\n ") == "Ada's iPhone")
+        #expect(NativeCompanionServer.cleanDeviceName("A\u{007F}\u{0085}\u{009F}\u{2028}\u{2029}B") == "A     B")
         #expect(NativeCompanionServer.cleanDeviceName(nil) == "Companion")
         #expect(NativeCompanionServer.cleanDeviceName(String(repeating: "x", count: 80)).count == 60)
 

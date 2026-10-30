@@ -659,7 +659,9 @@ public actor NativeCompanionServer {
         let space: Unicode.Scalar = " "
         var scalars = String.UnicodeScalarView()
         for scalar in (raw ?? "").unicodeScalars {
-            scalars.append(scalar.value < 0x20 || scalar.value == 0x7F ? space : scalar)
+            let value = scalar.value
+            let isControl = value < 0x20 || (0x7F...0x9F).contains(value) || value == 0x2028 || value == 0x2029
+            scalars.append(isControl ? space : scalar)
         }
         let trimmed = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
         let name = String(trimmed.prefix(60))
