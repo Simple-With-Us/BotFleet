@@ -543,7 +543,7 @@ export function buildTurnEvents(
 
   const priced = cost != null;
   const call = params.billedCall;
-  const exactCall = call && childSessionId && params.driverKind === "claudeAgent" &&
+  const exactCall = usageReported && call && childSessionId && params.driverKind === "claudeAgent" &&
     provider === "anthropic" && servedModel === call.model &&
     [call.input, call.output, call.cacheRead, call.cacheWrite].every((value) => Number.isSafeInteger(value) && value >= 0) &&
     call.input + call.cacheRead + call.cacheWrite === inTokens &&

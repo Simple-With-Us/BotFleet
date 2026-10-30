@@ -44,6 +44,17 @@ describe("exact single-call coverage receipt", () => {
   it("forwards the driver's proof through shared one-to-one and room usage details", () => {
     expect(turnUsageDetail({ billedCall: proof }, undefined, undefined).billedCall).toBe(proof);
   });
+
+  it("keeps zero-token unreported turns outside billed-call coverage", () => {
+    const [event] = buildTurnEvents({ ...params,
+      inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWrite5mTokens: 0,
+      billedCall: { ...proof, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    expect(event.eventId).not.toMatch(/^bf-call-v1:/);
+    expect(event.metadata).not.toHaveProperty("billedCallProofVersion");
+    expect(event.metadata?.usageReported).toBe(false);
+    expect(event.ai).toBeUndefined();
+  });
 });
 
 import {
