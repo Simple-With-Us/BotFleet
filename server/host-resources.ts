@@ -90,6 +90,8 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
   const read = deps.readText ?? ((path: string) => readFileSync(path, "utf8"));
   const safeRead = (path: string): string | null => { try { return read(path).trim(); } catch { return null; } };
   const sample = deps.probe.capacitySample(deps.dataDir);
+  const storage = deps.probe.storageState?.() ?? null;
+  const thresholds = deps.thresholds();
   const enforcement: HostResourcesReport["enforcement"] = {
     cpu: { kind: "priorityOnly" }, memory: gate(), swap: gate(), disk: gate(),
     inodes: unsupported("No inode admission gate is active"),
@@ -102,6 +104,9 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
     enforcement.memory = enforcement.swap = { kind: "notApplied", reason: "Swap reading unavailable; admission permits unknown readings", restartRequired: false };
   }
   if (sample.diskFreeBytes === null) enforcement.disk = { kind: "notApplied", reason: "Disk reading unavailable; admission permits unknown readings", restartRequired: false };
+  if (thresholds.minFreeInodes !== undefined) enforcement.inodes = sample.inodesFree !== null
+    ? gate() : { kind: "notApplied", reason: "Inode reading unavailable; admission permits unknown readings", restartRequired: false };
+  if (storage?.online === false) enforcement.disk = { kind: "notApplied", reason: "Server storage offline; new jobs are refused", restartRequired: false };
   const observedLimits: Record<string, string | null> = Object.fromEntries(CGROUP_FILES.map((file) => [file, null]));
   const limitations = [
     "Memory admission currently checks swap, not an aggregate RAM budget",
@@ -140,8 +145,8 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
   return {
     hostId: deps.hostId, version: deps.version, platform: deps.platform,
     capabilities: deps.platform === "darwin" ? ["shell", "macos", "desktop"] : ["shell"],
-    sample,
-    admission: { ...deps.thresholds(), unknownReading: "admit" },
+    sample, storage,
+    admission: { ...thresholds, unknownReading: "admit" },
     enforcement, observedLimits, limitations,
   };
 }

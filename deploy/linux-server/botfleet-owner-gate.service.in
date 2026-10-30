@@ -2,6 +2,8 @@
 Description=BotFleet owner gate (Tailscale identity reverse proxy in front of the harness)
 Documentation=https://github.com/Simple-With-Us/BotFleet
 After=botfleet-server.service
+RequiresMountsFor=@BF_VOLUME@
+ConditionPathIsMountPoint=@BF_VOLUME@
 
 [Service]
 Type=simple
@@ -21,8 +23,9 @@ Environment="PATH=@BF_ROOT@/node/bin:@BF_ROOT@/home/.local/bin:/usr/local/bin:/u
 # this read-only Infisical service token: a regular file owned by the service
 # user, mode 0600.
 ExecStart=@NODE_BIN@ @BF_CODE@/deploy/linux-server/owner-gate.mjs --bootstrap-token-file @BF_ROOT@/config/infisical-read-token
-StandardOutput=append:@BF_ROOT@/logs/owner-gate.log
-StandardError=append:@BF_ROOT@/logs/owner-gate.log
+ExecStartPre=@NODE_BIN@ @BF_ROOT@/bin/check-storage.mjs @BF_ROOT@/data
+StandardOutput=journal
+StandardError=journal
 Restart=on-failure
 RestartSec=10
 KillMode=mixed
@@ -36,9 +39,12 @@ ProtectSystem=strict
 # /home and /root stay read-only.
 ProtectHome=read-only
 # The fleet volume is the only writable path.
-ReadWritePaths=/mnt/fleet-extra
-# A private /tmp for this unit.
-PrivateTmp=yes
+ReadWritePaths=@BF_VOLUME@
+# Retain the volume inside this unit until it stops for maintenance.
+BindPaths=@BF_VOLUME@
+MountFlags=private
+PrivateTmp=no
+BindPaths=@BF_ROOT@/tmp:/tmp @BF_ROOT@/var-tmp:/var/tmp
 # Kernel tunables stay read-only.
 ProtectKernelTunables=yes
 # The cgroup file system stays read-only.

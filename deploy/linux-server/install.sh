@@ -58,7 +58,7 @@ note "code: $BF_CODE"
 # --------------------------------------------------------------------------
 
 say "creating the runtime tree under $BF_ROOT"
-for dir in home data logs tmp config workdir node; do
+for dir in home data logs tmp var-tmp config workdir node bin; do
   run mkdir -p "$BF_ROOT/$dir"
 done
 run mkdir -p "$PNPM_STORE_DIR"
@@ -73,9 +73,9 @@ if ! id -u "$BF_USER" >/dev/null 2>&1; then
 fi
 
 run chown "$BF_USER:$BF_GROUP" "$BF_ROOT" "$BF_ROOT/home" "$BF_ROOT/data" "$BF_ROOT/logs" \
-  "$BF_ROOT/tmp" "$BF_ROOT/config" "$BF_ROOT/workdir" "$BF_ROOT/node"
+  "$BF_ROOT/tmp" "$BF_ROOT/var-tmp" "$BF_ROOT/config" "$BF_ROOT/workdir" "$BF_ROOT/node" "$BF_ROOT/bin"
 run chmod 2770 "$BF_ROOT" "$BF_ROOT/home" "$BF_ROOT/data" "$BF_ROOT/logs" \
-  "$BF_ROOT/tmp" "$BF_ROOT/config" "$BF_ROOT/workdir" "$BF_ROOT/node"
+  "$BF_ROOT/tmp" "$BF_ROOT/var-tmp" "$BF_ROOT/config" "$BF_ROOT/workdir" "$BF_ROOT/node" "$BF_ROOT/bin"
 # The pnpm store is shared by every host on the fleet volume and is owned by
 # root:fleet, so it is created when it is missing and never re-owned here.
 
@@ -213,16 +213,19 @@ render_unit() {
     note "would render ${src} into ${dst}"
     return 0
   fi
-  sed -e "s|@BF_USER@|$BF_USER|g" \
-    -e "s|@BF_GROUP@|$BF_GROUP|g" \
-    -e "s|@BF_ROOT@|$BF_ROOT|g" \
-    -e "s|@BF_CODE@|$BF_CODE|g" \
-    -e "s|@NODE_BIN@|$BF_ROOT/node/bin/node|g" \
-    "$src" >"$dst"
-  chmod 0644 "$dst"
+  "$BF_ROOT/node/bin/node" --experimental-strip-types "$SCRIPT_DIR/render-resources.mjs" --write-unit "$(basename "$src")"
 }
 
 say "installing the systemd units"
+for helper in start.sh check-storage.mjs; do
+  run install -m 0755 -o "$BF_USER" -g "$BF_GROUP" "$SCRIPT_DIR/$helper" "$BF_ROOT/bin/$helper"
+done
+export BF_VOLUME BF_ROOT BF_CODE BF_USER BF_GROUP
+if [ "$DRY_RUN" -eq 1 ]; then
+  run "$BF_ROOT/node/bin/node" --experimental-strip-types "$SCRIPT_DIR/render-resources.mjs" --dry-run
+else
+  "$BF_ROOT/node/bin/node" --experimental-strip-types "$SCRIPT_DIR/render-resources.mjs" --write
+fi
 render_unit "$SCRIPT_DIR/botfleet-server.service.in" "/etc/systemd/system/$SERVER_UNIT"
 render_unit "$SCRIPT_DIR/botfleet-owner-gate.service.in" "/etc/systemd/system/$GATE_UNIT"
 run systemctl daemon-reload
