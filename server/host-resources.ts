@@ -16,11 +16,29 @@ export interface HostResourcesDeps {
 export type HostResourcesResponse =
   | { status: 200; body: HostResourcesReport }
   | { status: 403 | 501; body: { error: string } };
+interface HostResourceCaller { localOwner: boolean; fromCompanion: boolean; viaNamedTunnel: boolean }
+type HostResourcesEndpointDeps = Omit<HostResourcesDeps, "platform"> & { platform: NodeJS.Platform };
+type HostResourceSampler = (deps: HostResourcesDeps) => HostResourcesReport;
+
+/** Bound repeated owner requests without adding a timer or a stale config view. */
+export function createHostResourcesResponder(deps: HostResourcesEndpointDeps, now = () => performance.now()) {
+  let cached: { at: number; settings: string; report: HostResourcesReport } | undefined;
+  const sample: HostResourceSampler = (supported) => {
+    const at = now();
+    const settings = JSON.stringify(supported.thresholds());
+    if (cached && at >= cached.at && at - cached.at < 1000 && cached.settings === settings) return cached.report;
+    const report = hostResourcesReport(supported);
+    cached = { at, settings, report };
+    return report;
+  };
+  return (caller: HostResourceCaller) => hostResourcesResponse(caller, deps, sample);
+}
 
 /** The companion bearer is intentionally outside the host-owner boundary. */
 export function hostResourcesResponse(
-  caller: { localOwner: boolean; fromCompanion: boolean; viaNamedTunnel: boolean },
-  deps: Omit<HostResourcesDeps, "platform"> & { platform: NodeJS.Platform },
+  caller: HostResourceCaller,
+  deps: HostResourcesEndpointDeps,
+  sample: HostResourceSampler = hostResourcesReport,
 ): HostResourcesResponse {
   if (!caller.localOwner || caller.fromCompanion || caller.viaNamedTunnel) {
     return { status: 403, body: { error: "Host resources are available only through the local owner or authenticated server gate" } };
@@ -28,7 +46,7 @@ export function hostResourcesResponse(
   if (deps.platform !== "darwin" && deps.platform !== "linux") {
     return { status: 501, body: { error: "Host resource reporting is not available on this platform" } };
   }
-  return { status: 200, body: hostResourcesReport({ ...deps, platform: deps.platform }) };
+  return { status: 200, body: sample({ ...deps, platform: deps.platform }) };
 }
 
 /** Resolve only this process's unified cgroup, respecting the mount's root. */
@@ -84,7 +102,7 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
     enforcement.memory = enforcement.swap = { kind: "notApplied", reason: "Swap reading unavailable; admission permits unknown readings", restartRequired: false };
   }
   if (sample.diskFreeBytes === null) enforcement.disk = { kind: "notApplied", reason: "Disk reading unavailable; admission permits unknown readings", restartRequired: false };
-  const observedLimits: Record<string, string | null> = {};
+  const observedLimits: Record<string, string | null> = Object.fromEntries(CGROUP_FILES.map((file) => [file, null]));
   const limitations = [
     "Memory admission currently checks swap, not an aggregate RAM budget",
     "Disk is an admission gate; no disk quota is observed",

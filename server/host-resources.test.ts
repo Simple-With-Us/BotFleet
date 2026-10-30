@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { denyReason } from "../companion/src/routes.ts";
 import { createHostProbe, type CapacityHostProbe } from "./jobs/admission.ts";
-import { hostResourcesReport, hostResourcesResponse, ioDeviceForVolume, ownCgroupDirectory, type HostResourcesDeps } from "./host-resources.ts";
+import { createHostResourcesResponder, hostResourcesReport, hostResourcesResponse, ioDeviceForVolume, ownCgroupDirectory, type HostResourcesDeps } from "./host-resources.ts";
 
 const cgroupMount = "29 24 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw";
 const meminfo = "MemTotal: 16777216 kB\nMemAvailable: 8388608 kB\nSwapTotal: 4194304 kB\nSwapFree: 3145728 kB\n";
@@ -128,6 +128,8 @@ describe("observed enforcement", () => {
     expect(report.capabilities).toEqual(["shell", "macos", "desktop"]);
     expect(Object.values(report.enforcement).some((state) => state.kind === "kernelCap")).toBe(false);
     expect(report.enforcement.cpu.kind).toBe("priorityOnly");
+    expect(Object.keys(report.observedLimits)).toHaveLength(7);
+    expect(Object.values(report.observedLimits).every((value) => value === null)).toBe(true);
   });
 
   it("does not label unreadable admission probes as active protection", () => {
@@ -143,6 +145,35 @@ describe("observed enforcement", () => {
 });
 
 describe("host owner route boundary", () => {
+  it("reuses one snapshot for repeated owner requests, invalidating on age or admission changes", () => {
+    const d = deps();
+    const read = vi.fn(d.readText!);
+    const capacitySample = vi.fn(d.probe.capacitySample.bind(d.probe));
+    let at = 0;
+    let floor = 1234;
+    const responder = createHostResourcesResponder({ ...d, readText: read,
+      probe: { ...d.probe, capacitySample }, thresholds: () => ({ maxSwapPercent: 91, minFreeDiskBytes: floor }) }, () => at);
+    const owner = { localOwner: true, fromCompanion: false, viaNamedTunnel: false };
+    expect(responder({ ...owner, fromCompanion: true }).status).toBe(403);
+    expect(read).not.toHaveBeenCalled();
+    expect(capacitySample).not.toHaveBeenCalled();
+    const first = responder(owner);
+    const reads = read.mock.calls.length;
+    for (let i = 0; i < 50; i++) expect(responder(owner)).toEqual(first);
+    expect(read).toHaveBeenCalledTimes(reads);
+    expect(capacitySample).toHaveBeenCalledTimes(1);
+    at = 1000;
+    responder(owner);
+    expect(capacitySample).toHaveBeenCalledTimes(2);
+    floor = 5678;
+    const updated = responder(owner);
+    expect(updated.status === 200 && updated.body.admission.minFreeDiskBytes).toBe(5678);
+    expect(capacitySample).toHaveBeenCalledTimes(3);
+    at = 1;
+    responder(owner);
+    expect(capacitySample).toHaveBeenCalledTimes(4);
+  });
+
   it("refuses remote, companion and named-tunnel callers before any sampling", () => {
     const p: CapacityHostProbe = { capacitySample: () => { throw new Error("must not sample"); }, swapUsedPercent: () => null, freeDiskBytes: () => null };
     for (const caller of [

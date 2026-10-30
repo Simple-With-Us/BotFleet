@@ -112,7 +112,7 @@ import { planCredentialRestore } from "../electron/credential-restore.mjs";
 import { workspaceCredentialPending } from "../electron/workspace-credentials.mjs";
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
 import { loadHostId } from "./host-id.ts";
-import { hostResourcesResponse } from "./host-resources.ts";
+import { createHostResourcesResponder } from "./host-resources.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import {
   appendHeldWork,
@@ -805,6 +805,10 @@ const MIME: Record<string, string> = {
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 const hostId = loadHostId(DATA_DIR);
 const jobHostProbe = createHostProbe();
+const hostResourcesResponse = createHostResourcesResponder({
+  hostId, version: runtimeBuildIdentity.version, platform: process.platform,
+  dataDir: DATA_DIR, probe: jobHostProbe, thresholds: () => jobSettings().admission,
+});
 
 // ── the port opens BEFORE boot work, and health answers while it runs ─────
 // `server.listen` used to be the last statement in this file, behind the
@@ -15132,6 +15136,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       try {
         if (method === "GET" && path === "/api/system/control") {
           return json(res, 200, {
+            serverBuild: {
+              version: runtimeBuildIdentity.version,
+              build: runtimeBuildIdentity.build ?? null,
+              sourceCommit: runtimeBuildIdentity.sourceDirty ? null : runtimeBuildIdentity.sourceCommit,
+            },
             activeBotCount: store.bots.filter((bot) => bot.busy).length,
             localVms: await control.list(),
             persistOnExit: cfg.server?.persistOnExit !== false,
@@ -17163,9 +17172,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         localOwner: isLoopbackAddress(req.socket.remoteAddress),
         fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
         viaNamedTunnel: arrivedViaCloudflareTunnel(req),
-      }, {
-        hostId, version: runtimeBuildIdentity.version, platform: process.platform,
-        dataDir: DATA_DIR, probe: jobHostProbe, thresholds: () => jobSettings().admission,
       });
       return json(res, response.status, response.body);
     }

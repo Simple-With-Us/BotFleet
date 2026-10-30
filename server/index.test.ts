@@ -789,7 +789,8 @@ describe("harness HTTP API", () => {
     // Control app can name it instead of reporting a bare total.  Each entry
     // is a count and a plain label, and nothing else.
     z.array(z.object({ count: z.number(), label: z.string() }).strict()).parse(response.body.blockingWork);
-    expect(Object.keys(response.body).sort()).toEqual(["activeBotCount", "blockingWork", "localVms", "persistOnExit"]);
+    expect(response.body.serverBuild).toMatchObject({ version: expect.any(String), build: null });
+    expect(Object.keys(response.body).sort()).toEqual(["activeBotCount", "blockingWork", "localVms", "persistOnExit", "serverBuild"]);
   });
 
   it("native server controls reject companion replays and non-JSON shutdowns", async () => {

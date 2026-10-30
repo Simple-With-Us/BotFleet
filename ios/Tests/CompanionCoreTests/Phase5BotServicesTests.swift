@@ -727,11 +727,13 @@ struct Phase5BotServicesTests {
         let db = try DatabaseService(path: ":memory:")
 
         // No pairing code at all: the request must not mint a working token.
+        // A closed window answers 401, not 503 (BF-2591): the phone reads a
+        // 503 as a dead route and would report the computer unreachable.
         let noWindow = NativeCompanionServer(database: db, pairedTokens: [])
         let refused = await noWindow.handleRequest(
             CompanionHTTPRequest(method: "POST", path: "/api/pair", jsonString: "{\"code\":\"849201\"}")
         )
-        #expect(refused.statusCode == 503)
+        #expect(refused.statusCode == 401)
         #expect(refused.bodyString.contains("pairing_unavailable"))
         #expect(!refused.bodyString.contains("bf_tok_"))
 
@@ -749,7 +751,7 @@ struct Phase5BotServicesTests {
         let afterBurn = await capped.handleRequest(
             CompanionHTTPRequest(method: "POST", path: "/api/pair", jsonString: "{\"code\":\"849201\"}")
         )
-        #expect(afterBurn.statusCode == 503)
+        #expect(afterBurn.statusCode == 401)
 
         // The right code pairs once and is spent afterwards.
         let singleUse = NativeCompanionServer(database: db, pairedTokens: [], pairingCode: "849201")
@@ -761,7 +763,7 @@ struct Phase5BotServicesTests {
         let replay = await singleUse.handleRequest(
             CompanionHTTPRequest(method: "POST", path: "/api/pair", jsonString: "{\"code\":\"849201\"}")
         )
-        #expect(replay.statusCode == 503)
+        #expect(replay.statusCode == 401)
     }
 
     @Test("Search clamps an oversized or negative limit instead of trapping on the Int32 bind")
