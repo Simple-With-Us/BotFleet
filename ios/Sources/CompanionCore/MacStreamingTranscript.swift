@@ -518,6 +518,7 @@ public struct MacDesktopCapabilities: Codable, Equatable, Sendable {
 /// Surface 2: Native macOS Settings sections and deep-link router.
 public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identifiable, Sendable {
     case general
+    case servers
     case models
     case voice
     case shortcuts
@@ -529,6 +530,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
     public var displayTitle: String {
         switch self {
         case .general: return "General"
+        case .servers: return "Servers"
         case .models: return "Models"
         case .voice: return "Voice"
         case .shortcuts: return "Shortcuts"
@@ -540,6 +542,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
     public var symbolName: String {
         switch self {
         case .general: return "gearshape"
+        case .servers: return "server.rack"
         case .models: return "cpu"
         case .voice: return "waveform"
         case .shortcuts: return "command"

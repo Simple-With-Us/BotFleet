@@ -181,6 +181,24 @@ final class SavedHostsTests: XCTestCase {
         let hosts = try await store.hosts()
         XCTAssertEqual(hosts, [.thisMac])
     }
+    func testExplicitLocalAddressEditAllowsOnlyLoopbackHTTPAndCannotTouchRemote() async throws {
+        let (_, store) = try temporaryStore()
+        let remote = HostRecord(name: "Remote", origin: try HostOrigin("https://fixture.test"))
+        try await store.upsert(remote)
+        let edited = try HostOrigin("http://[::1]:8801")
+        try await store.updateThisMacOrigin(edited)
+        let records = try await store.hosts()
+        XCTAssertEqual(records.first?.id, HostRecord.localID)
+        XCTAssertEqual(records.first?.origin, edited)
+        XCTAssertEqual(records.last, remote)
+        do { try await store.updateThisMacOrigin(HostOrigin("https://fixture.test")); XCTFail("Remote local origin must fail") }
+        catch { XCTAssertEqual(error as? SavedHostError, .invalidRecord) }
+        do { try await store.updateThisMacOrigin(HostOrigin("https://localhost")); XCTFail("Local TLS origin must fail") }
+        catch { XCTAssertEqual(error as? SavedHostError, .invalidRecord) }
+        var changed = remote; changed.origin = try HostOrigin("https://other.test")
+        do { try await store.upsert(changed); XCTFail("Remote origin remains immutable") }
+        catch { XCTAssertEqual(error as? SavedHostError, .differentOrigin) }
+    }
     func testUppercaseUUIDPinIsAcceptedAndRemainsExact() async throws {
         let (_, store) = try temporaryStore()
         let remote = HostRecord(name: "Server", origin: try HostOrigin("https://fixture.test"), hostId: "server:ABCDEF12-1234-4123-8123-ABCDEF123456")
@@ -298,6 +316,63 @@ final class ServerHandshakeTests: XCTestCase {
         SavedHostURLProtocol.reply = { request in request.url!.path == "/api/host/resources" ? (404, [:]) : self.responses(request) }
         do { _ = try await client.test(host: host, credential: gate, acceptedPlacementVersion: "fixture-protocol"); XCTFail("Missing resource route must fail") }
         catch { XCTAssertEqual(error as? SavedHostError, .missingPlacementRoutes) }
+    }
+    func testCapacityReportIsTypedOptionalAndUsesUnitsWithChicagoSampleTime() async throws {
+        let (client, host, gate) = try client()
+        SavedHostURLProtocol.reply = { request in
+            var response = self.responses(request)
+            if request.url!.path == "/api/host/resources" {
+                response.1["sample"] = ["at": 1_793_386_800_000, "cores": 8, "ramTotalBytes": 32_000_000_000, "diskFreeBytes": 50_500_000_000] as [String: Any]
+            }
+            return response
+        }
+        let result = try await client.test(host: host, credential: gate, acceptedPlacementVersion: "fixture-protocol")
+        XCTAssertEqual(result.capacity?.cores, 8)
+        let text = ServerTestPresentation.reached(result, name: "Fixture")
+        XCTAssertTrue(text.contains("Reached Fixture: BotFleet 0.1.0 on Linux, 8 cores, 32.0 GB RAM, 50.5 GB free"))
+        XCTAssertTrue(text.contains("Capabilities: shell"))
+        XCTAssertTrue(text.contains("Sampled at")); XCTAssertTrue(text.contains("AM") || text.contains("PM"))
+        SavedHostURLProtocol.reply = { self.responses($0) }
+        let missing = try await client.test(host: host, credential: gate, acceptedPlacementVersion: "fixture-protocol")
+        XCTAssertNil(missing.capacity)
+        XCTAssertTrue(ServerTestPresentation.reached(missing, name: "Fixture").contains("RAM capacity unknown"))
+    }
+    func testNullCapacityMeansUnknownAndInvalidCapacityFailsHandshake() async throws {
+        let (client, host, gate) = try client()
+        SavedHostURLProtocol.reply = { request in
+            var response = self.responses(request)
+            if request.url!.path == "/api/host/resources" { response.1["sample"] = ["cores": NSNull(), "ramTotalBytes": NSNull(), "diskFreeBytes": NSNull()] }
+            return response
+        }
+        let unknown = try await client.test(host: host, credential: gate, acceptedPlacementVersion: "fixture-protocol")
+        XCTAssertNil(unknown.capacity?.cores)
+        for sample in [["cores": 0], ["ramTotalBytes": -1], ["diskFreeBytes": -1]] {
+            SavedHostURLProtocol.reply = { request in
+                var response = self.responses(request)
+                if request.url!.path == "/api/host/resources" { response.1["sample"] = sample }
+                return response
+            }
+            do { _ = try await client.test(host: host, credential: gate, acceptedPlacementVersion: "fixture-protocol"); XCTFail("Invalid capacity must fail") }
+            catch { XCTAssertEqual(error as? SavedHostError, .invalidResponse) }
+        }
+    }
+    func testCredentialFreeClientStillRequiresItsExactConfiguredOrigin() async throws {
+        let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [SavedHostURLProtocol.self]
+        let session = URLSession(configuration: config); defer { session.invalidateAndCancel() }
+        let origin = try HostOrigin("http://127.0.0.1:17891")
+        let host = HostRecord(id: HostRecord.localID, name: "This Mac", origin: origin)
+        SavedHostURLProtocol.reply = { request in
+            XCTAssertTrue(origin.contains(request.url!)); return (200, [:])
+        }
+        _ = try await CompanionClient(connection: host.companionConnection(), token: nil, session: session, hostOrigin: origin).config()
+        SavedHostURLProtocol.reply = { _ in XCTFail("Other origin must not make a request"); return (200, [:]) }
+        do {
+            _ = try await CompanionClient(connection: Connection(name: "Wrong", host: "127.0.0.1", port: 17892), token: nil, session: session, hostOrigin: origin).config()
+            XCTFail("Other port must be refused")
+        } catch { XCTAssertFalse(error.localizedDescription.contains("fixture-only-token")) }
+        let policy = HostOriginRedirectPolicy(origin: origin)
+        XCTAssertFalse(policy.allows(URL(string: "http://127.0.0.1:17892/api/config")))
+        XCTAssertFalse(policy.allows(URL(string: "https://fixture.test/api/config")))
     }
     func testCompanionClientGateHookUsesTheSameOriginBoundary() async throws {
         let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [SavedHostURLProtocol.self]

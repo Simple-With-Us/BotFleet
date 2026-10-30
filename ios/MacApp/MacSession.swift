@@ -57,7 +57,7 @@ public protocol MacSessionSourceProtocol: AnyObject {
     var activeReasoningText: String? { get }
     var unreadSummary: MacUnreadBadgeSummary { get }
 
-    func connect(host: String, port: Int)
+    func connect(host: HostRecord)
     func disconnect()
     @discardableResult
     func sendMessage(_ text: String) async -> Bool
@@ -75,8 +75,9 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
     @Published public var selectedThreadId: String?
     @Published public var isSending: Bool = false
-    @Published public var host: String = "127.0.0.1"
-    @Published public var port: Int = 8799
+    @Published public private(set) var host: String = "127.0.0.1"
+    @Published public private(set) var port: Int = 8799
+    public let servers: ServersCoordinator
 
     // Lifecycle & Remote Wake state (BF-2497)
     @Published public var lifecycleSettings = MacLifecycleSettings()
@@ -125,6 +126,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
 
     private var client: CompanionClient?
     private var streamTask: Task<Void, Never>?
+    private var connectionGeneration = UUID()
     private var reconnectAttempt = 0
     private let policyStore: MacPersistencePolicyStore
     private let permissionMonitor: CuaPermissionMonitor
@@ -146,6 +148,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         permissionMonitor: CuaPermissionMonitor = CuaPermissionMonitor()
     ) {
         self.policyStore = policyStore
+        self.servers = ServersCoordinator(store: HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json")))
         self.permissionMonitor = permissionMonitor
         if let localPersist = policyStore.readPersistOnExit() {
             self.lifecycleSettings = MacLifecycleSettings(
@@ -573,43 +576,38 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// A reconnect never clears the deliberate-stop sentinel: the marker is the
     /// only thing keeping the launchd `StartInterval` tick from resurrecting a
     /// harness the operator stopped on purpose.  Only `launch()` clears it.
-    public func connect(host: String = "127.0.0.1", port: Int = 8799) {
-        self.host = host
-        self.port = port
+    public func connect() {
+        guard servers.isLoaded, let local = servers.hosts.first(where: \.isLocal) else { return }
+        connect(host: local)
+    }
+
+    public func connect(host record: HostRecord) {
+        // Remote enrollment does not opt the app into remote chat or actions.
+        guard record.isLocal, let connection = try? record.companionConnection() else {
+            status = .failed("Choose This Mac to connect.")
+            return
+        }
+        self.host = connection.host
+        self.port = connection.port
         disconnect()
 
         if didDeliberatelyStopServer {
             // The harness was deliberately stopped in this session, so a
             // reconnect would only hammer a server that is meant to stay down.
-            status = .failed("Server was deliberately stopped. Start the harness to reconnect.")
+            status = .failed("Server was deliberately stopped.\u{00A0} Start the harness to reconnect.")
             return
         }
 
         status = .connecting
 
-        let normalizedHost = Connection.urlHost(host)
-        guard let url = URL(string: "http://\(normalizedHost):\(port)"),
-              let endpoint = CompanionEndpoint(url: url.absoluteString, kind: .lan, priority: 1) else {
-            status = .failed("Invalid server URL: http://\(normalizedHost):\(port)")
-            return
-        }
-
-        let connection = Connection(
-            name: "Local Mac",
-            host: host,
-            port: port,
-            activeEndpoint: endpoint,
-            endpoints: [endpoint],
-            allowedRouteKinds: [.lan, .bonjour, .hosted],
-            allowedLocalRouteURLs: [endpoint.url]
-        )
-
         // Local loopback does not require a bearer token in dev mode
-        let client = CompanionClient(connection: connection, token: nil)
+        let client = CompanionClient(connection: connection, token: nil, hostOrigin: record.origin)
         self.client = client
+        servers.connectedRecordID = record.id
+        let generation = connectionGeneration
 
         streamTask = Task { [weak self] in
-            await self?.runConnectionLoop(client: client, endpoint: "\(host):\(port)")
+            await self?.runConnectionLoop(client: client, endpoint: record.origin.url.absoluteString, generation: generation)
         }
     }
 
@@ -617,17 +615,27 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     ///
     /// The launch clears the deliberate-stop sentinel so the launchd wrapper is
     /// allowed to start or supervise the harness again.
-    public func launch(host: String = "127.0.0.1", port: Int = 8799) {
-        if !hasLaunched {
-            hasLaunched = true
-            _ = try? policyStore.clearStoppedMarker(for: .appLaunch)
-            // The native companion listener starts with the app when the
-            // setting is on; off by default, so this is a no-op today.
-            Task { @MainActor [weak self] in
-                await self?.companionListener.applyLaunch()
-            }
+    public func launch() {
+        guard !hasLaunched else { return }
+        hasLaunched = true
+        _ = try? policyStore.clearStoppedMarker(for: .appLaunch)
+        // The native companion listener starts with the app when the
+        // setting is on; off by default, so this is a no-op today.
+        Task { @MainActor [weak self] in
+            await self?.companionListener.applyLaunch()
         }
-        connect(host: host, port: port)
+        let generation = connectionGeneration
+        Task { [weak self] in
+            guard let self else { return }
+            await MacLocalConnectionBootstrap.run(
+                loadHosts: {
+                    await self.servers.load()
+                    return self.servers.isLoaded ? self.servers.hosts : nil
+                },
+                isCurrent: { self.connectionGeneration == generation && !self.didDeliberatelyStopServer },
+                connect: { self.connect(host: $0) }
+            )
+        }
     }
 
     /// Turns the native companion listener on or off from Settings.  The
@@ -723,15 +731,17 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
 
     public func disconnect() {
+        connectionGeneration = UUID()
         streamTask?.cancel()
         streamTask = nil
         client = nil
+        servers.connectedRecordID = nil
         status = .disconnected
         syncSystemSurfaces(force: true)
     }
 
-    private func runConnectionLoop(client: CompanionClient, endpoint: String) async {
-        while !Task.isCancelled {
+    private func runConnectionLoop(client: CompanionClient, endpoint: String, generation: UUID) async {
+        while !Task.isCancelled && connectionGeneration == generation {
             do {
                 // The roster snapshot and the lifecycle settings are fetched once
                 // per successful connection.  Fetching the settings on the
@@ -741,23 +751,25 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                 try await MacHarnessConnectionCycle.connect(
                     fetchFleet: { try await client.fleet() },
                     hydrate: { [weak self] fleet in
-                        guard let self else { return }
+                        guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
                         self.state.hydrate(fleet)
                         if self.selection == nil, let first = fleet.bots.first {
                             self.selection = .bot(first.id)
                         }
                     },
                     refreshLifecycleSettings: { [weak self] in
-                        await self?.refreshLifecycleSettings()
+                        guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
+                        await self.refreshLifecycleSettings()
                     }
                 )
+                guard connectionGeneration == generation, !Task.isCancelled else { return }
                 self.status = .connected(endpoint: endpoint)
                 self.reconnectAttempt = 0
                 self.syncSystemSurfaces(force: true)
 
                 let stream = try client.events(since: state.cursor, screens: true)
                 for try await frame in stream {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled || connectionGeneration != generation { break }
                     self.state.apply(frame)
                     if case let .notify(notification) = frame.frame {
                         self.handleNotificationFrame(notification)
@@ -769,12 +781,12 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                     self.syncSystemSurfaces()
                 }
             } catch {
-                if Task.isCancelled { break }
+                if Task.isCancelled || connectionGeneration != generation { break }
                 reconnectAttempt += 1
                 let baseBackoff = min(Double(reconnectAttempt) * 1.5, 10.0)
                 let jitter = Double.random(in: -0.2...0.2) * baseBackoff
                 let backoff = max(1.0, baseBackoff + jitter)
-                status = .failed("Connection lost. Retrying in \(Int(backoff))s…")
+                status = .failed("Connection lost.\u{00A0} Retrying in \(Int(backoff))s…")
                 syncSystemSurfaces(force: true)
                 try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
             }
@@ -835,8 +847,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
 
     public func refreshLifecycleSettings() async {
+        let generation = connectionGeneration
         let lifecycleClient = makeLifecycleClient()
         guard let fetched = try? await lifecycleClient.fetchLifecycleSettings() else { return }
+        guard connectionGeneration == generation, !Task.isCancelled else { return }
         // A grant the harness did not report stays unknown, so the next save
         // never writes back a `false` the app never read.
         var merged = fetched

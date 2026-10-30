@@ -4,6 +4,7 @@ import Darwin
 
 public enum SavedHostError: Error, LocalizedError, Equatable {
     case invalidOrigin, invalidRecord, unreadableStore, storeBusy, localAnchor, hostInUse, credentialUnavailable
+    case credentialExists
     case differentOrigin, authentication, invalidResponse, differentHost, missingPlacementRoutes, incompatibleVersion
 
     public var errorDescription: String? {
@@ -15,6 +16,7 @@ public enum SavedHostError: Error, LocalizedError, Equatable {
         case .localAnchor: return "This Mac cannot be removed."
         case .hostInUse: return "This server is a controller or holds a lease.\u{00A0} Release it before removing it."
         case .credentialUnavailable: return "The server credential is unavailable."
+        case .credentialExists: return "A credential already exists for this record.\u{00A0} Remove the server and add it again to enroll a fresh token."
         case .differentOrigin: return "The server credential belongs to a different origin."
         case .authentication: return "The server did not accept this credential."
         case .invalidResponse: return "The server did not return a valid BotFleet host response."
@@ -130,6 +132,18 @@ public actor HostStore {
         else { file.hosts.append(host) }
         }
     }
+    /// Only the fixed local anchor may explicitly change its loopback HTTP origin.
+    public func updateThisMacOrigin(_ origin: HostOrigin) throws {
+        var local = HostRecord.thisMac; local.origin = origin
+        try local.validate()
+        try mutate { file in
+            guard let index = file.hosts.firstIndex(where: \.isLocal) else { throw SavedHostError.invalidRecord }
+            if file.hosts[index].origin != origin {
+                file.hosts[index].origin = origin
+                file.hosts[index].hostId = nil
+            }
+        }
+    }
     public func remove(id: String, controllerID: String?, leasedHostIDs: Set<String>) throws {
         guard id != HostRecord.localID else { throw SavedHostError.localAnchor }
         try mutate { file in
@@ -232,6 +246,14 @@ public protocol HostTokenStore: Sendable {
     func read(for host: HostRecord) throws -> HostGateCredential?
     func write(_ token: RedactedSecret, for host: HostRecord) throws
     func remove(recordID: String) throws
+    func enrollIfAbsent(_ token: RedactedSecret, for host: HostRecord) throws
+}
+
+public extension HostTokenStore {
+    func enrollIfAbsent(_ token: RedactedSecret, for host: HostRecord) throws {
+        guard try read(for: host) == nil else { throw SavedHostError.credentialExists }
+        try write(token, for: host)
+    }
 }
 
 /// A separate per-user Keychain namespace; it never opens Control's JSON or service credentials.
@@ -297,6 +319,14 @@ public struct KeychainHostTokenStore: HostTokenStore {
             add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
             status = SecItemAdd(add as CFDictionary, nil)
         }
+        guard status == errSecSuccess else { throw SavedHostError.credentialUnavailable }
+    }
+    public func enrollIfAbsent(_ token: RedactedSecret, for host: HostRecord) throws {
+        var add = try Self.query(recordID: host.id)
+        add[kSecValueData as String] = try Self.encode(token, for: host)
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = SecItemAdd(add as CFDictionary, nil)
+        if status == errSecDuplicateItem { throw SavedHostError.credentialExists }
         guard status == errSecSuccess else { throw SavedHostError.credentialUnavailable }
     }
     public func remove(recordID: String) throws {
