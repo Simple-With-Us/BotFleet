@@ -1,0 +1,38 @@
+{
+  "kind": "jobs",
+  "threadId": "placement-contract",
+  "jobs": [
+    {
+      "id": "job_01J00000000000000000000000", "botId": "bot-contract", "threadId": "placement-contract",
+      "origin": "botfleet", "kind": "shell", "label": "legacy job", "cwd": "/fixture", "status": "completed",
+      "exitCode": 0, "signal": null, "startedAt": 1000, "endedAt": 2000, "timeoutMs": 60000, "onComplete": "notice", "notice": "none"
+    },
+    {
+      "id": "job_01J00000000000000000000001", "botId": "bot-contract", "threadId": "placement-contract",
+      "origin": "botfleet", "kind": "shell", "label": "waiting job", "cwd": "/fixture", "status": "queued",
+      "exitCode": null, "signal": null, "startedAt": 3000, "endedAt": null, "timeoutMs": 60000, "onComplete": "wake", "notice": "none",
+      "controllerHostId": "server:11111111-1111-4111-8111-111111111111", "epoch": 7, "queuedReason": "server: memory budget; Mac: swap 98%"
+    },
+    {
+      "id": "job_01J00000000000000000000002", "botId": "bot-contract", "threadId": "placement-contract",
+      "origin": "botfleet", "kind": "shell", "label": "dispatching job", "cwd": "/fixture", "status": "dispatching",
+      "exitCode": null, "signal": null, "startedAt": 4000, "endedAt": null, "timeoutMs": 60000, "onComplete": "wake", "notice": "none",
+      "controllerHostId": "server:11111111-1111-4111-8111-111111111111", "host": "mac:22222222-2222-4222-8222-222222222222",
+      "leaseId": "lease-dispatch", "epoch": 7, "placedReason": "pinned to this Mac"
+    },
+    {
+      "id": "job_01J00000000000000000000003", "botId": "bot-contract", "threadId": "placement-contract",
+      "origin": "botfleet", "kind": "shell", "label": "unreachable job", "cwd": "/fixture", "status": "worker-unreachable",
+      "exitCode": null, "signal": null, "startedAt": 5000, "endedAt": null, "timeoutMs": 60000, "onComplete": "wake", "notice": "none",
+      "controllerHostId": "server:11111111-1111-4111-8111-111111111111", "host": "mac:22222222-2222-4222-8222-222222222222",
+      "leaseId": "lease-unreachable", "epoch": 7, "placedReason": "needs xcodebuild"
+    },
+    {
+      "id": "job_01J00000000000000000000004", "botId": "bot-contract", "threadId": "placement-contract",
+      "origin": "botfleet", "kind": "shell", "label": "finished remote job", "cwd": "/fixture", "status": "completed",
+      "exitCode": 0, "signal": null, "startedAt": 6000, "endedAt": 7000, "timeoutMs": 60000, "onComplete": "notice", "notice": "none",
+      "controllerHostId": "server:11111111-1111-4111-8111-111111111111", "host": "server:11111111-1111-4111-8111-111111111111",
+      "leaseId": "lease-complete", "epoch": 0, "placedReason": "preferred server", "queuedReason": "previously waiting for capacity"
+    }
+  ]
+}

@@ -146,6 +146,33 @@ describe("settings", () => {
   });
 });
 
+describe("local placement identity", () => {
+  it("records both host ids before spawning and carries them through storage and frames", async () => {
+    const fake = fakeSpawn();
+    const h = harness({ spawn: (spec) => {
+      const record = stored(h.dir)[0]!;
+      expect(record.host).toBe(record.controllerHostId);
+      expect(record.host).toBe(readFileSync(join(h.dir, "host-id"), "utf8").trim());
+      return fake.spawnFn(spec);
+    } });
+    const result = start(h, "echo local");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.job.host).toMatch(/^mac:/);
+    expect(result.job.controllerHostId).toBe(result.job.host);
+    expect(result.job.placedReason).toBe("Running on this Mac");
+    expect(result.job.leaseId).toBeUndefined();
+    expect(result.job.epoch).toBeUndefined();
+    await until(() => h.frames.length > 0);
+    expect(h.frames[0]!.jobs[0]).toEqual(result.job);
+    fake.children[0]!.child.emit("exit", 0, null);
+    h.registry.dispose();
+    const restarted = harness({ spawn: fake.spawnFn }, h.dir);
+    expect(restarted.registry.get(result.job.id)?.host).toBe(result.job.host);
+    expect(restarted.registry.get(result.job.id)?.controllerHostId).toBe(result.job.host);
+  });
+});
+
 // Windows refuses every job (no process groups to stop), so every block that
 // starts one runs on POSIX hosts only; the refusal has its own block below.
 describe("on Windows", () => {

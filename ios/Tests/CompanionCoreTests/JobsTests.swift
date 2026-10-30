@@ -70,6 +70,36 @@ final class JobsTests: XCTestCase {
 
     // MARK: - Decoding
 
+    func testSharedPlacementFixturePreservesOptionalMetadataAndStatuses() throws {
+        let url = try XCTUnwrap(
+            Bundle.module.url(forResource: "jobs-placement", withExtension: "json", subdirectory: "Fixtures")
+                ?? Bundle.module.url(forResource: "jobs-placement", withExtension: "json")
+        )
+        let frame = try JSONDecoder().decode(StreamFrame.self, from: Data(contentsOf: url))
+        guard case let .jobs(threadId, jobs) = frame.frame else { return XCTFail("expected jobs") }
+        XCTAssertEqual(threadId, "placement-contract")
+        XCTAssertEqual(jobs.count, 5)
+        XCTAssertEqual(jobs.map(\.status), [.completed, .queued, .dispatching, .workerUnreachable, .completed])
+        XCTAssertEqual(jobs.map(\.isActive), [false, true, true, true, false])
+        XCTAssertEqual(jobs.map(\.exitChip), ["Exited 0", "Queued", "Dispatching", "Worker unreachable", "Exited 0"])
+        XCTAssertNil(jobs[0].controllerHostId)
+        XCTAssertNil(jobs[0].host)
+        XCTAssertNil(jobs[0].leaseId)
+        XCTAssertNil(jobs[0].epoch)
+        XCTAssertNil(jobs[0].placedReason)
+        XCTAssertNil(jobs[0].queuedReason)
+        XCTAssertNil(jobs[1].host)
+        XCTAssertEqual(jobs[1].queuedReason, "server: memory budget; Mac: swap 98%")
+        XCTAssertEqual(jobs[2].host, "mac:22222222-2222-4222-8222-222222222222")
+        XCTAssertEqual(jobs[2].leaseId, "lease-dispatch")
+        XCTAssertEqual(jobs[3].placedReason, "needs xcodebuild")
+        XCTAssertEqual(jobs[4].controllerHostId, jobs[4].host)
+        XCTAssertEqual(jobs[4].epoch, 0)
+        XCTAssertEqual(jobs[4].queuedReason, "previously waiting for capacity")
+        let roundtrip = try JSONDecoder().decode([JobSnapshot].self, from: JSONEncoder().encode(jobs))
+        XCTAssertEqual(roundtrip, jobs)
+    }
+
     func testAJobsFrameDecodesAndFoldsAsAFullSet() throws {
         let data = Data(#"{"kind":"jobs","seq":9,"threadId":"t1","jobs":[\#(jobJSON())]}"#.utf8)
         let frame = try JSONDecoder().decode(StreamFrame.self, from: data)

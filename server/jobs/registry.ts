@@ -67,6 +67,8 @@ import {
   type JobsFrame,
 } from "../../shared/jobs.ts";
 import { writeFileAtomic } from "../atomic.ts";
+import { loadHostId } from "../host-id.ts";
+import { HOST_ID_PATTERN, type HostId } from "../../shared/placement.ts";
 import { redactSecretsInText } from "../redact.ts";
 import { commandLabel, groupAlive, killGroup, signalGroup, startedNear, GROUP_KILL_GRACE_MS } from "../tools/process-group.ts";
 import { modelShellEnv } from "../tools/shell-env.ts";
@@ -175,7 +177,13 @@ const RecordFile = z.array(
     kind: z.enum(["shell"]),
     label: z.string(),
     cwd: z.string(),
-    status: z.enum(["running", "stopping", "completed", "failed", "killed", "lost"]),
+    status: z.enum(["queued", "dispatching", "worker-unreachable", "running", "stopping", "completed", "failed", "killed", "lost"]),
+    controllerHostId: z.string().regex(HOST_ID_PATTERN).transform((value) => value as HostId).optional(),
+    host: z.string().regex(HOST_ID_PATTERN).transform((value) => value as HostId).optional(),
+    leaseId: z.string().min(1).optional(),
+    epoch: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    placedReason: z.string().optional(),
+    queuedReason: z.string().optional(),
     exitCode: z.number().int().nullable(),
     signal: z.string().nullable(),
     startedAt: z.number(),
@@ -471,6 +479,7 @@ export class JobRegistry {
   private readonly listProcesses: JobProcessLister;
   private readonly leaderStartedNear: (pid: number, at: number) => Promise<boolean>;
   private readonly platform: NodeJS.Platform;
+  private readonly hostId: HostId;
   private readonly graceMs: number;
   private readonly tickMs: number;
   private readonly logMaxBytes: number;
@@ -512,6 +521,7 @@ export class JobRegistry {
     this.listProcesses = deps.listProcesses ?? createJobProcessLister();
     this.leaderStartedNear = deps.leaderStartedNear ?? startedNear;
     this.platform = deps.platform ?? process.platform;
+    this.hostId = loadHostId(deps.dataDir, this.platform);
     this.graceMs = deps.graceMs ?? GROUP_KILL_GRACE_MS;
     this.tickMs = deps.tickMs ?? 5_000;
     this.maxTickCreditMs = deps.maxTickCreditMs ?? 60_000;
@@ -649,6 +659,9 @@ export class JobRegistry {
       label: commandLabel(command),
       cwd: request.cwd,
       status: "running",
+      controllerHostId: this.hostId,
+      host: this.hostId,
+      placedReason: this.platform === "darwin" ? "Running on this Mac" : "Running on this server",
       exitCode: null,
       signal: null,
       startedAt: now,
@@ -811,6 +824,9 @@ export class JobRegistry {
       return { ok: true, job: this.snapshot(record) };
     }
     if (!isJobActive(record)) return { ok: false, job: this.snapshot(record), error: "the job already ended" };
+    if (!this.ownsLocalProcess(record)) {
+      return { ok: false, job: this.snapshot(record), error: "Placement control is not available in this build; the job was left unchanged" };
+    }
     record.status = "stopping";
     record.killedBy = by;
     if (reason) record.reason = reason;
@@ -862,6 +878,12 @@ export class JobRegistry {
     if (threads.size === 0) return;
     this.save();
     for (const threadId of threads) this.changed(threadId);
+  }
+
+  /** Legacy process management never acts for another host or a placement state. */
+  private ownsLocalProcess(record: JobRecord): boolean {
+    return (record.status === "running" || record.status === "stopping") &&
+      (record.host === undefined || record.host === this.hostId);
   }
 
   /** Whether the group a record names is still the one this job started.
@@ -959,7 +981,7 @@ export class JobRegistry {
     }
     for (const record of this.records.values()) {
       if (this.adoptable.has(record.id)) continue; // adopt() settles these
-      if (record.status !== "running") {
+      if (record.status !== "running" || !this.ownsLocalProcess(record)) {
         // A finished job whose conversation or bot is gone, deleted by a
         // route that did not stop its jobs itself: drop its output too.
         if (checkFinished && !isJobActive(record) && this.deps.stopReason?.(this.snapshot(record))?.forget) this.forget([record.id]);
@@ -989,7 +1011,7 @@ export class JobRegistry {
     const seconds = Math.max(0.001, (awake - this.lastLogCheck) / 1000);
     this.lastLogCheck = awake;
     for (const record of this.records.values()) {
-      if (record.status !== "running" || this.adoptable.has(record.id)) {
+      if (record.status !== "running" || !this.ownsLocalProcess(record) || this.adoptable.has(record.id)) {
         this.lastLogEnd.delete(record.id);
         continue;
       }
@@ -1134,7 +1156,7 @@ export class JobRegistry {
    *  updater's ordinary quiesce, which can still be rolled back — a job
    *  killed for a restart that never came would be work lost for nothing. */
   async quiesce(reason = JOB_STOPPED_REASON): Promise<number> {
-    const active = [...this.records.values()].filter(isJobActive);
+    const active = [...this.records.values()].filter((record) => this.ownsLocalProcess(record));
     await Promise.all(
       active.map(async (record) => {
         record.status = "stopping";
@@ -1153,7 +1175,7 @@ export class JobRegistry {
   shutdownSync(): void {
     let dirty = false;
     for (const record of this.records.values()) {
-      if (!isJobActive(record)) continue;
+      if (!this.ownsLocalProcess(record)) continue;
       if (record.pid !== null && this.stillOurs(record)) signalGroup(record.pid, "SIGKILL");
       record.status = "lost";
       record.killedBy = "system";
@@ -1176,6 +1198,8 @@ export class JobRegistry {
     let lost = 0;
     let leaderless = false;
     for (const record of loaded) {
+      // Placement states await their controller; a local restart cannot settle them.
+      if (isJobActive(record) && !this.ownsLocalProcess(record)) continue;
       // Nothing at boot wakes a bot: whatever ends up announced is a notice
       // for the bot's next turn.
       record.onComplete = record.onComplete === "none" ? "none" : "notice";
@@ -1243,6 +1267,12 @@ export class JobRegistry {
       onComplete: record.onComplete,
       notice: record.notice,
     };
+    if (record.controllerHostId !== undefined) snapshot.controllerHostId = record.controllerHostId;
+    if (record.host !== undefined) snapshot.host = record.host;
+    if (record.leaseId !== undefined) snapshot.leaseId = record.leaseId;
+    if (record.epoch !== undefined) snapshot.epoch = record.epoch;
+    if (record.placedReason !== undefined) snapshot.placedReason = redactSecretsInText(record.placedReason);
+    if (record.queuedReason !== undefined) snapshot.queuedReason = redactSecretsInText(record.queuedReason);
     if (record.turnId) snapshot.turnId = record.turnId;
     if (record.killedBy) snapshot.killedBy = record.killedBy;
     if (record.reason) snapshot.reason = record.reason;
