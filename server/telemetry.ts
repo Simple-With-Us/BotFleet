@@ -592,7 +592,16 @@ export function buildTurnEvents(
       costSource:
         params.billingMode === "estimated" ? "estimated" : params.billingMode === "actual" && cost != null ? "billed" : undefined,
     });
-    if (ai) event.ai = ai;
+    if (ai) {
+      // A reconciled receipt knows its absent buckets are exactly zero.
+      // Keep those zeros explicit so a receiver never invents missing proof.
+      if (exactCall) ai.tokens = {
+        ...ai.tokens,
+        input: call.input, output: call.output, cacheRead: call.cacheRead,
+        cacheWrite5m, cacheWrite1h,
+      };
+      event.ai = ai;
+    }
   }
   return [event];
 }

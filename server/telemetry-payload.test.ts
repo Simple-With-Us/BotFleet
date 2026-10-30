@@ -28,7 +28,7 @@ describe("exact single-call coverage receipt", () => {
       billedCallProofVersion: 1, billedCallId: "msg-test", billedCallModel: "claude-test",
       billedCallOutput: 20, billedCallCacheRead: 30, billedCallCacheWrite: 40,
     });
-    expect(event.ai?.tokens).toMatchObject({ input: 10, output: 20, cacheRead: 30, cacheWrite5m: 40 });
+    expect(event.ai?.tokens).toMatchObject({ input: 10, output: 20, cacheRead: 30, cacheWrite5m: 40, cacheWrite1h: 0 });
   });
 
   it.each([
