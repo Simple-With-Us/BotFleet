@@ -14,6 +14,12 @@ The bundled `botfleet-vm-control.mjs` helper reports managed Local VM state and 
 
 “Launch Control At Login” uses `SMAppService.mainApp`.  Hiding the icon leaves the process and server running; opening `BotFleet Control.app` again restores the icon.  Quitting Control never changes the server.  Closing the Electron BotFleet window releases Electron; the server's separate “Keep Server Running After Quitting BotFleet” setting determines whether it continues.
 
+## Connected Servers
+
+Control starts with the Local Mac host only.  Add a remote server through “Add Connected BotFleet Server” using its configured HTTP or HTTPS base URL and optional Bearer token.  The app does not supply a public hostname, hosting provider or Tailscale address; the address must be reachable from this Mac.
+
+Saved servers live in `~/.botfleet/control-hosts.json`.  Loading an older list removes the unchanged synthetic Hetzner entry only when provider configuration is readable and does not refer to that server ID.  A matching provider entry or unreadable provider file preserves the host and provider file; renamed, readdressed and credentialed entries are always kept.
+
 ## Managed Services
 
 The “Fleet Services (12)” submenu lists every long-lived process BotFleet starts on this Mac, and what the Control app can see of each one right now.  The BotFleet MCP Server is first, then the BotFleet Server, the BotFleet Companion, and the pm2 applications the ecosystem file defines.  Each row opens into the actions that make sense for the state that was seen: Start, Stop and Restart.

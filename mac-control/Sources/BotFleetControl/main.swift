@@ -4,7 +4,11 @@ import ServiceManagement
 
 @main
 final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private let hostStore = ServerHostStore()
+    private let vmProviderStore = VMProviderStore()
+    private lazy var hostStore: ServerHostStore = {
+        let providerStore = vmProviderStore
+        return ServerHostStore(preservedHostIDs: { providerStore.configuredServerIDs() })
+    }()
     private var hosts: [ServerHost] = []
     private var hostApis: [String: ControlAPI] = [:]
     private var hostStatuses: [String: ControlStatus] = [:]
@@ -97,7 +101,6 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The state of each remote machine, by server id.
     private var vmStates: [String: RemoteVMState] = [:]
     private let processMonitor = FleetProcessMonitor()
-    private let vmProviderStore = VMProviderStore()
     /// The state of every fleet service, read fresh each time the menu
     /// opens.
     private var fleetServiceStates: [String: ManagedServiceState] = [:]
@@ -601,7 +604,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !offlineVMHelper.available { add("Update BotFleet Control to manage Local VMs offline") }
         }
 
-        // 2. REMOTE CONNECTED SERVERS (e.g. Hetzner Server, or custom servers)
+        // 2. REMOTE CONNECTED SERVERS (configured by the user)
         for host in hosts where !host.isLocal {
             menu.addItem(.separator())
             let header = NSMenuItem(title: host.name.uppercased(), action: nil, keyEquivalent: "")
@@ -1169,7 +1172,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func promptAddServer() {
         let alert = NSAlert()
         alert.messageText = "Add Connected BotFleet Server"
-        alert.informativeText = "Enter the server name, base URL (e.g. https://hetzner.botfleet.app or http://192.168.1.50:8799), and optional Bearer auth token."
+        alert.informativeText = "Enter the server name, base URL, and optional Bearer auth token."
         alert.addButton(withTitle: "Add Server")
         alert.addButton(withTitle: "Cancel")
 
@@ -1178,10 +1181,10 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stack.spacing = 8
 
         let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        nameField.placeholderString = "Server Name (e.g. Hetzner Server)"
+        nameField.placeholderString = "Server Name"
 
         let urlField = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        urlField.placeholderString = "https://hetzner.botfleet.app"
+        urlField.placeholderString = "Server URL"
 
         let tokenField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
         tokenField.placeholderString = "Auth Token (optional)"
