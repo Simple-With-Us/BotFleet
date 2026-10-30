@@ -155,6 +155,23 @@ final class SavedHostsTests: XCTestCase {
             }
         }
     }
+    func testProtectedCredentialRefusesChangedOrNewIdentityPinsUntilExplicitEnrollment() throws {
+        var host = HostRecord(name: "Server", origin: try HostOrigin("https://fixture.test"))
+        let beforePin = try KeychainHostTokenStore.encode(RedactedSecret("fixture-secret"), for: host)
+        XCTAssertNoThrow(try KeychainHostTokenStore.decode(beforePin, for: host))
+        host.hostId = "server:11111111-1111-4111-8111-111111111111"
+        XCTAssertThrowsError(try KeychainHostTokenStore.decode(beforePin, for: host)) { error in
+            XCTAssertEqual(error as? SavedHostError, .differentHost)
+        }
+        let enrolled = try KeychainHostTokenStore.encode(RedactedSecret("fixture-secret"), for: host)
+        XCTAssertNoThrow(try KeychainHostTokenStore.decode(enrolled, for: host))
+        for changedPin in [nil, "server:22222222-2222-4222-8222-222222222222"] as [String?] {
+            var changed = host; changed.hostId = changedPin
+            XCTAssertThrowsError(try KeychainHostTokenStore.decode(enrolled, for: changed)) { error in
+                XCTAssertEqual(error as? SavedHostError, .differentHost)
+            }
+        }
+    }
     func testLocalAnchorOriginCannotDrift() async throws {
         let (_, store) = try temporaryStore()
         var changed = HostRecord.thisMac

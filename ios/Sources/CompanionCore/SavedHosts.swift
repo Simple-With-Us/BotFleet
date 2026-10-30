@@ -241,7 +241,17 @@ public struct KeychainHostTokenStore: HostTokenStore {
         let schema: Int
         let recordID: String
         let origin: HostOrigin
+        let hostId: String?
         let token: String
+        enum CodingKeys: String, CodingKey { case schema, recordID, origin, hostId, token }
+        func encode(to encoder: Encoder) throws {
+            var value = encoder.container(keyedBy: CodingKeys.self)
+            try value.encode(schema, forKey: .schema)
+            try value.encode(recordID, forKey: .recordID)
+            try value.encode(origin, forKey: .origin)
+            try value.encode(hostId, forKey: .hostId)
+            try value.encode(token, forKey: .token)
+        }
     }
     static func query(recordID: String) throws -> [String: Any] {
         // The account is the saved-record UUID, not the remote's mac:/server: identity pin.
@@ -252,7 +262,7 @@ public struct KeychainHostTokenStore: HostTokenStore {
         try host.validate()
         _ = try query(recordID: host.id)
         _ = try HostGateCredential(origin: host.origin, token: token)
-        return try JSONEncoder().encode(StoredCredential(schema: 1, recordID: host.id, origin: host.origin, token: token.exposeSecret()))
+        return try JSONEncoder().encode(StoredCredential(schema: 1, recordID: host.id, origin: host.origin, hostId: host.hostId, token: token.exposeSecret()))
     }
     static func decode(_ data: Data, for host: HostRecord) throws -> HostGateCredential {
         try host.validate()
@@ -261,11 +271,12 @@ public struct KeychainHostTokenStore: HostTokenStore {
         do {
             guard data.count <= 16_384,
                   let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  Set(json.keys) == Set(["schema", "recordID", "origin", "token"]) else { throw SavedHostError.credentialUnavailable }
+                  Set(json.keys) == Set(["schema", "recordID", "origin", "hostId", "token"]) else { throw SavedHostError.credentialUnavailable }
             stored = try JSONDecoder().decode(StoredCredential.self, from: data)
         } catch { throw SavedHostError.credentialUnavailable }
         guard stored.schema == 1, stored.recordID == host.id else { throw SavedHostError.credentialUnavailable }
         guard stored.origin == host.origin else { throw SavedHostError.differentOrigin }
+        guard stored.hostId == host.hostId else { throw SavedHostError.differentHost }
         return try HostGateCredential(origin: stored.origin, token: RedactedSecret(stored.token))
     }
     public func read(for host: HostRecord) throws -> HostGateCredential? {
