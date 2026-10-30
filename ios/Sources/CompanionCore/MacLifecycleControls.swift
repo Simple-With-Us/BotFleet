@@ -198,6 +198,42 @@ public final class MacPersistencePolicyStore: @unchecked Sendable {
         try MacPersistencePolicyStore(dataDir: dataDir).writePersistOnExit(enabled, dataDir: dataDir)
     }
 
+    // MARK: - Companion Listener Setting (`companion-listener.policy`)
+
+    /// Whether the native app hosts the companion listener (BF-2590).  Off
+    /// when the file is absent, so an install that never saw the setting
+    /// behaves as before.
+    public static let companionListenerPolicyFileName = "companion-listener.policy"
+
+    /// Reads the setting, returning `nil` when absent or unrecognized.
+    public func readCompanionListenerEnabled(dataDir: URL? = nil) -> Bool? {
+        let targetDir = dataDir ?? self.dataDir
+        let fileURL = targetDir.appendingPathComponent(Self.companionListenerPolicyFileName)
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        switch data {
+        case Data("true\n".utf8):
+            return true
+        case Data("false\n".utf8):
+            return false
+        default:
+            return nil
+        }
+    }
+
+    /// Atomically writes `"true\n"` or `"false\n"` with mode `0600`, the same
+    /// contract as `persist-on-exit.policy`, and reads it back before
+    /// returning.
+    public func writeCompanionListenerEnabled(_ enabled: Bool, dataDir: URL? = nil) throws {
+        let targetDir = dataDir ?? self.dataDir
+        try files.createDirectory(at: targetDir, withIntermediateDirectories: true)
+        let destination = targetDir.appendingPathComponent(Self.companionListenerPolicyFileName)
+        let bytes = Array((enabled ? "true\n" : "false\n").utf8)
+        try writeAtomicallyMode0600(bytes: bytes, to: destination, in: targetDir, prefix: ".companion-listener")
+        guard readCompanionListenerEnabled(dataDir: targetDir) == enabled else {
+            throw MacLifecycleError.invalidPolicyValue
+        }
+    }
+
     // MARK: - Deliberate-Stop Sentinel (`stopped.marker`)
 
     /// Returns `true` when `stopped.marker` exists in `dataDir`.
