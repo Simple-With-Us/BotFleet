@@ -58,6 +58,16 @@ public actor ClaudeStreamRunner: EngineDriver {
             args.append(contentsOf: ["--resume", resumeId])
         }
 
+        if let preparation = input.toolPreparation,
+           let configuration = try? preparation.claudeConfigurationJSON(forBot: input.botId) {
+            args.append(contentsOf: ["--strict-mcp-config", "--mcp-config", configuration])
+            let settings = ["env": ["ENABLE_TOOL_SEARCH": NativeClaudeToolSearch.setting(input: input)]]
+            if let data = try? JSONSerialization.data(withJSONObject: settings, options: [.sortedKeys]),
+               let json = String(data: data, encoding: .utf8) {
+                args.append(contentsOf: ["--settings", json])
+            }
+        }
+
         var env = input.environment
         for (key, value) in Self.containmentEnvironment {
             env[key] = value
@@ -99,6 +109,7 @@ public actor ClaudeStreamRunner: EngineDriver {
     }
 
     public func sendTurn(input: TurnInput) async throws -> AsyncStream<TurnEvent> {
+        _ = try input.toolPreparation?.claudeConfigurationJSON(forBot: input.botId)
         guard activeSessions[input.threadId] == nil else {
             throw EngineDriverError.turnAlreadyActive(threadId: input.threadId)
         }
@@ -214,8 +225,10 @@ public actor ClaudeStreamRunner: EngineDriver {
             return []
         }
 
-        // Ignore subagent narration deltas when `parent_tool_use_id` is non-null on `stream_event` frames.
+        // Child-origin frames cannot prove the parent model route healthy.
         let parentToolUseId = root["parent_tool_use_id"] as? String
+        // Child work may use another model and cannot prove the parent route healthy.
+        guard parentToolUseId == nil else { return [] }
         var events: [TurnEvent] = []
 
         switch type {

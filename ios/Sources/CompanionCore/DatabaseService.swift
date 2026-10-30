@@ -366,6 +366,18 @@ public actor DatabaseService {
 
         CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at);
 
+        CREATE TABLE IF NOT EXISTS native_event_waits (
+            wait_id TEXT PRIMARY KEY,
+            bot_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            deadline_at REAL NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            snapshot_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_native_event_waits_bot_status ON native_event_waits(bot_id, status);
+
         CREATE TABLE IF NOT EXISTS routine_request_receipts (
             request_id TEXT PRIMARY KEY,
             message_id TEXT NOT NULL,
@@ -426,6 +438,9 @@ public actor DatabaseService {
         // the launch path free of a write on a store that is already current.
         if try !tableHasColumn("metadata_json", inTable: "messages") {
             try execute(sql: "ALTER TABLE messages ADD COLUMN metadata_json TEXT;")
+        }
+        if try !tableHasColumn("revision", inTable: "native_event_waits") {
+            try execute(sql: "ALTER TABLE native_event_waits ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;")
         }
         try ensureMessageTriggers()
     }
@@ -912,6 +927,151 @@ public actor DatabaseService {
             ))
         }
         return results
+    }
+
+    // MARK: - Native Event Waits
+
+    public func saveNativeEventWait(_ wait: NativeEventWait) throws {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let encoder = JSONEncoder()
+        let encoded: String
+        do {
+            encoded = String(decoding: try encoder.encode(wait), as: UTF8.self)
+        } catch {
+            throw DatabaseError.executionFailed("Failed to encode native event wait: \(error.localizedDescription)")
+        }
+        let sql = """
+        INSERT INTO native_event_waits (wait_id, bot_id, status, created_at, deadline_at, revision, snapshot_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(wait_id) DO UPDATE SET
+            bot_id = excluded.bot_id,
+            status = excluded.status,
+            created_at = excluded.created_at,
+            deadline_at = excluded.deadline_at,
+            revision = excluded.revision,
+            snapshot_json = excluded.snapshot_json;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, (wait.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 2, (wait.botId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 3, (wait.status.rawValue as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(statement, 4, wait.createdAt)
+        sqlite3_bind_double(statement, 5, wait.deadlineAt)
+        sqlite3_bind_int64(statement, 6, Int64(wait.revision))
+        sqlite3_bind_text(statement, 7, (encoded as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    public func loadNativeEventWaits() throws -> [NativeEventWait] {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "SELECT snapshot_json FROM native_event_waits ORDER BY created_at, wait_id;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+        var waits: [NativeEventWait] = []
+        let decoder = JSONDecoder()
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { break }
+            guard result == SQLITE_ROW else {
+                throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            guard let text = sqlite3_column_text(statement, 0) else { continue }
+            let data = Data(String(cString: text).utf8)
+            do {
+                waits.append(try decoder.decode(NativeEventWait.self, from: data))
+            } catch {
+                throw DatabaseError.executionFailed("Failed to decode a native event wait: \(error.localizedDescription)")
+            }
+        }
+        return waits
+    }
+
+    public func deleteNativeEventWait(id: String) throws {
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let sql = "DELETE FROM native_event_waits WHERE wait_id = ?1;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    public func claimNativeEventWaitDispatch(_ wait: NativeEventWait) throws -> Bool {
+        guard wait.status == .dispatching else { return false }
+        guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
+        let current = try loadNativeEventWaits().first(where: { $0.id == wait.id })
+        guard let current, current.status == .dispatching, current.revision == wait.revision else { return false }
+        var accepted = current
+        accepted.status = .accepted
+        accepted.revision &+= 1
+        let encoded: String
+        do {
+            encoded = String(decoding: try JSONEncoder().encode(accepted), as: UTF8.self)
+        } catch {
+            throw DatabaseError.executionFailed("Failed to encode claimed native event wait: \(error.localizedDescription)")
+        }
+        let sql = """
+        UPDATE native_event_waits
+        SET status = ?1, revision = ?2, snapshot_json = ?3
+        WHERE wait_id = ?4 AND status = ?5 AND revision = ?6;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, (accepted.status.rawValue as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 2, Int64(accepted.revision))
+        sqlite3_bind_text(statement, 3, (encoded as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 4, (wait.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 5, (wait.status.rawValue as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 6, Int64(wait.revision))
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        return sqlite3_changes(db) == 1
+    }
+
+    public func replaceNativeEventWaitSnapshot(_ waits: [NativeEventWait]) throws {
+        guard waits.count <= 150 else {
+            throw DatabaseError.executionFailed("Native event wait snapshot exceeds the 150 wait storage limit")
+        }
+        try execute(sql: "BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            let acceptedById = Dictionary(
+                uniqueKeysWithValues: try loadNativeEventWaits()
+                    .filter { $0.status == .accepted }
+                    .map { ($0.id, $0) }
+            )
+            let reconciled = waits.map { incoming in
+                guard incoming.status == .dispatching,
+                      let accepted = acceptedById[incoming.id], accepted.revision > incoming.revision else {
+                    return incoming
+                }
+                return accepted
+            }
+            try execute(sql: "DELETE FROM native_event_waits;")
+            for wait in reconciled {
+                try saveNativeEventWait(wait)
+            }
+            try execute(sql: "COMMIT;")
+        } catch {
+            try? execute(sql: "ROLLBACK;")
+            throw error
+        }
     }
 
     // MARK: - Webhook Deliveries
@@ -1492,7 +1652,7 @@ public actor DatabaseService {
         let allowedTables: Set<String> = [
             "threads", "messages", "messages_fts",
             "routine_runs", "routine_request_receipts", "webhook_deliveries",
-            "bots", "routines", "webhooks"
+            "native_event_waits", "bots", "routines", "webhooks"
         ]
         guard allowedTables.contains(table) else {
             throw DatabaseError.executionFailed("Disallowed table name in countRows: \(table)")

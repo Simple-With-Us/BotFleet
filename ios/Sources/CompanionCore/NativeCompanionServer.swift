@@ -429,6 +429,26 @@ public enum CompanionFieldLimits {
     public static let messageTitle = 512
     public static let pushToken = 512
     public static let roomTerminology = 256
+    public static let waitPrompt = 4_000
+    public static let waitIdentifier = 256
+    public static let waitThreadId = 256
+    public static let waitBotId = 256
+    public static let waitPath = 1_024
+}
+
+private struct NativeWaitPredicatePayload: Decodable {
+    let kind: String
+    let relativePath: String?
+    let pid: Int32?
+    let startTime: Double?
+}
+
+private struct NativeWaitCreatePayload: Decodable {
+    let botId: String
+    let threadId: String
+    let prompt: String
+    let predicate: NativeWaitPredicatePayload
+    let timeoutSeconds: Double?
 }
 
 /// Pure-Swift HTTP and SSE companion server actor built on `Network.framework`.
@@ -436,6 +456,7 @@ public enum CompanionFieldLimits {
 /// Bearer token verification, and both BF-2489 security gates on `POST /api/desktop/open`.
 public actor NativeCompanionServer {
     private let database: DatabaseService
+    private let nativeRuntime: NativeRuntimeServices?
     private var pairedTokens: Set<String>
     private var pairingCode: String?
     /// When the open pairing window closes.  `nil` means no window is open.
@@ -496,6 +517,7 @@ public actor NativeCompanionServer {
         config: CompanionServerConfig = CompanionServerConfig(),
         bots: [CompanionBotRecord] = [],
         apnsProvider: NativeAPNsProvider? = nil,
+        nativeRuntime: NativeRuntimeServices? = nil,
         onDesktopOpen: (@Sendable () async throws -> Void)? = nil,
         onShutdown: (@Sendable () async -> Void)? = nil
     ) {
@@ -509,6 +531,7 @@ public actor NativeCompanionServer {
         self.config = config
         self.bots = bots
         self.apnsProvider = apnsProvider
+        self.nativeRuntime = nativeRuntime
         self.onDesktopOpen = onDesktopOpen
         self.onShutdown = onShutdown
     }
@@ -703,6 +726,12 @@ public actor NativeCompanionServer {
         case ("POST", "/api/system/shutdown"):
             return await handleSystemShutdown(request)
 
+        case ("GET", "/api/waits"):
+            return await handleListNativeWaits(request)
+
+        case ("POST", "/api/waits"):
+            return await handleCreateNativeWait(request)
+
         case ("GET", "/api/events"):
             // The socket path streams `subscribeSSE()` frames and keeps the
             // connection open (see `streamEvents`).  This branch answers an
@@ -718,6 +747,9 @@ public actor NativeCompanionServer {
             )
 
         default:
+            if method == "DELETE", let waitId = matchNativeWaitDeleteRoute(path: path) {
+                return await handleCancelNativeWait(id: waitId)
+            }
             if let threadRoute = matchThreadRoute(method: method, path: path) {
                 return await handleThreadRoute(threadRoute, request: request)
             }
@@ -931,8 +963,114 @@ public actor NativeCompanionServer {
         }
 
         shutdownRequested = true
+        await nativeRuntime?.shutdown()
         await onShutdown?()
         return .json(200, ["ok": true, "stopped": true])
+    }
+
+    private func handleListNativeWaits(_ request: CompanionHTTPRequest) async -> CompanionHTTPResponse {
+        guard let nativeRuntime else { return .error(404, "no_route") }
+        guard let botId = request.queryItems["botId"], Self.isValidIdentifier(botId),
+              botId.utf8.count <= CompanionFieldLimits.waitBotId else {
+            return .error(400, "botId is required")
+        }
+        do {
+            let waits = try await nativeRuntime.listWaits(botId: botId)
+            return .json(200, waits)
+        } catch let error as NativeRuntimeServicesError {
+            return nativeRuntimeErrorResponse(error)
+        } catch {
+            return .error(500, "failed_to_list_waits")
+        }
+    }
+
+    private func handleCreateNativeWait(_ request: CompanionHTTPRequest) async -> CompanionHTTPResponse {
+        guard let nativeRuntime else { return .error(404, "no_route") }
+        guard let contentType = request.headerValue(for: "Content-Type")?.lowercased(), contentType.contains("application/json") else {
+            return .error(415, "Content-Type must be application/json")
+        }
+        guard let body = request.body,
+              let payload = try? JSONDecoder().decode(NativeWaitCreatePayload.self, from: body) else {
+            return .error(400, "invalid_wait_payload")
+        }
+        guard Self.isValidIdentifier(payload.botId), payload.botId.utf8.count <= CompanionFieldLimits.waitBotId else {
+            return .error(400, "invalid_bot_id")
+        }
+        guard Self.isValidIdentifier(payload.threadId), payload.threadId.utf8.count <= CompanionFieldLimits.waitThreadId else {
+            return .error(400, "invalid_thread_id")
+        }
+        guard !payload.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              payload.prompt.utf8.count <= CompanionFieldLimits.waitPrompt else {
+            return .error(400, "invalid_prompt")
+        }
+        if let timeout = payload.timeoutSeconds, !timeout.isFinite || timeout <= 0 {
+            return .error(400, "invalid_timeout")
+        }
+        let predicate: NativeEventWaitPredicate
+        switch payload.predicate.kind {
+        case "fileExists":
+            guard let path = payload.predicate.relativePath, path.utf8.count <= CompanionFieldLimits.waitPath else {
+                return .error(400, "invalid_file_path")
+            }
+            predicate = .fileExists(relativePath: path)
+        case "processFinished":
+            guard let pid = payload.predicate.pid, let startTime = payload.predicate.startTime,
+                  pid > 0, startTime.isFinite, startTime > 0 else {
+                return .error(400, "invalid_process_identity")
+            }
+            predicate = .processFinished(pid: pid, startTime: startTime)
+        case "botIdle":
+            predicate = .botIdle
+        default:
+            return .error(400, "unsupported_wait_predicate")
+        }
+        do {
+            let wait = try await nativeRuntime.registerWait(
+                botId: payload.botId,
+                threadId: payload.threadId,
+                prompt: payload.prompt,
+                predicate: predicate,
+                timeout: payload.timeoutSeconds
+            )
+            return .json(201, wait)
+        } catch let error as NativeRuntimeServicesError {
+            return nativeRuntimeErrorResponse(error)
+        } catch let error as NativeEventWaitError {
+            return .error(400, error.localizedDescription)
+        } catch {
+            return .error(500, "failed_to_register_wait")
+        }
+    }
+
+    private func handleCancelNativeWait(id: String) async -> CompanionHTTPResponse {
+        guard let nativeRuntime else { return .error(404, "no_route") }
+        do {
+            let wait = try await nativeRuntime.cancelWait(id: id)
+            return .json(200, wait)
+        } catch let error as NativeRuntimeServicesError {
+            return nativeRuntimeErrorResponse(error)
+        } catch {
+            return .error(500, "failed_to_cancel_wait")
+        }
+    }
+
+    private func nativeRuntimeErrorResponse(_ error: NativeRuntimeServicesError) -> CompanionHTTPResponse {
+        switch error {
+        case .inactive, .stopped:
+            return .error(503, "native_runtime_unavailable")
+        case .unknownBot(_), .threadNotOwned(_), .unknownWait(_):
+            return .error(404, error.localizedDescription)
+        case .waitAlreadyDispatched(_):
+            return .error(409, error.localizedDescription)
+        }
+    }
+
+    private func matchNativeWaitDeleteRoute(path: String) -> String? {
+        let prefix = "/api/waits/"
+        guard path.hasPrefix(prefix) else { return nil }
+        let id = String(path.dropFirst(prefix.count))
+        guard Self.isValidIdentifier(id), id.utf8.count <= CompanionFieldLimits.waitIdentifier else { return nil }
+        return id
     }
 
     // MARK: - Thread Sub-Routes
@@ -1113,6 +1251,7 @@ public actor NativeCompanionServer {
     /// first listener instead of leaking it beside the new one.
     @discardableResult
     public func startListening(port: UInt16 = 0, options: ListenerOptions = ListenerOptions()) async throws -> UInt16? {
+        try await nativeRuntime?.activate(pollIntervalSeconds: 1)
         let nwPort: NWEndpoint.Port
         if port == 0 {
             nwPort = .any
@@ -1124,7 +1263,7 @@ public actor NativeCompanionServer {
         }
         // A listener that is already up is cancelled first, so a repeated
         // start never leaves an orphan bound to a port nobody knows.
-        stopListening()
+        stopListenerSocket()
         let listener = try NWListener(using: .tcp, on: nwPort)
         // Loopback by default: the cleartext device port must not be reachable
         // from the network unless someone opted in on purpose.
@@ -1185,7 +1324,12 @@ public actor NativeCompanionServer {
         }
     }
 
-    public func stopListening() {
+    public func stopListening() async {
+        stopListenerSocket()
+        await nativeRuntime?.shutdown()
+    }
+
+    private func stopListenerSocket() {
         listener?.cancel()
         listener = nil
     }

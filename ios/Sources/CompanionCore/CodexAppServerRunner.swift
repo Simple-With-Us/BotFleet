@@ -58,6 +58,10 @@ public actor CodexAppServerRunner: EngineDriver {
     /// Builds the verified spawn specification for Codex `app-server` over stdio.
     public static func buildSpawnSpec(executable: String = "codex", input: TurnInput) -> EngineSpawnSpec {
         var args = ["app-server"]
+        if let preparation = input.toolPreparation,
+           let overrides = try? preparation.codexConfigurationOverrides(forBot: input.botId) {
+            for override in overrides { args.append(contentsOf: ["-c", override]) }
+        }
         if let effort = input.configOptions["effort"], !effort.isEmpty {
             let normalized = effort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if allowedEfforts.contains(normalized) {
@@ -81,6 +85,7 @@ public actor CodexAppServerRunner: EngineDriver {
     }
 
     public func sendTurn(input: TurnInput) async throws -> AsyncStream<TurnEvent> {
+        _ = try input.toolPreparation?.codexConfigurationOverrides(forBot: input.botId)
         guard activeSessions[input.threadId] == nil else {
             throw EngineDriverError.turnAlreadyActive(threadId: input.threadId)
         }
