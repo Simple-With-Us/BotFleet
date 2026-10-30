@@ -59,4 +59,6 @@ Integration onto resource parent `736a9e71` passed typecheck, 267 focused Vitest
 
 The final source integration uses resource parent `6ee378d0`.  Conflicts were resolved to one resource responder retaining the bounded snapshot, null limit keys, storage-state probe and optional inode gate.  On that source, typecheck, 77 affected Vitest tests, 45 Node tests and the parent-ref lint gate passed (4,865 warnings, no per-rule increase).  The frozen complete-run record above remains the full-suite boundary; no live unit was installed or started.
 
+After current main and the resource/inventory branch were integrated through `c7829e63`, the affected checks passed typecheck, 55 Vitest tests and parent-ref lint (4,866 warnings with no per-rule increase).  The preceding integration also passed 62 resource/storage/identity/knob fixtures, all 45 renderer/gate Node tests, shell syntax and the 1,075-path inventory audit.  The rendered startup wrapper retains executable mode; these checks do not establish an installed unit or live filesystem isolation.
+
 Recipe 12's live mount/unmount and write attempts remain false, as do recipes 11 and 13 and every other complete placement assertion.  A deployed unit, its actual namespace behavior, log rotation and other-app responsiveness require the plan's separately authorized hand runs and reviewed output.
