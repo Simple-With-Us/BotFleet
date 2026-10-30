@@ -2,7 +2,7 @@ import { app, BrowserWindow, WebContentsView, clipboard, desktopCapturer, dialog
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { openServerControls, shutdownAttachedServer } from "./server-controls.mjs";
+import { openServerControls, shutdownAttachedServer, updateServerControls, UPDATE_CONTROL_ARGUMENT } from "./server-controls.mjs";
 import { botfleetDataDir } from "./app-paths.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -372,12 +372,31 @@ app.on("open-url", (event, url) => {
 });
 
 app.on("second-instance", (_event, commandLine) => {
+  if (commandLine.includes(UPDATE_CONTROL_ARGUMENT)) {
+    void app.whenReady().then(() => performControlUpdate());
+    return;
+  }
   const packageUrl = packageUrlFromCommandLine(commandLine);
   if (packageUrl) pendingPackageInstallUrl = packageUrl;
   activateExistingWindow(BrowserWindow.getAllWindows());
   const target = BrowserWindow.getAllWindows().find((win) => !win.isDestroyed());
   deliverPackageInstall(target);
 });
+
+let controlUpdateInProgress = false;
+async function performControlUpdate() {
+  if (controlUpdateInProgress || process.platform !== "darwin") return;
+  controlUpdateInProgress = true;
+  try {
+    await updateServerControls({
+      source: app.isPackaged ? path.join(process.resourcesPath, "BotFleet Control.app") : fileURLToPath(new URL("./resources/BotFleet Control.app", import.meta.url)),
+      shell,
+      dialog,
+    });
+  } finally {
+    controlUpdateInProgress = false;
+  }
+}
 
 // Packaged: the harness server ships in Resources (compiled JS, zero deps)
 // and runs on Electron's own Node via utilityProcess. It serves the built
@@ -2771,6 +2790,7 @@ function setupApplicationMenu() {
             dialog,
           }),
         }] : []),
+        ...(isMac ? [{ label: "Update Control…", click: () => performControlUpdate() }] : []),
         // On macOS the Server submenu lives in the app-name menu, so it is
         // not repeated here; every other platform has no app-name menu and
         // gets it under File instead.
@@ -2864,6 +2884,13 @@ function setupApplicationMenu() {
 }
 
 app.whenReady().then(async () => {
+  // A Control-only update must not clear a deliberate server stop, start a
+  // server, or load/migrate account credentials as ordinary app launch does.
+  if (process.argv.includes(UPDATE_CONTROL_ARGUMENT)) {
+    await performControlUpdate();
+    app.exit(0);
+    return;
+  }
   // A deliberate shutdown writes a sentinel so launchd's periodic tick leaves
   // the harness alone.  Launching the app is the documented way back, so clear
   // it first — before anything here tries to reach a server, so the request

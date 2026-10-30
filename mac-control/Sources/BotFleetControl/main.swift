@@ -76,6 +76,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// True when the local server answered the health check as BotFleet but
     /// has no control routes: it is running, and it is older than this app.
     private var serverOutdated = false
+    private let controlBuild = ControlBuildIdentity.installed()
+    private let controlUpdate = ControlUpdateHandoff()
     private var serverPresence: ServerPresence = .unknown
     private var offlineVMs: OfflineDockerState = .unavailable
     private var helperVMs: [LocalVM]?
@@ -565,6 +567,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else { add("Shared VM: unknown while server is busy") }
         }
         if let problem { add("Error: \(problem)") }
+        add(ControlVersionHandshake(control: controlBuild, server: status?.serverBuild).summary)
         if let ownerStopsProblem { add("Fleet Services: \(ownerStopsProblem)") }
         if let vmProblem { add("Local VM: \(vmProblem)") }
         if status?.sharedVM?.state == "stopped" { add("Local VM requires recreation in BotFleet") }
@@ -613,6 +616,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             if let st = hostStatuses[host.id] {
                 add("Server: running (\(st.activeBotCount) active bots)")
+                add(ControlVersionHandshake(control: controlBuild, server: st.serverBuild).summary)
                 let vmState = st.isSharedVMRunning ? "Running 🟢" : "Off ⚪️ (\(st.sharedVM?.state ?? "stopped"))"
                 add("Shared VM: \(vmState)")
                 if st.localVms.count > 1 {
@@ -767,6 +771,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             state: SMAppService.mainApp.status == .enabled ? .on : .off)
         menu.addItem(.separator())
         add("Open BotFleet", selector: #selector(openBotFleet))
+        add("Update Control…", selector: #selector(updateControl), enabled: ready)
         add("Hide Menu Bar Icon…", selector: #selector(hideIcon), enabled: ready)
         add("Quit Control", selector: #selector(quitControl), enabled: !isBusy)
     }
@@ -1275,6 +1280,16 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, error in
             if let error { DispatchQueue.main.async { self.showError(error.localizedDescription) } }
+        }
+    }
+
+    @objc private func updateControl() {
+        guard !isBusy && !isLoading else { return }
+        let application = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "app.botfleet.macos")
+        do {
+            try controlUpdate.perform(selection: .updateControl, application: application)
+        } catch {
+            showError(error.localizedDescription)
         }
     }
 
