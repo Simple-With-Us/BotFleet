@@ -3589,6 +3589,12 @@ export async function startDesktopBeforeWatchdog({ desktop, open, verify, bootst
   await bootstrap();
 }
 
+/** Recovery still attempts every watchdog if the preferred desktop cannot start. */
+export async function restoreDesktopBeforeWatchdogs({ desktop, open, verify, bootstraps, record }) {
+  if (desktop) await record(async () => { await open(); await verify(); });
+  for (const bootstrap of bootstraps) await record(bootstrap);
+}
+
 function createOperations(config) {
   let lastPreflight;
   const componentFlags = () => resolveUpdateComponentFlags(config.parsed.components);
@@ -4539,7 +4545,7 @@ function createOperations(config) {
         legacyPlistExists: await exists(config.legacyPlist),
         plistLabel: config.customPlist && rollbackPlistExists ? await launchAgentPlistLabel(config.plist) : null,
       });
-      await record(() => startDesktopBeforeWatchdog({
+      await restoreDesktopBeforeWatchdogs({
         desktop: previous.appWasRunning,
         open: () => run("open", [config.appPath]),
         verify: () => waitForStartup({
@@ -4549,12 +4555,9 @@ function createOperations(config) {
           fallback: "Restored application did not regain authenticated ownership",
           report: config.reportDetail,
         }),
-        bootstrap: async () => {
-          for (const plist of rollbackHarnessPlists) {
-            await run("launchctl", ["bootstrap", config.domain, plist]);
-          }
-        },
-      }));
+        bootstraps: rollbackHarnessPlists.map((plist) => () => run("launchctl", ["bootstrap", config.domain, plist])),
+        record,
+      });
       if (previous.launchdLoaded || previous.legacyLaunchdLoaded || previous.appWasRunning) await record(async () => {
         // The restored build boots as slowly as the one it replaced did: on
         // 2026-10-09 it took about two minutes at a load average near 900.  The

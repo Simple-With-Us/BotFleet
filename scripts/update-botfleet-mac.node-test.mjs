@@ -10,6 +10,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import {
   startDesktopBeforeWatchdog,
+  restoreDesktopBeforeWatchdogs,
   applicationAttachmentError,
   captureProcessIdentities,
   exactAppPidsFromPs,
@@ -102,6 +103,23 @@ test("server-only and no-open startup retain the existing watchdog route", async
     bootstrap: async () => { bootstrapped = true; },
   });
   assert.equal(bootstrapped, true);
+});
+
+test("rollback attempts every watchdog after desktop verification and individual bootstrap failures", async () => {
+  const calls = [];
+  const errors = [];
+  await restoreDesktopBeforeWatchdogs({
+    desktop: true,
+    open: async () => { calls.push("open restored app"); },
+    verify: async () => { calls.push("verify restored app"); throw new Error("app failed"); },
+    bootstraps: [
+      async () => { calls.push("first watchdog"); throw new Error("first plist failed"); },
+      async () => { calls.push("second watchdog"); },
+    ],
+    record: async (operation) => { try { await operation(); } catch (error) { errors.push(error.message); } },
+  });
+  assert.deepEqual(calls, ["open restored app", "verify restored app", "first watchdog", "second watchdog"]);
+  assert.deepEqual(errors, ["app failed", "first plist failed"]);
 });
 
 const scripts = dirname(fileURLToPath(import.meta.url));
