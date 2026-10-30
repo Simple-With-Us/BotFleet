@@ -13,12 +13,15 @@ export interface HostResourcesDeps {
   thresholds: () => AdmissionThresholds;
   readText?: (path: string) => string;
 }
+export type HostResourcesResponse =
+  | { status: 200; body: HostResourcesReport }
+  | { status: 403 | 501; body: { error: string } };
 
 /** The companion bearer is intentionally outside the host-owner boundary. */
 export function hostResourcesResponse(
   caller: { localOwner: boolean; fromCompanion: boolean; viaNamedTunnel: boolean },
   deps: Omit<HostResourcesDeps, "platform"> & { platform: NodeJS.Platform },
-): { status: number; body: HostResourcesReport | { error: string } } {
+): HostResourcesResponse {
   if (!caller.localOwner || caller.fromCompanion || caller.viaNamedTunnel) {
     return { status: 403, body: { error: "Host resources are available only through the local owner or authenticated server gate" } };
   }
