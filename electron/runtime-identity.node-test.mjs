@@ -4,12 +4,21 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { authorizedRuntime, buildCompatibility, hashStaticUi, readPackagedBuildIdentity, readSourceBuildIdentity } from "./runtime-identity.mjs";
+import { authorizedRuntime, buildCompatibility, hashStaticUi, readPackagedBuildIdentity, readSourceBuildIdentity, validBuildIdentity } from "./runtime-identity.mjs";
 import { harnessOwnerProof } from "./harness-ownership.mjs";
 import { probeHarness, resolvePackagedServer } from "./server-boot-probe.mjs";
 
 const build = { app: "botfleet", sourceCommit: "a".repeat(40), sourceDirty: false, apiVersion: 1, version: "1.0.30", uiHash: "e".repeat(64) };
 const owner = { version: 1, pid: 4242, port: 8799, nonce: "b".repeat(64) };
+
+test("release build metadata is optional for old identities and preserves the shared timestamp verbatim", () => {
+  assert.equal(validBuildIdentity(build), true);
+  assert.equal(validBuildIdentity({ ...build, version: "0.1.0", build: "202610301230" }), true);
+  assert.equal(validBuildIdentity({ ...build, build: "12.3.4" }), true);
+  for (const invalid of [null, 202610301230, "unknown", "1e12", "12..3", "1.2.3.4"]) {
+    assert.equal(validBuildIdentity({ ...build, build: invalid }), false);
+  }
+});
 
 test("runtime diagnostics require the private nonce and never accept the public health proof", () => {
   assert.equal(authorizedRuntime(owner, `Bearer ${owner.nonce}`), true);
@@ -51,6 +60,9 @@ test("source identity stays pinned after the checkout advances; packaged identit
     writeFileSync(join(root, "package.json"), JSON.stringify({ version: "1.0.30" }));
     git("add", "."); git("commit", "-m", "initial");
     const pinned = readSourceBuildIdentity(root);
+    const stamped = readSourceBuildIdentity(root, { requireGit: true, version: "0.1.0", build: "202610301230" });
+    assert.equal(stamped.version, "0.1.0");
+    assert.equal(stamped.build, "202610301230");
     writeFileSync(join(root, "package.json"), JSON.stringify({ version: "1.0.31" }));
     assert.equal(readSourceBuildIdentity(root).sourceDirty, true);
     git("add", "."); git("commit", "-m", "next");
@@ -60,6 +72,8 @@ test("source identity stays pinned after the checkout advances; packaged identit
     assert.throws(() => readPackagedBuildIdentity(join(root, "server")));
     writeFileSync(join(root, "server", "build-identity.json"), JSON.stringify(pinned));
     assert.deepEqual(readPackagedBuildIdentity(join(root, "server")), pinned);
+    writeFileSync(join(root, "server", "build-identity.json"), JSON.stringify(stamped));
+    assert.deepEqual(readPackagedBuildIdentity(join(root, "server")), stamped);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

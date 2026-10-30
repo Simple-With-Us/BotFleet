@@ -1,0 +1,38 @@
+# Control Version Handshake And Explicit Update
+
+BF-2531 implements the owner's Oct 30 Decision 2 ruling: “Version handshake with an explicit Update Control action (recommended)”.  Decision 1's product/fleet split remains the boundary, and optional pre-login support is the separate BF-2597 task.
+
+## Version Contract
+
+`GET /api/system/control` adds optional `serverBuild` metadata with `version`, `build` and `sourceCommit`.  The route keeps its existing loopback and companion-replay gates, and contains no new secret, download URL or executable path.  Control reads its own version and build from its bundle and its source commit from the bundled identity.
+
+Build components are compared numerically, with absent trailing components treated as zero.  The build is the shared planner's chronology authority across marketing versions, including the transition to 0.1.0.  Equal builds with conflicting marketing versions or known source commits report different identities with unknown order.  Missing or malformed metadata stays unknown; older status responses still decode, and the existing too-old server stop path stays available.
+
+The runtime manifest accepts an optional `build` without rejecting older manifests.  The Control builder stamps its exact version and build into its own identity.  The current server bundle does not supply a release build yet: BF-2588 must pass the shared planner's existing `{build}` output into `readSourceBuildIdentity` when it adopts that planner.  Until then, the handshake can identify differing versions or known commits but does not infer which build is newer.
+
+## Explicit Update Transaction
+
+Control's `Update Control…` validates the installed BotFleet app and its bundled Control package's update-handler protocol before launching the app with the fixed `--update-control` argument.  A second instance delivers that argument to a running Electron app; a Control-only launch exits after the transaction without entering ordinary server startup, clearing stop markers or migrating account credentials.
+
+The owning app compares the bundled and installed version/build metadata, asks for the explicit `Update Control` selection, requests a normal Control quit and observes exit before reusing the existing staged-copy/rename installer.  A busy Control app can refuse to quit; it is never forcibly killed or overwritten while observed running.  The installer rechecks before replacing, rejects release drift after consent, and retains its rollback on rename failure.  Cancellation changes nothing, and the transaction never reads or rewrites saved hosts or remote tokens.
+
+An older, equal, unknown or unavailable replacement is refused.  A native-only BotFleet installation currently has no bundled Control replacement or handler; the action reports that precise missing delivery capability and performs no install.  No server-provided path, download source, native lifecycle replacement or daemon is added here.
+
+## Verification
+
+The Node fixtures use temporary application directories and injected quit, process-probe, dialog, sleep and open handlers.  They cover cancellation, explicit selection, normal exit, a refused quit, a restart during the transaction, unsuitable package identities and release drift.  Runtime identity tests preserve old manifests and accept the shared timestamp unchanged.  Swift tests cover numeric build order, timestamp migration, unknown metadata, source mismatch, real status decoding and a supported package handoff through a stub command runner.
+
+```sh
+node --test electron/server-controls.node-test.mjs electron/runtime-identity.node-test.mjs electron/control-build-version.node-test.mjs
+pnpm typecheck
+VITEST=true pnpm exec vitest run server/index.test.ts -t 'native server controls expose VM state without configuration secrets'
+swift test --package-path mac-control --jobs 2
+```
+
+All 31 targeted Node tests, `pnpm typecheck`, the lint baseline, the focused server fixture and `git diff --check` passed locally.  The server fixture ran one selected test against its temporary home and randomized loopback ports, with the other 311 tests skipped.  Isolated Mac validation passed 228 Control Swift tests and the Control executable build.  No live Mac application or process was launched, quit or installed during implementation.
+
+The required full `pnpm test` run on frozen commit `a077753f780bc9bfba239bfe9235c50457cd5547` exited 1 at the Vitest floor gate: 46 failed, 12,187 passed and 26 skipped tests across 720 files (7 failed, 712 passed and 1 skipped).  The failing files were `server/env-path.test.ts`, `server/index.test.ts`, `server/local-vm-gh-credentials.test.ts`, `server/plugin-sandbox.test.ts`, `server/plugin-zulip-dispatch.test.ts`, `server/plugins.test.ts` and `server/procs.test.ts`.  Diagnostics include API timeouts/state assertions, `sandbox_exited`, an undefined `stdin` in the command runner and a CLI candidate-count assertion; no base-commit reproduction has established whether these are pre-existing.  Later commands chained after the floor gate did not run.
+
+After that run settled, the update action gained fixed-message exception backstops for the second-instance readiness chain and an error dialog that can itself throw during shutdown.  The 31 targeted Node tests, Electron syntax check, lint baseline and diff check passed again after this bounded change.
+
+The Electron main app declares the Apple Events entitlement and a usage description for its explicit, vetoable Control Quit request.  This is confined to the main entitlement file; nested helpers gain no automation permission.  [Apple documents a same-team exemption](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.security.automation.apple-events), but the Control builder also supports ad-hoc signing, so the update cannot assume that exemption.  macOS still controls consent; denial or Control's busy-action refusal leaves the installed bundle intact.  No permission was granted or live quit attempted during validation.

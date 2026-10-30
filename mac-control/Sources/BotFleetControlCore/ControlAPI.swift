@@ -26,17 +26,21 @@ public struct ControlStatus: Decodable, Equatable, Sendable {
     /// something else entirely.  The server sends the same breakdown it uses
     /// for that refusal, so the dialog and the refusal agree.
     public let blockingWork: [BlockingWork]?
+    /// The server's release metadata, absent from older servers.
+    public let serverBuild: ControlBuildIdentity?
 
     public init(
         activeBotCount: Int,
         localVms: [LocalVM],
         persistOnExit: Bool = true,
-        blockingWork: [BlockingWork]? = nil
+        blockingWork: [BlockingWork]? = nil,
+        serverBuild: ControlBuildIdentity? = nil
     ) {
         self.activeBotCount = activeBotCount
         self.localVms = localVms
         self.persistOnExit = persistOnExit
         self.blockingWork = blockingWork
+        self.serverBuild = serverBuild
     }
 
     public var runningVMCount: Int { localVms.filter(\.running).count }

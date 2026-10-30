@@ -17,6 +17,7 @@ import { join, dirname } from "node:path";
 import { z } from "zod";
 
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
+import { ClaudeSingleCallLedger } from "../claude-billed-call.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { augmentedPath } from "../env-path.ts";
 import { fileWritePaths } from "../auto-approve.ts";
@@ -1023,6 +1024,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         /** Highest helper-token total already counted for one assistant
          *  message id.  Streamed frames repeat that message's usage. */
         helperUsage: Map<string, number>;
+        billedCalls: ClaudeSingleCallLedger;
         /** How this turn's latest own CLI turn ended: what the settle
          *  reports, once nothing more of the turn is still to run. */
         outcome?: { ok: boolean; stopReason: string | null };
@@ -1410,7 +1412,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const live = sessions.get(threadId);
       if (live && !live.turn && !live.unsolicited && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
-        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), input: turn, retry, retryAbort };
+        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), billedCalls: new ClaudeSingleCallLedger(), input: turn, retry, retryAbort };
         live.engaged = false;
         live.foreignRunning = false;
         // stderr feeds the crash message; a warm process still holds turn
@@ -1518,7 +1520,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         argsKey,
         sessionId: sessionId ?? newSessionId,
         pendingReceipt: null,
-        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), input: turn, retry, retryAbort },
+        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), billedCalls: new ClaudeSingleCallLedger(), input: turn, retry, retryAbort },
         idleTimer: null,
         closing: false,
         stderr: "",
@@ -1567,7 +1569,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         retryState.delete(threadId);
         // Spread as an object or as nothing: absent unless the provider said.
         const servedModel = t.servedModel ? { servedModel: t.servedModel } : undefined;
-        emit({
+        const completed: RuntimeEvent = {
           ...base(threadId, t.turnId),
           type: "turn.completed",
           ok,
@@ -1578,7 +1580,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           ...(cost != null ? { billingMode: "estimated" as const } : {}),
           ...(usage ? { usage } : {}),
           ...servedModel,
-        });
+        };
+        const billedCall = t.billedCalls.proof();
+        if (billedCall) completed.billedCall = billedCall;
+        emit(completed);
         if (session.child.exitCode === null && !session.closing) armIdle(threadId);
       };
       /** The running BotFleet turn's id.  Only called with a turn running:
@@ -1863,6 +1868,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             // A helper's usage is ITS context, not the bot's: reported as the
             // bot's it would swing the context meter on every helper step.
             // The turn's result frame carries the whole bill either way.
+            if (!helperOf) session.turn?.billedCalls.observe(msg, session.lifecycle && session.engaged);
             if (msg.usage && !helperOf) {
               emit({
                 ...base(threadId, currentTurnId()),
@@ -1950,6 +1956,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             const ours = session.lifecycle
               ? session.engaged || claimsOurs
               : claimsOurs || origin === undefined || origin === "human";
+            t.billedCalls.result(o.usage, ours);
             session.engaged = false;
             const share = advanceCost(meta.total_cost_usd);
             if (!ours) {

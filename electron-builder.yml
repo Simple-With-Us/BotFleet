@@ -152,6 +152,7 @@ mac:
     - from: dist-native/cloudflared/darwin-${arch}/cloudflared
       to: cloudflared/cloudflared
   extendInfo:
+    NSAppleEventsUsageDescription: BotFleet asks Control to quit safely when you choose Update Control.
     NSMicrophoneUsageDescription: BotFleet uses the microphone for voice dictation into the composer.
     NSSpeechRecognitionUsageDescription: BotFleet transcribes your voice on-device to type messages for you.
     NSSpeechSynthesisUsageDescription: BotFleet uses your Apple Personal Voice to speak aloud during calls and voice replies.
