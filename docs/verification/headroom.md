@@ -4,6 +4,8 @@ Refs BF-2559, BF-2596 and BF-2544.  These are the seven resource recipes from [
 
 BF-2598 adds the harness's read-only `GET /api/host/resources` report and its injected enforcement/probe tests; see [Host Resource Report Rollout](../rollouts/2026-10-30-host-resources.md).  It does not assert any complete placement recipe or authorize a live host measurement.
 
+BF-2601 adds a fixture-tested inventory collector, documented in [Host Inventory Collection](host-inventory.md).  The collector sets no values; run it on a host only after the owner authorizes that read-only measurement.
+
 ## Required Recipes
 
 | Key | Fixture And Action | Required Result |
