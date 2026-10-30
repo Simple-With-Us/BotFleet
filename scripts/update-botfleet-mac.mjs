@@ -3580,6 +3580,15 @@ async function sweepAbandonedStageDirectories(config, stageDirectories = []) {
   }
 }
 
+/** Establish the requested desktop owner before its watchdog can start a source release. */
+export async function startDesktopBeforeWatchdog({ desktop, open, verify, bootstrap }) {
+  if (desktop) {
+    await open();
+    await verify();
+  }
+  await bootstrap();
+}
+
 function createOperations(config) {
   let lastPreflight;
   const componentFlags = () => resolveUpdateComponentFlags(config.parsed.components);
@@ -4236,7 +4245,18 @@ function createOperations(config) {
       // Recorded before the bootstrap: a bootstrap that errors can still have
       // loaded the job, and rollback must boot out the label that is running.
       if (previous) previous.startedHarnessLabel = await startedHarnessLabel(config, plist);
-      await run("launchctl", ["bootstrap", config.domain, plist]);
+      await startDesktopBeforeWatchdog({
+        desktop: componentFlags().updateApp && config.parsed.openApplication !== false,
+        open: () => run("open", [config.appPath]),
+        verify: () => waitForStartup({
+          attempt: () => runtimeIdentityPreflight(config, prepared),
+          timeoutMs: config.startupTimeoutMs,
+          what: "the packaged version",
+          fallback: "Installed application did not prove its expected build and ownership",
+          report: config.reportDetail,
+        }),
+        bootstrap: () => run("launchctl", ["bootstrap", config.domain, plist]),
+      });
     },
 
     verifyHarness: async (prepared, previous) => {
@@ -4519,10 +4539,22 @@ function createOperations(config) {
         legacyPlistExists: await exists(config.legacyPlist),
         plistLabel: config.customPlist && rollbackPlistExists ? await launchAgentPlistLabel(config.plist) : null,
       });
-      for (const plist of rollbackHarnessPlists) {
-        await record(async () => { await run("launchctl", ["bootstrap", config.domain, plist]); });
-      }
-      if (previous.appWasRunning) await record(async () => { await run("open", [config.appPath]); });
+      await record(() => startDesktopBeforeWatchdog({
+        desktop: previous.appWasRunning,
+        open: () => run("open", [config.appPath]),
+        verify: () => waitForStartup({
+          attempt: () => runtimePreflight(config),
+          timeoutMs: config.startupTimeoutMs,
+          what: "the restored application",
+          fallback: "Restored application did not regain authenticated ownership",
+          report: config.reportDetail,
+        }),
+        bootstrap: async () => {
+          for (const plist of rollbackHarnessPlists) {
+            await run("launchctl", ["bootstrap", config.domain, plist]);
+          }
+        },
+      }));
       if (previous.launchdLoaded || previous.legacyLaunchdLoaded || previous.appWasRunning) await record(async () => {
         // The restored build boots as slowly as the one it replaced did: on
         // 2026-10-09 it took about two minutes at a load average near 900.  The

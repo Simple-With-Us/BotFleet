@@ -9,6 +9,7 @@ import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import {
+  startDesktopBeforeWatchdog,
   applicationAttachmentError,
   captureProcessIdentities,
   exactAppPidsFromPs,
@@ -69,6 +70,39 @@ import {
   waitForStableApplication,
   waitForStartup,
 } from "./update-botfleet-mac.mjs";
+
+test("desktop update establishes verified packaged ownership before starting the source watchdog", async () => {
+  const calls = [];
+  await startDesktopBeforeWatchdog({
+    desktop: true,
+    open: async () => { calls.push("open"); },
+    verify: async () => { calls.push("verified packaged owner"); },
+    bootstrap: async () => { calls.push("watchdog"); },
+  });
+  assert.deepEqual(calls, ["open", "verified packaged owner", "watchdog"]);
+});
+
+test("failed packaged startup cannot start a competing source owner", async () => {
+  let bootstrapped = false;
+  await assert.rejects(startDesktopBeforeWatchdog({
+    desktop: true,
+    open: async () => {},
+    verify: async () => { throw new Error("expected manifest did not match"); },
+    bootstrap: async () => { bootstrapped = true; },
+  }), /expected manifest did not match/);
+  assert.equal(bootstrapped, false);
+});
+
+test("server-only and no-open startup retain the existing watchdog route", async () => {
+  let bootstrapped = false;
+  await startDesktopBeforeWatchdog({
+    desktop: false,
+    open: async () => { assert.fail("desktop must remain closed"); },
+    verify: async () => { assert.fail("no packaged owner requested"); },
+    bootstrap: async () => { bootstrapped = true; },
+  });
+  assert.equal(bootstrapped, true);
+});
 
 const scripts = dirname(fileURLToPath(import.meta.url));
 
