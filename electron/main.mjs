@@ -373,7 +373,9 @@ app.on("open-url", (event, url) => {
 
 app.on("second-instance", (_event, commandLine) => {
   if (commandLine.includes(UPDATE_CONTROL_ARGUMENT)) {
-    void app.whenReady().then(() => performControlUpdate());
+    void app.whenReady().then(() => performControlUpdate()).catch(() => {
+      console.error("[control] Could not handle the Control update request");
+    });
     return;
   }
   const packageUrl = packageUrlFromCommandLine(commandLine);
@@ -393,6 +395,9 @@ async function performControlUpdate() {
       shell,
       dialog,
     });
+  } catch {
+    // The error dialog itself can throw while Electron is shutting down.
+    console.error("[control] Could not complete the Control update");
   } finally {
     controlUpdateInProgress = false;
   }
