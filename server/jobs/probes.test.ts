@@ -3,7 +3,7 @@
 // keep nothing else it reads.
 import { describe, expect, it } from "vitest";
 
-import { admissionRefusal, createHostProbe, parseDarwinSwap, parseLinuxSwap } from "./admission.ts";
+import { admissionRefusal, createHostProbe, parseDarwinMemoryAvailablePercent, parseDarwinSwap, parseLinuxSwap } from "./admission.ts";
 import { parseEnvListing, parseProcStatPgid } from "./sweep.ts";
 
 describe("swap readings", () => {
@@ -50,6 +50,49 @@ describe("the host probe", () => {
   const swap = (percent: number) => `vm.swapusage: total = 1000.00M  used = ${percent * 10}.00M  free = ${(100 - percent) * 10}.00M  (encrypted)`;
   const settle = () => new Promise((resolve) => setImmediate(resolve));
 
+  it("parses optional XNU memory availability without guessing a pressure category", () => {
+    expect(parseDarwinMemoryAvailablePercent(" 12.5\n")).toBe(12.5);
+    expect(parseDarwinMemoryAvailablePercent("0")).toBe(0);
+    for (const text of ["", "-1", "101", "NaN", "unavailable", "kern.memorystatus_level: 50"]) {
+      expect(parseDarwinMemoryAvailablePercent(text)).toBeNull();
+    }
+  });
+
+  it("shares a bounded asynchronous memory cache and makes failed reads visibly unknown", async () => {
+    let now = 0;
+    const reads: Array<(value: string) => void> = [];
+    let fail = false;
+    const probe = createHostProbe({
+      platform: "darwin", now: () => now, totalMemory: () => 16 * 1024 ** 3,
+      readDarwinSwap: async () => swap(50),
+      readDarwinMemoryAvailable: () => fail ? Promise.reject(new Error("unsupported")) : new Promise((resolve) => reads.push(resolve)),
+      statfs: () => ({ bsize: 1, blocks: 100, bavail: 50, files: 10, ffree: 5 }),
+      readHostLoad: () => ({ cores: 8, load1: 1000 }),
+    });
+    expect(probe.memoryAvailablePercent?.()).toBeNull();
+    expect(reads).toHaveLength(1);
+    reads[0]!("25"); await settle();
+    expect(probe.memoryAvailablePercent?.()).toBe(25);
+    expect(probe.availableMemoryBytes?.()).toBe(4 * 1024 ** 3);
+    expect(probe.capacitySample("/fixture")).toMatchObject({ memoryAvailablePercent: 25, ramAvailableBytes: 4 * 1024 ** 3, memoryPressure: null });
+    expect(reads).toHaveLength(1);
+    now = 11_000; fail = true;
+    probe.memoryAvailablePercent?.(); await settle();
+    expect(probe.memoryAvailablePercent?.()).toBeNull();
+    expect(probe.capacitySample("/fixture").ramAvailableBytes).toBeNull();
+  });
+
+  it("keeps memory gates absent by default, enforces explicit floors and admits unknown without a CPU gate", () => {
+    const base = { swapUsedPercent: () => 0, freeDiskBytes: () => 10 ** 12, memoryAvailablePercent: () => 1, availableMemoryBytes: () => 1024 };
+    const defaults = { maxSwapPercent: 98, minFreeDiskBytes: 1 };
+    expect(admissionRefusal(base, defaults, "/fixture", false)).toBeNull();
+    expect(admissionRefusal(base, { ...defaults, reservedCpuCores: 10_000 }, "/fixture", false)).toBeNull();
+    expect(admissionRefusal(base, { ...defaults, minMemoryAvailablePercent: 10 }, "/fixture", false)).toContain("1.0% memory available");
+    expect(admissionRefusal(base, { ...defaults, reservedRamBytes: 2048 }, "/fixture", false)).toContain("available RAM");
+    const unknown = { ...base, memoryAvailablePercent: () => null, availableMemoryBytes: () => null };
+    expect(admissionRefusal(unknown, { ...defaults, minMemoryAvailablePercent: 10, reservedRamBytes: 2048 }, "/fixture", false)).toBeNull();
+  });
+
   it("answers from its last reading and never waits for the next one", async () => {
     let clock = 0;
     const reads: Array<(text: string) => void> = [];
@@ -57,6 +100,7 @@ describe("the host probe", () => {
       platform: "darwin",
       now: () => clock,
       readDarwinSwap: () => new Promise<string>((resolve) => reads.push(resolve)),
+      readDarwinMemoryAvailable: async () => "50",
     });
     // the first reading starts as the probe is built, and is not waited for
     expect(reads).toHaveLength(1);
@@ -84,6 +128,7 @@ describe("the host probe", () => {
     const probe = createHostProbe({
       platform: "darwin",
       now: () => clock,
+      readDarwinMemoryAvailable: async () => "50",
       readDarwinSwap: () => {
         reads += 1;
         return reads === 1 ? Promise.resolve(swap(60)) : Promise.reject(new Error("sysctl timed out"));

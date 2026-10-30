@@ -30,6 +30,22 @@ describe("patchChangesInfisicalConnection", () => {
 });
 
 describe("writeThroughKnobs", () => {
+  it("writes all headroom and waiting policy fields through the sole map and preserves the patch on failure", async () => {
+    const makePatch = (): Partial<AppConfig> => ({ jobs: { queueWaitMinutes: 90,
+      admission: { reservedCpuCores: 3.5, reservedRamMb: 4096, minMemoryAvailablePercent: 12.5 } } });
+    const patch = makePatch(), calls = new Map<string, string>();
+    const result = await writeThroughKnobs(patch, baseDeps({ writeSecret: async (name, value) => { calls.set(name, value); } }));
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual(new Map([
+      ["BOTFLEET_JOBS_QUEUE_WAIT_MINUTES", "90"], ["BOTFLEET_JOBS_RESERVED_CPU_CORES", "3.5"],
+      ["BOTFLEET_JOBS_RESERVED_RAM_MB", "4096"], ["BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT", "12.5"],
+    ]));
+    expect(patch.jobs).toBeUndefined();
+    const failed = makePatch();
+    const failure = await writeThroughKnobs(failed, baseDeps({ writeSecret: async () => { throw new Error("fixture refusal"); } }));
+    expect(failure).toMatchObject({ ok: false, status: 502, written: [] });
+    expect(failed).toEqual(makePatch());
+  });
   it("writes to the vault FIRST and only then drops the patch copy", async () => {
     const order: string[] = [];
     const patch: Partial<AppConfig> = { jobs: { defaultMinutes: 30 } };
@@ -177,10 +193,10 @@ describe("writeThroughKnobs", () => {
     expect(calls.get("BOTFLEET_AGENT_PROXY_PROJECT_ID")).toBe("proj-1");
     expect(calls.get("BOTFLEET_AGENT_PROXY_ENV")).toBe("prod");
     expect(calls.get("BOTFLEET_AGENT_PROXY_PATH")).toBe("/agents");
-    // 24 includes jobs.admission.minFreeInodes (BF-2600); bump this deliberately:
+    // 28 includes the four BF-2604 headroom/waiting knobs; bump this deliberately:
     // the count is here so that adding or dropping a knob is a decision
     // someone reads rather than an edit that slips through -- it is what
     // caught nineteen rows disappearing at once.
-    expect(KNOB_FIELDS.length).toBe(24);
+    expect(KNOB_FIELDS.length).toBe(28);
   });
 });

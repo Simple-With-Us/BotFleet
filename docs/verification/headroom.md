@@ -6,6 +6,20 @@ BF-2598 adds the harness's read-only `GET /api/host/resources` report and its in
 
 BF-2600 and BF-2601 provide the [Linux storage scaffold](../rollouts/2026-10-30-linux-storage-scaffold.md) and [bounded inventory collector](host-inventory.md), with isolated device/inode, rendering and measurement fixtures.  Volume pinning, temporary paths, journal use and log rotation still need the authorized live recipe, and the collector needs authorization for each host measurement.  These source changes set no budgets and change none of the assertions below.
 
+## BF-2604 Independent Knob And Probe Unit
+
+The first part of slice 7a adds absent-default `jobs.admission.reservedCpuCores`, `reservedRamMb` and `minMemoryAvailablePercent` to the sole Infisical knob map, config schema, resolver and write-through.  RAM MB resolves to bytes using 1024 × 1024; explicit values are clamped at resolution.  CPU reservation is reported only in this unit; concurrency sizing belongs to the controller slice and Mac admission retains no load or CPU cutoff.  The existing inode floor is reused.
+
+The Mac reader requests the optional `kern.memorystatus_level` asynchronously with a bounded command and shared cache.  [Apple's XNU fixture](https://github.com/apple-oss-distributions/xnu/blob/main/tests/memorystatus_vm_map_fork.c#L130-L139) identifies it as available-memory percent and notes that macOS may lack it.  Missing, failed and invalid readings remain unknown; they never become zero capacity or an invented warning/critical category.  An explicit available-memory floor gates only a known reading.  An admitted Mac job records unavailable memory/disk checks in `placedReason`; the resources report marks a configured unreadable memory gate `notApplied`.
+
+`jobs.queueWaitMinutes` is a separate waiting-policy knob, bounded from 1 to 10080 minutes.  When absent, resolution uses the existing `DEFAULT_LIMITS.queueMs` policy of 24 hours, independently of execution timeout.  Durable pressure queue activation remains pending the command-retention decision; existing pressure refusals remain in place.  The eventual queue must keep per-thread/per-bot active limits, a separate execution-state host cap and total pending bound, with cancellation on revoked grants or deleted bot/thread.  No command spool or raw-command persistence is implemented in this unit, and the complete BF-2604 task remains open.
+
+The isolated knob/probe/report/registry/write-through fixtures passed 115 tests; typecheck and lint baseline passed.  Both Mac readers are injected in fixtures; no live probe or host configuration was used.  The full required gate is recorded separately after its normal completion.
+
+```sh
+VITEST=true pnpm exec vitest run server/jobs/probes.test.ts server/knob-map.test.ts server/knob-write-through.test.ts server/host-resources.test.ts server/jobs/registry.test.ts
+```
+
 ## Required Recipes
 
 | Key | Fixture And Action | Required Result |

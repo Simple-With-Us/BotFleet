@@ -12,6 +12,7 @@ function probe(platform: NodeJS.Platform = "linux") {
     readHostLoad: () => ({ load1: 32, cores: 8 }), totalMemory: () => 16 * 1024 ** 3,
     statfs: () => disk, realPath: (path) => path, readMountinfo: () => "41 29 8:16 / /data rw - ext4 /dev/fixture rw\n29 1 8:1 / / rw - ext4 /dev/root rw",
     readDarwinSwap: async () => "total = 4096.00M used = 1024.00M free = 3072.00M",
+    readDarwinMemoryAvailable: async () => { throw new Error("optional memory reading unavailable"); },
   });
 }
 function deps(files: Record<string, string> = {}): HostResourcesDeps {
@@ -92,6 +93,18 @@ describe("host capacity probe", () => {
 });
 
 describe("observed enforcement", () => {
+  it("reports configured memory gates only when their readings are available", async () => {
+    const unavailable = probe("darwin");
+    await new Promise((resolve) => setImmediate(resolve));
+    const report = hostResourcesReport({ ...deps(), platform: "darwin", probe: unavailable,
+      thresholds: () => ({ maxSwapPercent: 98, minFreeDiskBytes: 1, reservedRamBytes: 1024, minMemoryAvailablePercent: 10, reservedCpuCores: 8 }) });
+    expect(report.enforcement.memory).toMatchObject({ kind: "notApplied", reason: expect.stringContaining("Memory reading unavailable") });
+    expect(report.enforcement.cpu.kind).toBe("priorityOnly");
+    expect(report.admission.reservedCpuCores).toBe(8);
+    const known = hostResourcesReport({ ...deps(), thresholds: () => ({ maxSwapPercent: 98, minFreeDiskBytes: 1, reservedRamBytes: 1024, minMemoryAvailablePercent: 10 }) });
+    expect(known.enforcement.memory.kind).toBe("gateOnly");
+    expect(known.limitations.join(" ")).toContain("no aggregate job memory cap or watchdog");
+  });
   it("keeps unreadable limits and missing volume identity unknown while distinguishing readable empty limits", () => {
     const unreadable = deps();
     const missingVolume = deps({ [file("io.max")]: "8:16 rbps=1024" });

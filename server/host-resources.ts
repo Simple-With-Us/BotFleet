@@ -104,14 +104,20 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
     enforcement.memory = enforcement.swap = { kind: "notApplied", reason: "Swap reading unavailable; admission permits unknown readings", restartRequired: false };
   }
   if (sample.diskFreeBytes === null) enforcement.disk = { kind: "notApplied", reason: "Disk reading unavailable; admission permits unknown readings", restartRequired: false };
+  const memoryConfigured = thresholds.reservedRamBytes !== undefined || thresholds.minMemoryAvailablePercent !== undefined;
+  if (memoryConfigured) enforcement.memory =
+    (thresholds.reservedRamBytes !== undefined && sample.ramAvailableBytes === null) ||
+    (thresholds.minMemoryAvailablePercent !== undefined && sample.memoryAvailablePercent === null)
+      ? { kind: "notApplied", reason: "Memory reading unavailable; admission permits unknown readings", restartRequired: false }
+      : gate();
   if (thresholds.minFreeInodes !== undefined) enforcement.inodes = sample.inodesFree !== null
     ? gate() : { kind: "notApplied", reason: "Inode reading unavailable; admission permits unknown readings", restartRequired: false };
   if (storage?.online === false) enforcement.disk = { kind: "notApplied", reason: "Server storage offline; new jobs are refused", restartRequired: false };
   const observedLimits: Record<string, string | null> = Object.fromEntries(CGROUP_FILES.map((file) => [file, null]));
   const limitations = [
-    "Memory admission currently checks swap, not an aggregate RAM budget",
+    memoryConfigured ? "Available memory is checked before jobs start; no aggregate job memory cap or watchdog is active" : "Memory admission currently checks swap; no available-RAM gate is configured",
     "Disk is an admission gate; no disk quota is observed",
-    "Memory pressure is not sampled in this build",
+    "Memory pressure categories are not inferred from available-memory percentage",
   ];
   if (deps.platform === "linux") {
     const cgroup = safeRead("/proc/self/cgroup");

@@ -71,6 +71,9 @@ export interface HostResourcesReport {
   sample: CapacitySample;
   storage?: StorageState | null;
   admission: {
+    reservedCpuCores?: number;
+    reservedRamBytes?: number;
+    minMemoryAvailablePercent?: number;
     maxSwapPercent: number;
     minFreeDiskBytes: number;
     minFreeInodes?: number;

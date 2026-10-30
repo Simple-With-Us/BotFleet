@@ -508,8 +508,12 @@ const appConfigSchema = z.object({
     cliLanes: z.boolean().optional(),
     defaultMinutes: z.number().int().min(1).max(360).optional(),
     maxMinutes: z.number().int().min(1).max(360).optional(),
+    queueWaitMinutes: z.number().int().min(1).max(10080).optional(),
     cpuCores: z.number().min(1).max(64).optional(),
     admission: z.object({
+      reservedCpuCores: z.number().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+      reservedRamMb: z.number().min(0).max(Number.MAX_SAFE_INTEGER / (1024 * 1024)).optional(),
+      minMemoryAvailablePercent: z.number().min(0).max(100).optional(),
       maxSwapPercent: z.number().min(1).max(100).optional(),
       minFreeDiskMb: z.number().min(0).optional(),
       minFreeInodes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
@@ -758,8 +762,9 @@ export interface AppConfig {
     cliLanes?: boolean;
     defaultMinutes?: number;
     maxMinutes?: number;
+    queueWaitMinutes?: number;
     cpuCores?: number;
-    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number };
+    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number; reservedRamMb?: number; minMemoryAvailablePercent?: number };
     /** Minutes a hot host may park a webhook before the wake dispatches
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;

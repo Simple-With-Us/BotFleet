@@ -62,7 +62,11 @@ BotFleet is a single-user local harness: the server binds loopback-only (`127.0.
 |---|---|---|---|
 | `BOTFLEET_JOBS_DEFAULT_MINUTES` | jobs.defaultMinutes | int | 1–360 |
 | `BOTFLEET_JOBS_MAX_MINUTES` | jobs.maxMinutes | int | 1–360 |
+| `BOTFLEET_JOBS_QUEUE_WAIT_MINUTES` | jobs.queueWaitMinutes | int | 1–10080; absent uses the existing delegation queue policy of 24 hours; pressure queue activation remains pending |
 | `BOTFLEET_JOBS_CPU_CORES` | jobs.cpuCores | int | 1–64 |
+| `BOTFLEET_JOBS_RESERVED_CPU_CORES` | jobs.admission.reservedCpuCores | float | ≥ 0; absent by default; reported only, never a CPU/load refusal |
+| `BOTFLEET_JOBS_RESERVED_RAM_MB` | jobs.admission.reservedRamMb | float | ≥ 0; absent by default; resolved into byte units without installing a resource budget |
+| `BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT` | jobs.admission.minMemoryAvailablePercent | float | 0–100; absent means no available-memory percentage gate |
 | `BOTFLEET_JOBS_MAX_SWAP_PERCENT` | jobs.admission.maxSwapPercent | float | 1–100 |
 | `BOTFLEET_JOBS_MIN_FREE_DISK_MB` | jobs.admission.minFreeDiskMb | float | ≥ 0 |
 | `BOTFLEET_JOBS_MIN_FREE_INODES` | jobs.admission.minFreeInodes | integer | ≥ 0; unset by default, measured inventory required before selecting a floor |

@@ -133,6 +133,17 @@ function alive(pid: number): boolean {
 }
 
 describe("settings", () => {
+  it("keeps headroom unset, clamps explicit values and separates waiting from execution time", () => {
+    const defaults = resolveJobsSettings(undefined);
+    expect(defaults.admission.reservedCpuCores).toBeUndefined();
+    expect(defaults.admission.reservedRamBytes).toBeUndefined();
+    expect(defaults.admission.minMemoryAvailablePercent).toBeUndefined();
+    expect(defaults.queueWaitMs).toBe(24 * 60 * 60_000);
+    const explicit = resolveJobsSettings({ maxMinutes: 10, queueWaitMinutes: 120,
+      admission: { reservedCpuCores: -1, reservedRamMb: 4096, minMemoryAvailablePercent: 150 } });
+    expect(explicit).toMatchObject({ maxMinutes: 10, queueWaitMs: 120 * 60_000,
+      admission: { reservedCpuCores: 0, reservedRamBytes: 4096 * 1024 ** 2, minMemoryAvailablePercent: 100 } });
+  });
   it("defaults to on, wake on, 60 minutes, at most 240", () => {
     expect(resolveJobsSettings(undefined)).toMatchObject({ enabled: true, wake: true, defaultMinutes: 60, maxMinutes: 240 });
   });
@@ -147,6 +158,16 @@ describe("settings", () => {
 });
 
 describe("local placement identity", () => {
+  it("records unknown Mac admission readings without fabricating active protection", () => {
+    const fake = fakeSpawn();
+    const h = harness({ spawn: fake.spawnFn, probe: { swapUsedPercent: () => 0, freeDiskBytes: () => null } });
+    h.settings.value = resolveJobsSettings({ admission: { minMemoryAvailablePercent: 10 } });
+    const result = start(h, "true");
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected unknown-reading admission");
+    expect(result.job.placedReason).toContain("admitted without a memory reading");
+    expect(result.job.placedReason).toContain("admitted without a disk reading");
+  });
   it("records both host ids before spawning and carries them through storage and frames", async () => {
     const fake = fakeSpawn();
     const h = harness({ spawn: (spec) => {

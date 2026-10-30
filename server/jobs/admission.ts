@@ -26,6 +26,10 @@ export interface AdmissionThresholds {
   minFreeDiskBytes: number;
   /** Absent means no inode gate; inventory must precede a configured floor. */
   minFreeInodes?: number;
+  /** Reported reservation only; CPU load never refuses a Mac job. */
+  reservedCpuCores?: number;
+  reservedRamBytes?: number;
+  minMemoryAvailablePercent?: number;
 }
 
 export const DEFAULT_ADMISSION: AdmissionThresholds = {
@@ -42,6 +46,8 @@ export interface HostProbe {
   freeDiskBytes(path: string): number | null;
   freeInodes?(path: string): number | null;
   storageState?(): StorageState | null;
+  memoryAvailablePercent?(): number | null;
+  availableMemoryBytes?(): number | null;
 }
 
 /** `sysctl vm.swapusage` on macOS:
@@ -67,6 +73,14 @@ export function parseLinuxSwap(text: string): number | null {
   return ((t - f) / t) * 100;
 }
 
+/** XNU's optional memorystatus_level is available-memory percent, not load. */
+export function parseDarwinMemoryAvailablePercent(text: string): number | null {
+  const raw = text.trim();
+  if (!/^\d+(?:\.\d+)?$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
+}
+
 const SWAP_CACHE_MS = 10_000;
 
 /** What `createHostProbe` reads the host with.  Injected so the probe is
@@ -76,6 +90,7 @@ export interface HostProbeDeps {
   now?: () => number;
   /** `sysctl vm.swapusage`'s output, read without blocking. */
   readDarwinSwap?: () => Promise<string>;
+  readDarwinMemoryAvailable?: () => Promise<string>;
   /** `/proc/meminfo`'s text. */
   readLinuxMeminfo?: () => string;
   readHostLoad?: () => HostLoad | null;
@@ -110,6 +125,11 @@ const sysctlSwap = (): Promise<string> =>
     execFile("/usr/sbin/sysctl", ["vm.swapusage"], { encoding: "utf8", timeout: 2_000 }, (error, stdout) => (error ? reject(error) : resolve(stdout)));
   });
 
+const sysctlMemoryAvailable = (): Promise<string> => new Promise((resolve, reject) => {
+  execFile("/usr/sbin/sysctl", ["-n", "kern.memorystatus_level"], { encoding: "utf8", timeout: 2_000 },
+    (error, stdout) => error ? reject(error) : resolve(stdout));
+});
+
 /** The real host.  The probe answers from a reading at most a few seconds
  *  old and never waits for the next one: on macOS the swap figure comes from
  *  a `sysctl` run in the background, because a harness at load 100 or more
@@ -121,10 +141,15 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
   const platform = deps.platform ?? process.platform;
   const now = deps.now ?? Date.now;
   const readDarwinSwap = deps.readDarwinSwap ?? sysctlSwap;
+  const readDarwinMemoryAvailable = deps.readDarwinMemoryAvailable ?? sysctlMemoryAvailable;
   const readLinuxMeminfo = deps.readLinuxMeminfo ?? (() => readFileSync("/proc/meminfo", "utf8"));
   const diskStats = deps.statfs ?? statfsSync;
   const hostLoad = deps.readHostLoad ?? readHostLoad;
   const memoryTotal = deps.totalMemory ?? totalmem;
+  const knownTotalMemory = (): number | null => {
+    try { const total = memoryTotal(); return Number.isFinite(total) && total > 0 ? total : null; }
+    catch { return null; }
+  };
   const mountinfo = deps.readMountinfo ?? (() => readFileSync("/proc/self/mountinfo", "utf8"));
   const realPath = deps.realPath ?? realpathSync;
   let swapAt = Number.NEGATIVE_INFINITY;
@@ -132,6 +157,17 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
   let swapTotalBytes: number | null = null;
   let swapUsedBytes: number | null = null;
   let ramAvailableBytes: number | null = null;
+  let darwinAvailablePercent: number | null = null;
+  let memoryAt = Number.NEGATIVE_INFINITY;
+  let memoryRefreshing = false;
+  const refreshMemory = () => {
+    if (platform !== "darwin" || memoryRefreshing || now() - memoryAt < SWAP_CACHE_MS) return;
+    memoryRefreshing = true; memoryAt = now();
+    readDarwinMemoryAvailable().then(
+      (text) => { darwinAvailablePercent = parseDarwinMemoryAvailablePercent(text); },
+      () => { darwinAvailablePercent = null; },
+    ).finally(() => { memoryRefreshing = false; });
+  };
   const nonnegative = (value: number): number | null => Number.isFinite(value) && value >= 0 ? value : null;
   let refreshing = false;
   const refreshDarwin = () => {
@@ -154,9 +190,21 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
         refreshing = false;
       });
   };
-  if (platform === "darwin") refreshDarwin();
+  if (platform === "darwin") { refreshDarwin(); refreshMemory(); }
   const probe: CapacityHostProbe = {
     storageState: () => deps.storageState?.() ?? null,
+    memoryAvailablePercent() {
+      if (platform === "darwin") { refreshMemory(); return darwinAvailablePercent; }
+      probe.swapUsedPercent();
+      const total = knownTotalMemory();
+      return total !== null && ramAvailableBytes !== null && ramAvailableBytes <= total ? ramAvailableBytes / total * 100 : null;
+    },
+    availableMemoryBytes() {
+      const percent = probe.memoryAvailablePercent?.() ?? null;
+      if (platform !== "darwin") return ramAvailableBytes;
+      const total = knownTotalMemory();
+      return percent !== null && total !== null ? total * percent / 100 : null;
+    },
     swapUsedPercent() {
       if (now() - swapAt < SWAP_CACHE_MS) return swapValue;
       if (platform === "darwin") {
@@ -203,7 +251,8 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       const cores = load && Number.isSafeInteger(load.cores) && load.cores > 0 ? load.cores : null;
       const total = safe(memoryTotal);
       const ramTotalBytes = total !== null && total > 0 ? nonnegative(total) : null;
-      const available = ramAvailableBytes !== null && (ramTotalBytes === null || ramAvailableBytes <= ramTotalBytes) ? ramAvailableBytes : null;
+      const availableReading = probe.availableMemoryBytes?.() ?? null;
+      const available = availableReading !== null && (ramTotalBytes === null || availableReading <= ramTotalBytes) ? availableReading : null;
       const online = deps.storageState?.().online !== false;
       const stats = online ? safe(() => diskStats(path)) : null;
       const root = safe(() => diskStats("/"));
@@ -213,7 +262,7 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       return {
         at: now(), cores, loadPerCore: loadPerCore(load),
         ramTotalBytes, ramAvailableBytes: available,
-        memoryAvailablePercent: ramTotalBytes && available !== null ? (available / ramTotalBytes) * 100 : null,
+        memoryAvailablePercent: probe.memoryAvailablePercent?.() ?? null,
         memoryPressure: null, swapTotalBytes, swapUsedBytes,
         diskTotalBytes: usableDisk ? nonnegative(Number(stats.blocks) * Number(stats.bsize)) : null,
         diskFreeBytes,
@@ -244,6 +293,14 @@ export function admissionRefusal(
     return "The spend ceiling for unattended work has been reached, so no new background job can start.  Run the command with bash if it is short, or tell the user.";
   }
   const swap = probe.swapUsedPercent();
+  if (thresholds.reservedRamBytes !== undefined) {
+    const available = probe.availableMemoryBytes?.() ?? null;
+    if (available !== null && available < thresholds.reservedRamBytes) return "This computer is short on available RAM, so new background work waits for room";
+  }
+  if (thresholds.minMemoryAvailablePercent !== undefined) {
+    const available = probe.memoryAvailablePercent?.() ?? null;
+    if (available !== null && available < thresholds.minMemoryAvailablePercent) return `This computer has ${available.toFixed(1)}% memory available, so new background work waits for room`;
+  }
   if (swap !== null && swap >= thresholds.maxSwapPercent) {
     return `This computer is short on memory (swap ${Math.round(swap)}% used), so no new background job can start right now.  Try again later, or tell the user.`;
   }

@@ -124,6 +124,20 @@ describe("parseKnobValue", () => {
 });
 
 describe("resolving knobs", () => {
+  it("keeps headroom absent until explicitly supplied and resolves vault values with provenance", () => {
+    const cfg: AppConfig = {};
+    resolveKnobFields(cfg, new Map());
+    for (const key of ["reservedCpuCores", "reservedRamMb", "minMemoryAvailablePercent"]) {
+      expect(readKnobField(cfg, spec(`jobs.admission.${key}`))).toBeUndefined();
+    }
+    resolveKnobFields(cfg, new Map([
+      ["BOTFLEET_JOBS_RESERVED_CPU_CORES", "3.5"],
+      ["BOTFLEET_JOBS_RESERVED_RAM_MB", "4096"],
+      ["BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT", "12.5"],
+    ]));
+    expect(cfg.jobs?.admission).toEqual({ reservedCpuCores: 3.5, reservedRamMb: 4096, minMemoryAvailablePercent: 12.5 });
+    expect(knobSource("jobs.admission.reservedRamMb")).toBe("infisical");
+  });
   it("leaves the inode floor unset until a file or vault explicitly supplies it", () => {
     const cfg: AppConfig = {};
     resolveKnobFields(cfg, new Map());

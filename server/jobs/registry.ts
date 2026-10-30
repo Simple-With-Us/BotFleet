@@ -68,6 +68,7 @@ import {
 } from "../../shared/jobs.ts";
 import { writeFileAtomic } from "../atomic.ts";
 import { loadHostId } from "../host-id.ts";
+import { DEFAULT_LIMITS } from "../runtime/types.ts";
 import { HOST_ID_PATTERN, type HostId } from "../../shared/placement.ts";
 import { redactSecretsInText } from "../redact.ts";
 import { commandLabel, groupAlive, killGroup, signalGroup, startedNear, GROUP_KILL_GRACE_MS } from "../tools/process-group.ts";
@@ -88,6 +89,8 @@ export interface JobsSettings {
   defaultMinutes: number;
   /** The most a bot may ask for: 240 unless the owner raised it (≤ 360). */
   maxMinutes: number;
+  /** Waiting policy is independent of a job's execution deadline. */
+  queueWaitMs: number;
   admission: AdmissionThresholds;
   /** Cores' worth of CPU time a job may average over its run limit before
    *  `ulimit -t` ends it. */
@@ -100,6 +103,7 @@ export const DEFAULT_JOBS_SETTINGS: JobsSettings = {
   cliLanes: true,
   defaultMinutes: JOB_DEFAULT_MINUTES,
   maxMinutes: JOB_MODEL_MAX_MINUTES,
+  queueWaitMs: DEFAULT_LIMITS.queueMs,
   admission: DEFAULT_ADMISSION,
   cpuCores: 2,
 };
@@ -114,7 +118,8 @@ export interface JobsConfigInput {
   cliLanes?: boolean;
   defaultMinutes?: number;
   maxMinutes?: number;
-  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number };
+  queueWaitMinutes?: number;
+  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number; reservedRamMb?: number; minMemoryAvailablePercent?: number };
   cpuCores?: number;
 }
 
@@ -137,12 +142,19 @@ export function resolveJobsSettings(input: JobsConfigInput | undefined): JobsSet
     minFreeDiskBytes: finite(disk) ? Math.max(0, disk) * 1024 * 1024 : DEFAULT_ADMISSION.minFreeDiskBytes,
   };
   if (finite(inodes)) admission.minFreeInodes = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(inodes)));
+  const reservedCpu = input?.admission?.reservedCpuCores;
+  const reservedRam = input?.admission?.reservedRamMb;
+  const available = input?.admission?.minMemoryAvailablePercent;
+  if (finite(reservedCpu)) admission.reservedCpuCores = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, reservedCpu));
+  if (finite(reservedRam)) admission.reservedRamBytes = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, reservedRam) * 1024 * 1024);
+  if (finite(available)) admission.minMemoryAvailablePercent = Math.min(100, Math.max(0, available));
   return {
     enabled: input?.enabled !== false,
     wake: input?.wake !== false,
     cliLanes: input?.cliLanes !== false,
     defaultMinutes,
     maxMinutes,
+    queueWaitMs: finite(input?.queueWaitMinutes) ? Math.min(10080, Math.max(1, Math.floor(input.queueWaitMinutes))) * 60_000 : DEFAULT_LIMITS.queueMs,
     admission,
     cpuCores: finite(input?.cpuCores) ? Math.min(64, Math.max(1, input.cpuCores)) : DEFAULT_JOBS_SETTINGS.cpuCores,
   };
@@ -664,7 +676,7 @@ export class JobRegistry {
       status: "running",
       controllerHostId: this.hostId,
       host: this.hostId,
-      placedReason: this.platform === "darwin" ? "Running on this Mac" : "Running on this server",
+      placedReason: this.placementReason(settings.admission),
       exitCode: null,
       signal: null,
       startedAt: now,
@@ -716,6 +728,16 @@ export class JobRegistry {
   }
 
   // ── output ────────────────────────────────────────────────────────────
+
+  private placementReason(thresholds: AdmissionThresholds): string {
+    const base = this.platform === "darwin" ? "Running on this Mac" : "Running on this server";
+    if (this.platform !== "darwin") return base;
+    const unknownMemory = this.probe.swapUsedPercent() === null ||
+      thresholds.reservedRamBytes !== undefined && (this.probe.availableMemoryBytes?.() ?? null) === null ||
+      thresholds.minMemoryAvailablePercent !== undefined && (this.probe.memoryAvailablePercent?.() ?? null) === null;
+    const unknownDisk = this.probe.freeDiskBytes(this.deps.dataDir) === null;
+    return base + (unknownMemory ? "; admitted without a memory reading" : "") + (unknownDisk ? "; admitted without a disk reading" : "");
+  }
 
   /** The model's next slice of new output: at most `maxBytes`, redacted,
    *  advancing the model's own cursor. */
