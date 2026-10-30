@@ -121,11 +121,22 @@ public struct McodeModelWireValue: Equatable, Sendable {
     }
 }
 
+/// Grok ACP auth preference matching the deployed integration; the CLI owns
+/// credentials and the runner selects only an advertised method id.
+public enum GrokAcpAuthMethod {
+    public static let preferenceOrder = ["cached_token", "grok.com"]
+
+    public static func select(advertised: [[String: Any]]) -> String? {
+        let ids = Set(advertised.compactMap { $0["id"] as? String })
+        return preferenceOrder.first(where: ids.contains)
+    }
+}
+
 /// Pure-Swift JSON-RPC 2.0 ACP runner supporting Grok Build (`grok agent stdio`),
 /// MiniMax Code (`mcode acp`), and Muse (`muse acp`).
 /// Enforces the double replay gate on `session/load`, round-trip config verification on
 /// `session/set_config_option`, and fail-closed permission handling on `session/request_permission`.
-public actor AcpProcessRunner: EngineDriver {
+public actor AcpProcessRunner: EngineQuietActivityReporting {
     public typealias PermissionHandler = @Sendable (
         _ requestId: String,
         _ tool: String,
@@ -137,6 +148,9 @@ public actor AcpProcessRunner: EngineDriver {
     public nonisolated let executable: String
     private let launcher: any EngineProcessLauncher
     private let permissionHandler: PermissionHandler?
+    private let activitySampler: any NativeEngineActivitySampling
+    private let quietClock: any NativeEngineQuietClock
+    private var quietEvidenceByThread: [String: NativeEngineQuietEvidence] = [:]
     private var activeSessions: [String: EngineProcessSession] = [:]
     private var activeSessionIds: [String: String] = [:]
     /// Identifies the turn that owns each registered session, so a turn that is winding down cannot
@@ -148,13 +162,17 @@ public actor AcpProcessRunner: EngineDriver {
         engineId: String? = nil,
         executable: String? = nil,
         launcher: any EngineProcessLauncher = ProcessSupervisorActor(),
-        permissionHandler: PermissionHandler? = nil
+        permissionHandler: PermissionHandler? = nil,
+        activitySampler: any NativeEngineActivitySampling = NativeMacEngineActivitySampler(),
+        quietClock: any NativeEngineQuietClock = NativeMonotonicQuietClock()
     ) {
         self.harnessKind = harnessKind
         self.engineId = engineId ?? harnessKind.rawValue
         self.executable = executable ?? harnessKind.defaultExecutable
         self.launcher = launcher
         self.permissionHandler = permissionHandler
+        self.activitySampler = activitySampler
+        self.quietClock = quietClock
     }
 
     public static func buildSpawnSpec(
@@ -181,11 +199,15 @@ public actor AcpProcessRunner: EngineDriver {
             throw EngineDriverError.turnAlreadyActive(threadId: input.threadId)
         }
 
+        let acpServers = try input.toolPreparation?.acpServers(forBot: input.botId) ?? []
         let spec = Self.buildSpawnSpec(harnessKind: harnessKind, executable: executable, input: input)
         let session = try await launcher.launch(spec: spec, threadId: input.threadId, engineId: engineId)
         let sessionToken = UUID()
         activeSessions[input.threadId] = session
         activeSessionTokens[input.threadId] = sessionToken
+        let quietEvidence = NativeEngineQuietEvidence()
+        quietEvidenceByThread[input.threadId] = quietEvidence
+        let quietClock = self.quietClock
 
         let (stream, continuation) = AsyncStream<TurnEvent>.makeStream()
         let threadId = input.threadId
@@ -193,6 +215,11 @@ public actor AcpProcessRunner: EngineDriver {
         let permHandler = permissionHandler
 
         Task { [weak self] in
+            let stderrTask = Task {
+                for await chunk in session.stderrChunks {
+                    await quietEvidence.appendStderr(chunk, at: quietClock.now())
+                }
+            }
             let coordinator = AcpRpcSessionCoordinator(
                 session: session,
                 harnessKind: kind,
@@ -209,7 +236,7 @@ public actor AcpProcessRunner: EngineDriver {
 
             do {
                 // 1. Handshake: initialize
-                _ = try await coordinator.sendRequest(
+                let initializeReply = try await coordinator.sendRequest(
                     method: "initialize",
                     params: [
                         "protocolVersion": 1,
@@ -221,6 +248,28 @@ public actor AcpProcessRunner: EngineDriver {
                         ]
                     ]
                 )
+
+                if kind == .grok, let advertisedAuthMethods = initializeReply["authMethods"] {
+                    guard let authMethods = advertisedAuthMethods as? [[String: Any]] else {
+                        throw EngineDriverError.protocolError(
+                            code: "unsupported_auth_method",
+                            message: "Grok ACP returned malformed authentication methods"
+                        )
+                    }
+                    if !authMethods.isEmpty {
+                        guard let methodId = GrokAcpAuthMethod.select(advertised: authMethods) else {
+                            throw EngineDriverError.protocolError(
+                                code: "unsupported_auth_method",
+                                message: "Grok ACP advertised no supported authentication method"
+                            )
+                        }
+                        // Auth is CLI-managed; select an advertised id without synthesizing credentials or starting login flows.
+                        _ = try await coordinator.sendRequest(
+                            method: "authenticate",
+                            params: ["methodId": methodId]
+                        )
+                    }
+                }
 
                 let cwd = input.workingDirectory ?? "/tmp"
                 let sessionId: String
@@ -235,7 +284,7 @@ public actor AcpProcessRunner: EngineDriver {
                         params: [
                             "sessionId": resumeId,
                             "cwd": cwd,
-                            "mcpServers": [] as [[String: Any]]
+                            "mcpServers": acpServers
                         ]
                     )
                     sessionId = (sessionReply["sessionId"] as? String) ?? resumeId
@@ -244,7 +293,7 @@ public actor AcpProcessRunner: EngineDriver {
                         method: "session/new",
                         params: [
                             "cwd": cwd,
-                            "mcpServers": [] as [[String: Any]]
+                            "mcpServers": acpServers
                         ]
                     )
                     guard let createdId = sessionReply["sessionId"] as? String, !createdId.isEmpty else {
@@ -269,6 +318,25 @@ public actor AcpProcessRunner: EngineDriver {
                             sessionId: sessionId,
                             configId: "model",
                             requestedValue: wireValue
+                        )
+                    }
+                }
+
+                if kind == .grok, let modelId = input.modelId, !modelId.isEmpty {
+                    let models = sessionReply["models"] as? [String: Any]
+                    let currentModelId = models?["currentModelId"] as? String
+                    let availableModels = models?["availableModels"] as? [[String: Any]]
+                    if currentModelId != modelId, let availableModels, !availableModels.isEmpty {
+                        let advertisedIds = Set(availableModels.compactMap { $0["modelId"] as? String })
+                        guard advertisedIds.contains(modelId) else {
+                            throw EngineDriverError.protocolError(
+                                code: "unknown_model",
+                                message: "Grok ACP does not advertise the selected model \(modelId)"
+                            )
+                        }
+                        _ = try await coordinator.sendRequest(
+                            method: "session/set_model",
+                            params: ["sessionId": sessionId, "modelId": modelId]
                         )
                     }
                 }
@@ -323,6 +391,7 @@ public actor AcpProcessRunner: EngineDriver {
 
             await session.closeStdin()
             readerTask.cancel()
+            stderrTask.cancel()
             _ = await session.waitForExit()
             // Release the thread before the stream ends so a consumer that retries the moment the stream
             // closes is not told a turn is still active.
@@ -336,6 +405,7 @@ public actor AcpProcessRunner: EngineDriver {
     public func cancelTurn(threadId: String) async {
         guard let session = activeSessions.removeValue(forKey: threadId) else { return }
         activeSessionTokens.removeValue(forKey: threadId)
+        quietEvidenceByThread.removeValue(forKey: threadId)
         if let sessionId = activeSessionIds.removeValue(forKey: threadId) {
             let cancelFrame: [String: Any] = [
                 "jsonrpc": "2.0",
@@ -350,6 +420,14 @@ public actor AcpProcessRunner: EngineDriver {
         await session.cancel()
     }
 
+    public func quietActivity(threadId: String) async -> NativeEngineQuietActivity {
+        guard let session = activeSessions[threadId], let token = activeSessionTokens[threadId],
+              let evidence = quietEvidenceByThread[threadId] else { return .unknown }
+        let sample = await activitySampler.sample(rootPID: session.pid)
+        guard activeSessionTokens[threadId] == token else { return .unknown }
+        return await evidence.activity(process: sample)
+    }
+
     private func recordSessionId(threadId: String, sessionId: String) {
         activeSessionIds[threadId] = sessionId
     }
@@ -361,6 +439,7 @@ public actor AcpProcessRunner: EngineDriver {
         activeSessions.removeValue(forKey: threadId)
         activeSessionIds.removeValue(forKey: threadId)
         activeSessionTokens.removeValue(forKey: threadId)
+        quietEvidenceByThread.removeValue(forKey: threadId)
     }
 
     /// Resolves a requested MiniMax Code picker model id against the `configOptions` the session
