@@ -203,6 +203,19 @@ struct BotFleetMacApp: App {
                                         )
                                     )
 
+                                    Toggle(
+                                        "Host The Companion API From This App",
+                                        isOn: Binding(
+                                            get: { session.companionListenerEnabled },
+                                            set: { newValue in
+                                                Task { await session.setCompanionListenerEnabled(newValue) }
+                                            }
+                                        )
+                                    )
+                                    Text(session.companionListenerState.summary)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+
                                     HStack {
                                         Button(role: .destructive) {
                                             Task { await session.shutDownServerAndLocalVM() }

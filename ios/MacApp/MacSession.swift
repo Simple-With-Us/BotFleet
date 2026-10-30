@@ -85,6 +85,17 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// toggles went back to their previous values.
     @Published public var lifecycleErrorMessage: String?
 
+    // Native companion listener lifecycle (BF-2590, the lifecycle half of BF-2511)
+    /// What the native companion listener is doing, mirrored from the
+    /// controller so the Settings section observes it.
+    @Published public var companionListenerState: CompanionListenerState = .off
+    /// Whether the person turned the native companion listener on.  Off by
+    /// default until the native pairing contract lands.
+    @Published public var companionListenerEnabled: Bool = false
+    /// Owns the listener's start and stop; the backend opens the app's store
+    /// only on the first start, so nothing is created while the setting is off.
+    public let companionListener: CompanionListenerController
+
     // CUA Live Stream & Safety state (BF-2499)
     @Published public var showCuaViewer: Bool = false
     @Published public var isCuaStreaming: Bool = false
@@ -141,6 +152,40 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                 allowRemoteDesktopLaunch: nil,
                 persistOnExit: localPersist
             )
+        }
+        // The native listener binds loopback until network exposure has its
+        // own acceptance (durable device credentials, Origin rejection and
+        // the pairing contract, all BF-2511), so it advertises nothing yet: a
+        // Bonjour entry the phone could not connect to would only mislead it.
+        // When that acceptance lands, the LAN opt-in and the advertisement
+        // below turn on together.
+        let listenerOptions = NativeCompanionServer.ListenerOptions()
+        let advertisement = listenerOptions.allowCleartextLAN
+            ? CompanionListenerController.defaultAdvertisement(computerName: Host.current().localizedName)
+            : nil
+        let storeURL = policyStore.dataDir
+            .appendingPathComponent("native", isDirectory: true)
+            .appendingPathComponent("companion.sqlite")
+        let backend = NativeCompanionListenerBackend(port: 0, options: listenerOptions) {
+            // A store of the listener's own, under the Mac's data directory,
+            // created only when the listener is first turned on.  Where the
+            // native engine's store finally lives is BF-2504's call; this
+            // path is provisional and named in the BF-2590 PR.
+            try FileManager.default.createDirectory(
+                at: storeURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let database = try DatabaseService(path: storeURL.path)
+            return NativeCompanionServer(database: database)
+        }
+        self.companionListener = CompanionListenerController(
+            backend: backend,
+            policyStore: policyStore,
+            advertisement: advertisement
+        )
+        self.companionListenerEnabled = self.companionListener.isEnabled
+        self.companionListener.onStateChange = { [weak self] state in
+            self?.companionListenerState = state
         }
         // Registering the notification categories is not asking for
         // permission:  the permission prompt stays lazy, at the first event
@@ -576,8 +621,27 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         if !hasLaunched {
             hasLaunched = true
             _ = try? policyStore.clearStoppedMarker(for: .appLaunch)
+            // The native companion listener starts with the app when the
+            // setting is on; off by default, so this is a no-op today.
+            Task { @MainActor [weak self] in
+                await self?.companionListener.applyLaunch()
+            }
         }
         connect(host: host, port: port)
+    }
+
+    /// Turns the native companion listener on or off from Settings.  The
+    /// setting is written before the listener moves, and a refusal is shown
+    /// on the same line the other lifecycle toggles use.
+    public func setCompanionListenerEnabled(_ enabled: Bool) async {
+        do {
+            try await companionListener.setEnabled(enabled)
+            companionListenerEnabled = companionListener.isEnabled
+            lifecycleErrorMessage = nil
+        } catch {
+            companionListenerEnabled = companionListener.isEnabled
+            lifecycleErrorMessage = "The companion listener setting could not be saved: \(error.localizedDescription)"
+        }
     }
 
     /// Observes the close of the app's main window.
@@ -825,17 +889,22 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// closing the SwiftUI window does not terminate the app, so the policy has
     /// to be evaluated here as well as on termination.
     public func handleWindowClose() async {
-        await applyExitPolicy()
+        await applyExitPolicy(for: .mainWindowClosed)
     }
 
     /// Applies the exit policy when the app terminates.
     public func handleAppTermination() async {
         triggerCuaEmergencyStop()
-        await applyExitPolicy()
+        await applyExitPolicy(for: .appTerminating)
     }
 
-    private func applyExitPolicy() async {
+    private func applyExitPolicy(for event: CompanionListenerExitEvent) async {
         let persist = policyStore.readPersistOnExit() ?? lifecycleSettings.persistOnExit
+        // The native listener reads the setting the same way the harness
+        // shutdown does: it stays up through a window close that keeps the
+        // server running, and stops when the server is shut down or the app
+        // quits.
+        await companionListener.applyExitPolicy(event, persistOnExit: persist)
         guard MacLifecycleClient.evaluateQuitAction(persistOnExit: persist) == .shutDownServerAndVM else {
             return
         }

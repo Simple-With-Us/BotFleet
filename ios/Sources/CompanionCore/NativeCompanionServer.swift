@@ -1086,10 +1086,17 @@ public actor NativeCompanionServer {
         public var bindAddress: String
         /// Set only by an explicit LAN opt-in; it is the only way off loopback.
         public var allowCleartextLAN: Bool
+        /// The Bonjour instance name to advertise under `_botfleet._tcp`, or
+        /// nil to advertise nothing.  Added for the Mac app's listener
+        /// lifecycle (BF-2590); the default keeps every existing caller as it
+        /// was, and a loopback-bound listener should pass nil, because an
+        /// advertisement the phone cannot connect to only confuses it.
+        public var advertisedName: String?
 
-        public init(bindAddress: String = "127.0.0.1", allowCleartextLAN: Bool = false) {
+        public init(bindAddress: String = "127.0.0.1", allowCleartextLAN: Bool = false, advertisedName: String? = nil) {
             self.bindAddress = bindAddress
             self.allowCleartextLAN = allowCleartextLAN
+            self.advertisedName = advertisedName
         }
 
         /// The address actually bound.
@@ -1115,6 +1122,12 @@ public actor NativeCompanionServer {
             host: NWEndpoint.Host(options.resolvedBindAddress),
             port: nwPort
         )
+        if let advertisedName = options.advertisedName {
+            // The phone's browser (`ios/App/Discovery.swift`) looks for this
+            // type and shows the instance name; the registration is withdrawn
+            // when the listener is cancelled.
+            listener.service = NWListener.Service(name: advertisedName, type: CompanionListenerAdvertisement.serviceType)
+        }
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
             Task {
@@ -1128,6 +1141,13 @@ public actor NativeCompanionServer {
     public func stopListening() {
         listener?.cancel()
         listener = nil
+    }
+
+    /// The port the listener bound, once it has one; nil before `startListening`
+    /// or after `stopListening`.  Read back from the listener, never from the
+    /// number that was asked for, so a system-chosen port is reported truly.
+    public var listeningPort: UInt16? {
+        listener?.port?.rawValue
     }
 
     private func acceptConnection(_ connection: NWConnection) {
