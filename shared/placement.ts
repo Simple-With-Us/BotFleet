@@ -63,6 +63,22 @@ export interface HostProfile {
   lastSeen: number | null;
 }
 export interface AdmissionVerdict { admit: boolean; reason?: string }
+export interface HostResourcesReport {
+  hostId: HostId;
+  version: string | null;
+  platform: HostPlatform;
+  capabilities: Capability[];
+  sample: CapacitySample;
+  admission: {
+    maxSwapPercent: number;
+    minFreeDiskBytes: number;
+    unknownReading: "admit";
+  };
+  enforcement: Record<HostResource, EnforcementState>;
+  /** Null means unreadable; "max" is an observed unlimited value. */
+  observedLimits: Record<string, string | null>;
+  limitations: string[];
+}
 /** Versions are checked before epochs; every state-changing message is fenced. */
 export interface PlacementMessage extends ControllerEpoch { version: string }
 export interface PlacementIdentity extends PlacementMessage {

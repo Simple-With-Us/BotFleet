@@ -111,6 +111,9 @@ import { authorizedRuntime } from "../electron/runtime-identity.mjs";
 import { planCredentialRestore } from "../electron/credential-restore.mjs";
 import { workspaceCredentialPending } from "../electron/workspace-credentials.mjs";
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
+import { loadHostId } from "./host-id.ts";
+import { hostResourcesResponse } from "./host-resources.ts";
+import { createHostProbe } from "./jobs/admission.ts";
 import {
   appendHeldWork,
   drainViewOf,
@@ -800,6 +803,8 @@ const MIME: Record<string, string> = {
 // SQLite, routines, or webhook receivers start.  Health timeouts never release it.
 // The parent startup lock also serializes the one-time legacy directory move.
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
+const hostId = loadHostId(DATA_DIR);
+const jobHostProbe = createHostProbe();
 
 // ── the port opens BEFORE boot work, and health answers while it runs ─────
 // `server.listen` used to be the last statement in this file, behind the
@@ -840,6 +845,8 @@ function handleBootRequest(req: IncomingMessage, res: ServerResponse): void {
   if (path === "/health" || path === "/api/health") {
     return json(res, 200, {
       app: "botfleet",
+      hostId,
+      version: runtimeBuildIdentity.version,
       pid: process.pid,
       static: Boolean(STATIC_DIR),
       ownerProof: harnessOwnerProof(harnessOwner, req.headers["x-botfleet-owner-challenge"]),
@@ -2838,6 +2845,7 @@ function jobStopReason(job: JobSnapshot): { reason: string; forget: boolean } | 
 const jobRegistry = new JobRegistry({
   dir: join(DATA_DIR, "jobs"),
   dataDir: DATA_DIR,
+  probe: jobHostProbe,
   settings: jobSettings,
   // A job is a shell the model started: it carries its bot's launch identity
   // the way the engine's own children do (server/launch-identity.ts).
@@ -17142,9 +17150,24 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (method === "GET" && (path === "/api/health" || path === "/health")) {
       return json(res, 200, {
         app: "botfleet", pid: process.pid, static: Boolean(STATIC_DIR),
+        hostId, version: runtimeBuildIdentity.version,
         ownerProof: harnessOwnerProof(harnessOwner, req.headers["x-botfleet-owner-challenge"]),
         ready: !booting, booting,
       });
+    }
+    if (method === "GET" && path === "/api/host/resources") {
+      // The Linux owner gate strips its credential before this loopback hop.
+      // Companion tokens grant no access to host inventory, even if its proxy
+      // allowlist is extended later; the named tunnel has no owner credential.
+      const response = hostResourcesResponse({
+        localOwner: isLoopbackAddress(req.socket.remoteAddress),
+        fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
+        viaNamedTunnel: arrivedViaCloudflareTunnel(req),
+      }, {
+        hostId, version: runtimeBuildIdentity.version, platform: process.platform,
+        dataDir: DATA_DIR, probe: jobHostProbe, thresholds: () => jobSettings().admission,
+      });
+      return json(res, response.status, response.body);
     }
     // Saved data that could not be read or used, for the notice at the top of the app.  File base names
     // and short reasons only: no paths, and never a fragment of a file.

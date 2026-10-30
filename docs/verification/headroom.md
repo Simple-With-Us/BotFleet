@@ -2,6 +2,8 @@
 
 Refs BF-2559, BF-2596 and BF-2544.  These are the seven resource recipes from [Native Server Mode](../plans/2026-10-29-native-server-mode.md), paired with the nine [placement recipes](placement.md).  They define required results for later slices; this foundation provides neither resource routing nor enforced budgets.  No numeric defaults are selected here.
 
+BF-2598 adds the harness's read-only `GET /api/host/resources` report and its injected enforcement/probe tests; see [Host Resource Report Rollout](../rollouts/2026-10-30-host-resources.md).  It does not assert any complete placement recipe or authorize a live host measurement.
+
 ## Required Recipes
 
 | Key | Fixture And Action | Required Result |

@@ -13,7 +13,10 @@
 // last few percent, and the owner can move it (`jobs.admission`).
 
 import { execFile } from "node:child_process";
-import { readFileSync, statfsSync } from "node:fs";
+import { readFileSync, realpathSync, statfsSync } from "node:fs";
+import { totalmem } from "node:os";
+import type { CapacitySample } from "../../shared/placement.ts";
+import { loadPerCore, readHostLoad, type HostLoad } from "../drivers/acp/init-deadline.ts";
 
 export interface AdmissionThresholds {
   /** Refuse at or above this share of swap in use.  A host with no swap
@@ -71,6 +74,29 @@ export interface HostProbeDeps {
   readDarwinSwap?: () => Promise<string>;
   /** `/proc/meminfo`'s text. */
   readLinuxMeminfo?: () => string;
+  readHostLoad?: () => HostLoad | null;
+  totalMemory?: () => number;
+  statfs?: (path: string) => Pick<ReturnType<typeof statfsSync>, "bsize" | "blocks" | "bavail" | "files" | "ffree">;
+  readMountinfo?: () => string;
+  realPath?: (path: string) => string;
+}
+
+export interface CapacityHostProbe extends HostProbe {
+  capacitySample(path: string): CapacitySample;
+}
+
+/** Linux mountinfo uses octal escapes for whitespace and backslashes. */
+export function mountForPath(mountinfo: string, path: string): CapacitySample["dataVolume"] {
+  const decode = (value: string) => value.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8)));
+  const matches = mountinfo.split("\n").flatMap((line) => {
+    const fields = line.split(" ");
+    if (fields.length < 10 || !fields.includes("-")) return [];
+    const mountPoint = decode(fields[4]!);
+    if (!mountPoint.startsWith("/") || !/^\d+:\d+$/.test(fields[2]!)) return [];
+    return path === mountPoint || path.startsWith(mountPoint === "/" ? "/" : `${mountPoint}/`)
+      ? [{ device: fields[2]!, mountPoint }] : [];
+  });
+  return matches.sort((a, b) => b.mountPoint.length - a.mountPoint.length)[0] ?? null;
 }
 
 /** A 2 s bound on a command that normally answers in a few milliseconds. */
@@ -86,13 +112,22 @@ const sysctlSwap = (): Promise<string> =>
  *  `job_start`).  An unreadable figure is "unknown", which admits, because a
  *  broken probe must not switch jobs off — and so does one not read yet, which
  *  is why the first reading is started as the probe is built. */
-export function createHostProbe(deps: HostProbeDeps = {}): HostProbe {
+export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
   const platform = deps.platform ?? process.platform;
   const now = deps.now ?? Date.now;
   const readDarwinSwap = deps.readDarwinSwap ?? sysctlSwap;
   const readLinuxMeminfo = deps.readLinuxMeminfo ?? (() => readFileSync("/proc/meminfo", "utf8"));
+  const diskStats = deps.statfs ?? statfsSync;
+  const hostLoad = deps.readHostLoad ?? readHostLoad;
+  const memoryTotal = deps.totalMemory ?? totalmem;
+  const mountinfo = deps.readMountinfo ?? (() => readFileSync("/proc/self/mountinfo", "utf8"));
+  const realPath = deps.realPath ?? realpathSync;
   let swapAt = Number.NEGATIVE_INFINITY;
   let swapValue: number | null = null;
+  let swapTotalBytes: number | null = null;
+  let swapUsedBytes: number | null = null;
+  let ramAvailableBytes: number | null = null;
+  const nonnegative = (value: number): number | null => Number.isFinite(value) && value >= 0 ? value : null;
   let refreshing = false;
   const refreshDarwin = () => {
     if (refreshing) return;
@@ -102,9 +137,12 @@ export function createHostProbe(deps: HostProbeDeps = {}): HostProbe {
       .then(
         (text) => {
           swapValue = parseDarwinSwap(text);
+          swapTotalBytes = nonnegative(Number(/total\s*=\s*([\d.]+)M/.exec(text)?.[1] ?? NaN) * 1024 ** 2);
+          swapUsedBytes = nonnegative(Number(/used\s*=\s*([\d.]+)M/.exec(text)?.[1] ?? NaN) * 1024 ** 2);
         },
         () => {
           swapValue = null;
+          swapTotalBytes = swapUsedBytes = null;
         },
       )
       .finally(() => {
@@ -112,7 +150,7 @@ export function createHostProbe(deps: HostProbeDeps = {}): HostProbe {
       });
   };
   if (platform === "darwin") refreshDarwin();
-  return {
+  const probe: CapacityHostProbe = {
     swapUsedPercent() {
       if (now() - swapAt < SWAP_CACHE_MS) return swapValue;
       if (platform === "darwin") {
@@ -122,21 +160,56 @@ export function createHostProbe(deps: HostProbeDeps = {}): HostProbe {
       swapAt = now();
       try {
         // a procfs read: instant, so it needs no background step
-        swapValue = platform === "linux" ? parseLinuxSwap(readLinuxMeminfo()) : null;
+        const text = platform === "linux" ? readLinuxMeminfo() : "";
+        swapValue = platform === "linux" ? parseLinuxSwap(text) : null;
+        const kb = (name: string) => nonnegative(Number(new RegExp(`^${name}:\\s+(\\d+) kB`, "m").exec(text)?.[1] ?? NaN) * 1024);
+        swapTotalBytes = kb("SwapTotal");
+        const free = kb("SwapFree");
+        swapUsedBytes = swapTotalBytes === null || free === null ? null : nonnegative(swapTotalBytes - free);
+        ramAvailableBytes = kb("MemAvailable");
       } catch {
         swapValue = null;
+        swapTotalBytes = swapUsedBytes = ramAvailableBytes = null;
       }
       return swapValue;
     },
     freeDiskBytes(path) {
       try {
-        const stats = statfsSync(path);
+        const stats = diskStats(path);
         return Number(stats.bavail) * Number(stats.bsize);
       } catch {
         return null;
       }
     },
+    capacitySample(path) {
+      // The swap/cache read is shared with admission; there is no second sampler.
+      probe.swapUsedPercent();
+      const safe = <T>(read: () => T): T | null => { try { return read(); } catch { return null; } };
+      const load = safe(hostLoad);
+      const cores = load && Number.isSafeInteger(load.cores) && load.cores > 0 ? load.cores : null;
+      const total = safe(memoryTotal);
+      const ramTotalBytes = total !== null && total > 0 ? nonnegative(total) : null;
+      const available = ramAvailableBytes !== null && (ramTotalBytes === null || ramAvailableBytes <= ramTotalBytes) ? ramAvailableBytes : null;
+      const stats = safe(() => diskStats(path));
+      const root = safe(() => diskStats("/"));
+      const usableDisk = stats && Number(stats.bsize) > 0 && Number(stats.blocks) > 0;
+      const inodeTotal = stats && Number(stats.files) > 0 ? nonnegative(Number(stats.files)) : null;
+      const diskFreeBytes = usableDisk ? nonnegative(Number(stats.bavail) * Number(stats.bsize)) : null;
+      return {
+        at: now(), cores, loadPerCore: loadPerCore(load),
+        ramTotalBytes, ramAvailableBytes: available,
+        memoryAvailablePercent: ramTotalBytes && available !== null ? (available / ramTotalBytes) * 100 : null,
+        memoryPressure: null, swapTotalBytes, swapUsedBytes,
+        diskTotalBytes: usableDisk ? nonnegative(Number(stats.blocks) * Number(stats.bsize)) : null,
+        diskFreeBytes,
+        inodesTotal: inodeTotal,
+        inodesFree: stats && inodeTotal !== null ? nonnegative(Number(stats.ffree)) : null,
+        dataVolume: platform === "linux" ? safe(() => mountForPath(mountinfo(), realPath(path))) : null,
+        rootDiskFreeBytes: root && Number(root.bsize) > 0 && Number(root.blocks) > 0 ? nonnegative(Number(root.bavail) * Number(root.bsize)) : null,
+      };
+    },
   };
+  return probe;
 }
 
 function formatGb(bytes: number): string {
