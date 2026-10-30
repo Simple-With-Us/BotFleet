@@ -3439,7 +3439,7 @@ describe("harness HTTP API", () => {
       }, { timeout: 10_000 }).toMatchObject({
         id: accepted.id,
         status: "queued",
-        holdReason: expect.stringMatching(/cooling down.*retry automatically/i),
+        holdReason: expect.stringMatching(/cooling down.*start automatically/i),
       });
 
       const quotaProse = (await api("GET", "/api/instances?fresh=1")).body.instances.find(
