@@ -29,7 +29,7 @@ export function aggregateSamples(samples, intervalMs) {
     groups: Object.fromEntries([...groups].map(([id, rows]) => {
       const first = rows[0];
       const identityRequired = rows.some((row) => row.identityRequired === true);
-      const hasIdentity = typeof first.identity === "string";
+      const hasIdentity = first.identity != null;
       const identityChanged = identityRequired && (!hasIdentity || rows.some((row) => row.identity !== first.identity));
       const rowsForPeak = identityChanged ? rows.filter((row) => hasIdentity && row.identity === first.identity) : rows;
       const peak = (key) => {
@@ -207,7 +207,7 @@ export function parseLinuxMemAvailableBytes(meminfo) {
 }
 
 export function availableMemoryBytes(platform, linuxMeminfo = null) {
-  return platform === "linux" && typeof linuxMeminfo === "string" ? parseLinuxMemAvailableBytes(linuxMeminfo) : null;
+  return platform === "linux" && linuxMeminfo != null ? parseLinuxMemAvailableBytes(linuxMeminfo) : null;
 }
 
 async function linuxPidConstants() {
