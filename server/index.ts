@@ -187,6 +187,8 @@ import {
   parseQuotaResetTime,
   providerErrorCodeFromStopReason,
   quotaCooldowns,
+  transientCapacityRetryDelayMs,
+  transientRouteHealth,
   quotaOrCapFromErrorCode,
   selectTurnFallback,
   selectionForFallbackPick,
@@ -196,6 +198,7 @@ import {
   sliceIsShortProviderError,
   turnModelRejectionEvidence,
   turnQuotaOrCapEvidence,
+  turnTransientCapacityEvidence,
   BOOT_RECOVERY_NOTICE,
   turnProducedAssistantOutput,
   unattendedModelDowngrade,
@@ -351,7 +354,7 @@ import {
 import { buildTurnTools } from "./turn-tools.ts";
 import { createTurnToolHost } from "./tools/host.ts";
 import { adoptGroupLedger } from "./tools/process-group.ts";
-import { completedToolRow, startedToolRow } from "./tool-row.ts";
+import { completedToolRow, redactToolTitle, startedToolRow } from "./tool-row.ts";
 import { createPermissionBroker, type ApprovalAnswerSource } from "./tools/approvals.ts";
 import { listAgentsResponse } from "./tools/agents.ts";
 import { toolsFor } from "./tools/registry.ts";
@@ -564,7 +567,8 @@ import {
   ensureContainerComputerSession,
   localVmSharedBotSession,
 } from "./local-vm-shared-session.ts";
-import { RepeatDetector, callKey } from "./repeat-detector.ts";
+import { RepeatDetector, callKey, titleCallKey } from "./repeat-detector.ts";
+import { ProviderRouteActivity } from "./provider-route-activity.ts";
 import { HelperTracker, type HelperPublication } from "./helpers/tracker.ts";
 import { helperSnapshotForWire, helperTranscript } from "../shared/helpers.ts";
 import { redactSecretsInText } from "./redact.ts";
@@ -1747,17 +1751,38 @@ function dispatchHoldFor(
   if (!bot) return undefined;
   const task = threadId ? store.taskByThread(bot.id, threadId) : undefined;
   const policy = task?.modelSelection ?? bot.modelSelection;
+  const boxCloud = cloudRunUsesBoxAgent(runOn, bot.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend)
+    ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent")
+    : undefined;
+  const modelRoute = boxCloud ? undefined : quotaCooldowns.resolveModel(bot.id, policy);
   // A Box-backed cloud run does NOT execute on the bot's model engine:
   // `startTurn` switches it to the boxAgent instance. Judging the hold against
   // the local engine queued healthy cloud work whenever the local engine was
   // setup-dead, and never consulted a breaker that had opened on boxAgent.
   // This is the engine the turn will actually reach, which is the only one a
   // hold can honestly be about.
-  const instanceId = executionInstanceFor(bot, policy, runOn);
+  const instanceId = boxCloud?.instanceId ?? modelRoute?.selection.instanceId;
+  if (!instanceId) return undefined;
   // The registry's own display name where it has one, so the reason says
   // "DeepSeek Harness" rather than "dsh".  A queue full of "dsh could not
   // start" is no easier to act on than the boolean it replaced.
   const engine = registry.get(instanceId as never)?.displayName ?? instanceId;
+
+  // Unattended work stays queued while its actual primary route is cooling
+  // and every saved fallback is unavailable.
+
+  // RoutineManager retries this gate on its normal tick, so the receipt
+  // resumes automatically when the cooldown expires.
+
+  // A Box-backed run has its own executor and bypasses this model-route hold.
+  if (!boxCloud && policy.fallbacks?.length && modelRoute?.transientCapacity && !modelRoute.cooldown && !modelRoute.isFallback) {
+    const hint = `No saved route currently has capacity; the queued run will retry automatically after a brief backoff or healthy activity on the same route`;
+    return { reason: `${engine} is temporarily at capacity — ${hint}`, hint };
+  }
+  if (!boxCloud && policy.fallbacks?.length && modelRoute?.cooldown && !modelRoute.isFallback) {
+    const hint = `The primary model is cooling down and no saved fallback is available; the queued run will retry automatically when the cooldown clears`;
+    return { reason: `${engine} is cooling down — ${hint}`, hint };
+  }
 
   // A (bot, engine) pair that has failed to START repeatedly is not going to
   // start on the next tick either — the CLI is missing, not executable, or
@@ -3432,10 +3457,11 @@ function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
         const text = redactSecretsInText(event.text);
         return text === event.text ? event : { ...event, text };
       }
+      const title = redactToolTitle(event.title);
       const detail = typeof event.detail === "string" ? redactSecretsInText(event.detail) : event.detail;
       const args = typeof event.arguments === "string" ? redactSecretsInText(event.arguments) : event.arguments;
-      if (detail === event.detail && args === event.arguments) return event;
-      return { ...event, detail, arguments: args };
+      if (title === event.title && detail === event.detail && args === event.arguments) return event;
+      return { ...event, title, detail, arguments: args };
     }
     case "request.opened": {
       const summary = redactSecretsInText(event.summary);
@@ -4153,6 +4179,7 @@ function notify(notification: Notification | null) {
 // records the active member here before dispatching its turn.
 const groupSpeakers = new Map<string, { botId: string; name: string; color: string }>();
 const activeTurnOwners = new ActiveTurnOwners();
+const providerRouteActivity = new ProviderRouteActivity();
 
 // A Sentry span only ever sees a thread id.  This is what turns one into the
 // bot, the engine, and the room behind it, so a failed turn in the Issues
@@ -5103,6 +5130,8 @@ async function launchFallbackTurn(input: {
             used: pick.nextUsed,
             current: selection,
             botId,
+            isCooling: (candidateBotId, instanceId, model, now) =>
+              Boolean(quotaCooldowns.get(candidateBotId, instanceId, model, now)) || Boolean(transientRouteHealth.get(instanceId, model, now)),
           });
       if (!following) {
         fallbackAttemptByTurn.delete(key);
@@ -5195,6 +5224,12 @@ bus.subscribe((event: RuntimeEvent) => {
   }
   broadcast({ kind: "runtime", event: redactRuntimeEventForWire(event) });
   const bot = store.botByThread(event.threadId);
+  if (event.type === "content.delta") {
+    const owner = activeTurnOwners.forEvent(event.threadId, event.providerInstanceId);
+    if (owner && providerRouteActivity.observe(owner, event.streamKind, event.delta)) {
+      transientRouteHealth.markHealthy(owner.botId, owner.selection.instanceId, owner.selection.model);
+    }
+  }
   noteThreadWedge(bot ?? null, event);
   noteDoomedDispatch(bot ?? null, event);
   const group = bot ? undefined : store.groupByThread(event.threadId);
@@ -5283,10 +5318,11 @@ bus.subscribe((event: RuntimeEvent) => {
           // item.started across — dropping them here would silently
           // un-narrate every completed tool and blank the row's target
           const existing = store.messagesFor(event.threadId).find((m) => m.id === messageId)?.tool;
-          toolName = existing?.name ?? "tool";
+          const safeEvent = event.title === undefined ? event : { ...event, title: redactToolTitle(event.title) };
+          toolName = safeEvent.title ?? existing?.name ?? "tool";
           const startedAt = toolStartedAt.get(itemKey);
           store.patchMessage(event.threadId, messageId, {
-            tool: completedToolRow(existing, event, startedAt === undefined ? undefined : Math.max(0, Date.now() - startedAt)),
+            tool: completedToolRow(existing, safeEvent, startedAt === undefined ? undefined : Math.max(0, Date.now() - startedAt)),
           });
           toolMessageByItem.delete(itemKey);
           toolStartedAt.delete(itemKey);
@@ -5921,7 +5957,9 @@ bus.subscribe((event: RuntimeEvent) => {
         // existing chip-prose regexes decide exactly as they do today.
         const structuredQuotaOrCap = quotaOrCapFromErrorCode(providerErrorCodeFromStopReason(event.stopReason));
         const quotaEvidence = turnQuotaOrCapEvidence(afterUser, Boolean(event.ok));
-        const quotaOrCap = structuredQuotaOrCap ?? Boolean(quotaEvidence);
+        const capacityEvidence = turnTransientCapacityEvidence(afterUser, Boolean(event.ok));
+        const quotaOrCap = capacityEvidence ? false : structuredQuotaOrCap ?? Boolean(quotaEvidence);
+        const fallbackCapacityHit = quotaOrCap || Boolean(capacityEvidence);
         const quotaText = (quotaEvidence?.text ?? reply) || lastMsgText;
         const quotaInfo = parseQuotaResetTime(quotaText, Date.now(), quotaOrCap);
         const textIsCandidateForQuota = !event.ok || Boolean(quotaEvidence);
@@ -5934,13 +5972,16 @@ bus.subscribe((event: RuntimeEvent) => {
         const isTextError =
           structuredQuotaOrCap === true ||
           Boolean(quotaEvidence) ||
+          Boolean(capacityEvidence) ||
           sliceIsShortProviderError(afterUser) ||
           Boolean(modelRejection);
         const isOk = Boolean(event.ok) && !isTextError;
+        if (!isOk) transientRouteHealth.markUnhealthy(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
         if (isOk) {
           fallbackAttemptByTurn.delete(fallbackKey);
           pendingMemberFallback.delete(event.threadId);
           quotaCooldowns.clear(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
+          transientRouteHealth.markHealthy(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
           modelRejections.clear(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
         } else if (
           actualSelection.instanceId &&
@@ -5951,6 +5992,21 @@ bus.subscribe((event: RuntimeEvent) => {
           (event.stopReason === "prompt_timeout" || event.stopReason === "prompt_stall" || event.stopReason === "resume_failed")
         ) {
           store.setResumeCursor(fallbackBot.id, actualSelection.instanceId, undefined, event.threadId);
+        }
+        if (capacityEvidence && actualSelection.instanceId && actualSelection.model) {
+          transientRouteHealth.recordFailure(
+            fallbackBot.id,
+            actualSelection.instanceId,
+            actualSelection.model,
+            redactSecretsInText(capacityEvidence.text),
+            Date.now(),
+            transientCapacityRetryDelayMs(capacityEvidence.text),
+            (peerId) => {
+              const peer = activeTurnOwners.forBot(peerId);
+              return Boolean(peer && !peer.revoked &&
+                peer.selection.instanceId === actualSelection.instanceId && peer.selection.model === actualSelection.model);
+            },
+          );
         }
         if (quotaOrCap && textIsCandidateForQuota) {
           quotaCooldowns.record({
@@ -5982,7 +6038,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // a fallback must not wander to another engine on any failure.
         const configuredChain = fallbackPolicy?.fallbacks;
         let chain = configuredChain && configuredChain.length > 0 ? configuredChain : undefined;
-        if (!chain && quotaOrCap) {
+        if (!chain && fallbackCapacityHit) {
           deferredAutoFallback = true;
           chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort, fallbackComputerReach(settledOwner?.computerInputs));
         }
@@ -6019,7 +6075,7 @@ bus.subscribe((event: RuntimeEvent) => {
           ok: isOk,
           stopReason: event.stopReason,
           produced: turnProducedAssistantOutput(afterUser, { textIsError: isTextError }),
-          quotaOrCap,
+          quotaOrCap: fallbackCapacityHit,
           fallbacks: chain,
           used,
           current: {
@@ -6030,6 +6086,8 @@ bus.subscribe((event: RuntimeEvent) => {
           // doomed breaker is refusing; without it the gate is inert and the
           // fail-over can hand the turn to a second dead engine.
           botId: fallbackBot.id,
+          isCooling: (candidateBotId, instanceId, model, now) =>
+            Boolean(quotaCooldowns.get(candidateBotId, instanceId, model, now)) || Boolean(transientRouteHealth.get(instanceId, model, now)),
         });
         // Receipt now that the failover decision exists: while a fallback is
         // launching the run stays open and receipts on the fallback's own
@@ -6329,6 +6387,7 @@ async function autoFallbackChain(
       priority: AUTO_FALLBACK_PRIORITY,
       isCooling: (candidateBotId, instanceId, model) =>
         Boolean(quotaCooldowns.get(candidateBotId, instanceId, model)) ||
+        Boolean(transientRouteHealth.get(instanceId, model)) ||
         modelRejections.isRejected(candidateBotId, instanceId, model),
     });
   } catch (error) {
@@ -6380,7 +6439,7 @@ bus.subscribe((event: RuntimeEvent) => {
     if (event.arguments != null && title) key = callKey(title, event.arguments);
     // A title with more than a bare identifier is a call with arguments
     // (ACP: "echo hi", "Read src/x.ts"); a bare "Bash" is not countable.
-    else if (/\s|\//.test(title)) key = callKey("tool", title);
+    else key = titleCallKey(title);
   } else if (event.type === "request.opened" && event.requestType === "permission") key = callKey(event.tool, event.summary);
   if (!key) return;
   const { threshold } = repeats.record(event.threadId, key);
@@ -6968,7 +7027,7 @@ async function startTurn(
             modelId,
           )
       : undefined,
-    isCooling: (instanceId, model) => Boolean(quotaCooldowns.get(bot.id, instanceId, model)),
+    isCooling: (instanceId, model) => Boolean(quotaCooldowns.get(bot.id, instanceId, model)) || Boolean(transientRouteHealth.get(instanceId, model)),
   });
   // The engine this turn will run on, not merely the one the selection names —
   // see `executionInstanceFor`. Asking the credential gate about a Box-backed

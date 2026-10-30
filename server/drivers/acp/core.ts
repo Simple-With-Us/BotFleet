@@ -1689,14 +1689,20 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               state.sawOutput = true;
               const bypassedBy = gate?.bypassed(u);
               if (bypassedBy) return tripAllowlist(bypassedBy);
+              const isTerminal = u.status === "completed" || u.status === "failed";
               // prepared once: the same text is filed with the event and
               // fingerprinted for the update that may follow
               const announced = "rawInput" in u ? prepareInput(u.rawInput) : undefined;
               const parsedToolCallId = z.string().max(256).safeParse(u.toolCallId);
               const toolCallId = parsedToolCallId.success ? parsedToolCallId.data : undefined;
               if (toolCallId !== undefined) {
-                openToolCalls.add(toolCallId);
-                if (announced !== undefined) toolInputs.set(toolCallId, textSignature(announced.text));
+                if (isTerminal) {
+                  openToolCalls.delete(toolCallId);
+                  toolInputs.delete(toolCallId);
+                } else {
+                  openToolCalls.add(toolCallId);
+                  if (announced !== undefined) toolInputs.set(toolCallId, textSignature(announced.text));
+                }
               }
               flushAssistantText();
               const parsedTitle = z.string().max(256).safeParse(u.title);
@@ -1722,6 +1728,20 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 }),
                 ...capturePreparedInput(announced),
               });
+              if (isTerminal) {
+                const output = u.content ?? u.rawOutput;
+                const parsedTerminalTitle = z.string().max(256).safeParse(u.title);
+                emit({
+                  ...base(threadId, turnId),
+                  type: "item.completed",
+                  itemType: "tool",
+                  itemId: toolCallId,
+                  ok: u.status === "completed",
+                  detail: describeResult(output),
+                  title: parsedTerminalTitle.success ? parsedTerminalTitle.data : undefined,
+                  ...capturePreparedBoth(undefined, output),
+                });
+              }
               break;
             }
             case "tool_call_update": {
@@ -1740,6 +1760,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   openToolCalls.delete(toolCallId);
                   toolInputs.delete(toolCallId);
                 }
+                const parsedTerminalTitle = z.string().max(256).safeParse(u.title);
                 emit({
                   ...base(threadId, turnId),
                   type: "item.completed",
@@ -1747,6 +1768,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   itemId: toolCallId,
                   ok: u.status !== "failed",
                   detail: describeResult(u.content ?? u.rawOutput),
+                  title: parsedTerminalTitle.success ? parsedTerminalTitle.data : undefined,
                   ...capturePreparedBoth(newInput, u.content ?? u.rawOutput),
                 });
               } else if (newInput !== undefined) {

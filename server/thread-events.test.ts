@@ -99,6 +99,31 @@ describe("readThreadEvents", () => {
     expect(page.total).toEqual({ runtime: 3, native: 2 });
   });
 
+  it("accepts a completed tool title and rejects a malformed one", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const completed = (eventId: string, title: string | number) => runtime({
+      eventId,
+      createdAt: eventId,
+      type: "item.completed",
+      itemType: "tool",
+      itemId: "tool-1",
+      ok: false,
+      title,
+    });
+    writeFileSync(
+      join(eventsDir, "t1.ndjson"),
+      line(completed("valid-title", "hookRun: failed")) +
+        line(completed("invalid-title", 42)) +
+        line(completed("unbounded-title", "x".repeat(257))),
+    );
+
+    const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1" });
+    expect(page.entries.map((entry) => entry.data)).toMatchObject([
+      { eventId: "valid-title", title: "hookRun: failed" },
+    ]);
+  });
+
   it("rejects malformed retry telemetry while retaining a valid retry event", () => {
     const eventsDir = tmp();
     const nativeDir = tmp();

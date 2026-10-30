@@ -5,7 +5,7 @@
 // session/prompt, and streams session/update notifications for a scripted
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
-//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | exit-with-lingering-child | happy-with-lingering-child | resume-fails | no-auth | auth-required | permission
+//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | exit-with-lingering-child | happy-with-lingering-child | resume-fails | no-auth | auth-required | permission | initial-terminal-tool-call | refreshed-tool-title
 //                   | interleave (message → tool → message → tool → message)
 //                   | exit-with-lingering-child (the leader exits before the
 //                     prompt result while a SIGTERM-ignoring descendant stays
@@ -891,6 +891,44 @@ function handle(rawMsg: unknown, resumed = false) {
           });
           complete();
         }, quietMs);
+        return;
+      }
+      if (mode === "initial-terminal-tool-call") {
+        // Muse's public adapter can put the terminal state and output on the
+        // initial tool_call notification, without a later tool_call_update.
+        const status = process.env.FAKE_ACP_TERMINAL_STATUS === "failed" ? "failed" : "completed";
+        const output = [{ type: "content", content: { type: "text", text: status === "failed" ? "hook rejected" : "hook ran" } }];
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "initial-terminal-1",
+              title: status === "failed" ? "hookRun: failed" : "hookRun: completed",
+              kind: "other",
+              status,
+              rawInput: { hook: "Run" },
+              content: output,
+            },
+          },
+        });
+        complete();
+        return;
+      }
+      if (mode === "refreshed-tool-title") {
+        const callId = "refreshed-title-1";
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { update: { sessionUpdate: "tool_call", toolCallId: callId, title: "hookRun: inProgress", kind: "other", rawInput: { hook: "Run" } } },
+        });
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { update: { sessionUpdate: "tool_call_update", toolCallId: callId, status: "completed", title: "hookRun: completed", content: [{ type: "content", content: { type: "text", text: "hook ran" } }] } },
+        });
+        complete();
         return;
       }
       if (mode === "late-input-tool-call") {

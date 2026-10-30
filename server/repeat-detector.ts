@@ -14,6 +14,15 @@ export function callKey(tool: string, args: string | undefined): string | null {
   return `${tool}:${a}`;
 }
 
+/** A descriptive title is the fallback when the engine supplies no arguments. */
+export function titleCallKey(title: string): string | null {
+  const normalized = title.replace(/\s+/g, " ").trim();
+  // Muse exposes distinct public lifecycle items as tools with generic
+  // titles. A status alone cannot establish an identical operation.
+  if (/^(?:hookRun|reminderChild|workflow|subagent): (?:inProgress|in_progress|pending|completed|failed|cancelled|canceled|rejected|live state unknown)$/.test(normalized)) return null;
+  return /\s|\//.test(normalized) ? callKey("tool", normalized) : null;
+}
+
 export class RepeatDetector {
   private readonly counts = new Map<string, Map<string, number>>();
   private readonly thresholds: readonly number[];

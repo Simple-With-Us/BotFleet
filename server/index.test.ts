@@ -190,7 +190,7 @@ const statusWithHeaders = (headers: Record<string, string>): Promise<number> =>
 const writeFakeClaudeWrapper = (
   file: string,
   mode: "exit-early" | "hang" | "happy" | "quota" | "model-not-found",
-  options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string; toolIo?: boolean } = {},
+  options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string; toolIo?: boolean; replyGate?: { path: string; present: string; absent: string } } = {},
 ): string => {
   const lines = [
     "#!/usr/bin/env node",
@@ -208,6 +208,9 @@ const writeFakeClaudeWrapper = (
   }
   if (options.replyText) {
     lines.push(`process.env.FAKE_CLAUDE_REPLY = ${JSON.stringify(options.replyText)};`);
+  }
+  if (options.replyGate) {
+    lines.push(`process.env.FAKE_CLAUDE_REPLY = (await import("node:fs")).existsSync(${JSON.stringify(options.replyGate.path)}) ? ${JSON.stringify(options.replyGate.present)} : ${JSON.stringify(options.replyGate.absent)};`);
   }
   if (options.toolIo) lines.push('process.env.FAKE_CLAUDE_TOOL_IO = "1";');
   lines.push(`await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`, "");
@@ -3386,6 +3389,151 @@ describe("harness HTTP API", () => {
       expect((await api("PATCH", "/api/instances/quota", { enabled: false })).status).toBe(200);
     }
   }, 30_000);
+
+  it("keeps routine receipts queued when the primary model is cooling with no viable fallback", async () => {
+    expect((await api("PATCH", "/api/instances/quota", { enabled: true })).status).toBe(200);
+    const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
+    const quota = instances.find((instance: { instanceId: string }) => instance.instanceId === "quota");
+    expect(quota?.snapshot.state).toBe("available");
+
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    let routineId: string | undefined;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "quota",
+          model: quota.models.default,
+          fallbacks: [{ instanceId: "quota", model: quota.models.default }],
+        },
+      })).status).toBe(200);
+      expect((await api("PATCH", "/api/instances/quotaProse", { enabled: true })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "cool the primary model" })).status).toBe(202);
+      await expect.poll(async () => {
+        // SAFETY: The harness /api/quotas response returns cooldown rows with botId fields.
+        const cooldowns = (await api("GET", "/api/quotas")).body.cooldowns as Array<{ botId: string }>;
+        return cooldowns.some((cooldown) => cooldown.botId === bot.id);
+      }, { timeout: 15_000 }).toBe(true);
+
+      const created = await api("POST", "/api/routines", {
+        name: "Cooldown queue probe",
+        prompt: "Process the queued event",
+        botId: bot.id,
+        runOn: "bot",
+        enabled: false,
+        schedule: { type: "daily", time: "10:00", weekdays: [1] },
+      });
+      expect(created.status).toBe(201);
+      routineId = created.body.routine.id;
+      const delivered = await api("POST", `/api/routines/${routineId}/run`, {});
+      expect(delivered.status).toBe(201);
+      const accepted = delivered.body.run;
+
+      await expect.poll(async () => {
+        // SAFETY: /api/routines returns run rows with status and optional holdReason fields.
+        const runs = (await api("GET", "/api/routines")).body.runs as Array<{
+          id: string;
+          status: string;
+          holdReason?: string;
+        }>;
+        return runs.find((run) => run.id === accepted.id);
+      }, { timeout: 10_000 }).toMatchObject({
+        id: accepted.id,
+        status: "queued",
+        holdReason: expect.stringMatching(/cooling down.*retry automatically/i),
+      });
+
+      const quotaProse = (await api("GET", "/api/instances?fresh=1")).body.instances.find(
+        (instance: { instanceId: string }) => instance.instanceId === "quotaProse",
+      );
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "quotaProse", model: quotaProse.models.default },
+      })).status).toBe(200);
+      await expect.poll(async () => {
+        // SAFETY: /api/routines returns run rows keyed by the ingress runId.
+        const runs = (await api("GET", "/api/routines")).body.runs as Array<{ id: string; status: string }>;
+        return runs.find((run) => run.id === accepted.id);
+      }, { timeout: 20_000 }).toMatchObject({ id: accepted.id, status: "completed" });
+    } finally {
+      if (routineId) await api("DELETE", `/api/routines/${routineId}`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      expect((await api("PATCH", "/api/instances/quota", { enabled: false })).status).toBe(200);
+      expect((await api("PATCH", "/api/instances/quotaProse", { enabled: false })).status).toBe(200);
+    }
+  }, 30_000);
+
+  it("resumes a capacity-held routine when another bot succeeds on the same model route", async () => {
+    const gate = join(home, "capacity-route-healthy");
+    const cli = writeFakeClaudeWrapper(join(home, "fake-capacity-route"), "happy", {
+      replyGate: {
+        path: gate,
+        present: "The same model route is working successfully.",
+        absent: "HTTP 429: concurrency limit reached; retry after 120 seconds",
+      },
+    });
+    expect((await api("PATCH", "/api/instances/quotaProse", { cli, enabled: true })).status).toBe(200);
+    const instance = (await api("GET", "/api/instances?fresh=1")).body.instances.find(
+      (candidate: { instanceId: string }) => candidate.instanceId === "quotaProse",
+    );
+    const first = (await api("POST", "/api/bots")).body.bot;
+    const sibling = (await api("POST", "/api/bots")).body.bot;
+    let routineId: string | undefined;
+    try {
+      for (const candidate of [first, sibling]) {
+        expect((await api("PATCH", `/api/bots/${candidate.id}`, {
+          modelSelection: {
+            instanceId: instance.instanceId,
+            model: instance.models.default,
+            fallbacks: [{ instanceId: instance.instanceId, model: instance.models.default }],
+          },
+        })).status).toBe(200);
+      }
+      expect((await api("POST", `/api/bots/${first.id}/messages`, { text: "probe a busy route" })).status).toBe(202);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === first.id,
+        );
+        return state?.busy;
+      }, { timeout: 15_000 }).toBe(false);
+      // SAFETY: /api/quotas returns the cooldown rows in the harness response contract.
+      const cooldowns = (await api("GET", "/api/quotas")).body.cooldowns as Array<{ botId: string }>;
+      expect(cooldowns.some((row) => row.botId === first.id)).toBe(false);
+
+      const created = await api("POST", "/api/routines", {
+        name: "Transient capacity queue probe",
+        prompt: "Process the pending capacity event",
+        botId: first.id,
+        runOn: "bot",
+        enabled: false,
+        schedule: { type: "daily", time: "10:00", weekdays: [1] },
+      });
+      expect(created.status).toBe(201);
+      routineId = created.body.routine.id;
+      const delivered = await api("POST", `/api/routines/${routineId}/run`, {});
+      expect(delivered.status).toBe(201);
+      const accepted = delivered.body.run;
+      const receipt = async () => {
+        // SAFETY: /api/routines returns run rows with these public status fields.
+        const runs = (await api("GET", "/api/routines")).body.runs as Array<{ id: string; status: string; holdReason?: string }>;
+        return runs.find((row) => row.id === accepted.id);
+      };
+      await expect.poll(receipt, { timeout: 10_000 }).toMatchObject({
+        status: "queued",
+        holdReason: expect.stringMatching(/temporarily at capacity/i),
+      });
+
+      writeFileSync(gate, "healthy");
+      expect((await api("POST", `/api/bots/${sibling.id}/messages`, { text: "prove the same route is healthy" })).status).toBe(202);
+      // The receipt resumes well before its two-minute Retry-After because
+      // the other bot's live provider activity proves this exact route works.
+      await expect.poll(receipt, { timeout: 20_000 }).toMatchObject({ id: accepted.id, status: "completed" });
+    } finally {
+      if (routineId) await api("DELETE", `/api/routines/${routineId}`);
+      await api("DELETE", `/api/bots/${first.id}`);
+      await api("DELETE", `/api/bots/${sibling.id}`);
+      rmSync(gate, { force: true });
+      expect((await api("PATCH", "/api/instances/quotaProse", { cli: fakeQuotaProseCli, enabled: false })).status).toBe(200);
+    }
+  }, 45_000);
 
   it("does not cool down or replay a successful reply that discusses subscription accounting", async () => {
     expect((await api("PATCH", "/api/instances/quotaProse", { enabled: true })).status).toBe(200);

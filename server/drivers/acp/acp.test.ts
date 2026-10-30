@@ -390,6 +390,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_USAGE_ROOT;
     delete process.env.FAKE_ACP_CACHE_READ;
     delete process.env.FAKE_ACP_COST;
+    delete process.env.FAKE_ACP_TERMINAL_STATUS;
     delete process.env.FAKE_ACP_TRANSIENTS;
     delete process.env.FAKE_ACP_PARTIAL_FAILS;
     delete process.env.FAKE_ACP_FAIL_AT_PROMPT;
@@ -1198,6 +1199,37 @@ describe("ACP turns (fake CLI)", () => {
     expect(started.io?.input?.text).toBe('{\n  "command": "pnpm build"\n}');
     const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1")!;
     expect(done.io?.output).toEqual({ text: "built", truncated: false, length: 5 });
+  });
+
+  it.each(["completed", "failed"] as const)("settles an initially terminal tool_call (%s) with its output", async (status) => {
+    process.env.FAKE_ACP_TERMINAL_STATUS = status;
+    await create(GrokAgentDriver, "initial-terminal-tool-call");
+    await instance.adapter.sendTurn({ threadId: `t-acp-initial-terminal-${status}`, text: "run the hook" });
+
+    const doneTurn = await recorder.until((event) => event.type === "turn.completed", 3_000);
+    expect(doneTurn).toMatchObject({ ok: true });
+    const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "initial-terminal-1");
+    const completed = recorder.events.find((event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "initial-terminal-1");
+    expect(started).toMatchObject({ title: `hookRun: ${status}` });
+    expect(started?.io?.input?.text).toContain('"hook": "Run"');
+    expect(completed).toMatchObject({
+      ok: status === "completed",
+      title: `hookRun: ${status}`,
+      detail: status === "completed" ? "hook ran" : "hook rejected",
+      io: { output: { text: status === "completed" ? "hook ran" : "hook rejected" } },
+    });
+    expect(completed?.io?.input).toBeUndefined();
+  });
+
+  it("uses a truthful terminal title from tool_call_update", async () => {
+    await create(GrokAgentDriver, "refreshed-tool-title");
+    await instance.adapter.sendTurn({ threadId: "t-acp-refreshed-title", text: "run the hook" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    expect(recorder.events.find((event) => event.type === "item.started" && event.itemId === "refreshed-title-1"))
+      .toMatchObject({ title: "hookRun: inProgress" });
+    expect(recorder.events.find((event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "refreshed-title-1"))
+      .toMatchObject({ ok: true, title: "hookRun: completed", detail: "hook ran" });
   });
 
   it("files the arguments a streaming agent sends on a later tool_call_update", async () => {
