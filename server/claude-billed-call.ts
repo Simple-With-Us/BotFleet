@@ -18,6 +18,7 @@ function counts(raw: unknown): Pick<ClaudeBilledCall, "input" | "output" | "cach
   const usage = raw as Record<string, unknown>;
   const values = [usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens];
   if (!values.every((value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) return null;
+  if (!Number.isSafeInteger(values.reduce<number>((total, value) => total + (value as number), 0))) return null;
   if (usage.cache_creation && typeof usage.cache_creation === "object") {
     const split = usage.cache_creation as Record<string, unknown>;
     const parts = [split.ephemeral_5m_input_tokens ?? 0, split.ephemeral_1h_input_tokens ?? 0];

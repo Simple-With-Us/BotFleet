@@ -20,6 +20,7 @@ describe("single-call billed proof", () => {
     { ...message, usage: { ...usage, output_tokens: -1 } },
     { ...message, usage: { ...usage, output_tokens: 0.5 } },
     { ...message, usage: { ...usage, output_tokens: Number.MAX_SAFE_INTEGER + 1 } },
+    { ...message, usage: { ...usage, input_tokens: Number.MAX_SAFE_INTEGER } },
     { ...message, usage: { ...usage, cache_creation: { ephemeral_5m_input_tokens: 99 } } },
   ])("fails open for incomplete or inconsistent call evidence %j", (bad) => {
     const ledger = new ClaudeSingleCallLedger();
