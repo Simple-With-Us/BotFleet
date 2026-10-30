@@ -1579,7 +1579,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // total_cost_usd is the equivalent API price, not a cash charge.
           ...(cost != null ? { billingMode: "estimated" as const } : {}),
           ...(usage ? { usage } : {}),
-          ...(t.billedCalls.proof() ? { billedCall: t.billedCalls.proof() } : {}),
+          billedCall: t.billedCalls.proof(),
           ...servedModel,
         });
         if (session.child.exitCode === null && !session.closing) armIdle(threadId);

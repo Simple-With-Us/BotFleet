@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { z } from "zod";
 
 export function billedClaudeCallEventId(sessionId: string, callId: string): string {
   return `bf-call-v1:${createHash("sha256").update(JSON.stringify([sessionId, callId])).digest("hex")}`;
@@ -13,19 +14,28 @@ export interface ClaudeBilledCall {
   cacheWrite: number;
 }
 
-function counts(raw: unknown): Pick<ClaudeBilledCall, "input" | "output" | "cacheRead" | "cacheWrite"> | null {
-  if (!raw || typeof raw !== "object") return null;
-  const usage = raw as Record<string, unknown>;
+const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const UsageSchema = z.object({
+  input_tokens: count, output_tokens: count, cache_read_input_tokens: count, cache_creation_input_tokens: count,
+  cache_creation: z.object({ ephemeral_5m_input_tokens: count.optional(), ephemeral_1h_input_tokens: count.optional() }).optional(),
+});
+const MessageSchema = z.object({
+  id: z.string().min(1).max(200),
+  model: z.string().min(1).max(160).refine(model => model !== "<synthetic>"),
+  usage: UsageSchema,
+});
+type UsageInput = z.input<ReturnType<typeof UsageSchema.partial>> | undefined;
+type MessageInput = { id?: string; model?: string; usage?: UsageInput } | undefined;
+
+function counts(raw: UsageInput): Pick<ClaudeBilledCall, "input" | "output" | "cacheRead" | "cacheWrite"> | null {
+  const parsed = UsageSchema.safeParse(raw);
+  if (!parsed.success) return null;
+  const usage = parsed.data;
   const values = [usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens];
-  if (!values.every((value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) return null;
-  if (!Number.isSafeInteger(values.reduce<number>((total, value) => total + (value as number), 0))) return null;
-  if (usage.cache_creation && typeof usage.cache_creation === "object") {
-    const split = usage.cache_creation as Record<string, unknown>;
-    const parts = [split.ephemeral_5m_input_tokens ?? 0, split.ephemeral_1h_input_tokens ?? 0];
-    if (!parts.every((value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0) ||
-        (parts[0] as number) + (parts[1] as number) !== values[3]) return null;
-  }
-  return { input: values[0] as number, output: values[1] as number, cacheRead: values[2] as number, cacheWrite: values[3] as number };
+  if (!Number.isSafeInteger(values.reduce((total, value) => total + value, 0))) return null;
+  if (usage.cache_creation &&
+      (usage.cache_creation.ephemeral_5m_input_tokens ?? 0) + (usage.cache_creation.ephemeral_1h_input_tokens ?? 0) !== usage.cache_creation_input_tokens) return null;
+  return { input: usage.input_tokens, output: usage.output_tokens, cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens };
 }
 
 /** Exact proof for the deliberately narrow, single-call Claude turn subset.
@@ -38,12 +48,12 @@ export class ClaudeSingleCallLedger {
   private pending: ClaudeBilledCall | undefined;
   private billed: ClaudeBilledCall | undefined;
 
-  observe(message: unknown, lifecycleOwned: boolean): void {
-    if (!lifecycleOwned || !message || typeof message !== "object") { this.invalid = true; return; }
-    const msg = message as Record<string, unknown>;
+  observe(message: MessageInput, lifecycleOwned: boolean): void {
+    const parsed = MessageSchema.safeParse(message);
+    if (!lifecycleOwned || !parsed.success) { this.invalid = true; return; }
+    const msg = parsed.data;
     const usage = counts(msg.usage);
-    if (typeof msg.id !== "string" || !msg.id || msg.id.length > 200 ||
-        typeof msg.model !== "string" || !msg.model || msg.model.length > 200 || msg.model === "<synthetic>" || !usage) {
+    if (!usage) {
       this.invalid = true;
       return;
     }
@@ -52,7 +62,7 @@ export class ClaudeSingleCallLedger {
     this.pending = call;
   }
 
-  result(rawUsage: unknown, ours: boolean): void {
+  result(rawUsage: UsageInput, ours: boolean): void {
     const candidate = this.pending;
     this.pending = undefined;
     if (!ours) return;
