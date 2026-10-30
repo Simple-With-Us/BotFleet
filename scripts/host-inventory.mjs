@@ -84,6 +84,7 @@ class SampleAccumulator {
       identityChanged: missingBeforeFirstObservation > 0,
       peakMemoryBytes: null,
       peakCPUPercent: null,
+      peakCPUPercentRange: null,
       cpuDeltaValid: true,
       previousCPU: null,
       firstReadBytes: null,
@@ -133,16 +134,28 @@ class SampleAccumulator {
     if (sameInitialIdentity) {
       state.peakMemoryBytes = maxNonnegative(state.peakMemoryBytes, row.memoryBytes);
       const cpuCounterValid = Number.isFinite(row.cpuUsec) && row.cpuUsec >= 0;
-      if (!cpuCounterValid || (state.previousCPU !== null && row.cpuUsec < state.previousCPU.cpuUsec)) {
+      const cpuTimeBounds = validCpuTimeBounds(row.cpuTimeBounds, atMs);
+      if (!cpuCounterValid || !cpuTimeBounds || (state.previousCPU !== null && row.cpuUsec < state.previousCPU.cpuUsec)) {
         state.cpuDeltaValid = false;
-        state.limitations.add("CPU counter was unavailable or decreased; full-window interval CPU peak is unknown");
+        state.limitations.add("CPU counter or read-time bounds were unavailable or decreased; full-window interval CPU estimate is unknown");
       }
       if (state.cpuDeltaValid && cpuCounterValid && state.previousCPU !== null &&
           (!state.identityRequired || state.previousCPU.identity === row.identity)) {
-        const elapsed = atMs - state.previousCPU.atMs;
-        if (elapsed > 0 && row.cpuUsec >= state.previousCPU.cpuUsec) {
-          const percent = ((row.cpuUsec - state.previousCPU.cpuUsec) / 1000) / elapsed * 100;
-          state.peakCPUPercent = maxNonnegative(state.peakCPUPercent, percent);
+        const elapsedMinimumMs = cpuTimeBounds.startAtMs - state.previousCPU.cpuTimeBounds.endAtMs;
+        const elapsedMaximumMs = cpuTimeBounds.endAtMs - state.previousCPU.cpuTimeBounds.startAtMs;
+        const elapsedEstimateMs = ((cpuTimeBounds.startAtMs + cpuTimeBounds.endAtMs) -
+          (state.previousCPU.cpuTimeBounds.startAtMs + state.previousCPU.cpuTimeBounds.endAtMs)) / 2;
+        if (elapsedMinimumMs <= 0 || elapsedMaximumMs < elapsedMinimumMs || elapsedEstimateMs <= 0) {
+          state.cpuDeltaValid = false;
+          state.limitations.add("CPU read-time bounds overlapped; full-window interval CPU estimate is unknown");
+        } else if (row.cpuUsec >= state.previousCPU.cpuUsec) {
+          const cpuElapsedMs = (row.cpuUsec - state.previousCPU.cpuUsec) / 1000;
+          const estimate = cpuElapsedMs / elapsedEstimateMs * 100;
+          const range = { minimum: cpuElapsedMs / elapsedMaximumMs * 100, maximum: cpuElapsedMs / elapsedMinimumMs * 100 };
+          if (state.peakCPUPercent === null || estimate > state.peakCPUPercent) {
+            state.peakCPUPercent = estimate;
+            state.peakCPUPercentRange = range;
+          }
         }
       }
     }
@@ -150,8 +163,9 @@ class SampleAccumulator {
         (!state.identityKnownAtStart || row.identity !== state.initialIdentity)) {
       state.identityChanged = true;
     }
-    state.previousCPU = Number.isFinite(row.cpuUsec) && row.cpuUsec >= 0
-      ? { atMs, cpuUsec: row.cpuUsec, identity: row.identity }
+    const cpuTimeBounds = validCpuTimeBounds(row.cpuTimeBounds, atMs);
+    state.previousCPU = Number.isFinite(row.cpuUsec) && row.cpuUsec >= 0 && cpuTimeBounds
+      ? { cpuUsec: row.cpuUsec, identity: row.identity, cpuTimeBounds }
       : null;
 
     this.observeCounter(state, "read", row.ioReadBytes);
@@ -188,7 +202,8 @@ class SampleAccumulator {
         initial: state.initial,
         peak: {
           memoryBytes: state.missing ? null : state.peakMemoryBytes,
-          cpuPercentOfOneCore: state.missing || !state.cpuDeltaValid ? null : state.peakCPUPercent,
+          cpuPercentOfOneCoreEstimate: state.missing || !state.cpuDeltaValid ? null : state.peakCPUPercent,
+          cpuPercentOfOneCoreEstimateRange: state.missing || !state.cpuDeltaValid ? null : state.peakCPUPercentRange,
         },
         memoryKind: state.initial.memoryKind,
         observedDelta: {
@@ -221,6 +236,12 @@ class SampleAccumulator {
       groups: groupRows,
     };
   }
+}
+
+function validCpuTimeBounds(bounds, fallbackAtMs) {
+  if (bounds === undefined || bounds === null) return { startAtMs: fallbackAtMs, endAtMs: fallbackAtMs };
+  if (!Number.isFinite(bounds.startAtMs) || !Number.isFinite(bounds.endAtMs) || bounds.endAtMs < bounds.startAtMs) return null;
+  return bounds;
 }
 
 function finiteNonnegative(value) {
@@ -278,7 +299,7 @@ export function validateOptions(options, platform = process.platform) {
 }
 
 export function platformMeasurementLimits(platform) {
-  if (platform === "darwin") return ["macOS process sampling excludes child processes", "macOS ps CPU percentage is an OS-reported lifetime average; interval CPU is derived from cumulative process CPU time and monotonic elapsed time", "Mac PID start time is used as identity; if unavailable, cross-sample peaks and deltas are not combined", "RSS does not account for shared or compressed memory as a unique process-owned amount", "OrbStack values are caller-supplied and are not verified by this script"];
+  if (platform === "darwin") return ["macOS process sampling excludes child processes", "macOS ps %cpu is an OS-reported average with a decaying time basis; interval CPU is estimated from cumulative process CPU time and monotonic read-time bounds", "Mac PID start time is used as identity; if unavailable, cross-sample peaks and deltas are not combined", "RSS does not account for shared or compressed memory as a unique process-owned amount", "OrbStack values are caller-supplied and are not verified by this script"];
   if (platform === "linux") return ["Linux PID sampling excludes child processes", "PID RSS and CPU use system page-size and clock-tick values when getconf is available", "PID I/O counters may be unavailable", "Cgroup memory.current is charged memory including cache, kernel accounting and descendant cgroups, not process RSS", "Cgroup memory.peak is not used because its kernel-lifetime peak is not bounded to this observation window", "Cgroup metrics cover only selected systemd service units; Docker scopes, other units and external daemons are not selected", "Linux PSI pressure is not sampled"];
   return ["Process and service resource counters are unsupported on this platform"];
 }
@@ -308,7 +329,7 @@ async function linuxUnitCgroup(unit) {
   return `/sys/fs/cgroup${group}`;
 }
 
-export async function cgroupSample(id, directory, atMs, filesystem = { stat, readFile }) {
+export async function cgroupSample(id, directory, atMs, filesystem = { stat, readFile }, monotonicNow = () => performance.now()) {
   let before;
   try {
     before = await filesystem.stat(directory);
@@ -319,7 +340,11 @@ export async function cgroupSample(id, directory, atMs, filesystem = { stat, rea
   const get = async (name) => { try { return await filesystem.readFile(`${directory}/${name}`, "utf8"); } catch { return null; } };
   const memoryMatch = /^(\d+)\s*$/.exec((await get("memory.current")) ?? "");
   const memory = memoryMatch ? Number(memoryMatch[1]) : null;
-  const cpu = /^usage_usec\s+(\d+)$/m.exec((await get("cpu.stat")) ?? "");
+  const cpuReadStartedAtMs = monotonicNow();
+  const cpuText = await get("cpu.stat");
+  const cpuReadCompletedAtMs = monotonicNow();
+  const cpuTimeBounds = { startAtMs: cpuReadStartedAtMs, endAtMs: cpuReadCompletedAtMs };
+  const cpu = /^usage_usec\s+(\d+)$/m.exec(cpuText ?? "");
   const io = await get("io.stat");
   let readBytes = 0, writeBytes = 0, foundIo = false;
   for (const line of (io ?? "").split("\n")) for (const field of line.split(/\s+/).slice(1)) {
@@ -331,43 +356,66 @@ export async function cgroupSample(id, directory, atMs, filesystem = { stat, rea
     after = await filesystem.stat(directory);
     if (!after.isDirectory() || before.dev !== after.dev || before.ino !== after.ino) throw new Error("cgroup directory identity changed");
   } catch {
-    return { id, atMs, identityRequired: true, identity: null, memoryBytes: null, memoryKind: "cgroupCharged", cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["Cgroup directory identity changed or became unreadable during sampling; sample metrics are unknown"] };
+    return { id, atMs, identityRequired: true, identity: null, memoryBytes: null, memoryKind: "cgroupCharged", cpuUsec: null, cpuTimeBounds, ioReadBytes: null, ioWriteBytes: null, limitations: ["Cgroup directory identity changed or became unreadable during sampling; sample metrics are unknown"] };
   }
   const identity = `dev:${before.dev}:ino:${before.ino}`;
-  return { id, atMs, identity, identityRequired: true, memoryBytes: Number.isFinite(memory) ? memory : null, memoryKind: "cgroupCharged", cpuUsec: cpu ? Number(cpu[1]) : null, ioReadBytes: foundIo ? readBytes : null, ioWriteBytes: foundIo ? writeBytes : null, limitations: ["Cgroup memory.current is charged memory, including cache, kernel accounting and descendant cgroups; it is not process RSS", "Cgroup counters cover only this selected service unit; Docker scopes, other units and external daemons are not selected"] };
+  return { id, atMs, identity, identityRequired: true, memoryBytes: Number.isFinite(memory) ? memory : null, memoryKind: "cgroupCharged", cpuUsec: cpu ? Number(cpu[1]) : null, cpuTimeBounds, ioReadBytes: foundIo ? readBytes : null, ioWriteBytes: foundIo ? writeBytes : null, limitations: ["Cgroup memory.current is charged memory, including cache, kernel accounting and descendant cgroups; it is not process RSS", "Cgroup counters cover only this selected service unit; Docker scopes, other units and external daemons are not selected"] };
 }
 
 export function parseMacCpuTimeUsec(value) {
-  const match = /^(?:(\d+)-)?(?:(\d+):)?(\d{1,2}):(\d{2})(?:\.(\d+))?$/.exec(value.trim());
-  if (!match) return null;
-  const days = Number(match[1] ?? 0);
-  const hours = Number(match[2] ?? 0);
-  const minutes = Number(match[3]);
-  const seconds = Number(match[4]);
-  if (minutes > 59 || seconds > 59) return null;
-  const fractionUsec = Number((match[5] ?? "").padEnd(6, "0").slice(0, 6));
-  return (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1_000_000 + fractionUsec;
+  const dayForm = /^(\d+)-(\d+):(\d{2}):(\d{2})(?:\.(\d+))?$/.exec(value.trim());
+  const hourForm = /^(\d+):(\d{2}):(\d{2})(?:\.(\d+))?$/.exec(value.trim());
+  const minuteForm = /^(\d+):(\d{2})(?:\.(\d+))?$/.exec(value.trim());
+  let days = 0, hours = 0, minutes, seconds, fraction;
+  if (dayForm) {
+    days = Number(dayForm[1]); hours = Number(dayForm[2]); minutes = Number(dayForm[3]); seconds = Number(dayForm[4]); fraction = dayForm[5];
+    if (hours > 23 || minutes > 59 || seconds > 59) return null;
+  } else if (hourForm) {
+    hours = Number(hourForm[1]); minutes = Number(hourForm[2]); seconds = Number(hourForm[3]); fraction = hourForm[4];
+    if (hours > 23 || minutes > 59 || seconds > 59) return null;
+  } else if (minuteForm) {
+    minutes = Number(minuteForm[1]); seconds = Number(minuteForm[2]); fraction = minuteForm[3];
+    if (seconds > 59) return null;
+  } else return null;
+  const fractionUsec = Number((fraction ?? "").padEnd(6, "0").slice(0, 6));
+  const totalUsec = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1_000_000 + fractionUsec;
+  return Number.isSafeInteger(totalUsec) ? totalUsec : null;
 }
 
-async function pidSample(pid, atMs, platform, linuxConstants = {}) {
+export async function pidSample(pid, atMs, platform, linuxConstants = {}, dependencies = {}) {
+  const readProcFile = dependencies.readProcFile ?? readFile;
+  const runExecFile = dependencies.execFile ?? execFile;
+  const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
   if (platform === "linux") {
     try {
-      const [stat, statm, io] = await Promise.all([readFile(`/proc/${pid}/stat`, "utf8"), readFile(`/proc/${pid}/statm`, "utf8"), readFile(`/proc/${pid}/io`, "utf8").catch(() => "")]);
+      const cpuReadStartedAtMs = monotonicNow();
+      const stat = await readProcFile(`/proc/${pid}/stat`, "utf8");
+      const cpuReadCompletedAtMs = monotonicNow();
+      const cpuTimeBounds = { startAtMs: cpuReadStartedAtMs, endAtMs: cpuReadCompletedAtMs };
       const identity = linuxPidIdentity(stat);
       const fields = linuxPidFields(stat);
-      if (!identity || linuxPidIdentity(await readFile(`/proc/${pid}/stat`, "utf8")) !== identity) return { id: `pid:${pid}`, atMs, identityRequired: true, memoryBytes: null, memoryKind: "resident", cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID exited or changed identity during sampling; sample metrics are unknown"] };
+      if (!identity) return { id: `pid:${pid}`, atMs, identityRequired: true, identity: null, memoryBytes: null, memoryKind: "resident", cpuUsec: null, cpuTimeBounds, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID identity unavailable; sample metrics are unknown"] };
+      const [statm, io] = await Promise.all([
+        readProcFile(`/proc/${pid}/statm`, "utf8"),
+        readProcFile(`/proc/${pid}/io`, "utf8").catch(() => ""),
+      ]);
+      const finalStat = await readProcFile(`/proc/${pid}/stat`, "utf8");
+      if (linuxPidIdentity(finalStat) !== identity) return { id: `pid:${pid}`, atMs, identityRequired: true, identity: null, memoryBytes: null, memoryKind: "resident", cpuUsec: null, cpuTimeBounds, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID exited or changed identity during sampling; sample metrics are unknown"] };
       const ticks = Number(fields[11]) + Number(fields[12]);
       const rssPages = Number(statm.split(/\s+/)[1]);
       const read = /^read_bytes:\s+(\d+)$/m.exec(io), write = /^write_bytes:\s+(\d+)$/m.exec(io);
-      return { id: `pid:${pid}`, atMs, identity, identityRequired: true, memoryBytes: Number.isFinite(rssPages) && linuxConstants.pageSize ? rssPages * linuxConstants.pageSize : null, memoryKind: "resident", cpuUsec: Number.isFinite(ticks) && linuxConstants.clockTicks ? ticks * 1e6 / linuxConstants.clockTicks : null, ioReadBytes: read ? Number(read[1]) : null, ioWriteBytes: write ? Number(write[1]) : null, limitations: ["PID scope excludes child processes", ...(!identity ? ["PID identity unavailable; cross-sample peaks and deltas are not combined"] : []), ...(!linuxConstants.pageSize ? ["RSS unavailable because system page size could not be read"] : []), ...(!linuxConstants.clockTicks ? ["PID CPU unavailable because clock tick rate could not be read"] : []), "I/O counters are per-process and may be unavailable"] };
+      return { id: `pid:${pid}`, atMs, identity, identityRequired: true, memoryBytes: Number.isFinite(rssPages) && linuxConstants.pageSize ? rssPages * linuxConstants.pageSize : null, memoryKind: "resident", cpuUsec: Number.isFinite(ticks) && linuxConstants.clockTicks ? ticks * 1e6 / linuxConstants.clockTicks : null, cpuTimeBounds, ioReadBytes: read ? Number(read[1]) : null, ioWriteBytes: write ? Number(write[1]) : null, limitations: ["PID scope excludes child processes", ...(!identity ? ["PID identity unavailable; cross-sample peaks and deltas are not combined"] : []), ...(!linuxConstants.pageSize ? ["RSS unavailable because system page size could not be read"] : []), ...(!linuxConstants.clockTicks ? ["PID CPU unavailable because clock tick rate could not be read"] : []), "I/O counters are per-process and may be unavailable"] };
     } catch { return { id: `pid:${pid}`, atMs, identityRequired: true, memoryBytes: null, memoryKind: "resident", cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID was unavailable or exited during sample"] }; }
   }
   try {
-    const { stdout } = await execFile("/bin/ps", ["-o", "pid=,rss=,%cpu=,time=,lstart=", "-p", String(pid)], { timeout: 2000, maxBuffer: 1024 });
+    const cpuReadStartedAtMs = monotonicNow();
+    const { stdout } = await runExecFile("/bin/ps", ["-o", "pid=,rss=,%cpu=,time=,lstart=", "-p", String(pid)], { timeout: 2000, maxBuffer: 1024 });
+    const cpuReadCompletedAtMs = monotonicNow();
+    const cpuTimeBounds = { startAtMs: cpuReadStartedAtMs, endAtMs: cpuReadCompletedAtMs };
     const match = /^\s*(\d+)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\S+)\s+(.+)\s*$/.exec(stdout);
     if (!match || Number(match[1]) !== pid) throw new Error("missing process");
     const identity = match[5].trim() || null;
-    return { id: `pid:${pid}`, atMs, identity, identityRequired: true, memoryBytes: Number(match[2]) * 1024, memoryKind: "resident", cpuPercentOSAverage: Number(match[3]), cpuUsec: parseMacCpuTimeUsec(match[4]), ioReadBytes: null, ioWriteBytes: null, limitations: ["PID scope excludes child processes", ...(!identity ? ["PID start time unavailable; cross-sample peaks and deltas are not combined"] : []), "RSS does not account for shared or compressed memory as a unique process-owned amount", "macOS ps %cpu is a lifetime average; interval CPU is derived from cumulative process time"] };
+    return { id: `pid:${pid}`, atMs, identity, identityRequired: true, memoryBytes: Number(match[2]) * 1024, memoryKind: "resident", cpuPercentOSAverage: Number(match[3]), cpuUsec: parseMacCpuTimeUsec(match[4]), cpuTimeBounds, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID scope excludes child processes", ...(!identity ? ["PID start time unavailable; cross-sample peaks and deltas are not combined"] : []), "RSS does not account for shared or compressed memory as a unique process-owned amount", "macOS ps %cpu is an OS-reported average; interval CPU is estimated from cumulative process time and read-time bounds"] };
   } catch { return { id: `pid:${pid}`, atMs, identityRequired: true, memoryBytes: null, memoryKind: "resident", cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID was unavailable or exited during sample", "macOS PID CPU and I/O counters are unavailable"] }; }
 }
 
@@ -424,15 +472,21 @@ export function renderMarkdown(report) {
   const availabilityLabel = report.host.platform === "linux" ? "available (MemAvailable)" : "available (not reported)";
   const start = new Date(report.window.startEpochMs).toLocaleString("en-US", { timeZone: "America/Chicago", hour: "numeric", minute: "2-digit", hour12: true });
   const end = new Date(report.window.endEpochMs).toLocaleString("en-US", { timeZone: "America/Chicago", hour: "numeric", minute: "2-digit", hour12: true });
-  const lines = ["# Host Inventory", "", `- Host: ${report.host.platform}`, `- Source: ${report.sourceCommit?.revision ?? "unknown"} (${report.sourceCommit?.workingTreeDirty === null ? "working-tree state unknown" : report.sourceCommit?.workingTreeDirty ? "working tree dirty" : "working tree clean"})`, `- Window wall-clock boundaries: ${start} to ${end}`, `- Observed duration: ${fmt(report.window.durationMs, "ms")} (monotonic clock)`, `- Requested interval: ${report.window.requestedIntervalMs} ms`, `- Collection: ${report.interrupted ? `interrupted${report.interruptedBy ? ` by ${report.interruptedBy}` : ""}; partial window` : "completed"}`, "", "| Scope | Memory measure | Initial memory | Sampled peak memory | Initial CPU OS average | Sampled interval CPU peak | Read / write delta | Sample coverage |", "|---|---|---:|---:|---:|---:|---:|---:|"];
-  for (const [id, row] of Object.entries(report.groups)) lines.push(`| ${id} | ${row.memoryKind === "cgroupCharged" ? "cgroup charged" : row.memoryKind === "resident" ? "process RSS" : "unknown"} | ${fmt(row.initial.memoryBytes, "bytes")} | ${fmt(row.peak.memoryBytes, "bytes")} | ${fmt(row.initial.cpuPercentOSAverage, "% of one core")} | ${fmt(row.peak.cpuPercentOfOneCore, "% of one core")} | ${fmt(row.observedDelta.ioReadBytes, "bytes")} / ${fmt(row.observedDelta.ioWriteBytes, "bytes")} | ${row.coverage.observedSamples}/${row.coverage.expectedSamples} |`);
+  const lines = ["# Host Inventory", "", `- Host: ${report.host.platform}`, `- Source: ${report.sourceCommit?.revision ?? "unknown"} (${report.sourceCommit?.workingTreeDirty === null ? "working-tree state unknown" : report.sourceCommit?.workingTreeDirty ? "working tree dirty" : "working tree clean"})`, `- Window wall-clock boundaries: ${start} to ${end}`, `- Observed duration: ${fmt(report.window.durationMs, "ms")} (monotonic clock)`, `- Requested interval: ${report.window.requestedIntervalMs} ms`, `- Collection: ${report.interrupted ? `interrupted${report.interruptedBy ? ` by ${report.interruptedBy}` : ""}; partial window` : "completed"}`, "", "| Scope | Memory measure | Initial memory | Sampled peak memory | Initial CPU OS average | Sampled interval CPU peak estimate and bounds | Read / write delta | Sample coverage |", "|---|---|---:|---:|---:|---:|---:|---:|"];
+  for (const [id, row] of Object.entries(report.groups)) {
+    const cpuEstimate = fmt(row.peak.cpuPercentOfOneCoreEstimate, "% of one core");
+    const cpuRange = row.peak.cpuPercentOfOneCoreEstimateRange
+      ? ` (${fmt(row.peak.cpuPercentOfOneCoreEstimateRange.minimum, "%")}–${fmt(row.peak.cpuPercentOfOneCoreEstimateRange.maximum, "%")})`
+      : "";
+    lines.push(`| ${id} | ${row.memoryKind === "cgroupCharged" ? "cgroup charged" : row.memoryKind === "resident" ? "process RSS" : "unknown"} | ${fmt(row.initial.memoryBytes, "bytes")} | ${fmt(row.peak.memoryBytes, "bytes")} | ${fmt(row.initial.cpuPercentOSAverage, "% of one core")} | ${cpuEstimate}${cpuRange} | ${fmt(row.observedDelta.ioReadBytes, "bytes")} / ${fmt(row.observedDelta.ioWriteBytes, "bytes")} | ${row.coverage.observedSamples}/${row.coverage.expectedSamples} |`);
+  }
   lines.push("", "## Capacity", "", `- Logical CPUs: ${fmt(report.capacity.logicalCpuCount, "cores")}`, `- Memory: ${fmt(report.capacity.totalMemoryBytes, "bytes")} total; ${fmt(report.capacity.availableMemoryBytes, "bytes")} ${availabilityLabel}; sampled minimum ${fmt(report.capacity.sampledMinimumAvailableMemoryBytes, "bytes")} (${report.capacity.availableMemoryCoverage.observedSamples}/${report.capacity.availableMemoryCoverage.expectedSamples} samples); ${fmt(report.capacity.freeMemoryBytes, "bytes")} free per Node OS API`, `- Swap: ${report.capacity.swap ? `${fmt(report.capacity.swap.totalBytes, "bytes")} total; ${fmt(report.capacity.swap.usedBytes, "bytes")} used` : "unknown"}`, `- Root disk: ${fmt(report.capacity.disks.root.freeBytes, "bytes")} free; ${fmt(report.capacity.disks.root.freeInodes, "inodes")} free inodes`, `- Data disk: ${fmt(report.capacity.disks.data.freeBytes, "bytes")} free; ${fmt(report.capacity.disks.data.freeInodes, "inodes")} free inodes`, `- OrbStack reservation: ${report.capacity.orbStackReservation ? "explicit input only; not verified by this script" : "unknown / not supplied"}`, "", "## Measurement Limits", ...report.limitations.map((limitation) => `- ${limitation}`), "");
   return lines.join("\n");
 }
 
 function fmt(value, unit) { return Number.isFinite(value) ? `${Math.round(value * 100) / 100} ${unit}` : "unknown"; }
 
-async function prepareOutputTargets(outputDir) {
+export async function prepareOutputTargets(outputDir, openReportFile = open) {
   await mkdir(outputDir, { recursive: false, mode: 0o700 }).catch((error) => {
     if (error?.code !== "EEXIST") throw new Error("output directory could not be created without creating missing parents");
   });
@@ -448,12 +502,21 @@ async function prepareOutputTargets(outputDir) {
   try {
     for (const [kind, name] of [["json", "host-inventory.json"], ["markdown", "host-inventory.md"]]) {
       const path = resolve(outputDir, name);
-      const handle = await open(path, flags, 0o600);
-      const info = await handle.stat();
+      const handle = await openReportFile(path, flags, 0o600);
       const target = { kind, path, handle, closed: false, identity: null };
       targets.push(target);
+      let info;
+      try {
+        info = await handle.stat();
+      } catch (error) {
+        try {
+          await handle.close();
+          target.closed = true;
+        } catch {}
+        throw error;
+      }
       target.identity = { dev: info.dev, ino: info.ino, uid: info.uid };
-      if (!info.isFile() || info.nlink !== 1 || (uid !== null && info.uid !== uid) || (info.mode & 0o077) !== 0) {
+      if (!info.isFile() || info.nlink !== 1 || info.uid !== uid || (info.mode & 0o777) !== 0o600) {
         throw new Error("report target is not a private, exclusively created regular file");
       }
     }
@@ -462,6 +525,30 @@ async function prepareOutputTargets(outputDir) {
     await cleanupOutputTargets(targets);
     if (error?.code === "EEXIST") throw new Error("report target already exists; choose a new output directory");
     throw error;
+  }
+}
+
+function matchesReservedPrivateFile(info, target, uid) {
+  return info.isFile() && info.nlink === 1 && info.dev === target.identity.dev &&
+    info.ino === target.identity.ino && info.uid === target.identity.uid && info.uid === uid &&
+    (info.mode & 0o777) === 0o600;
+}
+
+async function assertTargetPathStillOwned(target) {
+  if (!target.identity) throw new Error(`report target identity unavailable: ${target.kind}`);
+  const uid = process.getuid();
+  const current = await lstat(target.path).catch(() => null);
+  if (!current || !matchesReservedPrivateFile(current, target, uid)) {
+    throw new Error(`report target changed during collection: ${target.kind}`);
+  }
+}
+
+async function assertTargetStillOwned(target) {
+  if (!target.identity || target.closed) throw new Error(`report target descriptor unavailable: ${target.kind}`);
+  const uid = process.getuid();
+  const [descriptor, current] = await Promise.all([target.handle.stat(), lstat(target.path).catch(() => null)]);
+  if (!current || !matchesReservedPrivateFile(descriptor, target, uid) || !matchesReservedPrivateFile(current, target, uid)) {
+    throw new Error(`report target changed during collection: ${target.kind}`);
   }
 }
 
@@ -474,10 +561,7 @@ async function cleanupOutputTargets(targets) {
     if (!target.identity) continue;
     try {
       const current = await lstat(target.path);
-      if (current.isFile() && current.nlink === 1 &&
-          current.dev === target.identity.dev && current.ino === target.identity.ino &&
-          current.uid === target.identity.uid &&
-          current.uid === process.getuid()) {
+      if (matchesReservedPrivateFile(current, target, process.getuid())) {
         await unlink(target.path);
       }
     } catch {}
@@ -532,7 +616,7 @@ function delay(milliseconds, signal) {
 export async function run(options, dependencies = {}) {
   validateOptions(options);
   const sourceCommit = reportSourceCommitGuard(await (dependencies.readSourceCommit ?? readSourceCommit)());
-  const targets = await prepareOutputTargets(resolve(options.outputDir));
+  const targets = await prepareOutputTargets(resolve(options.outputDir), dependencies.openReportFile ?? open);
   try {
     const platform = dependencies.platform ?? process.platform;
     const wallNow = dependencies.wallNow ?? Date.now;
@@ -549,8 +633,8 @@ export async function run(options, dependencies = {}) {
     for (const pid of options.pids) groups.set(`pid:${pid}`, { kind: "pid", pid });
     const sampleGroup = dependencies.sampleGroup ?? (async (id, source, atMs) =>
       source.kind === "cgroup"
-        ? cgroupSample(id, source.path, atMs)
-        : pidSample(source.pid, atMs, platform, pidConstants));
+        ? cgroupSample(id, source.path, atMs, { stat, readFile }, monotonicNow)
+        : pidSample(source.pid, atMs, platform, pidConstants, { monotonicNow }));
     const readAvailableMemory = dependencies.readAvailableMemory ?? (() => platform === "linux" ? linuxMemAvailable() : null);
     const accumulator = new SampleAccumulator(options.intervalSeconds * 1000);
     const startAtMs = monotonicNow();
@@ -605,10 +689,15 @@ export async function run(options, dependencies = {}) {
       limitations: [...limitations, ...platformMeasurementLimits(platform)],
     };
     const writeArtifact = dependencies.writeArtifact ?? ((target, contents) => target.handle.writeFile(contents));
+    for (const target of targets) await assertTargetStillOwned(target);
     await writeArtifact(targets[0], `${JSON.stringify(report, null, 2)}\n`);
+    for (const target of targets) await assertTargetStillOwned(target);
     await writeArtifact(targets[1], renderMarkdown(report));
+    for (const target of targets) await assertTargetStillOwned(target);
     await Promise.all(targets.map((target) => target.handle.sync()));
+    for (const target of targets) await assertTargetStillOwned(target);
     await closeOutputTargets(targets);
+    for (const target of targets) await assertTargetPathStillOwned(target);
     return report;
   } catch (error) {
     await cleanupOutputTargets(targets);
