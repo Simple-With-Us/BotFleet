@@ -16,6 +16,8 @@ The host refuses interactive roots containing `config.json` or `harness-owner.js
 
 Trusted local composition can register a typed bot with one native Claude executable, model, service-owned workspace, and desktop requirement.  Registrations persist in the native store and cannot change while the graph is running.
 
+Trusted local setup registers bots serially; an identical completed registration is idempotent, while an in-flight duplicate is explicitly refused.
+
 The thin `BotFleetNativeHost --service-data /absolute/private/service-root` executable opens this actual graph, recovers existing registrations and waits, polls predicates, and shuts down cooperatively on SIGINT or SIGTERM.  Signal handlers install before opening the graph, buffering a startup signal until checked shutdown can run.
 
 It opens no network listener and provides no network registration, credential grant, or attachment endpoint.
@@ -101,6 +103,20 @@ Scoped verification on the integrated source passed:
 The project was generated with XcodeGen for the initial unsigned build; its project definition was unchanged by the later main integration, which received another unsigned build.  No additional Mac full test run was used to replace or obscure the earlier display assertion.
 
 Integration evidence is retained in `codex-bf2602-main-integration-scoped.log`, `codex-bf2602-main-full-swift.log`, `codex-bf2602-final-main-scoped-swift.log`, and `codex-bf2602-final-main-unsigned-ios.log`.  The complete Node gate remains failed with the baseline-matching failures above; the scoped passes do not establish an all-green full gate on the final rebased head.
+
+## Pre-Claim Interruption Recovery
+
+Sentry finding 4429381856 identified that a registration generation change or shutdown during suspended execution-context resolution could abandon work before any durable claim.  The queue now reports a dedicated non-serialized pre-claim interruption outcome, and the registry persists the existing `pending` state even when shutdown has cancelled its dispatch task.
+
+Credential resolution and lifecycle checks still precede `claimNativeEventWaitDispatch`.  The retry discards the interrupted preparation and resolves fresh execution context; errors and uncertain outcomes after a claim attempt retain the existing held behavior.
+
+Pending snapshots carry neither a credential-failure reason nor a new serialized enum value.  Their in-memory and database snapshots match, the existing schema backfill leaves them unclaimed on reopen, and the accepted-snapshot fence rejects even a newer pending mirror of an accepted wait.
+
+The scoped Mac run passed all 47 native host, runtime, wait-registry, and routine-admission tests.  Controlled registration and shutdown races prove no initial child or message, an unclaimed durable pending wait, recovery through refresh or restart, exactly one eventual child and user/assistant message pair, and no replay after a further restart; accepted-outcome no-replay coverage also passed.
+
+Typecheck, `git diff --check`, and the unsigned generic iOS Simulator build passed.  Evidence is retained as `codex-bf2602-preclaim-typecheck.log`, `codex-bf2602-preclaim-scoped-swift.log`, and `codex-bf2602-preclaim-unsigned-ios.log`; no full suite or live service run was repeated.
+
+Existing untagged held records and accepted claims are unchanged.  The fix does not infer that an older uncertain outcome is safe to replay, and the earlier full-gate qualifications remain in force.
 
 ## Remaining Delivery Boundary
 

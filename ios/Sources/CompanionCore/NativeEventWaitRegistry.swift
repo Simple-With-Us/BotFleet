@@ -108,6 +108,8 @@ public enum NativeEventWaitQueueResult: Equatable, Sendable {
     case completed
     case held(reason: String)
     case admissionHeld(NativeWorkHoldReason)
+    /// No durable claim was attempted, so the wait can return to pending without an uncertain outcome.
+    case preClaimInterrupted
 }
 
 /// Persistence stores a complete bounded snapshot so implementations can use one atomic write.
@@ -479,7 +481,7 @@ public actor NativeEventWaitRegistry {
             catch { result = .held(reason: "Wait dispatch could not confirm completion") }
             guard var latest = waitsById[dispatching.id], latest.status == .dispatching,
                   latest.revision == dispatching.revision else { return }
-            if stopped || Task.isCancelled {
+            if (stopped || Task.isCancelled) && result != .preClaimInterrupted {
                 latest.status = .held; latest.holdReason = "Dispatch outcome unknown after shutdown"
                 latest.admissionHold = nil
             } else {
@@ -488,6 +490,8 @@ public actor NativeEventWaitRegistry {
                 case .held(let reason): latest.status = .held; latest.holdReason = String(reason.prefix(512))
                 case .admissionHeld(let reason):
                     latest.status = .held; latest.admissionHold = reason; latest.holdReason = reason.rawValue
+                case .preClaimInterrupted:
+                    latest.status = .pending; latest.admissionHold = nil; latest.holdReason = nil
                 }
             }
             latest.revision &+= 1

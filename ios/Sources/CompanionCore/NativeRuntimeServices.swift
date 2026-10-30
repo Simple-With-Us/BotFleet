@@ -243,7 +243,7 @@ private actor NativeCoordinatorEventWaitQueue: NativeEventWaitQueue {
     }
 
     func enqueueFollowUp(_ wait: NativeEventWait) async throws -> NativeEventWaitQueueResult {
-        guard !isShutdown else { return .held(reason: "Native wait dispatcher is shut down") }
+        guard !isShutdown, !Task.isCancelled else { return .preClaimInterrupted }
         guard let threadId = wait.threadId, let prompt = wait.prompt else {
             return .held(reason: "Wait has no durable follow-up thread or prompt")
         }
@@ -251,13 +251,13 @@ private actor NativeCoordinatorEventWaitQueue: NativeEventWaitQueue {
               let thread = try? await database.loadThread(id: threadId), thread.botId == wait.botId else {
             return .held(reason: "Bot or thread ownership changed before dispatch")
         }
-        guard !isShutdown else { return .held(reason: "Native wait dispatcher is shut down") }
+        guard !isShutdown, !Task.isCancelled else { return .preClaimInterrupted }
 
+        let input: TurnInput
         do {
-            let input: TurnInput
             if let executionContext {
                 let admission = try await executionContext.resolve(wait: wait)
-                guard !isShutdown, !Task.isCancelled else { return .held(reason: "Native wait dispatcher is shut down") }
+                guard !isShutdown, !Task.isCancelled else { return .preClaimInterrupted }
                 switch admission {
                 case .held(let reason): return .admissionHeld(reason)
                 case .ready(let prepared):
@@ -269,7 +269,16 @@ private actor NativeCoordinatorEventWaitQueue: NativeEventWaitQueue {
             } else {
                 input = TurnInput(threadId: threadId, botId: wait.botId, prompt: prompt)
             }
-            guard !isShutdown, !Task.isCancelled else { return .held(reason: "Native wait dispatcher is shut down") }
+            guard !isShutdown, !Task.isCancelled else { return .preClaimInterrupted }
+        } catch NativeRuntimeServicesError.stopped {
+            return .preClaimInterrupted
+        } catch is CancellationError {
+            return .preClaimInterrupted
+        } catch {
+            return .held(reason: Self.bounded(error.localizedDescription))
+        }
+
+        do {
             guard try await database.claimNativeEventWaitDispatch(wait) else {
                 return .held(reason: "Wait dispatch was already claimed")
             }

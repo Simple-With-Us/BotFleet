@@ -225,7 +225,7 @@ struct NativeHeadlessHostTests {
         let credentials = GatedFixtureCredentials(output: fixture.output)
         let host = try await fixture.start(credentials: credentials)
         try await host.registerBot(fixture.bot())
-        _ = try await host.registerWait(botId: "bot-a", prompt: "racing stop", predicate: .botIdle)
+        let wait = try await host.registerWait(botId: "bot-a", prompt: "racing stop", predicate: .botIdle)
         try await host.tick()
         try await waitUntil { await credentials.entered }
         let stop = Task { try await host.shutdown(deliberateStop: true) }
@@ -238,11 +238,81 @@ struct NativeHeadlessHostTests {
         #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
         #expect(await host.state == .stopped)
         #expect(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("stopped.marker").path))
+        let pending = try #require(await host.wait(id: wait.id))
+        #expect(pending.status == .pending)
+        #expect(pending.admissionHold == nil)
+        let database = try DatabaseService(path: fixture.database.path)
+        #expect(try await database.loadNativeEventWaits() == [pending])
+        #expect(try await !database.hasNativeEventWaitDispatchClaim(id: wait.id))
+        try await database.checkpointAndClose()
         let next = try await fixture.start(credentials: FixtureServiceCredentials(output: fixture.output))
+        try await next.refreshCapabilities()
         try await next.tick()
         await next.waitForDispatches()
-        #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
+        #expect(await next.wait(id: wait.id)?.status == .completed)
+        #expect(try fixture.launchCount() == 1)
+        #expect(try await next.messages(botId: "bot-a").count == 2)
         try await next.shutdown()
+        let again = try await fixture.start(credentials: FixtureServiceCredentials(output: fixture.output))
+        try await again.tick()
+        await again.waitForDispatches()
+        #expect(try fixture.launchCount() == 1)
+        #expect(try await again.messages(botId: "bot-a").count == 2)
+        try await again.shutdown()
+    }
+
+    @Test("Registering another bot during suspended preparation leaves work retryable after refresh")
+    func registrationInterruptionResumesAfterRefresh() async throws {
+        try await verifyRegistrationInterruption(resumeAfterRestart: false)
+    }
+
+    @Test("Registering another bot during suspended preparation leaves an unclaimed durable wait across restart")
+    func registrationInterruptionResumesAfterRestart() async throws {
+        try await verifyRegistrationInterruption(resumeAfterRestart: true)
+    }
+
+    private func verifyRegistrationInterruption(resumeAfterRestart: Bool) async throws {
+        let fixture = try HostFixture()
+        defer { fixture.remove() }
+        let credentials = GatedFixtureCredentials(output: fixture.output)
+        var host = try await fixture.start(credentials: credentials)
+        try await host.registerBot(fixture.bot())
+        let wait = try await host.registerWait(botId: "bot-a", prompt: "after registration", predicate: .botIdle)
+        try await host.tick()
+        try await waitUntil { await credentials.entered }
+        try await host.registerBot(NativeHostBotConfiguration(id: "bot-b", name: "Second Fixture", threadId: "thread-b",
+                                                             claudeExecutable: fixture.executable.path))
+        await credentials.release()
+        await host.waitForDispatches()
+        let pending = try #require(await host.wait(id: wait.id))
+        #expect(pending.status == .pending)
+        #expect(pending.admissionHold == nil)
+        #expect(pending.holdReason == nil)
+        #expect(try await host.messages(botId: "bot-a").isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
+        if resumeAfterRestart {
+            try await host.shutdown()
+            let database = try DatabaseService(path: fixture.database.path)
+            #expect(try await database.loadNativeEventWaits() == [pending])
+            #expect(try await !database.hasNativeEventWaitDispatchClaim(id: wait.id))
+            try await database.checkpointAndClose()
+            host = try await fixture.start(credentials: FixtureServiceCredentials(output: fixture.output))
+        }
+        try await host.refreshCapabilities()
+        try await host.tick()
+        await host.waitForDispatches()
+        #expect(await host.wait(id: wait.id)?.status == .completed)
+        #expect(try fixture.launchCount() == 1)
+        let messages = try await host.messages(botId: "bot-a")
+        #expect(messages.filter { $0.role == "user" && $0.content == "after registration" }.count == 1)
+        #expect(messages.filter { $0.role == "assistant" && $0.content == "fixture reply" }.count == 1)
+        try await host.shutdown()
+        let again = try await fixture.start(credentials: FixtureServiceCredentials(output: fixture.output))
+        try await again.tick()
+        await again.waitForDispatches()
+        #expect(try fixture.launchCount() == 1)
+        #expect(try await again.messages(botId: "bot-a") == messages)
+        try await again.shutdown()
     }
 
     @Test("An explicit stop upgrades a suspended ordinary shutdown without writing an early marker")
@@ -450,13 +520,16 @@ private actor GatedFixtureCredentials: NativeServiceCredentialSource {
     let output: URL
     var entered = false
     private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
     init(output: URL) { self.output = output }
     func credentials(forBotId botId: String) async throws -> NativeServiceCredentialResult {
-        entered = true
-        await withCheckedContinuation { continuation = $0 }
+        if !released {
+            entered = true
+            await withCheckedContinuation { continuation = $0 }
+        }
         return try await FixtureServiceCredentials(output: output).credentials(forBotId: botId)
     }
-    func release() { continuation?.resume(); continuation = nil }
+    func release() { released = true; continuation?.resume(); continuation = nil }
 }
 
 private func waitUntil(_ condition: @escaping @Sendable () async -> Bool) async throws {
