@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -63,4 +63,38 @@ test("artifact references resolve beside the state file and must be readable fil
     writeFileSync(join(dir, "inventory.json"), "{}\n");
     assert.equal(checkPlacementEvidenceFile(path).ok, true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("artifacts cannot escape by absolute path, traversal, sibling prefix, symlink or hard link", () => {
+  const root = mkdtempSync(join(tmpdir(), "bf-evidence-boundary-"));
+  const bundle = join(root, "bundle");
+  const outside = join(root, "bundle-sibling");
+  mkdirSync(bundle); mkdirSync(outside);
+  writeFileSync(join(bundle, "run.log"), "fixture\n");
+  writeFileSync(join(bundle, "inventory.json"), "{}\n");
+  writeFileSync(join(outside, "external.json"), "{}\n");
+  linkSync(join(outside, "external.json"), join(bundle, "hardlink.json"));
+  const invalid = [join(outside, "external.json"), join(bundle, "inventory.json"), "../bundle-sibling/external.json", "hardlink.json"];
+  if (process.platform !== "win32") {
+    symlinkSync(join(outside, "external.json"), join(bundle, "linked.json"));
+    symlinkSync(outside, join(bundle, "linked-directory"));
+    invalid.push("linked.json", "linked-directory/external.json");
+  }
+  try {
+    const path = join(bundle, "placement-evidence.json");
+    for (const artifact of invalid) {
+      const state = complete();
+      state.inventory.mac = artifact;
+      writeFileSync(path, JSON.stringify(state));
+      assert.equal(checkPlacementEvidenceFile(path).ok, false, artifact);
+    }
+    writeFileSync(path, JSON.stringify(complete()));
+    assert.equal(checkPlacementEvidenceFile(path).ok, true);
+    mkdirSync(join(bundle, "nested"));
+    writeFileSync(join(bundle, "nested", "inventory.json"), "{}\n");
+    const nested = complete();
+    nested.inventory.mac = "nested/inventory.json";
+    writeFileSync(path, JSON.stringify(nested));
+    assert.equal(checkPlacementEvidenceFile(path).ok, true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

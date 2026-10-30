@@ -20,6 +20,16 @@ The placement evidence checker and [sixteen recipes](../verification/placement.m
 - The full local `pnpm test` run failed: 61 failed, 12,171 passed and 33 skipped tests across 722 files.  The recorded env-path, credential and plugin groups account for 36 matching failure headers from the unchanged-base run; additional HTTP-state and ACP timeout failures are being rechecked.  This is not a green full-suite result, and hosted gates remain required.
 - No live host probes, inventory, installations, resource settings or deployments were performed.
 
+## Review Follow-Up
+
+Round-one findings 4428446549 and 4428446939 are addressed by containing evidence artifacts within the manifest bundle and verifying opened files against the current single-link inode.  Evidence references must be relative child paths without symlinks or hard links; copy captured artifacts into the bundle before checking it.  This limits read authority and supports portable evidence, while acceptance still requires a human to inspect recipe relevance and results.
+
+Host identity canonicalizes the explicitly configured data directory like the existing harness ownership fence, preserving user-owned data aliases as well as operating-system aliases.  Its final entry checks the opened device/inode before reading and changing permissions and refuses symbolic links and hard links.  Atomic publication temporarily has two names for one inode; a bounded wait recognizes only the matching pending-publication alias and never deletes another starter's name.  The existing eight-process creation race, a delayed publication fixture and a non-root-owned data-alias fixture pass.
+
+Finding 4428447302's proposed hostless-queue settlement is declined.  A controller queue has no worker host or local process yet, so the legacy adoption path would incorrectly turn it lost/completed or trust an unrelated stale exit file.  A regression preserves a hostless queue owned by this controller through adoption, ticking, log checks, quiescing, shutdown and attempted kill, with no spawn or completion notice.
+
+Review validation passed `pnpm typecheck`, 59 focused Vitest tests and 37 Node evidence/decommission tests.  These checks do not change the full-suite boundary above or assert any live placement recipe.
+
 ## Update And Rollback
 
 Ship through the existing reviewed build/update path.  Preserve the complete data directory, including `host-id`, through code updates and rollback.  If identity is unreadable or invalid, startup refuses to replace it; restore the known identity from the data backup before restarting.  Never seed another host with an already-running host's id.

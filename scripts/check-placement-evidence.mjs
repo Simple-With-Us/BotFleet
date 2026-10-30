@@ -1,7 +1,8 @@
-import { readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { openedFileIsListedSync } from "../server/opened-file.ts";
 
 export const REQUIRED_PLACEMENT_EVIDENCE = [
   "fresh-mac-only-install", "server-first-placement", "server-saturation-overflow",
@@ -46,19 +47,41 @@ export function evaluatePlacementEvidence(raw = {}) {
 }
 
 export function checkPlacementEvidenceFile(path) {
-  const state = PlacementEvidenceSchema.parse(JSON.parse(readFileSync(path, "utf8")));
+  const manifest = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  let state;
+  try {
+    if (!openedFileIsListedSync(fstatSync(manifest), path)) throw new Error("Evidence manifest is not the listed regular single-link file");
+    state = PlacementEvidenceSchema.parse(JSON.parse(readFileSync(manifest, "utf8")));
+    if (!openedFileIsListedSync(fstatSync(manifest), path)) throw new Error("Evidence manifest changed while reading");
+  } finally { closeSync(manifest); }
+  const bundle = realpathSync(dirname(path));
+  const inside = (candidate) => {
+    const part = relative(bundle, candidate);
+    return part !== "" && !isAbsolute(part) && part !== ".." && !part.startsWith(`..${sep}`);
+  };
   const verdict = evaluatePlacementEvidence(state);
   const artifacts = [
     ...Object.entries(state.handRun ?? {}).map(([key, run]) => [`handRun ${key}`, run.log]),
     ...Object.entries(state.inventory ?? {}).map(([key, artifact]) => [`inventory ${key}`, artifact]),
   ];
   for (const [key, artifact] of artifacts) {
+    let fd;
     try {
-      if (!statSync(resolve(dirname(path), artifact)).isFile()) throw new Error("not a file");
-      readFileSync(resolve(dirname(path), artifact));
+      const target = resolve(bundle, artifact);
+      if (isAbsolute(artifact) || !inside(target)) throw new Error("artifact escapes the bundle");
+      let component = bundle;
+      for (const name of relative(bundle, target).split(sep)) {
+        component = join(component, name);
+        if (lstatSync(component).isSymbolicLink()) throw new Error("artifact path contains a link");
+      }
+      if (!inside(realpathSync(target))) throw new Error("artifact resolves outside the bundle");
+      fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      if (!inside(realpathSync(target)) || !openedFileIsListedSync(fstatSync(fd), target)) throw new Error("artifact handle differs from bundle entry");
+      readSync(fd, Buffer.alloc(1), 0, 1, 0);
+      if (!inside(realpathSync(target)) || !openedFileIsListedSync(fstatSync(fd), target)) throw new Error("artifact changed while reading");
     } catch {
-      verdict.blockers.push(`${key}: artifact is not a readable file: ${artifact}`);
-    }
+      verdict.blockers.push(`${key}: artifact must be a readable single-link file within this evidence bundle: ${artifact}`);
+    } finally { if (fd !== undefined) closeSync(fd); }
   }
   verdict.ok = verdict.blockers.length === 0;
   return verdict;

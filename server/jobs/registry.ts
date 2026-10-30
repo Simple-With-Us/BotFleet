@@ -1198,7 +1198,8 @@ export class JobRegistry {
     let lost = 0;
     let leaderless = false;
     for (const record of loaded) {
-      // Placement states await their controller; a local restart cannot settle them.
+      // Placement states await their controller, including queued jobs without a
+      // worker host; treating those as local processes would destroy the queue.
       if (isJobActive(record) && !this.ownsLocalProcess(record)) continue;
       // Nothing at boot wakes a bot: whatever ends up announced is a notice
       // for the bot's next turn.

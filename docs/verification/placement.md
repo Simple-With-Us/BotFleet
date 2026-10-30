@@ -38,12 +38,14 @@ The seven remaining keys are specified in [Headroom Evidence](headroom.md).  To
 
 ## Recording And Checking Evidence
 
-Start from [placement-evidence.json](placement-evidence.json), whose assertions intentionally remain false.  Copy it into a run's evidence directory and add artifact paths relative to that file, or absolute paths.  Set a key true only after its complete recipe passes.  Hand runs require `at` in America/Chicago written as `2026-10-30 3:15 PM`, `by` naming the runner, and `log` naming the captured output.  Machine timestamps within raw logs may remain machine timestamps.
+Start from [placement-evidence.json](placement-evidence.json), whose assertions intentionally remain false.  Copy it into a run's evidence directory and copy the inventory/log artifacts into that same bundle or its child directories.  Record only relative child paths; absolute paths, escapes, symbolic links and hard links are refused.  Set a key true only after its complete recipe passes.  Hand runs require `at` in America/Chicago written as `2026-10-30 3:15 PM`, `by` naming the runner, and `log` naming the captured output.  Machine timestamps within raw logs may remain machine timestamps.
 
 ```sh
 node scripts/check-placement-evidence.mjs /absolute/run/placement-evidence.json
 ```
 
-Expected while unfinished: exit 1 with `Placement evidence is BLOCKED` and each unasserted key.  Unknown keys, truthy strings or malformed records produce exit 2.  The checker requires all sixteen true assertions, both inventory artifact paths and every hand-run record; every supplied artifact must be a readable file.  It checks explicit assertions and artifact availability, so the reviewer must still inspect the output and approval for each recipe.
+Expected while unfinished: exit 1 with `Placement evidence is BLOCKED` and each unasserted key.  Unknown keys, truthy strings or malformed records produce exit 2.  The checker requires all sixteen true assertions, both inventory artifact paths and every hand-run record; every supplied artifact must be a readable, single-link file contained in this bundle, with the opened handle checked against the current listed inode.  Containment limits file-read authority and makes the bundle portable; it does not prove that a copied file is relevant or that a recipe passed, so the reviewer must still inspect the output and approval for each recipe.
 
 Only after that review may a human assert `placement-evidence` in the decommission state.  The decommission state builder defaults it to false, even when every Linear issue is Done.  Recipes 11, 12 and 13 require Jay's recipe-specific go-ahead on the server with Jay present.  The foundation does not grant that approval, run inventory, choose numeric defaults, install anything or change a live host.
+
+Run the checker on a reviewer-controlled bundle whose parent directories are not concurrently writable by an adversary.  Path and opened-inode rechecks detect observed replacements but do not pin the directory tree or create an operating-system sandbox against arbitrary concurrent parent renames.  The explicitly configured application data directory likewise follows the existing ownership fence's canonicalization rules; file validation does not replace that directory's ownership boundary.
