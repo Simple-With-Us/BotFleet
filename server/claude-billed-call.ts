@@ -24,8 +24,10 @@ const MessageSchema = z.object({
   model: z.string().min(1).max(160).refine(model => model !== "<synthetic>"),
   usage: UsageSchema,
 });
-type UsageInput = z.input<ReturnType<typeof UsageSchema.partial>> | undefined;
-type MessageInput = { id?: string; model?: string; usage?: UsageInput } | undefined;
+const UsageInputSchema = UsageSchema.partial();
+const MessageInputSchema = MessageSchema.partial().extend({ usage: UsageInputSchema.optional() });
+type UsageInput = z.infer<typeof UsageInputSchema> | undefined;
+type MessageInput = z.infer<typeof MessageInputSchema> | undefined;
 
 function counts(raw: UsageInput): Pick<ClaudeBilledCall, "input" | "output" | "cacheRead" | "cacheWrite"> | null {
   const parsed = UsageSchema.safeParse(raw);

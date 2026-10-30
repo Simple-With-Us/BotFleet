@@ -293,6 +293,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       usage: { input: 12, output: 5, cachedInput: 2 },
     });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+    expect(done).not.toHaveProperty("billedCall");
   });
 
   it("emits a reconciled single-call receipt only for lifecycle-owned exact usage", async () => {

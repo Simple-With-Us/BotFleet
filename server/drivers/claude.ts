@@ -1569,7 +1569,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         retryState.delete(threadId);
         // Spread as an object or as nothing: absent unless the provider said.
         const servedModel = t.servedModel ? { servedModel: t.servedModel } : undefined;
-        emit({
+        const completed: RuntimeEvent = {
           ...base(threadId, t.turnId),
           type: "turn.completed",
           ok,
@@ -1579,9 +1579,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // total_cost_usd is the equivalent API price, not a cash charge.
           ...(cost != null ? { billingMode: "estimated" as const } : {}),
           ...(usage ? { usage } : {}),
-          billedCall: t.billedCalls.proof(),
           ...servedModel,
-        });
+        };
+        const billedCall = t.billedCalls.proof();
+        if (billedCall) completed.billedCall = billedCall;
+        emit(completed);
         if (session.child.exitCode === null && !session.closing) armIdle(threadId);
       };
       /** The running BotFleet turn's id.  Only called with a turn running:
