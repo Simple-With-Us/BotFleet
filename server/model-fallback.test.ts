@@ -392,6 +392,10 @@ describe("quota and session-limit failover", () => {
     expect(transientCapacityRetryDelayMs("concurrency limit reached; retry after 120s")).toBe(120_000);
     expect(transientCapacityRetryDelayMs("concurrency limit reached; try again in 10 minutes")).toBe(300_000);
     expect(transientCapacityRetryDelayMs("concurrency limit reached; retry-after: 0")).toBe(1_000);
+    expect(transientCapacityRetryDelayMs("HTTP 429 Retry-After:120")).toBe(120_000);
+    expect(transientCapacityRetryDelayMs("retry after 10 seconds.")).toBe(10_000);
+    expect(transientCapacityRetryDelayMs("retry after10requests")).toBe(5_000);
+    expect(transientCapacityRetryDelayMs("retry after 10 requests")).toBe(5_000);
     expect(transientCapacityRetryDelayMs("concurrency limit reached")).toBe(5_000);
     expect(parseQuotaResetTime("API request failed: 429 rate limit reached · retry after 45s", 1_000, true)).toEqual({
       isQuotaOrCap: true,

@@ -407,7 +407,7 @@ export function turnTransientCapacityEvidence(
 /** Uses a provider's short retry hint when present and caps transient holds at
  * five minutes so no rate signal becomes a durable quota cooldown. */
 export function transientCapacityRetryDelayMs(text: string): number {
-  const retry = text.match(/\b(?:retry[- ]after:?|try again in)\s*(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m)?\b/i);
+  const retry = text.match(/\b(?:retry[- ]after:?|try again in)\s*(\d+)(?:\s*(seconds?|secs?|s|minutes?|mins?|m)\b|(?=\s*(?:$|[.,;!?)])))/i);
   if (!retry) return DEFAULT_TRANSIENT_CAPACITY_RETRY_MS;
   const amount = Number.parseInt(retry[1], 10);
   const unit = retry[2]?.toLowerCase() ?? "s";

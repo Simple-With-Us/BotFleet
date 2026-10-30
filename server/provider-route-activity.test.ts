@@ -122,6 +122,14 @@ describe("provider route activity evidence", () => {
     }
   });
 
+  it("consumes lifecycle completions without counting them as model health", () => {
+    const evidence = new ProviderRouteActivity();
+    const owner = { dispatchId: 1 };
+    evidence.observeTool(owner, toolStart({ itemId: "lifecycle-tool" }));
+    expect(evidence.observeTool(owner, toolCompletion({ itemId: "lifecycle-tool", title: "reminderChild" }))).toBe(false);
+    expect(evidence.observeTool(owner, toolCompletion({ itemId: "lifecycle-tool", title: "Read" }))).toBe(false);
+  });
+
   it("requires the same item, thread, and turn on completion", () => {
     const evidence = new ProviderRouteActivity();
     const owner = { dispatchId: 1 };

@@ -40,9 +40,10 @@ export class ProviderRouteActivity {
       this.pendingTools.set(owner, pending);
       return false;
     }
-    if (event.subagentId || LIFECYCLE_TOOL_TITLE.test(event.title ?? "")) return false;
+    if (event.subagentId) return false;
     const started = pending.get(event.itemId);
     pending.delete(event.itemId);
+    if (LIFECYCLE_TOOL_TITLE.test(event.title ?? "")) return false;
     if (!started || !event.ok || started.threadId !== event.threadId ||
       (started.turnId !== undefined && event.turnId !== undefined && started.turnId !== event.turnId)) return false;
     return ![event.title, event.detail].some((text) => text && (isShortProviderErrorText(text) || isTransientCapacityChip(text)));
