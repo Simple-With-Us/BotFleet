@@ -30,3 +30,7 @@ git diff --check
 ## Update And Rollback
 
 This adds an unused native library and optional client argument.  Existing companion connections and Control storage retain their current paths.  The future composition must keep the app-owned host directory through updates and handle an unsupported store schema without rewriting it.  No live acceptance assertion is enabled by these fixtures.
+
+## Main Integration Verification
+
+The library branch was integrated with `origin/main` at `8152ade4c3b7c4c3839204a87db8585b4565d933`.  The inventory merge retained every main row, including the landed placement and server rows, and added the BF-2599 library entry.  In an isolated Mac validation worktree, the focused saved-host/handshake command passed all 23 tests; the unsigned simulator build passed with `xcodebuild -project BotFleet.xcodeproj -scheme BotFleet -sdk iphonesimulator -destination "generic/platform=iOS Simulator" CODE_SIGNING_ALLOWED=NO build`.  No simulator was booted, app installed or launched, and no live credentials or servers were used.  Full Node tests were not repeated for this documentation-only integration update.

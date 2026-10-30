@@ -112,6 +112,7 @@ export function linearNodes() {
 
 /** Evidence a script on this host cannot observe; only a human may assert it. */
 export const HUMAN_ONLY_EVIDENCE = [
+  "placement-evidence",
   "soak-24h-no-node",
   "replay-parity",
   "final-import-parity",

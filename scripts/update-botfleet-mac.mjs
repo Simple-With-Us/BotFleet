@@ -3580,6 +3580,25 @@ async function sweepAbandonedStageDirectories(config, stageDirectories = []) {
   }
 }
 
+/** Establish the requested desktop owner before its watchdog can start a source release. */
+export function shouldStartDesktop({ updateApp, openApplication, wasRunning = true }) {
+  return updateApp && openApplication !== false && wasRunning;
+}
+
+export async function startDesktopBeforeWatchdog({ desktop, open, verify, bootstrap }) {
+  if (desktop) {
+    await open();
+    await verify();
+  }
+  await bootstrap();
+}
+
+/** Recovery still attempts every watchdog if the preferred desktop cannot start. */
+export async function restoreDesktopBeforeWatchdogs({ desktop, open, verify, bootstraps, record }) {
+  if (desktop) await record(async () => { await open(); await verify(); });
+  for (const bootstrap of bootstraps) await record(bootstrap);
+}
+
 function createOperations(config) {
   let lastPreflight;
   const componentFlags = () => resolveUpdateComponentFlags(config.parsed.components);
@@ -4236,7 +4255,18 @@ function createOperations(config) {
       // Recorded before the bootstrap: a bootstrap that errors can still have
       // loaded the job, and rollback must boot out the label that is running.
       if (previous) previous.startedHarnessLabel = await startedHarnessLabel(config, plist);
-      await run("launchctl", ["bootstrap", config.domain, plist]);
+      await startDesktopBeforeWatchdog({
+        desktop: shouldStartDesktop({ updateApp: componentFlags().updateApp, openApplication: config.parsed.openApplication }),
+        open: () => run("open", [config.appPath]),
+        verify: () => waitForStartup({
+          attempt: () => runtimeIdentityPreflight(config, prepared),
+          timeoutMs: config.startupTimeoutMs,
+          what: "the packaged version",
+          fallback: "Installed application did not prove its expected build and ownership",
+          report: config.reportDetail,
+        }),
+        bootstrap: () => run("launchctl", ["bootstrap", config.domain, plist]),
+      });
     },
 
     verifyHarness: async (prepared, previous) => {
@@ -4519,10 +4549,19 @@ function createOperations(config) {
         legacyPlistExists: await exists(config.legacyPlist),
         plistLabel: config.customPlist && rollbackPlistExists ? await launchAgentPlistLabel(config.plist) : null,
       });
-      for (const plist of rollbackHarnessPlists) {
-        await record(async () => { await run("launchctl", ["bootstrap", config.domain, plist]); });
-      }
-      if (previous.appWasRunning) await record(async () => { await run("open", [config.appPath]); });
+      await restoreDesktopBeforeWatchdogs({
+        desktop: shouldStartDesktop({ updateApp, openApplication: config.parsed.openApplication, wasRunning: previous.appWasRunning }),
+        open: () => run("open", [config.appPath]),
+        verify: () => waitForStartup({
+          attempt: () => runtimePreflight(config),
+          timeoutMs: config.startupTimeoutMs,
+          what: "the restored application",
+          fallback: "Restored application did not regain authenticated ownership",
+          report: config.reportDetail,
+        }),
+        bootstraps: rollbackHarnessPlists.map((plist) => () => run("launchctl", ["bootstrap", config.domain, plist])),
+        record,
+      });
       if (previous.launchdLoaded || previous.legacyLaunchdLoaded || previous.appWasRunning) await record(async () => {
         // The restored build boots as slowly as the one it replaced did: on
         // 2026-10-09 it took about two minutes at a load average near 900.  The
