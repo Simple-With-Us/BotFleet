@@ -305,6 +305,23 @@ describe("quota and session-limit failover", () => {
       expect(isQuotaOrCapText(message), message).toBe(true);
       expect(isTransientCapacityText(message), message).toBe(false);
     }
+    for (const reset of [
+      "resets at 5pm",
+      "resets 5 PM",
+      "resets Monday",
+      "resets on Nov 3",
+      "resets today",
+      "resets tomorrow",
+      "resets tonight",
+      "resets next week",
+      "resets next month",
+      "resets in a week",
+    ]) {
+      const message = `You've hit your session limit · ${reset}`;
+      expect(isQuotaOrCapText(message), message).toBe(true);
+      expect(isTransientCapacityText(message), message).toBe(false);
+      expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text: message }], true), message).toBeUndefined();
+    }
     for (const code of ["HTTP 429 insufficient_quota", "HTTP 429 usage_limit_exceeded", "HTTP 429 enforced_spend_limit_reached"]) {
       expect(isQuotaOrCapText(code), code).toBe(true);
       expect(isTransientCapacityText(code), code).toBe(false);

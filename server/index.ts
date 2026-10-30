@@ -5224,9 +5224,15 @@ bus.subscribe((event: RuntimeEvent) => {
   }
   broadcast({ kind: "runtime", event: redactRuntimeEventForWire(event) });
   const bot = store.botByThread(event.threadId);
-  if (event.type === "content.delta") {
+  if (event.type === "content.delta" && !event.subagentId) {
     const owner = activeTurnOwners.forEvent(event.threadId, event.providerInstanceId);
     if (owner && providerRouteActivity.observe(owner, event.streamKind, event.delta)) {
+      transientRouteHealth.markHealthy(owner.botId, owner.selection.instanceId, owner.selection.model);
+    }
+  }
+  if ((event.type === "item.started" || event.type === "item.completed") && event.itemType === "tool") {
+    const owner = activeTurnOwners.forEvent(event.threadId, event.providerInstanceId);
+    if (owner && providerRouteActivity.observeTool(owner, event)) {
       transientRouteHealth.markHealthy(owner.botId, owner.selection.instanceId, owner.selection.model);
     }
   }
