@@ -162,6 +162,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | VM image (`scripts/computer-vm-cli/`, CI `vm-image-build.yml`) | `server/container-computer.ts` Dockerfile + `vm-cli-*.ts` | Keep image build (Local VM is Docker on Mac); thin CLI shims retire with Node Phase 6 |
 | `cloudflare/composio-broker/` | None (no `:8799`/`:8810` calls) | Unaffected; self-host key path re-targets `InfisicalResolver` BF-2506 |
 | `cloudflare/control-plane/` | Stub only, already removed | No action |
+| `scripts/host-inventory.mjs`, `scripts/host-inventory.node-test.mjs`, `docs/verification/host-inventory.md` | Opt-in, read-only developer inventory and injected tests (BF-2601) | Retain as verification tooling for authorized capacity and selected-service observations; it sets no budget and is not runtime enforcement |
 | Dev scripts (`e2e-server`, `smoke-packaged-server`, `bundle-server`, fixture capture, `vite.config.ts` proxy) | Boot harness on throwaway HOME | Retire with Node Phase 6; fixture capture superseded by BF-2503 |
 | `apps/site`, `tools/`, `tv-face/` | None | Unaffected |
 
