@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, lchownSync, linkSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -93,5 +93,21 @@ describe("host identity", () => {
     await finished;
     expect(statSync(join(dir, "host-id")).nlink).toBe(1);
     expect(readdirSync(dir)).toEqual(["host-id"]);
+  });
+
+  it("recovers the published identity after its creator exits before removing the publication alias", () => {
+    const dir = fixture();
+    const id = "server:11111111-1111-4111-8111-111111111111";
+    const script = "import {writeFileSync,linkSync} from 'node:fs'; import {join} from 'node:path'; const path=join(process.argv[1],'host-id'); const candidate=path+'.22222222-2222-4222-8222-222222222222.pending'; writeFileSync(candidate,process.argv[2],{mode:0o600}); linkSync(candidate,path); process.exit(73);";
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script, dir, id], { stdio: "pipe" });
+    expect(child.status).toBe(73);
+    const unrelated = join(dir, "host-id.33333333-3333-4333-8333-333333333333.pending");
+    writeFileSync(unrelated, "unrelated");
+    expect(statSync(join(dir, "host-id")).nlink).toBe(2);
+    expect(loadHostId(dir)).toBe(id);
+    expect(loadHostId(dir)).toBe(id);
+    expect(statSync(join(dir, "host-id")).nlink).toBe(1);
+    expect(readFileSync(unrelated, "utf8")).toBe("unrelated");
+    expect(readdirSync(dir).sort()).toEqual(["host-id", "host-id.33333333-3333-4333-8333-333333333333.pending"]);
   });
 });
