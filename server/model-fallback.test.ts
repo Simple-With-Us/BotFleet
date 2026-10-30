@@ -1055,6 +1055,35 @@ describe("a user stop must not fail over", () => {
 });
 
 describe("QuotaCooldownRegistry", () => {
+  it("does not lazily prune live cooldowns outside persisted-load migration", () => {
+    const registry = new QuotaCooldownRegistry();
+    const resetsAt = Date.now() + 60_000;
+    registry.record({
+      botId: "grok-bot",
+      instanceId: "grok",
+      model: "grok-4",
+      resetsAt,
+      error: "session limit",
+      recordedAt: Date.now(),
+    });
+    registry.record({
+      botId: "*",
+      instanceId: "minimax",
+      model: "MiniMax-M3",
+      resetsAt,
+      error: "Rate limit reached for MiniMax-M3",
+      recordedAt: Date.now(),
+    });
+
+    // A balance refresh for another provider calls list() before filtering.
+    // It must not erase the Grok row, and a real MiniMax rate-limit row must
+    // remain authoritative while the account balance is healthy.
+    expect(registry.list()).toHaveLength(2);
+    expect(registry.get("grok-bot", "grok", "grok-4")?.resetsAt).toBe(resetsAt);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M3")?.error)
+      .toBe("Rate limit reached for MiniMax-M3");
+  });
+
   it("drops a transient row after record normalizes its missing reset to a default TTL", () => {
     const file = `${tmpdir()}/quota-cooldowns-transient-roundtrip-${Date.now()}.json`;
     const now = Date.now();

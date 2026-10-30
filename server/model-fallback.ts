@@ -1179,7 +1179,7 @@ export class QuotaCooldownRegistry {
     const key = `${botId}:${instanceId}:${model}`;
     const cd = this.cooldowns.get(key) ?? this.cooldowns.get(`*:${instanceId}:${model}`) ?? this.cooldowns.get(`*:${instanceId}:*`);
     if (!cd) return undefined;
-    if (this.isExpired(cd, now) || this.isLegacyTransientRoute(cd)) {
+    if (this.isExpired(cd, now)) {
       if (this.cooldowns.get(key) === cd) this.cooldowns.delete(key);
       if (this.cooldowns.get(`*:${instanceId}:${model}`) === cd) this.cooldowns.delete(`*:${instanceId}:${model}`);
       if (this.cooldowns.get(`*:${instanceId}:*`) === cd) this.cooldowns.delete(`*:${instanceId}:*`);
@@ -1193,7 +1193,7 @@ export class QuotaCooldownRegistry {
     const active: BotQuotaCooldown[] = [];
     let expired = false;
     for (const [key, cd] of [...this.cooldowns.entries()]) {
-      if (this.isExpired(cd, now) || this.isLegacyTransientRoute(cd)) {
+      if (this.isExpired(cd, now)) {
         this.cooldowns.delete(key);
         expired = true;
       } else {
