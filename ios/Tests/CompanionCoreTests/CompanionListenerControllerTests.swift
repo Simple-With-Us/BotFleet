@@ -21,7 +21,10 @@ private actor StubListenerBackend: CompanionListenerBackend {
         port = value
     }
 
-    func start(advertising: CompanionListenerAdvertisement?) async throws -> UInt16? {
+    func start(
+        advertising: CompanionListenerAdvertisement?,
+        onFailure: @escaping @Sendable (String) async -> Void
+    ) async throws -> UInt16? {
         calls.append(.start(advertising: advertising?.name))
         if let failure {
             throw NSError(domain: "StubListenerBackend", code: 1, userInfo: [NSLocalizedDescriptionKey: failure])
@@ -45,7 +48,10 @@ private actor StoreReadingBackend: CompanionListenerBackend {
         self.store = store
     }
 
-    func start(advertising: CompanionListenerAdvertisement?) async throws -> UInt16? {
+    func start(
+        advertising: CompanionListenerAdvertisement?,
+        onFailure: @escaping @Sendable (String) async -> Void
+    ) async throws -> UInt16? {
         settingAtStart.append(store.readCompanionListenerEnabled())
         return 8812
     }
@@ -72,7 +78,10 @@ private actor GatedListenerBackend: CompanionListenerBackend {
         self.gated = gated
     }
 
-    func start(advertising: CompanionListenerAdvertisement?) async throws -> UInt16? {
+    func start(
+        advertising: CompanionListenerAdvertisement?,
+        onFailure: @escaping @Sendable (String) async -> Void
+    ) async throws -> UInt16? {
         calls.append(.start(advertising: advertising?.name))
         if gated == .start { await waitAtGate() }
         return 8812
@@ -96,6 +105,63 @@ private actor GatedListenerBackend: CompanionListenerBackend {
     }
 
     func openGate() {
+        gate?.resume()
+        gate = nil
+    }
+}
+
+/// Keeps every start's callback so tests can deliver current or stale events
+/// directly, including an event while the first start has not answered.
+private actor FailingListenerBackend: CompanionListenerBackend {
+    private var failures: [@Sendable (String) async -> Void] = []
+    private let gateFirstStart: Bool
+    private let reportFailureOnStop: Bool
+    private var gate: CheckedContinuation<Void, Never>?
+    private var gateWaiters: [CheckedContinuation<Void, Never>] = []
+    private var firstStartError: String?
+
+    init(gateFirstStart: Bool = false, reportFailureOnStop: Bool = false) {
+        self.gateFirstStart = gateFirstStart
+        self.reportFailureOnStop = reportFailureOnStop
+    }
+
+    func start(
+        advertising: CompanionListenerAdvertisement?,
+        onFailure: @escaping @Sendable (String) async -> Void
+    ) async throws -> UInt16? {
+        let index = failures.count
+        failures.append(onFailure)
+        if index == 0, gateFirstStart {
+            await withCheckedContinuation { continuation in
+                gate = continuation
+                for waiter in gateWaiters { waiter.resume() }
+                gateWaiters.removeAll()
+            }
+            if let firstStartError {
+                throw NSError(domain: "FailingListenerBackend", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: firstStartError])
+            }
+        }
+        return 8812 + UInt16(index)
+    }
+
+    func stop() async {
+        if reportFailureOnStop, let failure = failures.last {
+            await failure("cancelled during stop")
+        }
+    }
+
+    func fail(start index: Int, reason: String) async {
+        await failures[index](reason)
+    }
+
+    func firstStartIsWaiting() async {
+        if gate != nil { return }
+        await withCheckedContinuation { gateWaiters.append($0) }
+    }
+
+    func finishFirstStart(error: String? = nil) {
+        firstStartError = error
         gate?.resume()
         gate = nil
     }
@@ -194,7 +260,7 @@ struct CompanionListenerControllerTests {
         let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
         await controller.applyLaunch()
         #expect(controller.state == .failed(reason: "port 8812 is in use"))
-        #expect(controller.state.summary == "Could not start: port 8812 is in use")
+        #expect(controller.state.summary == "Listener failed: port 8812 is in use")
         // A stop after a failed start does not pretend something was stopped.
         await controller.stop()
         #expect(controller.state == .failed(reason: "port 8812 is in use"))
@@ -373,6 +439,102 @@ struct CompanionListenerControllerTests {
         await controller.applyLaunch()
         await controller.stop()
         #expect(seen == [.starting, .listening(port: 8812, advertisedAs: "Ada's Mac"), .stopped])
+    }
+
+    @Test("A running listener failure replaces listening and reaches the session mirror (BF-2595)")
+    @MainActor
+    func runningFailureIsReported() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backend = FailingListenerBackend()
+        let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
+        var seen: [CompanionListenerState] = []
+        controller.onStateChange = { seen.append($0) }
+        try await controller.setEnabled(true)
+        await backend.fail(start: 0, reason: "network listener failed")
+        #expect(controller.state == .failed(reason: "network listener failed"))
+        #expect(controller.state.summary == "Listener failed: network listener failed")
+        #expect(controller.isEnabled)
+        #expect(store.readCompanionListenerEnabled() == true)
+        #expect(seen == [.starting, .listening(port: 8812, advertisedAs: "Ada's Mac"),
+                         .failed(reason: "network listener failed")])
+        // Enabling again retries a failed listener without changing policy.
+        try await controller.setEnabled(true)
+        #expect(controller.state == .listening(port: 8813, advertisedAs: "Ada's Mac"))
+    }
+
+    @Test("A failure after readiness but before start returns cannot be overwritten (BF-2595)")
+    @MainActor
+    func failureBeforeStartReturnsIsPreserved() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backend = FailingListenerBackend(gateFirstStart: true)
+        let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
+        let starting = Task { @MainActor in await controller.start() }
+        await backend.firstStartIsWaiting()
+        await backend.fail(start: 0, reason: "failed just after readiness")
+        #expect(controller.state == .failed(reason: "failed just after readiness"))
+        await backend.finishFirstStart()
+        await starting.value
+        #expect(controller.state == .failed(reason: "failed just after readiness"))
+    }
+
+    @Test("An old listener failure cannot overwrite a newer listener (BF-2595)")
+    @MainActor
+    func staleListenerFailureIsIgnored() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backend = FailingListenerBackend()
+        let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
+        await controller.start()
+        await controller.stop()
+        await controller.start()
+        await backend.fail(start: 0, reason: "old listener failed")
+        #expect(controller.state == .listening(port: 8813, advertisedAs: "Ada's Mac"))
+        await backend.fail(start: 1, reason: "current listener failed")
+        #expect(controller.state == .failed(reason: "current listener failed"))
+    }
+
+    @Test("A late error from a superseded start cannot overwrite its retry (BF-2595)")
+    @MainActor
+    func staleStartErrorIsIgnored() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backend = FailingListenerBackend(gateFirstStart: true)
+        let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
+        let first = Task { @MainActor in await controller.start() }
+        await backend.firstStartIsWaiting()
+        await backend.fail(start: 0, reason: "first listener failed")
+        await controller.start()
+        await backend.finishFirstStart(error: "old start finally threw")
+        await first.value
+        await backend.fail(start: 0, reason: "old queued failure")
+        #expect(controller.state == .listening(port: 8813, advertisedAs: "Ada's Mac"))
+    }
+
+    @Test("Intentional stop and disable ignore queued listener failures (BF-2595)")
+    @MainActor
+    func intentionalStopDoesNotReportFailure() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backend = FailingListenerBackend(reportFailureOnStop: true)
+        let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
+        try await controller.setEnabled(true)
+        var seen: [CompanionListenerState] = []
+        controller.onStateChange = { seen.append($0) }
+        await controller.stop()
+        await backend.fail(start: 0, reason: "failure queued before stop")
+        #expect(controller.state == .stopped)
+        #expect(seen == [.stopped])
+        try await controller.setEnabled(true)
+        try await controller.setEnabled(false)
+        await backend.fail(start: 1, reason: "failure queued before disable")
+        #expect(controller.state == .off)
+        #expect(!controller.isEnabled)
+        #expect(!seen.contains {
+            if case .failed = $0 { return true }
+            return false
+        })
     }
 
     @Test("The default advertisement is this Mac's name, or nothing when the name is unknown")

@@ -23,7 +23,7 @@ public enum CompanionListenerState: Equatable, Sendable {
     case listening(port: UInt16?, advertisedAs: String?)
     /// The listener was up and was stopped on purpose.
     case stopped
-    /// A start failed; `reason` is the error's own words.
+    /// A start or running listener failed; `reason` is the error's own words.
     case failed(reason: String)
 
     /// One line for the Settings section.
@@ -41,7 +41,7 @@ public enum CompanionListenerState: Equatable, Sendable {
         case .stopped:
             return "Stopped."
         case .failed(let reason):
-            return "Could not start: \(reason)"
+            return "Listener failed: \(reason)"
         }
     }
 }
@@ -72,7 +72,12 @@ public enum CompanionListenerExitEvent: Equatable, Sendable {
 /// nothing.
 public protocol CompanionListenerBackend: Sendable {
     /// Starts the listener and answers the bound port when it can be read.
-    func start(advertising: CompanionListenerAdvertisement?) async throws -> UInt16?
+    /// Reports a later failure through this start's callback, never a newer
+    /// start's callback; an intentional stop does not report a failure.
+    func start(
+        advertising: CompanionListenerAdvertisement?,
+        onFailure: @escaping @Sendable (String) async -> Void
+    ) async throws -> UInt16?
     /// Stops the listener; a stop with nothing running is not an error.
     func stop() async
 }
@@ -185,12 +190,26 @@ public final class CompanionListenerController {
         let mine = serial
         state = .starting
         do {
-            let port = try await backend.start(advertising: advertisement)
-            guard mine == serial else { return }
+            let port = try await backend.start(advertising: advertisement) { [weak self] reason in
+                await self?.listenerFailed(reason: reason, serial: mine)
+            }
+            // A failure can arrive after socket readiness but before this
+            // await returns, so it must not be replaced with "listening".
+            guard mine == serial, case .starting = state else { return }
             state = .listening(port: port, advertisedAs: advertisement?.name)
         } catch {
-            guard mine == serial else { return }
+            guard mine == serial, case .starting = state else { return }
             state = .failed(reason: error.localizedDescription)
+        }
+    }
+
+    private func listenerFailed(reason: String, serial failedSerial: Int) {
+        guard failedSerial == serial, newestRequest == .start else { return }
+        switch state {
+        case .starting, .listening:
+            state = .failed(reason: reason)
+        case .off, .stopped, .failed:
+            break
         }
     }
 
@@ -246,7 +265,10 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         self.makeServer = makeServer
     }
 
-    public func start(advertising: CompanionListenerAdvertisement?) async throws -> UInt16? {
+    public func start(
+        advertising: CompanionListenerAdvertisement?,
+        onFailure: @escaping @Sendable (String) async -> Void
+    ) async throws -> UInt16? {
         let server: NativeCompanionServer
         if let existing = self.server {
             server = existing
@@ -259,7 +281,7 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         // The server answers once the socket is ready, with the port it bound,
         // or throws the listener's own error; a loopback bind drops the
         // advertisement whatever was asked.
-        return try await server.startListening(port: port, options: options)
+        return try await server.startListening(port: port, options: options, onFailure: onFailure)
     }
 
     public func stop() async {

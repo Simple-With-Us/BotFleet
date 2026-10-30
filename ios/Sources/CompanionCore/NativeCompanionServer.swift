@@ -508,6 +508,7 @@ public actor NativeCompanionServer {
 
     #if canImport(Network)
     private var listener: NWListener?
+    private var listenerGeneration: UInt64 = 0
     private let listenerQueue = DispatchQueue(label: "app.botfleet.companion-server", qos: .userInitiated)
     #endif
 
@@ -1251,8 +1252,17 @@ public actor NativeCompanionServer {
     /// so a system-chosen port is reported truly.  A second start replaces the
     /// first listener instead of leaking it beside the new one.
     @discardableResult
-    public func startListening(port: UInt16 = 0, options: ListenerOptions = ListenerOptions()) async throws -> UInt16? {
+    public func startListening(
+        port: UInt16 = 0,
+        options: ListenerOptions = ListenerOptions(),
+        onFailure: @escaping @Sendable (String) async -> Void = { _ in }
+    ) async throws -> UInt16? {
+        // Invalidate an older start before activating the shared runtime,
+        // which can suspend and let a newer start or stop enter this actor.
+        stopListenerSocket()
+        let generation = listenerGeneration
         try await nativeRuntime?.activate(pollIntervalSeconds: 1)
+        guard generation == listenerGeneration else { throw CancellationError() }
         let nwPort: NWEndpoint.Port
         if port == 0 {
             nwPort = .any
@@ -1262,9 +1272,6 @@ public actor NativeCompanionServer {
             }
             nwPort = resolved
         }
-        // A listener that is already up is cancelled first, so a repeated
-        // start never leaves an orphan bound to a port nobody knows.
-        stopListenerSocket()
         let listener = try NWListener(using: .tcp, on: nwPort)
         // Loopback by default: the cleartext device port must not be reachable
         // from the network unless someone opted in on purpose.
@@ -1288,21 +1295,27 @@ public actor NativeCompanionServer {
         }
         self.listener = listener
         // The listener reports each state on its queue.  The first report that
-        // settles the start resumes the continuation; later ones, such as the
-        // cancel that follows a failure, are ignored.
+        // settles the start resumes the continuation; a later failure also
+        // clears this socket and reaches the lifecycle controller.
         let settlement = ListenerStartSettlement()
         do {
             let bound: UInt16? = try await withCheckedThrowingContinuation { continuation in
                 // Weak, so the handler never keeps its own listener alive.
-                listener.stateUpdateHandler = { [weak listener] state in
+                listener.stateUpdateHandler = { [weak self, weak listener] state in
                     switch state {
                     case .ready:
-                        settlement.once { continuation.resume(returning: listener?.port?.rawValue) }
+                        settlement.once(ready: true) { continuation.resume(returning: listener?.port?.rawValue) }
                     case .waiting(let error), .failed(let error):
                         // A port in use arrives as `.waiting` on some systems
                         // and as `.failed` on others, and neither becomes
                         // ready on its own, so both are a failed start.
-                        settlement.once { continuation.resume(throwing: error) }
+                        let wasReady = settlement.once { continuation.resume(throwing: error) }
+                        if wasReady, let listener {
+                            let reason = error.localizedDescription
+                            Task {
+                                await self?.listenerDidFail(listener, reason: reason, onFailure: onFailure)
+                            }
+                        }
                     case .cancelled:
                         settlement.once { continuation.resume(throwing: CancellationError()) }
                     case .setup:
@@ -1330,12 +1343,26 @@ public actor NativeCompanionServer {
     }
 
     private func stopListenerSocket() {
+        listenerGeneration &+= 1
         listener?.cancel()
         listener = nil
     }
 
+    private func listenerDidFail(
+        _ failedListener: NWListener,
+        reason: String,
+        onFailure: @Sendable (String) async -> Void
+    ) async {
+        // A queued state from a replaced or intentionally stopped listener
+        // cannot clear the current socket or report a failure for it.
+        guard listener === failedListener else { return }
+        stopListenerSocket()
+        await onFailure(reason)
+    }
+
     /// The port the listener bound, once it has one; nil before `startListening`
-    /// answers or after `stopListening`.  Read back from the listener, never
+    /// answers, after `stopListening`, or after a listener failure.
+    /// Read back from the listener, never
     /// from the number that was asked for, so a system-chosen port is reported
     /// truly.
     public var listeningPort: UInt16? {
@@ -1559,13 +1586,21 @@ public actor NativeCompanionServer {
 private final class ListenerStartSettlement: @unchecked Sendable {
     private let lock = NSLock()
     private var settled = false
+    private var becameReady = false
 
-    func once(_ body: () -> Void) {
+    /// Returns whether readiness settled the start before this event.
+    @discardableResult
+    func once(ready: Bool = false, _ body: () -> Void) -> Bool {
         lock.lock()
         let first = !settled
-        settled = true
+        let wasReady = becameReady
+        if first {
+            settled = true
+            becameReady = ready
+        }
         lock.unlock()
         if first { body() }
+        return wasReady
     }
 }
 #endif
