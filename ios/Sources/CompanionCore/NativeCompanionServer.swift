@@ -1089,8 +1089,9 @@ public actor NativeCompanionServer {
         /// The Bonjour instance name to advertise under `_botfleet._tcp`, or
         /// nil to advertise nothing.  Added for the Mac app's listener
         /// lifecycle (BF-2590); the default keeps every existing caller as it
-        /// was, and a loopback-bound listener should pass nil, because an
-        /// advertisement the phone cannot connect to only confuses it.
+        /// was.  Ignored unless `allowCleartextLAN` is set, because an
+        /// advertisement of a loopback-bound listener, which the phone cannot
+        /// connect to, only confuses it.
         public var advertisedName: String?
 
         public init(bindAddress: String = "127.0.0.1", allowCleartextLAN: Bool = false, advertisedName: String? = nil) {
@@ -1105,7 +1106,13 @@ public actor NativeCompanionServer {
         }
     }
 
-    public func startListening(port: UInt16 = 0, options: ListenerOptions = ListenerOptions()) throws {
+    /// Starts the listener and answers the port it bound once the socket is
+    /// ready, or throws the listener's own error when the bind fails.  The
+    /// port is read back from the listener, never from the number asked for,
+    /// so a system-chosen port is reported truly.  A second start replaces the
+    /// first listener instead of leaking it beside the new one.
+    @discardableResult
+    public func startListening(port: UInt16 = 0, options: ListenerOptions = ListenerOptions()) async throws -> UInt16? {
         let nwPort: NWEndpoint.Port
         if port == 0 {
             nwPort = .any
@@ -1115,6 +1122,9 @@ public actor NativeCompanionServer {
             }
             nwPort = resolved
         }
+        // A listener that is already up is cancelled first, so a repeated
+        // start never leaves an orphan bound to a port nobody knows.
+        stopListening()
         let listener = try NWListener(using: .tcp, on: nwPort)
         // Loopback by default: the cleartext device port must not be reachable
         // from the network unless someone opted in on purpose.
@@ -1122,10 +1132,12 @@ public actor NativeCompanionServer {
             host: NWEndpoint.Host(options.resolvedBindAddress),
             port: nwPort
         )
-        if let advertisedName = options.advertisedName {
+        if let advertisedName = options.advertisedName, options.allowCleartextLAN {
             // The phone's browser (`ios/App/Discovery.swift`) looks for this
             // type and shows the instance name; the registration is withdrawn
-            // when the listener is cancelled.
+            // when the listener is cancelled.  A loopback-bound listener is
+            // never advertised, whatever the caller asked: the phone could not
+            // connect to it.
             listener.service = NWListener.Service(name: advertisedName, type: CompanionListenerAdvertisement.serviceType)
         }
         listener.newConnectionHandler = { [weak self] connection in
@@ -1134,8 +1146,43 @@ public actor NativeCompanionServer {
                 await self.acceptConnection(connection)
             }
         }
-        listener.start(queue: listenerQueue)
         self.listener = listener
+        // The listener reports each state on its queue.  The first report that
+        // settles the start resumes the continuation; later ones, such as the
+        // cancel that follows a failure, are ignored.
+        let settlement = ListenerStartSettlement()
+        do {
+            let bound: UInt16? = try await withCheckedThrowingContinuation { continuation in
+                // Weak, so the handler never keeps its own listener alive.
+                listener.stateUpdateHandler = { [weak listener] state in
+                    switch state {
+                    case .ready:
+                        settlement.once { continuation.resume(returning: listener?.port?.rawValue) }
+                    case .waiting(let error), .failed(let error):
+                        // A port in use arrives as `.waiting` on some systems
+                        // and as `.failed` on others, and neither becomes
+                        // ready on its own, so both are a failed start.
+                        settlement.once { continuation.resume(throwing: error) }
+                    case .cancelled:
+                        settlement.once { continuation.resume(throwing: CancellationError()) }
+                    case .setup:
+                        break
+                    @unknown default:
+                        break
+                    }
+                }
+                listener.start(queue: listenerQueue)
+            }
+            return bound
+        } catch {
+            // Only this start's listener is torn down: a stop that ran while
+            // the start waited has already cleared or replaced it.
+            if self.listener === listener {
+                listener.cancel()
+                self.listener = nil
+            }
+            throw error
+        }
     }
 
     public func stopListening() {
@@ -1144,8 +1191,9 @@ public actor NativeCompanionServer {
     }
 
     /// The port the listener bound, once it has one; nil before `startListening`
-    /// or after `stopListening`.  Read back from the listener, never from the
-    /// number that was asked for, so a system-chosen port is reported truly.
+    /// answers or after `stopListening`.  Read back from the listener, never
+    /// from the number that was asked for, so a system-chosen port is reported
+    /// truly.
     public var listeningPort: UInt16? {
         listener?.port?.rawValue
     }
@@ -1360,3 +1408,20 @@ public actor NativeCompanionServer {
     }
     #endif
 }
+
+#if canImport(Network)
+/// Lets a Network.framework state handler, which fires once per state on the
+/// listener's queue, resume a start's continuation exactly once.
+private final class ListenerStartSettlement: @unchecked Sendable {
+    private let lock = NSLock()
+    private var settled = false
+
+    func once(_ body: () -> Void) {
+        lock.lock()
+        let first = !settled
+        settled = true
+        lock.unlock()
+        if first { body() }
+    }
+}
+#endif

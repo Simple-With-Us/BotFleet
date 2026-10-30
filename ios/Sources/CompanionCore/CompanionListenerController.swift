@@ -102,8 +102,15 @@ public final class CompanionListenerController {
     private let policyStore: MacPersistencePolicyStore
     private let advertisement: CompanionListenerAdvertisement?
     /// Bumped by every start and stop, so a start that finishes after a later
-    /// stop cannot write a stale state over the newer one.
+    /// stop cannot write a stale state over the newer one, nor a stop over a
+    /// newer start.
     private var serial = 0
+    /// Whether the newest request was a start or a stop, whatever has
+    /// answered so far.  A start while the newest request is already a start
+    /// would only restart a listener that is up, or on its way, on a new
+    /// port, so it is skipped unless that start failed and this is the retry.
+    private enum Request { case start, stop }
+    private var newestRequest: Request?
 
     public init(
         backend: CompanionListenerBackend,
@@ -118,8 +125,9 @@ public final class CompanionListenerController {
 
     /// The default advertisement: this Mac's own name, which is what the
     /// phone shows in its list of computers.  Nil when the name is unknown,
-    /// so the listener still starts and simply does not advertise.
-    public static func defaultAdvertisement(computerName: String?) -> CompanionListenerAdvertisement? {
+    /// so the listener still starts and simply does not advertise.  Pure, so
+    /// it is callable off the main actor too.
+    nonisolated public static func defaultAdvertisement(computerName: String?) -> CompanionListenerAdvertisement? {
         guard let computerName else { return nil }
         let trimmed = computerName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -144,8 +152,7 @@ public final class CompanionListenerController {
         if enabled {
             await start()
         } else {
-            await stop()
-            state = .off
+            await stop(then: .off)
         }
     }
 
@@ -162,8 +169,18 @@ public final class CompanionListenerController {
     }
 
     /// Starts the listener and records what the backend answered, never what
-    /// was hoped for.
+    /// was hoped for.  A start while the newest request is already a start is
+    /// a no-op, unless that start failed and this is the retry: a second
+    /// click on the toggle must not restart a listener that is up, or about
+    /// to be, on a new port.
     public func start() async {
+        if newestRequest == .start {
+            switch state {
+            case .starting, .listening: return
+            case .off, .stopped, .failed: break
+            }
+        }
+        newestRequest = .start
         serial += 1
         let mine = serial
         state = .starting
@@ -180,15 +197,25 @@ public final class CompanionListenerController {
     /// Stops the listener.  A listener that was never up keeps its state, so
     /// "off" and "could not start" are not overwritten with "stopped".
     public func stop() async {
+        await stop(then: .stopped)
+    }
+
+    /// Stops the listener and, when no newer start or stop ran while the
+    /// backend answered, records `outcome`: `.stopped` only when something
+    /// was up, `.off` always, because the setting itself was turned off.
+    private func stop(then outcome: CompanionListenerState) async {
+        newestRequest = .stop
         serial += 1
+        let mine = serial
         let wasUp: Bool
         switch state {
         case .listening, .starting: wasUp = true
         case .off, .stopped, .failed: wasUp = false
         }
         await backend.stop()
-        if wasUp {
-            state = .stopped
+        guard mine == serial else { return }
+        if wasUp || outcome == .off {
+            state = outcome
         }
     }
 }
@@ -229,8 +256,10 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         }
         var options = self.options
         options.advertisedName = advertising?.name
-        try await server.startListening(port: port, options: options)
-        return await server.listeningPort
+        // The server answers once the socket is ready, with the port it bound,
+        // or throws the listener's own error; a loopback bind drops the
+        // advertisement whatever was asked.
+        return try await server.startListening(port: port, options: options)
     }
 
     public func stop() async {
