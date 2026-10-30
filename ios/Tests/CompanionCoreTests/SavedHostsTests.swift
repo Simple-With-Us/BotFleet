@@ -44,9 +44,13 @@ final class SavedHostsTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         do { try await store.upsert(.thisMac); XCTFail("Unreadable store must refuse save") }
         catch { XCTAssertEqual(error as? SavedHostError, .unreadableStore) }
+        for _ in 0..<3 {
+            do { _ = try await HostStore(fileURL: file).hosts(); XCTFail("Corruption must remain visible") }
+            catch { XCTAssertEqual(error as? SavedHostError, .unreadableStore) }
+        }
         XCTAssertEqual(try Data(contentsOf: file), original)
         let backups = try FileManager.default.contentsOfDirectory(atPath: file.deletingLastPathComponent().path)
-        XCTAssertTrue(backups.contains(where: { $0.contains(".corrupt.") }))
+        XCTAssertEqual(backups.filter { $0.contains(".corrupt.") }, ["hosts.json.corrupt.json"])
     }
     func testSymlinkIsRefusedWithoutFollowingOrReplacingIt() async throws {
         let (file, store) = try temporaryStore()
@@ -116,6 +120,59 @@ final class SavedHostsTests: XCTestCase {
         XCTAssertFalse(policy.allows(other.url))
         XCTAssertFalse(policy.allows(URL(string: "http://fixture.test/api/config")))
         XCTAssertThrowsError(try HostGateCredential(origin: origin, token: RedactedSecret("bad\nheader")))
+    }
+    func testProtectedCredentialRestoresOnlyItsEnrolledOriginAndRecord() throws {
+        let host = HostRecord(name: "Pinned", origin: try HostOrigin("https://fixture.test"), hostId: "server:11111111-1111-4111-8111-111111111111")
+        let data = try KeychainHostTokenStore.encode(RedactedSecret("fixture-protected-token"), for: host)
+        let gate = try KeychainHostTokenStore.decode(data, for: host)
+        var request = URLRequest(url: host.origin.url.appendingPathComponent("health"))
+        try gate.authorize(&request)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-botfleet-gate-token"), "fixture-protected-token")
+        var tampered = host; tampered.origin = try HostOrigin("https://other.test")
+        XCTAssertThrowsError(try KeychainHostTokenStore.decode(data, for: tampered)) { error in
+            XCTAssertEqual(error as? SavedHostError, .differentOrigin)
+        }
+        let other = HostRecord(name: host.name, origin: host.origin, hostId: host.hostId)
+        XCTAssertThrowsError(try KeychainHostTokenStore.decode(data, for: other)) { error in
+            XCTAssertEqual(error as? SavedHostError, .credentialUnavailable)
+        }
+        // Keychain lookup uses the metadata UUID; the pinned remote identity is a separate field.
+        XCTAssertNoThrow(try KeychainHostTokenStore.query(recordID: host.id))
+        XCTAssertThrowsError(try KeychainHostTokenStore.query(recordID: host.hostId!))
+    }
+    func testProtectedCredentialRejectsMalformedLegacyAndFutureDataWithoutEchoingSecrets() throws {
+        let host = HostRecord(name: "Server", origin: try HostOrigin("https://fixture.test"))
+        let valid = try KeychainHostTokenStore.encode(RedactedSecret("fixture-secret"), for: host)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: valid) as? [String: Any])
+        json["schema"] = 2
+        let future = try JSONSerialization.data(withJSONObject: json)
+        json["schema"] = 1; json["extra"] = "fixture-secret"
+        let unknownField = try JSONSerialization.data(withJSONObject: json)
+        for data in [Data("fixture-secret".utf8), Data("{broken".utf8), future, unknownField] {
+            XCTAssertThrowsError(try KeychainHostTokenStore.decode(data, for: host)) { error in
+                XCTAssertEqual(error as? SavedHostError, .credentialUnavailable)
+                XCTAssertFalse(error.localizedDescription.contains("fixture-secret"))
+            }
+        }
+    }
+    func testLocalAnchorOriginCannotDrift() async throws {
+        let (_, store) = try temporaryStore()
+        var changed = HostRecord.thisMac
+        changed.origin = try HostOrigin("http://127.0.0.1:8801")
+        do { try await store.upsert(changed); XCTFail("Local origin must remain pinned") }
+        catch { XCTAssertEqual(error as? SavedHostError, .differentOrigin) }
+        let hosts = try await store.hosts()
+        XCTAssertEqual(hosts, [.thisMac])
+    }
+    func testUppercaseUUIDPinIsAcceptedAndRemainsExact() async throws {
+        let (_, store) = try temporaryStore()
+        let remote = HostRecord(name: "Server", origin: try HostOrigin("https://fixture.test"), hostId: "server:ABCDEF12-1234-4123-8123-ABCDEF123456")
+        try await store.upsert(remote)
+        let hosts = try await store.hosts()
+        XCTAssertEqual(hosts.last?.hostId, remote.hostId)
+        var changed = remote; changed.hostId = remote.hostId?.lowercased()
+        do { try await store.upsert(changed); XCTFail("Accepted pin spelling must remain exact") }
+        catch { XCTAssertEqual(error as? SavedHostError, .differentHost) }
     }
     func testEstablishedHostPinCannotBeClearedOrReplaced() async throws {
         let (_, store) = try temporaryStore()

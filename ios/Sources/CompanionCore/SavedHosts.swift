@@ -80,7 +80,7 @@ public struct HostRecord: Codable, Equatable, Identifiable, Sendable {
 
     static func validHostId(_ value: String) -> Bool {
         let parts = value.split(separator: ":", maxSplits: 1)
-        return parts.count == 2 && ["mac", "server"].contains(String(parts[0])) && UUID(uuidString: String(parts[1]))?.uuidString.lowercased() == String(parts[1])
+        return parts.count == 2 && ["mac", "server"].contains(String(parts[0])) && UUID(uuidString: String(parts[1])) != nil
     }
 
     func validate() throws {
@@ -122,8 +122,8 @@ public actor HostStore {
         try host.validate()
         try mutate { file in
         if let index = file.hosts.firstIndex(where: { $0.id == host.id }) {
-            // Changing a remote origin requires a new record and fresh credential enrollment.
-            guard host.isLocal || file.hosts[index].origin == host.origin else { throw SavedHostError.differentOrigin }
+            // Changing an origin requires a new record and fresh credential enrollment.
+            guard file.hosts[index].origin == host.origin else { throw SavedHostError.differentOrigin }
             guard file.hosts[index].hostId == nil || file.hosts[index].hostId == host.hostId else { throw SavedHostError.differentHost }
             file.hosts[index] = host
         }
@@ -176,7 +176,8 @@ public actor HostStore {
             return file
         } catch {
             if let original {
-                let backup = fileURL.appendingPathExtension("corrupt.\(UUID().uuidString).json")
+                // Preserve the first corrupt snapshot once; the unread source stays untouched.
+                let backup = fileURL.appendingPathExtension("corrupt.json")
                 try? writePrivate(original, to: backup)
             }
             throw SavedHostError.unreadableStore
@@ -228,30 +229,57 @@ public actor HostStore {
 }
 
 public protocol HostTokenStore: Sendable {
-    func read(hostID: String) throws -> RedactedSecret?
-    func write(_ token: RedactedSecret, hostID: String) throws
-    func remove(hostID: String) throws
+    func read(for host: HostRecord) throws -> HostGateCredential?
+    func write(_ token: RedactedSecret, for host: HostRecord) throws
+    func remove(recordID: String) throws
 }
 
 /// A separate per-user Keychain namespace; it never opens Control's JSON or service credentials.
 public struct KeychainHostTokenStore: HostTokenStore {
     public init() {}
-    private func query(_ hostID: String) throws -> [String: Any] {
-        guard UUID(uuidString: hostID) != nil else { throw SavedHostError.invalidRecord }
-        return [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "app.botfleet.macos.saved-host", kSecAttrAccount as String: hostID]
+    private struct StoredCredential: Codable {
+        let schema: Int
+        let recordID: String
+        let origin: HostOrigin
+        let token: String
     }
-    public func read(hostID: String) throws -> RedactedSecret? {
-        var query = try query(hostID); query[kSecReturnData as String] = true; query[kSecMatchLimit as String] = kSecMatchLimitOne
+    static func query(recordID: String) throws -> [String: Any] {
+        // The account is the saved-record UUID, not the remote's mac:/server: identity pin.
+        guard UUID(uuidString: recordID) != nil else { throw SavedHostError.invalidRecord }
+        return [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "app.botfleet.macos.saved-host", kSecAttrAccount as String: recordID]
+    }
+    static func encode(_ token: RedactedSecret, for host: HostRecord) throws -> Data {
+        try host.validate()
+        _ = try query(recordID: host.id)
+        _ = try HostGateCredential(origin: host.origin, token: token)
+        return try JSONEncoder().encode(StoredCredential(schema: 1, recordID: host.id, origin: host.origin, token: token.exposeSecret()))
+    }
+    static func decode(_ data: Data, for host: HostRecord) throws -> HostGateCredential {
+        try host.validate()
+        _ = try query(recordID: host.id)
+        let stored: StoredCredential
+        do {
+            guard data.count <= 16_384,
+                  let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  Set(json.keys) == Set(["schema", "recordID", "origin", "token"]) else { throw SavedHostError.credentialUnavailable }
+            stored = try JSONDecoder().decode(StoredCredential.self, from: data)
+        } catch { throw SavedHostError.credentialUnavailable }
+        guard stored.schema == 1, stored.recordID == host.id else { throw SavedHostError.credentialUnavailable }
+        guard stored.origin == host.origin else { throw SavedHostError.differentOrigin }
+        return try HostGateCredential(origin: stored.origin, token: RedactedSecret(stored.token))
+    }
+    public func read(for host: HostRecord) throws -> HostGateCredential? {
+        try host.validate()
+        var query = try Self.query(recordID: host.id); query[kSecReturnData as String] = true; query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = result as? Data, let token = String(data: data, encoding: .utf8), !token.isEmpty else { throw SavedHostError.credentialUnavailable }
-        return RedactedSecret(token)
+        guard status == errSecSuccess, let data = result as? Data else { throw SavedHostError.credentialUnavailable }
+        return try Self.decode(data, for: host)
     }
-    public func write(_ token: RedactedSecret, hostID: String) throws {
-        guard !token.isEmpty else { throw SavedHostError.credentialUnavailable }
-        let query = try query(hostID)
-        let data = Data(token.exposeSecret().utf8)
+    public func write(_ token: RedactedSecret, for host: HostRecord) throws {
+        let data = try Self.encode(token, for: host)
+        let query = try Self.query(recordID: host.id)
         var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if status == errSecItemNotFound {
             var add = query; add[kSecValueData as String] = data
@@ -260,8 +288,8 @@ public struct KeychainHostTokenStore: HostTokenStore {
         }
         guard status == errSecSuccess else { throw SavedHostError.credentialUnavailable }
     }
-    public func remove(hostID: String) throws {
-        let status = SecItemDelete(try query(hostID) as CFDictionary)
+    public func remove(recordID: String) throws {
+        let status = SecItemDelete(try Self.query(recordID: recordID) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw SavedHostError.credentialUnavailable }
     }
 }
