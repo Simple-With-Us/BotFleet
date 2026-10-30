@@ -69,15 +69,23 @@ export interface HostResourcesReport {
   platform: HostPlatform;
   capabilities: Capability[];
   sample: CapacitySample;
+  storage?: StorageState | null;
   admission: {
     maxSwapPercent: number;
     minFreeDiskBytes: number;
+    minFreeInodes?: number;
     unknownReading: "admit";
   };
   enforcement: Record<HostResource, EnforcementState>;
   /** Null means unreadable; "max" is an observed unlimited value. */
   observedLimits: Record<string, string | null>;
   limitations: string[];
+}
+export interface StorageState {
+  online: boolean;
+  dataDevice: string | null;
+  rootDevice: string | null;
+  reason?: string;
 }
 /** Versions are checked before epochs; every state-changing message is fenced. */
 export interface PlacementMessage extends ControllerEpoch { version: string }

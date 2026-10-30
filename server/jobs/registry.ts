@@ -114,7 +114,7 @@ export interface JobsConfigInput {
   cliLanes?: boolean;
   defaultMinutes?: number;
   maxMinutes?: number;
-  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number };
+  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number };
   cpuCores?: number;
 }
 
@@ -131,16 +131,19 @@ export function resolveJobsSettings(input: JobsConfigInput | undefined): JobsSet
     : Math.min(maxMinutes, JOB_DEFAULT_MINUTES);
   const swap = input?.admission?.maxSwapPercent;
   const disk = input?.admission?.minFreeDiskMb;
+  const inodes = input?.admission?.minFreeInodes;
+  const admission: AdmissionThresholds = {
+    maxSwapPercent: finite(swap) ? Math.min(100, Math.max(1, swap)) : DEFAULT_ADMISSION.maxSwapPercent,
+    minFreeDiskBytes: finite(disk) ? Math.max(0, disk) * 1024 * 1024 : DEFAULT_ADMISSION.minFreeDiskBytes,
+  };
+  if (finite(inodes)) admission.minFreeInodes = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(inodes)));
   return {
     enabled: input?.enabled !== false,
     wake: input?.wake !== false,
     cliLanes: input?.cliLanes !== false,
     defaultMinutes,
     maxMinutes,
-    admission: {
-      maxSwapPercent: finite(swap) ? Math.min(100, Math.max(1, swap)) : DEFAULT_ADMISSION.maxSwapPercent,
-      minFreeDiskBytes: finite(disk) ? Math.max(0, disk) * 1024 * 1024 : DEFAULT_ADMISSION.minFreeDiskBytes,
-    },
+    admission,
     cpuCores: finite(input?.cpuCores) ? Math.min(64, Math.max(1, input.cpuCores)) : DEFAULT_JOBS_SETTINGS.cpuCores,
   };
 }
