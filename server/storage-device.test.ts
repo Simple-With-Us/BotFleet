@@ -55,6 +55,10 @@ describe("dedicated-volume device guard", () => {
     expect(reads).toEqual(["/"]);
     expect(report.enforcement.disk).toMatchObject({ kind: "notApplied", reason: expect.stringContaining("Server storage offline") });
     expect(report.enforcement.inodes).toMatchObject({ kind: "notApplied", reason: expect.stringContaining("Server storage offline") });
+    const noInodeGate = hostResourcesReport({ hostId: "server:11111111-1111-4111-8111-111111111111", version: null, platform: "linux", dataDir: "/data", probe,
+      thresholds: () => ({ maxSwapPercent: 98, minFreeDiskBytes: 1 }), readText: () => { throw new Error("fixture"); } });
+    expect(noInodeGate.enforcement.inodes).toEqual({ kind: "unsupported", reason: "No inode admission gate is active" });
+    expect(noInodeGate.enforcement.disk).toMatchObject({ kind: "notApplied", reason: expect.stringContaining("Server storage offline") });
   });
 
   it("refuses a device loss during one disk/inode observation without retrying unknown readings", () => {

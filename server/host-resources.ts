@@ -106,7 +106,10 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
   if (sample.diskFreeBytes === null) enforcement.disk = { kind: "notApplied", reason: "Disk reading unavailable; admission permits unknown readings", restartRequired: false };
   if (thresholds.minFreeInodes !== undefined) enforcement.inodes = sample.inodesFree !== null
     ? gate() : { kind: "notApplied", reason: "Inode reading unavailable; admission permits unknown readings", restartRequired: false };
-  if (storage?.online === false) enforcement.disk = enforcement.inodes = { kind: "notApplied", reason: "Server storage offline; new jobs are refused", restartRequired: false };
+  if (storage?.online === false) {
+    enforcement.disk = { kind: "notApplied", reason: "Server storage offline; new jobs are refused", restartRequired: false };
+    if (thresholds.minFreeInodes !== undefined) enforcement.inodes = { kind: "notApplied", reason: "Server storage offline; new jobs are refused", restartRequired: false };
+  }
   const observedLimits: Record<string, string | null> = Object.fromEntries(CGROUP_FILES.map((file) => [file, null]));
   const limitations = [
     "Memory admission currently checks swap, not an aggregate RAM budget",

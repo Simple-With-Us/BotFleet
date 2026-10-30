@@ -65,4 +65,6 @@ The first review found contradictory offline inode reporting and an admission ra
 
 The corrected resource parent `3c3aa2a3` is integrated without changing the storage source.  Its combined check passed typecheck, the 79 affected Vitest tests, all 35 collector fixtures and parent-ref lint; no full-suite repeat or live probe was performed.
 
+The second storage review clarified the unset-floor case: without an inode floor, the inode row remains unsupported even when storage is offline; a configured floor still reports the named offline refusal.  Disk and inode states use separate records.  Typecheck, 30 affected storage/report/probe fixtures and lint passed after this correction in the combined resource branch.
+
 Recipe 12's live mount/unmount and write attempts remain false, as do recipes 11 and 13 and every other complete placement assertion.  A deployed unit, its actual namespace behavior, log rotation and other-app responsiveness require the plan's separately authorized hand runs and reviewed output.
