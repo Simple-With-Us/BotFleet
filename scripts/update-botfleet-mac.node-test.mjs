@@ -9,6 +9,9 @@ import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import {
+  startDesktopBeforeWatchdog,
+  restoreDesktopBeforeWatchdogs,
+  shouldStartDesktop,
   applicationAttachmentError,
   captureProcessIdentities,
   exactAppPidsFromPs,
@@ -69,6 +72,64 @@ import {
   waitForStableApplication,
   waitForStartup,
 } from "./update-botfleet-mac.mjs";
+
+test("desktop update establishes verified packaged ownership before starting the source watchdog", async () => {
+  const calls = [];
+  await startDesktopBeforeWatchdog({
+    desktop: true,
+    open: async () => { calls.push("open"); },
+    verify: async () => { calls.push("verified packaged owner"); },
+    bootstrap: async () => { calls.push("watchdog"); },
+  });
+  assert.deepEqual(calls, ["open", "verified packaged owner", "watchdog"]);
+});
+
+test("failed packaged startup cannot start a competing source owner", async () => {
+  let bootstrapped = false;
+  await assert.rejects(startDesktopBeforeWatchdog({
+    desktop: true,
+    open: async () => {},
+    verify: async () => { throw new Error("expected manifest did not match"); },
+    bootstrap: async () => { bootstrapped = true; },
+  }), /expected manifest did not match/);
+  assert.equal(bootstrapped, false);
+});
+
+test("server-only and no-open startup retain the existing watchdog route", async () => {
+  let bootstrapped = false;
+  await startDesktopBeforeWatchdog({
+    desktop: false,
+    open: async () => { assert.fail("desktop must remain closed"); },
+    verify: async () => { assert.fail("no packaged owner requested"); },
+    bootstrap: async () => { bootstrapped = true; },
+  });
+  assert.equal(bootstrapped, true);
+});
+
+test("rollback attempts every watchdog after desktop verification and individual bootstrap failures", async () => {
+  const calls = [];
+  const errors = [];
+  await restoreDesktopBeforeWatchdogs({
+    desktop: true,
+    open: async () => { calls.push("open restored app"); },
+    verify: async () => { calls.push("verify restored app"); throw new Error("app failed"); },
+    bootstraps: [
+      async () => { calls.push("first watchdog"); throw new Error("first plist failed"); },
+      async () => { calls.push("second watchdog"); },
+    ],
+    record: async (operation) => { try { await operation(); } catch (error) { errors.push(error.message); } },
+  });
+  assert.deepEqual(calls, ["open restored app", "verify restored app", "first watchdog", "second watchdog"]);
+  assert.deepEqual(errors, ["app failed", "first plist failed"]);
+});
+
+test("desktop startup respects component ownership, no-open and the pre-rollback application state", () => {
+  assert.equal(shouldStartDesktop({ updateApp: true }), true);
+  assert.equal(shouldStartDesktop({ updateApp: false }), false);
+  assert.equal(shouldStartDesktop({ updateApp: true, openApplication: false }), false);
+  assert.equal(shouldStartDesktop({ updateApp: true, wasRunning: false }), false);
+  assert.equal(shouldStartDesktop({ updateApp: true, openApplication: true, wasRunning: true }), true);
+});
 
 const scripts = dirname(fileURLToPath(import.meta.url));
 
