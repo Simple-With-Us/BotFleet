@@ -8,6 +8,7 @@ export const HARNESS_API_VERSION = 1;
 export function validBuildIdentity(value) {
   return value?.app === "botfleet" && Number.isInteger(value.apiVersion) && value.apiVersion > 0 &&
     typeof value.version === "string" && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(value.version) &&
+    (value.build === undefined || (value.build === String(value.build) && /^[0-9]+(?:\.[0-9]+){0,2}$/.test(value.build) && value.build.length <= 64)) &&
     typeof value.sourceCommit === "string" && /^[a-f0-9]{40}$/.test(value.sourceCommit) &&
     typeof value.sourceDirty === "boolean" &&
     (value.uiHash === null || (typeof value.uiHash === "string" && /^[a-f0-9]{64}$/.test(value.uiHash)));
@@ -48,7 +49,7 @@ export function readPackagedBuildIdentity(directory) {
  * real source commit, or the packaged app would ship a fabricated all-zeros
  * commit as provenance.  The server keeps the default for startup, where an
  * unavailable git is not a reason to refuse to boot. */
-export function readSourceBuildIdentity(root, { requireGit = false, version = null } = {}) {
+export function readSourceBuildIdentity(root, { requireGit = false, version = null, build = null } = {}) {
   // Git is not guaranteed to be on PATH: a checkout started from a GUI app, a
   // stripped container, or a test that scrubs PATH cannot run it.  That is not
   // a reason for the server to refuse to start, so an unavailable git reports
@@ -85,6 +86,9 @@ export function readSourceBuildIdentity(root, { requireGit = false, version = nu
     version: version ?? JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,
     apiVersion: HARNESS_API_VERSION, sourceCommit, sourceDirty, uiHash: null,
   };
+  // The shared release planner supplies this value; a source run without
+  // that plan reports no build rather than inventing one from the version.
+  if (build !== null) value.build = build;
   // A manifest stamped into a shipped bundle must name a real commit: git ran
   // but reported no usable HEAD (shallow archive, corrupt repo), so the
   // all-zeros fallback would be fabricated provenance.
