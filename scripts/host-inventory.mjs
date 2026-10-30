@@ -280,6 +280,7 @@ function parseArgs(argv) {
 }
 
 export function validateOptions(options, platform = process.platform) {
+  if (!["linux", "darwin"].includes(platform)) throw new Error("host inventory supports only Linux and macOS");
   if (options.help) return;
   options.pids ??= [];
   options.units ??= [];
@@ -325,8 +326,8 @@ async function linuxSwap() {
   } catch { return null; }
 }
 
-async function linuxUnitCgroup(unit) {
-  const { stdout } = await execFile("systemctl", ["show", "--property=ControlGroup", "--value", unit], { timeout: 3000, maxBuffer: 1024 });
+export async function linuxUnitCgroup(unit, runExecFile = execFile) {
+  const { stdout } = await runExecFile("/usr/bin/systemctl", ["show", "--property=ControlGroup", "--value", unit], { timeout: 3000, maxBuffer: 1024 });
   const group = stdout.trim();
   if (!group.startsWith("/") || group.split("/").includes("..")) throw new Error(`could not resolve cgroup for ${unit}`);
   return `/sys/fs/cgroup${group}`;
@@ -462,8 +463,8 @@ export function availableMemoryBytes(platform, linuxMeminfo = null) {
   return platform === "linux" && linuxMeminfo !== null ? parseLinuxMemAvailableBytes(linuxMeminfo) : null;
 }
 
-async function linuxPidConstants() {
-  const readPositiveInteger = async (name) => execFile("getconf", [name], { timeout: 2000, maxBuffer: 128 }).then(({ stdout }) => {
+export async function linuxPidConstants(runExecFile = execFile) {
+  const readPositiveInteger = async (name) => runExecFile("/usr/bin/getconf", [name], { timeout: 2000, maxBuffer: 128 }).then(({ stdout }) => {
     const value = Number(stdout.trim());
     return Number.isSafeInteger(value) && value > 0 ? value : null;
   }).catch(() => null);
@@ -489,12 +490,18 @@ export function renderMarkdown(report) {
 
 function fmt(value, unit) { return Number.isFinite(value) ? `${Math.round(value * 100) / 100} ${unit}` : "unknown"; }
 
-export async function prepareOutputTargets(outputDir, openReportFile = open) {
+function requirePosixUid(readUid = () => process.getuid?.()) {
+  const uid = readUid();
+  if (!Number.isSafeInteger(uid) || uid < 0) throw new Error("host inventory requires a readable POSIX user identity");
+  return uid;
+}
+
+export async function prepareOutputTargets(outputDir, openReportFile = open, readUid = () => process.getuid?.()) {
+  const uid = requirePosixUid(readUid);
   await mkdir(outputDir, { recursive: false, mode: 0o700 }).catch((error) => {
     if (error?.code !== "EEXIST") throw new Error("output directory could not be created without creating missing parents");
   });
   const directory = await lstat(outputDir).catch(() => null);
-  const uid = process.getuid();
   if (!directory?.isDirectory() || directory.isSymbolicLink() ||
       (uid !== null && directory.uid !== uid) || (directory.mode & 0o022) !== 0) {
     throw new Error("output directory must be a user-owned directory that is not writable by other users");
@@ -539,7 +546,7 @@ function matchesReservedPrivateFile(info, target, uid) {
 
 async function assertTargetPathStillOwned(target) {
   if (!target.identity) throw new Error(`report target identity unavailable: ${target.kind}`);
-  const uid = process.getuid();
+  const uid = requirePosixUid();
   const current = await lstat(target.path).catch(() => null);
   if (!current || !matchesReservedPrivateFile(current, target, uid)) {
     throw new Error(`report target changed during collection: ${target.kind}`);
@@ -548,7 +555,7 @@ async function assertTargetPathStillOwned(target) {
 
 async function assertTargetStillOwned(target) {
   if (!target.identity || target.closed) throw new Error(`report target descriptor unavailable: ${target.kind}`);
-  const uid = process.getuid();
+  const uid = requirePosixUid();
   const [descriptor, current] = await Promise.all([target.handle.stat(), lstat(target.path).catch(() => null)]);
   if (!current || !matchesReservedPrivateFile(descriptor, target, uid) || !matchesReservedPrivateFile(current, target, uid)) {
     throw new Error(`report target changed during collection: ${target.kind}`);
@@ -564,7 +571,7 @@ async function cleanupOutputTargets(targets) {
     if (!target.identity) continue;
     try {
       const current = await lstat(target.path);
-      if (matchesReservedPrivateFile(current, target, process.getuid())) {
+      if (matchesReservedPrivateFile(current, target, requirePosixUid())) {
         await unlink(target.path);
       }
     } catch {}
@@ -617,11 +624,13 @@ function delay(milliseconds, signal) {
 }
 
 export async function run(options, dependencies = {}) {
-  validateOptions(options);
+  const platform = dependencies.platform ?? process.platform;
+  validateOptions(options, platform);
+  const readUid = dependencies.readUid ?? (() => process.getuid?.());
+  requirePosixUid(readUid);
   const sourceCommit = reportSourceCommitGuard(await (dependencies.readSourceCommit ?? readSourceCommit)());
-  const targets = await prepareOutputTargets(resolve(options.outputDir), dependencies.openReportFile ?? open);
+  const targets = await prepareOutputTargets(resolve(options.outputDir), dependencies.openReportFile ?? open, readUid);
   try {
-    const platform = dependencies.platform ?? process.platform;
     const wallNow = dependencies.wallNow ?? Date.now;
     const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
     const signal = dependencies.signal;
