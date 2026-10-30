@@ -442,7 +442,11 @@ public actor TurnDispatcherActor {
     }
 
     private var activeTurns: [String: ActiveTurnContext] = [:]
+    private var unsettledTasks: [UUID: Task<Void, Never>] = [:]
+    private var isShutdown = false
     private let database: DatabaseService?
+    private let requiresDurablePersistence: Bool
+    private var persistenceFailed = false
     private let stallTimeoutSeconds: Double
     private let maxRetriesPerEngine: Int
     private let retryDelaySeconds: Double
@@ -455,9 +459,11 @@ public actor TurnDispatcherActor {
         maxRetriesPerEngine: Int = 1,
         retryDelaySeconds: Double = 0.05,
         bufferCapacity: Int = 256,
-        recovery: NativeEngineRecoveryActor = NativeEngineRecoveryActor()
+        recovery: NativeEngineRecoveryActor = NativeEngineRecoveryActor(),
+        requiresDurablePersistence: Bool = false
     ) {
         self.database = database
+        self.requiresDurablePersistence = requiresDurablePersistence
         self.stallTimeoutSeconds = stallTimeoutSeconds
         self.maxRetriesPerEngine = maxRetriesPerEngine
         self.retryDelaySeconds = retryDelaySeconds
@@ -491,6 +497,7 @@ public actor TurnDispatcherActor {
         input: TurnInput,
         fallbackChain: [any EngineDriver]
     ) throws -> AsyncStream<TurnEvent> {
+        guard !isShutdown else { throw EngineDriverError.cancelled(threadId: input.threadId) }
         guard !fallbackChain.isEmpty else {
             throw EngineDriverError.noEnginesConfigured(botId: input.botId)
         }
@@ -524,6 +531,7 @@ public actor TurnDispatcherActor {
             currentModelId: input.modelId,
             task: task
         )
+        unsettledTasks[generation] = task
 
         continuation.onTermination = { [weak self] termination in
             if case .cancelled = termination {
@@ -543,8 +551,23 @@ public actor TurnDispatcherActor {
     }
 
     private func finishTurn(threadId: String, generation: UUID) {
+        unsettledTasks.removeValue(forKey: generation)
         guard activeTurns[threadId]?.generation == generation else { return }
         activeTurns.removeValue(forKey: threadId)
+    }
+
+    /// Fence admission before cancelling owned turns, then await their persistence and stream settlement.
+    public func shutdownAndDrain() async throws {
+        isShutdown = true
+        let turns = Array(activeTurns.values)
+        let tasks = Array(unsettledTasks.values)
+        for turn in turns {
+            await cancelTurn(threadId: turn.threadId, generation: turn.generation)
+        }
+        for task in tasks { await task.value }
+        guard !persistenceFailed else {
+            throw EngineDriverError.protocolError(code: "persistence_failed", message: "Native turn persistence did not complete")
+        }
     }
 
     private func dispatchIsCurrent(threadId: String, generation: UUID) -> Bool {
@@ -563,32 +586,37 @@ public actor TurnDispatcherActor {
         }
 
         if let database {
-            let now = Date().timeIntervalSince1970
-            // `upsertThread` overwrites `title` and `bot_id` on conflict, so a thread that already
-            // carries a user-visible title must keep it: only a thread that does not exist yet gets
-            // the raw thread id as its title.
-            let existing = try? await database.loadThreads(forBot: nil, limit: 1000)
-                .first(where: { $0.id == input.threadId })
-            try? await database.upsertThread(
-                ThreadRecord(
-                    id: input.threadId,
-                    title: existing?.title ?? input.threadId,
-                    botId: existing?.botId ?? input.botId,
-                    createdAt: existing?.createdAt ?? now,
-                    updatedAt: now
+            do {
+                let now = Date().timeIntervalSince1970
+                // Preserve the existing title and bot ownership when persisting a native turn.
+                let existing = try await database.loadThread(id: input.threadId)
+                try await database.upsertThread(
+                    ThreadRecord(
+                        id: input.threadId,
+                        title: existing?.title ?? input.threadId,
+                        botId: existing?.botId ?? input.botId,
+                        createdAt: existing?.createdAt ?? now,
+                        updatedAt: now
+                    )
                 )
-            )
-            try? await database.insertMessage(
-                MessageRecord(
-                    id: "user-\(UUID().uuidString)",
-                    threadId: input.threadId,
-                    role: "user",
-                    kind: "text",
-                    content: input.prompt,
-                    createdAt: now,
-                    model: input.modelId
+                try await database.insertMessage(
+                    MessageRecord(
+                        id: "user-\(UUID().uuidString)",
+                        threadId: input.threadId,
+                        role: "user",
+                        kind: "text",
+                        content: input.prompt,
+                        createdAt: now,
+                        model: input.modelId
+                    )
                 )
-            )
+            } catch {
+                if requiresDurablePersistence {
+                    persistenceFailed = true
+                    continuation.yield(.error(code: "persistence_failed", message: "Native turn input could not be persisted"))
+                    return
+                }
+            }
         }
 
         var accumulatedText = ""
@@ -709,17 +737,24 @@ public actor TurnDispatcherActor {
                     await recovery.markHealthy(route: route)
                     await recovery.clearSuccessfulQuota(route: route)
                     if let database, !accumulatedText.isEmpty {
-                        try? await database.insertMessage(
-                            MessageRecord(
-                                id: "assistant-\(UUID().uuidString)",
-                                threadId: input.threadId,
-                                role: "assistant",
-                                kind: "text",
-                                content: accumulatedText,
-                                createdAt: Date().timeIntervalSince1970,
-                                model: input.modelId
+                        do {
+                            try await database.insertMessage(
+                                MessageRecord(
+                                    id: "assistant-\(UUID().uuidString)",
+                                    threadId: input.threadId,
+                                    role: "assistant",
+                                    kind: "text",
+                                    content: accumulatedText,
+                                    createdAt: Date().timeIntervalSince1970,
+                                    model: input.modelId
+                                )
                             )
-                        )
+                        } catch {
+                            if requiresDurablePersistence {
+                                persistenceFailed = true
+                                continuation.yield(.error(code: "persistence_failed", message: "Native turn output could not be persisted"))
+                            }
+                        }
                     }
                     return
                 }
@@ -793,6 +828,7 @@ public actor EngineCoordinatorActor {
     private var botFallbackChains: [String: [String]] = [:]
     private let dispatcher: TurnDispatcherActor
     private let turnTools: NativeTurnToolsActor?
+    private var isShutdown = false
 
     public init(
         drivers: [any EngineDriver] = [],
@@ -817,6 +853,7 @@ public actor EngineCoordinatorActor {
     }
 
     public func sendTurn(input: TurnInput) async throws -> AsyncStream<TurnEvent> {
+        guard !isShutdown else { throw EngineDriverError.cancelled(threadId: input.threadId) }
         let preparedInput: TurnInput
         if let turnTools {
             preparedInput = try input.withToolPreparation(await turnTools.prepare(botId: input.botId))
@@ -824,6 +861,7 @@ public actor EngineCoordinatorActor {
             preparedInput = try input.withToolPreparation(input.toolPreparation)
         }
         let chainIds = botFallbackChains[input.botId] ?? Array(driversById.keys.sorted())
+        guard !isShutdown else { throw EngineDriverError.cancelled(threadId: input.threadId) }
         let chain = chainIds.compactMap { driversById[$0] }
         guard !chain.isEmpty else {
             throw EngineDriverError.noEnginesConfigured(botId: input.botId)
@@ -836,5 +874,10 @@ public actor EngineCoordinatorActor {
 
     public func cancelTurn(threadId: String) async {
         await dispatcher.cancelTurn(threadId: threadId)
+    }
+
+    public func shutdownAndDrain() async throws {
+        isShutdown = true
+        try await dispatcher.shutdownAndDrain()
     }
 }
