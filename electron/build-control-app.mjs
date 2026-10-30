@@ -74,6 +74,10 @@ async function buildControlApp() {
   // the app's release path uses: the commit count with the package.json
   // floor, never the count of a shallow clone.
   const { version, build: buildNumber, source } = controlBuildVersion({ repoRoot: project });
+  writeFileSync(path.join(contents, "Resources", "build-identity.json"), JSON.stringify(
+    readSourceBuildIdentity(project, { requireGit: true, version, build: buildNumber }),
+  ) + "\n");
+  writeFileSync(path.join(contents, "Resources", "control-update-protocol.json"), JSON.stringify({ protocolVersion: 1 }) + "\n");
   console.log(`BotFleet Control version ${version} (${source})`);
   writeFileSync(path.join(contents, "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

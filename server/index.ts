@@ -15124,6 +15124,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       try {
         if (method === "GET" && path === "/api/system/control") {
           return json(res, 200, {
+            serverBuild: {
+              version: runtimeBuildIdentity.version,
+              build: runtimeBuildIdentity.build ?? null,
+              sourceCommit: runtimeBuildIdentity.sourceDirty ? null : runtimeBuildIdentity.sourceCommit,
+            },
             activeBotCount: store.bots.filter((bot) => bot.busy).length,
             localVms: await control.list(),
             persistOnExit: cfg.server?.persistOnExit !== false,
