@@ -20,4 +20,4 @@ Run on a Mac with the repository's Swift 6.4 toolchain:
 swift test --package-path ios --filter CompanionListenerControllerTests
 ```
 
-Local `git diff --check` passed.  Swift compilation and test execution are pending primary-agent validation because this Linux workspace has no Swift executable.  Publication, CI review and delivery remain with the primary agent.
+The isolated Mac validation checkout passed the full iOS package: 988 XCTest tests and 273 Swift Testing tests, including these five new races.  An unsigned iOS Xcode build and `git diff --check` also passed.  This validation checkout combined the pairing-contract and listener-failure changes; it did not install or launch the app against live user data.
