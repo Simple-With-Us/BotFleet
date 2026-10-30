@@ -124,7 +124,9 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         with:
           node-version: 26
-          cache: pnpm
+          # Cache restores currently hit the account egress limit and consume
+          # the test budget; install from the lockfile without a remote cache.
+          package-manager-cache: false
       - if: needs.changes.outputs.docs_only != 'true'
         run: pnpm install --frozen-lockfile
       - if: needs.changes.outputs.docs_only != 'true'
