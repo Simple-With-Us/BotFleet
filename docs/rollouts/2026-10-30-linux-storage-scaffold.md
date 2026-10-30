@@ -63,4 +63,6 @@ After current main and the resource/inventory branch were integrated through `c7
 
 The first review found contradictory offline inode reporting and an admission race between separate device/statistics reads.  Disk and inode diagnostics now name the storage-offline refusal together, and production admission uses one shared disk/inode observation bracketed by device checks, rejecting either observed offline state.  A fixture changes the device during the disk read and proves refusal with one statistics read and two guard checks.  Typecheck, 79 affected storage/report/probe/registry tests, lint and independent source review passed.  An unmount after the final observation remains possible; the rendered unit's pinned filesystem namespace is the all-writer boundary, and its live proof remains pending.
 
+The corrected resource parent `3c3aa2a3` is integrated without changing the storage source.  Its combined check passed typecheck, the 79 affected Vitest tests, all 35 collector fixtures and parent-ref lint; no full-suite repeat or live probe was performed.
+
 Recipe 12's live mount/unmount and write attempts remain false, as do recipes 11 and 13 and every other complete placement assertion.  A deployed unit, its actual namespace behavior, log rotation and other-app responsiveness require the plan's separately authorized hand runs and reviewed output.
