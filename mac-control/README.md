@@ -18,7 +18,7 @@ The bundled `botfleet-vm-control.mjs` helper reports managed Local VM state and 
 
 Control starts with the Local Mac host only.  Add a remote server through “Add Connected BotFleet Server” using its configured HTTP or HTTPS base URL and optional Bearer token.  The app does not supply a public hostname, hosting provider or Tailscale address; the address must be reachable from this Mac.
 
-Saved servers live in `~/.botfleet/control-hosts.json`.  Loading an older list removes only the unchanged synthetic Hetzner preset; renamed, readdressed or credentialed entries remain configured.
+Saved servers live in `~/.botfleet/control-hosts.json`.  Loading an older list removes the unchanged synthetic Hetzner entry only when provider configuration is readable and does not refer to that server ID.  A matching provider entry or unreadable provider file preserves the host and provider file; renamed, readdressed and credentialed entries are always kept.
 
 ## Managed Services
 

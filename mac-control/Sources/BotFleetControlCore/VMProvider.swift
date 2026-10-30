@@ -285,6 +285,19 @@ public final class VMProviderStore {
     /// The file the configuration lives in.
     public var configurationURL: URL { fileURL }
 
+    /// Returns configured server IDs, or nil when an existing file cannot be trusted.
+    public func configuredServerIDs() -> Set<String>? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
+        guard let data = try? Data(contentsOf: fileURL),
+              let configs = try? JSONDecoder().decode([VMProviderConfiguration].self, from: data),
+              configs.allSatisfy({ !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            return nil
+        }
+        return Set(configs.map(\.id))
+    }
+
     /// Reads every configuration, or an empty list when there are none.
     public func loadConfigurations() -> [VMProviderConfiguration] {
         lock.lock()

@@ -94,6 +94,74 @@ final class MultiHostControlTests: XCTestCase {
         }
     }
 
+    func testProviderLinkedLegacyHostAndProviderBytesArePreserved() throws {
+        let providerFile = tempDir.appendingPathComponent("linked-providers.json")
+        let providerStore = VMProviderStore(fileURL: providerFile)
+        try providerStore.saveConfigurations([providerConfiguration(id: "hetzner")])
+        let providerBytes = try Data(contentsOf: providerFile)
+        let hostStore = ServerHostStore(
+            fileURL: tempDir.appendingPathComponent("linked-hosts.json"),
+            preservedHostIDs: { providerStore.configuredServerIDs() }
+        )
+        try hostStore.saveHosts([.defaultLocal, legacySyntheticHost()])
+
+        let hosts = hostStore.loadHosts()
+
+        XCTAssertTrue(hosts.contains(legacySyntheticHost()))
+        XCTAssertEqual(try Data(contentsOf: providerFile), providerBytes)
+    }
+
+    func testUnrelatedProviderIDAllowsLegacyHostMigration() throws {
+        let providerFile = tempDir.appendingPathComponent("unrelated-providers.json")
+        let providerStore = VMProviderStore(fileURL: providerFile)
+        try providerStore.saveConfigurations([providerConfiguration(id: "another-server")])
+        let providerBytes = try Data(contentsOf: providerFile)
+        let hostStore = ServerHostStore(
+            fileURL: tempDir.appendingPathComponent("unrelated-hosts.json"),
+            preservedHostIDs: { providerStore.configuredServerIDs() }
+        )
+        try hostStore.saveHosts([.defaultLocal, legacySyntheticHost()])
+
+        let hosts = hostStore.loadHosts()
+
+        XCTAssertFalse(hosts.contains(legacySyntheticHost()))
+        XCTAssertEqual(hosts, [.defaultLocal])
+        XCTAssertEqual(try Data(contentsOf: providerFile), providerBytes)
+    }
+
+    func testUnreadableProviderStoreConservativelyPreservesLegacyHost() throws {
+        let providerFile = tempDir.appendingPathComponent("unreadable-providers.json")
+        try Data("not valid provider JSON".utf8).write(to: providerFile)
+        let providerBytes = try Data(contentsOf: providerFile)
+        let providerStore = VMProviderStore(fileURL: providerFile)
+        let hostStore = ServerHostStore(
+            fileURL: tempDir.appendingPathComponent("unreadable-hosts.json"),
+            preservedHostIDs: { providerStore.configuredServerIDs() }
+        )
+        try hostStore.saveHosts([.defaultLocal, legacySyntheticHost()])
+
+        let hosts = hostStore.loadHosts()
+
+        XCTAssertTrue(hosts.contains(legacySyntheticHost()))
+        XCTAssertEqual(try Data(contentsOf: providerFile), providerBytes)
+    }
+
+    func testAbsentProviderStoreAllowsLegacyHostMigration() throws {
+        let providerFile = tempDir.appendingPathComponent("absent-providers.json")
+        let providerStore = VMProviderStore(fileURL: providerFile)
+        let hostStore = ServerHostStore(
+            fileURL: tempDir.appendingPathComponent("absent-hosts.json"),
+            preservedHostIDs: { providerStore.configuredServerIDs() }
+        )
+        try hostStore.saveHosts([.defaultLocal, legacySyntheticHost()])
+
+        let hosts = hostStore.loadHosts()
+
+        XCTAssertFalse(hosts.contains(legacySyntheticHost()))
+        XCTAssertEqual(hosts, [.defaultLocal])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: providerFile.path))
+    }
+
     func testRemoteHostControlAPIInjectsBearerAuth() async throws {
         let host = ServerHost(
             id: "remote-server",
@@ -204,5 +272,24 @@ final class MultiHostControlTests: XCTestCase {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockURLProtocol.self]
         return URLSession(configuration: config)
+    }
+
+    private func legacySyntheticHost() -> ServerHost {
+        ServerHost(
+            id: "hetzner",
+            name: "Hetzner Server",
+            baseURL: URL(string: "https://hetzner.botfleet.app")!,
+            isLocal: false
+        )
+    }
+
+    private func providerConfiguration(id: String) -> VMProviderConfiguration {
+        VMProviderConfiguration(
+            id: id,
+            providerID: "custom-script",
+            displayName: "Fixture Provider",
+            apiToken: "fixture-token",
+            command: "/usr/bin/true"
+        )
     }
 }

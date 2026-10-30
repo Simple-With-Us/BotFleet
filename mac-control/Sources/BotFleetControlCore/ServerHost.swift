@@ -35,9 +35,11 @@ public struct ServerHost: Codable, Equatable, Identifiable, Sendable {
 /// Atomic storage for known server hosts in `~/.botfleet/control-hosts.json`.
 public final class ServerHostStore: @unchecked Sendable {
     private let fileURL: URL
+    private let preservedHostIDs: () -> Set<String>?
     private let lock = NSLock()
 
-    public init(fileURL: URL? = nil) {
+    public init(fileURL: URL? = nil, preservedHostIDs: @escaping () -> Set<String>? = { Set<String>() }) {
+        self.preservedHostIDs = preservedHostIDs
         if let fileURL {
             self.fileURL = fileURL
         } else {
@@ -116,13 +118,10 @@ public final class ServerHostStore: @unchecked Sendable {
         }
         var hosts = decodedHosts
         let originalHosts = hosts
-        // Remove only the exact unauthenticated remote row shipped by the old synthetic preset.
-        hosts.removeAll { host in
-            host.id == "hetzner"
-                && host.name == "Hetzner Server"
-                && host.baseURL.absoluteString == "https://hetzner.botfleet.app"
-                && host.authToken == nil
-                && !host.isLocal
+        if hosts.contains(where: isLegacySyntheticRemoteHost),
+           let preservedIDs = preservedHostIDs(),
+           !preservedIDs.contains("hetzner") {
+            hosts.removeAll(where: isLegacySyntheticRemoteHost)
         }
         if !hosts.contains(where: { $0.id == ServerHost.defaultLocal.id || $0.isLocal }) {
             hosts.insert(ServerHost.defaultLocal, at: 0)
@@ -131,6 +130,14 @@ public final class ServerHostStore: @unchecked Sendable {
             saveInternal(hosts)
         }
         return hosts
+    }
+
+    private func isLegacySyntheticRemoteHost(_ host: ServerHost) -> Bool {
+        host.id == "hetzner"
+            && host.name == "Hetzner Server"
+            && host.baseURL.absoluteString == "https://hetzner.botfleet.app"
+            && host.authToken == nil
+            && !host.isLocal
     }
 
     private func saveInternal(_ hosts: [ServerHost]) {

@@ -4,7 +4,11 @@ import ServiceManagement
 
 @main
 final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private let hostStore = ServerHostStore()
+    private let vmProviderStore = VMProviderStore()
+    private lazy var hostStore: ServerHostStore = {
+        let providerStore = vmProviderStore
+        return ServerHostStore(preservedHostIDs: { providerStore.configuredServerIDs() })
+    }()
     private var hosts: [ServerHost] = []
     private var hostApis: [String: ControlAPI] = [:]
     private var hostStatuses: [String: ControlStatus] = [:]
@@ -97,7 +101,6 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The state of each remote machine, by server id.
     private var vmStates: [String: RemoteVMState] = [:]
     private let processMonitor = FleetProcessMonitor()
-    private let vmProviderStore = VMProviderStore()
     /// The state of every fleet service, read fresh each time the menu
     /// opens.
     private var fleetServiceStates: [String: ManagedServiceState] = [:]
