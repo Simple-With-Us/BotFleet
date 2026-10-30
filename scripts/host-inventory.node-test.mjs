@@ -168,6 +168,17 @@ test("CPU interval estimate uses each counter read window instead of batch start
   assert.ok(result.groups["pid:123"].peak.cpuPercentOfOneCoreEstimateRange.maximum > 100);
 });
 
+test("overall CPU peak range covers every possible interval maximum independently of its midpoint peak", () => {
+  const result = aggregateSamples([
+    { atMs: 0, groups: { "pid:123": { cpuUsec: 0, cpuTimeBounds: { startAtMs: 0, endAtMs: 0 } } } },
+    { atMs: 1000, groups: { "pid:123": { cpuUsec: 1_000_000, cpuTimeBounds: { startAtMs: 1000, endAtMs: 1000 } } } },
+    { atMs: 2000, groups: { "pid:123": { cpuUsec: 1_400_000, cpuTimeBounds: { startAtMs: 1001, endAtMs: 3001 } } } },
+  ], 1000);
+  assert.equal(result.groups["pid:123"].peak.cpuPercentOfOneCoreEstimate, 100);
+  assert.equal(result.groups["pid:123"].peak.cpuPercentOfOneCoreEstimateRange.minimum, 100);
+  assert.equal(result.groups["pid:123"].peak.cpuPercentOfOneCoreEstimateRange.maximum, 40_000);
+});
+
 test("cgroup samples require a stable directory identity and label memory.current as charged memory", async () => {
   const info = { dev: 7, ino: 19, isDirectory: () => true };
   const contents = {

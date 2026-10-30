@@ -152,10 +152,13 @@ class SampleAccumulator {
           const cpuElapsedMs = (row.cpuUsec - state.previousCPU.cpuUsec) / 1000;
           const estimate = cpuElapsedMs / elapsedEstimateMs * 100;
           const range = { minimum: cpuElapsedMs / elapsedMaximumMs * 100, maximum: cpuElapsedMs / elapsedMinimumMs * 100 };
-          if (state.peakCPUPercent === null || estimate > state.peakCPUPercent) {
-            state.peakCPUPercent = estimate;
-            state.peakCPUPercentRange = range;
-          }
+          state.peakCPUPercent = state.peakCPUPercent === null ? estimate : Math.max(state.peakCPUPercent, estimate);
+          state.peakCPUPercentRange = state.peakCPUPercentRange === null
+            ? range
+            : {
+              minimum: Math.max(state.peakCPUPercentRange.minimum, range.minimum),
+              maximum: Math.max(state.peakCPUPercentRange.maximum, range.maximum),
+            };
         }
       }
     }
