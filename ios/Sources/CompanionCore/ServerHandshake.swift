@@ -1,5 +1,8 @@
 import Foundation
 
+/// Placement wire compatibility, independent of the app marketing/build version.
+public enum PlacementWireVersion { public static let current = "1" }
+
 /// An owner-gate credential is usable for exactly one enrolled origin.
 public struct HostGateCredential: Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     public let origin: HostOrigin
@@ -35,6 +38,30 @@ public struct VerifiedServer: Equatable, Sendable {
     public let capabilities: Set<String>
     public let controllerId: String
     public let epoch: Int
+    public let capacity: ServerCapacity?
+    public init(hostId: String, version: String, platform: String, capabilities: Set<String>, controllerId: String, epoch: Int, capacity: ServerCapacity? = nil) {
+        self.hostId = hostId; self.version = version; self.platform = platform
+        self.capabilities = capabilities; self.controllerId = controllerId; self.epoch = epoch; self.capacity = capacity
+    }
+}
+
+/// Only the capacity fields displayed by Servers; no runtime limits are inferred.
+public struct ServerCapacity: Decodable, Equatable, Sendable {
+    public let at: Double?
+    public let cores: Double?
+    public let ramTotalBytes: Double?
+    public let diskFreeBytes: Double?
+    enum CodingKeys: String, CodingKey { case at, cores, ramTotalBytes, diskFreeBytes }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        func number(_ key: CodingKeys, positive: Bool = false) throws -> Double? {
+            guard let value = try values.decodeIfPresent(Double.self, forKey: key) else { return nil }
+            guard value.isFinite, positive ? value > 0 : value >= 0 else { throw SavedHostError.invalidResponse }
+            return value
+        }
+        at = try number(.at); cores = try number(.cores, positive: true)
+        ramTotalBytes = try number(.ramTotalBytes); diskFreeBytes = try number(.diskFreeBytes)
+    }
 }
 
 /// A read-only enrollment check; this does not save a host, apply a mode or dispatch work.
@@ -42,12 +69,12 @@ public struct ServerHandshake: Sendable {
     private let session: URLSession
     public init(session: URLSession = .shared) { self.session = session }
 
-    public func test(host: HostRecord, credential: HostGateCredential?, acceptedPlacementVersion: String) async throws -> VerifiedServer {
+    public func test(host: HostRecord, credential: HostGateCredential?, acceptedPlacementVersion: String = PlacementWireVersion.current) async throws -> VerifiedServer {
         try host.validate()
         guard !acceptedPlacementVersion.isEmpty else { throw SavedHostError.incompatibleVersion }
         guard host.isLocal || credential != nil else { throw SavedHostError.credentialUnavailable }
         struct Health: Decodable { let app: String; let ready: Bool; let hostId: String; let version: String }
-        struct Resources: Decodable { let hostId: String; let version: String; let platform: String; let capabilities: Set<String> }
+        struct Resources: Decodable { let hostId: String; let version: String; let platform: String; let capabilities: Set<String>; let sample: ServerCapacity? }
         struct Identity: Decodable { let hostId: String; let version: String; let platform: String; let capabilities: Set<String>; let controllerId: String; let epoch: Int }
 
         let health: Health = try await get("/api/health", host: host, credential: credential)
@@ -60,7 +87,7 @@ public struct ServerHandshake: Sendable {
               HostRecord.validHostId(identity.controllerId), identity.epoch >= 0 else { throw SavedHostError.invalidResponse }
         guard identity.version == acceptedPlacementVersion else { throw SavedHostError.incompatibleVersion }
         return VerifiedServer(hostId: health.hostId, version: health.version, platform: resources.platform,
-                              capabilities: resources.capabilities, controllerId: identity.controllerId, epoch: identity.epoch)
+                              capabilities: resources.capabilities, controllerId: identity.controllerId, epoch: identity.epoch, capacity: resources.sample)
     }
 
     private func get<T: Decodable>(_ path: String, host: HostRecord, credential: HostGateCredential?, placement: Bool = false) async throws -> T {

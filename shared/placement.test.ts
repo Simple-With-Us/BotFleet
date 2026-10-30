@@ -5,6 +5,18 @@ import { expect, it } from "vitest";
 import { DEFAULT_JOBS_SETTINGS, JobRegistry } from "../server/jobs/registry.ts";
 import { loadHostId } from "../server/host-id.ts";
 import { isJobActive, jobExitChip, type JobsFrame } from "./jobs.ts";
+import { PLACEMENT_WIRE_VERSION, type PlacementIdentity } from "./placement.ts";
+
+it("uses the same placement wire version as native enrollment independently of the product version", () => {
+  const shared = JSON.parse(readFileSync(new URL("../ios/Tests/CompanionCoreTests/Fixtures/placement-wire-version.json", import.meta.url), "utf8")) as { placementWireVersion: string };
+  const identity: PlacementIdentity = {
+    hostId: "server:11111111-1111-4111-8111-111111111111", controllerId: "server:11111111-1111-4111-8111-111111111111",
+    epoch: 0, platform: "linux", capabilities: ["shell"], version: PLACEMENT_WIRE_VERSION,
+  };
+  expect(identity.version).toBe(shared.placementWireVersion);
+  expect(identity.version).toBe("1");
+  expect(identity.version).not.toBe("0.1.0");
+});
 
 // Swift JobsTests decodes these exact bytes through StreamFrame as well.
 const fixture = JSON.parse(readFileSync(new URL("../ios/Tests/CompanionCoreTests/Fixtures/jobs-placement.json", import.meta.url), "utf8")) as JobsFrame;
