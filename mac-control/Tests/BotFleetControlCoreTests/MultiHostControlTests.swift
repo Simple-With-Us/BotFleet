@@ -18,20 +18,16 @@ final class MultiHostControlTests: XCTestCase {
         try super.tearDownWithError()
     }
 
-    func testServerHostStoreSeedsDefaultsAndEnforcesPermissions() throws {
+    func testServerHostStoreSeedsOnlyLocalDefaultAndEnforcesPermissions() throws {
         let storeFile = tempDir.appendingPathComponent("hosts.json")
         let store = ServerHostStore(fileURL: storeFile)
 
-        // Initial load seeds Local Mac and Hetzner
+        // Initial load seeds only the app-owned loopback anchor.
         let hosts = store.loadHosts()
-        XCTAssertEqual(hosts.count, 2)
+        XCTAssertEqual(hosts.count, 1)
         XCTAssertEqual(hosts[0].id, "local")
         XCTAssertTrue(hosts[0].isLocal)
         XCTAssertEqual(hosts[0].baseURL.absoluteString, "http://127.0.0.1:8799")
-
-        XCTAssertEqual(hosts[1].id, "hetzner")
-        XCTAssertFalse(hosts[1].isLocal)
-        XCTAssertEqual(hosts[1].baseURL.absoluteString, "https://hetzner.botfleet.app")
 
         // File permissions are 0600
         let attrs = try FileManager.default.attributesOfItem(atPath: storeFile.path)
@@ -44,34 +40,65 @@ final class MultiHostControlTests: XCTestCase {
         let store = ServerHostStore(fileURL: storeFile)
 
         let customHost = ServerHost(
-            id: "work-vps",
-            name: "Work VPS",
-            baseURL: URL(string: "https://vps.company.internal:8799")!,
+            id: "team-server",
+            name: "Team Server",
+            baseURL: URL(string: "https://control.example.test:8799")!,
             authToken: "secret-token-123",
             isLocal: false
         )
 
         store.upsertHost(customHost)
         var hosts = store.loadHosts()
-        XCTAssertEqual(hosts.count, 3)
-        XCTAssertTrue(hosts.contains(where: { $0.id == "work-vps" && $0.authToken == "secret-token-123" }))
+        XCTAssertEqual(hosts.count, 2)
+        XCTAssertTrue(hosts.contains(where: { $0.id == "team-server" && $0.authToken == "secret-token-123" }))
 
         // Refuses to remove the local Mac anchor host
         XCTAssertFalse(store.removeHost(id: "local"))
-        XCTAssertEqual(store.loadHosts().count, 3)
+        XCTAssertEqual(store.loadHosts().count, 2)
 
         // Removes remote host
-        XCTAssertTrue(store.removeHost(id: "work-vps"))
+        XCTAssertTrue(store.removeHost(id: "team-server"))
         hosts = store.loadHosts()
-        XCTAssertEqual(hosts.count, 2)
-        XCTAssertFalse(hosts.contains(where: { $0.id == "work-vps" }))
+        XCTAssertEqual(hosts.count, 1)
+        XCTAssertFalse(hosts.contains(where: { $0.id == "team-server" }))
+    }
+
+    func testStoreMigratesOnlyTheExactSyntheticRemotePreset() throws {
+        let legacyURL = URL(string: "https://hetzner.botfleet.app")!
+        let exactPreset = ServerHost(
+            id: "hetzner",
+            name: "Hetzner Server",
+            baseURL: legacyURL,
+            isLocal: false
+        )
+        let nearMatches = [
+            ServerHost(id: "custom-id", name: "Hetzner Server", baseURL: legacyURL),
+            ServerHost(id: "hetzner", name: "Renamed Server", baseURL: legacyURL),
+            ServerHost(id: "hetzner", name: "Hetzner Server", baseURL: URL(string: "https://custom.example.test")!),
+            ServerHost(id: "hetzner", name: "Hetzner Server", baseURL: legacyURL, authToken: "configured-token"),
+            ServerHost(id: "hetzner", name: "Hetzner Server", baseURL: legacyURL, authToken: ""),
+            ServerHost(id: "hetzner", name: "Hetzner Server", baseURL: legacyURL, isLocal: true),
+        ]
+
+        for (index, nearMatch) in nearMatches.enumerated() {
+            let storeFile = tempDir.appendingPathComponent("hosts-\(index).json")
+            let store = ServerHostStore(fileURL: storeFile)
+            try store.saveHosts([.defaultLocal, exactPreset, nearMatch])
+
+            let hosts = store.loadHosts()
+
+            XCTAssertEqual(hosts.count, 2)
+            XCTAssertTrue(hosts.contains(nearMatch), "Near-match \(index) should be preserved")
+            XCTAssertFalse(hosts.contains(exactPreset), "Exact synthetic preset should be removed")
+            XCTAssertEqual(try JSONDecoder().decode([ServerHost].self, from: Data(contentsOf: storeFile)), hosts)
+        }
     }
 
     func testRemoteHostControlAPIInjectsBearerAuth() async throws {
         let host = ServerHost(
-            id: "hetzner",
-            name: "Hetzner Server",
-            baseURL: URL(string: "https://hetzner.botfleet.app")!,
+            id: "remote-server",
+            name: "Remote Server",
+            baseURL: URL(string: "https://control.example.test")!,
             authToken: "fleet-remote-bearer-key",
             isLocal: false
         )
@@ -105,9 +132,9 @@ final class MultiHostControlTests: XCTestCase {
 
     func testSharedVMLifecycleStateTransitions() async throws {
         let host = ServerHost(
-            id: "hetzner",
-            name: "Hetzner Server",
-            baseURL: URL(string: "https://hetzner.botfleet.app")!,
+            id: "remote-server",
+            name: "Remote Server",
+            baseURL: URL(string: "https://control.example.test")!,
             isLocal: false
         )
 
@@ -157,7 +184,7 @@ final class MultiHostControlTests: XCTestCase {
 
         let store = ServerHostStore(fileURL: storeFile)
         let loaded = store.loadHosts()
-        XCTAssertEqual(loaded.count, 2)
+        XCTAssertEqual(loaded.count, 1)
 
         // Verify a .corrupt backup file was created
         let files = try FileManager.default.contentsOfDirectory(atPath: tempDir.path)
