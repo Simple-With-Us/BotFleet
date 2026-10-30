@@ -241,6 +241,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_LIFECYCLE;
     delete process.env.FAKE_CLAUDE_RESULT_MARK;
     delete process.env.FAKE_CLAUDE_CACHE_WRITE;
+    delete process.env.FAKE_CLAUDE_PROOF;
     delete process.env.FAKE_CLAUDE_SERVED_MODEL;
     delete process.env.FAKE_CLAUDE_GATE;
     delete process.env.FAKE_CLAUDE_COST_DIR;
@@ -292,6 +293,18 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       usage: { input: 12, output: 5, cachedInput: 2 },
     });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("emits a reconciled single-call receipt only for lifecycle-owned exact usage", async () => {
+    process.env.FAKE_CLAUDE_PROOF = "1";
+    process.env.FAKE_CLAUDE_SERVED_MODEL = "claude-test";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-single-proof", text: "hi", model: "claude-test" });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(recorder.events.at(-1)).toMatchObject({
+      type: "turn.completed",
+      billedCall: { id: "msg-single-call", model: "claude-test", input: 10, output: 5, cacheRead: 2, cacheWrite: 0 },
+    });
   });
 
   it("names the cache writes by TTL and the served model, inside an input that still reads whole", async () => {

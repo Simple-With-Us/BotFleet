@@ -182,6 +182,8 @@ export type RuntimeEvent = RuntimeEventBase &
         /** The model the provider says served the turn, when it says (an
          * alias or a fallback can differ from the one requested). */
         servedModel?: string;
+        /** Present only when the Claude driver reconciled exactly one billed call. */
+        billedCall?: import("./claude-billed-call.ts").ClaudeBilledCall;
       }
     | {
         type: "item.started";
