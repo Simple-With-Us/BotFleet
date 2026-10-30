@@ -13,11 +13,11 @@ function read(rel) {
 }
 
 function extractPushPaths(block) {
-  return [...block.matchAll(/^\s+-\s+['"]?([^'"\s]+)['"]?\s*$/gm)].map((m) => m[1]);
+  return [...block.matchAll(/^\s+-\s+['"]?([^'"\s]+)['"]?\s*(?:#.*)?$/gm)].map((m) => m[1]);
 }
 
 function extractGatePrefixes(block) {
-  return [...block.matchAll(/^\s*--path-prefix\s+['"]?([^'"\s]+)['"]?/gm)].map((m) => m[1]);
+  return [...block.matchAll(/^\s*--path-prefix\s+['"]?([^'"\s]+)['"]?\s*(?:\\\s*)?(?:#.*)?$/gm)].map((m) => m[1]);
 }
 
 test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", () => {
@@ -32,19 +32,21 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   // (owner rule 2026-10-29: "unless they built recently they should
   // automatically build").
   // Self-check (Jay review 2026-10-29): both extractors accept single,
-  // double and unquoted values, and the gate extractor skips comments.
+  // double and unquoted values, keep entries with trailing comments, and
+  // the gate extractor skips full-line comments.
   assert.deepEqual(
-    extractPushPaths("    paths:\n      - 'a/**'\n      - \"b/**\"\n      - c/**\n"),
-    ["a/**", "b/**", "c/**"]
+    extractPushPaths("    paths:\n      - 'a/**'\n      - \"b/**\"\n      - c/**\n      - 'd/**' # reason\n"),
+    ["a/**", "b/**", "c/**", "d/**"]
   );
   assert.deepEqual(
     extractGatePrefixes(
       "          # One --path-prefix per on.push.paths entry above\n" +
         "            --path-prefix 'a/**' \\\n" +
         '            --path-prefix "b/**" \\\n' +
-        "            --path-prefix c/** \\\n"
+        "            --path-prefix c/** \\\n" +
+        "            --path-prefix 'd/**' # reason\n"
     ),
-    ["a/**", "b/**", "c/**"]
+    ["a/**", "b/**", "c/**", "d/**"]
   );
   const pushStart = yml.indexOf("\n    paths:");
   const pushEnd = yml.indexOf("\n  workflow_dispatch:");
