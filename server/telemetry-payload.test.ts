@@ -11,6 +11,51 @@
 // These tests are pure: `buildTurnEvents` never touches the network, so the
 // arithmetic is checked without a fetch stub anywhere near it.
 import { describe, expect, it } from "vitest";
+import { billedClaudeCallEventId } from "./claude-billed-call.ts";
+
+describe("exact single-call coverage receipt", () => {
+  const proof = { id: "msg-test", model: "claude-test", input: 10, output: 20, cacheRead: 30, cacheWrite: 40 };
+  const params = {
+    botId: "bot-test", botName: "Test", threadId: "thread-test", instanceId: "claude", driverKind: "claudeAgent",
+    inputTokens: 80, outputTokens: 20, cachedInputTokens: 30, cacheWrite5mTokens: 40,
+    servedModelId: "claude-test", childSessionId: "session-test", billedCall: proof,
+  };
+
+  it("names the unique call receipt only when settled tokens and model reconcile", () => {
+    const [event] = buildTurnEvents(params);
+    expect(event.eventId).toBe(billedClaudeCallEventId("session-test", "msg-test"));
+    expect(event.metadata).toMatchObject({
+      billedCallProofVersion: 1, billedCallId: "msg-test", billedCallModel: "claude-test",
+      billedCallOutput: 20, billedCallCacheRead: 30, billedCallCacheWrite: 40,
+    });
+    expect(event.ai?.tokens).toMatchObject({ input: 10, output: 20, cacheRead: 30, cacheWrite5m: 40, cacheWrite1h: 0 });
+  });
+
+  it.each([
+    { inputTokens: 81 }, { outputTokens: 21 }, { cachedInputTokens: 31 },
+    { cacheWrite5mTokens: 41 }, { childSessionId: undefined },
+    { servedModelId: "different-model" }, { driverKind: "codex" },
+  ])("keeps the ordinary turn identity without proof for inconsistent evidence %j", (change) => {
+    const [event] = buildTurnEvents({ ...params, ...change });
+    expect(event.eventId).not.toMatch(/^bf-call-v1:/);
+    expect(event.metadata).not.toHaveProperty("billedCallProofVersion");
+  });
+
+  it("forwards the driver's proof through shared one-to-one and room usage details", () => {
+    expect(turnUsageDetail({ billedCall: proof }, undefined, undefined).billedCall).toBe(proof);
+  });
+
+  it("keeps zero-token unreported turns outside billed-call coverage", () => {
+    const [event] = buildTurnEvents({ ...params,
+      inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWrite5mTokens: 0,
+      billedCall: { ...proof, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    expect(event.eventId).not.toMatch(/^bf-call-v1:/);
+    expect(event.metadata).not.toHaveProperty("billedCallProofVersion");
+    expect(event.metadata?.usageReported).toBe(false);
+    expect(event.ai).toBeUndefined();
+  });
+});
 
 import {
   buildAuxEvent,
