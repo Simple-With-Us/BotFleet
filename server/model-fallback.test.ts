@@ -1285,6 +1285,61 @@ describe("QuotaCooldownRegistry", () => {
     expect(JSON.parse(writes[0]).cooldowns).toHaveLength(4);
   });
 
+  it("keeps explicitly timed transient-looking cooldowns across persisted migration", () => {
+    const file = `${tmpdir()}/quota-cooldowns-explicit-reset-${Date.now()}.json`;
+    const recordedAt = Date.now();
+    const explicitReset = recordedAt + 60_000;
+    const defaultReset = recordedAt + DEFAULT_QUOTA_COOLDOWN_TTL_MS;
+    writeFileSync(file, JSON.stringify({
+      version: 1,
+      cooldowns: [
+        {
+          botId: "minimax-bot",
+          instanceId: "minimax",
+          model: "MiniMax-M3",
+          resetsAt: explicitReset,
+          error: "Rate limit reached for MiniMax-M3",
+          recordedAt,
+        },
+        {
+          botId: "provider-error-code-bot",
+          instanceId: "grok",
+          model: "grok-4",
+          resetsAt: explicitReset,
+          error: "API request failed: 429 rate limit reached",
+          recordedAt,
+          source: "provider-error-code",
+        },
+        {
+          botId: "*",
+          instanceId: "minimax",
+          model: "*",
+          resetsAt: explicitReset,
+          error: "429 rate limit reached",
+          recordedAt,
+          source: "usage-monitor",
+        },
+        {
+          botId: "legacy-bot",
+          instanceId: "grok",
+          model: "grok-3",
+          resetsAt: defaultReset,
+          error: "429 rate limit reached",
+          recordedAt,
+        },
+      ],
+    }));
+
+    const registry = new QuotaCooldownRegistry();
+    registry.enablePersist(file, (_path, json) => writeFileSync(file, json));
+
+    expect(registry.get("minimax-bot", "minimax", "MiniMax-M3")?.resetsAt).toBe(explicitReset);
+    expect(registry.get("provider-error-code-bot", "grok", "grok-4")?.resetsAt).toBe(explicitReset);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M2.7")?.source).toBe("usage-monitor");
+    expect(registry.get("legacy-bot", "grok", "grok-3")).toBeUndefined();
+    expect(registry.list()).toHaveLength(3);
+  });
+
   it("clearWhere removes a deleted instance's cooldowns even when they never expire, leaving other instances untouched", () => {
     // server/index.ts's DELETE /api/instances/:id relies on exactly this: a
     // recreated custom engine reuses the same slug/instance id, so a stale

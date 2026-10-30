@@ -1086,6 +1086,11 @@ export class QuotaCooldownRegistry {
     return (cd.source === undefined || cd.source === "terminal-chip") && isTransientCapacityText(cd.error);
   }
 
+  private hasSyntheticDefaultReset(cd: BotQuotaCooldown): boolean {
+    if (cd.resetsAt == null || !Number.isFinite(cd.resetsAt) || cd.resetsAt <= 0) return true;
+    return cd.resetsAt === cd.recordedAt + DEFAULT_QUOTA_COOLDOWN_TTL_MS;
+  }
+
   private load(): void {
     if (!this.persistPath) return;
     try {
@@ -1108,7 +1113,7 @@ export class QuotaCooldownRegistry {
           removed = true;
           continue;
         }
-        if (this.isLegacyTransientRoute(cd)) {
+        if (this.isLegacyTransientRoute(cd) && this.hasSyntheticDefaultReset(cd)) {
           removed = true;
           continue;
         }
