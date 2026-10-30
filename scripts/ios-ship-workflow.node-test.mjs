@@ -12,13 +12,62 @@ function read(rel) {
   return readFileSync(join(ROOT, rel), "utf8");
 }
 
+function extractPushPaths(block) {
+  return [...block.matchAll(/^\s+-\s+['"]?([^'"\s]+)['"]?\s*(?:#.*)?$/gm)].map((m) => m[1]);
+}
+
+function extractGatePrefixes(block) {
+  return [...block.matchAll(/^\s*--path-prefix\s+['"]?([^'"\s]+)['"]?\s*(?:\\\s*)?(?:#.*)?$/gm)].map((m) => m[1]);
+}
+
 test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", () => {
   const yml = read(".github/workflows/ios-ship.yml");
   const wrapper = read("scripts/ios-ship-testflight.sh");
   const prepare = read("scripts/ios-appstore-gm-prepare.sh");
 
   assert.match(yml, /ios\/\*\*/);
-  assert.match(yml, /--path-prefix 'ios\/'/);
+  // The scheduled backstop must watch the same path set as on.push.paths:
+  // a merge that only touched ship tooling ships no push-filtered run when
+  // its push event is missed, so the gate is the only thing that ships it
+  // (owner rule 2026-10-29: "unless they built recently they should
+  // automatically build").
+  // Self-check (Jay review 2026-10-29): both extractors accept single,
+  // double and unquoted values, keep entries with trailing comments, and
+  // the gate extractor skips full-line comments.
+  assert.deepEqual(
+    extractPushPaths("    paths:\n      - 'a/**'\n      - \"b/**\"\n      - c/**\n      - 'd/**' # reason\n"),
+    ["a/**", "b/**", "c/**", "d/**"]
+  );
+  assert.deepEqual(
+    extractGatePrefixes(
+      "          # One --path-prefix per on.push.paths entry above\n" +
+        "            --path-prefix 'a/**' \\\n" +
+        '            --path-prefix "b/**" \\\n' +
+        "            --path-prefix c/** \\\n" +
+        "            --path-prefix 'd/**' # reason\n"
+    ),
+    ["a/**", "b/**", "c/**", "d/**"]
+  );
+  const pushStart = yml.indexOf("\n    paths:");
+  const pushEnd = yml.indexOf("\n  workflow_dispatch:");
+  const ignoreAt = yml.indexOf("\n    paths-ignore:", pushStart);
+  const pushBlock = yml.slice(pushStart, ignoreAt !== -1 && ignoreAt < pushEnd ? ignoreAt : pushEnd);
+  const pushPaths = extractPushPaths(pushBlock);
+  assert.ok(pushPaths.length >= 9, `expected the full push path set, got ${pushPaths.length}`);
+  const gateStep = yml.slice(
+    yml.indexOf("name: Scheduled ship gate"),
+    yml.indexOf("- name: Assert stable Xcode")
+  );
+  const gatePrefixes = extractGatePrefixes(gateStep);
+  for (const p of pushPaths) {
+    assert.ok(gatePrefixes.includes(p), `gate must watch push path ${p}`);
+  }
+  assert.equal(
+    gatePrefixes.length,
+    pushPaths.length,
+    "gate watches exactly the push path set (no fewer, no extras)"
+  );
+  assert.match(read("scripts/ios-fleet/scheduled-ship-gate.sh"), /repeatable/);
   assert.match(yml, /scripts\/ios-fleet\/\*\*/);
   assert.match(yml, /runs-on:\s*xcode-27\s*$/m);
   assert.doesNotMatch(yml, /runs-on:\s*macos-latest/);

@@ -160,9 +160,20 @@ jobs:
       - name: Scheduled ship gate (skip unless iOS code changed)
         id: gate
         run: |
+          # One --path-prefix per on.push.paths entry above: the cron
+          # backstop ships exactly what a push would have shipped, so a
+          # merge the push trigger missed still ships (owner 2026-10-29).
           bash "$GITHUB_WORKSPACE/scripts/ios-fleet/scheduled-ship-gate.sh" \
             --event "${{ github.event_name }}" \
-            --path-prefix 'ios/' \
+            --path-prefix 'ios/**' \
+            --path-prefix '.github/workflows/ios-ship.yml' \
+            --path-prefix '.github/workflows/sentry-testflight.yml' \
+            --path-prefix 'scripts/sentry-report-testflight.mjs' \
+            --path-prefix 'scripts/sentry-testflight-receipt.mjs' \
+            --path-prefix 'scripts/ios-fleet/**' \
+            --path-prefix 'scripts/ios-ship-testflight.sh' \
+            --path-prefix 'scripts/ios-appstore-gm-prepare.sh' \
+            --path-prefix 'scripts/ios-install-appstore-profiles.sh' \
             --repo-root "$GITHUB_WORKSPACE" \
             botfleet
 
