@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { aggregateSamples, availableMemoryBytes, linuxPidIdentity, MAX_SCOPES, parseLinuxMemAvailableBytes, platformMeasurementLimits, repositoryRootFor, run, validateOptions } from "./host-inventory.mjs";
+import { aggregateSamples, availableMemoryBytes, cgroupSample, linuxPidIdentity, MAX_SCOPES, parseLinuxMemAvailableBytes, parseMacCpuTimeUsec, platformMeasurementLimits, readSourceCommit, repositoryRootFor, run, runWithCliSignalHandlers, validateOptions } from "./host-inventory.mjs";
 
 test("prints help when invoked through a symlink", () => {
   const directory = mkdtempSync(join(tmpdir(), "host-inventory-symlink-"));
@@ -30,6 +30,7 @@ test("aggregates initial baseline, peak memory and sampled CPU without inventing
   assert.deepEqual(result.window, { startEpochMs: 1000, endEpochMs: 3000, durationMs: 2000, durationClock: "monotonic", requestedIntervalMs: 1000, observedIntervalMinMs: 1000, observedIntervalMaxMs: 1000 });
   assert.equal(result.groups["botfleet.service"].initial.memoryBytes, 10);
   assert.equal(result.groups["botfleet.service"].peak.memoryBytes, 15);
+  assert.equal(result.groups["botfleet.service"].memoryKind, "unknown");
   assert.equal(result.groups["botfleet.service"].peak.cpuPercentOfOneCore, 40);
   assert.deepEqual(result.groups["botfleet.service"].observedDelta, { ioReadBytes: 70, ioWriteBytes: 20 });
   assert.deepEqual(result.groups["botfleet.service"].coverage, { observedSamples: 3, expectedSamples: 3, complete: true });
@@ -37,9 +38,9 @@ test("aggregates initial baseline, peak memory and sampled CPU without inventing
 
 test("marks peaks and counter deltas unknown when a selected scope is absent mid-window", () => {
   const result = aggregateSamples([
-    { atMs: 10, groups: { "unit.service": { memoryBytes: 5, cpuPercent: 2, ioReadBytes: 100, ioWriteBytes: 50 } } },
+    { atMs: 10, groups: { "unit.service": { memoryBytes: 5, cpuPercentOSAverage: 2, ioReadBytes: 100, ioWriteBytes: 50 } } },
     { atMs: 20, groups: {} },
-    { atMs: 30, groups: { "unit.service": { memoryBytes: 90, cpuPercent: 80, ioReadBytes: 1000, ioWriteBytes: 500 } } },
+    { atMs: 30, groups: { "unit.service": { memoryBytes: 90, cpuPercentOSAverage: 80, ioReadBytes: 1000, ioWriteBytes: 500 } } },
   ], 10);
   const scope = result.groups["unit.service"];
   assert.equal(scope.initial.memoryBytes, 5);
@@ -52,7 +53,7 @@ test("marks peaks and counter deltas unknown when a selected scope is absent mid
 test("aggregates a large synthetic sample window without argument spreading", () => {
   const samples = Array.from({ length: 150_001 }, (_, index) => ({
     atMs: index,
-    groups: { "unit.service": { memoryBytes: index % 17, cpuPercent: index % 13, ioReadBytes: index, ioWriteBytes: index * 2 } },
+    groups: { "unit.service": { memoryBytes: index % 17, cpuUsec: index * 120, ioReadBytes: index, ioWriteBytes: index * 2 } },
   }));
   const result = aggregateSamples(samples, 1);
   assert.equal(result.window.observedIntervalMinMs, 1);
@@ -68,10 +69,10 @@ test("reports unknown for unavailable or reset counters and preserves limitation
     { atMs: 1, groups: { "pid:17": { memoryBytes: null, cpuUsec: 900, ioReadBytes: 100, limitations: ["counter unavailable"] } } },
     { atMs: 2, groups: { "pid:17": { memoryBytes: null, cpuUsec: 200, ioReadBytes: 5, limitations: ["counter unavailable"] } } },
   ], 1000);
-  assert.deepEqual(result.groups["pid:17"].initial, { memoryBytes: null, cpuPercent: null, cpuUsec: 900, ioReadBytes: 100, ioWriteBytes: null });
+  assert.deepEqual(result.groups["pid:17"].initial, { memoryBytes: null, memoryKind: "unknown", cpuPercentOSAverage: null, cpuUsec: 900, ioReadBytes: 100, ioWriteBytes: null });
   assert.deepEqual(result.groups["pid:17"].peak, { memoryBytes: null, cpuPercentOfOneCore: null });
   assert.deepEqual(result.groups["pid:17"].observedDelta, { ioReadBytes: null, ioWriteBytes: null });
-  assert.deepEqual(result.groups["pid:17"].limitations, ["counter unavailable"]);
+  assert.deepEqual(result.groups["pid:17"].limitations, ["counter unavailable", "CPU counter was unavailable or decreased; full-window interval CPU peak is unknown"]);
 });
 
 test("marks a counter delta unknown after any mid-window reset", () => {
@@ -83,16 +84,46 @@ test("marks a counter delta unknown after any mid-window reset", () => {
   assert.deepEqual(result.groups["unit.service"].observedDelta, { ioReadBytes: null, ioWriteBytes: null });
 });
 
+test("marks the full-window CPU peak unknown after a mid-window counter reset and recovery", () => {
+  const result = aggregateSamples([
+    { atMs: 0, groups: { "unit.service": { cpuUsec: 1_000, ioReadBytes: 10 } } },
+    { atMs: 100, groups: { "unit.service": { cpuUsec: 101_000, ioReadBytes: 20 } } },
+    { atMs: 200, groups: { "unit.service": { cpuUsec: 10, ioReadBytes: 30 } } },
+    { atMs: 300, groups: { "unit.service": { cpuUsec: 500_010, ioReadBytes: 40 } } },
+  ], 100);
+  assert.equal(result.groups["unit.service"].peak.cpuPercentOfOneCore, null);
+  assert.match(result.groups["unit.service"].limitations.join(" "), /CPU counter was unavailable or decreased/);
+});
+
+test("requires complete host-memory samples before reporting a sampled minimum", () => {
+  const result = aggregateSamples([
+    { atMs: 1, availableMemoryBytes: 500, groups: {} },
+    { atMs: 2, availableMemoryBytes: null, groups: {} },
+    { atMs: 3, availableMemoryBytes: 300, groups: {} },
+  ], 1);
+  assert.deepEqual(result.availableMemory, { minimumBytes: null, observedSamples: 2, expectedSamples: 3, complete: false });
+});
+
+test("does not combine cgroup counters or peaks across a recreated unit directory", () => {
+  const result = aggregateSamples([
+    { atMs: 10, groups: { "unit.service": { identityRequired: true, identity: "dev:1:ino:2", memoryBytes: 100, memoryKind: "cgroupCharged", cpuUsec: 10_000, ioReadBytes: 100 } } },
+    { atMs: 20, groups: { "unit.service": { identityRequired: true, identity: "dev:1:ino:3", memoryBytes: 900, memoryKind: "cgroupCharged", cpuUsec: 500_000, ioReadBytes: 900 } } },
+  ], 10);
+  assert.equal(result.groups["unit.service"].peak.memoryBytes, 100);
+  assert.equal(result.groups["unit.service"].peak.cpuPercentOfOneCore, null);
+  assert.deepEqual(result.groups["unit.service"].observedDelta, { ioReadBytes: null, ioWriteBytes: null });
+});
+
 test("does not combine samples or deltas across a reused PID", () => {
   const result = aggregateSamples([
-    { atMs: 10, groups: { "pid:17": { identityRequired: true, identity: "start:old", memoryBytes: 20, cpuPercent: 4, ioReadBytes: 100 } } },
-    { atMs: 20, groups: { "pid:17": { identityRequired: true, identity: "start:new", memoryBytes: 90, cpuPercent: 80, ioReadBytes: 1000 } } },
+    { atMs: 10, groups: { "pid:17": { identityRequired: true, identity: "start:old", memoryBytes: 20, cpuPercentOSAverage: 4, ioReadBytes: 100 } } },
+    { atMs: 20, groups: { "pid:17": { identityRequired: true, identity: "start:new", memoryBytes: 90, cpuPercentOSAverage: 80, ioReadBytes: 1000 } } },
   ], 10);
   assert.equal(result.groups["pid:17"].peak.memoryBytes, 20);
-  assert.equal(result.groups["pid:17"].peak.cpuPercentOfOneCore, 4);
+  assert.equal(result.groups["pid:17"].peak.cpuPercentOfOneCore, null);
   assert.deepEqual(result.groups["pid:17"].observedDelta, { ioReadBytes: null, ioWriteBytes: null });
   assert.match(result.groups["pid:17"].limitations.join(" "), /identity changed/);
-  assert.equal(result.groups["pid:17"].initial.cpuPercent, 4);
+  assert.equal(result.groups["pid:17"].initial.cpuPercentOSAverage, 4);
   const unavailableIdentity = aggregateSamples([
     { atMs: 30, groups: { "pid:18": { identityRequired: true, memoryBytes: 3 } } },
     { atMs: 40, groups: { "pid:18": { identityRequired: true, identity: "start:later", memoryBytes: 9 } } },
@@ -113,6 +144,67 @@ test("parses Linux MemAvailable and leaves unsupported or absent platform readin
   assert.equal(availableMemoryBytes("linux"), null);
 });
 
+test("parses cumulative macOS ps CPU time formats and rejects malformed values", () => {
+  assert.equal(parseMacCpuTimeUsec("01:02"), 62_000_000);
+  assert.equal(parseMacCpuTimeUsec("02:01:02.5"), 7_262_500_000);
+  assert.equal(parseMacCpuTimeUsec("3-02:01:02.000007"), ((3 * 24 + 2) * 3600 + 62) * 1_000_000 + 7);
+  assert.equal(parseMacCpuTimeUsec("00:61"), null);
+  assert.equal(parseMacCpuTimeUsec("unknown"), null);
+});
+
+test("cgroup samples require a stable directory identity and label memory.current as charged memory", async () => {
+  const info = { dev: 7, ino: 19, isDirectory: () => true };
+  const contents = {
+    "memory.current": "4096\n",
+    "cpu.stat": "usage_usec 250000\n",
+    "io.stat": "8:0 rbytes=100 wbytes=20\n",
+  };
+  const stable = await cgroupSample("service", "/fixture/cgroup", 10, {
+    stat: async () => info,
+    readFile: async (path) => contents[path.split("/").at(-1)],
+  });
+  assert.equal(stable.identity, "dev:7:ino:19");
+  assert.equal(stable.memoryBytes, 4096);
+  assert.equal(stable.memoryKind, "cgroupCharged");
+  assert.equal(stable.identityRequired, true);
+  assert.match(stable.limitations.join(" "), /descendant cgroups/);
+
+  let statCalls = 0;
+  const replaced = await cgroupSample("service", "/fixture/cgroup", 20, {
+    stat: async () => ({ ...info, ino: ++statCalls === 1 ? 19 : 20 }),
+    readFile: async (path) => contents[path.split("/").at(-1)],
+  });
+  assert.equal(replaced.identity, null);
+  assert.equal(replaced.memoryBytes, null);
+  assert.equal(replaced.cpuUsec, null);
+  assert.match(replaced.limitations.join(" "), /identity changed/);
+  const unreadable = await cgroupSample("service", "/fixture/cgroup", 30, {
+    stat: async () => { throw new Error("unreadable fixture directory"); },
+    readFile: async () => "4096\n",
+  });
+  assert.equal(unreadable.identity, null);
+  assert.equal(unreadable.memoryKind, "cgroupCharged");
+  assert.equal(unreadable.memoryBytes, null);
+});
+
+test("source revision metadata distinguishes clean, dirty and unreadable checkout state", async () => {
+  const calls = [];
+  const exec = async (_command, args) => {
+    calls.push(args.at(-1));
+    return { stdout: args.includes("rev-parse") ? `${"a".repeat(40)}\n` : " M scripts/file.mjs\n" };
+  };
+  const dirty = await readSourceCommit(new URL("file:///fixture/repo/scripts/host-inventory.mjs"), exec);
+  assert.deepEqual(dirty, { revision: "a".repeat(40), workingTreeDirty: true });
+  assert.deepEqual(calls, ["HEAD", "--untracked-files=all"]);
+  const unreadable = await readSourceCommit(new URL("file:///fixture/repo/scripts/host-inventory.mjs"), async (_command, args) => {
+    if (args.includes("rev-parse")) return { stdout: `${"b".repeat(40)}\n` };
+    throw new Error("status unavailable");
+  });
+  assert.deepEqual(unreadable, { revision: "b".repeat(40), workingTreeDirty: null });
+  const clean = await readSourceCommit(new URL("file:///fixture/repo/scripts/host-inventory.mjs"), async (_command, args) => ({ stdout: args.includes("rev-parse") ? `${"c".repeat(40)}\n` : "" }));
+  assert.deepEqual(clean, { revision: "c".repeat(40), workingTreeDirty: false });
+});
+
 test("extracts Linux PID start identity from stat without depending on the comm field", () => {
   const fields = ["S", ...Array.from({ length: 18 }, (_, index) => String(index + 1)), "98765"];
   assert.equal(linuxPidIdentity(`42 (process name with ) paren) ${fields.join(" ")}`), "start:98765");
@@ -129,7 +221,7 @@ test("requires explicit bounded selections and report paths, and rejects unsuppo
   assert.throws(() => validateOptions({ ...common, pids: [42], orbCpu: 2 }, "linux"), /apply only to a Mac/);
   assert.doesNotThrow(() => validateOptions({ ...common, pids: [42] }, "darwin"));
   assert.match(platformMeasurementLimits("darwin").join(" "), /excludes child processes/);
-  assert.match(platformMeasurementLimits("linux").join(" "), /external container daemons/);
+  assert.match(platformMeasurementLimits("linux").join(" "), /Docker scopes/);
   assert.match(platformMeasurementLimits("freebsd").join(" "), /unsupported/);
 });
 
@@ -200,6 +292,7 @@ function injectedRunDependencies(overrides = {}) {
       disks: { root: { freeBytes: 100, freeInodes: 10 }, data: { freeBytes: 100, freeInodes: 10 } },
       swap: null, orbStackReservation: null,
     }),
+    readAvailableMemory: async () => 512,
     readPidConstants: async () => ({}),
     sampleGroup: async (id) => ({ id, memoryBytes: 10, cpuPercent: 1, ioReadBytes: 100, ioWriteBytes: 50 }),
     readSourceCommit: async () => null,
@@ -305,23 +398,59 @@ test("wall-clock backsteps do not invalidate monotonic sampling duration", async
   let monotonicMs = 0;
   const wallSamples = [1_800_000_000_000, 1_799_999_999_000, 1_799_999_999_000];
   let sampleCount = 0;
+  const available = [500, 300, 700];
   try {
     const report = await run(runOptions(outputDir), injectedRunDependencies({
       wallNow: () => wallSamples.shift() ?? 1_799_999_999_000,
       monotonicNow: () => monotonicMs,
       sleep: async (milliseconds) => { monotonicMs += milliseconds; },
+      readAvailableMemory: async () => available.shift() ?? null,
       sampleGroup: async (id) => {
         sampleCount++;
-        return { id, memoryBytes: 10 + sampleCount, cpuPercent: 2, ioReadBytes: sampleCount * 100, ioWriteBytes: sampleCount * 10 };
+        return { id, memoryBytes: 10 + sampleCount, memoryKind: "resident", cpuPercentOSAverage: 2, cpuUsec: sampleCount * 100_000, ioReadBytes: sampleCount * 100, ioWriteBytes: sampleCount * 10 };
       },
     }));
-    assert.equal(sampleCount, 2);
+    assert.equal(sampleCount, 3);
     assert.equal(report.window.startEpochMs, 1_800_000_000_000);
     assert.equal(report.window.endEpochMs, 1_799_999_999_000);
-    assert.equal(report.window.durationMs, 1_000);
+    assert.equal(report.window.durationMs, 2_000);
     assert.equal(report.window.durationClock, "monotonic");
     assert.equal(report.groups["pid:123"].coverage.complete, true);
+    assert.equal(report.capacity.sampledMinimumAvailableMemoryBytes, 300);
+    assert.deepEqual(report.capacity.availableMemoryCoverage, { observedSamples: 3, expectedSamples: 3, complete: true });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("run writes an interrupted partial report without installing process signal handlers", async () => {
+  const root = mkdtempSync(join(tmpdir(), "host-inventory-interrupted-"));
+  const outputDir = join(root, "reports");
+  mkdirSync(outputDir);
+  const controller = new AbortController();
+  const listenersBefore = { int: process.listenerCount("SIGINT"), term: process.listenerCount("SIGTERM") };
+  try {
+    const report = await run(runOptions(outputDir), injectedRunDependencies({
+      signal: controller.signal,
+      sleep: async () => { controller.abort("SIGTERM"); return false; },
+      readAvailableMemory: async () => 400,
+    }));
+    assert.equal(report.interrupted, true);
+    assert.equal(report.interruptedBy, "SIGTERM");
+    assert.equal(report.window.durationMs, 0);
+    assert.match(readFileSync(join(outputDir, "host-inventory.md"), "utf8"), /interrupted by SIGTERM; partial window/);
+    assert.deepEqual({ int: process.listenerCount("SIGINT"), term: process.listenerCount("SIGTERM") }, listenersBefore);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI signal wrapper aborts its collector and restores both process listeners", async () => {
+  const listenersBefore = { int: process.listenerCount("SIGINT"), term: process.listenerCount("SIGTERM") };
+  const outcome = await runWithCliSignalHandlers({}, async (_options, { signal }) => {
+    process.emit("SIGTERM");
+    return { aborted: signal.aborted, reason: signal.reason };
+  });
+  assert.deepEqual(outcome, { aborted: true, reason: "SIGTERM" });
+  assert.deepEqual({ int: process.listenerCount("SIGINT"), term: process.listenerCount("SIGTERM") }, listenersBefore);
 });

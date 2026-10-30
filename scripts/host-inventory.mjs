@@ -3,7 +3,7 @@ import { cpus, freemem, totalmem } from "node:os";
 import { execFile as callbackExecFile } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, readFile, statfs, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, stat, statfs, unlink } from "node:fs/promises";
 import { promisify } from "node:util";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,8 @@ class SampleAccumulator {
     this.endEpochMs = null;
     this.minGapMs = null;
     this.maxGapMs = null;
+    this.availableMemoryMinimum = null;
+    this.availableMemoryCoverage = 0;
     this.groups = new Map();
   }
 
@@ -47,6 +49,12 @@ class SampleAccumulator {
     }
     this.endAtMs = sample.atMs;
     this.endEpochMs = Number.isFinite(sample.epochMs) ? sample.epochMs : sample.atMs;
+    if (Number.isFinite(sample.availableMemoryBytes) && sample.availableMemoryBytes >= 0) {
+      this.availableMemoryCoverage++;
+      this.availableMemoryMinimum = this.availableMemoryMinimum === null
+        ? sample.availableMemoryBytes
+        : Math.min(this.availableMemoryMinimum, sample.availableMemoryBytes);
+    }
     const incoming = sample.groups ?? {};
 
     for (const [id, state] of this.groups) {
@@ -66,7 +74,7 @@ class SampleAccumulator {
 
   newGroup(missingBeforeFirstObservation) {
     return {
-      initial: { memoryBytes: null, cpuPercent: null, cpuUsec: null, ioReadBytes: null, ioWriteBytes: null },
+      initial: { memoryBytes: null, memoryKind: "unknown", cpuPercentOSAverage: null, cpuUsec: null, ioReadBytes: null, ioWriteBytes: null },
       observedSamples: 0,
       missingSamples: missingBeforeFirstObservation,
       missing: missingBeforeFirstObservation > 0,
@@ -76,6 +84,7 @@ class SampleAccumulator {
       identityChanged: missingBeforeFirstObservation > 0,
       peakMemoryBytes: null,
       peakCPUPercent: null,
+      cpuDeltaValid: true,
       previousCPU: null,
       firstReadBytes: null,
       lastReadBytes: null,
@@ -102,7 +111,8 @@ class SampleAccumulator {
     if (state.observedSamples === 1) {
       state.initial = {
         memoryBytes: finiteNonnegative(row.memoryBytes),
-        cpuPercent: finiteNonnegative(row.cpuPercent),
+        memoryKind: row.memoryKind ?? "unknown",
+        cpuPercentOSAverage: finiteNonnegative(row.cpuPercentOSAverage),
         cpuUsec: finiteNonnegative(row.cpuUsec),
         ioReadBytes: finiteNonnegative(row.ioReadBytes),
         ioWriteBytes: finiteNonnegative(row.ioWriteBytes),
@@ -122,9 +132,12 @@ class SampleAccumulator {
       (state.identityKnownAtStart && row.identity != null && row.identity === state.initialIdentity);
     if (sameInitialIdentity) {
       state.peakMemoryBytes = maxNonnegative(state.peakMemoryBytes, row.memoryBytes);
-      if (Number.isFinite(row.cpuPercent) && row.cpuPercent >= 0) {
-        state.peakCPUPercent = maxNonnegative(state.peakCPUPercent, row.cpuPercent);
-      } else if (Number.isFinite(row.cpuUsec) && row.cpuUsec >= 0 && state.previousCPU !== null &&
+      const cpuCounterValid = Number.isFinite(row.cpuUsec) && row.cpuUsec >= 0;
+      if (!cpuCounterValid || (state.previousCPU !== null && row.cpuUsec < state.previousCPU.cpuUsec)) {
+        state.cpuDeltaValid = false;
+        state.limitations.add("CPU counter was unavailable or decreased; full-window interval CPU peak is unknown");
+      }
+      if (state.cpuDeltaValid && cpuCounterValid && state.previousCPU !== null &&
           (!state.identityRequired || state.previousCPU.identity === row.identity)) {
         const elapsed = atMs - state.previousCPU.atMs;
         if (elapsed > 0 && row.cpuUsec >= state.previousCPU.cpuUsec) {
@@ -175,8 +188,9 @@ class SampleAccumulator {
         initial: state.initial,
         peak: {
           memoryBytes: state.missing ? null : state.peakMemoryBytes,
-          cpuPercentOfOneCore: state.missing ? null : state.peakCPUPercent,
+          cpuPercentOfOneCore: state.missing || !state.cpuDeltaValid ? null : state.peakCPUPercent,
         },
+        memoryKind: state.initial.memoryKind,
         observedDelta: {
           ioReadBytes: !state.missing && state.readDeltaValid && state.firstReadBytes !== null && state.lastReadBytes !== null
             ? state.lastReadBytes - state.firstReadBytes : null,
@@ -197,6 +211,12 @@ class SampleAccumulator {
         requestedIntervalMs: this.intervalMs,
         observedIntervalMinMs: this.minGapMs,
         observedIntervalMaxMs: this.maxGapMs,
+      },
+      availableMemory: {
+        minimumBytes: this.availableMemoryCoverage === this.sampleCount ? this.availableMemoryMinimum : null,
+        observedSamples: this.availableMemoryCoverage,
+        expectedSamples: this.sampleCount,
+        complete: this.availableMemoryCoverage === this.sampleCount,
       },
       groups: groupRows,
     };
@@ -258,8 +278,8 @@ export function validateOptions(options, platform = process.platform) {
 }
 
 export function platformMeasurementLimits(platform) {
-  if (platform === "darwin") return ["macOS process sampling excludes child processes", "macOS ps CPU percentage is sampled and per-process I/O is not read", "Mac PID start time is used as identity; if unavailable, cross-sample peaks and deltas are not combined", "OrbStack values are caller-supplied and are not verified by this script"];
-  if (platform === "linux") return ["Linux PID sampling excludes child processes", "PID RSS and CPU use system page-size and clock-tick values when getconf is available", "PID I/O counters may be unavailable", "Cgroup metrics cover only the selected service cgroup and may omit delegated descendants or external container daemons"];
+  if (platform === "darwin") return ["macOS process sampling excludes child processes", "macOS ps CPU percentage is an OS-reported lifetime average; interval CPU is derived from cumulative process CPU time and monotonic elapsed time", "Mac PID start time is used as identity; if unavailable, cross-sample peaks and deltas are not combined", "RSS does not account for shared or compressed memory as a unique process-owned amount", "OrbStack values are caller-supplied and are not verified by this script"];
+  if (platform === "linux") return ["Linux PID sampling excludes child processes", "PID RSS and CPU use system page-size and clock-tick values when getconf is available", "PID I/O counters may be unavailable", "Cgroup memory.current is charged memory including cache, kernel accounting and descendant cgroups, not process RSS", "Cgroup memory.peak is not used because its kernel-lifetime peak is not bounded to this observation window", "Cgroup metrics cover only selected systemd service units; Docker scopes, other units and external daemons are not selected", "Linux PSI pressure is not sampled"];
   return ["Process and service resource counters are unsupported on this platform"];
 }
 
@@ -288,9 +308,17 @@ async function linuxUnitCgroup(unit) {
   return `/sys/fs/cgroup${group}`;
 }
 
-async function cgroupSample(id, directory, atMs) {
-  const get = async (name) => { try { return await readFile(`${directory}/${name}`, "utf8"); } catch { return null; } };
-  const memory = Number.parseInt((await get("memory.current")) ?? "", 10);
+export async function cgroupSample(id, directory, atMs, filesystem = { stat, readFile }) {
+  let before;
+  try {
+    before = await filesystem.stat(directory);
+    if (!before.isDirectory()) throw new Error("cgroup path is not a directory");
+  } catch {
+    return { id, atMs, identityRequired: true, identity: null, memoryBytes: null, memoryKind: "cgroupCharged", cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["Cgroup directory identity was unavailable; sample metrics are unknown"] };
+  }
+  const get = async (name) => { try { return await filesystem.readFile(`${directory}/${name}`, "utf8"); } catch { return null; } };
+  const memoryMatch = /^(\d+)\s*$/.exec((await get("memory.current")) ?? "");
+  const memory = memoryMatch ? Number(memoryMatch[1]) : null;
   const cpu = /^usage_usec\s+(\d+)$/m.exec((await get("cpu.stat")) ?? "");
   const io = await get("io.stat");
   let readBytes = 0, writeBytes = 0, foundIo = false;
@@ -298,7 +326,27 @@ async function cgroupSample(id, directory, atMs) {
     const match = /^(rbytes|wbytes)=(\d+)$/.exec(field);
     if (match) { foundIo = true; if (match[1] === "rbytes") readBytes += Number(match[2]); else writeBytes += Number(match[2]); }
   }
-  return { id, atMs, memoryBytes: Number.isFinite(memory) ? memory : null, cpuUsec: cpu ? Number(cpu[1]) : null, ioReadBytes: foundIo ? readBytes : null, ioWriteBytes: foundIo ? writeBytes : null, limitations: ["Cgroup metrics include processes in this service cgroup only; delegated descendants and external container daemons may be elsewhere"] };
+  let after;
+  try {
+    after = await filesystem.stat(directory);
+    if (!after.isDirectory() || before.dev !== after.dev || before.ino !== after.ino) throw new Error("cgroup directory identity changed");
+  } catch {
+    return { id, atMs, identityRequired: true, identity: null, memoryBytes: null, memoryKind: "cgroupCharged", cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["Cgroup directory identity changed or became unreadable during sampling; sample metrics are unknown"] };
+  }
+  const identity = `dev:${before.dev}:ino:${before.ino}`;
+  return { id, atMs, identity, identityRequired: true, memoryBytes: Number.isFinite(memory) ? memory : null, memoryKind: "cgroupCharged", cpuUsec: cpu ? Number(cpu[1]) : null, ioReadBytes: foundIo ? readBytes : null, ioWriteBytes: foundIo ? writeBytes : null, limitations: ["Cgroup memory.current is charged memory, including cache, kernel accounting and descendant cgroups; it is not process RSS", "Cgroup counters cover only this selected service unit; Docker scopes, other units and external daemons are not selected"] };
+}
+
+export function parseMacCpuTimeUsec(value) {
+  const match = /^(?:(\d+)-)?(?:(\d+):)?(\d{1,2}):(\d{2})(?:\.(\d+))?$/.exec(value.trim());
+  if (!match) return null;
+  const days = Number(match[1] ?? 0);
+  const hours = Number(match[2] ?? 0);
+  const minutes = Number(match[3]);
+  const seconds = Number(match[4]);
+  if (minutes > 59 || seconds > 59) return null;
+  const fractionUsec = Number((match[5] ?? "").padEnd(6, "0").slice(0, 6));
+  return (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1_000_000 + fractionUsec;
 }
 
 async function pidSample(pid, atMs, platform, linuxConstants = {}) {
@@ -307,20 +355,20 @@ async function pidSample(pid, atMs, platform, linuxConstants = {}) {
       const [stat, statm, io] = await Promise.all([readFile(`/proc/${pid}/stat`, "utf8"), readFile(`/proc/${pid}/statm`, "utf8"), readFile(`/proc/${pid}/io`, "utf8").catch(() => "")]);
       const identity = linuxPidIdentity(stat);
       const fields = linuxPidFields(stat);
-      if (!identity || linuxPidIdentity(await readFile(`/proc/${pid}/stat`, "utf8")) !== identity) return { id: `pid:${pid}`, atMs, identityRequired: true, memoryBytes: null, cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID exited or changed identity during sampling; sample metrics are unknown"] };
+      if (!identity || linuxPidIdentity(await readFile(`/proc/${pid}/stat`, "utf8")) !== identity) return { id: `pid:${pid}`, atMs, identityRequired: true, memoryBytes: null, memoryKind: "resident", cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID exited or changed identity during sampling; sample metrics are unknown"] };
       const ticks = Number(fields[11]) + Number(fields[12]);
       const rssPages = Number(statm.split(/\s+/)[1]);
       const read = /^read_bytes:\s+(\d+)$/m.exec(io), write = /^write_bytes:\s+(\d+)$/m.exec(io);
-      return { id: `pid:${pid}`, atMs, identity, identityRequired: true, memoryBytes: Number.isFinite(rssPages) && linuxConstants.pageSize ? rssPages * linuxConstants.pageSize : null, cpuUsec: Number.isFinite(ticks) && linuxConstants.clockTicks ? ticks * 1e6 / linuxConstants.clockTicks : null, ioReadBytes: read ? Number(read[1]) : null, ioWriteBytes: write ? Number(write[1]) : null, limitations: ["PID scope excludes child processes", ...(!identity ? ["PID identity unavailable; cross-sample peaks and deltas are not combined"] : []), ...(!linuxConstants.pageSize ? ["RSS unavailable because system page size could not be read"] : []), ...(!linuxConstants.clockTicks ? ["PID CPU unavailable because clock tick rate could not be read"] : []), "I/O counters are per-process and may be unavailable"] };
-    } catch { return { id: `pid:${pid}`, atMs, identityRequired: true, memoryBytes: null, cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID was unavailable or exited during sample"] }; }
+      return { id: `pid:${pid}`, atMs, identity, identityRequired: true, memoryBytes: Number.isFinite(rssPages) && linuxConstants.pageSize ? rssPages * linuxConstants.pageSize : null, memoryKind: "resident", cpuUsec: Number.isFinite(ticks) && linuxConstants.clockTicks ? ticks * 1e6 / linuxConstants.clockTicks : null, ioReadBytes: read ? Number(read[1]) : null, ioWriteBytes: write ? Number(write[1]) : null, limitations: ["PID scope excludes child processes", ...(!identity ? ["PID identity unavailable; cross-sample peaks and deltas are not combined"] : []), ...(!linuxConstants.pageSize ? ["RSS unavailable because system page size could not be read"] : []), ...(!linuxConstants.clockTicks ? ["PID CPU unavailable because clock tick rate could not be read"] : []), "I/O counters are per-process and may be unavailable"] };
+    } catch { return { id: `pid:${pid}`, atMs, identityRequired: true, memoryBytes: null, memoryKind: "resident", cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID was unavailable or exited during sample"] }; }
   }
   try {
-    const { stdout } = await execFile("/bin/ps", ["-o", "pid=,rss=,%cpu=,lstart=", "-p", String(pid)], { timeout: 2000, maxBuffer: 1024 });
-    const match = /^\s*(\d+)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(.+)\s*$/.exec(stdout);
+    const { stdout } = await execFile("/bin/ps", ["-o", "pid=,rss=,%cpu=,time=,lstart=", "-p", String(pid)], { timeout: 2000, maxBuffer: 1024 });
+    const match = /^\s*(\d+)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\S+)\s+(.+)\s*$/.exec(stdout);
     if (!match || Number(match[1]) !== pid) throw new Error("missing process");
-    const identity = match[4].trim() || null;
-    return { id: `pid:${pid}`, atMs, identity, identityRequired: true, memoryBytes: Number(match[2]) * 1024, cpuPercent: Number(match[3]), cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID scope excludes child processes", ...(!identity ? ["PID start time unavailable; cross-sample peaks and deltas are not combined"] : []), "macOS ps CPU percentage is sampled and I/O counters are not read"] };
-  } catch { return { id: `pid:${pid}`, atMs, identityRequired: true, memoryBytes: null, cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID was unavailable or exited during sample", "macOS PID CPU and I/O counters are unavailable"] }; }
+    const identity = match[5].trim() || null;
+    return { id: `pid:${pid}`, atMs, identity, identityRequired: true, memoryBytes: Number(match[2]) * 1024, memoryKind: "resident", cpuPercentOSAverage: Number(match[3]), cpuUsec: parseMacCpuTimeUsec(match[4]), ioReadBytes: null, ioWriteBytes: null, limitations: ["PID scope excludes child processes", ...(!identity ? ["PID start time unavailable; cross-sample peaks and deltas are not combined"] : []), "RSS does not account for shared or compressed memory as a unique process-owned amount", "macOS ps %cpu is a lifetime average; interval CPU is derived from cumulative process time"] };
+  } catch { return { id: `pid:${pid}`, atMs, identityRequired: true, memoryBytes: null, memoryKind: "resident", cpuUsec: null, ioReadBytes: null, ioWriteBytes: null, limitations: ["PID was unavailable or exited during sample", "macOS PID CPU and I/O counters are unavailable"] }; }
 }
 
 function linuxPidFields(stat) {
@@ -376,9 +424,9 @@ export function renderMarkdown(report) {
   const availabilityLabel = report.host.platform === "linux" ? "available (MemAvailable)" : "available (not reported)";
   const start = new Date(report.window.startEpochMs).toLocaleString("en-US", { timeZone: "America/Chicago", hour: "numeric", minute: "2-digit", hour12: true });
   const end = new Date(report.window.endEpochMs).toLocaleString("en-US", { timeZone: "America/Chicago", hour: "numeric", minute: "2-digit", hour12: true });
-  const lines = ["# Host Inventory", "", `- Host: ${report.host.platform}`, `- Window wall-clock boundaries: ${start} to ${end}`, `- Observed duration: ${fmt(report.window.durationMs, "ms")} (monotonic clock)`, `- Requested interval: ${report.window.requestedIntervalMs} ms`, "", "| Scope | Initial resident memory | Peak resident memory | Initial CPU | Peak CPU | Read / write delta | Sample coverage |", "|---|---:|---:|---:|---:|---:|---:|"];
-  for (const [id, row] of Object.entries(report.groups)) lines.push(`| ${id} | ${fmt(row.initial.memoryBytes, "bytes")} | ${fmt(row.peak.memoryBytes, "bytes")} | ${fmt(row.initial.cpuPercent, "% of one core")} | ${fmt(row.peak.cpuPercentOfOneCore, "% of one core")} | ${fmt(row.observedDelta.ioReadBytes, "bytes")} / ${fmt(row.observedDelta.ioWriteBytes, "bytes")} | ${row.coverage.observedSamples}/${row.coverage.expectedSamples} |`);
-  lines.push("", "## Capacity", "", `- Logical CPUs: ${fmt(report.capacity.logicalCpuCount, "cores")}`, `- Memory: ${fmt(report.capacity.totalMemoryBytes, "bytes")} total; ${fmt(report.capacity.availableMemoryBytes, "bytes")} ${availabilityLabel}; ${fmt(report.capacity.freeMemoryBytes, "bytes")} free per Node OS API`, `- Swap: ${report.capacity.swap ? `${fmt(report.capacity.swap.totalBytes, "bytes")} total; ${fmt(report.capacity.swap.usedBytes, "bytes")} used` : "unknown"}`, `- Root disk: ${fmt(report.capacity.disks.root.freeBytes, "bytes")} free; ${fmt(report.capacity.disks.root.freeInodes, "inodes")} free inodes`, `- Data disk: ${fmt(report.capacity.disks.data.freeBytes, "bytes")} free; ${fmt(report.capacity.disks.data.freeInodes, "inodes")} free inodes`, `- OrbStack reservation: ${report.capacity.orbStackReservation ? "explicit input only; not verified by this script" : "unknown / not supplied"}`, "", "## Measurement Limits", ...report.limitations.map((limitation) => `- ${limitation}`), "");
+  const lines = ["# Host Inventory", "", `- Host: ${report.host.platform}`, `- Source: ${report.sourceCommit?.revision ?? "unknown"} (${report.sourceCommit?.workingTreeDirty === null ? "working-tree state unknown" : report.sourceCommit?.workingTreeDirty ? "working tree dirty" : "working tree clean"})`, `- Window wall-clock boundaries: ${start} to ${end}`, `- Observed duration: ${fmt(report.window.durationMs, "ms")} (monotonic clock)`, `- Requested interval: ${report.window.requestedIntervalMs} ms`, `- Collection: ${report.interrupted ? `interrupted${report.interruptedBy ? ` by ${report.interruptedBy}` : ""}; partial window` : "completed"}`, "", "| Scope | Memory measure | Initial memory | Sampled peak memory | Initial CPU OS average | Sampled interval CPU peak | Read / write delta | Sample coverage |", "|---|---|---:|---:|---:|---:|---:|---:|"];
+  for (const [id, row] of Object.entries(report.groups)) lines.push(`| ${id} | ${row.memoryKind === "cgroupCharged" ? "cgroup charged" : row.memoryKind === "resident" ? "process RSS" : "unknown"} | ${fmt(row.initial.memoryBytes, "bytes")} | ${fmt(row.peak.memoryBytes, "bytes")} | ${fmt(row.initial.cpuPercentOSAverage, "% of one core")} | ${fmt(row.peak.cpuPercentOfOneCore, "% of one core")} | ${fmt(row.observedDelta.ioReadBytes, "bytes")} / ${fmt(row.observedDelta.ioWriteBytes, "bytes")} | ${row.coverage.observedSamples}/${row.coverage.expectedSamples} |`);
+  lines.push("", "## Capacity", "", `- Logical CPUs: ${fmt(report.capacity.logicalCpuCount, "cores")}`, `- Memory: ${fmt(report.capacity.totalMemoryBytes, "bytes")} total; ${fmt(report.capacity.availableMemoryBytes, "bytes")} ${availabilityLabel}; sampled minimum ${fmt(report.capacity.sampledMinimumAvailableMemoryBytes, "bytes")} (${report.capacity.availableMemoryCoverage.observedSamples}/${report.capacity.availableMemoryCoverage.expectedSamples} samples); ${fmt(report.capacity.freeMemoryBytes, "bytes")} free per Node OS API`, `- Swap: ${report.capacity.swap ? `${fmt(report.capacity.swap.totalBytes, "bytes")} total; ${fmt(report.capacity.swap.usedBytes, "bytes")} used` : "unknown"}`, `- Root disk: ${fmt(report.capacity.disks.root.freeBytes, "bytes")} free; ${fmt(report.capacity.disks.root.freeInodes, "inodes")} free inodes`, `- Data disk: ${fmt(report.capacity.disks.data.freeBytes, "bytes")} free; ${fmt(report.capacity.disks.data.freeInodes, "inodes")} free inodes`, `- OrbStack reservation: ${report.capacity.orbStackReservation ? "explicit input only; not verified by this script" : "unknown / not supplied"}`, "", "## Measurement Limits", ...report.limitations.map((limitation) => `- ${limitation}`), "");
   return lines.join("\n");
 }
 
@@ -449,23 +497,48 @@ export function repositoryRootFor(moduleURL) {
   return fileURLToPath(new URL("..", moduleURL));
 }
 
-async function readSourceCommit(moduleURL = import.meta.url, runExecFile = execFile) {
+export async function readSourceCommit(moduleURL = import.meta.url, runExecFile = execFile) {
   try {
     const { stdout } = await runExecFile("git", ["-C", repositoryRootFor(moduleURL), "rev-parse", "HEAD"], { timeout: 2000, maxBuffer: 1024 });
-    return stdout.trim();
+    const revision = stdout.trim();
+    if (!/^[0-9a-f]{40,64}$/i.test(revision)) return { revision: null, workingTreeDirty: null };
+    try {
+      const status = await runExecFile("git", ["-C", repositoryRootFor(moduleURL), "status", "--porcelain=v1", "--untracked-files=all"], { timeout: 2000, maxBuffer: 16 * 1024 });
+      return { revision, workingTreeDirty: status.stdout.length > 0 };
+    } catch {
+      return { revision, workingTreeDirty: null };
+    }
   } catch {
-    return null;
+    return { revision: null, workingTreeDirty: null };
   }
+}
+
+function delay(milliseconds, signal) {
+  return new Promise((resolveDelay) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolveDelay(true);
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolveDelay(false);
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export async function run(options, dependencies = {}) {
   validateOptions(options);
+  const sourceCommit = reportSourceCommitGuard(await (dependencies.readSourceCommit ?? readSourceCommit)());
   const targets = await prepareOutputTargets(resolve(options.outputDir));
   try {
     const platform = dependencies.platform ?? process.platform;
     const wallNow = dependencies.wallNow ?? Date.now;
     const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
-    const sleep = dependencies.sleep ?? ((milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds)));
+    const signal = dependencies.signal;
+    const sleep = dependencies.sleep ?? delay;
     const capacity = await (dependencies.readCapacity ?? capacities)(options, platform);
     const pidConstants = options.pids.length && platform === "linux"
       ? await (dependencies.readPidConstants ?? linuxPidConstants)()
@@ -478,19 +551,31 @@ export async function run(options, dependencies = {}) {
       source.kind === "cgroup"
         ? cgroupSample(id, source.path, atMs)
         : pidSample(source.pid, atMs, platform, pidConstants));
+    const readAvailableMemory = dependencies.readAvailableMemory ?? (() => platform === "linux" ? linuxMemAvailable() : null);
     const accumulator = new SampleAccumulator(options.intervalSeconds * 1000);
     const startAtMs = monotonicNow();
     const deadline = startAtMs + options.windowSeconds * 1000;
-    do {
+    let interrupted = false;
+    while (true) {
       const atMs = monotonicNow();
       const epochMs = wallNow();
+      let availableMemoryBytes = null;
+      try { availableMemoryBytes = await readAvailableMemory(); } catch {}
       const rows = await Promise.all([...groups].map(([id, source]) => sampleGroup(id, source, atMs)));
-      accumulator.add({ atMs, epochMs, groups: Object.fromEntries(rows.map(({ id, ...row }) => [id, row])) });
+      accumulator.add({ atMs, epochMs, availableMemoryBytes, groups: Object.fromEntries(rows.map(({ id, ...row }) => [id, row])) });
+      if (signal?.aborted) {
+        interrupted = true;
+        break;
+      }
       const now = monotonicNow();
       const remaining = deadline - now;
       if (remaining <= 0) break;
-      await sleep(Math.min(options.intervalSeconds * 1000, remaining));
-    } while (monotonicNow() < deadline);
+      const completedSleep = await sleep(Math.min(options.intervalSeconds * 1000, remaining), signal);
+      if (signal?.aborted || completedSleep === false) {
+        interrupted = true;
+        break;
+      }
+    }
 
     const summary = accumulator.finish();
     const limitations = [
@@ -500,17 +585,22 @@ export async function run(options, dependencies = {}) {
       "Sampled duration and intervals use a monotonic clock; wall-clock boundaries are recorded as observed and may move backwards if system time changes",
       "A short interval can miss bursts; counters that reset, disappear or lack complete scope coverage are reported as unknown",
       `At most ${MAX_SCOPES} unique scopes can be selected; this is a collector safety bound, not a runtime or resource budget`,
+      "Linux PSI pressure is not sampled; sampled minimum MemAvailable may miss shorter-lived lows",
       ...(platform === "darwin" ? ["macOS process sampling excludes child processes and does not read per-process I/O", "OrbStack values are caller-supplied and are not verified by this script"] : []),
     ];
-    const sourceCommit = await (dependencies.readSourceCommit ?? readSourceCommit)();
-    reportSourceCommitGuard(sourceCommit);
     const report = {
       schemaVersion: 1,
       capturedAtEpochMs: wallNow(),
       sourceCommit,
       host: { platform },
-      capacity,
+      capacity: {
+        ...capacity,
+        sampledMinimumAvailableMemoryBytes: summary.availableMemory.minimumBytes,
+        availableMemoryCoverage: { observedSamples: summary.availableMemory.observedSamples, expectedSamples: summary.availableMemory.expectedSamples, complete: summary.availableMemory.complete },
+      },
       window: summary.window,
+      interrupted,
+      interruptedBy: interrupted && ["SIGINT", "SIGTERM"].includes(signal?.reason) ? signal.reason : null,
       groups: summary.groups,
       limitations: [...limitations, ...platformMeasurementLimits(platform)],
     };
@@ -527,7 +617,10 @@ export async function run(options, dependencies = {}) {
 }
 
 function reportSourceCommitGuard(sourceCommit) {
-  if (sourceCommit !== null && !/^[0-9a-f]{40,64}$/i.test(sourceCommit)) throw new Error("git returned an invalid source commit identifier");
+  if (sourceCommit === null || sourceCommit === undefined) return { revision: null, workingTreeDirty: null };
+  if (!sourceCommit || (sourceCommit.revision !== null && !/^[0-9a-f]{40,64}$/i.test(sourceCommit.revision)) ||
+      ![true, false, null].includes(sourceCommit.workingTreeDirty)) throw new Error("git returned invalid source revision metadata");
+  return sourceCommit;
 }
 
 function isEntryModule() {
@@ -538,12 +631,29 @@ function isEntryModule() {
   }
 }
 
+export async function runWithCliSignalHandlers(options, collector = run) {
+  const controller = new AbortController();
+  const onInterrupt = () => controller.abort("SIGINT");
+  const onTerminate = () => controller.abort("SIGTERM");
+  process.once("SIGINT", onInterrupt);
+  process.once("SIGTERM", onTerminate);
+  try {
+    return await collector(options, { signal: controller.signal });
+  } finally {
+    process.removeListener("SIGINT", onInterrupt);
+    process.removeListener("SIGTERM", onTerminate);
+  }
+}
+
 if (isEntryModule()) {
   try {
     const options = parseArgs(process.argv.slice(2));
     if (options.help) {
       process.stdout.write("Usage: node scripts/host-inventory.mjs --output-dir DIR --window-seconds N --interval-seconds N --root-path PATH --data-path PATH (--pid PID | --unit NAME) [--pid PID ...] [--unit NAME ...] [--orbstack-reserved-cpu N --orbstack-reserved-memory-mib N]\n");
-    } else await run(options);
+    } else {
+      const report = await runWithCliSignalHandlers(options);
+      if (report.interrupted) process.exitCode = report.interruptedBy === "SIGINT" ? 130 : 143;
+    }
   } catch (error) {
     process.stderr.write(`host-inventory: ${error.message}\n`);
     process.exitCode = 2;
