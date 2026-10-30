@@ -61,6 +61,8 @@ public enum RoutineSchedulerError: LocalizedError, Sendable, Equatable {
     case routineDisabled(String)
     case duplicateRunExecutionRefused(String)
     case executionFailed(String)
+    case schedulerStopped
+    case waitRegistryUnavailable
 
     public var errorDescription: String? {
         switch self {
@@ -72,6 +74,10 @@ public enum RoutineSchedulerError: LocalizedError, Sendable, Equatable {
             return "Refused duplicate execution of routine run '\(runId)'."
         case .executionFailed(let reason):
             return "Routine execution failed: \(reason)"
+        case .schedulerStopped:
+            return "The scheduler is stopped."
+        case .waitRegistryUnavailable:
+            return "The event wait registry is unavailable."
         }
     }
 }
@@ -85,6 +91,7 @@ public actor NativeRoutinesSchedulerActor {
     public static let restartInterruptionReason = "Interrupted by application restart"
 
     private let database: DatabaseService
+    private let eventWaitRegistry: NativeEventWaitRegistry?
     public var retentionPolicy: RoutineRetentionPolicy
 
     private var routinesById: [String: ScheduledRoutine] = [:]
@@ -95,19 +102,123 @@ public actor NativeRoutinesSchedulerActor {
     /// the window between the duplicate guard and the write, without marking a
     /// run as executed when the write fails.
     private var inFlightRunIds: Set<String> = []
+    private var routineRevisions: [String: UInt64] = [:]
+    private var lifecycleRevision: UInt64 = 0
+    private var isShutdown = false
 
     public init(
         database: DatabaseService,
         retentionPolicy: RoutineRetentionPolicy = RoutineRetentionPolicy(),
-        defaultExecutor: (@Sendable (ScheduledRoutine, RoutineRunRecord) async throws -> Void)? = nil
+        defaultExecutor: (@Sendable (ScheduledRoutine, RoutineRunRecord) async throws -> Void)? = nil,
+        eventWaitRegistry: NativeEventWaitRegistry? = nil
     ) {
         self.database = database
         self.retentionPolicy = retentionPolicy
         self.defaultExecutor = defaultExecutor
+        self.eventWaitRegistry = eventWaitRegistry
     }
 
     public func registerRoutine(_ routine: ScheduledRoutine) {
         routinesById[routine.id] = routine
+        routineRevisions[routine.id, default: 0] &+= 1
+    }
+
+    public func unregisterRoutine(id: String) {
+        routinesById.removeValue(forKey: id)
+        routineRevisions[id, default: 0] &+= 1
+    }
+
+    public func shutdown() async {
+        guard !isShutdown else { return }
+        isShutdown = true
+        lifecycleRevision &+= 1
+        await eventWaitRegistry?.shutdown()
+    }
+
+    @discardableResult
+    public func registerWait(
+        id: String = "wait_\(UUID().uuidString.lowercased())",
+        botId: String,
+        threadId: String? = nil,
+        prompt: String? = nil,
+        predicate: NativeEventWaitPredicate,
+        now: Double = Date().timeIntervalSince1970,
+        timeout: TimeInterval? = nil
+    ) async throws -> NativeEventWait {
+        guard !isShutdown else { throw RoutineSchedulerError.schedulerStopped }
+        guard let eventWaitRegistry else { throw RoutineSchedulerError.waitRegistryUnavailable }
+        let revision = lifecycleRevision
+        let wait: NativeEventWait
+        do {
+            wait = try await eventWaitRegistry.register(
+                id: id,
+                botId: botId,
+                threadId: threadId,
+                prompt: prompt,
+                predicate: predicate,
+                now: now,
+                timeout: timeout
+            )
+        } catch {
+            guard !isShutdown, revision == lifecycleRevision else {
+                _ = try? await eventWaitRegistry.cancel(id: id)
+                throw RoutineSchedulerError.schedulerStopped
+            }
+            throw error
+        }
+        guard !isShutdown, revision == lifecycleRevision else {
+            _ = try? await eventWaitRegistry.cancel(id: id)
+            throw RoutineSchedulerError.schedulerStopped
+        }
+        return wait
+    }
+
+    @discardableResult
+    public func tickWaits(now: Double = Date().timeIntervalSince1970) async throws -> [String] {
+        guard !isShutdown else { throw RoutineSchedulerError.schedulerStopped }
+        guard let eventWaitRegistry else { throw RoutineSchedulerError.waitRegistryUnavailable }
+        let revision = lifecycleRevision
+        let result: [String]
+        do {
+            result = try await eventWaitRegistry.tick(now: now)
+        } catch {
+            guard !isShutdown, revision == lifecycleRevision else { throw RoutineSchedulerError.schedulerStopped }
+            throw error
+        }
+        guard !isShutdown, revision == lifecycleRevision else { throw RoutineSchedulerError.schedulerStopped }
+        return result
+    }
+
+    @discardableResult
+    public func cancelWait(id: String) async throws -> NativeEventWait? {
+        guard !isShutdown else { throw RoutineSchedulerError.schedulerStopped }
+        guard let eventWaitRegistry else { throw RoutineSchedulerError.waitRegistryUnavailable }
+        let revision = lifecycleRevision
+        let result: NativeEventWait?
+        do {
+            result = try await eventWaitRegistry.cancel(id: id)
+        } catch {
+            guard !isShutdown, revision == lifecycleRevision else { throw RoutineSchedulerError.schedulerStopped }
+            throw error
+        }
+        guard !isShutdown, revision == lifecycleRevision else { throw RoutineSchedulerError.schedulerStopped }
+        return result
+    }
+
+    @discardableResult
+    public func recoverWaits(now: Double = Date().timeIntervalSince1970) async throws -> [NativeEventWait] {
+        guard !isShutdown else { throw RoutineSchedulerError.schedulerStopped }
+        guard let eventWaitRegistry else { throw RoutineSchedulerError.waitRegistryUnavailable }
+        let revision = lifecycleRevision
+        let result: [NativeEventWait]
+        do {
+            result = try await eventWaitRegistry.recover(now: now)
+        } catch {
+            guard !isShutdown, revision == lifecycleRevision else { throw RoutineSchedulerError.schedulerStopped }
+            throw error
+        }
+        guard !isShutdown, revision == lifecycleRevision else { throw RoutineSchedulerError.schedulerStopped }
+        return result
     }
 
     public func registeredRoutine(id: String) -> ScheduledRoutine? {
@@ -123,12 +234,15 @@ public actor NativeRoutinesSchedulerActor {
         now: Double = Date().timeIntervalSince1970,
         executor: (@Sendable (ScheduledRoutine, RoutineRunRecord) async throws -> Void)? = nil
     ) async throws -> RoutineRunRecord {
+        guard !isShutdown else { throw RoutineSchedulerError.schedulerStopped }
         guard let routine = routinesById[routineId] else {
             throw RoutineSchedulerError.routineNotFound(routineId)
         }
         guard routine.enabled else {
             throw RoutineSchedulerError.routineDisabled(routineId)
         }
+        let scheduledRevision = routineRevisions[routineId, default: 0]
+        let admissionRevision = lifecycleRevision
 
         let resolvedRunId = runId ?? "run_\(UUID().uuidString.lowercased())"
         guard !executedRunIds.contains(resolvedRunId) else {
@@ -157,9 +271,16 @@ public actor NativeRoutinesSchedulerActor {
         // never be retried with the same id.
         executedRunIds.insert(resolvedRunId)
 
+        guard isAdmitted(routineId: routineId, routineRevision: scheduledRevision, lifecycleRevision: admissionRevision) else {
+            return try await settleCancelled(runningRecord, reason: "Routine admission changed before execution")
+        }
+
         let runner = executor ?? defaultExecutor
         do {
             try await runner?(routine, runningRecord)
+            guard isAdmitted(routineId: routineId, routineRevision: scheduledRevision, lifecycleRevision: admissionRevision) else {
+                return try await settleCancelled(runningRecord, reason: "Routine admission changed during execution")
+            }
             let finishedRecord = RoutineRunRecord(
                 id: resolvedRunId,
                 routineId: routine.id,
@@ -170,8 +291,14 @@ public actor NativeRoutinesSchedulerActor {
                 error: nil
             )
             try await database.recordRoutineRun(finishedRecord)
+            guard isAdmitted(routineId: routineId, routineRevision: scheduledRevision, lifecycleRevision: admissionRevision) else {
+                return try await settleCancelled(finishedRecord, reason: "Routine admission changed while saving completion")
+            }
             return finishedRecord
         } catch {
+            guard isAdmitted(routineId: routineId, routineRevision: scheduledRevision, lifecycleRevision: admissionRevision) else {
+                return try await settleCancelled(runningRecord, reason: "Routine admission changed during execution")
+            }
             let failedRecord = RoutineRunRecord(
                 id: resolvedRunId,
                 routineId: routine.id,
@@ -182,6 +309,9 @@ public actor NativeRoutinesSchedulerActor {
                 error: error.localizedDescription
             )
             try await database.recordRoutineRun(failedRecord)
+            guard isAdmitted(routineId: routineId, routineRevision: scheduledRevision, lifecycleRevision: admissionRevision) else {
+                return try await settleCancelled(failedRecord, reason: "Routine admission changed while saving failure")
+            }
             return failedRecord
         }
     }
@@ -258,6 +388,8 @@ public actor NativeRoutinesSchedulerActor {
         guard let resolvedRoutine = routine ?? routinesById[queuedRun.routineId] else {
             throw RoutineSchedulerError.routineNotFound(queuedRun.routineId)
         }
+        guard !isShutdown else { throw RoutineSchedulerError.schedulerStopped }
+        guard resolvedRoutine.enabled else { throw RoutineSchedulerError.routineDisabled(resolvedRoutine.id) }
         // The same reservation `fireRoutine` takes.  Without it a concurrent
         // resume could run a queued id while a fire is still persisting it.
         guard !inFlightRunIds.contains(queuedRun.id) else {
@@ -265,11 +397,16 @@ public actor NativeRoutinesSchedulerActor {
         }
         inFlightRunIds.insert(queuedRun.id)
         defer { inFlightRunIds.remove(queuedRun.id) }
+        let scheduledRevision = routineRevisions[resolvedRoutine.id, default: 0]
+        let admissionRevision = lifecycleRevision
         executedRunIds.insert(queuedRun.id)
 
         let runner = executor ?? defaultExecutor
         do {
             try await runner?(resolvedRoutine, queuedRun)
+            guard isAdmitted(routineId: resolvedRoutine.id, routineRevision: scheduledRevision, lifecycleRevision: admissionRevision, fallbackRoutine: resolvedRoutine) else {
+                return try await settleCancelled(queuedRun, reason: "Routine admission changed during recovery")
+            }
             let completed = RoutineRunRecord(
                 id: queuedRun.id,
                 routineId: queuedRun.routineId,
@@ -280,8 +417,14 @@ public actor NativeRoutinesSchedulerActor {
                 error: nil
             )
             try await database.recordRoutineRun(completed)
+            guard isAdmitted(routineId: resolvedRoutine.id, routineRevision: scheduledRevision, lifecycleRevision: admissionRevision, fallbackRoutine: resolvedRoutine) else {
+                return try await settleCancelled(completed, reason: "Routine admission changed while saving completion")
+            }
             return completed
         } catch {
+            guard isAdmitted(routineId: resolvedRoutine.id, routineRevision: scheduledRevision, lifecycleRevision: admissionRevision, fallbackRoutine: resolvedRoutine) else {
+                return try await settleCancelled(queuedRun, reason: "Routine admission changed during recovery")
+            }
             let failed = RoutineRunRecord(
                 id: queuedRun.id,
                 routineId: queuedRun.routineId,
@@ -292,6 +435,9 @@ public actor NativeRoutinesSchedulerActor {
                 error: error.localizedDescription
             )
             try await database.recordRoutineRun(failed)
+            guard isAdmitted(routineId: resolvedRoutine.id, routineRevision: scheduledRevision, lifecycleRevision: admissionRevision, fallbackRoutine: resolvedRoutine) else {
+                return try await settleCancelled(failed, reason: "Routine admission changed while saving failure")
+            }
             return failed
         }
     }
@@ -356,6 +502,32 @@ public actor NativeRoutinesSchedulerActor {
         let all = try await database.loadRoutineRuns(forRoutine: routineId, limit: limit)
         return all.filter { $0.status != "expired" }
     }
+
+    private func isAdmitted(
+        routineId: String,
+        routineRevision: UInt64,
+        lifecycleRevision: UInt64,
+        fallbackRoutine: ScheduledRoutine? = nil
+    ) -> Bool {
+        guard !isShutdown, self.lifecycleRevision == lifecycleRevision,
+              routineRevisions[routineId, default: 0] == routineRevision,
+              let routine = routinesById[routineId] ?? fallbackRoutine else { return false }
+        return routine.enabled
+    }
+
+    private func settleCancelled(_ source: RoutineRunRecord, reason: String) async throws -> RoutineRunRecord {
+        let cancelled = RoutineRunRecord(
+            id: source.id,
+            routineId: source.routineId,
+            botId: source.botId,
+            status: "cancelled",
+            startedAt: source.startedAt,
+            completedAt: max(source.completedAt ?? 0, Date().timeIntervalSince1970),
+            error: reason
+        )
+        try await database.recordRoutineRun(cancelled)
+        return cancelled
+    }
 }
 
 // MARK: - Webhook Ingress Models & NativeWebhookIngressActor
@@ -404,6 +576,8 @@ public actor NativeWebhookIngressActor {
     private let database: DatabaseService
     private let sleepHandler: @Sendable (TimeInterval) async -> Void
     private var endpointsById: [String: WebhookEndpointConfig] = [:]
+    private var endpointRevisions: [String: UInt64] = [:]
+    private var isShutdown = false
 
     public private(set) var recordedBackoffDelays: [TimeInterval] = []
 
@@ -419,6 +593,16 @@ public actor NativeWebhookIngressActor {
 
     public func registerEndpoint(_ config: WebhookEndpointConfig) {
         endpointsById[config.id] = config
+        endpointRevisions[config.id, default: 0] &+= 1
+    }
+
+    public func unregisterEndpoint(id: String) {
+        endpointsById.removeValue(forKey: id)
+        endpointRevisions[id, default: 0] &+= 1
+    }
+
+    public func shutdown() {
+        isShutdown = true
     }
 
     /// Computes the GitHub-compatible `sha256=<hex>` HMAC-SHA256 signature for a payload and secret.
@@ -457,6 +641,10 @@ public actor NativeWebhookIngressActor {
         let baseDeliveryId = deliveryId ?? "wh_\(UUID().uuidString.lowercased())"
         let payloadText = String(data: payload, encoding: .utf8) ?? ""
 
+        guard !isShutdown else {
+            return .rejected(deliveryId: baseDeliveryId, statusCode: 503, reason: "webhook_ingress_stopped")
+        }
+
         guard let endpoint = endpointsById[webhookId] else {
             let record = WebhookDeliveryRecord(
                 id: baseDeliveryId,
@@ -470,6 +658,7 @@ public actor NativeWebhookIngressActor {
             try await database.recordWebhookDelivery(record)
             return .rejected(deliveryId: baseDeliveryId, statusCode: 404, reason: "unknown_webhook")
         }
+        let endpointRevision = endpointRevisions[webhookId, default: 0]
 
         // 1. Constant-time HMAC-SHA256 signature check
         guard Self.verifyHMACSignature(payload: payload, secret: endpoint.secret, signatureHeader: signatureHeader) else {
@@ -521,8 +710,14 @@ public actor NativeWebhookIngressActor {
         // 4. Dispatch with exponential backoff retry on transient failures
         let totalAllowedAttempts = endpoint.maxRetries + 1
         var lastErrorText = "unknown_dispatch_error"
+        var attemptsMade = 0
 
         for attempt in 0..<totalAllowedAttempts {
+            guard isAdmitted(webhookId: webhookId, revision: endpointRevision) else {
+                lastErrorText = isShutdown ? "webhook_ingress_stopped" : "webhook_endpoint_changed"
+                break
+            }
+            attemptsMade = attempt + 1
             let attemptRecordId = attempt == 0 ? baseDeliveryId : "\(baseDeliveryId)_retry\(attempt)"
 
             // The dispatch and the bookkeeping are separate steps.  Folding
@@ -547,9 +742,17 @@ public actor NativeWebhookIngressActor {
                 try await database.recordWebhookDelivery(failedAttemptRecord)
 
                 if attempt + 1 < totalAllowedAttempts {
+                    guard isAdmitted(webhookId: webhookId, revision: endpointRevision) else {
+                        lastErrorText = isShutdown ? "webhook_ingress_stopped" : "webhook_endpoint_changed"
+                        break
+                    }
                     let backoff = min(60.0, endpoint.baseBackoffSeconds * pow(2.0, Double(attempt)))
                     recordedBackoffDelays.append(backoff)
                     await sleepHandler(backoff)
+                    guard isAdmitted(webhookId: webhookId, revision: endpointRevision) else {
+                        lastErrorText = isShutdown ? "webhook_ingress_stopped" : "webhook_endpoint_changed"
+                        break
+                    }
                 }
                 continue
             }
@@ -591,9 +794,13 @@ public actor NativeWebhookIngressActor {
 
         return .failedAfterRetries(
             deliveryId: baseDeliveryId,
-            attempts: totalAllowedAttempts,
+            attempts: attemptsMade,
             lastError: lastErrorText
         )
+    }
+
+    private func isAdmitted(webhookId: String, revision: UInt64) -> Bool {
+        !isShutdown && endpointRevisions[webhookId, default: 0] == revision && endpointsById[webhookId] != nil
     }
 
     private static func isMergedPullRequestPayload(_ payload: Data) -> Bool {

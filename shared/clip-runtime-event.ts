@@ -47,10 +47,11 @@ export function clipRuntimeEvent(event: RuntimeEvent, limit: number = TRAJECTORY
         const text = cut(withoutRaw.text, limit);
         return text === withoutRaw.text ? withoutRaw : { ...withoutRaw, text };
       }
+      const title = withoutRaw.title === undefined ? undefined : cut(withoutRaw.title, limit);
       const detail = typeof withoutRaw.detail === "string" ? cut(withoutRaw.detail, limit) : withoutRaw.detail;
       const args = typeof withoutRaw.arguments === "string" ? cut(withoutRaw.arguments, limit) : withoutRaw.arguments;
-      if (detail === withoutRaw.detail && args === withoutRaw.arguments) return withoutRaw;
-      return { ...withoutRaw, detail, arguments: args };
+      if (title === withoutRaw.title && detail === withoutRaw.detail && args === withoutRaw.arguments) return withoutRaw;
+      return { ...withoutRaw, title, detail, arguments: args };
     }
     case "request.opened": {
       const summary = cut(withoutRaw.summary, limit);

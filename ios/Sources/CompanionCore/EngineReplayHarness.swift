@@ -594,6 +594,235 @@ public enum EngineReplayHarness {
         return list
     }
 
+    /// Codex may run a tool before acknowledging `turn/start`; if that RPC fails,
+    /// preserve the tool event so the dispatcher does not replay on a fallback engine.
+    public static func codexEarlyToolBeforeTurnStartErrorFixture() -> EngineReplayFixture {
+        let input = TurnInput(
+            threadId: "thread-codex-early-tool",
+            botId: "bot-codex",
+            prompt: "Create the fixture marker once",
+            modelId: "gpt-5.4",
+            workingDirectory: "/tmp/codex"
+        )
+        let threadId = "codex-thr-early-tool"
+        let tool = #"{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"codex-thr-early-tool","item":{"id":"action-1","type":"commandExecution","command":"touch marker","status":"in_progress"}}}"#
+        return EngineReplayFixture(
+            id: "codex-early-tool-before-turn-start-error",
+            family: .codex,
+            title: "Codex tool action arrives before transient turn/start error",
+            input: input,
+            expectedSpawnSpec: CodexAppServerRunner.buildSpawnSpec(input: input),
+            steps: [
+                .onClientRequest(method: "initialize", replyResultJSON: #"{"serverInfo":{"name":"codex"}}"#),
+                .onClientRequest(method: "thread/start", replyResultJSON: #"{"thread":{"id":"codex-thr-early-tool"}}"#),
+                .onClientRequest(
+                    method: "turn/start",
+                    notificationsBeforeReply: [tool],
+                    replyErrorJSON: #"{"code":-32000,"message":"HTTP 429 rate limit exceeded"}"#
+                )
+            ],
+            expectedEvents: [
+                .sessionStarted(sessionId: threadId),
+                .toolCall(
+                    id: "action-1",
+                    name: "touch marker",
+                    argumentsJSON: #"{"command":"touch marker","type":"commandExecution"}"#
+                ),
+                .error(code: "rate_limited", message: "HTTP 429 rate limit exceeded")
+            ]
+        )
+    }
+
+    /// Grok's selected auth method must follow the supported-method priority,
+    /// independent of the order the CLI advertises them.
+    public static func grokAuthPriorityFixture() -> EngineReplayFixture {
+        grokAuthFixture(
+            id: "grok-auth-prefers-cached-token",
+            methods: [#"{"id":"grok.com"}"#, #"{"id":"browser"}"#, #"{"id":"cached_token"}"#],
+            authenticateWith: "cached_token"
+        )
+    }
+
+    public static func grokAuthMethodFallbackFixture() -> EngineReplayFixture {
+        grokAuthFixture(
+            id: "grok-auth-uses-grok-com-when-no-cached-token",
+            methods: [#"{"id":"grok.com"}"#],
+            authenticateWith: "grok.com"
+        )
+    }
+
+    public static func grokUnsupportedAuthMethodFixture() -> EngineReplayFixture {
+        let input = grokProtocolFixtureInput(thread: "grok-unsupported-auth", model: nil)
+        let spec = AcpProcessRunner.buildSpawnSpec(harnessKind: .grok, input: input)
+        return EngineReplayFixture(
+            id: "grok-auth-rejects-unsupported-method",
+            family: .grok,
+            title: "Grok rejects an advertised unsupported ACP auth method",
+            input: input,
+            expectedSpawnSpec: spec,
+            steps: [
+                .onClientRequest(method: "initialize", replyResultJSON: #"{"authMethods":[{"id":"browser"}]}"#)
+            ],
+            expectedEvents: [
+                .error(code: "unsupported_auth_method", message: "Grok ACP advertised no supported authentication method")
+            ]
+        )
+    }
+
+    public static func mcodeIgnoresGrokAuthMethodsFixture() -> EngineReplayFixture {
+        let input = grokProtocolFixtureInput(thread: "mcode-auth-ignored", model: nil)
+        let spec = AcpProcessRunner.buildSpawnSpec(harnessKind: .mcode, input: input)
+        return EngineReplayFixture(
+            id: "mcode-does-not-authenticate-grok-methods",
+            family: .mcode,
+            title: "MiniMax Code ignores Grok-specific ACP auth methods",
+            input: input,
+            expectedSpawnSpec: spec,
+            steps: [
+                .onClientRequest(method: "initialize", replyResultJSON: #"{"authMethods":[{"id":"cached_token"}]}"#),
+                .onClientRequest(method: "session/new", replyResultJSON: #"{"sessionId":"mcode-auth-ignored"}"#),
+                .onClientRequest(method: "session/prompt", replyResultJSON: #"{"stopReason":"end_turn"}"#)
+            ],
+            expectedEvents: [
+                .sessionStarted(sessionId: "mcode-auth-ignored"),
+                .completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil)
+            ]
+        )
+    }
+
+    public static func grokAlreadySelectedModelFixture() -> EngineReplayFixture {
+        grokModelFixture(
+            id: "grok-skips-model-when-already-selected",
+            currentModel: "grok-4.7",
+            selectedModel: "grok-4.7",
+            advertisedModels: ["grok-4", "grok-4.7"],
+            setModel: false
+        )
+    }
+
+    public static func grokSelectsAdvertisedModelFixture() -> EngineReplayFixture {
+        grokModelFixture(
+            id: "grok-sets-advertised-selected-model",
+            currentModel: "grok-4",
+            selectedModel: "grok-4.7",
+            advertisedModels: ["grok-4", "grok-4.7"],
+            setModel: true
+        )
+    }
+
+    public static func grokRejectsUnadvertisedModelFixture() -> EngineReplayFixture {
+        grokModelFixture(
+            id: "grok-rejects-unadvertised-selected-model",
+            currentModel: "grok-4",
+            selectedModel: "grok-4.7",
+            advertisedModels: ["grok-4"],
+            setModel: false,
+            expectUnknownModel: true
+        )
+    }
+
+    public static func grokMismatchedToolOwnerFixture() -> EngineReplayFixture {
+        let identity = NativeToolIdentity(
+            hostId: "mac:test",
+            installationId: "fixture-installation",
+            userId: "fixture-user",
+            generation: 1
+        )
+        let preparation = NativeTurnToolPreparation(botId: "other-bot", identity: identity)
+        let input = TurnInput(
+            threadId: "thread-grok-mismatched-tools",
+            botId: "bot-grok",
+            prompt: "Fail closed on a mismatched prepared tool owner",
+            workingDirectory: "/tmp/grok",
+            toolPreparation: preparation
+        )
+        return EngineReplayFixture(
+            id: "grok-rejects-mismatched-prepared-tool-owner",
+            family: .grok,
+            title: "Grok ACP rejects tool preparation for another bot",
+            input: input,
+            expectedSpawnSpec: AcpProcessRunner.buildSpawnSpec(harnessKind: .grok, input: input),
+            steps: [],
+            expectedEvents: []
+        )
+    }
+
+    private static func grokProtocolFixtureInput(thread: String, model: String?) -> TurnInput {
+        TurnInput(
+            threadId: "thread-\(thread)",
+            botId: "bot-grok",
+            prompt: "Run isolated Grok protocol fixture",
+            modelId: model,
+            workingDirectory: "/tmp/grok"
+        )
+    }
+
+    private static func grokAuthFixture(
+        id: String,
+        methods: [String],
+        authenticateWith methodId: String
+    ) -> EngineReplayFixture {
+        let sessionId = "session-\(id)"
+        let input = grokProtocolFixtureInput(thread: id, model: nil)
+        return EngineReplayFixture(
+            id: id,
+            family: .grok,
+            title: "Grok ACP auth selects \(methodId)",
+            input: input,
+            expectedSpawnSpec: AcpProcessRunner.buildSpawnSpec(harnessKind: .grok, input: input),
+            steps: [
+                .onClientRequest(method: "initialize", replyResultJSON: #"{"authMethods":[\#(methods.joined(separator: ","))]}"#),
+                .onClientRequest(method: "authenticate", replyResultJSON: "{}"),
+                .onClientRequest(method: "session/new", replyResultJSON: #"{"sessionId":"\#(sessionId)"}"#),
+                .onClientRequest(method: "session/prompt", replyResultJSON: #"{"stopReason":"end_turn"}"#)
+            ],
+            expectedEvents: [
+                .sessionStarted(sessionId: sessionId),
+                .completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil)
+            ]
+        )
+    }
+
+    private static func grokModelFixture(
+        id: String,
+        currentModel: String,
+        selectedModel: String,
+        advertisedModels: [String],
+        setModel: Bool,
+        expectUnknownModel: Bool = false
+    ) -> EngineReplayFixture {
+        let sessionId = "session-\(id)"
+        let input = grokProtocolFixtureInput(thread: id, model: selectedModel)
+        let availableModels = advertisedModels.map { #"{"modelId":"\#($0)"}"# }.joined(separator: ",")
+        let sessionReply = #"{"sessionId":"\#(sessionId)","models":{"currentModelId":"\#(currentModel)","availableModels":[\#(availableModels)]}}"#
+        var steps: [ScriptedWireStep] = [
+            .onClientRequest(method: "initialize", replyResultJSON: #"{"agentCapabilities":{}}"#),
+            .onClientRequest(method: "session/new", replyResultJSON: sessionReply)
+        ]
+        var expected: [TurnEvent] = [.sessionStarted(sessionId: sessionId)]
+        if expectUnknownModel {
+            expected.append(.error(code: "unknown_model", message: "Grok ACP does not advertise the selected model \(selectedModel)"))
+        } else {
+            if setModel {
+                steps.append(.onClientRequest(
+                    method: "session/set_model",
+                    replyResultJSON: #"{"models":{"currentModelId":"\#(selectedModel)"}}"#
+                ))
+            }
+            steps.append(.onClientRequest(method: "session/prompt", replyResultJSON: #"{"stopReason":"end_turn"}"#))
+            expected.append(.completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil))
+        }
+        return EngineReplayFixture(
+            id: id,
+            family: .grok,
+            title: "Grok ACP model selection: \(id)",
+            input: input,
+            expectedSpawnSpec: AcpProcessRunner.buildSpawnSpec(harnessKind: .grok, input: input),
+            steps: steps,
+            expectedEvents: expected
+        )
+    }
+
     // MARK: - 2. Codex App-Server JSON-RPC Corpus (20 Scrubbed Turn Fixtures)
 
     public static func codexFixtures() -> [EngineReplayFixture] {

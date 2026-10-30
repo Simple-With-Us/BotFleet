@@ -54,7 +54,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/system-prompt.ts`, `server/context-injection.ts`, `server/turn-context.ts`, `server/tool-row.ts` | Prompt assembly → `EngineDriver` BF-2504 (pure logic, port with fixtures) |
 | `server/seat-prompt.ts`, `bots/_shared.md`, `bots/*.md` (11 seats) | Seat prompts → app resources, `LifecycleService` BF-2497 |
 | `server/chief-of-staff.ts`, `server/botfleet-status-capsule.ts` | Roster/status capsule → `TurnDispatcherActor` input BF-2512 |
-| `server/turn-{stats,watchdog}.ts`, `server/thread-wedge-guard.ts`, `server/repeat-detector.ts`, `server/mcode-lock-contention.ts` | Turn health → `EngineCoordinator` BF-2504 |
+| `server/turn-{stats,watchdog}.ts`, `server/thread-wedge-guard.ts`, `server/repeat-detector.ts`, `server/mcode-lock-contention.ts`, `server/provider-route-activity.ts` | Turn and provider-route health → `EngineCoordinator` BF-2504 |
 | `server/resume-recovery.ts`, `server/turn-worktree-admission.ts` | Resume/rebuild → `EngineDriver` BF-2504 + per-bot switch BF-2508 |
 | `server/checkpoints.ts` | Per-turn workspace snapshots → `EngineDriver` BF-2504 (git-based, reimplement with libgit2 or `git` CLI) |
 | `server/worktree-leases.ts` | Lease queue → `EngineDriver` BF-2504 |
