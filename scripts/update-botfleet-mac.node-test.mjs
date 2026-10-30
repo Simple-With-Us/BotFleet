@@ -11,6 +11,7 @@ import test from "node:test";
 import {
   startDesktopBeforeWatchdog,
   restoreDesktopBeforeWatchdogs,
+  shouldStartDesktop,
   applicationAttachmentError,
   captureProcessIdentities,
   exactAppPidsFromPs,
@@ -120,6 +121,14 @@ test("rollback attempts every watchdog after desktop verification and individual
   });
   assert.deepEqual(calls, ["open restored app", "verify restored app", "first watchdog", "second watchdog"]);
   assert.deepEqual(errors, ["app failed", "first plist failed"]);
+});
+
+test("desktop startup respects component ownership, no-open and the pre-rollback application state", () => {
+  assert.equal(shouldStartDesktop({ updateApp: true }), true);
+  assert.equal(shouldStartDesktop({ updateApp: false }), false);
+  assert.equal(shouldStartDesktop({ updateApp: true, openApplication: false }), false);
+  assert.equal(shouldStartDesktop({ updateApp: true, wasRunning: false }), false);
+  assert.equal(shouldStartDesktop({ updateApp: true, openApplication: true, wasRunning: true }), true);
 });
 
 const scripts = dirname(fileURLToPath(import.meta.url));

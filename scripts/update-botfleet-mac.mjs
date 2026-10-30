@@ -3581,6 +3581,10 @@ async function sweepAbandonedStageDirectories(config, stageDirectories = []) {
 }
 
 /** Establish the requested desktop owner before its watchdog can start a source release. */
+export function shouldStartDesktop({ updateApp, openApplication, wasRunning = true }) {
+  return updateApp && openApplication !== false && wasRunning;
+}
+
 export async function startDesktopBeforeWatchdog({ desktop, open, verify, bootstrap }) {
   if (desktop) {
     await open();
@@ -4252,7 +4256,7 @@ function createOperations(config) {
       // loaded the job, and rollback must boot out the label that is running.
       if (previous) previous.startedHarnessLabel = await startedHarnessLabel(config, plist);
       await startDesktopBeforeWatchdog({
-        desktop: componentFlags().updateApp && config.parsed.openApplication !== false,
+        desktop: shouldStartDesktop({ updateApp: componentFlags().updateApp, openApplication: config.parsed.openApplication }),
         open: () => run("open", [config.appPath]),
         verify: () => waitForStartup({
           attempt: () => runtimeIdentityPreflight(config, prepared),
@@ -4546,7 +4550,7 @@ function createOperations(config) {
         plistLabel: config.customPlist && rollbackPlistExists ? await launchAgentPlistLabel(config.plist) : null,
       });
       await restoreDesktopBeforeWatchdogs({
-        desktop: previous.appWasRunning,
+        desktop: shouldStartDesktop({ updateApp, openApplication: config.parsed.openApplication, wasRunning: previous.appWasRunning }),
         open: () => run("open", [config.appPath]),
         verify: () => waitForStartup({
           attempt: () => runtimePreflight(config),
