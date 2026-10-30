@@ -1,6 +1,9 @@
 import Foundation
 import Testing
 @testable import CompanionCore
+#if canImport(Network)
+import Network
+#endif
 
 /// Records what the controller asked of it and opens nothing.
 private actor StubListenerBackend: CompanionListenerBackend {
@@ -23,7 +26,7 @@ private actor StubListenerBackend: CompanionListenerBackend {
 
     func start(
         advertising: CompanionListenerAdvertisement?,
-        onFailure: @escaping @Sendable (String) async -> Void
+        onUpdate: @escaping @Sendable (CompanionListenerUpdate) async -> Void
     ) async throws -> UInt16? {
         calls.append(.start(advertising: advertising?.name))
         if let failure {
@@ -50,7 +53,7 @@ private actor StoreReadingBackend: CompanionListenerBackend {
 
     func start(
         advertising: CompanionListenerAdvertisement?,
-        onFailure: @escaping @Sendable (String) async -> Void
+        onUpdate: @escaping @Sendable (CompanionListenerUpdate) async -> Void
     ) async throws -> UInt16? {
         settingAtStart.append(store.readCompanionListenerEnabled())
         return 8812
@@ -80,7 +83,7 @@ private actor GatedListenerBackend: CompanionListenerBackend {
 
     func start(
         advertising: CompanionListenerAdvertisement?,
-        onFailure: @escaping @Sendable (String) async -> Void
+        onUpdate: @escaping @Sendable (CompanionListenerUpdate) async -> Void
     ) async throws -> UInt16? {
         calls.append(.start(advertising: advertising?.name))
         if gated == .start { await waitAtGate() }
@@ -113,7 +116,8 @@ private actor GatedListenerBackend: CompanionListenerBackend {
 /// Keeps every start's callback so tests can deliver current or stale events
 /// directly, including an event while the first start has not answered.
 private actor FailingListenerBackend: CompanionListenerBackend {
-    private var failures: [@Sendable (String) async -> Void] = []
+    private var updates: [@Sendable (CompanionListenerUpdate) async -> Void] = []
+    private var sequences: [UInt64] = []
     private let gateFirstStart: Bool
     private let reportFailureOnStop: Bool
     private var gate: CheckedContinuation<Void, Never>?
@@ -127,10 +131,11 @@ private actor FailingListenerBackend: CompanionListenerBackend {
 
     func start(
         advertising: CompanionListenerAdvertisement?,
-        onFailure: @escaping @Sendable (String) async -> Void
+        onUpdate: @escaping @Sendable (CompanionListenerUpdate) async -> Void
     ) async throws -> UInt16? {
-        let index = failures.count
-        failures.append(onFailure)
+        let index = updates.count
+        updates.append(onUpdate)
+        sequences.append(0)
         if index == 0, gateFirstStart {
             await withCheckedContinuation { continuation in
                 gate = continuation
@@ -146,13 +151,20 @@ private actor FailingListenerBackend: CompanionListenerBackend {
     }
 
     func stop() async {
-        if reportFailureOnStop, let failure = failures.last {
-            await failure("cancelled during stop")
+        if reportFailureOnStop, !updates.isEmpty {
+            await fail(start: updates.count - 1, reason: "cancelled during stop")
         }
     }
 
     func fail(start index: Int, reason: String) async {
-        await failures[index](reason)
+        await emit(start: index, event: .failed(reason: reason))
+    }
+
+    var startCount: Int { updates.count }
+
+    func emit(start index: Int, event: CompanionListenerUpdate.Event, sequence: UInt64? = nil) async {
+        sequences[index] += 1
+        await updates[index](CompanionListenerUpdate(sequence: sequence ?? sequences[index], event: event))
     }
 
     func firstStartIsWaiting() async {
@@ -537,6 +549,92 @@ struct CompanionListenerControllerTests {
         })
     }
 
+    @Test("A waiting listener recovers on ready without a new start")
+    @MainActor
+    func waitingRecoversAutomatically() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backend = FailingListenerBackend()
+        let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
+        await controller.start()
+        await backend.emit(start: 0, event: .waiting(reason: "network unavailable"))
+        #expect(controller.state == .waiting(reason: "network unavailable"))
+        #expect(controller.state.summary == "Waiting for network: network unavailable")
+        await controller.start()
+        #expect(await backend.startCount == 1)
+        await backend.emit(start: 0, event: .ready(port: 8812))
+        #expect(controller.state == .listening(port: 8812, advertisedAs: "Ada's Mac"))
+    }
+
+    @Test("Waiting after ready is not overwritten by a delayed start result")
+    @MainActor
+    func waitingSurvivesStartReturn() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backend = FailingListenerBackend(gateFirstStart: true)
+        let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
+        let starting = Task { @MainActor in await controller.start() }
+        await backend.firstStartIsWaiting()
+        await backend.emit(start: 0, event: .ready(port: 8812))
+        await backend.emit(start: 0, event: .waiting(reason: "network unavailable"))
+        await backend.finishFirstStart()
+        await starting.value
+        #expect(controller.state == .waiting(reason: "network unavailable"))
+        await backend.emit(start: 0, event: .ready(port: 8812))
+        #expect(controller.state == .listening(port: 8812, advertisedAs: "Ada's Mac"))
+    }
+
+    @Test("A fatal start error after its ready callback cannot leave the controller listening")
+    @MainActor
+    func readyThenThrowIsFailed() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backend = FailingListenerBackend(gateFirstStart: true)
+        let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
+        let starting = Task { @MainActor in await controller.start() }
+        await backend.firstStartIsWaiting()
+        await backend.emit(start: 0, event: .ready(port: 8812))
+        #expect(controller.state == .listening(port: 8812, advertisedAs: "Ada's Mac"))
+        await backend.finishFirstStart(error: "fatal after readiness")
+        await starting.value
+        #expect(controller.state == .failed(reason: "fatal after readiness"))
+    }
+
+    @Test("Queued waiting or ready events cannot revive a stopped or newer listener")
+    @MainActor
+    func staleNetworkStatesAreIgnored() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backend = FailingListenerBackend()
+        let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
+        await controller.start()
+        await backend.emit(start: 0, event: .waiting(reason: "network unavailable"))
+        await controller.stop()
+        await backend.emit(start: 0, event: .ready(port: 8812))
+        #expect(controller.state == .stopped)
+        await controller.start()
+        await backend.emit(start: 0, event: .waiting(reason: "stale wait"))
+        await backend.emit(start: 0, event: .ready(port: 8812))
+        #expect(controller.state == .listening(port: 8813, advertisedAs: "Ada's Mac"))
+    }
+
+    @Test("A later state wins when network callbacks cross actors out of order")
+    @MainActor
+    func reorderedNetworkStatesAreIgnored() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backend = FailingListenerBackend()
+        let controller = CompanionListenerController(backend: backend, policyStore: store, advertisement: ada)
+        await controller.start()
+        await backend.emit(start: 0, event: .ready(port: 8812), sequence: 3)
+        await backend.emit(start: 0, event: .waiting(reason: "older wait"), sequence: 2)
+        await backend.emit(start: 0, event: .failed(reason: "older failure"), sequence: 1)
+        #expect(controller.state == .listening(port: 8812, advertisedAs: "Ada's Mac"))
+        await backend.emit(start: 0, event: .failed(reason: "fatal failure"), sequence: 4)
+        await backend.emit(start: 0, event: .ready(port: 8812), sequence: 5)
+        #expect(controller.state == .failed(reason: "fatal failure"))
+    }
+
     @Test("The default advertisement is this Mac's name, or nothing when the name is unknown")
     func defaultAdvertisement() {
         #expect(CompanionListenerController.defaultAdvertisement(computerName: "Ada's Mac")?.name == "Ada's Mac")
@@ -559,27 +657,73 @@ struct CompanionListenerControllerTests {
     }
 
     #if canImport(Network)
+    @Test("A reserved fatal error wins over delayed ready and cleanup cancellation")
+    func reservedFatalCompletionWins() {
+        let settlement = ListenerStartSettlement()
+        let failure = NWError.posix(.ENETDOWN)
+        settlement.reserveFailure(failure)
+        var outcomes: [String] = []
+        settlement.once { outcomes.append("delayed ready") }
+        settlement.once { outcomes.append("cleanup cancellation") }
+        #expect(outcomes.isEmpty)
+        settlement.finishFailure { outcomes.append("fatal error") }
+        settlement.finishFailure { outcomes.append("duplicate failure") }
+        #expect(outcomes == ["fatal error"])
+        #expect(settlement.failure == failure)
+    }
+
     @Test(
-        "A real listener answers the port it bound, a second start replaces the first, and a port in use is a failed start",
+        "A replacement prepares before releasing the old port, and an occupied port is not reported ready",
         .timeLimit(.minutes(1))
     )
     func realListenerAnswersItsPort() async throws {
         // Loopback only, on ports the system picks: no desktop input, and
         // nothing a phone could reach.
         let database = try DatabaseService(path: ":memory:")
-        let server = NativeCompanionServer(database: database)
+        let runtime = NativeRuntimeServices(
+            database: database,
+            engineCoordinator: EngineCoordinatorActor(),
+            engineSwitch: BotNativeEngineSwitchActor(database: database),
+            workspaceSource: ListenerFixtureWorkspaces(),
+            processOwnershipSource: ListenerFixtureProcesses()
+        )
+        let server = NativeCompanionServer(database: database, nativeRuntime: runtime)
         let first = try await server.startListening(port: 0)
         #expect(first != nil)
         #expect(await server.listeningPort == first)
         let second = try await server.startListening(port: 0)
         #expect(second != nil)
         #expect(await server.listeningPort == second)
-        // The port the server holds is in use: a second server asking for it
-        // gets a thrown error, not a listener that never becomes ready.
+        // A rejected preparation leaves the healthy listener in place.
+        await runtime.shutdown()
+        await #expect(throws: NativeRuntimeServicesError.self) {
+            try await server.startListening(port: 0)
+        }
+        #expect(await server.listeningPort == second)
+
+        // A conflicting bind may wait or fail, depending on the platform.
+        // A waiting start remains cancellable instead of being called ready.
         let contenderDatabase = try DatabaseService(path: ":memory:")
         let contender = NativeCompanionServer(database: contenderDatabase)
+        let updates = ListenerFixtureUpdates()
+        let attempt = Task {
+            do {
+                return try await contender.startListening(port: second ?? 0) { update in
+                    await updates.record(update.event)
+                }
+            } catch {
+                await updates.record(.failed(reason: error.localizedDescription))
+                throw error
+            }
+        }
+        switch await updates.first() {
+        case .waiting, .failed: break
+        case .ready: Issue.record("An occupied listener port unexpectedly became ready")
+        }
+        #expect(await contender.listeningPort == nil)
+        await contender.stopListening()
         await #expect(throws: (any Error).self) {
-            try await contender.startListening(port: second ?? 0)
+            try await attempt.value
         }
         #expect(await contender.listeningPort == nil)
         await server.stopListening()
@@ -587,3 +731,30 @@ struct CompanionListenerControllerTests {
     }
     #endif
 }
+
+#if canImport(Network)
+private struct ListenerFixtureWorkspaces: NativeEventWaitWorkspaceSource {
+    func workspaceRoot(forRegisteredBotId botId: String) async throws -> URL? { nil }
+}
+
+private struct ListenerFixtureProcesses: NativeEventWaitProcessOwnershipSource {
+    func hasFinishedProcess(pid: Int32, startTime: Double, ownedByBotId botId: String) async -> Bool { false }
+}
+
+private actor ListenerFixtureUpdates {
+    private var firstUpdate: CompanionListenerUpdate.Event?
+    private var waiter: CheckedContinuation<CompanionListenerUpdate.Event, Never>?
+
+    func record(_ event: CompanionListenerUpdate.Event) {
+        guard firstUpdate == nil else { return }
+        firstUpdate = event
+        waiter?.resume(returning: event)
+        waiter = nil
+    }
+
+    func first() async -> CompanionListenerUpdate.Event {
+        if let firstUpdate { return firstUpdate }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+}
+#endif

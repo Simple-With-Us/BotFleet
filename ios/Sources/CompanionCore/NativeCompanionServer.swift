@@ -509,6 +509,7 @@ public actor NativeCompanionServer {
     #if canImport(Network)
     private var listener: NWListener?
     private var listenerGeneration: UInt64 = 0
+    private var listenerUpdateSequence: UInt64 = 0
     private let listenerQueue = DispatchQueue(label: "app.botfleet.companion-server", qos: .userInitiated)
     #endif
 
@@ -1247,22 +1248,21 @@ public actor NativeCompanionServer {
     }
 
     /// Starts the listener and answers the port it bound once the socket is
-    /// ready, or throws the listener's own error when the bind fails.  The
-    /// port is read back from the listener, never from the number asked for,
+    /// ready, or throws the listener's own fatal error; a waiting start
+    /// remains pending and can be stopped while networking recovers.
+    /// The port is read back from the listener, never from the number asked for,
     /// so a system-chosen port is reported truly.  A second start replaces the
     /// first listener instead of leaking it beside the new one.
     @discardableResult
     public func startListening(
         port: UInt16 = 0,
         options: ListenerOptions = ListenerOptions(),
-        onFailure: @escaping @Sendable (String) async -> Void = { _ in }
+        onUpdate: @escaping @Sendable (CompanionListenerUpdate) async -> Void = { _ in }
     ) async throws -> UInt16? {
-        // Invalidate an older start before activating the shared runtime,
-        // which can suspend and let a newer start or stop enter this actor.
-        stopListenerSocket()
+        // Reserve this request without stopping a healthy listener during
+        // validation, runtime activation or replacement construction.
+        listenerGeneration &+= 1
         let generation = listenerGeneration
-        try await nativeRuntime?.activate(pollIntervalSeconds: 1)
-        guard generation == listenerGeneration else { throw CancellationError() }
         let nwPort: NWEndpoint.Port
         if port == 0 {
             nwPort = .any
@@ -1272,6 +1272,8 @@ public actor NativeCompanionServer {
             }
             nwPort = resolved
         }
+        try await nativeRuntime?.activate(pollIntervalSeconds: 1)
+        guard generation == listenerGeneration else { throw CancellationError() }
         let listener = try NWListener(using: .tcp, on: nwPort)
         // Loopback by default: the cleartext device port must not be reachable
         // from the network unless someone opted in on purpose.
@@ -1293,10 +1295,15 @@ public actor NativeCompanionServer {
                 await self.acceptConnection(connection)
             }
         }
+        // A replacement on the same port needs a bind handoff: it cannot
+        // become ready while the old listener still owns that address.
+        let previous = self.listener
         self.listener = listener
+        listenerUpdateSequence = 0
+        previous?.cancel()
         // The listener reports each state on its queue.  The first report that
-        // settles the start resumes the continuation; a later failure also
-        // clears this socket and reaches the lifecycle controller.
+        // settles the start resumes the continuation; waiting retains the
+        // socket and a later ready event restores its visible state.
         let settlement = ListenerStartSettlement()
         do {
             let bound: UInt16? = try await withCheckedThrowingContinuation { continuation in
@@ -1304,17 +1311,25 @@ public actor NativeCompanionServer {
                 listener.stateUpdateHandler = { [weak self, weak listener] state in
                     switch state {
                     case .ready:
-                        settlement.once(ready: true) { continuation.resume(returning: listener?.port?.rawValue) }
-                    case .waiting(let error), .failed(let error):
-                        // A port in use arrives as `.waiting` on some systems
-                        // and as `.failed` on others, and neither becomes
-                        // ready on its own, so both are a failed start.
-                        let wasReady = settlement.once { continuation.resume(throwing: error) }
-                        if wasReady, let listener {
-                            let reason = error.localizedDescription
-                            Task {
-                                await self?.listenerDidFail(listener, reason: reason, onFailure: onFailure)
-                            }
+                        let port = listener?.port?.rawValue
+                        let update = CompanionListenerUpdate(sequence: settlement.nextSequence(), event: .ready(port: port))
+                        Task {
+                            if let listener { await self?.listenerChanged(listener, update: update, onUpdate: onUpdate) }
+                            settlement.once { continuation.resume(returning: port) }
+                        }
+                    case .waiting(let error):
+                        let update = CompanionListenerUpdate(sequence: settlement.nextSequence(), event: .waiting(reason: error.localizedDescription))
+                        Task {
+                            if let listener { await self?.listenerChanged(listener, update: update, onUpdate: onUpdate) }
+                        }
+                    case .failed(let error):
+                        let update = CompanionListenerUpdate(sequence: settlement.nextSequence(), event: .failed(reason: error.localizedDescription))
+                        // Reserve the fatal outcome before cancellation or a
+                        // delayed ready task can settle the pending start.
+                        settlement.reserveFailure(error)
+                        Task {
+                            if let listener { await self?.listenerChanged(listener, update: update, onUpdate: onUpdate) }
+                            settlement.finishFailure { continuation.resume(throwing: error) }
                         }
                     case .cancelled:
                         settlement.once { continuation.resume(throwing: CancellationError()) }
@@ -1325,6 +1340,10 @@ public actor NativeCompanionServer {
                     }
                 }
                 listener.start(queue: listenerQueue)
+            }
+            guard generation == listenerGeneration, self.listener === listener else {
+                if let failure = settlement.failure { throw failure }
+                throw CancellationError()
             }
             return bound
         } catch {
@@ -1348,25 +1367,28 @@ public actor NativeCompanionServer {
         listener = nil
     }
 
-    private func listenerDidFail(
-        _ failedListener: NWListener,
-        reason: String,
-        onFailure: @Sendable (String) async -> Void
+    private func listenerChanged(
+        _ changedListener: NWListener,
+        update: CompanionListenerUpdate,
+        onUpdate: @Sendable (CompanionListenerUpdate) async -> Void
     ) async {
         // A queued state from a replaced or intentionally stopped listener
-        // cannot clear the current socket or report a failure for it.
-        guard listener === failedListener else { return }
-        stopListenerSocket()
-        await onFailure(reason)
+        // cannot clear the current socket or overwrite a newer observation.
+        guard listener === changedListener, update.sequence > listenerUpdateSequence else { return }
+        listenerUpdateSequence = update.sequence
+        if case .failed = update.event {
+            changedListener.cancel()
+            listener = nil
+        }
+        await onUpdate(update)
     }
 
-    /// The port the listener bound, once it has one; nil before `startListening`
-    /// answers, after `stopListening`, or after a listener failure.
-    /// Read back from the listener, never
-    /// from the number that was asked for, so a system-chosen port is reported
-    /// truly.
+    /// The bound port while the current listener is ready; nil during setup,
+    /// waiting, after `stopListening`, or after a fatal listener failure.
+    /// Read back from the listener rather than the number that was asked for.
     public var listeningPort: UInt16? {
-        listener?.port?.rawValue
+        guard let listener, case .ready = listener.state else { return nil }
+        return listener.port?.rawValue
     }
 
     private func acceptConnection(_ connection: NWConnection) {
@@ -1583,24 +1605,45 @@ public actor NativeCompanionServer {
 #if canImport(Network)
 /// Lets a Network.framework state handler, which fires once per state on the
 /// listener's queue, resume a start's continuation exactly once.
-private final class ListenerStartSettlement: @unchecked Sendable {
+final class ListenerStartSettlement: @unchecked Sendable {
     private let lock = NSLock()
     private var settled = false
-    private var becameReady = false
+    private var sequence: UInt64 = 0
+    private var reservedFailure: NWError?
 
-    /// Returns whether readiness settled the start before this event.
-    @discardableResult
-    func once(ready: Bool = false, _ body: () -> Void) -> Bool {
+    var failure: NWError? {
         lock.lock()
-        let first = !settled
-        let wasReady = becameReady
-        if first {
-            settled = true
-            becameReady = ready
-        }
+        defer { lock.unlock() }
+        return reservedFailure
+    }
+
+    func reserveFailure(_ error: NWError) {
+        lock.lock()
+        if reservedFailure == nil { reservedFailure = error }
+        lock.unlock()
+    }
+
+    func nextSequence() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        sequence &+= 1
+        return sequence
+    }
+
+    func once(_ body: () -> Void) {
+        finish(allowReservedFailure: false, body)
+    }
+
+    func finishFailure(_ body: () -> Void) {
+        finish(allowReservedFailure: true, body)
+    }
+
+    private func finish(allowReservedFailure: Bool, _ body: () -> Void) {
+        lock.lock()
+        let first = !settled && (reservedFailure == nil || allowReservedFailure)
+        if first { settled = true }
         lock.unlock()
         if first { body() }
-        return wasReady
     }
 }
 #endif
