@@ -379,11 +379,13 @@ public struct CompanionClient: Sendable {
     public let connection: Connection
     private let token: String?
     private let session: URLSession
+    private let gateCredential: HostGateCredential?
 
-    public init(connection: Connection, token: String?, session: URLSession = .shared) {
+    public init(connection: Connection, token: String?, session: URLSession = .shared, gateCredential: HostGateCredential? = nil) {
         self.connection = connection
         self.token = token
         self.session = session
+        self.gateCredential = gateCredential
     }
 
     // MARK: - Requests
@@ -406,6 +408,7 @@ public struct CompanionClient: Sendable {
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
+        if let gateCredential { try gateCredential.authorize(&request) }
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -468,7 +471,7 @@ public struct CompanionClient: Sendable {
 
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
-            return try await session.data(for: request)
+            return try await session.data(for: request, delegate: gateCredential.map { HostOriginRedirectPolicy(origin: $0.origin) })
         } catch {
             if Task.isCancelled || (error as? URLError)?.code == .cancelled || error is CancellationError {
                 throw CancellationError()
@@ -1805,6 +1808,6 @@ public struct CompanionClient: Sendable {
         // first quiet gap and reconnect, forever, looking like a flaky network
         // rather than a number in the wrong place.
         streamRequest.timeoutInterval = 90
-        return eventStream(request: streamRequest, session: Self.streaming)
+        return eventStream(request: streamRequest, session: Self.streaming, delegate: gateCredential.map { HostOriginRedirectPolicy(origin: $0.origin) })
     }
 }

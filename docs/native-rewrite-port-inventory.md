@@ -84,7 +84,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/env-path.ts` | GUI-launch PATH augmentation → app startup BF-2497 (Finder-launch env) |
 | `server/proxy-paths.ts`, `server/runtime-identity.ts` | Runtime path/identity → app startup BF-2497 |
 | `server/atomic.ts`, `server/store-guard.ts` | Atomic writes + corrupt-store guard → `DatabaseService` BF-2480 (SQLite transactions subsume both) |
-| `electron/infisical-read.mjs`, `electron/server-target.mjs`, `electron/remote-credential-guard.mjs` + their `.node-test.mjs` twins | Out-of-harness vault read, the `local`/`remote` server target, and the remote-mode credential refusal (BF-2544) → `InfisicalResolver` + app settings BF-2506; the target choice becomes native settings and the refusal rule ports as a guard on the native credential path |
+| `electron/infisical-read.mjs`, `electron/server-target.mjs`, `electron/remote-credential-guard.mjs` + their `.node-test.mjs` twins | Out-of-harness vault read, the `local`/`remote` server target, and the remote-mode credential refusal (BF-2544) → `InfisicalResolver` + app settings BF-2506; BF-2599 adds the saved-host, origin-bound credential and read-only handshake library with isolated fixtures, while native settings composition and the remote credential guard remain later slices |
 
 ## 3. Storage → Phase 1 (BF-2480, BF-2495)
 
