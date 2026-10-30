@@ -48,12 +48,25 @@ describe("dedicated-volume device guard", () => {
       statfs: (path) => { reads.push(path); return { bsize: 1, blocks: 100, bavail: 50, files: 100, ffree: 0 }; }, realPath: (path) => path, readMountinfo: () => "" });
     expect(admissionRefusal(probe, { maxSwapPercent: 98, minFreeDiskBytes: 1 }, "/data", false)).toContain("Server storage offline");
     const report = hostResourcesReport({ hostId: "server:11111111-1111-4111-8111-111111111111", version: null, platform: "linux", dataDir: "/data", probe,
-      thresholds: () => ({ maxSwapPercent: 98, minFreeDiskBytes: 1 }), readText: () => { throw new Error("fixture"); } });
+      thresholds: () => ({ maxSwapPercent: 98, minFreeDiskBytes: 1, minFreeInodes: 1 }), readText: () => { throw new Error("fixture"); } });
     expect(report.storage?.online).toBe(false);
     expect(report.sample.diskFreeBytes).toBeNull();
     expect(report.sample.rootDiskFreeBytes).toBe(50);
     expect(reads).toEqual(["/"]);
     expect(report.enforcement.disk).toMatchObject({ kind: "notApplied", reason: expect.stringContaining("Server storage offline") });
+    expect(report.enforcement.inodes).toMatchObject({ kind: "notApplied", reason: expect.stringContaining("Server storage offline") });
+  });
+
+  it("refuses a device loss during one disk/inode observation without retrying unknown readings", () => {
+    let dataDevice = 2;
+    let deviceChecks = 0;
+    let diskReads = 0;
+    const guard = storageDeviceGuard("/data", (path) => ({ dev: path === "/" ? 1 : dataDevice }));
+    const probe = createHostProbe({ platform: "linux", readLinuxMeminfo: () => "", storageState: () => { deviceChecks++; return guard.sample(); },
+      statfs: () => { diskReads++; dataDevice = 1; return { bsize: 1, blocks: 100, bavail: 50, files: 100, ffree: 50 }; } });
+    expect(admissionRefusal(probe, { maxSwapPercent: 98, minFreeDiskBytes: 1, minFreeInodes: 1 }, "/data", false)).toContain("Server storage offline");
+    expect(diskReads).toBe(1);
+    expect(deviceChecks).toBe(2);
   });
 
   it.skipIf(process.platform === "win32")("checks storage before opening an application log or starting the harness", async () => {
