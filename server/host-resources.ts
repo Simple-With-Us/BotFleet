@@ -13,12 +13,15 @@ export interface HostResourcesDeps {
   thresholds: () => AdmissionThresholds;
   readText?: (path: string) => string;
 }
+export type HostResourcesResponse =
+  | { status: 200; body: HostResourcesReport }
+  | { status: 403 | 501; body: { error: string } };
 
 /** The companion bearer is intentionally outside the host-owner boundary. */
 export function hostResourcesResponse(
   caller: { localOwner: boolean; fromCompanion: boolean; viaNamedTunnel: boolean },
   deps: Omit<HostResourcesDeps, "platform"> & { platform: NodeJS.Platform },
-): { status: number; body: HostResourcesReport | { error: string } } {
+): HostResourcesResponse {
   if (!caller.localOwner || caller.fromCompanion || caller.viaNamedTunnel) {
     return { status: 403, body: { error: "Host resources are available only through the local owner or authenticated server gate" } };
   }
@@ -49,6 +52,20 @@ export function ownCgroupDirectory(cgroup: string, mountinfo: string): string | 
 const finiteLimit = (raw: string | null): boolean => raw !== null && /^\d+$/.test(raw) && Number.isSafeInteger(Number(raw));
 const gate = (): EnforcementState => ({ kind: "gateOnly" });
 const unsupported = (reason: string): EnforcementState => ({ kind: "unsupported", reason });
+
+/** Kernel io.max keys whole block devices; resolve a partition through sysfs. */
+export function ioDeviceForVolume(device: string, read: (path: string) => string | null): string | null {
+  const isDevice = (value: string | null): value is string => value !== null && /^\d+:\d+$/.test(value);
+  if (!isDevice(device)) return null;
+  const block = `/sys/dev/block/${device}`;
+  if (read(`${block}/dev`) !== device) return null;
+  const partition = read(`${block}/partition`);
+  if (partition === null) return device;
+  if (!/^[1-9]\d*$/.test(partition)) return null;
+  // Preserve /../ until kernel path lookup: the block entry is a sysfs symlink.
+  const parent = read(`${block}/../dev`);
+  return isDevice(parent) && parent !== device ? parent : null;
+}
 
 /** Read-back is evidence; desired config and drop-in contents are never consulted. */
 export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesReport {
@@ -85,8 +102,13 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
     if (finiteLimit(observedLimits["memory.max"]!)) enforcement.memory = { kind: "kernelCap", mechanism: "cgroup v2 memory.max, whole server; a runaway job can stop the harness" };
     if (finiteLimit(observedLimits["memory.swap.max"]!)) enforcement.swap = { kind: "kernelCap", mechanism: "cgroup v2 memory.swap.max, whole server" };
     const io = observedLimits["io.max"] ?? "";
-    if (sample.dataVolume && io.split("\n").some((line) => line.split(/\s/)[0] === sample.dataVolume!.device && /(?:^|\s)(?:rbps|wbps|riops|wiops)=[1-9]\d*(?:\s|$)/.test(line))) {
+    const ioDevice = sample.dataVolume ? ioDeviceForVolume(sample.dataVolume.device, safeRead) : null;
+    if (ioDevice && io.split("\n").some((line) => line.split(/\s/)[0] === ioDevice && /(?:^|\s)(?:rbps|wbps|riops|wiops)=[1-9]\d*(?:\s|$)/.test(line))) {
       enforcement.io = { kind: "kernelCap", mechanism: "cgroup v2 device I/O rate, whole server" };
+    }
+    if (sample.dataVolume && ioDevice === null) {
+      enforcement.io = { kind: "notApplied", reason: "The data volume's whole block device could not be resolved; I/O enforcement is unknown", restartRequired: false };
+      limitations.push("The data volume's whole block device could not be resolved; its I/O enforcement is unknown");
     }
     if (!directory) limitations.push("This process's cgroup v2 could not be resolved; kernel enforcement is unknown");
     limitations.push("Read-back covers this cgroup, not ancestor limits or a per-job cgroup");
