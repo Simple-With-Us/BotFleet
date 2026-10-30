@@ -42,7 +42,22 @@ export const MARKETING_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\
 // here; the DSN and auth token are never read by this module.
 function shown(value) {
   if (value === undefined) return "missing";
-  const text = JSON.stringify(value) ?? String(value);
+  let text;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    text = undefined;
+  }
+  // JSON.stringify returns undefined for functions and symbols, and throws on
+  // BigInt and cycles.  The String() fallback can carry raw CR/LF, so strip it.
+  if (text === undefined) {
+    try {
+      text = String(value);
+    } catch {
+      text = "unprintable";
+    }
+    text = text.replace(/[\r\n]+/g, " ");
+  }
   return text.length > 80 ? `${text.slice(0, 80)}...` : text;
 }
 

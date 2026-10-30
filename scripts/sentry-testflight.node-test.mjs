@@ -311,3 +311,10 @@ test('the actual reporting validation fails the explicit error indicator before 
   assert.match(result.stderr,/upload succeeded but receipt verification failed/);
   assert.ok(workflow.indexOf('Validate the distribution receipt') < workflow.indexOf('Load the required Sentry auth token'));
 });
+
+test("receipt errors stay single-line for values JSON cannot render", () => {
+  assert.throws(
+    () => validateReceipt({ bundleId: 10n, marketingVersion: Symbol("a\nb") }),
+    (error) => error instanceof Error && !(error instanceof TypeError) && /bundleId 10 is not a string/.test(error.message) && /marketingVersion Symbol\(a b\) is not a string/.test(error.message) && !/[\r\n]/.test(error.message),
+  );
+});
