@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { denyReason } from "../companion/src/routes.ts";
 import { createHostProbe, type CapacityHostProbe } from "./jobs/admission.ts";
-import { hostResourcesReport, hostResourcesResponse, ownCgroupDirectory, type HostResourcesDeps } from "./host-resources.ts";
+import { hostResourcesReport, hostResourcesResponse, ioDeviceForVolume, ownCgroupDirectory, type HostResourcesDeps } from "./host-resources.ts";
 
 const cgroupMount = "29 24 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw";
 const meminfo = "MemTotal: 16777216 kB\nMemAvailable: 8388608 kB\nSwapTotal: 4194304 kB\nSwapFree: 3145728 kB\n";
@@ -19,13 +19,36 @@ function deps(files: Record<string, string> = {}): HostResourcesDeps {
     hostId: "server:11111111-1111-4111-8111-111111111111", version: "fixture-version", platform: "linux", dataDir: "/data/jobs", probe: probe(),
     thresholds: () => ({ maxSwapPercent: 91, minFreeDiskBytes: 1234 }),
     readText: (path) => {
-      const text = ({ "/proc/self/cgroup": "0::/system.slice/botfleet-fixture.service", "/proc/self/mountinfo": cgroupMount, ...files })[path];
+      const text = ({ "/proc/self/cgroup": "0::/system.slice/botfleet-fixture.service", "/proc/self/mountinfo": cgroupMount, "/sys/dev/block/8:16/dev": "8:16", ...files })[path];
       if (text === undefined) throw new Error("fixture file unavailable");
       return text;
     },
   };
 }
 const file = (name: string) => `/sys/fs/cgroup/system.slice/botfleet-fixture.service/${name}`;
+
+describe("data-volume I/O device", () => {
+  it("resolves partitions through their sysfs parent without guessing minor numbers", () => {
+    const files: Record<string, string> = { "/sys/dev/block/259:7/dev": "259:7", "/sys/dev/block/259:7/partition": "3", "/sys/dev/block/259:7/../dev": "259:0", "/sys/dev/block/8:16/dev": "8:16" };
+    const read = (path: string) => files[path] ?? null;
+    expect(ioDeviceForVolume("259:7", read)).toBe("259:0");
+    expect(ioDeviceForVolume("8:16", read)).toBe("8:16");
+    expect(ioDeviceForVolume("0:91", read)).toBeNull();
+    expect(ioDeviceForVolume("../other", read)).toBeNull();
+    delete files["/sys/dev/block/259:7/../dev"];
+    expect(ioDeviceForVolume("259:7", read)).toBeNull();
+  });
+
+  it("recognizes a parent-disk rate for a partition and refuses unrelated or unresolved devices", () => {
+    const setup = deps({ "/sys/dev/block/8:16/partition": "1", "/sys/dev/block/8:16/../dev": "8:0", [file("io.max")]: "8:0 rbps=1024 wbps=max" });
+    expect(hostResourcesReport(setup).enforcement.io.kind).toBe("kernelCap");
+    const unrelated = deps({ "/sys/dev/block/8:16/partition": "1", "/sys/dev/block/8:16/../dev": "8:0", [file("io.max")]: "8:32 rbps=1024" });
+    expect(hostResourcesReport(unrelated).enforcement.io.kind).toBe("unsupported");
+    const unresolved = deps({ "/sys/dev/block/8:16/partition": "1", [file("io.max")]: "8:0 rbps=1024" });
+    expect(hostResourcesReport(unresolved).enforcement.io.kind).toBe("notApplied");
+    expect(hostResourcesReport(unresolved).limitations.join(" ")).toContain("I/O enforcement is unknown");
+  });
+});
 
 describe("host capacity probe", () => {
   it("uses admission's cached swap reading and disk filesystem with exact units", () => {
