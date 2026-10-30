@@ -2,7 +2,7 @@ import { appendFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { validateReceipt, BUILD_NUMBER_PATTERN } from "./sentry-testflight-receipt.mjs";
+import { validateReceipt, BUILD_NUMBER_PATTERN, MARKETING_VERSION_PATTERN } from "./sentry-testflight-receipt.mjs";
 
 const API = "https://sentry.io/api/0/organizations/simple-with-us/releases/";
 // One constant, because Sentry's refs[].repository must match the repository
@@ -17,8 +17,8 @@ const ReceiptSchema = z.object({
   milestone: z.literal("testflight-processed"),
   externalInstallPath: z.literal(true),
   bundleId: z.literal("app.botfleet.ios"),
-  marketingVersion: z.string().regex(/^1\.0\.\d+$/),
-  // Imported, not re-declared: see BUILD_NUMBER_PATTERN in sentry-testflight-receipt.mjs.
+  // Imported, not re-declared: see the patterns in sentry-testflight-receipt.mjs.
+  marketingVersion: z.string().regex(MARKETING_VERSION_PATTERN),
   buildNumber: z.string().regex(BUILD_NUMBER_PATTERN),
   sourceCommit: z.string().regex(/^[a-f0-9]{40}$/),
   ascBuildId: z.string().regex(/^[A-Za-z0-9-]{1,64}$/),

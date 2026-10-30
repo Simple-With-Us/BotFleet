@@ -131,14 +131,26 @@ resolve_token() {
 # Read the manifest at a ref (branch or commit) into a file.  Sets FETCHED_SHA
 # to the file's blob sha.
 fetch_json_at() {
-  local ref="$1" dest="$2" meta b64
+  local ref="$1" dest="$2" raw sha
   command -v gh >/dev/null 2>&1 || return 1
-  meta="$(gh api "repos/${REPO}/contents/${REMOTE_PATH}?ref=${ref}" --jq '[.sha, .content] | @tsv' 2>/dev/null || true)"
-  [[ -n "$meta" ]] || return 1
-  FETCHED_SHA="${meta%%$'\t'*}"
-  b64="${meta#*$'\t'}"
-  [[ -n "$b64" ]] || return 1
-  python3 -c 'import base64,sys; sys.stdout.write(base64.b64decode("".join(sys.argv[1].split())).decode())' "$b64" >"$dest"
+  # Parse the raw contents response, not a --jq '@tsv' line:  GitHub wraps the
+  # base64 content every 60 characters and @tsv escapes those newlines into a
+  # literal backslash-n, which base64 then reads as data and fails with
+  # "Incorrect padding" on every publish.
+  raw="$(gh api "repos/${REPO}/contents/${REMOTE_PATH}?ref=${ref}" 2>/dev/null || true)"
+  [[ -n "$raw" ]] || return 1
+  sha="$(printf '%s' "$raw" | python3 -c '
+import base64, json, sys
+doc = json.load(sys.stdin)
+sha, content = doc.get("sha"), doc.get("content")
+if not isinstance(sha, str) or not sha or not isinstance(content, str) or not content:
+    sys.exit(1)
+text = base64.b64decode("".join(content.split()), validate=True).decode()
+open(sys.argv[1], "w", encoding="utf-8").write(text)
+print(sha)
+' "$dest" 2>/dev/null)" || return 1
+  [[ -n "$sha" ]] || return 1
+  FETCHED_SHA="$sha"
 }
 
 fetch_remote_json() {
