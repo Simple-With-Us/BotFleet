@@ -248,6 +248,7 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
         inodesFree: stats && inodeTotal !== null ? nonnegative(Number(stats.ffree)) : null,
         dataVolume: online && platform === "linux" ? safe(() => mountForPath(mountinfo(), realPath(path))) : null,
         rootDiskFreeBytes: root && Number(root.bsize) > 0 && Number(root.blocks) > 0 ? nonnegative(Number(root.bavail) * Number(root.bsize)) : null,
+        storage: data.storage,
       };
     },
   };
