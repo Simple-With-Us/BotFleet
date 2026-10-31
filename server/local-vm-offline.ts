@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { z } from "zod";
 
 import { dataDir } from "./data-dir.ts";
+import { resolveHarnessPort } from "./harness-ports.ts";
 
 import {
   CONTAINER,
@@ -107,12 +108,13 @@ export async function inspectOfflineLocalVms(runner: CommandRunner = defaultComm
 
 export async function assertHarnessStopped(dir = dataDir()): Promise<void> {
   if (!existsSync(join(dir, "stopped.marker"))) throw new Error("BotFleet Server has no deliberate-stop marker");
+  const harnessPort = resolveHarnessPort();
   const portFree = await new Promise<boolean>((resolve) => {
     const server = createServer();
     server.once("error", () => resolve(false));
-    server.listen({ port: 8799, host: "127.0.0.1", exclusive: true }, () => server.close(() => resolve(true)));
+    server.listen({ port: harnessPort, host: "127.0.0.1", exclusive: true }, () => server.close(() => resolve(true)));
   });
-  if (!portFree) throw new Error("BotFleet Server may still be listening on port 8799");
+  if (!portFree) throw new Error(`BotFleet Server may still be listening on port ${harnessPort}`);
   if (process.platform === "darwin") {
     try {
       const launchd = execFileSync("/bin/launchctl", ["list"], {

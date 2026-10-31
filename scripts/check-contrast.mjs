@@ -13,7 +13,7 @@
 //     actually render (`bg-accent … text-white`), not the token against the
 //     page ground.
 //
-// The three pairs already below AA are listed in KNOWN below with the ratio
+// Any pairs below AA are listed in KNOWN below with the ratio
 // they measure today, so adopting this check does not force a palette change
 // in the same commit. Anything new fails the run — and so does a known pair
 // that gets WORSE than its recorded floor.
@@ -122,11 +122,7 @@ const PAIRS = [
 // fails like anything else. Improve one past AA and the run says so, so the
 // line gets deleted rather than quietly protecting a pair that no longer
 // needs it.
-const KNOWN = new Map([
-  ["#ffffff on --color-accent", 3.65],
-  ["#ffffff on --color-danger", 3.1],
-  ["--color-accent on --color-card", 4.15],
-]);
+const KNOWN = new Map([]);
 
 // Rounding headroom: the floors above are quoted to two decimals, so a value
 // that is unchanged can measure a hair under its own printed figure.
