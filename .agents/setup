@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Orb setup for the BotFleet repository.
+#
+# Fresh orbs need exactly what the CI workflows need (see .github/workflows/):
+#   - Node 26 with pnpm pinned by package.json `packageManager`
+#   - pnpm install --frozen-lockfile
+#   - Playwright Chromium + its system libraries for `pnpm test:e2e`
+#
+# The orb base image already ships Node, pnpm, git, gh, python3, uv, rg, jq,
+# bun, and ffmpeg, so this script only fills gaps.  Everything is idempotent:
+# on a warm snapshot each step is a cheap check, and setup finishes well under
+# the 20-minute Amp limit.
+
+step() {
+  local name="$1"
+  printf '[orb-setup] %s\n' "$name"
+  date '+[orb-setup]   started %H:%M:%S'
+}
+
+# --- 1. Toolchain: Node + pnpm pinned by package.json -------------------------
+step 'toolchain: node + pnpm'
+node --version
+
+want_pnpm="$(node -e 'const p=require("./package.json");console.log(String(p.packageManager||"").replace(/^pnpm@/,"").split("+")[0]||"")')"
+if [[ -z "$want_pnpm" ]]; then
+  echo '[orb-setup]   no packageManager pin in package.json, keeping installed pnpm'
+elif [[ "$(pnpm --version 2>/dev/null)" == "$want_pnpm" ]]; then
+  echo "[orb-setup]   pnpm $want_pnpm already active"
+elif command -v corepack >/dev/null 2>&1 && corepack enable pnpm 2>/dev/null && corepack prepare "pnpm@$want_pnpm" --activate 2>/dev/null; then
+  echo "[orb-setup]   activated pnpm $want_pnpm via corepack"
+elif [[ "$(pnpm --version 2>/dev/null)" != "$want_pnpm" ]]; then
+  echo "[orb-setup]   corepack unavailable; installing pnpm@$want_pnpm globally"
+  npm install -g "pnpm@$want_pnpm"
+fi
+pnpm --version
+
+# --- 2. Dependencies from the lockfile ---------------------------------------
+step 'dependencies: pnpm install --frozen-lockfile'
+pnpm install --frozen-lockfile
+
+# --- 3. Playwright Chromium (browser + system libs) ---------------------------
+# Only the browser CI's e2e workflow uses; skip apt entirely once cached.
+step 'playwright: chromium'
+chromium_dir="$HOME/.cache/ms-playwright"
+if compgen -G "$chromium_dir/chromium-*" >/dev/null; then
+  echo '[orb-setup]   chromium browser already present'
+else
+  echo '[orb-setup]   installing chromium'
+  if [[ "$(id -u)" -eq 0 ]] || sudo -n true 2>/dev/null; then
+    pnpm exec playwright install --with-deps chromium
+  else
+    echo '[orb-setup]   no root access; installing browser without system deps'
+    pnpm exec playwright install chromium
+  fi
+fi
+
+step 'setup complete'

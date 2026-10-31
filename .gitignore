@@ -78,7 +78,14 @@ playwright-report/
 # unignored it reads as local work, so the updater refused every run with
 # "the always-on checkout has uncommitted changes" on a directory that was
 # simply the engine doing its job.
-.agents/
+# Exception: .agents/setup and .agents/resume are Amp orb lifecycle files
+# (see https://ampcode.com/docs/orbs) and must stay tracked.
+.agents/*
+!.agents/setup
+!.agents/resume
+
+# Amp orb portal scratch (screenshots, preview links).  Never commit.
+.amp/portals/
 
 # Generated native server controller and Swift package products.
 electron/resources/BotFleet Control.app/
