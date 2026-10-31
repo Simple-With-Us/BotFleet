@@ -384,7 +384,9 @@ public actor DatabaseService {
         );
 
         INSERT OR IGNORE INTO native_event_wait_dispatches (wait_id, accepted_at)
-        SELECT wait_id, created_at FROM native_event_waits WHERE status IN ('accepted', 'completed', 'held');
+        SELECT wait_id, created_at FROM native_event_waits
+        WHERE status IN ('accepted', 'completed')
+           OR (status = 'held' AND json_extract(snapshot_json, '$.admissionHold') IS NULL);
 
         CREATE TABLE IF NOT EXISTS routine_request_receipts (
             request_id TEXT PRIMARY KEY,
@@ -1075,6 +1077,21 @@ public actor DatabaseService {
         }
     }
 
+    public func hasNativeEventWaitDispatchClaim(id: String) throws -> Bool {
+        guard let db else { throw DatabaseError.openFailed("Database connection closed") }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM native_event_wait_dispatches WHERE wait_id = ?1;", -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        let result = sqlite3_step(statement)
+        guard result == SQLITE_ROW || result == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        return result == SQLITE_ROW
+    }
+
     public func replaceNativeEventWaitSnapshot(_ waits: [NativeEventWait]) throws {
         guard waits.count <= 150, Set(waits.map(\.id)).count == waits.count else {
             throw DatabaseError.executionFailed("Native event wait snapshot exceeds the 150 wait storage limit")
@@ -1088,8 +1105,13 @@ public actor DatabaseService {
             let final: [NativeEventWaitStatus] = [.completed, .cancelled, .expired]
             for incoming in waits {
                 if let previous = existing[incoming.id] {
+                    var resumesUnclaimedAdmission = false
+                    if previous.status == .held, previous.admissionHold != nil,
+                       incoming.status == .pending, incoming.revision > previous.revision {
+                        resumesUnclaimedAdmission = try !hasNativeEventWaitDispatchClaim(id: incoming.id)
+                    }
                     if incoming.revision < previous.revision ||
-                        (active.contains(incoming.status) && (previous.status == .accepted || settled.contains(previous.status))) ||
+                        (active.contains(incoming.status) && (previous.status == .accepted || settled.contains(previous.status)) && !resumesUnclaimedAdmission) ||
                         (incoming.revision == previous.revision && final.contains(previous.status) && !final.contains(incoming.status)) {
                         reconciled[incoming.id] = previous
                         continue
@@ -1763,6 +1785,20 @@ public actor DatabaseService {
     public func checkpointWALTruncate() throws -> UInt64 {
         try execute(sql: "PRAGMA wal_checkpoint(TRUNCATE);")
         return try currentWALSizeBytes()
+    }
+
+    /// A host releases its owner lease only after this checked checkpoint and explicit close succeed.
+    public func checkpointAndClose() throws {
+        guard let handle = db else { return }
+        var logFrames: Int32 = 0
+        var checkpointed: Int32 = 0
+        guard sqlite3_wal_checkpoint_v2(handle, nil, SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointed) == SQLITE_OK else {
+            throw DatabaseError.executionFailed("Native host checkpoint did not complete")
+        }
+        guard sqlite3_close(handle) == SQLITE_OK else {
+            throw DatabaseError.executionFailed("Native host database still has unfinished statements")
+        }
+        db = nil
     }
 
     /// Runs `PRAGMA wal_checkpoint(PASSIVE)` and returns the resulting `-wal`

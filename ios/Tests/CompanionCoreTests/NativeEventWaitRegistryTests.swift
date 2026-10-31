@@ -164,7 +164,7 @@ struct NativeEventWaitRegistryTests {
         #expect(try await database.claimNativeEventWaitDispatch(dispatching))
         let accepted = try #require(try await database.loadNativeEventWaits().first)
         #expect(accepted.status == .accepted)
-        for (status, revision) in [(NativeEventWaitStatus.ready, UInt64(1)), (.dispatching, UInt64(3)), (.pending, UInt64(0))] {
+        for (status, revision) in [(NativeEventWaitStatus.ready, UInt64(1)), (.dispatching, UInt64(3)), (.pending, UInt64(0)), (.pending, UInt64(4))] {
             var stale = dispatching; stale.status = status; stale.revision = revision
             try await database.replaceNativeEventWaitSnapshot([stale])
             #expect(try await database.loadNativeEventWaits() == [accepted])
@@ -177,6 +177,27 @@ struct NativeEventWaitRegistryTests {
         #expect(try await database.loadNativeEventWaits() == [completed])
         try await database.replaceNativeEventWaitSnapshot([dispatching])
         #expect(try await database.loadNativeEventWaits() == [completed])
+    }
+
+    @Test("A confirmed pre-claim interruption mirrors the existing pending snapshot without a dispatch claim")
+    func preClaimInterruptionUsesPendingSnapshot() async throws {
+        let database = try DatabaseService(path: ":memory:")
+        let registry = NativeEventWaitRegistry(probe: MutableNativeEventWaitProbe(satisfied: true),
+            queue: InterruptedBeforeClaimQueue(), persistence: DatabaseNativeEventWaitPersistence(database: database), clock: { 100 })
+        let wait = try await registry.register(id: "unclaimed", botId: "a", predicate: .botIdle, now: 100)
+        _ = try await registry.tick(now: 100)
+        await registry.waitForDispatches()
+        let pending = try #require(await registry.wait(id: wait.id))
+        #expect(pending.status == .pending)
+        #expect(pending.admissionHold == nil)
+        #expect(pending.holdReason == nil)
+        #expect(try await database.loadNativeEventWaits() == [pending])
+        #expect(try await !database.hasNativeEventWaitDispatchClaim(id: wait.id))
+        let encoded = try JSONEncoder().encode(pending)
+        let object = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        #expect(object["status"] as? String == "pending")
+        #expect(object["admissionHold"] == nil)
+        #expect(try JSONDecoder().decode(NativeEventWait.self, from: encoded) == pending)
     }
 
     @Test("The id-only dispatch ledger survives settled-history pruning and permits a different wait id")
@@ -321,6 +342,10 @@ struct NativeEventWaitRegistryTests {
         #expect(await queue.waitIds.isEmpty)
         #expect(await registry.wait(id: "shutdown")?.status == .pending)
     }
+}
+
+private struct InterruptedBeforeClaimQueue: NativeEventWaitQueue {
+    func enqueueFollowUp(_ wait: NativeEventWait) async throws -> NativeEventWaitQueueResult { .preClaimInterrupted }
 }
 
 private actor ClaimingNativeEventWaitQueue: NativeEventWaitQueue {

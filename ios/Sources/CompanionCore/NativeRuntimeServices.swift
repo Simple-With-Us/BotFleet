@@ -61,7 +61,8 @@ public actor NativeRuntimeServices {
         engineSwitch: BotNativeEngineSwitchActor,
         workspaceSource: any NativeEventWaitWorkspaceSource,
         processOwnershipSource: any NativeEventWaitProcessOwnershipSource,
-        waitLimits: NativeEventWaitLimits = NativeEventWaitLimits()
+        waitLimits: NativeEventWaitLimits = NativeEventWaitLimits(),
+        executionContext: (any NativeExecutionContextSource)? = nil
     ) {
         self.database = database
         self.engineCoordinator = engineCoordinator
@@ -75,7 +76,8 @@ public actor NativeRuntimeServices {
         let queue = NativeCoordinatorEventWaitQueue(
             database: database,
             engineCoordinator: engineCoordinator,
-            engineSwitch: engineSwitch
+            engineSwitch: engineSwitch,
+            executionContext: executionContext
         )
         self.dispatchQueue = queue
         let registry = NativeEventWaitRegistry(
@@ -175,9 +177,29 @@ public actor NativeRuntimeServices {
         guard !isStopped else { return }
         isStopped = true
         await dispatchQueue.shutdown()
-        pollingTask?.cancel()
+        let polling = pollingTask
+        polling?.cancel()
         pollingTask = nil
         await scheduler.shutdown()
+        await polling?.value
+    }
+
+    /// Only typed, unclaimed capability holds can return to pending work.
+    public func resumeCapabilityHeldWaits() async throws {
+        try requireActive()
+        for wait in await waitRegistry.visibleWaits() where wait.admissionHold != nil {
+            guard try await !database.hasNativeEventWaitDispatchClaim(id: wait.id) else { continue }
+            try requireActive()
+            try await waitRegistry.resumeAdmissionHold(id: wait.id)
+        }
+    }
+
+    /// The host calls this before closing its database or releasing the lifetime owner lease.
+    public func shutdownAndDrain() async throws {
+        await shutdown()
+        try await engineCoordinator.shutdownAndDrain()
+        await waitRegistry.waitForDispatches()
+        try await waitRegistry.flushPersistence()
     }
 
     private func runPollingTick() async {
@@ -209,16 +231,19 @@ private actor NativeCoordinatorEventWaitQueue: NativeEventWaitQueue {
     private let database: DatabaseService
     private let engineCoordinator: EngineCoordinatorActor
     private let engineSwitch: BotNativeEngineSwitchActor
+    private let executionContext: (any NativeExecutionContextSource)?
     private var isShutdown = false
 
-    init(database: DatabaseService, engineCoordinator: EngineCoordinatorActor, engineSwitch: BotNativeEngineSwitchActor) {
+    init(database: DatabaseService, engineCoordinator: EngineCoordinatorActor, engineSwitch: BotNativeEngineSwitchActor,
+         executionContext: (any NativeExecutionContextSource)?) {
         self.database = database
         self.engineCoordinator = engineCoordinator
         self.engineSwitch = engineSwitch
+        self.executionContext = executionContext
     }
 
     func enqueueFollowUp(_ wait: NativeEventWait) async throws -> NativeEventWaitQueueResult {
-        guard !isShutdown else { return .held(reason: "Native wait dispatcher is shut down") }
+        guard !isShutdown, !Task.isCancelled else { return .preClaimInterrupted }
         guard let threadId = wait.threadId, let prompt = wait.prompt else {
             return .held(reason: "Wait has no durable follow-up thread or prompt")
         }
@@ -226,7 +251,32 @@ private actor NativeCoordinatorEventWaitQueue: NativeEventWaitQueue {
               let thread = try? await database.loadThread(id: threadId), thread.botId == wait.botId else {
             return .held(reason: "Bot or thread ownership changed before dispatch")
         }
-        guard !isShutdown else { return .held(reason: "Native wait dispatcher is shut down") }
+        guard !isShutdown, !Task.isCancelled else { return .preClaimInterrupted }
+
+        let input: TurnInput
+        do {
+            if let executionContext {
+                let admission = try await executionContext.resolve(wait: wait)
+                guard !isShutdown, !Task.isCancelled else { return .preClaimInterrupted }
+                switch admission {
+                case .held(let reason): return .admissionHeld(reason)
+                case .ready(let prepared):
+                    guard prepared.botId == wait.botId, prepared.threadId == threadId, prepared.prompt == prompt else {
+                        return .held(reason: "Execution context does not match the durable wait")
+                    }
+                    input = prepared
+                }
+            } else {
+                input = TurnInput(threadId: threadId, botId: wait.botId, prompt: prompt)
+            }
+            guard !isShutdown, !Task.isCancelled else { return .preClaimInterrupted }
+        } catch NativeRuntimeServicesError.stopped {
+            return .preClaimInterrupted
+        } catch is CancellationError {
+            return .preClaimInterrupted
+        } catch {
+            return .held(reason: Self.bounded(error.localizedDescription))
+        }
 
         do {
             guard try await database.claimNativeEventWaitDispatch(wait) else {
@@ -243,7 +293,7 @@ private actor NativeCoordinatorEventWaitQueue: NativeEventWaitQueue {
                 return .held(reason: "Native wait dispatcher shut down before turn start")
             }
             let stream = try await engineCoordinator.sendTurn(
-                input: TurnInput(threadId: threadId, botId: wait.botId, prompt: prompt)
+                input: input
             )
             var completed = false
             var failure: String?
