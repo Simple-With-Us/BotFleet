@@ -41,19 +41,27 @@ step 'dependencies: pnpm install --frozen-lockfile'
 pnpm install --frozen-lockfile
 
 # --- 3. Playwright Chromium (browser + system libs) ---------------------------
-# Only the browser CI's e2e workflow uses; skip apt entirely once cached.
+# The plain install is a fast no-op when the right revisions are already
+# cached and downloads exactly the revisions the installed @playwright/test
+# expects when they are missing or the package was upgraded — so it must
+# always run, never be skipped by a directory glob.  Only the apt system
+# library step is gated: it runs when a browser was newly downloaded this
+# run (fresh snapshot, or a Playwright upgrade).  A warm snapshot that
+# already has both skips apt entirely.
 step 'playwright: chromium'
 chromium_dir="$HOME/.cache/ms-playwright"
-if compgen -G "$chromium_dir/chromium-*" >/dev/null; then
-  echo '[orb-setup]   chromium browser already present'
-else
-  echo '[orb-setup]   installing chromium'
+before="$(ls "$chromium_dir" 2>/dev/null | grep -E '^(chromium|chromium_headless_shell|ffmpeg)-' | sort | tr '\n' ' ')"
+pnpm exec playwright install chromium
+after="$(ls "$chromium_dir" 2>/dev/null | grep -E '^(chromium|chromium_headless_shell|ffmpeg)-' | sort | tr '\n' ' ')"
+if [[ "$after" != "$before" ]]; then
+  echo '[orb-setup]   browser revisions changed, installing system libraries'
   if [[ "$(id -u)" -eq 0 ]] || sudo -n true 2>/dev/null; then
     pnpm exec playwright install --with-deps chromium
   else
-    echo '[orb-setup]   no root access; installing browser without system deps'
-    pnpm exec playwright install chromium
+    echo '[orb-setup]   no root access; browser installed without system deps'
   fi
+else
+  echo '[orb-setup]   chromium revisions already cached'
 fi
 
 step 'setup complete'
