@@ -58,13 +58,32 @@ public struct NativeServicePaths: Sendable {
     }
 
     func clearStoppedMarker() throws {
+        if try hasStoppedMarker() { try FileManager.default.removeItem(at: stoppedMarker) }
+    }
+
+    func hasStoppedMarker() throws -> Bool {
         var info = stat()
         if lstat(stoppedMarker.path, &info) == 0 {
-            guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(), info.st_nlink == 1 else {
+            guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(), info.st_nlink == 1,
+                  info.st_mode & 0o077 == 0 else {
                 throw NativeHeadlessHostError.unsafeServicePath
             }
-            try FileManager.default.removeItem(at: stoppedMarker)
+            let fd = open(stoppedMarker.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else { throw NativeHeadlessHostError.unsafeServicePath }
+            defer { Darwin.close(fd) }
+            var opened = stat()
+            guard fstat(fd, &opened) == 0, opened.st_dev == info.st_dev, opened.st_ino == info.st_ino,
+                  opened.st_mode & S_IFMT == S_IFREG, opened.st_uid == getuid(), opened.st_nlink == 1,
+                  opened.st_mode & 0o077 == 0, opened.st_size == 17 else { throw NativeHeadlessHostError.unsafeServicePath }
+            var bytes = [UInt8](repeating: 0, count: 18)
+            var count: Int
+            repeat { count = Darwin.read(fd, &bytes, bytes.count) } while count < 0 && errno == EINTR
+            guard count == 17, Data(bytes.prefix(count)) == Data("{\"stopped\":true}\n".utf8) else {
+                throw NativeHeadlessHostError.unsafeServicePath
+            }
+            return true
         } else if errno != ENOENT { throw NativeHeadlessHostError.unsafeServicePath }
+        return false
     }
 
     private static func privateDirectory(_ url: URL) throws {
@@ -136,6 +155,13 @@ public enum NativeHeadlessHostState: String, Sendable {
     case shutdownFailed
 }
 
+public enum NativeHostStartIntent: Equatable, Sendable { case automatic, explicit }
+
+public enum NativeHostLaunchResult: Sendable {
+    case running(NativeHeadlessHost)
+    case stoppedByOwner
+}
+
 /// A foreground service graph, independent of MacSession, NSWorkspace, login Keychain and desktop permissions.
 public actor NativeHeadlessHost {
     public let paths: NativeServicePaths
@@ -170,10 +196,28 @@ public actor NativeHeadlessHost {
         credentials: any NativeServiceCredentialSource = UnavailableNativeServiceCredentials(),
         pollIntervalSeconds: TimeInterval? = 1
     ) async throws -> NativeHeadlessHost {
+        let result = try await launch(serviceData: serviceData, intent: .explicit,
+            credentials: credentials, pollIntervalSeconds: pollIntervalSeconds)
+        guard case .running(let host) = result else { throw NativeHeadlessHostError.stopped }
+        return host
+    }
+
+    public static func launch(
+        serviceData: URL,
+        intent: NativeHostStartIntent,
+        credentials: any NativeServiceCredentialSource = UnavailableNativeServiceCredentials(),
+        pollIntervalSeconds: TimeInterval? = 1
+    ) async throws -> NativeHostLaunchResult {
         let paths = try NativeServicePaths(serviceData: serviceData)
         let lease = try NativeHostOwnerLease(paths: paths)
         var openedDatabase: DatabaseService?
         do {
+            if intent == .automatic, try paths.hasStoppedMarker() {
+                lease.release()
+                return .stoppedByOwner
+            }
+            // Refuse unsafe markers before explicit startup can open or recover the database.
+            _ = try paths.hasStoppedMarker()
             try paths.prepareContents()
             let database = try DatabaseService(path: paths.database.path)
             openedDatabase = database
@@ -200,7 +244,7 @@ public actor NativeHeadlessHost {
             try await runtime.resumeCapabilityHeldWaits()
             try paths.clearStoppedMarker()
             try await runtime.activate(pollIntervalSeconds: pollIntervalSeconds)
-            return host
+            return .running(host)
         } catch {
             // No work starts until recovery succeeds; a failed construction never publishes an owner.
             try? await openedDatabase?.checkpointAndClose()
