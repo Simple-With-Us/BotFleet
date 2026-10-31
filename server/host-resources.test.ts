@@ -157,6 +157,36 @@ describe("observed enforcement", () => {
     expect(report.enforcement.disk.kind).toBe("notApplied");
     expect(report.admission.unknownReading).toBe("admit");
   });
+
+  it("derives the report's storage view from the sample's own bracketed device check", () => {
+    const online = { online: true, dataDevice: "8:16", rootDevice: "8:1" };
+    const offline = { online: false, dataDevice: "8:16", rootDevice: "8:1", reason: "fixture flip" };
+    const mountinfo = "29 1 8:16 / /data rw - ext4 /dev/fixture rw";
+    let checks = 0;
+    // The bracket reads online twice; a device flip afterwards must not be re-read as a third observation.
+    const lost = createHostProbe({ platform: "linux", readLinuxMeminfo: () => meminfo, readHostLoad: () => null, totalMemory: () => 16 * 1024 ** 3,
+      statfs: () => disk, realPath: (path) => path, readMountinfo: () => mountinfo,
+      storageState: () => (checks++ < 2 ? online : offline) });
+    const report = hostResourcesReport({ ...deps(), probe: lost, thresholds: () => ({ maxSwapPercent: 91, minFreeDiskBytes: 1234, minFreeInodes: 1000 }) });
+    expect(checks).toBe(2);
+    expect(report.storage).toEqual(online);
+    expect(report.sample.diskFreeBytes).toBe(1024000);
+    expect(report.enforcement.disk).toEqual({ kind: "gateOnly" });
+    expect(report.enforcement.inodes).toEqual({ kind: "gateOnly" });
+
+    // The bracket observes offline first: the sample stays internally offline even when a later check would read online.
+    checks = 0;
+    const regained = createHostProbe({ platform: "linux", readLinuxMeminfo: () => meminfo, readHostLoad: () => null, totalMemory: () => 16 * 1024 ** 3,
+      statfs: () => disk, realPath: (path) => path, readMountinfo: () => mountinfo,
+      storageState: () => (checks++ < 1 ? offline : online) });
+    const stale = hostResourcesReport({ ...deps(), probe: regained, thresholds: () => ({ maxSwapPercent: 91, minFreeDiskBytes: 1234, minFreeInodes: 1000 }) });
+    expect(checks).toBe(2);
+    expect(stale.storage).toEqual(offline);
+    expect(stale.sample.diskFreeBytes).toBeNull();
+    expect(stale.sample.dataVolume).toBeNull();
+    expect(stale.enforcement.disk).toMatchObject({ kind: "notApplied", reason: "Server storage offline; new jobs are refused" });
+    expect(stale.enforcement.inodes).toMatchObject({ kind: "notApplied", reason: "Server storage offline; new jobs are refused" });
+  });
 });
 
 describe("host owner route boundary", () => {

@@ -4,7 +4,7 @@ Refs BF-2559.  Implements BF-2598, slice 2 of [Native Server Mode](../plans/202
 
 ## Behavior
 
-`GET /api/host/resources` reports the stable local host id, installed version, platform capabilities, current capacity sample, effective existing swap/disk admission thresholds and per-resource enforcement.  The report shares the job registry's existing admission probe, including its swap cache and filesystem disk readings.  It adds filesystem totals/inodes, Linux memory availability, data-volume identity and root-disk free; it starts no extra timer or shell probe.
+`GET /api/host/resources` reports the stable local host id, installed version, platform capabilities, current capacity sample, effective existing swap/disk admission thresholds and per-resource enforcement.  The report shares the job registry's existing admission probe, including its swap cache and filesystem disk readings.  It adds filesystem totals/inodes, Linux memory availability, data-volume identity and root-disk free; it starts no extra timer or shell probe.  Its storage view is the capacity sample's own bracketed device observation, so the sample's disk and inode readings and the offline enforcement always come from one device check.
 
 Authorized requests reuse one per-harness snapshot for up to one second measured with a monotonic clock, so repeated calls do not repeat the synchronous cgroup, sysfs and filesystem reads.  A change to resolved admission thresholds invalidates that snapshot immediately.  Authorization and platform checks run before sampling or consulting the cache.  The first refresh still performs synchronous local metadata reads; this bounds repeated work without claiming nonblocking I/O or introducing a sampler timer.
 
@@ -55,3 +55,7 @@ The full sixteen placement assertions remain false.  This report is only the ha
 ## Update And Rollback
 
 Use the existing reviewed delivery path and preserve the data directory including `host-id`.  The report and health fields are additive.  Older clients ignore the new health fields; rolling code back removes the report without changing mode, admission settings or job routing.
+
+Kody finding 4429622814 is addressed by one bracketed observation: `CapacitySample` now carries the storage-device state its disk and inode readings were taken under, and the report reuses that observation instead of calling `storageState()` a second time, so a device flip between the sample and the report can no longer leave live sample readings under offline enforcement or the reverse.
+
+The regression fixture drives the device check through both flip directions and counts its calls.  The focused report, storage, trigger, boot and route fixtures passed after this follow-up (167 tests across six files), with typecheck, lint, owner-gate and audit checks unchanged.

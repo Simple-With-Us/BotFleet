@@ -49,6 +49,8 @@ export interface CapacitySample {
   inodesFree: number | null;
   dataVolume: { device: string; mountPoint: string } | null;
   rootDiskFreeBytes: number | null;
+  /** The bracketed storage-device observation the disk and inode readings above were taken under. */
+  storage?: StorageState | null;
 }
 export type HostResource = "cpu" | "memory" | "swap" | "disk" | "inodes" | "io";
 export interface HostProfile {

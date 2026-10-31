@@ -90,7 +90,9 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
   const read = deps.readText ?? ((path: string) => readFileSync(path, "utf8"));
   const safeRead = (path: string): string | null => { try { return read(path).trim(); } catch { return null; } };
   const sample = deps.probe.capacitySample(deps.dataDir);
-  const storage = deps.probe.storageState?.() ?? null;
+  // One bracketed observation: the report's storage view is the sample's own device check,
+  // never a second reading that could disagree with the disk and inode readings above.
+  const storage = sample.storage ?? null;
   const thresholds = deps.thresholds();
   const enforcement: HostResourcesReport["enforcement"] = {
     cpu: { kind: "priorityOnly" }, memory: gate(), swap: gate(), disk: gate(),
