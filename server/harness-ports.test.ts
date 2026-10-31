@@ -51,15 +51,20 @@ describe("port env resolution", () => {
     expect(resolvePort("0", 8799)).toBe(8799);
     expect(resolvePort("65536", 8799)).toBe(8799);
     expect(resolvePort("9000", 8799)).toBe(9000);
+    expect(resolvePort("0x1F90", 8799)).toBe(8799);
+    expect(resolvePort("1e3", 8799)).toBe(8799);
+    expect(resolvePort("+9000", 8799)).toBe(8799);
+    expect(resolvePort(" 9000 ", 8799)).toBe(9000);
   });
 
   it("resolves the harness and webhook ports from env", () => {
     expect(resolveHarnessPort({})).toBe(8799);
     expect(resolveHarnessPort({ OMB_PORT: "9100" })).toBe(9100);
     expect(resolveHarnessPort({ OGB_PORT: "9200" })).toBe(9200);
-    expect(resolveHarnessPort({ OMB_PORT: "nope", OGB_PORT: "9200" })).toBe(8799);
+    expect(resolveHarnessPort({ OMB_PORT: "nope", OGB_PORT: "9200" })).toBe(9200);
     expect(resolveWebhookPort({}, 8799)).toBe(8800);
     expect(resolveWebhookPort({ OMB_WEBHOOK_PORT: "9900" }, 8799)).toBe(9900);
     expect(resolveWebhookPort({ OMB_WEBHOOK_PORT: "nope" }, 8799)).toBe(8800);
+    expect(resolveWebhookPort({}, 65535)).toBe(65534);
   });
 });

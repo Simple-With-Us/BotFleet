@@ -36,15 +36,18 @@ export function listenErrorDisposition(error: unknown): "named-exit" | "capture-
  * must fall back to the default instead of reaching listen() as NaN/0,
  * which throws an opaque error far from the typo that caused it. */
 export function resolvePort(raw: string | undefined, fallback: number): number {
-  if (raw === undefined || raw.trim() === "") return fallback;
-  const n = Number(raw);
-  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : fallback;
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return fallback;
+  const n = Number(trimmed);
+  return n >= 1 && n <= 65535 ? n : fallback;
 }
 
 export function resolveHarnessPort(env: NodeJS.ProcessEnv = process.env): number {
-  return resolvePort(env.OMB_PORT || env.OGB_PORT, 8799);
+  return resolvePort(env.OMB_PORT, resolvePort(env.OGB_PORT, 8799));
 }
 
 export function resolveWebhookPort(env: NodeJS.ProcessEnv = process.env, harnessPort: number): number {
-  return resolvePort(env.OMB_WEBHOOK_PORT, Math.min(harnessPort + 1, 65535));
+  const fallback = harnessPort >= 65535 ? harnessPort - 1 : harnessPort + 1;
+  return resolvePort(env.OMB_WEBHOOK_PORT, fallback);
 }
