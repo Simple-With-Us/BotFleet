@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { denyReason } from "../companion/src/routes.ts";
-import { createHostProbe, type CapacityHostProbe } from "./jobs/admission.ts";
+import { admissionRefusal, createHostProbe, type CapacityHostProbe } from "./jobs/admission.ts";
 import { createHostResourcesResponder, hostResourcesReport, hostResourcesResponse, ioDeviceForVolume, ownCgroupDirectory, type HostResourcesDeps } from "./host-resources.ts";
 
 const cgroupMount = "29 24 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw";
@@ -52,6 +52,18 @@ describe("data-volume I/O device", () => {
 });
 
 describe("host capacity probe", () => {
+  it("treats Linux available RAM above known total as unknown consistently at admission and reporting", () => {
+    const p = createHostProbe({ platform: "linux", readLinuxMeminfo: () => "MemAvailable: 101 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
+      totalMemory: () => 100 * 1024, readHostLoad: () => null, statfs: () => disk,
+      realPath: (path) => path, readMountinfo: () => "" });
+    expect(p.availableMemoryBytes?.()).toBeNull();
+    expect(p.memoryAvailablePercent?.()).toBeNull();
+    const thresholds = { maxSwapPercent: 98, minFreeDiskBytes: 1, reservedRamBytes: 200 * 1024, minMemoryAvailablePercent: 90 };
+    expect(admissionRefusal(p, thresholds, "/fixture", false)).toBeNull();
+    const report = hostResourcesReport({ ...deps(), probe: p, thresholds: () => thresholds });
+    expect(report.sample).toMatchObject({ ramTotalBytes: 100 * 1024, ramAvailableBytes: null, memoryAvailablePercent: null });
+    expect(report.enforcement.memory).toMatchObject({ kind: "notApplied", reason: expect.stringContaining("Memory reading unavailable") });
+  });
   it("uses admission's cached swap reading and disk filesystem with exact units", () => {
     const read = vi.fn(() => meminfo);
     const p = createHostProbe({ platform: "linux", now: () => 1000, readLinuxMeminfo: read, statfs: () => disk, readHostLoad: () => ({ load1: 32, cores: 8 }), totalMemory: () => 16 * 1024 ** 3, realPath: (path) => path, readMountinfo: () => "29 1 8:1 / / rw - ext4 /dev/root rw" });

@@ -276,6 +276,21 @@ posix("caps", () => {
 });
 
 posix("admission", () => {
+  it("refuses configured RAM and percent pressure without claiming a waiting job or creating a queued record", () => {
+    for (const admission of [{ reservedRamMb: 1 }, { minMemoryAvailablePercent: 10 }]) {
+      const fake = fakeSpawn();
+      const h = harness({ spawn: fake.spawnFn, probe: { swapUsedPercent: () => 0, freeDiskBytes: () => 10 ** 12,
+        availableMemoryBytes: () => 0, memoryAvailablePercent: () => 1 } });
+      h.settings.value = resolveJobsSettings({ admission });
+      const result = start(h, "true");
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("expected explicit pressure refusal");
+      expect(result.error).toContain("no new background job can start right now");
+      expect(result.error).not.toContain("waits");
+      expect(h.registry.list()).toEqual([]);
+      expect(fake.children).toHaveLength(0);
+    }
+  });
   it("refuses on high swap, low disk, or a tripped spend ceiling — and never on load", () => {
     const h = harness({ spawn: fakeSpawn().spawnFn });
     h.host.swap = 99;

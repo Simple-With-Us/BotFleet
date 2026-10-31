@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { aggregateSamples, availableMemoryBytes, cgroupSample, linuxPidIdentity, MAX_SCOPES, parseLinuxMemAvailableBytes, parseMacCpuTimeUsec, pidSample, platformMeasurementLimits, readSourceCommit, repositoryRootFor, run, runWithCliSignalHandlers, validateOptions } from "./host-inventory.mjs";
+import { aggregateSamples, availableMemoryBytes, cgroupSample, linuxPidConstants, linuxPidIdentity, linuxUnitCgroup, MAX_SCOPES, parseLinuxMemAvailableBytes, parseMacCpuTimeUsec, pidSample, platformMeasurementLimits, prepareOutputTargets, readSourceCommit, repositoryRootFor, run, runWithCliSignalHandlers, validateOptions } from "./host-inventory.mjs";
 
 test("prints help when invoked through a symlink", () => {
   const directory = mkdtempSync(join(tmpdir(), "host-inventory-symlink-"));
@@ -238,6 +238,24 @@ test("extracts Linux PID start identity from stat without depending on the comm 
   assert.equal(linuxPidIdentity("42 (short) S 1 2"), null);
 });
 
+test("Linux utility probes use fixed absolute tools without consulting PATH", async () => {
+  const calls = [];
+  const execute = async (command, args, options) => {
+    calls.push({ command, args, options });
+    if (command === "/usr/bin/systemctl") return { stdout: "/system.slice/fixture.service\n" };
+    assert.equal(command, "/usr/bin/getconf");
+    return { stdout: args[0] === "PAGESIZE" ? "4096\n" : "100\n" };
+  };
+  assert.equal(await linuxUnitCgroup("fixture.service", execute), "/sys/fs/cgroup/system.slice/fixture.service");
+  assert.deepEqual(await linuxPidConstants(execute), { pageSize: 4096, clockTicks: 100 });
+  assert.deepEqual(calls.map(({ command, args }) => [command, args]), [
+    ["/usr/bin/systemctl", ["show", "--property=ControlGroup", "--value", "fixture.service"]],
+    ["/usr/bin/getconf", ["PAGESIZE"]],
+    ["/usr/bin/getconf", ["CLK_TCK"]],
+  ]);
+  assert.ok(calls.every(({ options }) => options.timeout > 0 && options.maxBuffer > 0));
+});
+
 test("Linux PID sampling validates identity before metric reads and again afterward", async () => {
   const makeStat = (startTicks, userTicks = 10, systemTicks = 5) => {
     const fields = Array.from({ length: 20 }, (_, index) => String(index));
@@ -363,6 +381,97 @@ function injectedRunDependencies(overrides = {}) {
     ...overrides,
   };
 }
+
+test("unsupported platforms are refused before UID, source, output, or sampling access", async () => {
+  const root = mkdtempSync(join(tmpdir(), "host-inventory-unsupported-"));
+  try {
+    for (const platform of ["win32", "freebsd"]) {
+      const outputDir = join(root, platform);
+      const touched = [];
+      const forbidden = (name) => () => { touched.push(name); throw new Error("must not run"); };
+      await assert.rejects(run(runOptions(outputDir), injectedRunDependencies({
+        platform,
+        readUid: forbidden("uid"),
+        readSourceCommit: forbidden("source"),
+        readCapacity: forbidden("capacity"),
+        sampleGroup: forbidden("sample"),
+        openReportFile: forbidden("output"),
+      })), /supports only Linux and macOS/);
+      assert.deepEqual(touched, []);
+      assert.equal(existsSync(outputDir), false);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unavailable or invalid POSIX UID is refused before filesystem and probe work", async () => {
+  const root = mkdtempSync(join(tmpdir(), "host-inventory-uid-"));
+  try {
+    for (const [index, uid] of [undefined, -1, "0"].entries()) {
+      const outputDir = join(root, String(index));
+      let sourceReads = 0;
+      await assert.rejects(run(runOptions(outputDir), injectedRunDependencies({
+        readUid: () => uid,
+        readSourceCommit: async () => { sourceReads++; throw new Error("must not read source"); },
+      })), /readable POSIX user identity/);
+      assert.equal(sourceReads, 0);
+      assert.equal(existsSync(outputDir), false);
+    }
+    const directOutput = join(root, "direct");
+    await assert.rejects(prepareOutputTargets(directOutput, open, () => undefined), /readable POSIX user identity/);
+    assert.equal(existsSync(directOutput), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("run validates platform-specific selections against the platform it will execute", async () => {
+  const root = mkdtempSync(join(tmpdir(), "host-inventory-platform-validation-"));
+  try {
+    const cases = [
+      { platform: "darwin", overrides: { units: ["fixture.service"] }, message: /--unit is supported only on Linux/ },
+      { platform: "linux", overrides: { orbCpu: 2 }, message: /OrbStack reservation inputs apply only to a Mac/ },
+    ];
+    for (const { platform, overrides, message } of cases) {
+      const outputDir = join(root, platform);
+      let reads = 0;
+      await assert.rejects(run(runOptions(outputDir, overrides), injectedRunDependencies({
+        platform,
+        readSourceCommit: async () => { reads++; throw new Error("must not read source"); },
+        readCapacity: async () => { reads++; throw new Error("must not probe"); },
+      })), message);
+      assert.equal(reads, 0);
+      assert.equal(existsSync(outputDir), false);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an injected Mac platform accepts Mac inputs and drives the same reported sampling platform", async () => {
+  const root = mkdtempSync(join(tmpdir(), "host-inventory-platform-run-"));
+  try {
+    let observedPlatform;
+    const report = await run(runOptions(join(root, "report"), { orbCpu: 2, orbMemoryMiB: 4096 }), injectedRunDependencies({
+      platform: "darwin",
+      readCapacity: async (options, platform) => {
+        observedPlatform = platform;
+        assert.equal(options.orbCpu, 2);
+        assert.equal(options.orbMemoryMiB, 4096);
+        return { logicalCpuCount: 2, totalMemoryBytes: 8192, disks: { root: {}, data: {} }, swap: null, orbStackReservation: null };
+      },
+      readPidConstants: async () => { throw new Error("Linux constants must not be read"); },
+      readAvailableMemory: async () => null,
+    }));
+    assert.equal(observedPlatform, "darwin");
+    assert.equal(report.host.platform, "darwin");
+    assert.equal(report.capacity.availableMemoryCoverage.observedSamples, 0);
+    assert.match(report.limitations.join(" "), /macOS process sampling excludes child processes/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("preexisting report targets and missing output parents fail before any probe", async () => {
   const root = mkdtempSync(join(tmpdir(), "host-inventory-preflight-"));

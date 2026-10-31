@@ -46,6 +46,10 @@ The integrated foundation and current-main check passed typecheck, 22 resource/b
 
 PR #1431 was merged into this feature branch at its initial collector revision while its review fixes were local.  This source includes the corrected collector, all 30 isolated collector fixtures and current main through `8152ade4`; the combined typecheck, 22 resource/boot/identity fixtures and parent-ref lint gate passed.  The collector's independent full-suite record and measurement limitations remain in its verification document; no live collection or enforcement is claimed.
 
+The final collector findings 4429346458, 4429346740, and 4429347003 are fixed by absolute Linux utility paths, explicit Linux/macOS and POSIX UID preflight, and one resolved platform shared by validation and execution.  All 35 collector fixtures passed, including the original 30 cases and five new injected command/platform/UID cases; the CPU peak uncertainty fix is unchanged.
+
+Typecheck, lint against `origin/main`, and `git diff --check` passed after this final collector fix.  Lint remains at 4,865 warnings against the 4,884 baseline with no per-rule increase; no live sampling or full Node suite repeat was performed.
+
 The full sixteen placement assertions remain false.  This report is only the harness half of recipe 1; the native host handshake, queue, leases, enforcement and authorized hand runs remain later slices.  The parent task records the required full-suite and Apple verification boundaries before publication.
 
 ## Update And Rollback

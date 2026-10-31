@@ -14,11 +14,15 @@ The Mac reader requests the optional `kern.memorystatus_level` asynchronously wi
 
 `jobs.queueWaitMinutes` is a separate waiting-policy knob, bounded from 1 to 10080 minutes.  When absent, resolution uses the existing `DEFAULT_LIMITS.queueMs` policy of 24 hours, independently of execution timeout.  Durable pressure queue activation remains pending the command-retention decision; existing pressure refusals remain in place.  The eventual queue must keep per-thread/per-bot active limits, a separate execution-state host cap and total pending bound, with cancellation on revoked grants or deleted bot/thread.  No command spool or raw-command persistence is implemented in this unit, and the complete BF-2604 task remains open.
 
-The isolated knob/probe/report/registry/write-through fixtures passed 115 tests; typecheck and lint baseline passed.  Both Mac readers are injected in fixtures; no live probe or host configuration was used.  The full required gate is recorded separately after its normal completion.
+The initial isolated knob/probe/report/registry/write-through fixtures passed 115 tests; typecheck and lint baseline passed.  Both Mac readers are injected in fixtures; no live probe or host configuration was used.
 
 ```sh
 VITEST=true pnpm exec vitest run server/jobs/probes.test.ts server/knob-map.test.ts server/knob-write-through.test.ts server/host-resources.test.ts server/jobs/registry.test.ts
 ```
+
+The one full required gate ran on frozen `a29673fe17a4a59e09806c3fa3d31bf00cca612d` and settled normally with exit 1: typecheck passed; tests reported 37 failed, 12260 passed and 26 skipped out of 12323 across 726 files, taking 2151.61 seconds.  The unchanged full log and exit artifact are retained as `codex-bf2604-required-gate.log` and `codex-bf2604-required-gate-exit.json` in task scratch evidence.  Exact header comparison retained all 36 preceding baseline failures and added the `server/procs.test.ts` fast-child/soft-deadline case.  Compared with BF-2603's 37 headers, this replaces its deferred-fallback cleanup timeout.  The procs assertion expected no error and received `timedOut: true` with `SIGTERM`; this observation does not establish a cause.
+
+After that gate, corrected resource parent `60d06019` was integrated, retaining its bracketed disk/inode observation and configured-only offline inode report.  Review corrections share one validated Linux available-memory value across byte, percent and report paths; available RAM above known total becomes unknown.  Refusal text now explicitly says that no new job can start; a registry fixture proves that configured pressure leaves no queued record or spawn.  The combined seven-file focused check passed 152 tests and failed one out of 153: the same procs deadline case.  All six affected suites passed their 124 tests; typecheck and lint passed.  The source and test bytes for procs exactly match frozen parent `7fd4590f`, recorded in `codex-bf2604-gate-baseline-comparison.json`.  No second full suite was run, and no full-suite pass is claimed.
 
 ## Required Recipes
 
