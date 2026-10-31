@@ -1,0 +1,241 @@
+import { describe, expect, it, vi } from "vitest";
+import { denyReason } from "../companion/src/routes.ts";
+import { createHostProbe, type CapacityHostProbe } from "./jobs/admission.ts";
+import { createHostResourcesResponder, hostResourcesReport, hostResourcesResponse, ioDeviceForVolume, ownCgroupDirectory, type HostResourcesDeps } from "./host-resources.ts";
+
+const cgroupMount = "29 24 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw";
+const meminfo = "MemTotal: 16777216 kB\nMemAvailable: 8388608 kB\nSwapTotal: 4194304 kB\nSwapFree: 3145728 kB\n";
+const disk = { bsize: 4096, blocks: 1000, bavail: 250, files: 100, ffree: 40 };
+function probe(platform: NodeJS.Platform = "linux") {
+  return createHostProbe({
+    platform, now: () => 1000, readLinuxMeminfo: () => meminfo,
+    readHostLoad: () => ({ load1: 32, cores: 8 }), totalMemory: () => 16 * 1024 ** 3,
+    statfs: () => disk, realPath: (path) => path, readMountinfo: () => "41 29 8:16 / /data rw - ext4 /dev/fixture rw\n29 1 8:1 / / rw - ext4 /dev/root rw",
+    readDarwinSwap: async () => "total = 4096.00M used = 1024.00M free = 3072.00M",
+  });
+}
+function deps(files: Record<string, string> = {}): HostResourcesDeps {
+  return {
+    hostId: "server:11111111-1111-4111-8111-111111111111", version: "fixture-version", platform: "linux", dataDir: "/data/jobs", probe: probe(),
+    thresholds: () => ({ maxSwapPercent: 91, minFreeDiskBytes: 1234 }),
+    readText: (path) => {
+      const text = ({ "/proc/self/cgroup": "0::/system.slice/botfleet-fixture.service", "/proc/self/mountinfo": cgroupMount, "/sys/dev/block/8:16/dev": "8:16", ...files })[path];
+      if (text === undefined) throw new Error("fixture file unavailable");
+      return text;
+    },
+  };
+}
+const file = (name: string) => `/sys/fs/cgroup/system.slice/botfleet-fixture.service/${name}`;
+
+describe("data-volume I/O device", () => {
+  it("resolves partitions through their sysfs parent without guessing minor numbers", () => {
+    const files: Record<string, string> = { "/sys/dev/block/259:7/dev": "259:7", "/sys/dev/block/259:7/partition": "3", "/sys/dev/block/259:7/../dev": "259:0", "/sys/dev/block/8:16/dev": "8:16" };
+    const read = (path: string) => files[path] ?? null;
+    expect(ioDeviceForVolume("259:7", read)).toBe("259:0");
+    expect(ioDeviceForVolume("8:16", read)).toBe("8:16");
+    expect(ioDeviceForVolume("0:91", read)).toBeNull();
+    expect(ioDeviceForVolume("../other", read)).toBeNull();
+    delete files["/sys/dev/block/259:7/../dev"];
+    expect(ioDeviceForVolume("259:7", read)).toBeNull();
+  });
+
+  it("recognizes a parent-disk rate for a partition and refuses unrelated or unresolved devices", () => {
+    const setup = deps({ "/sys/dev/block/8:16/partition": "1", "/sys/dev/block/8:16/../dev": "8:0", [file("io.max")]: "8:0 rbps=1024 wbps=max" });
+    expect(hostResourcesReport(setup).enforcement.io.kind).toBe("kernelCap");
+    const unrelated = deps({ "/sys/dev/block/8:16/partition": "1", "/sys/dev/block/8:16/../dev": "8:0", [file("io.max")]: "8:32 rbps=1024" });
+    expect(hostResourcesReport(unrelated).enforcement.io.kind).toBe("unsupported");
+    const unresolved = deps({ "/sys/dev/block/8:16/partition": "1", [file("io.max")]: "8:0 rbps=1024" });
+    expect(hostResourcesReport(unresolved).enforcement.io.kind).toBe("notApplied");
+    expect(hostResourcesReport(unresolved).limitations.join(" ")).toContain("I/O enforcement is unknown");
+  });
+});
+
+describe("host capacity probe", () => {
+  it("uses admission's cached swap reading and disk filesystem with exact units", () => {
+    const read = vi.fn(() => meminfo);
+    const p = createHostProbe({ platform: "linux", now: () => 1000, readLinuxMeminfo: read, statfs: () => disk, readHostLoad: () => ({ load1: 32, cores: 8 }), totalMemory: () => 16 * 1024 ** 3, realPath: (path) => path, readMountinfo: () => "29 1 8:1 / / rw - ext4 /dev/root rw" });
+    expect(p.swapUsedPercent()).toBe(25);
+    expect(p.capacitySample("/data")).toMatchObject({
+      cores: 8, loadPerCore: 4, ramTotalBytes: 16 * 1024 ** 3, ramAvailableBytes: 8 * 1024 ** 3, memoryAvailablePercent: 50,
+      swapTotalBytes: 4 * 1024 ** 3, swapUsedBytes: 1024 ** 3, diskTotalBytes: 4096000, diskFreeBytes: 1024000,
+      inodesTotal: 100, inodesFree: 40, rootDiskFreeBytes: 1024000, memoryPressure: null,
+    });
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(p.freeDiskBytes("/data")).toBe(1024000);
+  });
+
+  it("preserves unknown and absent swap rather than claiming zero usage", () => {
+    const p = createHostProbe({ platform: "linux", readLinuxMeminfo: () => { throw new Error("unavailable"); }, totalMemory: () => NaN, readHostLoad: () => null, statfs: () => { throw new Error("offline"); }, realPath: (path) => path, readMountinfo: () => { throw new Error("unavailable"); } });
+    const sample = p.capacitySample("/data");
+    for (const [key, value] of Object.entries(sample)) if (key !== "at") expect(value, key).toBeNull();
+    const noSwap = createHostProbe({ platform: "linux", readLinuxMeminfo: () => "SwapTotal: 0 kB\nSwapFree: 0 kB\n", totalMemory: () => 100, readHostLoad: () => null, statfs: () => disk, realPath: (path) => path, readMountinfo: () => "" });
+    expect(noSwap.swapUsedPercent()).toBeNull();
+    expect(noSwap.capacitySample("/data").swapTotalBytes).toBe(0);
+  });
+
+  it("does not turn macOS free pages into an invented memory-availability signal", async () => {
+    const p = probe("darwin");
+    await Promise.resolve();
+    const sample = p.capacitySample("/data");
+    expect(sample.ramAvailableBytes).toBeNull();
+    expect(sample.memoryAvailablePercent).toBeNull();
+    expect(sample.memoryPressure).toBeNull();
+    expect(sample.swapUsedBytes).toBe(1024 ** 3);
+  });
+
+  it("resolves data-directory aliases and keeps unsupported inode statistics unknown", () => {
+    const p = createHostProbe({ platform: "linux", readLinuxMeminfo: () => meminfo, totalMemory: () => 100,
+      readHostLoad: () => null, statfs: () => ({ ...disk, files: 0, ffree: 0 }), realPath: () => "/data/real-folder",
+      readMountinfo: () => "29 1 8:16 / /data rw - ext4 /dev/fixture rw" });
+    expect(p.capacitySample("/alias")).toMatchObject({ dataVolume: { device: "8:16", mountPoint: "/data" }, inodesTotal: null, inodesFree: null });
+  });
+});
+
+describe("observed enforcement", () => {
+  it("keeps unreadable limits and missing volume identity unknown while distinguishing readable empty limits", () => {
+    const unreadable = deps();
+    const missingVolume = deps({ [file("io.max")]: "8:16 rbps=1024" });
+    missingVolume.probe = { ...missingVolume.probe, capacitySample: (path) => ({ ...probe().capacitySample(path), dataVolume: null }) };
+    const unresolvedDevice = deps({ [file("io.max")]: "8:16 rbps=1024", "/sys/dev/block/8:16/dev": "8:32" });
+    for (const d of [unreadable, missingVolume, unresolvedDevice]) {
+      const report = hostResourcesReport(d);
+      expect(report.enforcement.io).toMatchObject({ kind: "notApplied", restartRequired: false });
+      if (report.enforcement.io.kind !== "notApplied") throw new Error("expected unknown I/O enforcement");
+      expect(report.enforcement.io.reason).toContain("I/O enforcement is unknown");
+    }
+    expect(hostResourcesReport(deps({ [file("io.max")]: "" })).enforcement.io.kind).toBe("unsupported");
+    expect(hostResourcesReport(deps({ [file("io.max")]: "8:32 rbps=1024" })).enforcement.io.kind).toBe("unsupported");
+  });
+
+  it("reads finite limits only from the current process's cgroup", () => {
+    const d = deps({ [file("cpu.max")]: "200000 100000", [file("memory.max")]: "1073741824", [file("memory.high")]: "536870912", [file("memory.swap.max")]: "0", [file("io.max")]: "8:16 rbps=123456 wbps=max", [file("pids.max")]: "200" });
+    const report = hostResourcesReport(d);
+    expect(report.enforcement.cpu.kind).toBe("kernelCap");
+    expect(report.enforcement.memory.kind).toBe("kernelCap");
+    expect(report.enforcement.swap.kind).toBe("kernelCap");
+    expect(report.enforcement.io.kind).toBe("kernelCap");
+    expect(report.enforcement.disk.kind).toBe("gateOnly");
+    expect(report.enforcement.inodes.kind).toBe("unsupported");
+    expect(report.observedLimits["memory.swap.max"]).toBe("0");
+    expect(report.capabilities).toEqual(["shell"]);
+    expect(report.admission).toEqual({ maxSwapPercent: 91, minFreeDiskBytes: 1234, unknownReading: "admit" });
+    expect(report.sample.dataVolume).toEqual({ device: "8:16", mountPoint: "/data" });
+    expect(report.limitations.join(" ")).toMatch(/outside this cgroup/);
+  });
+
+  it("never treats desired settings, memory.high, weights, unlimited or malformed values as caps", () => {
+    for (const value of ["max", "-1", "garbage", "99999999999999999999999999999"]) {
+      const report = hostResourcesReport(deps({ [file("memory.max")]: value, [file("memory.high")]: "123", [file("cpu.max")]: "max 100000", [file("io.max")]: "8:16 rbps=max wbps=max", [file("io.weight")]: "default 200" }));
+      expect(report.enforcement.memory.kind).toBe("gateOnly");
+      expect(report.enforcement.cpu.kind).toBe("priorityOnly");
+      expect(report.enforcement.io.kind).toBe("unsupported");
+    }
+    const missing = hostResourcesReport({ ...deps(), readText: () => { throw new Error("unreadable"); } });
+    expect(Object.values(missing.observedLimits).every((value) => value === null)).toBe(true);
+    expect(missing.limitations.join(" ")).toMatch(/enforcement is unknown/);
+    expect(hostResourcesReport(deps({ [file("io.max")]: "8:32 rbps=1000" })).enforcement.io.kind).toBe("unsupported");
+  });
+
+  it("reports honest macOS gates and background priority without reading Linux files", () => {
+    const read = vi.fn(() => { throw new Error("must not read cgroups on Mac"); });
+    const report = hostResourcesReport({ ...deps(), platform: "darwin", probe: probe("darwin"), readText: read });
+    expect(read).not.toHaveBeenCalled();
+    expect(report.capabilities).toEqual(["shell", "macos", "desktop"]);
+    expect(Object.values(report.enforcement).some((state) => state.kind === "kernelCap")).toBe(false);
+    expect(report.enforcement.cpu.kind).toBe("priorityOnly");
+    expect(Object.keys(report.observedLimits)).toHaveLength(7);
+    expect(Object.values(report.observedLimits).every((value) => value === null)).toBe(true);
+  });
+
+  it("does not label unreadable admission probes as active protection", () => {
+    const p = createHostProbe({ platform: "linux", readLinuxMeminfo: () => { throw new Error("offline"); },
+      totalMemory: () => 100, readHostLoad: () => null, statfs: () => { throw new Error("offline"); },
+      realPath: (path) => path, readMountinfo: () => "" });
+    const report = hostResourcesReport({ ...deps(), probe: p });
+    expect(report.enforcement.memory.kind).toBe("notApplied");
+    expect(report.enforcement.swap.kind).toBe("notApplied");
+    expect(report.enforcement.disk.kind).toBe("notApplied");
+    expect(report.admission.unknownReading).toBe("admit");
+  });
+
+  it("derives the report's storage view from the sample's own bracketed device check", () => {
+    const online = { online: true, dataDevice: "8:16", rootDevice: "8:1" };
+    const offline = { online: false, dataDevice: "8:16", rootDevice: "8:1", reason: "fixture flip" };
+    const mountinfo = "29 1 8:16 / /data rw - ext4 /dev/fixture rw";
+    let checks = 0;
+    // The bracket reads online twice; a device flip afterwards must not be re-read as a third observation.
+    const lost = createHostProbe({ platform: "linux", readLinuxMeminfo: () => meminfo, readHostLoad: () => null, totalMemory: () => 16 * 1024 ** 3,
+      statfs: () => disk, realPath: (path) => path, readMountinfo: () => mountinfo,
+      storageState: () => (checks++ < 2 ? online : offline) });
+    const report = hostResourcesReport({ ...deps(), probe: lost, thresholds: () => ({ maxSwapPercent: 91, minFreeDiskBytes: 1234, minFreeInodes: 1000 }) });
+    expect(checks).toBe(2);
+    expect(report.storage).toEqual(online);
+    expect(report.sample.diskFreeBytes).toBe(1024000);
+    expect(report.enforcement.disk).toEqual({ kind: "gateOnly" });
+    expect(report.enforcement.inodes).toEqual({ kind: "gateOnly" });
+
+    // The bracket observes offline first: the sample stays internally offline even when a later check would read online.
+    checks = 0;
+    const regained = createHostProbe({ platform: "linux", readLinuxMeminfo: () => meminfo, readHostLoad: () => null, totalMemory: () => 16 * 1024 ** 3,
+      statfs: () => disk, realPath: (path) => path, readMountinfo: () => mountinfo,
+      storageState: () => (checks++ < 1 ? offline : online) });
+    const stale = hostResourcesReport({ ...deps(), probe: regained, thresholds: () => ({ maxSwapPercent: 91, minFreeDiskBytes: 1234, minFreeInodes: 1000 }) });
+    expect(checks).toBe(2);
+    expect(stale.storage).toEqual(offline);
+    expect(stale.sample.diskFreeBytes).toBeNull();
+    expect(stale.sample.dataVolume).toBeNull();
+    expect(stale.enforcement.disk).toMatchObject({ kind: "notApplied", reason: "Server storage offline; new jobs are refused" });
+    expect(stale.enforcement.inodes).toMatchObject({ kind: "notApplied", reason: "Server storage offline; new jobs are refused" });
+  });
+});
+
+describe("host owner route boundary", () => {
+  it("reuses one snapshot for repeated owner requests, invalidating on age or admission changes", () => {
+    const d = deps();
+    const read = vi.fn(d.readText!);
+    const capacitySample = vi.fn(d.probe.capacitySample.bind(d.probe));
+    let at = 0;
+    let floor = 1234;
+    const responder = createHostResourcesResponder({ ...d, readText: read,
+      probe: { ...d.probe, capacitySample }, thresholds: () => ({ maxSwapPercent: 91, minFreeDiskBytes: floor }) }, () => at);
+    const owner = { localOwner: true, fromCompanion: false, viaNamedTunnel: false };
+    expect(responder({ ...owner, fromCompanion: true }).status).toBe(403);
+    expect(read).not.toHaveBeenCalled();
+    expect(capacitySample).not.toHaveBeenCalled();
+    const first = responder(owner);
+    const reads = read.mock.calls.length;
+    for (let i = 0; i < 50; i++) expect(responder(owner)).toEqual(first);
+    expect(read).toHaveBeenCalledTimes(reads);
+    expect(capacitySample).toHaveBeenCalledTimes(1);
+    at = 1000;
+    responder(owner);
+    expect(capacitySample).toHaveBeenCalledTimes(2);
+    floor = 5678;
+    const updated = responder(owner);
+    expect(updated.status === 200 && updated.body.admission.minFreeDiskBytes).toBe(5678);
+    expect(capacitySample).toHaveBeenCalledTimes(3);
+    at = 1;
+    responder(owner);
+    expect(capacitySample).toHaveBeenCalledTimes(4);
+  });
+
+  it("refuses remote, companion and named-tunnel callers before any sampling", () => {
+    const p: CapacityHostProbe = { capacitySample: () => { throw new Error("must not sample"); }, swapUsedPercent: () => null, freeDiskBytes: () => null };
+    for (const caller of [
+      { localOwner: false, fromCompanion: false, viaNamedTunnel: false },
+      { localOwner: true, fromCompanion: true, viaNamedTunnel: false },
+      { localOwner: true, fromCompanion: false, viaNamedTunnel: true },
+    ]) expect(hostResourcesResponse(caller, { ...deps(), probe: p }).status).toBe(403);
+    expect(denyReason({ method: "GET", path: "/api/host/resources", authenticated: true })?.status).toBe(404);
+    expect(hostResourcesResponse({ localOwner: true, fromCompanion: false, viaNamedTunnel: false }, deps()).status).toBe(200);
+  });
+
+});
+
+it("resolves cgroup v2 mount roots and rejects v1, traversal and mismatched roots", () => {
+  expect(ownCgroupDirectory("0::/system.slice/botfleet-fixture.service", cgroupMount)).toBe("/sys/fs/cgroup/system.slice/botfleet-fixture.service");
+  expect(ownCgroupDirectory("0::/a/b", "29 24 0:26 /a /sys/fs/cgroup rw - cgroup2 cgroup rw")).toBe("/sys/fs/cgroup/b");
+  expect(ownCgroupDirectory("1:memory:/a", cgroupMount)).toBeNull();
+  expect(ownCgroupDirectory("0::/a/../b", cgroupMount)).toBeNull();
+  expect(ownCgroupDirectory("0::/other", "29 24 0:26 /a /sys/fs/cgroup rw - cgroup2 cgroup rw")).toBeNull();
+});

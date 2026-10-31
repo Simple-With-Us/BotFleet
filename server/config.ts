@@ -512,6 +512,7 @@ const appConfigSchema = z.object({
     admission: z.object({
       maxSwapPercent: z.number().min(1).max(100).optional(),
       minFreeDiskMb: z.number().min(0).optional(),
+      minFreeInodes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
     }).optional(),
     // How long a webhook may sit queued while the host is hot before the
     // scheduler dispatches it anyway.  Absent means 20 minutes
@@ -758,7 +759,7 @@ export interface AppConfig {
     defaultMinutes?: number;
     maxMinutes?: number;
     cpuCores?: number;
-    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number };
+    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number };
     /** Minutes a hot host may park a webhook before the wake dispatches
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;

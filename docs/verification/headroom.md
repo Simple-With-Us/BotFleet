@@ -2,6 +2,10 @@
 
 Refs BF-2559, BF-2596 and BF-2544.  These are the seven resource recipes from [Native Server Mode](../plans/2026-10-29-native-server-mode.md), paired with the nine [placement recipes](placement.md).  They define required results for later slices; this foundation provides neither resource routing nor enforced budgets.  No numeric defaults are selected here.
 
+BF-2598 adds the harness's read-only `GET /api/host/resources` report and its injected enforcement/probe tests; see [Host Resource Report Rollout](../rollouts/2026-10-30-host-resources.md).  It does not assert any complete placement recipe or authorize a live host measurement.
+
+BF-2600 and BF-2601 provide the [Linux storage scaffold](../rollouts/2026-10-30-linux-storage-scaffold.md) and [bounded inventory collector](host-inventory.md), with isolated device/inode, rendering and measurement fixtures.  Volume pinning, temporary paths, journal use and log rotation still need the authorized live recipe, and the collector needs authorization for each host measurement.  These source changes set no budgets and change none of the assertions below.
+
 ## Required Recipes
 
 | Key | Fixture And Action | Required Result |

@@ -119,6 +119,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     min: 0,
   },
   {
+    id: "jobs.admission.minFreeInodes",
+    label: "Job admission minimum free inodes",
+    section: "jobs",
+    path: ["admission", "minFreeInodes"],
+    infisicalName: "BOTFLEET_JOBS_MIN_FREE_INODES",
+    kind: "int",
+    min: 0,
+    max: Number.MAX_SAFE_INTEGER,
+  },
+  {
     id: "jobs.webhookHotDeferMinutes",
     label: "Webhook hot-host deferral limit",
     section: "jobs",

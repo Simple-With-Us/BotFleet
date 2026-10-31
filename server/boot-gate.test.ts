@@ -11,7 +11,7 @@
 // whose CLI blocks on `--version` stops `registry.load` exactly where the
 // real Infisical preload stops it, which makes the booting window a fixture
 // rather than a race.
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -115,6 +115,8 @@ describe("the harness answers while it is still booting", () => {
     const booting = await health();
     expect(booting.body).toMatchObject({ app: "botfleet", booting: true, ready: false });
     expect(typeof booting.body.pid).toBe("number");
+    expect(booting.body.hostId).toBe(readFileSync(join(home, ".botfleet", "host-id"), "utf8").trim());
+    expect(typeof booting.body.version).toBe("string");
     // The identity fields the desktop launcher matches on are still there —
     // including the ownership proof, which is what stops it attaching to a
     // harness serving somebody else's data directory.
@@ -145,6 +147,12 @@ describe("the harness answers while it is still booting", () => {
       .toBe(true);
     const ready = await health();
     expect(ready.body).toMatchObject({ app: "botfleet", booting: false, ready: true });
+    expect(ready.body.hostId).toBe(booting.body.hostId);
+    expect(ready.body.version).toBe(booting.body.version);
+    // Refusal is tested through the real listener without reading live cgroups.
+    for (const headers of [{ "x-botfleet-companion": "1" }, { "cf-connecting-ip": "192.0.2.1" }]) {
+      expect((await fetch(`${base}/api/host/resources`, { headers })).status).toBe(403);
+    }
     expect((await fetch(`${base}/api/bots`)).status, stderr).toBe(200);
   }, 300_000);
 });

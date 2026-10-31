@@ -149,7 +149,7 @@ describe("writeThroughKnobs", () => {
   it("serialises every knob kind the way the resolver reads it back", async () => {
     const calls = new Map<string, string>();
     const patch: Partial<AppConfig> = {
-      jobs: { defaultMinutes: 30, cpuCores: 4 },
+      jobs: { defaultMinutes: 30, cpuCores: 4, admission: { minFreeInodes: 1250 } },
       observability: { tracesSampleRate: 0.5 },
       usage: { spendCeilingUsd: 25.5 },
       infisical: { refreshMinutes: 10 },
@@ -167,6 +167,7 @@ describe("writeThroughKnobs", () => {
     expect(result.ok).toBe(true);
     expect(calls.get("BOTFLEET_JOBS_DEFAULT_MINUTES")).toBe("30");
     expect(calls.get("BOTFLEET_JOBS_CPU_CORES")).toBe("4");
+    expect(calls.get("BOTFLEET_JOBS_MIN_FREE_INODES")).toBe("1250");
     expect(calls.get("BOTFLEET_TRACES_SAMPLE_RATE")).toBe("0.5");
     expect(calls.get("BOTFLEET_SPEND_CEILING_USD")).toBe("25.5");
     expect(calls.get("BOTFLEET_INFISICAL_REFRESH_MINUTES")).toBe("10");
@@ -176,10 +177,10 @@ describe("writeThroughKnobs", () => {
     expect(calls.get("BOTFLEET_AGENT_PROXY_PROJECT_ID")).toBe("proj-1");
     expect(calls.get("BOTFLEET_AGENT_PROXY_ENV")).toBe("prod");
     expect(calls.get("BOTFLEET_AGENT_PROXY_PATH")).toBe("/agents");
-    // 22 + server.allowRemoteDesktopLaunch (BF-2489).  Bump this deliberately:
+    // 24 includes jobs.admission.minFreeInodes (BF-2600); bump this deliberately:
     // the count is here so that adding or dropping a knob is a decision
     // someone reads rather than an edit that slips through -- it is what
     // caught nineteen rows disappearing at once.
-    expect(KNOB_FIELDS.length).toBe(23);
+    expect(KNOB_FIELDS.length).toBe(24);
   });
 });

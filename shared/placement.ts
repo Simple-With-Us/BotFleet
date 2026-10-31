@@ -49,6 +49,8 @@ export interface CapacitySample {
   inodesFree: number | null;
   dataVolume: { device: string; mountPoint: string } | null;
   rootDiskFreeBytes: number | null;
+  /** The bracketed storage-device observation the disk and inode readings above were taken under. */
+  storage?: StorageState | null;
 }
 export type HostResource = "cpu" | "memory" | "swap" | "disk" | "inodes" | "io";
 export interface HostProfile {
@@ -65,6 +67,30 @@ export interface HostProfile {
   lastSeen: number | null;
 }
 export interface AdmissionVerdict { admit: boolean; reason?: string }
+export interface HostResourcesReport {
+  hostId: HostId;
+  version: string | null;
+  platform: HostPlatform;
+  capabilities: Capability[];
+  sample: CapacitySample;
+  storage?: StorageState | null;
+  admission: {
+    maxSwapPercent: number;
+    minFreeDiskBytes: number;
+    minFreeInodes?: number;
+    unknownReading: "admit";
+  };
+  enforcement: Record<HostResource, EnforcementState>;
+  /** Null means unreadable; "max" is an observed unlimited value. */
+  observedLimits: Record<string, string | null>;
+  limitations: string[];
+}
+export interface StorageState {
+  online: boolean;
+  dataDevice: string | null;
+  rootDevice: string | null;
+  reason?: string;
+}
 /** Versions are checked before epochs; every state-changing message is fenced. */
 export interface PlacementMessage extends ControllerEpoch { version: string }
 export interface PlacementIdentity extends PlacementMessage {
