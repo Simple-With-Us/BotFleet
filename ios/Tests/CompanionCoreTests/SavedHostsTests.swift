@@ -361,15 +361,20 @@ final class ServerHandshakeTests: XCTestCase {
         let session = URLSession(configuration: config); defer { session.invalidateAndCancel() }
         let origin = try HostOrigin("http://127.0.0.1:17891")
         let host = HostRecord(id: HostRecord.localID, name: "This Mac", origin: origin)
+        var requestCount = 0
         SavedHostURLProtocol.reply = { request in
+            requestCount += 1
             XCTAssertTrue(origin.contains(request.url!)); return (200, [:])
         }
         _ = try await CompanionClient(connection: host.companionConnection(), token: nil, session: session, hostOrigin: origin).config()
-        SavedHostURLProtocol.reply = { _ in XCTFail("Other origin must not make a request"); return (200, [:]) }
+        XCTAssertEqual(requestCount, 1)
+        requestCount = 0
+        SavedHostURLProtocol.reply = { _ in requestCount += 1; return (200, [:]) }
         do {
             _ = try await CompanionClient(connection: Connection(name: "Wrong", host: "127.0.0.1", port: 17892), token: nil, session: session, hostOrigin: origin).config()
             XCTFail("Other port must be refused")
-        } catch { XCTAssertFalse(error.localizedDescription.contains("fixture-only-token")) }
+        } catch { XCTAssertEqual(error as? SavedHostError, .differentOrigin) }
+        XCTAssertEqual(requestCount, 0, "Origin mismatch must fail before any request or retry")
         let policy = HostOriginRedirectPolicy(origin: origin)
         XCTAssertFalse(policy.allows(URL(string: "http://127.0.0.1:17892/api/config")))
         XCTAssertFalse(policy.allows(URL(string: "https://fixture.test/api/config")))

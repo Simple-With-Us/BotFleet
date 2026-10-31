@@ -480,6 +480,7 @@ public struct CompanionClient: Sendable {
             if Task.isCancelled || (error as? URLError)?.code == .cancelled || error is CancellationError {
                 throw CancellationError()
             }
+            if let error = error as? SavedHostError { throw error }
             throw APIError.transport(error.localizedDescription)
         }
     }
