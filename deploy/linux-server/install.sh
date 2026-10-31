@@ -165,7 +165,8 @@ fi
 
 say "installing dependencies and building the UI"
 run as_user corepack enable --install-directory "$BF_ROOT/node/bin"
-run as_user sh -c "cd '$BF_CODE' && pnpm install --frozen-lockfile --store-dir '$PNPM_STORE_DIR'"
+# The root compiler rewrites dependency exports; cached installs need independent copies and lifecycle execution.
+run as_user sh -c "cd '$BF_CODE' && pnpm install --frozen-lockfile --force --package-import-method=copy --config.optimistic-repeat-install=false --store-dir '$PNPM_STORE_DIR'"
 run as_user sh -c "cd '$BF_CODE' && pnpm exec vite build"
 
 # --------------------------------------------------------------------------
