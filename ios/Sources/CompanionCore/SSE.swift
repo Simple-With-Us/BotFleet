@@ -96,12 +96,13 @@ public struct SSEParser: Sendable {
 /// or the consuming task is cancelled.
 public func eventStream(
     request: URLRequest,
-    session: URLSession = .shared
+    session: URLSession = .shared,
+    delegate: (any URLSessionTaskDelegate)? = nil
 ) -> AsyncThrowingStream<StreamFrame, Error> {
     AsyncThrowingStream { continuation in
         let task = Task {
             do {
-                let (bytes, response) = try await session.bytes(for: request)
+                let (bytes, response) = try await session.bytes(for: request, delegate: delegate)
                 if let http = response as? HTTPURLResponse, http.statusCode != 200 {
                     throw APIError.status(code: http.statusCode, message: nil)
                 }

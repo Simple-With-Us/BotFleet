@@ -1,4 +1,6 @@
 /** Wire contracts only: these types do not enable placement or change admission. */
+/** Placement compatibility is independent of health/resources product versions. */
+export const PLACEMENT_WIRE_VERSION = "1";
 export type HostId = `mac:${string}` | `server:${string}`;
 export const HOST_ID_PATTERN = /^(mac|server):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export type Capability = "shell" | "macos" | "desktop";

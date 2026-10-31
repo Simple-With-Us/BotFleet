@@ -20,9 +20,11 @@ let package = Package(
         .library(name: "CompanionCore", targets: ["CompanionCore"]),
         .executable(name: "CodeBlockLayoutProbe", targets: ["CodeBlockLayoutProbe"]),
         .executable(name: "MacPerfHarness", targets: ["MacPerfHarness"]),
+        .executable(name: "BotFleetNativeHost", targets: ["BotFleetNativeHost"]),
     ],
     targets: [
         .target(name: "CompanionCore"),
+        .executableTarget(name: "BotFleetNativeHost", dependencies: ["CompanionCore"], path: "Scripts/BotFleetNativeHost"),
         .testTarget(
             name: "CompanionCoreTests",
             dependencies: ["CompanionCore"],
