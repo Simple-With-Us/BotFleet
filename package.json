@@ -102,7 +102,7 @@
     "test:work-labels": "node --test scripts/blocking-work-labels.node-test.mjs",
     "test:smoke-runtime-mode": "node --test scripts/smoke-runtime-mode.node-test.mjs",
     "test:native-release": "node --test scripts/native-appcast.node-test.mjs scripts/native-release-workflow.node-test.mjs scripts/decommission-gates.node-test.mjs scripts/placement-evidence.node-test.mjs",
-    "test:linux-server-install": "node --test deploy/linux-server/dependency-install.node-test.mjs"
+    "test:linux-server-install": "node --test deploy/linux-server/dependency-install.node-test.mjs deploy/linux-server/start.node-test.mjs"
   },
   "dependencies": {
     "@openfeature/server-sdk": "^1.23.0",

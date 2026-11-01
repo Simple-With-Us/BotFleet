@@ -182,6 +182,8 @@ if [ ! -f "$BF_ROOT/config/server.env" ]; then
 # No secrets live in this file.  Secrets come from Infisical (INFISICAL.md)
 # and from the engine CLIs' own login files under the service user's home.
 # OMB_DATA_DIR, OMB_STATIC_DIR and OMB_PORT are set by the systemd unit.
+# BF_NODE_HEAP_MB pins the V8 old-space heap in MB (default 6144) so the cgroup's memory.high cannot shrink it.
+# BF_NODE_HEAP_MB=6144
 EOF
 else
   say "keeping the existing $BF_ROOT/config/server.env"
