@@ -35,10 +35,19 @@ export function assertProject(p, config) {
 export async function resolveBaseline({ project, config, readDeployment, readAlias }) {
   const targetId = project.targets?.production?.id ?? project.targets?.production?.uid;
   if (isString(targetId) && DEPLOYMENT_ID.test(targetId)) {
-    const pointed = await readDeployment(targetId);
-    must(pointed.projectId === config.projectId, 'Wrong production baseline project');
-    if (pointed.target === 'production' && (pointed.readyState ?? pointed.state) === 'READY') {
-      return { baseline: pointed, via: 'target' };
+    let pointed, targetFetched = false;
+    try {
+      pointed = await readDeployment(targetId);
+      targetFetched = true;
+    } catch {
+      // A stale target may be unavailable. Only this read may fall back;
+      // a returned payload must still pass the fail-closed identity checks.
+    }
+    if (targetFetched) {
+      must(object(pointed) && pointed.projectId === config.projectId, 'Wrong production baseline project');
+      if (pointed.target === 'production' && (pointed.readyState ?? pointed.state) === 'READY') {
+        return { baseline: pointed, via: 'target' };
+      }
     }
   }
   const alias = config.productionAlias;
@@ -47,7 +56,7 @@ export async function resolveBaseline({ project, config, readDeployment, readAli
   must(object(record) && record.projectId === config.projectId, 'Serving alias is not bound to this project');
   must(isString(record.deploymentId) && DEPLOYMENT_ID.test(record.deploymentId), 'Serving alias points at no deployment');
   const serving = await readDeployment(record.deploymentId);
-  must(serving.projectId === config.projectId, 'Wrong serving baseline project');
+  must(object(serving) && serving.projectId === config.projectId, 'Wrong serving baseline project');
   must(serving.target === 'production' && (serving.readyState ?? serving.state) === 'READY', 'Serving production deployment is not READY');
   return { baseline: serving, via: 'alias' };
 }

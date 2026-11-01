@@ -74,6 +74,29 @@ test('baseline falls back to the serving alias only when the target pointer is n
  await assert.rejects(resolveBaseline({ project: pointedCanceled, config: cfg, readDeployment: async () => canceled, readAlias: async () => ({ projectId: 'prj_test', deploymentId: 'dpl_serving' }) }), /not READY/);
  await assert.rejects(resolveBaseline({ project: pointedCanceled, config: cfg, readDeployment: async id => id === 'dpl_canceled' ? canceled : { ...ready, projectId: 'wrong' }, readAlias: async () => ({ projectId: 'prj_test', deploymentId: 'dpl_serving' }) }), /Wrong serving/);
 });
+test('unavailable target falls back but invalid returned deployments fail closed', async () => {
+ const cfg = { ...config, productionAlias: 'site.example.test' };
+ const pointedProject = { ...project, targets: { production: { id: 'dpl_stale' } } };
+ const aliasRecord = { projectId: cfg.projectId, deploymentId: 'dpl_serving' };
+ const fallback = await resolveBaseline({ project: pointedProject, config: cfg,
+  readDeployment: async id => { if (id === 'dpl_stale') throw new Error('HTTP 404'); return baseline; },
+  readAlias: async () => aliasRecord });
+ assert.equal(fallback.via, 'alias');
+ assert.equal(fallback.baseline, baseline);
+ for (const invalid of [null, undefined, [], {}, { projectId: 'wrong' }]) {
+  await assert.rejects(resolveBaseline({ project: pointedProject, config: cfg,
+   readDeployment: async () => invalid,
+   readAlias: async () => { throw new Error('must not query alias'); } }), /Wrong production baseline project/);
+  await assert.rejects(resolveBaseline({ project: {}, config: cfg,
+   readDeployment: async () => invalid, readAlias: async () => aliasRecord }), /Wrong serving baseline project/);
+ }
+ await assert.rejects(resolveBaseline({ project: pointedProject, config: cfg,
+  readDeployment: async () => { throw new Error('deployment unavailable'); },
+  readAlias: async () => { throw new Error('alias unavailable'); } }), /alias unavailable/);
+ await assert.rejects(resolveBaseline({ project: {}, config: cfg,
+  readDeployment: async () => { throw new Error('serving unavailable'); },
+  readAlias: async () => aliasRecord }), /serving unavailable/);
+});
 test('receipt verifies project/target/sha/READY/url, not CLI exit code', () => {
  assert.equal(assertReceipt(baseline,config,A),'https://test.vercel.app');
  for (const d of [{...baseline,projectId:'wrong'},{...baseline,target:'preview'},{...baseline,readyState:'BUILDING'},{...baseline,url:'test.vercel.app.evil.test'},{...baseline,gitSource:{sha:B}}]) assert.throws(() => assertReceipt(d,config,A));
