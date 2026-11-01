@@ -40,6 +40,7 @@ import {
   resolveRealm,
   validZulipRole,
   verifyCredentialRealm,
+  zulipVaultNames,
   type ZulipCredentialSource,
   type ZulipCredentials,
   type ZulipVaultReader,
@@ -524,6 +525,7 @@ class ZulipSession {
       } catch (e) {
         if (signal.aborted) return;
         if (e instanceof ZulipCredentialError || e instanceof RoleRefused) {
+          if (e instanceof ZulipCredentialError) this.hub.warnVaultUnreadableOnce(e, this.credentialRole);
           this.setStatus("disabled", e.message);
           return;
         }
@@ -808,6 +810,11 @@ export class ZulipHub {
   /** Sessions being stopped.  A replacement for the same bot waits for the
    *  old one to finish, so two sessions never write one bot's state file. */
   private readonly stopping = new Map<string, Promise<void>>();
+  /** Vault folders (a refusal) and folder+role pairs (missing names) the
+   *  consolidated unreadable-folder warn line has already been logged for,
+   *  so a scoped token that cannot read `/zulip` warns once no matter how
+   *  many bots are bound or how often the reconcile timer retries them. */
+  private readonly vaultUnreadableWarned = new Set<string>();
   private readonly outgoingSpool: ZulipOutgoingSpool;
   private readonly outgoingRetry = new Map<string, number>();
   private outgoingDraining = false;
@@ -852,6 +859,26 @@ export class ZulipHub {
       vault: this.deps.vault,
       realm: "realm" in realm ? realm.realm : undefined,
     });
+  }
+
+  /** One consolidated warn line when the vault folder the Infisical source
+   *  reads is refused (401/403/404) or holds none of a role's expected
+   *  names.  The per-bot `disabled` line still carries the precise reason;
+   *  this is the single operator-facing signal: once per folder for a
+   *  refusal, once per folder and role for missing names (a shared folder
+   *  may hold other roles).  Path and names only, never a value. */
+  warnVaultUnreadableOnce(error: ZulipCredentialError, role: string): void {
+    const vault = error.vaultUnreadable;
+    if (!vault) return;
+    const key = vault.status === undefined ? `${vault.where} ${role}` : vault.where;
+    if (this.vaultUnreadableWarned.has(key)) return;
+    this.vaultUnreadableWarned.add(key);
+    if (vault.status === undefined) {
+      const names = zulipVaultNames(role);
+      this.log(`[zulip] infisical ${vault.where} has none of ${role}'s expected names (${names.email}, ${names.key}); Zulip credentials unavailable`);
+    } else {
+      this.log(`[zulip] infisical ${vault.where} unreadable with the configured token (${vault.status}); Zulip credentials unavailable`);
+    }
   }
 
   /** Whether the Zulip source should run at all. */

@@ -695,6 +695,41 @@ describe("credentials and identity", () => {
     expect(disabledLogs()).toBe(4);
   });
 
+  it("warns once per folder when the vault refuses the Infisical folder read, however many bots are bound", async () => {
+    settings.credentialDir = undefined;
+    settings.credentialSource = "infisical";
+    settings.bots = { "bot-plumber": { role: "BF-Plumber" }, "bot-fixer": { role: "BF-Fixer" } };
+    const hub = makeHub({
+      vault: async () => {
+        throw Object.assign(new Error("Infisical secrets list failed: HTTP 403"), { statusCode: 403 });
+      },
+    });
+    await waitFor(() => hub.status().bots.filter((bot) => bot.state === "disabled").length === 2, "both disabled");
+    const warns = () => logs.filter((line) => line.includes("Zulip credentials unavailable"));
+    expect(warns()).toEqual([
+      "[zulip] infisical /zulip unreadable with the configured token (403); Zulip credentials unavailable",
+    ]);
+    // the per-bot lines still carry the precise reason, and the status view too
+    expect(botStatus(hub, "bot-plumber")!.reason).toMatch(/cannot read Infisical \/zulip/);
+    expect(botStatus(hub, "bot-fixer")!.reason).toMatch(/cannot read Infisical \/zulip/);
+    // a reconcile retry re-disables both bots but warns no second time
+    hub.reconcile();
+    await waitFor(() => logs.filter((line) => line.includes(": disabled")).length === 4, "one retry each");
+    await settle(300);
+    expect(warns()).toHaveLength(1);
+  });
+
+  it("warns once per folder and role when the vault folder holds none of the role's names", async () => {
+    settings.credentialDir = undefined;
+    settings.credentialSource = "infisical";
+    const hub = makeHub({ vault: async () => new Map<string, string>() });
+    await waitFor(() => botStatus(hub, "bot-plumber")?.state === "disabled", "plumber disabled");
+    expect(logs.filter((line) => line.includes("Zulip credentials unavailable"))).toEqual([
+      "[zulip] infisical /zulip has none of BF-Plumber's expected names (ZULIP_BF_PLUMBER_EMAIL, ZULIP_BF_PLUMBER_API_KEY); Zulip credentials unavailable",
+    ]);
+    expect(botStatus(hub, "bot-plumber")!.reason).toMatch(/has no ZULIP_BF_PLUMBER_EMAIL or ZULIP_BF_PLUMBER_API_KEY/);
+  });
+
   it("connects with keys from BotFleet's own vault when the Infisical source is chosen", async () => {
     settings.credentialDir = undefined;
     settings.credentialSource = "infisical";
