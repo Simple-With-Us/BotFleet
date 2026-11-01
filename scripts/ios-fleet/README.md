@@ -68,5 +68,5 @@ printed.  Exit 0 means every app passes, 1 means a policy violation, and
 
 ```bash
 node scripts/ios-fleet/fleet-tf-audit.mjs [--config <file>] [--json] [--repo-heads <file>]
-node --test scripts/ios-fleet/fleet-tf-audit.test.mjs   # offline tests
+node --test scripts/ios-fleet/fleet-tf-audit.node-test.mjs   # offline tests
 ```

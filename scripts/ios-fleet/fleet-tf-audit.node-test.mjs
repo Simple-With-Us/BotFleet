@@ -2,11 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  AuditError,
   auditFleet,
   centralStamp,
   createReadOnlyApi,
   formatLine,
-  isTimestampBuild
+  highestApprovedVersion,
+  isTimestampBuild,
+  parseArgs
 } from "./fleet-tf-audit.mjs";
 
 // Fully offline:  the fake api(method, path) below stands in for the App Store Connect client from asc-api.mjs.  It records every method it sees, so a test can prove the audit only ever sends GET.
@@ -27,19 +30,29 @@ function makeFake(records) {
     }
     if (url.pathname === "/v1/builds") {
       const spec = byAppId.get(url.searchParams.get("filter[app]")) || { builds: [] };
+      const limit = Number(url.searchParams.get("limit")) || 200;
+      const sorted = [...(spec.builds || [])].sort(
+        (a, b) => String(b.uploadedDate || "").localeCompare(String(a.uploadedDate || ""))
+      );
+      const offset = Number(url.searchParams.get("_cursor")) || 0;
+      const slice = sorted.slice(offset, offset + limit);
+      const nextOffset = offset + slice.length;
       const included = [];
       const seenTrain = new Set();
-      const data = (spec.builds || []).map((b, i) => {
-        const trainId = `train-${b.platform || "IOS"}-${b.marketing || "0.1.0"}`;
+      const data = slice.map((b, i) => {
+        const plat = Object.prototype.hasOwnProperty.call(b, "platform") ? b.platform : "IOS";
+        const trainId = `train-${plat || "NONE"}-${b.marketing || "0.1.0"}`;
         if (!seenTrain.has(trainId)) {
           seenTrain.add(trainId);
+          const attrs = { version: b.marketing || "0.1.0" };
+          if (plat) attrs.platform = plat;
           included.push({
             id: trainId, type: "preReleaseVersions",
-            attributes: { version: b.marketing || "0.1.0", platform: b.platform || "IOS" }
+            attributes: attrs
           });
         }
         return {
-          id: `build-${i}`, type: "builds",
+          id: `build-${offset + i}`, type: "builds",
           attributes: {
             version: b.version,
             uploadedDate: b.uploadedDate,
@@ -48,7 +61,13 @@ function makeFake(records) {
           relationships: { preReleaseVersion: { data: { type: "preReleaseVersions", id: trainId } } }
         };
       });
-      return ok({ data, included, links: {} });
+      const links = {};
+      if (nextOffset < sorted.length) {
+        const next = new URL(url.href);
+        next.searchParams.set("_cursor", String(nextOffset));
+        links.next = next.pathname + next.search;
+      }
+      return ok({ data, included, links });
     }
     const store = url.pathname.match(/^\/v1\/apps\/(.+)\/appStoreVersions$/);
     if (store) {
@@ -197,4 +216,69 @@ test("centralStamp applies the CST offset and isTimestampBuild checks the calend
   assert.equal(isTimestampBuild("202613011200"), false);
   assert.equal(isTimestampBuild("202610291260"), false);
   assert.equal(isTimestampBuild("20261029120"), false);
+});
+
+test("invalid repo-head date is a per-app violation, not a fleet auth abort", async () => {
+  const { api } = makeFake({ "com.example.test": { builds: good } });
+  const [r] = await auditFleet({ api, entries: [entry()], repoHeads: { TestApp: "not-a-date" } });
+  assert.equal(r.pass, false);
+  assert.ok(r.violations.some((v) => v === "invalid repo-head date for TestApp: not-a-date"), r.violations.join(" | "));
+  assert.equal(r.repoHead, undefined);
+});
+
+test("build missing platform defaults to UNKNOWN and is surfaced", async () => {
+  const builds = [B("202610291200", "2026-10-29T17:05:00Z", { platform: "" })];
+  const { api } = makeFake({ "com.example.test": { builds } });
+  const [r] = await auditFleet({ api, entries: [entry()] });
+  assert.equal(r.pass, false);
+  assert.ok(r.platformList.includes("UNKNOWN"), r.platformList.join(" | "));
+  assert.ok(r.violations.some((v) => /build missing platform attribute/.test(v)), r.violations.join(" | "));
+  assert.ok(!r.violations.some((v) => /iOS\/macOS build mismatch/.test(v)), r.violations.join(" | "));
+});
+
+test("paginated builds: a higher build on a later page is still checked", async () => {
+  const builds = [];
+  for (let i = 0; i < 200; i += 1) {
+    const stamp = `20261001${String(1000 + i).padStart(4, "0")}`;
+    builds.push(B(stamp, `2026-10-01T17:${String(i % 60).padStart(2, "0")}:00Z`));
+  }
+  builds.push(B("202610291300", "2026-09-01T17:05:00Z"));
+  const { api } = makeFake({ "com.example.test": { builds } });
+  const [r] = await auditFleet({ api, entries: [entry()] });
+  assert.equal(r.pass, false);
+  assert.ok(
+    r.violations.some((v) => /is not the highest \(202610291300 seen\)/.test(v)),
+    r.violations.join(" | ")
+  );
+});
+
+test("highestApprovedVersion throws on unknown App Store version state", () => {
+  const rows = [{
+    attributes: {
+      versionString: "1.0.0",
+      platform: "IOS",
+      appStoreState: "MYSTERY_STATE"
+    }
+  }];
+  assert.throws(
+    () => highestApprovedVersion(rows, "IOS"),
+    (err) => err instanceof AuditError && /unknown App Store version state \["MYSTERY_STATE"\] for 1\.0\.0/.test(err.message)
+  );
+});
+
+test("highestApprovedVersion skips NOT_RELEASED states without throwing", () => {
+  const rows = [{
+    attributes: { versionString: "0.9.0", platform: "IOS", appStoreState: "REJECTED" }
+  }, {
+    attributes: { versionString: "1.0.0", platform: "IOS", appStoreState: "READY_FOR_SALE" }
+  }];
+  assert.equal(highestApprovedVersion(rows, "IOS"), "1.0.0");
+});
+
+test("parseArgs rejects --config and --repo-heads without a value or with a flag", () => {
+  assert.throws(() => parseArgs(["--config"]), /unknown or incomplete argument: --config/);
+  assert.throws(() => parseArgs(["--repo-heads"]), /unknown or incomplete argument: --repo-heads/);
+  assert.throws(() => parseArgs(["--config", "--json"]), /unknown or incomplete argument: --config/);
+  assert.throws(() => parseArgs(["--repo-heads", "--json"]), /unknown or incomplete argument: --repo-heads/);
+  assert.deepEqual(parseArgs(["--config", "apps.json", "--json"]).config, "apps.json");
 });

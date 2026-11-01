@@ -88,6 +88,12 @@ const RELEASED_STATES = new Set([
   "PROCESSING_FOR_DISTRIBUTION", "PROCESSING_FOR_APP_STORE"
 ]);
 
+// App Store version states that mean not released yet.  Mirrors asc-api.mjs released-store-version.
+const NOT_RELEASED = new Set([
+  "PREPARE_FOR_SUBMISSION", "READY_FOR_REVIEW", "WAITING_FOR_REVIEW", "IN_REVIEW",
+  "UNRESOLVED_ISSUES", "REJECTED", "METADATA_REJECTED", "DEVELOPER_REJECTED", "INVALID_BINARY"
+]);
+
 // The highest approved (released) App Store version in appStoreVersions rows for one platform, or "" when none is approved.
 export function highestApprovedVersion(rows, platform) {
   let best = "";
@@ -96,7 +102,12 @@ export function highestApprovedVersion(rows, platform) {
     if (platform && a.platform && a.platform !== platform) continue;
     if (!a.versionString) continue;
     const states = [a.appVersionState, a.appStoreState].filter(Boolean);
-    if (!states.some((s) => RELEASED_STATES.has(s))) continue;
+    if (!states.some((s) => RELEASED_STATES.has(s))) {
+      if (states.length === 0 || !states.every((x) => NOT_RELEASED.has(x))) {
+        throw new AuditError(`unknown App Store version state ${JSON.stringify(states)} for ${a.versionString}`);
+      }
+      continue;
+    }
     if (!best || compareVersions(a.versionString, best) > 0) best = a.versionString;
   }
   return best;
@@ -114,6 +125,9 @@ export function checkAppBuilds({ expectedMarketingVersion, buildsByPlatform, app
   for (const platform of present) {
     const builds = buildsByPlatform[platform];
     const latest = builds[0];
+    if (platform === "UNKNOWN") {
+      violations.push(`build missing platform attribute (latest build ${latest.version || "?"})`);
+    }
     let highest = null;
     let highestVersion = "";
     for (const b of builds) {
@@ -188,6 +202,32 @@ export function checkAppBuilds({ expectedMarketingVersion, buildsByPlatform, app
   return { platforms, violations, notes, repoHead };
 }
 
+// Every build row for one app, following links.next like ascAllRows in asc-api.mjs.  Included preReleaseVersions are merged across pages.
+const ASC_ORIGIN = "https://api.appstoreconnect.apple.com/";
+const ASC_MAX_PAGES = 50;
+
+async function fetchAllBuildRows({ api, appId }) {
+  const buildRows = [];
+  const includedTrains = [];
+  let next = `/v1/builds?filter[app]=${appId}&sort=-uploadedDate&limit=200&include=preReleaseVersion`;
+  for (let page = 0; page < ASC_MAX_PAGES && next; page += 1) {
+    const res = await api("GET", next);
+    if (!res.ok) return { ok: false, error: ascErrorText(res), buildRows: [], includedTrains: [] };
+    for (const b of res.parsed?.data || []) {
+      if (b && String(b.id) === b.id) buildRows.push(b);
+    }
+    for (const inc of res.parsed?.included || []) {
+      if (inc?.type === "preReleaseVersions") includedTrains.push(inc);
+    }
+    next = res.parsed?.links?.next || "";
+    if (next && !next.startsWith(ASC_ORIGIN) && !next.startsWith("/")) {
+      return { ok: false, error: "next link leaves App Store Connect", buildRows: [], includedTrains: [] };
+    }
+  }
+  if (next) return { ok: false, error: `more than ${ASC_MAX_PAGES} pages`, buildRows: [], includedTrains: [] };
+  return { ok: true, buildRows, includedTrains };
+}
+
 // Read one App Store Connect app record:  its latest builds with marketing version and platform, plus its App Store versions.  A rejected key or a failed query is an AuditError, because the audit cannot trust a partial read.  A bundle with no exact record resolves to {notFound: true} and the caller reports it as a violation.
 async function fetchAscApp({ api, bundleId }) {
   const appsRes = await api("GET", `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=50`);
@@ -198,14 +238,13 @@ async function fetchAscApp({ api, bundleId }) {
   // filter[bundleId] is a prefix match on Apple's side, so exact-match the bundle id here.
   const app = (appsRes.parsed?.data || []).find((a) => a?.attributes?.bundleId === bundleId);
   if (!app) return { notFound: true, builds: [], storeRows: [] };
-  const buildsRes = await api("GET",
-    `/v1/builds?filter[app]=${app.id}&sort=-uploadedDate&limit=10&include=preReleaseVersion`);
-  if (!buildsRes.ok) throw new AuditError(`builds query failed for ${bundleId}: ${ascErrorText(buildsRes)}`);
+  const buildsPage = await fetchAllBuildRows({ api, appId: app.id });
+  if (!buildsPage.ok) throw new AuditError(`builds query failed for ${bundleId}: ${buildsPage.error}`);
   const trainById = new Map();
-  for (const inc of buildsRes.parsed?.included || []) {
-    if (inc?.type === "preReleaseVersions") trainById.set(inc.id, inc.attributes || {});
+  for (const inc of buildsPage.includedTrains) {
+    trainById.set(inc.id, inc.attributes || {});
   }
-  const builds = (buildsRes.parsed?.data || []).map((b) => {
+  const builds = buildsPage.buildRows.map((b) => {
     const train = trainById.get(b?.relationships?.preReleaseVersion?.data?.id) || {};
     return {
       version: b?.attributes?.version ?? "",
@@ -227,7 +266,7 @@ export async function auditApp({ api, entry, repoHead }) {
   const buildsByPlatform = {};
   const storeRows = [];
   const fetchViolations = [];
-  for (const bundleId of [...new Set(Object.values(bundleIds).filter(Boolean))]) {
+  for (const bundleId of new Set(Object.values(bundleIds).filter(Boolean))) {
     const found = await fetchAscApp({ api: readOnly, bundleId });
     if (found.notFound) {
       fetchViolations.push(`no App Store Connect app found for bundle ${bundleId}`);
@@ -235,7 +274,7 @@ export async function auditApp({ api, entry, repoHead }) {
     }
     storeRows.push(...found.storeRows);
     for (const b of found.builds) {
-      const platform = b.platform || "IOS";
+      const platform = b.platform || "UNKNOWN";
       (buildsByPlatform[platform] ??= []).push(b);
     }
   }
@@ -245,13 +284,25 @@ export async function auditApp({ api, entry, repoHead }) {
   }
   const approvedByPlatform = {};
   for (const platform of Object.keys(buildsByPlatform)) {
-    approvedByPlatform[platform] = highestApprovedVersion(storeRows, platform);
+    approvedByPlatform[platform] = highestApprovedVersion(storeRows, platform === "UNKNOWN" ? undefined : platform);
+  }
+  let repoHeadStamp = null;
+  if (repoHead) {
+    try {
+      repoHeadStamp = centralStamp(repoHead);
+    } catch (err) {
+      if (err instanceof AuditError) {
+        fetchViolations.push(`invalid repo-head date for ${entry.app}: ${repoHead}`);
+      } else {
+        throw err;
+      }
+    }
   }
   const checked = checkAppBuilds({
     expectedMarketingVersion: entry.expectedMarketingVersion,
     buildsByPlatform,
     approvedByPlatform,
-    repoHeadStamp: repoHead ? centralStamp(repoHead) : null
+    repoHeadStamp
   });
   const violations = [...fetchViolations, ...(fetchViolations.length && checked.violations[0] === "no builds found" ? [] : checked.violations)];
   const allBuilds = Object.values(buildsByPlatform).flat()
@@ -296,15 +347,21 @@ export function formatLine(result) {
   return `${result.app} ${platforms} v${result.marketingVersion || "-"} build ${build} ${result.state || "-"} ${verdict}${notes}`;
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const out = { config: "", json: false, repoHeads: "", help: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--json") out.json = true;
     else if (arg === "--help" || arg === "-h") out.help = true;
-    else if (arg === "--config" && argv[i + 1]) out.config = argv[++i];
-    else if (arg === "--repo-heads" && argv[i + 1]) out.repoHeads = argv[++i];
-    else throw new AuditError(`unknown or incomplete argument: ${arg}`);
+    else if (arg === "--config") {
+      const val = argv[i + 1];
+      if (!val || val.startsWith("--")) throw new AuditError(`unknown or incomplete argument: ${arg}`);
+      out.config = argv[++i];
+    } else if (arg === "--repo-heads") {
+      const val = argv[i + 1];
+      if (!val || val.startsWith("--")) throw new AuditError(`unknown or incomplete argument: ${arg}`);
+      out.repoHeads = argv[++i];
+    } else throw new AuditError(`unknown or incomplete argument: ${arg}`);
   }
   return out;
 }
