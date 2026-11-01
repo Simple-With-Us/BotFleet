@@ -43,7 +43,7 @@
     "test:e2e": "playwright test",
     "e2e:update": "playwright test --update-snapshots=changed",
     "test:tvface": "vitest run --config vitest.tvface.config.ts",
-    "test:ios-ship": "node --test scripts/ios-ship-workflow.node-test.mjs scripts/sentry-testflight.node-test.mjs scripts/ios-fleet/version-plan.node-test.mjs",
+    "test:ios-ship": "node --test scripts/ios-ship-workflow.node-test.mjs scripts/sentry-testflight.node-test.mjs scripts/ios-fleet/version-plan.node-test.mjs scripts/ios-fleet/fleet-tf-audit.node-test.mjs",
     "test:infisical-fetch": "node --test scripts/infisical-fetch.node-test.mjs scripts/infisical-fetch-expand.node-test.mjs scripts/infisical-migrate.node-test.mjs",
     "test:release-workflow": "node --test scripts/release-workflow.node-test.mjs scripts/stamp-commit-version.node-test.mjs",
     "test:updater": "node --test electron/updater-coordinator.node-test.mjs electron/updater-throttle.node-test.mjs",
