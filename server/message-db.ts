@@ -31,7 +31,9 @@ function open(): DatabaseSync {
   closeSync(openSync(file, "a", 0o600));
   try {
     chmodSync(file, 0o600);
-  } catch {}
+  } catch {
+    // best-effort permission repair; a file just created above is already 0o600
+  }
   const db = new DatabaseSync(file);
   // auto_vacuum only takes effect set on an EMPTY database (SQLite ignores
   // it once a table exists, short of a full VACUUM), so this only ever runs
@@ -93,7 +95,11 @@ function backfillRunningHelpers(database: DatabaseSync): void {
     try {
       // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
       message = JSON.parse(row.json) as Message;
-    } catch {
+    } catch (error) {
+      console.error(
+        `[message-db] backfillRunningHelpers: skipping unparseable message row ${row.thread_id}/${row.id}`,
+        error,
+      );
       continue;
     }
     if (message.helper?.status !== "running") continue;
@@ -123,7 +129,9 @@ function db(): DatabaseSync {
   if (handle && handlePath === DB_FILE() && existsSync(DB_FILE())) return handle;
   try {
     handle?.close();
-  } catch {}
+  } catch (error) {
+    console.error("[message-db] closing the previous database handle before reopen failed", error);
+  }
   handle = open();
   handlePath = DB_FILE();
   return handle;
@@ -218,7 +226,13 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(legacyFile, "utf8"));
-  } catch {
+  } catch (error) {
+    // ENOENT is a fresh thread with no legacy file yet; anything else means a
+    // real transcript failed to read and is about to masquerade as empty.
+    // SAFETY: a failed `readFileSync` throws an errno exception carrying `code`.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[message-db] could not read legacy thread file ${legacyFile}; treating the thread as empty`, error);
+    }
     return { messages, activeLeafId }; // fresh thread
   }
   if (Array.isArray(raw)) messages = raw as Message[]; // pre-branching flat file
@@ -246,8 +260,14 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
     renameSync(legacyFile, `${legacyFile}.imported`);
     try {
       chmodSync(`${legacyFile}.imported`, 0o600);
-    } catch {}
-  } catch {}
+    } catch {
+      // best-effort permission tightening on the one-time backup
+    }
+  } catch (error) {
+    // Without the rename, a later read of a thread whose rows were deleted
+    // would re-import this stale file as if it were live history.
+    console.error(`[message-db] could not rename imported legacy thread file ${legacyFile} aside`, error);
+  }
   return { messages, activeLeafId };
 }
 
@@ -329,7 +349,13 @@ export function firstMessageAt(threadId: string, legacyFile: string): number | n
       ? (raw as Message[])
       : (((raw as { messages?: Message[] }).messages ?? []) as Message[]);
     return messages[0]?.at ?? null;
-  } catch {
+  } catch (error) {
+    // ENOENT just means no legacy file; a parse or IO failure returning null
+    // would silently reorder a merge as if the thread never started.
+    // SAFETY: a failed `readFileSync` throws an errno exception carrying `code`.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[message-db] could not read legacy thread file ${legacyFile} for its first timestamp`, error);
+    }
     return null;
   }
 }
@@ -351,7 +377,8 @@ export function runningHelperRows(): Array<{ threadId: string; message: Message 
     try {
       // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
       message = JSON.parse(json) as Message;
-    } catch {
+    } catch (error) {
+      console.error(`[message-db] runningHelperRows: skipping unparseable message row in thread ${thread_id}`, error);
       continue;
     }
     if (message.helper?.status !== "running") {
@@ -604,7 +631,9 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
 export function closeMessageDb(): void {
   try {
     handle?.close();
-  } catch {}
+  } catch {
+    // shutdown/test dispose; the handle is dropped either way
+  }
   handle = null;
   handlePath = null;
 }

@@ -1448,7 +1448,9 @@ export class Store {
     for (const file of [messagesFile(threadId), `${messagesFile(threadId)}.imported`]) {
       try {
         unlinkSync(file);
-      } catch {}
+      } catch {
+        // the legacy file may not exist; the DB rows are already gone
+      }
     }
     this.emit({ type: "thread.deleted", threadId });
   }
@@ -2302,7 +2304,9 @@ export class Store {
     // transcripts: deleting a bot deletes what it knew
     try {
       rmSync(workspaceDir(id), { recursive: true, force: true });
-    } catch {}
+    } catch (error) {
+      console.error(`store: could not remove workspace for deleted bot ${id}`, error);
+    }
     this.saveBots();
     this.emit({ type: "bot.deleted", botId: id });
     return true;
@@ -2828,7 +2832,13 @@ export class Store {
             if (Array.isArray(keys)) pendingById[id] = keys.filter((key): key is string => typeof key === "string");
           }
         }
-      } catch {
+      } catch (error) {
+        // ENOENT is the first boot before any marker exists; anything else
+        // reads as "directive never applied" and would re-run the migration.
+        // SAFETY: a failed `readFileSync` throws an errno exception carrying `code`.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          console.error("model-lineage: could not read the migration marker; treating the directive as unapplied", error);
+        }
         applied = [];
         pendingById = {};
       }
@@ -2959,7 +2969,8 @@ export class Store {
         let botId: unknown;
         try {
           [botId] = JSON.parse(key) as unknown[];
-        } catch {
+        } catch (error) {
+          console.error("model-lineage: dropping a malformed pending migration key", error);
           continue;
         }
         if (typeof botId === "string" && !visited.has(botId) && this.bots.some((bot) => bot.id === botId)) {
