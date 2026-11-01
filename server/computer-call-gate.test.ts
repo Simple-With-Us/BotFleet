@@ -1,14 +1,20 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  COMPUTER_WAIT_MAX_MS,
+  computerCallActWithinMs,
+  computerCallWaitMs,
+  computerPersonAwayMs,
   computerPersonAwayText,
   waitForComputerCall,
   type ComputerCallSnapshot,
 } from "./computer-call-gate.ts";
 import {
+  CONTROL_ACT_WITHIN_MS,
   CONTROL_BUSY,
   CONTROL_HANDED_BACK,
   CONTROL_REFUSAL_PLAIN,
+  CONTROL_WAIT_MS,
   CONTROL_WAITED,
   controlRefusal,
 } from "./control-client.ts";
@@ -22,6 +28,21 @@ function clock(start = 1_000) {
     },
   };
 }
+
+describe("gate wait bounds", () => {
+  it("falls back to the built-in defaults without a resolved override", () => {
+    expect(computerCallWaitMs()).toBe(CONTROL_WAIT_MS);
+    expect(computerCallActWithinMs()).toBe(CONTROL_ACT_WITHIN_MS);
+    expect(computerPersonAwayMs()).toBe(COMPUTER_WAIT_MAX_MS);
+  });
+
+  it("clamps a resolved override to the gate's bounds", () => {
+    expect(computerCallWaitMs(10)).toBe(500);
+    expect(computerCallWaitMs(999_999)).toBe(CONTROL_WAIT_MS);
+    expect(computerCallActWithinMs(1)).toBe(100);
+    expect(computerPersonAwayMs(0)).toBe(1);
+  });
+});
 
 describe("waitForComputerCall", () => {
   it("lets a free computer act at once", async () => {

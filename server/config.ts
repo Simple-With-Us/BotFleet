@@ -14,6 +14,7 @@ import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile }
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
 import { resolveKnobFields, stripVaultManagedKnobs } from "./knob-map.ts";
+import { CONTROL_ACT_WITHIN_MS, CONTROL_WAIT_MS } from "./control-client.ts";
 import { describeDsn } from "./sentry.ts";
 import {
   parseConversationMode,
@@ -520,6 +521,27 @@ const appConfigSchema = z.object({
     // field overrides the file.
     webhookHotDeferMinutes: z.number().int().min(1).max(720).optional(),
   }).optional(),
+  // How long one computer call waits inside the harness while its desktop
+  // is busy (server/computer-call-gate.ts).  Every field is optional: an
+  // absent field resolves through the legacy `OMB_COMPUTER_*` env names to
+  // the gate's built-in defaults (`computerCallSettings` below), and the
+  // vault knobs of the same fields override both.  The bounds are the
+  // gate's own clamps — a wait can never outlast the bridge client that is
+  // blocked on it (`CONTROL_WAIT_MS` in server/control-client.ts).
+  computerCall: z.object({
+    waitMs: z.number().int().min(500).max(CONTROL_WAIT_MS).optional(),
+    actWithinMs: z.number().int().min(100).max(CONTROL_ACT_WITHIN_MS).optional(),
+    personAwayMs: z.number().int().min(1).optional(),
+  }).optional(),
+  // How long an idle Claude CLI session is kept warm before the driver
+  // closes it (server/drivers/claude.ts).  `idleMinMs` is the floor the
+  // effective window never drops below.  Absent fields resolve through the
+  // legacy `OMB_CLAUDE_SESSION_IDLE_*` env names to the driver's built-in
+  // defaults (`claudeSessionIdleMs` below); the vault knobs override both.
+  claudeSession: z.object({
+    idleMs: z.number().int().min(1).optional(),
+    idleMinMs: z.number().int().min(1).optional(),
+  }).optional(),
   // Error and performance reporting.  The kill switch is explicit: a DSN
   // with no `enabled` flag reports.  Only a stored `false` stops it, so an
   // upgraded install never goes quiet without saying why.
@@ -763,6 +785,19 @@ export interface AppConfig {
     /** Minutes a hot host may park a webhook before the wake dispatches
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;
+  };
+  /** Computer-call gate waits (server/computer-call-gate.ts).  See the
+   *  schema above; absent fields resolve in `computerCallSettings`. */
+  computerCall?: {
+    waitMs?: number;
+    actWithinMs?: number;
+    personAwayMs?: number;
+  };
+  /** Idle lifetime of a warm Claude CLI session (server/drivers/claude.ts).
+   *  Absent fields resolve in `claudeSessionIdleMs`. */
+  claudeSession?: {
+    idleMs?: number;
+    idleMinMs?: number;
   };
   /** Who reviews a bot's approvals when its own engine cannot, and how many
    *  reviews one turn may spend. */
@@ -1057,6 +1092,62 @@ export function autoReviewMaxPerTurn(cfg: AppConfig): number {
   const value = cfg.autoReview?.maxReviewsPerTurn ?? Number.NaN;
   if (!Number.isFinite(value)) return DEFAULT_MAX_REVIEWS_PER_TURN;
   return Math.min(MAX_MAX_REVIEWS_PER_TURN, Math.max(MIN_MAX_REVIEWS_PER_TURN, Math.floor(value)));
+}
+
+/** The longest any turn waits for a person who has the computer before it
+ *  stops waiting and says so.  Mirrors `COMPUTER_WAIT_MAX_MS` in
+ *  server/computer-call-gate.ts, the gate's own fallback when no resolved
+ *  setting reaches it. */
+export const DEFAULT_COMPUTER_PERSON_AWAY_MS = 30 * 60 * 1000;
+
+export interface ComputerCallSettings {
+  waitMs: number;
+  actWithinMs: number;
+  personAwayMs: number;
+}
+
+function boundedMs(value: number | undefined, fallback: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback));
+}
+
+/** The computer-call gate's waits, already defaulted and clamped to the
+ *  gate's bounds.  The stored (or vault-resolved) field wins; underneath it
+ *  the long-standing `OMB_COMPUTER_*` env names still apply, so an operator
+ *  who pinned those before this section existed keeps what they had — the
+ *  same ordering `observabilitySettings` uses for the Sentry rates. */
+export function computerCallSettings(cfg: AppConfig): ComputerCallSettings {
+  const wait = cfg.computerCall?.waitMs ?? Number(process.env.OMB_COMPUTER_CALL_WAIT_MS);
+  const actWithin = cfg.computerCall?.actWithinMs ?? Number(process.env.OMB_COMPUTER_CALL_ACT_WITHIN_MS);
+  const personAway = cfg.computerCall?.personAwayMs ?? Number(process.env.OMB_COMPUTER_WAIT_MAX_MS);
+  return {
+    waitMs: boundedMs(wait, CONTROL_WAIT_MS, 500, CONTROL_WAIT_MS),
+    actWithinMs: boundedMs(actWithin, CONTROL_ACT_WITHIN_MS, 100, CONTROL_ACT_WITHIN_MS),
+    personAwayMs:
+      personAway !== undefined && Number.isFinite(personAway) && personAway > 0
+        ? personAway
+        : DEFAULT_COMPUTER_PERSON_AWAY_MS,
+  };
+}
+
+/** Ten quiet minutes is long enough that a follow-up message reuses the
+ *  warm Claude process, short enough that an abandoned thread does not
+ *  hold one open all day.  The floor exists so a typo cannot close a
+ *  session out from under a turn that is merely slow to start. */
+export const DEFAULT_CLAUDE_SESSION_IDLE_MS = 10 * 60_000;
+export const DEFAULT_CLAUDE_SESSION_IDLE_MIN_MS = 10_000;
+
+/** How long an idle Claude CLI session stays warm, with the configured
+ *  floor applied.  Stored (or vault-resolved) fields win; the legacy
+ *  `OMB_CLAUDE_SESSION_IDLE_*` env names sit underneath them, as in
+ *  `observabilitySettings`. */
+export function claudeSessionIdleMs(cfg: AppConfig): number {
+  const configuredMinimum = cfg.claudeSession?.idleMinMs ?? Number(process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS);
+  const minimum =
+    configuredMinimum !== undefined && Number.isFinite(configuredMinimum) && configuredMinimum > 0
+      ? configuredMinimum
+      : DEFAULT_CLAUDE_SESSION_IDLE_MIN_MS;
+  const configured = cfg.claudeSession?.idleMs ?? Number(process.env.OMB_CLAUDE_SESSION_IDLE_MS);
+  return Math.max(minimum, configured || DEFAULT_CLAUDE_SESSION_IDLE_MS);
 }
 
 export function localQuotaRoutingEnabled(cfg: AppConfig): boolean {

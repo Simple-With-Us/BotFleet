@@ -81,6 +81,11 @@ BotFleet is a single-user local harness: the server binds loopback-only (`127.0.
 | `BOTFLEET_AGENT_PROXY_PROJECT_ID` | agentProxy.projectId | string | — |
 | `BOTFLEET_AGENT_PROXY_ENV` | agentProxy.environment | string | — |
 | `BOTFLEET_AGENT_PROXY_PATH` | agentProxy.secretPath | string | — |
+| `BOTFLEET_COMPUTER_CALL_WAIT_MS` | computerCall.waitMs | int | 500–45000 |
+| `BOTFLEET_COMPUTER_CALL_ACT_WITHIN_MS` | computerCall.actWithinMs | int | 100–5000 |
+| `BOTFLEET_COMPUTER_CALL_WAIT_MAX_MS` | computerCall.personAwayMs | int | ≥ 1 |
+| `BOTFLEET_CLAUDE_SESSION_IDLE_MS` | claudeSession.idleMs | int | ≥ 1 |
+| `BOTFLEET_CLAUDE_SESSION_IDLE_MIN_MS` | claudeSession.idleMinMs | int | ≥ 1 |
 
 Knob values are parsed from their vault strings and clamped to the bounds above; an unparsable value is logged and ignored.  Knob values are not secrets — they are already visible in Settings and `GET /api/config` — so only ids and counts travel the status views.
 

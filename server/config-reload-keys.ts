@@ -40,6 +40,11 @@ export const CONFIG_KEYS_WITHOUT_PROVIDER_RELOAD: ReadonlySet<string> = new Set(
   "zulip",
   // The fallback reviewer is looked up per review from the live config.
   "autoReview",
+  // The computer-call gate resolves its waits per call from the live
+  // config (`computerCallSettings(cfg)` in server/index.ts); no driver
+  // reads the section.  `claudeSession` is deliberately absent: the Claude
+  // driver reads its idle window at create time, so a save must rebuild.
+  "computerCall",
 ]);
 
 /** The keys in a config patch that require rebuilding the provider fleet. */

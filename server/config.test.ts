@@ -34,6 +34,10 @@ import {
   isSentryDsn,
   observabilityEnabled,
   observabilitySettings,
+  computerCallSettings,
+  claudeSessionIdleMs,
+  DEFAULT_COMPUTER_PERSON_AWAY_MS,
+  DEFAULT_CLAUDE_SESSION_IDLE_MS,
   sentryDsnConfigured,
   DEFAULT_SENTRY_TRACES_SAMPLE_RATE,
   DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE,
@@ -1159,7 +1163,64 @@ describe("public ingress URL", () => {
   });
 });
 
+describe("knob-backed env migrations", () => {
+  let savedEnv: Record<string, string | undefined>;
+  const ENV_NAMES = [
+    "OMB_COMPUTER_CALL_WAIT_MS",
+    "OMB_COMPUTER_CALL_ACT_WITHIN_MS",
+    "OMB_COMPUTER_WAIT_MAX_MS",
+    "OMB_CLAUDE_SESSION_IDLE_MS",
+    "OMB_CLAUDE_SESSION_IDLE_MIN_MS",
+  ] as const;
+
+  beforeEach(() => {
+    savedEnv = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]));
+    for (const name of ENV_NAMES) delete process.env[name];
+  });
+  afterEach(() => {
+    for (const name of ENV_NAMES) {
+      if (savedEnv[name] === undefined) delete process.env[name];
+      else process.env[name] = savedEnv[name];
+    }
+  });
+
+  it("resolves the computer-call waits to the pre-knob defaults when nothing is set", () => {
+    expect(computerCallSettings({})).toEqual({
+      waitMs: 45_000,
+      actWithinMs: 5_000,
+      personAwayMs: DEFAULT_COMPUTER_PERSON_AWAY_MS,
+    });
+  });
+
+  it("keeps the legacy env names working underneath the config fields", () => {
+    process.env.OMB_COMPUTER_CALL_WAIT_MS = "2000";
+    process.env.OMB_COMPUTER_CALL_ACT_WITHIN_MS = "250";
+    process.env.OMB_COMPUTER_WAIT_MAX_MS = "90000";
+    expect(computerCallSettings({})).toEqual({ waitMs: 2_000, actWithinMs: 250, personAwayMs: 90_000 });
+    // A stored (or vault-resolved) field wins over the env name.
+    expect(computerCallSettings({ computerCall: { waitMs: 3_000 } }).waitMs).toBe(3_000);
+  });
+
+  it("clamps the computer-call waits to the gate's bounds", () => {
+    expect(computerCallSettings({ computerCall: { waitMs: 10, actWithinMs: 999_999 } })).toMatchObject({
+      waitMs: 500,
+      actWithinMs: 5_000,
+    });
+  });
+
+  it("resolves the Muse session idle window with its floor, cfg over env over default", () => {
+    expect(claudeSessionIdleMs({})).toBe(DEFAULT_CLAUDE_SESSION_IDLE_MS);
+    process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS = "10";
+    process.env.OMB_CLAUDE_SESSION_IDLE_MS = "50";
+    expect(claudeSessionIdleMs({})).toBe(50);
+    expect(claudeSessionIdleMs({ claudeSession: { idleMs: 120_000 } })).toBe(120_000);
+    // The floor holds even when the configured window is below it.
+    expect(claudeSessionIdleMs({ claudeSession: { idleMs: 5, idleMinMs: 2_000 } })).toBe(2_000);
+  });
+});
+
 describe("observability settings", () => {
+
   let savedEnv: Record<string, string | undefined>;
   const ENV_NAMES = ["SENTRY_ENV", "SENTRY_TRACES_SAMPLE_RATE", "NODE_ENV"] as const;
 

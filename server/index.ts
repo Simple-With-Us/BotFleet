@@ -305,6 +305,7 @@ import {
   localQuotaRoutingEnabled,
   autoReviewFallbackReviewer,
   autoReviewMaxPerTurn,
+  computerCallSettings,
   usageIngestUrl,
   usageProjectRules,
   vpsCpus,
@@ -13553,6 +13554,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             if (!res.writableEnded) abort.abort();
           });
           const snapshot = () => computerControl.snapshot(botId);
+          // Resolved per call from the live cfg (the `computerCall` knobs),
+          // the same way `jobSettings()` reads `cfg.jobs` per use.
+          const callWaits = computerCallSettings(cfg);
           return json(res, 200, await waitForComputerCall({
             snapshot: () => {
               const current = snapshot();
@@ -13563,6 +13567,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               };
             },
             signal: abort.signal,
+            waitMs: callWaits.waitMs,
+            actWithinMs: callWaits.actWithinMs,
+            personAwayMs: callWaits.personAwayMs,
           }));
         }
         if (method === "POST") {
