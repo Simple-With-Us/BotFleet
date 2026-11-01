@@ -2138,6 +2138,9 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // list meant PATCH /api/config { usage } never wrote
   // ~/.botfleet/config.json, so Settings reloaded empty fields.
   //
+  // `computerCall` and `claudeSession` are knob sections like `jobs`:
+  // they resolve from the file when the vault is off, so they belong in
+  // this list for the same reason.
   // `deepseek` was missing for the same reason and had the same bug: the key
   // is in the schema, in the API Keys panel and in the tombstone list, but a
   // save of it never reached disk.  `infisical` is here from the start so the
@@ -2146,7 +2149,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "githubRequestLog", "zulip", "autoReview", "sts"] as const) {
+  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "githubRequestLog", "zulip", "autoReview", "sts", "computerCall", "claudeSession"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
