@@ -4,7 +4,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { JsonValue } from "./schema.ts";
-import { WebhookManager, type WebhookManagerOptions, type WebhookManagerEvent } from "./webhooks.ts";
+import {
+  githubPrStateKey,
+  PR_STATE_DEDUPE_MS,
+  WebhookManager,
+  type WebhookManagerOptions,
+  type WebhookManagerEvent,
+} from "./webhooks.ts";
 
 const dirs: string[] = [];
 
@@ -1895,5 +1901,200 @@ describe("request metadata on attempt events", () => {
     }
     expect(attempts[0]?.attempt.outcome).toBe("accepted");
     expect(attempts[1]?.attempt.outcome).toBe("duplicate");
+  });
+});
+
+describe("GitHub PR state dedupe for classify wakes", () => {
+  const startedAt = Date.parse("2026-08-16T10:00:00.000Z");
+  const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet" };
+  const HEAD_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const HEAD_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const uiPass = { name: "UI Pass", prompt: "Run a UI pass on the pull request.", botId: "maus-1" };
+  const prEvent = (
+    deliveryId: string,
+    overrides?: { action?: string; headSha?: string; eventName?: string },
+  ) => ({
+    eventName: overrides?.eventName ?? "pull_request",
+    deliveryId,
+    payload: {
+      action: overrides?.action ?? "synchronize",
+      repository,
+      pull_request: { number: 42, head: { sha: overrides?.headSha ?? HEAD_A } },
+    },
+  });
+
+  it("ignores a redelivery of the same PR head and action for a UI Pass trigger", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...uiPass });
+    const first = h.manager.receive(webhook.endpointId, secret, prEvent("pr-state-1"));
+    expect(first).toMatchObject({ duplicate: false, runId: "run-1" });
+    expect(first.ignored).toBeUndefined();
+
+    const second = h.manager.receive(webhook.endpointId, secret, prEvent("pr-state-2"));
+    expect(second).toEqual({ deliveryId: "pr-state-2", duplicate: false, ignored: true });
+    expect(h.queued).toHaveLength(1);
+    expect(h.manager.listAttempts().at(-1)).toMatchObject({
+      outcome: "ignored",
+      reason: `GitHub PR state already handled: pull_request synchronize on Simple-With-Us/BotFleet#42 at ${HEAD_A.slice(0, 7)} (run run-1)`,
+    });
+
+    // The key is persisted, so a redelivery after a restart is ignored
+    // too.  Old receipts without a stateKey still load because the field
+    // is optional.
+    const reloaded = new WebhookManager(h.options);
+    expect(reloaded.receive(webhook.endpointId, secret, prEvent("pr-state-3"))).toMatchObject({ ignored: true });
+    expect(h.queued).toHaveLength(1);
+  });
+
+  it("accepts a new head SHA for the same PR and action", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...uiPass });
+    expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-head-1")).runId).toBe("run-1");
+    const second = h.manager.receive(
+      webhook.endpointId,
+      secret,
+      prEvent("pr-head-2", { headSha: HEAD_B }),
+    );
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("accepts a different action for the same PR head", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...uiPass });
+    expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-action-1")).runId).toBe("run-1");
+    const second = h.manager.receive(
+      webhook.endpointId,
+      secret,
+      prEvent("pr-action-2", { action: "labeled" }),
+    );
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("does not dedupe a non-classify trigger", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({
+      name: "Release notes",
+      prompt: "Draft release notes for the pull request.",
+      botId: "maus-1",
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-notes-1")).runId).toBe("run-1");
+    const second = h.manager.receive(webhook.endpointId, secret, prEvent("pr-notes-2"));
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("accepts the same PR state again after the dedupe window", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...uiPass });
+    expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-window-1")).runId).toBe("run-1");
+
+    h.setNow(startedAt + 60 * 60 * 1000);
+    expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-window-2"))).toMatchObject({
+      ignored: true,
+    });
+    expect(h.queued).toHaveLength(1);
+
+    h.setNow(startedAt + PR_STATE_DEDUPE_MS + 1);
+    const after = h.manager.receive(webhook.endpointId, secret, prEvent("pr-window-3"));
+    expect(after).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(after.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("accepts two different human review ids on the same head", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...uiPass });
+    const reviewEvent = (deliveryId: string, reviewId: number) => ({
+      eventName: "pull_request_review",
+      deliveryId,
+      payload: {
+        action: "submitted",
+        repository,
+        pull_request: { number: 42, head: { sha: HEAD_A } },
+        review: { id: reviewId, state: "approved" },
+      },
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, reviewEvent("pr-review-1", 1001)).runId).toBe("run-1");
+    const second = h.manager.receive(webhook.endpointId, secret, reviewEvent("pr-review-2", 1002));
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+
+    // The same review redelivered is the same state, so it is ignored.  A
+    // new review id above was not collapsed.
+    expect(h.manager.receive(webhook.endpointId, secret, reviewEvent("pr-review-3", 1001))).toMatchObject({
+      ignored: true,
+    });
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("returns undefined from githubPrStateKey without a head SHA", () => {
+    expect(
+      githubPrStateKey({
+        eventName: "pull_request",
+        payload: { action: "opened", repository, pull_request: { number: 42 } },
+      }),
+    ).toBeUndefined();
+    expect(
+      githubPrStateKey({
+        eventName: "issue_comment",
+        payload: {
+          action: "created",
+          repository,
+          issue: {
+            number: 42,
+            pull_request: { url: "https://api.github.com/repos/Simple-With-Us/BotFleet/pulls/42" },
+          },
+          comment: { id: 77 },
+        },
+      }),
+    ).toBeUndefined();
+  });
+
+  it("builds a state key from check_run pull_requests, head_sha and conclusion", () => {
+    const checkEvent = (conclusion: string) => ({
+      eventName: "check_run",
+      payload: {
+        action: "completed",
+        repository,
+        check_run: { head_sha: HEAD_A, conclusion, pull_requests: [{ number: 42 }] },
+      },
+    });
+    const success = githubPrStateKey(checkEvent("success"));
+    expect(success).toBeDefined();
+    expect(githubPrStateKey(checkEvent("success"))).toBe(success);
+    expect(githubPrStateKey(checkEvent("failure"))).not.toBe(success);
+  });
+
+  it("does not let a cancelled run block a later delivery for the same PR state", () => {
+    const h = harness();
+    const receipts: Array<{ id: string; status?: string; error?: string }> = [
+      { id: "skip-1", status: "cancelled", error: "Skipped: this bot is off" },
+      { id: "run-next", status: "queued" },
+    ];
+    const manager = new WebhookManager({ ...h.options, enqueue: () => receipts.shift()! });
+    const { webhook, secret } = manager.create({ ...uiPass });
+    expect(manager.receive(webhook.endpointId, secret, prEvent("pr-cancel-1")).runId).toBe("skip-1");
+    const second = manager.receive(webhook.endpointId, secret, prEvent("pr-cancel-2"));
+    expect(second).toMatchObject({ duplicate: false, runId: "run-next" });
+    expect(second.ignored).toBeUndefined();
+  });
+  it("does not let a run that later failed block a later delivery for the same PR state", () => {
+    const h = harness();
+    const statuses = new Map<string, string>();
+    const manager = new WebhookManager({ ...h.options, runStatus: (runId) => statuses.get(runId) });
+    const { webhook, secret } = manager.create({ ...uiPass });
+    const first = manager.receive(webhook.endpointId, secret, prEvent("pr-fail-1"));
+    expect(first.ignored).toBeUndefined();
+    statuses.set(first.runId!, "running");
+    expect(manager.receive(webhook.endpointId, secret, prEvent("pr-fail-2"))).toMatchObject({ ignored: true });
+    statuses.set(first.runId!, "failed");
+    const third = manager.receive(webhook.endpointId, secret, prEvent("pr-fail-3"));
+    expect(third.ignored).toBeUndefined();
   });
 });

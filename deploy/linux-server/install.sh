@@ -189,6 +189,8 @@ if [ ! -f "$BF_ROOT/config/server.env" ]; then
 # harness at the vault project with INFISICAL_PROJECT_ID when Settings does
 # not already name it:
 # INFISICAL_PROJECT_ID=
+# BF_NODE_HEAP_MB pins the V8 old-space heap in MB (default 6144) so the cgroup's memory.high cannot shrink it.
+# BF_NODE_HEAP_MB=6144
 EOF
 else
   say "keeping the existing $BF_ROOT/config/server.env"
