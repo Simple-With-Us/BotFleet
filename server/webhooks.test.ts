@@ -1925,6 +1925,19 @@ describe("shouldIgnoreWebhookEvent UI Pass bot review pre-filter", () => {
     },
   });
 
+  it("ignores a kody-ai pull_request_review when the trigger id is a UI pass wake", () => {
+    const byId = {
+      id: "ui-pass-designer",
+      name: "Designer webhook",
+      prompt: "Review the pull request and post findings.",
+    };
+    expect(shouldIgnoreWebhookEvent(byId, reviewEvent("kody-ai"))).toEqual({
+      ignore: true,
+      reason:
+        "GitHub pull_request_review by bot 'kody-ai' ignored: UI Pass reacts to human reviews and code changes, not bot review churn",
+    });
+  });
+
   it("ignores a kody-ai pull_request_review for a UI Pass trigger", () => {
     expect(shouldIgnoreWebhookEvent(uiPass, reviewEvent("kody-ai"))).toEqual({
       ignore: true,

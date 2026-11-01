@@ -502,7 +502,7 @@ function isBotAccount(sender: Record<string, JsonValue> | undefined, login: stri
 }
 
 export function shouldIgnoreWebhookEvent(
-  trigger: { prompt?: string; name?: string; eventTypes?: string[]; requiredLabels?: string[] },
+  trigger: { id?: string; prompt?: string; name?: string; eventTypes?: string[]; requiredLabels?: string[] },
   event: WebhookEvent,
 ): IngressIgnoreDecision {
   const payload = event.payload;
@@ -1048,7 +1048,7 @@ export function shouldIgnoreWebhookEvent(
   if (
     isGithubWebhookPayload(payload) &&
     UI_PASS_REVIEW_EVENTS.has(event.eventName ?? "") &&
-    isUiPassWake({ name, instructions: prompt }) &&
+    isUiPassWake({ id: trigger.id, name, instructions: prompt }) &&
     !ASKS_FOR_BOT_REVIEWS.test(prompt)
   ) {
     const root = asRecord(payload);
