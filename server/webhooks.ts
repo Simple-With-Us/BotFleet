@@ -7,7 +7,7 @@ import { z } from "zod";
 import { writeFileAtomic } from "./atomic.ts";
 import { extractRequestMetadata, type WebhookRequestMetadata } from "./request-log.ts";
 import { DATA_DIR } from "./config.ts";
-import { isUiPassWake } from "./ephemeral-dispatch.ts";
+import { isClassifyOrUiPassWake, isUiPassWake } from "./ephemeral-dispatch.ts";
 import type { RoutineRunOn } from "./routines.ts";
 import { parseJson, schemaIssue, type JsonValue } from "./schema.ts";
 import {
@@ -147,6 +147,7 @@ interface DeliveryReceipt {
   key: string;
   runId: string;
   at: number;
+  stateKey?: string;
 }
 
 interface WebhookFile {
@@ -196,7 +197,14 @@ export interface WebhookManagerOptions {
   }) => { id: string; status?: string; error?: string };
   cancelQueued?: (webhookId: string, message: string) => void;
   pendingRuns?: (webhookId: string) => number;
+  /** The current status of a run, when the engine still holds it.  A PR
+   *  state whose run failed, was cancelled or was missed did not get
+   *  handled, so it must not block a later delivery. */
+  runStatus?: (runId: string) => string | undefined;
 }
+
+/** Run statuses that mean the PR state was not handled. */
+const UNHANDLED_RUN_STATUSES = new Set(["failed", "cancelled", "missed"]);
 
 export type WebhookManagerEvent =
   | { kind: "webhook"; webhook: WebhookTrigger }
@@ -299,6 +307,7 @@ const deliveryReceiptSchema = z.object({
   key: z.string().min(1),
   runId: z.string().min(1),
   at: z.number().finite().nonnegative(),
+  stateKey: z.string().min(1).optional(),
 });
 const webhookAttemptSchema = z.object({
   id: z.string().min(1),
@@ -1276,6 +1285,86 @@ function githubRunObject(root: Record<string, JsonValue>): Record<string, JsonVa
   );
 }
 
+/** How long a handled GitHub PR state blocks a repeat classify wake.  Six
+ *  hours covers a redelivery burst for one head without hiding a later
+ *  re-check of the same head. */
+export const PR_STATE_DEDUPE_MS = 6 * 60 * 60 * 1000;
+
+interface GithubPrStateParts {
+  repo: string;
+  prNumber: number;
+  headSha: string;
+  eventName: string;
+  action: string;
+  key: string;
+}
+
+const prNumberSchema = z.number().int().positive();
+const githubIdSchema = z.union([z.number().finite(), z.string().min(1)]);
+
+function pickNumberField(record: Record<string, JsonValue> | undefined, key: string): number | undefined {
+  const parsed = prNumberSchema.safeParse(record?.[key]);
+  return parsed.success ? parsed.data : undefined;
+}
+
+function pickIdField(record: Record<string, JsonValue> | undefined, key: string): string | undefined {
+  const parsed = githubIdSchema.safeParse(record?.[key]);
+  return parsed.success ? String(parsed.data) : undefined;
+}
+
+function githubPrStateParts(event: WebhookEvent): GithubPrStateParts | undefined {
+  if (!isGithubWebhookPayload(event.payload)) return undefined;
+  const root = asRecord(event.payload);
+  if (!root) return undefined;
+  const repo = pickStr(asRecord(root.repository), "full_name");
+  if (!repo) return undefined;
+  const pullRequest = asRecord(root.pull_request);
+  let prNumber = pickNumberField(pullRequest, "number");
+  if (prNumber === undefined) {
+    const issue = asRecord(root.issue);
+    if (issue && issue.pull_request !== undefined && issue.pull_request !== null) {
+      prNumber = pickNumberField(issue, "number");
+    }
+  }
+  if (prNumber === undefined) {
+    for (const containerName of ["check_run", "check_suite", "workflow_run"] as const) {
+      const container = asRecord(root[containerName]);
+      const pulls = container?.pull_requests;
+      if (!Array.isArray(pulls) || pulls.length === 0) continue;
+      prNumber = pickNumberField(asRecord(pulls[0]), "number");
+      if (prNumber !== undefined) break;
+    }
+  }
+  if (prNumber === undefined) return undefined;
+  const headSha =
+    pickStr(asRecord(pullRequest?.head), "sha") ??
+    pickStr(asRecord(root.check_run), "head_sha") ??
+    pickStr(asRecord(root.check_suite), "head_sha") ??
+    pickStr(asRecord(root.workflow_run), "head_sha");
+  if (!headSha) return undefined;
+  const eventName = event.eventName ?? "";
+  const action = pickStr(root, "action") ?? "";
+  const parts: string[] = [repo, String(prNumber), headSha, eventName, action];
+  if (eventName === "check_run" || eventName === "check_suite" || eventName === "workflow_run") {
+    parts.push(pickStr(asRecord(root[eventName]), "conclusion") ?? "");
+  }
+  if (eventName === "pull_request_review") {
+    parts.push(`review:${pickIdField(asRecord(root.review), "id") ?? ""}`);
+  }
+  if (eventName === "issue_comment" || eventName === "pull_request_review_comment") {
+    parts.push(`comment:${pickIdField(asRecord(root.comment), "id") ?? ""}`);
+  }
+  return { repo, prNumber, headSha, eventName, action, key: parts.join("|") };
+}
+
+/** A stable key for one GitHub PR state, or undefined when the payload
+ *  does not carry a repo, a PR number and a head SHA.  Each human review
+ *  or comment keeps its own id in the key, so new human input is never
+ *  collapsed. */
+export function githubPrStateKey(event: WebhookEvent): string | undefined {
+  return githubPrStateParts(event)?.key;
+}
+
 /** The one decision every per-trigger filter makes, in one pure function so
  *  it can be tested without a delivery.  A filter that is not set never
  *  ignores anything. */
@@ -1680,6 +1769,33 @@ export class WebhookManager {
 
     const now = this.now();
 
+    // A classify wake for a PR state already handled in the window is
+    // ignored here, before rate limiting.  Other triggers still run for
+    // every delivery.
+    const prStateKey = isClassifyOrUiPassWake({ name: trigger.name, instructions: trigger.prompt, id: trigger.id })
+      ? githubPrStateKey(event)
+      : undefined;
+    if (prStateKey) {
+      const prior = this.deliveries.find(
+        (delivery) =>
+          delivery.key.startsWith(`${trigger.endpointId}:`) &&
+          delivery.stateKey === prStateKey &&
+          now - delivery.at < PR_STATE_DEDUPE_MS &&
+          !UNHANDLED_RUN_STATUSES.has(this.options.runStatus?.(delivery.runId) ?? ""),
+      );
+      if (prior) {
+        const deliveryId = requestedDeliveryId || randomUUID();
+        const [repo, prNumber, headSha, eventName, action] = prStateKey.split("|");
+        this.recordIgnoredAttempt(
+          trigger,
+          event,
+          deliveryId,
+          `GitHub PR state already handled: ${eventName || "unknown"} ${action || "unknown"} on ${repo}#${prNumber} at ${(headSha ?? "").slice(0, 7)} (run ${prior.runId})`,
+        );
+        return { deliveryId, duplicate: false, ignored: true };
+      }
+    }
+
     // A sender retrying an already-accepted delivery must remain idempotent
     // even while this webhook's queue is full. Only new work consumes a slot.
     if ((this.options.pendingRuns?.(trigger.id) ?? 0) >= MAX_PENDING_RUNS) {
@@ -1703,7 +1819,11 @@ export class WebhookManager {
       deliveryId,
       receivedAt: now,
     });
-    this.deliveries.push({ key: `${trigger.endpointId}:${deliveryId}`, runId: run.id, at: now });
+    // Only classify wakes store a stateKey.  A cancelled run did not
+    // handle the state, so it stores none either.  A later delivery for the same state can still run.
+    const receipt: DeliveryReceipt = { key: `${trigger.endpointId}:${deliveryId}`, runId: run.id, at: now };
+    if (prStateKey && run.status !== "cancelled") receipt.stateKey = prStateKey;
+    this.deliveries.push(receipt);
     if (this.deliveries.length > MAX_DELIVERIES) {
       this.deliveries.splice(0, this.deliveries.length - MAX_DELIVERIES);
     }

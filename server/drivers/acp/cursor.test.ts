@@ -502,11 +502,13 @@ describe("cursor ACP model namespace (NS: set_model wiring)", () => {
     }
   });
 
-  it.skip("reports the last accepted model when a pooled session rejects a later pin", async () => {
+  it("reports the last accepted model when a pooled session rejects a later pin", async () => {
     ensureDirs();
     chmodSync(FAKE_CLI, 0o755);
     process.env.FAKE_ACP_MODE = "set-model-invalid-after-first";
     process.env.FAKE_ACP_SESSION_MODELS = "default[]|Auto,grok-4.7[reasoning_effort=high,fast=true]|Grok";
+    const scratch = mkdtempSync(join(tmpdir(), "omb-cursor-pooled-"));
+    process.env.FAKE_ACP_DUMP = join(scratch, "dump.json");
     const instance = await CursorAgentDriver.create({
       instanceId: "cursor-pooled-rejection",
       displayName: "Cursor",
@@ -516,12 +518,15 @@ describe("cursor ACP model namespace (NS: set_model wiring)", () => {
     });
     const recorder = recordEvents(instance.adapter);
     try {
-      for (const text of ["first", "second"]) {
-        const turn = await instance.adapter.sendTurn({
-          threadId: "t-cursor-pooled-rejection",
-          text,
-          model: "grok-4.7-high-fast",
-        });
+      for (const [text, resumeCursor] of [
+        ["first", undefined],
+        ["second", "fake-acp-session"],
+      ] as const) {
+        const turn = await instance.adapter.sendTurn(
+          resumeCursor
+            ? { threadId: "t-cursor-pooled-rejection", text, model: "grok-4.7-high-fast", resumeCursor }
+            : { threadId: "t-cursor-pooled-rejection", text, model: "grok-4.7-high-fast" },
+        );
         expect(await recorder.until((e) => e.type === "turn.completed" && e.turnId === turn.turnId)).toMatchObject({
           ok: true,
         });
@@ -536,6 +541,8 @@ describe("cursor ACP model namespace (NS: set_model wiring)", () => {
       await instance.dispose();
       delete process.env.FAKE_ACP_MODE;
       delete process.env.FAKE_ACP_SESSION_MODELS;
+      delete process.env.FAKE_ACP_DUMP;
+      await removeTempDir(scratch);
     }
   });
 
