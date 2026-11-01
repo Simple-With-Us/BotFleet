@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 export const COOLDOWN_MS = 3 * 60 * 60 * 1000;
 const SHA = /^[a-f0-9]{40}$/;
+const DEPLOYMENT_ID = /^dpl_[A-Za-z0-9]+$/;
+const HOSTNAME = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
 const ACTIVE = new Set(['QUEUED', 'INITIALIZING', 'BUILDING']);
 const STATES = new Set([...ACTIVE, 'READY', 'ERROR', 'CANCELED']);
 function must(ok, message) { if (!ok) throw new Error(message); }
@@ -24,6 +26,39 @@ export function assertProject(p, config) {
   must(p.gitProviderOptions?.createDeployments === 'disabled', 'Disable competing Git publisher before activation');
   must(p.link?.type === 'github' && String(p.link.repoId) === String(config.repoId), 'Vercel repository binding drift');
   must(p.link.productionBranch === 'main', 'Wrong production branch');
+}
+// The baseline is what production SERVES, not what the project target pointer last
+// attempted.  targets.production can reference a CANCELED ignored-build attempt (host
+// finding 2026-10-31); when it is not a READY production deployment, the configured
+// serving alias (host-grounded in vercel-config.json as productionAlias) is the only
+// verified baseline.  Every miss fails closed.
+export async function resolveBaseline({ project, config, readDeployment, readAlias }) {
+  const targetId = project.targets?.production?.id ?? project.targets?.production?.uid;
+  if (isString(targetId) && DEPLOYMENT_ID.test(targetId)) {
+    let pointed, targetFetched = false;
+    try {
+      pointed = await readDeployment(targetId);
+      targetFetched = true;
+    } catch {
+      // A stale target may be unavailable. Only this read may fall back;
+      // a returned payload must still pass the fail-closed identity checks.
+    }
+    if (targetFetched) {
+      must(object(pointed) && pointed.projectId === config.projectId, 'Wrong production baseline project');
+      if (pointed.target === 'production' && (pointed.readyState ?? pointed.state) === 'READY') {
+        return { baseline: pointed, via: 'target' };
+      }
+    }
+  }
+  const alias = config.productionAlias;
+  must(isString(alias) && HOSTNAME.test(alias), 'Serving production alias not configured');
+  const record = await readAlias(alias);
+  must(object(record) && record.projectId === config.projectId, 'Serving alias is not bound to this project');
+  must(isString(record.deploymentId) && DEPLOYMENT_ID.test(record.deploymentId), 'Serving alias points at no deployment');
+  const serving = await readDeployment(record.deploymentId);
+  must(object(serving) && serving.projectId === config.projectId, 'Wrong serving baseline project');
+  must(serving.target === 'production' && (serving.readyState ?? serving.state) === 'READY', 'Serving production deployment is not READY');
+  return { baseline: serving, via: 'alias' };
 }
 export function classify({ deployments, baseline, target, now, changed, projectId }) {
   must(SHA.test(target), 'Invalid target SHA');
@@ -108,10 +143,13 @@ async function main() {
   }
   const project = await read(`/v9/projects/${config.projectId}`);
   assertProject(project, config);
-  const baselineId = project.targets?.production?.id ?? project.targets?.production?.uid;
-  must(isString(baselineId) && /^dpl_[A-Za-z0-9]+$/.test(baselineId), 'No current production target');
-  const baseline = await read(`/v13/deployments/${baselineId}?withGitRepoInfo=true`);
-  must(baseline.projectId === config.projectId, 'Wrong production baseline project');
+  const { baseline, via } = await resolveBaseline({
+    project,
+    config,
+    readDeployment: id => read(`/v13/deployments/${id}?withGitRepoInfo=true`),
+    readAlias: hostname => read(`/v4/aliases/${encodeURIComponent(hostname)}`)
+  });
+  console.log(`Production baseline resolved via ${via}`);
   const history = await read(`/v7/deployments?projectId=${config.projectId}&target=production&limit=100`);
   must(Array.isArray(history.deployments) && history.deployments.length > 0, 'Missing deployment history');
   // The newest page is enough only if its oldest row is outside the window.
