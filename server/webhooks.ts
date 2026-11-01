@@ -197,7 +197,14 @@ export interface WebhookManagerOptions {
   }) => { id: string; status?: string; error?: string };
   cancelQueued?: (webhookId: string, message: string) => void;
   pendingRuns?: (webhookId: string) => number;
+  /** The current status of a run, when the engine still holds it.  A PR
+   *  state whose run failed, was cancelled or was missed did not get
+   *  handled, so it must not block a later delivery. */
+  runStatus?: (runId: string) => string | undefined;
 }
+
+/** Run statuses that mean the PR state was not handled. */
+const UNHANDLED_RUN_STATUSES = new Set(["failed", "cancelled", "missed"]);
 
 export type WebhookManagerEvent =
   | { kind: "webhook"; webhook: WebhookTrigger }
@@ -1724,7 +1731,8 @@ export class WebhookManager {
         (delivery) =>
           delivery.key.startsWith(`${trigger.endpointId}:`) &&
           delivery.stateKey === prStateKey &&
-          now - delivery.at < PR_STATE_DEDUPE_MS,
+          now - delivery.at < PR_STATE_DEDUPE_MS &&
+          !UNHANDLED_RUN_STATUSES.has(this.options.runStatus?.(delivery.runId) ?? ""),
       );
       if (prior) {
         const deliveryId = requestedDeliveryId || randomUUID();

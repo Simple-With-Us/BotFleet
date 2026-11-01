@@ -2084,4 +2084,17 @@ describe("GitHub PR state dedupe for classify wakes", () => {
     expect(second).toMatchObject({ duplicate: false, runId: "run-next" });
     expect(second.ignored).toBeUndefined();
   });
+  it("does not let a run that later failed block a later delivery for the same PR state", () => {
+    const h = harness();
+    const statuses = new Map<string, string>();
+    const manager = new WebhookManager({ ...h.options, runStatus: (runId) => statuses.get(runId) });
+    const { webhook, secret } = manager.create({ ...uiPass });
+    const first = manager.receive(webhook.endpointId, secret, prEvent("pr-fail-1"));
+    expect(first.ignored).toBeUndefined();
+    statuses.set(first.runId!, "running");
+    expect(manager.receive(webhook.endpointId, secret, prEvent("pr-fail-2"))).toMatchObject({ ignored: true });
+    statuses.set(first.runId!, "failed");
+    const third = manager.receive(webhook.endpointId, secret, prEvent("pr-fail-3"));
+    expect(third.ignored).toBeUndefined();
+  });
 });
