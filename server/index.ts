@@ -8600,6 +8600,7 @@ const webhooks = new WebhookManager({
   enqueue: (input) => routines!.enqueueWebhook(input),
   cancelQueued: (webhookId, message) => routines!.cancelQueuedWebhook(webhookId, message),
   pendingRuns: (webhookId) => routines!.activeWebhookRunCount(webhookId),
+  runStatus: (runId) => routines!.runStatus(runId),
 });
 webhookEphemeralSource = (webhookId) => {
   const hook = webhooks.list().find((candidate) => candidate.id === webhookId);
