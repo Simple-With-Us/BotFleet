@@ -113,6 +113,7 @@ import { workspaceCredentialPending } from "../electron/workspace-credentials.mj
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
 import { loadHostId } from "./host-id.ts";
 import { createHostResourcesResponder } from "./host-resources.ts";
+import { loadControllerEpoch, placementIdentityResponse } from "./placement-identity.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
 import {
@@ -810,6 +811,7 @@ if (storageGuard && !storageGuard.initial.online) {
 }
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 const hostId = loadHostId(DATA_DIR);
+const placementController = loadControllerEpoch(DATA_DIR, hostId);
 const jobHostProbe = createHostProbe({ storageState: storageGuard?.sample });
 const hostResourcesResponse = createHostResourcesResponder({
   hostId, version: runtimeBuildIdentity.version, platform: process.platform,
@@ -17181,6 +17183,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
         viaNamedTunnel: arrivedViaCloudflareTunnel(req),
       });
+      return json(res, response.status, response.body);
+    }
+    if (method === "GET" && path === "/api/placement/identity") {
+      // The same owner boundary as host resources: the native server
+      // handshake reads this through the local owner or authenticated
+      // server gate, never through the companion or the named tunnel.
+      const response = placementIdentityResponse({
+        localOwner: isLoopbackAddress(req.socket.remoteAddress),
+        fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
+        viaNamedTunnel: arrivedViaCloudflareTunnel(req),
+      }, { hostId, controller: placementController, platform: process.platform });
       return json(res, response.status, response.body);
     }
     // Saved data that could not be read or used, for the notice at the top of the app.  File base names
