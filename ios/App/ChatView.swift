@@ -2820,6 +2820,7 @@ struct CardView: View {
     private func sendAnswerText(card: OptionCard) {
         let text = trimmedAnswerText
         guard !text.isEmpty, !answering else { return }
+        answerText = ""
         answer(card: card, choice: text)
     }
 
