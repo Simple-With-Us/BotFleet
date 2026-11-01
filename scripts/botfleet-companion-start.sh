@@ -93,6 +93,8 @@ if [ "$STOP" = true ]; then
   # leave it alone and say so instead of removing a file we did not publish.
   if [ -L "$RUNTIME_CLAIM" ]; then
     log "stop requested; $RUNTIME_CLAIM is a symlink, not a published runtime claim; leaving it alone"
+  elif [ -f "$RUNTIME_CLAIM" ] && [ ! -O "$RUNTIME_CLAIM" ]; then
+    log "stop requested; $RUNTIME_CLAIM is not owned by the current user, so it is not a claim this user published; leaving it alone"
   elif [ -f "$RUNTIME_CLAIM" ]; then
     rm -f "$RUNTIME_CLAIM"
     log "stop requested; removed the published runtime claim at $RUNTIME_CLAIM"
