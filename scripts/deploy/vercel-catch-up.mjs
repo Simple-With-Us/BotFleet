@@ -41,7 +41,7 @@ export function branchDeploymentDisabled(v, branch) {
   if (!object(v)) return false;
   let proven = false;
   for (const [pattern, value] of Object.entries(v)) {
-    if (typeof value !== 'boolean') return false;
+    if (value !== true && value !== false) return false;
     const provable = pattern === branch || pattern === '**' || pattern === '*';
     if (value === true) return false;
     if (provable) {
