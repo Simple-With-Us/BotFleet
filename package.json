@@ -18,7 +18,7 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@12.15.0",
+  "packageManager": "pnpm@12.16.0",
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "vendor:tv-face-gif": "node scripts/vendor-tv-face-gif-decoder.mjs",
