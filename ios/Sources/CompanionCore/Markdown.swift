@@ -14,9 +14,18 @@
 //
 // Deliberately not a full CommonMark implementation. It covers what a model
 // actually emits into a chat bubble — paragraphs, lists, headings, fences,
-// quotes, rules — and treats anything it does not recognise as text, which is
-// the failure mode that loses nothing.
+// quotes, rules, tables — and treats anything it does not recognise as text,
+// which is the failure mode that loses nothing.
 import Foundation
+
+/// How a table column lines up, from the colons in its delimiter cell:
+/// `:--` leading, `:-:` centre, `--:` trailing. No colon is leading, which
+/// is what GFM renders for a plain `---`.
+public enum TableAlignment: Equatable, Sendable {
+    case leading
+    case center
+    case trailing
+}
 
 public enum MarkdownBlock: Equatable, Sendable {
     case paragraph(String)
@@ -27,6 +36,12 @@ public enum MarkdownBlock: Equatable, Sendable {
     /// A fenced block. `language` is whatever followed the opening fence.
     case code(language: String?, text: String)
     case quote(String)
+    /// A GFM pipe table. Every row has exactly `header.count` cells —
+    /// short rows are padded with "" and long ones trimmed — and
+    /// `alignments` has one entry per column, so a view can index all
+    /// three by column without re-checking counts. Cells are inline
+    /// markdown, handed to Foundation like any other run.
+    case table(header: [String], alignments: [TableAlignment], rows: [[String]])
     case rule
 }
 
@@ -110,6 +125,27 @@ public enum Markdown {
                 continue
             }
 
+            // A table is only a table once its delimiter row is there:
+            // `tableHeader` demands one delimiter cell per header cell, so
+            // a header still streaming — delimiter not sent yet, or half
+            // sent — falls through to the paragraph below and reads as the
+            // text it is. Calling it a table early would draw a grid with
+            // no columns settled, then redraw it when the row lands.
+            if trimmed.contains("|"), let delimiter = lines.first,
+               let table = tableHeader(trimmed, delimiter: delimiter) {
+                flushParagraph()
+                lines = lines.dropFirst()
+                var rows: [[String]] = []
+                while let next = lines.first {
+                    let row = next.trimmingCharacters(in: .whitespaces)
+                    guard !row.isEmpty, row.contains("|") else { break }
+                    rows.append(tableRow(row, columns: table.header.count))
+                    lines = lines.dropFirst()
+                }
+                blocks.append(.table(header: table.header, alignments: table.alignments, rows: rows))
+                continue
+            }
+
             paragraph.append(trimmed)
         }
         flushParagraph()
@@ -145,5 +181,96 @@ public enum Markdown {
             }
         }
         return nil
+    }
+
+    /// The header and alignments when `delimiter` is a delimiter row for
+    /// `line`, nil otherwise. One delimiter cell per header cell, as GFM
+    /// has it: a row of pipes in prose followed by a `---` rule is prose
+    /// followed by a rule, not a one-column table that swallowed both.
+    private static func tableHeader(
+        _ line: String, delimiter: String
+    ) -> (header: [String], alignments: [TableAlignment])? {
+        let header = tableCells(line)
+        let cells = tableCells(delimiter)
+        guard !header.isEmpty, cells.count == header.count else { return nil }
+        var alignments: [TableAlignment] = []
+        for cell in cells {
+            guard let alignment = tableAlignment(cell) else { return nil }
+            alignments.append(alignment)
+        }
+        return (header, alignments)
+    }
+
+    private static func tableAlignment(_ cell: String) -> TableAlignment? {
+        var text = cell
+        let leadingColon = text.hasPrefix(":")
+        if leadingColon { text.removeFirst() }
+        let trailingColon = text.hasSuffix(":")
+        if trailingColon { text.removeLast() }
+        guard !text.isEmpty, text.allSatisfy({ $0 == "-" }) else { return nil }
+        switch (leadingColon, trailingColon) {
+        case (true, true): return .center
+        case (false, true): return .trailing
+        default: return .leading
+        }
+    }
+
+    /// One body row, forced to the header's width. The desktop pads a
+    /// short row with empty cells and drops a long row's extras, so a
+    /// model that miscounts one row loses that row's tail, not the table.
+    private static func tableRow(_ line: String, columns: Int) -> [String] {
+        var cells = tableCells(line)
+        if cells.count > columns { cells.removeLast(cells.count - columns) }
+        while cells.count < columns { cells.append("") }
+        return cells
+    }
+
+    /// Split one table line into its cells. The outer pipes are optional
+    /// in GFM and are dropped when present; `\|` is a literal pipe in the
+    /// cell, the only way one can appear there at all — an unescaped pipe
+    /// is a separator even inside a code span, so this does not track
+    /// backticks. A `\\` pair is kept as written (Foundation renders it
+    /// as one backslash) and a pipe after it still separates.
+    private static func tableCells(_ line: String) -> [String] {
+        var text = line.trimmingCharacters(in: .whitespaces)
+        if text.hasPrefix("|") { text.removeFirst() }
+        if text.hasSuffix("|"), !hasEscapedFinalPipe(text) { text.removeLast() }
+
+        let characters = Array(text)
+        var cells: [String] = []
+        var cell = ""
+        var index = 0
+        while index < characters.count {
+            let character = characters[index]
+            let next = index + 1 < characters.count ? characters[index + 1] : nil
+            if character == "\\", next == "|" {
+                cell.append("|")
+                index += 2
+            } else if character == "\\", next == "\\" {
+                cell.append("\\")
+                cell.append("\\")
+                index += 2
+            } else if character == "|" {
+                cells.append(cell.trimmingCharacters(in: .whitespaces))
+                cell = ""
+                index += 1
+            } else {
+                cell.append(character)
+                index += 1
+            }
+        }
+        cells.append(cell.trimmingCharacters(in: .whitespaces))
+        return cells
+    }
+
+    /// Is the line's final pipe escaped — an odd run of backslashes right
+    /// before it? Then it is cell content, not the optional closing pipe.
+    private static func hasEscapedFinalPipe(_ text: String) -> Bool {
+        var backslashes = 0
+        for character in text.dropLast().reversed() {
+            guard character == "\\" else { break }
+            backslashes += 1
+        }
+        return backslashes % 2 == 1
     }
 }
