@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  COMPUTER_WAIT_MAX_MS,
+  computerCallActWithinMs,
+  computerCallWaitMs,
+  computerPersonAwayMs,
   computerPersonAwayText,
   waitForComputerCall,
   type ComputerCallSnapshot,
@@ -22,6 +26,21 @@ function clock(start = 1_000) {
     },
   };
 }
+
+describe("gate waits from resolved knobs", () => {
+  it("holds the control windows when no knob is set, and clamps a set one", () => {
+    expect(computerCallWaitMs()).toBe(45_000);
+    expect(computerCallWaitMs(9_000)).toBe(9_000);
+    expect(computerCallWaitMs(10)).toBe(500);
+    expect(computerCallWaitMs(999_999)).toBe(45_000);
+    expect(computerCallActWithinMs()).toBe(5_000);
+    expect(computerCallActWithinMs(250)).toBe(250);
+    expect(computerCallActWithinMs(1)).toBe(100);
+    expect(computerPersonAwayMs()).toBe(COMPUTER_WAIT_MAX_MS);
+    expect(computerPersonAwayMs(120_000)).toBe(120_000);
+    expect(computerPersonAwayMs(0)).toBe(COMPUTER_WAIT_MAX_MS);
+  });
+});
 
 describe("waitForComputerCall", () => {
   it("lets a free computer act at once", async () => {

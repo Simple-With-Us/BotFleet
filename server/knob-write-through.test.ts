@@ -177,10 +177,11 @@ describe("writeThroughKnobs", () => {
     expect(calls.get("BOTFLEET_AGENT_PROXY_PROJECT_ID")).toBe("proj-1");
     expect(calls.get("BOTFLEET_AGENT_PROXY_ENV")).toBe("prod");
     expect(calls.get("BOTFLEET_AGENT_PROXY_PATH")).toBe("/agents");
-    // 24 includes jobs.admission.minFreeInodes (BF-2600); bump this deliberately:
+    // 29 includes jobs.admission.minFreeInodes (BF-2600) and the five
+    // server.* computer-call / claude idle waits; bump this deliberately:
     // the count is here so that adding or dropping a knob is a decision
     // someone reads rather than an edit that slips through -- it is what
     // caught nineteen rows disappearing at once.
-    expect(KNOB_FIELDS.length).toBe(24);
+    expect(KNOB_FIELDS.length).toBe(29);
   });
 });

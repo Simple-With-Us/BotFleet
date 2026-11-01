@@ -267,6 +267,58 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     kind: "bool",
   },
   {
+    // Computer-call gate waits (server/computer-call-gate.ts).  Bounds
+    // mirror the gate's own clamps: a call never waits past the bridge's
+    // control window, however the knob is set.
+    id: "server.computerCallWaitMs",
+    label: "Computer call wait",
+    section: "server",
+    path: ["computerCallWaitMs"],
+    infisicalName: "BOTFLEET_COMPUTER_CALL_WAIT_MS",
+    kind: "int",
+    min: 500,
+    max: 45000,
+  },
+  {
+    id: "server.computerCallActWithinMs",
+    label: "Computer call act-within window",
+    section: "server",
+    path: ["computerCallActWithinMs"],
+    infisicalName: "BOTFLEET_COMPUTER_CALL_ACT_WITHIN_MS",
+    kind: "int",
+    min: 100,
+    max: 5000,
+  },
+  {
+    id: "server.computerWaitMaxMs",
+    label: "Computer person-away wait ceiling",
+    section: "server",
+    path: ["computerWaitMaxMs"],
+    infisicalName: "BOTFLEET_COMPUTER_WAIT_MAX_MS",
+    kind: "int",
+    min: 1,
+  },
+  {
+    // Claude driver session idle window (server/drivers/claude.ts): how
+    // long a warm CLI process is kept across turns, and the floor under it.
+    id: "server.claudeSessionIdleMs",
+    label: "Claude session idle window",
+    section: "server",
+    path: ["claudeSessionIdleMs"],
+    infisicalName: "BOTFLEET_CLAUDE_SESSION_IDLE_MS",
+    kind: "int",
+    min: 1,
+  },
+  {
+    id: "server.claudeSessionIdleMinMs",
+    label: "Claude session idle floor",
+    section: "server",
+    path: ["claudeSessionIdleMinMs"],
+    infisicalName: "BOTFLEET_CLAUDE_SESSION_IDLE_MIN_MS",
+    kind: "int",
+    min: 1,
+  },
+  {
     id: "agentProxy.address",
     label: "Agent proxy address",
     section: "agentProxy",

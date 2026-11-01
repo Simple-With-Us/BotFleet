@@ -93,6 +93,25 @@ describe("parseKnobValue", () => {
     expect(cfg.autoReview).toEqual({ fallbackReviewer: "claude", maxReviewsPerTurn: 12 });
   });
 
+  it("clamps the computer-call and claude idle waits and applies them from the vault", () => {
+    expect(parseKnobValue(spec("server.computerCallWaitMs"), "10000")).toBe(10000);
+    expect(parseKnobValue(spec("server.computerCallWaitMs"), "10")).toBe(500);
+    expect(parseKnobValue(spec("server.computerCallWaitMs"), "99999")).toBe(45000);
+    expect(parseKnobValue(spec("server.computerCallActWithinMs"), "2000")).toBe(2000);
+    expect(parseKnobValue(spec("server.computerCallActWithinMs"), "1")).toBe(100);
+    expect(parseKnobValue(spec("server.computerCallActWithinMs"), "9999")).toBe(5000);
+    expect(parseKnobValue(spec("server.computerWaitMaxMs"), "120000")).toBe(120000);
+    expect(parseKnobValue(spec("server.computerWaitMaxMs"), "0")).toBe(1);
+    expect(parseKnobValue(spec("server.claudeSessionIdleMs"), "120000")).toBe(120000);
+    expect(parseKnobValue(spec("server.claudeSessionIdleMinMs"), "0")).toBe(1);
+    const cfg: AppConfig = { server: { persistOnExit: true } };
+    resolveKnobFields(cfg, new Map([
+      ["BOTFLEET_COMPUTER_CALL_WAIT_MS", "9000"],
+      ["BOTFLEET_CLAUDE_SESSION_IDLE_MS", "120000"],
+    ]));
+    expect(cfg.server).toEqual({ persistOnExit: true, computerCallWaitMs: 9000, claudeSessionIdleMs: 120000 });
+  });
+
   it("clamps the TTS audio retention days and applies it from the vault", () => {
     expect(parseKnobValue(spec("tts.audioRetentionDays"), "30")).toBe(30);
     expect(parseKnobValue(spec("tts.audioRetentionDays"), "-5")).toBe(0);

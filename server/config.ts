@@ -591,6 +591,16 @@ const appConfigSchema = z.object({
   server: z.object({
     allowRemoteDesktopLaunch: z.boolean().optional(),
     persistOnExit: z.boolean().optional(),
+    // Computer-call gate waits (server/computer-call-gate.ts).  Absent
+    // means CONTROL_WAIT_MS / CONTROL_ACT_WITHIN_MS / COMPUTER_WAIT_MAX_MS;
+    // the gate clamps again where it reads them.
+    computerCallWaitMs: z.number().int().min(500).max(45000).optional(),
+    computerCallActWithinMs: z.number().int().min(100).max(5000).optional(),
+    computerWaitMaxMs: z.number().int().min(1).optional(),
+    // Claude driver session idle window (server/drivers/claude.ts).
+    // Absent means 10 minutes, never below the 10 second floor.
+    claudeSessionIdleMs: z.number().int().min(1).optional(),
+    claudeSessionIdleMinMs: z.number().int().min(1).optional(),
   }).strict().optional(),
   features: featureConfigSchema.optional(),
   conversationMode: z.enum(STORED_CONVERSATION_MODES).optional(),
@@ -849,6 +859,20 @@ export interface AppConfig {
     allowRemoteDesktopLaunch?: boolean;
     /** Does the harness outlive the desktop app's window? */
     persistOnExit?: boolean;
+    /** How long one computer call waits while its desktop is busy.
+     *  Absent means CONTROL_WAIT_MS (45s). */
+    computerCallWaitMs?: number;
+    /** How promptly a freed computer must be acted on before the call
+     *  counts as waited out.  Absent means CONTROL_ACT_WITHIN_MS (5s). */
+    computerCallActWithinMs?: number;
+    /** The longest any turn waits for a person who has the computer.
+     *  Absent means COMPUTER_WAIT_MAX_MS (30 minutes). */
+    computerWaitMaxMs?: number;
+    /** Quiet time before the Claude driver closes a session.
+     *  Absent means 10 minutes. */
+    claudeSessionIdleMs?: number;
+    /** Floor under `claudeSessionIdleMs`.  Absent means 10 seconds. */
+    claudeSessionIdleMinMs?: number;
   };
   /** Opt-in product experiments. Every flag defaults to disabled. */
   features?: {

@@ -13563,6 +13563,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               };
             },
             signal: abort.signal,
+            waitMs: cfg.server?.computerCallWaitMs,
+            actWithinMs: cfg.server?.computerCallActWithinMs,
+            personAwayMs: cfg.server?.computerWaitMaxMs,
           }));
         }
         if (method === "POST") {

@@ -41,21 +41,21 @@ function bounded(value: number, fallback: number, min: number, max: number): num
   return Math.min(max, Math.max(min, Number.isFinite(value) && value > 0 ? value : fallback));
 }
 
-/** Read at call time so a test can shorten the wait without restarting. */
-export function computerCallWaitMs(override?: number): number {
-  if (override !== undefined) return bounded(override, CONTROL_WAIT_MS, 500, CONTROL_WAIT_MS);
-  return bounded(Number(process.env.OMB_COMPUTER_CALL_WAIT_MS), CONTROL_WAIT_MS, 500, CONTROL_WAIT_MS);
+/** The caller passes the resolved `server.*` knob (see knob-map.ts); an
+ * absent or unusable value holds the control client's own window, and no
+ * setting can wait past it. */
+export function computerCallWaitMs(configured?: number): number {
+  return bounded(configured ?? Number.NaN, CONTROL_WAIT_MS, 500, CONTROL_WAIT_MS);
 }
 
-export function computerCallActWithinMs(override?: number): number {
-  if (override !== undefined) return bounded(override, CONTROL_ACT_WITHIN_MS, 100, CONTROL_ACT_WITHIN_MS);
-  return bounded(Number(process.env.OMB_COMPUTER_CALL_ACT_WITHIN_MS), CONTROL_ACT_WITHIN_MS, 100, CONTROL_ACT_WITHIN_MS);
+export function computerCallActWithinMs(configured?: number): number {
+  return bounded(configured ?? Number.NaN, CONTROL_ACT_WITHIN_MS, 100, CONTROL_ACT_WITHIN_MS);
 }
 
-export function computerPersonAwayMs(override?: number): number {
-  if (override !== undefined) return Math.max(1, override);
-  const fromEnv = Number(process.env.OMB_COMPUTER_WAIT_MAX_MS);
-  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : COMPUTER_WAIT_MAX_MS;
+export function computerPersonAwayMs(configured?: number): number {
+  return configured !== undefined && Number.isFinite(configured) && configured > 0
+    ? Math.max(1, configured)
+    : COMPUTER_WAIT_MAX_MS;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

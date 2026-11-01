@@ -16,7 +16,7 @@ import { join, dirname } from "node:path";
 
 import { z } from "zod";
 
-import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
+import { DATA_DIR, loadConfig, stripWorkspaceCredentialEnv } from "../config.ts";
 import { ClaudeSingleCallLedger } from "../claude-billed-call.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { augmentedPath } from "../env-path.ts";
@@ -497,6 +497,10 @@ export interface ClaudeConfig {
   tools?: string[];
   /** Claude tool patterns to deny after the available set is selected. */
   disallowedTools?: string[];
+  /** Per-instance override of the `server.claudeSessionIdleMs` knob. */
+  sessionIdleMs?: number;
+  /** Per-instance override of the `server.claudeSessionIdleMinMs` knob. */
+  sessionIdleMinMs?: number;
 }
 
 // model catalog ported from upstream packages/contracts/src/model.ts
@@ -873,12 +877,17 @@ function decodeConfig(raw: unknown): ClaudeConfig {
   // wins, so a hand-written one is never overridden.  The host-control
   // downgrade in sendTurn applies to either spelling.
   const fullAuto = o.fullAuto === true;
-  return {
+  const decoded: ClaudeConfig = {
     cli: typeof o.cli === "string" ? o.cli : "claude",
     permissionMode: (mode as ClaudeConfig["permissionMode"]) ?? (fullAuto ? "bypassPermissions" : "acceptEdits"),
     ...(tools !== undefined ? { tools } : {}),
     ...(disallowedTools !== undefined ? { disallowedTools } : {}),
   };
+  const sessionIdleMs = Number(o.sessionIdleMs);
+  if (Number.isFinite(sessionIdleMs) && sessionIdleMs > 0) decoded.sessionIdleMs = sessionIdleMs;
+  const sessionIdleMinMs = Number(o.sessionIdleMinMs);
+  if (Number.isFinite(sessionIdleMinMs) && sessionIdleMinMs > 0) decoded.sessionIdleMinMs = sessionIdleMinMs;
+  return decoded;
 }
 
 function firstText(content: unknown): string {
@@ -1069,11 +1078,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     const cliCostTotals = new Map<string, number>();
     const sessions = new Map<string, Session>();
     sweepReceiptsOnce();
-    const configuredIdleMinimum = Number(process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS);
+    // The idle window is a `server.*` knob (see knob-map.ts), resolved
+    // into cfg at load; a per-instance config value still wins over it.
+    const serverKnobs = loadConfig().server;
+    const configuredIdleMinimum = config.sessionIdleMinMs ?? serverKnobs?.claudeSessionIdleMinMs ?? Number.NaN;
     const sessionIdleMinimum = Number.isFinite(configuredIdleMinimum) && configuredIdleMinimum > 0
       ? configuredIdleMinimum
       : 10_000;
-    const SESSION_IDLE_MS = Math.max(sessionIdleMinimum, Number(process.env.OMB_CLAUDE_SESSION_IDLE_MS) || 10 * 60_000);
+    const SESSION_IDLE_MS = Math.max(
+      sessionIdleMinimum,
+      config.sessionIdleMs ?? serverKnobs?.claudeSessionIdleMs ?? 10 * 60_000,
+    );
 
     const closeSession = (threadId: string, why: string) => {
       const s = sessions.get(threadId);

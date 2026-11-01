@@ -251,8 +251,6 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.BOX_TOKEN;
     delete process.env.OPENCODE_API_KEY;
     delete process.env.OMB_TTS_KEY;
-    delete process.env.OMB_CLAUDE_SESSION_IDLE_MS;
-    delete process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -1319,9 +1317,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
   });
 
   it("closes an idle session after the configured window", async () => {
-    process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS = "10";
-    process.env.OMB_CLAUDE_SESSION_IDLE_MS = "50";
-    await create();
+    await create(undefined, {}, { sessionIdleMinMs: 10, sessionIdleMs: 50 });
     await instance.adapter.sendTurn({ threadId: "t-idle", text: "one" });
     await recorder.until((e) => e.type === "turn.completed");
     process.env.FAKE_CLAUDE_DUMP = join(scratch, "idle-dump.json");
