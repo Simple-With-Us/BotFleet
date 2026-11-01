@@ -6815,7 +6815,7 @@ function restoreHeldWork(work: HeldWork, context: string) {
   const pending: Array<{ heldAt: number; entry: SteerQueueSnapshot }> = [];
   for (const send of sends.run) {
     if (!store.bot(send.botId)) continue;
-    if (!store.messagesFor(send.threadId).some((message) => message.id === send.userMessageId)) {
+    if (!store.hasMessage(send.threadId, send.userMessageId)) {
       console.log(`[${context}] held message for bot ${send.botId} is no longer in its thread; nothing to run`);
       continue;
     }

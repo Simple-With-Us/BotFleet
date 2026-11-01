@@ -138,16 +138,62 @@ export interface ThreadRows {
 
 /** Read one thread, importing its legacy JSON file on first touch. */
 export function readThread(threadId: string, legacyFile: string): ThreadRows {
-  const rows = db()
+  // Stream row by row: `.all()` held every raw JSON string alongside the
+  // parsed objects, doubling the peak for a large thread at boot.
+  const messages: Message[] = [];
+  // SAFETY: the query selects only `json`, a TEXT NOT NULL column on `messages`.
+  for (const row of db()
     .prepare("SELECT json FROM messages WHERE thread_id = ? ORDER BY rowid")
-    .all(threadId) as Array<{ json: string }>;
-  if (rows.length) {
+    .iterate(threadId) as Iterable<{ json: string }>) {
+    messages.push(rowToMessage(row));
+  }
+  if (messages.length) {
     const state = db()
       .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
       .get(threadId) as { active_leaf_id: string | null } | undefined;
-    return { messages: rows.map(rowToMessage), activeLeafId: state?.active_leaf_id ?? null };
+    return { messages, activeLeafId: state?.active_leaf_id ?? null };
   }
   return importLegacy(threadId, legacyFile);
+}
+
+/** One message by id, without hydrating its thread — the boot helper sweep
+ * and the held-work restore only ever need a single row. Returns null when
+ * the thread has no such row (a legacy file that was never imported has no
+ * rows to find it in; callers that must see it hydrate explicitly). */
+export function readMessageById(threadId: string, messageId: string): Message | null {
+  // SAFETY: the query selects only `json`, a TEXT NOT NULL column; `get` is undefined when no row matches.
+  const row = db()
+    .prepare("SELECT json FROM messages WHERE thread_id = ? AND id = ?")
+    .get(threadId, messageId) as { json: string } | undefined;
+  return row ? rowToMessage(row) : null;
+}
+
+/** The first user text in a thread, read at the SQL boundary — naming a
+ * task at boot must not hydrate (or cache) a whole transcript to find its
+ * first line. Falls back to the legacy JSON file only when the thread has
+ * no rows yet, mirroring `firstMessageAt`. */
+export function firstUserText(threadId: string, legacyFile: string): string | null {
+  const hasRows = db().prepare("SELECT 1 AS one FROM messages WHERE thread_id = ? LIMIT 1").get(threadId) !== undefined;
+  if (hasRows) {
+    // SAFETY: the query selects only `text`, a nullable TEXT column on `messages`.
+    for (const row of db()
+      .prepare("SELECT text FROM messages WHERE thread_id = ? AND role = 'user' AND kind = 'text' ORDER BY rowid")
+      .iterate(threadId) as Iterable<{ text: string | null }>) {
+      if (row.text?.trim()) return row.text;
+    }
+    return null;
+  }
+  try {
+    const raw = JSON.parse(readFileSync(legacyFile, "utf8"));
+    // SAFETY: a legacy messages file is either a bare `Message[]` or `{ messages: Message[] }`, the same two shapes
+    // `importLegacy` reads; a malformed file throws or yields no match and lands in the catch / null below.
+    const messages = Array.isArray(raw)
+      ? (raw as Message[])
+      : (((raw as { messages?: Message[] }).messages ?? []) as Message[]);
+    return messages.find((m) => m.role === "user" && m.kind === "text" && m.text?.trim())?.text ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export interface ThreadTailRows extends ThreadRows {
