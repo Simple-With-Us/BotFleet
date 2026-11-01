@@ -37,6 +37,11 @@ if [ -z "${BOTFLEET_COMPANION_ROOT:-}" ]; then
     ROOT="$COMPANION_STORE_POINTER"
   fi
 fi
+# The published runtime claim, at the path electron/managed-companion-runtime.mjs
+# writes (`managedCompanionRuntimePath`): the supervisor publishes its verified
+# identity there so the desktop app can adopt the sidecar.  `--stop` removes it,
+# mirroring `clearManagedCompanionRuntime` in that module.
+RUNTIME_CLAIM="$HOME/.botfleet-companion/runtime/supervisor.json"
 PORT="${BOTFLEET_COMPANION_PORT:-8810}"
 CONTROL_PORT="${BOTFLEET_COMPANION_CONTROL_PORT:-8811}"
 HARNESS_PORT="${BOTFLEET_HARNESS_PORT:-8799}"
@@ -80,7 +85,22 @@ elif [ "$#" -gt 0 ]; then
 fi
 
 if [ "$STOP" = true ]; then
-  log "stop requested"
+  # Remove the published runtime claim, mirroring clearManagedCompanionRuntime:
+  # only the exact regular file the supervisor publishes, never a symlink or
+  # anything else at that path.  An absent claim is already the stopped state,
+  # so a second --stop is a no-op rather than an error.  A symlink or
+  # non-regular file there is not a claim any reader would accept either, so
+  # leave it alone and say so instead of removing a file we did not publish.
+  if [ -L "$RUNTIME_CLAIM" ]; then
+    log "stop requested; $RUNTIME_CLAIM is a symlink, not a published runtime claim; leaving it alone"
+  elif [ -f "$RUNTIME_CLAIM" ]; then
+    rm -f "$RUNTIME_CLAIM"
+    log "stop requested; removed the published runtime claim at $RUNTIME_CLAIM"
+  elif [ -e "$RUNTIME_CLAIM" ]; then
+    log "stop requested; $RUNTIME_CLAIM is not a regular file, so it is not a published runtime claim; leaving it alone"
+  else
+    log "stop requested; no published runtime claim at $RUNTIME_CLAIM"
+  fi
   exit 0
 fi
 
