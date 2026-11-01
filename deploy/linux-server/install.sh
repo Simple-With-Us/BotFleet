@@ -182,6 +182,13 @@ if [ ! -f "$BF_ROOT/config/server.env" ]; then
 # No secrets live in this file.  Secrets come from Infisical (INFISICAL.md)
 # and from the engine CLIs' own login files under the service user's home.
 # OMB_DATA_DIR, OMB_STATIC_DIR and OMB_PORT are set by the systemd unit.
+# The harness reads its vault secrets with the read-only Infisical service
+# token in config/harness-infisical-token (mode 0600, owned by the service
+# user; start.sh loads it into INFISICAL_TOKEN unless the environment already
+# sets one).  That file is optional and is never created here.  Point the
+# harness at the vault project with INFISICAL_PROJECT_ID when Settings does
+# not already name it:
+# INFISICAL_PROJECT_ID=
 # BF_NODE_HEAP_MB pins the V8 old-space heap in MB (default 6144) so the cgroup's memory.high cannot shrink it.
 # BF_NODE_HEAP_MB=6144
 EOF

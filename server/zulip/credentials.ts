@@ -44,10 +44,21 @@ export class ZulipCredentialError extends Error {
   /** "missing": no file yet, so the bot is simply not set up.  Anything else
    *  is a file that exists and is wrong. */
   readonly reason: "missing" | "invalid" | "insecure" | "realm";
-  constructor(message: string, reason: "missing" | "invalid" | "insecure" | "realm") {
+  /** Set when the Infisical folder itself is unreadable: the read was refused
+   *  (401/403/404, carried in `status`) or the folder holds none of the
+   *  role's expected names (`status` unset).  The hub logs one consolidated
+   *  warn line per folder from this; the message still carries the precise
+   *  per-role reason.  Path and status only, never a value. */
+  readonly vaultUnreadable?: { where: string; status?: number };
+  constructor(
+    message: string,
+    reason: "missing" | "invalid" | "insecure" | "realm",
+    vaultUnreadable?: { where: string; status?: number },
+  ) {
     super(message);
     this.name = "ZulipCredentialError";
     this.reason = reason;
+    if (vaultUnreadable) this.vaultUnreadable = vaultUnreadable;
   }
 }
 
@@ -289,12 +300,33 @@ export function infisicalCredentialSource(
       } catch (e) {
         // The manager's errors are value-free; keep only its message.
         const why = e instanceof Error ? e.message : "unknown error";
-        throw new ZulipCredentialError(`cannot read Infisical ${where}: ${why}`, "invalid");
+        // The statuses that mean the folder itself refused the read: a
+        // revoked token (401), a grant that does not cover the folder (403),
+        // or a project, environment or path that is gone (404).  Read
+        // structurally off the injected reader's error, never parsed out of
+        // the message; only the manager's own errors carry a status.  A 429,
+        // a 5xx or a dropped connection is transient and says nothing about
+        // the folder, so it marks nothing.
+        // SAFETY: the reader is injected and its errors are untyped; `statusCode`
+        // is read as `unknown` and only ever used once confirmed to be one of
+        // the three refusal statuses below.
+        const status = (e as { statusCode?: unknown } | null)?.statusCode;
+        const refused = status === 401 || status === 403 || status === 404 ? { where, status } : undefined;
+        throw new ZulipCredentialError(`cannot read Infisical ${where}: ${why}`, "invalid", refused);
       }
       const email = values.get(names.email)?.trim();
       const key = values.get(names.key)?.trim();
       const missing = [!email && names.email, !key && names.key].filter(Boolean);
-      if (missing.length) throw new ZulipCredentialError(`Infisical ${where} has no ${missing.join(" or ")}`, "missing");
+      if (missing.length) {
+        throw new ZulipCredentialError(
+          `Infisical ${where} has no ${missing.join(" or ")}`,
+          "missing",
+          // Only when NONE of the role's expected names is there: one name
+          // present and one missing is a partial setup, and the message
+          // above already names exactly which half is missing.
+          !email && !key ? { where } : undefined,
+        );
+      }
       const source = `infisical ${where}`;
       const site = normalizeSite(values.get(names.site)?.trim() || opts.realm);
       const outgoingWebhookToken = z.string().regex(/^[\x21-\x7e]+$/).optional()
