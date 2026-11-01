@@ -19,6 +19,13 @@ export interface EphemeralResultDelivery {
 const UI_PASS = /\bui[\s-]*pass\b/i;
 const CLASSIFY_WORD = /\bclassify\b/i;
 
+/** True when this trigger's own name, id, or saved instructions name a
+ *  Designer UI pass.  Narrower than `isClassifyOrUiPassWake`:  a plain
+ *  classify wake is not a UI pass. */
+export function isUiPassWake(input: { name?: string; instructions?: string; id?: string }): boolean {
+  return UI_PASS.test(input.name ?? "") || UI_PASS.test(input.instructions ?? "") || UI_PASS.test(input.id ?? "");
+}
+
 /** True when this trigger's own name, id, or saved instructions are a
  *  classify, gate, or Designer UI-pass wake.  The saved instructions are the
  *  operator's prompt, so the word "classify" there is the wake.  Delivery

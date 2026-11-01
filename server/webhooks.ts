@@ -7,6 +7,7 @@ import { z } from "zod";
 import { writeFileAtomic } from "./atomic.ts";
 import { extractRequestMetadata, type WebhookRequestMetadata } from "./request-log.ts";
 import { DATA_DIR } from "./config.ts";
+import { isUiPassWake } from "./ephemeral-dispatch.ts";
 import type { RoutineRunOn } from "./routines.ts";
 import { parseJson, schemaIssue, type JsonValue } from "./schema.ts";
 import {
@@ -471,6 +472,33 @@ function isLabelSignal(
   action: string | undefined,
 ): boolean {
   return action === "labeled" && (trigger.requiredLabels?.length ?? 0) > 0;
+}
+
+/** Review bots whose GitHub login carries no `[bot]` suffix.  Lower case. */
+export const KNOWN_REVIEW_BOT_LOGINS: readonly string[] = [
+  "kody-ai",
+  "kodus-ai",
+  "coderabbitai",
+  "sentry-io",
+  "vercel",
+  "seer-by-sentry",
+];
+
+/** PR review and comment events that a bot account sends as review churn. */
+const UI_PASS_REVIEW_EVENTS = new Set([
+  "pull_request_review",
+  "pull_request_review_comment",
+  "pull_request_review_thread",
+  "issue_comment",
+]);
+
+/** A saved prompt that asks the bot to act on bot reviews keeps them. */
+const ASKS_FOR_BOT_REVIEWS = /\bkody\b|\bbot[\s-]+reviews?\b|\breview[\s-]+comments?\b/i;
+
+function isBotAccount(sender: Record<string, JsonValue> | undefined, login: string): boolean {
+  if (/\[bot\]$/i.test(login) || login === "github-actions") return true;
+  if (pickStr(sender, "type") === "Bot") return true;
+  return KNOWN_REVIEW_BOT_LOGINS.includes(login.toLowerCase());
 }
 
 export function shouldIgnoreWebhookEvent(
@@ -1013,7 +1041,29 @@ export function shouldIgnoreWebhookEvent(
     }
   }
 
-  // 4. Universal GitHub Ingress Guard: automated bot issue edits across any trigger
+  // 4. GitHub UI Pass Pre-Filter: bot review churn (only applies to verified GitHub payloads)
+  // A UI pass judges code changes and human reviews.  Reviews and comments
+  // from bot accounts (Kody, Cursor, Actions) never change that verdict, and
+  // each one used to cost a full model turn.
+  if (
+    isGithubWebhookPayload(payload) &&
+    UI_PASS_REVIEW_EVENTS.has(event.eventName ?? "") &&
+    isUiPassWake({ name, instructions: prompt }) &&
+    !ASKS_FOR_BOT_REVIEWS.test(prompt)
+  ) {
+    const root = asRecord(payload);
+    const action = pickStr(root, "action");
+    const sender = asRecord(root?.sender);
+    const senderLogin = pickStr(sender, "login") ?? "";
+    if (!isLabelSignal(trigger, action) && isBotAccount(sender, senderLogin)) {
+      return {
+        ignore: true,
+        reason: `GitHub ${event.eventName} by bot '${senderLogin}' ignored: UI Pass reacts to human reviews and code changes, not bot review churn`,
+      };
+    }
+  }
+
+  // 5. Universal GitHub Ingress Guard: automated bot issue edits across any trigger
   if (isGithubWebhookPayload(payload) && event.eventName === "issues") {
     const root = asRecord(payload);
     const action = pickStr(root, "action");
