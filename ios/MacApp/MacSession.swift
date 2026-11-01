@@ -179,7 +179,14 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                 withIntermediateDirectories: true
             )
             let database = try DatabaseService(path: storeURL.path)
-            return NativeCompanionServer(database: database)
+            // Inject the native runtime so the wait routes serve instead of
+            // answering 503, with workspaces confined beside the store.  The
+            // server retains the runtime (and through it the graph's actors);
+            // the listener stays default-off and stop stays socket-only.
+            let workspacesRoot = storeURL.deletingLastPathComponent()
+                .appendingPathComponent("workspaces", isDirectory: true)
+            let macRuntime = NativeMacCompanionRuntime(database: database, workspacesRoot: workspacesRoot)
+            return NativeCompanionServer(database: database, nativeRuntime: macRuntime.runtime)
         }
         self.companionListener = CompanionListenerController(
             backend: backend,
