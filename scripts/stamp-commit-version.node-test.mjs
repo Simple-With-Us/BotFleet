@@ -62,6 +62,18 @@ describe("version planning", () => {
     assert.equal(plan.floored, true);
   });
 
+  it("carries the ordered build the version handshake compares (BF-2588)", () => {
+    // The build is the planner output the packaged server stamps into its
+    // identity.  It must be the same number the version ends in, floored
+    // builds included, and a later commit must order strictly after an
+    // earlier one.
+    assert.equal(planVersion({ commitCount: 2127 }).build, "2127");
+    assert.equal(planVersion({ commitCount: 31, floorVersion: "1.0.900" }).build, "900");
+    assert.ok(Number(planVersion({ commitCount: 2128 }).build) > Number(planVersion({ commitCount: 2127 }).build));
+    assert.equal(resolveBuildVersion(initRepo(tempRepo())).build, "4");
+    assert.equal(resolveBuildVersion(initRepo(tempRepo(), { version: "1.0.900" })).build, "900");
+  });
+
   it("leaves a floor it cannot parse alone rather than inventing one", () => {
     assert.equal(planVersion({ commitCount: 2127, floorVersion: "1.0.0-beta.3" }).version, "1.0.2127");
     assert.equal(planVersion({ commitCount: 2127, floorVersion: "latest" }).version, "1.0.2127");
