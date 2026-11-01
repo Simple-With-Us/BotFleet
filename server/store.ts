@@ -1286,7 +1286,9 @@ export class Store {
     ]);
     for (const threadId of knownThreads) {
       const legacyFile = messagesFile(threadId);
-      if (existsSync(legacyFile)) mdb.readThread(threadId, legacyFile);
+      // Only a thread with no rows can need importing; readThread on an
+      // already-migrated thread hydrated the whole transcript for nothing.
+      if (existsSync(legacyFile) && mdb.countMessages(threadId) === 0) mdb.readThread(threadId, legacyFile);
     }
   }
 
@@ -2198,9 +2200,26 @@ export class Store {
       if (!row.message.helper) continue;
       const helper = interruptedHelper(row.message.helper, now);
       if (!helper) continue;
-      if (this.patchMessage(row.threadId, row.message.id, { helper })) settled += 1;
+      // A warm thread patches in place; a cold one patches its single row
+      // by id so boot never hydrates a large thread to settle one card.
+      if (this.threads.has(row.threadId)) {
+        if (this.patchMessage(row.threadId, row.message.id, { helper })) settled += 1;
+        continue;
+      }
+      const updated: Message = { ...row.message, helper };
+      mdb.updateMessage(row.threadId, updated);
+      this.emit({ type: "message.patch", threadId: row.threadId, message: updated });
+      settled += 1;
     }
     return settled;
+  }
+
+  /** Whether one message exists, without hydrating its thread when cold —
+   * the held-work restore at boot only needs this lookup by id. */
+  hasMessage(threadId: string, messageId: string): boolean {
+    const warm = this.threads.get(threadId);
+    if (warm) return warm.messages.some((m) => m.id === messageId);
+    return mdb.readMessageById(threadId, messageId) !== null;
   }
 
   patchMessage(threadId: string, messageId: string, patch: Partial<Message>): Message | null {
@@ -2572,8 +2591,8 @@ export class Store {
   // ── tasks ─────────────────────────────────────────────────────────────
   /** The first thing the human asked in a thread — a task's natural name. */
   private firstUserLine(threadId: string): string | null {
-    const first = this.messagesFor(threadId).find((m) => m.role === "user" && m.kind === "text" && m.text?.trim());
-    return first?.text ? titleFromMessage(first.text) : null;
+    const text = mdb.firstUserText(threadId, messagesFile(threadId));
+    return text ? titleFromMessage(text) : null;
   }
 
   tasks(botId: string): TaskRecord[] {
