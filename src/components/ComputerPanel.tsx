@@ -345,7 +345,7 @@ export function ComputerPanel({
       if (!vpsSupported) {
         if (autoLocal) setPhase("local");
         else {
-          setError("This model engine cannot use a self-hosted VPS. Choose Claude or an ACP engine, or switch the cloud backend to Box.");
+          setError("This engine can't run a desktop on your own server.\u00a0 Pick an engine that can control a computer, such as Claude, to use Self-hosted VPS, or switch the cloud backend to Box.");
           setPhase("error");
         }
         return;
@@ -1414,6 +1414,7 @@ export function ComputerPanel({
                 value={cloudBackend}
                 inherited={cloudBackendInherited(bot)}
                 vpsSupported={vpsSupported}
+                engineName={selectedInstance?.displayName}
                 onChange={(backend) => dispatch({ type: "updateBot", botId: bot.id, patch: { cloudBackend: backend } })}
               />
               {!(bot.computers?.length) && cloudBackend === "vps" && (

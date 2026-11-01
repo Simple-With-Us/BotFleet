@@ -2,6 +2,7 @@
 // picker whenever a bot can end up on a cloud computer. One component, two
 // homes (ComputerPanel and SettingsPanel), so the copy and the disabled
 // rules can never drift apart.
+import { useId } from "react";
 import type { CloudBackend } from "../../server/contracts.ts";
 import { cn } from "@/lib/cn";
 
@@ -9,6 +10,7 @@ export function CloudBackendPicker({
   value,
   inherited,
   vpsSupported,
+  engineName,
   onChange,
 }: {
   /** The backend actually in effect — resolved, so for a bot that never chose
@@ -20,8 +22,14 @@ export function CloudBackendPicker({
    * person made, and picking either segment silently pins it. */
   inherited?: boolean;
   vpsSupported: boolean;
+  /** The selected engine's display name, named in the note that explains a
+   * disabled Self-hosted VPS segment.  Omitted (still loading, or an engine
+   * the client has not heard of) reads as "This engine". */
+  engineName?: string;
   onChange: (backend: CloudBackend) => void;
 }) {
+  const vpsNoteId = useId();
+  const engineLabel = engineName?.trim() ? engineName.trim() : "This engine";
   return (
     <div className="mt-3 rounded-lg bg-inset p-3">
       <div className="text-[12px] font-medium text-ink">Cloud Backend</div>
@@ -37,7 +45,7 @@ export function CloudBackendPicker({
             <button
               key={backend}
               disabled={disabled}
-              title={disabled ? "Self-hosted VPS requires Claude or an ACP engine" : undefined}
+              aria-describedby={disabled ? vpsNoteId : undefined}
               onClick={() => onChange(backend)}
               className={cn(
                 "flex-1 py-1.5 text-[12px]",
@@ -53,6 +61,11 @@ export function CloudBackendPicker({
           );
         })}
       </div>
+      {!vpsSupported && (
+        <div id={vpsNoteId} className="mt-2 text-[11.5px] text-ink-secondary">
+          {`${engineLabel} can't run a desktop on your own server.\u00a0 Pick an engine that can control a computer, such as Claude, to use Self-hosted VPS.`}
+        </div>
+      )}
       {inherited && (
         <div className="mt-2 text-[11.5px] text-ink-secondary">
           This bot has not chosen one, so it follows the New Bots default in App Settings → Computers.  Picking
