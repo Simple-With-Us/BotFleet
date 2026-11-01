@@ -71,6 +71,9 @@ test("source identity stays pinned after the checkout advances; packaged identit
     mkdirSync(join(root, "server"));
     assert.throws(() => readPackagedBuildIdentity(join(root, "server")));
     writeFileSync(join(root, "server", "build-identity.json"), JSON.stringify(pinned));
+    // A build-less legacy manifest still resolves: null build stays the
+    // legal unknown-order identity for old packages (BF-2588).
+    assert.equal(pinned.build, undefined);
     assert.deepEqual(readPackagedBuildIdentity(join(root, "server")), pinned);
     writeFileSync(join(root, "server", "build-identity.json"), JSON.stringify(stamped));
     assert.deepEqual(readPackagedBuildIdentity(join(root, "server")), stamped);

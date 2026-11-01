@@ -99,6 +99,16 @@ test("the Control builder stamps through the shared helper and not its own commi
   assert.doesNotMatch(builder, /rev-list/);
 });
 
+test("the server bundler stamps the pinned release build into its identity (BF-2588)", () => {
+  // The helper's tests prove the helper; this pins that the packaged server
+  // bundler passes the planner's build, not only its version, into the
+  // identity it writes.  Without it every packaged server reported
+  // build: null and the version handshake could not order builds.
+  const bundler = readFileSync(path.join(repoRoot, "scripts/bundle-server.mjs"), "utf8");
+  assert.match(bundler, /controlBuildVersion/);
+  assert.match(bundler, /readSourceBuildIdentity\(root,\s*\{[^}]*build:/s);
+});
+
 test("every workflow job that packages the Mac app has the history the Control stamp needs", () => {
   // The stamp refuses a shallow clone unless BOTFLEET_BUILD_VERSION is
   // pinned, so a job that runs a package:mac script must either pin the

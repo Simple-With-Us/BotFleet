@@ -37,10 +37,16 @@ export function planVersion({ commitCount, floorVersion }) {
   // parse, is left alone: inventing a floor from half a version string is how a
   // build ends up numbered below something already published.
   const floorPatch = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(floorVersion ?? "").trim())?.[3];
+  // The build is the number the version ends in, named on its own because it
+  // is the chronology authority the version handshake orders by (BF-2588):
+  // a consumer stamps {build} into its identity instead of re-deriving it
+  // from the version string.  The two agree by construction here.
   if (floorPatch !== undefined && Number(floorPatch) > commitCount) {
-    return { version: `1.0.${Number(floorPatch)}`, floored: true, commitCount, floor: floorVersion };
+    const build = String(Number(floorPatch));
+    return { version: `1.0.${build}`, build, floored: true, commitCount, floor: floorVersion };
   }
-  return { version: `1.0.${commitCount}`, floored: false, commitCount, floor: floorVersion ?? null };
+  const build = String(commitCount);
+  return { version: `1.0.${build}`, build, floored: false, commitCount, floor: floorVersion ?? null };
 }
 
 /** The commit's position in history, refusing a clone too shallow to know it. */
