@@ -20,6 +20,45 @@ it("keeps an old active execution and its receipts beyond 2,000 newer terminal r
   expect(pruned.slice(0, 2).map((run) => run.id)).toEqual(["owner", "child"]);
 });
 
+it("trims the noisiest routine first so other routines keep their terminal history", () => {
+  const noisyId = "routine-noisy";
+  const quietBase = 10_000;
+  const noisy = Array.from({ length: 1500 }, (_, i) => ({
+    id: `noisy-${i}`,
+    status: "completed",
+    createdAt: quietBase + i,
+    routineId: noisyId,
+  }));
+  const quiet = Array.from({ length: 10 }, (_, r) =>
+    Array.from({ length: 60 }, (_, i) => ({
+      id: `quiet-${r}-${i}`,
+      status: "completed",
+      createdAt: r * 100 + i,
+      routineId: `routine-${r}`,
+    })),
+  ).flat();
+  const input = [...noisy, ...quiet];
+  const result = retainRoutineRuns(input, 2000);
+  expect(result).toHaveLength(2000);
+  expect(result.filter((run) => run.routineId === noisyId)).toHaveLength(1400);
+  for (let r = 0; r < 10; r += 1) {
+    expect(result.filter((run) => run.routineId === `routine-${r}`)).toHaveLength(60);
+  }
+  expect(input).toHaveLength(2100);
+});
+
+it("drops oldest terminal runs within a single routine exactly as global oldest-first would", () => {
+  const routineId = "only-routine";
+  const runs = Array.from({ length: 5 }, (_, i) => ({
+    id: `run-${i}`,
+    status: "completed",
+    createdAt: i,
+    routineId,
+  }));
+  expect(retainRoutineRuns(runs, 3).map((run) => run.id)).toEqual(["run-2", "run-3", "run-4"]);
+  expect(runs).toHaveLength(5);
+});
+
 it("preserves a referenced owner and every queued or waiting receipt without expanding admission", () => {
   const runs = [
     { id: "owner", status: "completed", createdAt: 1 },
