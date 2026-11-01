@@ -146,26 +146,26 @@ struct AgentProfileView: View {
         case .elevenlabs:
             return "Add the shared ElevenLabs key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .system:
-            return "Built-in Mac voices need no key, and this computer has none available.\u{00A0} Switch the voice engine in a bot's Voice settings on the computer to keep using voice."
+            return "Built-in Mac voices need no key, and this computer has none available.\u{00A0} Switch the voice provider in a bot's Voice settings on the computer to keep using voice."
         case .personal:
             return "Apple Personal Voice speaks directly on this iOS device and requires authorization."
         case .unknown:
-            return "Configure the selected voice engine in a bot's Voice settings on the computer.\u{00A0} Provider keys are never returned to iOS."
+            return "Configure the selected voice provider in a bot's Voice settings on the computer.\u{00A0} Provider keys are never returned to iOS."
         }
     }
 
     private var missingDefaultVoiceGuidance: String {
         switch voiceProvider {
         case .minimax:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the shared MiniMax key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared MiniMax key on your computer."
         case .elevenlabs:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the shared ElevenLabs key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared ElevenLabs key on your computer."
         case .system:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the built-in Mac voices on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the built-in Mac voices on your computer."
         case .personal:
             return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose an Apple Personal Voice for this iPhone above to speak on this device."
         case .unknown:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the selected voice engine on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the selected voice provider on your computer."
         }
     }
 
