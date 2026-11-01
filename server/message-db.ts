@@ -141,6 +141,7 @@ export function readThread(threadId: string, legacyFile: string): ThreadRows {
   // Stream row by row: `.all()` held every raw JSON string alongside the
   // parsed objects, doubling the peak for a large thread at boot.
   const messages: Message[] = [];
+  // SAFETY: the query selects only `json`, a TEXT NOT NULL column on `messages`.
   for (const row of db()
     .prepare("SELECT json FROM messages WHERE thread_id = ? ORDER BY rowid")
     .iterate(threadId) as Iterable<{ json: string }>) {
@@ -160,6 +161,7 @@ export function readThread(threadId: string, legacyFile: string): ThreadRows {
  * the thread has no such row (a legacy file that was never imported has no
  * rows to find it in; callers that must see it hydrate explicitly). */
 export function readMessageById(threadId: string, messageId: string): Message | null {
+  // SAFETY: the query selects only `json`, a TEXT NOT NULL column; `get` is undefined when no row matches.
   const row = db()
     .prepare("SELECT json FROM messages WHERE thread_id = ? AND id = ?")
     .get(threadId, messageId) as { json: string } | undefined;
@@ -173,6 +175,7 @@ export function readMessageById(threadId: string, messageId: string): Message | 
 export function firstUserText(threadId: string, legacyFile: string): string | null {
   const hasRows = db().prepare("SELECT 1 AS one FROM messages WHERE thread_id = ? LIMIT 1").get(threadId) !== undefined;
   if (hasRows) {
+    // SAFETY: the query selects only `text`, a nullable TEXT column on `messages`.
     for (const row of db()
       .prepare("SELECT text FROM messages WHERE thread_id = ? AND role = 'user' AND kind = 'text' ORDER BY rowid")
       .iterate(threadId) as Iterable<{ text: string | null }>) {
@@ -182,6 +185,8 @@ export function firstUserText(threadId: string, legacyFile: string): string | nu
   }
   try {
     const raw = JSON.parse(readFileSync(legacyFile, "utf8"));
+    // SAFETY: a legacy messages file is either a bare `Message[]` or `{ messages: Message[] }`, the same two shapes
+    // `importLegacy` reads; a malformed file throws or yields no match and lands in the catch / null below.
     const messages = Array.isArray(raw)
       ? (raw as Message[])
       : (((raw as { messages?: Message[] }).messages ?? []) as Message[]);
