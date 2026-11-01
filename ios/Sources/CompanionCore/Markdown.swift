@@ -129,9 +129,12 @@ public enum Markdown {
             // `tableHeader` demands one delimiter cell per header cell, so
             // a header still streaming — delimiter not sent yet, or half
             // sent — falls through to the paragraph below and reads as the
-            // text it is. Calling it a table early would draw a grid with
-            // no columns settled, then redraw it when the row lands.
+            // text it is. The delimiter line must contain `|` too, or a
+            // lone `---` after a pipe line would read as a one-column table
+            // and swallow a thematic break. Calling it a table early would
+            // draw a grid with no columns settled, then redraw when the row lands.
             if trimmed.contains("|"), let delimiter = lines.first,
+               delimiter.trimmingCharacters(in: .whitespaces).contains("|"),
                let table = tableHeader(trimmed, delimiter: delimiter) {
                 flushParagraph()
                 lines = lines.dropFirst()

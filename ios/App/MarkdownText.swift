@@ -274,31 +274,40 @@ private struct MarkdownTableView: View {
                 Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
                     GridRow {
                         ForEach(header.indices, id: \.self) { column in
-                            cell(
+                            let rowCell = cell(
                                 header[column], column: column, isHeader: true,
                                 caret: tail && visibleRows.isEmpty && column == header.count - 1
                             )
+                            if column == 0 {
+                                rowCell
+                                    .accessibilityElement(children: .ignore)
+                                    .accessibilityLabel(header.map { plain($0) }.joined(separator: ", "))
+                            } else {
+                                rowCell.accessibilityHidden(true)
+                            }
                         }
                     }
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(header.map { plain($0) }.joined(separator: ", "))
 
                     Divider()
 
                     ForEach(visibleRows.indices, id: \.self) { row in
                         GridRow {
                             ForEach(header.indices, id: \.self) { column in
-                                cell(
+                                let rowCell = cell(
                                     visibleRows[row][column], column: column, isHeader: false,
                                     caret: tail && row == visibleRows.count - 1 && column == header.count - 1
                                 )
+                                if column == 0 {
+                                    // GridRow forwards modifiers to each cell;
+                                    // label the first cell only and hide the rest.
+                                    rowCell
+                                        .accessibilityElement(children: .ignore)
+                                        .accessibilityLabel(label(for: visibleRows[row]))
+                                } else {
+                                    rowCell.accessibilityHidden(true)
+                                }
                             }
                         }
-                        // A row read cell by cell loses which column each
-                        // value belongs to, so the row is one element that
-                        // names its headers as it goes.
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel(label(for: visibleRows[row]))
 
                         if row < visibleRows.count - 1 {
                             Divider()
