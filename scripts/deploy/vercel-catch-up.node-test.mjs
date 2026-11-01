@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { COOLDOWN_MS, classify, assertProject, assertCi, pendingCi, assertReceipt, deploymentSha, request, resolveBaseline } from './vercel-catch-up.mjs';
+import { COOLDOWN_MS, classify, assertProject, assertCi, pendingCi, assertReceipt, deploymentSha, request, resolveBaseline, branchDeploymentDisabled, assertGitPublisherDisabled } from './vercel-catch-up.mjs';
 const A = 'a'.repeat(40), B = 'b'.repeat(40), now = 1_800_000_000_000;
 const config = { projectId: 'prj_test', teamId: 'team_test', repoId: 17, rootDirectory: 'site' };
 const baseline = { projectId: 'prj_test', target: 'production', readyState: 'READY', created: now - COOLDOWN_MS - 1, gitSource: { sha: A }, url: 'test.vercel.app' };
 const old = { projectId: config.projectId, target: 'production', readyState: 'READY', created: now - COOLDOWN_MS - 1 };
 const decide = extra => classify({ deployments: [old], baseline, target: B, now, projectId: config.projectId, changed: () => true, ...extra });
-const project = { id: 'prj_test', accountId: 'team_test', rootDirectory: 'site', gitProviderOptions: { createDeployments: 'disabled' }, link: { type: 'github', repoId: 17, productionBranch: 'main' } };
+const project = { id: 'prj_test', accountId: 'team_test', rootDirectory: 'site', link: { type: 'github', repoId: 17, productionBranch: 'main' } };
 test('latest main drains after 3h without another merge', () => assert.equal(decide().deploy, true));
 test('skip inside cooldown and allow exactly at boundary', () => {
  assert.equal(decide({ deployments: [{ ...old, created: now - COOLDOWN_MS + 1 }] }).deploy, false);
@@ -34,7 +34,7 @@ test('unknown history, timestamp, baseline or metadata fails closed', () => {
 test('binding checks stable repo ID and preserves root', () => {
  assert.doesNotThrow(() => assertProject(project,config));
  assert.doesNotThrow(() => assertProject({...project,link:{...project.link,org:'old-owner'}},config));
- for (const p of [{...project,id:'wrong'},{...project,accountId:'wrong'},{...project,rootDirectory:''},{...project,gitProviderOptions:{createDeployments:'enabled'}},{...project,link:{...project.link,repoId:18}},{...project,link:{...project.link,productionBranch:'dev'}}]) assert.throws(() => assertProject(p,config));
+ for (const p of [{...project,id:'wrong'},{...project,accountId:'wrong'},{...project,rootDirectory:''},{...project,link:{...project.link,repoId:18}},{...project,link:{...project.link,productionBranch:'dev'}}]) assert.throws(() => assertProject(p,config));
 });
 test('CI requires latest exact main successful trusted event', () => {
  const good = {id:1,name:'CI',head_sha:B,head_branch:'main',event:'push',status:'completed',conclusion:'success'};
@@ -97,6 +97,13 @@ test('unavailable target falls back but invalid returned deployments fail closed
   readDeployment: async () => { throw new Error('serving unavailable'); },
   readAlias: async () => aliasRecord }), /serving unavailable/);
 });
+test('competing Git publisher guard reads git.deploymentEnabled for the production branch, failing closed on unevaluable shapes', () => {
+ for (const v of [false, { '**': false, main: false }, { '**': false }, { '*': false }]) assert.equal(branchDeploymentDisabled(v, 'main'), true);
+ for (const v of [true, undefined, { '**': false, main: true }, { main: true }, { 'internal-*': false }, { '**': true }, { '**': true, main: false }, { '**': false, 'ma*': true }, { '**': false, '{main,dev}': true }, { '**': false, '!(dev)': true }, { '**': false, dev: true }, { '**': false, main: 'false' }, 'disabled', 0]) assert.equal(branchDeploymentDisabled(v, 'main'), false);
+ assert.doesNotThrow(() => assertGitPublisherDisabled({ git: { deploymentEnabled: false } }, 'main'));
+ assert.doesNotThrow(() => assertGitPublisherDisabled({ git: { deploymentEnabled: { '**': false, main: false } } }, 'main'));
+ for (const cfg of [{ git: { deploymentEnabled: { '**': false, main: true } } }, { git: { deploymentEnabled: true } }, { git: {} }, {}, { git: { deploymentEnabled: { 'internal-*': false } } }, { git: { deploymentEnabled: { '**': true, main: false } } }, { git: { deploymentEnabled: { '**': false, 'ma*': true } } }]) assert.throws(() => assertGitPublisherDisabled(cfg, 'main'), /Git publisher/);
+});
 test('receipt verifies project/target/sha/READY/url, not CLI exit code', () => {
  assert.equal(assertReceipt(baseline,config,A),'https://test.vercel.app');
  for (const d of [{...baseline,projectId:'wrong'},{...baseline,target:'preview'},{...baseline,readyState:'BUILDING'},{...baseline,url:'test.vercel.app.evil.test'},{...baseline,gitSource:{sha:B}}]) assert.throws(() => assertReceipt(d,config,A));
@@ -125,6 +132,7 @@ test('entrypoint reconciles skipped site changes behind docs, rechecks and verif
  try {
   mkdirSync(join(dir,'scripts/deploy'),{recursive:true});
   mkdirSync(join(dir,'site'));
+  writeFileSync(join(dir,'site/vercel.json'),JSON.stringify({git:{deploymentEnabled:{'**':false,'main':false}}}));
   copyFileSync(new URL('./vercel-catch-up.mjs',import.meta.url),join(dir,'scripts/deploy/vercel-catch-up.mjs'));
   writeFileSync(join(dir,'scripts/deploy/vercel-config.json'),JSON.stringify({...config,repository:'owner/repo',ciWorkflows:['CI'],watch:['site/**']}));
   runGit('init','-q');runGit('config','user.email','test@localhost');runGit('config','user.name','Fixture');
@@ -148,6 +156,9 @@ test('entrypoint reconciles skipped site changes behind docs, rechecks and verif
   fixture.alias={projectId:'prj_test',deploymentId:'dpl_serving'};
   result=execute('prepare');assert.equal(result.status,0,result.stderr);assert.equal(readFileSync(output,'utf8'),'deploy=true\n');assert.match(result.stdout,/via alias/);
   delete fixture.byId;delete fixture.alias;fixture.project.targets.production.id='dpl_fixture';
+  writeFileSync(join(dir,'site/vercel.json'),JSON.stringify({git:{deploymentEnabled:{'**':false,'main':true}}}));
+  result=execute('prepare');assert.equal(result.status,1);assert.match(result.stderr,/Git publisher/);
+  writeFileSync(join(dir,'site/vercel.json'),JSON.stringify({git:{deploymentEnabled:{'**':false,'main':false}}}));
   fixture.baseline.gitSource.sha=latest;result=execute('receipt',receipt);assert.equal(result.status,0,result.stderr);assert.match(result.stdout,/https:\/\/test.vercel.app/);
   fixture.project.targets.production.id='dpl_other';result=execute('receipt',receipt);assert.equal(result.status,1);assert.match(result.stderr,/current production target/);
  } finally { rmSync(dir,{recursive:true,force:true}); }

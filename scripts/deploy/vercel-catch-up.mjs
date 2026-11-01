@@ -23,9 +23,35 @@ export function assertProject(p, config) {
   must(object(p) && p.id === config.projectId, 'Wrong Vercel project');
   must((p.rootDirectory ?? '') === config.rootDirectory, 'Vercel root directory drift');
   must(p.accountId === config.teamId, 'Wrong Vercel team');
-  must(p.gitProviderOptions?.createDeployments === 'disabled', 'Disable competing Git publisher before activation');
   must(p.link?.type === 'github' && String(p.link.repoId) === String(config.repoId), 'Vercel repository binding drift');
   must(p.link.productionBranch === 'main', 'Wrong production branch');
+}
+// The competing Git publisher switch is git.deploymentEnabled in the site vercel.json at the
+// exact checkout (vercel.com/docs/project-configuration/git-configuration; it replaced
+// github.enabled).  gitProviderOptions.createDeployments only controls GitHub Deployment
+// records, not Git-push builds (host finding 2026-10-31), so it is not checked here.
+// Conservative evaluation of the documented rules: ANY matching true enables builds, and a
+// branch with no matching rule defaults to enabled.  So a branch is disabled only when no
+// rule enables any branch AND at least one provably matching rule disables this branch.
+// This intentionally rejects maps with true entries rather than partially implementing
+// Vercel glob syntax (including braces, extglobs and negation). Only the exact branch key
+// and the '**'/'*' wildcards prove a disabling match. Anything unevaluable fails closed.
+export function branchDeploymentDisabled(v, branch) {
+  if (v === false) return true;
+  if (!object(v)) return false;
+  let proven = false;
+  for (const [pattern, value] of Object.entries(v)) {
+    if (value !== true && value !== false) return false;
+    const provable = pattern === branch || pattern === '**' || pattern === '*';
+    if (value === true) return false;
+    if (provable) {
+      proven = true;
+    }
+  }
+  return proven;
+}
+export function assertGitPublisherDisabled(siteConfig, branch) {
+  must(branchDeploymentDisabled(siteConfig?.git?.deploymentEnabled, branch), 'Competing Git publisher still enabled for the production branch in the site vercel.json');
 }
 // The baseline is what production SERVES, not what the project target pointer last
 // attempted.  targets.production can reference a CANCELED ignored-build attempt (host
@@ -117,6 +143,13 @@ export async function request(url, token, fetchImpl = fetch) {
 }
 async function main() {
   const config = JSON.parse(readFileSync('scripts/deploy/vercel-config.json', 'utf8'));
+  const siteConfigPath = `${config.rootDirectory}/vercel.json`;
+  let siteConfig;
+  try {
+    siteConfig = JSON.parse(readFileSync(siteConfigPath, 'utf8'));
+  } catch {
+    must(false, `Site config unreadable: ${siteConfigPath}`);
+  }
   const target = git(['rev-parse', 'HEAD']);
   must(process.env.GITHUB_REPOSITORY === config.repository, 'Wrong repository');
   must(process.env.VERCEL_TOKEN && process.env.GH_TOKEN, 'Missing deploy/read credentials');
@@ -130,6 +163,7 @@ async function main() {
     const url = assertReceipt(await read(`/v13/deployments/${id}?withGitRepoInfo=true`), config, target);
     const project = await read(`/v9/projects/${config.projectId}`);
     assertProject(project, config);
+    assertGitPublisherDisabled(siteConfig, project.link.productionBranch);
     must((project.targets?.production?.id ?? project.targets?.production?.uid) === id, 'Deployment is not the current production target');
     console.log(`Verified production ${target}: ${url}`);
     if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `Verified production: ${url}\n\nCommit: ${target}\n`);
@@ -143,6 +177,7 @@ async function main() {
   }
   const project = await read(`/v9/projects/${config.projectId}`);
   assertProject(project, config);
+  assertGitPublisherDisabled(siteConfig, project.link.productionBranch);
   const { baseline, via } = await resolveBaseline({
     project,
     config,
