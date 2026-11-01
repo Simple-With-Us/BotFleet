@@ -452,6 +452,42 @@ export function ascErrorText(res) {
   return `HTTP ${res?.status} ${e.code || ""} ${e.detail || e.title || ""}`.trim();
 }
 
+// One authenticated client for importers (fleet-tf-audit.mjs).  It resolves the
+// credential and signs the JWT exactly as main() does, then hands back the
+// same api(method, path, jsonBody) shape the helpers above take.  Nothing here
+// changes the CLI:  main() keeps its own client.  Key material and the token
+// stay inside the closure and are never returned or printed.
+export function createAscApi({ fetchImpl = fetch } = {}) {
+  const cred = resolveCredential();
+  if (cred.error) return { ok: false, error: cred.error };
+  if (!cred.privateKeyPem) {
+    const notes = RESOLUTION_NOTES.length ? ` Skipped: ${RESOLUTION_NOTES.join("; ")}.` : "";
+    return { ok: false, error: `no App Store Connect credential found.${notes}` };
+  }
+  let token;
+  try {
+    token = signJwt({ keyId: cred.keyId, issuerId: cred.issuerId, privateKeyPem: cred.privateKeyPem });
+  } catch {
+    return { ok: false, error: "could not sign the App Store Connect token with the resolved credential" };
+  }
+  async function api(methodName, apiPath, jsonBody) {
+    const url = apiPath.startsWith("http") ? apiPath : `https://api.appstoreconnect.apple.com${apiPath}`;
+    const res = await fetchImpl(url, {
+      method: methodName,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: jsonBody ? jsonBody : undefined
+    });
+    const text = await res.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+    return { status: res.status, ok: res.ok, parsed, text };
+  }
+  return { ok: true, api, source: cred.source };
+}
+
 export function maskEmail(email) {
   const [user, domain] = String(email).split("@");
   return `${String(user).slice(0, 1)}***@${domain}`;

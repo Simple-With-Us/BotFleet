@@ -47,3 +47,26 @@ wrapper with no extra flags.
 
 The `.xcodeproj` is gitignored; hosted ships must run `xcodegen generate`
 (the workflow installs xcodegen before the wrapper).
+
+## Fleet TestFlight Audit
+
+`fleet-tf-audit.mjs` is a read-only App Store Connect audit for the
+GB-Compiler q6hr fleet check.  It issues only GET requests (the request
+layer refuses any other method) and checks each fleet app in
+`fleet-tf-audit.apps.json` against the fleet TestFlight policy:  expected
+marketing version (0.1.0, except Congress.Trade at 1.1.2; an approved App
+Store version above it is reported as "kept approved X"), a 12-digit
+Central Time timestamp build number (YYYYMMDDHHMM), one shared build
+number across iOS and macOS where both ship through App Store Connect,
+the latest upload holding the highest build number, and the latest build
+in the VALID processing state.  With `--repo-heads <file>` (a JSON map of
+app name to main HEAD committer date) it also reports whether the latest
+build equals that commit's Central Time stamp or the highest earlier
+build plus one.  Credentials resolve through `asc-api.mjs` and are never
+printed.  Exit 0 means every app passes, 1 means a policy violation, and
+2 means an auth or network error.
+
+```bash
+node scripts/ios-fleet/fleet-tf-audit.mjs [--config <file>] [--json] [--repo-heads <file>]
+node --test scripts/ios-fleet/fleet-tf-audit.test.mjs   # offline tests
+```
