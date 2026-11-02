@@ -412,6 +412,22 @@ describe("the retired launcher spelling", () => {
     expect(decision.reason).toContain("retired");
   });
 
+  it("refuses a case-variant of it that a case-insensitive volume resolves to the same binary", () => {
+    const variantPolicy: ToolPolicy = {
+      ...policy,
+      commands: [{ argv0: "/Users/jay/.local/bin/Agent-Sync", sub: ["whoami"], flags: {}, args: [], positionals: 0 }],
+    };
+    const decision = evaluateCommand(variantPolicy, "/Users/jay/.local/bin/Agent-Sync whoami");
+    expect(decision.ok).toBe(false);
+    expect(decision.reason).toContain("retired");
+  });
+
+  it("does not touch a word that only starts with the name", () => {
+    const decision = evaluateCommand(policy, "/usr/bin/tail /tmp/agent-sync.log");
+    expect(decision.ok).toBe(false);
+    expect(decision.reason).not.toContain("retired");
+  });
+
   it("refuses to save a new policy that names it", () => {
     expect(() => sanitizeToolPolicy(policy)).toThrow(/agent-sync has been retired/);
   });

@@ -72,8 +72,17 @@ const CHAT_CLI_LABEL = "simple-chat";
 
 /** The fleet chat CLI's retired launcher spelling.  It names nothing
  *  runnable:  any use is refused with a pointer to the current name -
- *  never matched, migrated or aliased. */
+ *  never matched, migrated or aliased.  Compared in any letter case, the
+ *  same way `namesChatCli` treats the current name:  on a case-insensitive
+ *  volume `AGENT-SYNC` is the same retired binary, and a same-named word is
+ *  only ever a refusal. */
 const RETIRED_CHAT_CLI_NAME = "agent-sync";
+
+/** Whether a program or script word spells the retired launcher name, in
+ *  any letter case.  A suffix (`agent-sync.log`) is not the name. */
+function namesRetiredChatCli(word: string): boolean {
+  return posix.basename(word).toLowerCase() === RETIRED_CHAT_CLI_NAME;
+}
 
 /** simple-chat flags no routine may pass, whatever its policy says:  each one
  *  changes who the post is from or who it wakes.  A word that is a prefix of
@@ -207,7 +216,7 @@ const commandSchema = z
     if (names.length > MAX_FLAGS) ctx.addIssue({ code: "custom", message: `has more than ${MAX_FLAGS} flags` });
     // the chat CLI as the program, or as the script an interpreter runs
     const fixed = [command.argv0, ...command.sub];
-    if (fixed.some((word) => posix.basename(word) === RETIRED_CHAT_CLI_NAME)) {
+    if (fixed.some(namesRetiredChatCli)) {
       ctx.addIssue({ code: "custom", message: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}` });
     }
     const chatCliAt = fixed.findIndex(namesChatCli);
@@ -426,7 +435,7 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
   }
   // The retired launcher spelling is refused by name, even if a stored
   //  policy from before the rename still lists it:  it is not an alias.
-  if (argv.slice(0, 1 + MAX_SUB).some((word) => posix.basename(word) === RETIRED_CHAT_CLI_NAME)) {
+  if (argv.slice(0, 1 + MAX_SUB).some(namesRetiredChatCli)) {
     return { ok: false, reason: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}`, name };
   }
   const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
