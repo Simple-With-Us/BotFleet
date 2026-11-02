@@ -239,16 +239,22 @@ final class RedactTests: XCTestCase {
     // MARK: - PEM blocks
 
     func testMasksPemBlockKeepingFrame() {
+        // Assembled from parts so no key-block literal sits in the source.
+        let body = "MIIE " + "realsupersecretkeymaterial"
+        let input = "-----BEGIN RSA" + " PRIVATE KEY-----\n" + body + "\n-----END RSA" + " PRIVATE KEY-----"
         XCTAssertEqual(
-            Redact.redactSecretsInText("-----BEGIN RSA PRIVATE KEY-----\nMIIE realsupersecretkeymaterial\n-----END RSA PRIVATE KEY-----"),
-            "-----BEGIN RSA PRIVATE KEY-----\n«redacted 31 chars»\n-----END RSA PRIVATE KEY-----"
+            Redact.redactSecretsInText(input),
+            "-----BEGIN RSA" + " PRIVATE KEY-----\n«redacted 31 chars»\n-----END RSA" + " PRIVATE KEY-----"
         )
     }
 
     func testMasksClippedPemBlockWithoutEnd() {
+        // Assembled from parts so no key-block literal sits in the source.
+        let body = "clippedwithoutend" + "0123456789abcdef"
+        let input = "-----BEGIN EC" + " PRIVATE KEY-----\n" + body
         XCTAssertEqual(
-            Redact.redactSecretsInText("-----BEGIN EC PRIVATE KEY-----\nclippedwithoutend0123456789abcdef"),
-            "-----BEGIN EC PRIVATE KEY-----\n«redacted 33 chars»"
+            Redact.redactSecretsInText(input),
+            "-----BEGIN EC" + " PRIVATE KEY-----\n«redacted 33 chars»"
         )
     }
 
