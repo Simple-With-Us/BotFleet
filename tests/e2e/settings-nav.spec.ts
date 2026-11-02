@@ -72,7 +72,7 @@ for (const skin of ['studio', 'midnight'] as const) {
       await expect(dialog.getByRole('button', { name: 'Phone', exact: true })).toBeVisible();
     });
 
-    test('Resources tab renders a stubbed host report with read-only headroom knobs', async ({ page }) => {
+    test('Resources tab renders a stubbed host report with editable headroom knobs', async ({ page }) => {
       const dialog = await openSettings(page, skin);
       // The E2E preview server has no /api/* backend, so stub the one route
       // this tab reads (composer-draft.spec.ts stubs **/api/** the same way).
@@ -127,10 +127,11 @@ for (const skin of ['studio', 'midnight'] as const) {
       await expect(dialog.getByRole('table', { name: 'Host resource readings' })).toBeVisible();
       await expect(dialog.getByText('Admission Thresholds (Saved vs Applied)', { exact: true })).toBeVisible();
       await expect(dialog.getByText('Owner-Set Headroom', { exact: true })).toBeVisible();
-      // Unset headroom knobs stay read-only with a Not set placeholder.
-      const reservedCpu = dialog.getByLabel('Reserved CPU cores (set by the owner)');
-      await expect(reservedCpu).toBeDisabled();
+      // Unset headroom knobs stay editable with a Not set placeholder.
+      const reservedCpu = dialog.getByLabel('Reserved CPU cores');
+      await expect(reservedCpu).toBeEnabled();
       await expect(reservedCpu).toHaveAttribute('placeholder', 'Not set');
+      await expect(dialog.getByRole('button', { name: 'Save headroom' })).toBeVisible();
       // Refresh keeps the report on screen instead of flashing a skeleton.
       await dialog.getByRole('button', { name: 'Refresh host resources' }).click();
       await expect(dialog.getByRole('table', { name: 'Host resource readings' })).toBeVisible();

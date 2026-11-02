@@ -5,15 +5,18 @@ import { describe, expect, it } from "vitest";
 import type { CapacitySample, EnforcementState, HostResourcesReport } from "../../shared/placement.ts";
 import {
   admissionRows,
+  buildHeadroomPatch,
   enforcementSentence,
   formatBytes,
   formatCentralTime,
   formatCount,
+  headroomEditInitial,
   hostNoun,
   hostResourcesReportSchema,
   hostSubtitle,
   nextRefreshState,
   noCapacitySentence,
+  parseHeadroomEdit,
   resourceRows,
 } from "./host-resources";
 
@@ -424,5 +427,88 @@ describe("hostResourcesReportSchema", () => {
     expect(hostResourcesReportSchema.safeParse(null).success).toBe(false);
     expect(hostResourcesReportSchema.safeParse({ error: "nope" }).success).toBe(false);
     expect(hostResourcesReportSchema.safeParse({ ...report(), admission: undefined }).success).toBe(false);
+  });
+});
+
+describe("parseHeadroomEdit", () => {
+  it("parses numbers and omits empty boxes", () => {
+    const parsed = parseHeadroomEdit({ reservedCpuCores: "2", reservedRamMb: "", minMemoryAvailablePercent: "10.5" });
+    expect(parsed).toEqual({ ok: true, parsed: { reservedCpuCores: 2, minMemoryAvailablePercent: 10.5 } });
+  });
+
+  it("refuses non-numeric, fractional ints and out-of-range values", () => {
+    expect(parseHeadroomEdit({ reservedCpuCores: "abc", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "1.5", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "65", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "-1", minMemoryAvailablePercent: "" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "101" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "0x10", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "1e3", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "1000001", minMemoryAvailablePercent: "" }).ok).toBe(false);
+  });
+
+  it("refuses an all-empty save as a no-op", () => {
+    const parsed = parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "" });
+    expect(parsed.ok).toBe(false);
+  });
+});
+
+describe("buildHeadroomPatch", () => {
+  it("builds the full-admission PUT /api/config patch so unrelated gates survive", () => {
+    const current = report({
+      admission: {
+        maxSwapPercent: 98,
+        minFreeDiskBytes: 2 * GB,
+        minFreeInodes: 1000,
+        reservedCpuCores: 1,
+        unknownReading: "admit",
+      },
+    });
+    expect(buildHeadroomPatch(current, { reservedCpuCores: 2, reservedRamMb: 512 })).toEqual({
+      jobs: {
+        admission: {
+          maxSwapPercent: 98,
+          minFreeDiskMb: 2048,
+          minFreeInodes: 1000,
+          reservedCpuCores: 2,
+          reservedRamMb: 512,
+          minMemoryAvailablePercent: undefined,
+        },
+      },
+    });
+  });
+
+  it("keeps current headroom when boxes are empty", () => {
+    const current = report({
+      admission: {
+        maxSwapPercent: 90,
+        minFreeDiskBytes: 4 * GB,
+        reservedRamBytes: 256 * 1024 * 1024,
+        minMemoryAvailablePercent: 20,
+        unknownReading: "admit",
+      },
+    });
+    const patch = buildHeadroomPatch(current, { reservedCpuCores: 3 });
+    expect(patch.jobs.admission.maxSwapPercent).toBe(90);
+    expect(patch.jobs.admission.minFreeDiskMb).toBe(4096);
+    expect(patch.jobs.admission.reservedCpuCores).toBe(3);
+    expect(patch.jobs.admission.reservedRamMb).toBe(256);
+    expect(patch.jobs.admission.minMemoryAvailablePercent).toBe(20);
+  });
+});
+
+describe("headroomEditInitial", () => {
+  it("renders set knobs as strings and unset as empty", () => {
+    const initial = headroomEditInitial(
+      report({ admission: { maxSwapPercent: 98, minFreeDiskBytes: 2 * GB, reservedCpuCores: 2, unknownReading: "admit" } }),
+    );
+    expect(initial.reservedCpuCores).toBe("2");
+    expect(initial.reservedRamMb).toBe("");
+    const withRam = headroomEditInitial(
+      report({
+        admission: { maxSwapPercent: 98, minFreeDiskBytes: 2 * GB, reservedRamBytes: 512 * 1024 * 1024, unknownReading: "admit" },
+      }),
+    );
+    expect(withRam.reservedRamMb).toBe("512");
   });
 });

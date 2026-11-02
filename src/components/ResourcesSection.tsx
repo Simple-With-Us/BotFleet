@@ -1,22 +1,23 @@
 // App settings → Resources: host readings from GET /api/host/resources
-// with the saved admission thresholds against the applied values.
-//
-// Display side only (P-BF-6 B7 UI half).  Read-write editing of the three
-// unset-by-default knobs is out of scope — numbers are owner-gated, so the
-// headroom card renders disabled inputs with an "owner sets these" note and
-// this file never builds a PUT/PATCH body.
+// with the saved admission thresholds against the applied values, plus
+// write-through editing of the three unset-by-default headroom knobs via
+// PUT /api/config (server/knob-map.ts).
 import * as React from "react";
-import { Loader2, RefreshCw } from "lucide-react";
+import { Check, Loader2, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { Card } from "./SettingsPrimitives";
 import {
   admissionRows,
   fetchHostResources,
   formatBytes,
+  headroomEditInitial,
+  parseHeadroomEdit,
+  saveHeadroomThresholds,
   hostNoun,
   hostSubtitle,
   nextRefreshState,
   resourceRows,
+  type HeadroomEditValues,
   type HostResourcesState,
 } from "@/lib/host-resources";
 import type { HostResourcesReport } from "../../shared/placement.ts";
@@ -188,7 +189,7 @@ function ResourcesReportView({
         </details>
       </Card>
 
-      <HeadroomCard report={report} highlightClass={highlightClass} />
+      <HeadroomCard report={report} highlightClass={highlightClass} onSaved={onRefresh} />
 
       {report.limitations.length > 0 && (
         <Card
@@ -208,21 +209,61 @@ function ResourcesReportView({
   );
 }
 
-/** The three unset-by-default headroom knobs, shown read-only.  The inputs
- *  mirror the numeric-knob tab pattern but stay disabled: choosing numbers
- *  is the owner's call, so this tab names the values and where they come
- *  from (config knob + Infisical name) without letting anyone type here. */
+/** The three unset-by-default headroom knobs, editable with write-through.
+ *  Empty means omit (no change); the PUT patch only carries fields with a
+ *  number, so an untouched box never clears a saved knob.  Clearing back to
+ *  unset is a file/vault edit. */
 function HeadroomCard({
   report,
   highlightClass,
+  onSaved,
 }: {
   report: HostResourcesReport;
   highlightClass?: (domId: string) => string | undefined;
+  onSaved?: () => void;
 }) {
-  const reservedRamMb =
-    report.admission.reservedRamBytes === undefined
-      ? ""
-      : String(Math.round(report.admission.reservedRamBytes / 1024 / 1024));
+  const [values, setValues] = React.useState<HeadroomEditValues>(() => headroomEditInitial(report));
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const [touched, setTouched] = React.useState(false);
+  const [submitAttempted, setSubmitAttempted] = React.useState(false);
+
+  React.useEffect(() => {
+    setValues(headroomEditInitial(report));
+    setTouched(false);
+    setSubmitAttempted(false);
+    setError(null);
+  }, [report.hostId, report.admission.reservedCpuCores, report.admission.reservedRamBytes, report.admission.minMemoryAvailablePercent]);
+
+  const parsed = parseHeadroomEdit(values);
+  const showValidation = !parsed.ok && (touched || submitAttempted);
+  const canSave = !saving && parsed.ok;
+
+  const markTouched = (next: HeadroomEditValues) => {
+    setValues(next);
+    setTouched(true);
+  };
+
+  const save = () => {
+    setSubmitAttempted(true);
+    if (!parsed.ok || saving) {
+      setError(!parsed.ok ? parsed.errors[0]?.message ?? "Enter a number." : null);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    void (async () => {
+      try {
+        await saveHeadroomThresholds(values, report);
+        onSaved?.();
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+      } finally {
+        setSaving(false);
+      }
+    })();
+  };
+
   return (
     <Card
       id="setting-resources-headroom"
@@ -238,11 +279,13 @@ function HeadroomCard({
           <input
             id="resources-reserved-cpu"
             type="number"
-            value={report.admission.reservedCpuCores ?? ""}
+            value={values.reservedCpuCores}
+            min={0}
+            max={64}
+            step={1}
             placeholder="Not set"
-            disabled
-            aria-label="Reserved CPU cores (set by the owner)"
-            title="Set by the owner — editing is disabled on this tab"
+            onChange={(e) => markTouched({ ...values, reservedCpuCores: e.target.value })}
+            aria-label="Reserved CPU cores"
             className={inputClass}
           />
         </div>
@@ -253,11 +296,12 @@ function HeadroomCard({
           <input
             id="resources-reserved-ram"
             type="number"
-            value={reservedRamMb}
+            value={values.reservedRamMb}
+            min={0}
+            step={1}
             placeholder="Not set"
-            disabled
-            aria-label="Reserved RAM in MB (set by the owner)"
-            title="Set by the owner — editing is disabled on this tab"
+            onChange={(e) => markTouched({ ...values, reservedRamMb: e.target.value })}
+            aria-label="Reserved RAM in MB"
             className={inputClass}
           />
         </div>
@@ -268,17 +312,41 @@ function HeadroomCard({
           <input
             id="resources-min-memory-percent"
             type="number"
-            value={report.admission.minMemoryAvailablePercent ?? ""}
+            value={values.minMemoryAvailablePercent}
+            min={0}
+            max={100}
+            step={0.5}
             placeholder="Not set"
-            disabled
-            aria-label="Minimum available memory percent (set by the owner)"
-            title="Set by the owner — editing is disabled on this tab"
+            onChange={(e) => markTouched({ ...values, minMemoryAvailablePercent: e.target.value })}
+            aria-label="Minimum available memory percent"
             className={inputClass}
           />
         </div>
       </div>
+      {showValidation && (
+        <div role="alert" className="mt-2 text-[12px] leading-relaxed text-danger">
+          {parsed.errors[0]?.message}
+        </div>
+      )}
+      {error && (
+        <div role="alert" className="mt-2 text-[12px] leading-relaxed text-danger">
+          Couldn’t save headroom.  {error}
+        </div>
+      )}
+      <div className="mt-2.5 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={save}
+          disabled={!canSave}
+          className="flex items-center gap-1.5 rounded-lg bg-control px-3 py-2 text-[13px] font-medium text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {saving ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+          {saving ? "Saving…" : "Save headroom"}
+        </button>
+        <span className="text-[12px] text-ink-secondary">Saves via PUT /api/config, then reloads the report.</span>
+      </div>
       <div className="mt-2 text-[12px] leading-relaxed text-ink-secondary">
-        The owner sets these numbers — this tab shows them read-only and editing is disabled here. 
+        Empty keeps the current value — the save sends the full admission object so unrelated gates are never erased.  Clearing back to unset is a file/vault edit. 
         {report.admission.reservedRamBytes !== undefined && (
           <>Reserved RAM in force: {formatBytes(report.admission.reservedRamBytes)}. </>
         )}
