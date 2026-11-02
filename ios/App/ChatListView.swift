@@ -729,7 +729,10 @@ struct ChatListView: View {
             await session.viewThread(task, for: live)
             if let next = session.state.bot(live.id) { open(Chat.bot(next)) }
         case .none:
-            break
+            // The active thread with no view pinned: nothing to switch or
+            // view, but the row was tapped from the list, so the active
+            // chat still has to open.
+            open(Chat.bot(live))
         }
     }
 

@@ -1916,9 +1916,10 @@ final class Session: ObservableObject {
         state.viewThread(botId: bot.id, threadId: nil)
     }
 
-    /// Fetch the viewed thread's first page when its screen appears with an
-    /// empty cache — the store answers whether a fetch is still needed, so a
-    /// frame that landed first is never refetched.
+    /// Fetch the viewed thread's first page when its screen appears without
+    /// one — the store answers whether a fetch is still needed, so only a
+    /// fetched page suppresses it; frames that landed first are buffered
+    /// and merge after the page instead.
     func ensureViewedThreadLoaded() async {
         guard let botId = state.viewedBotId, let threadId = state.viewedThreadId,
               let bot = state.bot(botId),

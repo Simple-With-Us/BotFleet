@@ -58,6 +58,11 @@ public struct CompanionState: Sendable {
     public var viewedThreadId: String?
     /// Viewed threads whose first transcript page is still in flight.
     public var loadingThread: [String: Bool] = [:]
+    /// Viewed threads whose first transcript page has been fetched. Frames
+    /// that land on a retained thread before any open only buffer into
+    /// `messages[]` — they never set this, so opening the thread later
+    /// still fetches full history and merges those frames after the page.
+    public var loadedThread: [String: Bool] = [:]
     /// The paired Mac's update status, from the last fetch or `update.status`
     /// event.  `nil` until the first of either arrives — not the same as "up
     /// to date", which is a real answer this has to wait for.
@@ -274,9 +279,11 @@ public struct CompanionState: Sendable {
         guard bot.tasks?.contains(where: { $0.threadId == threadId }) == true else { return false }
         viewedBotId = botId
         viewedThreadId = threadId
-        // A thread already held — a fetched page, or frames that landed
-        // while it streamed — needs no fetch; an unopened one does.
-        guard messages[threadId]?.isEmpty != false else { return false }
+        // Only a fetched first page counts as held. Frames that landed on
+        // a retained thread before any open are buffered, not loaded, so
+        // opening it later still fetches full history; an unopened one
+        // always does.
+        guard loadedThread[threadId] != true else { return false }
         if loadingThread[threadId] == true { return false }
         loadingThread[threadId] = true
         return true
@@ -288,6 +295,7 @@ public struct CompanionState: Sendable {
     public mutating func threadTranscriptLoaded(threadId: String, messages page: [Message], hasMore more: Bool?) {
         hydrationRevision &+= 1
         loadingThread.removeValue(forKey: threadId)
+        loadedThread[threadId] = true
         if let existing = messages[threadId], !existing.isEmpty {
             let known = Set(page.map(\.id))
             let extras = existing.filter { !known.contains($0.id) }
@@ -372,6 +380,7 @@ public struct CompanionState: Sendable {
             if staleThreadId == viewedThreadId { continue }
             messages.removeValue(forKey: staleThreadId)
             hasMore.removeValue(forKey: staleThreadId)
+            loadedThread.removeValue(forKey: staleThreadId)
         }
         for bot in fleet.bots {
             mergeHydratedPage(bot.messages, hasMore: bot.hasMore, threadId: bot.threadId)
@@ -595,6 +604,7 @@ public struct CompanionState: Sendable {
                         messages.removeValue(forKey: viewed)
                         hasMore.removeValue(forKey: viewed)
                         loadingThread.removeValue(forKey: viewed)
+                        loadedThread.removeValue(forKey: viewed)
                     }
                 }
             } else {
@@ -624,6 +634,7 @@ public struct CompanionState: Sendable {
                     messages.removeValue(forKey: viewed)
                     hasMore.removeValue(forKey: viewed)
                     loadingThread.removeValue(forKey: viewed)
+                    loadedThread.removeValue(forKey: viewed)
                     viewedBotId = nil
                     viewedThreadId = nil
                 }

@@ -84,9 +84,50 @@ final class ThreadViewTests: XCTestCase {
         XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))
         state.threadTranscriptLoaded(threadId: "thread-b", messages: [message("b1")], hasMore: false)
         XCTAssertNil(state.loadingThread["thread-b"])
-        // Frames that landed first mean the reopen fetches nothing.
+        // A fetched page means the reopen fetches nothing.
         XCTAssertFalse(state.viewThread(botId: botId, threadId: "thread-b"))
         XCTAssertEqual(state.viewingThreadId(forBotId: botId), "thread-b")
+    }
+
+    func testFramesOnAnUnviewedRetainedThreadStillFetchFullHistory() throws {
+        var (state, botId, _) = try busyBot()
+
+        // A frame lands on the retained thread before anyone opens it: it
+        // buffers into the transcript without marking the page loaded.
+        state.apply(Frame.message(threadId: "thread-b", message: message("b-live", at: 9)))
+        XCTAssertEqual(state.transcript(forThread: "thread-b").map(\.id), ["b-live"])
+        XCTAssertNil(state.loadedThread["thread-b"])
+
+        // Opening later still fetches the first page — the buffered frame
+        // alone must never read as a held page.
+        XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))
+        XCTAssertEqual(state.viewingThreadId(forBotId: botId), "thread-b")
+        XCTAssertEqual(state.loadingThread["thread-b"], true)
+
+        // The page arrives and the buffered frame merges after it, with
+        // pagination configured so older messages stay loadable.
+        state.threadTranscriptLoaded(
+            threadId: "thread-b", messages: [message("b1", at: 1)], hasMore: true)
+        XCTAssertEqual(state.transcript(forThread: "thread-b").map(\.id), ["b1", "b-live"])
+        XCTAssertEqual(state.hasMore["thread-b"], true)
+        // Now held: reopening fetches nothing.
+        XCTAssertFalse(state.viewThread(botId: botId, threadId: "thread-b"))
+    }
+
+    func testDroppedViewedPageFetchesAgainOnReopen() throws {
+        var (state, botId, active) = try busyBot()
+        XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))
+        state.threadTranscriptLoaded(threadId: "thread-b", messages: [message("b1")], hasMore: false)
+
+        // Back to the active thread, then a hydrate that drops the unviewed
+        // retained page: the loaded flag goes with it, so the next open
+        // refetches. The bot still lists the thread, so it stays openable.
+        XCTAssertFalse(state.viewThread(botId: botId, threadId: active))
+        XCTAssertNil(state.viewingThreadId(forBotId: botId))
+        state.hydrate(try fleetOwningRetainedThread())
+
+        XCTAssertNil(state.messages["thread-b"])
+        XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))
     }
 
     // MARK: - Picking a thread stays gated on the turn
@@ -111,6 +152,17 @@ final class ThreadViewTests: XCTestCase {
             threadPickIntent(busy: false, active: true, viewing: true, canView: true), .viewActive)
         XCTAssertEqual(
             threadPickIntent(busy: true, active: true, viewing: false, canView: true), .none)
+    }
+
+    func testActivePickWithNoViewNeedsNoneSoTheCallerOpensTheChat() {
+        // `ChatListView.openTask` always passes `canView: true`, so tapping
+        // the active thread's row with no view pinned is `.none` — busy or
+        // idle. That means "already on the active thread", and the caller
+        // opens the active chat for it instead of breaking.
+        XCTAssertEqual(
+            threadPickIntent(busy: true, active: true, viewing: false, canView: true), .none)
+        XCTAssertEqual(
+            threadPickIntent(busy: false, active: true, viewing: false, canView: true), .none)
     }
 
     // MARK: - A streams while B fills
