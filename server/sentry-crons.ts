@@ -19,6 +19,27 @@ import { getSentry, isSentryActive, type SentryNode } from "./sentry.ts";
 type MonitorConfig = NonNullable<Parameters<NonNullable<ReturnType<typeof getSentry>>["captureCheckIn"]>[1]>;
 type CheckIn = Parameters<NonNullable<ReturnType<typeof getSentry>>["captureCheckIn"]>[0];
 
+interface SentryEnvelopeItemPayload {
+  check_in_id?: string;
+  checkInId?: string;
+}
+
+interface SentryEnvelopeItemHeader {
+  type?: string;
+}
+
+type SentryEnvelopeItem = [SentryEnvelopeItemHeader, SentryEnvelopeItemPayload];
+
+interface SentryEnvelopeHeader {
+  event_id?: string;
+}
+
+type SentryEnvelope = [SentryEnvelopeHeader, SentryEnvelopeItem[]];
+
+interface SentryClientWithEvents {
+  on: (event: string, cb: (envelope: SentryEnvelope) => void) => () => void;
+}
+
 /** `a b c` -> `a-b-c`, ASCII-lowercase, no leading/trailing/doubled hyphens. */
 function slugify(value: string): string {
   return value
@@ -117,11 +138,12 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function matchesCheckInEnvelope(envelope: unknown, checkInId: string): boolean {
+function matchesCheckInEnvelope(envelope: SentryEnvelope, checkInId: string): boolean {
   if (!Array.isArray(envelope) || !Array.isArray(envelope[1])) return false;
   for (const item of envelope[1]) {
-    if (Array.isArray(item) && item[1] && typeof item[1] === "object") {
-      const payload = item[1] as Record<string, unknown>;
+    if (Array.isArray(item) && item[1] instanceof Object) {
+      // SAFETY: item[1] is a verified Object within the envelope items list.
+      const payload = item[1] as SentryEnvelopeItemPayload;
       if (payload.check_in_id === checkInId || payload.checkInId === checkInId) {
         return true;
       }
@@ -163,7 +185,7 @@ async function deliverCheckInClose(
   onSettled?: CheckInCloseSettledCallback,
   initialAttempt?: { state: { confirmed: boolean }; unhook?: () => void },
 ): Promise<void> {
-  const targetId = "checkInId" in checkIn && typeof checkIn.checkInId === "string" ? checkIn.checkInId : undefined;
+  const targetId = "checkInId" in checkIn ? checkIn.checkInId : undefined;
 
   for (let attempt = 0; ; attempt += 1) {
     let delivered = false;
@@ -175,11 +197,12 @@ async function deliverCheckInClose(
       const attemptState = { confirmed: false };
       let unhook: (() => void) | undefined;
       try {
-        const client = typeof sdk.getClient === "function" ? sdk.getClient() : undefined;
-        if (client && typeof (client as { on?: unknown }).on === "function" && targetId) {
-          unhook = (client as { on: (event: string, cb: (env: unknown) => void) => () => void }).on(
+        const client = "getClient" in sdk && sdk.getClient ? sdk.getClient() : undefined;
+        if (client && "on" in client && Boolean(client.on) && targetId) {
+          // SAFETY: client.on is a verified event-subscription method on the Sentry client.
+          unhook = (client as SentryClientWithEvents).on(
             "afterEnvelope",
-            (envelope: unknown) => {
+            (envelope: SentryEnvelope) => {
               if (matchesCheckInEnvelope(envelope, targetId)) {
                 attemptState.confirmed = true;
               }
@@ -244,17 +267,20 @@ export function checkInRoutineFinish(
     monitorSlug: routineMonitorSlug(run),
     status: ok ? "ok" : "error",
     checkInId,
-    ...(duration !== undefined ? { duration } : {}),
   };
+  if (duration !== undefined) {
+    checkIn.duration = duration;
+  }
 
   const initialAttemptState = { confirmed: false };
   let unhook: (() => void) | undefined;
   try {
-    const client = typeof sdk.getClient === "function" ? sdk.getClient() : undefined;
-    if (client && typeof (client as { on?: unknown }).on === "function") {
-      unhook = (client as { on: (event: string, cb: (env: unknown) => void) => () => void }).on(
+    const client = "getClient" in sdk && sdk.getClient ? sdk.getClient() : undefined;
+    if (client && "on" in client && Boolean(client.on)) {
+      // SAFETY: client.on is a verified event-subscription method on the Sentry client.
+      unhook = (client as SentryClientWithEvents).on(
         "afterEnvelope",
-        (envelope: unknown) => {
+        (envelope: SentryEnvelope) => {
           if (matchesCheckInEnvelope(envelope, checkInId)) {
             initialAttemptState.confirmed = true;
           }

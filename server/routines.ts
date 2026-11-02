@@ -668,14 +668,17 @@ export class RoutineManager {
       // or Sentry only learns of the failure when the monitor times out.
       // `this.options` is assigned first thing in the constructor, and the
       // server applies its Sentry settings before building this manager.
-      for (const run of recovered) {
-        if (run.sentryCheckInId) this.closeCheckIn(run, run.sentryCheckInId, false);
+      // Pass the canonical run in this.runs so pendingClose persists to disk.
+      for (const rec of recovered) {
+        const canonical = this.runs.find((r) => r.id === rec.id) ?? rec;
+        if (canonical.sentryCheckInId) this.closeCheckIn(canonical, canonical.sentryCheckInId, false);
       }
     }
     // Reconcile unclosed check-ins that were in-flight or pending when the
-    // server stopped or crashed.
+    // server stopped or crashed (skipping runs just recovered above).
+    const recoveredIds = new Set(recovered.map((r) => r.id));
     for (const run of this.runs) {
-      if (run.pendingClose && run.status !== "running" && run.status !== "waiting") {
+      if (run.pendingClose && !recoveredIds.has(run.id) && run.status !== "running" && run.status !== "waiting") {
         const checkInId = run.pendingClose.checkInId || run.sentryCheckInId;
         if (checkInId) {
           const isOk = run.pendingClose.status === "ok";
@@ -1995,14 +1998,18 @@ export class RoutineManager {
   }
 
   private closeCheckIn(run: RoutineRun, checkInId: string, ok: boolean): void {
-    run.pendingClose = {
+    const canonical = this.runs.find((r) => r.id === run.id) ?? run;
+    canonical.pendingClose = {
       status: ok ? "ok" : "error",
-      attempts: run.pendingClose?.attempts ?? 0,
+      attempts: canonical.pendingClose?.attempts ?? 0,
       checkInId,
     };
+    if (run !== canonical) {
+      run.pendingClose = canonical.pendingClose;
+    }
     this.save();
-    this.options.checkInFinish?.(run, checkInId, ok, (delivered) => {
-      this.onCheckInSettled(run.id, delivered);
+    this.options.checkInFinish?.(canonical, checkInId, ok, (delivered) => {
+      this.onCheckInSettled(canonical.id, delivered);
     });
   }
 

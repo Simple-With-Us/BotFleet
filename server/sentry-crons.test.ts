@@ -371,14 +371,15 @@ describe("checkInRoutineFinish close delivery", () => {
 
   it("confirms delivery and notifies onSettled when afterEnvelope verifies acceptance", async () => {
     vi.useFakeTimers();
+    type MockEnvelope = [Record<string, string>, Array<[Record<string, string>, Record<string, string>]>];
     const checkIns: SentryCheckIn[] = [];
-    const listeners: Array<(envelope: unknown) => void> = [];
+    const listeners: Array<(envelope: MockEnvelope) => void> = [];
 
     const client = {
       getDsn: () => ({}),
       getOptions: () => ({ enabled: true }),
       getTransport: () => ({}),
-      on(event: string, cb: (envelope: unknown) => void) {
+      on(event: string, cb: (envelope: MockEnvelope) => void) {
         if (event === "afterEnvelope") listeners.push(cb);
         return () => {
           const idx = listeners.indexOf(cb);
@@ -387,6 +388,7 @@ describe("checkInRoutineFinish close delivery", () => {
       },
     };
 
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
     const sdk = Object.assign({} as FakeSentrySdk, {
       init() {},
       close() { return Promise.resolve(true); },
@@ -397,7 +399,7 @@ describe("checkInRoutineFinish close delivery", () => {
         checkIns.push(checkIn);
         if ("checkInId" in checkIn) {
           queueMicrotask(() => {
-            for (const listener of [...listeners]) {
+            for (const listener of listeners) {
               listener([{}, [[{ type: "check_in" }, { check_in_id: checkIn.checkInId }]]]);
             }
           });
@@ -435,15 +437,16 @@ describe("checkInRoutineFinish close delivery", () => {
 
   it("retries when flush succeeds but afterEnvelope never fires (transport drop)", async () => {
     vi.useFakeTimers();
+    type MockEnvelope = [Record<string, string>, Array<[Record<string, string>, Record<string, string>]>];
     const checkIns: SentryCheckIn[] = [];
-    const listeners: Array<(envelope: unknown) => void> = [];
+    const listeners: Array<(envelope: MockEnvelope) => void> = [];
     let callCount = 0;
 
     const client = {
       getDsn: () => ({}),
       getOptions: () => ({ enabled: true }),
       getTransport: () => ({}),
-      on(event: string, cb: (envelope: unknown) => void) {
+      on(event: string, cb: (envelope: MockEnvelope) => void) {
         if (event === "afterEnvelope") listeners.push(cb);
         return () => {
           const idx = listeners.indexOf(cb);
@@ -452,6 +455,7 @@ describe("checkInRoutineFinish close delivery", () => {
       },
     };
 
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
     const sdk = Object.assign({} as FakeSentrySdk, {
       init() {},
       close() { return Promise.resolve(true); },
@@ -465,7 +469,7 @@ describe("checkInRoutineFinish close delivery", () => {
         // Attempt 2 succeeds and emits afterEnvelope.
         if (callCount === 2 && "checkInId" in checkIn) {
           queueMicrotask(() => {
-            for (const listener of [...listeners]) {
+            for (const listener of listeners) {
               listener([{}, [[{ type: "check_in" }, { check_in_id: checkIn.checkInId }]]]);
             }
           });
