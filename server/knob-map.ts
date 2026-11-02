@@ -298,6 +298,67 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     infisicalName: "BOTFLEET_AGENT_PROXY_PATH",
     kind: "string",
   },
+  {
+    // The computer-call gate's waits (server/computer-call-gate.ts),
+    // resolved per call from the live cfg in server/index.ts.  Bounds are
+    // the gate's own clamps: no wait may outlast the bridge client blocked
+    // on it.  The legacy OMB_COMPUTER_* env names remain as the fallback
+    // underneath these fields in `computerCallSettings` (server/config.ts).
+    id: "computerCall.waitMs",
+    label: "Computer call wait",
+    section: "computerCall",
+    path: ["waitMs"],
+    infisicalName: "BOTFLEET_COMPUTER_CALL_WAIT_MS",
+    kind: "int",
+    min: 500,
+    max: 45000,
+  },
+  {
+    id: "computerCall.actWithinMs",
+    label: "Computer call act-within window",
+    section: "computerCall",
+    path: ["actWithinMs"],
+    infisicalName: "BOTFLEET_COMPUTER_CALL_ACT_WITHIN_MS",
+    kind: "int",
+    min: 100,
+    max: 5000,
+  },
+  {
+    id: "computerCall.personAwayMs",
+    label: "Computer call person-away ceiling",
+    section: "computerCall",
+    path: ["personAwayMs"],
+    infisicalName: "BOTFLEET_COMPUTER_CALL_WAIT_MAX_MS",
+    kind: "int",
+    min: 1,
+    max: 2_147_483_647,
+  },
+  {
+    // Read once when the Claude driver is created (server/drivers/claude.ts),
+    // so a change applies on the next provider rebuild — a Settings save of
+    // this section rebuilds the fleet (it is deliberately absent from
+    // CONFIG_KEYS_WITHOUT_PROVIDER_RELOAD).  The legacy
+    // OMB_CLAUDE_SESSION_IDLE_* env names remain as the fallback underneath
+    // these fields in `claudeSessionIdleMs` (server/config.ts).
+    id: "claudeSession.idleMs",
+    label: "Claude session idle lifetime",
+    section: "claudeSession",
+    path: ["idleMs"],
+    infisicalName: "BOTFLEET_CLAUDE_SESSION_IDLE_MS",
+    kind: "int",
+    min: 1,
+    max: 2_147_483_647,
+  },
+  {
+    id: "claudeSession.idleMinMs",
+    label: "Claude session idle lifetime floor",
+    section: "claudeSession",
+    path: ["idleMinMs"],
+    infisicalName: "BOTFLEET_CLAUDE_SESSION_IDLE_MIN_MS",
+    kind: "int",
+    min: 1,
+    max: 2_147_483_647,
+  },
 ] as const;
 
 /** Every Infisical name this process will accept as a knob, built once from

@@ -16,7 +16,7 @@ import { join, dirname } from "node:path";
 
 import { z } from "zod";
 
-import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
+import { claudeSessionIdleMs, DATA_DIR, loadConfig, stripWorkspaceCredentialEnv } from "../config.ts";
 import { ClaudeSingleCallLedger } from "../claude-billed-call.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { augmentedPath } from "../env-path.ts";
@@ -1069,11 +1069,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     const cliCostTotals = new Map<string, number>();
     const sessions = new Map<string, Session>();
     sweepReceiptsOnce();
-    const configuredIdleMinimum = Number(process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS);
-    const sessionIdleMinimum = Number.isFinite(configuredIdleMinimum) && configuredIdleMinimum > 0
-      ? configuredIdleMinimum
-      : 10_000;
-    const SESSION_IDLE_MS = Math.max(sessionIdleMinimum, Number(process.env.OMB_CLAUDE_SESSION_IDLE_MS) || 10 * 60_000);
+    // Resolved from cfg (file, vault knob, legacy env underneath — see
+    // `claudeSessionIdleMs` in server/config.ts) at create time, the same
+    // moment the env names were read before this became a knob.  A
+    // Settings save of `claudeSession` rebuilds the provider fleet, so the
+    // new window applies then; `loadConfig()` here follows the pattern
+    // server/container-computer.ts uses for its own cfg reads.
+    const SESSION_IDLE_MS = claudeSessionIdleMs(loadConfig());
 
     const closeSession = (threadId: string, why: string) => {
       const s = sessions.get(threadId);
