@@ -8,6 +8,7 @@ import {
   Bug,
   Clock,
   Crown,
+  Eye,
   Folder,
   ListTree,
   Loader2,
@@ -695,6 +696,10 @@ function Bubble({
  * contents, is what this is for. */
 const NO_QUEUE: ReadonlyArray<{ queueId: string; text: string }> = [];
 
+/** Shared empty transcript for a browsed thread whose first page has
+ * not landed yet.  Same identity reasoning as NO_QUEUE above. */
+const NO_MESSAGES: Message[] = [];
+
 function ActivityChip({ bot, message }: { bot: Bot, message: Message }) {
   const { dispatch } = useStore();
   const [expanded, setExpanded] = useState(false);
@@ -1142,17 +1147,30 @@ function formatHoverTime(at: number) {
 }
 
 export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; explicitThreadId?: string }) {
-  // A pin onto a different thread for App views.  Memoized so the derived
-  // object keeps a stable identity across renders and effects don't churn
-  // when the pin isn't shadowing anything.
+  const { state, dispatch } = useStore();
+  // A pin onto a different thread for App views and busy-time browsing.
+  // The derived bot reads that thread's own cached transcript — never
+  // the active thread's messages under the viewed thread's id.
+  // Memoized so the derived object keeps a stable identity across
+  // renders and effects don't churn when the pin isn't shadowing anything.
+  const viewingOther = Boolean(explicitThreadId && explicitThreadId !== originalBot.threadId);
+  const viewedMessages = explicitThreadId ? state.threadTranscripts[explicitThreadId] : undefined;
+  const viewedLoading = explicitThreadId ? Boolean(state.loadingThread[explicitThreadId]) : false;
   const bot = useMemo(
     () =>
-      explicitThreadId && explicitThreadId !== originalBot.threadId
-        ? { ...originalBot, threadId: explicitThreadId }
+      viewingOther && explicitThreadId
+        ? { ...originalBot, threadId: explicitThreadId, messages: viewedMessages ?? NO_MESSAGES }
         : originalBot,
-    [originalBot, explicitThreadId],
+    [originalBot, explicitThreadId, viewingOther, viewedMessages],
   );
-  const { state, dispatch } = useStore();
+  // First open of a retained thread fetches its page; later frames keep
+  // the cache live through the reducer.  The store wrapper dedupes
+  // concurrent fetches for the same thread.
+  useEffect(() => {
+    if (viewingOther && explicitThreadId && !viewedMessages && !viewedLoading) {
+      dispatch({ type: "viewThread", botId: originalBot.id, threadId: explicitThreadId });
+    }
+  }, [viewingOther, explicitThreadId, viewedMessages, viewedLoading, originalBot.id, dispatch]);
   const { capabilities } = useDesktopCapabilities();
   const macInset = capabilities.windowChrome === "mac-inset";
   const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
@@ -1632,7 +1650,47 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
         </div>
       </div>
 
-      <ThreadTabs bot={bot} />
+      <ThreadTabs bot={originalBot} />
+
+      {/* Browsing a retained thread is read-only: the bot keeps working
+          in its active thread, and becoming the execution target stays
+          gated on the turn finishing, exactly as tab switching was. */}
+      {viewingOther && explicitThreadId && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-hairline/40 bg-raised/40 px-4 py-1.5 text-[12.5px] text-ink-secondary"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Eye size={13} className="shrink-0" />
+            <span className="truncate">
+              Viewing “{originalBot.tasks?.find((task) => task.threadId === explicitThreadId)?.title || "Untitled"}”
+              {viewedLoading && !viewedMessages ? " — loading…" : ""}
+              {" · "}
+              {originalBot.busy
+                ? `${originalBot.name} is working in “${originalBot.tasks?.find((task) => task.threadId === originalBot.threadId)?.title || "Untitled"}”.`
+                : `The active thread is “${originalBot.tasks?.find((task) => task.threadId === originalBot.threadId)?.title || "Untitled"}”.`}
+            </span>
+          </span>
+          <span className="ml-auto flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              disabled={Boolean(originalBot.busy)}
+              title={originalBot.busy ? "Let this turn finish first" : "Make this the active thread"}
+              onClick={() => dispatch({ type: "switchTask", botId: originalBot.id, threadId: explicitThreadId })}
+              className="rounded-full border border-hairline/40 px-2.5 py-0.5 text-ink hover:bg-raised disabled:opacity-40"
+            >
+              Switch to this thread
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "viewThread", botId: originalBot.id, threadId: null })}
+              className="rounded-full border border-hairline/40 px-2.5 py-0.5 text-ink hover:bg-raised"
+            >
+              Back to active thread
+            </button>
+          </span>
+        </div>
+      )}
 
       {findOpen && !trajectoryOpen && <ChatFindBar threadId={bot.threadId} onClose={() => setFindOpen(false)} />}
 
@@ -1819,9 +1877,10 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
         </div>
       </div>
 
-      {/* keyed by bot: a draft belongs to the conversation it was typed in,
-          so switching bots starts from an empty composer instead of carrying
-          the previous bot's half-written message over. ArrowUp-to-edit is
+      {/* keyed by bot and shown thread: a draft belongs to the conversation
+          it was typed in, so switching bots — or browsing a retained
+          thread — starts from that thread's composer instead of carrying
+          the previous thread's half-written message over. ArrowUp-to-edit is
           gated on busy like the pencil button — editing rewinds the thread,
           which a live turn forbids (the server 409s it). */}
       <div
@@ -1840,7 +1899,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
       <div className="w-full">
       <UpdateDrainNotice />
       <Composer
-        key={bot.id}
+        key={`${bot.id}:${bot.threadId}`}
         bot={bot}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}

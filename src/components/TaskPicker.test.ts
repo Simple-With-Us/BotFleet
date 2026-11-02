@@ -4,6 +4,7 @@ import {
   TASK_PICKER_DISMISS_MS,
   TASK_RENAME_HINT,
   taskPickerPointerIntent,
+  threadPickIntent,
 } from "./TaskPicker";
 
 describe("taskPickerPointerIntent", () => {
@@ -25,6 +26,27 @@ describe("taskPickerPointerIntent", () => {
 
   it("ignores unrelated events", () => {
     expect(taskPickerPointerIntent("mousedown")).toBe("ignore");
+  });
+});
+
+describe("threadPickIntent", () => {
+  it("views instead of switching while busy, when viewing is offered", () => {
+    expect(threadPickIntent({ busy: true, active: false, viewing: false, canView: true })).toBe("view");
+    // without a view affordance the busy gate is exactly what it was
+    expect(threadPickIntent({ busy: true, active: false, viewing: false, canView: false })).toBe("none");
+  });
+
+  it("switches (activates) only when the bot is idle", () => {
+    expect(threadPickIntent({ busy: false, active: false, viewing: false, canView: true })).toBe("switch");
+    expect(threadPickIntent({ busy: false, active: false, viewing: true, canView: true })).toBe("switch");
+    expect(threadPickIntent({ busy: false, active: false, viewing: false, canView: false })).toBe("switch");
+  });
+
+  it("returns to the active thread from a view, and otherwise leaves the active row alone", () => {
+    expect(threadPickIntent({ busy: true, active: true, viewing: true, canView: true })).toBe("viewActive");
+    expect(threadPickIntent({ busy: false, active: true, viewing: true, canView: true })).toBe("viewActive");
+    expect(threadPickIntent({ busy: true, active: true, viewing: false, canView: true })).toBe("none");
+    expect(threadPickIntent({ busy: true, active: true, viewing: true, canView: false })).toBe("none");
   });
 });
 

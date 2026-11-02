@@ -1012,6 +1012,15 @@ export interface AppState {
   /** Threads with a scrollback page in flight — the pill says "Loading…"
    * instead of firing a second request per click. */
   loadingEarlier: Record<string, boolean>;
+  /** Transcripts of threads opened for reading while they are not their
+   * bot's active (execution) thread, keyed by threadId.  Browsing a
+   * retained thread while the bot works reads from here; the active
+   * thread's transcript stays on the bot itself, so viewing never
+   * disturbs the turn in flight.  Fed by the per-thread messages route
+   * and by the same SSE message frames, applied by threadId. */
+  threadTranscripts: Record<string, Message[]>;
+  /** Viewed threads whose first transcript page is still in flight. */
+  loadingThread: Record<string, boolean>;
 }
 
 /** Messages hydrated per thread on a cold start.
@@ -1069,6 +1078,13 @@ export type Action =
   | { type: "loadEarlier"; threadId: string }
   | { type: "earlierLoading"; threadId: string }
   | { type: "earlierLoaded"; threadId: string; messages: Message[]; hasMore: boolean }
+  /** Open a thread for reading without making it the execution target.
+   * `threadId: null` (or the bot's active thread) returns to the active
+   * thread.  The wrapper fetches the transcript on a cache miss; the
+   * busy guard on switching is untouched. */
+  | { type: "viewThread"; botId: string; threadId: string | null }
+  | { type: "threadTranscriptLoaded"; threadId: string; messages: Message[]; hasMore: boolean }
+  | { type: "threadTranscriptFailed"; threadId: string }
   | { type: "showRoutines"; routineId?: string }
   | { type: "showTeamMap" }
   | { type: "showSkillRecorder" }
@@ -1380,6 +1396,34 @@ export function prependEarlier(current: Message[], earlier: Message[]): Message[
   return fresh.length ? [...fresh, ...current] : current;
 }
 
+/** Apply a live frame to a browsed (non-active) thread's cached
+ * transcript.  Returns the state unchanged when the thread was never
+ * opened — an unopened thread costs no memory, and its page is fetched
+ * whole when the reader first opens it. */
+function appendToCachedTranscript(state: AppState, threadId: string, incoming: Message[]): AppState {
+  const cached = state.threadTranscripts[threadId];
+  if (!cached) return state;
+  const known = new Set(cached.map((message) => message.id));
+  const fresh = incoming.filter((message) => !known.has(message.id));
+  if (!fresh.length) return state;
+  return {
+    ...state,
+    threadTranscripts: { ...state.threadTranscripts, [threadId]: [...cached, ...fresh] },
+  };
+}
+
+function patchCachedTranscript(state: AppState, threadId: string, message: Message): AppState {
+  const cached = state.threadTranscripts[threadId];
+  if (!cached?.some((candidate) => candidate.id === message.id)) return state;
+  return {
+    ...state,
+    threadTranscripts: {
+      ...state.threadTranscripts,
+      [threadId]: cached.map((candidate) => (candidate.id === message.id ? message : candidate)),
+    },
+  };
+}
+
 /** Transcript to apply from a bot frame, or undefined to keep the current one.
  * A switch frame with messages always wins. A later snapshot for the same
  * thread replaces only when it shares no ids with the transcript on screen.
@@ -1431,6 +1475,11 @@ export function reducer(state: AppState, action: Action): AppState {
         // for a thread the server just sent in full
         hasMore: hydratedHasMore(action.bots, action.groups),
         loadingEarlier: {},
+        // A hydrate replaces every active transcript from the server;
+        // cached browsed pages may have missed frames while away, so
+        // they are refetched on next view instead of trusted.
+        threadTranscripts: {},
+        loadingThread: {},
       };
     }
     // an effect-only action: the wrapper fetches, and `earlierLoaded` lands
@@ -1444,10 +1493,14 @@ export function reducer(state: AppState, action: Action): AppState {
       delete loadingEarlier[action.threadId];
       const hasMore = { ...state.hasMore, [action.threadId]: action.hasMore };
       if (!action.messages.length) return { ...state, loadingEarlier, hasMore };
+      const cached = state.threadTranscripts[action.threadId];
       return {
         ...state,
         loadingEarlier,
         hasMore,
+        threadTranscripts: cached
+          ? { ...state.threadTranscripts, [action.threadId]: prependEarlier(cached, action.messages) }
+          : state.threadTranscripts,
         bots: state.bots.map((bot) =>
           bot.threadId === action.threadId
             ? { ...bot, messages: prependEarlier(bot.messages, action.messages) }
@@ -1459,6 +1512,50 @@ export function reducer(state: AppState, action: Action): AppState {
             : group,
         ),
       };
+    }
+    case "viewThread": {
+      const bot = state.bots.find((candidate) => candidate.id === action.botId);
+      if (!bot) return state;
+      // Viewing is passive: it moves only the pin, never bot.threadId,
+      // so the running turn keeps its execution target.  A null (or the
+      // active thread itself) simply drops the pin.
+      if (!action.threadId || action.threadId === bot.threadId) {
+        return state.viewedThreadId === null ? state : { ...state, viewedThreadId: null };
+      }
+      if (!(bot.tasks ?? []).some((task) => task.threadId === action.threadId)) return state;
+      const needsFetch = !state.threadTranscripts[action.threadId];
+      return {
+        ...state,
+        viewedThreadId: action.threadId,
+        loadingThread: needsFetch
+          ? { ...state.loadingThread, [action.threadId]: true }
+          : state.loadingThread,
+      };
+    }
+    case "threadTranscriptLoaded": {
+      const loadingThread = { ...state.loadingThread };
+      delete loadingThread[action.threadId];
+      // Frames that landed in the cache while the page was in flight are
+      // newer than anything the page holds; keep them after the page.
+      const existing = state.threadTranscripts[action.threadId];
+      let messages = action.messages;
+      if (existing?.length) {
+        const known = new Set(messages.map((message) => message.id));
+        const extras = existing.filter((message) => !known.has(message.id));
+        if (extras.length) messages = [...messages, ...extras];
+      }
+      return {
+        ...state,
+        loadingThread,
+        hasMore: { ...state.hasMore, [action.threadId]: action.hasMore },
+        threadTranscripts: { ...state.threadTranscripts, [action.threadId]: messages },
+      };
+    }
+    case "threadTranscriptFailed": {
+      if (!state.loadingThread[action.threadId]) return state;
+      const loadingThread = { ...state.loadingThread };
+      delete loadingThread[action.threadId];
+      return { ...state, loadingThread };
     }
     case "showRoutines":
       return {
@@ -1714,7 +1811,9 @@ export function reducer(state: AppState, action: Action): AppState {
       if (!bot) {
         // room thread — plain linear append, no branching/mascot machinery
         const group = state.groups.find((g) => g.threadId === action.threadId);
-        if (!group) return state;
+        // A browsed non-active thread keeps receiving frames into its
+        // cache; the active thread's transcript is not touched.
+        if (!group) return appendToCachedTranscript(state, action.threadId, [action.message]);
         if (group.messages.some((m) => m.id === action.message.id)) return state;
         return {
           ...state,
@@ -1772,7 +1871,7 @@ export function reducer(state: AppState, action: Action): AppState {
       const bot = state.bots.find((b) => b.threadId === action.threadId);
       if (!bot) {
         const group = state.groups.find((g) => g.threadId === action.threadId);
-        if (!group) return state;
+        if (!group) return appendToCachedTranscript(state, action.threadId, action.messages);
         const known = new Set(group.messages.map((m) => m.id));
         const fresh = action.messages.filter((m) => !known.has(m.id));
         if (fresh.length === 0) return state;
@@ -1804,7 +1903,7 @@ export function reducer(state: AppState, action: Action): AppState {
       const bot = state.bots.find((b) => b.threadId === action.threadId);
       if (!bot) {
         const group = state.groups.find((g) => g.threadId === action.threadId);
-        if (!group) return state;
+        if (!group) return patchCachedTranscript(state, action.threadId, action.message);
         return {
           ...state,
           groups: state.groups.map((g) =>
@@ -2317,6 +2416,7 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     }
     case "taskSwitched": {
+      const before = state.bots.find((candidate) => candidate.id === action.bot.id);
       const next = updateBot(state, action.bot.id, (bot) => ({
         ...bot,
         ...action.bot,
@@ -2325,9 +2425,33 @@ export function reducer(state: AppState, action: Action): AppState {
         // an empty thread until a later frame; keep what we have.
         messages: action.bot.messages ?? bot.messages,
       }));
+      // The thread the bot just left stays readable from the cache, so
+      // browsing back to it does not need a round trip.  Only a full
+      // switch (one that carried its transcript) proves the old
+      // transcript on screen really belongs to the old thread.
+      const stashed =
+        before && action.bot.messages && action.bot.threadId !== before.threadId && before.messages.length
+          ? { ...next, threadTranscripts: { ...state.threadTranscripts, [before.threadId]: before.messages } }
+          : next;
+      // A full switch answer is also how a delete lands: a thread the
+      // bot no longer lists has no readable future, so its cached page
+      // goes with it instead of outliving the conversation.
+      if (before && action.bot.tasks) {
+        const kept = new Set(action.bot.tasks.map((task) => task.threadId));
+        const dropped = (before.tasks ?? []).filter(
+          (task) => !kept.has(task.threadId) && stashed.threadTranscripts[task.threadId],
+        );
+        if (dropped.length) {
+          const threadTranscripts = { ...stashed.threadTranscripts };
+          for (const task of dropped) delete threadTranscripts[task.threadId];
+          return state.selectedId === action.bot.id
+            ? { ...stashed, threadTranscripts, viewedThreadId: null }
+            : { ...stashed, threadTranscripts };
+        }
+      }
       // The pin points at a thread; the active thread just changed, so the
       // pin is stale.  Clearing it is a no-op when it already agreed.
-      return state.selectedId === action.bot.id ? { ...next, viewedThreadId: null } : next;
+      return state.selectedId === action.bot.id ? { ...stashed, viewedThreadId: null } : stashed;
     }
     case "newBot":
     case "duplicateBot":
@@ -2393,6 +2517,8 @@ export const initialState: AppState = {
   groupEpoch: {},
   hasMore: {},
   loadingEarlier: {},
+  threadTranscripts: {},
+  loadingThread: {},
 };
 
 // ── API response contracts ─────────────────────────────────────────────
@@ -2682,6 +2808,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // only StreamContext consumers
   const [stream, setStream] = useState<StreamState>(EMPTY_STREAM);
   const deltaBuffer = useRef(new Map<string, { text: string; reasoning: string }>());
+  /** Browsed-thread transcript fetches in flight, by threadId.  The
+   * reducer's loadingThread flag cannot guard this on its own: the
+   * wrapper runs before the render that would publish the flag. */
+  const threadFetchInFlight = useRef(new Set<string>());
   const deltaFlush = useRef<number | null>(null);
   const clearStream = (threadId: string) => {
     // Drop the thread's un-flushed deltas too: the settled message that
@@ -3367,12 +3497,39 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           break;
         }
+        case "viewThread": {
+          const threadId = action.threadId;
+          if (!threadId) break;
+          const current = stateRef.current;
+          const bot = current.bots.find((candidate) => candidate.id === action.botId);
+          // Only a retained, non-active thread needs its own page; the
+          // active thread already lives on the bot.  Reading never
+          // consults busy — that guard stays on switching alone.
+          if (!bot || bot.threadId === threadId) break;
+          if (current.threadTranscripts[threadId] || threadFetchInFlight.current.has(threadId)) break;
+          threadFetchInFlight.current.add(threadId);
+          api(`/api/threads/${threadId}/messages?limit=${INITIAL_PAGE}`)
+            .then((page: { messages?: Message[]; hasMore?: boolean }) =>
+              rawDispatch({
+                type: "threadTranscriptLoaded",
+                threadId,
+                messages: page?.messages ?? [],
+                hasMore: page?.hasMore === true,
+              }),
+            )
+            .catch((error) => {
+              rawDispatch({ type: "threadTranscriptFailed", threadId });
+              showError(error);
+            })
+            .finally(() => threadFetchInFlight.current.delete(threadId));
+          break;
+        }
         case "loadEarlier": {
           const current = stateRef.current;
           const conversation =
             current.bots.find((bot) => bot.threadId === action.threadId) ??
             current.groups.find((group) => group.threadId === action.threadId);
-          const oldest = conversation?.messages[0]?.id;
+          const oldest = conversation?.messages[0]?.id ?? current.threadTranscripts[action.threadId]?.[0]?.id;
           // nothing loaded yet means the hydrate is still in flight; it will
           // bring the tail and the flag, and the pill will be there after
           if (!oldest || current.loadingEarlier[action.threadId]) break;

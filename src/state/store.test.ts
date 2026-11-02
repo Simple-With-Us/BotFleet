@@ -1407,3 +1407,127 @@ describe("selectionNonce", () => {
     expect(botGone.selectionNonce).toBe(open.selectionNonce);
   });
 });
+
+describe("browsing a retained thread while the bot works", () => {
+  const message = (id: string): Message => ({ id, role: "bot", kind: "text", text: id, at: 1 });
+  const busyBot = {
+    id: "worker",
+    threadId: "thread-a",
+    name: "Worker",
+    title: "",
+    description: "",
+    notifications: true,
+    color: "blue",
+    unread: false,
+    busy: true,
+    modelSelection: { instanceId: "codex", model: "gpt" },
+    messages: [message("a1")],
+    tasks: [
+      { threadId: "thread-a", title: "Active", createdAt: 1 },
+      { threadId: "thread-b", title: "Retained", createdAt: 2 },
+    ],
+  } satisfies Bot;
+  const open = { ...initialState, bots: [busyBot], selectedId: "worker" };
+
+  it("views thread B without moving the execution target or its transcript", () => {
+    const viewed = reducer(open, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    expect(viewed.viewedThreadId).toBe("thread-b");
+    expect(viewed.bots[0]?.threadId).toBe("thread-a");
+    expect(viewed.bots[0]?.busy).toBe(true);
+    expect(viewed.bots[0]?.messages.map((entry) => entry.id)).toEqual(["a1"]);
+    // a first open needs its own page from the messages route
+    expect(viewed.loadingThread["thread-b"]).toBe(true);
+  });
+
+  it("refuses to view a thread the bot does not own, and clears the pin for the active thread", () => {
+    const viewed = reducer(open, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    expect(reducer(viewed, { type: "viewThread", botId: "worker", threadId: "elsewhere" })).toBe(viewed);
+    expect(reducer(viewed, { type: "viewThread", botId: "worker", threadId: "thread-a" }).viewedThreadId).toBeNull();
+    expect(reducer(viewed, { type: "viewThread", botId: "worker", threadId: null }).viewedThreadId).toBeNull();
+  });
+
+  it("keeps A streaming into the bot while B fills and updates its own cache", () => {
+    let state = reducer(open, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    state = reducer(state, {
+      type: "threadTranscriptLoaded",
+      threadId: "thread-b",
+      messages: [message("b1")],
+      hasMore: false,
+    });
+    expect(state.loadingThread["thread-b"]).toBeUndefined();
+    // A is still the execution target: its frames land on the bot
+    state = reducer(state, { type: "messageAdded", threadId: "thread-a", message: message("a2") });
+    expect(state.bots[0]?.messages.map((entry) => entry.id)).toEqual(["a1", "a2"]);
+    // B keeps receiving frames by threadId without touching A's transcript
+    state = reducer(state, { type: "messageAdded", threadId: "thread-b", message: message("b2") });
+    state = reducer(state, {
+      type: "messagePatched",
+      threadId: "thread-b",
+      message: { ...message("b2"), text: "edited" },
+    });
+    state = reducer(state, { type: "messagesAdded", threadId: "thread-b", messages: [message("b3")] });
+    expect(state.threadTranscripts["thread-b"]?.map((entry) => entry.id)).toEqual(["b1", "b2", "b3"]);
+    expect(state.threadTranscripts["thread-b"]?.[1]?.text).toBe("edited");
+    expect(state.bots[0]?.messages.map((entry) => entry.id)).toEqual(["a1", "a2"]);
+    expect(state.bots[0]?.threadId).toBe("thread-a");
+    // duplicate frames are dropped, unopened threads stay uncached
+    const dupes = reducer(state, { type: "messageAdded", threadId: "thread-b", message: message("b3") });
+    expect(dupes.threadTranscripts["thread-b"]).toHaveLength(3);
+    const unopened = reducer(open, { type: "messageAdded", threadId: "thread-b", message: message("b1") });
+    expect(unopened.threadTranscripts["thread-b"]).toBeUndefined();
+  });
+
+  it("prepends scrollback into the cache and stashes the left thread on a real switch", () => {
+    let state = reducer(open, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    state = reducer(state, {
+      type: "threadTranscriptLoaded",
+      threadId: "thread-b",
+      messages: [message("b2")],
+      hasMore: true,
+    });
+    state = reducer(state, {
+      type: "earlierLoaded",
+      threadId: "thread-b",
+      messages: [message("b1")],
+      hasMore: false,
+    });
+    expect(state.threadTranscripts["thread-b"]?.map((entry) => entry.id)).toEqual(["b1", "b2"]);
+    expect(state.hasMore["thread-b"]).toBe(false);
+
+    const switched = reducer(open, {
+      type: "taskSwitched",
+      bot: { id: "worker", threadId: "thread-b", messages: [message("b1")] },
+    });
+    expect(switched.bots[0]?.threadId).toBe("thread-b");
+    expect(switched.threadTranscripts["thread-a"]?.map((entry) => entry.id)).toEqual(["a1"]);
+    expect(switched.viewedThreadId).toBeNull();
+
+    // the same answer shape after a delete drops the deleted page
+    const deleted = reducer(state, {
+      type: "taskSwitched",
+      bot: {
+        id: "worker",
+        threadId: "thread-a",
+        messages: [message("a1")],
+        tasks: [{ threadId: "thread-a", title: "Active", createdAt: 1 }],
+      },
+    });
+    expect(deleted.threadTranscripts["thread-b"]).toBeUndefined();
+  });
+
+  it("drops cached pages on hydrate so a reconnect refetches instead of trusting them", () => {
+    const cached = {
+      ...open,
+      threadTranscripts: { "thread-b": [message("b1")] },
+      loadingThread: { "thread-b": true },
+    };
+    const hydrated = reducer(cached, {
+      type: "hydrate",
+      bots: [busyBot],
+      groups: [],
+      computerControl: {},
+    });
+    expect(hydrated.threadTranscripts).toEqual({});
+    expect(hydrated.loadingThread).toEqual({});
+  });
+});
