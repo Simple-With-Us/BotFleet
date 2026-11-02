@@ -314,6 +314,7 @@ public enum EngineReplayHarness {
         let recordedStdin = await launcher.getCapturedStdinLines()
         let specMatches = (recordedSpec == fixture.expectedSpawnSpec)
         let eventsMatch = (actualEvents == fixture.expectedEvents)
+        let stdinMatches = (fixture.family != .antigravity || fixture.id != "agy-turn-16" || recordedStdin.contains(where: { $0.utf8.count > AntigravityStreamRunner.maxArgvPromptUTF8Bytes }))
 
         return EngineReplayResult(
             fixtureId: fixture.id,
@@ -321,7 +322,7 @@ public enum EngineReplayHarness {
             recordedSpawnSpec: recordedSpec,
             actualEvents: actualEvents,
             recordedClientStdinLines: recordedStdin,
-            passed: specMatches && eventsMatch
+            passed: specMatches && eventsMatch && stdinMatches
         )
     }
 
