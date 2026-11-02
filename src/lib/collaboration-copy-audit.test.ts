@@ -11,7 +11,7 @@ describe("collaboration copy audit", () => {
 
   it("converts only after the user chooses Zulip", () => {
     expect(convertSlackReferenceToZulip("Run slack-collab, then post to Slack."))
-      .toBe("Run Work-In-Progress, then post to Zulip.");
+      .toBe("Run simple-chat, then post to Zulip.");
     expect(convertSlackReferenceToZulip("Keep SLACK_BOT_TOKEN secret."))
       .toBe("Keep SLACK_BOT_TOKEN secret.");
   });
