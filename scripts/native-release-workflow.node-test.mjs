@@ -31,15 +31,28 @@ test("the native workflow is dispatch-only and never publishes", () => {
   assert.doesNotMatch(workflow, /gh release edit/);
 });
 
-test("the version is stamped once from a full-history checkout", () => {
+test("the version is planned once from a full-history checkout", () => {
   assert.match(workflow, /fetch-depth: 0/);
-  assert.match(workflow, /stamp-commit-version\.mjs/);
+  assert.match(workflow, /mac-release-version\.mjs/);
   // The overwrite guard reads the producing job's own output.  Reading
   // needs.prepare.outputs.version inside prepare was the release.yml bug
   // fixed in PR #1315: needs is empty there, so the guard never fired.
   assert.match(workflow, /steps\.pin\.outputs\.version/);
   const prepare = workflow.slice(workflow.indexOf("prepare:"), workflow.indexOf("mac-native:"));
   assert.doesNotMatch(prepare, /needs\.prepare\.outputs/);
+});
+
+test("the native release carries the shared build beside the marketing version", () => {
+  // One shared build per commit, planned once: the marketing version is
+  // fixed and the build is the commit's Central merge stamp, so the appcast
+  // and the verifier are told the build instead of deriving it from a
+  // version string (BF-2588).
+  assert.match(workflow, /BUILD: \$\{\{ needs\.prepare\.outputs\.build \}\}/);
+  assert.match(workflow, /CURRENT_PROJECT_VERSION="\$build"/);
+  assert.match(workflow, /--build "\$BUILD"/);
+  // The release tag carries the build, so two releases of the same
+  // marketing version cannot collide on one tag.
+  assert.match(workflow, /tag="v\$\{VERSION\}-\$\{BUILD\}/);
 });
 
 test("the codesign gate runs before any notarization submission", () => {
@@ -84,17 +97,17 @@ test("the local script refuses beta toolchains and labels dev builds", () => {
   assert.match(localScript, /spctl --assess/);
 });
 
-// A failed version stamp must stop the job where it happens.  `echo
+// A failed version plan must stop the job where it happens.  `echo
 // "$(...)"` returns echo's status, so the stamp script's failure was
 // swallowed and an empty version was published.
-test("a failed version stamp stops the prepare job", () => {
+test("a failed version plan stops the prepare job", () => {
   assert.match(
     workflow,
-    /version="\$\(node scripts\/stamp-commit-version\.mjs \.\)" \|\| exit 1/,
+    /plan="\$\(node scripts\/mac-release-version\.mjs --repo-root \. --sha "\$\(git rev-parse HEAD\)"\)" \|\| exit 1/,
   );
   assert.doesNotMatch(
     workflow,
-    /echo "version=\$\(node scripts\/stamp-commit-version\.mjs \.\)"/,
+    /echo "version=\$\(node scripts\/mac-release-version\.mjs/,
   );
 });
 
@@ -142,12 +155,16 @@ test("the native assets live on their own release tag", () => {
   assert.match(workflow, /NATIVE_TAG_SUFFIX: "-native"/);
   // The tag is used for the release, for the published guard, and for the
   // appcast's enclosure URL, or the feed would point at a release that does
-  // not carry the bytes.
-  assert.match(workflow, /tag="v\$VERSION\$\{NATIVE_TAG_SUFFIX\}"/);
-  assert.match(workflow, /v="v\$\{\{ steps\.pin\.outputs\.version \}\}\$\{NATIVE_TAG_SUFFIX\}"/);
+  // not carry the bytes.  It carries the build, so two releases of the same
+  // fixed marketing version cannot collide on one tag (BF-2588).
+  assert.match(workflow, /tag="v\$\{VERSION\}-\$\{BUILD\}\$\{NATIVE_TAG_SUFFIX\}"/);
   assert.match(
     workflow,
-    /node scripts\/native-appcast\.mjs native-upload "\$VERSION" "v\$VERSION\$\{NATIVE_TAG_SUFFIX\}"/,
+    /v="v\$\{\{ steps\.pin\.outputs\.version \}\}-\$\{\{ steps\.pin\.outputs\.build \}\}\$\{NATIVE_TAG_SUFFIX\}"/,
+  );
+  assert.match(
+    workflow,
+    /node scripts\/native-appcast\.mjs native-upload "\$VERSION" "v\$\{VERSION\}-\$\{BUILD\}\$\{NATIVE_TAG_SUFFIX\}"/,
   );
   assert.match(localScript, /native-appcast\.mjs" "\$OUT" "\$VERSION" "v\$VERSION\$\{NATIVE_TAG_SUFFIX\}"/);
 });
