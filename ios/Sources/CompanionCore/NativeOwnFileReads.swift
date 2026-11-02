@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Opt-in own-file approval for the native permission gates, ported from
 /// OpenMausBot #3791 (`server/own-file-reads.ts`): a bot reading its own files
@@ -47,41 +50,52 @@ public enum NativeOwnFileReads {
     /// Splits a command into plain words, or returns nil when any part is the
     /// shell's to expand (glob, variable, substitution, redirect, pipe,
     /// second command, newline, tilde or zsh `=cmd`).
+    ///
+    /// Tokenizes on Unicode scalars, never grapheme clusters: the shell is
+    /// byte-oriented, so a quote, backtick or dollar followed by a combining
+    /// mark is still that ASCII byte to the shell, and scalar comparison
+    /// keeps it that way here too.  Empty words (`''`, `""`) are refused —
+    /// one would otherwise resolve to the working directory itself.
     static func words(_ command: String) -> [String]? {
-        if command.contains("\0") || command.contains("\r") || command.contains("\n") { return nil }
-        let text = command.trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
-        let chars = Array(text)
+        let scalars = Array(command.unicodeScalars)
+        if scalars.contains(where: { $0.value == 0 || $0 == "\r" || $0 == "\n" }) { return nil }
+        func isSpace(_ scalar: UnicodeScalar) -> Bool { scalar == " " || scalar == "\t" }
+        func wordString(_ range: Range<Int>) -> String {
+            String(String.UnicodeScalarView(scalars[range]))
+        }
+        let bareAllowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./~+@%:,=-".unicodeScalars)
         var out: [String] = []
         var index = 0
-        let bareAllowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./~+@%:,=-")
-        while index < chars.count {
-            while index < chars.count && (chars[index] == " " || chars[index] == "\t") { index += 1 }
-            if index >= chars.count { break }
+        while index < scalars.count {
+            while index < scalars.count && isSpace(scalars[index]) { index += 1 }
+            if index >= scalars.count { break }
             let word: String
-            if chars[index] == "'" {
+            if scalars[index] == "'" {
                 var end = index + 1
-                while end < chars.count && chars[end] != "'" { end += 1 }
-                guard end < chars.count else { return nil }
-                word = String(chars[(index + 1)..<end])
+                while end < scalars.count && scalars[end] != "'" { end += 1 }
+                guard end < scalars.count else { return nil }
+                word = wordString((index + 1)..<end)
                 index = end + 1
-            } else if chars[index] == "\"" {
+            } else if scalars[index] == "\"" {
                 var end = index + 1
-                while end < chars.count && chars[end] != "\"" {
-                    if chars[end] == "$" || chars[end] == "`" || chars[end] == "\\" || chars[end] == "!" { return nil }
+                while end < scalars.count && scalars[end] != "\"" {
+                    let scalar = scalars[end]
+                    if scalar == "$" || scalar == "`" || scalar == "\\" || scalar == "!" { return nil }
                     end += 1
                 }
-                guard end < chars.count else { return nil }
-                word = String(chars[(index + 1)..<end])
+                guard end < scalars.count else { return nil }
+                word = wordString((index + 1)..<end)
                 index = end + 1
             } else {
                 var end = index
-                while end < chars.count && String(chars[end]).rangeOfCharacter(from: bareAllowed) != nil { end += 1 }
+                while end < scalars.count && bareAllowed.contains(scalars[end]) { end += 1 }
                 guard end > index else { return nil }
-                word = String(chars[index..<end])
+                word = wordString(index..<end)
                 if word.contains("~") || word.hasPrefix("=") { return nil }
                 index = end
             }
-            guard index >= chars.count || chars[index] == " " || chars[index] == "\t" else { return nil }
+            guard !word.isEmpty else { return nil }
+            guard index >= scalars.count || isSpace(scalars[index]) else { return nil }
             out.append(word)
         }
         return out.isEmpty ? nil : out
@@ -138,10 +152,14 @@ public enum NativeOwnFileReads {
         return paths
     }
 
+    /// `realpath(3)` canonicalization, so roots, candidates and an opened
+    /// handle's `F_GETPATH` all speak the same path language (`/var` and
+    /// `/private/var` must not compare unequal).  Nil when the path does
+    /// not exist.
     private static func realPath(_ path: String) -> String? {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else { return nil }
-        return URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        guard let cString = realpath(path, nil) else { return nil }
+        defer { free(cString) }
+        return String(cString: cString)
     }
 
     private static func isInside(_ path: String, root: String) -> Bool {
@@ -160,16 +178,102 @@ public enum NativeOwnFileReads {
         ].compactMap { realPath($0.path) }
     }
 
-    /// Every path exists and is inside one of `roots` once links are followed.
+    /// Every path exists, carries no symlink at or below an own root, and
+    /// resolves inside one of `roots`.
+    ///
+    /// Fail-closed rules, beyond plain resolved-path containment:
+    /// - A symlinked final component is never auto-approved, even when it
+    ///   points inside the roots today: its target can be repointed between
+    ///   this check and the agent's own open.
+    /// - A symlinked intermediate component whose parent resolves inside a
+    ///   root is likewise refused (system links above the roots, such as
+    ///   `/var` -> `/private/var`, are outside the bot's control and pass).
+    /// - The candidate is opened once with `O_NOFOLLOW` and the opened
+    ///   handle's own path (`F_GETPATH`) must equal the resolved path, so a
+    ///   swap raced against the resolve is caught at check time.
+    /// - A directory target (what `grep -r`, `rg` and `ls -R` traverse) is
+    ///   walked without following links; any symlink anywhere under it, or
+    ///   a tree too large to walk, refuses auto-approval.  The reachable
+    ///   set of a recursive tool then cannot leave the roots, whatever
+    ///   link-following semantics the agent's `grep`/`rg` build has.
+    ///
+    /// Residual risk, stated plainly: this is a permission predicate for an
+    /// external agent process, which re-opens the path itself after the
+    /// approval reply — no file descriptor can be handed across.  A process
+    /// that can write inside the bot's folders could still replace a
+    /// regular file with a symlink in the approval-to-execution window.
+    /// Refusing every symlink-bearing path above narrows that window to
+    /// regular-file replacement; it does not eliminate it.
     public static func readsOnly(paths: [String], cwd: String, roots: [String]) -> Bool {
-        guard !paths.isEmpty, !roots.isEmpty else { return false }
+        guard !paths.isEmpty, !roots.isEmpty, paths.allSatisfy({ !$0.isEmpty }) else { return false }
         return paths.allSatisfy { path in
-            let resolved = path.hasPrefix("/")
-                ? path
-                : URL(fileURLWithPath: cwd, isDirectory: true).appendingPathComponent(path).path
-            guard let real = realPath(resolved) else { return false }
-            return roots.contains { isInside(real, root: $0) }
+            validatedInsideRoots(path: path, cwd: cwd, roots: roots)
         }
+    }
+
+    private static func validatedInsideRoots(path: String, cwd: String, roots: [String]) -> Bool {
+        let lexicalURL = path.hasPrefix("/")
+            ? URL(fileURLWithPath: path)
+            : URL(fileURLWithPath: cwd, isDirectory: true).appendingPathComponent(path)
+        let lexical = lexicalURL.standardizedFileURL.path
+
+        var info = stat()
+        guard lstat(lexical, &info) == 0 else { return false }
+        let kind = info.st_mode & S_IFMT
+        // Only regular files and directories: anything else (a FIFO would
+        // block the open below, a device is not a plain read) asks a human.
+        guard kind == S_IFREG || kind == S_IFDIR else { return false }
+
+        guard let resolved = realPath(lexical),
+              roots.contains(where: { isInside(resolved, root: $0) }) else { return false }
+
+        // Intermediate components: refuse a symlink whose parent already
+        // resolves inside an own root (i.e. a link the bot's area contains).
+        let components = lexical.split(separator: "/", omittingEmptySubsequences: true)
+        var prefix = ""
+        for (offset, component) in components.enumerated() {
+            prefix += "/" + component
+            if offset == components.count - 1 { break }
+            var prefixInfo = stat()
+            guard lstat(prefix, &prefixInfo) == 0 else { return false }
+            if prefixInfo.st_mode & S_IFMT == S_IFLNK {
+                let parent = (prefix as NSString).deletingLastPathComponent
+                guard let resolvedParent = realPath(parent.isEmpty ? "/" : parent) else { return false }
+                if roots.contains(where: { isInside(resolvedParent, root: $0) }) { return false }
+            }
+        }
+
+        // Validate the opened handle, not just the path.
+        let fd = open(lexical, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(fd, F_GETPATH, &buffer) == 0, String(cString: buffer) == resolved else { return false }
+
+        if kind == S_IFDIR { return treeContainsNoSymlinks(resolved) }
+        return true
+    }
+
+    /// The whole tree under `directory`, walked by `lstat` without following
+    /// any link: false on the first symlink, unreadable entry, or a tree
+    /// larger than the walk budget.
+    private static func treeContainsNoSymlinks(_ directory: String) -> Bool {
+        var stack = [directory]
+        var visited = 0
+        while let current = stack.popLast() {
+            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: current) else { return false }
+            for entry in entries {
+                visited += 1
+                guard visited <= 10_000 else { return false }
+                let candidate = current + "/" + entry
+                var entryInfo = stat()
+                guard lstat(candidate, &entryInfo) == 0 else { return false }
+                let entryKind = entryInfo.st_mode & S_IFMT
+                if entryKind == S_IFLNK { return false }
+                if entryKind == S_IFDIR { stack.append(candidate) }
+            }
+        }
+        return true
     }
 
     /// Whether a shell ask only reads the bot's own files.
