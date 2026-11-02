@@ -211,7 +211,7 @@ importers:
         version: 12.2.0
       posthog-js:
         specifier: ^1.415.6
-        version: 1.440.0(@types/react@19.3.0)(react@19.3.1)
+        version: 1.441.0(@types/react@19.3.0)(react@19.3.1)
       qrcode.react:
         specifier: ^4.2.0
         version: 4.2.0(react@19.3.1)
@@ -3780,8 +3780,8 @@ packages:
   '@poppinss/exception@1.2.3':
     resolution: {integrity: sha512-dCED+QRChTVatE9ibtoaxc+WkdzOSjYTKi/+uacHWIsfodVfpsueo3+DKpgU5Px8qXjgmXkSvhXvSCz3fnP9lw==}
 
-  '@posthog/browser-common@0.9.12':
-    resolution: {integrity: sha512-pKYLYgV0o4UK5PAQ3OTlZpQnKvcBpG+UOqWYa+W41Omec8TlI6FXzGMHdYMTmaymxii0vi9R4jLVi7JQSr4vnQ==}
+  '@posthog/browser-common@0.10.2':
+    resolution: {integrity: sha512-ieHSMmY4xG+HfkMTrT9yZoG0NMBWyA4aXMFPCuOOV+xRe706+zoPuwqmNHXv7LGXfi6CvOv4qksEoPNWfP359Q==}
 
   '@posthog/core@1.62.0':
     resolution: {integrity: sha512-KjNwGC7s0141wnWWHubNMdg1lOhZjqKRw2OTNstuzdVvNDfvv2RbFJQSSvvABmbCmTXwlMpdnbb/M/aAigDnNQ==}
@@ -7885,8 +7885,8 @@ packages:
     resolution: {integrity: sha512-LJlKCCAUFKOuZxipUdYw1NzIITEsPcgyOG9LkvRJvuKj/bRzbuRY0ARXvL0pWGpsZvn8jku+LMep2eU0seHp8g==}
     engines: {node: ^10 || ^12 || >=14}
 
-  posthog-js@1.440.0:
-    resolution: {integrity: sha512-M5/7NE8fgR8Qi3Jl8UizWjum7xnxu68C3ddaewxbxhsD23Pj/a1O5f1n+oWrKoGBS2loWJma4IXb3MFv1/FNLw==}
+  posthog-js@1.441.0:
+    resolution: {integrity: sha512-iL3GpR6ASrlAp7P3jZepskpMm4pe8jRR4VaENyB4BtJ5+IhrkXeb2pLCTPuQvju7yna22BB06r0DychtBDJAJw==}
     peerDependencies:
       '@types/react': '>=16.8.0'
       react: '>=16.8.0'
@@ -13009,7 +13009,7 @@ snapshots:
 
   '@poppinss/exception@1.2.3': {}
 
-  '@posthog/browser-common@0.9.12':
+  '@posthog/browser-common@0.10.2':
     dependencies:
       '@posthog/core': 1.62.0
       '@posthog/types': 1.419.0
@@ -17732,9 +17732,9 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.2
 
-  posthog-js@1.440.0(@types/react@19.3.0)(react@19.3.1):
+  posthog-js@1.441.0(@types/react@19.3.0)(react@19.3.1):
     dependencies:
-      '@posthog/browser-common': 0.9.12
+      '@posthog/browser-common': 0.10.2
       '@posthog/core': 1.62.0
       '@posthog/types': 1.419.0
       core-js: 3.50.0
