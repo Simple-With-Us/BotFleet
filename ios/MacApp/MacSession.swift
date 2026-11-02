@@ -78,6 +78,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public private(set) var host: String = "127.0.0.1"
     @Published public private(set) var port: Int = 8799
     public let servers: ServersCoordinator
+    public let resources: ResourcesCoordinator
 
     // Lifecycle & Remote Wake state (BF-2497)
     @Published public var lifecycleSettings = MacLifecycleSettings()
@@ -148,7 +149,9 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         permissionMonitor: CuaPermissionMonitor = CuaPermissionMonitor()
     ) {
         self.policyStore = policyStore
-        self.servers = ServersCoordinator(store: HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json")))
+        let hostStore = HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json"))
+        self.servers = ServersCoordinator(store: hostStore)
+        self.resources = ResourcesCoordinator(store: hostStore)
         self.permissionMonitor = permissionMonitor
         if let localPersist = policyStore.readPersistOnExit() {
             self.lifecycleSettings = MacLifecycleSettings(

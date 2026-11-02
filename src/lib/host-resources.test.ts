@@ -82,7 +82,7 @@ describe("enforcementSentence", () => {
     );
     expect(enforcementSentence(gate(), "this Mac")).toBe("Checked before each job starts");
     expect(enforcementSentence({ kind: "priorityOnly" }, "this Mac")).toBe(
-      "Full speed allowed.  Jobs run at background priority",
+      "Full speed allowed.  Jobs run at background priority.",
     );
     expect(enforcementSentence({ kind: "unsupported", reason: "No swap is configured" }, "this Mac")).toBe(
       "Not enforced on this Mac: No swap is configured",
@@ -372,7 +372,7 @@ describe("resourceRows", () => {
     const cpu = resourceRows(report()).find((row) => row.key === "cpu")!;
     expect(cpu.detected).toBe("10 cores");
     expect(cpu.use).toContain("Load 2.41 per core");
-    expect(cpu.enforcement).toBe("Full speed allowed.  Jobs run at background priority");
+    expect(cpu.enforcement).toBe("Full speed allowed.  Jobs run at background priority.");
   });
 
   it("never renders a null reading as zero", () => {

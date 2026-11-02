@@ -224,6 +224,8 @@ struct BotFleetMacApp: App {
                             }
                         } else if section == .servers {
                             MacServersSettings(coordinator: session.servers) { session.connect(host: $0) }
+                        } else if section == .resources {
+                            MacResourcesSettings(coordinator: session.resources)
                         } else if section == .permissions,
                                   let banner = session.notificationCoordinator.settingsStatusBanner {
                             Text(banner)

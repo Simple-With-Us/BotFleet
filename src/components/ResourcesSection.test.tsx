@@ -61,8 +61,9 @@ function render(state: Parameters<typeof ResourcesSectionView>[0]["state"]): str
 describe("ResourcesSectionView", () => {
   it("renders loading without readings", () => {
     const html = render({ status: "loading" });
+    expect(html).toContain("Host Resource Readings");
     expect(html).toContain("Loading host resources…");
-    expect(html).not.toContain("Admission thresholds");
+    expect(html).not.toContain("Admission Thresholds (Saved vs Applied)");
   });
 
   it("renders the error with its message and a retry", () => {
@@ -74,9 +75,12 @@ describe("ResourcesSectionView", () => {
 
   it("shows host readings with enforcement sentences, and unset knobs as Not set", () => {
     const html = render({ status: "ready", report: fixture() });
+    expect(html).toContain("Host Resource Readings");
+    expect(html).toContain("Admission Thresholds (Saved vs Applied)");
+    expect(html).toContain("Owner-Set Headroom");
     expect(html).toContain("10 cores");
     expect(html).toContain("16.0 GB");
-    expect(html).toContain("Full speed allowed.");
+    expect(html).toContain("Full speed allowed.  Jobs run at background priority.");
     expect(html).toContain("Checked before each job starts");
     expect(html).toContain("Not set");
     expect(html).toContain("Not set: no gate");
@@ -99,10 +103,12 @@ describe("ResourcesSectionView", () => {
     expect(html).not.toContain("Saved and applied agree on every threshold.");
   });
 
-  it("disables headroom editing with the owner-sets-these note", () => {
+  it("disables headroom editing with the owner-sets-these note and tucks env var names inside a details disclosure", () => {
     const html = render({ status: "ready", report: fixture() });
     expect(html).toContain("The owner sets these numbers");
     expect(html).toContain("editing is disabled here");
+    expect(html).toContain("Environment variable names");
+    expect(html).toContain("<details");
     expect(html).toContain("BOTFLEET_JOBS_RESERVED_CPU_CORES");
     expect(html).toContain("BOTFLEET_JOBS_RESERVED_RAM_MB");
     expect(html).toContain("BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT");

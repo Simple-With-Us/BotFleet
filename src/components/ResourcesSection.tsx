@@ -52,7 +52,7 @@ export function ResourcesSectionView({
   if (state.status === "loading") {
     return (
       <div className="flex flex-col gap-4">
-        <Card title="Host resources" subtitle="Detected capacity, current use and admission thresholds for this host.">
+        <Card title="Host Resource Readings" subtitle="Detected capacity, current use and admission thresholds for this host.">
           <div className="flex items-center gap-2 text-[13px] text-ink-secondary" role="status">
             <Loader2 size={14} className="animate-spin" />
             Loading host resources…
@@ -70,7 +70,7 @@ export function ResourcesSectionView({
     return (
       <div className="flex flex-col gap-4">
         <Card
-          title="Host resources"
+          title="Host Resource Readings"
           subtitle="Detected capacity, current use and admission thresholds for this host."
           actions={<RefreshButton onRefresh={onRefresh} spinning={false} />}
         >
@@ -106,8 +106,8 @@ function ResourcesReportView({
       <Card
         id="setting-resources-host"
         className={highlightClass?.("setting-resources-host")}
-        title={noun === "this Mac" ? "This Mac’s resources" : "Server resources"}
-        subtitle={`${report.hostId} · ${hostSubtitle(report)}`}
+        title="Host Resource Readings"
+        subtitle={`${noun === "this Mac" ? "This Mac" : "Server"} · ${report.hostId} · ${hostSubtitle(report)}`}
         actions={<RefreshButton onRefresh={onRefresh} spinning={refreshing ?? false} />}
       >
         <div className="flex flex-col gap-2 text-[13px]" role="table" aria-label="Host resource readings">
@@ -138,7 +138,7 @@ function ResourcesReportView({
       <Card
         id="setting-resources-thresholds"
         className={highlightClass?.("setting-resources-thresholds")}
-        title="Admission thresholds"
+        title="Admission Thresholds (Saved vs Applied)"
         subtitle="Saved values from the owner’s config against what the runtime actually applies.  Jobs settings apply live, so the two agree unless a row below says otherwise."
       >
         <div className="flex flex-col gap-2 text-[13px]" role="table" aria-label="Saved versus applied admission thresholds">
@@ -150,7 +150,7 @@ function ResourcesReportView({
           {thresholds.map((row) => (
             <div key={row.key} className="rounded-lg border border-hairline/20 bg-inset/20 p-2">
               <div className="grid grid-cols-[150px_1fr_1fr] gap-2">
-                <span className="font-medium text-ink" title={`${row.knob} · ${row.source}`}>
+                <span className="font-medium text-ink">
                   {row.label}
                 </span>
                 <span className="text-ink">{row.saved}</span>
@@ -173,6 +173,19 @@ function ResourcesReportView({
         <div className="mt-2 text-[12px] leading-relaxed text-ink-secondary">
           A saved number the runtime has not applied keeps the previous applied value in force — a saved value is never shown as applied.
         </div>
+        <details className="mt-2 text-[12px] text-ink-secondary">
+          <summary className="cursor-pointer select-none font-medium text-ink-secondary">
+            Environment variable names
+          </summary>
+          <ul className="mt-1.5 flex flex-col gap-1 pl-4 text-[11.5px]">
+            {thresholds.map((row) => (
+              <li key={row.key}>
+                <span className="font-medium text-ink">{row.label}:</span>{" "}
+                <span className="font-mono">{row.knob}</span> · <span className="font-mono">{row.source}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
       </Card>
 
       <HeadroomCard report={report} highlightClass={highlightClass} />
@@ -181,7 +194,7 @@ function ResourcesReportView({
         <Card
           id="setting-resources-gaps"
           className={highlightClass?.("setting-resources-gaps")}
-          title="Known gaps"
+          title="Known Gaps"
           subtitle="What this report cannot see, in its own words."
         >
           <ul className="flex list-disc flex-col gap-1 pl-5 text-[12.5px] leading-relaxed text-ink-secondary">
@@ -214,7 +227,7 @@ function HeadroomCard({
     <Card
       id="setting-resources-headroom"
       className={highlightClass?.("setting-resources-headroom")}
-      title="Owner-set headroom"
+      title="Owner-Set Headroom"
       subtitle="Reserved capacity for everything else on this host.  Absent means unset: no gate, exactly as before."
     >
       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
@@ -232,7 +245,6 @@ function HeadroomCard({
             title="Set by the owner — editing is disabled on this tab"
             className={inputClass}
           />
-          <span className="font-mono text-[11px] text-ink-secondary">BOTFLEET_JOBS_RESERVED_CPU_CORES</span>
         </div>
         <div className="flex flex-col gap-1">
           <label className="text-[12px] font-medium text-ink-secondary" htmlFor="resources-reserved-ram">
@@ -248,7 +260,6 @@ function HeadroomCard({
             title="Set by the owner — editing is disabled on this tab"
             className={inputClass}
           />
-          <span className="font-mono text-[11px] text-ink-secondary">BOTFLEET_JOBS_RESERVED_RAM_MB</span>
         </div>
         <div className="flex flex-col gap-1">
           <label className="text-[12px] font-medium text-ink-secondary" htmlFor="resources-min-memory-percent">
@@ -264,7 +275,6 @@ function HeadroomCard({
             title="Set by the owner — editing is disabled on this tab"
             className={inputClass}
           />
-          <span className="font-mono text-[11px] text-ink-secondary">BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT</span>
         </div>
       </div>
       <div className="mt-2 text-[12px] leading-relaxed text-ink-secondary">
@@ -275,6 +285,16 @@ function HeadroomCard({
         {report.platform === "darwin" &&
           "On this Mac reserved CPU never refuses a job; it sizes the per-job CPU-time budget instead."}
       </div>
+      <details className="mt-2 text-[12px] text-ink-secondary">
+        <summary className="cursor-pointer select-none font-medium text-ink-secondary">
+          Environment variable names
+        </summary>
+        <ul className="mt-1.5 flex flex-col gap-1 pl-4 font-mono text-[11px]">
+          <li>BOTFLEET_JOBS_RESERVED_CPU_CORES</li>
+          <li>BOTFLEET_JOBS_RESERVED_RAM_MB</li>
+          <li>BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT</li>
+        </ul>
+      </details>
     </Card>
   );
 }
