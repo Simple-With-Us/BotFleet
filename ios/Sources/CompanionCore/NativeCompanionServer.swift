@@ -1626,6 +1626,7 @@ public actor NativeCompanionServer {
 
     public func stopListening() async {
         stopListenerSocket()
+        await nativeRuntime?.deactivatePolling()
     }
 
     private func stopListenerSocket() {
