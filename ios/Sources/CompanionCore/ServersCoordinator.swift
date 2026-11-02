@@ -42,6 +42,10 @@ public final class ServersCoordinator: ObservableObject {
     private var generations: [String: UUID] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     private var loading: Task<[HostRecord], Error>?
+    /// Freshest controller epoch observed from each verified controller identity.
+    /// `confirmPlacementApplied` refuses acks older than this; a replayed ack
+    /// from a prior epoch must not record applied state.
+    private var controllerEpochs: [String: Int] = [:]
 
     public init(store: any ServersHostStore, tokens: any HostTokenStore = KeychainHostTokenStore(),
                 handshake: @escaping Handshake = { try await ServerHandshake().test(host: $0, credential: $1) }) {
@@ -54,9 +58,10 @@ public final class ServersCoordinator: ObservableObject {
         if loading == nil { loading = Task { try await store.hosts() } }
         guard let loading else { return }
         do {
-            let loaded = try await loading.value
+            let loadedHosts = try await loading.value
+            let loadedSettings = try await store.settings()
             guard !isLoaded else { return }
-            hosts = loaded; placement = try await store.settings(); isLoaded = true; errorMessage = nil
+            hosts = loadedHosts; placement = loadedSettings; isLoaded = true; errorMessage = nil
         } catch { errorMessage = SavedHostError.unreadableStore.localizedDescription }
         self.loading = nil; isBusy = false
     }
@@ -115,7 +120,11 @@ public final class ServersCoordinator: ObservableObject {
     /// Records applied state only for the saved selection and only with the
     /// controller's acknowledgement naming that selection's expected
     /// controller: the saved server's pinned identity in Server First, this
-    /// Mac's pinned identity otherwise.  Anything else leaves applied alone.
+    /// Mac's pinned identity otherwise.  Expected identities resolve from the
+    /// store — the same source as the saved selection — never from in-memory
+    /// hosts, which can lag a repin.  An ack older than the freshest epoch
+    /// observed from that controller is a replay and is refused.  Anything
+    /// else leaves applied alone.
     @discardableResult
     public func confirmPlacementApplied(_ selection: PlacementSelection, acknowledgedBy ack: ControllerAcknowledgement) async -> Bool {
         guard canMutate else { return false }
@@ -124,13 +133,17 @@ public final class ServersCoordinator: ObservableObject {
             let current = try await store.settings()
             guard selection == current.saved else { throw SavedHostError.placementNotSaved }
             guard HostRecord.validHostId(ack.controllerId), ack.epoch >= 0 else { throw SavedHostError.placementUnacknowledged }
+            let storedHosts = try await store.hosts()
             let expected: String?
             if selection.mode == .serverFirst {
-                expected = hosts.first(where: { !$0.isLocal && $0.id == selection.serverID })?.hostId
+                expected = storedHosts.first(where: { !$0.isLocal && $0.id == selection.serverID })?.hostId
             } else {
-                expected = hosts.first(where: \.isLocal)?.hostId
+                expected = storedHosts.first(where: \.isLocal)?.hostId
             }
             guard let expected, ack.controllerId == expected else { throw SavedHostError.placementUnacknowledged }
+            if let observed = controllerEpochs[ack.controllerId], ack.epoch < observed {
+                throw SavedHostError.placementUnacknowledged
+            }
             try await store.recordApplied(selection)
             placement = try await store.settings(); errorMessage = nil
             return true
@@ -207,6 +220,7 @@ public final class ServersCoordinator: ObservableObject {
             }
             let verified = try await handshake(host, credential)
             guard current(host, generation) else { return }
+            controllerEpochs[verified.controllerId] = verified.epoch
             guard !isBusy else {
                 statuses[host.id] = "Settings changed during this test.\u{00A0} Test the server again."
                 return
