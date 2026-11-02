@@ -28,6 +28,8 @@ The graceful stop's fixture injects the clock, the wait, the bot roster, the in-
 
 The second scenario in that file is the refusal path:  it puts a directory where the carrier file belongs, so the write that carries the queued messages across the restart fails, and it asks the server to stop anyway.  The stop has to refuse, the server has to stay up and keep serving, and the message that was waiting behind the bot has to run afterwards, which the provider's request count proves:  twice with the work put back, once without it.  With the restore removed the fixture fails on that count, which is how the loss was proven rather than assumed.
 
+The third recipe is the discount the stop takes for the queued routine runs, in `server/update-drain.test.ts`.  One queued run for a bot that is switched Off and one running routine run:  the runtime count is 1, the old discount was 1 and left the running run at 0 in flight, and the new discount is 0 and leaves it at 1.  The discount is taken from the runtime count, so a discount that was bigger than the count hid a routine run that was really running, and the stop's wait ended early and interrupted it.  Both numbers now come from one list in one place (`routineRunCounts`), filtered the same way.  The same recipe covers the update drain's own discount, which had the same asymmetry.
+
 The build runs Swift tests, builds both arm64 and x86_64 slices, checks the generated plist and verifies the app signature.  The existing Mac packaging gate runs for changes under `mac-control/` and packages the controller alongside the main app.
 
 ## Install And Open
