@@ -480,7 +480,12 @@ public actor NativeCompanionServer {
     private let database: DatabaseService
     /// The injecting app composition owns this shared runtime; listener activation does not transfer lifetime ownership.
     private let nativeRuntime: NativeRuntimeServices?
-    private var pairedTokens: Set<String>
+    /// The paired fleet, held only as token digests.  When
+    /// `deviceStoreURL` is set the fleet is durable across restarts, as
+    /// `companion/src/devices.ts` keeps it; without one it is memory-only,
+    /// which is what direct unit tests get.
+    private var deviceRegistry: CompanionDeviceRegistry
+    private let deviceStoreURL: URL?
     /// The six-digit code a person types on the phone.
     private var pairingCode: String?
     /// The high-entropy credential the Mac puts in its pairing QR code.  It
@@ -562,9 +567,16 @@ public actor NativeCompanionServer {
     /// `endpointAdvertisement` is what the app knows about its own routes;
     /// the empty default advertises none.  `clock` is the time every pairing
     /// window and replay is measured against; tests pass a manual one.
+    ///
+    /// `pairedTokens` are raw bearer tokens the caller already holds; each
+    /// becomes a device record kept only as its digest.  `deviceStoreURL`
+    /// is the durable `devices.json`: the fleet is loaded from it here and
+    /// written back on every pairing change, so a paired phone survives a
+    /// restart of the listener.
     public init(
         database: DatabaseService,
         pairedTokens: Set<String> = [],
+        deviceStoreURL: URL? = nil,
         pairingCode: String? = nil,
         pairingQRCredential: String? = nil,
         config: CompanionServerConfig = CompanionServerConfig(),
@@ -577,7 +589,14 @@ public actor NativeCompanionServer {
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.database = database
-        self.pairedTokens = pairedTokens
+        self.deviceStoreURL = deviceStoreURL
+        var registry = deviceStoreURL.map { CompanionDeviceRegistry.load(from: $0) }
+            ?? CompanionDeviceRegistry()
+        let seededAtMs = clock().timeIntervalSince1970 * 1000
+        for token in pairedTokens where !token.isEmpty && !registry.contains(token: token) {
+            registry.register(name: "Companion", token: token, nowMs: seededAtMs)
+        }
+        self.deviceRegistry = registry
         self.pairingCode = pairingCode
         self.pairingQRCredential = pairingQRCredential
         let opensWindow = pairingCode != nil || pairingQRCredential != nil
@@ -699,25 +718,36 @@ public actor NativeCompanionServer {
         )
     }
 
-    private func isAuthenticated(_ request: CompanionHTTPRequest) -> Bool {
-        guard let authHeader = request.headerValue(for: "Authorization") else {
-            return false
+    /// Resolves the request's bearer token to its paired device.  The
+    /// header is parsed by the registry's one parser (as `devices.ts`
+    /// insists: two parsers that disagree about what a credential looks
+    /// like means a phone authenticates on one path and not the other),
+    /// and only the token's digest is ever compared or kept.
+    private func authenticatedDevice(_ request: CompanionHTTPRequest) -> CompanionDeviceRecord? {
+        let token = CompanionDeviceRegistry.bearerToken(
+            fromAuthorizationHeader: request.headerValue(for: "Authorization")
+        )
+        guard let device = deviceRegistry.authenticate(token: token) else { return nil }
+        // `lastSeenAt` decorates a settings row; a failed write must never
+        // stop an already-valid token from authenticating.
+        if deviceRegistry.recordSeen(id: device.id, nowMs: clock().timeIntervalSince1970 * 1000) {
+            persistDevicesBestEffort()
         }
-        let prefix = "Bearer "
-        guard authHeader.count > prefix.count,
-              authHeader.lowercased().hasPrefix(prefix.lowercased()) else {
-            return false
-        }
-        let candidate = String(authHeader.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
-        guard !candidate.isEmpty else { return false }
+        return device
+    }
 
-        var matched = false
-        for storedToken in pairedTokens {
-            if Self.constantTimeEquals(candidate, storedToken) {
-                matched = true
-            }
-        }
-        return matched
+    private func isAuthenticated(_ request: CompanionHTTPRequest) -> Bool {
+        authenticatedDevice(request) != nil
+    }
+
+    /// Writes the paired fleet when a durable store is configured.
+    private func persistDevices() throws {
+        guard let deviceStoreURL else { return }
+        try deviceRegistry.persist(to: deviceStoreURL)
+    }
+
+    private func persistDevicesBestEffort() {
+        try? persistDevices()
     }
 
     // MARK: - Configuration & State Mutation
@@ -730,8 +760,47 @@ public actor NativeCompanionServer {
         config
     }
 
+    /// Pairs a raw token the caller already holds, kept only as its
+    /// digest.  An empty token is not a credential and is refused.
     public func addPairedToken(_ token: String) {
-        pairedTokens.insert(token)
+        guard !token.isEmpty, !deviceRegistry.contains(token: token) else { return }
+        deviceRegistry.register(
+            name: "Companion",
+            token: token,
+            nowMs: clock().timeIntervalSince1970 * 1000
+        )
+        persistDevicesBestEffort()
+    }
+
+    /// Every paired device, without its digest — what a settings page
+    /// renders, as `list()` answers in `companion/src/devices.ts`.
+    public func pairedDevices() -> [PairedDevice] {
+        deviceRegistry.devices.map(\.publicDevice)
+    }
+
+    /// How many phones are paired, against `CompanionDeviceRegistry.maxDevices`.
+    public var pairedDeviceCount: Int {
+        deviceRegistry.count
+    }
+
+    /// Takes one phone's access away.  False when there was no such
+    /// device, or when the revoked fleet could not be saved — in which
+    /// case the device keeps its access rather than the file and the
+    /// running server disagreeing about it.  A successful revoke also
+    /// forgets the pairing replay, whose whole purpose is handing a
+    /// just-minted token out again.
+    @discardableResult
+    public func revokeDevice(id: String) -> Bool {
+        let before = deviceRegistry
+        guard deviceRegistry.revoke(id: id) else { return false }
+        do {
+            try persistDevices()
+        } catch {
+            deviceRegistry = before
+            return false
+        }
+        pairingReplay = nil
+        return true
     }
 
     /// Replaces what `GET /api/companion/endpoints` and the pairing response
@@ -832,6 +901,15 @@ public actor NativeCompanionServer {
         let method = request.method.uppercased()
         let path = request.path
 
+        // 0. Origin rejection, before any route or credential is looked
+        // at.  A native app sends no Origin; anything that does is a
+        // browser that has found this port, and a browser has no business
+        // on it — whatever the origin claims, and however good the token
+        // behind it is.  Mirrors `companion/src/proxy.ts`.
+        if let origin = request.headerValue(for: "Origin"), !origin.isEmpty {
+            return .error(403, "forbidden: cross-origin request")
+        }
+
         // 1. Open routes (unauthenticated)
         if method == "GET" && path == "/api/health" {
             // `app` and `ready` are what the phone checks before it sends a
@@ -927,8 +1005,9 @@ public actor NativeCompanionServer {
     // MARK: - Route Handlers
 
     /// A successful redemption that named a `pairRequestId`.  The credential
-    /// is kept only as its digest; the token is the one already in
-    /// `pairedTokens`.
+    /// is kept only as its digest; the token is the raw bearer held only in
+    /// this replay (the registry keeps just its digest), and only until
+    /// the window's original expiry.
     private struct PairingReplay: Sendable {
         let requestId: String
         let credentialDigest: String
@@ -983,7 +1062,7 @@ public actor NativeCompanionServer {
            Self.constantTimeEquals(replay.requestId, requestId),
            Self.constantTimeEquals(replay.credentialDigest, presentedDigest) {
             // A token taken away since must not come back through a replay.
-            guard pairedTokens.contains(replay.token) else {
+            guard deviceRegistry.contains(token: replay.token) else {
                 pairingReplay = nil
                 return .error(401, "pairing_unavailable")
             }
@@ -1017,18 +1096,38 @@ public actor NativeCompanionServer {
             return .error(403, "invalid_pairing_code")
         }
 
-        let issuedToken = "bf_tok_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())"
-        pairedTokens.insert(issuedToken)
-        let pairedAtMs = now.timeIntervalSince1970 * 1000.0
-        let device = PairedDevice(
-            id: UUID().uuidString.lowercased(),
-            name: Self.cleanDeviceName(payload.deviceName),
-            createdAt: pairedAtMs,
-            lastSeenAt: pairedAtMs
-        )
+        // After the credential, not before: checked first, a full fleet
+        // would answer every wrong guess without spending its budget.
+        // The window survives, so removing a phone and presenting the
+        // same credential again still works, as in `devices.ts`.
+        guard deviceRegistry.count < CompanionDeviceRegistry.maxDevices else {
+            return .error(401, "too_many_paired_devices")
+        }
+
         // One window, one device: redeeming either credential spends both.
-        // The replay outlives the window, but only to its original expiry.
         discardPairingWindow()
+        // 32 random bytes, not a UUID: this token is the credential for
+        // the device port once the socket leaves loopback.
+        let tokenBytes = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
+        let issuedToken = "bf_tok_" + NativeAPNsProvider.base64URLEncode(tokenBytes)
+        let pairedAtMs = now.timeIntervalSince1970 * 1000.0
+        let record = deviceRegistry.register(
+            name: Self.cleanDeviceName(payload.deviceName),
+            token: issuedToken,
+            nowMs: pairedAtMs
+        )
+        // A device that lives in memory but not on disk is paired until
+        // the next restart and then silently is not.  Roll the pairing
+        // back and say so, so the person retries now instead of
+        // discovering it days later.
+        do {
+            try persistDevices()
+        } catch {
+            deviceRegistry.revoke(id: record.id)
+            return .error(500, "pairing_persist_failed")
+        }
+        let device = record.publicDevice
+        // The replay outlives the window, but only to its original expiry.
         if let requestId {
             pairingReplay = PairingReplay(
                 requestId: requestId,
@@ -1085,7 +1184,7 @@ public actor NativeCompanionServer {
         }
         let summary = FleetSummary(
             bots: bots,
-            pairedDevices: pairedTokens.count,
+            pairedDevices: deviceRegistry.count,
             pushTokensRegistered: pushTokens.count
         )
         return .json(200, summary)
