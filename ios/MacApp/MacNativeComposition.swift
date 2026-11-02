@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import CompanionCore
 
@@ -11,6 +12,10 @@ public enum MacNativeComposition {
     public static let drainDeadlineMs: Double = 10_000
     /// How often the drain re-reads the turn counts.
     public static let drainPollMs: Double = 250
+    /// How long quit waits for the terminal runtime shutdown to acknowledge
+    /// after the settle window.  Quit replies and proceeds regardless: a hung
+    /// quit is worse than a shutdown that finishes behind it.
+    public static let shutdownAckTimeoutMs: Double = 5_000
 }
 
 /// Snapshot of native engine activity for the Mac app's server-bridge session
@@ -73,9 +78,15 @@ public struct MacNativeDrainResult: Equatable, Sendable {
         self.didShutDownRuntime = didShutDownRuntime
     }
 
-    /// One sentence for logs and the session's drain summary.
+    /// One sentence for logs and the session's drain summary.  Stopped work
+    /// is only claimed after the terminal shutdown acknowledged: a shutdown
+    /// that never answered leaves the work's fate to the next start, and the
+    /// summary says that instead of claiming a stop that may not have run.
     public var summary: String {
         if settledCleanly { return "Native engine work settled before quitting." }
+        if !didShutDownRuntime {
+            return "Native shutdown did not answer before quitting.\u{00A0} Unfinished turns resume at the next start."
+        }
         var parts: [String] = []
         if remainingEngineTurns > 0 {
             parts.append("\(remainingEngineTurns) turn\(remainingEngineTurns == 1 ? "" : "s") stopped")
@@ -104,16 +115,21 @@ public enum MacNativeGracefulDrain {
         sleepNanoseconds: @Sendable (UInt64) async -> Void = { nanoseconds in
             try? await Task.sleep(nanoseconds: nanoseconds)
         },
-        nowMs: @Sendable () -> Double = { Date().timeIntervalSince1970 * 1_000 }
+        nowMs: @Sendable () -> Double = { Self.uptimeMilliseconds() }
     ) async -> MacNativeDrainResult {
         let clampedPollMs = max(1, pollMs)
-        let deadline = nowMs() + max(0, deadlineMs)
+        let totalMs = Self.clampedPositiveInterval(deadlineMs)
+        let deadline = nowMs() + totalMs
         var snapshot = await readSnapshot()
         // The first check is immediate, because settled work needs no wait.
         while snapshot.isBusy, nowMs() < deadline {
-            let waitMs = min(clampedPollMs, max(0, deadline - nowMs()))
-            guard waitMs > 0 else { break }
-            await sleepNanoseconds(UInt64(waitMs * 1_000_000))
+            let remainingMs = deadline - nowMs()
+            // A non-finite or non-positive remainder ends the wait instead of
+            // sleeping: converting it to nanoseconds below would trap.
+            guard remainingMs.isFinite, remainingMs > 0 else { break }
+            let waitMs = min(clampedPollMs, remainingMs)
+            guard waitMs.isFinite, waitMs > 0 else { break }
+            await sleepNanoseconds(Self.nanoseconds(clampingMilliseconds: waitMs))
             snapshot = await readSnapshot()
         }
         return MacNativeDrainResult(
@@ -121,6 +137,71 @@ public enum MacNativeGracefulDrain {
             remainingEngineTurns: snapshot.engineTurns,
             remainingProcesses: snapshot.supervisedProcesses
         )
+    }
+
+    /// Bounded wait for a flag the caller flips elsewhere (for example a
+    /// detached terminal shutdown acknowledging).  Returns whether the flag
+    /// was set before the deadline.  Never sleeps past the deadline and
+    /// never converts a non-finite interval.
+    public static func waitUntil(
+        deadlineMs: Double,
+        pollMs: Double = MacNativeComposition.drainPollMs,
+        condition: @Sendable () async -> Bool,
+        sleepNanoseconds: @Sendable (UInt64) async -> Void = { nanoseconds in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+        },
+        nowMs: @Sendable () -> Double = { Self.uptimeMilliseconds() }
+    ) async -> Bool {
+        let clampedPollMs = max(1, pollMs)
+        let deadline = nowMs() + Self.clampedPositiveInterval(deadlineMs)
+        if await condition() { return true }
+        while nowMs() < deadline {
+            let remainingMs = deadline - nowMs()
+            guard remainingMs.isFinite, remainingMs > 0 else { break }
+            let waitMs = min(clampedPollMs, remainingMs)
+            guard waitMs.isFinite, waitMs > 0 else { break }
+            await sleepNanoseconds(Self.nanoseconds(clampingMilliseconds: waitMs))
+            if await condition() { return true }
+        }
+        return await condition()
+    }
+
+    /// Milliseconds on the monotonic uptime clock, so an NTP step or manual
+    /// clock change mid-quit can neither stretch nor collapse the bounded
+    /// window the way wall-clock time could.
+    public static func uptimeMilliseconds() -> Double {
+        Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1_000_000
+    }
+
+    /// A finite, non-negative nanosecond count for a millisecond interval.
+    /// Non-finite or negative input sleeps nothing instead of trapping the
+    /// `UInt64` conversion, and huge input saturates instead of wrapping.
+    public static func nanoseconds(clampingMilliseconds ms: Double) -> UInt64 {
+        guard ms.isFinite, ms > 0 else { return 0 }
+        let nanos = ms * 1_000_000
+        guard nanos.isFinite else { return UInt64.max }
+        return UInt64(min(nanos, Double(UInt64.max)))
+    }
+
+    private static func clampedPositiveInterval(_ ms: Double) -> Double {
+        guard ms.isFinite, ms > 0 else { return 0 }
+        return ms
+    }
+}
+
+/// Acknowledgement flag for the detached terminal shutdown.
+///
+/// The quit path must not await the shutdown directly: a cancelled engine
+/// task that never exits would hang termination past its bounded window.
+/// The shutdown runs detached, flips this flag when it answers, and quit
+/// proceeds after a bounded acknowledgement wait regardless.
+actor MacNativeShutdownAck {
+    private(set) var isAcknowledged = false
+    private(set) var didSucceed = false
+
+    func acknowledge(success: Bool) {
+        isAcknowledged = true
+        didSucceed = success
     }
 }
 

@@ -740,12 +740,16 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// Fences admission first so the bounded wait converges, waits for the
     /// in-flight native turns and processes to settle, then runs the
     /// terminal runtime shutdown which stops what remains and flushes the
-    /// stores.  A listener that never started drains trivially.  This never
-    /// runs on window close: a persisted window close keeps the listener up,
-    /// and the terminal shutdown would make a later listener start fail.
+    /// stores.  Both phases are bounded: quit replies and proceeds even if a
+    /// cancelled engine task never exits, because a hung quit is worse than
+    /// a shutdown that finishes behind it.  A listener that never started
+    /// drains trivially.  This never runs on window close: a persisted
+    /// window close keeps the listener up, and the terminal shutdown would
+    /// make a later listener start fail.
     public func drainNativeEnginesForTermination(
         deadlineMs: Double = MacNativeComposition.drainDeadlineMs,
-        pollMs: Double = MacNativeComposition.drainPollMs
+        pollMs: Double = MacNativeComposition.drainPollMs,
+        shutdownAckTimeoutMs: Double = MacNativeComposition.shutdownAckTimeoutMs
     ) async -> MacNativeDrainResult {
         guard let macRuntime = nativeRuntimeBox.runtime else {
             let result = MacNativeDrainResult(settledCleanly: true)
@@ -755,17 +759,39 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         // Fence first: no new wait dispatches while the bounded wait runs,
         // so the counters it watches can actually reach zero.  In-flight
         // engine turns keep running until they settle or are stopped below.
+        // This is the right layer for this composition: the app dispatches
+        // native turns only through the wait queue, which this shutdown
+        // fences, and supervised processes stop through the engine
+        // cancellations the terminal shutdown below performs.
         await macRuntime.runtime.shutdown()
         var result = await MacNativeGracefulDrain.drain(
             deadlineMs: deadlineMs,
             pollMs: pollMs,
             readSnapshot: { [weak self] in await self?.readNativeBusySnapshot() ?? MacNativeBusySnapshot() }
         )
-        do {
-            try await macRuntime.runtime.shutdownAndDrain()
-            result.didShutDownRuntime = true
-        } catch {
-            NSLog("Native runtime shutdown failed: %@", error.localizedDescription)
+        // The terminal phase runs detached and only acknowledged: awaiting
+        // it directly would hang quit past the bounded window when a
+        // cancelled engine task never exits.
+        let shutdownAck = MacNativeShutdownAck()
+        let runtime = macRuntime.runtime
+        Task.detached(priority: .utility) {
+            do {
+                try await runtime.shutdownAndDrain()
+                await shutdownAck.acknowledge(success: true)
+            } catch {
+                NSLog("Native runtime shutdown failed: %@", error.localizedDescription)
+                await shutdownAck.acknowledge(success: false)
+            }
+        }
+        let ackedCleanly = await MacNativeGracefulDrain.waitUntil(
+            deadlineMs: shutdownAckTimeoutMs,
+            pollMs: pollMs,
+            condition: { await shutdownAck.isAcknowledged }
+        )
+        let shutdownSucceeded = await shutdownAck.didSucceed
+        result.didShutDownRuntime = ackedCleanly && shutdownSucceeded
+        if !ackedCleanly {
+            NSLog("Native runtime shutdown did not answer before quitting; proceeding with termination.")
         }
         await refreshNativeBusyState()
         nativeDrainSummary = result.summary
