@@ -531,17 +531,17 @@ const appConfigSchema = z.object({
   computerCall: z.object({
     waitMs: z.number().int().min(500).max(CONTROL_WAIT_MS).optional(),
     actWithinMs: z.number().int().min(100).max(CONTROL_ACT_WITHIN_MS).optional(),
-    personAwayMs: z.number().int().min(1).optional(),
-  }).optional(),
+    personAwayMs: z.number().int().min(1).max(2_147_483_647).optional(),
+  }).strict().optional(),
   // How long an idle Claude CLI session is kept warm before the driver
   // closes it (server/drivers/claude.ts).  `idleMinMs` is the floor the
   // effective window never drops below.  Absent fields resolve through the
   // legacy `OMB_CLAUDE_SESSION_IDLE_*` env names to the driver's built-in
   // defaults (`claudeSessionIdleMs` below); the vault knobs override both.
   claudeSession: z.object({
-    idleMs: z.number().int().min(1).optional(),
-    idleMinMs: z.number().int().min(1).optional(),
-  }).optional(),
+    idleMs: z.number().int().min(1).max(2_147_483_647).optional(),
+    idleMinMs: z.number().int().min(1).max(2_147_483_647).optional(),
+  }).strict().optional(),
   // Error and performance reporting.  The kill switch is explicit: a DSN
   // with no `enabled` flag reports.  Only a stored `false` stops it, so an
   // upgraded install never goes quiet without saying why.
@@ -1147,7 +1147,9 @@ export function claudeSessionIdleMs(cfg: AppConfig): number {
       ? configuredMinimum
       : DEFAULT_CLAUDE_SESSION_IDLE_MIN_MS;
   const configured = cfg.claudeSession?.idleMs ?? Number(process.env.OMB_CLAUDE_SESSION_IDLE_MS);
-  return Math.max(minimum, configured || DEFAULT_CLAUDE_SESSION_IDLE_MS);
+  // Node timers collapse delays above 2^31-1 to 1ms, which would close
+  // the warm session on every turn instead of keeping it.
+  return Math.min(2_147_483_647, Math.max(minimum, configured || DEFAULT_CLAUDE_SESSION_IDLE_MS));
 }
 
 export function localQuotaRoutingEnabled(cfg: AppConfig): boolean {

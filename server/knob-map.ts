@@ -331,6 +331,7 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     infisicalName: "BOTFLEET_COMPUTER_CALL_WAIT_MAX_MS",
     kind: "int",
     min: 1,
+    max: 2_147_483_647,
   },
   {
     // Read once when the Claude driver is created (server/drivers/claude.ts),
@@ -346,6 +347,7 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     infisicalName: "BOTFLEET_CLAUDE_SESSION_IDLE_MS",
     kind: "int",
     min: 1,
+    max: 2_147_483_647,
   },
   {
     id: "claudeSession.idleMinMs",
@@ -355,6 +357,7 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     infisicalName: "BOTFLEET_CLAUDE_SESSION_IDLE_MIN_MS",
     kind: "int",
     min: 1,
+    max: 2_147_483_647,
   },
 ] as const;
 

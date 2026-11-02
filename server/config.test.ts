@@ -1216,6 +1216,7 @@ describe("knob-backed env migrations", () => {
     expect(claudeSessionIdleMs({ claudeSession: { idleMs: 120_000 } })).toBe(120_000);
     // The floor holds even when the configured window is below it.
     expect(claudeSessionIdleMs({ claudeSession: { idleMs: 5, idleMinMs: 2_000 } })).toBe(2_000);
+    expect(claudeSessionIdleMs({ claudeSession: { idleMs: 9_999_999_999 } })).toBe(2_147_483_647);
   });
 });
 
