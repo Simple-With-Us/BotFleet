@@ -1563,6 +1563,21 @@ describe("the secret-store section", () => {
     expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "ok", projectId: "../x" }] } })).toThrow("readSources");
     expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } } } })).not.toThrow();
     expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "Bad Source" } } } })).toThrow("credentialSources");
+    // A pattern without {ROLE} would resolve every role to the same
+    // secret; the login pattern also needs {FIELD}.
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "ZULIP_{FIELD}" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_API_KEY" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_TOKEN" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" } } } })).not.toThrow();
+    // A per-field project/environment cannot be honoured (the named
+    // source's token is scoped to its own project/env), so it is dropped.
+    expect(parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}", projectId: "other-proj", environment: "dev" } } } })).toEqual({
+      zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } } },
+    });
+    // Stored read-source paths are normalized the same way requests are.
+    expect(
+      infisicalSettings({ infisical: { projectId: "main-proj", readSources: [{ name: "a-source", tokenEnv: "FAKE_TOK", projectId: "p1", secretPath: "/zulip/" }] } }).readSources[0]?.secretPath,
+    ).toBe("/zulip");
   });
 
   it("drops one bad readSources entry and keeps the main infisical settings and the valid entries", () => {

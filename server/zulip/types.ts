@@ -61,13 +61,13 @@ export interface ZulipWorkUnit {
 }
 
 export interface ZulipCredentialFieldSource {
-  /** Name of an `infisical.readSources` entry. */
+  /** Name of an `infisical.readSources` entry.  That entry's token is
+   * scoped to its own project and environment, so there is no per-field
+   * project/environment override: it could not be honoured. */
   source: string;
   /** Key template with `{ROLE}` and (for login fields) `{FIELD}`. */
   keyPattern?: string;
   path?: string;
-  projectId?: string;
-  environment?: string;
 }
 
 /** The `zulip` section of ~/.botfleet/config.json. */

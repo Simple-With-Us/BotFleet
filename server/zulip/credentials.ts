@@ -108,11 +108,12 @@ export function describeVaultLocation(location: Pick<ZulipVaultLocation, "secret
 }
 
 export interface ZulipCredentialFieldSource {
+  /** Name of an `infisical.readSources` entry.  That entry's token is
+   * scoped to its own project and environment, so there is no per-field
+   * project/environment override: it could not be honoured. */
   source: string;
   keyPattern?: string;
   path?: string;
-  projectId?: string;
-  environment?: string;
 }
 
 export function roleCode(role: string): string {
@@ -313,10 +314,10 @@ export function infisicalCredentialSource(
   const loginSpec = opts.credentialSources?.login;
   const outgoingSpec = opts.credentialSources?.outgoing;
   const loginLoc: ZulipVaultLocation = loginSpec
-    ? { secretPath: loginSpec.path?.trim() || secretPath, projectId: loginSpec.projectId?.trim() || undefined, environment: loginSpec.environment?.trim() || undefined, source: loginSpec.source }
+    ? { secretPath: loginSpec.path?.trim() || secretPath, source: loginSpec.source }
     : { secretPath, projectId, environment };
   const outgoingLoc: ZulipVaultLocation | null = outgoingSpec
-    ? { secretPath: outgoingSpec.path?.trim() || secretPath, projectId: outgoingSpec.projectId?.trim() || undefined, environment: outgoingSpec.environment?.trim() || undefined, source: outgoingSpec.source }
+    ? { secretPath: outgoingSpec.path?.trim() || secretPath, source: outgoingSpec.source }
     : null;
   const where = describeVaultLocation(loginLoc);
   const bound = opts.roles?.map((role) => role.trim());

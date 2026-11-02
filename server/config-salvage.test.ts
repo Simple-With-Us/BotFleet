@@ -119,6 +119,26 @@ describe("loadConfig with a config.json it cannot fully use", () => {
     ]);
   });
 
+  it("drops a zulip credentialSources entry whose keyPattern lacks its placeholders, with a warning", () => {
+    writeFileSync(
+      path,
+      JSON.stringify({
+        profile: { name: "Ada" },
+        zulip: {
+          enabled: true,
+          credentialSources: {
+            login: { source: "fleetops-zulip", keyPattern: "ZULIP_API_KEY" },
+            outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" },
+          },
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.profile?.name).toBe("Ada");
+    expect(cfg.zulip?.credentialSources).toEqual({ outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" } });
+    expect(warned().join(" ")).toContain("zulip.credentialSources.login");
+  });
+
   it("treats a file where no section survives as ignored rather than partial", () => {
     writeFileSync(
       path,

@@ -269,12 +269,27 @@ const featureConfigSchema = z.object({
   /** Per-turn Git worktree isolation for bots working in a shared repository. */
   gitWorktreeLeases: z.boolean().optional(),
 });
-const zulipCredentialFieldSourceSchema = z.object({
+const zulipKeyPatternSchema = z.string().trim().regex(/^[A-Z0-9_{}]+$/).max(200);
+// Without `{ROLE}` every role resolves to the same secret name, so a
+// pattern that omits it must never validate.  The login pattern also
+// needs `{FIELD}`, or EMAIL/API_KEY/SITE collapse onto one name.
+const zulipLoginCredentialFieldSourceSchema = z.object({
   source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
-  keyPattern: z.string().trim().regex(/^[A-Z0-9_{}]+$/).max(200).optional(),
+  keyPattern: zulipKeyPatternSchema
+    .refine((value) => value.includes("{ROLE}") && value.includes("{FIELD}"), {
+      message: "login keyPattern must contain {ROLE} and {FIELD}",
+    })
+    .optional(),
   path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
-  projectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
-  environment: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
+});
+const zulipOutgoingCredentialFieldSourceSchema = z.object({
+  source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  keyPattern: zulipKeyPatternSchema
+    .refine((value) => value.includes("{ROLE}"), {
+      message: "outgoing keyPattern must contain {ROLE}",
+    })
+    .optional(),
+  path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
 });
 const zulipConfigSchema = z.object({
   enabled: z.boolean().optional(),
@@ -289,8 +304,8 @@ const zulipConfigSchema = z.object({
   infisicalProjectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
   infisicalEnv: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
   credentialSources: z.object({
-    login: zulipCredentialFieldSourceSchema.optional(),
-    outgoing: zulipCredentialFieldSourceSchema.optional(),
+    login: zulipLoginCredentialFieldSourceSchema.optional(),
+    outgoing: zulipOutgoingCredentialFieldSourceSchema.optional(),
   }).optional(),
   bots: z
     .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
@@ -1202,6 +1217,14 @@ export interface InfisicalReadSource {
   secretPath?: string;
 }
 
+/** Strip one trailing slash (except root), so `/zulip/` and `/zulip`
+ * name the same folder everywhere paths are stored or compared. */
+export function normalizeInfisicalSecretPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) return "/";
+  return trimmed.length > 1 && trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+}
+
 export interface ResolvedInfisicalReadSource {
   name: string;
   tokenFile: string;
@@ -1279,7 +1302,7 @@ export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
           tokenEnv: src.tokenEnv?.trim() ?? "",
           projectId,
           environment: INFISICAL_ENVIRONMENT_PATTERN.test(env) ? env : (stored.environment?.trim() || DEFAULT_INFISICAL_ENVIRONMENT),
-          secretPath: path.startsWith("/") ? path : DEFAULT_INFISICAL_SECRET_PATH,
+          secretPath: path.startsWith("/") ? normalizeInfisicalSecretPath(path) : DEFAULT_INFISICAL_SECRET_PATH,
         });
       }
       return out;
@@ -1652,7 +1675,8 @@ function salvageZulipCredentialSources(value: JsonValue): { usable: JsonObject; 
   for (const field of ["login", "outgoing"] as const) {
     const entry = raw[field];
     if (entry === undefined) continue;
-    if (zulipCredentialFieldSourceSchema.safeParse(entry).success) {
+    const fieldSchema = field === "login" ? zulipLoginCredentialFieldSourceSchema : zulipOutgoingCredentialFieldSourceSchema;
+    if (fieldSchema.safeParse(entry).success) {
       kept[field] = entry;
     } else {
       issues.push(`zulip.credentialSources.${field} is invalid`);

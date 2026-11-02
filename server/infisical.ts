@@ -11,9 +11,11 @@
 // leave this module.  `writeSecret` is the one path that sends a value
 // anywhere at all, and it goes straight to Infisical over the connection
 // `login()` already authenticated, never through a log line.
-import { readFileSync, statSync } from "node:fs";
+import { lstat, readFile, realpath } from "node:fs/promises";
+import { resolve, sep } from "node:path";
 
-import type { InfisicalSettings, ResolvedInfisicalReadSource } from "./config.ts";
+import { normalizeInfisicalSecretPath, type InfisicalSettings, type ResolvedInfisicalReadSource } from "./config.ts";
+import { dataDir } from "./data-dir.ts";
 import { InfisicalError, login, listSecrets, upsertSecret } from "./infisical-client.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { SECRET_FIELDS, infisicalSnapshot, setInfisicalSnapshot, vaultNames as snapshotVaultNames } from "./secret-map.ts";
@@ -307,19 +309,33 @@ class InfisicalManager {
     return new InfisicalError(`read source "${source.name}" unavailable (${locator}): ${detail}`, statusCode);
   }
 
-  private resolveSourceToken(source: ResolvedInfisicalReadSource): { token: string } | { error: string } {
+  private async resolveSourceToken(source: ResolvedInfisicalReadSource): Promise<{ token: string } | { error: string }> {
     if (source.tokenFile) {
+      // The file's contents become a bearer token sent to `siteUrl`, so
+      // the path itself is part of the trust boundary: it must live in
+      // the BotFleet config directory (where `config.json` lives), be a
+      // real regular file, and be owner-only.  Any failure is a refusal,
+      // never a warning-and-continue.
+      const configDir = resolve(dataDir());
+      const candidate = resolve(source.tokenFile);
+      if (candidate !== configDir && !candidate.startsWith(`${configDir}${sep}`)) {
+        return { error: `token file ${source.tokenFile} is outside the BotFleet config directory ${configDir}; refusing to read it` };
+      }
       try {
-        const st = statSync(source.tokenFile);
-        if (!st.isFile()) return { error: "token file is not a regular file" };
+        const st = await lstat(candidate);
+        if (st.isSymbolicLink()) return { error: `token file ${source.tokenFile} is a symlink; refusing to read it` };
+        if (!st.isFile()) return { error: `token file ${source.tokenFile} is not a regular file; refusing to read it` };
         if (process.platform !== "win32" && (st.mode & 0o077) !== 0) {
-          const key = `${source.name}\u0000insecure\u0000${source.tokenFile}`;
-          if (!this.warnedReadSources.has(key)) {
-            this.warnedReadSources.add(key);
-            console.warn(`[infisical] read source "${source.name}" token file ${source.tokenFile} is readable by group or other (mode ${(st.mode & 0o777).toString(8)}); run chmod 600 on it`);
-          }
+          return { error: `token file ${source.tokenFile} is readable or writable by group or other (mode ${(st.mode & 0o777).toString(8)}); run chmod 600 on it` };
         }
-        const token = readFileSync(source.tokenFile, "utf8").trim();
+        // A symlinked parent directory must not smuggle the file out of
+        // the config directory the lexical check above approved.
+        const realConfigDir = await realpath(configDir);
+        const realCandidate = await realpath(candidate);
+        if (realCandidate !== realConfigDir && !realCandidate.startsWith(`${realConfigDir}${sep}`)) {
+          return { error: `token file ${source.tokenFile} is outside the BotFleet config directory ${configDir}; refusing to read it` };
+        }
+        const token = (await readFile(candidate, "utf8")).trim();
         return token ? { token } : { error: "token file is empty" };
       } catch (e) {
         const code = e instanceof Error && "code" in e && e.code ? String(e.code) : "error";
@@ -334,14 +350,18 @@ class InfisicalManager {
   }
 
   private findReadSource(settings: InfisicalSettings, projectId: string, environment: string, secretPath: string): ResolvedInfisicalReadSource | undefined {
-    const covers = (src: ResolvedInfisicalReadSource) => src.secretPath === "/" || secretPath === src.secretPath || secretPath.startsWith(`${src.secretPath}/`);
+    const requested = normalizeInfisicalSecretPath(secretPath);
+    const covers = (src: ResolvedInfisicalReadSource) => {
+      const stored = normalizeInfisicalSecretPath(src.secretPath);
+      return stored === "/" || requested === stored || requested.startsWith(`${stored}/`);
+    };
     return (settings.readSources ?? [])
       .filter((src) => src.projectId === projectId && src.environment === environment && covers(src))
-      .sort((a, b) => b.secretPath.length - a.secretPath.length)[0];
+      .sort((a, b) => normalizeInfisicalSecretPath(b.secretPath).length - normalizeInfisicalSecretPath(a.secretPath).length)[0];
   }
 
   private async readWithSource(settings: InfisicalSettings, source: ResolvedInfisicalReadSource, secretPath: string, projectId: string, environment: string): Promise<ReadonlyMap<string, string>> {
-    const resolved = this.resolveSourceToken(source);
+    const resolved = await this.resolveSourceToken(source);
     if ("error" in resolved) {
       this.warnReadSource(source, resolved.error);
       throw this.readSourceFailure(source, resolved.error, 409);
@@ -389,7 +409,7 @@ class InfisicalManager {
       this.warnReadSource(source, "Infisical is turned off");
       throw this.readSourceFailure(source, "Infisical is turned off", 409);
     }
-    return this.readWithSource(settings, source, secretPath?.trim() || source.secretPath, source.projectId, source.environment);
+    return this.readWithSource(settings, source, normalizeInfisicalSecretPath(secretPath?.trim() || source.secretPath), source.projectId, source.environment);
   }
 
   private settings(): InfisicalSettings {
@@ -777,6 +797,7 @@ class InfisicalManager {
     const settings = this.settings();
     const projectId = scope.projectId?.trim() || settings.projectId;
     const environment = scope.environment?.trim() || settings.environment;
+    secretPath = normalizeInfisicalSecretPath(secretPath);
     const source = settings.enabled === true ? this.findReadSource(settings, projectId, environment, secretPath) : undefined;
     if (source) return this.readWithSource(settings, source, secretPath, projectId, environment);
     if (!isConfigured(settings) || settings.enabled !== true) {

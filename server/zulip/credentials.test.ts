@@ -327,6 +327,10 @@ describe("the Infisical source", () => {
     expect(creds.key).toBe(FAKE_KEY);
     expect(creds.outgoingWebhookToken).toBe("fake-outgoing-not-real");
     expect(locations.map((l) => l.source)).toEqual(["fleetops-zulip", "afc-zulip"]);
+    // A named source's token is scoped to its own project/environment:
+    // the field carries no project/environment override to drop.
+    expect(locations[0]).not.toHaveProperty("projectId");
+    expect(locations[0]).not.toHaveProperty("environment");
     expect(locations[0]?.names).toContain("BF_PLUMBER_ZULIP_API_KEY");
     expect(locations[1]?.names).toContain("ZULIP_OUTGOING_BF_PLUMBER_TOKEN");
     // a missing login in the split source is "missing", not a crash

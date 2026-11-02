@@ -1,10 +1,11 @@
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { InfisicalSettings } from "./config.ts";
+import { dataDir } from "./data-dir.ts";
 import { infisical } from "./infisical.ts";
 import { infisicalSnapshot, setInfisicalSnapshot, vaultNames } from "./secret-map.ts";
 
@@ -515,7 +516,10 @@ describe("readSources", () => {
   const FLEET_TOKEN = "fake-fleetops-token-not-real";
   const AFC_TOKEN = "fake-afc-token-not-real";
   function tokenFile(token: string): string {
-    const dir = mkdtempSync(join(tmpdir(), "bf-infi-"));
+    // Token files are only read from the BotFleet config directory, so
+    // fixtures must live there (the throwaway test home), not in tmpdir.
+    mkdirSync(dataDir(), { recursive: true });
+    const dir = mkdtempSync(join(dataDir(), "bf-infi-"));
     const path = join(dir, "token");
     writeFileSync(path, `${token}\n`);
     chmodSync(path, 0o600);
@@ -585,7 +589,8 @@ describe("readSources", () => {
   });
 
   it("does not cache a failed source read: a later call retries and can succeed", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "bf-infi-"));
+    mkdirSync(dataDir(), { recursive: true });
+    const dir = mkdtempSync(join(dataDir(), "bf-infi-"));
     const path = join(dir, "token");
     withSettings({
       token: SENTINEL_READ_TOKEN,
@@ -601,6 +606,74 @@ describe("readSources", () => {
       const values = await infisical.readSource("fleetops-zulip");
       expect(values.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
       expect(infisical.getStatus().readSources[0]).toMatchObject({ name: "fleetops-zulip", ok: true });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("matches a read source when stored or requested path has a trailing slash", async () => {
+    withSettings({
+      token: SENTINEL_READ_TOKEN,
+      readSources: [{ name: "fleetops-zulip", tokenFile: tokenFile(FLEET_TOKEN), tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip/" }],
+    });
+    const { calls, impl } = recordingFetch();
+    vi.stubGlobal("fetch", impl);
+    const storedSlash = await infisical.readPath("/zulip", { projectId: "fleet-proj", environment: "prod" });
+    expect(storedSlash.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
+    const requestedSlash = await infisical.readPath("/zulip/", { projectId: "fleet-proj", environment: "prod" });
+    expect(requestedSlash.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
+    const namedSlash = await infisical.readSource("fleetops-zulip", "/zulip/");
+    expect(namedSlash.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
+    expect(calls.length).toBe(3);
+    expect(calls.every((c) => c.authorization?.includes(FLEET_TOKEN))).toBe(true);
+  });
+
+  it("refuses a token file outside the config directory, a symlink, and a group-readable file", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const outsideDir = mkdtempSync(join(tmpdir(), "bf-infi-outside-"));
+      const outside = join(outsideDir, "token");
+      writeFileSync(outside, `${FLEET_TOKEN}\n`);
+      chmodSync(outside, 0o600);
+      withSettings({
+        readSources: [{ name: "fleetops-zulip", tokenFile: outside, tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
+      });
+      await expect(infisical.readSource("fleetops-zulip")).rejects.toThrow(/outside the BotFleet config directory/);
+      await expect(infisical.readSource("fleetops-zulip")).rejects.toThrow(new RegExp(outside.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+      const real = tokenFile(FLEET_TOKEN);
+      const link = join(dataDir(), "bf-infi-link-token");
+      symlinkSync(real, link);
+      withSettings({
+        readSources: [{ name: "fleetops-zulip", tokenFile: link, tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
+      });
+      await expect(infisical.readSource("fleetops-zulip")).rejects.toThrow(/is a symlink/);
+
+      const loose = tokenFile(FLEET_TOKEN);
+      chmodSync(loose, 0o640);
+      withSettings({
+        readSources: [{ name: "fleetops-zulip", tokenFile: loose, tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
+      });
+      await expect(infisical.readSource("fleetops-zulip")).rejects.toThrow(/group or other/);
+
+      const notAFile = join(dataDir(), "bf-infi-dir-token");
+      mkdirSync(notAFile, { recursive: true });
+      withSettings({
+        readSources: [{ name: "fleetops-zulip", tokenFile: notAFile, tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
+      });
+      await expect(infisical.readSource("fleetops-zulip")).rejects.toThrow(/not a regular file/);
+
+      const linkDir = join(dataDir(), "bf-infi-link-dir");
+      symlinkSync(outsideDir, linkDir);
+      withSettings({
+        readSources: [{ name: "fleetops-zulip", tokenFile: join(linkDir, "token"), tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
+      });
+      await expect(infisical.readSource("fleetops-zulip")).rejects.toThrow(/outside the BotFleet config directory/);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(warn.mock.calls.flat().join(" ")).toContain("fleetops-zulip");
+      expect(warn.mock.calls.flat().join(" ")).not.toContain(FLEET_TOKEN);
     } finally {
       warn.mockRestore();
     }
