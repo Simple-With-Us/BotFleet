@@ -6,6 +6,7 @@ public enum SavedHostError: Error, LocalizedError, Equatable {
     case invalidOrigin, invalidRecord, unreadableStore, storeBusy, localAnchor, hostInUse, credentialUnavailable
     case credentialExists
     case differentOrigin, authentication, invalidResponse, differentHost, missingPlacementRoutes, incompatibleVersion
+    case placementNotSaved, placementUnacknowledged
 
     public var errorDescription: String? {
         switch self {
@@ -23,6 +24,8 @@ public enum SavedHostError: Error, LocalizedError, Equatable {
         case .differentHost: return "This is a different server than the one you added."
         case .missingPlacementRoutes: return "This server has no placement routes.\u{00A0} Update the server to use this mode."
         case .incompatibleVersion: return "This server uses an incompatible placement version."
+        case .placementNotSaved: return "Save the placement before applying it."
+        case .placementUnacknowledged: return "The controller has not confirmed this placement.\u{00A0} Try again after it answers."
         }
     }
 }

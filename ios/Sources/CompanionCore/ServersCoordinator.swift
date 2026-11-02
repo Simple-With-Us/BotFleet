@@ -7,6 +7,8 @@ public protocol ServersHostStore: Sendable {
     func upsert(_ host: HostRecord) async throws
     func updateThisMacOrigin(_ origin: HostOrigin) async throws
     func remove(id: String, controllerID: String?, leasedHostIDs: Set<String>) async throws
+    func save(_ selection: PlacementSelection) async throws
+    func recordApplied(_ selection: PlacementSelection) async throws
 }
 extension HostStore: ServersHostStore {}
 
@@ -29,6 +31,7 @@ public final class ServersCoordinator: ObservableObject {
     @Published public private(set) var isBusy = false
     @Published public private(set) var isLoaded = false
     @Published public private(set) var errorMessage: String?
+    @Published public private(set) var placement = PlacementSettings()
     public var connectedRecordID: String? = HostRecord.localID
     public var controllerID: String?
     public var leasedHostIDs: Set<String> = []
@@ -53,7 +56,7 @@ public final class ServersCoordinator: ObservableObject {
         do {
             let loaded = try await loading.value
             guard !isLoaded else { return }
-            hosts = loaded; isLoaded = true; errorMessage = nil
+            hosts = loaded; placement = try await store.settings(); isLoaded = true; errorMessage = nil
         } catch { errorMessage = SavedHostError.unreadableStore.localizedDescription }
         self.loading = nil; isBusy = false
     }
@@ -94,6 +97,44 @@ public final class ServersCoordinator: ObservableObject {
             hosts = records; errorMessage = nil
             return records.first(where: \.isLocal)
         } catch { errorMessage = safeMessage(error); return nil }
+    }
+
+    /// Saves a placement selection without applying it.  Applied state is
+    /// recorded only by `confirmPlacementApplied` after the controller answers.
+    @discardableResult
+    public func savePlacement(_ selection: PlacementSelection) async -> Bool {
+        guard canMutate else { return false }
+        isBusy = true; defer { isBusy = false }
+        do {
+            try await store.save(selection)
+            placement = try await store.settings(); errorMessage = nil
+            return true
+        } catch { errorMessage = safeMessage(error); return false }
+    }
+
+    /// Records applied state only for the saved selection and only with the
+    /// controller's acknowledgement naming that selection's expected
+    /// controller: the saved server's pinned identity in Server First, this
+    /// Mac's pinned identity otherwise.  Anything else leaves applied alone.
+    @discardableResult
+    public func confirmPlacementApplied(_ selection: PlacementSelection, acknowledgedBy ack: ControllerAcknowledgement) async -> Bool {
+        guard canMutate else { return false }
+        isBusy = true; defer { isBusy = false }
+        do {
+            let current = try await store.settings()
+            guard selection == current.saved else { throw SavedHostError.placementNotSaved }
+            guard HostRecord.validHostId(ack.controllerId), ack.epoch >= 0 else { throw SavedHostError.placementUnacknowledged }
+            let expected: String?
+            if selection.mode == .serverFirst {
+                expected = hosts.first(where: { !$0.isLocal && $0.id == selection.serverID })?.hostId
+            } else {
+                expected = hosts.first(where: \.isLocal)?.hostId
+            }
+            guard let expected, ack.controllerId == expected else { throw SavedHostError.placementUnacknowledged }
+            try await store.recordApplied(selection)
+            placement = try await store.settings(); errorMessage = nil
+            return true
+        } catch { errorMessage = safeMessage(error); return false }
     }
 
     public func removalReason(_ host: HostRecord) -> String? {

@@ -26,6 +26,8 @@ private actor FixtureHosts: ServersHostStore {
         else { records.append(host) }
     }
     func updateThisMacOrigin(_ origin: HostOrigin) { records[0].origin = origin }
+    func save(_ selection: PlacementSelection) { placement.saved = selection }
+    func recordApplied(_ selection: PlacementSelection) { placement.applied = selection }
     func remove(id: String, controllerID: String?, leasedHostIDs: Set<String>) throws {
         if failRemove { throw SavedHostError.unreadableStore }
         records.removeAll { $0.id == id }
@@ -242,6 +244,65 @@ final class ServersCoordinatorTests: XCTestCase {
             for _ in 0..<30 { await Task.yield() }
             XCTAssertNil(model.hosts.first?.hostId); XCTAssertNil(model.statuses[HostRecord.localID])
         }
+    }
+    func testSavePlacementWritesSavedOnlyAndAppliedWaitsForControllerAck() async throws {
+        let (model, store, tokens) = await fixture()
+        let host = await add(model)
+        model.test(host, token: RedactedSecret("fixture-only-token"))
+        try await settled(model)
+        let pinned = try XCTUnwrap(model.hosts.last)
+        XCTAssertEqual(pinned.hostId, hostID)
+        XCTAssertTrue(tokens.contains(host.id))
+        let selection = PlacementSelection(mode: .serverFirst, serverID: host.id, allowOverflowToThisMac: true)
+        let saved = await model.savePlacement(selection)
+        XCTAssertTrue(saved)
+        XCTAssertEqual(model.placement.saved, selection)
+        XCTAssertEqual(model.placement.applied.mode, .localOnly)
+        XCTAssertTrue(model.placement.hasUnappliedChanges)
+        let storedAfterSave = await store.settings()
+        XCTAssertTrue(storedAfterSave.hasUnappliedChanges)
+        // A mismatched controller cannot apply the saved selection.
+        let other = ControllerAcknowledgement(controllerId: "server:22222222-2222-4222-8222-222222222222", epoch: 1)
+        let refused = await model.confirmPlacementApplied(selection, acknowledgedBy: other)
+        XCTAssertFalse(refused)
+        XCTAssertTrue(model.placement.hasUnappliedChanges)
+        XCTAssertTrue(model.errorMessage!.contains("has not confirmed"))
+        // The controller's own acknowledgement applies it.
+        let ack = ControllerAcknowledgement(verified)
+        let applied = await model.confirmPlacementApplied(selection, acknowledgedBy: ack)
+        XCTAssertTrue(applied)
+        XCTAssertFalse(model.placement.hasUnappliedChanges)
+        let storedAfterApply = await store.settings()
+        XCTAssertEqual(storedAfterApply.applied, selection)
+    }
+    func testConfirmAppliedRefusesUnsavedSelectionAndUnpinnedTarget() async throws {
+        let (model, _, _) = await fixture()
+        let host = await add(model)
+        let selection = PlacementSelection(mode: .serverFirst, serverID: host.id)
+        // Nothing saved yet: applying is refused before any ack is examined.
+        let unsaved = await model.confirmPlacementApplied(selection, acknowledgedBy: ControllerAcknowledgement(verified))
+        XCTAssertFalse(unsaved)
+        XCTAssertTrue(model.errorMessage!.contains("Save the placement"))
+        XCTAssertEqual(model.placement.applied.mode, .localOnly)
+        // Saved but never handshook: no pinned identity, so no ack can match.
+        let kept = await model.savePlacement(selection)
+        XCTAssertTrue(kept)
+        let unpinned = await model.confirmPlacementApplied(selection, acknowledgedBy: ControllerAcknowledgement(verified))
+        XCTAssertFalse(unpinned)
+        XCTAssertTrue(model.placement.hasUnappliedChanges)
+    }
+    func testConfirmAppliedLocalOnlyNeedsThisMacControllerAck() async throws {
+        let (model, _, _) = await fixture()
+        model.test(.thisMac)
+        try await settled(model)
+        let local = try XCTUnwrap(model.hosts.first)
+        XCTAssertEqual(local.hostId, hostID)
+        let selection = PlacementSelection(mode: .localOnly)
+        let kept = await model.savePlacement(selection)
+        XCTAssertTrue(kept)
+        let applied = await model.confirmPlacementApplied(selection, acknowledgedBy: ControllerAcknowledgement(verified))
+        XCTAssertTrue(applied)
+        XCTAssertFalse(model.placement.hasUnappliedChanges)
     }
     func testWireVersionUsesSharedFixtureAndServersDeepLinks() throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "placement-wire-version", withExtension: "json", subdirectory: "Fixtures"))
