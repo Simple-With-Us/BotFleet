@@ -116,13 +116,18 @@ public struct NativeMacCompanionRuntime {
     /// visible to `processFinished` waits.  Nil off macOS.
     public let ownedProcessLauncher: (any EngineProcessLauncher)?
     private let database: DatabaseService
+    /// The supervisor behind the ledger, retained so the Mac app's session
+    /// state and graceful-stop drain can read its supervised-process count.
+    /// Nil off macOS, where no owned process can run.
+    private let processSupervisor: ProcessSupervisorActor?
 
     public init(
         database: DatabaseService,
         workspacesRoot: URL,
         engineCoordinator: EngineCoordinatorActor? = nil,
         engineSwitch: BotNativeEngineSwitchActor? = nil,
-        executionContext: (any NativeExecutionContextSource)? = nil
+        executionContext: (any NativeExecutionContextSource)? = nil,
+        processSupervisor: ProcessSupervisorActor? = nil
     ) {
         self.database = database
         let coordinator = engineCoordinator ?? EngineCoordinatorActor(
@@ -132,11 +137,16 @@ public struct NativeMacCompanionRuntime {
         #if os(macOS)
         // The interactive app's supervisor inherits the app process
         // environment (the default), unlike the headless service, whose
-        // execution context supplies an explicit one.
-        let ledger = NativeHostProcessLedger(supervisor: ProcessSupervisorActor(), database: database)
+        // execution context supplies an explicit one.  An injected
+        // supervisor is used as-is so the Mac app composition owns the one
+        // instance its drain counters read.
+        let supervisor = processSupervisor ?? ProcessSupervisorActor()
+        self.processSupervisor = supervisor
+        let ledger = NativeHostProcessLedger(supervisor: supervisor, database: database)
         self.ownedProcessLauncher = ledger
         let processSource: any NativeEventWaitProcessOwnershipSource = ledger
         #else
+        self.processSupervisor = nil
         self.ownedProcessLauncher = nil
         let processSource: any NativeEventWaitProcessOwnershipSource = NoOwnedProcessSource()
         #endif
@@ -156,5 +166,21 @@ public struct NativeMacCompanionRuntime {
     /// served instead of answering `no_route`.
     public func makeServer() -> NativeCompanionServer {
         NativeCompanionServer(database: database, nativeRuntime: runtime)
+    }
+
+    /// Active engine turns on this graph.  Feeds the Mac app session state's
+    /// busy reading and the graceful-stop drain's work-in-flight counter.
+    public func activeEngineTurnCount() async -> Int {
+        await runtime.engineCoordinator.activeTurnCount()
+    }
+
+    /// Supervised engine processes on this graph.  Off macOS this is always
+    /// zero: no owned process can ever have started there.
+    public func activeProcessCount() async -> Int {
+        #if os(macOS)
+        await processSupervisor?.activeProcessCount() ?? 0
+        #else
+        return 0
+        #endif
     }
 }
