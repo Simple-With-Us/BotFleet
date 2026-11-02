@@ -11,6 +11,7 @@ public enum NativeHeadlessHostInstallerError: Error, Equatable, Sendable {
     case signatureValidationFailed
     case identityMismatch
     case invalidDataRoot
+    case dataRootOwnershipFailed
     case invalidPlistDestination
     case foreignPlistPresent
     case writeFailed
@@ -89,6 +90,30 @@ public struct SecCodeNativeHostSignatureInspector: NativeHostSignatureInspecting
     }
 }
 
+/// Resolves a service account and transfers data-root ownership to it.  Injected so fixtures
+/// can exercise the ownership step without root or a real service account.
+public protocol NativeHostDataRootOwnershipApplying: Sendable {
+    func serviceUID(forUserName name: String) -> uid_t?
+    func applyOwnership(of url: URL, userName: String) throws
+}
+
+public struct SystemNativeHostDataRootOwnershipApplier: NativeHostDataRootOwnershipApplying {
+    public init() {}
+
+    public func serviceUID(forUserName name: String) -> uid_t? {
+        getpwnam(name)?.pointee.pw_uid
+    }
+
+    public func applyOwnership(of url: URL, userName: String) throws {
+        guard let record = getpwnam(userName)?.pointee else {
+            throw NativeHeadlessHostInstallerError.dataRootOwnershipFailed
+        }
+        guard chown(url.path, record.pw_uid, record.pw_gid) == 0 else {
+            throw NativeHeadlessHostInstallerError.dataRootOwnershipFailed
+        }
+    }
+}
+
 public struct NativeHeadlessHostInstallValidation: Sendable {
     public let executable: URL
     public let signingIdentity: NativeHostSigningIdentity
@@ -114,14 +139,19 @@ public struct NativeHeadlessHostInstallResult: Sendable {
 public struct NativeHeadlessHostInstaller: Sendable {
     public let configuration: NativeHeadlessHostInstallConfiguration
     private let inspector: any NativeHostSignatureInspecting
+    private let ownershipApplier: any NativeHostDataRootOwnershipApplying
+    /// Stable ownership marker written into every rendered plist; launchd ignores unknown keys.
+    static let managedMarkerKey = "BotFleetInstallerManaged"
     // Test-only fault seams, exercised by CompanionCoreTests to prove rollback.  Nil in production.
     var beforeCommitHook: (@Sendable () throws -> Void)?
     var afterBackupHook: (@Sendable () throws -> Void)?
 
     public init(configuration: NativeHeadlessHostInstallConfiguration,
-                inspector: any NativeHostSignatureInspecting = SecCodeNativeHostSignatureInspector()) {
+                inspector: any NativeHostSignatureInspecting = SecCodeNativeHostSignatureInspector(),
+                ownershipApplier: any NativeHostDataRootOwnershipApplying = SystemNativeHostDataRootOwnershipApplier()) {
         self.configuration = configuration
         self.inspector = inspector
+        self.ownershipApplier = ownershipApplier
     }
 
     // MARK: - Validation (read-only)
@@ -143,10 +173,21 @@ public struct NativeHeadlessHostInstaller: Sendable {
               identity.codeIdentifier == config.expectedCodeIdentifier,
               identity.teamIdentifier == config.expectedTeamIdentifier
         else { throw NativeHeadlessHostInstallerError.identityMismatch }
-        let dataRoot = try Self.validatedDataRoot(config.serviceDataRoot)
+        let serviceUID = try resolvedServiceUID()
+        let dataRoot = try Self.validatedDataRoot(config.serviceDataRoot, serviceUID: serviceUID)
         let destination = try Self.validatedDestination(config.plistDestination, label: config.label)
         return NativeHeadlessHostInstallValidation(executable: executable, signingIdentity: identity,
                                                    serviceDataRoot: dataRoot, plistDestination: destination)
+    }
+
+    /// The configured service account must exist before anything is written; `nil` only when
+    /// no `serviceUserName` is configured.
+    private func resolvedServiceUID() throws -> uid_t? {
+        guard let user = configuration.serviceUserName else { return nil }
+        guard let uid = ownershipApplier.serviceUID(forUserName: user) else {
+            throw NativeHeadlessHostInstallerError.dataRootOwnershipFailed
+        }
+        return uid
     }
 
     private static func validatedExecutable(_ url: URL) throws -> URL {
@@ -166,16 +207,19 @@ public struct NativeHeadlessHostInstaller: Sendable {
     }
 
     /// Mirrors `NativeServicePaths` without creating anything: an existing root must already be
-    /// a private, caller-owned directory and must not be an interactive/Node root; a missing
-    /// root is created by `install()` through `NativeServicePaths` itself.
-    private static func validatedDataRoot(_ url: URL) throws -> URL {
+    /// a private directory owned by the caller or by the configured service user, and must not
+    /// be an interactive/Node root; a missing root is created by `install()` and then handed
+    /// to the service user through the ownership applier.
+    private static func validatedDataRoot(_ url: URL, serviceUID: uid_t?) throws -> URL {
         guard url.isFileURL, url.path.hasPrefix("/"), url.path != "/", !url.path.contains("\0") else {
             throw NativeHeadlessHostInstallerError.invalidDataRoot
         }
         let standardized = url.standardizedFileURL
         var info = stat()
         if lstat(standardized.path, &info) == 0 {
-            guard info.st_mode & S_IFMT == S_IFDIR, info.st_uid == getuid(), info.st_mode & 0o077 == 0 else {
+            guard info.st_mode & S_IFMT == S_IFDIR,
+                  info.st_uid == getuid() || (serviceUID != nil && info.st_uid == serviceUID),
+                  info.st_mode & 0o077 == 0 else {
                 throw NativeHeadlessHostInstallerError.invalidDataRoot
             }
             for name in ["harness-owner.json", "config.json"]
@@ -220,6 +264,7 @@ public struct NativeHeadlessHostInstaller: Sendable {
 
     static func plistDictionary(label: String, executable: URL, serviceDataRoot: URL, serviceUserName: String?) -> [String: Any] {
         var dictionary: [String: Any] = [
+            managedMarkerKey: true,
             "Label": label,
             // Matches the BotFleetNativeHost executable contract: exactly `--service-data <root>`.
             "ProgramArguments": [executable.path, "--service-data", serviceDataRoot.path],
@@ -264,11 +309,18 @@ public struct NativeHeadlessHostInstaller: Sendable {
         return dictionary
     }
 
-    /// A plist is ours only when it parses, carries our label, and launches our executable.
-    /// Anything else at the destination is foreign and is never overwritten or removed.
-    private func isOurPlist(_ dictionary: [String: Any], executable: URL) -> Bool {
-        dictionary["Label"] as? String == configuration.label &&
-            (dictionary["ProgramArguments"] as? [String])?.first == executable.path
+    /// A plist is ours when it carries our label, our `--service-data` argument shape, and
+    /// either the stable managed marker (so an executable-path change across releases still
+    /// upgrades in place) or, for definitions written before the marker existed, the exact
+    /// executable and data root this configuration would have written.  Anything else at the
+    /// destination is foreign and is never overwritten or removed.
+    private func isOurPlist(_ dictionary: [String: Any]) -> Bool {
+        guard dictionary["Label"] as? String == configuration.label,
+              let arguments = dictionary["ProgramArguments"] as? [String],
+              arguments.count == 3, arguments[1] == "--service-data" else { return false }
+        if dictionary[Self.managedMarkerKey] as? Bool == true { return true }
+        return arguments[0] == configuration.executable.standardizedFileURL.path &&
+            arguments[2] == configuration.serviceDataRoot.standardizedFileURL.path
     }
 
     // MARK: - Install / uninstall
@@ -279,36 +331,56 @@ public struct NativeHeadlessHostInstaller: Sendable {
     /// it does not register the job with launchd.
     public func install() throws -> NativeHeadlessHostInstallResult {
         let validation = try validate()
-        // Provision (or re-validate) the private, service-owned root the host itself requires.
-        _ = try NativeServicePaths(serviceData: validation.serviceDataRoot)
         let destination = validation.plistDestination
         let rendered = Self.plistDictionary(label: configuration.label,
                                             executable: validation.executable,
                                             serviceDataRoot: validation.serviceDataRoot,
                                             serviceUserName: configuration.serviceUserName)
+        // Refuse a foreign destination before any filesystem write, so a failed install
+        // leaves neither a data root nor a partial plist behind.
         var replacingOurs = false
         if FileManager.default.fileExists(atPath: destination.path) {
-            guard let existing = Self.parsedPlist(at: destination), isOurPlist(existing, executable: validation.executable) else {
+            guard let existing = Self.parsedPlist(at: destination), isOurPlist(existing) else {
                 throw NativeHeadlessHostInstallerError.foreignPlistPresent
             }
             if (existing as NSDictionary) == (rendered as NSDictionary) {
+                try provisionDataRoot(validation)
                 return NativeHeadlessHostInstallResult(plistURL: destination, outcome: .alreadyInstalled)
             }
             replacingOurs = true
         }
+        try provisionDataRoot(validation)
         let data = try renderedPlistData(validation: validation)
         try writeAtomically(data, to: destination, replacingExisting: replacingOurs)
         return NativeHeadlessHostInstallResult(plistURL: destination, outcome: replacingOurs ? .updated : .installed)
     }
 
+    /// Provisions (or re-validates) the private root and, when a different service user is
+    /// configured, transfers ownership to it.  A root already owned by the service user is
+    /// validated but never passed through `NativeServicePaths`, whose checks are written for
+    /// the runtime identity itself.
+    private func provisionDataRoot(_ validation: NativeHeadlessHostInstallValidation) throws {
+        let root = validation.serviceDataRoot
+        let serviceUID = try resolvedServiceUID()
+        var info = stat()
+        let ownedByServiceUser = serviceUID != nil && serviceUID != getuid() &&
+            lstat(root.path, &info) == 0 && info.st_uid == serviceUID
+        if !ownedByServiceUser { _ = try NativeServicePaths(serviceData: root) }
+        if let user = configuration.serviceUserName, let serviceUID, serviceUID != getuid() {
+            try ownershipApplier.applyOwnership(of: root, userName: user)
+        }
+    }
+
     /// Removes exactly the plist this installer wrote.  Returns false when nothing is
-    /// installed.  Service data under the data root is always left in place.
+    /// installed.  Service data under the data root is always left in place.  Uninstall runs
+    /// the same executable, signature, and identity validation as install and fails closed:
+    /// an unvalidated executable never authorizes a deletion.
     @discardableResult
     public func uninstall() throws -> Bool {
-        let destination = try Self.validatedDestination(configuration.plistDestination, label: configuration.label)
+        let validation = try validate()
+        let destination = validation.plistDestination
         guard FileManager.default.fileExists(atPath: destination.path) else { return false }
-        let executable = configuration.executable.standardizedFileURL
-        guard let existing = Self.parsedPlist(at: destination), isOurPlist(existing, executable: executable) else {
+        guard let existing = Self.parsedPlist(at: destination), isOurPlist(existing) else {
             throw NativeHeadlessHostInstallerError.foreignPlistPresent
         }
         guard unlink(destination.path) == 0 else { throw NativeHeadlessHostInstallerError.removeFailed }
@@ -321,6 +393,7 @@ public struct NativeHeadlessHostInstaller: Sendable {
         let token = UUID().uuidString
         let temporary = directory.appendingPathComponent(".\(configuration.label).plist.tmp-\(token)")
         let backup = directory.appendingPathComponent(".\(configuration.label).plist.backup-\(token)")
+        var backupRestored = false
         do {
             try Self.writeNewFile(data, at: temporary)
             try beforeCommitHook?()
@@ -334,8 +407,10 @@ public struct NativeHeadlessHostInstaller: Sendable {
                         throw NativeHeadlessHostInstallerError.writeFailed
                     }
                 } catch {
-                    // Roll back: the previous definition goes back exactly as it was.
-                    _ = rename(backup.path, destination.path)
+                    // Roll back: the previous definition goes back exactly as it was.  When
+                    // the restore itself fails the backup is the only copy left, so the
+                    // outer cleanup must not delete it.
+                    backupRestored = rename(backup.path, destination.path) == 0
                     throw error
                 }
                 _ = unlink(backup.path)
@@ -347,7 +422,9 @@ public struct NativeHeadlessHostInstaller: Sendable {
             Self.fsyncDirectory(directory)
         } catch {
             _ = unlink(temporary.path)
-            _ = unlink(backup.path)
+            if backupRestored || !FileManager.default.fileExists(atPath: backup.path) {
+                _ = unlink(backup.path)
+            }
             throw error
         }
     }
