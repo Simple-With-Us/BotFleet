@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  ORDERING_VERSION_PREFIX,
   orderingVersion,
   planElectronReleaseVersion,
   resolveElectronReleaseVersion,
@@ -14,11 +15,12 @@ import {
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const STAMP = "202610291425";
 
-test("the app version carries the build in the patch of the marketing version", () => {
+test("the app version carries the build in the patch", () => {
   // The Electron updater orders releases by semver on the app version alone
   // (electron/vendor/electron-updater.cjs), so the build has to travel inside
   // it.  The patch is the slot the retired 1.0.<commit_count> scheme used.
-  assert.equal(orderingVersion({ version: "0.1.0", build: STAMP }), "0.1.202610291425");
+  assert.equal(orderingVersion({ version: "0.1.0", build: STAMP }), "1.0.202610291425");
+  assert.equal(ORDERING_VERSION_PREFIX, "1.0");
 });
 
 /**
@@ -44,12 +46,22 @@ test("the app version orders two releases of the same marketing version", () => 
   assert.ok(compareVersions(second, later) < 0, `${second} must sort below ${later}`);
 });
 
-test("the app version sorts above the last published desktop release", () => {
-  // The transition:  an installed 0.1.38 compares itself against the feed's
-  // version, and electron-updater offers an update only when the feed version
-  // is GREATER.  A feed version below 0.1.38 would strand every install.
+test("the app version sorts above every version the fleet has shipped", () => {
+  // The transition, and it has two parts.  The last published release's feed
+  // says 0.1.38, and the owner's Mac has 1.0.31 installed (BF-2458).  The
+  // updater offers an update only when the feed version is GREATER than the
+  // installed one, and it sets no allowDowngrade, so a feed version below
+  // either of those would strand every install.
   const appVersion = orderingVersion({ version: "0.1.0", build: STAMP });
   assert.ok(compareVersions(appVersion, "0.1.38") > 0, `${appVersion} must sort above 0.1.38`);
+  assert.ok(compareVersions(appVersion, "1.0.31") > 0, `${appVersion} must sort above 1.0.31`);
+  assert.ok(compareVersions(appVersion, "1.0.2143") > 0, `${appVersion} must sort above 1.0.2143`);
+});
+
+test("the app version does not follow the marketing version's line", () => {
+  // A 0.1.<build> app version would be a downgrade against the installed
+  // 1.0.31, so the ordering prefix is not the marketing version's prefix.
+  assert.notEqual(orderingVersion({ version: "0.1.0", build: STAMP }).split(".")[0], "0");
 });
 
 test("a marketing version that is not x.y.z is refused", () => {
@@ -69,7 +81,7 @@ test("the release carries the marketing version, the build and the app version",
   assert.deepEqual(plan, {
     version: "0.1.0",
     build: STAMP,
-    appVersion: "0.1.202610291425",
+    appVersion: "1.0.202610291425",
   });
 });
 
@@ -80,7 +92,7 @@ test("the resolved plan answers the policy version, the build and the app versio
   const plan = resolveElectronReleaseVersion({ repoRoot, sha: "HEAD", forcedBuild: STAMP });
   assert.equal(plan.version, "0.1.0");
   assert.equal(plan.build, STAMP);
-  assert.equal(plan.appVersion, `0.1.${STAMP}`);
+  assert.equal(plan.appVersion, `1.0.${STAMP}`);
   assert.match(plan.mergeStamp, /^[1-9][0-9]{11}$/);
 });
 
@@ -98,7 +110,7 @@ test("the CLI prints the three values the release workflow pins", () => {
   );
   assert.equal(values.version, "0.1.0");
   assert.equal(values.build, STAMP);
-  assert.equal(values.app_version, `0.1.${STAMP}`);
+  assert.equal(values.app_version, `1.0.${STAMP}`);
   assert.match(values.merge_stamp, /^[1-9][0-9]{11}$/);
 });
 

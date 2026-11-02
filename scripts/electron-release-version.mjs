@@ -27,17 +27,28 @@
 // The build therefore travels in the patch of the app version, which is the
 // slot it has always occupied:  the retired scheme was 1.0.<commit_count>.
 // What the policy changes is what fills that slot - the merge stamp instead
-// of the commit count - and the version prefix, which is the marketing
-// version.  The three values are:
+// of the commit count - and the version prefix, which stays on the line the
+// installed fleet is already on.  The three values are:
 //
 //   marketing version   0.1.0             CFBundleShortVersionString
 //   build number        202611030100      CFBundleVersion
-//   app version         0.1.202611030100  package.json, the feed, the assets
+//   app version         1.0.202610291425  package.json, the feed, the assets
 //
 // The app version is what an installed app compares, so it has to carry the
 // build for two releases to order at all.  The marketing version stays 0.1.0
 // on every surface that reports a version to a person:  Finder, the settings
 // panel, and the Control bundle's own Info.plist.
+//
+// WHY THE APP VERSION KEEPS THE 1.0 PREFIX, and this is not a detail.  The
+// updater offers an update only when the feed's version is GREATER than the
+// installed app's version, and the installed app's version is its
+// package.json version, not its Info.plist.  The owner's Mac has 1.0.31
+// installed (BF-2458), and the last published release's feed says 0.1.38, so
+// an app version of 0.1.<build> would be a DOWNGRADE against both and every
+// install would refuse the update:  the updater sets no allowDowngrade, and
+// none should be added.  A feed version of 1.0.<build> sorts above every
+// version the fleet has ever shipped, because a merge stamp is twelve digits
+// and a commit count was four.
 //
 // One more consequence, and it is the reason the app version is not the
 // marketing version:  the app version is also what the artifact names and the
@@ -58,28 +69,37 @@ import {
 } from "./mac-release-version.mjs";
 
 /**
+ * The prefix the app version carries.
+ *
+ * Not the marketing version's prefix, and that is deliberate.  The updater
+ * offers an update only when the feed's version is greater than the installed
+ * app's version, and the installed fleet is on the 1.0 line:  the owner's Mac
+ * has 1.0.31 (BF-2458), and the last published release's feed says 0.1.38.
+ * A feed version on the 0.1 line would be a downgrade against both, and the
+ * updater sets no allowDowngrade, so every install would refuse the update.
+ * The build number fills the patch, and a merge stamp is twelve digits where
+ * a commit count was four, so 1.0.<build> sorts above every version the
+ * fleet has ever shipped.
+ */
+export const ORDERING_VERSION_PREFIX = "1.0";
+
+/**
  * The app version the Electron updater orders releases by.
  *
- * The marketing version supplies the major and minor parts and the build
- * number fills the patch, so the result is a plain three-part version that
- * sorts correctly:  0.1.202611030100 < 0.1.202611030101 < 0.1.202611040000.
- *
- * It also sorts ABOVE the retired scheme's releases, which is what keeps an
- * installed 0.1.38 (the last published desktop release) updatable:  the feed
- * version has to be greater than the installed one or electron-updater
- * answers "no update available" and the install never happens.
+ * The prefix is the ordering line and the build number fills the patch, so
+ * the result is a plain three-part version that sorts correctly:
+ * 1.0.202610291425 < 1.0.202610291426 < 1.0.202611040000.
  */
 export function orderingVersion({ version, build }) {
   const marketing = String(version ?? "").trim();
-  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(marketing);
-  if (!match) {
+  if (!/^\d+\.\d+\.\d+$/.test(marketing)) {
     throw new Error(`the marketing version is not x.y.z: ${marketing}`);
   }
   const number = String(build ?? "").trim();
   if (!/^[0-9]+$/.test(number)) {
     throw new Error(`the build number is not a number: ${build}`);
   }
-  return `${match[1]}.${match[2]}.${number}`;
+  return `${ORDERING_VERSION_PREFIX}.${number}`;
 }
 
 /**
