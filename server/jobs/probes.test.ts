@@ -85,11 +85,66 @@ describe("headroom admission (P-BF-6 B7)", () => {
     expect(reads).toBe(1);
     expect(sample.memoryAvailablePercent).toBeCloseTo(42, 0);
     expect(sample.ramAvailableBytes).toBe(Math.round(0.42 * 16 * 1024 ** 3));
+    // CPU is unknown on a Mac even with a load reading: load average is
+    // never an admission input there (owner ruling).
     expect(on.headroomReadings!()).toEqual({
-      availableCpuCores: 6,
+      availableCpuCores: null,
       ramAvailableBytes: Math.round(0.42 * 16 * 1024 ** 3),
       memoryAvailablePercent: 42,
     });
+  });
+
+  it("never gates Mac admission on load average, however high, but still gates Linux", async () => {
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    const statfs = () => ({ bsize: 4096, blocks: 1_000_000, bavail: 500_000, files: 100, ffree: 50 });
+    const mac = createHostProbe({
+      platform: "darwin",
+      readDarwinSwap: () => Promise.resolve("vm.swapusage: total = 1000.00M  used = 100.00M  free = 900.00M  (encrypted)"),
+      readHostLoad: () => ({ load1: 200, cores: 8 }),
+      totalMemory: () => 16 * 1024 ** 3,
+      statfs,
+    });
+    await settle();
+    expect(mac.headroomReadings!().availableCpuCores).toBeNull();
+    expect(admissionRefusal(mac, { ...thresholds, reservedCpuCores: 64 }, "/", false)).toBeNull();
+
+    const linux = createHostProbe({
+      platform: "linux",
+      readLinuxMeminfo: () => "MemTotal: 16777216 kB\nMemAvailable: 8388608 kB\nSwapTotal: 1000 kB\nSwapFree: 900 kB\n",
+      readHostLoad: () => ({ load1: 200, cores: 8 }),
+      totalMemory: () => 16 * 1024 ** 3,
+      statfs,
+    });
+    expect(linux.headroomReadings!().availableCpuCores).toBe(0);
+    expect(admissionRefusal(linux, { ...thresholds, reservedCpuCores: 1 }, "/", false)).toContain("CPU headroom");
+  });
+
+  it("does not answer from a memory reading cached before the knob was disabled", async () => {
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    let clock = 0;
+    let enabled = true;
+    let percent = 42;
+    const probe = createHostProbe({
+      platform: "darwin",
+      now: () => clock,
+      memoryHeadroomEnabled: () => enabled,
+      readDarwinSwap: () => Promise.resolve("vm.swapusage: total = 1000.00M  used = 100.00M  free = 900.00M  (encrypted)"),
+      readDarwinMemoryPressure: () => Promise.resolve(`System-wide memory free percentage: ${percent}%`),
+      totalMemory: () => 16 * 1024 ** 3,
+      statfs: () => ({ bsize: 4096, blocks: 1000, bavail: 500, files: 100, ffree: 50 }),
+    });
+    probe.capacitySample("/"); // starts the first read
+    await settle();
+    expect(probe.headroomReadings!().memoryAvailablePercent).toBe(42);
+    enabled = false;
+    expect(probe.headroomReadings!().memoryAvailablePercent).toBeNull();
+    percent = 30;
+    clock = 60_000;
+    enabled = true;
+    // re-enabled long after the cached read: unknown until the refresh lands
+    expect(probe.headroomReadings!().memoryAvailablePercent).toBeNull();
+    await settle();
+    expect(probe.headroomReadings!().memoryAvailablePercent).toBe(30);
   });
 });
 

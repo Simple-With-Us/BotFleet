@@ -32,7 +32,9 @@ export interface AdmissionThresholds {
    *  an unset knob leaves admission exactly as it was.  `reservedCpuCores`
    *  refuses when fewer cores than this are idle by load average; it exists
    *  only when set, so the no-load-gate ruling above still holds by
-   *  default. */
+   *  default.  On macOS it is never an admission input at all (the owner
+   *  forbade a CPU cutoff on the Mac, not the setting): the real probe
+   *  reports the CPU reading as unknown there, so it fails open. */
   reservedCpuCores?: number;
   /** Refuse when available RAM is below this many bytes.  Absent: no gate. */
   reservedRamBytes?: number;
@@ -63,7 +65,9 @@ export interface HostProbe {
 /** Null fields are unknown readings, which admit (fail-open, as everywhere
  *  else in admission). */
 export interface HeadroomReadings {
-  /** Cores idle by 1-minute load average (`cores − load1`, floored at 0). */
+  /** Cores idle by 1-minute load average (`cores − load1`, floored at 0).
+   *  Always null (unknown) on macOS: load average there is never an
+   *  admission input (see `reservedCpuCores`). */
   availableCpuCores: number | null;
   ramAvailableBytes: number | null;
   memoryAvailablePercent: number | null;
@@ -231,8 +235,20 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       .finally(() => { memRefreshing = false; });
   };
   const darwinMemoryPercent = (): number | null => {
-    if (platform !== "darwin" || !memoryHeadroomOn()) return null;
-    if (now() - memPercentAt >= SWAP_CACHE_MS) refreshDarwinMemory();
+    if (platform !== "darwin") return null;
+    if (!memoryHeadroomOn()) {
+      // Drop the cache on disable: a later re-enable must not answer from a
+      // reading taken before the knob was switched off.
+      memPercent = null;
+      memPercentAt = Number.NEGATIVE_INFINITY;
+      return null;
+    }
+    if (now() - memPercentAt >= SWAP_CACHE_MS) {
+      // Expired (or never read): refresh in the background and answer
+      // unknown meanwhile, never the stale figure.
+      refreshDarwinMemory();
+      return null;
+    }
     return memPercent;
   };
   if (platform === "darwin") refreshDarwin();
@@ -301,7 +317,9 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       probe.swapUsedPercent();
       const safe = <T>(read: () => T): T | null => { try { return read(); } catch { return null; } };
       const load = safe(hostLoad);
-      const availableCpuCores = load && Number.isFinite(load.load1) && load.load1 >= 0 && Number.isFinite(load.cores) && load.cores > 0
+      // macOS load average is never an admission input (owner ruling): on
+      // a Mac this reading is unknown, so `reservedCpuCores` fails open.
+      const availableCpuCores = platform !== "darwin" && load && Number.isFinite(load.load1) && load.load1 >= 0 && Number.isFinite(load.cores) && load.cores > 0
         ? Math.max(0, load.cores - load.load1) : null;
       const total = safe(memoryTotal);
       const ramTotalBytes = total !== null && total > 0 ? nonnegative(total) : null;
