@@ -7,6 +7,7 @@ import type { JsonValue } from "./schema.ts";
 import {
   githubPrStateKey,
   PR_STATE_DEDUPE_MS,
+  shouldIgnoreWebhookEvent,
   WebhookManager,
   type WebhookManagerOptions,
   type WebhookManagerEvent,
@@ -1901,6 +1902,113 @@ describe("request metadata on attempt events", () => {
     }
     expect(attempts[0]?.attempt.outcome).toBe("accepted");
     expect(attempts[1]?.attempt.outcome).toBe("duplicate");
+  });
+});
+
+describe("shouldIgnoreWebhookEvent UI Pass bot review pre-filter", () => {
+  const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet", default_branch: "main" };
+  const uiPass = {
+    name: "GitHub UI Pass",
+    prompt: "Run a UI pass on the pull request and report the verdict.",
+  };
+  const reviewEvent = (
+    login: string,
+    type = "Bot",
+    eventName = "pull_request_review",
+    action = "submitted",
+  ) => ({
+    eventName,
+    payload: {
+      action,
+      repository,
+      sender: { login, type },
+      review: { state: "commented" },
+      pull_request: { number: 7 },
+    },
+  });
+
+  it("ignores a kody-ai pull_request_review when the trigger id is a UI pass wake", () => {
+    const byId = {
+      id: "ui-pass-designer",
+      name: "Designer webhook",
+      prompt: "Review the pull request and post findings.",
+    };
+    expect(shouldIgnoreWebhookEvent(byId, reviewEvent("kody-ai"))).toEqual({
+      ignore: true,
+      reason:
+        "GitHub pull_request_review by bot 'kody-ai' ignored: UI Pass reacts to human reviews and code changes, not bot review churn",
+    });
+  });
+
+  it("ignores a kody-ai pull_request_review for a UI Pass trigger", () => {
+    expect(shouldIgnoreWebhookEvent(uiPass, reviewEvent("kody-ai"))).toEqual({
+      ignore: true,
+      reason:
+        "GitHub pull_request_review by bot 'kody-ai' ignored: UI Pass reacts to human reviews and code changes, not bot review churn",
+    });
+  });
+
+  it("ignores a cursor[bot] issue_comment for a UI Pass trigger", () => {
+    const event = {
+      eventName: "issue_comment",
+      payload: {
+        action: "created",
+        repository,
+        sender: { login: "cursor[bot]", type: "Bot" },
+        comment: { body: "Suggested fix" },
+        issue: { number: 7 },
+      },
+    };
+    expect(shouldIgnoreWebhookEvent(uiPass, event)).toMatchObject({ ignore: true });
+  });
+
+  it("ignores the other review events and bot sender shapes for a UI Pass trigger", () => {
+    expect(
+      shouldIgnoreWebhookEvent(
+        uiPass,
+        reviewEvent("github-actions", "Bot", "pull_request_review_comment", "created"),
+      ),
+    ).toMatchObject({ ignore: true });
+    expect(
+      shouldIgnoreWebhookEvent(
+        uiPass,
+        reviewEvent("some-reviewer", "Bot", "pull_request_review_thread", "resolved"),
+      ),
+    ).toMatchObject({ ignore: true });
+    expect(shouldIgnoreWebhookEvent(uiPass, reviewEvent("KODY-AI", "User"))).toMatchObject({
+      ignore: true,
+    });
+  });
+
+  it("does not ignore a human review for a UI Pass trigger", () => {
+    expect(shouldIgnoreWebhookEvent(uiPass, reviewEvent("jaywedgeworth22", "User"))).toEqual({
+      ignore: false,
+    });
+  });
+
+  it("does not ignore a bot review for a non-UI-pass trigger", () => {
+    const releaseWatcher = { name: "Release watcher", prompt: "Summarize pull request activity." };
+    expect(shouldIgnoreWebhookEvent(releaseWatcher, reviewEvent("kody-ai"))).toEqual({ ignore: false });
+    const classifyOnly = { name: "Designer classify", prompt: "Classify the event and stop." };
+    expect(shouldIgnoreWebhookEvent(classifyOnly, reviewEvent("kody-ai"))).toEqual({ ignore: false });
+  });
+
+  it("does not ignore a bot review when the saved prompt asks for Kody reviews", () => {
+    const asksForKody = {
+      name: "GitHub UI Pass",
+      prompt: "Run a UI pass.  Act on Kody bot review comments.",
+    };
+    expect(shouldIgnoreWebhookEvent(asksForKody, reviewEvent("kody-ai"))).toEqual({ ignore: false });
+  });
+
+  it("does not swallow a label signal for a UI Pass trigger that requires labels", () => {
+    // A required label landing is the signal the trigger asked for.  The
+    // pre-filter must keep that escape, the way sections 2 and 3 do.
+    const labeled = reviewEvent("kody-ai", "Bot", "issue_comment", "labeled");
+    expect(shouldIgnoreWebhookEvent({ ...uiPass, requiredLabels: ["ui"] }, labeled)).toEqual({
+      ignore: false,
+    });
+    expect(shouldIgnoreWebhookEvent(uiPass, labeled)).toMatchObject({ ignore: true });
   });
 });
 
