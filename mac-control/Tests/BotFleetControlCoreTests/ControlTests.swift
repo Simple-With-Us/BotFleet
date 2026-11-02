@@ -49,6 +49,31 @@ final class ControlTests: XCTestCase {
         XCTAssertTrue(created.canStartSharedVM)
     }
 
+    /// The graceful stop's report:  what the server stopped and what was
+    /// still running (BF-2536).
+    func testStopServerReportsWhatTheGracefulStopDid() async throws {
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
+            return (200, Data(#"{"ok":true,"detail":{"markerWritten":true,"localVmStop":"stopped"},"report":{"finished":["Daylight"],"interrupted":["Nightowl"],"leftRunning":["1 routine run"],"ok":true}}"#.utf8))
+        }
+        let report = try await ControlAPI(session: mockSession()).stopServer()
+        XCTAssertEqual(report?.finished, ["Daylight"])
+        XCTAssertEqual(report?.interrupted, ["Nightowl"])
+        XCTAssertEqual(report?.leftRunning, ["1 routine run"])
+        XCTAssertEqual(report?.summary, "already finished: Daylight; stopped: Nightowl; still running: 1 routine run")
+    }
+
+    /// An older server sends no report at all.  The stop still happened, so
+    /// the owner is told nothing rather than something invented.
+    func testStopServerWithoutAReportReportsNothing() async throws {
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
+            return (200, Data(#"{"ok":true,"detail":{"markerWritten":true,"localVmStop":"stopped"}}"#.utf8))
+        }
+        let report = try await ControlAPI(session: mockSession()).stopServer()
+        XCTAssertNil(report)
+    }
+
     func testBusyRefusalIsSurfaced() async {
         MockURLProtocol.handler = { request in
             if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }

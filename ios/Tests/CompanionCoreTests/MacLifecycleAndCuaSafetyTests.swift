@@ -291,9 +291,10 @@ struct MacLifecycleAndCuaSafetyTests {
     @Test("MacLifecycleClient shutDownServerAndLocalVM asks the fenced stop route first and ensures stopped.marker")
     func testShutdownEndpointAndMarker() async throws {
         // BotFleet Control stops the harness through POST /api/system/control/stop,
-        // which refuses while work is in flight.  The native app's stop has to
-        // be the same stop, or the same owner has one button that protects
-        // active bots and one that kills them mid-turn (BF-2584).
+        // which stops the bots that are working and then shuts the server down
+        // (BF-2536).  The native app's stop has to be the same stop, or the same
+        // owner has one button that ends a turn cleanly and one that kills it
+        // mid-turn (BF-2584).
         let tempDir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
