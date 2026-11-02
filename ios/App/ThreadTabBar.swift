@@ -58,7 +58,7 @@ struct ThreadTabBar: View {
                                             .font(.system(size: 9))
                                             .foregroundStyle(Color.secondary)
                                     }
-                                    Text(task.title.isEmpty ? "Untitled" : task.title)
+                                    Text(task.title.isEmpty ? "Untitled Thread" : task.title)
                                         .font(.system(size: 13, weight: task.threadId == current.threadId ? .semibold : .medium))
                                         .lineLimit(1)
                                 }
@@ -110,7 +110,7 @@ struct ThreadTabBar: View {
     /// A sleeping tab is dimmed and carries a moon, neither of which VoiceOver
     /// can read, so the state and its deadline go into the label itself.
     static func tabLabel(_ task: BotTask, now: Date = Date()) -> String {
-        let title = task.title.isEmpty ? "Untitled thread" : task.title
+        let title = task.title.isEmpty ? "Untitled Thread" : task.title
         guard let snoozed = task.snoozeLabel(now: now) else { return title }
         return "\(title), snoozed \(snoozed.lowercased())"
     }

@@ -123,8 +123,48 @@ struct MessageGroupingTests {
     func errorToolsNeverFold() {
         var m = tool("e1", at: 1_000)
         m.tool = ToolActivity(name: "error:boom", ok: false)
-        let items = groupMessageRuns([m, tool("e2", at: 1_005)])
+        var m2 = tool("e2", at: 1_003)
+        m2.tool = ToolActivity(name: "error:crash", ok: false)
+        let items = groupMessageRuns([m, m2, tool("t1", at: 1_005)])
+        #expect(items.count == 3, "error: tools never fold with each other or with foldable tools")
+    }
+
+    @Test("option cards and comm rows never merge into prose runs")
+    func cardsAndCommNeverMergeIntoProse() {
+        let card = Message(
+            id: "c1",
+            role: .bot,
+            kind: .options,
+            at: 1_005,
+            card: OptionCard(title: "Proceed?", subtitle: "", options: ["Yes"])
+        )
+        var commMsg = text("m2", at: 1_015)
+        commMsg.comm = CommChip(groupId: "g1", withBotId: "b2", withName: "Peer", withColor: "blue")
+        let items = groupMessageRuns([
+            text("m1", at: 1_000),
+            card,
+            text("m1b", at: 1_010),
+            commMsg,
+            text("m3", at: 1_020),
+        ])
+        #expect(items.count == 5)
+    }
+
+    @Test("transcriptRowEndsRun handles multi-message prose runs and gap boundaries")
+    func transcriptRowEndsRunOnGroupedProseRuns() {
+        let beyondMs = Double(1_000 + Int(groupMessageTimeGap) * 1_000 + 500)
+        let items = groupMessageRuns([
+            text("b1", at: 1_000),
+            text("b2", at: 1_010),
+            text("b3", at: beyondMs),
+            text("b4", at: beyondMs + 10),
+        ])
         #expect(items.count == 2)
+        // First prose run is separated from second prose run by > 60s, so it ends its visual bubble run.
+        #expect(transcriptRowEndsRun(at: 0, in: items, liveReply: false, liveSpeaker: nil) == true)
+        // Second prose run is at the end: ends when idle, hands tail to live reply when streaming.
+        #expect(transcriptRowEndsRun(at: 1, in: items, liveReply: false, liveSpeaker: nil) == true)
+        #expect(transcriptRowEndsRun(at: 1, in: items, liveReply: true, liveSpeaker: nil) == false)
     }
 
     // MARK: - Identity and accessibility contract
@@ -146,6 +186,13 @@ struct MessageGroupingTests {
         let label = messageRunAccessibilityLabel(items[0])
         #expect(label.contains("3"))
         #expect(label.contains("failed"), "a failure must survive into the label")
+
+        let proseItems = groupMessageRuns([
+            text("p1", at: 1_000),
+            text("p2", at: 1_010),
+        ])
+        let proseLabel = messageRunAccessibilityLabel(proseItems[0], sender: "Ada", relativeTime: "2 minutes ago")
+        #expect(proseLabel == "Ada, 2 messages, 2 minutes ago")
     }
 
     @Test("a single message is not a run, and labels as itself")

@@ -451,7 +451,7 @@ struct ChatView: View {
     /// exceeded the type-check budget on CI.
     private var transcriptColumn: some View {
         let transcript = messages
-        let items = groupActivityRuns(transcript)
+        let items = groupMessageRuns(transcript)
         let live = liveRow
         let newestSettled = BottomFollow.newestSettledId(in: transcript)
         return ScrollViewReader { proxy in
@@ -479,7 +479,7 @@ struct ChatView: View {
                                     // row may have joined a longer tool run
                                     // from the loaded page, under a new id.
                                     if let firstMessageId,
-                                       let row = transcriptRowId(containing: firstMessageId, in: groupActivityRuns(messages)) {
+                                       let row = transcriptRowId(containing: firstMessageId, in: groupMessageRuns(messages)) {
                                         proxy.scrollTo(row, anchor: .top)
                                     }
                                     // Let the prepended rows lay out under the
@@ -510,10 +510,34 @@ struct ChatView: View {
                                         readOnly: viewingOther
                                     )
                                 case let .run(_, runMessages):
-                                    ActivityRunView(
-                                        chat: current,
-                                        messages: runMessages
-                                    )
+                                    if runMessages.allSatisfy(isFoldableActivity) {
+                                        ActivityRunView(
+                                            chat: current,
+                                            messages: runMessages
+                                        )
+                                    } else {
+                                        let rowEndsRun = endsRun(at: index, in: items, live: live)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            ForEach(Array(runMessages.enumerated()), id: \.element.id) { msgIndex, message in
+                                                MessageRow(
+                                                    chat: current,
+                                                    message: message,
+                                                    startsRun: msgIndex == 0,
+                                                    endsRun: msgIndex == runMessages.count - 1 && rowEndsRun,
+                                                    threadId: displayedThreadId,
+                                                    readOnly: viewingOther
+                                                )
+                                            }
+                                        }
+                                        .accessibilityElement(children: .contain)
+                                        .accessibilityLabel(
+                                            messageRunAccessibilityLabel(
+                                                item,
+                                                sender: runSenderLabel(for: runMessages.first),
+                                                relativeTime: runRelativeTimeLabel(for: runMessages.first)
+                                            )
+                                        )
+                                    }
                                 }
                             }
                             .id(item.id)
@@ -880,7 +904,7 @@ struct ChatView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Color.secondary)
                     Text(
-                        "Viewing “\(viewedTask.title.isEmpty ? "Untitled" : viewedTask.title)”\(loading ? " — loading…" : "")"
+                        "Viewing “\(viewedTask.title.isEmpty ? "Untitled Thread" : viewedTask.title)”\(loading ? " — loading…" : "")"
                     )
                     .font(.system(size: 13))
                     .foregroundStyle(Color.secondary)
@@ -889,14 +913,14 @@ struct ChatView: View {
                 }
                 Text(
                     bot.busy == true
-                        ? "\(bot.name) is working in “\(activeTitle?.isEmpty == false ? activeTitle! : "Untitled")”."
-                        : "The active thread is “\(activeTitle?.isEmpty == false ? activeTitle! : "Untitled")”."
+                        ? "\(bot.name) is working in “\(activeTitle?.isEmpty == false ? activeTitle! : "Untitled Thread")”."
+                        : "The active thread is “\(activeTitle?.isEmpty == false ? activeTitle! : "Untitled Thread")”."
                 )
                 .font(.system(size: 12))
                 .foregroundStyle(Color.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 HStack(spacing: 8) {
-                    Button("Switch to this thread") {
+                    Button("Switch to This Thread") {
                         Task { await session.switchTask(viewedTask, for: bot) }
                     }
                     .buttonStyle(.plain)
@@ -905,7 +929,7 @@ struct ChatView: View {
                     .disabled(bot.busy == true)
                     .accessibilityHint(bot.busy == true ? "Let this turn finish first" : "Make this the active thread")
                     Spacer(minLength: 0)
-                    Button("Back to active thread") {
+                    Button("Back to Active Thread") {
                         session.showActiveThread(for: bot)
                     }
                     .buttonStyle(.plain)
@@ -1148,6 +1172,23 @@ struct ChatView: View {
             in: items,
             liveReply: live == .text || live == .reasoning,
             liveSpeaker: liveSpeaker
+        )
+    }
+
+    private func runSenderLabel(for message: Message?) -> String? {
+        guard let message else { return nil }
+        if let from = message.from?.name, !from.isEmpty { return from }
+        if message.role == .user { return "You" }
+        return current.name
+    }
+
+    private func runRelativeTimeLabel(for message: Message?) -> String? {
+        guard let message else { return nil }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(
+            for: Date(timeIntervalSince1970: message.at / 1_000),
+            relativeTo: Date()
         )
     }
 
@@ -1884,6 +1925,8 @@ struct ChatView: View {
 struct MessageRow: View {
     let chat: Chat
     let message: Message
+    /// First bubble of a run from the same speaker: the one that shows the speaker header in rooms.
+    var startsRun = true
     /// Last bubble of a run from the same side: the one that gets the tail.
     var endsRun = true
     /// The thread on screen, which is the viewed (non-active) thread while
@@ -2279,7 +2322,7 @@ struct MessageRow: View {
             } else if message.role == .user, let imessage = ImessageMessageView.parse(message.text) {
                 ImessageEventCard(view: imessage)
             } else {
-                TextBubble(message: message, chat: chat, tailed: endsRun)
+                TextBubble(message: message, chat: chat, tailed: endsRun, showsSpeaker: startsRun)
             }
         case .options:
             CardView(chat: chat, message: message, readOnly: readOnly)
@@ -2294,7 +2337,7 @@ struct MessageRow: View {
             // When there is nothing to show, show nothing — a placeholder
             // saying "unsupported" is a worse gap than the gap.
             if let text = message.text, !text.isEmpty {
-                TextBubble(message: message, chat: chat, tailed: endsRun)
+                TextBubble(message: message, chat: chat, tailed: endsRun, showsSpeaker: startsRun)
             }
         }
     }
@@ -2352,6 +2395,7 @@ struct TextBubble: View {
     let message: Message
     let chat: Chat
     var tailed = true
+    var showsSpeaker = true
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     private var parsedDiff: (filename: String, diff: String)? {
@@ -2437,7 +2481,7 @@ struct TextBubble: View {
             if mine { Spacer(minLength: 56) }
 
             VStack(alignment: .leading, spacing: 4) {
-                if let speaker, !mine {
+                if showsSpeaker, let speaker, !mine {
                     Text(speaker.name)
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(BotPalette.color(speaker.color))
