@@ -769,14 +769,134 @@ public enum Redact {
 
     // MARK: - The tree walk both public deep redactors share
 
+    /// How deep the shared tree walk redacts before it stops trusting the
+    /// shape. Past this a container is masked whole rather than walked:
+    /// returning it verbatim handed every credential field below the cap back
+    /// in the clear.
+    private static let maxRedactDepth = 12
+
+    /// Mask a subtree whose root sits past `maxRedactDepth`, using only the
+    /// existing mask marker. Keys survive so the shape still says WHERE a
+    /// secret was; every string value is masked with its true length, so
+    /// nothing below the cap is trusted. Non-strings pass through.
+    ///
+    /// What `maskDeep` refuses to walk comes back as a fixed marker instead,
+    /// byte-identical with `shared/redact.ts` (the differential tests pin both
+    /// spellings): a subtree cut by the depth/node budget, or an object
+    /// reached twice through a cycle.
+    private static let maskedSubtree = "«redacted subtree»"
+    private static let maskedCircular = "«redacted circular»"
+
+    /// How far below its own root `maskDeep` still descends. Mirrors
+    /// `MAX_MASK_DEPTH`: a past-cap chain a hundred thousand levels deep
+    /// would otherwise overflow the stack on the redaction path.
+    private static let maxMaskDepth = 32
+    /// How many values one `maskDeep` call walks before it elides the rest.
+    /// Mirrors `MAX_MASK_NODES` so a huge past-cap fan-out costs the same
+    /// bounded work on both sides.
+    private static let maxMaskNodes = 100_000
+
+    /// The identity of a reference container, or nil for anything else. Only
+    /// the reference containers the walk recurses into (`NSDictionary` /
+    /// `NSArray`, notably their mutable subclasses) are tracked: Swift value
+    /// types cannot cycle, and immutable bridged values (`NSString`,
+    /// `NSNumber`) must never be tracked — equal values may share one
+    /// identity, which would misreport a duplicate as a cycle. Anything
+    /// untracked still terminates: the depth bounds in `redactTree` and
+    /// `maskDeep` cut every recursion regardless of identity.
+    ///
+    /// Foundation bridges wrap each value in an extra `Optional` layer, which
+    /// `type(of:)` reports instead of the class underneath — so unwrap first.
+    /// Casts (`as?`) already see through the wrapper; only the identity check
+    /// needs the explicit loop.
+    private static func classIdentity(_ input: Any?) -> ObjectIdentifier? {
+        var current = input
+        while let value = current {
+            let mirror = Mirror(reflecting: value)
+            guard mirror.displayStyle == .optional else {
+                // `type(of:)` first: Swift value types bridge to `NSDictionary`
+                // in an `is` check, and only genuine classes cycle.
+                guard type(of: value) is AnyClass else { return nil }
+                guard value is NSDictionary || value is NSArray else { return nil }
+                return ObjectIdentifier(value as AnyObject)
+            }
+            guard let child = mirror.children.first else { return nil }
+            current = child.value
+        }
+        return nil
+    }
+
+    /// Mask a subtree whose root sits past `maxRedactDepth` (see above for
+    /// the markers). `seen` is the chain of class identities from the shared
+    /// walk: an object reached twice is a cycle, and it is elided rather than
+    /// recursed into. `depth` and the `nodes` budget bound the walk itself —
+    /// past either, the remainder of the subtree is elided rather than walked.
+    private static func maskDeep(_ input: Any?, seen: inout Set<ObjectIdentifier>, depth: Int, nodes: inout Int) -> Any? {
+        if input == nil || input is NSNull { return input }
+        if nodes <= 0 { return maskedSubtree }
+        nodes -= 1
+        if let s = input as? String { return mask(s) }
+        if let id = classIdentity(input) {
+            if seen.contains(id) { return maskedCircular }
+            if depth > maxMaskDepth { return maskedSubtree }
+            seen.insert(id)
+            defer { seen.remove(id) }
+            return maskDeepContents(input, seen: &seen, depth: depth, nodes: &nodes)
+        } else if depth > maxMaskDepth {
+            return maskedSubtree
+        }
+        return maskDeepContents(input, seen: &seen, depth: depth, nodes: &nodes)
+    }
+
+    /// The container descent of `maskDeep`, factored out so the ancestor
+    /// `defer` above spans the recursion. (A `defer` inside the `if let`
+    /// identity block would run when the block exits — before the descent —
+    /// and no revisit would ever be detected.)
+    private static func maskDeepContents(_ input: Any?, seen: inout Set<ObjectIdentifier>, depth: Int, nodes: inout Int) -> Any? {
+        if let arr = input as? [Any?] {
+            return arr.map { item -> Any? in maskDeep(item, seen: &seen, depth: depth + 1, nodes: &nodes) }
+        }
+        if let arr = input as? [Any] {
+            return arr.map { item -> Any? in maskDeep(item, seen: &seen, depth: depth + 1, nodes: &nodes) }
+        }
+        if let dict = input as? [String: Any?] {
+            var out: [String: Any?] = [:]
+            for (key, value) in dict { out[key] = maskDeep(value, seen: &seen, depth: depth + 1, nodes: &nodes) }
+            return out
+        }
+        if let dict = input as? [String: Any] {
+            var out: [String: Any] = [:]
+            for (key, value) in dict { out[key] = maskDeep(value, seen: &seen, depth: depth + 1, nodes: &nodes) as Any }
+            return out
+        }
+        return input
+    }
+
     /// `text` is what every string that is NOT under a secret-shaped key goes
     /// through. A secret-shaped key is masked outright either way.
-    private static func redactTree(_ input: Any?, depth: Int, text: (String) -> String) -> Any? {
+    ///
+    /// `seen` is the chain of class-identity ancestors: `NSMutableDictionary`
+    /// and `NSArray` graphs can cycle where Swift value types cannot, so an
+    /// object reached twice is elided rather than recursed into.
+    private static func redactTree(_ input: Any?, depth: Int, text: (String) -> String, seen: inout Set<ObjectIdentifier>) -> Any? {
         if let s = input as? String { return text(s) }
-        if depth > 12 || input == nil { return input }
-        if input is NSNull { return input }
+        if input == nil || input is NSNull { return input }
+        if let id = classIdentity(input) {
+            if seen.contains(id) { return maskedCircular }
+        }
+        if depth > maxRedactDepth {
+            var maskSeen = seen
+            var nodes = maxMaskNodes
+            return maskDeep(input, seen: &maskSeen, depth: 0, nodes: &nodes)
+        }
+        let heldIdentity = classIdentity(input)
+        if let heldIdentity { seen.insert(heldIdentity) }
+        defer { if let heldIdentity { seen.remove(heldIdentity) } }
         if let arr = input as? [Any?] {
             return arr.map { item -> Any? in
+                if let item, let id = classIdentity(item), seen.contains(id) {
+                    return maskedCircular
+                }
                 if let dict = item as? [String: Any],
                    let name = dict["name"] as? String,
                    let entryValue = dict["value"] as? String {
@@ -788,11 +908,14 @@ public enum Redact {
                     entry["value"] = isSecretName(name) ? mask(entryValue) : text(entryValue)
                     return entry
                 }
-                return redactTree(item, depth: depth + 1, text: text)
+                return redactTree(item, depth: depth + 1, text: text, seen: &seen)
             }
         }
         if let arr = input as? [Any] {
             return arr.map { item -> Any? in
+                if let id = classIdentity(item), seen.contains(id) {
+                    return maskedCircular
+                }
                 if let dict = item as? [String: Any],
                    let name = dict["name"] as? String,
                    let entryValue = dict["value"] as? String {
@@ -800,7 +923,7 @@ public enum Redact {
                     entry["value"] = isSecretName(name) ? mask(entryValue) : text(entryValue)
                     return entry
                 }
-                return redactTree(item, depth: depth + 1, text: text)
+                return redactTree(item, depth: depth + 1, text: text, seen: &seen)
             }
         }
         if let dict = input as? [String: Any?] {
@@ -810,7 +933,7 @@ public enum Redact {
                     out[key] = mask(s)
                     continue
                 }
-                out[key] = redactTree(value, depth: depth + 1, text: text)
+                out[key] = redactTree(value, depth: depth + 1, text: text, seen: &seen)
             }
             return out
         }
@@ -821,7 +944,7 @@ public enum Redact {
                     out[key] = mask(s)
                     continue
                 }
-                out[key] = redactTree(value, depth: depth + 1, text: text) as Any
+                out[key] = redactTree(value, depth: depth + 1, text: text, seen: &seen) as Any
             }
             return out
         }
@@ -833,13 +956,15 @@ public enum Redact {
     /// ACP wire shape (env: `[{name, value}]`). Anything unrecognised is
     /// copied as-is.
     public static func redactSecrets(_ input: Any?, depth: Int = 0) -> Any? {
-        redactTree(input, depth: depth, text: redactSecretsInText)
+        var seen = Set<ObjectIdentifier>()
+        return redactTree(input, depth: depth, text: redactSecretsInText, seen: &seen)
     }
 
     /// The same tree walk with the caller's own content pass for every string
     /// that is not under a secret-shaped key.
     public static func redactSecretsWith(_ input: Any?, text: (String) -> String) -> Any? {
-        redactTree(input, depth: 0, text: text)
+        var seen = Set<ObjectIdentifier>()
+        return redactTree(input, depth: 0, text: text, seen: &seen)
     }
 
     // MARK: - The log tee cap
@@ -848,26 +973,58 @@ public enum Redact {
     /// code units — the same unit `String.length` (and the marker) uses.
     public static let logTeeMaxStringChars = 256 * 1024
 
+    /// How far past the cap the log-tee content pass still reads before it
+    /// cuts. A secret straddling the cap has to be WHOLE to match; the margin
+    /// only has to cover the longest pattern floor, so 4 KB is generous.
+    public static let logTeeOverlapChars = 4 * 1024
+
+    /// A JWT opener whose closing dots were cut off by the log-tee window.
+    /// Mirrors `TRUNCATED_JWT_TAIL` byte for byte: every other credential
+    /// shape either matches its in-window prefix on its floor alone or
+    /// anchors at end-of-text, which the window slice provides. A JWT without
+    /// a dot in the window is the one shape that matches nothing when cut.
+    private static let truncatedJwtTailPattern = try! NSRegularExpression(
+        pattern: #"eyJ[A-Za-z0-9_-]{8,}$"#,
+        options: []
+    )
+
     /// Content pass for the log tee: redact, THEN cut. The order is
-    /// load-bearing — cutting first would end the string in a marker instead,
-    /// and a secret straddling the boundary would ship its prefix in the
-    /// clear. The elided tail is never written, redacted or not.
+    /// load-bearing — the head is redacted over a window overlapping the cap
+    /// by `logTeeOverlapChars`, and the REDACTED window is cut back to the
+    /// cap, so a secret straddling the boundary masks whole and the cut lands
+    /// in the marker, never in the credential. The elided tail is never
+    /// written, redacted or not.
     public static func redactSecretsInLogText(_ text: String, maxChars: Int = logTeeMaxStringChars) -> String {
         if text.utf16.count <= maxChars { return redactSecretsInText(text) }
         let elided = text.utf16.count - maxChars
         // Slice in UTF-16 units like `String.slice`; a boundary that lands
         // inside a surrogate pair drops the dangling high half (a Swift
         // string cannot hold the lone surrogate JavaScript would keep).
-        var headUnits = Array(text.utf16.prefix(maxChars))
-        if let last = headUnits.last, (0xD800...0xDBFF).contains(last) { headUnits.removeLast() }
-        let head = String(decoding: headUnits, as: UTF16.self)
-        return "\(redactSecretsInText(head))[… \(elided) characters elided from log]"
+        var windowUnits = Array(text.utf16.prefix(maxChars + logTeeOverlapChars))
+        if let last = windowUnits.last, (0xD800...0xDBFF).contains(last) { windowUnits.removeLast() }
+        let rawWindow = String(decoding: windowUnits, as: UTF16.self)
+        // Fail closed: an `eyJ…` run reaching the window edge lost the dots
+        // its pattern anchors on. Mask it here, where the cut is still the
+        // last thing in the string, so the normal pass cannot emit its
+        // in-cap prefix in the clear. Anything without a credential opener
+        // is untouched — a long non-secret still takes the cut path.
+        var closedWindow = rawWindow
+        let fullRange = NSRange(rawWindow.startIndex..<rawWindow.endIndex, in: rawWindow)
+        if let match = truncatedJwtTailPattern.firstMatch(in: rawWindow, options: [], range: fullRange),
+           let matchRange = Range(match.range, in: rawWindow) {
+            closedWindow = rawWindow.replacingCharacters(in: matchRange, with: mask(String(rawWindow[matchRange])))
+        }
+        let windowed = redactSecretsInText(closedWindow)
+        var outUnits = Array(windowed.utf16.prefix(maxChars))
+        if let last = outUnits.last, (0xD800...0xDBFF).contains(last) { outUnits.removeLast() }
+        return "\(String(decoding: outUnits, as: UTF16.self))[… \(elided) characters elided from log]"
     }
 
     /// `redactSecrets` for a destination that is a log file rather than a
     /// live consumer: identical tree, identical masking, plus a per-string
     /// length cap so the cost of redacting one event is bounded by the cap.
     public static func redactSecretsForLog(_ input: Any?, maxChars: Int = logTeeMaxStringChars) -> Any? {
-        redactTree(input, depth: 0, text: { redactSecretsInLogText($0, maxChars: maxChars) })
+        var seen = Set<ObjectIdentifier>()
+        return redactTree(input, depth: 0, text: { redactSecretsInLogText($0, maxChars: maxChars) }, seen: &seen)
     }
 }
