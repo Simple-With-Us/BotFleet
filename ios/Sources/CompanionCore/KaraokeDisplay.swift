@@ -33,7 +33,9 @@ extension Markdown {
 
 extension MarkdownBlock {
     /// The inline markdown a block renders as running text, or nil for a
-    /// block karaoke skips (fenced code, a rule).
+    /// block karaoke skips (fenced code, a rule, a table — a table is many
+    /// runs, not the one run per block the paint is keyed by, so the
+    /// highlight sweeps past it like it does a fence).
     public var inlineText: String? {
         switch self {
         case let .paragraph(text), let .quote(text):
@@ -42,7 +44,7 @@ extension MarkdownBlock {
             return text
         case let .ordered(_, _, text):
             return text
-        case .code, .rule:
+        case .code, .rule, .table:
             return nil
         }
     }

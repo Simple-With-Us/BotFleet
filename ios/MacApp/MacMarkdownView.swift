@@ -112,9 +112,55 @@ public struct MarkdownText: View {
             .background(Color.black.opacity(0.06))
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
+        case .table(let header, let alignments, let rows):
+            // The same shape as the phone's grid: columns keep their width
+            // and the block scrolls sideways, capped so one huge table
+            // cannot hand layout thousands of cells at once.
+            let visibleRows = Array(rows.prefix(200))
+            VStack(alignment: .leading, spacing: 6) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+                        GridRow {
+                            ForEach(header.indices, id: \.self) { column in
+                                inlineText(header[column])
+                                    .font(.body.bold())
+                                    .gridColumnAlignment(horizontalAlignment(of: alignments, column: column))
+                            }
+                        }
+                        Divider()
+                        ForEach(visibleRows.indices, id: \.self) { row in
+                            GridRow {
+                                ForEach(header.indices, id: \.self) { column in
+                                    inlineText(visibleRows[row][column])
+                                        .font(.body)
+                                        .gridColumnAlignment(horizontalAlignment(of: alignments, column: column))
+                                }
+                            }
+                        }
+                    }
+                }
+                if rows.count > visibleRows.count {
+                    Text("Showing \(visibleRows.count) of \(rows.count) rows")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(10)
+            .background(Color.secondary.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
         case .rule:
             Divider()
                 .padding(.vertical, 4)
+        }
+    }
+
+    private func horizontalAlignment(of alignments: [TableAlignment], column: Int) -> HorizontalAlignment {
+        guard column < alignments.count else { return .leading }
+        switch alignments[column] {
+        case .leading: return .leading
+        case .center: return .center
+        case .trailing: return .trailing
         }
     }
 

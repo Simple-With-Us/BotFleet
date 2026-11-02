@@ -262,6 +262,10 @@ jobs:
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
           IOS_MANUAL_SIGN: "1"  # 2026-10-07: API profiles; no Xcode provisioning service
+          # fleet-icon-audit.mjs is a Mac-side fleet tool not vendored in
+          # this repo, so the hosted ship cannot run it; hand runs on the
+          # Mac keep the publisher's default block gate.
+          FLEET_ICON_AUDIT: "off"
           # The fleet iOS version manifest lives in AI-Fleet-Coordinator, and
           # that repository's ruleset refuses a direct write to its protected
           # branch, so the publish is a branch plus a pull request.  The

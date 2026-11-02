@@ -2722,6 +2722,9 @@ struct CardView: View {
     @EnvironmentObject private var session: Session
     @State private var answering = false
     @State private var approvingAll = false
+    /// A question card's typed answer, for when the right reply is not one
+    /// of the offered choices — or none were offered.
+    @State private var answerText = ""
 
     /// One definition of "the refusal", shared by the button tint and the
     /// choice above so the two cannot drift apart.
@@ -2763,6 +2766,94 @@ struct CardView: View {
         .accessibilityHint(ApproveAll.hint)
     }
 
+    /// Every way of answering — a choice button or typed text — goes
+    /// through here, so they all send the same way and share the
+    /// "answer in flight" state that disables the card.
+    private func answer(card: OptionCard, choice: String) {
+        answering = true
+        Task {
+            await session.answer(chat: chat, card: card, choice: choice)
+            answering = false
+        }
+    }
+
+    @ViewBuilder
+    private func choiceButton(_ option: String, card: OptionCard, stacked: Bool) -> some View {
+        Button {
+            answer(card: card, choice: option)
+        } label: {
+            if stacked {
+                Text(card.displayChoice(for: option))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Self.isRefusal(option) ? Color.primary : .white)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .background(
+                        Capsule().fill(Self.isRefusal(option) ? Color.secondary.opacity(0.18) : tint)
+                    )
+            } else {
+                Text(card.displayChoice(for: option))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Self.isRefusal(option) ? Color.primary : .white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 40)
+                    .background(
+                        Capsule().fill(Self.isRefusal(option) ? Color.secondary.opacity(0.18) : tint)
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(answering)
+    }
+
+    private var trimmedAnswerText: String {
+        answerText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canSendAnswerText: Bool {
+        !answering && !trimmedAnswerText.isEmpty
+    }
+
+    private func sendAnswerText(card: OptionCard) {
+        let text = trimmedAnswerText
+        guard !text.isEmpty, !answering else { return }
+        answerText = ""
+        answer(card: card, choice: text)
+    }
+
+    /// The typed answer under a question's choices.  Shown only while the
+    /// card is pending, so it disappears with the buttons once answered.
+    @ViewBuilder
+    private func answerField(card: OptionCard) -> some View {
+        HStack(spacing: 8) {
+            TextField("Type an answer", text: $answerText)
+                .font(.subheadline)
+                .padding(.horizontal, 12)
+                .frame(minHeight: 44)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.secondary.opacity(0.12))
+                )
+                .submitLabel(.send)
+                .onSubmit { sendAnswerText(card: card) }
+                .disabled(answering)
+
+            Button {
+                sendAnswerText(card: card)
+            } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(canSendAnswerText ? tint : Color.secondary.opacity(0.4))
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSendAnswerText)
+            .accessibilityLabel("Send answer")
+        }
+    }
+
     var body: some View {
         if let card = message.card {
             VStack(alignment: .leading, spacing: 10) {
@@ -2790,29 +2881,29 @@ struct CardView: View {
                 }
 
                 if card.isPending {
-                    HStack(spacing: 8) {
-                        ForEach(card.options, id: \.self) { option in
-                            Button {
-                                answering = true
-                                Task {
-                                    await session.answer(chat: chat, card: card, choice: option)
-                                    answering = false
-                                }
-                            } label: {
-                                Text(card.displayChoice(for: option))
-                                    .font(.subheadline.weight(.semibold))
-                                    .foregroundStyle(Self.isRefusal(option) ? Color.primary : .white)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 40)
-                                    .background(
-                                        Capsule().fill(Self.isRefusal(option) ? Color.secondary.opacity(0.18) : tint)
-                                    )
+                    if card.prefersStackedChoices {
+                        // Too many choices, or too long, to share one row:
+                        // stack them full-width so each stays readable.
+                        VStack(spacing: 8) {
+                            ForEach(card.options, id: \.self) { option in
+                                choiceButton(option, card: card, stacked: true)
                             }
-                            .buttonStyle(.plain)
-                            .disabled(answering)
                         }
+                        .padding(.top, 2)
+                    } else if !card.options.isEmpty {
+                        HStack(spacing: 8) {
+                            ForEach(card.options, id: \.self) { option in
+                                choiceButton(option, card: card, stacked: false)
+                            }
+                        }
+                        .padding(.top, 2)
                     }
-                    .padding(.top, 2)
+
+                    // Questions (no `tool`) can always be answered in your
+                    // own words — including when no choices were offered.
+                    if !card.isPermission {
+                        answerField(card: card)
+                    }
 
                     if let count = approveAllCount {
                         approveAllButton(count: count)

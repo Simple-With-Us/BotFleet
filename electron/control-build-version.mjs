@@ -43,6 +43,5 @@ export function controlBuildVersion({ env = process.env, repoRoot }) {
     return { version, build: String(Number(match[1])), source: "package.json (stamp skipped)" };
   }
   const plan = resolveBuildVersion(repoRoot);
-  const build = plan.version.split(".")[2];
-  return { version: plan.version, build, source: plan.floored ? "package.json floor" : "commit count" };
+  return { version: plan.version, build: plan.build, source: plan.floored ? "package.json floor" : "commit count" };
 }
