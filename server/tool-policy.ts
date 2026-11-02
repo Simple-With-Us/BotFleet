@@ -449,7 +449,7 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
   //  one runs is the ordinary allowlist's call:  a genuinely allowed
   //  interpreter can still execute such a script.  Data words are never
   //  scanned, so a file that carries the retired name
-  //  (`rm /Users/jay/.local/bin/agent-sync`, when deleting the retired
+  //  (`rm ~/.local/bin/agent-sync`, when deleting the retired
   //  launcher) runs normally.
   const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
   if (namesRetiredChatCli(argv0)) {
