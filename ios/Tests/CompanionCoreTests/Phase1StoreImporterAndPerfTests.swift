@@ -1388,33 +1388,124 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(Set(MacConnectionStatusPill.pillByConnectionState.values) == Set(MacStatusPillKind.allCases))
     }
 
-    @Test("The Mac app does not render the mascot or status pill surface yet")
-    func macAppVisualSurfaceIsNotImplementedYet() throws {
+    @Test("The Mac app renders the mascot and status pill surface without hardcoded hex colors")
+    func macAppVisualSurfaceRendersMascotAndStatusPillsWithoutHardcodedHex() throws {
         let repoRoot = Self.repoRoot()
         let sources = try Self.macAppSources(repoRoot: repoRoot)
 
         let rendersMascot = sources.contains { $0.contains("MacMascotExpression") }
         let rendersStatusPills = sources.contains { $0.contains("MacStatusPillKind") }
-        let appSurfaceVerified = rendersMascot && rendersStatusPills
+        let forcesScheme = sources.contains { $0.contains(".preferredColorScheme(") }
+        let hexPattern = try NSRegularExpression(pattern: "#[0-9A-Fa-f]{6}")
+        let hardcodedHexCount = sources.reduce(into: 0) { count, source in
+            let range = NSRange(source.startIndex..<source.endIndex, in: source)
+            count += hexPattern.numberOfMatches(in: source, range: range)
+        }
 
-        // Phase 1 ships the shared design contract; the views that draw it
-        // land with the Phase 2 and Phase 3 user interface.  This tripwire
-        // fails the moment the app starts rendering the contract, so the
-        // visual parity gate has to be updated to verify the app surface and
-        // to run the snapshot suite BF-2496 asks for.
+        #expect(rendersMascot == true)
+        #expect(rendersStatusPills == true)
+        #expect(forcesScheme == false)
+        #expect(hardcodedHexCount == 0)
+
+        // Every expression in the shared contract resolves a non-empty symbol,
+        // display label, and canonical sidebar category across light and dark
+        // system appearance.
+        for expression in MacMascotExpression.allCases {
+            #expect(expression.symbolName.isEmpty == false)
+            #expect(expression.displayLabel.isEmpty == false)
+            #expect(expression.canonicalCategory.symbolName.isEmpty == false)
+        }
+        let coreExpressions: [MacMascotExpression] = [
+            .idle, .thinking, .working, .happy, .confused,
+            .sleeping, .crash, .celebrate, .listening, .speaking
+        ]
+        for expression in coreExpressions {
+            var bot = Bot(
+                id: "bot-\(expression.rawValue)",
+                threadId: "thread-\(expression.rawValue)",
+                name: "Bot",
+                title: "",
+                description: "",
+                notifications: true,
+                color: "blue",
+                unread: false,
+                modelSelection: ModelSelection(instanceId: "claude", model: "sonnet"),
+                createdAt: 1,
+                mascotExpression: expression.rawValue
+            )
+            let resolved = MacMascotExpression.resolve(for: bot, isConnected: true)
+            #expect(resolved == expression)
+            bot.busy = true
+            let busyResolved = MacMascotExpression.resolve(for: bot, isConnected: true)
+            let canonicalBusyResolved = MacBotMascotExpression.resolve(for: bot, isConnected: true)
+            #expect(busyResolved == .working)
+            #expect(canonicalBusyResolved == .working)
+            #expect(busyResolved.canonicalCategory == canonicalBusyResolved)
+        }
+        let baseBot = Bot(
+            id: "bot-live",
+            threadId: "thread-live",
+            name: "Monet",
+            title: "",
+            description: "",
+            notifications: true,
+            color: "blue",
+            unread: false,
+            modelSelection: ModelSelection(instanceId: "claude", model: "sonnet"),
+            createdAt: 1
+        )
+        #expect(MacMascotExpression.resolve(for: baseBot, isConnected: false) == .sleeping)
+        #expect(MacMascotExpression.resolve(for: baseBot, hasPendingCard: true, isConnected: true) == .alerting)
+        #expect(MacMascotExpression.resolve(for: baseBot, hasReasoning: true, isConnected: true) == .thinking)
+        #expect(MacMascotExpression.resolve(for: baseBot, isConnected: true) == .idle)
+
+        // Every status pill kind carries a label, symbol, semantic color token,
+        // and VoiceOver accessibility label (including visible detail text).
+        for pill in MacStatusPillKind.allCases {
+            #expect(pill.label.isEmpty == false)
+            #expect(pill.symbolName.isEmpty == false)
+            #expect(pill.semanticColorToken.isEmpty == false)
+            #expect(pill.accessibilityLabel == "Connection status: \(pill.label)")
+            #expect(pill.accessibilityLabel(detailText: nil) == pill.accessibilityLabel)
+            #expect(pill.accessibilityLabel(detailText: pill.label) == pill.accessibilityLabel)
+        }
         #expect(
-            appSurfaceVerified == false,
-            "The Mac app renders the mascot or status pill surface now; update the visual parity gate to verify the app surface and to run the snapshot suite."
+            MacStatusPillKind.connected.accessibilityLabel(detailText: "Connected (http://127.0.0.1:8799)") ==
+            "Connection status: Connected, Connected (http://127.0.0.1:8799)"
         )
+        #expect(
+            MacStatusPillKind.error.accessibilityLabel(detailText: "Error: Connection refused") ==
+            "Connection status: Error, Error: Connection refused"
+        )
+        #expect(MacThemeMode.system.followsSystemAppearance == true)
+        #expect(MacThemeMode.light.followsSystemAppearance == false)
+        #expect(MacThemeMode.dark.followsSystemAppearance == false)
 
-        // The gate reports the app surface separately from the contract, so a
-        // contract pass can never read as an app surface pass.
-        let report = MacPerformanceHarness.verifyVisualParity(
-            appSurfaceVerified: appSurfaceVerified,
-            appSurfaceNote: "the Mac app does not render the mascot or status pill surface yet"
-        )
+        // Light/dark snapshot suite covers all 3 theme modes across light and dark
+        // effective appearances, 51 mascot expressions, and 4 status pills.
+        let snapshots = MacPerformanceHarness.runLightDarkVisualSnapshotSuite()
+        #expect(snapshots.count == 4)
+        #expect(MacPerformanceHarness.verifyLightDarkVisualSnapshotSuite() == true)
+        for snapshot in snapshots {
+            #expect(snapshot.mascotSnapshots.count == 51)
+            #expect(snapshot.statusPillSnapshots.count == 4)
+        }
+
+        let report = MacPerformanceHarness.verifyVisualParity(macAppSources: sources)
         #expect(report.contractSnapshotVerified == true)
-        #expect(report.appSurfaceVerified == false)
+        #expect(report.appSurfaceVerified == true)
         #expect(report.allPassed == true)
+        #expect(report.summaryLine.isEmpty == false)
+
+        let emptySurfaceReport = MacPerformanceHarness.verifyVisualParity(macAppSources: [])
+        #expect(emptySurfaceReport.appSurfaceVerified == false)
+
+        // Comment-only mentions of MacMascotExpression and MacStatusPillKind must
+        // never satisfy the visual parity gate.
+        let commentOnlySources = [
+            "// MacMascotExpression.resolve(for: bot) : MacMascotExpression\n/* MacStatusPillView(kind: .connected) : MacStatusPillKind */\nstruct PlaceholderView {}"
+        ]
+        let commentOnlyReport = MacPerformanceHarness.verifyVisualParity(macAppSources: commentOnlySources)
+        #expect(commentOnlyReport.appSurfaceVerified == false)
     }
 }
