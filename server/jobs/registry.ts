@@ -316,7 +316,7 @@ export interface JobRegistryDeps {
    *  past that cap queues instead. */
   placementMode?: () => PlacementMode;
   /** How long a queued job may wait for a host before it expires unrun.
-   *  Absent: queued jobs do not expire in this build. */
+   *  Absent: DEFAULT_QUEUE_WINDOW_MS, so the queue always expires. */
   queueWindowMs?: number;
   probe?: HostProbe;
   listProcesses?: JobProcessLister;
@@ -341,6 +341,12 @@ const FORGET_CHECK_MS = 60_000;
  *  a Mac whose disk gates sit at 2 GB free.) */
 export const JOB_FINISHED_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
 export const JOB_FINISHED_LOG_BUDGET_BYTES = 256 * 1024 * 1024;
+
+/** How long a queued job waits for a host when no explicit window is set: as
+ *  long as the longest run any job is allowed, so a legitimately busy host
+ *  never expires a waiter, but sustained pressure can never accumulate queued
+ *  jobs (memory, `pending` entries, `jobs.json` rows) without limit. */
+export const DEFAULT_QUEUE_WINDOW_MS = JOB_MODEL_MAX_MINUTES * 60_000;
 
 /** A finished job whose process could have left strays that matter this long
  *  after it ended.  Past it the sweep has had every chance to stop them. */
@@ -689,6 +695,21 @@ export class JobRegistry {
     return pressureRefusal(this.probe, settings.admission, this.deps.dataDir);
   }
 
+  /** The queue window in force: an explicit knob when the owner set one,
+   *  else the fail-safe default, so a queued job always expires. */
+  private queueWindowMs(): number {
+    return this.deps.queueWindowMs ?? DEFAULT_QUEUE_WINDOW_MS;
+  }
+
+  /** Fire-and-forget a stop from a periodic pass: a rejection must never
+   *  escape as an unhandled rejection, and the log carries only the error,
+   *  never the job's inputs. */
+  private stopInBackground(promise: Promise<unknown>, what: string): void {
+    promise.catch((error) => {
+      this.deps.log?.(`[jobs] ${what} failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+
   start(request: JobStartRequest): JobStartResult {
     const settings = this.deps.settings();
     const refused = this.refusal(request);
@@ -800,55 +821,52 @@ export class JobRegistry {
     if (this.draining) return;
     this.draining = true;
     try {
-      for (;;) {
-        const queued = [...this.records.values()]
-          .filter((record) => record.status === "queued" && !this.adoptable.has(record.id))
-          .sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1));
-        if (queued.length === 0) return;
-        if (this.deps.spendBlocked()) return;
-        const settings = this.deps.settings();
-        const pressure = pressureRefusal(this.probe, settings.admission, this.deps.dataDir);
-        if (pressure) {
-          for (const record of queued) {
-            if (record.queuedReason !== pressure) {
-              record.queuedReason = pressure;
-              this.changed(record.threadId);
-            }
-          }
-          this.save();
-          return;
-        }
-        if (this.runningLike().length >= JOB_CAP_PER_HOST) return;
-        const blockedBots = new Set<string>();
-        let launched = false;
+      if (this.deps.spendBlocked()) return;
+      const settings = this.deps.settings();
+      const pressure = pressureRefusal(this.probe, settings.admission, this.deps.dataDir);
+      // One scan and sort per drain: launching changes running counts but
+      // never `startedAt` order, so rebuilding and re-sorting after every
+      // launch was pure cost on a deep queue.
+      const queued = [...this.records.values()]
+        .filter((record) => record.status === "queued" && !this.adoptable.has(record.id))
+        .sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1));
+      if (queued.length === 0) return;
+      if (pressure) {
         for (const record of queued) {
-          if (blockedBots.has(record.botId)) continue;
-          // A queued job this process never accepted has no command (memory
-          // only, never on disk): it stays queued for its controller, never
-          // launches here, and never blocks its bot's other queued jobs.
-          const pending = this.pending.get(record.id);
-          if (!pending) continue;
-          const running = this.runningLike();
-          if (
-            running.filter((other) => other.threadId === record.threadId).length >= JOB_CAP_PER_THREAD ||
-            running.filter((other) => other.botId === record.botId).length >= JOB_CAP_PER_BOT
-          ) {
-            blockedBots.add(record.botId);
-            continue;
-          }
-          this.pending.delete(record.id);
-          const error = this.launch(record, pending.command, pending.minutes, settings);
-          if (error) {
-            record.reason = error;
-            this.finish(record, "failed");
-          } else {
-            this.save();
+          if (record.queuedReason !== pressure) {
+            record.queuedReason = pressure;
             this.changed(record.threadId);
           }
-          launched = true;
-          break;
         }
-        if (!launched) return;
+        this.save();
+        return;
+      }
+      const blockedBots = new Set<string>();
+      for (const record of queued) {
+        if (this.runningLike().length >= JOB_CAP_PER_HOST) return;
+        if (blockedBots.has(record.botId)) continue;
+        // A queued job this process never accepted has no command (memory
+        // only, never on disk): it stays queued for its controller, never
+        // launches here, and never blocks its bot's other queued jobs.
+        const pending = this.pending.get(record.id);
+        if (!pending) continue;
+        const running = this.runningLike();
+        if (
+          running.filter((other) => other.threadId === record.threadId).length >= JOB_CAP_PER_THREAD ||
+          running.filter((other) => other.botId === record.botId).length >= JOB_CAP_PER_BOT
+        ) {
+          blockedBots.add(record.botId);
+          continue;
+        }
+        this.pending.delete(record.id);
+        const error = this.launch(record, pending.command, pending.minutes, settings);
+        if (error) {
+          record.reason = error;
+          this.finish(record, "failed");
+        } else {
+          this.save();
+          this.changed(record.threadId);
+        }
       }
     } finally {
       this.draining = false;
@@ -1135,8 +1153,8 @@ export class JobRegistry {
     for (const record of Array.from(this.records.values())) {
       if (this.adoptable.has(record.id)) continue; // adopt() settles these
       if (record.status === "queued") {
-        const windowMs = this.deps.queueWindowMs;
-        if (windowMs !== undefined && this.now() - record.startedAt >= windowMs) {
+        const windowMs = this.queueWindowMs();
+        if (this.now() - record.startedAt >= windowMs) {
           this.pending.delete(record.id);
           record.reason = `no host could take it within ${Math.max(1, Math.round(windowMs / 60_000))} minutes`;
           this.finish(record, "lost");
@@ -1145,9 +1163,9 @@ export class JobRegistry {
         const queuedStop = this.deps.stopReason?.(this.snapshot(record)) ?? null;
         if (queuedStop) {
           const id = record.id;
-          void this.kill(id, "system", queuedStop.reason).then(() => {
+          this.stopInBackground(this.kill(id, "system", queuedStop.reason).then(() => {
             if (queuedStop.forget) this.forget([id]);
-          });
+          }), "queued stop");
         }
         continue;
       }
@@ -1162,13 +1180,13 @@ export class JobRegistry {
       const stop = this.deps.stopReason?.(this.snapshot(record)) ?? null;
       if (stop) {
         const id = record.id;
-        void this.kill(id, "system", stop.reason).then(() => {
+        this.stopInBackground(this.kill(id, "system", stop.reason).then(() => {
           if (stop.forget) this.forget([id]);
-        });
+        }), "stop");
         continue;
       }
       if (record.awakeMs >= record.timeoutMs) {
-        void this.kill(record.id, "timeout", `it ran past its ${Math.round(record.timeoutMs / 60_000)}-minute limit`);
+        this.stopInBackground(this.kill(record.id, "timeout", `it ran past its ${Math.round(record.timeoutMs / 60_000)}-minute limit`), "timeout stop");
       }
     }
     this.drainQueue();
@@ -1192,7 +1210,7 @@ export class JobRegistry {
       const grew = before === undefined ? 0 : end - before;
       if (grew > this.logMaxBytes && grew / seconds > this.floodBytesPerSecond) {
         const mib = Math.round(this.floodBytesPerSecond / (1024 * 1024));
-        void this.kill(record.id, "limit", `it printed more than ${mib} MiB of output a second`);
+        this.stopInBackground(this.kill(record.id, "limit", `it printed more than ${mib} MiB of output a second`), "flood stop");
       }
       this.capLog(record);
     }

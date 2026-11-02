@@ -20,7 +20,6 @@ import {
   PLACEMENT_WIRE_VERSION,
   type AdmissionVerdict,
   type Capability,
-  type CapacitySample,
   type ClaimMessage,
   type ClaimReply,
   type ControllerEpoch,
@@ -111,15 +110,19 @@ export class PlacementLeaseService {
   }
 
   /** The epoch fence every state-changing message crosses first: versions
-   *  before epochs, a lower epoch refused with the current pair so the
-   *  sender converges, a higher pair adopted. */
+   *  before epochs, and only the current pair passes.  A lower pair is
+   *  refused so the sender converges; a higher pair is refused too, never
+   *  adopted — this slice has no takeover path (see the file header), so no
+   *  worker message may legitimately carry a newer epoch, and adopting one
+   *  would let any skewed or forged bump invalidate outstanding leases.
+   *  The future takeover route will own adoption behind its own
+   *  authorization; until then the fence fails closed. */
   private fence(message: PlacementMessage): string | null {
     if (message.version !== PLACEMENT_WIRE_VERSION) {
       return `placement version ${message.version} is not spoken here (this host speaks ${PLACEMENT_WIRE_VERSION})`;
     }
     if (message.epoch > this.current.epoch) {
-      this.current = { controllerId: message.controllerId, epoch: message.epoch };
-      return null;
+      return `stale controller epoch ${message.epoch}; the controller is ${this.current.controllerId} at epoch ${this.current.epoch}`;
     }
     if (message.epoch < this.current.epoch || message.controllerId !== this.current.controllerId) {
       return `stale controller epoch ${message.epoch}; the controller is ${this.current.controllerId} at epoch ${this.current.epoch}`;
@@ -161,13 +164,24 @@ export class PlacementLeaseService {
     return { ok: true, reply: { pendingStops: [], ...this.current } };
   }
 
-  /** Admit a job to the one authoritative queue.  Idempotent on job id: a
-   *  replay answers with the existing record and enqueues nothing twice. */
+  /** Admit a job to the one authoritative queue.  Idempotent on job id: an
+   *  exact replay answers with the existing record and enqueues nothing
+   *  twice, but the same id with a different payload is a conflict (409),
+   *  never a silent drop — the caller must use a new job id for new work. */
   enqueue(message: EnqueueMessage): LeaseResult<EnqueueReply> {
     const stale = this.fence(message);
     if (stale) return { ok: true, reply: { accepted: false, jobId: message.jobId, status: "refused", reason: stale, ...this.current } };
     const existing = this.jobs.get(message.jobId);
     if (existing) {
+      const samePayload =
+        existing.botId === message.botId &&
+        existing.threadId === message.threadId &&
+        existing.command === message.command &&
+        existing.cwd === message.cwd &&
+        existing.timeoutMs === message.timeoutMs;
+      if (!samePayload) {
+        return this.refused(`job ${message.jobId} is already queued with a different payload; use a new job id for new work`);
+      }
       return { ok: true, reply: { accepted: true, duplicate: true, jobId: existing.jobId, status: existing.status, ...this.current } };
     }
     const derived = derivedCapability(message.command, { cwd: message.cwd });
@@ -221,9 +235,18 @@ export class PlacementLeaseService {
     const refuse = (reason: string): LeaseResult<ReportReply> => ({ ok: true, reply: { accepted: false, reason, ...this.current } });
     const job = this.jobs.get(message.jobId);
     if (!job) return refuse(`no job ${message.jobId} on this controller`);
-    if (job.leaseId !== message.leaseId) return refuse(`lease ${message.leaseId} does not hold job ${message.jobId}`);
+    // The report settles only from the holding host with the holding lease:
+    // a leaked lease id in another host's hands settles nothing.
+    if (job.leaseId !== message.leaseId || job.host !== message.hostId) {
+      return refuse(`lease ${message.leaseId} does not hold job ${message.jobId}`);
+    }
     if (TERMINAL.includes(job.status)) {
-      return job.report?.status === message.status && job.report.exitCode === message.exitCode
+      const replayed =
+        job.report?.status === message.status &&
+        job.report.exitCode === message.exitCode &&
+        job.report.signal === message.signal &&
+        job.report.endedAt === message.endedAt;
+      return replayed
         ? { ok: true, reply: { accepted: true, ...this.current } }
         : refuse(`job ${message.jobId} already reported as ${job.status}`);
     }
@@ -278,9 +301,11 @@ export type PlacementLeaseResponse =
   | { status: 400 | 403; body: { error: string } }
   | { status: 409; body: { error: string } & ControllerEpoch };
 
-const hostId = z.string().regex(HOST_ID_PATTERN).transform((value) => {
-  // SAFETY: the regex above matched the HOST_ID_PATTERN shape, which is
-  // exactly the HostId type TypeScript cannot narrow to.
+const hostId = z.string().max(64).regex(HOST_ID_PATTERN).transform((value) => {
+  // SAFETY: the regex above matched the HOST_ID_PATTERN shape (a fixed
+  // `mac:`/`server:` prefix plus a UUID, 43 characters at most; the `.max`
+  // is belt-and-braces per the API-schema rules), which is exactly the
+  // HostId type TypeScript cannot narrow to.
   return value as HostId;
 });
 const fenced = {
@@ -288,13 +313,32 @@ const fenced = {
   epoch: z.number().int().nonnegative().safe(),
   version: z.string().min(1),
 };
-const sample = z.object({ at: z.number() }).passthrough().transform((value) => {
-  // SAFETY: the route validates only the sample's `at` field and the service
-  // never reads the sample; the assertion supplies the unread CapacitySample
-  // shape the message types require.
-  // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- the passthrough object provably lacks the unread fields, so no single assertion bridges it; the SAFETY note above states the invariant
-  return value as unknown as CapacitySample;
-});
+/** The full `CapacitySample` wire shape, strictly parsed: at this owned
+ *  boundary unknown keys fail closed so contract drift is visible, and the
+ *  service never silently accepts a sample it does not understand. */
+const sample = z.object({
+  at: z.number(),
+  cores: z.number().nullable(),
+  loadPerCore: z.number().nullable(),
+  ramTotalBytes: z.number().nullable(),
+  ramAvailableBytes: z.number().nullable(),
+  memoryPressure: z.enum(["normal", "warning", "critical"]).nullable(),
+  memoryAvailablePercent: z.number().nullable(),
+  swapTotalBytes: z.number().nullable(),
+  swapUsedBytes: z.number().nullable(),
+  diskTotalBytes: z.number().nullable(),
+  diskFreeBytes: z.number().nullable(),
+  inodesTotal: z.number().nullable(),
+  inodesFree: z.number().nullable(),
+  dataVolume: z.object({ device: z.string(), mountPoint: z.string() }).strict().nullable(),
+  rootDiskFreeBytes: z.number().nullable(),
+  storage: z.object({
+    online: z.boolean(),
+    dataDevice: z.string().nullable(),
+    rootDevice: z.string().nullable(),
+    reason: z.string().optional(),
+  }).strict().nullable().optional(),
+}).strict();
 const capabilities = z.array(z.enum(["shell", "macos", "desktop"]));
 const schemas = {
   register: z.object({ ...fenced, hostId, role: z.enum(["controller", "worker"]), capabilities, sample }).strict(),

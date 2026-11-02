@@ -20,4 +20,18 @@ describe("the Mac-only command table", () => {
     expect(hostCanRunCommand(["shell"], "open .")).toBe(false);
     expect(hostCanRunCommand(["shell", "macos"], "open .")).toBe(true);
   });
+  it("derives Mac-only tools past chains, pipes, and wrappers the way /bin/sh runs them", () => {
+    expect(derivedCapability("pnpm test; xcodebuild -scheme App build")).toMatchObject({ command: "xcodebuild" });
+    expect(derivedCapability("pnpm test && xcrun simctl list")).toMatchObject({ command: "xcrun" });
+    expect(derivedCapability("echo hi | xcodebuild -version")).toMatchObject({ command: "xcodebuild" });
+    expect(derivedCapability("sudo xcodebuild -scheme App build")).toMatchObject({ command: "xcodebuild" });
+    expect(derivedCapability("sudo -u worker codesign --sign - app")).toMatchObject({ command: "codesign" });
+    expect(derivedCapability("env DEVELOPER_DIR=/x xcrun simctl list")).toMatchObject({ command: "xcrun" });
+    expect(derivedCapability("sh -c 'xcodebuild -scheme App build'")).toMatchObject({ command: "xcodebuild" });
+    expect(derivedCapability("sudo sh -c 'simctl list'")).toMatchObject({ command: "simctl" });
+    expect(hostCanRunCommand(["shell"], "sh -c 'xcodebuild -scheme App build'")).toBe(false);
+    expect(hostCanRunCommand(["shell", "macos"], "sh -c 'xcodebuild -scheme App build'")).toBe(true);
+    expect(derivedCapability("pnpm test && echo done")).toBeNull();
+    expect(derivedCapability("sh -c 'pnpm test'")).toBeNull();
+  });
 });

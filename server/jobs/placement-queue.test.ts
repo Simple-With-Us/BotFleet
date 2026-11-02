@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { JobSnapshot } from "../../shared/jobs.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
-import { DEFAULT_JOBS_SETTINGS, JobRegistry, type JobRegistryDeps, type JobsSettings } from "./registry.ts";
+import { DEFAULT_JOBS_SETTINGS, DEFAULT_QUEUE_WINDOW_MS, JobRegistry, type JobRegistryDeps, type JobsSettings } from "./registry.ts";
 import type { JobSpawnResult, JobSpawnSpec } from "./runner.ts";
 import type { ChildProcess } from "node:child_process";
 
@@ -318,5 +318,27 @@ describe("placement queue", () => {
     const killed = await h.registry.kill(killable.job.id, "model");
     expect(killed.ok).toBe(true);
     expect(killed.job?.status).toBe("killed");
+  });
+
+  it("expires a queued job under the default window when no window is configured", () => {
+    // The fail-safe default is the longest run any job is allowed, so this
+    // test names the exported constant instead of a magic duration.
+    expect(DEFAULT_QUEUE_WINDOW_MS).toBe(240 * 60_000);
+    const { h } = harness({ placementMode: () => "serverFirst" });
+    runningIds(h, 8);
+    const queued = start(h, "doomed queue", "tq", "bot-q");
+    if (!queued.ok) throw new Error(queued.error);
+    expect(queued.job.status).toBe("queued");
+    // Just inside the default window the job still waits for its slot.
+    h.clock.now += DEFAULT_QUEUE_WINDOW_MS - 1_000;
+    h.awake.now += 5_000;
+    h.registry.tick();
+    expect(h.registry.get(queued.job.id)?.status).toBe("queued");
+    // Past it the job expires unrun instead of accumulating without limit.
+    h.clock.now += 2_000;
+    h.awake.now += 5_000;
+    h.registry.tick();
+    expect(h.registry.get(queued.job.id)?.status).toBe("lost");
+    expect(h.registry.get(queued.job.id)?.reason).toMatch(/no host could take it within 240 minutes/);
   });
 });
