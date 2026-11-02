@@ -15,7 +15,7 @@
 //                                 launcher only (skills never write it)
 //   AGENT_SEAT=<seat>             the same value, for older readers
 //   AGENT_SESSION=<thread id>     BotFleet's id for this bot's thread
-//   AGENT_SYNC_ATTACH=0           the Claude hooks plugin never attaches a
+//   SIMPLE_TOOLS_ATTACH=0         the Claude hooks plugin never attaches a
 //                                 session BotFleet launched
 //
 // It also removes every variable that could carry a different identity from
@@ -152,7 +152,7 @@ export function launchIdentityFor(
  *  so it is assignable to a process environment. */
 export type LaunchEnvironment = {
   AGENT_LAUNCHER: "botfleet";
-  AGENT_SYNC_ATTACH: "0";
+  SIMPLE_TOOLS_ATTACH: "0";
   AGENT_LAUNCH_SEAT?: string;
   AGENT_SEAT?: string;
   AGENT_SESSION?: string;
@@ -161,7 +161,7 @@ export type LaunchEnvironment = {
 /** The variables a launched child is given, in the form its environment
  *  takes.  `identity` absent means a launched child with no seat. */
 export function launchEnvironment(identity?: LaunchIdentity): LaunchEnvironment {
-  const env: LaunchEnvironment = { AGENT_LAUNCHER: "botfleet", AGENT_SYNC_ATTACH: "0" };
+  const env: LaunchEnvironment = { AGENT_LAUNCHER: "botfleet", SIMPLE_TOOLS_ATTACH: "0" };
   if (identity?.seat) {
     env.AGENT_LAUNCH_SEAT = identity.seat;
     env.AGENT_SEAT = identity.seat;
@@ -171,7 +171,7 @@ export function launchEnvironment(identity?: LaunchIdentity): LaunchEnvironment 
 }
 
 const SCRUB_NAMES = new Set(["AGENT_SEAT", "AGENT_TAG", "AGENT_SESSION", "CLAUDE_CODE_SESSION_ID"]);
-const SCRUB_PREFIXES = ["AGENT_LAUNCH", "AGENT_SYNC_", "ZULIP_"];
+const SCRUB_PREFIXES = ["AGENT_LAUNCH", "SIMPLE_TOOLS_", "ZULIP_"];
 
 /** Whether an inherited variable could carry another identity or a Zulip
  *  credential into a launched child.  Compared upper-cased: Windows
