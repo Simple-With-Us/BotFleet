@@ -2771,6 +2771,7 @@ export interface InfisicalStatusPayload {
     appliedCount: number;
     appliedFields: string[];
     unusedVaultNames: string[];
+    readSources?: Array<{ name: string; projectId: string; environment: string; secretPath: string; ok: boolean; error: string | null }>;
   };
   fields: SecretFieldRow[];
 }

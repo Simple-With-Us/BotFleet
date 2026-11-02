@@ -11,7 +11,12 @@
 // leave this module.  `writeSecret` is the one path that sends a value
 // anywhere at all, and it goes straight to Infisical over the connection
 // `login()` already authenticated, never through a log line.
-import type { InfisicalSettings } from "./config.ts";
+import { constants } from "node:fs";
+import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
+import { resolve, sep } from "node:path";
+
+import { normalizeInfisicalSecretPath, type InfisicalSettings, type ResolvedInfisicalReadSource } from "./config.ts";
+import { dataDir } from "./data-dir.ts";
 import { InfisicalError, login, listSecrets, upsertSecret } from "./infisical-client.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { SECRET_FIELDS, infisicalSnapshot, setInfisicalSnapshot, vaultNames as snapshotVaultNames } from "./secret-map.ts";
@@ -62,6 +67,7 @@ export interface InfisicalStatusView {
   knobCount: number;
   appliedKnobs: string[];
   unusedVaultNames: string[];
+  readSources: Array<{ name: string; projectId: string; environment: string; secretPath: string; ok: boolean; error: string | null }>;
 }
 
 /** Every Infisical name this process will ever apply, built once from the
@@ -99,6 +105,7 @@ const UNSET_SETTINGS: InfisicalSettings = {
   clientSecret: "",
   token: "",
   writeToken: "",
+  readSources: [],
   refreshMinutes: DEFAULT_REFRESH_MINUTES,
 };
 
@@ -252,7 +259,9 @@ class InfisicalManager {
    * hatch is `retryRefusedTokens()`, which the Sync Now and the Settings
    * save paths call:  an explicit ask for a retry is the operator saying
    * the thing I fixed, try it again. */
-  private rejectedTokens = new Map<"read" | "write", Array<{ token: string; scope: string }>>();
+  private rejectedTokens = new Map<string, Array<{ token: string; scope: string }>>();
+  private warnedReadSources = new Set<string>();
+  private readSourceStatus = new Map<string, { ok: boolean; error: string | null }>();
 
 
   /** Live view of app config, installed by the server at boot.  A getter
@@ -269,6 +278,8 @@ class InfisicalManager {
     // a new credential, and it must be tried on its own merits rather than
     // inherit the previous source's rejection.
     this.rejectedTokens.clear();
+    this.warnedReadSources.clear();
+    this.readSourceStatus.clear();
   }
 
   /** Forget every remembered refusal, so the configured tokens are tried
@@ -280,6 +291,166 @@ class InfisicalManager {
    * tick must not re-probe a token the server has already refused. */
   retryRefusedTokens(): void {
     this.rejectedTokens.clear();
+    this.warnedReadSources.clear();
+  }
+
+  private warnReadSource(source: ResolvedInfisicalReadSource, detail: string): void {
+    const locator = source.tokenFile ? `token file ${source.tokenFile}` : source.tokenEnv ? `env ${source.tokenEnv}` : "no token file or env";
+    const key = `${source.name}\u0000${locator}`;
+    this.readSourceStatus.set(source.name, { ok: false, error: detail });
+    if (this.warnedReadSources.has(key)) return;
+    this.warnedReadSources.add(key);
+    console.warn(`[infisical] read source "${source.name}" unavailable (${locator}): ${detail}`);
+  }
+
+  /** The failure a source read rejects with.  Names the source and its
+   * token file or env name only — never a token value. */
+  private readSourceFailure(source: ResolvedInfisicalReadSource, detail: string, statusCode = 502): InfisicalError {
+    const locator = source.tokenFile ? `token file ${source.tokenFile}` : source.tokenEnv ? `env ${source.tokenEnv}` : "no token file or env";
+    return new InfisicalError(`read source "${source.name}" unavailable (${locator}): ${detail}`, statusCode);
+  }
+
+  private async resolveSourceToken(source: ResolvedInfisicalReadSource): Promise<{ token: string } | { error: string }> {
+    if (source.tokenFile) {
+      // The file's contents become a bearer token sent to `siteUrl`, so
+      // the path itself is part of the trust boundary: it must live in
+      // the BotFleet config directory (where `config.json` lives), be a
+      // real regular file, and be owner-only.  Any failure is a refusal,
+      // never a warning-and-continue.
+      const configDir = resolve(dataDir());
+      const candidate = resolve(source.tokenFile);
+      if (candidate !== configDir && !candidate.startsWith(`${configDir}${sep}`)) {
+        return { error: `token file ${source.tokenFile} is outside the BotFleet config directory ${configDir}; refusing to read it` };
+      }
+      try {
+        const st = await lstat(candidate);
+        if (st.isSymbolicLink()) return { error: `token file ${source.tokenFile} is a symlink; refusing to read it` };
+        if (!st.isFile()) return { error: `token file ${source.tokenFile} is not a regular file; refusing to read it` };
+        if (process.platform !== "win32" && (st.mode & 0o077) !== 0) {
+          return { error: `token file ${source.tokenFile} is readable or writable by group or other (mode ${(st.mode & 0o777).toString(8)}); run chmod 600 on it` };
+        }
+        // A symlinked parent directory must not smuggle the file out of
+        // the config directory the lexical check above approved.
+        const realConfigDir = await realpath(configDir);
+        const realCandidate = await realpath(candidate);
+        if (realCandidate !== realConfigDir && !realCandidate.startsWith(`${realConfigDir}${sep}`)) {
+          return { error: `token file ${source.tokenFile} is outside the BotFleet config directory ${configDir}; refusing to read it` };
+        }
+        // Read through a verified handle, not the path again: open
+        // without following a symlink swapped in since the checks
+        // above, then re-verify on the descriptor (the pattern
+        // `electron/infisical-read.mjs` uses for its bootstrap token).
+        let handle: FileHandle;
+        try {
+          handle = await open(candidate, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+        } catch (e) {
+          if (e instanceof Error && "code" in e && e.code === "ELOOP") {
+            return { error: `token file ${source.tokenFile} is a symlink; refusing to read it` };
+          }
+          throw e;
+        }
+        try {
+          const handleStat = await handle.stat();
+          if (!handleStat.isFile()) return { error: `token file ${source.tokenFile} is not a regular file; refusing to read it` };
+          if (process.platform !== "win32" && (handleStat.mode & 0o077) !== 0) {
+            return { error: `token file ${source.tokenFile} is readable or writable by group or other (mode ${(handleStat.mode & 0o777).toString(8)}); run chmod 600 on it` };
+          }
+          if (handleStat.dev !== st.dev || handleStat.ino !== st.ino) {
+            return { error: `token file ${source.tokenFile} changed while it was read; refusing to read it` };
+          }
+          const token = (await handle.readFile("utf8")).trim();
+          return token ? { token } : { error: "token file is empty" };
+        } finally {
+          await handle.close();
+        }
+      } catch (e) {
+        const code = e instanceof Error && "code" in e && e.code ? String(e.code) : "error";
+        return { error: `token file cannot be read (${code})` };
+      }
+    }
+    if (source.tokenEnv) {
+      const token = (process.env[source.tokenEnv] ?? "").trim();
+      return token ? { token } : { error: `env ${source.tokenEnv} is empty or unset` };
+    }
+    return { error: "no tokenFile or tokenEnv configured" };
+  }
+
+  /** Whether `requestedPath` is the source's own `secretPath` or under
+   * it.  Root "/" covers everything.  Both sides are normalized first,
+   * so a trailing slash never changes the answer. */
+  private sourceCovers(source: ResolvedInfisicalReadSource, requestedPath: string): boolean {
+    const stored = normalizeInfisicalSecretPath(source.secretPath);
+    const requested = normalizeInfisicalSecretPath(requestedPath);
+    return stored === "/" || requested === stored || requested.startsWith(`${stored}/`);
+  }
+
+  private findReadSource(settings: InfisicalSettings, projectId: string, environment: string, secretPath: string): ResolvedInfisicalReadSource | undefined {
+    const requested = normalizeInfisicalSecretPath(secretPath);
+    return (settings.readSources ?? [])
+      .filter((src) => src.projectId === projectId && src.environment === environment && this.sourceCovers(src, requested))
+      .sort((a, b) => normalizeInfisicalSecretPath(b.secretPath).length - normalizeInfisicalSecretPath(a.secretPath).length)[0];
+  }
+
+  private async readWithSource(settings: InfisicalSettings, source: ResolvedInfisicalReadSource, secretPath: string, projectId: string, environment: string): Promise<ReadonlyMap<string, string>> {
+    const resolved = await this.resolveSourceToken(source);
+    if ("error" in resolved) {
+      this.warnReadSource(source, resolved.error);
+      throw this.readSourceFailure(source, resolved.error, 409);
+    }
+    const scope = scopeSignature(projectId, environment, secretPath);
+    const mode = `source:${source.name}`;
+    if (this.isRefused(mode, resolved.token, scope)) {
+      this.warnReadSource(source, "token was refused by the server");
+      throw this.readSourceFailure(source, "token was refused by the server", 401);
+    }
+    try {
+      const { values } = await listSecrets({
+        siteUrl: settings.siteUrl,
+        token: resolved.token,
+        projectId,
+        environment,
+        secretPath,
+        viewValues: true,
+        timeoutMs: callTimeoutMs(),
+      });
+      this.readSourceStatus.set(source.name, { ok: true, error: null });
+      return new Map(values);
+    } catch (err) {
+      const status = rejectionStatus(err);
+      if (status !== undefined && isDefinitiveRejection(status)) this.rememberRefusal(mode, resolved.token, refusalScope(status, scope));
+      const raw = err instanceof Error ? err.message : "unknown error";
+      const detail = redactSecretsInText(raw).split(resolved.token).join("[redacted]");
+      this.warnReadSource(source, detail);
+      throw this.readSourceFailure(source, detail, status ?? 502);
+    }
+  }
+
+  async readSource(name: string, secretPath?: string): Promise<ReadonlyMap<string, string>> {
+    const settings = this.settings();
+    const source = (settings.readSources ?? []).find((src) => src.name === name);
+    if (!source) {
+      const key = `missing\u0000${name}`;
+      if (!this.warnedReadSources.has(key)) {
+        this.warnedReadSources.add(key);
+        console.warn(`[infisical] read source "${name}" is not configured`);
+      }
+      throw new InfisicalError(`read source "${name}" is not configured`, 404);
+    }
+    if (settings.enabled !== true) {
+      this.warnReadSource(source, "Infisical is turned off");
+      throw this.readSourceFailure(source, "Infisical is turned off", 409);
+    }
+    const explicit = secretPath?.trim();
+    if (!explicit) {
+      return this.readWithSource(settings, source, normalizeInfisicalSecretPath(source.secretPath), source.projectId, source.environment);
+    }
+    const requested = normalizeInfisicalSecretPath(explicit);
+    if (!this.sourceCovers(source, requested)) {
+      const detail = `requested path ${requested} is not covered by the source's secretPath ${normalizeInfisicalSecretPath(source.secretPath)}`;
+      this.warnReadSource(source, detail);
+      throw this.readSourceFailure(source, detail, 403);
+    }
+    return this.readWithSource(settings, source, requested, source.projectId, source.environment);
   }
 
   private settings(): InfisicalSettings {
@@ -302,7 +473,7 @@ class InfisicalManager {
   }
 
   /** Whether a refusal is remembered for this token and this scope. */
-  private isRefused(mode: "read" | "write", token: string, scope: string): boolean {
+  private isRefused(mode: string, token: string, scope: string): boolean {
     const remembered = this.rejectedTokens.get(mode) ?? [];
     return remembered.some(
       (entry) => entry.token === token && (entry.scope === CREDENTIAL_REFUSAL_SCOPE || entry.scope === scope),
@@ -313,7 +484,7 @@ class InfisicalManager {
    * one entry per refused scope, and one entry is dropped once it grows
    * past the cap, so a long-lived install cannot accumulate them without
    * end. */
-  private rememberRefusal(mode: "read" | "write", token: string, scope: string): void {
+  private rememberRefusal(mode: string, token: string, scope: string): void {
     const remembered = this.rejectedTokens.get(mode) ?? [];
     if (!remembered.some((entry) => entry.token === token && entry.scope === scope)) {
       remembered.push({ token, scope });
@@ -605,6 +776,14 @@ class InfisicalManager {
       knobCount: names.filter((name) => KNOB_INFISICAL_NAMES.has(name)).length,
       appliedKnobs,
       unusedVaultNames,
+      readSources: (settings.readSources ?? []).map((src) => ({
+        name: src.name,
+        projectId: src.projectId,
+        environment: src.environment,
+        secretPath: src.secretPath,
+        ok: this.readSourceStatus.get(src.name)?.ok ?? false,
+        error: this.readSourceStatus.get(src.name)?.error ?? null,
+      })),
     };
   }
 
@@ -657,16 +836,14 @@ class InfisicalManager {
     scope: { projectId?: string; environment?: string } = {},
   ): Promise<ReadonlyMap<string, string>> {
     const settings = this.settings();
+    const projectId = scope.projectId?.trim() || settings.projectId;
+    const environment = scope.environment?.trim() || settings.environment;
+    secretPath = normalizeInfisicalSecretPath(secretPath);
+    const source = settings.enabled === true ? this.findReadSource(settings, projectId, environment, secretPath) : undefined;
+    if (source) return this.readWithSource(settings, source, secretPath, projectId, environment);
     if (!isConfigured(settings) || settings.enabled !== true) {
       throw new InfisicalError("Infisical is not configured and turned on for this workspace.", 409);
     }
-    // The scope this call is actually made against.  The caller's own
-    // project, environment and path decide what the server answers for,
-    // so a refusal of THIS call is remembered against THIS scope:  a
-    // folder that does not exist must not deprioritize a good token for
-    // the whole vault.
-    const projectId = scope.projectId?.trim() || settings.projectId;
-    const environment = scope.environment?.trim() || settings.environment;
     const { values } = await this.withServiceTokenFallback(
       settings,
       "read",
@@ -789,7 +966,8 @@ class InfisicalManager {
       return `[infisical] unavailable: ${status.lastError}; using environment and config values${refusedPart}`;
     }
     const fields = status.appliedFields.join(",");
-    return `[infisical] enabled env=${status.environment} path=${status.secretPath} vault=${status.vaultCount} applied=${status.appliedCount} fields=${fields} unused=${status.unusedVaultNames.length}${refusedPart} ms=${status.lastSyncMs ?? 0}`;
+    const sourcesPart = status.readSources.length ? ` sources=${status.readSources.map((s) => `${s.name}:${s.ok ? "ok" : s.error ? "error" : "unknown"}`).join(",")}` : "";
+    return `[infisical] enabled env=${status.environment} path=${status.secretPath} vault=${status.vaultCount} applied=${status.appliedCount} fields=${fields} unused=${status.unusedVaultNames.length}${refusedPart}${sourcesPart} ms=${status.lastSyncMs ?? 0}`;
   }
 
   /** `bootLine()`'s text, or `null` when it is unchanged from the last time
