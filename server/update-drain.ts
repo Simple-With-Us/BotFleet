@@ -75,6 +75,52 @@ export function clampDrainTimeout(value: DrainWindowInput): number {
   return Math.min(UPDATE_DRAIN_MAX_TIMEOUT_MS, Math.max(UPDATE_DRAIN_MIN_TIMEOUT_MS, Math.round(parsed)));
 }
 
+/** A routine run, as far as the counts care:  which bot it is for, and where
+ *  it is in its life. */
+export interface RoutineRunLike {
+  readonly botId: string;
+  readonly status: string;
+}
+
+/** The routine runs that are work in flight, and the queued ones among them:
+ *  the number a wait watches, and the number a discount may take from it. */
+export interface RoutineRunCounts {
+  readonly inFlight: number;
+  readonly queued: number;
+}
+
+/** The routine runs that are work in flight, and the queued ones among them.
+ *
+ *  A queued run is held rather than in flight, so the counts discount it:  it
+ *  survives a restart as-is and runs after it.  A queued run for a bot that
+ *  is switched Off is neither:  it will be dropped or refused, never run, so
+ *  the runtime count leaves it out.  Discounting it anyway takes more than
+ *  the count holds, and a routine run that really is running disappears from
+ *  the work in flight:  a drain or a stop then waits for nothing and
+ *  interrupts work that was still going.
+ *
+ *  The two filters have to agree, so they are written once, here:  the
+ *  discount can never be bigger than the count it is taken from. */
+export function routineRunCounts(
+  runs: readonly RoutineRunLike[],
+  options: {
+    /** Whether the runs waiting on a credential count as work in flight.
+     *  The drain holds them, so it does not wait for them. */
+    readonly allowCredentialQueues: boolean;
+    /** Whether the bot is switched Off.  A missing bot is not Off. */
+    readonly isBotOff: (botId: string) => boolean;
+  },
+): RoutineRunCounts {
+  const counted = runs.filter((run) =>
+    (options.allowCredentialQueues ? ["running", "waiting"] : ["queued", "running", "waiting"]).includes(run.status)
+    && !(run.status === "queued" && options.isBotOff(run.botId)));
+  return {
+    inFlight: counted.length,
+    // The queued runs among the counted ones:  the ones a discount may take.
+    queued: counted.filter((run) => run.status === "queued").length,
+  };
+}
+
 /** The work a drain waits for: the readiness counts minus what is only held.
  *  Held is durable or re-deliverable on its own — queued routine receipts
  *  and the steer queue — so counting it would keep a webhook-fed Mac "busy"

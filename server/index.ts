@@ -130,6 +130,7 @@ import {
   type HeldSend,
   type HeldWork,
   type DrainWindowInput,
+  routineRunCounts,
 } from "./update-drain.ts";
 import {
   arrivedViaCloudflareTunnel,
@@ -12159,8 +12160,12 @@ function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueu
  *  what the updater tells a person it is waiting for. */
 function drainRuntimeReadiness() {
   const counts = runtimeWorkCounts();
+  // The queued runs are discounted with the same filter the runtime count
+  // uses, so the discount can never be bigger than the count it is taken
+  // from:  a queued run for a bot that is switched Off is in neither, because
+  // it will be dropped or refused, never run.
   const queuedRoutineRuns = bootComplete
-    ? routines?.listRuns().filter((run) => run.status === "queued").length ?? 0
+    ? routineRunCounts(routines?.listRuns() ?? [], { allowCredentialQueues: false, isBotOff: botIsOffId }).queued
     : 0;
   return {
     ...runtimeReadiness(inFlightCounts(counts, { queuedRoutineRuns })),
@@ -12267,10 +12272,10 @@ function runtimeWorkCounts(ownAdmissionActive = false, allowCredentialQueues = f
     localVmChanges: Number(localVmImageBusy) + Number(localVmProvisionBusy) + Number(localVmModeChangeBusy),
     restores: checkpointRestoreLeases.size,
     reloads: pendingProviderReloads + Number(providerConfigBusy),
-    routineRuns: routines?.listRuns().filter((run) =>
-      (allowCredentialQueues ? ["running", "waiting"] : ["queued", "running", "waiting"]).includes(run.status)
-      && !(run.status === "queued" && botIsOffId(run.botId))
-    ).length ?? 0,
+    routineRuns: routineRunCounts(routines?.listRuns() ?? [], {
+      allowCredentialQueues,
+      isBotOff: botIsOffId,
+    }).inFlight,
   };
 }
 
@@ -12399,8 +12404,15 @@ const GRACEFUL_STOP_SETTLED_KINDS = new Set([
  *  the stop has to wait for. */
 function gracefulStopWorkCounts(ownAdmissionActive: boolean, ownControlLock = false): RuntimeWorkCounts {
   const counts = runtimeWorkCounts(ownAdmissionActive);
+  // The queued runs are discounted with the same filter the runtime count
+  // uses, so the discount can never be bigger than the count it is taken
+  // from.  A queued run for a bot that is switched Off is in neither:  it
+  // will be dropped or refused, never run.  Discounting it anyway took more
+  // than the count held, and a routine run that really was running
+  // disappeared from the work in flight:  the wait ended early and the
+  // shutdown interrupted a run that was still going.
   const queuedRoutineRuns = bootComplete
-    ? routines?.listRuns().filter((run) => run.status === "queued").length ?? 0
+    ? routineRunCounts(routines?.listRuns() ?? [], { allowCredentialQueues: false, isBotOff: botIsOffId }).queued
     : 0;
   return withoutOwnControlLock(inFlightCounts(counts, { queuedRoutineRuns }), ownControlLock);
 }
