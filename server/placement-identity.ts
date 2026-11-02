@@ -13,7 +13,7 @@ import { writeFileAtomic } from "./atomic.ts";
 const controllerEpochSchema = z.object({
   controllerId: z.string().regex(HOST_ID_PATTERN),
   epoch: z.number().int().nonnegative().safe(),
-});
+}).strict();
 
 /**
  * The controller fence belongs to the data directory, beside `host-id`.
