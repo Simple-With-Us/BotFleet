@@ -488,4 +488,98 @@ final class RedactTests: XCTestCase {
             "carry «redacted 23 chars» " + String(repeating: "B", count: 84) + "[… 120 characters elided from log]"
         )
     }
+
+    func testCyclicInputElidedNotRecursed() {
+        // Swift value types cannot cycle; reference graphs can. A stack
+        // overflow in Swift is a crash, not a catchable error, so returning
+        // at all proves the elision. TS-verified marker spelling.
+        let cyclic = NSMutableDictionary()
+        cyclic["note"] = "hello world ok"
+        cyclic["self"] = cyclic
+        let out = Redact.redactSecrets(cyclic) as? [String: Any]
+        XCTAssertEqual(out?["note"] as? String, "hello world ok")
+        XCTAssertEqual(out?["self"] as? String, "«redacted circular»")
+    }
+
+    func testCyclicArrayElidedOnLogPath() {
+        let cyclic = NSMutableArray()
+        cyclic.add("ok")
+        cyclic.add(cyclic)
+        let out = Redact.redactSecretsForLog(cyclic) as? [Any]
+        XCTAssertEqual(out?[0] as? String, "ok")
+        XCTAssertEqual(out?[1] as? String, "«redacted circular»")
+    }
+
+    func testCyclePastDepthCapElided() {
+        let inner = NSMutableDictionary()
+        inner["api_key"] = "live-secret-value-0000"
+        inner["loop"] = inner
+        var deep: Any = inner
+        for i in 0..<15 { deep = ["k\(i)": deep] }
+        // NSMutableDictionary bridges lazily, so this only terminates
+        // because the shared walk carries its ancestor set into maskDeep.
+        let text = "\(Redact.redactSecrets(deep) as Any)"
+        XCTAssertFalse(text.contains("live-secret-value-0000"))
+        XCTAssertTrue(text.contains("«redacted circular»"))
+    }
+
+    func testMaskDeepElidesFarDeeperThanBudget() {
+        // TS-verified: walk 12 + mask 32, then the marker — the secret never
+        // ships and the outer keys still say where it was.
+        var deep: Any = ["api_key": "live-secret-value-0000"]
+        for i in 0..<60 { deep = ["k\(i)": deep] }
+        let text = "\(Redact.redactSecrets(deep) as Any)"
+        XCTAssertFalse(text.contains("live-secret-value-0000"))
+        XCTAssertTrue(text.contains("«redacted subtree»"))
+        XCTAssertTrue(text.contains("k59"))
+    }
+
+    func testMaskDeepElidesPastNodeBudget() {
+        // 123,001 values past the cap against a 100,000 budget: the cut must
+        // engage (the marker), keys survive (only values elide), and no leaf
+        // plaintext survives on either side of the cut. Dictionary order is
+        // unspecified, so no assertion depends on which leaves were masked.
+        var wide: [String: Any] = [:]
+        for i in 0..<3000 {
+            var arr: [String] = []
+            for j in 0..<40 { arr.append("padding-\(i)-\(j)-0000000000") }
+            wide["arr\(i)"] = arr
+        }
+        var deep: Any = wide
+        for i in 0..<15 { deep = ["k\(i)": deep] }
+        let text = "\(Redact.redactSecrets(deep) as Any)"
+        XCTAssertTrue(text.contains("«redacted subtree»"))
+        XCTAssertTrue(text.contains("arr2999"))
+        XCTAssertFalse(text.contains("padding-2999-39-0000000000"))
+        XCTAssertFalse(text.contains("padding-0-0-0000000000"))
+    }
+
+    func testLogTeeTruncatedJwtMaskedFailClosed() {
+        // TS-verified, byte-identical: the dotless opener runs to the window
+        // edge, so only the fail-closed pass can catch it.
+        let blob = "eyJ" + String(repeating: "A", count: 9000)
+        XCTAssertEqual(
+            Redact.redactSecretsInLogText("tok " + blob + " tail", maxChars: 200),
+            "tok «redacted 4292 chars»[… 8812 characters elided from log]"
+        )
+    }
+
+    func testLogTeeWholeJwtStillMasked() {
+        // TS-verified, byte-identical: a dotted JWT inside the window takes
+        // the normal pattern path, unchanged by the fail-closed pass.
+        let jwt = ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "c3VjcmV0LXZha2UtcGF5bG9hZA", "c2lnbmF0dXJl"].joined(separator: ".")
+        XCTAssertEqual(
+            Redact.redactSecretsInLogText("carry " + jwt + " " + String(repeating: "B", count: 200), maxChars: 110),
+            "carry «redacted 76 chars» " + String(repeating: "B", count: 84) + "[… 173 characters elided from log]"
+        )
+    }
+
+    func testLogTeeLongNonSecretUnmasked() {
+        // The fail-closed pass keys on the credential opener: a long
+        // secret-free run still takes the cut path with no mask.
+        let out = Redact.redactSecretsInLogText("data " + String(repeating: "aB3x", count: 2500) + " end", maxChars: 200)
+        XCTAssertFalse(out.contains("«redacted"))
+        XCTAssertTrue(out.contains("characters elided from log"))
+        XCTAssertTrue(out.hasPrefix("data aB3x"))
+    }
 }

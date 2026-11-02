@@ -181,6 +181,116 @@ describe("log tee redacts before it cuts", () => {
   });
 });
 
+/** A fixture that is cyclic at runtime; the named contract keeps the static
+ * view honest without an open dictionary type. */
+interface CyclicNoteFixture {
+  note: string;
+  self: unknown;
+}
+/** A fixture that is cyclic at runtime, nested past the depth cap. */
+interface CyclicInnerFixture {
+  api_key: string;
+  loop: unknown;
+}
+
+describe("cyclic input is elided, not recursed", () => {
+  it("elides a self-referencing object instead of overflowing the stack", () => {
+    const cyclic: CyclicNoteFixture = { note: "hello world ok", self: null };
+    cyclic.self = cyclic;
+    const out = redactSecrets(cyclic);
+    if (!isJsonObject(out)) throw new Error("fixture drifted: cyclic root is not an object");
+    expect(out.note).toBe("hello world ok");
+    expect(out.self).toBe("«redacted circular»");
+    expect(() => JSON.stringify(out)).not.toThrow();
+  });
+
+  it("elides a self-referencing array on the log path", () => {
+    const cyclic: Array<JsonValue> = ["ok"];
+    cyclic.push(cyclic);
+    const out = redactSecretsForLog(cyclic);
+    if (!Array.isArray(out)) throw new Error("fixture drifted: cyclic log root is not an array");
+    expect(out[0]).toBe("ok");
+    expect(out[1]).toBe("«redacted circular»");
+    expect(() => JSON.stringify(out)).not.toThrow();
+  });
+
+  it("elides a cycle nested past the depth cap", () => {
+    const inner: CyclicInnerFixture = { api_key: "live-secret-value-0000", loop: null };
+    inner.loop = inner;
+    // SAFETY: intentionally cyclic at runtime; viewed as JSON only for the
+    // nesting loop below. redactSecrets itself takes unknown.
+    let deep = inner as JsonValue;
+    for (let i = 0; i < 15; i++) deep = { [`k${i}`]: deep };
+    const out = redactSecrets(deep);
+    expect(JSON.stringify(out)).not.toContain("live-secret-value-0000");
+    expect(JSON.stringify(out)).toContain("«redacted circular»");
+  });
+
+  it("still redacts a shared reference twice when it is not a cycle", () => {
+    // Ancestors-only tracking: the same object in two places is processed
+    // twice, because neither visit is an ancestor of the other.
+    const shared = { api_key: "live-secret-value-0000" };
+    const out = redactSecrets({ a: shared, b: shared });
+    if (!isJsonObject(out) || !isJsonObject(out.a) || !isJsonObject(out.b)) {
+      throw new Error("fixture drifted: shared shape lost");
+    }
+    expect(out.a.api_key).toBe("«redacted 22 chars»");
+    expect(out.b.api_key).toBe("«redacted 22 chars»");
+  });
+});
+
+describe("maskDeep is bounded past the cap", () => {
+  it("elides a nesting far deeper than the mask budget instead of overflowing", () => {
+    let deep: JsonValue = { api_key: "live-secret-value-0000" };
+    for (let i = 0; i < 60; i++) deep = { [`k${i}`]: deep };
+    const out = redactSecrets(deep);
+    const text = JSON.stringify(out);
+    expect(text).not.toContain("live-secret-value-0000");
+    expect(text).toContain("«redacted subtree»");
+    expect(text).toContain("k59");
+  });
+
+  it("elides past the node budget on a huge past-cap fan-out", () => {
+    const leaf = (i: number, j: number) => `padding-${i}-${j}-0000000000`;
+    const wide: Record<string, JsonValue> = {};
+    for (let i = 0; i < 3000; i++) {
+      const arr: JsonValue[] = [];
+      for (let j = 0; j < 40; j++) arr.push(leaf(i, j));
+      wide[`arr${i}`] = arr;
+    }
+    let deep: JsonValue = wide;
+    for (let i = 0; i < 15; i++) deep = { [`k${i}`]: deep };
+    const out = redactSecrets(deep);
+    const text = JSON.stringify(out);
+    expect(text).toContain("«redacted subtree»");
+    expect(text).not.toContain(leaf(2999, 39));
+    expect(text).toContain(`«redacted ${leaf(0, 0).length} chars»`);
+  });
+});
+
+describe("log tee fails a truncated JWT closed", () => {
+  it("masks an overlong dotless JWT instead of shipping its in-cap prefix", () => {
+    const blob = "eyJ" + "A".repeat(9000);
+    const out = redactSecretsInLogText(`tok ${blob} tail`, 200);
+    expect(out).not.toContain("eyJAAAA");
+    expect(out).not.toContain(blob);
+    expect(out).toContain("«redacted");
+  });
+
+  it("still masks a whole JWT that fits the window", () => {
+    const jwt = ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "c3VjcmV0LXZha2UtcGF5bG9hZA", "c2lnbmF0dXJl"].join(".");
+    const out = redactSecretsInLogText(`carry ${jwt} ` + "B".repeat(200), 110);
+    expect(out).not.toContain(jwt);
+    expect(out).toContain("«redacted");
+  });
+
+  it("leaves a long secret-free base64 run on the cut path with no mask", () => {
+    const out = redactSecretsInLogText(`data ${"aB3x".repeat(2500)} end`, 200);
+    expect(out).not.toContain("«redacted");
+    expect(out).toContain("characters elided from log");
+  });
+});
+
 describe("CREDENTIAL_TOKEN_PATTERNS", () => {
   it("is a global-flagged list, because redaction replaces over every match", () => {
     expect(CREDENTIAL_TOKEN_PATTERNS.length).toBeGreaterThan(0);
