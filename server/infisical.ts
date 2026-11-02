@@ -300,6 +300,13 @@ class InfisicalManager {
     console.warn(`[infisical] read source "${source.name}" unavailable (${locator}): ${detail}`);
   }
 
+  /** The failure a source read rejects with.  Names the source and its
+   * token file or env name only — never a token value. */
+  private readSourceFailure(source: ResolvedInfisicalReadSource, detail: string, statusCode = 502): InfisicalError {
+    const locator = source.tokenFile ? `token file ${source.tokenFile}` : source.tokenEnv ? `env ${source.tokenEnv}` : "no token file or env";
+    return new InfisicalError(`read source "${source.name}" unavailable (${locator}): ${detail}`, statusCode);
+  }
+
   private resolveSourceToken(source: ResolvedInfisicalReadSource): { token: string } | { error: string } {
     if (source.tokenFile) {
       try {
@@ -337,13 +344,13 @@ class InfisicalManager {
     const resolved = this.resolveSourceToken(source);
     if ("error" in resolved) {
       this.warnReadSource(source, resolved.error);
-      return new Map();
+      throw this.readSourceFailure(source, resolved.error, 409);
     }
     const scope = scopeSignature(projectId, environment, secretPath);
     const mode = `source:${source.name}`;
     if (this.isRefused(mode, resolved.token, scope)) {
       this.warnReadSource(source, "token was refused by the server");
-      return new Map();
+      throw this.readSourceFailure(source, "token was refused by the server", 401);
     }
     try {
       const { values } = await listSecrets({
@@ -363,7 +370,7 @@ class InfisicalManager {
       const raw = err instanceof Error ? err.message : "unknown error";
       const detail = redactSecretsInText(raw).split(resolved.token).join("[redacted]");
       this.warnReadSource(source, detail);
-      return new Map();
+      throw this.readSourceFailure(source, detail, status ?? 502);
     }
   }
 
@@ -376,11 +383,11 @@ class InfisicalManager {
         this.warnedReadSources.add(key);
         console.warn(`[infisical] read source "${name}" is not configured`);
       }
-      return new Map();
+      throw new InfisicalError(`read source "${name}" is not configured`, 404);
     }
     if (settings.enabled !== true) {
       this.warnReadSource(source, "Infisical is turned off");
-      return new Map();
+      throw this.readSourceFailure(source, "Infisical is turned off", 409);
     }
     return this.readWithSource(settings, source, secretPath?.trim() || source.secretPath, source.projectId, source.environment);
   }

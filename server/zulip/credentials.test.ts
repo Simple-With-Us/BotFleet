@@ -2,7 +2,7 @@ import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { looksSensitive } from "../auto-approve.ts";
 import {
@@ -259,6 +259,41 @@ describe("the Infisical source", () => {
     now = 1_500;
     await cached(at);
     expect(reads).toBe(3);
+  });
+
+  it("does not cache a rejected login source read, and a rejected outgoing source read is non-fatal", async () => {
+    let loginReads = 0;
+    let failLogin = true;
+    const cached = cachedVaultReader(async (location) => {
+      if (location.source === "fleetops-zulip") {
+        loginReads += 1;
+        if (failLogin) throw new Error('read source "fleetops-zulip" unavailable (token file /tmp/fake-token): token file cannot be read (ENOENT)');
+        return new Map([
+          ["BF_PLUMBER_ZULIP_EMAIL", "bf-plumber-bot@z.test"],
+          ["BF_PLUMBER_ZULIP_API_KEY", FAKE_KEY],
+        ]);
+      }
+      throw new Error('read source "afc-zulip" unavailable (env FAKE_AFC_TOKEN): env FAKE_AFC_TOKEN is empty or unset');
+    });
+    const source = infisicalCredentialSource(cached, {
+      realm: REALM,
+      credentialSources: {
+        login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" },
+        outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" },
+      },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(source.load("BF-Plumber")).rejects.toBeInstanceOf(ZulipCredentialError);
+      failLogin = false;
+      const creds = await source.load("BF-Plumber");
+      expect(loginReads).toBe(2);
+      expect(creds.key).toBe(FAKE_KEY);
+      expect(creds.outgoingWebhookToken).toBeUndefined();
+      expect(warn.mock.calls.flat().join(" ")).toContain("afc-zulip");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("reads login and outgoing token from different sources with different key patterns", async () => {

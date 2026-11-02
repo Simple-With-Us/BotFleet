@@ -558,7 +558,7 @@ describe("readSources", () => {
     expect(JSON.stringify(infisical.getStatus())).not.toContain(FLEET_TOKEN);
   });
 
-  it("warns once and returns empty for a missing token file, without throwing", async () => {
+  it("warns once and rejects for a missing token file, naming the source and file only", async () => {
     withSettings({
       token: SENTINEL_READ_TOKEN,
       readSources: [{ name: "fleetops-zulip", tokenFile: "/tmp/bf-definitely-missing-token-file", tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
@@ -566,23 +566,47 @@ describe("readSources", () => {
     vi.stubGlobal("fetch", vi.fn());
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
-      await expect(infisical.readPath("/zulip", { projectId: "fleet-proj", environment: "prod" })).resolves.toEqual(new Map());
-      await expect(infisical.readSource("fleetops-zulip")).resolves.toEqual(new Map());
+      await expect(infisical.readPath("/zulip", { projectId: "fleet-proj", environment: "prod" })).rejects.toThrow(/fleetops-zulip/);
+      await expect(infisical.readSource("fleetops-zulip")).rejects.toThrow(/\/tmp\/bf-definitely-missing-token-file/);
       expect(warn).toHaveBeenCalledTimes(1);
       const text = warn.mock.calls.flat().join(" ");
       expect(text).toContain("fleetops-zulip");
       expect(text).toContain("/tmp/bf-definitely-missing-token-file");
       expect(text).not.toContain(FLEET_TOKEN);
+      expect(infisical.getStatus().readSources[0]).toMatchObject({ name: "fleetops-zulip", ok: false });
       // main vault path still works after the failing source
       const { impl } = recordingFetch();
       vi.stubGlobal("fetch", impl);
       await expect(infisical.readPath("/other", { projectId: "proj-1", environment: "prod" })).resolves.toBeInstanceOf(Map);
+      await expect(infisical.refresh("manual")).resolves.toMatchObject({ lastError: null });
     } finally {
       warn.mockRestore();
     }
   });
 
-  it("warns once and returns empty when a source token is refused, without leaking it", async () => {
+  it("does not cache a failed source read: a later call retries and can succeed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bf-infi-"));
+    const path = join(dir, "token");
+    withSettings({
+      token: SENTINEL_READ_TOKEN,
+      readSources: [{ name: "fleetops-zulip", tokenFile: path, tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(infisical.readSource("fleetops-zulip")).rejects.toThrow(/fleetops-zulip/);
+      writeFileSync(path, `${FLEET_TOKEN}\n`);
+      chmodSync(path, 0o600);
+      const { impl } = recordingFetch();
+      vi.stubGlobal("fetch", impl);
+      const values = await infisical.readSource("fleetops-zulip");
+      expect(values.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
+      expect(infisical.getStatus().readSources[0]).toMatchObject({ name: "fleetops-zulip", ok: true });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("warns once and rejects when a source token is refused, without leaking it", async () => {
     withSettings({
       token: SENTINEL_READ_TOKEN,
       readSources: [{ name: "afc-zulip", tokenFile: tokenFile(AFC_TOKEN), tokenEnv: "", projectId: "afc-proj", environment: "prod", secretPath: "/zulip" }],
@@ -590,8 +614,8 @@ describe("readSources", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("no", { status: 401 })));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
-      await expect(infisical.readSource("afc-zulip")).resolves.toEqual(new Map());
-      await expect(infisical.readSource("afc-zulip")).resolves.toEqual(new Map());
+      await expect(infisical.readSource("afc-zulip")).rejects.toThrow(/afc-zulip/);
+      await expect(infisical.readSource("afc-zulip")).rejects.toThrow(/afc-zulip/);
       expect(warn).toHaveBeenCalledTimes(1);
       expect(warn.mock.calls.flat().join(" ")).not.toContain(AFC_TOKEN);
       expect(infisical.getStatus().readSources[0]).toMatchObject({ name: "afc-zulip", ok: false });

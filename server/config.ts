@@ -269,6 +269,13 @@ const featureConfigSchema = z.object({
   /** Per-turn Git worktree isolation for bots working in a shared repository. */
   gitWorktreeLeases: z.boolean().optional(),
 });
+const zulipCredentialFieldSourceSchema = z.object({
+  source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  keyPattern: z.string().trim().regex(/^[A-Z0-9_{}]+$/).max(200).optional(),
+  path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+  projectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
+  environment: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
+});
 const zulipConfigSchema = z.object({
   enabled: z.boolean().optional(),
   dryRun: z.boolean().optional(),
@@ -282,20 +289,8 @@ const zulipConfigSchema = z.object({
   infisicalProjectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
   infisicalEnv: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
   credentialSources: z.object({
-    login: z.object({
-      source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
-      keyPattern: z.string().trim().regex(/^[A-Z0-9_{}]+$/).max(200).optional(),
-      path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
-      projectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
-      environment: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
-    }).optional(),
-    outgoing: z.object({
-      source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
-      keyPattern: z.string().trim().regex(/^[A-Z0-9_{}]+$/).max(200).optional(),
-      path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
-      projectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
-      environment: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
-    }).optional(),
+    login: zulipCredentialFieldSourceSchema.optional(),
+    outgoing: zulipCredentialFieldSourceSchema.optional(),
   }).optional(),
   bots: z
     .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
@@ -314,6 +309,14 @@ const zulipConfigSchema = z.object({
     .optional(),
 });
 
+const infisicalReadSourceSchema = z.object({
+  name: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  tokenFile: z.string().trim().min(1).refine((v) => v.startsWith("/"), "tokenFile must be an absolute path").optional(),
+  tokenEnv: z.string().trim().regex(/^[A-Z][A-Z0-9_]*$/).optional(),
+  projectId: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/),
+  environment: z.string().trim().regex(/^[a-z0-9-]{1,64}$/).optional(),
+  secretPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+});
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -570,14 +573,7 @@ const appConfigSchema = z.object({
     // identity.  The environment names are the primary route.
     token: optionalText,
     writeToken: optionalText,
-    readSources: z.array(z.object({
-      name: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
-      tokenFile: z.string().trim().min(1).refine((v) => v.startsWith("/"), "tokenFile must be an absolute path").optional(),
-      tokenEnv: z.string().trim().regex(/^[A-Z][A-Z0-9_]*$/).optional(),
-      projectId: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/),
-      environment: z.string().trim().regex(/^[a-z0-9-]{1,64}$/).optional(),
-      secretPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
-    })).max(32).optional(),
+    readSources: z.array(infisicalReadSourceSchema).max(32).optional(),
     credentialStorage: externalCredentialStorage,
     refreshMinutes: z.number().int().min(5).max(1440).optional(),
   }).optional(),
@@ -1599,6 +1595,77 @@ function ignoredConfig(reason: string): StoredConfigRead {
   return { config: {}, problem: { kind: "config-ignored", reason, sections: [] } };
 }
 
+/** Drop only the invalid `infisical.readSources` entries.  The warning
+ * names the entry index and, when present, its name — never any other
+ * value from the entry.  Returns null when nothing was dropped or when
+ * the rest of the section still does not validate. */
+function salvageInfisicalReadSources(value: JsonValue): { usable: JsonObject; issues: string[]; left: string[] } | null {
+  if (!isJsonObject(value)) return null;
+  const raw = value.readSources;
+  if (raw === undefined) return null;
+  if (!Array.isArray(raw)) {
+    const { readSources: _dropped, ...rest } = value;
+    try {
+      parseStoredConfig({ infisical: rest });
+    } catch {
+      return null;
+    }
+    return { usable: rest, issues: ["infisical.readSources is invalid"], left: ["infisical.readSources"] };
+  }
+  const kept: JsonValue[] = [];
+  const issues: string[] = [];
+  const left: string[] = [];
+  raw.forEach((entry, index) => {
+    if (infisicalReadSourceSchema.safeParse(entry).success) {
+      kept.push(entry);
+      return;
+    }
+    const name = isJsonObject(entry) && isJsonString(entry.name) ? ` (name ${JSON.stringify(entry.name.slice(0, 64))})` : "";
+    issues.push(`infisical.readSources.${index}${name} is invalid`);
+    left.push(`infisical.readSources.${index}`);
+  });
+  if (issues.length === 0) return null;
+  const usable: JsonObject = { ...value, readSources: kept };
+  try {
+    parseStoredConfig({ infisical: usable });
+  } catch {
+    return null;
+  }
+  return { usable, issues, left };
+}
+
+/** Drop only the invalid `zulip.credentialSources` entries (`login` /
+ * `outgoing`).  Returns null when nothing was dropped or when the rest
+ * of the section still does not validate. */
+function salvageZulipCredentialSources(value: JsonValue): { usable: JsonObject; issues: string[]; left: string[] } | null {
+  if (!isJsonObject(value)) return null;
+  const raw = value.credentialSources;
+  if (raw === undefined) return null;
+  if (!isJsonObject(raw)) {
+    const { credentialSources: _dropped, ...rest } = value;
+    if (!zulipConfigSchema.safeParse(rest).success) return null;
+    return { usable: rest, issues: ["zulip.credentialSources is invalid"], left: ["zulip.credentialSources"] };
+  }
+  const kept: JsonObject = {};
+  const issues: string[] = [];
+  const left: string[] = [];
+  for (const field of ["login", "outgoing"] as const) {
+    const entry = raw[field];
+    if (entry === undefined) continue;
+    if (zulipCredentialFieldSourceSchema.safeParse(entry).success) {
+      kept[field] = entry;
+    } else {
+      issues.push(`zulip.credentialSources.${field} is invalid`);
+      left.push(`zulip.credentialSources.${field}`);
+    }
+  }
+  if (issues.length === 0) return null;
+  const { credentialSources: _dropped, ...rest } = value;
+  const usable: JsonObject = Object.keys(kept).length > 0 ? { ...rest, credentialSources: kept } : rest;
+  if (!zulipConfigSchema.safeParse(usable).success) return null;
+  return { usable, issues, left };
+}
+
 /** Keep every section of an invalid config.json that validates on its own, and report the rest.
  * Inside `instances` the unit is one engine entry, because dropping the whole map reroutes every
  * engine to its default for the sake of one bad field.  Each piece is validated with the same
@@ -1609,11 +1676,29 @@ function salvageStoredConfig(stored: JsonObject): StoredConfigRead {
   const left: string[] = [];
   for (const [section, value] of Object.entries(stored)) {
     if (!STORED_CONFIG_SECTIONS.has(section)) continue;
+    if (section === "zulip") {
+      const salvaged = salvageZulipCredentialSources(value);
+      if (salvaged) {
+        usable[section] = salvaged.usable;
+        issues.push(...salvaged.issues);
+        left.push(...salvaged.left);
+        continue;
+      }
+    }
     try {
       parseStoredConfig({ [section]: value });
       usable[section] = value;
       continue;
     } catch (error) {
+      if (section === "infisical") {
+        const salvaged = salvageInfisicalReadSources(value);
+        if (salvaged) {
+          usable[section] = salvaged.usable;
+          issues.push(...salvaged.issues);
+          left.push(...salvaged.left);
+          continue;
+        }
+      }
       const entries = section === "instances" ? jsonObjectSchema.safeParse(value) : null;
       if (!entries?.success) {
         issues.push(error instanceof Error ? error.message : `${section} is invalid`);
@@ -1695,7 +1780,14 @@ function readStoredConfig(path: string): StoredConfigRead {
     return ignoredConfig(jsonFailureReason(error instanceof Error ? error : new Error(String(error)), body.length));
   }
   try {
-    return { config: parseStoredConfig(parsed), problem: null };
+    const config = parseStoredConfig(parsed);
+    // `zulip` is caught to undefined by its schema, so a bad
+    // `credentialSources` entry would otherwise drop the whole section
+    // silently instead of reaching the per-entry salvage below.
+    if (isJsonObject(parsed) && parsed.zulip !== undefined && salvageZulipCredentialSources(parsed.zulip) !== null) {
+      return salvageStoredConfig(parsed);
+    }
+    return { config, problem: null };
   } catch {
     const asObject = jsonObjectSchema.safeParse(parsed);
     return asObject.success ? salvageStoredConfig(asObject.data) : ignoredConfig("it must hold a JSON object");
