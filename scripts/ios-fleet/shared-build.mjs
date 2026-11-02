@@ -12,7 +12,7 @@
 // No typeof here: x === String(x) is true only for a string primitive and
 // x === Number(x) only for a number primitive (the idiom asc-api.mjs uses at
 // its boundaries), so the lint baseline counts no new no-runtime-typeof hit.
-export function nextSharedBuild({iosBuilds, macBuilds, extraFloors = [], complete, mergeStamp}) {
+export function nextSharedBuild({iosBuilds, macBuilds, extraFloors = [], complete, mergeStamp, platform}) {
   if (complete !== true || !Array.isArray(iosBuilds) || !Array.isArray(macBuilds)) {
     throw new Error('complete build inventory required');
   }
@@ -32,17 +32,48 @@ export function nextSharedBuild({iosBuilds, macBuilds, extraFloors = [], complet
   for (const value of [...iosBuilds, ...macBuilds]) {
     if (value !== String(value) || !re.test(value)) throw new Error('malformed build inventory');
   }
+  const stamp = BigInt(mergeStamp);
+  // `platform` makes the plan platform-aware, and that is what lets the iOS
+  // and the Mac build of ONE commit carry the same number.
+  //
+  // The merge stamp is the authority for a commit's FIRST build on each
+  // platform.  A build equal to the stamp is that commit's own build on the
+  // OTHER platform, so it must not push this platform's plan up: otherwise
+  // the iOS ship of a commit moves the inventory under the Mac release and
+  // the two platforms disagree by one.  Only a REBUILD of the same commit on
+  // THIS platform takes the highest-existing-plus-one rule.
+  //
+  // Without `platform` the plan is exactly what it always was, so the landed
+  // iOS path keeps its behaviour until it opts in.
+  let own = null;
+  if (platform !== undefined && platform !== null && platform !== "") {
+    if (platform !== "ios" && platform !== "macos") {
+      throw new Error(`platform must be ios or macos (got ${JSON.stringify(platform)})`);
+    }
+    own = platform === "ios" ? iosBuilds : macBuilds;
+  }
   let max = -1n;
+  let maxWithoutStamp = -1n;
   for (const value of [...iosBuilds, ...macBuilds]) {
     const first = BigInt(value.split('.')[0]);
     if (first > max) max = first;
+    if (first !== stamp && first > maxWithoutStamp) maxWithoutStamp = first;
   }
   for (const floor of extraFloors) {
     const candidate = BigInt(floor);
     if (candidate > max) max = candidate;
+    if (candidate > maxWithoutStamp) maxWithoutStamp = candidate;
   }
-  const stamp = BigInt(mergeStamp);
-  const next = max + 1n > stamp ? max + 1n : stamp;
+  const ownHasStamp =
+    own !== null && own.some((value) => BigInt(value.split('.')[0]) === stamp);
+  let next;
+  if (own === null) {
+    next = max + 1n > stamp ? max + 1n : stamp;
+  } else if (ownHasStamp) {
+    next = max + 1n;
+  } else {
+    next = maxWithoutStamp + 1n > stamp ? maxWithoutStamp + 1n : stamp;
+  }
   // Fixed mode ships a 12-digit merge-timestamp build, and the ship's gate
   // rejects anything else; a floor or an existing build past 12 digits
   // fails closed here instead of planning a build that can never upload.

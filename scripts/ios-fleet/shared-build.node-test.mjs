@@ -111,3 +111,60 @@ test('incomplete inventory refuses', () => {
   assert.throws(() => next({macBuilds: [], complete: true, mergeStamp: STAMP}), /complete build inventory required/);
   assert.throws(() => next({iosBuilds: '1000', macBuilds: [], complete: true, mergeStamp: STAMP}), /complete build inventory required/);
 });
+
+// The platform rule is what lets the iOS and the Mac build of ONE commit
+// carry the same number.  The merge stamp is the authority for a commit's
+// first build on each platform; only a rebuild of the same commit on the
+// same platform takes the highest-plus-one rule.
+test('without a platform the plan is exactly what it always was', () => {
+  assert.deepEqual(next({...input, iosBuilds: [STAMP]}), {build: '202610290001'});
+  assert.deepEqual(next({...input, macBuilds: [STAMP]}), {build: '202610290001'});
+  assert.deepEqual(next({...input, iosBuilds: ['1000']}), {build: STAMP});
+});
+
+test('a platform plan ignores the other platform build of the same commit', () => {
+  // The iOS ship published the stamp; the Mac build of the SAME commit
+  // still carries it.
+  assert.deepEqual(
+    next({...input, iosBuilds: [STAMP], platform: 'macos'}),
+    {build: STAMP}
+  );
+  assert.deepEqual(
+    next({...input, macBuilds: [STAMP], platform: 'ios'}),
+    {build: STAMP}
+  );
+});
+
+test('a platform plan of a rebuild of the same commit goes up', () => {
+  assert.deepEqual(
+    next({...input, iosBuilds: [STAMP], macBuilds: [STAMP], platform: 'macos'}),
+    {build: '202610290001'}
+  );
+  assert.deepEqual(
+    next({...input, iosBuilds: [STAMP], macBuilds: [STAMP], platform: 'ios'}),
+    {build: '202610290001'}
+  );
+});
+
+test('a platform plan still never ships below a newer build', () => {
+  assert.deepEqual(
+    next({...input, iosBuilds: ['209912312359'], platform: 'macos'}),
+    {build: '209912312360'}
+  );
+  assert.deepEqual(
+    next({...input, macBuilds: ['209912312359'], platform: 'ios'}),
+    {build: '209912312360'}
+  );
+});
+
+test('a platform plan honours the floors', () => {
+  assert.deepEqual(
+    next({...input, extraFloors: ['202610290003'], platform: 'macos'}),
+    {build: '202610290004'}
+  );
+});
+
+test('an unknown platform is refused', () => {
+  assert.throws(() => next({...input, platform: 'mac'}), /platform must be ios or macos/);
+  assert.throws(() => next({...input, platform: 'windows'}), /platform must be ios or macos/);
+});

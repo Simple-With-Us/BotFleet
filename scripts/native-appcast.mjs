@@ -42,13 +42,28 @@ export function nativeArtifactNames(version) {
   };
 }
 
-/** The Sparkle build number for 1.0.<commit_count> is the count itself. */
-export function buildNumberFor(version) {
+/**
+ * The Sparkle build number a native release carries.
+ *
+ * The shared release policy (owner, Oct 29 2026) writes the build as the
+ * commit's Central merge stamp, so the build arrives as its own value and is
+ * never derived from the version string.  The 1.0.<commit_count> derivation
+ * stays for the old scheme, so a release still stamped that way keeps
+ * working.
+ */
+export function buildNumberFor(version, build) {
+  if (build !== undefined && build !== null && build !== "") {
+    const value = String(build).trim();
+    if (!/^[0-9]+$/.test(value)) {
+      throw new Error(`native build ${build} is not a build number`);
+    }
+    return value;
+  }
   const match = /^1\.0\.(\d+)$/.exec(version);
   if (!match) {
     throw new Error(
       `native version ${version} is not 1.0.<commit_count>; ` +
-        `stamp it with scripts/stamp-commit-version.mjs instead of inventing one`,
+        `pass the planned build, or stamp it with scripts/stamp-commit-version.mjs instead of inventing one`,
     );
   }
   return match[1];
@@ -145,6 +160,7 @@ export function readEdSignature(releaseDir, zipName) {
 export function generateAppcast({
   releaseDir,
   version,
+  build,
   tag = `v${version}`,
   feedBaseUrl = DEFAULT_FEED_BASE_URL,
   pubDate,
@@ -170,7 +186,7 @@ export function generateAppcast({
     pubDate,
     items: [
       {
-        build: buildNumberFor(version),
+        build: buildNumberFor(version, build),
         shortVersion: version,
         url: `${feedBaseUrl}/${tag}/${zip}`,
         length: statSync(zipPath).size,
@@ -200,13 +216,15 @@ function isEntryModule() {
 }
 
 if (isEntryModule()) {
-  const [, , releaseDir, version, tag] = process.argv;
+  const [, , releaseDir, version, tag, ...rest] = process.argv;
   if (!releaseDir || !version) {
     throw new Error(
-      "usage: node scripts/native-appcast.mjs <release-dir> <version> [tag]",
+      "usage: node scripts/native-appcast.mjs <release-dir> <version> [tag] [--build N]",
     );
   }
-  generateAppcast({ releaseDir, version, tag });
+  const buildIndex = rest.indexOf("--build");
+  const build = buildIndex === -1 ? undefined : rest[buildIndex + 1];
+  generateAppcast({ releaseDir, version, build, tag });
 }
 
 export { root as _rootForTests };

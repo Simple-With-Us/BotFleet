@@ -1432,7 +1432,7 @@ async function main() {
   // App Store Connect at upload, so the loser fails loudly and nothing is
   // promoted.  Do not run a local ship while the workflow is running.
   async function planSharedReleaseBuild(command, restArgs) {
-    const usage = `Usage: node asc-api.mjs ${command} <bundleId> [pairedBundleId] [floor...] --merge-stamp <S>`;
+    const usage = `Usage: node asc-api.mjs ${command} <bundleId> [pairedBundleId] [floor...] --merge-stamp <S> [--platform ios|macos]`;
     const bundleId = restArgs[0] || "";
     if (!bundleId || bundleId.startsWith("--")) {
       console.error(usage);
@@ -1442,12 +1442,18 @@ async function main() {
     // bare integers), so a caller with no paired app passes only floors.
     // --merge-stamp S (or --merge-stamp=S) carries the merge stamp.
     let macBundleId = "";
+    let platform = "";
     const floorArgs = [];
     let mergeStamp = "";
     const rest = restArgs.slice(1);
     for (let i = 0; i < rest.length; i++) {
       const arg = rest[i];
-      if (arg === "--merge-stamp") {
+      if (arg === "--platform") {
+        platform = rest[i + 1] || "";
+        i++;
+      } else if (arg.startsWith("--platform=")) {
+        platform = arg.slice("--platform=".length);
+      } else if (arg === "--merge-stamp") {
         mergeStamp = rest[i + 1] || "";
         i++;
       } else if (arg.startsWith("--merge-stamp=")) {
@@ -1466,6 +1472,10 @@ async function main() {
     }
     if (!/^[1-9][0-9]{11}$/.test(mergeStamp)) {
       console.error(`${command}: --merge-stamp must be a 12-digit YYYYMMDDHHMM string`);
+      process.exit(2);
+    }
+    if (platform && platform !== "ios" && platform !== "macos") {
+      console.error(`${command}: --platform must be ios or macos (got "${platform}")`);
       process.exit(2);
     }
     // Floors stay strings: an 18-digit Sparkle floor is past Number's safe
@@ -1519,7 +1529,7 @@ async function main() {
       macBuilds = macA;
     }
     try {
-      const planned = nextSharedBuild({ iosBuilds, macBuilds, extraFloors, complete: true, mergeStamp });
+      const planned = nextSharedBuild({ iosBuilds, macBuilds, extraFloors, complete: true, mergeStamp, platform: platform || undefined });
       console.error(`${command}: ${iosBuilds.length} iOS build(s) + ${macBuilds.length} macOS build(s) inspected; merge stamp ${mergeStamp}; next is ${planned.build}`);
       console.log(planned.build);
     } catch (error) {
