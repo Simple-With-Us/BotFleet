@@ -433,9 +433,13 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
     const problem = chatCliProblem(argv.slice(chatCliAt));
     if (problem) return { ok: false, reason: problem, name };
   }
-  // The retired launcher spelling is refused by name, even if a stored
-  //  policy from before the rename still lists it:  it is not an alias.
-  if (argv.slice(0, 1 + MAX_SUB).some(namesRetiredChatCli)) {
+  // The retired launcher spelling is refused by name in the two positions
+  //  that can launch it - the program itself, or the script an interpreter
+  //  runs - even if a stored policy from before the rename still lists it:
+  //  it is not an alias.  Data words stay untouched, so a file operand that
+  //  carries the retired name (`rm /Users/jay/.local/bin/agent-sync`, when
+  //  deleting it) still runs.
+  if (namesRetiredChatCli(argv0) || (argv[1] !== undefined && namesRetiredChatCli(argv[1]))) {
     return { ok: false, reason: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}`, name };
   }
   const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);

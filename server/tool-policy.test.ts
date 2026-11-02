@@ -422,6 +422,15 @@ describe("the retired launcher spelling", () => {
     expect(decision.reason).toContain("retired");
   });
 
+  it("still runs a data word that carries the retired name, so the retired file can be removed", () => {
+    const tailPolicy: ToolPolicy = {
+      ...policy,
+      commands: [{ argv0: "/usr/bin/tail", sub: [], flags: {}, args: [], positionals: 1 }],
+    };
+    const decision = evaluateCommand(tailPolicy, "/usr/bin/tail /tmp/agent-sync");
+    if (!decision.ok) throw new Error(`refused a data word named agent-sync: ${decision.reason}`);
+  });
+
   it("does not touch a word that only starts with the name", () => {
     const decision = evaluateCommand(policy, "/usr/bin/tail /tmp/agent-sync.log");
     if (decision.ok) throw new Error("allowed an unlisted program");
