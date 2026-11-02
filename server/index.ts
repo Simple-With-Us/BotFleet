@@ -225,6 +225,8 @@ import {
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { requestHarnessShutdown } from "./harness-lifecycle.ts";
 import { ControlConflict, createSystemControl, reserveSystemShutdown } from "./system-control.ts";
+import { describeGracefulStop, gracefulStop, gracefulStopRefusal as gracefulStopRefusalMessage } from "./graceful-shutdown.ts";
+import type { GracefulStopReport } from "./graceful-shutdown.ts";
 import { botFleetStatusSystemPrompt } from "./botfleet-status-capsule.ts";
 import {
   BOX_GATEWAY_PATH,
@@ -12351,11 +12353,135 @@ function blockingWorkBreakdown(ownAdmissionActive: boolean): { count: number; la
     .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
 }
 
+/** The kinds of work a graceful stop can settle (BF-2536).
+ *
+ *  These are the kinds the bots themselves are doing, and every one of them
+ *  survives the shutdown in a way the owner can be told about:
+ *
+ *  - A bot turn is interrupted by the harness's own shutdown and recorded for
+ *    the next boot, so it resumes instead of being lost.
+ *  - A completion fold is the tail of a turn that has already written its
+ *    events, and those events are in the event log the shutdown flushes.
+ *  - A delegated task is held by the job registry, which is on disk.
+ *  - A connector or a secret resume is a card in the thread's transcript, so
+ *    the next boot finds the work the bot was waiting on.
+ *  - A routine run is held by the routines store:  a queued one runs at the
+ *    next boot, and a running one ends with its bot.
+ *
+ *  Everything else in flight is work the stop has no way to carry, and the
+ *  refusal is the safe answer for it:  an in-flight request, a file restore,
+ *  a provider reload, a VPS thread or mode change, a Local VM task or change,
+ *  and the server still starting.  A room turn is the one that matters most:
+ *  the shutdown deliberately skips a room turn, because a room turn cannot be
+ *  resumed without repeating it, so the work would be lost rather than
+ *  carried. */
+const GRACEFUL_STOP_SETTLED_KINDS = new Set([
+  "turns",
+  "completions",
+  "delegations",
+  "connectors",
+  "secrets",
+  "routineRuns",
+]);
+
+/** The work in flight for a graceful stop, by kind.
+ *
+ *  The drain's counts, because the work a graceful stop parks is held rather
+ *  than in flight (a queued message, a queued room round and a queued
+ *  routine run survive the restart or are carried across it), and less this
+ *  request's own admission, because the stop request is itself an admitted
+ *  request:  counting it would mean the work in flight never reached zero
+ *  and every stop would wait out the whole window. */
+function gracefulStopWorkCounts(ownAdmissionActive: boolean): RuntimeWorkCounts {
+  const counts = runtimeWorkCounts(ownAdmissionActive);
+  const queuedRoutineRuns = bootComplete
+    ? routines?.listRuns().filter((run) => run.status === "queued").length ?? 0
+    : 0;
+  return inFlightCounts(counts, { queuedRoutineRuns });
+}
+
+/** Can the graceful stop settle the work that is in flight right now? */
+function gracefulStopAllowed(ownAdmissionActive: boolean): boolean {
+  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive))
+    .every(([kind, count]) => count <= 0 || GRACEFUL_STOP_SETTLED_KINDS.has(kind));
+}
+
+/** The work in flight that a graceful stop cannot carry, by kind.
+ *
+ *  The kinds the stop can settle are not here:  they are what the stop is
+ *  for.  What is here is the work that would be lost rather than carried,
+ *  and it is why the server stays up. */
+function gracefulStopBlockers(ownAdmissionActive: boolean): { count: number; label: string }[] {
+  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive))
+    .filter(([kind, count]) => count > 0 && !GRACEFUL_STOP_SETTLED_KINDS.has(kind))
+    .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
+}
+
+/** Why the server stays up, when the work in flight cannot be carried.
+ *
+ *  The wording lives with the rest of the graceful stop, in
+ *  server/graceful-shutdown.ts, so it can be exercised without a server. */
+const gracefulStopRefusal = gracefulStopRefusalMessage;
+
+/** The work still in flight, by kind, for the graceful stop's report.
+ *
+ *  The bot turns are left out:  the report names the bots that are being
+ *  stopped one by one, and a count of the same bots under a second heading
+ *  reads as two different facts about one thing. */
+function inFlightWorkBreakdown(ownAdmissionActive: boolean): { count: number; label: string }[] {
+  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive))
+    .filter(([kind, count]) => count > 0 && kind !== "turns")
+    .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
+}
+
+/** How long a graceful stop waits for the work in flight to settle.
+ *
+ *  The stop's whole answer has to fit inside the clients' request budgets:
+ *  the native Mac app waits 30 seconds for this route, and a Local VM
+ *  container stop in the same request can take 10 of them, so the window
+ *  takes 10 and leaves the rest to the container.  It is enough for a turn
+ *  that is about to end to land, and for the report to tell a bot that
+ *  finished from one that was interrupted.
+ *
+ *  It is a bound and not a promise:  when it passes, the server shuts down
+ *  anyway and the report names what did not finish. */
+const GRACEFUL_STOP_DEADLINE_MS = 10_000;
+
+/** How often the graceful stop re-reads the count while it waits. */
+const GRACEFUL_STOP_POLL_MS = 250;
+
+/** Stop the bots that are working, the way the owner asked, and report it.
+ *
+ *  The bots are given a window to finish on their own.  The ones still
+ *  working when it closes are stopped by the shutdown that follows, which
+ *  interrupts them the way the harness always has and records them for the
+ *  next boot.  The messages queued behind them are carried across the
+ *  restart by the same carrier the update drain parks work in, so they run
+ *  the next time the harness comes up. */
+async function runGracefulStop(context: string, ownAdmissionActive: boolean): Promise<GracefulStopReport> {
+  const report = await gracefulStop({
+    busyBots: () => store.bots.filter((bot) => bot.busy).map((bot) => ({ id: bot.id, name: bot.name })),
+    activeWorkCount: () => runtimeReadiness(gracefulStopWorkCounts(ownAdmissionActive)).activeWorkCount ?? 1,
+    blockingWork: () => inFlightWorkBreakdown(ownAdmissionActive),
+    // The bots that are being stopped keep their queued sends uncommitted:
+    // their own turn resumes first at the next boot, and boot recovery reads
+    // the thread to find it.  Every other bot's sends are committed to their
+    // transcripts and run at that boot.
+    parkHeldWork: (interrupted) => {
+      const unsaved = persistHeldWork(context, interrupted);
+      return unsaved.sends.length === 0 && unsaved.queued.length === 0 && unsaved.rooms.length === 0;
+    },
+    deadlineMs: GRACEFUL_STOP_DEADLINE_MS,
+    pollMs: GRACEFUL_STOP_POLL_MS,
+  });
+  console.log(`[graceful-shutdown] ${describeGracefulStop(report)}`);
+  return report;
+}
+
 /** Whether the bot with this id is switched Off (a missing bot is not). */
 function botIsOffId(botId: string): boolean {
   return botIsOff(store.bot(botId));
 }
-
 /** A bot was just switched Off: settle what was waiting for it.
  *
  *  - Queued routine, webhook and resource receipts become `Skipped: this bot
@@ -15104,6 +15230,29 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!isLoopbackAddress(req.socket.remoteAddress)) {
         return json(res, 403, { error: "forbidden: the harness can only be shut down from this computer" });
       }
+      // The bots that are working are stopped before the server goes down, so
+      // a turn in flight ends the way the Stop button ends it instead of being
+      // cut in half by the exit (BF-2536).  The fence goes up first, so no new
+      // turn starts while they are being stopped.
+      //
+      // The work in flight has to be work the graceful stop can carry across
+      // the restart.  A room turn cannot:  the shutdown leaves a room turn
+      // alone, because a room turn cannot be resumed without repeating it.
+      const blockers = gracefulStopBlockers(ownAdmissionActive);
+      if (blockers.length) {
+        return json(res, 409, { ok: false, error: gracefulStopRefusal(blockers) });
+      }
+      cancelFenceLease();
+      controlShutdownPending = true;
+      runtimeQuiescing = true;
+      const report = await runGracefulStop("system-shutdown", ownAdmissionActive);
+      if (!report.ok) {
+        // The work could not be preserved, and it is still in memory, so the
+        // server stays up rather than losing it.
+        controlShutdownPending = false;
+        runtimeQuiescing = false;
+        return json(res, 409, { ok: false, error: report.refusal, report });
+      }
       const stopping = await requestHarnessShutdown({
         stopLocalVm: async () => {
           // Same lease check the Computer panel's own stop route makes.  The
@@ -15119,9 +15268,22 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           localVmIdleFor(SHARED_LOCAL_VM_TARGET).cancel();
           return { stopped: true };
         },
+        // Through the registered signal handler, so the queued event logs, the
+        // children and the stores receive the normal graceful drain.  A
+        // process.exit here skipped all of it, and a turn in flight was cut in
+        // half rather than recorded.
+        exit: () => process.kill(process.pid, "SIGTERM"),
       });
-      if (!stopping.ok) return json(res, 500, { error: stopping.error });
-      return json(res, 200, { ok: true, detail: stopping.detail });
+      if (!stopping.ok) {
+        // The marker could not be written, so the harness is not going down
+        // and the fence has to come back down with it:  a server that stays
+        // up and refuses every other route is worse than a server that stays
+        // up and serves them.
+        controlShutdownPending = false;
+        runtimeQuiescing = false;
+        return json(res, 500, { error: stopping.error });
+      }
+      return json(res, 200, { ok: true, detail: stopping.detail, report });
     }
     if (path === "/api/system/control" || path.startsWith("/api/system/control/")) {
       if (!isLoopbackAddress(req.socket.remoteAddress) || req.headers["x-botfleet-companion"] === "1") {
@@ -15131,6 +15293,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       let ownControlLock = false;
+      // A graceful stop is about to stop the bots that are working, so the
+      // "a bot is busy" half of the guard does not apply to it (BF-2536).
+      // Everything else the guard refuses on still does.
+      let ownGracefulStop = false;
       const control = createSystemControl({
         targets: () => localVmModeSwitchTargets(store.bots.map((bot) => bot.id)),
         status: (target) => containerComputerStatus(undefined, undefined, target),
@@ -15152,7 +15318,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             ? store.bots.map((bot) => localVmLeaseFor(localVmTargetForBot(bot.id)).current(localVmOwnerBusy)?.botId).find(Boolean)
             : undefined),
         busy: () => runtimeFencing || updateDrain.active || (runtimeQuiescing && !controlShutdownPending)
-          || store.bots.some((bot) => bot.busy) || localVmActiveThreads.size > 0
+          || (store.bots.some((bot) => bot.busy) && !ownGracefulStop) || localVmActiveThreads.size > 0
           || localVmLifecycleBusy.size > 0 || localVmImageBusy || localVmProvisionBusy
           || (localVmModeChangeBusy && !ownControlLock),
         action: async (action, target) => {
@@ -15207,11 +15373,23 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           } finally { localVmModeChangeBusy = false; }
         }
         if (method === "POST" && path === "/api/system/control/stop") {
+          // The owner confirmed this in the app, so the bots that are working
+          // are stopped and the server then shuts down (BF-2536).  The count is
+          // still a refusal when the work in flight is something the graceful
+          // stop cannot settle.
+          ownGracefulStop = true;
           // No marker or VM effect until all active work and leases are clear.
           const reservation = reserveSystemShutdown({
             guard: () => control.guard(),
-            activeWorkCount: () => currentRuntimeReadiness(ownAdmissionActive).activeWorkCount ?? 1,
+            activeWorkCount: () => runtimeReadiness(gracefulStopWorkCounts(ownAdmissionActive)).activeWorkCount ?? 1,
             blockingWork: () => blockingWorkBreakdown(ownAdmissionActive),
+            // The work in flight is not a refusal:  the graceful stop settles
+            // it, and says so in the report it returns.
+            canStopGracefully: () => gracefulStopAllowed(ownAdmissionActive),
+            // The default refusal counts the work and names its kinds.  This
+            // one says why the server stays up, and names the kinds the stop
+            // cannot carry.
+            refusal: () => gracefulStopRefusal(gracefulStopBlockers(ownAdmissionActive)),
             fence: () => {
               reserveControl();
               cancelFenceLease();
@@ -15222,8 +15400,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               controlShutdownPending = false;
               runtimeQuiescing = false;
               localVmModeChangeBusy = false;
+              ownGracefulStop = false;
             },
           });
+          const report = await runGracefulStop("control-stop", ownAdmissionActive);
+          if (!report.ok) {
+            // The work could not be preserved, so the server stays up.
+            reservation.release();
+            return json(res, 409, { ok: false, error: report.refusal, report });
+          }
           let stopping;
           try {
             stopping = await requestHarnessShutdown({
@@ -15246,9 +15431,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               ok: false,
               error: "Server shutdown is proceeding, but one or more Local VMs could not be stopped.  Check Computer settings before assuming they are off.",
               detail: stopping.detail,
+              report,
             });
           }
-          return json(res, 200, { ok: true, detail: stopping.detail });
+          return json(res, 200, { ok: true, detail: stopping.detail, report });
         }
       } catch (error) {
         const failure = localComputerActionError(error);

@@ -486,12 +486,13 @@ public final class MacLifecycleClient: @unchecked Sendable {
 
     /// The route a shutdown asks first, and the one it falls back to.
     ///
-    /// `POST /api/system/control/stop` is fenced: the server refuses it with
-    /// 409 while bots, leases or admitted work are active, names that work,
-    /// and exits through its signal handler so logs, children and stores
-    /// drain.  `POST /api/system/shutdown` has no fence and exits the process
-    /// 250 ms after writing the marker, so a bot mid-turn loses its work; it
-    /// is kept only for a harness old enough to lack the fenced route.
+    /// `POST /api/system/control/stop` is fenced and graceful (BF-2536):  the
+    /// server stops the bots that are working, keeps the messages queued
+    /// behind them for the next start, and exits through its signal handler so
+    /// logs, children and stores drain.  It still refuses with 409 for the
+    /// work a graceful stop cannot carry across the restart, and names that
+    /// work.  `POST /api/system/shutdown` does the same graceful stop and is
+    /// kept for a harness old enough to lack the fenced route.
     public static let fencedStopPath = "/api/system/control/stop"
     public static let legacyShutdownPath = "/api/system/shutdown"
     /// Where the fenced route's refusal explains itself.
