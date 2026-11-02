@@ -75,6 +75,107 @@ struct EngineRunnerAndSupervisorTests {
         }
     }
 
+    @Test("Antigravity (agy) stream-json 20-turn replay corpus produces exact TurnEvent sequence and spawn spec")
+    func antigravityReplayCorpusParity() async throws {
+        let fixtures = EngineReplayHarness.antigravityFixtures()
+        #expect(fixtures.count == 20)
+        #expect(EngineReplayHarness.allFixtures().count == 120)
+
+        for fixture in fixtures {
+            let result = try await EngineReplayHarness.runFixture(fixture)
+            #expect(result.recordedSpawnSpec == fixture.expectedSpawnSpec, "Spawn spec mismatch on \(fixture.id)")
+            #expect(result.actualEvents == fixture.expectedEvents, "Event sequence mismatch on \(fixture.id)")
+            #expect(result.passed, "Fixture \(fixture.id) failed replay check")
+        }
+    }
+
+    @Test("AntigravityStreamRunner builds spawn spec with stdin fallback, host-control bypass stripping, and stream-json event parsing")
+    func antigravityStreamRunnerSpawnSpecAndParser() async throws {
+        // 1. Default <= 64 KiB prompt passes on argv with --mode accept-edits and default model
+        let defaultInput = TurnInput(
+            threadId: "t-agy-default",
+            botId: "bot-agy",
+            prompt: "Run status check",
+            workingDirectory: "/tmp/ws-agy"
+        )
+        let defaultSpec = AntigravityStreamRunner.buildSpawnSpec(input: defaultInput)
+        #expect(defaultSpec.executable == "agy")
+        #expect(defaultSpec.arguments == [
+            "--print", "Run status check",
+            "--output-format", "stream-json",
+            "--print-timeout", "11m",
+            "--add-dir", "/tmp/ws-agy",
+            "--mode", "accept-edits",
+            "--model", "gemini-3.1-pro-high"
+        ])
+
+        // 2. > 64 KiB prompt uses `--print -` and pipes over stdin; fullAuto without host control adds bypass
+        let hugePrompt = String(repeating: "X", count: AntigravityStreamRunner.maxArgvPromptUTF8Bytes + 1)
+        let stdinInput = TurnInput(
+            threadId: "t-agy-stdin",
+            botId: "bot-agy",
+            prompt: hugePrompt,
+            modelId: "gemini-3.1-pro-low",
+            resumeSessionId: "conv-resume-99",
+            workingDirectory: "/tmp/ws-agy",
+            configOptions: [
+                "fullAuto": "true",
+                "printTimeoutSeconds": "660"
+            ]
+        )
+        let stdinSpec = AntigravityStreamRunner.buildSpawnSpec(input: stdinInput)
+        #expect(stdinSpec.arguments == [
+            "--print", "-",
+            "--output-format", "stream-json",
+            "--print-timeout", "12m",
+            "--add-dir", "/tmp/ws-agy",
+            "--dangerously-skip-permissions",
+            "--model", "gemini-3.1-pro-low",
+            "--conversation", "conv-resume-99"
+        ])
+
+        // 3. Host-control turn strips `--dangerously-skip-permissions` even when `fullAuto == "true"`
+        let hostControlInput = TurnInput(
+            threadId: "t-agy-host",
+            botId: "bot-agy",
+            prompt: "Inspect desktop",
+            workingDirectory: "/tmp/ws-agy",
+            configOptions: [
+                "fullAuto": "true",
+                "controlsHostMac": "true"
+            ]
+        )
+        let hostControlSpec = AntigravityStreamRunner.buildSpawnSpec(input: hostControlInput)
+        #expect(!hostControlSpec.arguments.contains("--dangerously-skip-permissions"))
+        #expect(hostControlSpec.arguments.contains("--mode"))
+        #expect(hostControlSpec.arguments.contains("accept-edits"))
+
+        // 4. Host-control parser refuses `always-proceed` and `proceed-in-sandbox` and ignores trailing lines
+        var hostState = AntigravityStreamRunner.AntigravityStreamParserState(
+            controlsHostMac: true,
+            isAutoApproved: false
+        )
+        let initEvents = AntigravityStreamRunner.parseLine(
+            #"{"event":"init","conversation_id":"conv-host-1","init":{"permission_mode":"proceed-in-sandbox"}}"#,
+            state: &hostState
+        )
+        #expect(hostState.hostPolicyRefused)
+        #expect(hostState.sawTerminalEvent)
+        #expect(initEvents.count == 2)
+        #expect(initEvents.first == .sessionStarted(sessionId: "conv-host-1"))
+        if case .error(let code, let message) = initEvents.last {
+            #expect(code == "host_control_policy")
+            #expect(message.contains("proceed-in-sandbox"))
+        } else {
+            Issue.record("Expected host_control_policy error event")
+        }
+        let trailingEvents = AntigravityStreamRunner.parseLine(
+            #"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Ignored"}}"#,
+            state: &hostState
+        )
+        #expect(trailingEvents.isEmpty)
+    }
+
     // MARK: - 2. ProcessSupervisorActor Hostile Process Tests
 
     #if os(macOS)
