@@ -170,7 +170,26 @@ struct EngineRunnerAndSupervisorTests {
         #expect(hostAutoApprovedSpec.arguments.contains("--dangerously-skip-permissions"))
         #expect(!hostAutoApprovedSpec.arguments.contains("--mode"))
 
-        // 4. Host-control parser refuses `always-proceed` and `proceed-in-sandbox` and ignores trailing lines
+        // 4. Host-control parser refuses `always-proceed` even when auto-approved, matching EngineMatrixRegistry
+        var autoApprovedHostState = AntigravityStreamRunner.AntigravityStreamParserState(
+            controlsHostMac: true,
+            isAutoApproved: true
+        )
+        let refusedEvents = AntigravityStreamRunner.parseLine(
+            #"{"event":"init","conversation_id":"conv-host-auto","init":{"permission_mode":"always-proceed"}}"#,
+            state: &autoApprovedHostState
+        )
+        #expect(autoApprovedHostState.hostPolicyRefused)
+        #expect(autoApprovedHostState.sawTerminalEvent)
+        #expect(refusedEvents.count == 2)
+        if case .error(let code, let message) = refusedEvents.last {
+            #expect(code == "host_control_policy")
+            #expect(message.contains("always-proceed"))
+        } else {
+            Issue.record("Expected host_control_policy error event")
+        }
+
+        // 5. Host-control parser refuses `proceed-in-sandbox` and ignores trailing lines
         var hostState = AntigravityStreamRunner.AntigravityStreamParserState(
             controlsHostMac: true,
             isAutoApproved: false
@@ -194,6 +213,31 @@ struct EngineRunnerAndSupervisorTests {
             state: &hostState
         )
         #expect(trailingEvents.isEmpty)
+
+        // 6. Missing step_index disambiguates sequential tool calls instead of dropping the second
+        var toolState = AntigravityStreamRunner.AntigravityStreamParserState(
+            conversationId: "conv-tool"
+        )
+        let tool1Events = AntigravityStreamRunner.parseLine(
+            #"{"event":"step_update","step_update":{"step_type":"tool","tool_name":"bash","state":"ACTIVE","tool_input":{"cmd":"pwd"}}}"#,
+            state: &toolState
+        )
+        let tool2Events = AntigravityStreamRunner.parseLine(
+            #"{"event":"step_update","step_update":{"step_type":"tool","tool_name":"bash","state":"ACTIVE","tool_input":{"cmd":"whoami"}}}"#,
+            state: &toolState
+        )
+        #expect(tool1Events.count == 1)
+        #expect(tool2Events.count == 1)
+        if case .toolCall(let id1, let name1, _) = tool1Events.first,
+           case .toolCall(let id2, let name2, _) = tool2Events.first {
+            #expect(name1 == "bash")
+            #expect(name2 == "bash")
+            #expect(id1 == "conv-tool:bash_0")
+            #expect(id2 == "conv-tool:bash_1")
+            #expect(id1 != id2)
+        } else {
+            Issue.record("Expected two distinct toolCall events with disambiguated IDs")
+        }
     }
 
     // MARK: - 2. ProcessSupervisorActor Hostile Process Tests

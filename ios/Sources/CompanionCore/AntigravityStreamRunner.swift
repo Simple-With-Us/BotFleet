@@ -128,6 +128,10 @@ public actor AntigravityStreamRunner: EngineDriver {
             isAutoApproved: isAutoApproved
         )
         let session = try await launcher.launch(spec: spec, threadId: input.threadId, engineId: engineId)
+        guard activeSessions[input.threadId] == nil else {
+            await session.cancel()
+            throw EngineDriverError.turnAlreadyActive(threadId: input.threadId)
+        }
         let sessionToken = UUID()
         activeSessions[input.threadId] = session
         activeSessionTokens[input.threadId] = sessionToken
@@ -269,7 +273,7 @@ public actor AntigravityStreamRunner: EngineDriver {
                 events.append(.sessionStarted(sessionId: convId))
             }
 
-            if state.controlsHostMac && !state.isAutoApproved {
+            if state.controlsHostMac {
                 let permissionMode = (payload["permission_mode"] as? String)
                     ?? (json["permission_mode"] as? String)
                 if let refusal = AntigravityDriverPolicy.hostPolicyRefusal(for: permissionMode) {
@@ -284,6 +288,11 @@ public actor AntigravityStreamRunner: EngineDriver {
             let stepType = (payload["step_type"] as? String) ?? (json["step_type"] as? String) ?? ""
             switch stepType {
             case "tool":
+                let toolInfo = (payload["tool_info"] as? [String: Any]) ?? (json["tool_info"] as? [String: Any])
+                let toolName = (payload["tool_name"] as? String)
+                    ?? (toolInfo?["name"] as? String)
+                    ?? (json["tool_name"] as? String)
+                    ?? "tool"
                 let convPrefix = state.conversationId
                     ?? (payload["conversation_id"] as? String)
                     ?? (json["conversation_id"] as? String)
@@ -295,11 +304,10 @@ public actor AntigravityStreamRunner: EngineDriver {
                           !idxStr.isEmpty {
                     stepIndexString = idxStr
                 } else {
-                    stepIndexString = "0"
+                    stepIndexString = "\(toolName)_\(state.emittedToolCallIds.count)"
                 }
                 let itemId = "\(convPrefix):\(stepIndexString)"
                 let stepState = ((payload["state"] as? String) ?? (json["state"] as? String) ?? "").uppercased()
-                let toolInfo = (payload["tool_info"] as? [String: Any]) ?? (json["tool_info"] as? [String: Any])
 
                 if stepState == "ACTIVE" {
                     let toolName = (payload["tool_name"] as? String)
