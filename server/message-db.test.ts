@@ -9,6 +9,7 @@ import {
   closeMessageDb,
   deleteThread,
   firstUserText,
+  hasThreadRows,
   insertMessage,
   pruneDeadThreads,
   readMessageById,
@@ -222,6 +223,38 @@ describe("message-db", () => {
     expect(settled?.helper).toMatchObject({ status: "failed", endedAt: 5_000 });
     expect(next.hasMessage(bot.threadId, settled!.id)).toBe(true);
     expect(next.threadIsCachedForTests(bot.threadId)).toBe(false);
+  });
+
+  it("hasMessage finds a message that lives only in a legacy JSON file", () => {
+    // No SQLite rows yet: the held-work restore at boot (restoreHeldWork in
+    // server/index.ts) gates on hasMessage, so a legacy-only thread must not
+    // read as "message gone" just because its file was never imported.
+    writeFileSync(legacy("legacy-only"), JSON.stringify([msg("held-1", "held ask"), msg("other", "other line")]));
+    expect(hasThreadRows("legacy-only")).toBe(false);
+    const store = new Store(selection);
+    expect(store.threadIsCachedForTests("legacy-only")).toBe(false);
+    expect(store.hasMessage("legacy-only", "held-1")).toBe(true);
+    expect(store.hasMessage("legacy-only", "missing")).toBe(false);
+    // the fallback hydrated through the one-time legacy import
+    expect(hasThreadRows("legacy-only")).toBe(true);
+    expect(existsSync(`${legacy("legacy-only")}.imported`)).toBe(true);
+  });
+
+  it("hasMessage on a thread with DB rows stays bounded and does not hydrate it", () => {
+    insertMessage("bounded", msg("m1", "hello"));
+    insertMessage("bounded", msg("m2", "world"));
+    expect(hasThreadRows("bounded")).toBe(true);
+    const store = new Store(selection);
+    expect(store.threadIsCachedForTests("bounded")).toBe(false);
+    expect(store.hasMessage("bounded", "m1")).toBe(true);
+    expect(store.threadIsCachedForTests("bounded")).toBe(false);
+  });
+
+  it("hasMessage returns false for a missing message in a thread with DB rows", () => {
+    insertMessage("with-rows", msg("present", "here"));
+    const store = new Store(selection);
+    expect(store.hasMessage("with-rows", "absent")).toBe(false);
+    expect(store.threadIsCachedForTests("with-rows")).toBe(false);
   });
 
   it("deleteThread removes rows and state", () => {

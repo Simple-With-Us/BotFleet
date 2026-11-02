@@ -2217,10 +2217,16 @@ export class Store {
   }
 
   /** Whether one message exists, without hydrating its thread when cold —
-   * the held-work restore at boot only needs this lookup by id. */
+   * the held-work restore at boot only needs this lookup by id. A cold
+   * thread with no rows yet may still hold the message in its legacy JSON
+   * file, so only that case falls back to the hydrating read (which imports
+   * the file once); a thread with rows keeps the bounded by-id lookup. */
   hasMessage(threadId: string, messageId: string): boolean {
     const warm = this.threads.get(threadId);
     if (warm) return warm.messages.some((m) => m.id === messageId);
+    if (!mdb.hasThreadRows(threadId)) {
+      return this.thread(threadId).messages.some((m) => m.id === messageId);
+    }
     return mdb.readMessageById(threadId, messageId) !== null;
   }
 

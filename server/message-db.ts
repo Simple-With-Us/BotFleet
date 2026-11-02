@@ -176,13 +176,20 @@ export function readMessageById(threadId: string, messageId: string): Message | 
   return row ? rowToMessage(row) : null;
 }
 
+/** Whether a thread has any rows at all — a `SELECT 1 … LIMIT 1` existence
+ * probe, not a count or a read, so a caller can tell a legacy-only thread
+ * (no rows yet, messages still only in its JSON file) from a migrated one
+ * without hydrating either. */
+export function hasThreadRows(threadId: string): boolean {
+  return db().prepare("SELECT 1 AS one FROM messages WHERE thread_id = ? LIMIT 1").get(threadId) !== undefined;
+}
+
 /** The first user text in a thread, read at the SQL boundary — naming a
  * task at boot must not hydrate (or cache) a whole transcript to find its
  * first line. Falls back to the legacy JSON file only when the thread has
  * no rows yet, mirroring `firstMessageAt`. */
 export function firstUserText(threadId: string, legacyFile: string): string | null {
-  const hasRows = db().prepare("SELECT 1 AS one FROM messages WHERE thread_id = ? LIMIT 1").get(threadId) !== undefined;
-  if (hasRows) {
+  if (hasThreadRows(threadId)) {
     // SAFETY: the query selects only `text`, a nullable TEXT column on `messages`.
     for (const row of db()
       .prepare("SELECT text FROM messages WHERE thread_id = ? AND role = 'user' AND kind = 'text' ORDER BY rowid")
