@@ -16,7 +16,7 @@
 // no closer protects nothing), @-mentions, and a numbered-list marker
 // ("1.  Item").  Running it twice changes nothing.
 //
-// A port of the fleet listener's own function (AFC scripts/agent_sync,
+// A port of the fleet listener's own function (the AFC Python package,
 // `sentence_gap`), so a BF bot and a CLI seat put the same text on the realm.
 
 export const SENTENCE_GAP_NBSP = "\u00a0";

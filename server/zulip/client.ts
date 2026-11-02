@@ -1,5 +1,5 @@
-// A small Zulip REST client on `fetch`, ported from the fleet's agent-sync
-// client (AFC scripts/agent_sync/zulip.py) so both speak the realm the same
+// A small Zulip REST client on `fetch`, ported from the fleet's chat CLI
+// client (the AFC Python package) so both speak the realm the same
 // way:
 //
 //   - Basic auth (email:key).  The realm is fixed at construction and a

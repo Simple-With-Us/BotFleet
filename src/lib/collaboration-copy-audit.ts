@@ -7,7 +7,7 @@ export function hasSlackReference(...values: Array<string | undefined | null>): 
  * chooses this action for that saved routine or webhook. */
 export function convertSlackReferenceToZulip(value: string): string {
   return value
-    .replace(/slack-(?:sync|collab)/gi, "agent-sync")
+    .replace(/slack-(?:sync|collab)/gi, "Work-In-Progress")
     // Replace only the standalone product name.  A sentence-ending period is
     // not part of the word.  A period that starts a host (`slack.com`) is.
     // URLs, channel names, environment variables, and other identifiers stay
