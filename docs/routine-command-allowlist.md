@@ -45,7 +45,7 @@ Chat turns, webhook turns, resource turns and Zulip wakes are unchanged.  Only a
 
 `POST /api/routines` and `PATCH /api/routines/:id` take it as `toolPolicy`.  A PATCH that omits it keeps the stored one;  `null` removes it.  A routine with an allowlist must run on the bot (`runOn: "bot"`).  Bot-requested routine changes (routine cards) cannot set or clear it.
 
-A stored allowlist that still names the retired `agent-sync` launcher as a command's program is rewritten to `simple-chat` on server boot, when the renamed program exists next to the old path:  the launcher lived beside the CLI it ran, so that sibling is the same tool, while a bare old basename with no sibling is left alone and denied loudly rather than redirected.  Only a routine's stored policy and still-queued runs change, and only the program basename;  finished runs keep the policy they ran under as the record, and flags, args and paths are untouched.
+A stored allowlist that still names the retired `agent-sync` launcher as a command's program is rewritten to `simple-chat` on server boot, but only on the documented install route (`~/.local/bin`) and only when the renamed program exists there:  that one route is known to be the launcher for the same CLI, and anywhere else an old basename could be an unrelated program, so the entry stays as saved and is denied loudly under the old name rather than redirected.  Only a routine's stored policy and still-queued runs change, and only the program basename;  finished runs keep the policy they ran under as the record, and flags, args and paths are untouched.
 
 ## How a Command Is Matched
 

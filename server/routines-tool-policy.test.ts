@@ -65,23 +65,37 @@ describe("routine toolPolicy", () => {
     expect(reloaded.listRoutines()[0]!.toolPolicy).toEqual(created.toolPolicy);
   });
 
-  it("migrates stored allowlists off the retired agent-sync launcher, preserving run history", () => {
+  it("migrates only the known launcher route off the retired agent-sync spelling, preserving run history", () => {
     const h = harness();
-    const bin = join(dirs[dirs.length - 1]!, "bin");
+    const base = dirs[dirs.length - 1]!;
+    const bin = join(base, "bin"); // stands in for the documented ~/.local/bin route
     mkdirSync(bin);
     writeFileSync(join(bin, "simple-chat"), "#!/bin/sh\n");
-    const oldPolicy = {
+    const other = join(base, "other"); // has a same-named sibling, but is not the known route
+    mkdirSync(other);
+    writeFileSync(join(other, "simple-chat"), "#!/bin/sh\n");
+    const dirSibling = join(base, "dircase"); // sibling exists but is a directory, not a program
+    mkdirSync(dirSibling);
+    mkdirSync(join(dirSibling, "simple-chat"));
+    h.options.chatCliLauncherDir = bin;
+    const policyAt = (argv0: string) => ({
       mode: "allowlist" as const,
-      commands: [{ argv0: join(bin, "agent-sync"), sub: ["whoami"], flags: { "--json": { value: "none" as const } }, args: [], positionals: 0 }],
+      commands: [{ argv0, sub: ["whoami"], flags: { "--json": { value: "none" as const } }, args: [], positionals: 0 }],
       writePaths: [],
       readPaths: [],
-    };
-    // A routines.json from before the rename: one routine, one still-queued
-    // run (live state) and one completed run (the audit record).
+    });
+    const routine = (id: string, argv0: string) => ({
+      id, name: id, prompt: "Check", botId: "bot", schedule: daily, runOn: "bot", toolPolicy: policyAt(argv0), createdAt: 1, updatedAt: 1,
+    });
+    const oldPolicy = policyAt(join(bin, "agent-sync"));
     writeFileSync(h.options.file!, JSON.stringify({
       routines: [
-        { id: "r1", name: "Backup Health", prompt: "Check", botId: "bot", schedule: daily, runOn: "bot", toolPolicy: oldPolicy, createdAt: 1, updatedAt: 1 },
-        { id: "r2", name: "No Sibling", prompt: "Check", botId: "bot", schedule: daily, runOn: "bot", toolPolicy: { ...oldPolicy, commands: [{ ...oldPolicy.commands[0], argv0: join(dirs[dirs.length - 1]!, "agent-sync") }] }, createdAt: 1, updatedAt: 1 },
+        routine("r1", join(bin, "agent-sync")), // the known route: migrates
+        routine("r2", join(other, "agent-sync")), // same basename elsewhere: fails closed
+        routine("r3", "agent-sync"), // bare/relative: fails closed
+        routine("r4", join(bin, "Agent-Sync")), // case variant on the known route: migrates
+        routine("r5", join(dirSibling, "agent-sync")), // sibling not a file: fails closed
+        { id: "r6", name: "r6", prompt: "Check", botId: "bot", schedule: daily, runOn: "bot", toolPolicy: { mode: "allowlist" }, createdAt: 1, updatedAt: 1 },
       ],
       runs: [
         { id: "run-queued", routineId: "r1", botId: "bot", status: "queued", scheduledFor: 1, createdAt: 1, manual: false, triggerSource: "schedule", toolPolicy: oldPolicy },
@@ -90,17 +104,21 @@ describe("routine toolPolicy", () => {
     }));
     const reloaded = new RoutineManager(h.options);
     const routines = reloaded.listRoutines();
-    // The routine whose sibling binary exists migrates; the one without stays.
-    expect(routines.find((r) => r.id === "r1")!.toolPolicy?.commands[0]!.argv0).toBe(join(bin, "simple-chat"));
-    expect(routines.find((r) => r.id === "r2")!.toolPolicy?.commands[0]!.argv0).toBe(join(dirs[dirs.length - 1]!, "agent-sync"));
+    const argv0Of = (id: string) => routines.find((r) => r.id === id)!.toolPolicy?.commands[0]!.argv0;
+    expect(argv0Of("r1")).toBe(join(bin, "simple-chat"));
+    expect(argv0Of("r2")).toBe(join(other, "agent-sync"));
+    expect(argv0Of("r3")).toBe("agent-sync");
+    expect(argv0Of("r4")).toBe(join(bin, "simple-chat"));
+    expect(argv0Of("r5")).toBe(join(dirSibling, "agent-sync"));
+    // A malformed stored policy loads untouched rather than crashing the boot.
+    expect(routines.find((r) => r.id === "r6")!.toolPolicy).toEqual({ mode: "allowlist" });
     // A queued run's snapshot is still executable state and migrates;  a
     // completed run's snapshot is the record of what it ran under and stays.
     expect(reloaded.listRuns().find((r) => r.id === "run-queued")!.toolPolicy?.commands[0]!.argv0).toBe(join(bin, "simple-chat"));
     expect(reloaded.listRuns().find((r) => r.id === "run-done")!.toolPolicy?.commands[0]!.argv0).toBe(join(bin, "agent-sync"));
     reloaded.flushNow();
     const persisted = readFileSync(h.options.file!, "utf8");
-    expect(persisted).toContain(join(bin, "simple-chat"));
-    expect(persisted.match(/agent-sync/g)).toHaveLength(2); // r2 and run-done, untouched
+    expect(persisted.match(/agent-sync/g)).toHaveLength(4); // r2, r3, r5, run-done
   });
 
   it("refuses an invalid allowlist and one on a cloud run", () => {
