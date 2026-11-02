@@ -29,6 +29,12 @@ private actor FixtureResourceHosts: ServersHostStore {
     func remove(id: String, controllerID: String?, leasedHostIDs: Set<String>) throws {
         records.removeAll { $0.id == id }
     }
+    func save(_ selection: PlacementSelection) throws {
+        placement.saved = selection
+    }
+    func recordApplied(_ selection: PlacementSelection) throws {
+        placement.applied = selection
+    }
 }
 
 private final class FixtureResourceTokens: HostTokenStore, @unchecked Sendable {
