@@ -16597,6 +16597,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           recording,
           automationSource: fromImessage ? "imessage" : undefined,
           unattended: relaySourced || undefined,
+          // person-initiated: a person targeted this thread on purpose,
+          // which is how a stopped bot is meant to be woken — `interrupt`
+          // stops automation, not the owner.
           personInitiated: true,
         });
         return { status: 202, body: { ok: true } };
