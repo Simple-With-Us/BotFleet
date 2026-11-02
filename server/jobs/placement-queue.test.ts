@@ -184,6 +184,123 @@ describe("placement queue", () => {
     expect(second.children.at(-1)!.spec.command).toBe("cmd-b-new");
   });
 
+  it("a restart-read queued job holds no thread or bot slot and never launches", async () => {
+    const first = harness();
+    first.h.host.disk = 1;
+    const old = start(first.h, "old cmd", "t", "bot-a");
+    if (!old.ok) throw new Error(old.error);
+    expect(old.job.status).toBe("queued");
+    // A restart with no queue window (production-like): the record stays
+    // queued for its controller, but this process holds no command for it.
+    const second = harness();
+    second.h.clock.now = first.h.clock.now;
+    const restarted = new JobRegistry({
+      dir: join(first.h.dir, "jobs"),
+      dataDir: first.h.dir,
+      settings: () => second.h.settings.value,
+      spendBlocked: () => false,
+      broadcast: () => undefined,
+      probe: { swapUsedPercent: () => 50, freeDiskBytes: () => 100 * 1024 ** 3 },
+      now: () => second.h.clock.now,
+      awakeNow: () => second.h.awake.now,
+      spawn: second.spawnFn,
+      listProcesses: async () => [],
+      platform: "darwin",
+    });
+    registries.push(restarted);
+    await restarted.adopt();
+    expect(restarted.get(old.job.id)?.status).toBe("queued");
+    // It holds no admission slot: the same thread and bot may still fill
+    // their whole caps with new work.
+    expect(restarted.refusal({ botId: "bot-a", threadId: "t" })).toBeNull();
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      second.h.clock.now += 1000;
+      const started = restarted.start({ botId: "bot-a", threadId: "t", command: `new cmd ${i}`, cwd: first.h.dir, onComplete: "wake" });
+      if (!started.ok) throw new Error(started.error);
+      expect(started.job.status).toBe("running");
+      ids.push(started.job.id);
+    }
+    expect(ids).toHaveLength(3);
+    expect(restarted.get(old.job.id)?.status).toBe("queued");
+    // Nothing this process never accepted ever launched.
+    expect(second.children.map((child) => child.spec.command).sort()).toEqual(["new cmd 0", "new cmd 1", "new cmd 2"]);
+  });
+
+  it("a newer queued job of the same bot passes one this process never accepted", async () => {
+    const first = harness({ placementMode: () => "serverFirst" });
+    runningIds(first.h, 8);
+    const aOld = start(first.h, "cmd-a-old", "ta", "bot-a");
+    if (!aOld.ok) throw new Error("expected a queued job");
+    const second = harness({ placementMode: () => "serverFirst" });
+    second.h.clock.now = first.h.clock.now;
+    const restarted = new JobRegistry({
+      dir: join(first.h.dir, "jobs"),
+      dataDir: first.h.dir,
+      settings: () => second.h.settings.value,
+      spendBlocked: () => false,
+      broadcast: () => undefined,
+      probe: { swapUsedPercent: () => 50, freeDiskBytes: () => 100 * 1024 ** 3 },
+      now: () => second.h.clock.now,
+      awakeNow: () => second.h.awake.now,
+      spawn: second.spawnFn,
+      listProcesses: async () => [],
+      platform: "darwin",
+      placementMode: () => "serverFirst" as const,
+    });
+    registries.push(restarted);
+    await restarted.adopt();
+    for (let i = 0; i < 8; i++) {
+      second.h.clock.now += 1000;
+      const started = restarted.start({ botId: `host-bot-${i % 4}`, threadId: `host-thread-${i}`, command: `host job ${i}`, cwd: first.h.dir, onComplete: "wake" });
+      if (!started.ok) throw new Error("expected the filler to run");
+      expect(started.job.status).toBe("running");
+    }
+    second.h.clock.now += 1000;
+    const aNew = restarted.start({ botId: "bot-a", threadId: "ta", command: "cmd-a-new", cwd: first.h.dir, onComplete: "wake" });
+    if (!aNew.ok) throw new Error("expected a-new to queue");
+    expect(aNew.job.status).toBe("queued");
+    // A slot frees: the unlaunchable head of bot-a's line must not block its
+    // newer queued job, which takes the slot without launching the old one.
+    second.children[0]!.child.emit("exit", 0, null);
+    expect(restarted.get(aOld.job.id)?.status).toBe("queued");
+    expect(restarted.get(aNew.job.id)?.status).toBe("running");
+    expect(second.children.at(-1)!.spec.command).toBe("cmd-a-new");
+    expect(second.children.every((child) => child.spec.command !== "cmd-a-old")).toBe(true);
+  });
+
+  it("a restart-read queued job expires past its window without ever launching", async () => {
+    const first = harness();
+    first.h.host.disk = 1;
+    const old = start(first.h, "old cmd", "t", "bot-a");
+    if (!old.ok) throw new Error(old.error);
+    const second = harness({ queueWindowMs: 60_000 });
+    second.h.clock.now = first.h.clock.now;
+    const restarted = new JobRegistry({
+      dir: join(first.h.dir, "jobs"),
+      dataDir: first.h.dir,
+      settings: () => second.h.settings.value,
+      spendBlocked: () => false,
+      broadcast: () => undefined,
+      probe: { swapUsedPercent: () => 50, freeDiskBytes: () => 100 * 1024 ** 3 },
+      now: () => second.h.clock.now,
+      awakeNow: () => second.h.awake.now,
+      spawn: second.spawnFn,
+      listProcesses: async () => [],
+      platform: "darwin",
+      queueWindowMs: 60_000,
+    });
+    registries.push(restarted);
+    await restarted.adopt();
+    expect(restarted.get(old.job.id)?.status).toBe("queued");
+    second.h.clock.now += 61_000;
+    second.h.awake.now += 5_000;
+    restarted.tick();
+    expect(restarted.get(old.job.id)?.status).toBe("lost");
+    expect(restarted.get(old.job.id)?.reason).toMatch(/no host could take it/);
+    expect(second.children).toHaveLength(0);
+  });
+
   it("expires a queued job past its window and kills a queued job on demand", async () => {
     const { h } = harness({ placementMode: () => "serverFirst", queueWindowMs: 60_000 });
     runningIds(h, 8);

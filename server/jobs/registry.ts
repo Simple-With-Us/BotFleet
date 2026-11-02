@@ -643,7 +643,12 @@ export class JobRegistry {
     }
     const settings = this.deps.settings();
     if (!settings.enabled) return "Background jobs are turned off in BotFleet's settings.";
-    const active = [...this.records.values()].filter(isJobActive);
+    // A queued job this process never accepted (restart-read: its command is
+    // memory-only and was never written to disk) can never run here, so it
+    // holds no thread or bot slot; it stays queued for its controller.
+    const active = [...this.records.values()].filter(
+      (record) => isJobActive(record) && (record.status !== "queued" || this.pending.has(record.id)),
+    );
     if (active.filter((record) => record.threadId === request.threadId).length >= JOB_CAP_PER_THREAD) {
       return `This conversation already has ${JOB_CAP_PER_THREAD} jobs running, the most it may.  Wait for one to finish, or stop one with job_kill.`;
     }
@@ -818,10 +823,13 @@ export class JobRegistry {
         let launched = false;
         for (const record of queued) {
           if (blockedBots.has(record.botId)) continue;
+          // A queued job this process never accepted has no command (memory
+          // only, never on disk): it stays queued for its controller, never
+          // launches here, and never blocks its bot's other queued jobs.
           const pending = this.pending.get(record.id);
+          if (!pending) continue;
           const running = this.runningLike();
           if (
-            !pending ||
             running.filter((other) => other.threadId === record.threadId).length >= JOB_CAP_PER_THREAD ||
             running.filter((other) => other.botId === record.botId).length >= JOB_CAP_PER_BOT
           ) {
