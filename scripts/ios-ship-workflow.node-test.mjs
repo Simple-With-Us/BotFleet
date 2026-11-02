@@ -1037,3 +1037,34 @@ test("externalInstallability follows the external-group/public-link policy", asy
   assert.equal(out.ok, false);
   assert.equal(out.installable, false);
 });
+
+test("a --platform with no value is refused instead of planning the legacy build", () => {
+  // An empty --platform would pass the "is it ios or macos" check and fall
+  // through to the legacy max + 1 plan, which splits the iOS and the Mac
+  // build of one commit by one, silently.  The flag itself must fail.
+  const empty = spawnSync(
+    process.execPath,
+    [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "plan-release-build", "app.botfleet.ios", "--merge-stamp", "202610291425", "--platform"],
+    { encoding: "utf8", env: { PATH: process.env.PATH || "", HOME: tmpdir() } },
+  );
+  assert.equal(empty.status, 2);
+  assert.match(empty.stderr, /--platform requires a value/);
+
+  const emptyEquals = spawnSync(
+    process.execPath,
+    [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "plan-release-build", "app.botfleet.ios", "--merge-stamp", "202610291425", "--platform="],
+    { encoding: "utf8", env: { PATH: process.env.PATH || "", HOME: tmpdir() } },
+  );
+  assert.equal(emptyEquals.status, 2);
+  assert.match(emptyEquals.stderr, /--platform requires a value/);
+});
+
+test("an unknown --platform is still refused by name", () => {
+  const bad = spawnSync(
+    process.execPath,
+    [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "plan-release-build", "app.botfleet.ios", "--merge-stamp", "202610291425", "--platform", "windows"],
+    { encoding: "utf8", env: { PATH: process.env.PATH || "", HOME: tmpdir() } },
+  );
+  assert.equal(bad.status, 2);
+  assert.match(bad.stderr, /--platform must be ios or macos/);
+});

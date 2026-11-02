@@ -201,17 +201,40 @@ export function resolveMacReleaseVersion({
   return { ...plan, mergeStamp: stamp };
 }
 
-/** The fixed marketing version and bundle id of one app in apps.json. */
+/**
+ * The fixed marketing version and bundle id of one app in apps.json.
+ *
+ * The file is parsed and its two fields are shape-checked by hand rather than
+ * through zod, and that is not a shortcut.  The release plan runs in a
+ * workflow job that never installs dependencies (native-mac-release.yml's
+ * `prepare` job has no install step, and neither does ios-ship.yml's
+ * `plan-build`), so a bare `import "zod"` there dies with
+ * ERR_MODULE_NOT_FOUND and the release cannot plan a build at all.  Every
+ * module in that path imports nothing but node: builtins.  The intent of the
+ * zod rule -- never read a field off an untrusted file without checking its
+ * shape -- is met explicitly below; see also
+ * scripts/ci-build-resolver.mjs, which hand-checks its boundary for the same
+ * reason.
+ */
+/* oxlint-disable anti-slop/no-runtime-typeof -- hand-written apps.json boundary parse; zod is unavailable in the release plan job (see comment above). */
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
 export function appVersionPolicy(repoRoot, appKey) {
   const path = join(repoRoot, "scripts", "ios-fleet", "apps.json");
-  let apps = {};
+  let parsed;
   try {
-    apps = JSON.parse(readFileSync(path, "utf8")).apps ?? {};
+    parsed = JSON.parse(readFileSync(path, "utf8"));
   } catch (error) {
     throw new Error(`cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const app = apps[appKey];
-  if (!app) {
+  if (!isPlainObject(parsed) || !isPlainObject(parsed.apps)) {
+    throw new Error(`${path} is not an object with an "apps" object`);
+  }
+  const app = parsed.apps[appKey];
+  if (!isPlainObject(app)) {
     throw new Error(`apps.json has no app named ${appKey}`);
   }
   const marketingVersion = String(app.fixedMarketingVersion ?? "").trim();

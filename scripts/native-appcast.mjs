@@ -85,12 +85,17 @@ function escapeXml(value) {
  */
 export function buildAppcast({
   version,
+  build: explicitBuild,
   feedBaseUrl = DEFAULT_FEED_BASE_URL,
   pubDate = new Date(),
   minimumSystemVersion = "14.0",
   items,
 } = {}) {
-  const build = buildNumberFor(version);
+  // The build arrives as its own value under the shared release policy, so it
+  // is threaded in here too: deriving it from the version string alone cannot
+  // answer 0.1.0, and a release that cannot name its own build would fail
+  // here instead of publishing a feed.
+  const build = buildNumberFor(version, explicitBuild);
   if (!Array.isArray(items) || items.length === 0) {
     throw new Error("appcast needs at least one item");
   }
@@ -182,6 +187,7 @@ export function generateAppcast({
   const edSignature = readEdSignature(releaseDir, zip);
   const appcast = buildAppcast({
     version,
+    build,
     feedBaseUrl,
     pubDate,
     items: [
@@ -224,6 +230,12 @@ if (isEntryModule()) {
   }
   const buildIndex = rest.indexOf("--build");
   const build = buildIndex === -1 ? undefined : rest[buildIndex + 1];
+  // A --build with no value fails here, on the flag itself.  Falling through
+  // would derive the build from the version string and report the wrong
+  // failure, which reads as a version problem when it is a typo.
+  if (buildIndex !== -1 && (build === undefined || build === "")) {
+    throw new Error("--build requires a build number");
+  }
   generateAppcast({ releaseDir, version, build, tag });
 }
 

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   buildAppcast,
@@ -145,4 +147,58 @@ test("generateAppcast carries a mirror feed base into both the enclosure and the
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("a 0.1.0 release carries its build as its own value", () => {
+  // The shared release policy writes the marketing version 0.1.0 and the
+  // build as the commit's Central merge stamp, so the build is its own value
+  // and can never be derived from the version string.
+  assert.equal(buildNumberFor("0.1.0", "202610291425"), "202610291425");
+  const appcast = buildAppcast({
+    version: "0.1.0",
+    build: "202610291425",
+    items: [
+      {
+        build: "202610291425",
+        shortVersion: "0.1.0",
+        url: "https://example.invalid/BotFleetMac-0.1.0.zip",
+        length: 10,
+      },
+    ],
+  });
+  assert.match(appcast, /<sparkle:version>202610291425<\/sparkle:version>/);
+  assert.match(appcast, /<sparkle:shortVersionString>0\.1\.0<\/sparkle:shortVersionString>/);
+});
+
+test("a 0.1.0 appcast without its build is refused instead of guessed", () => {
+  // The old single-argument lookup cannot answer 0.1.0, and a release that
+  // cannot name its own build must fail here rather than publish a feed.
+  assert.throws(
+    () =>
+      buildAppcast({
+        version: "0.1.0",
+        items: [
+          {
+            build: "202610291425",
+            shortVersion: "0.1.0",
+            url: "https://example.invalid/BotFleetMac-0.1.0.zip",
+            length: 10,
+          },
+        ],
+      }),
+    /not 1\.0\.<commit_count>/,
+  );
+});
+
+test("a --build with no value fails on the flag itself", () => {
+  // Falling through would derive the build from the version string and
+  // report a version problem, which reads as the wrong cause.  The flag is
+  // the cause, so the flag is what fails.
+  const result = spawnSync(
+    process.execPath,
+    [join(dirname(fileURLToPath(import.meta.url)), "native-appcast.mjs"), "/nonexistent-release-dir", "0.1.0", "v0.1.0-202610291425-native", "--build"],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--build requires a build number/);
 });

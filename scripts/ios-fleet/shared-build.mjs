@@ -62,7 +62,12 @@ export function nextSharedBuild({iosBuilds, macBuilds, extraFloors = [], complet
   for (const floor of extraFloors) {
     const candidate = BigInt(floor);
     if (candidate > max) max = candidate;
-    if (candidate > maxWithoutStamp) maxWithoutStamp = candidate;
+    // A floor equal to the merge stamp is that commit's own build, so it is
+    // excluded here for the same reason a stamp-valued build is excluded
+    // above.  Including it would set maxWithoutStamp to the stamp and make
+    // this platform's FIRST build overshoot to stamp + 1, so the iOS and the
+    // Mac build of one commit would differ by one.
+    if (candidate !== stamp && candidate > maxWithoutStamp) maxWithoutStamp = candidate;
   }
   const ownHasStamp =
     own !== null && own.some((value) => BigInt(value.split('.')[0]) === stamp);

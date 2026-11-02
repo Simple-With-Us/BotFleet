@@ -168,3 +168,25 @@ test('an unknown platform is refused', () => {
   assert.throws(() => next({...input, platform: 'mac'}), /platform must be ios or macos/);
   assert.throws(() => next({...input, platform: 'windows'}), /platform must be ios or macos/);
 });
+
+test('a platform plan ignores a floor equal to the merge stamp', () => {
+  // The stamp floor is that commit's own build, so it must not push this
+  // platform's FIRST build to stamp + 1: the iOS and the Mac build of one
+  // commit have to carry the same number.
+  assert.deepEqual(
+    next({...input, extraFloors: [STAMP], platform: 'macos'}),
+    {build: STAMP}
+  );
+  assert.deepEqual(
+    next({...input, extraFloors: [STAMP], platform: 'ios'}),
+    {build: STAMP}
+  );
+});
+
+test('a floor equal to the stamp still counts when the plan has no platform', () => {
+  // Without a platform the plan is the legacy max + 1 rule, unchanged.
+  assert.deepEqual(
+    next({...input, extraFloors: [STAMP]}),
+    {build: '202610290001'}
+  );
+});
