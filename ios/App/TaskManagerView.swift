@@ -37,9 +37,25 @@ struct TaskManagerView: View {
 
                 Section("Tasks") {
                     ForEach(tasks, id: \.threadId) { task in
+                    let viewed = session.state.viewingThreadId(forBotId: current.id) == task.threadId
                     Button {
                         Task {
-                            await session.switchTask(task, for: current)
+                            // While the bot works, a non-active thread opens
+                            // for reading only; switching stays gated on the
+                            // turn finishing, as in the tab bar.
+                            switch threadPickIntent(
+                                busy: current.busy == true,
+                                active: task.threadId == current.threadId,
+                                viewing: session.state.viewingThreadId(forBotId: current.id) != nil,
+                                canView: true
+                            ) {
+                            case .switchTo:
+                                await session.switchTask(task, for: current)
+                            case .view, .viewActive:
+                                await session.viewThread(task, for: current)
+                            case .none:
+                                break
+                            }
                             dismiss()
                         }
                     } label: {
@@ -56,7 +72,7 @@ struct TaskManagerView: View {
                                         .font(.caption)
                                         .foregroundStyle(Color.secondary)
                                 } else {
-                                    Text(RelativeStamp.list(task.createdAt))
+                                    Text(RelativeStamp.list(task.createdAt) + (viewed ? " · Viewing" : ""))
                                         .font(.caption)
                                         .foregroundStyle(Color.secondary)
                                 }
@@ -64,6 +80,8 @@ struct TaskManagerView: View {
                             Spacer()
                             if task.threadId == current.threadId {
                                 Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor)
+                            } else if viewed {
+                                Image(systemName: "eye").foregroundStyle(Color.secondary)
                             }
                         }
                     }

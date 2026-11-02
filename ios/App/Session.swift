@@ -194,6 +194,10 @@ final class Session: ObservableObject {
     /// for the same attachment path.
     private var avatarFetches: [String: (id: UUID, task: Task<Data?, Never>)] = [:]
     private var avatarCacheGeneration = 0
+    /// Viewed-thread first pages in flight, by threadId. The store's
+    /// `loadingThread` flag cannot guard this on its own: these calls run
+    /// before the render that would publish the flag.
+    private var threadViewFetches: Set<String> = []
     /// Per-mutation success flags for one settings flush.  `status` may be a
     /// recovery GET applied for display even when a PATCH failed; callers must
     /// require their own OK flag before treating the mutation as saved.
@@ -1871,6 +1875,56 @@ final class Session: ObservableObject {
         guard let client, task.threadId != bot.threadId else { return }
         do { state.apply(.bot(try await client.switchTask(botId: bot.id, threadId: task.threadId))) }
         catch { recordActionError(error) }
+    }
+
+    /// Open a retained thread for reading without making it the execution
+    /// target. Passive: the pin moves, `Bot.threadId` does not, so the
+    /// running turn is untouched and `switchTask` is never called. The
+    /// busy gate stays exactly where it was — on switching alone.
+    func viewThread(_ task: BotTask, for bot: Bot) async {
+        guard task.threadId != bot.threadId,
+              (bot.tasks ?? []).contains(where: { $0.threadId == task.threadId })
+        else {
+            if task.threadId == bot.threadId { showActiveThread(for: bot) }
+            return
+        }
+        // Only a retained, non-active thread needs its own page; the active
+        // thread already lives on the bot. Reading never consults busy —
+        // that guard stays on switching alone.
+        guard state.viewThread(botId: bot.id, threadId: task.threadId) else { return }
+        guard let client else {
+            state.threadTranscriptFailed(threadId: task.threadId)
+            return
+        }
+        guard threadViewFetches.insert(task.threadId).inserted else { return }
+        defer { threadViewFetches.remove(task.threadId) }
+        do {
+            let page = try await client.messages(threadId: task.threadId)
+            state.threadTranscriptLoaded(
+                threadId: task.threadId,
+                messages: page.messages,
+                hasMore: page.hasMore
+            )
+        } catch {
+            state.threadTranscriptFailed(threadId: task.threadId)
+            recordActionError(error)
+        }
+    }
+
+    /// Return to the bot's active thread from a viewed one.
+    func showActiveThread(for bot: Bot) {
+        state.viewThread(botId: bot.id, threadId: nil)
+    }
+
+    /// Fetch the viewed thread's first page when its screen appears with an
+    /// empty cache — the store answers whether a fetch is still needed, so a
+    /// frame that landed first is never refetched.
+    func ensureViewedThreadLoaded() async {
+        guard let botId = state.viewedBotId, let threadId = state.viewedThreadId,
+              let bot = state.bot(botId),
+              let task = bot.tasks?.first(where: { $0.threadId == threadId })
+        else { return }
+        await viewThread(task, for: bot)
     }
 
     func renameTask(_ task: BotTask, for bot: Bot, title: String) async {
