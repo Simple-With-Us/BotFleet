@@ -12,7 +12,8 @@ struct NativeMacCompanionRuntimeTests {
             database: fixture.database,
             workspacesRoot: fixture.workspacesRoot,
             engineCoordinator: fixture.coordinator,
-            engineSwitch: fixture.engineSwitch
+            engineSwitch: fixture.engineSwitch,
+            executionContext: MacRuntimeReadyExecutionContext()
         )
         let token = "bf_tok_mac_runtime"
         let server = NativeCompanionServer(
@@ -57,6 +58,56 @@ struct NativeMacCompanionRuntimeTests {
         await graph.runtime.shutdown()
     }
 
+    @Test("The production Mac graph admission-holds a satisfied wait without claiming it")
+    func productionGraphHoldsUnclaimed() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        // Exactly the MacSession composition: no injected coordinator,
+        // engine switch or execution context, so no driver can run a turn.
+        let graph = NativeMacCompanionRuntime(
+            database: fixture.database,
+            workspacesRoot: fixture.workspacesRoot
+        )
+        let token = "bf_tok_mac_runtime_held"
+        let server = NativeCompanionServer(
+            database: fixture.database, pairedTokens: [token], nativeRuntime: graph.runtime
+        )
+        #expect(try await server.startListening(port: 0) != nil)
+
+        let created = await server.handleRequest(CompanionHTTPRequest(
+            method: "POST",
+            path: "/api/waits",
+            headers: ["Authorization": "Bearer \(token)"],
+            jsonString: "{\"botId\":\"bot-a\",\"threadId\":\"thread-a\",\"prompt\":\"continue\",\"predicate\":{\"kind\":\"fileExists\",\"relativePath\":\"output/complete.json\"}}"
+        ))
+        #expect(created.statusCode == 201)
+        let wait = try created.decodeJSON(NativeEventWait.self)
+
+        #expect(try await graph.runtime.tick().isEmpty)
+        let outputFile = fixture.workspacesRoot
+            .appendingPathComponent("bot-a", isDirectory: true)
+            .appendingPathComponent("output", isDirectory: true)
+            .appendingPathComponent("complete.json")
+        try FileManager.default.createDirectory(
+            at: outputFile.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data("{}".utf8).write(to: outputFile)
+
+        #expect(try await graph.runtime.tick() == [wait.id])
+        await graph.runtime.waitRegistry.waitForDispatches()
+        // Held at admission as typed, unclaimed work: no dispatch claim was
+        // written, so a later composition with real drivers can resume it.
+        let held = await graph.runtime.waitRegistry.wait(id: wait.id)
+        #expect(held?.status == .held)
+        #expect(held?.admissionHold == .credentialsUnavailable)
+        #expect(try await !fixture.database.hasNativeEventWaitDispatchClaim(id: wait.id))
+        #expect(try await graph.runtime.tick().isEmpty)
+        #expect(await graph.runtime.waitRegistry.wait(id: wait.id)?.status == .held)
+
+        await server.stopListening()
+        await graph.runtime.shutdown()
+    }
+
     @Test("The production workspace source only serves registered bots inside its root")
     func workspaceSourceConfinesToRegisteredBots() async throws {
         let fixture = try await makeFixture()
@@ -68,6 +119,26 @@ struct NativeMacCompanionRuntimeTests {
         #expect(root?.path == resolvedRoot + "/bot-a")
         #expect(try await source.workspaceRoot(forRegisteredBotId: "bot-unknown") == nil)
         #expect(try await source.workspaceRoot(forRegisteredBotId: "../escape") == nil)
+    }
+
+    @Test("The workspace source caches registered bots and refreshes only on a miss")
+    func workspaceSourceCachesBotTable() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let source = DatabaseBotWorkspaceSource(database: fixture.database, workspacesRoot: fixture.workspacesRoot)
+
+        #expect(try await source.workspaceRoot(forRegisteredBotId: "bot-a") != nil)
+        // A bot registered after the first load resolves via the miss refresh.
+        try await fixture.database.upsertBot(StoredBotRecord(id: "bot-b", name: "Second", createdAt: 1, rawJSON: "{}"))
+        #expect(try await source.workspaceRoot(forRegisteredBotId: "bot-b") != nil)
+
+        // Cached hits need no database at all; a miss still reloads (and so
+        // surfaces the closed database instead of serving from the cache).
+        try await fixture.database.checkpointAndClose()
+        #expect(try await source.workspaceRoot(forRegisteredBotId: "bot-a") != nil)
+        await #expect(throws: (any Error).self) {
+            _ = try await source.workspaceRoot(forRegisteredBotId: "bot-unknown")
+        }
     }
 
     private struct Fixture {
@@ -100,6 +171,14 @@ struct NativeMacCompanionRuntimeTests {
             base: base, workspacesRoot: workspacesRoot, database: database,
             engine: engine, coordinator: coordinator, engineSwitch: engineSwitch
         )
+    }
+}
+
+/// Admits every wait as a bare turn, mirroring a future Mac execution
+/// context that resolves ready work for its registered drivers.
+private struct MacRuntimeReadyExecutionContext: NativeExecutionContextSource {
+    func resolve(wait: NativeEventWait) async throws -> NativeExecutionAdmission {
+        .ready(TurnInput(threadId: wait.threadId ?? "", botId: wait.botId, prompt: wait.prompt ?? ""))
     }
 }
 

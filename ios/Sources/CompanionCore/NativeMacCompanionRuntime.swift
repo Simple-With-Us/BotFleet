@@ -1,5 +1,22 @@
 import Foundation
 
+/// Registered-bot ids for the workspace source, loaded lazily from the
+/// database and then served from memory for the source's lifetime.
+/// `DatabaseService` exposes no bot-change signal to invalidate on, so a
+/// cache hit never touches the database; a miss reloads the bot table
+/// once, which picks up bots registered after the first probe (and drops
+/// deregistered ones) without rescanning on every poll tick.
+private actor RegisteredBotIdCache {
+    private var cachedIds: Set<String>?
+
+    func contains(_ botId: String, load: @Sendable () async throws -> [String]) async throws -> Bool {
+        if let cachedIds, cachedIds.contains(botId) { return true }
+        let loaded = Set(try await load())
+        cachedIds = loaded
+        return loaded.contains(botId)
+    }
+}
+
 /// Production workspace source for the Mac companion listener: one directory
 /// per bot registered in the listener's own database, confined under the
 /// listener's `workspaces` root.  Unlike the headless host's execution
@@ -7,9 +24,10 @@ import Foundation
 /// this source reads registration from the database the listener already
 /// owns, so a `fileExists` wait resolves under
 /// `<workspacesRoot>/<botId>/` and nowhere else.
-public struct DatabaseBotWorkspaceSource: NativeEventWaitWorkspaceSource {
+public final class DatabaseBotWorkspaceSource: NativeEventWaitWorkspaceSource {
     private let database: DatabaseService
     private let workspacesRoot: URL
+    private let registeredBotIds = RegisteredBotIdCache()
 
     public init(database: DatabaseService, workspacesRoot: URL) {
         self.database = database
@@ -19,8 +37,7 @@ public struct DatabaseBotWorkspaceSource: NativeEventWaitWorkspaceSource {
     public func workspaceRoot(forRegisteredBotId botId: String) async throws -> URL? {
         guard Self.safeComponent(botId), workspacesRoot.isFileURL,
               workspacesRoot.path.hasPrefix("/"), workspacesRoot.path != "/" else { return nil }
-        let bots = try await database.loadBots()
-        guard bots.contains(where: { $0.id == botId }) else { return nil }
+        guard try await registeredBotIds.contains(botId, load: { try await database.loadBots().map(\.id) }) else { return nil }
         try FileManager.default.createDirectory(at: workspacesRoot, withIntermediateDirectories: true)
         let candidate = workspacesRoot.appendingPathComponent(botId, isDirectory: true)
         try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
@@ -35,6 +52,25 @@ public struct DatabaseBotWorkspaceSource: NativeEventWaitWorkspaceSource {
 
     private static func safeComponent(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 128 && value.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil
+    }
+}
+
+/// Admission for the production Mac graph, which has no engine drivers
+/// yet: every satisfied wait is held here, before any dispatch claim, as
+/// typed unclaimed work that `resumeCapabilityHeldWaits` can later
+/// resume.  The headless host can register production drivers because its
+/// bootstrap decodes a per-bot `NativeHostBotConfiguration` (including
+/// the engine executable) from each bot's stored JSON, resolves service
+/// credentials, and switches the bot to native ownership
+/// (`NativeHeadlessHost.registerBot`).  Mac listener bots carry Node
+/// `bots.json` records with none of that configuration, and the
+/// interactive app has no service credential source, so claiming a wait
+/// here could only fail inside driver dispatch.  Holding at admission is
+/// the honest state until the Mac composition supplies an execution
+/// context (and with it, registered drivers).
+private struct UnavailableMacExecutionContext: NativeExecutionContextSource {
+    func resolve(wait: NativeEventWait) async throws -> NativeExecutionAdmission {
+        .held(.credentialsUnavailable)
     }
 }
 
@@ -53,7 +89,10 @@ private struct NoOwnedProcessSource: NativeEventWaitProcessOwnershipSource {
 /// workspace source confined under the listener's data directory.
 /// Construction starts nothing: the server activates the runtime (and its
 /// polling) only from `startListening`, and `stopListening` stays
-/// socket-only, exactly as before this injection.
+/// socket-only, exactly as before this injection.  Unless the caller
+/// supplies an execution context, satisfied waits are admission-held
+/// unclaimed (see `UnavailableMacExecutionContext`): this graph serves
+/// and probes waits, but dispatches no turns.
 public struct NativeMacCompanionRuntime {
     public let runtime: NativeRuntimeServices
     /// The launcher engine drivers must use for their processes to be
@@ -65,7 +104,8 @@ public struct NativeMacCompanionRuntime {
         database: DatabaseService,
         workspacesRoot: URL,
         engineCoordinator: EngineCoordinatorActor? = nil,
-        engineSwitch: BotNativeEngineSwitchActor? = nil
+        engineSwitch: BotNativeEngineSwitchActor? = nil,
+        executionContext: (any NativeExecutionContextSource)? = nil
     ) {
         self.database = database
         let coordinator = engineCoordinator ?? EngineCoordinatorActor(
@@ -83,12 +123,15 @@ public struct NativeMacCompanionRuntime {
         self.ownedProcessLauncher = nil
         let processSource: any NativeEventWaitProcessOwnershipSource = NoOwnedProcessSource()
         #endif
+        let resolvedExecutionContext: any NativeExecutionContextSource =
+            executionContext ?? UnavailableMacExecutionContext()
         self.runtime = NativeRuntimeServices(
             database: database,
             engineCoordinator: coordinator,
             engineSwitch: engineSwitch,
             workspaceSource: DatabaseBotWorkspaceSource(database: database, workspacesRoot: workspacesRoot),
-            processOwnershipSource: processSource
+            processOwnershipSource: processSource,
+            executionContext: resolvedExecutionContext
         )
     }
 
