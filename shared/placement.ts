@@ -139,3 +139,22 @@ export interface ReportMessage extends PlacementMessage {
 export interface ReportReply extends ControllerEpoch { accepted: boolean; reason?: string }
 export interface TakeoverMessage extends PlacementMessage { reconcile: boolean }
 export interface ReleaseMessage extends PlacementMessage { toControllerId: HostId }
+export interface EnqueueMessage extends PlacementMessage {
+  jobId: string;
+  botId: string;
+  threadId: string;
+  command: string;
+  cwd: string;
+  timeoutMs: number;
+}
+export interface EnqueueReply extends ControllerEpoch {
+  accepted: boolean;
+  jobId: string;
+  status: string;
+  duplicate?: boolean;
+  reason?: string;
+}
+/** A worker giving back a lease it has not started yet.  Distinct from
+ *  `ReleaseMessage`, which hands the controller role itself over. */
+export interface LeaseReleaseMessage extends PlacementMessage { hostId: HostId; jobId: string; leaseId: string }
+export interface LeaseReleaseReply extends ControllerEpoch { accepted: boolean; jobId: string; reason?: string }

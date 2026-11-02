@@ -268,19 +268,25 @@ posix("caps", () => {
 });
 
 posix("admission", () => {
-  it("refuses on high swap, low disk, or a tripped spend ceiling — and never on load", () => {
+  it("queues on high swap or low disk, refuses on a tripped spend ceiling — and never on load", () => {
     const h = harness({ spawn: fakeSpawn().spawnFn });
+    // Memory and storage pressure queue in every mode (the pressure-gate
+    // queue, slice 8a); only the spend ceiling still refuses.
     h.host.swap = 99;
     const swap = start(h, "true");
-    expect(swap.ok).toBe(false);
-    if (!swap.ok) expect(swap.error).toContain("short on memory");
+    expect(swap.ok).toBe(true);
+    if (!swap.ok) throw new Error("expected pressure to queue, not refuse");
+    expect(swap.job.status).toBe("queued");
+    expect(swap.job.queuedReason).toContain("short on memory");
     h.host.swap = 94;
     expect(start(h, "true", "t2").ok).toBe(true);
     h.host.swap = null;
     h.host.disk = 100 * 1024 * 1024;
     const disk = start(h, "true", "t3");
-    expect(disk.ok).toBe(false);
-    if (!disk.ok) expect(disk.error).toContain("short on disk space");
+    expect(disk.ok).toBe(true);
+    if (!disk.ok) throw new Error("expected pressure to queue, not refuse");
+    expect(disk.job.status).toBe("queued");
+    expect(disk.job.queuedReason).toContain("short on disk space");
     h.host.disk = null;
     h.host.spend = true;
     const spend = start(h, "true", "t4");
@@ -983,7 +989,12 @@ describe("refusing before the ask", () => {
     for (let i = 0; i < 3; i++) start(h, `job ${i}`);
     expect(h.registry.refusal({ botId: "bot-a", threadId: "thread-a" })).toContain("3 jobs running");
     h.host.disk = 1024;
-    expect(h.registry.refusal({ botId: "bot-b", threadId: "thread-b" })).toContain("short on disk space");
+    // Pressure queues instead of refusing, so it never blocks the ask.
+    expect(h.registry.refusal({ botId: "bot-b", threadId: "thread-b" })).toBeNull();
+    const pressured = start(h, "queued by pressure", "thread-b", "bot-b");
+    if (!pressured.ok) throw new Error(pressured.error);
+    expect(pressured.job.status).toBe("queued");
+    expect(pressured.job.queuedReason).toContain("short on disk space");
     expect(harness({ platform: "win32" }).registry.refusal({ botId: "bot-a", threadId: "thread-a" })).toContain("not available on Windows");
   });
 });
