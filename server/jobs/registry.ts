@@ -114,7 +114,7 @@ export interface JobsConfigInput {
   cliLanes?: boolean;
   defaultMinutes?: number;
   maxMinutes?: number;
-  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number };
+  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number; reservedRamMb?: number; minMemoryAvailablePercent?: number };
   cpuCores?: number;
 }
 
@@ -137,6 +137,12 @@ export function resolveJobsSettings(input: JobsConfigInput | undefined): JobsSet
     minFreeDiskBytes: finite(disk) ? Math.max(0, disk) * 1024 * 1024 : DEFAULT_ADMISSION.minFreeDiskBytes,
   };
   if (finite(inodes)) admission.minFreeInodes = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(inodes)));
+  const reservedCpu = input?.admission?.reservedCpuCores;
+  if (finite(reservedCpu)) admission.reservedCpuCores = Math.min(64, Math.max(0, reservedCpu));
+  const reservedRam = input?.admission?.reservedRamMb;
+  if (finite(reservedRam)) admission.reservedRamMb = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(reservedRam)));
+  const minMemoryPercent = input?.admission?.minMemoryAvailablePercent;
+  if (finite(minMemoryPercent)) admission.minMemoryAvailablePercent = Math.min(100, Math.max(0, Math.floor(minMemoryPercent)));
   return {
     enabled: input?.enabled !== false,
     wake: input?.wake !== false,

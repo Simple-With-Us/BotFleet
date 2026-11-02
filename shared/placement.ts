@@ -78,6 +78,9 @@ export interface HostResourcesReport {
     maxSwapPercent: number;
     minFreeDiskBytes: number;
     minFreeInodes?: number;
+    reservedCpuCores?: number;
+    reservedRamMb?: number;
+    minMemoryAvailablePercent?: number;
     unknownReading: "admit";
   };
   enforcement: Record<HostResource, EnforcementState>;

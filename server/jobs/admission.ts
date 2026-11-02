@@ -26,6 +26,15 @@ export interface AdmissionThresholds {
   minFreeDiskBytes: number;
   /** Absent means no inode gate; inventory must precede a configured floor. */
   minFreeInodes?: number;
+  /** Absent means no CPU headroom gate.  When set, a job is refused when
+   *  the usable core count minus this reserve leaves less than one core. */
+  reservedCpuCores?: number;
+  /** Absent means no RAM headroom gate.  When set, a job is refused when
+   *  known available memory is below this many MiB. */
+  reservedRamMb?: number;
+  /** Absent means no memory-available gate.  When set, a job is refused
+   *  when known available memory is below this percent of total RAM. */
+  minMemoryAvailablePercent?: number;
 }
 
 export const DEFAULT_ADMISSION: AdmissionThresholds = {
@@ -41,6 +50,12 @@ export interface HostProbe {
   /** Bytes free to this user on the disk holding `path`, or null. */
   freeDiskBytes(path: string): number | null;
   freeInodes?(path: string): number | null;
+  /** MiB of memory available without swapping, or null when unknown. */
+  memoryAvailableMb?(): number | null;
+  /** Percent of total RAM available, or null when unknown. */
+  memoryAvailablePercent?(): number | null;
+  /** Usable (cgroup-aware) CPU cores, or null when unknown. */
+  usableCpuCores?(): number | null;
   storageState?(): StorageState | null;
   /** One bracketed device/statfs observation for an admission decision. */
   admissionStorageSample?(path: string): AdmissionStorageSample;
@@ -64,6 +79,35 @@ export function parseDarwinSwap(text: string): number | null {
   return (u / t) * 100;
 }
 
+/** Bytes available without swapping from macOS `vm_stat` output, or null
+ *  when the reading is missing or malformed.  Available is free plus the
+ *  reclaimable inactive, speculative and purgeable page counts, times the
+ *  reported page size: the same reclaimable set Activity Monitor treats as
+ *  available, never just the free list. */
+export function parseDarwinVmStatAvailableBytes(text: string): number | null {
+  const pageSize = Number(/page size of (\d+) bytes/.exec(text)?.[1] ?? NaN);
+  if (!Number.isFinite(pageSize) || pageSize <= 0) return null;
+  const pages = (label: string): number | null => {
+    const match = new RegExp(`^Pages ${label}:\\s+(\\d+)\\.?$`, "m").exec(text);
+    if (!match) return null;
+    const value = Number(match[1]);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  };
+  const free = pages("free");
+  const inactive = pages("inactive");
+  const speculative = pages("speculative");
+  if (free === null || inactive === null || speculative === null) return null;
+  const purgeable = pages("purgeable") ?? 0;
+  const bytes = (free + inactive + speculative + purgeable) * pageSize;
+  return Number.isFinite(bytes) && bytes >= 0 ? bytes : null;
+}
+
+/** Available memory as a percent of total, or null when either is unknown. */
+export function memoryAvailablePercentOf(availableBytes: number | null, totalBytes: number | null): number | null {
+  if (availableBytes === null || totalBytes === null || totalBytes <= 0 || availableBytes > totalBytes) return null;
+  return (availableBytes / totalBytes) * 100;
+}
+
 /** `/proc/meminfo` on Linux: `SwapTotal:  2097148 kB` / `SwapFree: …`. */
 export function parseLinuxSwap(text: string): number | null {
   const total = /^SwapTotal:\s+(\d+)/m.exec(text);
@@ -84,6 +128,8 @@ export interface HostProbeDeps {
   now?: () => number;
   /** `sysctl vm.swapusage`'s output, read without blocking. */
   readDarwinSwap?: () => Promise<string>;
+  /** `vm_stat`'s output on macOS, read without blocking. */
+  readDarwinVmStat?: () => Promise<string>;
   /** `/proc/meminfo`'s text. */
   readLinuxMeminfo?: () => string;
   readHostLoad?: () => HostLoad | null;
@@ -118,6 +164,11 @@ const sysctlSwap = (): Promise<string> =>
     execFile("/usr/sbin/sysctl", ["vm.swapusage"], { encoding: "utf8", timeout: 2_000 }, (error, stdout) => (error ? reject(error) : resolve(stdout)));
   });
 
+const vmStat = (): Promise<string> =>
+  new Promise((resolve, reject) => {
+    execFile("/usr/bin/vm_stat", [], { encoding: "utf8", timeout: 2_000 }, (error, stdout) => (error ? reject(error) : resolve(stdout)));
+  });
+
 /** The real host.  The probe answers from a reading at most a few seconds
  *  old and never waits for the next one: on macOS the swap figure comes from
  *  a `sysctl` run in the background, because a harness at load 100 or more
@@ -129,6 +180,7 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
   const platform = deps.platform ?? process.platform;
   const now = deps.now ?? Date.now;
   const readDarwinSwap = deps.readDarwinSwap ?? sysctlSwap;
+  const readDarwinVmStat = deps.readDarwinVmStat ?? vmStat;
   const readLinuxMeminfo = deps.readLinuxMeminfo ?? (() => readFileSync("/proc/meminfo", "utf8"));
   const diskStats = deps.statfs ?? statfsSync;
   const hostLoad = deps.readHostLoad ?? readHostLoad;
@@ -162,7 +214,36 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
         refreshing = false;
       });
   };
-  if (platform === "darwin") refreshDarwin();
+  let vmStatAt = Number.NEGATIVE_INFINITY;
+  let darwinAvailableBytes: number | null = null;
+  let vmRefreshing = false;
+  const refreshDarwinVmStat = () => {
+    if (vmRefreshing || platform !== "darwin") return;
+    vmRefreshing = true;
+    vmStatAt = now();
+    readDarwinVmStat()
+      .then(
+        (text) => { darwinAvailableBytes = parseDarwinVmStatAvailableBytes(text); },
+        () => { darwinAvailableBytes = null; },
+      )
+      .finally(() => { vmRefreshing = false; });
+  };
+  const refreshDarwinVmStatIfStale = () => {
+    if (platform === "darwin" && now() - vmStatAt >= SWAP_CACHE_MS) refreshDarwinVmStat();
+  };
+  if (platform === "darwin") { refreshDarwin(); refreshDarwinVmStat(); }
+  // Known available memory, validated the way `capacitySample` validates it:
+  // an over-total or unreadable figure is unknown, which admits.
+  const knownAvailableBytes = (): number | null => {
+    if (platform === "darwin") refreshDarwinVmStatIfStale();
+    else if (platform === "linux") probe.swapUsedPercent();
+    else return null;
+    const raw = platform === "darwin" ? darwinAvailableBytes : ramAvailableBytes;
+    if (raw === null) return null;
+    let total: number | null = null;
+    try { total = memoryTotal(); } catch { total = null; }
+    return total === null || total <= 0 || raw <= total ? raw : null;
+  };
   const readDataStorage = (path: string) => {
     const before = deps.storageState?.() ?? null;
     let stats: ReturnType<typeof diskStats> | null = null;
@@ -221,6 +302,21 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
         return Number(stats.files) > 0 ? nonnegative(Number(stats.ffree)) : null;
       } catch { return null; }
     },
+    memoryAvailableMb() {
+      const bytes = knownAvailableBytes();
+      return bytes === null ? null : bytes / (1024 * 1024);
+    },
+    memoryAvailablePercent() {
+      let total: number | null = null;
+      try { total = memoryTotal(); } catch { total = null; }
+      return memoryAvailablePercentOf(knownAvailableBytes(), total !== null && total > 0 ? total : null);
+    },
+    usableCpuCores() {
+      try {
+        const load = hostLoad();
+        return load && Number.isSafeInteger(load.cores) && load.cores > 0 ? load.cores : null;
+      } catch { return null; }
+    },
     capacitySample(path) {
       // The swap/cache read is shared with admission; there is no second sampler.
       probe.swapUsedPercent();
@@ -229,7 +325,9 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       const cores = load && Number.isSafeInteger(load.cores) && load.cores > 0 ? load.cores : null;
       const total = safe(memoryTotal);
       const ramTotalBytes = total !== null && total > 0 ? nonnegative(total) : null;
-      const available = ramAvailableBytes !== null && (ramTotalBytes === null || ramAvailableBytes <= ramTotalBytes) ? ramAvailableBytes : null;
+      if (platform === "darwin") refreshDarwinVmStatIfStale();
+      const rawAvailable = platform === "darwin" ? darwinAvailableBytes : ramAvailableBytes;
+      const available = rawAvailable !== null && (ramTotalBytes === null || rawAvailable <= ramTotalBytes) ? rawAvailable : null;
       const data = readDataStorage(path);
       const online = data.storage?.online !== false;
       const stats = data.stats;
@@ -240,7 +338,7 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       return {
         at: now(), cores, loadPerCore: loadPerCore(load),
         ramTotalBytes, ramAvailableBytes: available,
-        memoryAvailablePercent: ramTotalBytes && available !== null ? (available / ramTotalBytes) * 100 : null,
+        memoryAvailablePercent: memoryAvailablePercentOf(available, ramTotalBytes),
         memoryPressure: null, swapTotalBytes, swapUsedBytes,
         diskTotalBytes: usableDisk ? nonnegative(Number(stats.blocks) * Number(stats.bsize)) : null,
         diskFreeBytes,
@@ -283,6 +381,24 @@ export function admissionRefusal(
   if (thresholds.minFreeInodes !== undefined) {
     const inodes = storage ? storage.freeInodes : probe.freeInodes?.(dataDir) ?? null;
     if (inodes !== null && inodes < thresholds.minFreeInodes) return "This computer is short on inodes, so no new background job can start right now";
+  }
+  if (thresholds.minMemoryAvailablePercent !== undefined) {
+    const percent = probe.memoryAvailablePercent?.() ?? null;
+    if (percent !== null && percent < thresholds.minMemoryAvailablePercent) {
+      return `This computer is short on available memory (${Math.round(percent)}% available, below the ${thresholds.minMemoryAvailablePercent}% minimum), so no new background job can start right now.  Try again later, or tell the user.`;
+    }
+  }
+  if (thresholds.reservedRamMb !== undefined) {
+    const availableMb = probe.memoryAvailableMb?.() ?? null;
+    if (availableMb !== null && availableMb < thresholds.reservedRamMb) {
+      return `This computer is inside its reserved RAM headroom (${Math.round(availableMb)} MB available, ${thresholds.reservedRamMb} MB reserved), so no new background job can start right now.  Try again later, or tell the user.`;
+    }
+  }
+  if (thresholds.reservedCpuCores !== undefined) {
+    const cores = probe.usableCpuCores?.() ?? null;
+    if (cores !== null && cores - thresholds.reservedCpuCores < 1) {
+      return `This computer is inside its reserved CPU headroom (${cores} usable cores, ${thresholds.reservedCpuCores} reserved), so no new background job can start right now.  Try again later, or tell the user.`;
+    }
   }
   return null;
 }

@@ -66,6 +66,9 @@ BotFleet is a single-user local harness: the server binds loopback-only (`127.0.
 | `BOTFLEET_JOBS_MAX_SWAP_PERCENT` | jobs.admission.maxSwapPercent | float | 1–100 |
 | `BOTFLEET_JOBS_MIN_FREE_DISK_MB` | jobs.admission.minFreeDiskMb | float | ≥ 0 |
 | `BOTFLEET_JOBS_MIN_FREE_INODES` | jobs.admission.minFreeInodes | integer | ≥ 0; unset by default, measured inventory required before selecting a floor |
+| `BOTFLEET_JOBS_ADMISSION_RESERVED_CPU_CORES` | jobs.admission.reservedCpuCores | float | 0–64; unset by default |
+| `BOTFLEET_JOBS_ADMISSION_RESERVED_RAM_MB` | jobs.admission.reservedRamMb | int | ≥ 0; unset by default |
+| `BOTFLEET_JOBS_ADMISSION_MIN_MEMORY_AVAILABLE_PERCENT` | jobs.admission.minMemoryAvailablePercent | int | 0–100; unset by default |
 | `BOTFLEET_WEBHOOK_HOT_DEFER_MINUTES` | jobs.webhookHotDeferMinutes | int | 1–720 |
 | `BOTFLEET_TRACES_SAMPLE_RATE` | observability.tracesSampleRate | float | 0–1 |
 | `BOTFLEET_AI_TRACES_SAMPLE_RATE` | observability.aiTracesSampleRate | float | 0–1 |

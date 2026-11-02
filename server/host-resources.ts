@@ -114,7 +114,9 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
   }
   const observedLimits: Record<string, string | null> = Object.fromEntries(CGROUP_FILES.map((file) => [file, null]));
   const limitations = [
-    "Memory admission currently checks swap, not an aggregate RAM budget",
+    thresholds.reservedRamMb === undefined && thresholds.minMemoryAvailablePercent === undefined
+      ? "Memory admission currently checks swap, not an aggregate RAM budget"
+      : "Memory admission checks swap and the configured available-memory headroom; unknown readings admit",
     "Disk is an admission gate; no disk quota is observed",
     "Memory pressure is not sampled in this build",
   ];

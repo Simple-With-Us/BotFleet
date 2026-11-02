@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { denyReason } from "../companion/src/routes.ts";
-import { createHostProbe, type CapacityHostProbe } from "./jobs/admission.ts";
+import { createHostProbe, memoryAvailablePercentOf, parseDarwinVmStatAvailableBytes, type CapacityHostProbe } from "./jobs/admission.ts";
 import { createHostResourcesResponder, hostResourcesReport, hostResourcesResponse, ioDeviceForVolume, ownCgroupDirectory, type HostResourcesDeps } from "./host-resources.ts";
 
 const cgroupMount = "29 24 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw";
@@ -12,6 +12,7 @@ function probe(platform: NodeJS.Platform = "linux") {
     readHostLoad: () => ({ load1: 32, cores: 8 }), totalMemory: () => 16 * 1024 ** 3,
     statfs: () => disk, realPath: (path) => path, readMountinfo: () => "41 29 8:16 / /data rw - ext4 /dev/fixture rw\n29 1 8:1 / / rw - ext4 /dev/root rw",
     readDarwinSwap: async () => "total = 4096.00M used = 1024.00M free = 3072.00M",
+    readDarwinVmStat: async () => { throw new Error("fixture: no vm_stat reading"); },
   });
 }
 function deps(files: Record<string, string> = {}): HostResourcesDeps {
@@ -81,6 +82,36 @@ describe("host capacity probe", () => {
     expect(sample.memoryAvailablePercent).toBeNull();
     expect(sample.memoryPressure).toBeNull();
     expect(sample.swapUsedBytes).toBe(1024 ** 3);
+  });
+
+  it("derives macOS available memory and its percent from vm_stat pages", async () => {
+    const vmStat = [
+      "Mach Virtual Memory Statistics: (page size of 16384 bytes)",
+      "Pages free:                               100000.",
+      "Pages active:                             500000.",
+      "Pages inactive:                           140000.",
+      "Pages speculative:                         20000.",
+      "Pages purgeable:                            2144.",
+    ].join("\n");
+    // (100000 + 140000 + 20000 + 2144) pages * 16384 bytes = 4 GiB exactly.
+    expect(parseDarwinVmStatAvailableBytes(vmStat)).toBe(4 * 1024 ** 3);
+    expect(parseDarwinVmStatAvailableBytes("garbage")).toBeNull();
+    expect(memoryAvailablePercentOf(4 * 1024 ** 3, 16 * 1024 ** 3)).toBe(25);
+    expect(memoryAvailablePercentOf(null, 16 * 1024 ** 3)).toBeNull();
+    expect(memoryAvailablePercentOf(4 * 1024 ** 3, null)).toBeNull();
+    expect(memoryAvailablePercentOf(32 * 1024 ** 3, 16 * 1024 ** 3)).toBeNull();
+    const p = createHostProbe({
+      platform: "darwin", now: () => 1000,
+      readDarwinSwap: async () => "total = 4096.00M used = 1024.00M free = 3072.00M",
+      readDarwinVmStat: async () => vmStat,
+      readHostLoad: () => ({ load1: 8, cores: 8 }), totalMemory: () => 16 * 1024 ** 3,
+      statfs: () => disk, realPath: (path) => path, readMountinfo: () => "",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(p.memoryAvailableMb?.()).toBe(4096);
+    expect(p.memoryAvailablePercent?.()).toBe(25);
+    expect(p.usableCpuCores?.()).toBe(8);
+    expect(p.capacitySample("/data")).toMatchObject({ ramAvailableBytes: 4 * 1024 ** 3, memoryAvailablePercent: 25 });
   });
 
   it("resolves data-directory aliases and keeps unsupported inode statistics unknown", () => {
