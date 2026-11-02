@@ -160,15 +160,23 @@ if (invokedDirectly) {
   let forcedBuild = "";
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    const take = () => {
+    // A flag where a value belongs is a typo, not a value.  Consuming it would
+    // shift every later option and plan the wrong repository or the wrong
+    // commit without an error, so it fails fast instead.
+    const take = (flag) => {
       index += 1;
-      return args[index] ?? "";
+      const value = args[index] ?? "";
+      if (value === "" || value.startsWith("--")) {
+        console.error(`missing value for ${flag}`);
+        process.exit(2);
+      }
+      return value;
     };
-    if (arg === "--repo-root") repoRoot = take();
-    else if (arg === "--app") appKey = take();
-    else if (arg === "--sha") sha = take();
-    else if (arg === "--version") forcedVersion = take();
-    else if (arg === "--build") forcedBuild = take();
+    if (arg === "--repo-root") repoRoot = take("--repo-root");
+    else if (arg === "--app") appKey = take("--app");
+    else if (arg === "--sha") sha = take("--sha");
+    else if (arg === "--version") forcedVersion = take("--version");
+    else if (arg === "--build") forcedBuild = take("--build");
     else {
       console.error(`unknown argument: ${arg}`);
       process.exit(2);

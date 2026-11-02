@@ -126,6 +126,20 @@ test("the CLI refuses an unknown argument instead of guessing", () => {
   );
 });
 
+test("the CLI refuses a flag where a value belongs", () => {
+  // "--repo-root --sha HEAD" used to consume the flag as the value and plan
+  // the wrong repository without an error, so a missing value fails fast.
+  assert.throws(
+    () =>
+      execFileSync(
+        process.execPath,
+        [path.join(repoRoot, "scripts", "electron-release-version.mjs"), "--repo-root", "--sha", "HEAD"],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      ),
+    /missing value for --repo-root/,
+  );
+});
+
 test("the resolver imports nothing the release plan job does not have", () => {
   // The plan job runs in a workflow that never installs dependencies
   // (release.yml's prepare job has no install step), so an import of a
