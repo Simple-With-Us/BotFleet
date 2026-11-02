@@ -12487,7 +12487,13 @@ async function runGracefulStop(context: string, options: {
     // transcripts and run at that boot.
     parkHeldWork: (interrupted) => {
       const unsaved = persistHeldWork(context, interrupted);
-      return unsaved.sends.length === 0 && unsaved.queued.length === 0 && unsaved.rooms.length === 0;
+      if (unsaved.sends.length === 0 && unsaved.queued.length === 0 && unsaved.rooms.length === 0) return true;
+      // The queues were drained before the write, so the work that could not
+      // be saved is neither on disk nor in memory.  Put it back where it came
+      // from before the stop refuses, or the refusal itself is what loses the
+      // messages.  The update drain restores it the same way.
+      returnUnsavedWork(unsaved, context);
+      return false;
     },
     deadlineMs: GRACEFUL_STOP_DEADLINE_MS,
     pollMs: GRACEFUL_STOP_POLL_MS,
@@ -15280,6 +15286,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // The work could not be preserved, and it is still in memory, so the
           // server stays up rather than losing it.
           lowerTheFence();
+          // The work the park could not save is back in the queues, and the
+          // fence is down, so it runs:  a stop that refuses has to leave the
+          // server doing what it was doing.
+          drainQueuedSends();
           return json(res, 409, { ok: false, error: report.refusal, report });
         }
         const stopping = await requestHarnessShutdown({
@@ -15457,6 +15467,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           if (!report.ok) {
             // The work could not be preserved, so the server stays up.
             reservation.release();
+            // The work the park could not save is back in the queues, and the
+            // fence is down, so it runs:  a stop that refuses has to leave the
+            // server doing what it was doing.
+            drainQueuedSends();
             return json(res, 409, { ok: false, error: report.refusal, report });
           }
           let stopping;

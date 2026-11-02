@@ -92,6 +92,16 @@ describe("gracefulStop", () => {
     expect(report.refusal).toMatch(/could not be saved/);
   });
 
+  it("does not claim a bot was stopped when the stop was refused", async () => {
+    // The server stays up when the stop is refused, so the bots that were
+    // still working are still working.  Saying they were stopped would be a
+    // lie, and this report is what the owner reads.
+    const { deps } = fixture({ busy: [{ id: "a", name: "Nightowl" }], park: false });
+    const report = await gracefulStop(deps);
+    expect(report.interrupted).toEqual([]);
+    expect(report.leftRunning).toEqual(["1 bot turn"]);
+  });
+
   it("waits for the work in flight to settle and reports nothing left running", async () => {
     const { deps, state } = fixture({
       active: 2,

@@ -67,3 +67,23 @@ describe("the legacy shutdown route", () => {
     expect(shutdownBranch).toMatch(/if \(!report\.ok\) \{[\s\S]{0,200}lowerTheFence\(\)/);
   });
 });
+
+describe("the park", () => {
+  it("puts the work back when it cannot be saved", () => {
+    // The queues are drained before the carrier is written, so the work that
+    // could not be saved is neither on disk nor in memory.  Without putting
+    // it back, the refusal itself is what loses the owner's messages.
+    const start = SERVER_SOURCE.indexOf("parkHeldWork: (interrupted)");
+    expect(start).toBeGreaterThan(-1);
+    const park = SERVER_SOURCE.slice(start, start + 900);
+    expect(park).toContain("returnUnsavedWork(unsaved, context)");
+    expect(park).toMatch(/returnUnsavedWork\(unsaved, context\);[\s\S]{0,80}return false;/);
+  });
+
+  it("runs the restored work when the stop refuses", () => {
+    // The fence comes back down with the refusal, so the restored work runs
+    // instead of waiting for whatever else triggers a drain.
+    expect(shutdownBranch).toMatch(/if \(!report\.ok\) \{[\s\S]{0,900}drainQueuedSends\(\)/);
+    expect(controlStopBranch).toMatch(/if \(!report\.ok\) \{[\s\S]{0,900}drainQueuedSends\(\)/);
+  });
+});

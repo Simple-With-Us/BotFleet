@@ -184,8 +184,14 @@ async function settleTheBots(options: GracefulStopOptions): Promise<GracefulStop
     return {
       ok: false,
       finished,
-      interrupted,
-      leftRunning: [],
+      // Nothing was stopped:  the server stays up, so the bots that were
+      // still working are still working.  Saying they were stopped would be a
+      // lie, and this report is what the owner reads.
+      interrupted: [],
+      // They are named as what is still running instead.
+      leftRunning: stillWorking.length
+        ? [`${stillWorking.length} bot turn${stillWorking.length === 1 ? "" : "s"}`]
+        : [],
       refusal: "the messages waiting behind the stopped bots could not be saved, so the server stays up rather than losing them",
     };
   }

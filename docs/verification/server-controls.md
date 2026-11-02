@@ -26,6 +26,8 @@ The graceful stop's fixture injects the clock, the wait, the bot roster, the in-
 
 `server/graceful-shutdown-e2e.test.ts` drives the route itself:  it boots one real harness on a throwaway home with a provider fixture that holds its answer open, waits until the bot's turn is in flight, and then asks the server to stop.  It reads the time from the harness's own log, so it measures the stop rather than the request, and it asserts that the stop ends well inside the ten second window and that the report does not name the stop's own control lock as work left running.  The same fixture on the pre-fix head took 10,008 ms and reported "still running: 1 Local VM change";  on the fixed tree it takes about 2,076 ms.
 
+The second scenario in that file is the refusal path:  it puts a directory where the carrier file belongs, so the write that carries the queued messages across the restart fails, and it asks the server to stop anyway.  The stop has to refuse, the server has to stay up and keep serving, and the message that was waiting behind the bot has to run afterwards, which the provider's request count proves:  twice with the work put back, once without it.  With the restore removed the fixture fails on that count, which is how the loss was proven rather than assumed.
+
 The build runs Swift tests, builds both arm64 and x86_64 slices, checks the generated plist and verifies the app signature.  The existing Mac packaging gate runs for changes under `mac-control/` and packages the controller alongside the main app.
 
 ## Install And Open
