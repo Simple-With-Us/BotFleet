@@ -9,13 +9,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const directory = dirname(fileURLToPath(import.meta.url));
 const START_SH = join(directory, "start.sh");
+const TOKEN_HELPER = join(directory, "read-harness-token.mjs");
+const REAL_NODE = process.execPath;
 
 // Fake tokens, built at runtime so no token-shaped literal is in the source.
 const FILE_TOKEN = `st.test-file-${crypto.randomBytes(8).toString("hex")}`;
@@ -27,6 +29,7 @@ const ENV_TOKEN = `st.test-env-${crypto.randomBytes(12).toString("hex")}`;
 const FAKE_NODE = `#!/bin/sh
 for arg in "$@"; do
   case "$arg" in
+    *read-harness-token.mjs) exec "${REAL_NODE}" "$@" ;;
     *check-storage.mjs) exit 0 ;;
   esac
 done
@@ -190,5 +193,60 @@ test("strips one trailing newline and CR from the token file", posixOnly, () => 
     assert.equal(run.status, 0);
     assert.equal(run.stderr, "");
     assert.match(run.log, new RegExp(`^token_len=${FILE_TOKEN.length}$`, "m"));
+  });
+});
+
+test("trims leading and trailing whitespace and treats whitespace-only as empty", posixOnly, () => {
+  withFixture((fx) => {
+    writeFileSync(fx.tokenFile, ` \t ${FILE_TOKEN} \t\r\n`, { mode: 0o600 });
+    const run = runStart(fx, freshEnv());
+    assert.equal(run.status, 0);
+    assert.equal(run.stderr, "");
+    assert.match(run.log, new RegExp(`^token_len=${FILE_TOKEN.length}$`, "m"));
+    assert.ok(!run.log.includes(FILE_TOKEN));
+  });
+  withFixture((fx) => {
+    writeFileSync(fx.tokenFile, " \t\r\n  \n", { mode: 0o600 });
+    const run = runStart(fx, freshEnv());
+    assert.equal(run.status, 0);
+    assert.equal(run.stderr.trim().split("\n").length, 1);
+    assert.ok(run.stderr.includes(fx.tokenFile));
+    assert.match(run.stderr, /ignoring.*empty/);
+    assert.match(run.log, /^token_state=unset-or-empty$/m);
+  });
+});
+
+test("refuses a hard-linked token file and starts without it", posixOnly, () => {
+  withFixture((fx) => {
+    writeFileSync(fx.tokenFile, FILE_TOKEN, { mode: 0o600 });
+    linkSync(fx.tokenFile, join(fx.rr, "config", "token-hardlink"));
+    const run = runStart(fx, freshEnv());
+    assert.equal(run.status, 0);
+    assert.equal(run.stderr.trim().split("\n").length, 1);
+    assert.ok(run.stderr.includes(fx.tokenFile));
+    assert.match(run.stderr, /hard link/);
+    assert.match(run.log, /^token_state=unset-or-empty$/m);
+    assert.ok(!run.stderr.includes(FILE_TOKEN));
+    assert.ok(!run.log.includes(FILE_TOKEN));
+  });
+});
+
+test("the token helper reads only through a verified handle", posixOnly, () => {
+  withFixture((fx) => {
+    writeFileSync(join(fx.rr, "config", "real-token"), FILE_TOKEN, { mode: 0o600 });
+    symlinkSync(join(fx.rr, "config", "real-token"), fx.tokenFile);
+    const refused = spawnSync(REAL_NODE, ["--no-warnings", TOKEN_HELPER, fx.tokenFile], { encoding: "utf8" });
+    assert.notEqual(refused.status, 0);
+    assert.equal(refused.stdout, "");
+    assert.match(refused.stderr, /symlink/);
+    assert.ok(!refused.stderr.includes(FILE_TOKEN));
+    assert.ok(!refused.stdout.includes(FILE_TOKEN));
+  });
+  withFixture((fx) => {
+    writeFileSync(fx.tokenFile, ` \t${FILE_TOKEN}\r\n`, { mode: 0o600 });
+    const read = spawnSync(REAL_NODE, ["--no-warnings", TOKEN_HELPER, fx.tokenFile], { encoding: "utf8" });
+    assert.equal(read.status, 0, read.stderr);
+    assert.equal(read.stdout, FILE_TOKEN);
+    assert.equal(read.stderr, "");
   });
 });

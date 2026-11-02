@@ -61,22 +61,35 @@ if [ -z "${INFISICAL_TOKEN:-}" ]; then
         esac
       fi
     fi
+    harness_token_helper=""
+    harness_token_dir="$(dirname "$0")"
+    if [ -f "$harness_token_dir/read-harness-token.mjs" ]; then
+      harness_token_helper="$harness_token_dir/read-harness-token.mjs"
+    elif [ -f "$runtime_root/bin/read-harness-token.mjs" ]; then
+      harness_token_helper="$runtime_root/bin/read-harness-token.mjs"
+    fi
+    unset harness_token_dir
     if [ -n "$harness_token_reason" ]; then
       echo "start.sh: not using $harness_token_file: $harness_token_reason" >&2
-    elif harness_token="$(cat "$harness_token_file" 2>/dev/null)"; then
-      harness_token_cr="$(printf '\r')"
-      harness_token="${harness_token%"$harness_token_cr"}"
+    elif [ -z "$harness_token_helper" ]; then
+      echo "start.sh: not using $harness_token_file: it cannot be read" >&2
+    elif harness_token="$("$node_bin" --no-warnings "$harness_token_helper" "$harness_token_file" 2>&1)"; then
       if [ -z "$harness_token" ]; then
         echo "start.sh: ignoring $harness_token_file: it is empty" >&2
       else
         INFISICAL_TOKEN="$harness_token"
         export INFISICAL_TOKEN
       fi
-      unset harness_token harness_token_cr
+      unset harness_token
     else
-      echo "start.sh: not using $harness_token_file: it cannot be read" >&2
+      harness_token_reason="$harness_token"
+      unset harness_token
+      if [ -z "$harness_token_reason" ]; then
+        harness_token_reason="it cannot be read"
+      fi
+      echo "start.sh: not using $harness_token_file: $harness_token_reason" >&2
     fi
-    unset harness_token_file harness_token_reason harness_token_owner harness_token_mode
+    unset harness_token_file harness_token_reason harness_token_owner harness_token_mode harness_token_helper
   fi
 fi
 exec "$node_bin" "--max-old-space-size=$heap" --experimental-strip-types "$code_root/server/index.ts" --require-data-volume >>"$runtime_root/logs/server.log" 2>&1

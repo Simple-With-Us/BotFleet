@@ -719,6 +719,56 @@ describe("credentials and identity", () => {
     expect(warns()).toHaveLength(1);
   });
 
+  it("warns again for a distinct status, after a successful load, and after a settings change", async () => {
+    settings.credentialDir = undefined;
+    settings.credentialSource = "infisical";
+    let vaultStatus: number | null = 403;
+    const hub = makeHub({
+      vault: async () => {
+        if (vaultStatus !== null) {
+          throw Object.assign(new Error(`Infisical secrets list failed: HTTP ${vaultStatus}`), { statusCode: vaultStatus });
+        }
+        return new Map([
+          ["ZULIP_BF_PLUMBER_EMAIL", "bf-plumber-bot@zulip.test"],
+          ["ZULIP_BF_PLUMBER_API_KEY", "plumber-test-key"],
+          ["ZULIP_BF_PLUMBER_SITE", fake.url],
+        ]);
+      },
+    });
+    const warns = () => logs.filter((line) => line.includes("Zulip credentials unavailable"));
+    const disabledLogs = () => logs.filter((line) => line.includes(": disabled")).length;
+    await waitFor(() => botStatus(hub, "bot-plumber")?.state === "disabled", "plumber disabled on 403");
+    expect(warns()).toEqual([
+      "[zulip] infisical /zulip unreadable with the configured token (403); Zulip credentials unavailable",
+    ]);
+    hub.reconcile();
+    await waitFor(() => disabledLogs() === 2, "one 403 retry");
+    await settle(300);
+    expect(warns()).toHaveLength(1);
+    vaultStatus = 404;
+    hub.reconcile();
+    await waitFor(() => warns().length === 2, "404 warns as a distinct outage");
+    expect(warns()[1]).toBe(
+      "[zulip] infisical /zulip unreadable with the configured token (404); Zulip credentials unavailable",
+    );
+    vaultStatus = null;
+    hub.reconcile();
+    await connected(hub);
+    vaultStatus = 403;
+    await hub.stop();
+    hub.start();
+    await waitFor(() => warns().length === 3, "403 warns again after a successful load");
+    expect(warns()[2]).toBe(
+      "[zulip] infisical /zulip unreadable with the configured token (403); Zulip credentials unavailable",
+    );
+    settings.postChannels = ["builds-renamed"];
+    hub.reconcile();
+    await waitFor(() => warns().length === 4, "403 warns again after a settings change");
+    expect(warns()[3]).toBe(
+      "[zulip] infisical /zulip unreadable with the configured token (403); Zulip credentials unavailable",
+    );
+  });
+
   it("warns once per folder and role when the vault folder holds none of the role's names", async () => {
     settings.credentialDir = undefined;
     settings.credentialSource = "infisical";

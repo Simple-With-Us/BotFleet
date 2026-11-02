@@ -227,7 +227,7 @@ render_unit() {
 }
 
 say "installing the systemd units"
-for helper in start.sh check-storage.mjs; do
+for helper in start.sh check-storage.mjs read-harness-token.mjs; do
   run install -m 0755 -o "$BF_USER" -g "$BF_GROUP" "$SCRIPT_DIR/$helper" "$BF_ROOT/bin/$helper"
 done
 export BF_VOLUME BF_ROOT BF_CODE BF_USER BF_GROUP
