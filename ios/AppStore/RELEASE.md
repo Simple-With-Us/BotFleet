@@ -12,7 +12,7 @@ The app is native Swift and uses XcodeGen; EAS commands do not apply.
 
 ## Hosted TestFlight (primary)
 
-Merges that touch `ios/**` (or the ship scripts) run `.github/workflows/ios-ship.yml` on GitHub-hosted `macos-latest`.  The job maps existing `APPLE_API_*` and `IOS_CERT_*` repository secrets, installs or creates the App Store profiles named in `ios/appstore-profiles.json`, then calls `scripts/ios-ship-testflight.sh` with `IOS_MANUAL_SIGN=1`.  Marketing and build both come from the repo's commit count (`1.0.<commit_count>` and `<commit_count>`), so the pair always describes one number.  Do not mint a new API key.
+Merges that touch `ios/**` (or the ship scripts) run `.github/workflows/ios-ship.yml` on GitHub-hosted `macos-latest`.  The job maps existing `APPLE_API_*` and `IOS_CERT_*` repository secrets, installs or creates the App Store profiles named in `ios/appstore-profiles.json`, then calls `scripts/ios-ship-testflight.sh` with `IOS_MANUAL_SIGN=1`.  The marketing version is the fixed `0.1.0` the bundle carries, and the build number is the commit's Central merge-to-main timestamp (`YYYYMMDDHHMM`), planned once by the shared planner so the iOS and Mac builds of one commit carry the same pair.  Do not mint a new API key.
 
 ### App Group on App Store profiles
 
