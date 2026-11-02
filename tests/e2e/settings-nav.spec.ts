@@ -53,6 +53,7 @@ for (const skin of ['studio', 'midnight'] as const) {
         'Usage',
         'Observability',
         'Secrets',
+        'Resources',
       ]);
       for (const tab of tabs) {
         expect(tab.weight, `${tab.text} font weight`).toBeGreaterThanOrEqual(600);
