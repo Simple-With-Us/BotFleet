@@ -165,10 +165,14 @@ public actor NativeHeadlessHost {
         self.engineSwitch = engineSwitch; self.runtime = runtime
     }
 
+    /// `turnTools` defaults to the local production stack (bounded MCP HTTP
+    /// client plus the loopback mount provider); MCP routes stay omitted for
+    /// every bot until routes are configured on that actor.
     public static func start(
         serviceData: URL,
         credentials: any NativeServiceCredentialSource = UnavailableNativeServiceCredentials(),
-        pollIntervalSeconds: TimeInterval? = 1
+        pollIntervalSeconds: TimeInterval? = 1,
+        turnTools: NativeTurnToolsActor? = nil
     ) async throws -> NativeHeadlessHost {
         let paths = try NativeServicePaths(serviceData: serviceData)
         let lease = try NativeHostOwnerLease(paths: paths)
@@ -181,7 +185,8 @@ public actor NativeHeadlessHost {
             let processes = NativeHostProcessLedger(supervisor: supervisor, database: database)
             let context = NativeHostExecutionContext(paths: paths, credentials: credentials)
             let coordinator = EngineCoordinatorActor(dispatcher: TurnDispatcherActor(database: database,
-                maxRetriesPerEngine: 0, requiresDurablePersistence: true))
+                maxRetriesPerEngine: 0, requiresDurablePersistence: true),
+                turnTools: turnTools ?? .localProduction())
             let engineSwitch = BotNativeEngineSwitchActor(database: database)
             let runtime = NativeRuntimeServices(database: database, engineCoordinator: coordinator,
                 engineSwitch: engineSwitch, workspaceSource: context, processOwnershipSource: processes,
