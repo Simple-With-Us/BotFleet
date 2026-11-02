@@ -294,10 +294,7 @@ export function checkInRoutineFinish(
   try {
     sdk.captureCheckIn(checkIn);
   } catch {
-    /* check-in reporting must never take down a run */
-    unhook?.();
-    onSettled?.(false);
-    return;
+    /* check-in reporting must never take down a run; fall through so deliverCheckInClose retries */
   }
   const delivery = deliverCheckInClose(sdk, checkIn, run.id, onSettled, { state: initialAttemptState, unhook });
   pendingCheckInCloses.add(delivery);

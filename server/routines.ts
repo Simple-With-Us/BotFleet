@@ -2008,6 +2008,7 @@ export class RoutineManager {
       run.pendingClose = canonical.pendingClose;
     }
     this.save();
+    this.flushNow();
     this.options.checkInFinish?.(canonical, checkInId, ok, (delivered) => {
       this.onCheckInSettled(canonical.id, delivered);
     });
