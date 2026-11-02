@@ -65,12 +65,12 @@ describe("CloudBackendPicker", () => {
     // and greyed because this engine cannot take it there.
     const html = markup({ ...base, vpsSupported: false, value: "vps", inherited: true });
     expect(litSegment(html)).toBe("vps");
-    expect(html).toContain("Self-hosted VPS requires Claude or a coding bot");
+    expect(html).toContain("Self-hosted VPS requires Claude or an ACP engine");
   });
 
   it("still disables VPS when the engine cannot drive one", () => {
     const html = markup({ ...base, vpsSupported: false, value: "box", inherited: true });
-    expect(html).toContain("Self-hosted VPS requires Claude or a coding bot");
+    expect(html).toContain("Self-hosted VPS requires Claude or an ACP engine");
     expect(html).toContain("disabled");
   });
 });

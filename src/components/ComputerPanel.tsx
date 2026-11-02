@@ -275,7 +275,7 @@ export function ComputerPanel({
     }
     if (previewSource === "vm") {
       if (!vmSupported) {
-        setError("This bot cannot use the Local VM.\u00A0 Choose Claude or a coding bot.");
+        setError("This bot cannot use the Local VM.\u00A0 Choose Claude or an ACP engine.");
         setPhase("vm-unavailable");
         return;
       }
@@ -327,7 +327,7 @@ export function ComputerPanel({
       };
     }
     if (previewSource === "cloud" && !cloudSupported) {
-      setError("This bot cannot use cloud computer tools.\u00A0 Choose Claude, a coding bot, or ASCII.dev Box.");
+      setError("This bot cannot use cloud computer tools.\u00A0 Choose Claude, an ACP engine, or ASCII.dev Box.");
       setPhase("error");
       return;
     }
@@ -345,7 +345,7 @@ export function ComputerPanel({
       if (!vpsSupported) {
         if (autoLocal) setPhase("local");
         else {
-          setError("This bot cannot use a self-hosted VPS.\u00A0 Choose Claude or a coding bot, or switch the cloud backend to Box.");
+          setError("This bot cannot use a self-hosted VPS.\u00A0 Choose Claude or an ACP engine, or switch the cloud backend to Box.");
           setPhase("error");
         }
         return;
