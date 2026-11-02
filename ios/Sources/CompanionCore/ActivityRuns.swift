@@ -119,22 +119,30 @@ public func transcriptRowEndsRun(
     at index: Int,
     in items: [TranscriptItem],
     liveReply: Bool,
-    liveSpeaker: String?
+    liveSpeaker: String?,
+    liveAt: Date? = nil
 ) -> Bool {
+    guard let this = items[index].messages.last,
+          isGroupableProse(this)
+    else {
+        return true
+    }
     guard index + 1 < items.count else {
-        guard liveReply, case let .message(this) = items[index],
-              this.role == .bot, this.kind == .text
-        else { return true }
+        guard liveReply, this.role == .bot else { return true }
+        if let liveAt, liveAt.timeIntervalSince(this.date) > groupMessageTimeGap {
+            return true
+        }
         return this.from?.name != liveSpeaker
     }
-    guard case let .message(this) = items[index],
-          case let .message(next) = items[index + 1] else {
+    guard let next = items[index + 1].messages.first,
+          isGroupableProse(next)
+    else {
         return true
     }
     if this.role != next.role { return true }
     if this.from?.name != next.from?.name { return true }
-    // a card or a tool chip between two texts breaks the run visually
-    return next.kind != .text
+    if !messagesShareGroup(this, next) { return true }
+    return false
 }
 
 /// Describes a folded activity run with tool breakdown and failure count.
