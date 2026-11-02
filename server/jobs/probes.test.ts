@@ -3,7 +3,7 @@
 // keep nothing else it reads.
 import { describe, expect, it } from "vitest";
 
-import { admissionRefusal, createHostProbe, parseDarwinSwap, parseLinuxSwap } from "./admission.ts";
+import { admissionRefusal, createHostProbe, parseDarwinMemoryAvailablePercent, parseDarwinSwap, parseLinuxSwap } from "./admission.ts";
 import { parseEnvListing, parseProcStatPgid } from "./sweep.ts";
 
 describe("swap readings", () => {
@@ -21,6 +21,75 @@ describe("swap readings", () => {
   it("admits when a reading is unknown", () => {
     const probe = { swapUsedPercent: () => null, freeDiskBytes: () => null };
     expect(admissionRefusal(probe, { maxSwapPercent: 98, minFreeDiskBytes: 1 }, "/", false)).toBeNull();
+  });
+});
+
+describe("headroom admission (P-BF-6 B7)", () => {
+  const base = { swapUsedPercent: () => 10, freeDiskBytes: () => 10 * 1024 ** 3 };
+  const thresholds = { maxSwapPercent: 98, minFreeDiskBytes: 1 };
+
+  it("is unchanged when no headroom knob is set — readings are never consulted", () => {
+    let consulted = 0;
+    const probe = {
+      ...base,
+      headroomReadings: () => { consulted += 1; return { availableCpuCores: 0, ramAvailableBytes: 0, memoryAvailablePercent: 0 }; },
+    };
+    expect(admissionRefusal(probe, thresholds, "/", false)).toBeNull();
+    expect(consulted).toBe(0);
+  });
+
+  it("refuses on a positively-read breach of each set threshold", () => {
+    const probe = { ...base, headroomReadings: () => ({ availableCpuCores: 0.5, ramAvailableBytes: 512 * 1024 ** 2, memoryAvailablePercent: 4 }) };
+    expect(admissionRefusal(probe, { ...thresholds, reservedCpuCores: 1 }, "/", false)).toContain("CPU headroom");
+    expect(admissionRefusal(probe, { ...thresholds, reservedRamBytes: 1024 ** 3 }, "/", false)).toContain("short on memory");
+    expect(admissionRefusal(probe, { ...thresholds, minMemoryAvailablePercent: 10 }, "/", false)).toContain("4% available");
+  });
+
+  it("admits when readings clear the set thresholds, and when readings are unknown", () => {
+    const all = { ...thresholds, reservedCpuCores: 1, reservedRamBytes: 1024 ** 3, minMemoryAvailablePercent: 10 };
+    const clear = { ...base, headroomReadings: () => ({ availableCpuCores: 4, ramAvailableBytes: 8 * 1024 ** 3, memoryAvailablePercent: 50 }) };
+    expect(admissionRefusal(clear, all, "/", false)).toBeNull();
+    const unknown = { ...base, headroomReadings: () => ({ availableCpuCores: null, ramAvailableBytes: null, memoryAvailablePercent: null }) };
+    expect(admissionRefusal(unknown, all, "/", false)).toBeNull();
+    // a probe with no headroom method at all also admits (fail-open)
+    expect(admissionRefusal(base, all, "/", false)).toBeNull();
+  });
+
+  it("reads macOS memory_pressure's free percentage", () => {
+    expect(parseDarwinMemoryAvailablePercent("Stats: \nSystem-wide memory free percentage: 42%\n")).toBe(42);
+    expect(parseDarwinMemoryAvailablePercent("no figure here")).toBeNull();
+  });
+
+  it("runs the Mac memory-pressure probe only while a knob enables it", async () => {
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    let reads = 0;
+    const deps = {
+      platform: "darwin" as const,
+      readDarwinSwap: () => Promise.resolve("vm.swapusage: total = 1000.00M  used = 100.00M  free = 900.00M  (encrypted)"),
+      readDarwinMemoryPressure: () => { reads += 1; return Promise.resolve("System-wide memory free percentage: 42%"); },
+      totalMemory: () => 16 * 1024 ** 3,
+      readHostLoad: () => ({ load1: 2, cores: 8 }),
+      statfs: () => ({ bsize: 4096, blocks: 1000, bavail: 500, files: 100, ffree: 50 }),
+    };
+    const off = createHostProbe({ ...deps, memoryHeadroomEnabled: () => false });
+    const offSample = off.capacitySample("/");
+    await settle();
+    expect(offSample.memoryAvailablePercent).toBeNull();
+    expect(offSample.ramAvailableBytes).toBeNull();
+    expect(reads).toBe(0);
+
+    const on = createHostProbe({ ...deps, memoryHeadroomEnabled: () => true });
+    on.capacitySample("/"); // first ask starts the background read
+    await settle();
+    const sample = on.capacitySample("/");
+    expect(reads).toBe(1);
+    expect(sample.memoryAvailablePercent).toBeCloseTo(42, 0);
+    expect(sample.ramAvailableBytes).toBe(Math.round(0.42 * 16 * 1024 ** 3));
+    expect(on.headroomReadings!()).toEqual({
+      availableCpuCores: 6,
+      ramAvailableBytes: Math.round(0.42 * 16 * 1024 ** 3),
+      memoryAvailablePercent: 42,
+    });
   });
 });
 

@@ -1,6 +1,7 @@
 // Whether the host can take one more background job right now (jobs P1).
 //
-// Three gates, and only three.  A job is refused when swap is nearly full,
+// Three gates by default, plus owner-set headroom gates (P-BF-6 B7) that
+// exist only when their knob is set.  A job is refused when swap is nearly full,
 // when the data folder's disk is nearly full, or when the rolling spend
 // ceiling has tripped (a job's wake turns are unattended spend).  There is
 // deliberately NO load-average gate: on the owner's Mac load ran 76–173 in
@@ -26,6 +27,17 @@ export interface AdmissionThresholds {
   minFreeDiskBytes: number;
   /** Absent means no inode gate; inventory must precede a configured floor. */
   minFreeInodes?: number;
+  /** Headroom (P-BF-6 B7): absent means no gate.  There is deliberately no
+   *  default for any of these — the numbers are the owner's to choose, and
+   *  an unset knob leaves admission exactly as it was.  `reservedCpuCores`
+   *  refuses when fewer cores than this are idle by load average; it exists
+   *  only when set, so the no-load-gate ruling above still holds by
+   *  default. */
+  reservedCpuCores?: number;
+  /** Refuse when available RAM is below this many bytes.  Absent: no gate. */
+  reservedRamBytes?: number;
+  /** Refuse when available memory is below this percent of total RAM. */
+  minMemoryAvailablePercent?: number;
 }
 
 export const DEFAULT_ADMISSION: AdmissionThresholds = {
@@ -44,6 +56,17 @@ export interface HostProbe {
   storageState?(): StorageState | null;
   /** One bracketed device/statfs observation for an admission decision. */
   admissionStorageSample?(path: string): AdmissionStorageSample;
+  /** Headroom readings, consulted only when a headroom threshold is set. */
+  headroomReadings?(): HeadroomReadings;
+}
+
+/** Null fields are unknown readings, which admit (fail-open, as everywhere
+ *  else in admission). */
+export interface HeadroomReadings {
+  /** Cores idle by 1-minute load average (`cores − load1`, floored at 0). */
+  availableCpuCores: number | null;
+  ramAvailableBytes: number | null;
+  memoryAvailablePercent: number | null;
 }
 
 interface AdmissionStorageSample {
@@ -62,6 +85,17 @@ export function parseDarwinSwap(text: string): number | null {
   const u = Number(used[1]);
   if (!Number.isFinite(t) || !Number.isFinite(u) || t <= 0) return null;
   return (u / t) * 100;
+}
+
+/** macOS `memory_pressure` ends with
+ *  `System-wide memory free percentage: 42%` — the share of RAM the kernel
+ *  counts as available (free + inactive + purgeable, the same figure
+ *  `kern.memorystatus_level` reports). */
+export function parseDarwinMemoryAvailablePercent(text: string): number | null {
+  const match = /System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%/.exec(text);
+  if (!match) return null;
+  const percent = Number(match[1]);
+  return Number.isFinite(percent) && percent >= 0 && percent <= 100 ? percent : null;
 }
 
 /** `/proc/meminfo` on Linux: `SwapTotal:  2097148 kB` / `SwapFree: …`. */
@@ -84,6 +118,13 @@ export interface HostProbeDeps {
   now?: () => number;
   /** `sysctl vm.swapusage`'s output, read without blocking. */
   readDarwinSwap?: () => Promise<string>;
+  /** macOS `memory_pressure`'s output, read without blocking. */
+  readDarwinMemoryPressure?: () => Promise<string>;
+  /** Whether a memory-headroom knob is set right now.  The Mac
+   *  memory-pressure probe runs ONLY when this answers true: with no knob
+   *  set there is no extra subprocess and the capacity sample keeps its
+   *  previous null memory readings.  Absent means never. */
+  memoryHeadroomEnabled?: () => boolean;
   /** `/proc/meminfo`'s text. */
   readLinuxMeminfo?: () => string;
   readHostLoad?: () => HostLoad | null;
@@ -118,6 +159,11 @@ const sysctlSwap = (): Promise<string> =>
     execFile("/usr/sbin/sysctl", ["vm.swapusage"], { encoding: "utf8", timeout: 2_000 }, (error, stdout) => (error ? reject(error) : resolve(stdout)));
   });
 
+const darwinMemoryPressure = (): Promise<string> =>
+  new Promise((resolve, reject) => {
+    execFile("/usr/bin/memory_pressure", [], { encoding: "utf8", timeout: 2_000 }, (error, stdout) => (error ? reject(error) : resolve(stdout)));
+  });
+
 /** The real host.  The probe answers from a reading at most a few seconds
  *  old and never waits for the next one: on macOS the swap figure comes from
  *  a `sysctl` run in the background, because a harness at load 100 or more
@@ -129,6 +175,10 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
   const platform = deps.platform ?? process.platform;
   const now = deps.now ?? Date.now;
   const readDarwinSwap = deps.readDarwinSwap ?? sysctlSwap;
+  const readDarwinMemoryPressure = deps.readDarwinMemoryPressure ?? darwinMemoryPressure;
+  const memoryHeadroomOn = () => {
+    try { return deps.memoryHeadroomEnabled?.() === true; } catch { return false; }
+  };
   const readLinuxMeminfo = deps.readLinuxMeminfo ?? (() => readFileSync("/proc/meminfo", "utf8"));
   const diskStats = deps.statfs ?? statfsSync;
   const hostLoad = deps.readHostLoad ?? readHostLoad;
@@ -161,6 +211,29 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       .finally(() => {
         refreshing = false;
       });
+  };
+  // Mac available-memory percent, from `memory_pressure`.  Cached and
+  // background-refreshed exactly like swap, but only ever read while a
+  // memory-headroom knob is set (`memoryHeadroomOn`) — unset knobs mean no
+  // subprocess and null readings, as before.
+  let memPercentAt = Number.NEGATIVE_INFINITY;
+  let memPercent: number | null = null;
+  let memRefreshing = false;
+  const refreshDarwinMemory = () => {
+    if (memRefreshing || platform !== "darwin" || !memoryHeadroomOn()) return;
+    memRefreshing = true;
+    memPercentAt = now();
+    readDarwinMemoryPressure()
+      .then(
+        (text) => { memPercent = parseDarwinMemoryAvailablePercent(text); },
+        () => { memPercent = null; },
+      )
+      .finally(() => { memRefreshing = false; });
+  };
+  const darwinMemoryPercent = (): number | null => {
+    if (platform !== "darwin" || !memoryHeadroomOn()) return null;
+    if (now() - memPercentAt >= SWAP_CACHE_MS) refreshDarwinMemory();
+    return memPercent;
   };
   if (platform === "darwin") refreshDarwin();
   const readDataStorage = (path: string) => {
@@ -221,6 +294,24 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
         return Number(stats.files) > 0 ? nonnegative(Number(stats.ffree)) : null;
       } catch { return null; }
     },
+    headroomReadings() {
+      // Shares the swap/cache refresh, which on Linux also lands
+      // MemAvailable; on a Mac the percent comes from the gated
+      // memory-pressure probe above.
+      probe.swapUsedPercent();
+      const safe = <T>(read: () => T): T | null => { try { return read(); } catch { return null; } };
+      const load = safe(hostLoad);
+      const availableCpuCores = load && Number.isFinite(load.load1) && load.load1 >= 0 && Number.isFinite(load.cores) && load.cores > 0
+        ? Math.max(0, load.cores - load.load1) : null;
+      const total = safe(memoryTotal);
+      const ramTotalBytes = total !== null && total > 0 ? nonnegative(total) : null;
+      const percent = platform === "darwin" ? darwinMemoryPercent()
+        : ramTotalBytes && ramAvailableBytes !== null ? (ramAvailableBytes / ramTotalBytes) * 100 : null;
+      const bytes = platform === "darwin"
+        ? percent !== null && ramTotalBytes !== null ? Math.round((percent / 100) * ramTotalBytes) : null
+        : ramAvailableBytes;
+      return { availableCpuCores, ramAvailableBytes: bytes, memoryAvailablePercent: percent };
+    },
     capacitySample(path) {
       // The swap/cache read is shared with admission; there is no second sampler.
       probe.swapUsedPercent();
@@ -229,7 +320,11 @@ export function createHostProbe(deps: HostProbeDeps = {}): CapacityHostProbe {
       const cores = load && Number.isSafeInteger(load.cores) && load.cores > 0 ? load.cores : null;
       const total = safe(memoryTotal);
       const ramTotalBytes = total !== null && total > 0 ? nonnegative(total) : null;
-      const available = ramAvailableBytes !== null && (ramTotalBytes === null || ramAvailableBytes <= ramTotalBytes) ? ramAvailableBytes : null;
+      // On a Mac the available figure exists only while a memory-headroom
+      // knob is set (the gated probe); otherwise both stay null, as before.
+      const darwinPercent = platform === "darwin" ? darwinMemoryPercent() : null;
+      const darwinAvailable = darwinPercent !== null && ramTotalBytes !== null ? Math.round((darwinPercent / 100) * ramTotalBytes) : null;
+      const available = darwinAvailable ?? (ramAvailableBytes !== null && (ramTotalBytes === null || ramAvailableBytes <= ramTotalBytes) ? ramAvailableBytes : null);
       const data = readDataStorage(path);
       const online = data.storage?.online !== false;
       const stats = data.stats;
@@ -283,6 +378,22 @@ export function admissionRefusal(
   if (thresholds.minFreeInodes !== undefined) {
     const inodes = storage ? storage.freeInodes : probe.freeInodes?.(dataDir) ?? null;
     if (inodes !== null && inodes < thresholds.minFreeInodes) return "This computer is short on inodes, so no new background job can start right now";
+  }
+  // Headroom gates (P-BF-6 B7): consulted only when the owner set the knob,
+  // and each refuses only on a positively-read breach — an unknown reading
+  // admits, exactly like swap and disk above.
+  const { reservedCpuCores, reservedRamBytes, minMemoryAvailablePercent } = thresholds;
+  if (reservedCpuCores !== undefined || reservedRamBytes !== undefined || minMemoryAvailablePercent !== undefined) {
+    const headroom = probe.headroomReadings?.() ?? null;
+    if (reservedCpuCores !== undefined && headroom?.availableCpuCores !== null && headroom?.availableCpuCores !== undefined && headroom.availableCpuCores < reservedCpuCores) {
+      return "This computer is busy (less CPU headroom than the reserved cores), so no new background job can start right now.  Try again later, or tell the user.";
+    }
+    if (reservedRamBytes !== undefined && headroom?.ramAvailableBytes !== null && headroom?.ramAvailableBytes !== undefined && headroom.ramAvailableBytes < reservedRamBytes) {
+      return `This computer is short on memory (${formatGb(headroom.ramAvailableBytes)} available, below the reserved headroom), so no new background job can start right now.  Try again later, or tell the user.`;
+    }
+    if (minMemoryAvailablePercent !== undefined && headroom?.memoryAvailablePercent !== null && headroom?.memoryAvailablePercent !== undefined && headroom.memoryAvailablePercent < minMemoryAvailablePercent) {
+      return `This computer is short on memory (${Math.round(headroom.memoryAvailablePercent)}% available), so no new background job can start right now.  Try again later, or tell the user.`;
+    }
   }
   return null;
 }
