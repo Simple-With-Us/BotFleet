@@ -36,10 +36,10 @@ export function parseAppcast(text) {
   return { items };
 }
 
-export function verifyNativeRelease(directory, version, { requireSignature = false } = {}) {
+export function verifyNativeRelease(directory, version, { requireSignature = false, build } = {}) {
   const rootDir = resolve(directory);
   const { zip, dmg } = nativeArtifactNames(version);
-  const build = buildNumberFor(version);
+  const buildNumber = buildNumberFor(version, build);
 
   for (const name of [zip, dmg, NATIVE_FEED_NAME]) {
     if (!existsSync(join(rootDir, name))) {
@@ -66,9 +66,9 @@ export function verifyNativeRelease(directory, version, { requireSignature = fal
   const { items } = parseAppcast(readFileSync(join(rootDir, NATIVE_FEED_NAME), "utf8"));
   if (items.length === 0) throw new Error(`${NATIVE_FEED_NAME}: no items`);
   const [head, ...older] = items;
-  if (head.shortVersion !== version || head.build !== build) {
+  if (head.shortVersion !== version || head.build !== buildNumber) {
     throw new Error(
-      `${NATIVE_FEED_NAME}: head item is ${head.shortVersion}/${head.build}, release is ${version}/${build}`,
+      `${NATIVE_FEED_NAME}: head item is ${head.shortVersion}/${head.build}, release is ${version}/${buildNumber}`,
     );
   }
   for (let i = 1; i < items.length; i += 1) {
@@ -97,7 +97,7 @@ export function verifyNativeRelease(directory, version, { requireSignature = fal
     );
   }
   console.log(
-    `native release ${version} (build ${build}): DMG, ZIP and appcast agree` +
+    `native release ${version} (build ${buildNumber}): DMG, ZIP and appcast agree` +
       (head.edSignature ? " (EdDSA-signed)" : " (unsigned draft)"),
   );
   return { zip, dmg, signed: Boolean(head.edSignature) };
@@ -118,10 +118,13 @@ if (isEntryModule()) {
   const [, , directory, version, ...rest] = process.argv;
   if (!directory || !version) {
     throw new Error(
-      "usage: node scripts/verify-native-release.mjs <directory> <version> [--require-signature]",
+      "usage: node scripts/verify-native-release.mjs <directory> <version> [--require-signature] [--build N]",
     );
   }
+  const buildIndex = rest.indexOf("--build");
+  const build = buildIndex === -1 ? undefined : rest[buildIndex + 1];
   verifyNativeRelease(directory, version, {
     requireSignature: rest.includes("--require-signature"),
+    build,
   });
 }

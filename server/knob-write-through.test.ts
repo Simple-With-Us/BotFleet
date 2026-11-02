@@ -182,6 +182,6 @@ describe("writeThroughKnobs", () => {
     // deliberately: the count is here so that adding or dropping a knob is
     // a decision someone reads rather than an edit that slips through --
     // it is what caught nineteen rows disappearing at once.
-    expect(KNOB_FIELDS.length).toBe(29);
+    expect(KNOB_FIELDS.length).toBe(32);
   });
 });

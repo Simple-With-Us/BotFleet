@@ -123,18 +123,19 @@ actor NativeHostExecutionContext: NativeExecutionContextSource, NativeEventWaitW
 }
 
 /// The launch ledger contains only sessions this host launched, and never infers ownership from a PID probe.
-actor NativeHostProcessLedger: EngineProcessLauncher, NativeEventWaitProcessOwnershipSource {
+/// Public so the Mac app composition can reuse the same owned-process source as the headless host.
+public actor NativeHostProcessLedger: EngineProcessLauncher, NativeEventWaitProcessOwnershipSource {
     private let supervisor: ProcessSupervisorActor
     private let database: DatabaseService
     private struct Record { let botId: String; let startTime: Double; var finished: Bool }
     private var records: [Int32: Record] = [:]
     private var stopped = false
 
-    init(supervisor: ProcessSupervisorActor, database: DatabaseService) {
+    public init(supervisor: ProcessSupervisorActor, database: DatabaseService) {
         self.supervisor = supervisor; self.database = database
     }
 
-    func launch(spec: EngineSpawnSpec, threadId: String, engineId: String) async throws -> EngineProcessSession {
+    public func launch(spec: EngineSpawnSpec, threadId: String, engineId: String) async throws -> EngineProcessSession {
         guard !stopped, let thread = try await database.loadThread(id: threadId), let botId = thread.botId else {
             throw NativeRuntimeServicesError.stopped
         }
@@ -152,12 +153,12 @@ actor NativeHostProcessLedger: EngineProcessLauncher, NativeEventWaitProcessOwne
         return session
     }
 
-    func hasFinishedProcess(pid: Int32, startTime: Double, ownedByBotId botId: String) async -> Bool {
+    public func hasFinishedProcess(pid: Int32, startTime: Double, ownedByBotId botId: String) async -> Bool {
         guard let record = records[pid] else { return false }
         return record.botId == botId && record.startTime == startTime && record.finished
     }
 
-    func stop() { stopped = true }
+    public func stop() { stopped = true }
     private func markFinished(pid: Int32, identity: Double) {
         guard records[pid]?.startTime == identity else { return }
         records[pid]?.finished = true

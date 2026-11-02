@@ -156,19 +156,30 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                 persistOnExit: localPersist
             )
         }
-        // The native listener binds loopback until network exposure has its
-        // own acceptance (durable device credentials, Origin rejection and
-        // the pairing contract, all BF-2511), so it advertises nothing yet: a
-        // Bonjour entry the phone could not connect to would only mislead it.
-        // When that acceptance lands, the LAN opt-in and the advertisement
-        // below turn on together.
-        let listenerOptions = NativeCompanionServer.ListenerOptions()
+        // BF-2511's acceptance has landed: durable device credentials
+        // (digest-only `devices.json`, revocation, the fleet cap), Origin
+        // rejection on every device route, and the pairing contract now
+        // stand between a network peer and this listener.  So the LAN
+        // opt-in and the Bonjour advertisement turn on together here —
+        // and only together: both read the one explicit opt-in
+        // (`OMB_COMPANION_ALLOW_CLEARTEXT_LAN`, as the Node sidecar reads
+        // it), and with nothing configured the listener still binds
+        // loopback and advertises nothing a phone could not connect to.
+        // The listener itself also stays off until it is turned on.
+        let lanPolicy = CompanionLANPolicy.read()
+        let listenerOptions = NativeCompanionServer.ListenerOptions(
+            allowCleartextLAN: lanPolicy.allowCleartextLAN
+        )
         let advertisement = listenerOptions.allowCleartextLAN
             ? CompanionListenerController.defaultAdvertisement(computerName: Host.current().localizedName)
             : nil
         let storeURL = policyStore.dataDir
             .appendingPathComponent("native", isDirectory: true)
             .appendingPathComponent("companion.sqlite")
+        // The paired fleet's durable home, beside the listener's store:
+        // digests only, so a paired phone survives an app restart.
+        let deviceStoreURL = storeURL.deletingLastPathComponent()
+            .appendingPathComponent("devices.json")
         let backend = NativeCompanionListenerBackend(port: 0, options: listenerOptions) {
             // A store of the listener's own, under the Mac's data directory,
             // created only when the listener is first turned on.  Where the
@@ -179,7 +190,14 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                 withIntermediateDirectories: true
             )
             let database = try DatabaseService(path: storeURL.path)
-            return NativeCompanionServer(database: database)
+            // Inject the native runtime so the wait routes serve instead of
+            // answering 503, with workspaces confined beside the store.  The
+            // server retains the runtime (and through it the graph's actors);
+            // the listener stays default-off and stop stays socket-only.
+            let workspacesRoot = storeURL.deletingLastPathComponent()
+                .appendingPathComponent("workspaces", isDirectory: true)
+            let macRuntime = NativeMacCompanionRuntime(database: database, workspacesRoot: workspacesRoot)
+            return NativeCompanionServer(database: database, deviceStoreURL: deviceStoreURL, nativeRuntime: macRuntime.runtime)
         }
         self.companionListener = CompanionListenerController(
             backend: backend,

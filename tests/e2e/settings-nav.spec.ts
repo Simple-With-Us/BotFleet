@@ -53,6 +53,7 @@ for (const skin of ['studio', 'midnight'] as const) {
         'Usage',
         'Observability',
         'Secrets',
+        'Resources',
       ]);
       for (const tab of tabs) {
         expect(tab.weight, `${tab.text} font weight`).toBeGreaterThanOrEqual(600);
@@ -69,6 +70,69 @@ for (const skin of ['studio', 'midnight'] as const) {
       await expect(dialog.getByRole('button', { name: 'Remote', exact: true })).toHaveAttribute('aria-current', 'page');
       await expect(dialog.getByText('Remote Access', { exact: true })).toBeVisible();
       await expect(dialog.getByRole('button', { name: 'Phone', exact: true })).toBeVisible();
+    });
+
+    test('Resources tab renders a stubbed host report with read-only headroom knobs', async ({ page }) => {
+      const dialog = await openSettings(page, skin);
+      // The E2E preview server has no /api/* backend, so stub the one route
+      // this tab reads (composer-draft.spec.ts stubs **/api/** the same way).
+      const GB = 1024 ** 3;
+      await page.route('**/api/host/resources', (route) =>
+        route.fulfill({
+          contentType: 'application/json',
+          body: JSON.stringify({
+            hostId: 'mac:e2e-stub',
+            version: '1.2.3',
+            platform: 'darwin',
+            capabilities: ['shell', 'macos'],
+            sample: {
+              at: Date.UTC(2026, 9, 29, 19, 14, 0),
+              cores: 10,
+              loadPerCore: 2.41,
+              ramTotalBytes: 32 * GB,
+              ramAvailableBytes: 20 * GB,
+              memoryPressure: null,
+              memoryAvailablePercent: 63,
+              swapTotalBytes: 4 * GB,
+              swapUsedBytes: 3 * GB,
+              diskTotalBytes: 100 * GB,
+              diskFreeBytes: 60 * GB,
+              inodesTotal: 6_000_000,
+              inodesFree: 5_000_000,
+              dataVolume: null,
+              rootDiskFreeBytes: 10 * GB,
+              storage: { online: true, dataDevice: '8:16', rootDevice: '8:1' },
+            },
+            storage: { online: true, dataDevice: '8:16', rootDevice: '8:1' },
+            admission: { maxSwapPercent: 98, minFreeDiskBytes: 2 * GB, unknownReading: 'admit' },
+            enforcement: {
+              cpu: { kind: 'priorityOnly' },
+              memory: { kind: 'gateOnly' },
+              swap: { kind: 'gateOnly' },
+              disk: { kind: 'gateOnly' },
+              inodes: { kind: 'unsupported', reason: 'No inode admission gate is active' },
+              io: { kind: 'unsupported', reason: 'No I/O rate enforcement observed' },
+            },
+            observedLimits: {},
+            limitations: ['Disk is an admission gate; no disk quota is observed'],
+          }),
+        }),
+      );
+      await dialog.getByRole('button', { name: 'Resources', exact: true }).click();
+      await expect(dialog.getByRole('button', { name: 'Resources', exact: true })).toHaveAttribute(
+        'aria-current',
+        'page',
+      );
+      await expect(dialog.getByRole('table', { name: 'Host resource readings' })).toBeVisible();
+      await expect(dialog.getByText('Admission thresholds', { exact: true })).toBeVisible();
+      await expect(dialog.getByText('Owner-set headroom', { exact: true })).toBeVisible();
+      // Unset headroom knobs stay read-only with a Not set placeholder.
+      const reservedCpu = dialog.getByLabel('Reserved CPU cores (set by the owner)');
+      await expect(reservedCpu).toBeDisabled();
+      await expect(reservedCpu).toHaveAttribute('placeholder', 'Not set');
+      // Refresh keeps the report on screen instead of flashing a skeleton.
+      await dialog.getByRole('button', { name: 'Refresh host resources' }).click();
+      await expect(dialog.getByRole('table', { name: 'Host resource readings' })).toBeVisible();
     });
 
     test('there is more room under Search, and the field is lighter than before', async ({ page }) => {

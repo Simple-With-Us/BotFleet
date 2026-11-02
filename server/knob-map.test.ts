@@ -30,6 +30,29 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("headroom knobs (P-BF-6 B7)", () => {
+  const ids = ["jobs.admission.reservedCpuCores", "jobs.admission.reservedRamMb", "jobs.admission.minMemoryAvailablePercent"];
+  it("are unset when neither file nor vault holds them — no default is invented", () => {
+    const cfg: AppConfig = {};
+    const rows = resolveKnobFields(cfg, new Map());
+    for (const id of ids) {
+      expect(rows.find((row) => row.id === id)).toMatchObject({ source: "none", hasValue: false });
+      expect(readKnobField(cfg, spec(id))).toBeUndefined();
+    }
+    expect(cfg.jobs?.admission).toBeUndefined();
+  });
+  it("land on the config when the vault sets them", () => {
+    const cfg: AppConfig = {};
+    const rows = resolveKnobFields(cfg, new Map([
+      ["BOTFLEET_JOBS_RESERVED_CPU_CORES", "2"],
+      ["BOTFLEET_JOBS_RESERVED_RAM_MB", "4096"],
+      ["BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT", "15"],
+    ]));
+    expect(cfg.jobs?.admission).toEqual({ reservedCpuCores: 2, reservedRamMb: 4096, minMemoryAvailablePercent: 15 });
+    for (const id of ids) expect(rows.find((row) => row.id === id)).toMatchObject({ source: "infisical", hasValue: true });
+  });
+});
+
 describe("the knob table", () => {
   it("has unique ids, paths and Infisical names", () => {
     const ids = KNOB_FIELDS.map((entry) => entry.id);

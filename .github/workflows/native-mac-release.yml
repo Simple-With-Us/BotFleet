@@ -53,26 +53,50 @@ jobs:
   prepare:
     name: Pin the release commit
     runs-on: ubuntu-26.04
-    timeout-minutes: 5
+    # The shared planner reads the App Store Connect inventory, so this job
+    # waits on a network read, not on the clock it used to need.
+    timeout-minutes: 10
     outputs:
       sha: ${{ steps.pin.outputs.sha }}
       version: ${{ steps.pin.outputs.version }}
+      build: ${{ steps.pin.outputs.build }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
-          # fetch-depth: 0 is REQUIRED: the version is 1.0.<commit_count>,
-          # and a depth-1 clone counts 1.  The stamp script refuses shallow.
+          # fetch-depth: 0 is REQUIRED: the merge stamp is the committer
+          # date of the commit being released, and a depth-1 clone cannot
+          # prove which commit that is.
           fetch-depth: 0
           persist-credentials: false
+      # The shared planner consults App Store Connect, so it authenticates
+      # the same way the iOS plan-build job does (BF-2588).
+      - name: Load the App Store Connect credentials
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+          required: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
       - id: pin
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          # The stamp script exits 1 on a shallow clone or a git error, and
-          # `echo "$(...)"` would return echo's status and publish an EMPTY
-          # version, which then fails much later with an unrelated error.
-          version="$(node scripts/stamp-commit-version.mjs .)" || exit 1
+          # The shared planner answers the fixed marketing version 0.1.0
+          # and the commit's Central merge stamp as the build, which is the
+          # same number the iOS ship plans for this commit.  It exits 1
+          # when it cannot plan, and `echo "$(...)"` would return echo's
+          # status and publish an EMPTY version, which then fails much
+          # later with an unrelated error.
+          plan="$(node scripts/mac-release-version.mjs --repo-root . --sha "$(git rev-parse HEAD)")" || exit 1
+          version="$(printf '%s\n' "$plan" | sed -n 's/^version=//p')"
+          build="$(printf '%s\n' "$plan" | sed -n 's/^build=//p')"
+          if [ -z "$version" ] || [ -z "$build" ]; then
+            echo "::error::the shared planner returned no version and build"
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
       - name: Refuse to overwrite a published release
         if: ${{ inputs.draft }}
         env:
@@ -82,7 +106,7 @@ jobs:
           # inside the job that produces an output, needs is still empty,
           # which is how the release.yml guard silently never fired before
           # PR #1315 fixed it there.
-          v="v${{ steps.pin.outputs.version }}${NATIVE_TAG_SUFFIX}"
+          v="v${{ steps.pin.outputs.version }}-${{ steps.pin.outputs.build }}${NATIVE_TAG_SUFFIX}"
           if gh release view "$v" --repo "$RELEASES_REPO" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
             echo "::error::$v is already published on $RELEASES_REPO; refusing to add native assets to it"
             exit 1
@@ -153,10 +177,11 @@ jobs:
       - name: Archive BotFleetMac
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD: ${{ needs.prepare.outputs.build }}
           SENTRY_DSN: ${{ env.SENTRY_DSN }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.sha }}
         run: |
-          build="${VERSION##*.}"
+          build="$BUILD"
           if [ -n "${SENTRY_DSN:-}" ]; then
             echo "::add-mask::$SENTRY_DSN"
           else
@@ -234,6 +259,7 @@ jobs:
       - name: Package the final ZIP and DMG from the stapled app
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD: ${{ needs.prepare.outputs.build }}
           APPLE_API_KEY_P8_BASE64: ${{ env.APPLE_API_KEY_P8_BASE64 }}
           APPLE_API_KEY_ID: ${{ env.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ env.APPLE_API_ISSUER_ID }}
@@ -272,6 +298,7 @@ jobs:
       - name: Generate and verify the appcast over the final bytes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD: ${{ needs.prepare.outputs.build }}
           SPARKLE_EDDSA_PRIVATE_KEY_B64: ${{ env.SPARKLE_EDDSA_PRIVATE_KEY_B64 }}
         run: |
           zip="native-upload/BotFleetMac-$VERSION.zip"
@@ -300,12 +327,12 @@ jobs:
           else
             echo "::warning::no Sparkle EdDSA signing (key unprovisioned); appcast is an unsigned draft"
           fi
-          node scripts/native-appcast.mjs native-upload "$VERSION" "v$VERSION${NATIVE_TAG_SUFFIX}"
+          node scripts/native-appcast.mjs native-upload "$VERSION" "v${VERSION}-${BUILD}${NATIVE_TAG_SUFFIX}" --build "$BUILD"
           if [ -f "$zip.edsig" ]; then
-            node scripts/verify-native-release.mjs native-upload "$VERSION" --require-signature
+            node scripts/verify-native-release.mjs native-upload "$VERSION" --build "$BUILD" --require-signature
             rm "$zip.edsig"
           else
-            node scripts/verify-native-release.mjs native-upload "$VERSION"
+            node scripts/verify-native-release.mjs native-upload "$VERSION" --build "$BUILD"
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -331,7 +358,8 @@ jobs:
       - name: Verify the appcast against the actual bytes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: node scripts/verify-native-release.mjs assets "$VERSION"
+          BUILD: ${{ needs.prepare.outputs.build }}
+        run: node scripts/verify-native-release.mjs assets "$VERSION" --build "$BUILD"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: botfleet-native-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.sha }}
@@ -360,10 +388,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD: ${{ needs.prepare.outputs.build }}
           SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           cd assets
-          tag="v$VERSION${NATIVE_TAG_SUFFIX}"
+          tag="v${VERSION}-${BUILD}${NATIVE_TAG_SUFFIX}"
           if existing=$(gh api "repos/$RELEASES_REPO/releases/tags/$tag" 2>/dev/null); then
             is_draft=$(jq -r .draft <<< "$existing")
             if [ "$is_draft" != true ]; then
@@ -372,7 +401,7 @@ jobs:
             fi
           else
             gh release create "$tag" --repo "$RELEASES_REPO" \
-              --draft --target "$SHA" --title "BotFleet $VERSION (native)" \
+              --draft --target "$SHA" --title "BotFleet $VERSION ($BUILD, native)" \
               --notes "Draft assembled by the native release workflow. Edit these notes, then publish."
           fi
           # Native names never collide with the Electron set, so --clobber

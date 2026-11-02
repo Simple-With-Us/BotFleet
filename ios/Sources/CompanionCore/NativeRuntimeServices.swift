@@ -113,6 +113,17 @@ public actor NativeRuntimeServices {
         }
     }
 
+    /// Cancels the polling task without the terminal `shutdown()`: the
+    /// runtime stays activated, so a later `activate` restarts polling.
+    /// Listener stop uses this — socket stop must not leave waits polling,
+    /// and must not make a later listener start fail as stopped.
+    public func deactivatePolling() async {
+        let polling = pollingTask
+        polling?.cancel()
+        pollingTask = nil
+        await polling?.value
+    }
+
     public func tick() async throws -> [String] {
         guard !isStopped else { throw NativeRuntimeServicesError.stopped }
         guard isActivated else { throw NativeRuntimeServicesError.inactive }

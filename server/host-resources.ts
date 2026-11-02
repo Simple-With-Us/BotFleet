@@ -113,10 +113,15 @@ export function hostResourcesReport(deps: HostResourcesDeps): HostResourcesRepor
     if (thresholds.minFreeInodes !== undefined) enforcement.inodes = { kind: "notApplied", reason: "Server storage offline; new jobs are refused", restartRequired: false };
   }
   const observedLimits: Record<string, string | null> = Object.fromEntries(CGROUP_FILES.map((file) => [file, null]));
+  const memoryHeadroomSet = thresholds.reservedRamBytes !== undefined || thresholds.minMemoryAvailablePercent !== undefined;
   const limitations = [
-    "Memory admission currently checks swap, not an aggregate RAM budget",
+    memoryHeadroomSet
+      ? "Memory admission checks swap plus the owner-set available-memory headroom; it is a gate, not a per-job RAM budget"
+      : "Memory admission currently checks swap, not an aggregate RAM budget",
     "Disk is an admission gate; no disk quota is observed",
-    "Memory pressure is not sampled in this build",
+    ...(sample.memoryAvailablePercent === null
+      ? ["Available memory is sampled only while a memory-headroom knob is set; memory pressure level is not sampled"]
+      : ["Memory pressure level is not sampled; available-memory percent is"]),
   ];
   if (deps.platform === "linux") {
     const cgroup = safeRead("/proc/self/cgroup");
