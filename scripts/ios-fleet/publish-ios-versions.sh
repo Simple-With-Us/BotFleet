@@ -277,7 +277,7 @@ fi
 ICON_MODE="${FLEET_ICON_AUDIT:-block}"
 ICON_SCRIPT="${FLEET_ICON_AUDIT_SCRIPT:-${FLEET_DIR}/fleet-icon-audit.mjs}"
 case "$ICON_MODE" in
-  off) ;;
+  off) echo "icon-audit: skipped (FLEET_ICON_AUDIT=off)" >&2 ;;
   block|warn)
     if node "$ICON_SCRIPT" --no-lanes >&2; then
       echo "icon-audit: clean"

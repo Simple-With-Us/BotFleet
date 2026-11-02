@@ -217,6 +217,21 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(prepare, /echo "\$IOS_CERT_P12/);
 });
 
+test("ios-ship.yml skips the unvendored icon audit only on the hosted ship step", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const shipStep = yml.slice(
+    yml.indexOf("name: Ship BotFleet to TestFlight"),
+    yml.indexOf("name: Sync standing TestFlight testers")
+  );
+  assert.ok(shipStep.length > 0, "the Ship BotFleet to TestFlight step is present");
+  assert.match(shipStep, /FLEET_ICON_AUDIT:\s*"off"/);
+  assert.match(shipStep, /Mac-side fleet tool/);
+  assert.match(shipStep, /not vendored/);
+  assert.match(shipStep, /hosted ship cannot run it/);
+  assert.match(shipStep, /default block gate/);
+  assert.equal((yml.match(/FLEET_ICON_AUDIT:/g) || []).length, 1);
+});
+
 test("wrapper --plan-build-only keeps stdout clean for the plan-build capture", () => {
   // Git bash on windows-latest may exist while /usr/bin/python3 does not.
   if (process.platform === "win32") return;
