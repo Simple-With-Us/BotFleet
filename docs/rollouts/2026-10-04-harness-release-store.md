@@ -4,7 +4,7 @@ repo: BotFleet | [MM] Claim: board `f1482275` (Recommendation 2, harness half), 
 `minimax/harness-release-store`, PR #858, issue #891, board f1482275, seat MINIMAX, Mac.
 
 **Coordination exception (historical, not retroactive compliance):** the first commits on this
-lane landed before a `repo: BotFleet`-first `#agent-sync` post.  The board row was live first;
+lane landed before a `repo: BotFleet`-first `#Work-In-Progress` post.  The board row was live first;
 the Slack claim and this rollout header were written during review, and that ordering is stated
 here rather than rewritten as if it had been compliant from minute zero.
 

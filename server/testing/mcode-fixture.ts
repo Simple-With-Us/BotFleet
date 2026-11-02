@@ -265,7 +265,7 @@ export async function writeMcodeFixture(input: {
   return { dataDir, home };
 }
 
-/** The environment that hands `agent-sync mcp` a seat's bot credentials,
+/** The environment that hands `simple-chat mcp` a seat's bot credentials,
  *  pointing at a fake realm:  `ZULIP_<CODE>_EMAIL` and `ZULIP_<CODE>_API_KEY`
  *  for each bot (CODE is the seat with hyphens as underscores) and
  *  `ZULIP_SITE`, which is how an MCP server is given a key now that no

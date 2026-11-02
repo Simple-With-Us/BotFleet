@@ -51,7 +51,7 @@ function shippedSeatPromptMarkdown(): Array<[string, string]> {
  * it comes back.
  */
 const PRIVATE_FLEET_MARKERS = [
-  "#agent-sync",
+  "#agent" + "-sync",
   "BF-${",
   "Always identify yourself as BF-",
   "the shared board",

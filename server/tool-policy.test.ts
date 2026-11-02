@@ -13,7 +13,6 @@ import {
   type ToolPolicy,
 } from "./tool-policy.ts";
 
-const AGENT_SYNC = "/Users/jay/.local/bin/agent-sync";
 const SIMPLE_CHAT = "/Users/jay/.local/bin/simple-chat";
 const OPEN_LOOPS = "/Users/jay/.local/bin/open-loops";
 const PYTHON = "/opt/homebrew/bin/python3";
@@ -26,19 +25,19 @@ function policy(): ToolPolicy {
   return sanitizeToolPolicy({
     mode: "allowlist",
     commands: [
-      { argv0: AGENT_SYNC, sub: ["whoami"], flags: { "--json": { value: "none" } } },
+      { argv0: SIMPLE_CHAT, sub: ["whoami"], flags: { "--json": { value: "none" } } },
       {
-        argv0: AGENT_SYNC,
+        argv0: SIMPLE_CHAT,
         sub: ["post"],
         flags: { "--topic": { value: "text", required: true }, "--body-file": { value: "path", paths: [LINE_FILE], required: true } },
       },
       {
-        argv0: AGENT_SYNC,
+        argv0: SIMPLE_CHAT,
         sub: ["read"],
         flags: { "--topic": { value: "text" }, "--json": { value: "none" }, "--limit": { value: "int", min: 1, max: 50 } },
       },
       {
-        argv0: AGENT_SYNC,
+        argv0: SIMPLE_CHAT,
         sub: ["dm"],
         flags: { "--owner": { value: "none", required: true }, "--body-file": { value: "path", paths: [DM_FILE], required: true } },
       },
@@ -70,18 +69,18 @@ function policy(): ToolPolicy {
 
 describe("tokenizeCommand", () => {
   it("splits plain words and keeps a quoted topic with spaces as one word", () => {
-    expect(tokenizeCommand(`${AGENT_SYNC} read --topic "AFC 29c02bcb fleet-work-backup" --json`)).toEqual({
+    expect(tokenizeCommand(`${SIMPLE_CHAT} read --topic "AFC 29c02bcb fleet-work-backup" --json`)).toEqual({
       ok: true,
-      words: [AGENT_SYNC, "read", "--topic", "AFC 29c02bcb fleet-work-backup", "--json"],
+      words: [SIMPLE_CHAT, "read", "--topic", "AFC 29c02bcb fleet-work-backup", "--json"],
     });
-    expect(tokenizeCommand(`${AGENT_SYNC} read --topic 'AFC 29c02bcb fleet-work-backup'`)).toMatchObject({
-      words: [AGENT_SYNC, "read", "--topic", "AFC 29c02bcb fleet-work-backup"],
+    expect(tokenizeCommand(`${SIMPLE_CHAT} read --topic 'AFC 29c02bcb fleet-work-backup'`)).toMatchObject({
+      words: [SIMPLE_CHAT, "read", "--topic", "AFC 29c02bcb fleet-work-backup"],
     });
   });
 
   it("treats a quoted ; as text but refuses an unquoted one", () => {
-    expect(tokenizeCommand(`${AGENT_SYNC} read --topic "a;b"`)).toMatchObject({ ok: true, words: [AGENT_SYNC, "read", "--topic", "a;b"] });
-    expect(tokenizeCommand(`${AGENT_SYNC} whoami --json; touch PWNED`).ok).toBe(false);
+    expect(tokenizeCommand(`${SIMPLE_CHAT} read --topic "a;b"`)).toMatchObject({ ok: true, words: [SIMPLE_CHAT, "read", "--topic", "a;b"] });
+    expect(tokenizeCommand(`${SIMPLE_CHAT} whoami --json; touch PWNED`).ok).toBe(false);
   });
 
   it("concatenates adjacent quoted segments like a shell", () => {
@@ -125,7 +124,7 @@ describe("tokenizeCommand", () => {
 
   it("refuses an empty command and an empty quoted word", () => {
     expect(tokenizeCommand("   ").ok).toBe(false);
-    expect(tokenizeCommand(`${AGENT_SYNC} read --topic ''`).ok).toBe(false);
+    expect(tokenizeCommand(`${SIMPLE_CHAT} read --topic ''`).ok).toBe(false);
   });
 });
 
@@ -133,10 +132,10 @@ describe("evaluateCommand: the allowed shapes", () => {
   it("allows each fixed command a routine installs", () => {
     const p = policy();
     for (const command of [
-      `${AGENT_SYNC} whoami --json`,
-      `${AGENT_SYNC} post --topic "AFC 29c02bcb fleet-work-backup" --body-file ${LINE_FILE}`,
-      `${AGENT_SYNC} read --topic "AFC 29c02bcb fleet-work-backup" --json --limit 20`,
-      `${AGENT_SYNC} dm --owner --body-file ${DM_FILE}`,
+      `${SIMPLE_CHAT} whoami --json`,
+      `${SIMPLE_CHAT} post --topic "AFC 29c02bcb fleet-work-backup" --body-file ${LINE_FILE}`,
+      `${SIMPLE_CHAT} read --topic "AFC 29c02bcb fleet-work-backup" --json --limit 20`,
+      `${SIMPLE_CHAT} dm --owner --body-file ${DM_FILE}`,
       `${SIMPLE_CHAT} whoami --json`,
       `${SIMPLE_CHAT} dm --owner --body-file ${DM_FILE}`,
       `${OPEN_LOOPS} send --dm-file ${DM_FILE}`,
@@ -149,12 +148,12 @@ describe("evaluateCommand: the allowed shapes", () => {
   });
 
   it("returns the exact argv it allowed, and the words it matched as paths", () => {
-    expect(evaluateCommand(policy(), `${AGENT_SYNC} read --topic "a b" --json`)).toEqual({
+    expect(evaluateCommand(policy(), `${SIMPLE_CHAT} read --topic "a b" --json`)).toEqual({
       ok: true,
-      argv: [AGENT_SYNC, "read", "--topic", "a b", "--json"],
+      argv: [SIMPLE_CHAT, "read", "--topic", "a b", "--json"],
       paths: [],
     });
-    expect(evaluateCommand(policy(), `${AGENT_SYNC} dm --owner --body-file ${DM_FILE}`)).toMatchObject({ paths: [DM_FILE] });
+    expect(evaluateCommand(policy(), `${SIMPLE_CHAT} dm --owner --body-file ${DM_FILE}`)).toMatchObject({ paths: [DM_FILE] });
     expect(evaluateCommand(policy(), "/usr/bin/tail -n 5 /Users/jay/Library/Logs/fleet-work-backup.log")).toMatchObject({
       paths: ["/Users/jay/Library/Logs/fleet-work-backup.log"],
     });
@@ -171,63 +170,63 @@ describe("evaluateCommand: attacks", () => {
   };
 
   it("refuses chaining an allowed command with another:  ; && || | & |&", () => {
-    denied(`${AGENT_SYNC} whoami --json; touch PWNED`);
-    denied(`${AGENT_SYNC} whoami --json;touch PWNED`);
-    denied(`${AGENT_SYNC} whoami --json && touch PWNED`);
-    denied(`${AGENT_SYNC} whoami --json || touch PWNED`);
-    denied(`${AGENT_SYNC} whoami --json | /bin/sh`);
-    denied(`${AGENT_SYNC} whoami --json |& /bin/sh`);
-    denied(`${AGENT_SYNC} whoami --json & touch PWNED`);
-    denied(`${AGENT_SYNC} whoami --json\ntouch PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json; touch PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json;touch PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json && touch PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json || touch PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json | /bin/sh`);
+    denied(`${SIMPLE_CHAT} whoami --json |& /bin/sh`);
+    denied(`${SIMPLE_CHAT} whoami --json & touch PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json\ntouch PWNED`);
   });
 
   it("refuses command substitution:  $() and backticks, bare or inside double quotes", () => {
-    denied(`${AGENT_SYNC} whoami --json $(touch PWNED)`);
-    denied(`${AGENT_SYNC} whoami --json \`touch PWNED\``);
-    denied(`${AGENT_SYNC} read --topic "$(touch PWNED)"`);
-    denied(`${AGENT_SYNC} read --topic "\`touch PWNED\`"`);
-    denied(`${AGENT_SYNC} read --topic $((1+1))`);
-    denied(`${AGENT_SYNC} read --topic \${HOME}`);
-    denied(`${AGENT_SYNC} read --topic "\${HOME}"`);
+    denied(`${SIMPLE_CHAT} whoami --json $(touch PWNED)`);
+    denied(`${SIMPLE_CHAT} whoami --json \`touch PWNED\``);
+    denied(`${SIMPLE_CHAT} read --topic "$(touch PWNED)"`);
+    denied(`${SIMPLE_CHAT} read --topic "\`touch PWNED\`"`);
+    denied(`${SIMPLE_CHAT} read --topic $((1+1))`);
+    denied(`${SIMPLE_CHAT} read --topic \${HOME}`);
+    denied(`${SIMPLE_CHAT} read --topic "\${HOME}"`);
     denied(`/usr/bin/tail -n 50 <(touch PWNED)`);
   });
 
   it("refuses redirects", () => {
-    denied(`${AGENT_SYNC} whoami --json > /tmp/PWNED`);
-    denied(`${AGENT_SYNC} whoami --json >/tmp/PWNED`);
-    denied(`${AGENT_SYNC} whoami --json >> /tmp/PWNED`);
-    denied(`${AGENT_SYNC} whoami --json 1>/tmp/PWNED`);
-    denied(`${AGENT_SYNC} whoami --json 2>&1`);
-    denied(`${AGENT_SYNC} whoami --json &>/tmp/PWNED`);
-    denied(`${AGENT_SYNC} whoami --json >| /tmp/PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json > /tmp/PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json >/tmp/PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json >> /tmp/PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json 1>/tmp/PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json 2>&1`);
+    denied(`${SIMPLE_CHAT} whoami --json &>/tmp/PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json >| /tmp/PWNED`);
     denied(`/usr/bin/tail -n 50 < /Users/jay/.secrets/example-credentials`);
     denied(`/usr/bin/tail -n 50 <<< x`);
   });
 
   it("refuses quoting tricks:  quotes group a word, they never smuggle one", () => {
     // a forbidden flag quoted whole, or split across quoted pieces, is still that flag
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} '--fleet'`);
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --fl''eet`);
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --"to" CODEX`);
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} "--to=CODEX"`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} '--fleet'`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} --fl''eet`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} --"to" CODEX`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} "--to=CODEX"`);
     // ANSI-C quoting starts with an unquoted $
-    denied(`${AGENT_SYNC} whoami --json $'\\x3b' touch PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json $'\\x3b' touch PWNED`);
     // a quoted space glues words into one, so the program or verb no longer matches
-    denied(`"${AGENT_SYNC} whoami" --json`);
-    denied(`${AGENT_SYNC} "whoami --json"`);
+    denied(`"${SIMPLE_CHAT} whoami" --json`);
+    denied(`${SIMPLE_CHAT} "whoami --json"`);
     // a quoted ; is text, never a separator:  here it is an extra word, refused
-    denied(`${AGENT_SYNC} whoami --json "; touch PWNED"`);
-    denied(`${AGENT_SYNC} whoami "--json;touch" PWNED`);
+    denied(`${SIMPLE_CHAT} whoami --json "; touch PWNED"`);
+    denied(`${SIMPLE_CHAT} whoami "--json;touch" PWNED`);
     // a quote-concatenated ../ is still a different path
-    denied(`${AGENT_SYNC} dm --owner --body-file "/Users/jay/apps/state/open-loops/"'..'"/../../.secrets/x"`);
+    denied(`${SIMPLE_CHAT} dm --owner --body-file "/Users/jay/apps/state/open-loops/"'..'"/../../.secrets/x"`);
     // typographic quotes and a no-break space are not quotes or spaces at all
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} “--fleet”`);
-    denied(`${AGENT_SYNC} whoami --json`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} “--fleet”`);
+    denied(`${SIMPLE_CHAT} whoami --json`);
     // a backslash or ! inside double quotes, which a shell would still act on
-    denied(`${AGENT_SYNC} read --topic "a\\"b"`);
-    denied(`${AGENT_SYNC} read --topic "a!b"`);
+    denied(`${SIMPLE_CHAT} read --topic "a\\"b"`);
+    denied(`${SIMPLE_CHAT} read --topic "a!b"`);
     // quoting the listed program itself changes nothing:  the same argv is allowed
-    expect(evaluateCommand(p, `'${AGENT_SYNC}' whoami "--json"`)).toEqual({ ok: true, argv: [AGENT_SYNC, "whoami", "--json"], paths: [] });
+    expect(evaluateCommand(p, `'${SIMPLE_CHAT}' whoami "--json"`)).toEqual({ ok: true, argv: [SIMPLE_CHAT, "whoami", "--json"], paths: [] });
   });
 
   it("refuses a bare command with no path, the shape an engine's own allow rules auto-run", () => {
@@ -235,21 +234,17 @@ describe("evaluateCommand: attacks", () => {
     denied("whoami");
     denied("gh pr merge 1 --admin");
     denied("gh --version");
-    denied("agent-sync whoami --json");
+    denied("simple-chat whoami --json");
   });
 
   it("refuses an unlisted program and an unlisted verb of a listed one", () => {
     denied("/usr/bin/touch /tmp/PWNED");
     denied("/bin/sh -c whoami");
-    denied(`${AGENT_SYNC} subscribe --channel x`);
+    denied(`${SIMPLE_CHAT} subscribe --channel x`);
     denied(`${OPEN_LOOPS} gather --json`);
   });
 
   it("refuses path tricks on the program", () => {
-    denied("/Users/jay/.local/bin/../bin/agent-sync whoami --json");
-    denied("/Users/jay/.local/bin/./agent-sync whoami --json");
-    denied("/Users/jay//.local/bin/agent-sync whoami --json");
-    denied("/tmp/agent-sync whoami --json");
     denied("/Users/jay/.local/bin/../bin/simple-chat whoami --json");
     denied("/Users/jay/.local/bin/./simple-chat whoami --json");
     denied("/Users/jay//.local/bin/simple-chat whoami --json");
@@ -257,34 +252,34 @@ describe("evaluateCommand: attacks", () => {
   });
 
   it("refuses an environment prefix", () => {
-    expect(denied(`PATH=/tmp ${AGENT_SYNC} whoami --json`).name).toBe("env-prefix");
-    denied(`AGENT_LAUNCH_SEAT=CLAUDE ${AGENT_SYNC} whoami --json`);
-    denied(`/usr/bin/env AGENT_SEAT=CLAUDE ${AGENT_SYNC} whoami --json`);
+    expect(denied(`PATH=/tmp ${SIMPLE_CHAT} whoami --json`).name).toBe("env-prefix");
+    denied(`AGENT_LAUNCH_SEAT=CLAUDE ${SIMPLE_CHAT} whoami --json`);
+    denied(`/usr/bin/env AGENT_SEAT=CLAUDE ${SIMPLE_CHAT} whoami --json`);
   });
 
   it("refuses long-option smuggling", () => {
     // argparse expands an unambiguous prefix, so every abbreviation is refused
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --fleet`);
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --fl`);
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --to CODEX`);
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --to-owner`);
-    denied(`${AGENT_SYNC} whoami --json --as CLAUDE`);
-    denied(`${AGENT_SYNC.replace("agent-sync", "AGENT-SYNC")} whoami --json --as CLAUDE`);
-    denied(`${AGENT_SYNC} whoami --json --a CLAUDE`);
-    denied(`${AGENT_SYNC} whoami --json --rc /tmp/other-zuliprc`);
-    denied(`${AGENT_SYNC} whoami --json --default-seat MM`);
-    denied(`${AGENT_SYNC} whoami --json --session x`);
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --no-tag`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} --fleet`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} --fl`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} --to CODEX`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} --to-owner`);
+    denied(`${SIMPLE_CHAT} whoami --json --as CLAUDE`);
+    denied(`${SIMPLE_CHAT.replace("simple-chat", "SIMPLE-CHAT")} whoami --json --as CLAUDE`);
+    denied(`${SIMPLE_CHAT} whoami --json --a CLAUDE`);
+    denied(`${SIMPLE_CHAT} whoami --json --rc /tmp/other-zuliprc`);
+    denied(`${SIMPLE_CHAT} whoami --json --default-seat MM`);
+    denied(`${SIMPLE_CHAT} whoami --json --session x`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} --no-tag`);
     // --flag=value is refused outright, so `--to=X` cannot slip past a check on `--to`
-    denied(`${AGENT_SYNC} post --topic=t --body-file ${LINE_FILE}`);
-    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --to=CODEX`);
+    denied(`${SIMPLE_CHAT} post --topic=t --body-file ${LINE_FILE}`);
+    denied(`${SIMPLE_CHAT} post --topic t --body-file ${LINE_FILE} --to=CODEX`);
     // an end-of-options marker
-    denied(`${AGENT_SYNC} read -- --fleet`);
+    denied(`${SIMPLE_CHAT} read -- --fleet`);
     // a value that is really a flag
-    denied(`${AGENT_SYNC} read --topic --fleet`);
+    denied(`${SIMPLE_CHAT} read --topic --fleet`);
     // an unlisted flag, and a repeated one
-    denied(`${AGENT_SYNC} whoami --json --verbose`);
-    denied(`${AGENT_SYNC} whoami --json --json`);
+    denied(`${SIMPLE_CHAT} whoami --json --verbose`);
+    denied(`${SIMPLE_CHAT} whoami --json --json`);
     // a combined short flag
     denied("/usr/bin/tail -n50 /tmp/x");
     denied("/usr/bin/tail -fn 50 /tmp/x");
@@ -298,7 +293,7 @@ describe("evaluateCommand: attacks", () => {
       commands: [
         { argv0: SIMPLE_CHAT, sub: ["post"], flags: { "--as": { value: "text" }, "--topic": { value: "text" } }, args: [], positionals: 0 },
         { argv0: SIMPLE_CHAT, sub: ["dm"], flags: { "--owner": { value: "none" }, "--body-file": { value: "path", paths: [DM_FILE] } }, args: [], positionals: 0 },
-        { argv0: AGENT_SYNC, sub: ["post"], flags: { "--as": { value: "text" }, "--topic": { value: "text" } }, args: [], positionals: 0 },
+        { argv0: SIMPLE_CHAT, sub: ["post"], flags: { "--as": { value: "text" }, "--topic": { value: "text" } }, args: [], positionals: 0 },
       ],
       writePaths: [],
       readPaths: [],
@@ -311,9 +306,6 @@ describe("evaluateCommand: attacks", () => {
     expect(dm.ok).toBe(false);
     if (dm.ok) throw new Error("allowed:  simple-chat dm without --owner");
     expect(dm.reason).toContain("dm is allowed only with --owner");
-    // the retired spelling answers to the same rules, and still works otherwise
-    expect(evaluateCommand(unchecked, `${AGENT_SYNC} post --topic t --as CLAUDE`).ok).toBe(false);
-    expect(evaluateCommand(unchecked, `${AGENT_SYNC} post --topic t`)).toMatchObject({ ok: true });
     // the saved policy's own rules hold for the current name too
     expect(evaluateCommand(policy(), `${SIMPLE_CHAT} whoami --json --as CLAUDE`).ok).toBe(false);
     expect(evaluateCommand(policy(), `${SIMPLE_CHAT} post --topic t --to CODEX`).ok).toBe(false);
@@ -321,9 +313,9 @@ describe("evaluateCommand: attacks", () => {
     expect(evaluateCommand(policy(), `${SIMPLE_CHAT} dm --body-file ${DM_FILE}`).ok).toBe(false);
     expect(evaluateCommand(policy(), `${SIMPLE_CHAT} dm --as CODEX --body-file ${DM_FILE}`).ok).toBe(false);
     expect(evaluateCommand(policy(), `${SIMPLE_CHAT} dm --owner --body-file ${DM_FILE}`)).toMatchObject({ ok: true });
-    expect(evaluateCommand(policy(), `${AGENT_SYNC} whoami --json --as CLAUDE`).ok).toBe(false);
-    expect(evaluateCommand(policy(), `${AGENT_SYNC} dm --body-file ${DM_FILE}`).ok).toBe(false);
-    expect(evaluateCommand(policy(), `${AGENT_SYNC} dm --owner --body-file ${DM_FILE}`)).toMatchObject({ ok: true });
+    expect(evaluateCommand(policy(), `${SIMPLE_CHAT} whoami --json --as CLAUDE`).ok).toBe(false);
+    expect(evaluateCommand(policy(), `${SIMPLE_CHAT} dm --body-file ${DM_FILE}`).ok).toBe(false);
+    expect(evaluateCommand(policy(), `${SIMPLE_CHAT} dm --owner --body-file ${DM_FILE}`)).toMatchObject({ ok: true });
   });
 
   it("keeps the chat CLI's rules in another letter case or run by an interpreter", () => {
@@ -347,46 +339,26 @@ describe("evaluateCommand: attacks", () => {
     expect(refusal.ok).toBe(false);
     if (refusal.ok) throw new Error("allowed:  simple-chat --as");
     expect(refusal.reason).toContain("simple-chat");
-    // the retired spelling is refused with the same message
-    const retired = evaluateCommand(policy(), `${AGENT_SYNC} whoami --json --as CLAUDE`);
-    expect(retired.ok).toBe(false);
-    if (retired.ok) throw new Error("allowed:  agent-sync --as");
-    expect(retired.reason).toContain("simple-chat");
   });
 
-  it("keeps agent-sync's rules for agent-sync in another letter case or run by an interpreter", () => {
-    // Built by hand:  sanitizeToolPolicy refuses these entries, and the run-time check must hold alone.
-    const unchecked: ToolPolicy = {
-      mode: "allowlist",
-      commands: [
-        { argv0: "/Users/jay/.local/bin/Agent-Sync", sub: ["post"], flags: { "--as": { value: "text" }, "--topic": { value: "text" } }, args: [], positionals: 0 },
-        { argv0: PYTHON, sub: ["/Users/jay/apps/fleet/agent-sync", "dm"], flags: { "--to": { value: "text" } }, args: [], positionals: 0 },
-      ],
-      writePaths: [],
-      readPaths: [],
-    };
-    expect(evaluateCommand(unchecked, "/Users/jay/.local/bin/Agent-Sync post --topic t --as CLAUDE").ok).toBe(false);
-    expect(evaluateCommand(unchecked, "/Users/jay/.local/bin/Agent-Sync post --topic t")).toMatchObject({ ok: true });
-    expect(evaluateCommand(unchecked, `${PYTHON} /Users/jay/apps/fleet/agent-sync dm --to CODEX`).ok).toBe(false);
-  });
 
   it("refuses a direct message to anyone but the owner", () => {
-    denied(`${AGENT_SYNC} dm --body-file ${DM_FILE}`);
-    denied(`${AGENT_SYNC} dm --owner --to CODEX --body-file ${DM_FILE}`);
-    denied(`${AGENT_SYNC} dm --owner --body-file ${DM_FILE} hello`);
+    denied(`${SIMPLE_CHAT} dm --body-file ${DM_FILE}`);
+    denied(`${SIMPLE_CHAT} dm --owner --to CODEX --body-file ${DM_FILE}`);
+    denied(`${SIMPLE_CHAT} dm --owner --body-file ${DM_FILE} hello`);
   });
 
   it("refuses a path flag naming any other file", () => {
-    denied(`${AGENT_SYNC} dm --owner --body-file /Users/jay/.secrets/example-credentials`);
-    denied(`${AGENT_SYNC} dm --owner --body-file /Users/jay/apps/state/open-loops/../../../.secrets/x`);
+    denied(`${SIMPLE_CHAT} dm --owner --body-file /Users/jay/.secrets/example-credentials`);
+    denied(`${SIMPLE_CHAT} dm --owner --body-file /Users/jay/apps/state/open-loops/../../../.secrets/x`);
     denied(`${OPEN_LOOPS} send --dm-file /tmp/dm.md`);
   });
 
   it("refuses bad values and extra words", () => {
-    denied(`${AGENT_SYNC} read --topic t --limit 500`);
-    denied(`${AGENT_SYNC} read --topic t --limit -1`);
-    denied(`${AGENT_SYNC} read --topic t --limit 1e3`);
-    denied(`${AGENT_SYNC} whoami --json extra`);
+    denied(`${SIMPLE_CHAT} read --topic t --limit 500`);
+    denied(`${SIMPLE_CHAT} read --topic t --limit -1`);
+    denied(`${SIMPLE_CHAT} read --topic t --limit 1e3`);
+    denied(`${SIMPLE_CHAT} whoami --json extra`);
     denied("/usr/bin/tail -n 50 /Users/jay/Library/Logs/fleet-work-backup.log /tmp/b");
     denied("/usr/bin/tail -n 50");
     denied(`/Users/jay/.local/bin/echo-note "one" "two"`);
@@ -413,27 +385,27 @@ describe("evaluateCommand: attacks", () => {
   });
 
   it("names only the program in a denial, never its arguments", () => {
-    const decision = denied(`${AGENT_SYNC} whoami --json; cat /Users/jay/.secrets/example-credentials`);
-    expect(decision.name).toBe("agent-sync");
+    const decision = denied(`${SIMPLE_CHAT} whoami --json; cat /Users/jay/.secrets/example-credentials`);
+    expect(decision.name).toBe("simple-chat");
     expect(JSON.stringify(decision)).not.toContain("secrets");
   });
 });
 
 describe("evaluateArgv", () => {
   it("applies the same rules to an argv an engine passes as a list", () => {
-    expect(evaluateArgv(policy(), [AGENT_SYNC, "whoami", "--json"])).toMatchObject({ ok: true });
-    expect(evaluateArgv(policy(), [AGENT_SYNC, "whoami", "--json", ";", "touch", "PWNED"]).ok).toBe(false);
+    expect(evaluateArgv(policy(), [SIMPLE_CHAT, "whoami", "--json"])).toMatchObject({ ok: true });
+    expect(evaluateArgv(policy(), [SIMPLE_CHAT, "whoami", "--json", ";", "touch", "PWNED"]).ok).toBe(false);
     expect(evaluateArgv(policy(), ["touch", "PWNED"]).ok).toBe(false);
   });
 });
 
 describe("unwrapShellCommand", () => {
   it("unwraps the bash -lc wrapper an engine builds, including the '\"'\"' idiom", () => {
-    expect(unwrapShellCommand(`/opt/homebrew/bin/bash -lc '${AGENT_SYNC} whoami --json'`)).toEqual({
-      command: `${AGENT_SYNC} whoami --json`,
+    expect(unwrapShellCommand(`/opt/homebrew/bin/bash -lc '${SIMPLE_CHAT} whoami --json'`)).toEqual({
+      command: `${SIMPLE_CHAT} whoami --json`,
     });
-    expect(unwrapShellCommand(`/bin/bash -lc '${AGENT_SYNC} read --topic '"'"'a b'"'"''`)).toEqual({
-      command: `${AGENT_SYNC} read --topic 'a b'`,
+    expect(unwrapShellCommand(`/bin/bash -lc '${SIMPLE_CHAT} read --topic '"'"'a b'"'"''`)).toEqual({
+      command: `${SIMPLE_CHAT} read --topic 'a b'`,
     });
     expect(unwrapShellCommand("/bin/sh", ["-c", "touch PWNED"])).toEqual({ command: "touch PWNED" });
   });
@@ -446,7 +418,7 @@ describe("unwrapShellCommand", () => {
   });
 
   it("passes a plain command through for the strict check", () => {
-    expect(unwrapShellCommand(`${AGENT_SYNC} whoami --json`)).toEqual({ command: `${AGENT_SYNC} whoami --json` });
+    expect(unwrapShellCommand(`${SIMPLE_CHAT} whoami --json`)).toEqual({ command: `${SIMPLE_CHAT} whoami --json` });
   });
 
   it("reads a double-quoted wrapper the way bash does, and the strict check still refuses what it carries", () => {
@@ -459,14 +431,14 @@ describe("unwrapShellCommand", () => {
       if (!unwrapped || !("command" in unwrapped)) throw new Error(`not unwrapped: ${wrapper}`);
       return unwrapped.command;
     };
-    const quoted = inner(`/bin/bash -lc "${AGENT_SYNC} read --topic \\"a b\\""`);
-    expect(quoted).toBe(`${AGENT_SYNC} read --topic "a b"`);
+    const quoted = inner(`/bin/bash -lc "${SIMPLE_CHAT} read --topic \\"a b\\""`);
+    expect(quoted).toBe(`${SIMPLE_CHAT} read --topic "a b"`);
     expect(evaluateCommand(policy(), quoted)).toMatchObject({ ok: true });
     for (const wrapper of [
-      `/bin/bash -lc "${AGENT_SYNC} read --topic \\"a!b\\""`,
-      `/bin/bash -lc "${AGENT_SYNC} read --topic \\"a\\\\\\"b\\""`,
-      `/bin/bash -lc "${AGENT_SYNC} read --topic \\"\\$(touch PWNED)\\""`,
-      `/bin/bash -lc "${AGENT_SYNC} whoami --json \\\`touch PWNED\\\`"`,
+      `/bin/bash -lc "${SIMPLE_CHAT} read --topic \\"a!b\\""`,
+      `/bin/bash -lc "${SIMPLE_CHAT} read --topic \\"a\\\\\\"b\\""`,
+      `/bin/bash -lc "${SIMPLE_CHAT} read --topic \\"\\$(touch PWNED)\\""`,
+      `/bin/bash -lc "${SIMPLE_CHAT} whoami --json \\\`touch PWNED\\\`"`,
     ]) {
       expect(evaluateCommand(policy(), inner(wrapper)).ok, wrapper).toBe(false);
     }
@@ -518,7 +490,7 @@ describe("sanitizeToolPolicy", () => {
   it.each([
     ["a mode other than allowlist", { mode: "denylist", commands: [] }],
     ["an unknown top-level field", { mode: "allowlist", commands: [], extra: 1 }],
-    ["a relative program", { mode: "allowlist", commands: [{ argv0: "agent-sync", sub: [] }] }],
+    ["a relative program", { mode: "allowlist", commands: [{ argv0: "simple-chat", sub: [] }] }],
     ["a program with ..", { mode: "allowlist", commands: [{ argv0: "/usr/../bin/sh", sub: [] }] }],
     ["a program with a space", { mode: "allowlist", commands: [{ argv0: "/usr/bin/my tool", sub: [] }] }],
     ["a sub word that is a flag", { mode: "allowlist", commands: [{ argv0: "/bin/x", sub: ["-c"] }] }],
@@ -526,11 +498,6 @@ describe("sanitizeToolPolicy", () => {
     ["a bad flag name", { mode: "allowlist", commands: [{ argv0: "/bin/x", flags: { "json": { value: "none" } } }] }],
     ["an unknown value kind", { mode: "allowlist", commands: [{ argv0: "/bin/x", flags: { "--a": { value: "regex" } } }] }],
     ["a relative path flag", { mode: "allowlist", commands: [{ argv0: "/bin/x", flags: { "--a": { value: "path", paths: ["a.md"] } } }] }],
-    ["agent-sync --fleet", { mode: "allowlist", commands: [{ argv0: AGENT_SYNC, sub: ["post"], flags: { "--fleet": { value: "none" } } }] }],
-    ["agent-sync --to", { mode: "allowlist", commands: [{ argv0: AGENT_SYNC, sub: ["post"], flags: { "--to": { value: "text" } } }] }],
-    ["agent-sync --as", { mode: "allowlist", commands: [{ argv0: AGENT_SYNC, sub: ["whoami"], flags: { "--as": { value: "text" } } }] }],
-    ["an abbreviation of a forbidden agent-sync flag", { mode: "allowlist", commands: [{ argv0: AGENT_SYNC, sub: ["post"], flags: { "--fl": { value: "none" } } }] }],
-    ["agent-sync dm without a required --owner", { mode: "allowlist", commands: [{ argv0: AGENT_SYNC, sub: ["dm"], flags: { "--owner": { value: "none" } } }] }],
     ["a directory write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/apps/state/"] }],
     ["a relative write path", { mode: "allowlist", commands: [], writePaths: ["state/dm.md"] }],
     ["a glob write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/apps/state/*.md"] }],
@@ -539,7 +506,6 @@ describe("sanitizeToolPolicy", () => {
     ["a credential directory write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/.secrets/zulip"] }],
     ["a LaunchAgents write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/Library/LaunchAgents/x.plist"] }],
     ["a LaunchAgents write path with folded case", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/library/launchagents/x.plist"] }],
-    ["agent-sync --as through a case-folded argv0", { mode: "allowlist", commands: [{ argv0: "/Users/jay/.local/bin/AGENT-SYNC", sub: ["whoami"], flags: { "--as": { value: "text" } } }] }],
     ["too many positionals", { mode: "allowlist", commands: [{ argv0: "/bin/x", positionals: 99 }] }],
     ["a positional switch", { mode: "allowlist", commands: [{ argv0: "/bin/x", args: [{ value: "none" }] }] }],
     ["a relative positional path", { mode: "allowlist", commands: [{ argv0: "/bin/x", args: [{ value: "path", paths: ["log.txt"] }] }] }],
@@ -551,7 +517,6 @@ describe("sanitizeToolPolicy", () => {
     ["a read path under a credential directory", { mode: "allowlist", commands: [], readPaths: ["/Users/jay/.config/gh/hosts.yml"] }],
     ["a write path under LaunchAgents in another letter case", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/library/launchagents/x.plist"] }],
     ["a positional path under LaunchDaemons in another letter case", { mode: "allowlist", commands: [{ argv0: "/bin/cat", args: [{ value: "path", paths: ["/LIBRARY/LAUNCHDAEMONS/x.plist"] }] }] }],
-    ["agent-sync named in another letter case, with --as", { mode: "allowlist", commands: [{ argv0: "/Users/jay/.local/bin/Agent-Sync", sub: ["whoami"], flags: { "--as": { value: "text" } } }] }],
     ["simple-chat --fleet", { mode: "allowlist", commands: [{ argv0: SIMPLE_CHAT, sub: ["post"], flags: { "--fleet": { value: "none" } } }] }],
     ["simple-chat --to", { mode: "allowlist", commands: [{ argv0: SIMPLE_CHAT, sub: ["post"], flags: { "--to": { value: "text" } } }] }],
     ["simple-chat --as", { mode: "allowlist", commands: [{ argv0: SIMPLE_CHAT, sub: ["whoami"], flags: { "--as": { value: "text" } } }] }],
@@ -562,8 +527,6 @@ describe("sanitizeToolPolicy", () => {
     ["simple-chat named in another letter case, with --as", { mode: "allowlist", commands: [{ argv0: "/Users/jay/.local/bin/Simple-Chat", sub: ["whoami"], flags: { "--as": { value: "text" } } }] }],
     ["simple-chat run by an interpreter, with --to", { mode: "allowlist", commands: [{ argv0: PYTHON, sub: ["/Users/jay/apps/fleet/simple-chat", "post"], flags: { "--to": { value: "text" } } }] }],
     ["simple-chat dm run by an interpreter without a required --owner", { mode: "allowlist", commands: [{ argv0: PYTHON, sub: ["/Users/jay/apps/fleet/simple-chat", "dm"], flags: { "--owner": { value: "none" } } }] }],
-    ["agent-sync run by an interpreter, with --to", { mode: "allowlist", commands: [{ argv0: PYTHON, sub: ["/Users/jay/apps/fleet/agent-sync", "post"], flags: { "--to": { value: "text" } } }] }],
-    ["agent-sync dm run by an interpreter without a required --owner", { mode: "allowlist", commands: [{ argv0: PYTHON, sub: ["/Users/jay/apps/fleet/agent-sync", "dm"], flags: { "--owner": { value: "none" } } }] }],
   ])("refuses %s", (_label, raw) => {
     expect(() => sanitizeToolPolicy(raw)).toThrow(/Command allowlist/);
   });
@@ -579,17 +542,15 @@ describe("sanitizeToolPolicy", () => {
 });
 
 describe("namesChatCli", () => {
-  it("names the current CLI and the retired compatibility launcher, in any letter case", () => {
+  it("names the current CLI in any letter case", () => {
     for (const word of [
       "/Users/jay/.local/bin/simple-chat",
-      "/Users/jay/.local/bin/agent-sync",
       "/Users/jay/.local/bin/SIMPLE-CHAT",
-      "/Users/jay/.local/bin/Agent-Sync",
+      "/Users/jay/.local/bin/Simple-Chat",
       "/Users/jay/.local/bin/../bin/simple-chat",
       "/Users/jay/.local/bin/./simple-chat",
       "/Users/jay//.local/bin/simple-chat",
       "/tmp/simple-chat",
-      "/tmp/agent-sync",
     ]) {
       expect(namesChatCli(word), word).toBe(true);
     }
@@ -598,7 +559,7 @@ describe("namesChatCli", () => {
   it("names nothing else", () => {
     for (const word of [
       "/Users/jay/.local/bin/simple-chatter",
-      "/Users/jay/.local/bin/agent-syncs",
+      "/Users/jay/.local/bin/simple-chats",
       "/Users/jay/.local/bin/whoami",
       "/Users/jay/.local/bin/simple_chat",
     ]) {

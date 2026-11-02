@@ -63,16 +63,12 @@ const FLAG_NAME = /^(?:-[A-Za-z0-9]|--[A-Za-z0-9][A-Za-z0-9_-]*)$/;
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const INTEGER = /^(?:0|[1-9][0-9]{0,8})$/;
 
-/** The fleet chat CLI's basenames:  `simple-chat` is the current name and
- *  `agent-sync` survives on PATH only as a compatibility launcher that runs
- *  it.  They are one tool, so a routine is held to the same rules under
- *  either spelling. */
-export const CHAT_CLI_NAMES = ["simple-chat", "agent-sync"] as const;
+/** The fleet chat CLI's basename:  `simple-chat`.  The retired launcher
+ *  name is gone from PATH, so there is one spelling and one rule set. */
+export const CHAT_CLI_NAMES = ["simple-chat"] as const;
 
-/** How a refusal names the fleet chat CLI:  the current name first, with the
- *  retired spelling it still answers to, so a routine that called the old
- *  name sees why it was refused. */
-const CHAT_CLI_LABEL = "simple-chat (agent-sync)";
+/** How a refusal names the fleet chat CLI. */
+const CHAT_CLI_LABEL = "simple-chat";
 
 /** simple-chat flags no routine may pass, whatever its policy says:  each one
  *  changes who the post is from or who it wakes.  A word that is a prefix of
@@ -125,8 +121,8 @@ export function isProtectedPath(path: string): boolean {
   return PROTECTED_WRITE_PARTS.some((part) => folded.includes(part.toLowerCase()));
 }
 
-/** Whether a program or script path names the fleet chat CLI (`simple-chat`,
- *  or the `agent-sync` compatibility launcher), in any letter case:  a
+/** Whether a program or script path names the fleet chat CLI (`simple-chat`),
+ *  in any letter case:  a
  *  `SIMPLE-CHAT` spelling on a case-insensitive volume is the same binary, and
  *  the forbidden-flag checks must still apply.  This is a basename, so the ACP
  *  gate also resolves links — an alias of another name is caught at run time
@@ -447,7 +443,7 @@ export function evaluateCommand(policy: ToolPolicy, command: string): PolicyDeci
 const WRAPPER_SHELLS = new Set(["bash", "sh", "zsh"]);
 
 /** An engine that runs commands through the client terminal hands BotFleet a
- *  wrapper such as `/opt/homebrew/bin/bash -lc 'agent-sync whoami'`.  Return
+ *  wrapper such as `/opt/homebrew/bin/bash -lc 'simple-chat whoami'`.  Return
  *  the inner command when `command` is exactly such a wrapper, the command
  *  itself when it is not a wrapper, or null when it is a wrapper of any other
  *  shape. */
