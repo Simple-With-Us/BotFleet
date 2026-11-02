@@ -50,7 +50,76 @@ test("a pinned BOTFLEET_BUILD_VERSION is the version Control carries", () => {
 test("a BOTFLEET_BUILD_VERSION that is not a build version is refused", () => {
   assert.throws(
     () => controlBuildVersion({ env: { BOTFLEET_BUILD_VERSION: "2.1.0-beta" }, repoRoot: "/nonexistent" }),
-    /not a 1\.0\.<count> build version/,
+    /neither an x\.y\.z app version nor a 1\.0\.<count> build version/,
+  );
+});
+
+test("the policy pin carries the app version, the build and the marketing version (BF-2588)", () => {
+  // The release pins the app version (which carries the build in its patch)
+  // and the marketing version a person sees.  The build is the patch, so the
+  // two can never disagree about it.  The app version sits on the ordering
+  // line (1.0), not the marketing line (0.1):  the updater orders releases by
+  // the app version alone and the installed fleet is already on 1.0.x.
+  const stamp = controlBuildVersion({
+    env: { BOTFLEET_BUILD_VERSION: "1.0.202611030100", BOTFLEET_MARKETING_VERSION: "0.1.0" },
+    repoRoot: "/nonexistent",
+  });
+  assert.deepEqual(stamp, {
+    version: "1.0.202611030100",
+    build: "202611030100",
+    source: "BOTFLEET_BUILD_VERSION",
+  });
+});
+
+test("a policy pin whose app version is off the ordering line is refused", () => {
+  // The app version has to sit on the ordering line, because that is the line
+  // the updater compares and the line the installed fleet is on.  A pin off
+  // it would read as a downgrade to every install.
+  assert.throws(
+    () => controlBuildVersion({
+      env: { BOTFLEET_BUILD_VERSION: "0.2.202611030100", BOTFLEET_MARKETING_VERSION: "0.1.0" },
+      repoRoot: "/nonexistent",
+    }),
+    /ordering line/,
+  );
+});
+
+test("a policy pin whose app version carries no build is refused", () => {
+  // The app version puts the build in its patch, so a patch of 0 carries none.
+  // Stamping that as the build would number the bundle 0 and read as the
+  // oldest build in every comparison.
+  assert.throws(
+    () => controlBuildVersion({
+      env: { BOTFLEET_BUILD_VERSION: "1.0.0", BOTFLEET_MARKETING_VERSION: "0.1.0" },
+      repoRoot: "/nonexistent" },
+    ),
+    /carries no build/,
+  );
+});
+
+test("a retired pin read with a stale marketing version resolves to the retired shape", () => {
+  // A release that pinned 1.0.<count> and left a marketing version in the
+  // environment from another plan still resolves the way it always did:  the
+  // marketing version never enters the answer, so a stale one cannot change
+  // what a pin means.
+  const stamp = controlBuildVersion({
+    env: { BOTFLEET_BUILD_VERSION: "1.0.2222", BOTFLEET_MARKETING_VERSION: "0.1.0" },
+    repoRoot: "/nonexistent",
+  });
+  assert.deepEqual(stamp, {
+    version: "1.0.2222",
+    build: "2222",
+    source: "BOTFLEET_BUILD_VERSION",
+  });
+});
+
+test("a policy pin with a malformed marketing version is refused", () => {
+  assert.throws(
+    () => controlBuildVersion({
+      env: { BOTFLEET_BUILD_VERSION: "1.0.202611030100", BOTFLEET_MARKETING_VERSION: "0.1" },
+      repoRoot: "/nonexistent",
+    }),
+    /BOTFLEET_MARKETING_VERSION is not an x\.y\.z version/,
   );
 });
 
