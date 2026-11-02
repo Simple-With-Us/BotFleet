@@ -86,6 +86,23 @@ final class ModelAliasPersistenceTests: XCTestCase {
         XCTAssertNotNil(sonnetOpt)
         XCTAssertEqual(sonnetOpt?.label, "Latest Sonnet")
         XCTAssertEqual(sonnetOpt?.resolvedId, "claude-sonnet-4.6")
+
+        let nonLineageInstance = Instance(
+            instanceId: "minimax-1",
+            name: "MiniMax",
+            driverKind: "minimax",
+            models: InstanceModels(
+                default: "MiniMax-M3",
+                options: [
+                    ModelOption(id: "MiniMax-M3", label: "MiniMax M3"),
+                    ModelOption(id: "custom-sonnet-clone", label: "Custom Sonnet Clone")
+                ]
+            )
+        )
+        XCTAssertTrue(
+            ModelLineage.latestOptions(for: nonLineageInstance).isEmpty,
+            "Engines without configured lineage must not offer Latest options"
+        )
     }
 
     func testDisplayLabelMatchesWebFormat() {

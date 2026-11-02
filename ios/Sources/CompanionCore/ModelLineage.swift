@@ -192,16 +192,10 @@ public enum ModelLineage {
     }
 
     public static func latestOptions(for instance: Instance) -> [LatestOption] {
-        var result: [LatestOption] = []
-        var classDefs = classes(for: instance.driverKind)
-        if classDefs.isEmpty {
-            for def in allKnownClasses {
-                if instance.models.options.contains(where: { matchesClass($0.id, classKey: def.key) }) {
-                    classDefs.append(def)
-                }
-            }
-        }
+        let classDefs = classes(for: instance.driverKind)
+        guard !classDefs.isEmpty else { return [] }
 
+        var result: [LatestOption] = []
         for def in classDefs {
             if let newest = newestModel(for: def.key, in: instance.models.options) {
                 result.append(LatestOption(
