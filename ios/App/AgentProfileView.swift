@@ -25,6 +25,7 @@ struct AgentProfileView: View {
     @State private var instanceId: String
     @State private var modelId: String
     @State private var effort: String?
+    @State private var latest: String?
     @State private var fallbacks: [ModelSelection]
     @State private var maxToolRoundsText: String
     @State private var photo: PhotosPickerItem?
@@ -76,6 +77,7 @@ struct AgentProfileView: View {
         _instanceId = State(initialValue: bot.modelSelection.instanceId)
         _modelId = State(initialValue: bot.modelSelection.model)
         _effort = State(initialValue: bot.modelSelection.effort)
+        _latest = State(initialValue: bot.modelSelection.latest ?? ModelLineage.detectAlias(from: bot.modelSelection.model))
         _fallbacks = State(initialValue: bot.modelSelection.fallbacks ?? [])
         _maxToolRoundsText = State(initialValue: Self.roundsText(bot.maxToolRounds))
         _isOff = State(initialValue: bot.isOff)
@@ -275,8 +277,14 @@ struct AgentProfileView: View {
                                 set: { newInstanceId in
                                     fallbacks[index].instanceId = newInstanceId
                                     if let inst = instances.first(where: { $0.id == newInstanceId }) {
-                                        if !inst.models.options.contains(where: { $0.id == fallbacks[index].model }) {
-                                            fallbacks[index].model = inst.models.default
+                                        if let fbLatest = fallbacks[index].latest,
+                                           let resolved = ModelLineage.resolveClass(fbLatest, in: inst) {
+                                            fallbacks[index].model = resolved.resolvedId
+                                        } else {
+                                            fallbacks[index].latest = nil
+                                            if !inst.models.options.contains(where: { $0.id == fallbacks[index].model }) {
+                                                fallbacks[index].model = inst.models.default
+                                            }
                                         }
                                         if let effort = fallbacks[index].effort,
                                            !inst.effortLevels(for: fallbacks[index].model).contains(effort) {
@@ -293,17 +301,47 @@ struct AgentProfileView: View {
 
                             if let fallbackInstance = instances.first(where: { $0.id == fallbacks[index].instanceId }) {
                                 Picker("Model", selection: Binding(
-                                    get: { fallbacks[index].model },
-                                    set: { newModel in
-                                        fallbacks[index].model = newModel
+                                    get: {
+                                        if let fbLatest = fallbacks[index].latest, !fbLatest.isEmpty {
+                                            return "latest:\(fbLatest)"
+                                        }
+                                        return fallbacks[index].model
+                                    },
+                                    set: { newTag in
+                                        if newTag.hasPrefix("latest:") {
+                                            let classKey = String(newTag.dropFirst("latest:".count))
+                                            fallbacks[index].latest = classKey
+                                            if let resolved = ModelLineage.resolveClass(classKey, in: fallbackInstance) {
+                                                fallbacks[index].model = resolved.resolvedId
+                                            }
+                                        } else {
+                                            fallbacks[index].latest = nil
+                                            fallbacks[index].model = newTag
+                                        }
                                         if let effort = fallbacks[index].effort,
-                                           !fallbackInstance.effortLevels(for: newModel).contains(effort) {
+                                           !fallbackInstance.effortLevels(for: fallbacks[index].model).contains(effort) {
                                             fallbacks[index].effort = nil
                                         }
                                     }
                                 )) {
-                                    ForEach(fallbackInstance.models.options) { option in
-                                        Text(option.label).tag(option.id)
+                                    let latestOpts = ModelLineage.latestOptions(for: fallbackInstance)
+                                    if !latestOpts.isEmpty {
+                                        Section("Latest") {
+                                            ForEach(latestOpts) { opt in
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(opt.label)
+                                                    Text(opt.resolvedId)
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                .tag("latest:\(opt.classKey)")
+                                            }
+                                        }
+                                    }
+                                    Section("Models") {
+                                        ForEach(fallbackInstance.models.options) { option in
+                                            Text(option.label).tag(option.id)
+                                        }
                                     }
                                 }
                                 .pickerStyle(.navigationLink)
@@ -642,6 +680,7 @@ struct AgentProfileView: View {
             instanceId: instanceId,
             model: modelId,
             effort: effort,
+            latest: latest,
             fallbacks: fallbacks.isEmpty ? nil : fallbacks
         )
         let trimmedCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -689,8 +728,14 @@ struct AgentProfileView: View {
             .pickerStyle(.navigationLink)
             .onChange(of: instanceId) { _, newInstanceId in
                 if let instance = instances.first(where: { $0.id == newInstanceId }) {
-                    if !instance.models.options.contains(where: { $0.id == modelId }) {
-                        modelId = instance.models.default
+                    if let curLatest = latest,
+                       let resolved = ModelLineage.resolveClass(curLatest, in: instance) {
+                        modelId = resolved.resolvedId
+                    } else {
+                        latest = nil
+                        if !instance.models.options.contains(where: { $0.id == modelId }) {
+                            modelId = instance.models.default
+                        }
                     }
                     if let effort, !instance.effortLevels(for: modelId).contains(effort) {
                         self.effort = nil
@@ -699,17 +744,50 @@ struct AgentProfileView: View {
             }
 
             if let selectedInstance = instances.first(where: { $0.id == instanceId }) {
-                Picker("Model", selection: $modelId) {
-                    ForEach(selectedInstance.models.options) { option in
-                        Text(option.label).tag(option.id)
+                Picker("Model", selection: Binding(
+                    get: {
+                        if let curLatest = latest, !curLatest.isEmpty {
+                            return "latest:\(curLatest)"
+                        }
+                        return modelId
+                    },
+                    set: { newTag in
+                        if newTag.hasPrefix("latest:") {
+                            let classKey = String(newTag.dropFirst("latest:".count))
+                            latest = classKey
+                            if let resolved = ModelLineage.resolveClass(classKey, in: selectedInstance) {
+                                modelId = resolved.resolvedId
+                            }
+                        } else {
+                            latest = nil
+                            modelId = newTag
+                        }
+                        if let effort, !selectedInstance.effortLevels(for: modelId).contains(effort) {
+                            self.effort = nil
+                        }
+                    }
+                )) {
+                    let latestOpts = ModelLineage.latestOptions(for: selectedInstance)
+                    if !latestOpts.isEmpty {
+                        Section("Latest") {
+                            ForEach(latestOpts) { opt in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(opt.label)
+                                    Text(opt.resolvedId)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .tag("latest:\(opt.classKey)")
+                            }
+                        }
+                    }
+                    Section("Models") {
+                        ForEach(selectedInstance.models.options) { option in
+                            Text(option.label).tag(option.id)
+                        }
                     }
                 }
                 .pickerStyle(.navigationLink)
-                .onChange(of: modelId) { _, newModelId in
-                    if let effort, !selectedInstance.effortLevels(for: newModelId).contains(effort) {
-                        self.effort = nil
-                    }
-                }
 
                 effortPicker(selection: $effort, instance: selectedInstance, modelId: modelId)
             }

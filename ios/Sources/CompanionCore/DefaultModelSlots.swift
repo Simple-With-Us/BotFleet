@@ -58,12 +58,12 @@ public struct DefaultModelSlot: Codable, Hashable, Sendable {
     /// `slotFromPick`: instance and model only, never effort or fallbacks,
     /// which belong to each bot rather than to the default.
     public init(pick selection: ModelSelection) {
-        self.init(instanceId: selection.instanceId, model: selection.model)
+        self.init(instanceId: selection.instanceId, model: selection.model, latest: selection.latest)
     }
 
     /// The slot as a bare selection, for drawing it with the model picker.
     public var selection: ModelSelection {
-        ModelSelection(instanceId: instanceId, model: model)
+        ModelSelection(instanceId: instanceId, model: model, latest: latest)
     }
 }
 
@@ -293,11 +293,13 @@ public enum FleetModels {
         _ selection: ModelSelection,
         instanceId: String,
         model: String,
+        latest: String? = nil,
         effortLevels: [String]?
     ) -> ModelSelection {
         var next = selection
         next.instanceId = instanceId
         next.model = model
+        next.latest = latest
         if let effort = next.effort, let effortLevels, !effortLevels.contains(effort) {
             next.effort = nil
         }
@@ -312,6 +314,7 @@ public enum FleetModels {
         at index: Int,
         instanceId: String,
         model: String,
+        latest: String? = nil,
         effortLevels: [String]?
     ) -> ModelSelection {
         var fallbacks = selection.fallbacks ?? []
@@ -320,6 +323,7 @@ public enum FleetModels {
             fallbacks[index],
             instanceId: instanceId,
             model: model,
+            latest: latest,
             effortLevels: effortLevels
         )
         var next = selection
