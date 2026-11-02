@@ -62,7 +62,10 @@ public struct CompanionDeviceRegistry: Sendable, Equatable {
     private var lastSeenWrites: [String: Double]
 
     public init(devices: [CompanionDeviceRecord] = []) {
-        self.devices = devices.filter { Self.isWellFormed($0) }
+        // The cap bounds every insertion path, including a hand-edited
+        // or seeded fleet larger than `maxDevices`: records past the
+        // cap never authenticate.
+        self.devices = Array(devices.filter { Self.isWellFormed($0) }.prefix(Self.maxDevices))
         self.lastSeenWrites = [:]
     }
 
@@ -199,8 +202,12 @@ public struct CompanionDeviceRegistry: Sendable, Equatable {
     }
 
     /// Writes the fleet atomically, because a torn file reads as empty and
-    /// would sign every phone out.  The file is owner-only: it names the
-    /// paired fleet even though it cannot impersonate it.
+    /// would sign every phone out.  The file is owner-only from the moment
+    /// it exists: the bytes land in a `0600` temp file in the same
+    /// directory and are renamed over the destination, so there is no
+    /// window where `devices.json` sits world-readable, and a failure to
+    /// create, harden, or rename the file is thrown — never swallowed
+    /// after a successful-looking write.
     public func persist(to fileURL: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -209,11 +216,41 @@ public struct CompanionDeviceRegistry: Sendable, Equatable {
             at: fileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try data.write(to: fileURL, options: [.atomic])
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: fileURL.path
+        let directory = fileURL.deletingLastPathComponent()
+        let temporary = directory.appendingPathComponent(
+            ".devices.\(UUID().uuidString.lowercased()).tmp"
         )
+        let descriptor = Darwin.open(temporary.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer {
+            _ = Darwin.close(descriptor)
+            try? FileManager.default.removeItem(at: temporary)
+        }
+        guard Darwin.fchmod(descriptor, 0o600) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        try data.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                guard let baseAddress = buffer.baseAddress else {
+                    throw POSIXError(.EIO)
+                }
+                let written = Darwin.write(
+                    descriptor,
+                    baseAddress.advanced(by: offset),
+                    buffer.count - offset
+                )
+                if written < 0 && errno == EINTR { continue }
+                guard written > 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                offset += written
+            }
+        }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard Darwin.rename(temporary.path, fileURL.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 }
 

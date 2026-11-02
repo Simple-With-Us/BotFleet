@@ -351,3 +351,135 @@ struct CompanionDeviceAcceptanceTests {
     }
 
 }
+
+// MARK: - PR #1477 round 2: 0600-from-creation, coalesced lastSeen, cap on every path
+
+private final class DeviceTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = Date(timeIntervalSince1970: 1_800_000_000)
+    func now() -> Date { lock.lock(); defer { lock.unlock() }; return current }
+    func advance(by seconds: TimeInterval) {
+        lock.lock(); current = current.addingTimeInterval(seconds); lock.unlock()
+    }
+}
+
+@Suite("Native companion devices, round 2 (PR #1477)")
+struct CompanionDeviceRound2Tests {
+
+    private static func tempDir() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("bf1477r2-\(UUID().uuidString.lowercased())", isDirectory: true)
+    }
+
+    private static func fleetRequest(token: String) -> CompanionHTTPRequest {
+        CompanionHTTPRequest(
+            method: "GET", path: "/api/fleet",
+            headers: ["Authorization": "Bearer \(token)"],
+            remoteAddress: "192.168.1.50"
+        )
+    }
+
+    @Test("devices.json is 0600 after persist, replaces a world-readable file, and leaves no temp behind")
+    func persistHardensPermissionsAtomically() throws {
+        let dir = Self.tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let storeURL = dir.appendingPathComponent("devices.json")
+        // A pre-existing world-readable file must not survive a persist.
+        try Data("{}".utf8).write(to: storeURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: storeURL.path)
+
+        var registry = CompanionDeviceRegistry()
+        registry.register(name: "Ada", token: "bf_tok_perms", nowMs: 1_800_000_000_000)
+        try registry.persist(to: storeURL)
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: storeURL.path)
+        #expect((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        #expect(CompanionDeviceRegistry.load(from: storeURL).count == 1)
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasSuffix(".tmp") }
+        #expect(leftovers.isEmpty)
+    }
+
+    @Test("A persist that cannot create its file throws and keeps the old bytes")
+    func persistPropagatesWriteErrors() throws {
+        let dir = Self.tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let storeURL = dir.appendingPathComponent("devices.json")
+        var registry = CompanionDeviceRegistry()
+        registry.register(name: "Ada", token: "bf_tok_errs", nowMs: 1_800_000_000_000)
+        try registry.persist(to: storeURL)
+        let before = try Data(contentsOf: storeURL)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+        registry.register(name: "Bo", token: "bf_tok_errs_2", nowMs: 1_800_000_000_000)
+        #expect(throws: (any Error).self) { try registry.persist(to: storeURL) }
+        #expect(try Data(contentsOf: storeURL) == before)
+    }
+
+    @Test("The fleet cap bounds seeding, addPairedToken, and a hand-built registry alike")
+    func capOnEveryInsertionPath() async throws {
+        let db = try DatabaseService(path: ":memory:")
+        let seeded = Set((0..<25).map { String(format: "bf_tok_cap_%02d", $0) })
+        let server = NativeCompanionServer(database: db, pairedTokens: seeded)
+        #expect(await server.pairedDeviceCount == CompanionDeviceRegistry.maxDevices)
+        // Deterministic truncation: the sorted-first tokens pair, the rest do not.
+        #expect(await server.handleRequest(Self.fleetRequest(token: "bf_tok_cap_00")).statusCode == 200)
+        #expect(await server.handleRequest(Self.fleetRequest(token: "bf_tok_cap_24")).statusCode == 401)
+
+        await server.addPairedToken("bf_tok_cap_extra")
+        #expect(await server.pairedDeviceCount == CompanionDeviceRegistry.maxDevices)
+        #expect(await server.handleRequest(Self.fleetRequest(token: "bf_tok_cap_extra")).statusCode == 401)
+
+        let records = (0..<25).map { i in
+            CompanionDeviceRecord(
+                id: "dev-\(i)", name: "Companion",
+                tokenHash: CompanionDeviceRegistry.tokenHash(for: "bf_tok_reg_\(i)"),
+                createdAt: 1, lastSeenAt: 1
+            )
+        }
+        #expect(CompanionDeviceRegistry(devices: records).count == CompanionDeviceRegistry.maxDevices)
+    }
+
+    @Test("lastSeenAt flushes are coalesced across devices, then land after the window")
+    func lastSeenFlushesCoalesce() async throws {
+        let dir = Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let storeURL = dir.appendingPathComponent("devices.json")
+        let db = try DatabaseService(path: ":memory:")
+        let time = DeviceTestClock()
+        let tokenA = "bf_tok_coalesce_a", tokenB = "bf_tok_coalesce_b"
+        let server = NativeCompanionServer(
+            database: db, pairedTokens: [tokenA, tokenB],
+            deviceStoreURL: storeURL, clock: { time.now() }
+        )
+        func onDiskSeen(_ token: String) -> Double? {
+            CompanionDeviceRegistry.load(from: storeURL).devices
+                .first { $0.tokenHash == CompanionDeviceRegistry.tokenHash(for: token) }?.lastSeenAt
+        }
+        let t0 = 1_800_000_000_000.0
+
+        // First sighting of the window flushes immediately.
+        #expect(await server.handleRequest(Self.fleetRequest(token: tokenA)).statusCode == 200)
+        let afterFirst = try Data(contentsOf: storeURL)
+        #expect(onDiskSeen(tokenA) == t0)
+
+        // A second device one second later updates memory only: the file
+        // is not rewritten inside the coalescing window.
+        time.advance(by: 1)
+        #expect(await server.handleRequest(Self.fleetRequest(token: tokenB)).statusCode == 200)
+        #expect(await server.pairedDevices().map(\.lastSeenAt) == [t0, t0 + 1_000])
+        #expect(try Data(contentsOf: storeURL) == afterFirst)
+        #expect(onDiskSeen(tokenB) == t0)
+
+        // The first sighting after the window flushes every pending one.
+        time.advance(by: 61)
+        #expect(await server.handleRequest(Self.fleetRequest(token: tokenA)).statusCode == 200)
+        #expect(onDiskSeen(tokenA) == t0 + 62_000)
+        #expect(onDiskSeen(tokenB) == t0 + 1_000)
+    }
+}

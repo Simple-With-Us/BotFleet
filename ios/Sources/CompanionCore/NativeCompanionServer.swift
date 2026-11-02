@@ -486,6 +486,13 @@ public actor NativeCompanionServer {
     /// which is what direct unit tests get.
     private var deviceRegistry: CompanionDeviceRegistry
     private let deviceStoreURL: URL?
+    /// When `lastSeenAt` last reached disk (ms), and whether fresher
+    /// sightings are waiting.  Sightings from every device share one
+    /// flush window, so a burst of authenticated requests across the
+    /// fleet rewrites `devices.json` at most once per
+    /// `lastSeenWriteIntervalMs` instead of once per device.
+    private var lastSeenPersistedAtMs: Double?
+    private var lastSeenPersistPending = false
     /// The six-digit code a person types on the phone.
     private var pairingCode: String?
     /// The high-entropy credential the Mac puts in its pairing QR code.  It
@@ -600,7 +607,9 @@ public actor NativeCompanionServer {
         var registry = deviceStoreURL.map { CompanionDeviceRegistry.load(from: $0) }
             ?? CompanionDeviceRegistry()
         let seededAtMs = clock().timeIntervalSince1970 * 1000
-        for token in pairedTokens where !token.isEmpty && !registry.contains(token: token) {
+        for token in pairedTokens.sorted()
+        where !token.isEmpty && !registry.contains(token: token)
+            && registry.count < CompanionDeviceRegistry.maxDevices {
             registry.register(name: "Companion", token: token, nowMs: seededAtMs)
         }
         self.deviceRegistry = registry
@@ -737,8 +746,9 @@ public actor NativeCompanionServer {
         guard let device = deviceRegistry.authenticate(token: token) else { return nil }
         // `lastSeenAt` decorates a settings row; a failed write must never
         // stop an already-valid token from authenticating.
-        if deviceRegistry.recordSeen(id: device.id, nowMs: clock().timeIntervalSince1970 * 1000) {
-            persistDevicesBestEffort()
+        let nowMs = clock().timeIntervalSince1970 * 1000
+        if deviceRegistry.recordSeen(id: device.id, nowMs: nowMs) {
+            persistLastSeenCoalesced(nowMs: nowMs)
         }
         return device
     }
@@ -748,13 +758,33 @@ public actor NativeCompanionServer {
     }
 
     /// Writes the paired fleet when a durable store is configured.
+    /// Any successful write also carries every pending `lastSeenAt`
+    /// sighting, so the coalesced flush restarts its window here.
     private func persistDevices() throws {
         guard let deviceStoreURL else { return }
         try deviceRegistry.persist(to: deviceStoreURL)
+        lastSeenPersistedAtMs = clock().timeIntervalSince1970 * 1000
+        lastSeenPersistPending = false
     }
 
     private func persistDevicesBestEffort() {
         try? persistDevices()
+    }
+
+    /// Batches `lastSeenAt` persistence across devices: the first
+    /// sighting in a window writes immediately, later sightings only
+    /// mark the fleet dirty until the window (`lastSeenWriteIntervalMs`
+    /// since the last successful write) closes, when the next sighting
+    /// flushes them all in one write.  At most one window of sightings
+    /// is ever unwritten — the same bound the per-device throttle in
+    /// `recordSeen` already accepts.
+    private func persistLastSeenCoalesced(nowMs: Double) {
+        if let lastSeenPersistedAtMs,
+           nowMs - lastSeenPersistedAtMs <= CompanionDeviceRegistry.lastSeenWriteIntervalMs {
+            lastSeenPersistPending = true
+            return
+        }
+        persistDevicesBestEffort()
     }
 
     // MARK: - Configuration & State Mutation
@@ -770,7 +800,8 @@ public actor NativeCompanionServer {
     /// Pairs a raw token the caller already holds, kept only as its
     /// digest.  An empty token is not a credential and is refused.
     public func addPairedToken(_ token: String) {
-        guard !token.isEmpty, !deviceRegistry.contains(token: token) else { return }
+        guard !token.isEmpty, !deviceRegistry.contains(token: token),
+              deviceRegistry.count < CompanionDeviceRegistry.maxDevices else { return }
         deviceRegistry.register(
             name: "Companion",
             token: token,
