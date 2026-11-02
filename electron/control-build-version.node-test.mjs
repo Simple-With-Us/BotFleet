@@ -81,6 +81,19 @@ test("a policy pin whose app version disagrees with its marketing version is ref
   );
 });
 
+test("a policy pin whose app version carries no build is refused", () => {
+  // The app version puts the build in its patch, so an app version equal to
+  // the marketing version carries none.  Stamping that as the build would
+  // number the bundle 0 and read as the oldest build in every comparison.
+  assert.throws(
+    () => controlBuildVersion({
+      env: { BOTFLEET_BUILD_VERSION: "0.1.0", BOTFLEET_MARKETING_VERSION: "0.1.0" },
+      repoRoot: "/nonexistent",
+    }),
+    /carries no build/,
+  );
+});
+
 test("a policy pin with a malformed marketing version is refused", () => {
   assert.throws(
     () => controlBuildVersion({

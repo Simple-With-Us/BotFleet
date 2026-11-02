@@ -68,6 +68,16 @@ export function controlBuildVersion({ env = process.env, repoRoot }) {
             `and the build travels in the patch`,
         );
       }
+      if (app[3] === shown[3]) {
+        // The app version carries the build in its patch, so an app version
+        // equal to the marketing version carries no build at all.  Stamping
+        // that as the build would number the bundle 0 and read as the oldest
+        // build in every comparison, so it is refused instead.
+        throw new Error(
+          `the app version ${pinned} carries no build: ` +
+            `the app version puts the build number in its patch, and the marketing version's patch is not one`,
+        );
+      }
       return {
         version: pinned,
         build: String(app[3]),
