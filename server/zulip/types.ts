@@ -60,6 +60,16 @@ export interface ZulipWorkUnit {
   notBefore: number;
 }
 
+export interface ZulipCredentialFieldSource {
+  /** Name of an `infisical.readSources` entry. */
+  source: string;
+  /** Key template with `{ROLE}` and (for login fields) `{FIELD}`. */
+  keyPattern?: string;
+  path?: string;
+  projectId?: string;
+  environment?: string;
+}
+
 /** The `zulip` section of ~/.botfleet/config.json. */
 export interface ZulipSettings {
   enabled?: boolean;
@@ -90,6 +100,11 @@ export interface ZulipSettings {
   /** The environment slug that folder is in (`prod`).  Unset or empty: the
    *  harness's own environment. */
   infisicalEnv?: string;
+  /** Per-field vault sources. Absent: the single-folder behaviour above. */
+  credentialSources?: {
+    login?: ZulipCredentialFieldSource;
+    outgoing?: ZulipCredentialFieldSource;
+  };
   /** BotFleet bot id -> its Zulip role (the file code, e.g. "BF-Plumber"). */
   bots?: Record<string, { role: string; enabled?: boolean }>;
   /** Channels a bot may post to outside the conversation it was woken by. */

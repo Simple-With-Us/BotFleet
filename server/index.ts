@@ -20027,7 +20027,9 @@ zulipHub = new ZulipHub({
   // rest are in memory for the length of the fetch.  The keys stay in the
   // hub's memory, never in `cfg`, `process.env` or a log (docs/zulip.md, D0).
   vault: cachedVaultReader((location) =>
-    infisical.readPath(location.secretPath, { projectId: location.projectId, environment: location.environment }),
+    location.source
+      ? infisical.readSource(location.source, location.secretPath)
+      : infisical.readPath(location.secretPath, { projectId: location.projectId, environment: location.environment }),
   ),
   botExists: (botId) => Boolean(store.bot(botId)),
   // A bot holding a crash marker is not free either: its interrupted turn

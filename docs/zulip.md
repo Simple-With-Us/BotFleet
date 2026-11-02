@@ -119,6 +119,8 @@ Do these in order.  Nothing below runs until `zulip.enabled` is `true`.
 
 Other settings: `credentialSource` (`"file"` or `"infisical"`), `infisicalPath` (default `/zulip`), `infisicalProjectId` and `infisicalEnv` (default:  the harness's own project and environment), `autoReply` (`"final"` or `"off"`), `staleMinutes`, `budgets` (`dmsPerHour`, `peerWakesPerHour`, `peerWakesPerTopicPerHour`, `ownerWakesPerHour`, `peerChainLimit`), `realm`, `ownerClients`.
 
+Split credential sources: when the login keys and the outgoing webhook tokens live in different projects, add `zulip.credentialSources` naming `infisical.readSources` entries (see `docs/secrets.md`).  `login` takes a `source` and a `keyPattern` with `{ROLE}` (the role code, `BF-Plumber` → `BF_PLUMBER`) and `{FIELD}` (`EMAIL`, `API_KEY`, `SITE`), for example `"{ROLE}_ZULIP_{FIELD}"` for `<BOT>_ZULIP_EMAIL` style names.  `outgoing` takes a `source` and a pattern with `{ROLE}` only, for example `"ZULIP_OUTGOING_{ROLE}_TOKEN"`.  Each field source may also set `path`, `projectId` and `environment`.  When `credentialSources` is absent, the single-folder behaviour above is unchanged.  A missing source or key leaves that bot not set up, as before; a missing outgoing source just leaves the bot without a webhook token.
+
 Environment overrides, for tests and soak rigs: `OMB_ZULIP_REALM`, `OMB_ZULIP_CREDENTIAL_DIR`, and `OMB_ZULIP_DISABLE=1` (a kill switch, read at boot and on every reconcile: with it set, no session runs).
 
 ## One Listener per Bot

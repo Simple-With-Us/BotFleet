@@ -1,3 +1,7 @@
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { InfisicalSettings } from "./config.ts";
@@ -24,6 +28,7 @@ const BASE_SETTINGS: InfisicalSettings = {
   clientSecret: SENTINEL_CLIENT_SECRET,
   token: "",
   writeToken: "",
+  readSources: [],
   refreshMinutes: 15,
 };
 
@@ -503,6 +508,96 @@ describe("readPath", () => {
 
     await expect(infisical.readPath("/zulip")).rejects.toThrow(/not configured and turned on/);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("readSources", () => {
+  const FLEET_TOKEN = "fake-fleetops-token-not-real";
+  const AFC_TOKEN = "fake-afc-token-not-real";
+  function tokenFile(token: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "bf-infi-"));
+    const path = join(dir, "token");
+    writeFileSync(path, `${token}\n`);
+    chmodSync(path, 0o600);
+    return path;
+  }
+  function recordingFetch() {
+    const calls: Array<{ url: string; authorization: string | undefined }> = [];
+    const impl = vi.fn(async (url: string, init?: RequestInit) => {
+      const headers = headerBag(init);
+      calls.push({ url: String(url), authorization: headers.authorization });
+      const auth = headers.authorization ?? "";
+      const key = auth.includes(FLEET_TOKEN) ? "FLEET_KEY" : auth.includes(AFC_TOKEN) ? "AFC_KEY" : "MAIN_KEY";
+      return new Response(JSON.stringify({ secrets: [{ secretKey: key, secretValue: `value-for-${key}` }] }), { status: 200 });
+    });
+    return { calls, impl };
+  }
+
+  it("selects a source by project, environment and path, and reads a named source", async () => {
+    withSettings({
+      token: SENTINEL_READ_TOKEN,
+      readSources: [
+        { name: "fleetops-zulip", tokenFile: tokenFile(FLEET_TOKEN), tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" },
+        { name: "afc-zulip", tokenFile: tokenFile(AFC_TOKEN), tokenEnv: "", projectId: "afc-proj", environment: "prod", secretPath: "/zulip" },
+      ],
+    });
+    const { calls, impl } = recordingFetch();
+    vi.stubGlobal("fetch", impl);
+    const fleet = await infisical.readPath("/zulip", { projectId: "fleet-proj", environment: "prod" });
+    expect(fleet.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
+    expect(calls.at(-1)?.authorization).toContain(FLEET_TOKEN);
+    const under = await infisical.readPath("/zulip/nested", { projectId: "fleet-proj", environment: "prod" });
+    expect(under.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
+    const named = await infisical.readSource("afc-zulip");
+    expect(named.get("AFC_KEY")).toBe("value-for-AFC_KEY");
+    expect(calls.at(-1)?.authorization).toContain(AFC_TOKEN);
+    const main = await infisical.readPath("/zulip", { projectId: "proj-1", environment: "prod" });
+    expect(main.get("MAIN_KEY")).toBe("value-for-MAIN_KEY");
+    expect(calls.at(-1)?.authorization).toContain(SENTINEL_READ_TOKEN);
+    expect(infisical.getStatus().readSources.map((s) => [s.name, s.ok])).toEqual([["fleetops-zulip", true], ["afc-zulip", true]]);
+    expect(JSON.stringify(infisical.getStatus())).not.toContain(FLEET_TOKEN);
+  });
+
+  it("warns once and returns empty for a missing token file, without throwing", async () => {
+    withSettings({
+      token: SENTINEL_READ_TOKEN,
+      readSources: [{ name: "fleetops-zulip", tokenFile: "/tmp/bf-definitely-missing-token-file", tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
+    });
+    vi.stubGlobal("fetch", vi.fn());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(infisical.readPath("/zulip", { projectId: "fleet-proj", environment: "prod" })).resolves.toEqual(new Map());
+      await expect(infisical.readSource("fleetops-zulip")).resolves.toEqual(new Map());
+      expect(warn).toHaveBeenCalledTimes(1);
+      const text = warn.mock.calls.flat().join(" ");
+      expect(text).toContain("fleetops-zulip");
+      expect(text).toContain("/tmp/bf-definitely-missing-token-file");
+      expect(text).not.toContain(FLEET_TOKEN);
+      // main vault path still works after the failing source
+      const { impl } = recordingFetch();
+      vi.stubGlobal("fetch", impl);
+      await expect(infisical.readPath("/other", { projectId: "proj-1", environment: "prod" })).resolves.toBeInstanceOf(Map);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("warns once and returns empty when a source token is refused, without leaking it", async () => {
+    withSettings({
+      token: SENTINEL_READ_TOKEN,
+      readSources: [{ name: "afc-zulip", tokenFile: tokenFile(AFC_TOKEN), tokenEnv: "", projectId: "afc-proj", environment: "prod", secretPath: "/zulip" }],
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("no", { status: 401 })));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(infisical.readSource("afc-zulip")).resolves.toEqual(new Map());
+      await expect(infisical.readSource("afc-zulip")).resolves.toEqual(new Map());
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls.flat().join(" ")).not.toContain(AFC_TOKEN);
+      expect(infisical.getStatus().readSources[0]).toMatchObject({ name: "afc-zulip", ok: false });
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

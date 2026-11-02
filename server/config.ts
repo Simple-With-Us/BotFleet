@@ -11,7 +11,7 @@ import { readPersistOnExitPolicy, writePersistOnExitPolicy } from "../electron/p
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
 import { dataDir } from "./data-dir.ts";
 import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
-import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
+import { isJsonObject, isJsonString, parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
 import { resolveKnobFields, stripVaultManagedKnobs } from "./knob-map.ts";
 import { describeDsn } from "./sentry.ts";
@@ -281,6 +281,22 @@ const zulipConfigSchema = z.object({
   // Empty means unset (the harness's own project and environment).
   infisicalProjectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
   infisicalEnv: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
+  credentialSources: z.object({
+    login: z.object({
+      source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+      keyPattern: z.string().trim().regex(/^[A-Z0-9_{}]+$/).max(200).optional(),
+      path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+      projectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
+      environment: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
+    }).optional(),
+    outgoing: z.object({
+      source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+      keyPattern: z.string().trim().regex(/^[A-Z0-9_{}]+$/).max(200).optional(),
+      path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+      projectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
+      environment: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
+    }).optional(),
+  }).optional(),
   bots: z
     .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
     .optional(),
@@ -554,6 +570,14 @@ const appConfigSchema = z.object({
     // identity.  The environment names are the primary route.
     token: optionalText,
     writeToken: optionalText,
+    readSources: z.array(z.object({
+      name: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+      tokenFile: z.string().trim().min(1).refine((v) => v.startsWith("/"), "tokenFile must be an absolute path").optional(),
+      tokenEnv: z.string().trim().regex(/^[A-Z][A-Z0-9_]*$/).optional(),
+      projectId: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/),
+      environment: z.string().trim().regex(/^[a-z0-9-]{1,64}$/).optional(),
+      secretPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+    })).max(32).optional(),
     credentialStorage: externalCredentialStorage,
     refreshMinutes: z.number().int().min(5).max(1440).optional(),
   }).optional(),
@@ -829,6 +853,7 @@ export interface AppConfig {
     clientSecret?: string;
     token?: string;
     writeToken?: string;
+    readSources?: InfisicalReadSource[];
     credentialStorage?: "external";
     refreshMinutes?: number;
   };
@@ -1172,6 +1197,24 @@ export const DEFAULT_INFISICAL_REFRESH_MINUTES = 15;
  * defaulted.  Values are used, never rendered: the only fields here a status
  * view may repeat are the site URL, the project id, the environment and the
  * path. */
+export interface InfisicalReadSource {
+  name: string;
+  tokenFile?: string;
+  tokenEnv?: string;
+  projectId: string;
+  environment?: string;
+  secretPath?: string;
+}
+
+export interface ResolvedInfisicalReadSource {
+  name: string;
+  tokenFile: string;
+  tokenEnv: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+}
+
 export interface InfisicalSettings {
   enabled: boolean;
   writeThrough: boolean;
@@ -1183,6 +1226,7 @@ export interface InfisicalSettings {
   clientSecret: string;
   token: string;
   writeToken: string;
+  readSources: ResolvedInfisicalReadSource[];
   refreshMinutes: number;
 }
 
@@ -1223,6 +1267,27 @@ export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
     clientSecret: stored.clientSecret ?? "",
     token: stored.token?.trim() ?? "",
     writeToken: stored.writeToken?.trim() ?? "",
+    readSources: (() => {
+      const seen = new Set<string>();
+      const out: ResolvedInfisicalReadSource[] = [];
+      for (const src of stored.readSources ?? []) {
+        const name = src.name?.trim() ?? "";
+        const projectId = src.projectId?.trim() ?? "";
+        if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name) || !INFISICAL_PROJECT_ID_PATTERN.test(projectId) || seen.has(name)) continue;
+        seen.add(name);
+        const env = src.environment?.trim() ?? "";
+        const path = src.secretPath?.trim() ?? "";
+        out.push({
+          name,
+          tokenFile: src.tokenFile?.trim() ?? "",
+          tokenEnv: src.tokenEnv?.trim() ?? "",
+          projectId,
+          environment: INFISICAL_ENVIRONMENT_PATTERN.test(env) ? env : (stored.environment?.trim() || DEFAULT_INFISICAL_ENVIRONMENT),
+          secretPath: path.startsWith("/") ? path : DEFAULT_INFISICAL_SECRET_PATH,
+        });
+      }
+      return out;
+    })(),
     refreshMinutes:
       refresh !== undefined && Number.isFinite(refresh)
         ? Math.min(Math.max(Math.trunc(refresh), 5), 1440)
@@ -1748,6 +1813,22 @@ export function loadConfig(): AppConfig {
   for (const [field, names] of identity) {
     const name = names.find((candidate) => process.env[candidate] !== undefined);
     if (name !== undefined) cfg.infisical[field] = process.env[name];
+  }
+  if (process.env.INFISICAL_READ_SOURCES !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(process.env.INFISICAL_READ_SOURCES);
+      if (Array.isArray(parsed)) {
+        cfg.infisical.readSources = parsed.flatMap((entry): InfisicalReadSource[] => {
+          if (!isJsonObject(entry) || !isJsonString(entry.name) || !isJsonString(entry.projectId)) return [];
+          const source: InfisicalReadSource = { name: entry.name, projectId: entry.projectId };
+          if (isJsonString(entry.tokenFile)) source.tokenFile = entry.tokenFile;
+          if (isJsonString(entry.tokenEnv)) source.tokenEnv = entry.tokenEnv;
+          if (isJsonString(entry.environment)) source.environment = entry.environment;
+          if (isJsonString(entry.secretPath)) source.secretPath = entry.secretPath;
+          return [source];
+        });
+      }
+    } catch { /* invalid JSON is ignored; infisicalSettings() drops malformed entries */ }
   }
   cfg.agentProxy = { ...cfg.agentProxy };
   if (process.env.INFISICAL_AGENT_PROXY_ENABLED !== undefined) {

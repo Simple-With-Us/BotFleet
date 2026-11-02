@@ -261,6 +261,48 @@ describe("the Infisical source", () => {
     expect(reads).toBe(3);
   });
 
+  it("reads login and outgoing token from different sources with different key patterns", async () => {
+    const locations: ZulipVaultLocation[] = [];
+    const read = async (location: ZulipVaultLocation) => {
+      locations.push(location);
+      if (location.source === "fleetops-zulip") {
+        return new Map([
+          ["BF_PLUMBER_ZULIP_EMAIL", "bf-plumber-bot@z.test"],
+          ["BF_PLUMBER_ZULIP_API_KEY", FAKE_KEY],
+          ["BF_PLUMBER_ZULIP_SITE", "https://z.test"],
+        ]);
+      }
+      if (location.source === "afc-zulip") return new Map([["ZULIP_OUTGOING_BF_PLUMBER_TOKEN", "fake-outgoing-not-real"]]);
+      return new Map();
+    };
+    const source = credentialSourceFor(
+      {
+        credentialSource: "infisical",
+        bots: { a: { role: "BF-Plumber" } },
+        credentialSources: {
+          login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" },
+          outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" },
+        },
+      },
+      {},
+      { vault: read, realm: REALM },
+    );
+    const creds = await source!.load("BF-Plumber");
+    expect(creds.email).toBe("bf-plumber-bot@z.test");
+    expect(creds.key).toBe(FAKE_KEY);
+    expect(creds.outgoingWebhookToken).toBe("fake-outgoing-not-real");
+    expect(locations.map((l) => l.source)).toEqual(["fleetops-zulip", "afc-zulip"]);
+    expect(locations[0]?.names).toContain("BF_PLUMBER_ZULIP_API_KEY");
+    expect(locations[1]?.names).toContain("ZULIP_OUTGOING_BF_PLUMBER_TOKEN");
+    // a missing login in the split source is "missing", not a crash
+    const empty = credentialSourceFor(
+      { credentialSource: "infisical", credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } } },
+      {},
+      { vault: async () => new Map(), realm: REALM },
+    );
+    await expect(empty!.load("BF-Plumber")).rejects.toMatchObject({ reason: "missing" });
+  });
+
   it("reads another project's folder when infisicalProjectId and infisicalEnv are set", async () => {
     const { read, locations } = vault({ ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test", ZULIP_BF_PLUMBER_API_KEY: FAKE_KEY });
     const source = credentialSourceFor(
