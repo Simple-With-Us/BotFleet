@@ -181,7 +181,7 @@ Small, high-value items first.  Each line names its findings and effort.
 
 1. **Three unpushed commits on local `main` in `~/Code/BotFleet`** (`02ed8ad15`, `7661f360a`, `99d018ecd`; 8 UI files, +44/−27).  Origin/main already has the draggable header (#839) and a sanitized per-user Local VM container name.  The commits also revert the fleet's "CUA" copy standard and produce "BotFleet prepares BotFleet and the VM for you".  Recommendation: discard them.  They were left untouched.
 2. **Updater feed.**  Cut a transition release so 1.0.x installs can update (a public release, so it needs your approval), or remove the auto-check until one exists (RUN-9).
-3. **Audit freeze and ceremony changes.**  Corrections 1 and 10 change fleet protocol in `AGENT-SYNC.md`, which is yours to approve.
+3. **Audit freeze and ceremony changes.**  Corrections 1 and 10 change fleet protocol in `FLEET-PROTOCOL.md`, which is yours to approve.
 4. **Engine tiering and room defaults.**  Which engines are Tier 1, and whether "everyone" rooms stop being a default (corrections 5 and 8).
 
 ## Fixed Since Prior Audits

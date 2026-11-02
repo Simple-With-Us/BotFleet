@@ -1,6 +1,6 @@
 // A routine's command allowlist through RoutineManager:  validated on save,
 // kept on disk, snapshotted on each run, and handed to the turn it dispatches.
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -65,19 +65,42 @@ describe("routine toolPolicy", () => {
     expect(reloaded.listRoutines()[0]!.toolPolicy).toEqual(created.toolPolicy);
   });
 
-  it("rewrites a stored allowlist that still names the retired agent-sync launcher", () => {
+  it("migrates stored allowlists off the retired agent-sync launcher, preserving run history", () => {
     const h = harness();
-    h.manager.create({ name: "Backup Health", prompt: "Check", botId: "bot", schedule: daily, toolPolicy: POLICY });
-    h.manager.flushNow();
-    const file = h.options.file!;
-    // A routine saved before the rename, as an old routines.json would read.
-    writeFileSync(file, readFileSync(file, "utf8").replaceAll("/Users/jay/.local/bin/simple-chat", "/Users/jay/.local/bin/agent-sync"));
+    const bin = join(dirs[dirs.length - 1]!, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "simple-chat"), "#!/bin/sh\n");
+    const oldPolicy = {
+      mode: "allowlist" as const,
+      commands: [{ argv0: join(bin, "agent-sync"), sub: ["whoami"], flags: { "--json": { value: "none" as const } }, args: [], positionals: 0 }],
+      writePaths: [],
+      readPaths: [],
+    };
+    // A routines.json from before the rename: one routine, one still-queued
+    // run (live state) and one completed run (the audit record).
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [
+        { id: "r1", name: "Backup Health", prompt: "Check", botId: "bot", schedule: daily, runOn: "bot", toolPolicy: oldPolicy, createdAt: 1, updatedAt: 1 },
+        { id: "r2", name: "No Sibling", prompt: "Check", botId: "bot", schedule: daily, runOn: "bot", toolPolicy: { ...oldPolicy, commands: [{ ...oldPolicy.commands[0], argv0: join(dirs[dirs.length - 1]!, "agent-sync") }] }, createdAt: 1, updatedAt: 1 },
+      ],
+      runs: [
+        { id: "run-queued", routineId: "r1", botId: "bot", status: "queued", scheduledFor: 1, createdAt: 1, manual: false, triggerSource: "schedule", toolPolicy: oldPolicy },
+        { id: "run-done", routineId: "r1", botId: "bot", status: "completed", scheduledFor: 1, createdAt: 1, finishedAt: 2, manual: false, triggerSource: "schedule", toolPolicy: oldPolicy },
+      ],
+    }));
     const reloaded = new RoutineManager(h.options);
-    expect(reloaded.listRoutines()[0]!.toolPolicy?.commands[0]!.argv0).toBe("/Users/jay/.local/bin/simple-chat");
+    const routines = reloaded.listRoutines();
+    // The routine whose sibling binary exists migrates; the one without stays.
+    expect(routines.find((r) => r.id === "r1")!.toolPolicy?.commands[0]!.argv0).toBe(join(bin, "simple-chat"));
+    expect(routines.find((r) => r.id === "r2")!.toolPolicy?.commands[0]!.argv0).toBe(join(dirs[dirs.length - 1]!, "agent-sync"));
+    // A queued run's snapshot is still executable state and migrates;  a
+    // completed run's snapshot is the record of what it ran under and stays.
+    expect(reloaded.listRuns().find((r) => r.id === "run-queued")!.toolPolicy?.commands[0]!.argv0).toBe(join(bin, "simple-chat"));
+    expect(reloaded.listRuns().find((r) => r.id === "run-done")!.toolPolicy?.commands[0]!.argv0).toBe(join(bin, "agent-sync"));
     reloaded.flushNow();
-    const persisted = readFileSync(file, "utf8");
-    expect(persisted).toContain("/Users/jay/.local/bin/simple-chat");
-    expect(persisted).not.toContain("agent-sync");
+    const persisted = readFileSync(h.options.file!, "utf8");
+    expect(persisted).toContain(join(bin, "simple-chat"));
+    expect(persisted.match(/agent-sync/g)).toHaveLength(2); // r2 and run-done, untouched
   });
 
   it("refuses an invalid allowlist and one on a cloud run", () => {

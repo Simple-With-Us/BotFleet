@@ -2,7 +2,7 @@ import { boundStalePromptSnapshots, retainRoutineRuns } from "../shared/routine-
 import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 
@@ -495,8 +495,8 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
 /** The fleet chat CLI's retired launcher spelling.  An allowlist saved
  *  before the rename still names it in a command's `argv0`, and the
  *  string-compared match would deny the same program under its current
- *  name - so the stored entry is rewritten on load, once.  Only the
- *  basename moves;  the directory, flags, args and paths are untouched. */
+ *  name - so the stored entry is rewritten on load.  Only the basename
+ *  moves;  the directory, flags, args and paths are untouched. */
 const RETIRED_CHAT_CLI_ARGV0 = "agent-sync";
 
 function migrateChatCliArgv0(policy: ToolPolicy | undefined): { policy: ToolPolicy | undefined; migrated: boolean } {
@@ -505,8 +505,15 @@ function migrateChatCliArgv0(policy: ToolPolicy | undefined): { policy: ToolPoli
   const commands = policy.commands.map((entry) => {
     if (typeof entry?.argv0 !== "string") return entry;
     if (basename(entry.argv0).toLowerCase() !== RETIRED_CHAT_CLI_ARGV0) return entry;
+    // The retired launcher lived next to the CLI it ran, so a sibling under
+    // the current name is the same program and the entry's flags keep their
+    // meaning.  Without that sibling the path could be an unrelated program
+    // that happens to share the old basename:  leave the entry as saved, so
+    // it is denied loudly under the old name rather than redirected.
+    const renamed = join(dirname(entry.argv0), CHAT_CLI_NAMES[0]);
+    if (!existsSync(renamed)) return entry;
     migrated = true;
-    return { ...entry, argv0: join(dirname(entry.argv0), CHAT_CLI_NAMES[0]) };
+    return { ...entry, argv0: renamed };
   });
   return migrated ? { policy: { ...policy, commands }, migrated: true } : { policy, migrated: false };
 }
@@ -623,6 +630,10 @@ export class RoutineManager {
     this.runs = rawRuns.map((run) => {
       const runOn = normalizeRunOn(run.runOn);
       if ((run as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
+      // Only a queued run's snapshot is still executable state.  Boot
+      // recovery below fails anything running or waiting, and a terminal
+      // run's snapshot is the audit record of the policy it ran under.
+      if (run.status !== "queued") return { ...run, runOn };
       const policy = migrateChatCliArgv0(run.toolPolicy);
       if (policy.migrated) policyMigrated = true;
       return { ...run, runOn, toolPolicy: policy.policy };
