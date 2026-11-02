@@ -18,7 +18,7 @@ export function healthReadiness(input: HealthReadinessInput) {
   return {
     ready: !input.booting,
     booting: input.booting,
-    degraded: Boolean(input.webhookIngressError),
+    degraded: input.webhookIngressError !== null,
     webhookIngressError: input.webhookIngressError,
   };
 }

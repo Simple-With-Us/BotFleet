@@ -3,6 +3,10 @@ import { describe, expect, it } from "vitest";
 import { healthReadiness } from "./health-readiness.ts";
 
 describe("health readiness", () => {
+  it("treats an empty-string ingress error as degraded, honoring string | null", () => {
+    expect(healthReadiness({ booting: false, webhookIngressError: "" }).degraded).toBe(true);
+  });
+
   it("reports not-ready and not degraded while booting cleanly", () => {
     expect(healthReadiness({ booting: true, webhookIngressError: null })).toEqual({
       ready: false,
