@@ -402,13 +402,13 @@ describe("the retired launcher spelling", () => {
 
   it("refuses it even when a stored policy still names it, and says it is retired", () => {
     const decision = evaluateCommand(policy, `${RETIRED} whoami`);
-    expect(decision.ok).toBe(false);
+    if (decision.ok) throw new Error("allowed the retired spelling");
     expect(decision.reason).toContain("agent-sync has been retired: use simple-chat");
   });
 
   it("refuses it as an interpreter's script", () => {
     const decision = evaluateCommand(policy, `${PYTHON} /Users/jay/apps/fleet/agent-sync dm`);
-    expect(decision.ok).toBe(false);
+    if (decision.ok) throw new Error("allowed the retired spelling as a script");
     expect(decision.reason).toContain("retired");
   });
 
@@ -418,13 +418,13 @@ describe("the retired launcher spelling", () => {
       commands: [{ argv0: "/Users/jay/.local/bin/Agent-Sync", sub: ["whoami"], flags: {}, args: [], positionals: 0 }],
     };
     const decision = evaluateCommand(variantPolicy, "/Users/jay/.local/bin/Agent-Sync whoami");
-    expect(decision.ok).toBe(false);
+    if (decision.ok) throw new Error("allowed a case variant of the retired spelling");
     expect(decision.reason).toContain("retired");
   });
 
   it("does not touch a word that only starts with the name", () => {
     const decision = evaluateCommand(policy, "/usr/bin/tail /tmp/agent-sync.log");
-    expect(decision.ok).toBe(false);
+    if (decision.ok) throw new Error("allowed an unlisted program");
     expect(decision.reason).not.toContain("retired");
   });
 
