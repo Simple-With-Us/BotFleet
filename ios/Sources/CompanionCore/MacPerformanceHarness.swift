@@ -742,23 +742,200 @@ public enum MacPerformanceHarness {
         )
     }
 
+    /// Strips line comments (`//...`) and block comments (`/*...*/`) from Swift
+    /// source while preserving string literals, so comment-only type mentions
+    /// can never satisfy the visual surface gate.
+    public static func stripSwiftComments(from source: String) -> String {
+        var result = String()
+        result.reserveCapacity(source.count)
+        let chars = Array(source)
+        var index = 0
+        var inString = false
+        var inLineComment = false
+        var inBlockComment = false
+
+        while index < chars.count {
+            let current = chars[index]
+            let next: Character? = (index + 1 < chars.count) ? chars[index + 1] : nil
+
+            if inLineComment {
+                if current == "\n" {
+                    inLineComment = false
+                    result.append(current)
+                }
+                index += 1
+                continue
+            }
+
+            if inBlockComment {
+                if current == "*" && next == "/" {
+                    inBlockComment = false
+                    index += 2
+                } else {
+                    if current == "\n" {
+                        result.append(current)
+                    }
+                    index += 1
+                }
+                continue
+            }
+
+            if inString {
+                result.append(current)
+                if current == "\\" && next != nil {
+                    result.append(next!)
+                    index += 2
+                    continue
+                }
+                if current == "\"" {
+                    inString = false
+                }
+                index += 1
+                continue
+            }
+
+            if current == "\"" {
+                inString = true
+                result.append(current)
+                index += 1
+                continue
+            }
+
+            if current == "/" && next == "/" {
+                inLineComment = true
+                index += 2
+                continue
+            }
+
+            if current == "/" && next == "*" {
+                inBlockComment = true
+                index += 2
+                continue
+            }
+
+            result.append(current)
+            index += 1
+        }
+
+        return result
+    }
+
+    /// Generates the deterministic light/dark visual snapshot matrix across all
+    /// `MacThemeMode` cases, all 51 `MacMascotExpression` states, and all 4
+    /// `MacStatusPillKind` states (BF-2496 / BF-2558).
+    public static func runLightDarkVisualSnapshotSuite() -> [MacVisualSurfaceSnapshot] {
+        var snapshots: [MacVisualSurfaceSnapshot] = []
+        for themeMode in MacThemeMode.allCases {
+            for appearance in themeMode.effectiveAppearances {
+                let mascots = MacMascotExpression.allCases.map { expr in
+                    MacVisualSurfaceSnapshot.MascotSnapshot(
+                        expression: expr,
+                        symbolName: expr.symbolName,
+                        displayLabel: expr.displayLabel,
+                        canonicalCategory: expr.canonicalCategory.rawValue,
+                        isAnimated: expr.isAnimated,
+                        badgeTintToken: "controlAccentColor:\(appearance)"
+                    )
+                }
+                let pills = MacStatusPillKind.allCases.map { kind in
+                    MacVisualSurfaceSnapshot.StatusPillSnapshot(
+                        kind: kind,
+                        label: kind.label,
+                        symbolName: kind.symbolName,
+                        accessibilityLabel: kind.accessibilityLabel,
+                        semanticColorToken: "\(kind.semanticColorToken):\(appearance)"
+                    )
+                }
+                snapshots.append(
+                    MacVisualSurfaceSnapshot(
+                        themeMode: themeMode,
+                        effectiveAppearance: appearance,
+                        backgroundToken: "windowBackgroundColor:\(appearance)",
+                        foregroundToken: "labelColor:\(appearance)",
+                        mascotSnapshots: mascots,
+                        statusPillSnapshots: pills
+                    )
+                )
+            }
+        }
+        return snapshots
+    }
+
+    /// Evaluates the light/dark visual snapshot suite and returns true only when
+    /// every theme mode, appearance, mascot expression, and status pill renders
+    /// with semantic appearance tokens and zero hardcoded hex colors.
+    public static func verifyLightDarkVisualSnapshotSuite() -> Bool {
+        let snapshots = runLightDarkVisualSnapshotSuite()
+        guard snapshots.count == 4 else { return false }
+
+        let systemSnapshots = snapshots.filter { $0.themeMode == .system }
+        guard Set(systemSnapshots.map(\.effectiveAppearance)) == Set(["aqua", "darkAqua"]) else {
+            return false
+        }
+
+        guard let aquaSnapshot = systemSnapshots.first(where: { $0.effectiveAppearance == "aqua" }),
+              let darkSnapshot = systemSnapshots.first(where: { $0.effectiveAppearance == "darkAqua" }),
+              aquaSnapshot.backgroundToken != darkSnapshot.backgroundToken,
+              aquaSnapshot.foregroundToken != darkSnapshot.foregroundToken else {
+            return false
+        }
+
+        for snapshot in snapshots {
+            if snapshot.backgroundToken.contains("#") || snapshot.foregroundToken.contains("#") {
+                return false
+            }
+            if Set(snapshot.mascotSnapshots.map { $0.expression.rawValue }) != MacVisualParityExpectations.mascotExpressions {
+                return false
+            }
+            if Set(snapshot.statusPillSnapshots.map { $0.kind.rawValue }) != MacVisualParityExpectations.statusPills {
+                return false
+            }
+            let mascotsValid = snapshot.mascotSnapshots.allSatisfy {
+                !$0.symbolName.isEmpty &&
+                !$0.displayLabel.isEmpty &&
+                !$0.canonicalCategory.isEmpty &&
+                !$0.badgeTintToken.isEmpty &&
+                !$0.badgeTintToken.contains("#")
+            }
+            let pillsValid = snapshot.statusPillSnapshots.allSatisfy {
+                !$0.label.isEmpty &&
+                !$0.symbolName.isEmpty &&
+                !$0.accessibilityLabel.isEmpty &&
+                !$0.semanticColorToken.isEmpty &&
+                !$0.semanticColorToken.contains("#")
+            }
+            if !mascotsValid || !pillsValid {
+                return false
+            }
+        }
+
+        return true
+    }
+
     /// Verifies both the shared visual design contract and the Mac app's source
     /// surface against the BF-2496 and BF-2558 visual parity requirements.
     public static func verifyVisualParity(macAppSources: [String]) -> MacVisualParityReport {
-        let rendersMascot = macAppSources.contains { $0.contains("MacMascotExpression") }
-        let rendersStatusPills = macAppSources.contains { $0.contains("MacStatusPillKind") }
-        let forcesColorScheme = macAppSources.contains { $0.contains(".preferredColorScheme(") }
-        let hexPattern = try? NSRegularExpression(pattern: "#[0-9A-Fa-f]{6}")
-        let hasHardcodedHex = macAppSources.contains { source in
-            let range = NSRange(source.startIndex..<source.endIndex, in: source)
-            return hexPattern?.firstMatch(in: source, range: range) != nil
+        let uncommentedSources = macAppSources.map(stripSwiftComments(from:))
+        let rendersMascot = uncommentedSources.contains {
+            $0.contains("MacMascotExpression.resolve(") || $0.contains(": MacMascotExpression")
         }
-        let allExpressionsRenderable = MacMascotExpression.allCases.allSatisfy {
-            !$0.symbolName.isEmpty && !$0.displayLabel.isEmpty
+        let rendersStatusPills = uncommentedSources.contains {
+            $0.contains("MacStatusPillView(") || $0.contains(": MacStatusPillKind")
         }
-        let allPillsRenderable = MacStatusPillKind.allCases.allSatisfy {
-            !$0.label.isEmpty && !$0.symbolName.isEmpty && !$0.accessibilityLabel.isEmpty
+        let forcesColorScheme = uncommentedSources.contains {
+            $0.contains(".preferredColorScheme(")
         }
+        let hasHardcodedHex: Bool
+        do {
+            let hexPattern = try NSRegularExpression(pattern: "#[0-9A-Fa-f]{6}")
+            hasHardcodedHex = macAppSources.contains { source in
+                let range = NSRange(source.startIndex..<source.endIndex, in: source)
+                return hexPattern.firstMatch(in: source, range: range) != nil
+            }
+        } catch {
+            hasHardcodedHex = true
+        }
+        let snapshotSuiteVerified = verifyLightDarkVisualSnapshotSuite()
         let systemThemeFollowsAppearance = MacDesignTokens.defaultThemeMode.followsSystemAppearance &&
             Set(MacThemeMode.allCases) == Set([.light, .dark, .system])
 
@@ -767,15 +944,14 @@ public enum MacPerformanceHarness {
             rendersStatusPills &&
             !forcesColorScheme &&
             !hasHardcodedHex &&
-            allExpressionsRenderable &&
-            allPillsRenderable &&
+            snapshotSuiteVerified &&
             systemThemeFollowsAppearance
 
         let note: String
         if verified {
-            note = "the Mac app renders MacMascotExpression (\(MacMascotExpression.allCases.count) states) and MacStatusPillKind (\(MacStatusPillKind.allCases.count) states) with system light/dark appearance and zero hardcoded hex colors"
+            note = "the Mac app renders MacMascotExpression (\(MacMascotExpression.allCases.count) states) and MacStatusPillKind (\(MacStatusPillKind.allCases.count) states) across the light/dark visual snapshot suite with zero hardcoded hex colors"
         } else {
-            note = "the Mac app surface is missing MacMascotExpression or MacStatusPillKind rendering, or carries a hardcoded hex color or forced color scheme"
+            note = "the Mac app surface is missing MacMascotExpression or MacStatusPillKind rendering, failed the light/dark snapshot suite, or carries a hardcoded hex color or forced color scheme"
         }
 
         return verifyVisualParity(

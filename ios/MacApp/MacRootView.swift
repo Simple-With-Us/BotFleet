@@ -82,7 +82,7 @@ struct MacStatusPillView: View {
         .clipShape(Capsule())
         .help(detailText ?? kind.label)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(kind.accessibilityLabel)
+        .accessibilityLabel(kind.accessibilityLabel(detailText: detailText))
     }
 
     private var pillColor: Color {
@@ -128,7 +128,6 @@ struct MacSidebarView: View {
                             MacBotRowView(
                                 bot: bot,
                                 pill: pill,
-                                expression: mascotExpression.canonicalCategory,
                                 mascotExpression: mascotExpression
                             )
                             .tag(SidebarSelection.bot(bot.id))
@@ -202,8 +201,7 @@ struct MacSidebarView: View {
 struct MacBotRowView: View {
     let bot: Bot
     let pill: MacSidebarStatusPill
-    let expression: MacBotMascotExpression
-    var mascotExpression: MacMascotExpression = .idle
+    let mascotExpression: MacMascotExpression
 
     var body: some View {
         HStack(spacing: 10) {

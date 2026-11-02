@@ -204,15 +204,12 @@ public enum MacMascotExpression: String, CaseIterable, Sendable, Codable {
         if hasReasoning {
             return .thinking
         }
-        if let raw = bot.mascotExpression?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-           let explicit = MacMascotExpression(rawValue: raw) {
-            if bot.busy == true && explicit == .idle {
-                return .working
-            }
-            return explicit
-        }
         if bot.busy == true {
             return .working
+        }
+        if let raw = bot.mascotExpression?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           let explicit = MacMascotExpression(rawValue: raw) {
+            return explicit
         }
         return .idle
     }
@@ -266,6 +263,28 @@ public enum MacStatusPillKind: String, CaseIterable, Sendable, Codable {
     public var accessibilityLabel: String {
         "Connection status: \(label)"
     }
+
+    /// The VoiceOver accessibility label for the status pill, including any
+    /// visible detail text such as the connected endpoint or failure reason.
+    public func accessibilityLabel(detailText: String?) -> String {
+        guard let detail = detailText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !detail.isEmpty,
+              detail != label,
+              detail != accessibilityLabel else {
+            return accessibilityLabel
+        }
+        return "\(accessibilityLabel), \(detail)"
+    }
+
+    /// The semantic system color token name for the status pill across light and dark appearances.
+    public var semanticColorToken: String {
+        switch self {
+        case .connected: return "systemGreen"
+        case .reconnecting: return "systemYellow"
+        case .offline: return "systemGray"
+        case .error: return "systemRed"
+        }
+    }
 }
 
 /// Maps the app's connection states onto the shared pill vocabulary.
@@ -293,6 +312,88 @@ public enum MacThemeMode: String, CaseIterable, Sendable, Codable {
     /// True when the theme mode defers to macOS system appearance rather than pinning a scheme.
     public var followsSystemAppearance: Bool {
         self == .system
+    }
+
+    /// The effective macOS appearances this theme mode resolves across light and dark environments.
+    public var effectiveAppearances: [String] {
+        switch self {
+        case .light: return ["aqua"]
+        case .dark: return ["darkAqua"]
+        case .system: return ["aqua", "darkAqua"]
+        }
+    }
+}
+
+/// A rendered light/dark visual snapshot entry for the BF-2496 parity suite.
+public struct MacVisualSurfaceSnapshot: Sendable, Codable, Equatable {
+    public let themeMode: MacThemeMode
+    public let effectiveAppearance: String
+    public let backgroundToken: String
+    public let foregroundToken: String
+    public let mascotSnapshots: [MascotSnapshot]
+    public let statusPillSnapshots: [StatusPillSnapshot]
+
+    public struct MascotSnapshot: Sendable, Codable, Equatable {
+        public let expression: MacMascotExpression
+        public let symbolName: String
+        public let displayLabel: String
+        public let canonicalCategory: String
+        public let isAnimated: Bool
+        public let badgeTintToken: String
+
+        public init(
+            expression: MacMascotExpression,
+            symbolName: String,
+            displayLabel: String,
+            canonicalCategory: String,
+            isAnimated: Bool,
+            badgeTintToken: String
+        ) {
+            self.expression = expression
+            self.symbolName = symbolName
+            self.displayLabel = displayLabel
+            self.canonicalCategory = canonicalCategory
+            self.isAnimated = isAnimated
+            self.badgeTintToken = badgeTintToken
+        }
+    }
+
+    public struct StatusPillSnapshot: Sendable, Codable, Equatable {
+        public let kind: MacStatusPillKind
+        public let label: String
+        public let symbolName: String
+        public let accessibilityLabel: String
+        public let semanticColorToken: String
+
+        public init(
+            kind: MacStatusPillKind,
+            label: String,
+            symbolName: String,
+            accessibilityLabel: String,
+            semanticColorToken: String
+        ) {
+            self.kind = kind
+            self.label = label
+            self.symbolName = symbolName
+            self.accessibilityLabel = accessibilityLabel
+            self.semanticColorToken = semanticColorToken
+        }
+    }
+
+    public init(
+        themeMode: MacThemeMode,
+        effectiveAppearance: String,
+        backgroundToken: String,
+        foregroundToken: String,
+        mascotSnapshots: [MascotSnapshot],
+        statusPillSnapshots: [StatusPillSnapshot]
+    ) {
+        self.themeMode = themeMode
+        self.effectiveAppearance = effectiveAppearance
+        self.backgroundToken = backgroundToken
+        self.foregroundToken = foregroundToken
+        self.mascotSnapshots = mascotSnapshots
+        self.statusPillSnapshots = statusPillSnapshots
     }
 }
 

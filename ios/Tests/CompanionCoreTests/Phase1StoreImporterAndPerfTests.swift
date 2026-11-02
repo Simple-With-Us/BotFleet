@@ -1437,11 +1437,10 @@ struct Phase1StoreImporterAndPerfTests {
             #expect(resolved == expression)
             bot.busy = true
             let busyResolved = MacMascotExpression.resolve(for: bot, isConnected: true)
-            if expression == .idle {
-                #expect(busyResolved == .working)
-            } else {
-                #expect(busyResolved == expression)
-            }
+            let canonicalBusyResolved = MacBotMascotExpression.resolve(for: bot, isConnected: true)
+            #expect(busyResolved == .working)
+            #expect(canonicalBusyResolved == .working)
+            #expect(busyResolved.canonicalCategory == canonicalBusyResolved)
         }
         let baseBot = Bot(
             id: "bot-live",
@@ -1460,15 +1459,37 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(MacMascotExpression.resolve(for: baseBot, hasReasoning: true, isConnected: true) == .thinking)
         #expect(MacMascotExpression.resolve(for: baseBot, isConnected: true) == .idle)
 
-        // Every status pill kind carries a label, symbol, and accessibility label.
+        // Every status pill kind carries a label, symbol, semantic color token,
+        // and VoiceOver accessibility label (including visible detail text).
         for pill in MacStatusPillKind.allCases {
             #expect(pill.label.isEmpty == false)
             #expect(pill.symbolName.isEmpty == false)
+            #expect(pill.semanticColorToken.isEmpty == false)
             #expect(pill.accessibilityLabel == "Connection status: \(pill.label)")
+            #expect(pill.accessibilityLabel(detailText: nil) == pill.accessibilityLabel)
+            #expect(pill.accessibilityLabel(detailText: pill.label) == pill.accessibilityLabel)
         }
+        #expect(
+            MacStatusPillKind.connected.accessibilityLabel(detailText: "Connected (http://127.0.0.1:8799)") ==
+            "Connection status: Connected, Connected (http://127.0.0.1:8799)"
+        )
+        #expect(
+            MacStatusPillKind.error.accessibilityLabel(detailText: "Error: Connection refused") ==
+            "Connection status: Error, Error: Connection refused"
+        )
         #expect(MacThemeMode.system.followsSystemAppearance == true)
         #expect(MacThemeMode.light.followsSystemAppearance == false)
         #expect(MacThemeMode.dark.followsSystemAppearance == false)
+
+        // Light/dark snapshot suite covers all 3 theme modes across light and dark
+        // effective appearances, 51 mascot expressions, and 4 status pills.
+        let snapshots = MacPerformanceHarness.runLightDarkVisualSnapshotSuite()
+        #expect(snapshots.count == 4)
+        #expect(MacPerformanceHarness.verifyLightDarkVisualSnapshotSuite() == true)
+        for snapshot in snapshots {
+            #expect(snapshot.mascotSnapshots.count == 51)
+            #expect(snapshot.statusPillSnapshots.count == 4)
+        }
 
         let report = MacPerformanceHarness.verifyVisualParity(macAppSources: sources)
         #expect(report.contractSnapshotVerified == true)
@@ -1478,5 +1499,13 @@ struct Phase1StoreImporterAndPerfTests {
 
         let emptySurfaceReport = MacPerformanceHarness.verifyVisualParity(macAppSources: [])
         #expect(emptySurfaceReport.appSurfaceVerified == false)
+
+        // Comment-only mentions of MacMascotExpression and MacStatusPillKind must
+        // never satisfy the visual parity gate.
+        let commentOnlySources = [
+            "// MacMascotExpression.resolve(for: bot) : MacMascotExpression\n/* MacStatusPillView(kind: .connected) : MacStatusPillKind */\nstruct PlaceholderView {}"
+        ]
+        let commentOnlyReport = MacPerformanceHarness.verifyVisualParity(macAppSources: commentOnlySources)
+        #expect(commentOnlyReport.appSurfaceVerified == false)
     }
 }

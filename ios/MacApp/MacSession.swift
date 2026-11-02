@@ -22,13 +22,13 @@ public enum MacConnectionStatus: Equatable, Sendable {
     public var statusPillKind: MacStatusPillKind {
         switch self {
         case .connected:
-            return MacConnectionStatusPill.pillByConnectionState["connected"] ?? .connected
+            return .connected
         case .connecting:
-            return MacConnectionStatusPill.pillByConnectionState["connecting"] ?? .reconnecting
+            return .reconnecting
         case .disconnected:
-            return MacConnectionStatusPill.pillByConnectionState["disconnected"] ?? .offline
+            return .offline
         case .failed:
-            return MacConnectionStatusPill.pillByConnectionState["failed"] ?? .error
+            return .error
         }
     }
 
