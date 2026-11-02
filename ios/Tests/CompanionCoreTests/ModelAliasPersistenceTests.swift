@@ -47,18 +47,14 @@ final class ModelAliasPersistenceTests: XCTestCase {
         XCTAssertEqual(decodedHyphen.latest, "sonnet")
     }
 
-    func testLatestOptionsForCursorAndClaude() {
-        let cursorInstance = Instance(
-            instanceId: "cursor-1",
-            name: "Cursor",
+    func testLatestOptionsForCursorAndClaude() throws {
+        let cursorInstance = try makeInstance(
+            id: "cursor-1",
             driverKind: "cursorAgent",
-            models: InstanceModels(
-                default: "composer-2.5",
-                options: [
-                    ModelOption(id: "composer-1.5", label: "Composer 1.5"),
-                    ModelOption(id: "composer-2.5", label: "Composer 2.5")
-                ]
-            )
+            options: [
+                ModelOption(id: "composer-1.5", label: "Composer 1.5"),
+                ModelOption(id: "composer-2.5", label: "Composer 2.5")
+            ]
         )
 
         let cursorOpts = ModelLineage.latestOptions(for: cursorInstance)
@@ -67,18 +63,14 @@ final class ModelAliasPersistenceTests: XCTestCase {
         XCTAssertEqual(cursorOpts.first?.label, "Latest Composer")
         XCTAssertEqual(cursorOpts.first?.resolvedId, "composer-2.5")
 
-        let claudeInstance = Instance(
-            instanceId: "claude-1",
-            name: "Claude",
+        let claudeInstance = try makeInstance(
+            id: "claude-1",
             driverKind: "claudeAgent",
-            models: InstanceModels(
-                default: "claude-sonnet-4.6",
-                options: [
-                    ModelOption(id: "claude-sonnet-4.5", label: "Claude Sonnet 4.5"),
-                    ModelOption(id: "claude-sonnet-4.6", label: "Claude Sonnet 4.6"),
-                    ModelOption(id: "claude-opus-4.1", label: "Claude Opus 4.1")
-                ]
-            )
+            options: [
+                ModelOption(id: "claude-sonnet-4.5", label: "Claude Sonnet 4.5"),
+                ModelOption(id: "claude-sonnet-4.6", label: "Claude Sonnet 4.6"),
+                ModelOption(id: "claude-opus-4.1", label: "Claude Opus 4.1")
+            ]
         )
 
         let claudeOpts = ModelLineage.latestOptions(for: claudeInstance)
@@ -87,17 +79,13 @@ final class ModelAliasPersistenceTests: XCTestCase {
         XCTAssertEqual(sonnetOpt?.label, "Latest Sonnet")
         XCTAssertEqual(sonnetOpt?.resolvedId, "claude-sonnet-4.6")
 
-        let nonLineageInstance = Instance(
-            instanceId: "minimax-1",
-            name: "MiniMax",
+        let nonLineageInstance = try makeInstance(
+            id: "minimax-1",
             driverKind: "minimax",
-            models: InstanceModels(
-                default: "MiniMax-M3",
-                options: [
-                    ModelOption(id: "MiniMax-M3", label: "MiniMax M3"),
-                    ModelOption(id: "custom-sonnet-clone", label: "Custom Sonnet Clone")
-                ]
-            )
+            options: [
+                ModelOption(id: "MiniMax-M3", label: "MiniMax M3"),
+                ModelOption(id: "custom-sonnet-clone", label: "Custom Sonnet Clone")
+            ]
         )
         XCTAssertTrue(
             ModelLineage.latestOptions(for: nonLineageInstance).isEmpty,
@@ -105,18 +93,14 @@ final class ModelAliasPersistenceTests: XCTestCase {
         )
     }
 
-    func testDisplayLabelMatchesWebFormat() {
-        let cursorInstance = Instance(
-            instanceId: "cursor",
-            name: "Cursor",
+    func testDisplayLabelMatchesWebFormat() throws {
+        let cursorInstance = try makeInstance(
+            id: "cursor",
             driverKind: "cursorAgent",
-            models: InstanceModels(
-                default: "composer-2.5",
-                options: [
-                    ModelOption(id: "composer-1.5", label: "Composer 1.5"),
-                    ModelOption(id: "composer-2.5", label: "Composer 2.5")
-                ]
-            )
+            options: [
+                ModelOption(id: "composer-1.5", label: "Composer 1.5"),
+                ModelOption(id: "composer-2.5", label: "Composer 2.5")
+            ]
         )
 
         let selectionWithLatest = ModelSelection(
@@ -134,6 +118,25 @@ final class ModelAliasPersistenceTests: XCTestCase {
         )
         let concreteLabel = ModelLineage.displayLabel(selection: concreteSelection, instance: cursorInstance)
         XCTAssertEqual(concreteLabel, "Composer 2.5")
+    }
+
+    private func makeInstance(
+        id: String,
+        driverKind: String,
+        options: [ModelOption]
+    ) throws -> Instance {
+        let object: [String: Any] = [
+            "instanceId": id,
+            "driverKind": driverKind,
+            "snapshot": ["state": "available"],
+            "models": [
+                "default": options.first?.id ?? "",
+                "options": options.map { opt -> [String: Any] in
+                    ["id": opt.id, "label": opt.label]
+                }
+            ]
+        ]
+        return try JSONDecoder().decode(Instance.self, from: JSONSerialization.data(withJSONObject: object))
     }
 
     func testSimulatedPickerReopeningPreservesLatest() {
