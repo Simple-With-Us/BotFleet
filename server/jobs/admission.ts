@@ -372,6 +372,49 @@ function formatGb(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+/** The memory/storage pressure part of admission: swap, free disk, free
+ *  inodes, the owner-set headroom gates, and the data volume being offline.
+ *  Placement queues on these in every mode (the pressure-gate queue) instead
+ *  of refusing, so the registry asks for them separately from the hard
+ *  refusals.  The spend ceiling is deliberately absent: unattended spend is
+ *  refused, never queued. */
+export function pressureRefusal(
+  probe: HostProbe,
+  thresholds: AdmissionThresholds,
+  dataDir: string,
+): string | null {
+  const storage = probe.admissionStorageSample?.(dataDir);
+  if ((storage ? storage.storage : probe.storageState?.())?.online === false) return "Server storage offline: no new background job can start until the data volume is available";
+  const swap = probe.swapUsedPercent();
+  if (swap !== null && swap >= thresholds.maxSwapPercent) {
+    return `This computer is short on memory (swap ${Math.round(swap)}% used), so no new background job can start right now.  Try again later, or tell the user.`;
+  }
+  const free = storage ? storage.freeDiskBytes : probe.freeDiskBytes(dataDir);
+  if (free !== null && free < thresholds.minFreeDiskBytes) {
+    return `This computer is short on disk space (${formatGb(free)} free), so no new background job can start right now.  Tell the user.`;
+  }
+  if (thresholds.minFreeInodes !== undefined) {
+    const inodes = storage ? storage.freeInodes : probe.freeInodes?.(dataDir) ?? null;
+    if (inodes !== null && inodes < thresholds.minFreeInodes) return "This computer is short on inodes, so no new background job can start right now";
+  }
+  // Headroom gates (P-BF-6 B7): the same unset-means-no-gate readings
+  // `admissionRefusal` checks.  A breach queues like any other pressure.
+  const { reservedCpuCores, reservedRamBytes, minMemoryAvailablePercent } = thresholds;
+  if (reservedCpuCores !== undefined || reservedRamBytes !== undefined || minMemoryAvailablePercent !== undefined) {
+    const headroom = probe.headroomReadings?.() ?? null;
+    if (reservedCpuCores !== undefined && headroom?.availableCpuCores !== null && headroom?.availableCpuCores !== undefined && headroom.availableCpuCores < reservedCpuCores) {
+      return "This computer is busy (less CPU headroom than the reserved cores), so no new background job can start right now.  Try again later, or tell the user.";
+    }
+    if (reservedRamBytes !== undefined && headroom?.ramAvailableBytes !== null && headroom?.ramAvailableBytes !== undefined && headroom.ramAvailableBytes < reservedRamBytes) {
+      return `This computer is short on memory (${formatGb(headroom.ramAvailableBytes)} available, below the reserved headroom), so no new background job can start right now.  Try again later, or tell the user.`;
+    }
+    if (minMemoryAvailablePercent !== undefined && headroom?.memoryAvailablePercent !== null && headroom?.memoryAvailablePercent !== undefined && headroom.memoryAvailablePercent < minMemoryAvailablePercent) {
+      return `This computer is short on memory (${Math.round(headroom.memoryAvailablePercent)}% available), so no new background job can start right now.  Try again later, or tell the user.`;
+    }
+  }
+  return null;
+}
+
 /** Why a new job may not start now, or null when it may.  The text is read
  *  by the model, so it says what to do instead. */
 export function admissionRefusal(

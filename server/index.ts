@@ -114,6 +114,7 @@ import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./run
 import { loadHostId } from "./host-id.ts";
 import { createHostResourcesResponder } from "./host-resources.ts";
 import { loadControllerEpoch, placementIdentityResponse } from "./placement-identity.ts";
+import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, type PlacementLeaseAction } from "./placement-leases.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
 import {
@@ -823,6 +824,7 @@ if (storageGuard && !storageGuard.initial.online) {
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 const hostId = loadHostId(DATA_DIR);
 const placementController = loadControllerEpoch(DATA_DIR, hostId);
+const placementLeases = new PlacementLeaseService({ hostId, controller: placementController });
 const jobHostProbe = createHostProbe({
   storageState: storageGuard?.sample,
   // The Mac memory-pressure probe runs only while a memory-headroom knob
@@ -17211,6 +17213,28 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
         viaNamedTunnel: arrivedViaCloudflareTunnel(req),
       });
+      return json(res, response.status, response.body);
+    }
+    // SAFETY: `includes` narrowed the path segment to a known lease action;
+    // the assertion restores the narrowed literal TypeScript cannot keep.
+    if (method === "POST" && path.startsWith("/api/placement/") && PLACEMENT_LEASE_ACTIONS.includes(path.slice("/api/placement/".length) as PlacementLeaseAction)) {
+      // The same owner boundary as placement identity and host resources.
+      // No worker-scoped credential class exists yet (the plan's open
+      // question 3), so these routes invent none.
+      // SAFETY: the guard above accepted only segments in
+      // PLACEMENT_LEASE_ACTIONS, so this slice is one of them.
+      const action = path.slice("/api/placement/".length) as PlacementLeaseAction;
+      let body: unknown;
+      try {
+        body = await readBody(req);
+      } catch {
+        return json(res, 400, { error: "invalid placement message" });
+      }
+      const response = placementLeaseRoute({
+        localOwner: isLoopbackAddress(req.socket.remoteAddress),
+        fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
+        viaNamedTunnel: arrivedViaCloudflareTunnel(req),
+      }, action, body, placementLeases);
       return json(res, response.status, response.body);
     }
     if (method === "GET" && path === "/api/placement/identity") {
