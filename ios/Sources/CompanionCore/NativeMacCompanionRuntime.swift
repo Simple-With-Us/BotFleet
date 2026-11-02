@@ -1,18 +1,27 @@
 import Foundation
 
 /// Registered-bot ids for the workspace source, loaded lazily from the
-/// database and then served from memory for the source's lifetime.
+/// database and then served from memory until the entry expires.
 /// `DatabaseService` exposes no bot-change signal to invalidate on, so a
-/// cache hit never touches the database; a miss reloads the bot table
-/// once, which picks up bots registered after the first probe (and drops
-/// deregistered ones) without rescanning on every poll tick.
+/// fresh cache hit never touches the database; a miss — or an entry older
+/// than `ttl` — reloads the bot table once, which picks up bots registered
+/// after the first probe and drops deregistered ones within one TTL
+/// window, without rescanning on every poll tick.
 private actor RegisteredBotIdCache {
     private var cachedIds: Set<String>?
+    private var loadedAt: Date?
+    private let ttl: TimeInterval
+
+    init(ttl: TimeInterval = 30) {
+        self.ttl = ttl
+    }
 
     func contains(_ botId: String, load: @Sendable () async throws -> [String]) async throws -> Bool {
-        if let cachedIds, cachedIds.contains(botId) { return true }
+        if let cachedIds, let loadedAt, cachedIds.contains(botId),
+           Date().timeIntervalSince(loadedAt) < ttl { return true }
         let loaded = Set(try await load())
         cachedIds = loaded
+        loadedAt = Date()
         return loaded.contains(botId)
     }
 }
@@ -27,11 +36,19 @@ private actor RegisteredBotIdCache {
 public final class DatabaseBotWorkspaceSource: NativeEventWaitWorkspaceSource {
     private let database: DatabaseService
     private let workspacesRoot: URL
-    private let registeredBotIds = RegisteredBotIdCache()
+    private let registeredBotIds: RegisteredBotIdCache
 
     public init(database: DatabaseService, workspacesRoot: URL) {
         self.database = database
         self.workspacesRoot = workspacesRoot
+        self.registeredBotIds = RegisteredBotIdCache()
+    }
+
+    /// Test seam for cache-expiry behavior; production uses the default TTL.
+    init(database: DatabaseService, workspacesRoot: URL, botIdCacheTTL: TimeInterval) {
+        self.database = database
+        self.workspacesRoot = workspacesRoot
+        self.registeredBotIds = RegisteredBotIdCache(ttl: botIdCacheTTL)
     }
 
     public func workspaceRoot(forRegisteredBotId botId: String) async throws -> URL? {

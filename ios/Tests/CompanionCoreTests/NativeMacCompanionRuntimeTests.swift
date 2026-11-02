@@ -141,6 +141,41 @@ struct NativeMacCompanionRuntimeTests {
         }
     }
 
+    @Test("An expired bot-id cache entry revalidates against the database")
+    func workspaceSourceCacheExpires() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let source = DatabaseBotWorkspaceSource(
+            database: fixture.database,
+            workspacesRoot: fixture.workspacesRoot,
+            botIdCacheTTL: 0
+        )
+
+        #expect(try await source.workspaceRoot(forRegisteredBotId: "bot-a") != nil)
+        // With a zero TTL the next probe must reload, surfacing the closed
+        // database instead of serving the stale cached hit forever.
+        try await fixture.database.checkpointAndClose()
+        await #expect(throws: (any Error).self) {
+            _ = try await source.workspaceRoot(forRegisteredBotId: "bot-a")
+        }
+    }
+
+    @Test("Deactivating polling is not terminal: activate can restart it")
+    func pollingDeactivateIsNotTerminal() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let graph = NativeMacCompanionRuntime(
+            database: fixture.database,
+            workspacesRoot: fixture.workspacesRoot,
+            engineCoordinator: fixture.coordinator,
+            engineSwitch: fixture.engineSwitch
+        )
+        try await graph.runtime.activate(pollIntervalSeconds: 1)
+        await graph.runtime.deactivatePolling()
+        try await graph.runtime.activate(pollIntervalSeconds: 1)
+        await graph.runtime.shutdown()
+    }
+
     private struct Fixture {
         let base: URL
         let workspacesRoot: URL
