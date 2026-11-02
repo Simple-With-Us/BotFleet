@@ -65,6 +65,21 @@ describe("routine toolPolicy", () => {
     expect(reloaded.listRoutines()[0]!.toolPolicy).toEqual(created.toolPolicy);
   });
 
+  it("rewrites a stored allowlist that still names the retired agent-sync launcher", () => {
+    const h = harness();
+    h.manager.create({ name: "Backup Health", prompt: "Check", botId: "bot", schedule: daily, toolPolicy: POLICY });
+    h.manager.flushNow();
+    const file = h.options.file!;
+    // A routine saved before the rename, as an old routines.json would read.
+    writeFileSync(file, readFileSync(file, "utf8").replaceAll("/Users/jay/.local/bin/simple-chat", "/Users/jay/.local/bin/agent-sync"));
+    const reloaded = new RoutineManager(h.options);
+    expect(reloaded.listRoutines()[0]!.toolPolicy?.commands[0]!.argv0).toBe("/Users/jay/.local/bin/simple-chat");
+    reloaded.flushNow();
+    const persisted = readFileSync(file, "utf8");
+    expect(persisted).toContain("/Users/jay/.local/bin/simple-chat");
+    expect(persisted).not.toContain("agent-sync");
+  });
+
   it("refuses an invalid allowlist and one on a cloud run", () => {
     const h = harness();
     expect(() =>

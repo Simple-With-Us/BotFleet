@@ -45,6 +45,8 @@ Chat turns, webhook turns, resource turns and Zulip wakes are unchanged.  Only a
 
 `POST /api/routines` and `PATCH /api/routines/:id` take it as `toolPolicy`.  A PATCH that omits it keeps the stored one;  `null` removes it.  A routine with an allowlist must run on the bot (`runOn: "bot"`).  Bot-requested routine changes (routine cards) cannot set or clear it.
 
+A stored allowlist that still names the retired `agent-sync` launcher as a command's program is rewritten to `simple-chat` on server boot:  the rename left no compatibility spelling on PATH, and the string-compared `argv0` match would otherwise deny the same program under its current name.  Only the program basename changes;  flags, args and paths are untouched.
+
 ## How a Command Is Matched
 
 The command is split into words the way a shell would for a narrow grammar:  single and double quotes group a word, so a topic name with spaces is one word.  Anything a shell would act on outside quotes is refused, not interpreted:  `;` `&` `|` `$` backtick `(` `)` `<` `>` newline, globs, `~`, `#`, `\`, `!` and braces.  Inside double quotes `$`, backtick, `\` and `!` are refused too.  An environment prefix (`PATH=... cmd`) is refused.

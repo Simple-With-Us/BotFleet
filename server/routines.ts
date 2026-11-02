@@ -3,7 +3,7 @@ import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 
 import { writeFileAtomic } from "./atomic.ts";
@@ -24,7 +24,7 @@ import { botAutomationsPausedMessage } from "./bot-stop-policy.ts";
 import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { canonicalTimeZone, nextZonedOccurrence } from "../shared/time-zone.ts";
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
-import { sanitizeToolPolicy, type ToolPolicy } from "./tool-policy.ts";
+import { CHAT_CLI_NAMES, sanitizeToolPolicy, type ToolPolicy } from "./tool-policy.ts";
 
 export type RoutineSchedule =
   | { type: "once"; at: number }
@@ -492,6 +492,25 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
   };
 }
 
+/** The fleet chat CLI's retired launcher spelling.  An allowlist saved
+ *  before the rename still names it in a command's `argv0`, and the
+ *  string-compared match would deny the same program under its current
+ *  name - so the stored entry is rewritten on load, once.  Only the
+ *  basename moves;  the directory, flags, args and paths are untouched. */
+const RETIRED_CHAT_CLI_ARGV0 = "agent-sync";
+
+function migrateChatCliArgv0(policy: ToolPolicy | undefined): { policy: ToolPolicy | undefined; migrated: boolean } {
+  if (!policy || !Array.isArray(policy.commands)) return { policy, migrated: false };
+  let migrated = false;
+  const commands = policy.commands.map((entry) => {
+    if (typeof entry?.argv0 !== "string") return entry;
+    if (basename(entry.argv0).toLowerCase() !== RETIRED_CHAT_CLI_ARGV0) return entry;
+    migrated = true;
+    return { ...entry, argv0: join(dirname(entry.argv0), CHAT_CLI_NAMES[0]) };
+  });
+  return migrated ? { policy: { ...policy, commands }, migrated: true } : { policy, migrated: false };
+}
+
 export class RoutineManager {
   private readonly file: string;
   private readonly now: () => number;
@@ -586,6 +605,7 @@ export class RoutineManager {
     this.file = options.file ?? join(DATA_DIR, "routines.json");
     this.now = options.now ?? Date.now;
     let runOnMigrated = false;
+    let policyMigrated = false;
     // A routines.json that cannot be used is moved aside, never deleted, and reported (store-guard.ts).
     // It used to read as "no routines", and the next save replaced it.
     const loaded = loadGuarded(this.file, interpretRoutineFile);
@@ -596,12 +616,16 @@ export class RoutineManager {
     this.routines = rawRoutines.map((routine) => {
       const runOn = normalizeRunOn(routine.runOn);
       if ((routine as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
-      return { ...routine, runOn };
+      const policy = migrateChatCliArgv0(routine.toolPolicy);
+      if (policy.migrated) policyMigrated = true;
+      return { ...routine, runOn, toolPolicy: policy.policy };
     });
     this.runs = rawRuns.map((run) => {
       const runOn = normalizeRunOn(run.runOn);
       if ((run as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
-      return { ...run, runOn };
+      const policy = migrateChatCliArgv0(run.toolPolicy);
+      if (policy.migrated) policyMigrated = true;
+      return { ...run, runOn, toolPolicy: policy.policy };
     });
     this.routineRequestReceipts = Array.isArray(disk.routineRequestReceipts)
       ? disk.routineRequestReceipts.filter((receipt): receipt is RoutineRequestReceipt =>
@@ -628,7 +652,7 @@ export class RoutineManager {
         }
       }
     }
-    if (runOnMigrated) this.save();
+    if (runOnMigrated || policyMigrated) this.save();
     // A local process cannot still own these turns after a full restart.
     const recovered: RoutineRun[] = [];
     for (const run of this.runs) {
