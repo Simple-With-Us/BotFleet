@@ -20,6 +20,15 @@ import Foundation
 //   `walkBalancedSpan`, `bareValueEnd`) step over `Character`s and use the
 //   JavaScript non-unicode `\s` set (see `isRedactSpace`), so ASCII log text
 //   behaves identically and non-ASCII text can never be misread as syntax.
+// - Word boundaries that are `\b` in the TS patterns (ASCII-only without
+//   the unicode flag) are spelled `(?<![A-Za-z0-9_])` / `(?![A-Za-z0-9_])`
+//   here: `NSRegularExpression` `\b` uses ICU Unicode word characters and
+//   would miss tokens glued to non-ASCII letters that TS matches.
+// - `\s` inside the patterns is spelled as the explicit JavaScript set
+//   `[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]`:
+//   ICU `\s` additionally matches U+0085, which JavaScript `\s` does not.
+// - `"\n"` lookups that mirror `lastIndexOf("\n")` run over Unicode scalars:
+//   a `Character` search cannot see the `\n` inside a CRLF grapheme cluster.
 
 /// Namespace for the `shared/redact.ts` port. All entry points are static.
 public enum Redact {
@@ -50,6 +59,10 @@ public enum Redact {
     /// JavaScript `\s` without the unicode flag: the exact set the TS
     /// patterns and scans test against.
     static func isRedactSpace(_ c: Character) -> Bool {
+        // CRLF is one grapheme cluster (two scalars): both halves are
+        // JavaScript whitespace, so the cluster counts, exactly like the
+        // two units `String.trim()` and `/\s/` see in TypeScript.
+        if c == "\r\n" { return true }
         guard c.unicodeScalars.count == 1, let v = c.unicodeScalars.first?.value else { return false }
         switch v {
         case 0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x0020, 0x00A0, 0x1680,
@@ -86,7 +99,7 @@ public enum Redact {
         while end > s.startIndex {
             let p = s.index(before: end)
             let c = s[p]
-            if c == "\r" || c == "\n" || !isRedactSpace(c) { break }
+            if c == "\r" || c == "\n" || c == "\r\n" || !isRedactSpace(c) { break }
             end = p
         }
         return String(s[..<end])
@@ -98,23 +111,23 @@ public enum Redact {
     /// Same shapes as `CREDENTIAL_TOKEN_PATTERNS` in `shared/redact.ts`;
     /// compiled without `.caseInsensitive` exactly like the TS `/g` patterns.
     public static let credentialTokenPatternSources: [String] = [
-        #"\bsk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{16,}"#,
-        #"\bxai-[A-Za-z0-9_-]{20,}"#,
-        #"\bgsk_[A-Za-z0-9]{40,}"#,
-        #"\bhf_[A-Za-z0-9]{30,}"#,
-        #"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"#,
-        #"\bgithub_pat_[A-Za-z0-9_]{20,}"#,
-        #"\bxox[abposr]-[A-Za-z0-9-]{20,}"#,
-        #"\bsk_(?:live|test)_[A-Za-z0-9]{8,}"#,
-        #"\bak_[A-Za-z0-9_-]{16,}"#,
-        #"\bwhsec_[A-Za-z0-9_-]{8,}"#,
-        #"\bya29\.[A-Za-z0-9_-]{4,}"#,
-        #"\bglpat-[A-Za-z0-9_-]{8,}"#,
-        #"\bAKIA[0-9A-Z]{16}\b"#,
-        #"\bAIza[0-9A-Za-z_-]{30,}"#,
-        #"\bnpm_[A-Za-z0-9]{20,}"#,
-        #"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?"#,
-        #"\bst\.[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{16,}){0,3}"#,
+        #"(?<![A-Za-z0-9_])sk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{16,}"#,
+        #"(?<![A-Za-z0-9_])xai-[A-Za-z0-9_-]{20,}"#,
+        #"(?<![A-Za-z0-9_])gsk_[A-Za-z0-9]{40,}"#,
+        #"(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{30,}"#,
+        #"(?<![A-Za-z0-9_])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"#,
+        #"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}"#,
+        #"(?<![A-Za-z0-9_])xox[abposr]-[A-Za-z0-9-]{20,}"#,
+        #"(?<![A-Za-z0-9_])sk_(?:live|test)_[A-Za-z0-9]{8,}"#,
+        #"(?<![A-Za-z0-9_])ak_[A-Za-z0-9_-]{16,}"#,
+        #"(?<![A-Za-z0-9_])whsec_[A-Za-z0-9_-]{8,}"#,
+        #"(?<![A-Za-z0-9_])ya29\.[A-Za-z0-9_-]{4,}"#,
+        #"(?<![A-Za-z0-9_])glpat-[A-Za-z0-9_-]{8,}"#,
+        #"(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}(?![A-Za-z0-9_])"#,
+        #"(?<![A-Za-z0-9_])AIza[0-9A-Za-z_-]{30,}"#,
+        #"(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{20,}"#,
+        #"(?<![A-Za-z0-9_])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?"#,
+        #"(?<![A-Za-z0-9_])st\.[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{16,}){0,3}"#,
     ]
 
     /// Compiled view of ``credentialTokenPatternSources``. Every entry
@@ -127,7 +140,7 @@ public enum Redact {
     /// `Bearer <token>` standing on its own, anywhere. Case-insensitive, with
     /// the 12-character minimum that keeps "Bearer [REDACTED] are sent in the …" out.
     private static let bearerPattern = try! NSRegularExpression(
-        pattern: #"(\bBearer\s+)([A-Za-z0-9._~+/=-]{12,})"#,
+        pattern: #"((?<![A-Za-z0-9_])Bearer[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+)([A-Za-z0-9._~+/=-]{12,})"#,
         options: [.caseInsensitive]
     )
 
@@ -135,7 +148,7 @@ public enum Redact {
     /// spelling. The quote that opened it is what ends it; end of text closes
     /// it too for a value whose closing quote was clipped away upstream.
     private static let authHeaderQuotedPattern = try! NSRegularExpression(
-        pattern: #"\b((?:proxy-)?authorization)(["']?\s*[=:]\s*)(["'])([A-Za-z][A-Za-z0-9-]{2,}\s+)?((?:\\.|(?!\3)[^\\\r\n])+)(\3|\z)"#,
+        pattern: #"(?<![A-Za-z0-9_])((?:proxy-)?authorization)(["']?[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*[=:][\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*)(["'])([A-Za-z][A-Za-z0-9-]{2,}[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+)?((?:\\.|(?!\3)[^\\\r\n])+)(\3|\z)"#,
         options: [.caseInsensitive]
     )
 
@@ -143,7 +156,7 @@ public enum Redact {
     /// echoed stderr line. Runs to the end of its line, cut at the wrapper's
     /// closing quote when the header sits inside one (see `bareValueEnd`).
     private static let authHeaderBarePattern = try! NSRegularExpression(
-        pattern: #"\b((?:proxy-)?authorization)(["']?\s*[=:](?!\s*["'])\s*)([A-Za-z][A-Za-z0-9-]{2,}\s+)?([^\r\n]+)"#,
+        pattern: #"(?<![A-Za-z0-9_])((?:proxy-)?authorization)(["']?[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*[=:](?![\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*["'])[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*)([A-Za-z][A-Za-z0-9-]{2,}[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+)?([^\r\n]+)"#,
         options: [.caseInsensitive]
     )
 
@@ -160,10 +173,17 @@ public enum Redact {
     /// quote found by stepping backwards over blanks, and it only counts when
     /// it is the odd, opening member of its pair at its own escaping level.
     static func wrapperQuoteAt(_ text: String, _ index: String.Index) -> HeaderWrapper? {
+        // Mirrors `text.lastIndexOf("\n", index - 1) + 1` over UTF-16 units:
+        // a `Character` search cannot see the `\n` inside a CRLF grapheme
+        // cluster, so the lookup runs on `NSString`, whose unit domain is
+        // exactly the one TypeScript indexes in.
         let lineStart: String.Index = {
             if index == text.startIndex { return text.startIndex }
-            if let r = text[..<index].range(of: "\n", options: .backwards) { return r.upperBound }
-            return text.startIndex
+            let ns = text as NSString
+            let before = NSRange(text.startIndex..<index, in: text)
+            let found = ns.range(of: "\n", options: .backwards, range: before)
+            guard found.location != NSNotFound, let r = Range(found, in: text) else { return text.startIndex }
+            return r.upperBound
         }()
         guard index > lineStart else { return nil }
         var at = text.index(before: index)
@@ -492,9 +512,16 @@ public enum Redact {
     /// verb? Only as far back as the nearest shell separator, and `set` with
     /// an option flag right after it is a builtin call, not a lead-in.
     static func hasPlaceholderLeadIn(_ before: String) -> Bool {
+        // Mirrors `before.lastIndexOf(sep) + 1` over UTF-16 units: a
+        // `Character` search cannot see the `\n` inside a CRLF grapheme
+        // cluster, so every separator lookup runs on `NSString`.
         var clauseStart = before.startIndex
+        let ns = before as NSString
         for sep in [";", "&", "|", "\n"] {
-            if let r = before.range(of: String(sep), options: .backwards), r.upperBound > clauseStart {
+            let found = ns.range(of: sep, options: .backwards)
+            if found.location != NSNotFound,
+               let r = Range(found, in: before),
+               r.upperBound > clauseStart {
                 clauseStart = r.upperBound
             }
         }
@@ -560,7 +587,7 @@ public enum Redact {
     /// `authorization` is deliberately NOT in this list: the AUTH_HEADER
     /// patterns own that key end to end.
     private static let keyValuePattern = try! NSRegularExpression(
-        pattern: #"\b((?:[A-Za-z0-9_-]*_)?(?:api[_-]?key|apikey|secret|token|password|passwd|auth[_-]?token|access[_-]?key|private[_-]?key)s?)(["']?\s*[=:]\s*)(["']?)([A-Za-z0-9._~+/=-]{8,})\3"#,
+        pattern: #"(?<![A-Za-z0-9_])((?:[A-Za-z0-9_-]*_)?(?:api[_-]?key|apikey|secret|token|password|passwd|auth[_-]?token|access[_-]?key|private[_-]?key)s?)(["']?[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*[=:][\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*)(["']?)([A-Za-z0-9._~+/=-]{8,})\3"#,
         options: [.caseInsensitive]
     )
 
@@ -568,7 +595,7 @@ public enum Redact {
     /// Anchored at end-of-text, because that is the only place a quote that
     /// never closes can legitimately come from. Single match (no /g), like TS.
     private static let keyValueUnterminatedPattern = try! NSRegularExpression(
-        pattern: #"\b((?:[A-Za-z0-9_-]*_)?(?:api[_-]?key|apikey|secret|token|password|passwd|authorization|auth[_-]?token|access[_-]?key|private[_-]?key)s?)(["']?\s*[=:]\s*)(["'])([^"']{8,})\z"#,
+        pattern: #"(?<![A-Za-z0-9_])((?:[A-Za-z0-9_-]*_)?(?:api[_-]?key|apikey|secret|token|password|passwd|authorization|auth[_-]?token|access[_-]?key|private[_-]?key)s?)(["']?[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*[=:][\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*)(["'])([^"']{8,})\z"#,
         options: [.caseInsensitive]
     )
 
@@ -576,7 +603,7 @@ public enum Redact {
     /// mask": a value that is only partly masked still has a live secret in
     /// the rest of it, so it must go through the pass again.
     private static let whollyMaskedPattern = try! NSRegularExpression(
-        pattern: #"^[\s,;]*(?:«redacted \d+ chars»[\s,;]*)+\z"#,
+        pattern: #"^[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF,;]*(?:«redacted \d+ chars»[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF,;]*)+\z"#,
         options: []
     )
 
@@ -680,7 +707,7 @@ public enum Redact {
             while credEnd > value.startIndex {
                 let p = value.index(before: credEnd)
                 let c = value[p]
-                if c == "\r" || c == "\n" || !isRedactSpace(c) { break }
+                if c == "\r" || c == "\n" || c == "\r\n" || !isRedactSpace(c) { break }
                 credEnd = p
             }
             let credential = String(value[..<credEnd])

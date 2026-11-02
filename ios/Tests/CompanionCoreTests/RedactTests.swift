@@ -360,4 +360,100 @@ final class RedactTests: XCTestCase {
         XCTAssertTrue(line.contains("characters elided from log"), line)
         XCTAssertFalse(line.contains(String(repeating: "L", count: 200)))
     }
+
+    // MARK: - Unicode-boundary parity (review findings, TS-verified)
+
+    func testMasksTokenGluedToNonASCIILetter() {
+        // `NSRegularExpression` `\b` is ICU-Unicode; TS `\b` is ASCII-only.
+        // The port spells the boundary out, so a token glued to a non-ASCII
+        // letter masks exactly like the TS side does.
+        let sample = "sk" + "-ant-" + String(repeating: "0", count: 16)
+        XCTAssertEqual(
+            Redact.redactSecretsInText("é" + sample),
+            "é«redacted 23 chars»"
+        )
+        XCTAssertEqual(
+            Redact.redactSecretsInText("日" + sample),
+            "日«redacted 23 chars»"
+        )
+        // A preceding ASCII word character still blocks the match, both sides.
+        let glued = "prefix_" + sample + " tail ok here"
+        XCTAssertEqual(Redact.redactSecretsInText(glued), glued)
+    }
+
+    func testMasksTokenBesideCombiningMark() {
+        // A match ending before a combining mark still redacts: both sides
+        // slice UTF-16 units, so the mark survives outside the mask.
+        let acute = String(UnicodeScalar(0x301)!)
+        let sample = "sk" + "-ant-" + String(repeating: "0", count: 16)
+        XCTAssertEqual(
+            Redact.redactSecretsInText("carrying " + sample + acute + " home ok"),
+            "carrying «redacted 23 chars»" + acute + " home ok"
+        )
+    }
+
+    func testTrailingBoundaryMatchesBeforeCombiningMark() {
+        let akia = "AKIA" + String(repeating: "E", count: 16)
+        let acute = String(UnicodeScalar(0x301)!)
+        XCTAssertEqual(
+            Redact.redactSecretsInText("carrying " + akia + acute + " home ok"),
+            "carrying «redacted 20 chars»" + acute + " home ok"
+        )
+    }
+
+    func testWhitespaceClassIgnoresNEL() {
+        // ICU `\s` matches U+0085; JavaScript `\s` does not. The port spells
+        // the class out, so a NEL never joins a scheme word to its value.
+        let nel = "\u{85}"
+        let word = "Bear" + "er" + nel + String(repeating: "x", count: 12)
+        let input = "hold " + word + " tail"
+        XCTAssertEqual(Redact.redactSecretsInText(input), input)
+    }
+
+    func testPemBlockTrimsCRLFWrappers() {
+        // CRLF is one grapheme cluster; both halves are whitespace, so the
+        // body trims exactly like `String.trim()` and reports 31 chars.
+        let body = "MIIE " + "realsupersecretkeymaterial"
+        let input = "-----BEGIN RSA" + " PRIVATE KEY-----\r\n" + body + "\r\n-----END RSA" + " PRIVATE KEY-----"
+        XCTAssertEqual(
+            Redact.redactSecretsInText(input),
+            "-----BEGIN RSA" + " PRIVATE KEY-----\n«redacted 31 chars»\n-----END RSA" + " PRIVATE KEY-----"
+        )
+    }
+
+    func testBareHeaderRedactsOnCRLFLine() {
+        // `wrapperQuoteAt` finds its line over the `\n` inside CRLF, so the
+        // wrapper still closes the value at its own quote (TS-verified).
+        let input = "line one here\r\ncurl -H \"authorization: Basic " + String(repeating: "k", count: 20) + "\" done ok"
+        XCTAssertEqual(
+            Redact.redactSecretsInText(input),
+            "line one here\r\ncurl -H \"authorization: Basic «redacted 20 chars»\" done ok"
+        )
+    }
+
+    func testTreeDepthCapMatchesTypeScript() {
+        // Past depth 12 the walk returns containers verbatim on both sides,
+        // so a deeply nested leaf keeps its text in TS too. Any change here
+        // belongs to `shared/redact.ts` first; the port keeps parity.
+        let leaf = "leaf-" + "sk" + "-ant-" + String(repeating: "0", count: 16)
+        var deep: Any = leaf
+        for i in 0..<15 { deep = ["k\(i)": deep] }
+        var node = Redact.redactSecrets(deep)
+        for i in (0..<15).reversed() {
+            node = (node as? [String: Any])?["k\(i)"]
+        }
+        XCTAssertEqual(node as? String, leaf)
+    }
+
+    func testLogTeeStraddlingSecretMatchesTypeScript() {
+        // The tee cuts the raw head and redacts it on both sides, so a secret
+        // across the boundary loses its shape in TS too. Redact-then-cut
+        // would diverge; this pins the shared order.
+        let sample = "sk" + "-ant-" + String(repeating: "0", count: 16)
+        let big = String(repeating: "A", count: 100) + sample + String(repeating: "B", count: 100)
+        XCTAssertEqual(
+            Redact.redactSecretsInLogText(big, maxChars: 110),
+            String(repeating: "A", count: 100) + "sk" + "-ant-" + "000" + "[… 113 characters elided from log]"
+        )
+    }
 }
