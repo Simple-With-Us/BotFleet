@@ -103,18 +103,23 @@ describe("ResourcesSectionView", () => {
     expect(html).not.toContain("Saved and applied agree on every threshold.");
   });
 
-  it("disables headroom editing with the owner-sets-these note and tucks env var names inside a details disclosure", () => {
+  it("edits headroom with a save button and tucks env var names inside a details disclosure", () => {
     const html = render({ status: "ready", report: fixture() });
-    expect(html).toContain("The owner sets these numbers");
-    expect(html).toContain("editing is disabled here");
+    expect(html).toContain("Owner-Set Headroom");
+    expect(html).toContain("Save headroom");
+    expect(html).toContain("Saves via PUT /api/config");
+    expect(html).toContain("Empty means no change");
     expect(html).toContain("Environment variable names");
     expect(html).toContain("<details");
     expect(html).toContain("BOTFLEET_JOBS_RESERVED_CPU_CORES");
     expect(html).toContain("BOTFLEET_JOBS_RESERVED_RAM_MB");
     expect(html).toContain("BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT");
-    // All three headroom inputs render disabled: no numeric editing.
-    const disabledInputs = html.match(/<input[^>]*disabled[^>]*>/g) ?? [];
-    expect(disabledInputs.length).toBeGreaterThanOrEqual(3);
+    // All three headroom inputs render enabled: numeric editing is allowed.
+    expect(html).toContain('id="resources-reserved-cpu"');
+    expect(html).toContain('id="resources-reserved-ram"');
+    expect(html).toContain('id="resources-min-memory-percent"');
+    const disabledInputs = html.match(/<input[^>]*\sdisabled(?:\s|=|>)/g) ?? [];
+    expect(disabledInputs.length).toBe(0);
   });
 
   it("keeps readings on screen with a spinning refresh button while refreshing", () => {

@@ -1,10 +1,12 @@
-// Settings → Resources: the read-only view over GET /api/host/resources.
+// Settings → Resources: the view over GET /api/host/resources with
+// write-through editing of the owner-set headroom knobs via PUT /api/config.
 //
-// Display side only: this tab shows host readings plus the saved admission
-// thresholds against the applied values.  Editing the unset-by-default
-// headroom knobs is out of scope — numbers are owner-gated, so this module
-// never builds a PUT/PATCH body; the component renders disabled controls
-// with an "owner sets these" note instead.
+// Display plus edit: this tab shows host readings plus the saved admission
+// thresholds against the applied values, and builds the PUT /api/config
+// patch for the three unset-by-default headroom knobs
+// (reservedCpuCores / reservedRamMb / minMemoryAvailablePercent) through
+// server/knob-map.ts.  Empty stays omitted (no change); clearing back to
+// unset is a file/vault edit, not a PUT.
 //
 // Copy rules (docs/plans/2026-10-29-native-server-mode.md, "Headroom
 // Profiles And What The UI May Say" and docs/verification/headroom.md):
@@ -500,4 +502,116 @@ export function hostSubtitle(report: HostResourcesReport): string {
   const version = report.version ?? "unknown version";
   const capabilities = report.capabilities.length > 0 ? report.capabilities.join(", ") : "no capabilities reported";
   return `${platform} · ${version} · ${capabilities}`;
+}
+
+/** Editable headroom inputs, as typed strings.  Empty means omit (no change):
+ *  the PUT patch only carries fields with a number, so an untouched box never
+ *  clears a saved knob.  Clearing back to unset is a file/vault edit. */
+export interface HeadroomEditValues {
+  reservedCpuCores: string;
+  reservedRamMb: string;
+  minMemoryAvailablePercent: string;
+}
+
+export interface HeadroomFieldError {
+  field: keyof HeadroomEditValues;
+  message: string;
+}
+
+/** Bounds mirroring server/knob-map.ts (clamped there, refused here with a
+ *  message so the owner sees why). */
+export const HEADROOM_BOUNDS = {
+  reservedCpuCores: { min: 0, max: 64, int: true },
+  reservedRamMb: { min: 0, max: Number.MAX_SAFE_INTEGER, int: true },
+  minMemoryAvailablePercent: { min: 0, max: 100, int: false },
+} as const;
+
+/** Parsed headroom numbers for the non-empty boxes. */
+export interface HeadroomParsed {
+  reservedCpuCores?: number;
+  reservedRamMb?: number;
+  minMemoryAvailablePercent?: number;
+}
+
+/** One parsed number or its validation message. */
+export interface HeadroomNumberResult {
+  value?: number;
+  error?: string;
+}
+
+/** PUT /api/config patch for the headroom knobs. */
+export interface HeadroomPatch {
+  jobs: { admission: HeadroomParsed };
+}
+
+function parseHeadroomNumber(field: keyof HeadroomEditValues, raw: string): HeadroomNumberResult {
+  const text = raw.trim();
+  if (text === "") return {};
+  const num = Number(text);
+  if (!Number.isFinite(num)) return { error: "Enter a number." };
+  const bounds = HEADROOM_BOUNDS[field];
+  if (bounds.int && !Number.isInteger(num)) return { error: "Enter a whole number." };
+  if (num < bounds.min || num > bounds.max) {
+    return { error: `Enter ${bounds.min}–${bounds.max === Number.MAX_SAFE_INTEGER ? "∞" : bounds.max}.` };
+  }
+  return { value: num };
+}
+
+/** Validate the three headroom boxes.  Returns the parsed numbers for the
+ *  non-empty boxes, or the per-field errors.  At least one number is
+ *  required: an all-empty save is a no-op and is refused with a message. */
+export function parseHeadroomEdit(values: HeadroomEditValues):
+  | { ok: true; parsed: HeadroomParsed }
+  | { ok: false; errors: HeadroomFieldError[] } {
+  const errors: HeadroomFieldError[] = [];
+  const parsed: HeadroomParsed = {};
+  const cpu = parseHeadroomNumber("reservedCpuCores", values.reservedCpuCores);
+  if (cpu.error) errors.push({ field: "reservedCpuCores", message: cpu.error });
+  else if (cpu.value !== undefined) parsed.reservedCpuCores = cpu.value;
+  const ram = parseHeadroomNumber("reservedRamMb", values.reservedRamMb);
+  if (ram.error) errors.push({ field: "reservedRamMb", message: ram.error });
+  else if (ram.value !== undefined) parsed.reservedRamMb = ram.value;
+  const mem = parseHeadroomNumber("minMemoryAvailablePercent", values.minMemoryAvailablePercent);
+  if (mem.error) errors.push({ field: "minMemoryAvailablePercent", message: mem.error });
+  else if (mem.value !== undefined) parsed.minMemoryAvailablePercent = mem.value;
+  if (errors.length > 0) return { ok: false, errors };
+  if (Object.keys(parsed).length === 0) {
+    return { ok: false, errors: [{ field: "reservedCpuCores", message: "Enter at least one number to save." }] };
+  }
+  return { ok: true, parsed };
+}
+
+/** Build the PUT /api/config patch for the parsed headroom knobs.  Only
+ *  non-empty fields are carried, under jobs.admission, matching
+ *  server/knob-map.ts ids jobs.admission.reservedCpuCores,
+ *  jobs.admission.reservedRamMb and
+ *  jobs.admission.minMemoryAvailablePercent. */
+export function buildHeadroomPatch(parsed: HeadroomParsed): HeadroomPatch {
+  return { jobs: { admission: { ...parsed } } };
+}
+
+/** Save the edited headroom knobs through PUT /api/config, then refetch the
+ *  host report so Saved vs Applied reflects what the runtime applies.  Uses
+ *  the store's api() helper so 4xx/5xx arrive as thrown errors with the
+ *  server's message (including the Infisical 409). */
+export async function saveHeadroomThresholds(values: HeadroomEditValues): Promise<HostResourcesReport> {
+  const parsed = parseHeadroomEdit(values);
+  if (!parsed.ok) {
+    throw new Error(parsed.errors[0]?.message ?? "Enter a number.");
+  }
+  await api("/api/config", { method: "PUT", body: JSON.stringify(buildHeadroomPatch(parsed.parsed)) });
+  return fetchHostResources();
+}
+
+/** Initial edit values from a report: numbers as strings, unset as empty. */
+export function headroomEditInitial(report: HostResourcesReport): HeadroomEditValues {
+  return {
+    reservedCpuCores: report.admission.reservedCpuCores === undefined ? "" : String(report.admission.reservedCpuCores),
+    reservedRamMb:
+      report.admission.reservedRamBytes === undefined
+        ? ""
+        : String(Math.round(report.admission.reservedRamBytes / 1024 / 1024)),
+    minMemoryAvailablePercent:
+      report.admission.minMemoryAvailablePercent === undefined ? "" : String(report.admission.minMemoryAvailablePercent),
+  };
 }
