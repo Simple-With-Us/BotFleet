@@ -119,6 +119,46 @@ describe("loadConfig with a config.json it cannot fully use", () => {
     ]);
   });
 
+  it("drops a zulip credentialSources entry whose keyPattern lacks its placeholders, with a warning", () => {
+    writeFileSync(
+      path,
+      JSON.stringify({
+        profile: { name: "Ada" },
+        zulip: {
+          enabled: true,
+          credentialSources: {
+            login: { source: "fleetops-zulip", keyPattern: "ZULIP_API_KEY" },
+            outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" },
+          },
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.profile?.name).toBe("Ada");
+    expect(cfg.zulip?.credentialSources).toEqual({ outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" } });
+    expect(warned().join(" ")).toContain("zulip.credentialSources.login");
+  });
+
+  it("drops a zulip credentialSources outgoing entry whose keyPattern contains {FIELD}, with a warning", () => {
+    writeFileSync(
+      path,
+      JSON.stringify({
+        profile: { name: "Ada" },
+        zulip: {
+          enabled: true,
+          credentialSources: {
+            login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" },
+            outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_{FIELD}_TOKEN" },
+          },
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.profile?.name).toBe("Ada");
+    expect(cfg.zulip?.credentialSources).toEqual({ login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } });
+    expect(warned().join(" ")).toContain("zulip.credentialSources.outgoing");
+  });
+
   it("treats a file where no section survives as ignored rather than partial", () => {
     writeFileSync(
       path,

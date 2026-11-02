@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DATA_DIR,
@@ -1476,6 +1476,17 @@ describe("the secret-store section", () => {
     expect(loadConfig().infisical?.clientId).toBe("from-alias");
   });
 
+  it("reads read sources from INFISICAL_READ_SOURCES JSON", () => {
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([{ name: "env-source", tokenEnv: "FAKE_ENV_TOK", projectId: "env-proj" }]);
+    try {
+      expect(infisicalSettings(loadConfig()).readSources).toEqual([
+        { name: "env-source", tokenFile: "", tokenEnv: "FAKE_ENV_TOK", projectId: "env-proj", environment: "prod", secretPath: "/" },
+      ]);
+    } finally {
+      delete process.env.INFISICAL_READ_SOURCES;
+    }
+  });
+
   it("stays inert with no project id and no identity", () => {
     expect(infisicalConfigured(loadConfig())).toBe(false);
     expect(infisicalConfigured({ infisical: { projectId: PROJECT_ID } })).toBe(false);
@@ -1501,6 +1512,7 @@ describe("the secret-store section", () => {
       clientSecret: "",
       token: "",
       writeToken: "",
+      readSources: [],
       refreshMinutes: DEFAULT_INFISICAL_REFRESH_MINUTES,
     });
     expect(
@@ -1524,6 +1536,96 @@ describe("the secret-store section", () => {
     expect(
       infisicalSettings({ infisical: { projectId: "p", token: " st.read ", writeToken: " st.write " } }),
     ).toMatchObject({ token: "st.read", writeToken: "st.write" });
+  });
+
+  it("accepts multiple read sources and defaults their environment and path", () => {
+    const settings = infisicalSettings({
+      infisical: {
+        projectId: "main-proj",
+        token: "st.main-not-real",
+        readSources: [
+          { name: "fleetops-zulip", tokenFile: "/tmp/fake-fleetops-token", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" },
+          { name: "afc-zulip", tokenEnv: "FAKE_AFC_TOKEN", projectId: "afc-proj" },
+          { name: "fleetops-zulip", tokenEnv: "FAKE_DUP", projectId: "dup-proj" },
+          { name: "Bad Name", tokenEnv: "FAKE_BAD", projectId: "bad-proj" },
+        ],
+      },
+    });
+    expect(settings.token).toBe("st.main-not-real");
+    expect(settings.readSources).toEqual([
+      { name: "fleetops-zulip", tokenFile: "/tmp/fake-fleetops-token", tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" },
+      { name: "afc-zulip", tokenFile: "", tokenEnv: "FAKE_AFC_TOKEN", projectId: "afc-proj", environment: "prod", secretPath: "/" },
+    ]);
+    expect(parseConfigPatch({ infisical: { readSources: [{ name: "a-source", projectId: "p1", tokenEnv: "FAKE_TOK" }] } })).toMatchObject({
+      infisical: { readSources: [{ name: "a-source", projectId: "p1" }] },
+    });
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "Bad Name", projectId: "p1" }] } })).toThrow("readSources");
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "ok", projectId: "../x" }] } })).toThrow("readSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } } } })).not.toThrow();
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "Bad Source" } } } })).toThrow("credentialSources");
+    // A pattern without {ROLE} would resolve every role to the same
+    // secret; the login pattern also needs {FIELD}.
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "ZULIP_{FIELD}" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_API_KEY" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_TOKEN" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" } } } })).not.toThrow();
+    // `{FIELD}` in an outgoing pattern expands to "" (there is no field),
+    // so it must be rejected rather than produce a double-underscore name.
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_{FIELD}_TOKEN" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{FIELD}_TOKEN" } } } })).toThrow("credentialSources");
+    // A per-field project/environment cannot be honoured (the named
+    // source's token is scoped to its own project/env), so it is dropped.
+    expect(parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}", projectId: "other-proj", environment: "dev" } } } })).toEqual({
+      zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } } },
+    });
+    // Stored read-source paths are normalized the same way requests are.
+    expect(
+      infisicalSettings({ infisical: { projectId: "main-proj", readSources: [{ name: "a-source", tokenEnv: "FAKE_TOK", projectId: "p1", secretPath: "/zulip/" }] } }).readSources[0]?.secretPath,
+    ).toBe("/zulip");
+  });
+
+  it("drops one bad readSources entry and keeps the main infisical settings and the valid entries", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      writeFileSync(
+        join(DATA_DIR, "config.json"),
+        JSON.stringify({
+          infisical: {
+            projectId: "main-proj",
+            clientId: "fake-client-id",
+            clientSecret: "fake-client-secret-not-real",
+            token: "st.main-not-real",
+            readSources: [
+              { name: "fleetops-zulip", tokenFile: "/tmp/fake-fleetops-token", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" },
+              { name: "Bad Name", tokenEnv: "FAKE_BAD_TOKEN_VALUE", projectId: "../bad" },
+              { name: "afc-zulip", tokenEnv: "FAKE_AFC_TOKEN", projectId: "afc-proj" },
+            ],
+          },
+          zulip: {
+            enabled: true,
+            credentialSources: {
+              login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" },
+              outgoing: { source: "Bad Source" },
+            },
+          },
+          profile: { name: "Ada" },
+        }),
+      );
+      const cfg = loadConfig();
+      expect(cfg.profile?.name).toBe("Ada");
+      expect(cfg.infisical).toMatchObject({ projectId: "main-proj", clientId: "fake-client-id", token: "st.main-not-real" });
+      expect(infisicalSettings(cfg).readSources.map((s) => s.name)).toEqual(["fleetops-zulip", "afc-zulip"]);
+      expect(cfg.zulip?.enabled).toBe(true);
+      expect(cfg.zulip?.credentialSources).toEqual({ login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } });
+      const text = warn.mock.calls.flat().join(" ");
+      expect(text).toContain("infisical.readSources.1");
+      expect(text).toContain("Bad Name");
+      expect(text).toContain("zulip.credentialSources.outgoing");
+      expect(text).not.toContain("FAKE_BAD_TOKEN_VALUE");
+      expect(text).not.toContain("st.main-not-real");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("keeps a service token that arrives in the config file or in a patch", () => {
