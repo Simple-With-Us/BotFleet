@@ -373,6 +373,23 @@ public struct HostAdmissionRow: Equatable, Identifiable, Sendable {
 public enum HostResourcesPresentation {
     private static let gap = "\u{00A0} "
     private static let unknown = "Unknown"
+    private static let countFormatterLock = NSLock()
+    private static let countFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        return formatter
+    }()
+    private static let centralTimeFormatterLock = NSLock()
+    private static let centralTimeZone = TimeZone(identifier: "America/Chicago") ?? .current
+    private static let centralTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = centralTimeZone
+        formatter.dateFormat = "MMM d, h:mm a"
+        return formatter
+    }()
 
     /// `"this Mac"` on darwin, `"the server"` on linux — the nouns the refusal
     /// and no-capacity sentences use, so no host name lands in a default.
@@ -444,11 +461,9 @@ public enum HostResourcesPresentation {
     public static func formatCount(_ n: Double, singular: String, plural: String? = nil) -> String {
         let intVal = Int(n.rounded())
         let word = intVal == 1 ? singular : (plural ?? "\(singular)s")
-        let formatter = NumberFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.numberStyle = .decimal
-        formatter.usesGroupingSeparator = true
-        let digits = formatter.string(from: NSNumber(value: intVal)) ?? "\(intVal)"
+        countFormatterLock.lock()
+        let digits = countFormatter.string(from: NSNumber(value: intVal)) ?? "\(intVal)"
+        countFormatterLock.unlock()
         return "\(digits) \(word)"
     }
 
@@ -457,16 +472,28 @@ public enum HostResourcesPresentation {
         return formatCount(n, singular: singular, plural: plural)
     }
 
+    /// Formats a percentage matching TypeScript `${value}%` interpolation:
+    /// whole numbers omit `.0` (`98%`), fractional values preserve decimals (`85.5%`).
+    public static func formatPercent(_ value: Double) -> String {
+        "\(formatNumericValue(value))%"
+    }
+
+    /// Formats a numeric value without `.0` for exact integers while preserving fractional digits.
+    public static func formatNumericValue(_ value: Double) -> String {
+        if value.isFinite, value.truncatingRemainder(dividingBy: 1) == 0 {
+            return "\(Int(value))"
+        }
+        return String(format: "%g", locale: Locale(identifier: "en_US_POSIX"), value)
+    }
+
     /// Central Time (`America/Chicago`), 12-hour format with short timezone name.
     public static func formatCentralTime(_ timestampMs: Double) -> String {
         let date = Date(timeIntervalSince1970: timestampMs / 1000.0)
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        let central = TimeZone(identifier: "America/Chicago") ?? .current
-        formatter.timeZone = central
-        formatter.dateFormat = "MMM d, h:mm a"
-        let tzAbbrev = central.abbreviation(for: date) ?? "CT"
-        return "\(formatter.string(from: date)) \(tzAbbrev)"
+        centralTimeFormatterLock.lock()
+        let formatted = centralTimeFormatter.string(from: date)
+        let tzAbbrev = centralTimeZone.abbreviation(for: date) ?? "CT"
+        centralTimeFormatterLock.unlock()
+        return "\(formatted) \(tzAbbrev)"
     }
 
     /// `"This leaves BotFleet no capacity on <host>.  New jobs will wait here until you lower it"`
@@ -522,7 +549,7 @@ public enum HostResourcesPresentation {
 
         // 1. Swap gate
         do {
-            let value = "\(Int(admission.maxSwapPercent.rounded()))%"
+            let value = formatPercent(admission.maxSwapPercent)
             let (applied, mismatch) = appliedFromEnforcement(value: value, enforcement: enforcement.swap, noun: noun)
             rows.append(
                 HostAdmissionRow(
@@ -643,7 +670,7 @@ public enum HostResourcesPresentation {
 
         // 6. Minimum available-memory percent
         do {
-            let saved = admission.minMemoryAvailablePercent.map { "\(Int($0.rounded()))%" } ?? "Not set"
+            let saved = admission.minMemoryAvailablePercent.map(formatPercent) ?? "Not set"
             var applied = saved
             var mismatch: String? = nil
             if admission.minMemoryAvailablePercent != nil {

@@ -152,6 +152,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         let hostStore = HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json"))
         self.servers = ServersCoordinator(store: hostStore)
         self.resources = ResourcesCoordinator(store: hostStore)
+        self.resources.observeHosts(from: self.servers)
         self.permissionMonitor = permissionMonitor
         if let localPersist = policyStore.readPersistOnExit() {
             self.lifecycleSettings = MacLifecycleSettings(

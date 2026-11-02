@@ -124,6 +124,7 @@ public final class ResourcesCoordinator: ObservableObject {
     private let credentials: ResourcesCredentials
     private let fetcher: Fetcher
     private var inflightByHostID: [String: UUID] = [:]
+    private var hostsCancellable: AnyCancellable?
 
     public init(
         store: any ServersHostStore,
@@ -147,13 +148,43 @@ public final class ResourcesCoordinator: ObservableObject {
         state.report
     }
 
+    /// Subscribes to `ServersCoordinator.$hosts` so host additions, renames, origin edits,
+    /// and removals in `Settings › Servers` propagate immediately to `Settings › Resources`.
+    public func observeHosts(from servers: ServersCoordinator) {
+        hostsCancellable = servers.$hosts
+            .dropFirst()
+            .sink { [weak self] updated in
+                self?.syncHosts(updated)
+            }
+    }
+
+    /// Synchronizes the host picker with an updated saved-host list, pruning removed host state
+    /// and falling back to `This Mac` if the active host was removed.
+    public func syncHosts(_ updated: [HostRecord]) {
+        let normalized = updated.isEmpty ? [.thisMac] : updated
+        let validIDs = Set(normalized.map(\.id))
+        hosts = normalized
+        statesByHostID = statesByHostID.filter { validIDs.contains($0.key) }
+        inflightByHostID = inflightByHostID.filter { validIDs.contains($0.key) }
+        if !validIDs.contains(selectedHostID) {
+            selectedHostID = normalized.first?.id ?? HostRecord.localID
+            state = statesByHostID[selectedHostID] ?? .idle
+            Task { [weak self] in
+                await self?.refresh()
+            }
+        }
+    }
+
     /// Loads the saved hosts list from `HostStore` and fetches resources for the selected host.
     public func load() async {
         do {
             let loaded = try await store.hosts()
-            hosts = loaded.isEmpty ? [.thisMac] : loaded
-            if !hosts.contains(where: { $0.id == selectedHostID }) {
-                selectedHostID = hosts.first?.id ?? HostRecord.localID
+            let normalized = loaded.isEmpty ? [.thisMac] : loaded
+            let validIDs = Set(normalized.map(\.id))
+            hosts = normalized
+            statesByHostID = statesByHostID.filter { validIDs.contains($0.key) }
+            if !validIDs.contains(selectedHostID) {
+                selectedHostID = normalized.first?.id ?? HostRecord.localID
             }
         } catch {
             let msg = SavedHostError.unreadableStore.localizedDescription

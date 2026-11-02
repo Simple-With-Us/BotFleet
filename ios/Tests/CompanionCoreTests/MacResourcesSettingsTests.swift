@@ -226,6 +226,10 @@ final class MacResourcesSettingsTests: XCTestCase {
         XCTAssertEqual(HostResourcesPresentation.formatCount(5_000_000, singular: "inode"), "5,000,000 inodes")
         XCTAssertEqual(HostResourcesPresentation.formatCount(1, singular: "core"), "1 core")
         XCTAssertEqual(HostResourcesPresentation.formatCount(10, singular: "core"), "10 cores")
+        XCTAssertEqual(HostResourcesPresentation.formatPercent(98), "98%")
+        XCTAssertEqual(HostResourcesPresentation.formatPercent(85.5), "85.5%")
+        XCTAssertEqual(HostResourcesPresentation.formatNumericValue(12.5), "12.5")
+        XCTAssertEqual(HostResourcesPresentation.formatNumericValue(2.0), "2")
 
         let central = HostResourcesPresentation.formatCentralTime(sampleTimestampMs)
         XCTAssertTrue(central.contains("2:14 PM"), central)
@@ -307,6 +311,22 @@ final class MacResourcesSettingsTests: XCTestCase {
         XCTAssertEqual(swaplessByKey["minMemoryAvailablePercent"]?.applied, "10%")
         XCTAssertNil(swaplessByKey["minMemoryAvailablePercent"]?.mismatch)
         XCTAssertEqual(swaplessByKey["maxSwapPercent"]?.applied, "Not enforced on the server: No swap is configured")
+
+        // Fractional percentages preserve their decimal digits instead of rounding to integers.
+        let fractionalReport = makeReport(
+            admission: HostAdmissionThresholds(
+                maxSwapPercent: 85.5,
+                minFreeDiskBytes: 2 * gb,
+                minMemoryAvailablePercent: 12.5
+            )
+        )
+        let fractionalByKey = Dictionary(
+            uniqueKeysWithValues: HostResourcesPresentation.admissionRows(for: fractionalReport).map { ($0.key, $0) }
+        )
+        XCTAssertEqual(fractionalByKey["maxSwapPercent"]?.saved, "85.5%")
+        XCTAssertEqual(fractionalByKey["maxSwapPercent"]?.applied, "85.5%")
+        XCTAssertEqual(fractionalByKey["minMemoryAvailablePercent"]?.saved, "12.5%")
+        XCTAssertEqual(fractionalByKey["minMemoryAvailablePercent"]?.applied, "12.5%")
     }
 
     func testResourceRowsUnknownReadingOfflineStorageAndNullSafety() {
@@ -396,6 +416,44 @@ final class MacResourcesSettingsTests: XCTestCase {
         XCTAssertEqual(coordinator.selectedHostID, remoteHost.id)
         XCTAssertEqual(coordinator.currentReport?.hostId, remoteID)
         XCTAssertEqual(coordinator.currentReport?.platform, "linux")
+    }
+
+    func testObserveHostsSyncsServersCoordinatorMutationsAndFallsBackWhenSelectedHostRemoved() async throws {
+        let store = FixtureResourceHosts()
+        let tokens = FixtureResourceTokens()
+        let localReport = makeReport()
+        let servers = ServersCoordinator(store: store, tokens: tokens)
+        let resources = ResourcesCoordinator(
+            store: store,
+            tokens: tokens,
+            fetcher: { _, _ in localReport }
+        )
+        resources.observeHosts(from: servers)
+
+        await servers.load()
+        await resources.load()
+        XCTAssertEqual(resources.hosts, [.thisMac])
+
+        let added = await servers.add(name: "Staging Server", origin: "https://staging.fixture.test")
+        XCTAssertTrue(added)
+        XCTAssertEqual(resources.hosts.count, 2)
+        let stagingHost = try XCTUnwrap(resources.hosts.last)
+        XCTAssertEqual(stagingHost.name, "Staging Server")
+
+        let renamed = await servers.rename(stagingHost, name: "Production Server")
+        XCTAssertTrue(renamed)
+        XCTAssertEqual(resources.hosts.last?.name, "Production Server")
+
+        let renamedHost = try XCTUnwrap(resources.hosts.last)
+        try tokens.write(RedactedSecret("staging-token"), for: renamedHost)
+        await resources.selectHost(id: renamedHost.id)
+        XCTAssertEqual(resources.selectedHostID, renamedHost.id)
+
+        let removed = await servers.remove(renamedHost)
+        XCTAssertTrue(removed)
+        XCTAssertEqual(resources.hosts, [.thisMac])
+        XCTAssertEqual(resources.selectedHostID, HostRecord.localID)
+        XCTAssertNil(resources.statesByHostID[renamedHost.id])
     }
 
     func testHostResourcesClientForwardsGateHeaderAndValidatesResponse() async throws {

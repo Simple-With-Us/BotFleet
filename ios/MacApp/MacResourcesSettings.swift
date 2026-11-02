@@ -217,9 +217,9 @@ private struct HeadroomCard: View {
     @Binding var showEnvNames: Bool
 
     var body: some View {
-        let reservedCpuText = report.admission.reservedCpuCores.map { "\(Int($0.rounded()))" } ?? ""
+        let reservedCpuText = report.admission.reservedCpuCores.map(HostResourcesPresentation.formatNumericValue) ?? ""
         let reservedRamText = report.admission.reservedRamBytes.map { "\(Int(($0 / 1024.0 / 1024.0).rounded()))" } ?? ""
-        let minMemoryPercentText = report.admission.minMemoryAvailablePercent.map { "\(Int($0.rounded()))" } ?? ""
+        let minMemoryPercentText = report.admission.minMemoryAvailablePercent.map(HostResourcesPresentation.formatNumericValue) ?? ""
 
         GroupBox("Owner-Set Headroom") {
             VStack(alignment: .leading, spacing: 8) {
