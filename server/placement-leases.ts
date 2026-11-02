@@ -182,16 +182,20 @@ export class PlacementLeaseService {
     worker.lastSeen = this.now();
     worker.admission = message.admission;
     const held = new Set(message.leases);
+    const dispatchingOnHost = new Set<string>();
     for (const job of this.jobs.values()) {
-      if (job.host === message.hostId && job.leaseId && held.has(job.leaseId) &&
-        (job.status === "dispatching" || job.status === "worker-unreachable")) {
-        job.status = "running";
+      if (job.host === message.hostId && job.leaseId) {
+        if (held.has(job.leaseId) && (job.status === "dispatching" || job.status === "worker-unreachable")) {
+          job.status = "running";
+        } else if (job.status === "dispatching") {
+          dispatchingOnHost.add(job.leaseId);
+        }
       }
     }
     const stopsForHost = this.pendingStops.get(message.hostId);
     if (stopsForHost) {
       for (const leaseId of stopsForHost) {
-        if (!held.has(leaseId)) {
+        if (!held.has(leaseId) && !dispatchingOnHost.has(leaseId)) {
           stopsForHost.delete(leaseId);
         }
       }
@@ -297,6 +301,11 @@ export class PlacementLeaseService {
     }
     if (!samePayload) {
       return refuse(`dispatch payload for job ${job.jobId} does not match the queued job`);
+    }
+    for (const other of this.jobs.values()) {
+      if (other.jobId !== job.jobId && other.leaseId === lease.leaseId) {
+        return refuse("lease_conflict");
+      }
     }
     const worker = this.workers.get(lease.host);
     if (!worker) return refuse(`${lease.host} is not registered with this controller`);

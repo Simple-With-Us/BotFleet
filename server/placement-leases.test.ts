@@ -215,6 +215,66 @@ describe("placement lease compare-and-set", () => {
     });
     expect(duplicate.ok && duplicate.reply.accepted).toBe(false);
     expect(duplicate.ok && duplicate.reply.reason).toMatch(/never leased twice/);
+
+    // Reusing an existing leaseId for a different jobId is rejected with lease_conflict.
+    leases.enqueue({ ...fence, jobId: "job-d2", botId: "bot-a", threadId: "t", command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    const collided = leases.dispatch({
+      ...fence,
+      lease: { controllerId, epoch: 0, leaseId: "lease-1", jobId: "job-d2", host: workerId },
+      command: "true",
+      cwd: "/tmp",
+      timeoutMs: 60_000,
+    });
+    expect(collided.ok && collided.reply).toEqual({
+      accepted: false,
+      leaseId: "lease-1",
+      reason: "lease_conflict",
+      controllerId,
+      epoch: 0,
+    });
+    expect(leases.job("job-d2")?.status).toBe("queued");
+  });
+
+  it("retains pendingStops across intervening heartbeats while a stopped job is still dispatching", () => {
+    const { leases } = service();
+    leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
+    leases.enqueue({ ...fence, jobId: "job-early-stop", botId: "bot-a", threadId: "t", command: "sleep 30", cwd: "/tmp", timeoutMs: 60_000 });
+    const claim = leases.claim({ ...fence, hostId: workerId, jobId: "job-early-stop" });
+    const leaseId = claim.ok && claim.reply.accepted ? claim.reply.lease.leaseId : "";
+
+    expect(leases.stop({ ...fence, jobId: "job-early-stop", leaseId, reason: "stop before ack" }).ok).toBe(true);
+
+    // Intervening heartbeat before worker acknowledges holding the lease must NOT prune the pending stop.
+    const preAckHb = leases.heartbeat({
+      ...fence,
+      hostId: workerId,
+      leases: [],
+      admission: { admit: true },
+      sample,
+    });
+    expect(preAckHb.ok && preAckHb.reply.pendingStops).toEqual([leaseId]);
+    expect(leases.job("job-early-stop")?.status).toBe("dispatching");
+
+    // Subsequent heartbeat where the worker reports holding the lease still delivers the pending stop.
+    const ackHb = leases.heartbeat({
+      ...fence,
+      hostId: workerId,
+      leases: [leaseId],
+      admission: { admit: true },
+      sample,
+    });
+    expect(ackHb.ok && ackHb.reply.pendingStops).toEqual([leaseId]);
+    expect(leases.job("job-early-stop")?.status).toBe("running");
+
+    // Once the worker stops holding the lease on a subsequent heartbeat, the pending stop is pruned.
+    const postStopHb = leases.heartbeat({
+      ...fence,
+      hostId: workerId,
+      leases: [],
+      admission: { admit: true },
+      sample,
+    });
+    expect(postStopHb.ok && postStopHb.reply.pendingStops).toEqual([]);
   });
 
   it("delivers pendingStops on heartbeat for a stopped lease and prunes once dropped or reported", () => {
