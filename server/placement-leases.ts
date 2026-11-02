@@ -1,17 +1,18 @@
 /** The controller's placement lease book (native server mode plan, slice 8b —
- *  the register / heartbeat / claim / release half).
+ *  register, heartbeat, claim, dispatch, stop, release, release-controller,
+ *  takeover, enqueue, and report).
  *
  *  One authoritative queue lives here on the controller: a job is enqueued
- *  once (idempotent on job id), claimed once (a compare-and-set from
- *  `queued` to leased, fenced on the controller epoch), and reported once
+ *  once (idempotent on job id), claimed or dispatched once (a compare-and-set
+ *  from `queued` to leased, fenced on the controller epoch), and reported once
  *  (a replayed report gets the same acknowledgement and changes nothing).
  *  A worker that stops heartbeating takes its leased jobs to
  *  `worker-unreachable`; they are never requeued or re-dispatched from a
  *  timer, so a job can never run twice because a link went quiet.
  *
- *  What this file is not yet: dispatch, stop and takeover (the rest of 8b),
- *  and persistence.  Leases are the controller's live book; the job records
- *  a person reads stay in the job registry. */
+ *  What this file is not yet: durable persistence across controller restarts.
+ *  Leases are the controller's live book; the job records a person reads stay
+ *  in the job registry. */
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { derivedCapability, hostCanRunCommand } from "../shared/mac-only-capabilities.ts";
@@ -23,6 +24,9 @@ import {
   type ClaimMessage,
   type ClaimReply,
   type ControllerEpoch,
+  type ControllerReleaseReply,
+  type DispatchMessage,
+  type DispatchReply,
   type EnqueueMessage,
   type EnqueueReply,
   type HeartbeatMessage,
@@ -34,9 +38,16 @@ import {
   type PlacementMessage,
   type RegisterMessage,
   type RegisterReply,
+  type ReleaseMessage,
   type ReportMessage,
   type ReportReply,
+  type StopMessage,
+  type StopReply,
+  type TakeoverMessage,
+  type TakeoverReply,
 } from "../shared/placement.ts";
+
+export type { ControllerReleaseReply, DispatchReply, StopReply, TakeoverReply } from "../shared/placement.ts";
 
 export type PlacementJobStatus =
   | "queued" | "dispatching" | "running" | "worker-unreachable"
@@ -56,6 +67,9 @@ export interface PlacementJob {
   requiredReason?: string;
   queuedReason?: string;
   placedReason?: string;
+  stopReason?: string;
+  /** Set when a forced takeover adopts a higher epoch while this job was in flight. */
+  ranAfterTakeover?: boolean;
   report?: { status: ReportMessage["status"]; exitCode: number | null; signal: string | null; endedAt: number };
 }
 
@@ -81,10 +95,14 @@ export type LeaseResult<T> = { ok: true; reply: T } | { ok: false; reason: strin
 
 const TERMINAL: readonly PlacementJobStatus[] = ["completed", "failed", "killed", "lost"];
 
+export const MAX_TAKEOVER_EPOCH_JUMP = 100_000;
+
 export class PlacementLeaseService {
   private current: ControllerEpoch;
+  private reconcileState = false;
   private readonly workers = new Map<HostId, WorkerBook>();
   private readonly jobs = new Map<string, PlacementJob>();
+  private readonly pendingStops = new Map<HostId, Set<string>>();
   private readonly now: () => number;
   private readonly unreachableAfterMs: number;
   private readonly newLeaseId: () => string;
@@ -100,6 +118,10 @@ export class PlacementLeaseService {
     return { ...this.current };
   }
 
+  reconciling(): boolean {
+    return this.reconcileState;
+  }
+
   job(jobId: string): PlacementJob | null {
     const job = this.jobs.get(jobId);
     return job ? { ...job } : null;
@@ -111,12 +133,9 @@ export class PlacementLeaseService {
 
   /** The epoch fence every state-changing message crosses first: versions
    *  before epochs, and only the current pair passes.  A lower pair is
-   *  refused so the sender converges; a higher pair is refused too, never
-   *  adopted — this slice has no takeover path (see the file header), so no
-   *  worker message may legitimately carry a newer epoch, and adopting one
-   *  would let any skewed or forged bump invalidate outstanding leases.
-   *  The future takeover route will own adoption behind its own
-   *  authorization; until then the fence fails closed. */
+   *  refused so the sender converges; a higher pair is refused on worker
+   *  and queue messages too, never adopted outside `takeover`, so no skewed
+   *  or forged worker bump can invalidate outstanding leases. */
   private fence(message: PlacementMessage): string | null {
     if (message.version !== PLACEMENT_WIRE_VERSION) {
       return `placement version ${message.version} is not spoken here (this host speaks ${PLACEMENT_WIRE_VERSION})`;
@@ -132,6 +151,16 @@ export class PlacementLeaseService {
 
   private refused<T>(reason: string): LeaseResult<T> {
     return { ok: false, reason, controller: this.controller() };
+  }
+
+  private clearPendingStop(hostId: HostId | undefined, leaseId: string | undefined): void {
+    if (!hostId || !leaseId) return;
+    const set = this.pendingStops.get(hostId);
+    if (!set) return;
+    set.delete(leaseId);
+    if (set.size === 0) {
+      this.pendingStops.delete(hostId);
+    }
   }
 
   register(message: RegisterMessage): LeaseResult<RegisterReply> {
@@ -155,13 +184,29 @@ export class PlacementLeaseService {
     worker.lastSeen = this.now();
     worker.admission = message.admission;
     const held = new Set(message.leases);
+    const dispatchingOnHost = new Set<string>();
     for (const job of this.jobs.values()) {
-      if (job.host === message.hostId && job.leaseId && held.has(job.leaseId) &&
-        (job.status === "dispatching" || job.status === "worker-unreachable")) {
-        job.status = "running";
+      if (job.host === message.hostId && job.leaseId) {
+        if (held.has(job.leaseId) && (job.status === "dispatching" || job.status === "worker-unreachable")) {
+          job.status = "running";
+        } else if (job.status === "dispatching") {
+          dispatchingOnHost.add(job.leaseId);
+        }
       }
     }
-    return { ok: true, reply: { pendingStops: [], ...this.current } };
+    const stopsForHost = this.pendingStops.get(message.hostId);
+    if (stopsForHost) {
+      for (const leaseId of stopsForHost) {
+        if (!held.has(leaseId) && !dispatchingOnHost.has(leaseId)) {
+          stopsForHost.delete(leaseId);
+        }
+      }
+      if (stopsForHost.size === 0) {
+        this.pendingStops.delete(message.hostId);
+      }
+    }
+    const pendingStops = [...(this.pendingStops.get(message.hostId) ?? [])];
+    return { ok: true, reply: { pendingStops, ...this.current } };
   }
 
   /** Admit a job to the one authoritative queue.  Idempotent on job id: an
@@ -226,6 +271,154 @@ export class PlacementLeaseService {
     return { ok: true, reply: { accepted: true, lease, ...this.current } };
   }
 
+  /** Push-side lease assignment: fenced on both the message and the embedded
+   *  lease epoch, idempotent on an exact replay of the active lease, and
+   *  refused when the job already holds a different lease or is no longer
+   *  queued. */
+  dispatch(message: DispatchMessage): LeaseResult<DispatchReply> {
+    const { lease } = message;
+    const refuse = (reason: string): LeaseResult<DispatchReply> => ({
+      ok: true,
+      reply: { accepted: false, leaseId: lease.leaseId, reason, ...this.current },
+    });
+    const stale = this.fence(message);
+    if (stale) return refuse(stale);
+    if (lease.controllerId !== this.current.controllerId || lease.epoch !== this.current.epoch) {
+      return refuse(`stale lease epoch ${lease.epoch}; the controller is ${this.current.controllerId} at epoch ${this.current.epoch}`);
+    }
+    const job = this.jobs.get(lease.jobId);
+    if (!job) return refuse(`no queued job ${lease.jobId} on this controller`);
+    const samePayload =
+      job.command === message.command &&
+      job.cwd === message.cwd &&
+      job.timeoutMs === message.timeoutMs;
+    if (job.status === "dispatching" || job.status === "running" || job.status === "worker-unreachable") {
+      if (job.leaseId === lease.leaseId && job.host === lease.host && samePayload) {
+        return { ok: true, reply: { accepted: true, leaseId: lease.leaseId, ...this.current } };
+      }
+      return refuse(`job ${job.jobId} is already leased as ${job.leaseId ?? "unleased"} on ${job.host ?? "unknown"}; it is never leased twice`);
+    }
+    if (job.status !== "queued") {
+      return refuse(`job ${job.jobId} is ${job.status}, not queued; it is never re-dispatched`);
+    }
+    if (!samePayload) {
+      return refuse(`dispatch payload for job ${job.jobId} does not match the queued job`);
+    }
+    for (const other of this.jobs.values()) {
+      if (other.jobId !== job.jobId && other.leaseId === lease.leaseId) {
+        return refuse("lease_conflict");
+      }
+    }
+    const worker = this.workers.get(lease.host);
+    if (!worker) return refuse(`${lease.host} is not registered with this controller`);
+    if (this.now() - worker.lastSeen > this.unreachableAfterMs) return refuse(`${lease.host} has not heartbeated within the window`);
+    if (!worker.admission.admit) return refuse(worker.admission.reason ?? `${lease.host} is not admitting work`);
+    if (!hostCanRunCommand(worker.capabilities, job.command, { cwd: job.cwd })) {
+      return refuse(`${lease.host} cannot run this job (${job.requiredReason ?? "capability missing"})`);
+    }
+    job.status = "dispatching";
+    job.host = lease.host;
+    job.leaseId = lease.leaseId;
+    job.queuedReason = undefined;
+    job.placedReason = job.requiredReason ?? "dispatched to an eligible host";
+    return { ok: true, reply: { accepted: true, leaseId: lease.leaseId, ...this.current } };
+  }
+
+  /** Record a pending stop for an active lease so the holding worker receives
+   *  the lease id on its next heartbeat and terminates the process. */
+  stop(message: StopMessage): LeaseResult<StopReply> {
+    const refuse = (reason: string): LeaseResult<StopReply> => ({
+      ok: true,
+      reply: { accepted: false, jobId: message.jobId, leaseId: message.leaseId, reason, ...this.current },
+    });
+    const stale = this.fence(message);
+    if (stale) return refuse(stale);
+    const job = this.jobs.get(message.jobId);
+    if (!job) return refuse(`no job ${message.jobId} on this controller`);
+    if (!job.host || job.leaseId !== message.leaseId) {
+      return refuse(`lease ${message.leaseId} does not hold job ${message.jobId}`);
+    }
+    if (TERMINAL.includes(job.status)) {
+      return refuse(`job ${message.jobId} is already ${job.status}`);
+    }
+    let stops = this.pendingStops.get(job.host);
+    if (!stops) {
+      stops = new Set<string>();
+      this.pendingStops.set(job.host, stops);
+    }
+    stops.add(message.leaseId);
+    job.stopReason = message.reason;
+    return { ok: true, reply: { accepted: true, jobId: message.jobId, leaseId: message.leaseId, ...this.current } };
+  }
+
+  /** Clean controller handoff (transition 4): requires zero active jobs on
+   *  this controller, then increments the epoch and hands the controller role
+   *  to `toControllerId`. */
+  release(message: ReleaseMessage): LeaseResult<ControllerReleaseReply> {
+    const refuse = (reason: string): LeaseResult<ControllerReleaseReply> => ({
+      ok: true,
+      reply: { accepted: false, reason, ...this.current },
+    });
+    const stale = this.fence(message);
+    if (stale) return refuse(stale);
+    let activeCount = 0;
+    for (const job of this.jobs.values()) {
+      if (!TERMINAL.includes(job.status)) {
+        activeCount += 1;
+        break;
+      }
+    }
+    if (activeCount > 0) {
+      return refuse("Settle all active jobs with terminal reports before releasing the controller");
+    }
+    const previousEpoch = this.current.epoch;
+    this.current = { controllerId: message.toControllerId, epoch: previousEpoch + 1 };
+    this.reconcileState = false;
+    return {
+      ok: true,
+      reply: {
+        accepted: true,
+        releasedFromEpoch: previousEpoch,
+        ...this.current,
+      },
+    };
+  }
+
+  /** Forced takeover (transition 5): adopts a strictly higher epoch from the
+   *  taking-over controller, records reconcile mode, and marks in-flight
+   *  leased jobs as `ranAfterTakeover` so they are surfaced and never
+   *  re-dispatched automatically. */
+  takeover(message: TakeoverMessage): LeaseResult<TakeoverReply> {
+    const refuse = (reason: string): LeaseResult<TakeoverReply> => ({
+      ok: true,
+      reply: { accepted: false, reconcile: false, orphanedJobIds: [], reason, ...this.current },
+    });
+    if (message.version !== PLACEMENT_WIRE_VERSION) {
+      return refuse(`placement version ${message.version} is not spoken here (this host speaks ${PLACEMENT_WIRE_VERSION})`);
+    }
+    if (message.epoch <= this.current.epoch || message.epoch > this.current.epoch + MAX_TAKEOVER_EPOCH_JUMP) {
+      return refuse(`takeover epoch ${message.epoch} must exceed current epoch ${this.current.epoch} on ${this.current.controllerId} within bounds`);
+    }
+    this.current = { controllerId: message.controllerId, epoch: message.epoch };
+    this.reconcileState = message.reconcile;
+    const orphanedJobIds: string[] = [];
+    for (const job of this.jobs.values()) {
+      if (job.status === "dispatching" || job.status === "running" || job.status === "worker-unreachable") {
+        job.ranAfterTakeover = true;
+        orphanedJobIds.push(job.jobId);
+      }
+    }
+    return {
+      ok: true,
+      reply: {
+        accepted: true,
+        reconcile: message.reconcile,
+        orphanedJobIds,
+        ...this.current,
+      },
+    };
+  }
+
   /** Record a worker's final word on a job.  Idempotent on job id: the
    *  first report settles the job, a replay of it is acknowledged and
    *  applies nothing twice. */
@@ -252,6 +445,7 @@ export class PlacementLeaseService {
     }
     job.status = message.status;
     job.report = { status: message.status, exitCode: message.exitCode, signal: message.signal, endedAt: message.endedAt };
+    this.clearPendingStop(job.host, job.leaseId);
     return { ok: true, reply: { accepted: true, ...this.current } };
   }
 
@@ -266,10 +460,12 @@ export class PlacementLeaseService {
     if (!job) return refuse(`no job ${message.jobId} on this controller`);
     if (job.leaseId !== message.leaseId || job.host !== message.hostId) return refuse(`lease ${message.leaseId} does not hold job ${message.jobId}`);
     if (job.status !== "dispatching") return refuse(`job ${message.jobId} is ${job.status}; only an unstarted lease can be released`);
+    this.clearPendingStop(job.host, job.leaseId);
     job.status = "queued";
     job.host = undefined;
     job.leaseId = undefined;
     job.placedReason = undefined;
+    job.stopReason = undefined;
     job.queuedReason = "waiting for an eligible host";
     return { ok: true, reply: { accepted: true, jobId: job.jobId, ...this.current } };
   }
@@ -292,12 +488,46 @@ export class PlacementLeaseService {
 
 // ── routes ────────────────────────────────────────────────────────────────
 
-export type PlacementLeaseAction = "register" | "heartbeat" | "claim" | "release" | "enqueue" | "report";
-export const PLACEMENT_LEASE_ACTIONS: readonly PlacementLeaseAction[] = ["register", "heartbeat", "claim", "release", "enqueue", "report"];
+export type PlacementLeaseAction =
+  | "register"
+  | "heartbeat"
+  | "claim"
+  | "dispatch"
+  | "stop"
+  | "release"
+  | "release-controller"
+  | "takeover"
+  | "enqueue"
+  | "report";
+export const PLACEMENT_LEASE_ACTIONS: readonly PlacementLeaseAction[] = [
+  "register",
+  "heartbeat",
+  "claim",
+  "dispatch",
+  "stop",
+  "release",
+  "release-controller",
+  "takeover",
+  "enqueue",
+  "report",
+];
 
 interface PlacementCaller { localOwner: boolean; fromCompanion: boolean; viaNamedTunnel: boolean }
 export type PlacementLeaseResponse =
-  | { status: 200; body: RegisterReply | HeartbeatReply | ClaimReply | LeaseReleaseReply | EnqueueReply | ReportReply }
+  | {
+      status: 200;
+      body:
+        | RegisterReply
+        | HeartbeatReply
+        | ClaimReply
+        | DispatchReply
+        | StopReply
+        | LeaseReleaseReply
+        | ControllerReleaseReply
+        | TakeoverReply
+        | EnqueueReply
+        | ReportReply;
+    }
   | { status: 400 | 403; body: { error: string } }
   | { status: 409; body: { error: string } & ControllerEpoch };
 
@@ -340,6 +570,13 @@ const sample = z.object({
   }).strict().nullable().optional(),
 }).strict();
 const capabilities = z.array(z.enum(["shell", "macos", "desktop"]));
+const leaseSchema = z.object({
+  controllerId: hostId,
+  epoch: z.number().int().nonnegative().safe(),
+  leaseId: z.string().min(1),
+  jobId: z.string().min(1),
+  host: hostId,
+}).strict();
 const schemas = {
   register: z.object({ ...fenced, hostId, role: z.enum(["controller", "worker"]), capabilities, sample }).strict(),
   heartbeat: z.object({
@@ -347,7 +584,16 @@ const schemas = {
     admission: z.object({ admit: z.boolean(), reason: z.string().optional() }).strict(), sample,
   }).strict(),
   claim: z.object({ ...fenced, hostId, jobId: z.string().min(1) }).strict(),
+  dispatch: z.object({
+    ...fenced, lease: leaseSchema,
+    command: z.string().min(1).max(16_000), cwd: z.string().min(1), timeoutMs: z.number().positive(),
+  }).strict(),
+  stop: z.object({
+    ...fenced, jobId: z.string().min(1), leaseId: z.string().min(1), reason: z.string().min(1),
+  }).strict(),
   release: z.object({ ...fenced, hostId, jobId: z.string().min(1), leaseId: z.string().min(1) }).strict(),
+  "release-controller": z.object({ ...fenced, toControllerId: hostId }).strict(),
+  takeover: z.object({ ...fenced, reconcile: z.boolean() }).strict(),
   enqueue: z.object({
     ...fenced, jobId: z.string().min(1), botId: z.string().min(1), threadId: z.string().min(1),
     command: z.string().min(1).max(16_000), cwd: z.string().min(1), timeoutMs: z.number().positive(),
@@ -386,7 +632,11 @@ export function placementLeaseRoute(
     action === "register" ? service.register(message as RegisterMessage) :
     action === "heartbeat" ? service.heartbeat(message as HeartbeatMessage) :
     action === "claim" ? service.claim(message as ClaimMessage) :
+    action === "dispatch" ? service.dispatch(message as DispatchMessage) :
+    action === "stop" ? service.stop(message as StopMessage) :
     action === "release" ? service.releaseLease(message as LeaseReleaseMessage) :
+    action === "release-controller" ? service.release(message as ReleaseMessage) :
+    action === "takeover" ? service.takeover(message as TakeoverMessage) :
     action === "enqueue" ? service.enqueue(message as EnqueueMessage) :
     service.report(message as ReportMessage);
   if (!result.ok) return { status: 409, body: { error: result.reason, ...result.controller } };
