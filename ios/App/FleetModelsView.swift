@@ -75,8 +75,8 @@ struct FleetModelsView: View {
                 engines: instances,
                 enginesLoaded: instancesLoaded,
                 initial: initialChoice(target),
-                onChoose: { instanceId, model in
-                    choose(target, instanceId: instanceId, model: model)
+                onChoose: { instanceId, model, latest in
+                    choose(target, instanceId: instanceId, model: model, latest: latest)
                 }
             )
         }
@@ -206,6 +206,7 @@ struct FleetModelsView: View {
                 label: "Primary",
                 instanceId: bot.modelSelection.instanceId,
                 model: bot.modelSelection.model,
+                latest: bot.modelSelection.latest,
                 target: .botPrimary(bot.id),
                 removeLabel: nil,
                 onRemove: nil
@@ -220,6 +221,7 @@ struct FleetModelsView: View {
                             label: "Fallback \(index + 1)",
                             instanceId: entry.instanceId,
                             model: entry.model,
+                            latest: entry.latest,
                             target: .botFallback(bot.id, index),
                             removeLabel: "Remove Fallback \(index + 1) from \(bot.name)",
                             onRemove: { removeFallback(from: bot, at: index) }
@@ -252,6 +254,7 @@ struct FleetModelsView: View {
                 label: label,
                 instanceId: slot.instanceId,
                 model: slot.model,
+                latest: slot.latest,
                 target: target,
                 removeLabel: "Clear \(label)",
                 onRemove: { setDefault(target, nil) }
@@ -276,6 +279,7 @@ struct FleetModelsView: View {
         label: String,
         instanceId: String,
         model: String,
+        latest: String? = nil,
         target: ModelChoiceTarget,
         removeLabel: String?,
         onRemove: (() -> Void)?
@@ -289,7 +293,7 @@ struct FleetModelsView: View {
                         .foregroundStyle(.primary)
                     Spacer()
                     VStack(alignment: .trailing, spacing: 2) {
-                        Text(modelLabel(instanceId: instanceId, model: model))
+                        Text(modelLabel(instanceId: instanceId, model: model, latest: latest))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
                         Text(engineName(instanceId))
@@ -319,9 +323,12 @@ struct FleetModelsView: View {
         instances.first(where: { $0.instanceId == instanceId })?.settingsDisplayName ?? instanceId
     }
 
-    private func modelLabel(instanceId: String, model: String) -> String {
+    private func modelLabel(instanceId: String, model: String, latest: String? = nil) -> String {
         let engine = instances.first(where: { $0.instanceId == instanceId })
-        return engine?.models.options.first(where: { $0.id == model })?.label ?? model
+        return ModelLineage.displayLabel(
+            selection: ModelSelection(instanceId: instanceId, model: model, latest: latest),
+            instance: engine
+        )
     }
 
     /// Nil when the engine is not in the roster, which leaves effort alone.
@@ -384,17 +391,18 @@ struct FleetModelsView: View {
         }
     }
 
-    private func choose(_ target: ModelChoiceTarget, instanceId: String, model: String) {
+    private func choose(_ target: ModelChoiceTarget, instanceId: String, model: String, latest: String? = nil) {
         let levels = effortLevels(instanceId: instanceId, model: model)
         switch target {
         case .defaultPrimary, .defaultFallback:
-            setDefault(target, DefaultModelSlot(instanceId: instanceId, model: model))
+            setDefault(target, DefaultModelSlot(instanceId: instanceId, model: model, latest: latest))
         case let .botPrimary(botId):
             guard let bot = session.state.bot(botId) else { return }
             save(bot, FleetModels.withPrimary(
                 bot.modelSelection,
                 instanceId: instanceId,
                 model: model,
+                latest: latest,
                 effortLevels: levels
             ))
         case let .botFallback(botId, index):
@@ -404,6 +412,7 @@ struct FleetModelsView: View {
                 at: index,
                 instanceId: instanceId,
                 model: model,
+                latest: latest,
                 effortLevels: levels
             ))
         }
@@ -465,11 +474,12 @@ private struct ModelChoiceSheet: View {
     let title: String
     let engines: [Instance]
     let enginesLoaded: Bool
-    let onChoose: (String, String) -> Void
+    let onChoose: (String, String, String?) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var instanceId: String
     @State private var modelId: String
+    @State private var latest: String?
     private let initialInstanceId: String
 
     init(
@@ -477,7 +487,7 @@ private struct ModelChoiceSheet: View {
         engines: [Instance],
         enginesLoaded: Bool,
         initial: ModelSelection,
-        onChoose: @escaping (String, String) -> Void
+        onChoose: @escaping (String, String, String?) -> Void
     ) {
         self.title = title
         self.engines = engines
@@ -486,6 +496,7 @@ private struct ModelChoiceSheet: View {
         self.initialInstanceId = initial.instanceId
         _instanceId = State(initialValue: initial.instanceId)
         _modelId = State(initialValue: initial.model)
+        _latest = State(initialValue: initial.latest ?? ModelLineage.detectAlias(from: initial.model))
     }
 
     private var choosable: [Instance] {
@@ -515,16 +526,58 @@ private struct ModelChoiceSheet: View {
                         }
                         .pickerStyle(.navigationLink)
                         .onChange(of: instanceId) { _, newInstanceId in
-                            if let instance = engines.first(where: { $0.instanceId == newInstanceId }),
-                               !instance.models.options.contains(where: { $0.id == modelId }) {
-                                modelId = instance.models.default
+                            if let instance = engines.first(where: { $0.instanceId == newInstanceId }) {
+                                if let curLatest = latest,
+                                   let resolved = ModelLineage.resolveClass(curLatest, in: instance) {
+                                    modelId = resolved.resolvedId
+                                } else {
+                                    latest = nil
+                                    if !instance.models.options.contains(where: { $0.id == modelId }) {
+                                        modelId = instance.models.default
+                                    }
+                                }
                             }
                         }
 
                         if let engine = selectedEngine {
-                            Picker("Model", selection: $modelId) {
-                                ForEach(engine.models.options) { option in
-                                    Text(option.label).tag(option.id)
+                            let latestOpts = ModelLineage.latestOptions(for: engine)
+                            Picker("Model", selection: Binding(
+                                get: {
+                                    if let curLatest = latest, !curLatest.isEmpty {
+                                        return "latest:\(curLatest)"
+                                    }
+                                    return modelId
+                                },
+                                set: { newTag in
+                                    if newTag.hasPrefix("latest:") {
+                                        let classKey = String(newTag.dropFirst("latest:".count))
+                                        latest = classKey
+                                        if let resolved = ModelLineage.resolveClass(classKey, in: engine) {
+                                            modelId = resolved.resolvedId
+                                        }
+                                    } else {
+                                        latest = nil
+                                        modelId = newTag
+                                    }
+                                }
+                            )) {
+                                if !latestOpts.isEmpty {
+                                    Section("Latest") {
+                                        ForEach(latestOpts) { opt in
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(opt.label)
+                                                Text(opt.resolvedId)
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            .tag("latest:\(opt.classKey)")
+                                        }
+                                    }
+                                }
+                                Section("Models") {
+                                    ForEach(engine.models.options) { option in
+                                        Text(option.label).tag(option.id)
+                                    }
                                 }
                             }
                             .pickerStyle(.navigationLink)
@@ -540,7 +593,7 @@ private struct ModelChoiceSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
-                        onChoose(instanceId, modelId)
+                        onChoose(instanceId, modelId, latest)
                         dismiss()
                     }
                     .disabled(selectedEngine == nil || modelId.isEmpty)

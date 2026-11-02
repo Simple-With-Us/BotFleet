@@ -266,13 +266,59 @@ public struct ModelSelection: Codable, Hashable, Sendable {
     /// Kept as a string so a newer server's saved value still round-trips
     /// through an older phone until the person explicitly changes it.
     public var effort: String?
+    /// A model class this entry floats on ("Latest Sonnet" is `latest: "sonnet"`).
+    public var latest: String?
     public var fallbacks: [ModelSelection]?
 
-    public init(instanceId: String, model: String, effort: String? = nil, fallbacks: [ModelSelection]? = nil) {
+    public init(
+        instanceId: String,
+        model: String,
+        effort: String? = nil,
+        latest: String? = nil,
+        fallbacks: [ModelSelection]? = nil
+    ) {
         self.instanceId = instanceId
         self.model = model
         self.effort = effort
+        self.latest = latest
         self.fallbacks = fallbacks
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case instanceId
+        case model
+        case effort
+        case latest
+        case fallbacks
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.instanceId = try container.decode(String.self, forKey: .instanceId)
+        let rawModel = try container.decode(String.self, forKey: .model)
+        self.effort = try container.decodeIfPresent(String.self, forKey: .effort)
+        let rawLatest = try container.decodeIfPresent(String.self, forKey: .latest)
+        self.fallbacks = try container.decodeIfPresent([ModelSelection].self, forKey: .fallbacks)
+
+        if let rawLatest, !rawLatest.isEmpty {
+            self.latest = rawLatest
+            self.model = rawModel
+        } else if let alias = ModelLineage.detectAlias(from: rawModel) {
+            self.latest = alias
+            self.model = rawModel
+        } else {
+            self.latest = nil
+            self.model = rawModel
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(instanceId, forKey: .instanceId)
+        try container.encode(model, forKey: .model)
+        try container.encodeIfPresent(effort, forKey: .effort)
+        try container.encodeIfPresent(latest, forKey: .latest)
+        try container.encodeIfPresent(fallbacks, forKey: .fallbacks)
     }
 }
 

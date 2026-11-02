@@ -183,12 +183,17 @@ export function cursorPickerBaseId(id: string): string {
 
 const CURSOR: Family = {
   id: "cursor",
-  classes: [],
+  classes: [
+    { key: "composer", label: "Composer" },
+  ],
   classify(id) {
     const base = cursorPickerBaseId(id);
     if (!base || base === "auto" || base === "default") return null;
     const versioned = CURSOR_VERSION_TAIL.exec(base);
     const rank = versioned ? rankOf(num(versioned[2]), num(versioned[3])) : rankOf(0, 0);
+    if (versioned && versioned[1] === "composer") {
+      return { classKey: "composer", rank };
+    }
     return { classKey: base, rank };
   },
   label(id, _c) {
