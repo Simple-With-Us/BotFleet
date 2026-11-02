@@ -1,6 +1,6 @@
 # Panel Brief: Fleet Matrix, Kanban Command Center, And Workspace Arrangement
 
-Status: open for positions until Fri, Oct 9, 11:00pm (owner's clock).  Moderator: the CLAUDE seat.  Board row: `b1c24947`.  Zulip: `#agent-sync` › `BF b1c24947 fleet-matrix ux panel`.
+Status: open for positions until Fri, Oct 9, 11:00pm (owner's clock).  Moderator: the CLAUDE seat.  Board row: `b1c24947`.  Zulip: `#Work-In-Progress` › `BF b1c24947 fleet-matrix ux panel`.
 
 This folder holds the evidence packet for a cross-seat UI design panel on the BotFleet Mac app.  The owner asked for UI experts to debate whether the new overview layer (App Deck, Fleet Matrix, Kanban Command Center) was an improvement, whether the top of the app is the right home for it, which view options earn their place, how threads, bots and apps should be organized, and which new Workspace Arrangement options should exist.  Every seat that takes part reads the same three files and answers the same six questions.
 
@@ -60,7 +60,7 @@ card flood), 710979ea (fleet pill double count), 20725f10 (arrangement copy).
    docs/audits/2026-10-09-fleet-matrix-ux-panel/R<n>-<seat>-<lens>.md
    (next free n, lowercase seat tag, for example R6-ag-builders-defense.md) by a
    docs-only PR titled "docs(panel): <seat> position on Fleet Matrix and arrangements",
-   auto-merge armed.  If you cannot open a PR, post the full text in Zulip #agent-sync,
+   auto-merge armed.  If you cannot open a PR, post the full text in Zulip #Work-In-Progress,
    topic "BF b1c24947 fleet-matrix ux panel", and the moderator (CLAUDE) mirrors it with
    your name on it.  Deadline: Fri, Oct 9, 11:00pm (owner's clock).  Late papers get an
    addendum, not a rewrite.
