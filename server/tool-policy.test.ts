@@ -391,6 +391,32 @@ describe("evaluateCommand: attacks", () => {
   });
 });
 
+describe("the retired launcher spelling", () => {
+  const RETIRED = "/Users/jay/.local/bin/agent-sync";
+  const policy: ToolPolicy = {
+    mode: "allowlist",
+    commands: [{ argv0: RETIRED, sub: ["whoami"], flags: {}, args: [], positionals: 0 }],
+    writePaths: [],
+    readPaths: [],
+  };
+
+  it("refuses it even when a stored policy still names it, and says it is retired", () => {
+    const decision = evaluateCommand(policy, `${RETIRED} whoami`);
+    expect(decision.ok).toBe(false);
+    expect(decision.reason).toContain("agent-sync has been retired: use simple-chat");
+  });
+
+  it("refuses it as an interpreter's script", () => {
+    const decision = evaluateCommand(policy, `${PYTHON} /Users/jay/apps/fleet/agent-sync dm`);
+    expect(decision.ok).toBe(false);
+    expect(decision.reason).toContain("retired");
+  });
+
+  it("refuses to save a new policy that names it", () => {
+    expect(() => sanitizeToolPolicy(policy)).toThrow(/agent-sync has been retired/);
+  });
+});
+
 describe("evaluateArgv", () => {
   it("applies the same rules to an argv an engine passes as a list", () => {
     expect(evaluateArgv(policy(), [SIMPLE_CHAT, "whoami", "--json"])).toMatchObject({ ok: true });

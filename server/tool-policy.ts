@@ -70,6 +70,11 @@ export const CHAT_CLI_NAMES = ["simple-chat"] as const;
 /** How a refusal names the fleet chat CLI. */
 const CHAT_CLI_LABEL = "simple-chat";
 
+/** The fleet chat CLI's retired launcher spelling.  It names nothing
+ *  runnable:  any use is refused with a pointer to the current name -
+ *  never matched, migrated or aliased. */
+const RETIRED_CHAT_CLI_NAME = "agent-sync";
+
 /** simple-chat flags no routine may pass, whatever its policy says:  each one
  *  changes who the post is from or who it wakes.  A word that is a prefix of
  *  one of these is refused too, because Python's argparse expands an
@@ -202,6 +207,9 @@ const commandSchema = z
     if (names.length > MAX_FLAGS) ctx.addIssue({ code: "custom", message: `has more than ${MAX_FLAGS} flags` });
     // the chat CLI as the program, or as the script an interpreter runs
     const fixed = [command.argv0, ...command.sub];
+    if (fixed.some((word) => posix.basename(word) === RETIRED_CHAT_CLI_NAME)) {
+      ctx.addIssue({ code: "custom", message: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}` });
+    }
     const chatCliAt = fixed.findIndex(namesChatCli);
     for (const [name, spec] of Object.entries(command.flags)) {
       if (spec.value === "int" && spec.min !== undefined && spec.max !== undefined && spec.min > spec.max) {
@@ -415,6 +423,11 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
   if (chatCliAt >= 0) {
     const problem = chatCliProblem(argv.slice(chatCliAt));
     if (problem) return { ok: false, reason: problem, name };
+  }
+  // The retired launcher spelling is refused by name, even if a stored
+  //  policy from before the rename still lists it:  it is not an alias.
+  if (argv.slice(0, 1 + MAX_SUB).some((word) => posix.basename(word) === RETIRED_CHAT_CLI_NAME)) {
+    return { ok: false, reason: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}`, name };
   }
   const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
   if (candidates.length === 0) return { ok: false, reason: "the program is not on the allowlist", name };
