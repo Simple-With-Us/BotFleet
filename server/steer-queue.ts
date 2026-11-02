@@ -70,9 +70,12 @@ const queues = new Map<string, QueueEntry>(); // threadId → waiting sends
 export function queueSteeredMessage(
   bot: BotRecord,
   text: string,
-  options: { prompt?: string; replyToId?: string; linqChatId?: string } = {},
+  options: { prompt?: string; replyToId?: string; linqChatId?: string; threadId?: string; automationSource?: Message["automationSource"] } = {},
 ): { id: string } {
-  const threadId = bot.threadId;
+  // A per-context send holds its words against its own thread, not the
+  // active one: the drain already runs one batch per thread per pass, so a
+  // queued side thread waits its turn without touching bot.threadId.
+  const threadId = options.threadId ?? bot.threadId;
   const id = newId();
   const entry = queues.get(threadId) ?? { botId: bot.id, items: [] };
   entry.items.push({
