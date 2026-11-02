@@ -29,6 +29,7 @@ const TAB_ORDER: AppSettingsSection[] = [
   "usage",
   "observability",
   "secrets",
+  "resources",
 ];
 
 function props(overrides: Partial<SettingsNavProps> = {}): SettingsNavProps {
@@ -80,7 +81,7 @@ function findAll(node: ReactNode, test: (element: ReactElement<Record<string, un
 }
 
 describe("Settings rail tabs", () => {
-  it("lists the ten tabs in order, with Remote as its own tab between Connections and Engines", () => {
+  it("lists the eleven tabs in order, with Remote as its own tab between Connections and Engines", () => {
     expect(SETTINGS_SECTIONS.map((entry) => entry.id)).toEqual(TAB_ORDER);
     expect(buttons(render()).map((tab) => tab.label)).toEqual([
       "General",
@@ -93,6 +94,7 @@ describe("Settings rail tabs", () => {
       "Usage",
       "Observability",
       "Secrets",
+      "Resources",
     ]);
   });
 
