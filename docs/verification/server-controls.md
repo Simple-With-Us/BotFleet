@@ -10,7 +10,8 @@ Run from a seat lane:
 pnpm typecheck
 pnpm test
 pnpm exec vitest run server/system-control.test.ts server/harness-lifecycle.test.ts
-pnpm exec vitest run server/graceful-shutdown.test.ts server/desktop-open-policy.test.ts
+pnpm exec vitest run server/graceful-shutdown.test.ts server/graceful-shutdown-route.test.ts server/desktop-open-policy.test.ts
+pnpm exec vitest run server/graceful-shutdown-e2e.test.ts
 pnpm exec vitest run server/local-vm-offline.test.ts server/container-computer.test.ts server/config.test.ts
 pnpm test:control
 node electron/build-control-app.mjs --helper-only
@@ -22,6 +23,8 @@ git diff --check
 The Swift tests inject HTTP responses, filesystem roots and command runners.  The server tests inject VM status, leases and actions, and the wrapper tests use a temporary root, fake boot identity and a stub runtime.  They do not contact port 8799, start a real server, or mutate a container runtime.  The helper-only build and invalid-action probe verify that the standalone bundle loads and emits strict JSON without calling Docker.
 
 The graceful stop's fixture injects the clock, the wait, the bot roster, the in-flight count and the work breakdown, so the window, the classification of a finished bot against an interrupted one, the refusal when the queued work cannot be saved and the report's wording are all exercised without a server, a store or a filesystem.
+
+`server/graceful-shutdown-e2e.test.ts` drives the route itself:  it boots one real harness on a throwaway home with a provider fixture that holds its answer open, waits until the bot's turn is in flight, and then asks the server to stop.  It reads the time from the harness's own log, so it measures the stop rather than the request, and it asserts that the stop ends well inside the ten second window and that the report does not name the stop's own control lock as work left running.  The same fixture on the pre-fix head took 10,008 ms and reported "still running: 1 Local VM change";  on the fixed tree it takes about 2,076 ms.
 
 The build runs Swift tests, builds both arm64 and x86_64 slices, checks the generated plist and verifies the app signature.  The existing Mac packaging gate runs for changes under `mac-control/` and packages the controller alongside the main app.
 

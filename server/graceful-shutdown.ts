@@ -85,6 +85,49 @@ export interface GracefulStopOptions {
   sleep?(ms: number): Promise<void>;
   /** The clock, injected so a fixture does not depend on the wall clock. */
   now?(): number;
+  /** Called when the stop fails with an exception, so the caller can put its
+   *  fence back down.
+   *
+   *  The caller fences the server while the stop runs, and a fence that stays
+   *  up after a failure refuses every route of a server that is still running.
+   *  The hook is the one place that knows how to lower it, so the two fences
+   *  in this server cannot drift apart. */
+  onFailure?(): void;
+}
+
+/** The work in flight, by kind:  the counters the stop waits on.
+ *
+ *  A named contract rather than a bare `Record<string, number>`:  the lint
+ *  ratchet treats an open dictionary annotation as throwing away known type
+ *  evidence, and a named owner keeps the index signature while saying what
+ *  the counts hold. */
+export interface WorkCounts {
+  readonly [kind: string]: number;
+}
+
+/** The kind of work the control lock is counted as.
+ *
+ *  The stop's own fence takes the control lock, and the control lock is
+ *  counted as a Local VM change in flight.  It is the stop's own reservation
+ *  rather than work in flight, so counting it would mean the work in flight
+ *  never reached zero and every stop would wait out the whole window instead
+ *  of ending as soon as the bots are done. */
+const OWN_CONTROL_LOCK_KIND = "localVmChanges";
+
+/** The work in flight, less the stop's own control lock.
+ *
+ *  The stop takes the control lock when it fences the server, and that lock
+ *  is one of the counters of work in flight.  The lock belongs to the stop,
+ *  so it is not work the stop has to wait for:  without this the wait always
+ *  ran out the whole window, because the count it watched could never reach
+ *  zero. */
+export function withoutOwnControlLock(counts: WorkCounts, ownControlLock: boolean): WorkCounts {
+  if (!ownControlLock) return counts;
+  const held = counts[OWN_CONTROL_LOCK_KIND];
+  // A kind that is not counted at all holds nothing to discount, and a count
+  // that is not a number is not a count:  neither is a reason to change one.
+  if (!Number.isFinite(held) || held <= 0) return counts;
+  return { ...counts, [OWN_CONTROL_LOCK_KIND]: held - 1 };
 }
 
 /**
@@ -103,6 +146,19 @@ export interface GracefulStopOptions {
  * that does.
  */
 export async function gracefulStop(options: GracefulStopOptions): Promise<GracefulStopReport> {
+  try {
+    return await settleTheBots(options);
+  } catch (error) {
+    // The caller's fence is up while the stop runs, and a fence that stays up
+    // after a failure refuses every route of a server that is still running.
+    // The caller is told to lower it before the error travels on.
+    options.onFailure?.();
+    throw error;
+  }
+}
+
+/** The stop itself:  let the bots finish, carry the work across, report it. */
+async function settleTheBots(options: GracefulStopOptions): Promise<GracefulStopReport> {
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }));
   const pollMs = options.pollMs ?? 250;

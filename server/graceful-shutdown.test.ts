@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { describeGracefulStop, gracefulStop, gracefulStopRefusal } from "./graceful-shutdown.ts";
+import { describeGracefulStop, gracefulStop, gracefulStopRefusal, withoutOwnControlLock } from "./graceful-shutdown.ts";
 import type { GracefulStopOptions } from "./graceful-shutdown.ts";
 
 /** A graceful stop with a fake clock and no real waiting.
@@ -139,6 +139,70 @@ describe("gracefulStop", () => {
     });
     await gracefulStop(deps);
     expect(state.parked).toBe(1);
+  });
+});
+
+describe("withoutOwnControlLock", () => {
+  it("discounts the stop's own control lock from the work in flight", () => {
+    // The stop takes the control lock when it fences the server, and the lock
+    // is counted as a Local VM change in flight.  It is the stop's own
+    // reservation rather than work in flight, so counting it would mean the
+    // count the wait watches could never reach zero and every stop would wait
+    // out the whole window.
+    expect(withoutOwnControlLock({ localVmChanges: 1, turns: 2 }, true)).toEqual({
+      localVmChanges: 0,
+      turns: 2,
+    });
+  });
+
+  it("leaves the counts alone when the caller does not hold the lock", () => {
+    // Another request's control lock is real work in flight, and the stop has
+    // to refuse it rather than discount it.
+    expect(withoutOwnControlLock({ localVmChanges: 1 }, false)).toEqual({ localVmChanges: 1 });
+  });
+
+  it("never counts below zero, and leaves the other kinds alone", () => {
+    expect(withoutOwnControlLock({ localVmChanges: 0, turns: 1 }, true)).toEqual({
+      localVmChanges: 0,
+      turns: 1,
+    });
+  });
+});
+
+describe("a stop whose only work in flight is its own control lock", () => {
+  it("does not wait", async () => {
+    // The wait watches the work in flight.  With the stop's own lock counted
+    // as work, the count could never reach zero, so the stop always waited
+    // out the whole window and the owner waited for nothing.
+    const { deps, state } = fixture({ deadlineMs: 10_000 });
+    deps.activeWorkCount = () => withoutOwnControlLock({ localVmChanges: 1 }, true).localVmChanges;
+    const report = await gracefulStop(deps);
+    expect(state.slept).toBe(0);
+    expect(report.ok).toBe(true);
+  });
+});
+
+describe("a stop that fails", () => {
+  it("tells the caller to put its fence back down", async () => {
+    // The caller fences the server while the stop runs.  A fence that stays
+    // up after a failure refuses every route of a server that is still
+    // running, so the caller is told before the error travels on.
+    const failures: string[] = [];
+    const { deps } = fixture();
+    deps.parkHeldWork = () => {
+      throw new Error("the disk is full");
+    };
+    await expect(gracefulStop({ ...deps, onFailure: () => { failures.push("the fence came down"); } }))
+      .rejects.toThrow("the disk is full");
+    expect(failures).toHaveLength(1);
+  });
+
+  it("leaves the failure to the caller when there is no fence to lower", async () => {
+    const { deps } = fixture();
+    deps.parkHeldWork = () => {
+      throw new Error("the disk is full");
+    };
+    await expect(gracefulStop(deps)).rejects.toThrow("the disk is full");
   });
 });
 

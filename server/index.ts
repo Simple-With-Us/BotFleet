@@ -225,7 +225,7 @@ import {
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { requestHarnessShutdown } from "./harness-lifecycle.ts";
 import { ControlConflict, createSystemControl, reserveSystemShutdown } from "./system-control.ts";
-import { describeGracefulStop, gracefulStop, gracefulStopRefusal as gracefulStopRefusalMessage } from "./graceful-shutdown.ts";
+import { describeGracefulStop, gracefulStop, gracefulStopRefusal as gracefulStopRefusalMessage, withoutOwnControlLock } from "./graceful-shutdown.ts";
 import type { GracefulStopReport } from "./graceful-shutdown.ts";
 import { botFleetStatusSystemPrompt } from "./botfleet-status-capsule.ts";
 import {
@@ -12346,8 +12346,8 @@ function blockingWorkLabel(kind: string): string {
  * "2 active operation(s) must finish before the server can stop" with nothing
  * in between to explain the contradiction.  Naming the kinds closes that gap.
  */
-function blockingWorkBreakdown(ownAdmissionActive: boolean): { count: number; label: string }[] {
-  const counts = runtimeWorkCounts(ownAdmissionActive);
+function blockingWorkBreakdown(ownAdmissionActive: boolean, ownControlLock = false): { count: number; label: string }[] {
+  const counts = withoutOwnControlLock(runtimeWorkCounts(ownAdmissionActive), ownControlLock);
   return Object.entries(counts)
     .filter(([, count]) => count > 0)
     .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
@@ -12391,18 +12391,23 @@ const GRACEFUL_STOP_SETTLED_KINDS = new Set([
  *  routine run survive the restart or are carried across it), and less this
  *  request's own admission, because the stop request is itself an admitted
  *  request:  counting it would mean the work in flight never reached zero
- *  and every stop would wait out the whole window. */
-function gracefulStopWorkCounts(ownAdmissionActive: boolean): RuntimeWorkCounts {
+ *  and every stop would wait out the whole window.
+ *
+ *  Less this request's own control lock too, for the same reason:  the stop
+ *  takes that lock when it fences the server, and the lock is counted as a
+ *  Local VM change in flight.  It is the stop's own reservation, not work
+ *  the stop has to wait for. */
+function gracefulStopWorkCounts(ownAdmissionActive: boolean, ownControlLock = false): RuntimeWorkCounts {
   const counts = runtimeWorkCounts(ownAdmissionActive);
   const queuedRoutineRuns = bootComplete
     ? routines?.listRuns().filter((run) => run.status === "queued").length ?? 0
     : 0;
-  return inFlightCounts(counts, { queuedRoutineRuns });
+  return withoutOwnControlLock(inFlightCounts(counts, { queuedRoutineRuns }), ownControlLock);
 }
 
 /** Can the graceful stop settle the work that is in flight right now? */
-function gracefulStopAllowed(ownAdmissionActive: boolean): boolean {
-  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive))
+function gracefulStopAllowed(ownAdmissionActive: boolean, ownControlLock = false): boolean {
+  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive, ownControlLock))
     .every(([kind, count]) => count <= 0 || GRACEFUL_STOP_SETTLED_KINDS.has(kind));
 }
 
@@ -12411,8 +12416,8 @@ function gracefulStopAllowed(ownAdmissionActive: boolean): boolean {
  *  The kinds the stop can settle are not here:  they are what the stop is
  *  for.  What is here is the work that would be lost rather than carried,
  *  and it is why the server stays up. */
-function gracefulStopBlockers(ownAdmissionActive: boolean): { count: number; label: string }[] {
-  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive))
+function gracefulStopBlockers(ownAdmissionActive: boolean, ownControlLock = false): { count: number; label: string }[] {
+  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive, ownControlLock))
     .filter(([kind, count]) => count > 0 && !GRACEFUL_STOP_SETTLED_KINDS.has(kind))
     .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
 }
@@ -12428,8 +12433,8 @@ const gracefulStopRefusal = gracefulStopRefusalMessage;
  *  The bot turns are left out:  the report names the bots that are being
  *  stopped one by one, and a count of the same bots under a second heading
  *  reads as two different facts about one thing. */
-function inFlightWorkBreakdown(ownAdmissionActive: boolean): { count: number; label: string }[] {
-  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive))
+function inFlightWorkBreakdown(ownAdmissionActive: boolean, ownControlLock = false): { count: number; label: string }[] {
+  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive, ownControlLock))
     .filter(([kind, count]) => count > 0 && kind !== "turns")
     .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
 }
@@ -12458,11 +12463,24 @@ const GRACEFUL_STOP_POLL_MS = 250;
  *  next boot.  The messages queued behind them are carried across the
  *  restart by the same carrier the update drain parks work in, so they run
  *  the next time the harness comes up. */
-async function runGracefulStop(context: string, ownAdmissionActive: boolean): Promise<GracefulStopReport> {
+async function runGracefulStop(context: string, options: {
+  /** The stop request's own admission:  it is an admitted request itself. */
+  ownAdmissionActive: boolean;
+  /** Whether this request holds the control lock.  Its own reservation is
+   *  not work in flight, so it is discounted from the counts the wait
+   *  watches:  counting it would mean the count never reached zero and every
+   *  stop waited out the whole window. */
+  ownControlLock?: boolean;
+  /** Called when the stop fails, so the caller can put its fence back down.
+   *  A fence that stays up after a failure refuses every route of a server
+   *  that is still running. */
+  onFailure?(): void;
+}): Promise<GracefulStopReport> {
+  const { ownAdmissionActive, ownControlLock = false } = options;
   const report = await gracefulStop({
     busyBots: () => store.bots.filter((bot) => bot.busy).map((bot) => ({ id: bot.id, name: bot.name })),
-    activeWorkCount: () => runtimeReadiness(gracefulStopWorkCounts(ownAdmissionActive)).activeWorkCount ?? 1,
-    blockingWork: () => inFlightWorkBreakdown(ownAdmissionActive),
+    activeWorkCount: () => runtimeReadiness(gracefulStopWorkCounts(ownAdmissionActive, ownControlLock)).activeWorkCount ?? 1,
+    blockingWork: () => inFlightWorkBreakdown(ownAdmissionActive, ownControlLock),
     // The bots that are being stopped keep their queued sends uncommitted:
     // their own turn resumes first at the next boot, and boot recovery reads
     // the thread to find it.  Every other bot's sends are committed to their
@@ -12473,6 +12491,7 @@ async function runGracefulStop(context: string, ownAdmissionActive: boolean): Pr
     },
     deadlineMs: GRACEFUL_STOP_DEADLINE_MS,
     pollMs: GRACEFUL_STOP_POLL_MS,
+    onFailure: options.onFailure,
   });
   console.log(`[graceful-shutdown] ${describeGracefulStop(report)}`);
   return report;
@@ -15245,45 +15264,59 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       cancelFenceLease();
       controlShutdownPending = true;
       runtimeQuiescing = true;
-      const report = await runGracefulStop("system-shutdown", ownAdmissionActive);
-      if (!report.ok) {
-        // The work could not be preserved, and it is still in memory, so the
-        // server stays up rather than losing it.
+      // The fence is up while the stop runs.  A failure that left it up would
+      // refuse every route of a server that is still running, so it comes
+      // back down before the error travels on.
+      const lowerTheFence = () => {
         controlShutdownPending = false;
         runtimeQuiescing = false;
-        return json(res, 409, { ok: false, error: report.refusal, report });
+      };
+      try {
+        const report = await runGracefulStop("system-shutdown", {
+          ownAdmissionActive,
+          onFailure: lowerTheFence,
+        });
+        if (!report.ok) {
+          // The work could not be preserved, and it is still in memory, so the
+          // server stays up rather than losing it.
+          lowerTheFence();
+          return json(res, 409, { ok: false, error: report.refusal, report });
+        }
+        const stopping = await requestHarnessShutdown({
+          stopLocalVm: async () => {
+            // Same lease check the Computer panel's own stop route makes.  The
+            // harness is about to go away either way, but yanking a VM out from
+            // under a bot mid-turn destroys work the person did not ask to lose,
+            // so a leased VM is left running and reported instead.  It will be
+            // reclaimed by the runtime's own idle reaper.
+            const owner = localVmLeaseFor(SHARED_LOCAL_VM_TARGET).current(localVmOwnerBusy);
+            if (owner) {
+              return { stopped: false, note: `the Local VM is in use by ${owner}; left running` };
+            }
+            await containerComputerAction("stop", undefined, undefined, SHARED_LOCAL_VM_TARGET);
+            localVmIdleFor(SHARED_LOCAL_VM_TARGET).cancel();
+            return { stopped: true };
+          },
+          // Through the registered signal handler, so the queued event logs, the
+          // children and the stores receive the normal graceful drain.  A
+          // process.exit here skipped all of it, and a turn in flight was cut in
+          // half rather than recorded.
+          exit: () => process.kill(process.pid, "SIGTERM"),
+        });
+        if (!stopping.ok) {
+          // The marker could not be written, so the harness is not going down
+          // and the fence has to come back down with it:  a server that stays
+          // up and refuses every other route is worse than a server that stays
+          // up and serves them.
+          lowerTheFence();
+          return json(res, 500, { error: stopping.error });
+        }
+        return json(res, 200, { ok: true, detail: stopping.detail, report });
+      } catch (error) {
+        lowerTheFence();
+        console.error("[graceful-shutdown] the graceful stop failed", error);
+        return json(res, 500, { ok: false, error: "the graceful stop failed, so the server stays up" });
       }
-      const stopping = await requestHarnessShutdown({
-        stopLocalVm: async () => {
-          // Same lease check the Computer panel's own stop route makes.  The
-          // harness is about to go away either way, but yanking a VM out from
-          // under a bot mid-turn destroys work the person did not ask to lose,
-          // so a leased VM is left running and reported instead.  It will be
-          // reclaimed by the runtime's own idle reaper.
-          const owner = localVmLeaseFor(SHARED_LOCAL_VM_TARGET).current(localVmOwnerBusy);
-          if (owner) {
-            return { stopped: false, note: `the Local VM is in use by ${owner}; left running` };
-          }
-          await containerComputerAction("stop", undefined, undefined, SHARED_LOCAL_VM_TARGET);
-          localVmIdleFor(SHARED_LOCAL_VM_TARGET).cancel();
-          return { stopped: true };
-        },
-        // Through the registered signal handler, so the queued event logs, the
-        // children and the stores receive the normal graceful drain.  A
-        // process.exit here skipped all of it, and a turn in flight was cut in
-        // half rather than recorded.
-        exit: () => process.kill(process.pid, "SIGTERM"),
-      });
-      if (!stopping.ok) {
-        // The marker could not be written, so the harness is not going down
-        // and the fence has to come back down with it:  a server that stays
-        // up and refuses every other route is worse than a server that stays
-        // up and serves them.
-        controlShutdownPending = false;
-        runtimeQuiescing = false;
-        return json(res, 500, { error: stopping.error });
-      }
-      return json(res, 200, { ok: true, detail: stopping.detail, report });
     }
     if (path === "/api/system/control" || path.startsWith("/api/system/control/")) {
       if (!isLoopbackAddress(req.socket.remoteAddress) || req.headers["x-botfleet-companion"] === "1") {
@@ -15381,15 +15414,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // No marker or VM effect until all active work and leases are clear.
           const reservation = reserveSystemShutdown({
             guard: () => control.guard(),
-            activeWorkCount: () => runtimeReadiness(gracefulStopWorkCounts(ownAdmissionActive)).activeWorkCount ?? 1,
-            blockingWork: () => blockingWorkBreakdown(ownAdmissionActive),
+            activeWorkCount: () => runtimeReadiness(gracefulStopWorkCounts(ownAdmissionActive, ownControlLock)).activeWorkCount ?? 1,
+            blockingWork: () => blockingWorkBreakdown(ownAdmissionActive, ownControlLock),
             // The work in flight is not a refusal:  the graceful stop settles
             // it, and says so in the report it returns.
-            canStopGracefully: () => gracefulStopAllowed(ownAdmissionActive),
+            canStopGracefully: () => gracefulStopAllowed(ownAdmissionActive, ownControlLock),
             // The default refusal counts the work and names its kinds.  This
             // one says why the server stays up, and names the kinds the stop
             // cannot carry.
-            refusal: () => gracefulStopRefusal(gracefulStopBlockers(ownAdmissionActive)),
+            refusal: () => gracefulStopRefusal(gracefulStopBlockers(ownAdmissionActive, ownControlLock)),
             fence: () => {
               reserveControl();
               cancelFenceLease();
@@ -15403,7 +15436,24 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               ownGracefulStop = false;
             },
           });
-          const report = await runGracefulStop("control-stop", ownAdmissionActive);
+          let report: GracefulStopReport;
+          try {
+            report = await runGracefulStop("control-stop", {
+              ownAdmissionActive,
+              // The fence is up now, and the lock it took is the stop's own
+              // reservation:  it is discounted from the counts the wait
+              // watches, so the wait ends as soon as the bots are done.
+              ownControlLock,
+              // A failure that left the fence up would refuse every route of a
+              // server that is still running, so the reservation is released
+              // before the error travels on.
+              onFailure: () => reservation.release(),
+            });
+          } catch (error) {
+            reservation.release();
+            console.error("[graceful-shutdown] the graceful stop failed", error);
+            return json(res, 500, { ok: false, error: "the graceful stop failed, so the server stays up" });
+          }
           if (!report.ok) {
             // The work could not be preserved, so the server stays up.
             reservation.release();

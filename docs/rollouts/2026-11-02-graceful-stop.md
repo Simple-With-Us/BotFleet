@@ -39,14 +39,24 @@ The graceful stop waits 10 seconds for the work in flight to settle, and the wai
 
 The size comes from the clients rather than from the drain:  the native Mac app waits 30 seconds for this route, and a Local VM container stop in the same request can take 10 of them, so the window takes 10 and leaves the rest to the container.  The worst case for the answer is therefore the window plus that container stop plus the harness's own 3-second shutdown grace, and it fits inside the native app's budget.  BotFleet Control waits 300 seconds for the stop, so it is not the constraint.
 
+## What The Review Found
+
+Kody read the diff twice and both findings were real.  The first was that the wait never ended early.  The second was that a failed stop left the fence up.
+
+The wait never ended early because the stop's own fence takes the control lock, and the control lock is counted as a Local VM change in flight.  The count the wait watches could therefore never reach zero, so every stop waited out the whole ten seconds even when the bots were done on the first second.  The lock is the stop's own reservation rather than work in flight, so it is discounted from the counts now (`withoutOwnControlLock`), the same way the stop request's own admission already was.
+
+The fence staying up was worse.  A stop that threw left `runtimeQuiescing` and `controlShutdownPending` set, and every API route answered 503 for the rest of the server's life, with nothing left running to notice.  Both routes catch a failed stop and put the fence back down: the control route releases its reservation, and the legacy shutdown route clears both flags.  The hook that lowers the fence lives with the stop itself (`onFailure`), so the two fences in this server cannot drift apart.
+
+The measurement, on one fixture harness with one bot whose provider holds its answer open for two seconds:  before the fix the stop took 10,008 ms and the report said "still running: 1 Local VM change";  after it, the stop took 2,076 ms and the report named the bot and no Local VM change at all.  The fixture is `server/graceful-shutdown-e2e.test.ts`, and it asserts that the stop ends well inside the window and that the report does not name the stop's own lock.
+
 ## Verification
 
-The affected fixtures are `server/graceful-shutdown.test.ts` (14 tests), `server/system-control.test.ts` (18 tests) and `server/desktop-open-policy.test.ts` (8 tests), 40 in total, and they pass.  The integration suite `server/index.test.ts` passes 312 of 312 on its own, including the one that asserts the stop route refuses an in-flight request and writes no marker.
+The affected fixtures are `server/graceful-shutdown.test.ts` (20 tests), `server/graceful-shutdown-route.test.ts` (4 tests), `server/graceful-shutdown-e2e.test.ts` (1 test), `server/system-control.test.ts` (18 tests) and `server/desktop-open-policy.test.ts` (8 tests), 51 in total, and they pass.  The integration suite `server/index.test.ts` passes 312 of 312 on its own, including the one that asserts the stop route refuses an in-flight request and writes no marker.
 
 ```sh
 pnpm typecheck
 node scripts/check-lint-baseline.mjs
-pnpm exec vitest run server/graceful-shutdown.test.ts server/system-control.test.ts server/desktop-open-policy.test.ts
+pnpm exec vitest run server/graceful-shutdown.test.ts server/graceful-shutdown-route.test.ts server/graceful-shutdown-e2e.test.ts server/system-control.test.ts server/desktop-open-policy.test.ts
 pnpm exec vitest run server/index.test.ts
 pnpm test
 ```
