@@ -123,9 +123,10 @@ for (const skin of ['studio', 'midnight'] as const) {
         'aria-current',
         'page',
       );
+      await expect(dialog.getByText('Host Resource Readings', { exact: true })).toBeVisible();
       await expect(dialog.getByRole('table', { name: 'Host resource readings' })).toBeVisible();
-      await expect(dialog.getByText('Admission thresholds', { exact: true })).toBeVisible();
-      await expect(dialog.getByText('Owner-set headroom', { exact: true })).toBeVisible();
+      await expect(dialog.getByText('Admission Thresholds (Saved vs Applied)', { exact: true })).toBeVisible();
+      await expect(dialog.getByText('Owner-Set Headroom', { exact: true })).toBeVisible();
       // Unset headroom knobs stay read-only with a Not set placeholder.
       const reservedCpu = dialog.getByLabel('Reserved CPU cores (set by the owner)');
       await expect(reservedCpu).toBeDisabled();

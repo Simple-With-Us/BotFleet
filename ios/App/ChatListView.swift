@@ -1054,7 +1054,7 @@ struct ThreadRow: View {
                 .foregroundStyle(Color.secondary)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 1) {
-                Text(task.title.isEmpty ? "Untitled" : task.title)
+                Text(task.title.isEmpty ? "Untitled Thread" : task.title)
                     .font(.system(size: 15, weight: active ? .semibold : .regular))
                     .foregroundStyle(Color.primary)
                     .lineLimit(1)
@@ -1074,7 +1074,7 @@ struct ThreadRow: View {
         .padding(.vertical, 8)
         .contentShape(Rectangle())
         .accessibilityLabel(
-            (task.title.isEmpty ? "Untitled thread" : task.title) + (viewed ? ", viewing" : "")
+            (task.title.isEmpty ? "Untitled Thread" : task.title) + (viewed ? ", viewing" : "")
         )
     }
 }

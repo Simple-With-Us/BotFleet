@@ -68,6 +68,23 @@ describe("the legacy shutdown route", () => {
   });
 });
 
+describe("the work in flight the stop waits for", () => {
+  it("discounts the queued routine runs with the same filter the runtime count uses", () => {
+    // The discount for the queued routine runs is taken from the runtime
+    // count, so it can never be bigger than the count it is taken from.  A
+    // queued run for a bot that is switched Off is in neither:  it will be
+    // dropped or refused, never run.  Discounting it anyway took more than
+    // the count held, and a routine run that really was running disappeared
+    // from the work in flight:  the wait ended early and the shutdown
+    // interrupted a run that was still going.
+    const start = SERVER_SOURCE.indexOf("function gracefulStopWorkCounts(");
+    expect(start).toBeGreaterThan(-1);
+    const counts = SERVER_SOURCE.slice(start, start + 900);
+    expect(counts).toContain("routineRunCounts(");
+    expect(counts).not.toMatch(/listRuns\(\)\)\.filter\(\(run\) => run\.status === "queued"\)/);
+  });
+});
+
 describe("the park", () => {
   it("puts the work back when it cannot be saved", () => {
     // The queues are drained before the carrier is written, so the work that

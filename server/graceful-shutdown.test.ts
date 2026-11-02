@@ -3,6 +3,16 @@ import { describe, expect, it } from "vitest";
 import { describeGracefulStop, gracefulStop, gracefulStopRefusal, withoutOwnControlLock } from "./graceful-shutdown.ts";
 import type { GracefulStopOptions } from "./graceful-shutdown.ts";
 
+/** The fixture's own record of what the stop did. */
+interface FixtureState {
+  now: number;
+  active: number;
+  busy: Array<{ id: string; name: string }>;
+  parked: number;
+  parkedFor: string[];
+  slept: number;
+}
+
 /** A graceful stop with a fake clock and no real waiting.
  *
  *  The clock only moves when the fixture sleeps, so a deadline is reached
@@ -18,12 +28,12 @@ function fixture(options: {
   settle?: (state: { active: number }) => void;
 } = {}) {
   // SAFETY: the fake clock starts with no parked threads; the empty array is the known initial value.
-  const state = {
+  const state: FixtureState = {
     now: 0,
     active: options.active ?? 0,
     busy: [...(options.busy ?? [])],
     parked: 0,
-    parkedFor: [] as string[],
+    parkedFor: [],
     slept: 0,
   };
   const deps: GracefulStopOptions = {

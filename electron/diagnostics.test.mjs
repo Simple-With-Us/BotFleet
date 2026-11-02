@@ -59,6 +59,10 @@ describe("credential shape parity with shared/redact.ts", () => {
       ["webhook signing secret", ["wh", "sec_", "test", "_", "fake"].join("")],
       ["google oauth", ["ya29", ".", "fake"].join("")],
       ["gitlab pat", ["glpat", "-", "fake0000"].join("")],
+      ["gitlab deploy", ["gldt", "-", "fake0000"].join("")],
+      ["gitlab runner", ["glrt", "-", "fake0000"].join("")],
+      ["gitlab runner registration", ["glrtr", "-", "fake0000"].join("")],
+      ["slack app", ["xapp", "-", "fake000000000000000000"].join("")],
       ["infisical service token", ["st", ".", "fake0000000000000000000"].join("")],
     ];
     for (const [label, sample] of samples) {
@@ -182,6 +186,10 @@ describe("buildDiagnosticsReport", () => {
     "wh" + "sec_abcdefghijklmnopqrstuvwxyz0123456789",
     "ya29" + ".abcdefghijklmnopqrstuvwxyz0123456789abcdefghij",
     "glpat" + "-abcdefghijklmnopqrst",
+    "gldt" + "-abcdefghijklmnopqrst",
+    "glrt" + "-abcdefghijklmnopqrst",
+    "glrtr" + "-abcdefghijklmnopqrst",
+    "xapp" + "-abcdefghijklmnopqrst",
   ])("masks the issued-credential shape %s", (token) => {
     // S13: credential shapes BotFleet itself issues or stores must not ride
     // out in a diagnostics bundle.

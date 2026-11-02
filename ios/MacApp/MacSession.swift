@@ -19,12 +19,25 @@ public enum MacConnectionStatus: Equatable, Sendable {
         return false
     }
 
-    public var statusColor: Color {
+    public var statusPillKind: MacStatusPillKind {
         switch self {
+        case .connected:
+            return .connected
+        case .connecting:
+            return .reconnecting
+        case .disconnected:
+            return .offline
+        case .failed:
+            return .error
+        }
+    }
+
+    public var statusColor: Color {
+        switch statusPillKind {
         case .connected: return .green
-        case .connecting: return .yellow
-        case .disconnected: return .gray
-        case .failed: return .red
+        case .reconnecting: return .yellow
+        case .offline: return .gray
+        case .error: return .red
         }
     }
 
@@ -78,6 +91,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public private(set) var host: String = "127.0.0.1"
     @Published public private(set) var port: Int = 8799
     public let servers: ServersCoordinator
+    public let resources: ResourcesCoordinator
 
     // Lifecycle & Remote Wake state (BF-2497)
     @Published public var lifecycleSettings = MacLifecycleSettings()
@@ -148,7 +162,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         permissionMonitor: CuaPermissionMonitor = CuaPermissionMonitor()
     ) {
         self.policyStore = policyStore
-        self.servers = ServersCoordinator(store: HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json")))
+        let hostStore = HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json"))
+        self.servers = ServersCoordinator(store: hostStore)
+        self.resources = ResourcesCoordinator(store: hostStore)
+        self.resources.observeHosts(from: self.servers)
         self.permissionMonitor = permissionMonitor
         if let localPersist = policyStore.readPersistOnExit() {
             self.lifecycleSettings = MacLifecycleSettings(

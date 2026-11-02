@@ -134,7 +134,7 @@ export function enforcementSentence(state: EnforcementState, noun: string): stri
     case "gateOnly":
       return "Checked before each job starts";
     case "priorityOnly":
-      return `Full speed allowed.${gap}Jobs run at background priority`;
+      return `Full speed allowed.${gap}Jobs run at background priority.`;
     case "unsupported":
       return `Not enforced on ${noun}: ${state.reason}`;
     case "notApplied":
