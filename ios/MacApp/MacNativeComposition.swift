@@ -180,7 +180,11 @@ public enum MacNativeGracefulDrain {
         guard ms.isFinite, ms > 0 else { return 0 }
         let nanos = ms * 1_000_000
         guard nanos.isFinite else { return UInt64.max }
-        return UInt64(min(nanos, Double(UInt64.max)))
+        // Double(UInt64.max) rounds up to 2^64, which is out of range and
+        // would trap the conversion below: compare first, and convert only
+        // the strictly smaller value.
+        if nanos >= Double(UInt64.max) { return UInt64.max }
+        return UInt64(nanos)
     }
 
     private static func clampedPositiveInterval(_ ms: Double) -> Double {
