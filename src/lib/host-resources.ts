@@ -25,8 +25,19 @@ import type {
  *  error and mismatch output never depend on a live harness. */
 export type HostResourcesState =
   | { status: "loading" }
+  | { status: "refreshing"; report: HostResourcesReport }
   | { status: "error"; message: string }
   | { status: "ready"; report: HostResourcesReport };
+
+/** The refresh transition: from ready (or an in-flight refresh) the last
+ *  report stays on screen under a refreshing flag, so readings never vanish
+ *  and the button spins; from loading or error there is no report to keep,
+ *  so it loads clean. */
+export function nextRefreshState(current: HostResourcesState): HostResourcesState {
+  if (current.status === "ready") return { status: "refreshing", report: current.report };
+  if (current.status === "refreshing") return current;
+  return { status: "loading" };
+}
 
 /** GET /api/host/resources through the store's api() helper (not bare
  *  fetch): api() checks res.ok, so a 404 from a harness that predates the
@@ -205,6 +216,22 @@ function appliedFromEnforcement(
   return { applied: value, mismatch: null };
 }
 
+/** The memory enforcement the tab may claim.  server/host-resources.ts
+ *  marks enforcement.memory unsupported on a swapless host, but
+ *  server/jobs/admission.ts still refuses jobs on the owner-set
+ *  available-memory headroom gates there: probe.headroomReadings() reads
+ *  MemAvailable and needs no swap.  The swap gate is honestly unsupported
+ *  on that host, yet a set headroom knob keeps a memory gate in force —
+ *  never claim unenforced what the scheduler enforces. */
+function effectiveMemoryEnforcement(report: HostResourcesReport): EnforcementState {
+  const headroomSet =
+    report.admission.reservedRamBytes !== undefined || report.admission.minMemoryAvailablePercent !== undefined;
+  if (headroomSet && report.sample.swapTotalBytes === 0 && report.enforcement.memory.kind === "unsupported") {
+    return { kind: "gateOnly" };
+  }
+  return report.enforcement.memory;
+}
+
 export function admissionRows(report: HostResourcesReport): SavedAppliedRow[] {
   const noun = hostNoun(report);
   const { admission, enforcement, sample } = report;
@@ -241,7 +268,7 @@ export function admissionRows(report: HostResourcesReport): SavedAppliedRow[] {
       source: "BOTFLEET_JOBS_MIN_FREE_DISK_MB",
       saved: value,
       applied,
-      mismatch: overCapacity ? noCapacitySentence(noun) : mismatch,
+      mismatch: mismatch === null && overCapacity ? noCapacitySentence(noun) : mismatch,
       note: "2 GB is the built-in default in force when the owner has set nothing — a current default, not a measured value.",
     });
   }
@@ -278,11 +305,17 @@ export function admissionRows(report: HostResourcesReport): SavedAppliedRow[] {
       if (report.platform === "darwin") {
         applied = "Not applied on this Mac: reserved CPU never refuses a job on macOS; it sizes budgets instead";
         mismatch = applied;
-      } else if (
-        sample.cores !== null &&
-        admission.reservedCpuCores >= sample.cores
-      ) {
-        mismatch = noCapacitySentence(noun);
+      } else {
+        // Fail closed like every other set knob: a notApplied or
+        // unsupported cpu report is shown in force, never as applied.
+        ({ applied, mismatch } = appliedFromEnforcement(saved, enforcement.cpu, noun));
+        if (
+          mismatch === null &&
+          sample.cores !== null &&
+          admission.reservedCpuCores >= sample.cores
+        ) {
+          mismatch = noCapacitySentence(noun);
+        }
       }
     }
     rows.push({
@@ -303,7 +336,7 @@ export function admissionRows(report: HostResourcesReport): SavedAppliedRow[] {
     let applied = saved;
     let mismatch: string | null = null;
     if (admission.reservedRamBytes !== undefined) {
-      ({ applied, mismatch } = appliedFromEnforcement(saved, enforcement.memory, noun));
+      ({ applied, mismatch } = appliedFromEnforcement(saved, effectiveMemoryEnforcement(report), noun));
       if (
         mismatch === null &&
         sample.ramTotalBytes !== null &&
@@ -330,7 +363,7 @@ export function admissionRows(report: HostResourcesReport): SavedAppliedRow[] {
     let applied = saved;
     let mismatch: string | null = null;
     if (admission.minMemoryAvailablePercent !== undefined) {
-      ({ applied, mismatch } = appliedFromEnforcement(saved, enforcement.memory, noun));
+      ({ applied, mismatch } = appliedFromEnforcement(saved, effectiveMemoryEnforcement(report), noun));
     }
     rows.push({
       key: "minMemoryAvailablePercent",
@@ -377,7 +410,7 @@ export function resourceRows(report: HostResourcesReport): ResourceRow[] {
     sample.ramAvailableBytes === null
       ? unknown
       : sample.ramTotalBytes !== null && sample.memoryAvailablePercent !== null
-        ? `${formatBytes(sample.ramAvailableBytes)} available (${sample.memoryAvailablePercent}% of total)`
+        ? `${formatBytes(sample.ramAvailableBytes)} available (${Math.round(sample.memoryAvailablePercent)}% of total)`
         : `${formatBytes(sample.ramAvailableBytes)} available`;
   const swapUse =
     sample.swapUsedBytes === null
@@ -411,7 +444,7 @@ export function resourceRows(report: HostResourcesReport): ResourceRow[] {
           ? `${memoryUse} · Pressure ${sample.memoryPressure}`
           : memoryUse,
       ),
-      enforcement: gateOrUnknown(memoryUse, enforcement.memory),
+      enforcement: gateOrUnknown(memoryUse, effectiveMemoryEnforcement(report)),
     },
     {
       key: "swap",

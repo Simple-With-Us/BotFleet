@@ -63,6 +63,7 @@ import { Card } from "./SettingsPrimitives";
 import { UsageSection } from "./UsageSection";
 import { ObservabilitySection } from "./ObservabilitySection";
 import { ResourcesSection } from "./ResourcesSection";
+import { scrollToSettingDomId } from "./scroll-to-setting";
 import { SecretsSection } from "./SecretsSection";
 import { SkinPicker } from "./SkinPicker";
 import { RoomTurnTimeoutSettings } from "./RoomTurnTimeoutSettings";
@@ -1213,17 +1214,6 @@ export function SettingsModal() {
     };
   }, []);
 
-  const HIGHLIGHT_CLASSES = [
-    "ring-2",
-    "ring-accent",
-    "ring-offset-2",
-    "ring-offset-panel",
-    "shadow-[0_0_20px_rgba(33,139,255,0.35)]",
-    "rounded-xl",
-    "transition-all",
-    "duration-300",
-  ];
-
   const handleNavigateToSetting = (item: SettingsSearchItem) => {
     setQuery("");
     setSelectedSectionFilter(null);
@@ -1237,22 +1227,9 @@ export function SettingsModal() {
       setHighlightedDomId(null);
     }, 2600);
 
-    setTimeout(() => {
-      const el = document.getElementById(item.domId);
-      if (el) {
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
-        el.classList.add(...HIGHLIGHT_CLASSES);
-        setTimeout(() => {
-          el.classList.remove(
-            "ring-2",
-            "ring-accent",
-            "ring-offset-2",
-            "ring-offset-panel",
-            "shadow-[0_0_20px_rgba(33,139,255,0.35)]",
-          );
-        }, 2600);
-      }
-    }, 80);
+    // The target card mounts its id only after its fetch resolves, so wait
+    // for it instead of racing a fixed timeout (see scroll-to-setting.ts).
+    scrollToSettingDomId(item.domId);
   };
 
   const highlightClass = (domId: string) =>

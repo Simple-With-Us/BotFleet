@@ -12,6 +12,7 @@ import {
   hostNoun,
   hostResourcesReportSchema,
   hostSubtitle,
+  nextRefreshState,
   noCapacitySentence,
   resourceRows,
 } from "./host-resources";
@@ -195,6 +196,143 @@ describe("admissionRows saved vs applied", () => {
     expect(ram.mismatch).toContain("New jobs will wait here until you lower it");
   });
 
+  it("rounds the available-memory percent instead of printing fractions", () => {
+    const r = report({ sample: sample({ ramAvailableBytes: 20 * GB, memoryAvailablePercent: 62.5 }) });
+    const memory = resourceRows(r).find((row) => row.key === "memory")!;
+    expect(memory.use).toContain("63% of total");
+    expect(memory.use).not.toContain("62.5");
+  });
+
+  it("keeps headroom gates enforced on a swapless host", () => {
+    const r = report({
+      platform: "linux",
+      hostId: "server:12345678-1234-1234-1234-123456789012",
+      sample: sample({ swapTotalBytes: 0, swapUsedBytes: 0 }),
+      admission: {
+        maxSwapPercent: 98,
+        minFreeDiskBytes: 2 * GB,
+        reservedRamBytes: 1 * GB,
+        minMemoryAvailablePercent: 10,
+        unknownReading: "admit",
+      },
+      enforcement: {
+        cpu: { kind: "priorityOnly" },
+        memory: { kind: "unsupported", reason: "No swap is configured; no RAM budget check is active" },
+        swap: { kind: "unsupported", reason: "No swap is configured" },
+        disk: gate(),
+        inodes: { kind: "unsupported", reason: "No inode admission gate is active" },
+        io: { kind: "unsupported", reason: "No I/O rate enforcement observed" },
+      },
+    });
+    const byKey = Object.fromEntries(admissionRows(r).map((row) => [row.key, row]));
+    expect(byKey.reservedRam!.applied).toBe("1.0 GB");
+    expect(byKey.reservedRam!.mismatch).toBeNull();
+    expect(byKey.minMemoryAvailablePercent!.applied).toBe("10%");
+    expect(byKey.minMemoryAvailablePercent!.mismatch).toBeNull();
+    // The swap gate itself stays honestly unsupported; only the memory
+    // headroom gates the scheduler still enforces read as gates.
+    expect(byKey.maxSwapPercent!.applied).toBe("Not enforced on the server: No swap is configured");
+    const memory = resourceRows(r).find((row) => row.key === "memory")!;
+    expect(memory.enforcement).toBe("Checked before each job starts");
+  });
+
+  it("still reports memory unenforced on a swapless host with no headroom knobs", () => {
+    const r = report({
+      platform: "linux",
+      hostId: "server:12345678-1234-1234-1234-123456789012",
+      sample: sample({ swapTotalBytes: 0, swapUsedBytes: 0 }),
+      enforcement: {
+        cpu: { kind: "priorityOnly" },
+        memory: { kind: "unsupported", reason: "No swap is configured; no RAM budget check is active" },
+        swap: { kind: "unsupported", reason: "No swap is configured" },
+        disk: gate(),
+        inodes: { kind: "unsupported", reason: "No inode admission gate is active" },
+        io: { kind: "unsupported", reason: "No I/O rate enforcement observed" },
+      },
+    });
+    const byKey = Object.fromEntries(admissionRows(r).map((row) => [row.key, row]));
+    expect(byKey.reservedRam!.saved).toBe("Not set");
+    const memory = resourceRows(r).find((row) => row.key === "memory")!;
+    expect(memory.enforcement).toBe("Not enforced on the server: No swap is configured; no RAM budget check is active");
+  });
+
+  it("fails a saved Linux CPU reservation closed when cpu is not applied", () => {
+    const r = report({
+      platform: "linux",
+      hostId: "server:12345678-1234-1234-1234-123456789012",
+      admission: { maxSwapPercent: 98, minFreeDiskBytes: 2 * GB, reservedCpuCores: 2, unknownReading: "admit" },
+      enforcement: {
+        cpu: {
+          kind: "notApplied",
+          reason: "CPU reading unavailable; admission permits unknown readings",
+          restartRequired: false,
+        },
+        memory: gate(),
+        swap: gate(),
+        disk: gate(),
+        inodes: { kind: "unsupported", reason: "No inode admission gate is active" },
+        io: { kind: "unsupported", reason: "No I/O rate enforcement observed" },
+      },
+    });
+    const cpu = admissionRows(r).find((row) => row.key === "reservedCpuCores")!;
+    expect(cpu.saved).toBe("2 cores");
+    expect(cpu.applied).toBe("Not applied: CPU reading unavailable; admission permits unknown readings");
+    expect(cpu.mismatch).toBe(cpu.applied);
+  });
+
+  it("keeps a saved Linux CPU reservation applied under a live cpu gate", () => {
+    const r = report({
+      platform: "linux",
+      hostId: "server:12345678-1234-1234-1234-123456789012",
+      admission: { maxSwapPercent: 98, minFreeDiskBytes: 2 * GB, reservedCpuCores: 2, unknownReading: "admit" },
+    });
+    const cpu = admissionRows(r).find((row) => row.key === "reservedCpuCores")!;
+    expect(cpu.saved).toBe("2 cores");
+    expect(cpu.applied).toBe("2 cores");
+    expect(cpu.mismatch).toBeNull();
+  });
+
+  it("reads the Linux CPU no-capacity sentence when the reservation covers all cores", () => {
+    const r = report({
+      platform: "linux",
+      hostId: "server:12345678-1234-1234-1234-123456789012",
+      admission: { maxSwapPercent: 98, minFreeDiskBytes: 2 * GB, reservedCpuCores: 10, unknownReading: "admit" },
+    });
+    const cpu = admissionRows(r).find((row) => row.key === "reservedCpuCores")!;
+    expect(cpu.mismatch).toBe(noCapacitySentence("the server"));
+  });
+
+  it("keeps the not-applied reason when an over-capacity disk floor also fires", () => {
+    const r = report({
+      sample: sample({ diskTotalBytes: 100 * GB }),
+      admission: { maxSwapPercent: 98, minFreeDiskBytes: 200 * GB, unknownReading: "admit" },
+      enforcement: {
+        cpu: { kind: "priorityOnly" },
+        memory: gate(),
+        swap: gate(),
+        disk: {
+          kind: "notApplied",
+          reason: "Disk reading unavailable; admission permits unknown readings",
+          restartRequired: false,
+        },
+        inodes: { kind: "unsupported", reason: "No inode admission gate is active" },
+        io: { kind: "unsupported", reason: "No I/O rate enforcement observed" },
+      },
+    });
+    const disk = admissionRows(r).find((row) => row.key === "minFreeDisk")!;
+    expect(disk.applied).toBe("Not applied: Disk reading unavailable; admission permits unknown readings");
+    expect(disk.mismatch).toBe(disk.applied);
+  });
+
+  it("reads the disk no-capacity sentence when the floor covers detected capacity", () => {
+    const r = report({
+      sample: sample({ diskTotalBytes: 100 * GB }),
+      admission: { maxSwapPercent: 98, minFreeDiskBytes: 200 * GB, unknownReading: "admit" },
+    });
+    const disk = admissionRows(r).find((row) => row.key === "minFreeDisk")!;
+    expect(disk.mismatch).toBe(noCapacitySentence("this Mac"));
+  });
+
   it("shows a swap gate against no swap as not enforced, not as applied", () => {
     const r = report({
       sample: sample({ swapTotalBytes: 0, swapUsedBytes: 0 }),
@@ -259,6 +397,24 @@ describe("resourceRows", () => {
       expect(row.detected).not.toContain("0 GB");
       expect(row.use).not.toContain("0 GB");
     }
+  });
+});
+
+describe("nextRefreshState", () => {
+  it("keeps the last report under a refreshing flag from ready", () => {
+    const ready = report();
+    const next = nextRefreshState({ status: "ready", report: ready });
+    expect(next).toEqual({ status: "refreshing", report: ready });
+  });
+
+  it("stays refreshing while a fetch is already in flight", () => {
+    const refreshing = { status: "refreshing", report: report() } as const;
+    expect(nextRefreshState(refreshing)).toBe(refreshing);
+  });
+
+  it("loads clean from loading or error, where no report exists", () => {
+    expect(nextRefreshState({ status: "loading" })).toEqual({ status: "loading" });
+    expect(nextRefreshState({ status: "error", message: "nope" })).toEqual({ status: "loading" });
   });
 });
 

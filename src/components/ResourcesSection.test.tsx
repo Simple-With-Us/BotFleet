@@ -111,6 +111,14 @@ describe("ResourcesSectionView", () => {
     expect(disabledInputs.length).toBeGreaterThanOrEqual(3);
   });
 
+  it("keeps readings on screen with a spinning refresh button while refreshing", () => {
+    const html = render({ status: "refreshing", report: fixture() });
+    expect(html).toContain("10 cores");
+    expect(html).toContain("16.0 GB");
+    expect(html).toContain("Refreshing…");
+    expect(html).not.toContain("Loading host resources…");
+  });
+
   it("wires the refresh action", () => {
     const onRefresh = vi.fn();
     renderToStaticMarkup(createElement(ResourcesSectionView, { state: { status: "loading" }, onRefresh }));

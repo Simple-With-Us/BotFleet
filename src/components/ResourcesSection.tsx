@@ -15,6 +15,7 @@ import {
   formatBytes,
   hostNoun,
   hostSubtitle,
+  nextRefreshState,
   resourceRows,
   type HostResourcesState,
 } from "@/lib/host-resources";
@@ -61,6 +62,10 @@ export function ResourcesSectionView({
     );
   }
 
+  if (state.status === "refreshing") {
+    return <ResourcesReportView report={state.report} onRefresh={onRefresh} refreshing highlightClass={highlightClass} />;
+  }
+
   if (state.status === "error") {
     return (
       <div className="flex flex-col gap-4">
@@ -83,10 +88,12 @@ export function ResourcesSectionView({
 function ResourcesReportView({
   report,
   onRefresh,
+  refreshing,
   highlightClass,
 }: {
   report: HostResourcesReport;
   onRefresh: () => void;
+  refreshing?: boolean;
   highlightClass?: (domId: string) => string | undefined;
 }) {
   const noun = hostNoun(report);
@@ -101,7 +108,7 @@ function ResourcesReportView({
         className={highlightClass?.("setting-resources-host")}
         title={noun === "this Mac" ? "This Mac’s resources" : "Server resources"}
         subtitle={`${report.hostId} · ${hostSubtitle(report)}`}
-        actions={<RefreshButton onRefresh={onRefresh} spinning={false} />}
+        actions={<RefreshButton onRefresh={onRefresh} spinning={refreshing ?? false} />}
       >
         <div className="flex flex-col gap-2 text-[13px]" role="table" aria-label="Host resource readings">
           <div className="grid grid-cols-[110px_1fr_1fr_1fr] gap-2 text-[11.5px] uppercase tracking-wide text-ink-secondary" role="row">
@@ -274,14 +281,23 @@ function HeadroomCard({
 
 export function ResourcesSection({ highlightClass }: { highlightClass?: (domId: string) => string | undefined }) {
   const [state, setState] = React.useState<HostResourcesState>({ status: "loading" });
+  // A second click while a fetch is in flight is ignored: overlapping
+  // fetches race last-write-wins and can plant a stale report.
+  const inflightRef = React.useRef(false);
 
-  const refresh = React.useCallback(async () => {
-    setState({ status: "loading" });
-    try {
-      setState({ status: "ready", report: await fetchHostResources() });
-    } catch (caught) {
-      setState({ status: "error", message: caught instanceof Error ? caught.message : String(caught) });
-    }
+  const refresh = React.useCallback(() => {
+    if (inflightRef.current) return;
+    inflightRef.current = true;
+    setState((prev) => nextRefreshState(prev));
+    void (async () => {
+      try {
+        setState({ status: "ready", report: await fetchHostResources() });
+      } catch (caught) {
+        setState({ status: "error", message: caught instanceof Error ? caught.message : String(caught) });
+      } finally {
+        inflightRef.current = false;
+      }
+    })();
   }, []);
 
   React.useEffect(() => {
