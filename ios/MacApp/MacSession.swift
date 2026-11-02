@@ -111,6 +111,19 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// only on the first start, so nothing is created while the setting is off.
     public let companionListener: CompanionListenerController
 
+    // Native engine composition (sole-writer handoff from AG).  The
+    // supervisor is owned here so its supervised-process count is readable
+    // even before the listener first starts; the engine turns are read
+    // through the listener-built runtime below.  Together they feed the
+    // graceful-stop drain counters (AG busy-flag note).
+    private let nativeProcessSupervisor: ProcessSupervisorActor
+    private let nativeRuntimeBox: MacNativeRuntimeBox
+    /// Native engine work currently in flight on the listener graph, for the
+    /// server-bridge session state.  Zero until the listener first starts.
+    @Published public private(set) var nativeBusy = MacNativeBusySnapshot()
+    /// What the last quit-time native drain did, in the owner's words.
+    @Published public private(set) var nativeDrainSummary: String?
+
     // CUA Live Stream & Safety state (BF-2499)
     @Published public var showCuaViewer: Bool = false
     @Published public var isCuaStreaming: Bool = false
@@ -197,6 +210,16 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         // digests only, so a paired phone survives an app restart.
         let deviceStoreURL = storeURL.deletingLastPathComponent()
             .appendingPathComponent("devices.json")
+        // Session-owned composition pieces: the supervisor is created now
+        // (no disk I/O) and injected into the listener graph on first start,
+        // so the session reads the one supervised-process count its drain
+        // counters use.  The box ferries the built runtime back out for
+        // quit-time drain; it stays empty while the setting is off, and an
+        // empty box honestly reads as nothing to drain.
+        let nativeProcessSupervisor = ProcessSupervisorActor()
+        let nativeRuntimeBox = MacNativeRuntimeBox()
+        self.nativeProcessSupervisor = nativeProcessSupervisor
+        self.nativeRuntimeBox = nativeRuntimeBox
         let backend = NativeCompanionListenerBackend(port: 0, options: listenerOptions) {
             // A store of the listener's own, under the Mac's data directory,
             // created only when the listener is first turned on.  Where the
@@ -213,7 +236,12 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             // the listener stays default-off and stop stays socket-only.
             let workspacesRoot = storeURL.deletingLastPathComponent()
                 .appendingPathComponent("workspaces", isDirectory: true)
-            let macRuntime = NativeMacCompanionRuntime(database: database, workspacesRoot: workspacesRoot)
+            let macRuntime = NativeMacCompanionRuntime(
+                database: database,
+                workspacesRoot: workspacesRoot,
+                processSupervisor: nativeProcessSupervisor
+            )
+            nativeRuntimeBox.store(macRuntime)
             return NativeCompanionServer(database: database, deviceStoreURL: deviceStoreURL, nativeRuntime: macRuntime.runtime)
         }
         self.companionListener = CompanionListenerController(
@@ -685,6 +713,63 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
             companionListenerEnabled = companionListener.isEnabled
             lifecycleErrorMessage = "The companion listener setting could not be saved: \(error.localizedDescription)"
         }
+        await refreshNativeBusyState()
+    }
+
+    // MARK: - Native Engine Composition (drain counters + graceful stop)
+
+    /// Reads the current native busy snapshot for the server-bridge session
+    /// state: engine turns from the listener graph's coordinator and
+    /// supervised processes from the session-owned supervisor.  Zero while
+    /// the listener has never started.
+    public func refreshNativeBusyState() async {
+        let engineTurns = await nativeRuntimeBox.runtime?.activeEngineTurnCount() ?? 0
+        let processes = await nativeProcessSupervisor.activeProcessCount()
+        nativeBusy = MacNativeBusySnapshot(engineTurns: engineTurns, supervisedProcesses: processes)
+    }
+
+    /// Reads the snapshot without publishing it, for the drain path.
+    private func readNativeBusySnapshot() async -> MacNativeBusySnapshot {
+        let engineTurns = await nativeRuntimeBox.runtime?.activeEngineTurnCount() ?? 0
+        let processes = await nativeProcessSupervisor.activeProcessCount()
+        return MacNativeBusySnapshot(engineTurns: engineTurns, supervisedProcesses: processes)
+    }
+
+    /// Bounded graceful drain of the native runtime for app termination.
+    ///
+    /// Fences admission first so the bounded wait converges, waits for the
+    /// in-flight native turns and processes to settle, then runs the
+    /// terminal runtime shutdown which stops what remains and flushes the
+    /// stores.  A listener that never started drains trivially.  This never
+    /// runs on window close: a persisted window close keeps the listener up,
+    /// and the terminal shutdown would make a later listener start fail.
+    public func drainNativeEnginesForTermination(
+        deadlineMs: Double = MacNativeComposition.drainDeadlineMs,
+        pollMs: Double = MacNativeComposition.drainPollMs
+    ) async -> MacNativeDrainResult {
+        guard let macRuntime = nativeRuntimeBox.runtime else {
+            let result = MacNativeDrainResult(settledCleanly: true)
+            nativeDrainSummary = result.summary
+            return result
+        }
+        // Fence first: no new wait dispatches while the bounded wait runs,
+        // so the counters it watches can actually reach zero.  In-flight
+        // engine turns keep running until they settle or are stopped below.
+        await macRuntime.runtime.shutdown()
+        var result = await MacNativeGracefulDrain.drain(
+            deadlineMs: deadlineMs,
+            pollMs: pollMs,
+            readSnapshot: { [weak self] in await self?.readNativeBusySnapshot() ?? MacNativeBusySnapshot() }
+        )
+        do {
+            try await macRuntime.runtime.shutdownAndDrain()
+            result.didShutDownRuntime = true
+        } catch {
+            NSLog("Native runtime shutdown failed: %@", error.localizedDescription)
+        }
+        await refreshNativeBusyState()
+        nativeDrainSummary = result.summary
+        return result
     }
 
     /// Observes the close of the app's main window.
@@ -942,8 +1027,13 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
 
     /// Applies the exit policy when the app terminates.
+    ///
+    /// The native engine graph drains first, inside its bounded window, so
+    /// in-flight turns settle or are stopped and flushed before the listener
+    /// socket closes and the harness shuts down.
     public func handleAppTermination() async {
         triggerCuaEmergencyStop()
+        await drainNativeEnginesForTermination()
         await applyExitPolicy(for: .appTerminating)
     }
 

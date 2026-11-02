@@ -479,6 +479,13 @@ public actor TurnDispatcherActor {
         activeTurns.values.contains { $0.botId == botId }
     }
 
+    /// How many turns are in flight right now.  Read-only composition glue
+    /// for the Mac app's graceful-stop drain counters: the active engine
+    /// turn count feeds the drain path's work-in-flight number.
+    public func activeTurnCount() -> Int {
+        activeTurns.count
+    }
+
     public func cancelTurn(threadId: String) async {
         guard let generation = activeTurns[threadId]?.generation else { return }
         await cancelTurn(threadId: threadId, generation: generation)
@@ -871,6 +878,10 @@ public actor EngineCoordinatorActor {
 
     public func isTurnActive(threadId: String) async -> Bool { await dispatcher.isTurnActive(threadId: threadId) }
     public func isBotActive(botId: String) async -> Bool { await dispatcher.isBotActive(botId: botId) }
+
+    /// How many turns are in flight right now.  Read-only composition glue
+    /// for the Mac app's graceful-stop drain counters.
+    public func activeTurnCount() async -> Int { await dispatcher.activeTurnCount() }
 
     public func cancelTurn(threadId: String) async {
         await dispatcher.cancelTurn(threadId: threadId)
