@@ -228,6 +228,114 @@ final class ThreadViewTests: XCTestCase {
         XCTAssertEqual(state.viewingThreadId(forBotId: botId), "thread-b")
     }
 
+    func testHydrateDropsTheViewedPageWhenItsTaskIsGone() throws {
+        var (state, botId, _) = try busyBot()
+        XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))
+        state.threadTranscriptLoaded(
+            threadId: "thread-b", messages: [message("b1", at: 1)], hasMore: false)
+
+        // The next roster no longer lists the viewed thread: the pin reads
+        // as no pin everywhere else, so the hydrate drops it with its cached
+        // page instead of letting a deleted thread outlive the conversation.
+        state.hydrate(try fleet())
+
+        XCTAssertNil(state.viewingThreadId(forBotId: botId))
+        XCTAssertNil(state.viewedBotId)
+        XCTAssertNil(state.viewedThreadId)
+        XCTAssertNil(state.messages["thread-b"])
+        XCTAssertNil(state.hasMore["thread-b"])
+        XCTAssertNil(state.loadingThread["thread-b"])
+        XCTAssertNil(state.loadedThread["thread-b"])
+    }
+
+    func testHydrateDropsThePinWhenItsOwnerBotIsGone() throws {
+        var (state, botId, _) = try busyBot()
+        XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))
+        state.threadTranscriptLoaded(
+            threadId: "thread-b", messages: [message("b1", at: 1)], hasMore: false)
+
+        // The owner bot itself left the roster: the pin and its page go with
+        // it, like the bot-deleted frame.
+        var emptied = try fleet()
+        emptied.bots = []
+        state.hydrate(emptied)
+
+        XCTAssertNil(state.viewingThreadId(forBotId: botId))
+        XCTAssertNil(state.viewedThreadId)
+        XCTAssertNil(state.messages["thread-b"])
+        XCTAssertTrue(state.bots.isEmpty)
+    }
+
+    func testHydrateClearsThePinWhenTheViewedThreadBecomesActive() throws {
+        var (state, botId, _) = try busyBot()
+        XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))
+        state.threadTranscriptLoaded(
+            threadId: "thread-b", messages: [message("b1", at: 1)], hasMore: false)
+
+        // The viewed thread is the active thread again: no pin is needed,
+        // and its transcript merges instead of being dropped.
+        var switched = try fleetOwningRetainedThread()
+        switched.bots[0].threadId = "thread-b"
+        switched.bots[0].messages = [message("b1", at: 1), message("b2", at: 2)]
+        state.hydrate(switched)
+
+        XCTAssertNil(state.viewingThreadId(forBotId: botId))
+        XCTAssertNil(state.viewedThreadId)
+        XCTAssertEqual(state.transcript(forThread: "thread-b").map(\.id), ["b1", "b2"])
+    }
+
+    func testHydrateClearsAStaleLoadingFlagSoTheReopenFetches() throws {
+        var (state, botId, _) = try busyBot()
+        state.bots[0].tasks?.append(try task("thread-c", title: "Second retained"))
+        XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))
+        // Frames buffer while the first page is still in flight, then the
+        // pin moves on: thread-b keeps a stale in-flight flag with no pin.
+        state.apply(Frame.message(threadId: "thread-b", message: message("b-live", at: 9)))
+        XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-c"))
+
+        var owned = try fleetOwningRetainedThread()
+        owned.bots[0].tasks?.append(try task("thread-c", title: "Second retained"))
+        state.hydrate(owned)
+
+        // The unviewed buffered page drops — but so does its fetch flag, or
+        // the reopen would read the flag as a page still coming and return
+        // without fetching, pinning a thread that loads never.
+        XCTAssertNil(state.messages["thread-b"])
+        XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))
+        XCTAssertEqual(state.loadingThread["thread-b"], true)
+    }
+
+    func testALoadedEmptyPageFetchesOnlyOnce() throws {
+        var (state, botId, _) = try busyBot()
+        XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))
+
+        // A thread with no messages still loads a page — an empty one — and
+        // that counts as held: every reopen after it fetches nothing. Only
+        // the fetched flag distinguishes it from a miss; the transcript
+        // alone cannot, which is why a nil-check there would refetch forever.
+        state.threadTranscriptLoaded(threadId: "thread-b", messages: [], hasMore: false)
+
+        XCTAssertEqual(state.loadedThread["thread-b"], true)
+        XCTAssertFalse(state.viewThread(botId: botId, threadId: "thread-b"))
+        XCTAssertFalse(state.viewThread(botId: botId, threadId: "thread-b"))
+    }
+
+    // MARK: - The live row follows the displayed thread
+
+    func testBottomLiveRowShowsTypingOnlyForTheDisplayedThread() throws {
+        // Browsing an idle retained thread while the active one works shows
+        // no indicator: the busy fallback is the active bot's flag, not the
+        // displayed thread's.
+        XCTAssertEqual(bottomLiveRow(streaming: nil, reasoning: nil, viewingOther: true, busy: true), .none)
+        // On the active thread the same flag still drives the indicator.
+        XCTAssertEqual(bottomLiveRow(streaming: nil, reasoning: nil, viewingOther: false, busy: true), .typing)
+        XCTAssertEqual(bottomLiveRow(streaming: nil, reasoning: nil, viewingOther: false, busy: false), .none)
+        // Live text for the displayed thread wins over either flag.
+        XCTAssertEqual(bottomLiveRow(streaming: "hi", reasoning: nil, viewingOther: true, busy: false), .text)
+        XCTAssertEqual(bottomLiveRow(streaming: nil, reasoning: "hmm", viewingOther: true, busy: false), .reasoning)
+        XCTAssertEqual(bottomLiveRow(streaming: "", reasoning: nil, viewingOther: false, busy: true), .typing)
+    }
+
     func testTaskSwitchClearsTheStalePin() throws {
         var (state, botId, active) = try busyBot()
         XCTAssertTrue(state.viewThread(botId: botId, threadId: "thread-b"))

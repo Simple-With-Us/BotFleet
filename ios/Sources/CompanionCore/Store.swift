@@ -374,12 +374,37 @@ public struct CompanionState: Sendable {
         bots = fleet.bots
         rooms = fleet.groups
         let liveThreadIds = Set(fleet.bots.map(\.threadId) + fleet.groups.map(\.threadId))
+        // A pin that outlived its task reads as no pin everywhere else
+        // (`viewingThreadId(forBotId:)` refuses threads the owner bot no
+        // longer lists), so the hydrate drops it instead of leaking it past
+        // the conversation — with its cached page, exactly like the
+        // bot-frame prune. A pin on a thread that is active again needs no
+        // pin: the merge below owns that transcript.
+        if let viewed = viewedThreadId, let owner = viewedBotId {
+            if liveThreadIds.contains(viewed) {
+                viewedBotId = nil
+                viewedThreadId = nil
+            } else if fleet.bots.first(where: { $0.id == owner })?.tasks?.contains(where: { $0.threadId == viewed }) != true {
+                viewedBotId = nil
+                viewedThreadId = nil
+                messages.removeValue(forKey: viewed)
+                hasMore.removeValue(forKey: viewed)
+                loadingThread.removeValue(forKey: viewed)
+                loadedThread.removeValue(forKey: viewed)
+            }
+        }
         for staleThreadId in Array(messages.keys) where !liveThreadIds.contains(staleThreadId) {
             // A hydrate replaces every active transcript from the server; a
             // viewed retained thread keeps its page instead of refetching it.
+            // The pin above already guarantees the viewed thread is still
+            // owned, so this skip can no longer outlive the conversation.
             if staleThreadId == viewedThreadId { continue }
             messages.removeValue(forKey: staleThreadId)
             hasMore.removeValue(forKey: staleThreadId)
+            // A dropped page must never leave its fetch flag behind: the
+            // next open would read the stale flag as a page still in flight
+            // and return without fetching, pinning a thread that loads never.
+            loadingThread.removeValue(forKey: staleThreadId)
             loadedThread.removeValue(forKey: staleThreadId)
         }
         for bot in fleet.bots {

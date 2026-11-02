@@ -82,9 +82,12 @@ struct ChatView: View {
 
     /// What sits after the last settled row while the bot works.
     private var liveRow: BottomFollow.LiveRow {
-        if let live = session.state.streaming[displayedThreadId], !live.isEmpty { return .text }
-        if let thinking = session.state.reasoning[displayedThreadId], !thinking.isEmpty { return .reasoning }
-        return current.busy ? .typing : .none
+        bottomLiveRow(
+            streaming: session.state.streaming[displayedThreadId],
+            reasoning: session.state.reasoning[displayedThreadId],
+            viewingOther: viewingOther,
+            busy: current.busy
+        )
     }
 
     /// The bot whose reply is streaming: the chat's bot, or in a room the
@@ -2088,19 +2091,23 @@ struct MessageRow: View {
                 .buttonBorderShape(.capsule)
             }
 
-            // Reactions and version moves are writes against the thread on
-            // screen, which a viewed thread is not allowed to be. The counts
-            // still read; the buttons do not.
-            if !readOnly, let reactions = message.reactions, !reactions.isEmpty {
+            // Reactions are writes against the thread on screen, which a
+            // viewed thread is not allowed to be. The counts still read;
+            // only the tap goes away — fail closed both in the control
+            // state and in the action, so a read-only row can never file
+            // a toggle against a thread that is not the execution target.
+            if let reactions = message.reactions, !reactions.isEmpty {
                 HStack(spacing: 6) {
                     ForEach(reactionGroups(reactions), id: \.emoji) { group in
                         Button("\(group.emoji) \(group.count)") {
+                            guard !readOnly else { return }
                             Task { await session.react(to: message, in: tid, emoji: group.emoji) }
                         }
                         .font(.system(size: 13))
                         .buttonStyle(.bordered)
                         .buttonBorderShape(.capsule)
                         .tint(group.mine ? Color.accentColor : Color.secondary)
+                        .disabled(readOnly)
                     }
                 }
             }
