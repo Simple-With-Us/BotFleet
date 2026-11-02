@@ -1156,6 +1156,10 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
   const viewingOther = Boolean(explicitThreadId && explicitThreadId !== originalBot.threadId);
   const viewedMessages = explicitThreadId ? state.threadTranscripts[explicitThreadId] : undefined;
   const viewedLoading = explicitThreadId ? Boolean(state.loadingThread[explicitThreadId]) : false;
+  // A failed page stays failed until the reader opens the thread again:
+  // without this, clearing `loadingThread` re-arms the fetch below and a
+  // persistently failing route refetches without bound.
+  const viewedFailed = explicitThreadId ? state.threadTranscriptErrors[explicitThreadId] : undefined;
   const bot = useMemo(
     () =>
       viewingOther && explicitThreadId
@@ -1165,12 +1169,13 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
   );
   // First open of a retained thread fetches its page; later frames keep
   // the cache live through the reducer.  The store wrapper dedupes
-  // concurrent fetches for the same thread.
+  // concurrent fetches for the same thread, and a recorded failure
+  // blocks re-dispatch until the reader opens the thread again.
   useEffect(() => {
-    if (viewingOther && explicitThreadId && !viewedMessages && !viewedLoading) {
+    if (viewingOther && explicitThreadId && !viewedMessages && !viewedLoading && !viewedFailed) {
       dispatch({ type: "viewThread", botId: originalBot.id, threadId: explicitThreadId });
     }
-  }, [viewingOther, explicitThreadId, viewedMessages, viewedLoading, originalBot.id, dispatch]);
+  }, [viewingOther, explicitThreadId, viewedMessages, viewedLoading, viewedFailed, originalBot.id, dispatch]);
   const { capabilities } = useDesktopCapabilities();
   const macInset = capabilities.windowChrome === "mac-inset";
   const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
@@ -1905,6 +1910,12 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
         onClearReply={() => setReplyTo(null)}
         onRestoreReply={(message) => setReplyTo((current) => current ?? message)}
         onEditLast={lastUserMessage && !bot.busy ? () => setEditingId(lastUserMessage.id) : undefined}
+        // Browsing is read-only while the bot works: a send from here
+        // would auto-switch the execution target to the viewed thread
+        // mid-turn (and steer onto it), defeating the busy gate the tabs
+        // and the banner above enforce.  The reader switches first, then
+        // sends — the Switch button unlocks when the turn finishes.
+        locked={viewingOther && originalBot.busy}
       />
       <ThreadStatsBar stats={activeTask?.stats} usage={activeTask?.usage} />
       </div>

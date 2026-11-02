@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -6,6 +9,8 @@ import {
   taskPickerPointerIntent,
   threadPickIntent,
 } from "./TaskPicker";
+
+const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "TaskPicker.tsx"), "utf8").replace(/\r\n/g, "\n");
 
 describe("taskPickerPointerIntent", () => {
   it("treats a single click as switch, not rename", () => {
@@ -55,5 +60,15 @@ describe("task picker copy", () => {
     expect(TASK_RENAME_HINT).toContain("double-click");
     expect(TASK_RENAME_HINT).toContain("right-click");
     expect(TASK_PICKER_DISMISS_MS).toBeGreaterThanOrEqual(500);
+  });
+});
+
+describe("busy rows without a view affordance", () => {
+  it("leaves a none intent alone instead of switching through the picker fallback", () => {
+    // threadPickIntent already returns "none" for busy + no view; the row
+    // handler must not second-guess it back into onSwitch the way the old
+    // `!active && !onView` fallback did (ThreadTabs never had one).
+    expect(SRC).not.toContain("!active && !onView");
+    expect(SRC).toContain('else if (intent === "viewActive") onView?.(null);');
   });
 });

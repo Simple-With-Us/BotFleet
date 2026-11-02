@@ -288,7 +288,9 @@ function ConversationTaskPicker({
                         if (intent === "switch") onSwitch(task.threadId);
                         else if (intent === "view") onView?.(task.threadId);
                         else if (intent === "viewActive") onView?.(null);
-                        else if (!active && !onView) onSwitch(task.threadId);
+                        // intent "none" stays a no-op: without a view
+                        // affordance a busy row must not switch, exactly
+                        // like the tabs, which have no such fallback.
                         queueDismiss();
                       }}
                       onDoubleClick={(e) => {

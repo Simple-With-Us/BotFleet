@@ -147,3 +147,15 @@ describe("ChatView karaoke on the reply itself", () => {
     expect(hook).toBeLessThan(firstReturn);
   });
 });
+
+describe("browsing a retained thread while the bot works", () => {
+  it("holds the view fetch while the page failure stands, until the reader reopens it", () => {
+    expect(SRC).toContain("const viewedFailed = explicitThreadId ? state.threadTranscriptErrors[explicitThreadId] : undefined;");
+    expect(SRC).toContain("if (viewingOther && explicitThreadId && !viewedMessages && !viewedLoading && !viewedFailed) {");
+    expect(SRC).toContain("[viewingOther, explicitThreadId, viewedMessages, viewedLoading, viewedFailed, originalBot.id, dispatch]);");
+  });
+
+  it("locks the composer while browsing with a busy bot, so a send cannot retarget the turn", () => {
+    expect(SRC).toContain("locked={viewingOther && originalBot.busy}");
+  });
+});

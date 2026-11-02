@@ -1520,6 +1520,7 @@ describe("browsing a retained thread while the bot works", () => {
       ...open,
       threadTranscripts: { "thread-b": [message("b1")] },
       loadingThread: { "thread-b": true },
+      threadTranscriptErrors: { "thread-b": "boom" },
     };
     const hydrated = reducer(cached, {
       type: "hydrate",
@@ -1529,5 +1530,78 @@ describe("browsing a retained thread while the bot works", () => {
     });
     expect(hydrated.threadTranscripts).toEqual({});
     expect(hydrated.loadingThread).toEqual({});
+    expect(hydrated.threadTranscriptErrors).toEqual({});
+  });
+
+  it("records a failed page so the view stops refetching, and clears it on an explicit reopen", () => {
+    let state = reducer(open, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    // a failure for a thread that is not loading is ignored
+    expect(reducer(state, { type: "threadTranscriptFailed", threadId: "thread-x" })).toBe(state);
+    state = reducer(state, { type: "threadTranscriptFailed", threadId: "thread-b", error: "boom" });
+    // no cache and no loading flag, but the error stays so the view
+    // effect holds instead of redispatching viewThread in a loop
+    expect(state.threadTranscripts["thread-b"]).toBeUndefined();
+    expect(state.loadingThread["thread-b"]).toBeUndefined();
+    expect(state.threadTranscriptErrors["thread-b"]).toBe("boom");
+    // opening the same thread again is an explicit retry: the error
+    // clears and the page is flagged for loading
+    const retried = reducer(state, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    expect(retried.threadTranscriptErrors["thread-b"]).toBeUndefined();
+    expect(retried.loadingThread["thread-b"]).toBe(true);
+  });
+
+  it("drops the newly active thread's stale browsed cache on a real switch", () => {
+    const browsed = {
+      ...open,
+      threadTranscripts: { "thread-b": [message("b-old")] },
+    };
+    const switched = reducer(browsed, {
+      type: "taskSwitched",
+      bot: { id: "worker", threadId: "thread-b", messages: [message("b1")] },
+    });
+    expect(switched.bots[0]?.threadId).toBe("thread-b");
+    // the thread just left is stashed for browsing back ...
+    expect(switched.threadTranscripts["thread-a"]?.map((entry) => entry.id)).toEqual(["a1"]);
+    // ... while the newly active thread's older browsed page is dropped:
+    // new frames land on the bot now, so the cache would lie by omission
+    expect(switched.threadTranscripts["thread-b"]).toBeUndefined();
+  });
+
+  it("keeps the browsed cache when a switch answer carries no thread change", () => {
+    const browsed = {
+      ...open,
+      threadTranscripts: { "thread-b": [message("b-old")] },
+    };
+    const same = reducer(browsed, {
+      type: "taskSwitched",
+      bot: { id: "worker", threadId: "thread-a", messages: [message("a1")] },
+    });
+    expect(same.threadTranscripts["thread-b"]?.map((entry) => entry.id)).toEqual(["b-old"]);
+  });
+
+  it("drops the newly active thread's stale browsed cache on a bot frame switch", () => {
+    const browsed = {
+      ...open,
+      threadTranscripts: { "thread-b": [message("b-old")] },
+    };
+    const patched = reducer(browsed, {
+      type: "botPatched",
+      bot: { ...busyBot, threadId: "thread-b", messages: [message("b1")] },
+    });
+    expect(patched.bots[0]?.threadId).toBe("thread-b");
+    expect(patched.bots[0]?.messages.map((entry) => entry.id)).toEqual(["b1"]);
+    expect(patched.threadTranscripts["thread-b"]).toBeUndefined();
+  });
+
+  it("keeps the browsed cache on bot frames that carry no thread change", () => {
+    const browsed = {
+      ...open,
+      threadTranscripts: { "thread-b": [message("b-old")] },
+    };
+    const patched = reducer(browsed, {
+      type: "botPatched",
+      bot: { ...busyBot, busy: false },
+    });
+    expect(patched.threadTranscripts["thread-b"]?.map((entry) => entry.id)).toEqual(["b-old"]);
   });
 });

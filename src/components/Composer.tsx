@@ -11,7 +11,7 @@ import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
-import { botThreadDraftId, foldSentDrafts, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
+import { botThreadDraftId, foldSentDrafts, getDraft, getDraftAttachments, getStore, migrateThreadDraft, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
 import { BotOffComposer } from "./BotOffComposer";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
@@ -244,6 +244,26 @@ function ComposerInner({
         state.bots.find((candidate) => candidate.id === bot?.id)?.threadId ?? bot?.threadId ?? "",
       );
   const [text, setText, attachments, setAttachments] = useComposerDraft(draftId);
+  // A thread typed while browsed drafts under its per-thread key; when
+  // that thread becomes the active one this composer resolves the legacy
+  // per-bot key instead.  Carry the text across so Switch keeps what was
+  // typed — scoped to this bot going active on the migrated thread, so
+  // closing a view or switching bots never moves text between threads.
+  const prevDraftId = useRef(draftId);
+  useEffect(() => {
+    const previous = prevDraftId.current;
+    prevDraftId.current = draftId;
+    if (!bot || group || previous === draftId) return;
+    const perThread = previous.match(/^bot:([^:]+):(.+)$/);
+    const [, migratedBotId, migratedThreadId] = perThread ?? [];
+    if (!migratedBotId || !migratedThreadId || `bot:${migratedBotId}` !== draftId || migratedBotId !== bot.id) return;
+    const liveThreadId = state.bots.find((candidate) => candidate.id === bot.id)?.threadId;
+    if (liveThreadId !== migratedThreadId) return;
+    const store = getStore();
+    migrateThreadDraft(store, previous, draftId);
+    setText(getDraft(store, draftId));
+    setAttachments(getDraftAttachments(store, draftId));
+  }, [bot, group, draftId, state.bots, setText, setAttachments]);
   // The composer clears the moment a message goes out; a send the server
   // refuses, or cannot be reached for, hands it all back through this.
   const restoreFailedSend = useFailedSendRestore<Message>(threadId, onRestoreReply);

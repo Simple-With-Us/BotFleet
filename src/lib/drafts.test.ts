@@ -7,6 +7,7 @@ import {
   getDraft,
   getDraftAttachments,
   mergeRestoredDraft,
+  migrateThreadDraft,
   registerLiveDraft,
   restoreDraft,
   setDraft,
@@ -225,5 +226,35 @@ describe("botThreadDraftId", () => {
     setDraft(store, viewedId, "");
     expect(getDraft(store, viewedId)).toBe("");
     expect(getDraft(store, activeId)).toBe("for the working thread");
+  });
+});
+
+describe("migrateThreadDraft", () => {
+  it("carries a browsed thread's text to the legacy key when it goes active", () => {
+    const store = memoryStore();
+    setDraft(store, "bot:one:thread-b", "typed while browsing");
+    migrateThreadDraft(store, "bot:one:thread-b", "bot:one");
+    expect(getDraft(store, "bot:one")).toBe("typed while browsing");
+    expect(getDraft(store, "bot:one:thread-b")).toBe("");
+  });
+
+  it("merges with text already waiting on the target instead of dropping either", () => {
+    const store = memoryStore();
+    setDraft(store, "bot:one", "older active text");
+    setDraft(store, "bot:one:thread-b", "typed while browsing");
+    setDraftAttachments(store, "bot:one:thread-b", [paste("p1")]);
+    migrateThreadDraft(store, "bot:one:thread-b", "bot:one");
+    expect(getDraft(store, "bot:one")).toBe("typed while browsing\n\nolder active text");
+    expect(getDraftAttachments(store, "bot:one")).toEqual([paste("p1")]);
+    expect(getDraft(store, "bot:one:thread-b")).toBe("");
+    expect(getDraftAttachments(store, "bot:one:thread-b")).toEqual([]);
+  });
+
+  it("is a no-op when the source holds nothing or the ids match", () => {
+    const store = memoryStore();
+    setDraft(store, "bot:one", "stays put");
+    migrateThreadDraft(store, "bot:one:thread-b", "bot:one");
+    migrateThreadDraft(store, "bot:one", "bot:one");
+    expect(getDraft(store, "bot:one")).toBe("stays put");
   });
 });
