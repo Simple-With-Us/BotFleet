@@ -823,7 +823,15 @@ if (storageGuard && !storageGuard.initial.online) {
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 const hostId = loadHostId(DATA_DIR);
 const placementController = loadControllerEpoch(DATA_DIR, hostId);
-const jobHostProbe = createHostProbe({ storageState: storageGuard?.sample });
+const jobHostProbe = createHostProbe({
+  storageState: storageGuard?.sample,
+  // The Mac memory-pressure probe runs only while a memory-headroom knob
+  // is set (P-BF-6 B7); unset means no probe and unchanged readings.
+  memoryHeadroomEnabled: () => {
+    const admission = jobSettings().admission;
+    return admission.reservedRamBytes !== undefined || admission.minMemoryAvailablePercent !== undefined;
+  },
+});
 const hostResourcesResponse = createHostResourcesResponder({
   hostId, version: runtimeBuildIdentity.version, platform: process.platform,
   dataDir: DATA_DIR, probe: jobHostProbe, thresholds: () => jobSettings().admission,

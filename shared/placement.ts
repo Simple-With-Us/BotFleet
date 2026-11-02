@@ -78,6 +78,10 @@ export interface HostResourcesReport {
     maxSwapPercent: number;
     minFreeDiskBytes: number;
     minFreeInodes?: number;
+    /** Headroom (P-BF-6 B7): present only when the owner set the knob. */
+    reservedCpuCores?: number;
+    reservedRamBytes?: number;
+    minMemoryAvailablePercent?: number;
     unknownReading: "admit";
   };
   enforcement: Record<HostResource, EnforcementState>;

@@ -114,7 +114,7 @@ export interface JobsConfigInput {
   cliLanes?: boolean;
   defaultMinutes?: number;
   maxMinutes?: number;
-  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number };
+  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number; reservedRamMb?: number; minMemoryAvailablePercent?: number };
   cpuCores?: number;
 }
 
@@ -137,6 +137,13 @@ export function resolveJobsSettings(input: JobsConfigInput | undefined): JobsSet
     minFreeDiskBytes: finite(disk) ? Math.max(0, disk) * 1024 * 1024 : DEFAULT_ADMISSION.minFreeDiskBytes,
   };
   if (finite(inodes)) admission.minFreeInodes = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(inodes)));
+  // Headroom (P-BF-6 B7): set only when the owner set the knob — no defaults.
+  const reservedCpu = input?.admission?.reservedCpuCores;
+  const reservedRam = input?.admission?.reservedRamMb;
+  const minMemPercent = input?.admission?.minMemoryAvailablePercent;
+  if (finite(reservedCpu)) admission.reservedCpuCores = Math.min(64, Math.max(0, Math.floor(reservedCpu)));
+  if (finite(reservedRam)) admission.reservedRamBytes = Math.max(0, Math.floor(reservedRam)) * 1024 * 1024;
+  if (finite(minMemPercent)) admission.minMemoryAvailablePercent = Math.min(100, Math.max(0, minMemPercent));
   return {
     enabled: input?.enabled !== false,
     wake: input?.wake !== false,

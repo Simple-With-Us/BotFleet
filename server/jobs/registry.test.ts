@@ -144,6 +144,19 @@ describe("settings", () => {
   it("does not trip the default swap gate at the 90-94% this Mac sits at", () => {
     expect(resolveJobsSettings(undefined).admission.maxSwapPercent).toBeGreaterThan(95);
   });
+  it("leaves every headroom gate unset unless the owner set the knob", () => {
+    const admission = resolveJobsSettings(undefined).admission;
+    expect(admission.reservedCpuCores).toBeUndefined();
+    expect(admission.reservedRamBytes).toBeUndefined();
+    expect(admission.minMemoryAvailablePercent).toBeUndefined();
+    expect(Object.keys(admission).sort()).toEqual(["maxSwapPercent", "minFreeDiskBytes"]);
+  });
+  it("resolves set headroom knobs, converting RAM to bytes and clamping", () => {
+    const admission = resolveJobsSettings({ admission: { reservedCpuCores: 99, reservedRamMb: 4096, minMemoryAvailablePercent: 150 } }).admission;
+    expect(admission.reservedCpuCores).toBe(64);
+    expect(admission.reservedRamBytes).toBe(4096 * 1024 * 1024);
+    expect(admission.minMemoryAvailablePercent).toBe(100);
+  });
 });
 
 describe("local placement identity", () => {

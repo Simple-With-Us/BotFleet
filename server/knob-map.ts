@@ -129,6 +129,39 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: Number.MAX_SAFE_INTEGER,
   },
   {
+    // Headroom knobs (P-BF-6 B7).  Absent means unset: no gate, exactly like
+    // `minFreeInodes` above.  There is deliberately no default anywhere for
+    // these three — choosing numbers is the owner's call, and an unset knob
+    // leaves admission byte-for-byte unchanged.
+    id: "jobs.admission.reservedCpuCores",
+    label: "Job admission reserved CPU cores",
+    section: "jobs",
+    path: ["admission", "reservedCpuCores"],
+    infisicalName: "BOTFLEET_JOBS_RESERVED_CPU_CORES",
+    kind: "int",
+    min: 0,
+    max: 64,
+  },
+  {
+    id: "jobs.admission.reservedRamMb",
+    label: "Job admission reserved RAM",
+    section: "jobs",
+    path: ["admission", "reservedRamMb"],
+    infisicalName: "BOTFLEET_JOBS_RESERVED_RAM_MB",
+    kind: "int",
+    min: 0,
+  },
+  {
+    id: "jobs.admission.minMemoryAvailablePercent",
+    label: "Job admission minimum available memory percent",
+    section: "jobs",
+    path: ["admission", "minMemoryAvailablePercent"],
+    infisicalName: "BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT",
+    kind: "float",
+    min: 0,
+    max: 100,
+  },
+  {
     id: "jobs.webhookHotDeferMinutes",
     label: "Webhook hot-host deferral limit",
     section: "jobs",
