@@ -41,7 +41,7 @@ The size comes from the clients rather than from the drain: the native Mac app w
 
 ## What The Review Found
 
-Kody read the diff twice and five findings came back.  Four were real, and the fifth was a question about the Control app.
+Kody read the diff four times and six findings came back.  Five were real, and the sixth was a question about the Control app.
 
 Two were about the wait.  The stop's own fence takes the control lock, and the control lock is counted as a Local VM change in flight, so the count the wait watches could never reach zero and every stop waited out the whole ten seconds even when the bots were done on the first second.  The lock is the stop's own reservation rather than work in flight, so it is discounted from the counts now (`withoutOwnControlLock`), the same way the stop request's own admission already was.
 
@@ -49,18 +49,20 @@ Two were about the fence.  A stop that threw left `runtimeQuiescing` and `contr
 
 The fifth was the worst one, and it was about the park.  The queues are drained before the carrier is written, so when that write fails the work that could not be saved is neither on disk nor in memory, and the refusal that followed was itself what lost the owner's messages.  The park puts the work back now (`returnUnsavedWork`), the way the update drain does, and the refusal path drains the queues so the restored work runs.
 
-The measurements, on fixture harnesses with one bot whose provider holds its answer open for two seconds: before the fixes the stop took 10,008 ms and the report said "still running: 1 Local VM change"; after them it takes 2,076 ms and the report names the bot and no Local VM change at all.  The park fixture makes the carrier unwritable and then asks the server to stop: before the fix the queued message never ran, because it was gone; after it, the provider is asked twice, once for the first turn and once for the message the refusal put back.
+The sixth was about the discount the stop takes for the queued routine runs.  The runtime count leaves a queued run out when the bot is switched Off, because such a run will be dropped or refused and never runs, but the discount counted every queued run, so the subtraction could take more than the count held and the count fell to zero while a routine run was really running.  Since the routine runs feed the active work count the wait watches, that ended the wait early and the shutdown interrupted a run that was still going.  Both numbers now come from one list in one place (`routineRunCounts` in `server/update-drain.ts`), filtered the same way, so the discount can never be bigger than the count it is taken from.  The update drain had the same asymmetry in its own discount, and it is fixed the same way.
+
+The measurements, on fixture harnesses with one bot whose provider holds its answer open for two seconds: before the fixes the stop took 10,008 ms and the report said "still running: 1 Local VM change"; after them it takes 2,076 ms and the report names the bot and no Local VM change at all.  The discount fixture is one queued run for a bot that is switched Off and one running routine run: the runtime count is 1, the old discount was 1 and left the running run at 0 in flight, and the new discount is 0 and leaves it at 1.  The park fixture makes the carrier unwritable and then asks the server to stop: before the fix the queued message never ran, because it was gone; after it, the provider is asked twice, once for the first turn and once for the message the refusal put back.
 
 One finding was not a defect to fix.  The Control app decodes the stop's report only when the stop worked, and a refusal throws before the report is read.  Every refusal already names what blocks it (a room turn, an in-flight request, the messages that could not be saved), and the report on a refusal describes a shutdown that did not happen, so showing it would misinform.  The report is honest on that path now (no bot is claimed as stopped when the server stays up), and the Control side is a follow-up rather than untested Swift in this change: no workflow runs `swift test --package-path mac-control`.
 
 ## Verification
 
-The affected fixtures are `server/graceful-shutdown.test.ts` (21 tests), `server/graceful-shutdown-route.test.ts` (6 tests), `server/graceful-shutdown-e2e.test.ts` (2 tests), `server/system-control.test.ts` (18 tests) and `server/desktop-open-policy.test.ts` (8 tests), 55 in total, and they pass.  The integration suite `server/index.test.ts` passes 312 of 312 on its own, including the one that asserts the stop route refuses an in-flight request and writes no marker.
+The affected fixtures are `server/graceful-shutdown.test.ts` (21 tests), `server/graceful-shutdown-route.test.ts` (7 tests), `server/graceful-shutdown-e2e.test.ts` (2 tests), `server/update-drain.test.ts` (23 tests), `server/system-control.test.ts` (18 tests) and `server/desktop-open-policy.test.ts` (8 tests), 79 in total, and they pass.  The integration suite `server/index.test.ts` passes 312 of 312 on its own, including the one that asserts the stop route refuses an in-flight request and writes no marker.
 
 ```sh
 pnpm typecheck
 node scripts/check-lint-baseline.mjs
-pnpm exec vitest run server/graceful-shutdown.test.ts server/graceful-shutdown-route.test.ts server/graceful-shutdown-e2e.test.ts server/system-control.test.ts server/desktop-open-policy.test.ts
+pnpm exec vitest run server/graceful-shutdown.test.ts server/graceful-shutdown-route.test.ts server/graceful-shutdown-e2e.test.ts server/update-drain.test.ts server/system-control.test.ts server/desktop-open-policy.test.ts
 pnpm exec vitest run server/index.test.ts
 pnpm test
 ```
@@ -70,6 +72,12 @@ The graceful stop's fixture injects the clock, the wait, the bot roster, the in-
 The local full `pnpm test` run counted 12,491 tests: 12,460 passed, 6 failed and 25 skipped.  The six failures are in two files this change does not touch.  `server/env-path.test.ts` fails four times because a real `/usr/local/bin/dsh` exists on this host, and the same four failures reproduce on `origin/main`.  `server/index.test.ts` fails two webhook tests when the whole suite runs at once, because the webhook receiver binds one fixed port and the suite runs hundreds of files in parallel; both pass when that file runs on its own.
 
 The lint baseline is unchanged at 4,867 warnings.  The hosted required gate is the merge authority.
+
+## The Follow-up Pull Request
+
+This pull request merged before the fourth round of review was answered.  The sixth finding, the queued-routine-run discount, and a lint repair that the merge itself needed both went into a follow-up pull request, because the discount was a real defect in the wait and the ratchet had to hold for both of them to land.
+
+The lint repair is worth naming:  the fixture's state carried a type assertion with no SAFETY comment, and the ratchet counts every one of them.  The branch this work was developed on had an older base and the counts happened to balance there, so nothing saw it until the merge put main one warning over its own baseline.  The state has a named interface now, and the count is back to the baseline.
 
 ## Limits
 
