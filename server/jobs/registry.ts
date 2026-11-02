@@ -986,6 +986,13 @@ export class JobRegistry {
     }
     if (!isJobActive(record)) return { ok: false, job: this.snapshot(record), error: "the job already ended" };
     if (record.status === "queued") {
+      // A queued job this process never accepted has no command (memory
+      // only, never on disk): this process can never launch it, so it stays
+      // queued for its controller and kill leaves it unchanged — the way a
+      // foreign leased job is left to its host.
+      if (!this.pending.has(id)) {
+        return { ok: false, job: this.snapshot(record), error: "the job is queued for its controller and this process holds no local command for it; the job was left unchanged" };
+      }
       this.pending.delete(id);
       record.killedBy = by;
       if (reason) record.reason = reason;

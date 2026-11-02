@@ -320,6 +320,40 @@ describe("placement queue", () => {
     expect(killed.job?.status).toBe("killed");
   });
 
+  it("refuses to kill a restart-read queued job this process never accepted", async () => {
+    const first = harness({ placementMode: () => "serverFirst" });
+    runningIds(first.h, 8);
+    const queued = start(first.h, "stays queued", "tq", "bot-q");
+    if (!queued.ok) throw new Error(queued.error);
+    expect(queued.job.status).toBe("queued");
+    // A restart drops the memory-only pending command, so the restarted
+    // process never accepted this job: it stays queued for its controller
+    // and kill leaves it unchanged instead of settling it as killed.
+    const second = harness({ placementMode: () => "serverFirst" });
+    const restarted = new JobRegistry({
+      dir: join(first.h.dir, "jobs"),
+      dataDir: first.h.dir,
+      settings: () => second.h.settings.value,
+      spendBlocked: () => false,
+      broadcast: () => undefined,
+      probe: { swapUsedPercent: () => 50, freeDiskBytes: () => 100 * 1024 ** 3 },
+      now: () => second.h.clock.now,
+      awakeNow: () => second.h.awake.now,
+      spawn: second.spawnFn,
+      listProcesses: async () => [],
+      platform: "darwin",
+    });
+    registries.push(restarted);
+    const refused = await restarted.kill(queued.job.id, "owner");
+    expect(refused.ok).toBe(false);
+    expect(restarted.get(queued.job.id)?.status).toBe("queued");
+    expect(second.children).toHaveLength(0);
+    // The process that accepted the job can still dequeue it on demand.
+    const killed = await first.h.registry.kill(queued.job.id, "owner");
+    expect(killed.ok).toBe(true);
+    expect(killed.job?.status).toBe("killed");
+  });
+
   it("expires a queued job under the default window when no window is configured", () => {
     // The fail-safe default is the longest run any job is allowed, so this
     // test names the exported constant instead of a magic duration.
