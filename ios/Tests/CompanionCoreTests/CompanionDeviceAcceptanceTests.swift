@@ -271,4 +271,83 @@ struct CompanionDeviceAcceptanceTests {
         #expect(CompanionDeviceRegistry.bearerToken(fromAuthorizationHeader: nil) == nil)
         #expect(CompanionDeviceRegistry.bearerToken(fromAuthorizationHeader: "") == nil)
     }
+    @Test("Socket events authorization rejects a bad Origin and streams for a native request")
+    func eventsStreamOriginGate() async throws {
+        let db = try DatabaseService(path: ":memory:")
+        let token = "bf_tok_events_origin"
+        let server = NativeCompanionServer(database: db, pairedTokens: [token])
+        let device = try #require(await server.pairedDevices().first)
+
+        // The socket path (`authorizeEventsStream`, used by `streamEvents`)
+        // applies the same Origin gate as `handleRequest`, before auth.
+        let badOrigin = await server.authorizeEventsStream(
+            Self.authedRequest(path: "/api/events", token: token, extraHeaders: ["Origin": "https://attacker.example"])
+        )
+        guard case .rejected(let badResponse) = badOrigin else {
+            Issue.record("cross-origin events request must be rejected")
+            return
+        }
+        #expect(badResponse.statusCode == 403)
+        #expect(badResponse.bodyString.contains("cross-origin"))
+
+        // Even with no credential at all, Origin is refused first (403, not 401).
+        let badOriginNoToken = await server.authorizeEventsStream(
+            Self.authedRequest(path: "/api/events", token: nil, extraHeaders: ["Origin": "https://attacker.example"])
+        )
+        guard case .rejected(let noTokenResponse) = badOriginNoToken else {
+            Issue.record("cross-origin events request must be rejected before auth")
+            return
+        }
+        #expect(noTokenResponse.statusCode == 403)
+
+        // A native request (no Origin) with a good credential is authorized
+        // as its device and actually streams the connected frame.
+        let good = await server.authorizeEventsStream(
+            Self.authedRequest(path: "/api/events", token: token)
+        )
+        guard case .authorized(let deviceId) = good else {
+            Issue.record("native events request with a paired token must be authorized")
+            return
+        }
+        #expect(deviceId == device.id)
+        let stream = await server.subscribeSSE(deviceId: deviceId)
+        var iterator = stream.makeAsyncIterator()
+        let first = await iterator.next()
+        #expect(first?.contains("event: connected") == true)
+    }
+
+    @Test("Revoking a device finishes its SSE stream and leaves another device's stream live")
+    func revokeTerminatesOnlyThatDevicesStream() async throws {
+        let db = try DatabaseService(path: ":memory:")
+        let server = NativeCompanionServer(database: db)
+        await server.addPairedToken("bf_tok_revoked_stream")
+        let victim = try #require(await server.pairedDevices().first)
+        await server.addPairedToken("bf_tok_surviving_stream")
+        let survivor = try #require(await server.pairedDevices().first { $0.id != victim.id })
+
+        let victimStream = await server.subscribeSSE(deviceId: victim.id)
+        let survivorStream = await server.subscribeSSE(deviceId: survivor.id)
+        var victimIterator = victimStream.makeAsyncIterator()
+        var survivorIterator = survivorStream.makeAsyncIterator()
+        #expect(await victimIterator.next()?.contains("event: connected") == true)
+        #expect(await survivorIterator.next()?.contains("event: connected") == true)
+
+        #expect(await server.revokeDevice(id: victim.id))
+
+        // The revoked device's stream is finished.
+        #expect(await victimIterator.next() == nil)
+
+        // The other device's stream still receives broadcasts: trigger one
+        // through its own authenticated interrupt route.
+        let interrupt = await server.handleRequest(CompanionHTTPRequest(
+            method: "POST",
+            path: "/api/threads/thread-1/interrupt",
+            headers: ["Authorization": "Bearer bf_tok_surviving_stream"],
+            remoteAddress: "192.168.1.50"
+        ))
+        #expect(interrupt.statusCode == 200)
+        let frame = await survivorIterator.next()
+        #expect(frame?.contains("thread.interrupted") == true)
+    }
+
 }

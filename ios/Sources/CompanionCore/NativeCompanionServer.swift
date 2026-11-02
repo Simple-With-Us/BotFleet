@@ -509,7 +509,14 @@ public actor NativeCompanionServer {
     private var liveActivityTokens: Set<String> = []
     private var apnsProvider: NativeAPNsProvider?
     private var interruptedThreadIds: Set<String> = []
-    private var sseContinuationById: [UUID: AsyncStream<String>.Continuation] = [:]
+    /// One live SSE subscription.  `deviceId` is the paired device whose
+    /// credential opened the stream (`nil` for an in-process `subscribeSSE()`
+    /// caller), so revoking a device can finish exactly its streams.
+    private struct SSESubscriber {
+        let deviceId: String?
+        let continuation: AsyncStream<String>.Continuation
+    }
+    private var sseContinuationById: [UUID: SSESubscriber] = [:]
 
     public private(set) var desktopOpenCount: Int = 0
     public private(set) var shutdownRequested: Bool = false
@@ -800,7 +807,19 @@ public actor NativeCompanionServer {
             return false
         }
         pairingReplay = nil
+        terminateSSEStreams(forDeviceId: id)
         return true
+    }
+
+    /// Finishes every live SSE stream opened with this device's credential,
+    /// and no other device's.  Finishing a continuation ends the socket
+    /// task's `for await` loop, which then cancels its connection.
+    private func terminateSSEStreams(forDeviceId deviceId: String) {
+        let doomed = sseContinuationById.filter { $0.value.deviceId == deviceId }
+        for (id, subscriber) in doomed {
+            sseContinuationById.removeValue(forKey: id)
+            subscriber.continuation.finish()
+        }
     }
 
     /// Replaces what `GET /api/companion/endpoints` and the pairing response
@@ -855,13 +874,19 @@ public actor NativeCompanionServer {
         subscribeSSEWithIdentifier().stream
     }
 
+    /// Subscribes on behalf of one paired device, so `revokeDevice` can
+    /// finish this stream the moment that device loses access.
+    func subscribeSSE(deviceId: String?) -> AsyncStream<String> {
+        subscribeSSEWithIdentifier(deviceId: deviceId).stream
+    }
+
     /// Subscribes to Server-Sent Events and returns the subscriber's id, so a
     /// caller that owns the transport can retire the subscription itself
     /// instead of waiting for the stream to terminate.
-    func subscribeSSEWithIdentifier() -> (stream: AsyncStream<String>, id: UUID) {
+    func subscribeSSEWithIdentifier(deviceId: String? = nil) -> (stream: AsyncStream<String>, id: UUID) {
         let id = UUID()
         let stream = AsyncStream<String>(bufferingPolicy: .bufferingNewest(Self.sseBufferCapacity)) { continuation in
-            sseContinuationById[id] = continuation
+            sseContinuationById[id] = SSESubscriber(deviceId: deviceId, continuation: continuation)
             continuation.yield("event: connected\ndata: {\"ok\":true}\n\n")
             continuation.onTermination = { [weak self] _ in
                 Task {
@@ -878,8 +903,8 @@ public actor NativeCompanionServer {
 
     private func broadcastSSE(event: String, jsonPayload: String) {
         let frame = "event: \(event)\ndata: \(jsonPayload)\n\n"
-        for continuation in sseContinuationById.values {
-            continuation.yield(frame)
+        for subscriber in sseContinuationById.values {
+            subscriber.continuation.yield(frame)
         }
     }
 
@@ -893,6 +918,40 @@ public actor NativeCompanionServer {
         return text
     }
 
+    /// The one Origin gate every request path shares - the router and the
+    /// socket SSE path alike.  A native app sends no Origin; anything that
+    /// does is a browser that has found this port, and a browser has no
+    /// business on it, whatever the origin claims and however good the
+    /// token behind it is.  Mirrors `companion/src/proxy.ts`.
+    static func crossOriginRejection(for request: CompanionHTTPRequest) -> CompanionHTTPResponse? {
+        if let origin = request.headerValue(for: "Origin"), !origin.isEmpty {
+            return .error(403, "forbidden: cross-origin request")
+        }
+        return nil
+    }
+
+    /// Whether a socket `GET /api/events` request may stream, and as which
+    /// device.  The Origin gate runs before any credential is looked at,
+    /// exactly as in `handleRequest`; the socket path must not bypass it
+    /// by streaming directly.
+    enum EventsAuthorization {
+        case authorized(deviceId: String)
+        case rejected(CompanionHTTPResponse)
+    }
+
+    func authorizeEventsStream(_ request: CompanionHTTPRequest) -> EventsAuthorization {
+        if let rejection = Self.crossOriginRejection(for: request) {
+            return .rejected(rejection)
+        }
+        guard let device = authenticatedDevice(request) else {
+            return .rejected(.error(
+                401,
+                "pair this device from Phone settings in BotFleet on your computer"
+            ))
+        }
+        return .authorized(deviceId: device.id)
+    }
+
     // MARK: - HTTP Request Router (Default-Deny Allowlist)
 
     /// Primary HTTP request entrypoint for both `NWConnection` and unit tests.
@@ -901,13 +960,9 @@ public actor NativeCompanionServer {
         let method = request.method.uppercased()
         let path = request.path
 
-        // 0. Origin rejection, before any route or credential is looked
-        // at.  A native app sends no Origin; anything that does is a
-        // browser that has found this port, and a browser has no business
-        // on it — whatever the origin claims, and however good the token
-        // behind it is.  Mirrors `companion/src/proxy.ts`.
-        if let origin = request.headerValue(for: "Origin"), !origin.isEmpty {
-            return .error(403, "forbidden: cross-origin request")
+        // 0. Origin rejection, before any route or credential is looked at.
+        if let rejection = Self.crossOriginRejection(for: request) {
+            return rejection
         }
 
         // 1. Open routes (unauthenticated)
@@ -1837,11 +1892,11 @@ public actor NativeCompanionServer {
     /// connection open, so `message.created` and `thread.interrupted` actually
     /// reach a network client.
     private func streamEvents(over connection: NWConnection, request: CompanionHTTPRequest) {
-        guard isAuthenticated(request) else {
-            let response = CompanionHTTPResponse.error(
-                401,
-                "pair this device from Phone settings in BotFleet on your computer"
-            )
+        let deviceId: String
+        switch authorizeEventsStream(request) {
+        case .authorized(let authorizedDeviceId):
+            deviceId = authorizedDeviceId
+        case .rejected(let response):
             connection.send(content: Self.serializeHTTPResponse(response), completion: .contentProcessed { _ in
                 connection.cancel()
             })
@@ -1849,7 +1904,7 @@ public actor NativeCompanionServer {
         }
         let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
         connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
-        let subscription = subscribeSSEWithIdentifier()
+        let subscription = subscribeSSEWithIdentifier(deviceId: deviceId)
         Task.detached { [weak self] in
             for await frame in subscription.stream {
                 // A write that fails means the peer is gone.  The loop ends
