@@ -3,7 +3,7 @@
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Smartphone, Terminal, User, X } from "lucide-react";
+import { Activity, Coins, Gauge, Globe, KeyRound, Layers, Monitor, Smartphone, Terminal, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
 import { searchSettings, type SettingsSearchItem } from "@/lib/settings-search";
 import { SettingsSearchResultsView } from "./SettingsSearchResultsView";
@@ -62,6 +62,7 @@ import { RemoteAccessSection } from "./RemoteAccessSection";
 import { Card } from "./SettingsPrimitives";
 import { UsageSection } from "./UsageSection";
 import { ObservabilitySection } from "./ObservabilitySection";
+import { ResourcesSection } from "./ResourcesSection";
 import { SecretsSection } from "./SecretsSection";
 import { SkinPicker } from "./SkinPicker";
 import { RoomTurnTimeoutSettings } from "./RoomTurnTimeoutSettings";
@@ -117,6 +118,7 @@ const SECTION_ICONS: Record<AppSettingsSection, typeof User> = {
   usage: Coins,
   observability: Activity,
   secrets: KeyRound,
+  resources: Gauge,
 };
 
 /** Name + email, persisted to /api/config {profile} on blur. */
@@ -1649,6 +1651,8 @@ export function SettingsModal() {
                   <SecretsSection />
                 </div>
               )}
+
+              {section === "resources" && <ResourcesSection highlightClass={highlightClass} />}
             </div>
           )}
         </div>

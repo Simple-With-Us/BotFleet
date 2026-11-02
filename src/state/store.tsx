@@ -925,7 +925,8 @@ export type AppSettingsSection =
   | "computers"
   | "usage"
   | "observability"
-  | "secrets";
+  | "secrets"
+  | "resources";
 
 export interface AppState {
   bots: Bot[];
