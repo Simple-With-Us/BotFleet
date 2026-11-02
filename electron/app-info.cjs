@@ -4,7 +4,7 @@
 // version a "build number".  That trick is only valid where the patch IS the
 // build, and it now is for the desktop app:  its app version carries the
 // commit's merge stamp in the patch (scripts/electron-release-version.mjs), so
-// 0.1.202610291425 names one build exactly.  That is still not the same thing
+// 1.0.202610291425 names one build exactly.  That is still not the same thing
 // as reading the build out of the string, and this file does not do it:  the
 // version is reported as it stands, and a build that wants to be named hands
 // its own in.  Printing `build 31` for a version whose patch was a typed patch

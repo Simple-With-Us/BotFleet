@@ -22,19 +22,26 @@
 // version (scripts/electron-release-version.mjs), and a release pins TWO
 // values:
 //
-//   BOTFLEET_BUILD_VERSION       0.1.202611030100   the app version
+//   BOTFLEET_BUILD_VERSION       1.0.202611030100   the app version
 //   BOTFLEET_MARKETING_VERSION   0.1.0              the version a person sees
 //
 // The build number is the app version's patch, which is the slot the retired
-// 1.0.<commit_count> scheme used, so nothing else has to carry it.
+// 1.0.<commit_count> scheme used, so nothing else has to carry it.  The app
+// version sits on the ORDERING line (1.0) rather than the marketing line
+// (0.1), because the updater orders releases by the app version alone and the
+// installed fleet is already on 1.0.x:  a 0.1.<build> feed would read as a
+// downgrade to every install and be refused (scripts/electron-release-version.mjs).
 //
 // A pin that names no marketing version is the RETIRED shape, and it keeps
 // working exactly as it did:  1.0.2222 still means the version 1.0.2222 and
 // the build 2222, and the marketing version is the app version because that
 // scheme had only one.  That is what keeps an in-flight release or a local
-// build on the old scheme from breaking on this change.
+// build on the old scheme from breaking on this change.  The marketing
+// version never enters the answer, so a stale one left in the environment
+// cannot change what a pin resolves to.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { ORDERING_VERSION_PREFIX } from "../scripts/electron-release-version.mjs";
 import { resolveBuildVersion } from "../scripts/stamp-commit-version.mjs";
 
 const SEMVER = /^(\d+)\.(\d+)\.(\d+)$/;
@@ -50,49 +57,44 @@ export function controlBuildVersion({ env = process.env, repoRoot }) {
   const pinned = String(env.BOTFLEET_BUILD_VERSION ?? "").trim();
   const marketing = String(env.BOTFLEET_MARKETING_VERSION ?? "").trim();
   if (pinned !== "") {
-    if (marketing !== "") {
-      // The policy shape:  the app version carries the build in its patch and
-      // the marketing version says what a person sees.
-      const app = SEMVER.exec(pinned);
-      if (!app) {
-        throw new Error(`BOTFLEET_BUILD_VERSION is not an x.y.z app version: ${pinned}`);
-      }
-      const shown = SEMVER.exec(marketing);
-      if (!shown) {
-        throw new Error(`BOTFLEET_MARKETING_VERSION is not an x.y.z version: ${marketing}`);
-      }
-      if (app[1] !== shown[1] || app[2] !== shown[2]) {
-        throw new Error(
-          `the app version ${pinned} and the marketing version ${marketing} disagree: ` +
-            `the app version takes its major and minor from the marketing version, ` +
-            `and the build travels in the patch`,
-        );
-      }
-      if (app[3] === shown[3]) {
-        // The app version carries the build in its patch, so an app version
-        // equal to the marketing version carries no build at all.  Stamping
-        // that as the build would number the bundle 0 and read as the oldest
-        // build in every comparison, so it is refused instead.
-        throw new Error(
-          `the app version ${pinned} carries no build: ` +
-            `the app version puts the build number in its patch, and the marketing version's patch is not one`,
-        );
-      }
-      return {
-        version: pinned,
-        build: String(app[3]),
-        source: "BOTFLEET_BUILD_VERSION",
-      };
-    }
-    // The retired 1.0.<count> shape, unchanged.
-    const match = /^1\.0\.(\d+)$/.exec(pinned);
-    if (!match) {
+    const app = SEMVER.exec(pinned);
+    if (!app) {
       throw new Error(
         `BOTFLEET_BUILD_VERSION is neither an x.y.z app version nor a 1.0.<count> build version: ${pinned}`,
       );
     }
-    const build = String(Number(match[1]));
-    return { version: `1.0.${build}`, build, source: "BOTFLEET_BUILD_VERSION" };
+    if (marketing !== "" && !SEMVER.exec(marketing)) {
+      throw new Error(`BOTFLEET_MARKETING_VERSION is not an x.y.z version: ${marketing}`);
+    }
+    // The app version the updater orders by sits on the ordering line, and the
+    // build travels in its patch.  The check is against the ORDERING LINE and
+    // not against the marketing version's major and minor, because the two are
+    // deliberately on different lines:  the marketing version is 0.1.0 for
+    // every release, and the app version is 1.0.<build>.
+    if (`${app[1]}.${app[2]}` !== ORDERING_VERSION_PREFIX) {
+      throw new Error(
+        `the app version ${pinned} is not on the ${ORDERING_VERSION_PREFIX} ordering line: ` +
+          `the app version the updater orders by carries the build in its patch on that line`,
+      );
+    }
+    const build = String(Number(app[3]));
+    if (build === "0") {
+      // The app version carries the build in its patch, so an app version
+      // whose patch is 0 carries no build at all.  Stamping that as the build
+      // would number the bundle 0 and read as the oldest build in every
+      // comparison, so it is refused instead.
+      throw new Error(
+        `the app version ${pinned} carries no build: ` +
+          `the app version puts the build number in its patch, and a patch of 0 is not one`,
+      );
+    }
+    // A pin with no marketing version is the RETIRED 1.0.<count> shape, and it
+    // resolves to the same answer:  the retired scheme had only one version,
+    // so the app version is the marketing version and the build is the count.
+    // A retired pin read while a stale marketing version sits in the
+    // environment resolves the same way too, because the marketing version
+    // never enters the answer.
+    return { version: `${ORDERING_VERSION_PREFIX}.${build}`, build, source: "BOTFLEET_BUILD_VERSION" };
   }
   if (String(env.BOTFLEET_SKIP_VERSION_STAMP ?? "").trim() === "1") {
     const version = String(JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).version ?? "").trim();

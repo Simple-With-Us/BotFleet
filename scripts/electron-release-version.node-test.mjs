@@ -25,8 +25,8 @@ test("the app version carries the build in the patch", () => {
 
 /**
  * Semver precedence for plain x.y.z versions, the way electron-updater
- * compares them:  the numeric parts, not the strings.  "0.1.202610291425"
- * sorts ABOVE "0.1.38" as versions and below it as text, and only the first
+ * compares them:  the numeric parts, not the strings.  "1.0.202610291425"
+ * sorts ABOVE "1.0.2143" as versions and below it as text, and only the first
  * answer is the one the updater uses.
  */
 function compareVersions(left, right) {
