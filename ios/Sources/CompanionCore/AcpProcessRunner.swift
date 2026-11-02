@@ -148,6 +148,7 @@ public actor AcpProcessRunner: EngineQuietActivityReporting {
     public nonisolated let executable: String
     private let launcher: any EngineProcessLauncher
     private let permissionHandler: PermissionHandler?
+    private let ownFileReadPolicy: NativeOwnFileReadPolicy?
     private let activitySampler: any NativeEngineActivitySampling
     private let quietClock: any NativeEngineQuietClock
     private var quietEvidenceByThread: [String: NativeEngineQuietEvidence] = [:]
@@ -163,6 +164,7 @@ public actor AcpProcessRunner: EngineQuietActivityReporting {
         executable: String? = nil,
         launcher: any EngineProcessLauncher = ProcessSupervisorActor(),
         permissionHandler: PermissionHandler? = nil,
+        ownFileReadPolicy: NativeOwnFileReadPolicy? = nil,
         activitySampler: any NativeEngineActivitySampling = NativeMacEngineActivitySampler(),
         quietClock: any NativeEngineQuietClock = NativeMonotonicQuietClock()
     ) {
@@ -171,6 +173,7 @@ public actor AcpProcessRunner: EngineQuietActivityReporting {
         self.executable = executable ?? harnessKind.defaultExecutable
         self.launcher = launcher
         self.permissionHandler = permissionHandler
+        self.ownFileReadPolicy = ownFileReadPolicy
         self.activitySampler = activitySampler
         self.quietClock = quietClock
     }
@@ -213,6 +216,9 @@ public actor AcpProcessRunner: EngineQuietActivityReporting {
         let threadId = input.threadId
         let kind = harnessKind
         let permHandler = permissionHandler
+        let ownFilePolicy = ownFileReadPolicy
+        let turnBotId = input.botId
+        let turnCwd = input.workingDirectory ?? "/"
 
         Task { [weak self] in
             let stderrTask = Task {
@@ -224,7 +230,10 @@ public actor AcpProcessRunner: EngineQuietActivityReporting {
                 session: session,
                 harnessKind: kind,
                 continuation: continuation,
-                permissionHandler: permHandler
+                permissionHandler: permHandler,
+                ownFileReadPolicy: ownFilePolicy,
+                botId: turnBotId,
+                workingDirectory: turnCwd
             )
 
             let readerTask = Task {
@@ -487,6 +496,9 @@ private actor AcpRpcSessionCoordinator {
     private let harnessKind: AcpHarnessKind
     private let continuation: AsyncStream<TurnEvent>.Continuation
     private let permissionHandler: AcpProcessRunner.PermissionHandler?
+    private let ownFileReadPolicy: NativeOwnFileReadPolicy?
+    private let botId: String
+    private let workingDirectory: String
 
     private var nextId: Int = 1
     private var pendingRequests: [Int: CheckedContinuation<[String: Any], Error>] = [:]
@@ -499,12 +511,18 @@ private actor AcpRpcSessionCoordinator {
         session: EngineProcessSession,
         harnessKind: AcpHarnessKind,
         continuation: AsyncStream<TurnEvent>.Continuation,
-        permissionHandler: AcpProcessRunner.PermissionHandler?
+        permissionHandler: AcpProcessRunner.PermissionHandler?,
+        ownFileReadPolicy: NativeOwnFileReadPolicy? = nil,
+        botId: String = "",
+        workingDirectory: String = "/"
     ) {
         self.session = session
         self.harnessKind = harnessKind
         self.continuation = continuation
         self.permissionHandler = permissionHandler
+        self.ownFileReadPolicy = ownFileReadPolicy
+        self.botId = botId
+        self.workingDirectory = workingDirectory
     }
 
     func markPromptSent() {
@@ -680,10 +698,26 @@ private actor AcpRpcSessionCoordinator {
 
         continuation.yield(.permissionRequest(id: reqId, tool: toolName, description: description))
 
+        // Own-file reads never wait for the person when a policy is injected
+        // (upstream #3791); every other ask keeps the fail-closed handler path.
+        let locations = ((toolCall["locations"] as? [[String: Any]]) ?? []).compactMap { $0["path"] as? String }
+        let isOwnFileRead: Bool = {
+            guard let ownFileReadPolicy else { return false }
+            if let readPaths = NativeOwnFileReads.acpReadPaths(kind: kind, locations: locations, rawInput: rawInput) {
+                return NativeOwnFileReads.readsOwnFiles(policy: ownFileReadPolicy, botId: botId, readPaths: readPaths)
+            }
+            if kind == "execute", let command = rawInput?["command"] as? String {
+                return NativeOwnFileReads.readsOwnFiles(policy: ownFileReadPolicy, botId: botId, command: command, cwd: workingDirectory)
+            }
+            return false
+        }()
+
         // Fail-closed permission gate: default to `cancelled` unless an explicit permissionHandler
         // approves AND the agent provided an `allow*` option in `params.options`.
         let decision: AcpPermissionDecision
-        if let permissionHandler {
+        if isOwnFileRead {
+            decision = .allow
+        } else if let permissionHandler {
             decision = await permissionHandler(reqId, toolName, description)
         } else {
             decision = .cancel
