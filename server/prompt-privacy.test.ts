@@ -50,8 +50,10 @@ function shippedSeatPromptMarkdown(): Array<[string, string]> {
  * business in shipped source, and the cheapest guard is to fail the build when
  * it comes back.
  */
+// The markers are spelled literally.  This file is a `.test.` file, which
+// the scan above skips, so the guard never trips on its own list.
 const PRIVATE_FLEET_MARKERS = [
-  "#agent" + "-sync",
+  "#agent-sync",
   "BF-${",
   "Always identify yourself as BF-",
   "the shared board",
