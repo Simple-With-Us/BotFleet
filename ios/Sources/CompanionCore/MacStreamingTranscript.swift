@@ -328,6 +328,19 @@ public enum MacBotMascotExpression: String, Codable, CaseIterable, Equatable, Se
         }
     }
 
+    /// Maps the canonical sidebar category onto the full `MacMascotExpression` design vocabulary.
+    public var designExpression: MacMascotExpression {
+        switch self {
+        case .idle: return .idle
+        case .working: return .working
+        case .thinking: return .thinking
+        case .waiting: return .alerting
+        case .happy: return .happy
+        case .error: return .crash
+        case .offline: return .sleeping
+        }
+    }
+
     /// Resolves a bot's live mascot expression from its state, pending cards,
     /// reasoning stream, and connection health.
     public static func resolve(
@@ -348,9 +361,13 @@ public enum MacBotMascotExpression: String, Codable, CaseIterable, Equatable, Se
         if bot.busy == true {
             return .working
         }
-        if let raw = bot.mascotExpression?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-           let explicit = MacBotMascotExpression(rawValue: raw) {
-            return explicit
+        if let raw = bot.mascotExpression?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            if let explicit = MacBotMascotExpression(rawValue: raw) {
+                return explicit
+            }
+            if let fullExpression = MacMascotExpression(rawValue: raw) {
+                return fullExpression.canonicalCategory
+            }
         }
         return .idle
     }

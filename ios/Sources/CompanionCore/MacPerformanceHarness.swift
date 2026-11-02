@@ -742,6 +742,48 @@ public enum MacPerformanceHarness {
         )
     }
 
+    /// Verifies both the shared visual design contract and the Mac app's source
+    /// surface against the BF-2496 and BF-2558 visual parity requirements.
+    public static func verifyVisualParity(macAppSources: [String]) -> MacVisualParityReport {
+        let rendersMascot = macAppSources.contains { $0.contains("MacMascotExpression") }
+        let rendersStatusPills = macAppSources.contains { $0.contains("MacStatusPillKind") }
+        let forcesColorScheme = macAppSources.contains { $0.contains(".preferredColorScheme(") }
+        let hexPattern = try? NSRegularExpression(pattern: "#[0-9A-Fa-f]{6}")
+        let hasHardcodedHex = macAppSources.contains { source in
+            let range = NSRange(source.startIndex..<source.endIndex, in: source)
+            return hexPattern?.firstMatch(in: source, range: range) != nil
+        }
+        let allExpressionsRenderable = MacMascotExpression.allCases.allSatisfy {
+            !$0.symbolName.isEmpty && !$0.displayLabel.isEmpty
+        }
+        let allPillsRenderable = MacStatusPillKind.allCases.allSatisfy {
+            !$0.label.isEmpty && !$0.symbolName.isEmpty && !$0.accessibilityLabel.isEmpty
+        }
+        let systemThemeFollowsAppearance = MacDesignTokens.defaultThemeMode.followsSystemAppearance &&
+            Set(MacThemeMode.allCases) == Set([.light, .dark, .system])
+
+        let verified = !macAppSources.isEmpty &&
+            rendersMascot &&
+            rendersStatusPills &&
+            !forcesColorScheme &&
+            !hasHardcodedHex &&
+            allExpressionsRenderable &&
+            allPillsRenderable &&
+            systemThemeFollowsAppearance
+
+        let note: String
+        if verified {
+            note = "the Mac app renders MacMascotExpression (\(MacMascotExpression.allCases.count) states) and MacStatusPillKind (\(MacStatusPillKind.allCases.count) states) with system light/dark appearance and zero hardcoded hex colors"
+        } else {
+            note = "the Mac app surface is missing MacMascotExpression or MacStatusPillKind rendering, or carries a hardcoded hex color or forced color scheme"
+        }
+
+        return verifyVisualParity(
+            appSurfaceVerified: verified,
+            appSurfaceNote: note
+        )
+    }
+
     // MARK: Idle CPU Measurement
 
     /// The number of quiet windows the idle CPU metric is the median of.

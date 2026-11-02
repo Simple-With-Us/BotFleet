@@ -19,12 +19,25 @@ public enum MacConnectionStatus: Equatable, Sendable {
         return false
     }
 
-    public var statusColor: Color {
+    public var statusPillKind: MacStatusPillKind {
         switch self {
+        case .connected:
+            return MacConnectionStatusPill.pillByConnectionState["connected"] ?? .connected
+        case .connecting:
+            return MacConnectionStatusPill.pillByConnectionState["connecting"] ?? .reconnecting
+        case .disconnected:
+            return MacConnectionStatusPill.pillByConnectionState["disconnected"] ?? .offline
+        case .failed:
+            return MacConnectionStatusPill.pillByConnectionState["failed"] ?? .error
+        }
+    }
+
+    public var statusColor: Color {
+        switch statusPillKind {
         case .connected: return .green
-        case .connecting: return .yellow
-        case .disconnected: return .gray
-        case .failed: return .red
+        case .reconnecting: return .yellow
+        case .offline: return .gray
+        case .error: return .red
         }
     }
 

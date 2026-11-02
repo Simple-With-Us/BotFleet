@@ -44,14 +44,10 @@ public struct MacRootView: View {
                 .help("Toggle Computer Use Agent (CUA) live viewer")
             }
             ToolbarItem(placement: .automatic) {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(session.status.statusColor)
-                        .frame(width: 8, height: 8)
-                    Text(session.status.displayText)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+                MacStatusPillView(
+                    kind: session.status.statusPillKind,
+                    detailText: session.status.displayText
+                )
             }
             ToolbarItem(placement: .primaryAction) {
                 Button(action: { session.connect() }) {
@@ -59,6 +55,42 @@ public struct MacRootView: View {
                 }
                 .help("Reconnect to local harness")
             }
+        }
+    }
+}
+
+struct MacStatusPillView: View {
+    let kind: MacStatusPillKind
+    var detailText: String? = nil
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(pillColor)
+                .frame(width: 8, height: 8)
+            Image(systemName: kind.symbolName)
+                .font(.caption2)
+                .foregroundColor(pillColor)
+            Text(detailText ?? kind.label)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(pillColor.opacity(0.12))
+        .clipShape(Capsule())
+        .help(detailText ?? kind.label)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(kind.accessibilityLabel)
+    }
+
+    private var pillColor: Color {
+        switch kind {
+        case .connected: return .green
+        case .reconnecting: return .yellow
+        case .offline: return .gray
+        case .error: return .red
         }
     }
 }
@@ -86,15 +118,18 @@ struct MacSidebarView: View {
                                 in: session.state,
                                 isConnected: session.status.isConnected
                             )
+                            let hasReasoning = (session.state.reasoning[bot.threadId]?.isEmpty == false)
+                            let mascotExpression = MacMascotExpression.resolve(
+                                for: bot,
+                                hasPendingCard: pill.kind == .waiting,
+                                hasReasoning: hasReasoning,
+                                isConnected: session.status.isConnected
+                            )
                             MacBotRowView(
                                 bot: bot,
                                 pill: pill,
-                                expression: MacBotMascotExpression.resolve(
-                                    for: bot,
-                                    hasPendingCard: pill.kind == .waiting,
-                                    hasReasoning: (session.state.reasoning[bot.threadId]?.isEmpty == false),
-                                    isConnected: session.status.isConnected
-                                )
+                                expression: mascotExpression.canonicalCategory,
+                                mascotExpression: mascotExpression
                             )
                             .tag(SidebarSelection.bot(bot.id))
                         }
@@ -168,11 +203,12 @@ struct MacBotRowView: View {
     let bot: Bot
     let pill: MacSidebarStatusPill
     let expression: MacBotMascotExpression
+    var mascotExpression: MacMascotExpression = .idle
 
     var body: some View {
         HStack(spacing: 10) {
             ZStack(alignment: .bottomTrailing) {
-                Image(systemName: expression.symbolName)
+                Image(systemName: mascotExpression.symbolName)
                     .resizable()
                     .scaledToFit()
                     .frame(width: 24, height: 24)
@@ -180,12 +216,15 @@ struct MacBotRowView: View {
                     .padding(4)
                     .background(Color.accentColor.opacity(0.12))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .help(mascotExpression.displayLabel)
 
                 Circle()
                     .fill(statusDotColor)
                     .frame(width: 8, height: 8)
                     .overlay(Circle().stroke(Color(NSColor.windowBackgroundColor), lineWidth: 1.5))
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(bot.name), \(mascotExpression.displayLabel), \(pill.text)")
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -237,7 +276,27 @@ struct MacThreadListView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if session.activeThreadId != nil {
-                HStack {
+                HStack(spacing: 10) {
+                    if let bot = session.activeBot {
+                        let pill = MacSidebarStatusPill.forBot(
+                            bot,
+                            in: session.state,
+                            isConnected: session.status.isConnected
+                        )
+                        let activeExpression = MacMascotExpression.resolve(
+                            for: bot,
+                            hasPendingCard: pill.kind == .waiting,
+                            hasReasoning: (session.activeReasoningText?.isEmpty == false),
+                            isConnected: session.status.isConnected
+                        )
+                        Image(systemName: activeExpression.symbolName)
+                            .font(.headline)
+                            .foregroundColor(.accentColor)
+                            .frame(width: 26, height: 26)
+                            .background(Color.accentColor.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .help(activeExpression.displayLabel)
+                    }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(session.activeTitle)
                             .font(.headline)
