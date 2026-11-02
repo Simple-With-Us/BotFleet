@@ -779,6 +779,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                   value={cloudBackend}
                   inherited={cloudBackendInherited(bot)}
                   vpsSupported={canUseVps}
+                  engineName={engine?.displayName}
                   onChange={(backend) => patch({ cloudBackend: backend })}
                 />
                 {!(bot.computers?.length) && cloudBackend === "vps" && (

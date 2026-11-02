@@ -1414,6 +1414,7 @@ export function ComputerPanel({
                 value={cloudBackend}
                 inherited={cloudBackendInherited(bot)}
                 vpsSupported={vpsSupported}
+                engineName={selectedInstance?.displayName}
                 onChange={(backend) => dispatch({ type: "updateBot", botId: bot.id, patch: { cloudBackend: backend } })}
               />
               {!(bot.computers?.length) && cloudBackend === "vps" && (
