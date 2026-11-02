@@ -238,6 +238,48 @@ describe("the Infisical source", () => {
     await expect(infisicalCredentialSource(read, { realm: REALM }).load("../etc")).rejects.toThrow(/not a valid Zulip role/);
   });
 
+  it("marks a refused folder read (401/403/404) and a folder with none of the role's names for the hub's one warn line", async () => {
+    const loadError = (
+      read: (location: ZulipVaultLocation) => Promise<ReadonlyMap<string, string>>,
+    ): Promise<ZulipCredentialError> =>
+      // `load` may answer synchronously, so wrap it before attaching handlers.
+      Promise.resolve(infisicalCredentialSource(read, { realm: REALM }).load("BF-Plumber")).then(
+        () => {
+          throw new Error("expected a refusal");
+        },
+        // oxlint-disable-next-line anti-slop/no-unknown-parameters
+        (e: unknown) => {
+          // SAFETY: a promise rejection is untyped by the language's own
+          // contract; the instanceof below is the parse, and anything else
+          // is rethrown, never read.
+          if (!(e instanceof ZulipCredentialError)) throw e;
+          return e;
+        },
+      );
+    for (const status of [401, 403, 404]) {
+      const refused = await loadError(async () => {
+        throw Object.assign(new Error(`Infisical secrets list failed: HTTP ${status}`), { statusCode: status });
+      });
+      expect(refused.reason).toBe("invalid");
+      expect(refused.vaultUnreadable).toEqual({ where: "/zulip", status });
+    }
+    // transient failures mark nothing: a 500 says nothing about the folder
+    const transient = await loadError(async () => {
+      throw Object.assign(new Error("Infisical secrets list failed: HTTP 500"), { statusCode: 500 });
+    });
+    expect(transient.vaultUnreadable).toBeUndefined();
+    const down = await loadError(async () => {
+      throw new Error("down");
+    });
+    expect(down.vaultUnreadable).toBeUndefined();
+    // none of the role's expected names: marked; one of two present: a
+    // partial setup the message already names, so not marked
+    const { read: empty } = vault({});
+    expect((await loadError(empty)).vaultUnreadable).toEqual({ where: "/zulip" });
+    const { read: partial } = vault({ ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test" });
+    expect((await loadError(partial)).vaultUnreadable).toBeUndefined();
+  });
+
   it("reads the vault once per folder per window, and does not cache a failure", async () => {
     let now = 0;
     let fail = true;
