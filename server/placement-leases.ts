@@ -95,6 +95,8 @@ export type LeaseResult<T> = { ok: true; reply: T } | { ok: false; reason: strin
 
 const TERMINAL: readonly PlacementJobStatus[] = ["completed", "failed", "killed", "lost"];
 
+export const MAX_TAKEOVER_EPOCH_JUMP = 100_000;
+
 export class PlacementLeaseService {
   private current: ControllerEpoch;
   private reconcileState = false;
@@ -290,7 +292,7 @@ export class PlacementLeaseService {
       job.command === message.command &&
       job.cwd === message.cwd &&
       job.timeoutMs === message.timeoutMs;
-    if (job.status === "dispatching" || job.status === "running") {
+    if (job.status === "dispatching" || job.status === "running" || job.status === "worker-unreachable") {
       if (job.leaseId === lease.leaseId && job.host === lease.host && samePayload) {
         return { ok: true, reply: { accepted: true, leaseId: lease.leaseId, ...this.current } };
       }
@@ -363,10 +365,11 @@ export class PlacementLeaseService {
     for (const job of this.jobs.values()) {
       if (!TERMINAL.includes(job.status)) {
         activeCount += 1;
+        break;
       }
     }
     if (activeCount > 0) {
-      return refuse(`Finish or stop ${activeCount} active job${activeCount === 1 ? "" : "s"} before releasing the controller`);
+      return refuse("Settle all active jobs with terminal reports before releasing the controller");
     }
     const previousEpoch = this.current.epoch;
     this.current = { controllerId: message.toControllerId, epoch: previousEpoch + 1 };
@@ -393,8 +396,8 @@ export class PlacementLeaseService {
     if (message.version !== PLACEMENT_WIRE_VERSION) {
       return refuse(`placement version ${message.version} is not spoken here (this host speaks ${PLACEMENT_WIRE_VERSION})`);
     }
-    if (message.epoch <= this.current.epoch) {
-      return refuse(`takeover epoch ${message.epoch} must exceed current epoch ${this.current.epoch} on ${this.current.controllerId}`);
+    if (message.epoch <= this.current.epoch || message.epoch > this.current.epoch + MAX_TAKEOVER_EPOCH_JUMP) {
+      return refuse(`takeover epoch ${message.epoch} must exceed current epoch ${this.current.epoch} on ${this.current.controllerId} within bounds`);
     }
     this.current = { controllerId: message.controllerId, epoch: message.epoch };
     this.reconcileState = message.reconcile;

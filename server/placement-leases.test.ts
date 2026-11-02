@@ -235,6 +235,24 @@ describe("placement lease compare-and-set", () => {
     expect(leases.job("job-d2")?.status).toBe("queued");
   });
 
+  it("accepts idempotent dispatch replay after worker is marked unreachable", () => {
+    const { now, leases } = service();
+    leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
+    leases.enqueue({ ...fence, jobId: "job-unreach", botId: "bot-a", threadId: "t", command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    const claim = leases.claim({ ...fence, hostId: workerId, jobId: "job-unreach" });
+    const lease = claim.ok && claim.reply.accepted ? claim.reply.lease : undefined;
+    expect(lease).toBeDefined();
+    if (!lease) return;
+
+    leases.dispatch({ ...fence, lease, command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    now.value += 60_000;
+    expect(leases.sweepUnreachable()).toEqual(["job-unreach"]);
+    expect(leases.job("job-unreach")?.status).toBe("worker-unreachable");
+
+    const replay = leases.dispatch({ ...fence, lease, command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    expect(replay.ok && replay.reply.accepted).toBe(true);
+  });
+
   it("retains pendingStops across intervening heartbeats while a stopped job is still dispatching", () => {
     const { leases } = service();
     leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
@@ -338,7 +356,7 @@ describe("placement lease compare-and-set", () => {
     const blocked = leases.release({ ...fence, toControllerId: workerId });
     expect(blocked.ok && blocked.reply).toEqual({
       accepted: false,
-      reason: "Finish or stop 1 active job before releasing the controller",
+      reason: "Settle all active jobs with terminal reports before releasing the controller",
       controllerId,
       epoch: 0,
     });
@@ -382,6 +400,17 @@ describe("placement lease compare-and-set", () => {
       reconcile: true,
     });
     expect(sameEpoch.ok && sameEpoch.reply.accepted).toBe(false);
+    expect(leases.controller()).toEqual({ controllerId, epoch: 0 });
+
+    // Epoch jump exceeding bounds is refused.
+    const outOfBounds = leases.takeover({
+      version: PLACEMENT_WIRE_VERSION,
+      controllerId: otherController,
+      epoch: 100_001,
+      reconcile: true,
+    });
+    expect(outOfBounds.ok && outOfBounds.reply.accepted).toBe(false);
+    expect(outOfBounds.ok && outOfBounds.reply.reason).toMatch(/within bounds/);
     expect(leases.controller()).toEqual({ controllerId, epoch: 0 });
 
     // Strictly higher epoch is adopted and surfaces orphaned in-flight jobs.
