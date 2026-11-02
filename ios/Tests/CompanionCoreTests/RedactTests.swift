@@ -20,6 +20,10 @@ final class RedactTests: XCTestCase {
             ("stripe test key", "sk_test_", "sk" + "_test_" + String(repeating: "0", count: 14)),
             ("google oauth access token", "ya29.", "ya29" + "." + "fake"),
             ("gitlab personal access token", "glpat-", "glpat" + "-" + "fake0000"),
+            ("gitlab deploy token", "gldt-", "gldt" + "-" + "fake0000"),
+            ("gitlab runner authentication token", "glrt-", "glrt" + "-" + "fake0000"),
+            ("gitlab runner registration token", "glrtr-", "glrtr" + "-" + "fake0000"),
+            ("slack app-level token", "xapp-", "xapp" + "-" + "fake" + String(repeating: "0", count: 16)),
             ("infisical service token", "st.", "st" + "." + "fake" + String(repeating: "0", count: 19)),
         ]
     }

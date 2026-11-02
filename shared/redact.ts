@@ -58,6 +58,7 @@ const KEY_PREFIXES: RegExp[] = [
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g, // github classic
   /\bgithub_pat_[A-Za-z0-9_]{20,}/g, // github fine-grained
   /\bxox[abposr]-[A-Za-z0-9-]{20,}/g, // slack
+  /\bxapp-[A-Za-z0-9-]{20,}/g, // slack app-level token
   // ── shapes BotFleet itself issues or stores ──
   // The four above are all somebody else's format, recognised because the
   // provider's own prefix is in the value. These are the same kind of thing
@@ -82,6 +83,8 @@ const KEY_PREFIXES: RegExp[] = [
   /\bwhsec_[A-Za-z0-9_-]{8,}/g, // stripe / botfleet webhook signing secret
   /\bya29\.[A-Za-z0-9_-]{4,}/g, // google oauth access token
   /\bglpat-[A-Za-z0-9_-]{8,}/g, // gitlab personal access token
+  /\bgldt-[A-Za-z0-9_-]{8,}/g, // gitlab deploy token
+  /\bglrtr?-[A-Za-z0-9_-]{8,}/g, // gitlab runner authentication token (glrt-, glrtr- via registration token)
   /\bAKIA[0-9A-Z]{16}\b/g, // aws access key id
   /\bAIza[0-9A-Za-z_-]{30,}/g, // google api key
   /\bnpm_[A-Za-z0-9]{20,}/g, // npm

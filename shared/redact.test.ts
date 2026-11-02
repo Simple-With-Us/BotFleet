@@ -24,6 +24,10 @@ const PROVIDER_CASES: Array<{ label: string; prefix: string; sample: string }> =
   { label: "stripe test key", prefix: "sk_test_", sample: ["sk", "_test_", "00000000000000"].join("") },
   { label: "google oauth access token", prefix: "ya29.", sample: ["ya29", ".", "fake"].join("") },
   { label: "gitlab personal access token", prefix: "glpat-", sample: ["glpat", "-", "fake0000"].join("") },
+  { label: "gitlab deploy token", prefix: "gldt-", sample: ["gldt", "-", "fake0000"].join("") },
+  { label: "gitlab runner authentication token", prefix: "glrt-", sample: ["glrt", "-", "fake0000"].join("") },
+  { label: "gitlab runner registration token", prefix: "glrtr-", sample: ["glrtr", "-", "fake0000"].join("") },
+  { label: "slack app-level token", prefix: "xapp-", sample: ["xapp", "-", "fake000000000000000000"].join("") },
   { label: "infisical service token", prefix: "st.", sample: ["st", ".", "fake0000000000000000000"].join("") },
 ];
 
