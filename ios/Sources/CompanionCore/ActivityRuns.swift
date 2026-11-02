@@ -119,21 +119,23 @@ public func transcriptRowEndsRun(
     at index: Int,
     in items: [TranscriptItem],
     liveReply: Bool,
-    liveSpeaker: String?
+    liveSpeaker: String?,
+    liveAt: Date? = nil
 ) -> Bool {
     guard let this = items[index].messages.last,
-          this.kind == .text,
-          !isFoldableActivity(this)
+          isGroupableProse(this)
     else {
         return true
     }
     guard index + 1 < items.count else {
         guard liveReply, this.role == .bot else { return true }
+        if let liveAt, liveAt.timeIntervalSince(this.date) > groupMessageTimeGap {
+            return true
+        }
         return this.from?.name != liveSpeaker
     }
     guard let next = items[index + 1].messages.first,
-          next.kind == .text,
-          !isFoldableActivity(next)
+          isGroupableProse(next)
     else {
         return true
     }

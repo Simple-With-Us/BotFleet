@@ -162,9 +162,36 @@ struct MessageGroupingTests {
         #expect(items.count == 2)
         // First prose run is separated from second prose run by > 60s, so it ends its visual bubble run.
         #expect(transcriptRowEndsRun(at: 0, in: items, liveReply: false, liveSpeaker: nil) == true)
-        // Second prose run is at the end: ends when idle, hands tail to live reply when streaming.
+        // Second prose run is at the end: ends when idle, hands tail to live reply when streaming within gap.
         #expect(transcriptRowEndsRun(at: 1, in: items, liveReply: false, liveSpeaker: nil) == true)
         #expect(transcriptRowEndsRun(at: 1, in: items, liveReply: true, liveSpeaker: nil) == false)
+        // If live reply arrives after > 60s from the last message, the closing bubble keeps its tail.
+        let lateLiveDate = Date(timeIntervalSince1970: (beyondMs + 10) / 1_000 + groupMessageTimeGap + 5)
+        #expect(transcriptRowEndsRun(at: 1, in: items, liveReply: true, liveSpeaker: nil, liveAt: lateLiveDate) == true)
+    }
+
+    @Test("chained messages within pairwise gap stay in one run and comm/card rows break tails")
+    func chainedAdjacencyAndCommTailBreak() {
+        // 0s, 50s, 100s: each adjacent pair is 50s apart (<= 60s), so they form 1 run.
+        let chained = groupMessageRuns([
+            text("c1", at: 0),
+            text("c2", at: 50_000),
+            text("c3", at: 100_000),
+        ])
+        #expect(chained.count == 1)
+        #expect(chained[0].messages.map(\.id) == ["c1", "c2", "c3"])
+
+        // A comm delegation row between two text messages keeps them separate and ends the first bubble's run.
+        var commMsg = text("comm", at: 1_005)
+        commMsg.comm = CommChip(groupId: "g1", withBotId: "b2", withName: "Peer", withColor: "blue")
+        let withComm = groupMessageRuns([
+            text("m1", at: 1_000),
+            commMsg,
+            text("m2", at: 1_010),
+        ])
+        #expect(withComm.count == 3)
+        #expect(transcriptRowEndsRun(at: 0, in: withComm, liveReply: false, liveSpeaker: nil) == true)
+        #expect(transcriptRowEndsRun(at: 1, in: withComm, liveReply: false, liveSpeaker: nil) == true)
     }
 
     // MARK: - Identity and accessibility contract

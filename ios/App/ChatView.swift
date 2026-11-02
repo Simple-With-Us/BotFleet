@@ -1162,6 +1162,12 @@ struct ChatView: View {
     /// Where a run of bubbles gets its tail; `transcriptRowEndsRun` holds
     /// the rule, including the reply being typed counting as the next
     /// message.
+    private static let runTimeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
+
     private func endsRun(at index: Int, in items: [TranscriptItem], live: BottomFollow.LiveRow) -> Bool {
         // In a room the settled reply is attributed to the member holding
         // the turn; in a bot chat it carries no speaker.
@@ -1171,7 +1177,8 @@ struct ChatView: View {
             at: index,
             in: items,
             liveReply: live == .text || live == .reasoning,
-            liveSpeaker: liveSpeaker
+            liveSpeaker: liveSpeaker,
+            liveAt: Date()
         )
     }
 
@@ -1184,9 +1191,7 @@ struct ChatView: View {
 
     private func runRelativeTimeLabel(for message: Message?) -> String? {
         guard let message else { return nil }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .full
-        return formatter.localizedString(
+        return Self.runTimeFormatter.localizedString(
             for: Date(timeIntervalSince1970: message.at / 1_000),
             relativeTo: Date()
         )

@@ -51,7 +51,7 @@ private func isGroupableTool(_ message: Message) -> Bool {
 
 /// True when this message is groupable prose (not a system row, tool chip,
 /// option card, screenshot, or delegation/comm event).
-private func isGroupableProse(_ message: Message) -> Bool {
+internal func isGroupableProse(_ message: Message) -> Bool {
     message.role != .system &&
         message.kind == .text &&
         message.comm == nil &&
@@ -74,7 +74,7 @@ public func groupMessageRuns(_ messages: [Message]) -> [TranscriptItem] {
     }
 
     for message in messages {
-        guard let first = run.first else {
+        guard let previous = run.last else {
             // The first message always opens a run.  Emitting it straight to
             // `items` instead is why text messages could never group: the next
             // one would find `run` empty and start over.
@@ -85,9 +85,9 @@ public func groupMessageRuns(_ messages: [Message]) -> [TranscriptItem] {
         // only a run of other prose.  That keeps a text bubble between two
         // tools ending that run rather than being swallowed by it, while
         // still letting a text turn form a group of its own.
-        let bothTools = isGroupableTool(first) && isGroupableTool(message)
-        let bothText = isGroupableProse(first) && isGroupableProse(message)
-        if (bothTools || bothText) && messagesShareGroup(first, message) {
+        let bothTools = isGroupableTool(previous) && isGroupableTool(message)
+        let bothText = isGroupableProse(previous) && isGroupableProse(message)
+        if (bothTools || bothText) && messagesShareGroup(previous, message) {
             run.append(message)
         } else {
             flush()
