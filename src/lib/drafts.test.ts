@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Attachment } from "./composer-attachments";
 import {
+  botThreadDraftId,
   foldSentDrafts,
   getDraft,
   getDraftAttachments,
@@ -202,5 +203,27 @@ describe("restoreDraft", () => {
     expect(first).not.toHaveBeenCalled();
     expect(second).toHaveBeenCalledTimes(1);
     unregisterSecond();
+  });
+});
+
+describe("botThreadDraftId", () => {
+  it("keeps the legacy per-bot key for the active thread", () => {
+    expect(botThreadDraftId("one", "thread-a", "thread-a")).toBe("bot:one");
+    expect(botThreadDraftId("one", "", "thread-a")).toBe("bot:one");
+  });
+
+  it("gives a browsed non-active thread an independent draft", () => {
+    const store = memoryStore();
+    const activeId = botThreadDraftId("one", "thread-a", "thread-a");
+    const viewedId = botThreadDraftId("one", "thread-b", "thread-a");
+    expect(viewedId).toBe("bot:one:thread-b");
+    setDraft(store, activeId, "for the working thread");
+    setDraft(store, viewedId, "for the retained thread");
+    expect(getDraft(store, activeId)).toBe("for the working thread");
+    expect(getDraft(store, viewedId)).toBe("for the retained thread");
+    // clearing one draft leaves the other untouched
+    setDraft(store, viewedId, "");
+    expect(getDraft(store, viewedId)).toBe("");
+    expect(getDraft(store, activeId)).toBe("for the working thread");
   });
 });

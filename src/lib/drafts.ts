@@ -23,6 +23,15 @@ function read(store: Store, key: string): Values {
   }
 }
 
+/** Draft key for a bot thread on screen.  The active thread keeps the
+ * legacy per-bot key (sidebar drops and the command palette target it,
+ * and existing drafts stay put); a browsed non-active thread gets its
+ * own key so typing while reading it never bleeds into the active
+ * thread's draft. */
+export function botThreadDraftId(botId: string, shownThreadId: string, activeThreadId: string): string {
+  return shownThreadId && shownThreadId !== activeThreadId ? `bot:${botId}:${shownThreadId}` : `bot:${botId}`;
+}
+
 export function getDraft(store: Store, id: string): string {
   const text = read(store, KEY)[id];
   return typeof text === "string" ? text : "";

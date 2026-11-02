@@ -11,7 +11,7 @@ import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
-import { foldSentDrafts, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
+import { botThreadDraftId, foldSentDrafts, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
 import { BotOffComposer } from "./BotOffComposer";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
@@ -234,7 +234,15 @@ function ComposerInner({
     : (bot?.name ?? "The bot");
   // Per-thread draft: switching bots unmounts this component, so both the
   // text and its attachment chips have to outlive it (see lib/drafts).
-  const draftId = group ? `group:${group.id}:${group.threadId}` : `bot:${bot?.id ?? ""}`;
+  // A browsed non-active thread drafts under its own key; the active
+  // thread keeps the legacy per-bot key.
+  const draftId = group
+    ? `group:${group.id}:${group.threadId}`
+    : botThreadDraftId(
+        bot?.id ?? "",
+        bot?.threadId ?? "",
+        state.bots.find((candidate) => candidate.id === bot?.id)?.threadId ?? bot?.threadId ?? "",
+      );
   const [text, setText, attachments, setAttachments] = useComposerDraft(draftId);
   // The composer clears the moment a message goes out; a send the server
   // refuses, or cannot be reached for, hands it all back through this.
