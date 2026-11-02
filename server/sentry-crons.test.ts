@@ -186,6 +186,18 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
     expect(checkIns[1].checkIn).toMatchObject({ status: "error", checkInId: "check-in-id-1" });
   });
 
+  it("calculates duration in seconds when startedAt and finishedAt are present", async () => {
+    const checkIns = await activateFakeSentry();
+    const theRun = run({ startedAt: 10_000, finishedAt: 45_000 });
+    checkInRoutineFinish(theRun, "check-in-id-1", true);
+    expect(checkIns).toHaveLength(1);
+    expect(checkIns[0].checkIn).toMatchObject({
+      status: "ok",
+      checkInId: "check-in-id-1",
+      duration: 35,
+    });
+  });
+
   it("returns undefined when captureCheckIn would fabricate an id on a disabled client", async () => {
     // SAFETY: empty object shell — runtime only calls the members stamped below.
     const sdk = Object.assign({} as FakeSentrySdk, {
@@ -345,11 +357,147 @@ describe("checkInRoutineFinish close delivery", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       expect(isSentryActive()).toBe(false);
-      checkInRoutineFinish(run(), "check-in-id-1", true);
+      let settledDelivered: boolean | undefined;
+      checkInRoutineFinish(run(), "check-in-id-1", true, (delivered) => {
+        settledDelivered = delivered;
+      });
       await awaitPendingCheckInCloses();
       expect(warn).not.toHaveBeenCalled();
+      expect(settledDelivered).toBe(false);
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it("confirms delivery and notifies onSettled when afterEnvelope verifies acceptance", async () => {
+    vi.useFakeTimers();
+    const checkIns: SentryCheckIn[] = [];
+    const listeners: Array<(envelope: unknown) => void> = [];
+
+    const client = {
+      getDsn: () => ({}),
+      getOptions: () => ({ enabled: true }),
+      getTransport: () => ({}),
+      on(event: string, cb: (envelope: unknown) => void) {
+        if (event === "afterEnvelope") listeners.push(cb);
+        return () => {
+          const idx = listeners.indexOf(cb);
+          if (idx !== -1) listeners.splice(idx, 1);
+        };
+      },
+    };
+
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init() {},
+      close() { return Promise.resolve(true); },
+      addIntegration() {},
+      consoleLoggingIntegration() { return { name: "ConsoleLogs" }; },
+      getClient() { return client; },
+      captureCheckIn(checkIn: SentryCheckIn) {
+        checkIns.push(checkIn);
+        if ("checkInId" in checkIn) {
+          queueMicrotask(() => {
+            for (const listener of [...listeners]) {
+              listener([{}, [[{ type: "check_in" }, { check_in_id: checkIn.checkInId }]]]);
+            }
+          });
+        }
+        return "check-in-id-1";
+      },
+      async flush() {
+        await Promise.resolve();
+        return true;
+      },
+    });
+
+    setSentryLoaderForTests(sentryTestLoader(sdk));
+    await applySentryConfig({
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 1,
+      logsEnabled: false,
+      source: "config",
+    });
+
+    let settledDelivered: boolean | undefined;
+    checkInRoutineFinish(run(), "check-in-id-1", true, (delivered) => {
+      settledDelivered = delivered;
+    });
+
+    const settled = awaitPendingCheckInCloses();
+    await vi.advanceTimersByTimeAsync(RETRY_BUDGET_MS);
+    await settled;
+
+    expect(checkIns).toHaveLength(1);
+    expect(settledDelivered).toBe(true);
+  });
+
+  it("retries when flush succeeds but afterEnvelope never fires (transport drop)", async () => {
+    vi.useFakeTimers();
+    const checkIns: SentryCheckIn[] = [];
+    const listeners: Array<(envelope: unknown) => void> = [];
+    let callCount = 0;
+
+    const client = {
+      getDsn: () => ({}),
+      getOptions: () => ({ enabled: true }),
+      getTransport: () => ({}),
+      on(event: string, cb: (envelope: unknown) => void) {
+        if (event === "afterEnvelope") listeners.push(cb);
+        return () => {
+          const idx = listeners.indexOf(cb);
+          if (idx !== -1) listeners.splice(idx, 1);
+        };
+      },
+    };
+
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init() {},
+      close() { return Promise.resolve(true); },
+      addIntegration() {},
+      consoleLoggingIntegration() { return { name: "ConsoleLogs" }; },
+      getClient() { return client; },
+      captureCheckIn(checkIn: SentryCheckIn) {
+        checkIns.push(checkIn);
+        callCount++;
+        // Attempt 1 fails to emit afterEnvelope (transport dropped it);
+        // Attempt 2 succeeds and emits afterEnvelope.
+        if (callCount === 2 && "checkInId" in checkIn) {
+          queueMicrotask(() => {
+            for (const listener of [...listeners]) {
+              listener([{}, [[{ type: "check_in" }, { check_in_id: checkIn.checkInId }]]]);
+            }
+          });
+        }
+        return "check-in-id-1";
+      },
+      async flush() {
+        await Promise.resolve();
+        return true;
+      },
+    });
+
+    setSentryLoaderForTests(sentryTestLoader(sdk));
+    await applySentryConfig({
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 1,
+      logsEnabled: false,
+      source: "config",
+    });
+
+    let settledDelivered: boolean | undefined;
+    checkInRoutineFinish(run(), "check-in-id-1", true, (delivered) => {
+      settledDelivered = delivered;
+    });
+
+    const settled = awaitPendingCheckInCloses();
+    await vi.advanceTimersByTimeAsync(RETRY_BUDGET_MS);
+    await settled;
+
+    expect(checkIns).toHaveLength(2);
+    expect(settledDelivered).toBe(true);
   });
 });

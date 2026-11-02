@@ -107,12 +107,27 @@ const CHECK_IN_CLOSE_RETRY_BACKOFF_MS = [5_000, 30_000, 120_000] as const;
  *  can settle the in-flight work deterministically. */
 const pendingCheckInCloses = new Set<Promise<void>>();
 
+export type CheckInCloseSettledCallback = (delivered: boolean) => void;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     // Unref'd: a routine finishing must not be what holds the harness open.
     const timer = setTimeout(resolve, ms);
     timer.unref?.();
   });
+}
+
+function matchesCheckInEnvelope(envelope: unknown, checkInId: string): boolean {
+  if (!Array.isArray(envelope) || !Array.isArray(envelope[1])) return false;
+  for (const item of envelope[1]) {
+    if (Array.isArray(item) && item[1] && typeof item[1] === "object") {
+      const payload = item[1] as Record<string, unknown>;
+      if (payload.check_in_id === checkInId || payload.checkInId === checkInId) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** Did the transport actually take the close?  `false` from `sdk.flush` means
@@ -129,29 +144,75 @@ async function flushCheckInClose(sdk: SentryNode): Promise<boolean> {
   }
 }
 
-/** Confirm the close left the process, and re-send it while it has not.
+/** Confirm the close was accepted by Sentry, and re-send it while it has not.
  *
  *  `captureCheckIn` only enqueues: it returns before the envelope reaches
- *  Sentry, so on a saturated host (the failure this exists for was a run that
- *  finished while the box was at load 19-89 per core with 91-94% swap) the
- *  buffered event is simply dropped at process exit and the monitor stays
- *  `in_progress` until the cron check times it out as an error.  Re-sending
- *  the same `checkInId` is idempotent on Sentry's side, so a close that
- *  actually landed is harmless to repeat. */
-async function deliverCheckInClose(sdk: SentryNode, checkIn: CheckIn, runId: string): Promise<void> {
+ *  Sentry.  `sdk.flush()` alone only confirms that internal queue promises
+ *  settled; if the transport encountered a network drop or rejected the
+ *  send, the envelope is lost while flush still returns true.  We therefore
+ *  hook the client's `afterEnvelope` event (when available) to confirm that
+ *  the envelope containing this check-in was actually accepted by the
+ *  transport.
+ *
+ *  Re-sending the same `checkInId` is idempotent on Sentry's side, so a close
+ *  that actually landed is harmless to repeat. */
+async function deliverCheckInClose(
+  sdk: SentryNode,
+  checkIn: CheckIn,
+  runId: string,
+  onSettled?: CheckInCloseSettledCallback,
+  initialAttempt?: { state: { confirmed: boolean }; unhook?: () => void },
+): Promise<void> {
+  const targetId = "checkInId" in checkIn && typeof checkIn.checkInId === "string" ? checkIn.checkInId : undefined;
+
   for (let attempt = 0; ; attempt += 1) {
-    if (await flushCheckInClose(sdk)) return;
+    let delivered = false;
+    if (attempt === 0 && initialAttempt) {
+      const flushed = await flushCheckInClose(sdk);
+      initialAttempt.unhook?.();
+      delivered = initialAttempt.unhook !== undefined ? (initialAttempt.state.confirmed && flushed) : flushed;
+    } else {
+      const attemptState = { confirmed: false };
+      let unhook: (() => void) | undefined;
+      try {
+        const client = typeof sdk.getClient === "function" ? sdk.getClient() : undefined;
+        if (client && typeof (client as { on?: unknown }).on === "function" && targetId) {
+          unhook = (client as { on: (event: string, cb: (env: unknown) => void) => () => void }).on(
+            "afterEnvelope",
+            (envelope: unknown) => {
+              if (matchesCheckInEnvelope(envelope, targetId)) {
+                attemptState.confirmed = true;
+              }
+            },
+          );
+        }
+      } catch {
+        /* fallback to flush if client hooking throws */
+      }
+
+      try {
+        sdk.captureCheckIn(checkIn);
+      } catch {
+        /* the flush below is the arbiter; a throw here is not the end of it */
+      }
+
+      const flushed = await flushCheckInClose(sdk);
+      unhook?.();
+      delivered = unhook !== undefined ? (attemptState.confirmed && flushed) : flushed;
+    }
+
+    if (delivered) {
+      onSettled?.(true);
+      return;
+    }
+
     const backoff = CHECK_IN_CLOSE_RETRY_BACKOFF_MS[attempt];
     if (backoff === undefined) {
       console.warn(`[sentry-crons] check-in close failed slug=${checkIn.monitorSlug} run=${runId}`);
+      onSettled?.(false);
       return;
     }
     await sleep(backoff);
-    try {
-      sdk.captureCheckIn(checkIn);
-    } catch {
-      /* the flush below is the arbiter; a throw here is not the end of it */
-    }
   }
 }
 
@@ -160,22 +221,59 @@ async function deliverCheckInClose(sdk: SentryNode, checkIn: CheckIn, runId: str
  *  monitor).  Returns as soon as the close is queued — confirming it left
  *  the process is detached, so a slow or dead Sentry cannot delay or fail the
  *  run that just finished. */
-export function checkInRoutineFinish(run: RoutineRun, checkInId: string, ok: boolean): void {
-  if (!isSentryActive()) return;
+export function checkInRoutineFinish(
+  run: RoutineRun,
+  checkInId: string,
+  ok: boolean,
+  onSettled?: CheckInCloseSettledCallback,
+): void {
+  if (!isSentryActive()) {
+    onSettled?.(false);
+    return;
+  }
   const sdk = getSentry();
-  if (!sdk) return;
+  if (!sdk) {
+    onSettled?.(false);
+    return;
+  }
+  const duration =
+    run.finishedAt && run.startedAt && run.finishedAt >= run.startedAt
+      ? Math.round((run.finishedAt - run.startedAt) / 1000)
+      : undefined;
   const checkIn: CheckIn = {
     monitorSlug: routineMonitorSlug(run),
     status: ok ? "ok" : "error",
     checkInId,
+    ...(duration !== undefined ? { duration } : {}),
   };
+
+  const initialAttemptState = { confirmed: false };
+  let unhook: (() => void) | undefined;
+  try {
+    const client = typeof sdk.getClient === "function" ? sdk.getClient() : undefined;
+    if (client && typeof (client as { on?: unknown }).on === "function") {
+      unhook = (client as { on: (event: string, cb: (env: unknown) => void) => () => void }).on(
+        "afterEnvelope",
+        (envelope: unknown) => {
+          if (matchesCheckInEnvelope(envelope, checkInId)) {
+            initialAttemptState.confirmed = true;
+          }
+        },
+      );
+    }
+  } catch {
+    /* fallback to flush if client hooking throws */
+  }
+
   try {
     sdk.captureCheckIn(checkIn);
   } catch {
     /* check-in reporting must never take down a run */
+    unhook?.();
+    onSettled?.(false);
     return;
   }
-  const delivery = deliverCheckInClose(sdk, checkIn, run.id);
+  const delivery = deliverCheckInClose(sdk, checkIn, run.id, onSettled, { state: initialAttemptState, unhook });
   pendingCheckInCloses.add(delivery);
   void delivery.finally(() => pendingCheckInCloses.delete(delivery));
 }
