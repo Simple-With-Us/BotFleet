@@ -42,13 +42,28 @@ export function nativeArtifactNames(version) {
   };
 }
 
-/** The Sparkle build number for 1.0.<commit_count> is the count itself. */
-export function buildNumberFor(version) {
+/**
+ * The Sparkle build number a native release carries.
+ *
+ * The shared release policy (owner, Oct 29 2026) writes the build as the
+ * commit's Central merge stamp, so the build arrives as its own value and is
+ * never derived from the version string.  The 1.0.<commit_count> derivation
+ * stays for the old scheme, so a release still stamped that way keeps
+ * working.
+ */
+export function buildNumberFor(version, build) {
+  if (build !== undefined && build !== null && build !== "") {
+    const value = String(build).trim();
+    if (!/^[0-9]+$/.test(value)) {
+      throw new Error(`native build ${build} is not a build number`);
+    }
+    return value;
+  }
   const match = /^1\.0\.(\d+)$/.exec(version);
   if (!match) {
     throw new Error(
       `native version ${version} is not 1.0.<commit_count>; ` +
-        `stamp it with scripts/stamp-commit-version.mjs instead of inventing one`,
+        `pass the planned build, or stamp it with scripts/stamp-commit-version.mjs instead of inventing one`,
     );
   }
   return match[1];
@@ -70,12 +85,17 @@ function escapeXml(value) {
  */
 export function buildAppcast({
   version,
+  build: explicitBuild,
   feedBaseUrl = DEFAULT_FEED_BASE_URL,
   pubDate = new Date(),
   minimumSystemVersion = "14.0",
   items,
 } = {}) {
-  const build = buildNumberFor(version);
+  // The build arrives as its own value under the shared release policy, so it
+  // is threaded in here too: deriving it from the version string alone cannot
+  // answer 0.1.0, and a release that cannot name its own build would fail
+  // here instead of publishing a feed.
+  const build = buildNumberFor(version, explicitBuild);
   if (!Array.isArray(items) || items.length === 0) {
     throw new Error("appcast needs at least one item");
   }
@@ -145,6 +165,7 @@ export function readEdSignature(releaseDir, zipName) {
 export function generateAppcast({
   releaseDir,
   version,
+  build,
   tag = `v${version}`,
   feedBaseUrl = DEFAULT_FEED_BASE_URL,
   pubDate,
@@ -166,11 +187,12 @@ export function generateAppcast({
   const edSignature = readEdSignature(releaseDir, zip);
   const appcast = buildAppcast({
     version,
+    build,
     feedBaseUrl,
     pubDate,
     items: [
       {
-        build: buildNumberFor(version),
+        build: buildNumberFor(version, build),
         shortVersion: version,
         url: `${feedBaseUrl}/${tag}/${zip}`,
         length: statSync(zipPath).size,
@@ -200,13 +222,21 @@ function isEntryModule() {
 }
 
 if (isEntryModule()) {
-  const [, , releaseDir, version, tag] = process.argv;
+  const [, , releaseDir, version, tag, ...rest] = process.argv;
   if (!releaseDir || !version) {
     throw new Error(
-      "usage: node scripts/native-appcast.mjs <release-dir> <version> [tag]",
+      "usage: node scripts/native-appcast.mjs <release-dir> <version> [tag] [--build N]",
     );
   }
-  generateAppcast({ releaseDir, version, tag });
+  const buildIndex = rest.indexOf("--build");
+  const build = buildIndex === -1 ? undefined : rest[buildIndex + 1];
+  // A --build with no value fails here, on the flag itself.  Falling through
+  // would derive the build from the version string and report the wrong
+  // failure, which reads as a version problem when it is a typo.
+  if (buildIndex !== -1 && (build === undefined || build === "")) {
+    throw new Error("--build requires a build number");
+  }
+  generateAppcast({ releaseDir, version, build, tag });
 }
 
 export { root as _rootForTests };
