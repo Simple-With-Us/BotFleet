@@ -407,8 +407,22 @@ describe("the retired launcher spelling", () => {
   });
 
   it("refuses it as an interpreter's script", () => {
-    const decision = evaluateCommand(policy, `${PYTHON} /Users/jay/apps/fleet/agent-sync dm`);
+    const scriptPolicy: ToolPolicy = {
+      ...policy,
+      commands: [{ argv0: PYTHON, sub: ["/Users/jay/apps/fleet/agent-sync"], flags: {}, args: [], positionals: 0 }],
+    };
+    const decision = evaluateCommand(scriptPolicy, `${PYTHON} /Users/jay/apps/fleet/agent-sync dm`);
     if (decision.ok) throw new Error("allowed the retired spelling as a script");
+    expect(decision.reason).toContain("retired");
+  });
+
+  it("refuses it as the script after an interpreter's flag", () => {
+    const flagScriptPolicy: ToolPolicy = {
+      ...policy,
+      commands: [{ argv0: PYTHON, sub: ["-u", "/Users/jay/apps/fleet/agent-sync"], flags: {}, args: [], positionals: 0 }],
+    };
+    const decision = evaluateCommand(flagScriptPolicy, `${PYTHON} -u /Users/jay/apps/fleet/agent-sync`);
+    if (decision.ok) throw new Error("allowed the retired spelling after an interpreter flag");
     expect(decision.reason).toContain("retired");
   });
 
@@ -422,13 +436,22 @@ describe("the retired launcher spelling", () => {
     expect(decision.reason).toContain("retired");
   });
 
-  it("still runs a data word that carries the retired name, so the retired file can be removed", () => {
+  it("still runs tail on a file that carries the retired name", () => {
     const tailPolicy: ToolPolicy = {
       ...policy,
       commands: [{ argv0: "/usr/bin/tail", sub: [], flags: {}, args: [], positionals: 1 }],
     };
     const decision = evaluateCommand(tailPolicy, "/usr/bin/tail /tmp/agent-sync");
-    if (!decision.ok) throw new Error(`refused a data word named agent-sync: ${decision.reason}`);
+    if (!decision.ok) throw new Error(`refused tail on a file named agent-sync: ${decision.reason}`);
+  });
+
+  it("still runs rm on the retired launcher itself, so it can be deleted", () => {
+    const rmPolicy: ToolPolicy = {
+      ...policy,
+      commands: [{ argv0: "/bin/rm", sub: [], flags: {}, args: [], positionals: 1 }],
+    };
+    const decision = evaluateCommand(rmPolicy, "/bin/rm /Users/jay/.local/bin/agent-sync");
+    if (!decision.ok) throw new Error(`refused rm of the retired launcher: ${decision.reason}`);
   });
 
   it("does not touch a word that only starts with the name", () => {

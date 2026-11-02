@@ -433,16 +433,18 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
     const problem = chatCliProblem(argv.slice(chatCliAt));
     if (problem) return { ok: false, reason: problem, name };
   }
-  // The retired launcher spelling is refused by name in the two positions
-  //  that can launch it - the program itself, or the script an interpreter
-  //  runs - even if a stored policy from before the rename still lists it:
-  //  it is not an alias.  Data words stay untouched, so a file operand that
-  //  carries the retired name (`rm /Users/jay/.local/bin/agent-sync`, when
-  //  deleting it) still runs.
-  if (namesRetiredChatCli(argv0) || (argv[1] !== undefined && namesRetiredChatCli(argv[1]))) {
+  // The retired launcher spelling is refused by name, even if a stored
+  //  policy from before the rename still lists it:  it is not an alias.
+  //  Only positions that can launch it are scanned:  the program itself,
+  //  and the fixed words its policy entry declares after it (a verb, or
+  //  the script an interpreter runs) - the same scope the save-time check
+  //  validates.  Data operands stay untouched, so a file that carries the
+  //  retired name (`rm /Users/jay/.local/bin/agent-sync`, when deleting
+  //  the retired launcher) still runs.
+  const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
+  if (namesRetiredChatCli(argv0) || candidates.some((entry) => argv.slice(1, 1 + entry.sub.length).some(namesRetiredChatCli))) {
     return { ok: false, reason: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}`, name };
   }
-  const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
   if (candidates.length === 0) return { ok: false, reason: "the program is not on the allowlist", name };
   let lastProblem = "it matches no allowlist entry";
   for (const entry of candidates) {
