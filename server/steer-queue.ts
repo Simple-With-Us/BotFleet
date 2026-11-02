@@ -70,9 +70,12 @@ const queues = new Map<string, QueueEntry>(); // threadId → waiting sends
 export function queueSteeredMessage(
   bot: BotRecord,
   text: string,
-  options: { prompt?: string; replyToId?: string; linqChatId?: string } = {},
+  options: { prompt?: string; replyToId?: string; linqChatId?: string; threadId?: string; automationSource?: Message["automationSource"] } = {},
 ): { id: string } {
-  const threadId = bot.threadId;
+  // A per-context send holds its words against its own thread, not the
+  // active one: the drain already runs one batch per thread per pass, so a
+  // queued side thread waits its turn without touching bot.threadId.
+  const threadId = options.threadId ?? bot.threadId;
   const id = newId();
   const entry = queues.get(threadId) ?? { botId: bot.id, items: [] };
   entry.items.push({
@@ -326,6 +329,33 @@ export function dropSteeredMessages(threadId: string): number {
   if (!entry) return 0;
   queues.delete(threadId);
   return entry.items.length;
+}
+
+/** The ids of one bot's waiting sends, across every thread it owns, in no
+ *  particular order.  The caller reads them before `dropSteeredMessagesForBot`
+ *  so it can forget what it keyed on them (a relayed message's unattended mark). */
+export function queuedMessageIdsForBot(botId: string): string[] {
+  const ids: string[] = [];
+  for (const entry of queues.values()) {
+    if (entry.botId !== botId) continue;
+    for (const item of entry.items) ids.push(item.messageId);
+  }
+  return ids;
+}
+
+/** Drop every send waiting behind every thread one bot owns, so none of them
+ *  drains.  Per-context sends queue against their own thread, so a typed /stop
+ *  on the active thread must reach the side threads too — stopping everything
+ *  is the whole point of the typed command.  Returns how many were dropped. */
+export function dropSteeredMessagesForBot(botId: string): number {
+  let dropped = 0;
+  // deleting only the entry being visited is safe under Map iteration
+  for (const [threadId, entry] of queues) {
+    if (entry.botId !== botId) continue;
+    queues.delete(threadId);
+    dropped += entry.items.length;
+  }
+  return dropped;
 }
 
 /** Test helper: how many messages remain queued for a thread. */

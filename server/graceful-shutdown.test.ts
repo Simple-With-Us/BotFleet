@@ -27,6 +27,7 @@ function fixture(options: {
   /** What the work in flight does while the stop waits for it. */
   settle?: (state: { active: number }) => void;
 } = {}) {
+  // SAFETY: the fake clock starts with no parked threads; the empty array is the known initial value.
   const state: FixtureState = {
     now: 0,
     active: options.active ?? 0,

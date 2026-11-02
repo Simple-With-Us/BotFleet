@@ -415,13 +415,13 @@ import {
   dropJobNotices,
   dropJobNoticesForBot,
   dropQueuedForOffBot,
-  dropSteeredMessages,
+  dropSteeredMessagesForBot,
   pendingJobNotices,
   queueJobNotice,
   queueSteeredMessage,
   queuedMessageCount,
   queuedMessageCountFor,
-  queuedMessageIds,
+  queuedMessageIdsForBot,
   restoreJobNotices,
   drainEveryReadyBatch,
   restoreSteeredEntries,
@@ -1280,6 +1280,18 @@ const PLUGIN_SETTINGS_BODY = z.object({ settings: z.record(z.string(), z.json())
 const PLUGIN_SLUG = z.string().min(1).max(64).regex(/^[\w][\w-]*$/);
 const PLUGIN_PATH_PARAMS = z.tuple([PLUGIN_SLUG]);
 const PLUGIN_ITEM_PATH_PARAMS = z.tuple([PLUGIN_SLUG, PLUGIN_SLUG]);
+
+// Request schema for the explicit per-context send route.  Bodies are
+// untrusted input; the handler only ever sees parsed values.
+const PER_CONTEXT_SEND_BODY = z.object({
+  text: z.unknown(),
+  recording: z.unknown().optional(),
+  idempotencyKey: z.unknown().optional(),
+  replyToId: z.unknown().optional(),
+  source: z.unknown().optional(),
+  senderVerified: z.unknown().optional(),
+  chatId: z.unknown().optional(),
+}).strip();
 
 pluginsModule.initPluginRuntime({
   listBots: () => store.bots.map((bot) => ({
@@ -4001,11 +4013,13 @@ function commandsFor(bot: BotRecord, surface: CommandSurface) {
   });
 }
 
-/** Drop every message waiting behind the bot's running turn, and forget the
- * unattended mark a relayed one carried. */
+/** Drop every message waiting behind the bot's running turn, on every thread
+ * it owns, and forget the unattended mark a relayed one carried.  Per-context
+ * sends queue against their own thread, so clearing only the active thread
+ * would let a side thread's queue drain and run after a typed /stop. */
 function dropQueuedMessages(bot: BotRecord): number {
-  for (const queueId of queuedMessageIds(bot.threadId)) relayQueuedMessageIds.delete(queueId);
-  const dropped = dropSteeredMessages(bot.threadId);
+  for (const queueId of queuedMessageIdsForBot(bot.id)) relayQueuedMessageIds.delete(queueId);
+  const dropped = dropSteeredMessagesForBot(bot.id);
   if (dropped > 0) {
     const fresh = store.bot(bot.id);
     if (fresh) broadcast({ kind: "bot", bot: botWithThreadView(fresh) });
@@ -16504,12 +16518,117 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, reply.status, reply.body);
     }
 
+    // Explicit per-context send (Slice 0 item 5): a composer pinned on a
+    // non-active thread posts here.  The message either queues for when that
+    // context can run, or dispatches there when the bot is idle — without
+    // ever re-pointing bot.threadId, so the parent's in-flight turn and
+    // default automation targeting are untouched.  The active thread keeps
+    // its own endpoint byte-identical; posting the active thread id here is
+    // a 400, not a second way to do the same send.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/threads\/([\w-]+)\/messages$/);
+    if (m && method === "POST") {
+      const parsedBody = PER_CONTEXT_SEND_BODY.safeParse(await readBody(req));
+      if (!parsedBody.success) return json(res, 400, { error: "body must be a JSON object" });
+      const body = parsedBody.data;
+      const rawText = String(body.text ?? "").trim();
+      if (!rawText) return json(res, 400, { error: "text required" });
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      if (botIsOff(bot)) return json(res, 409, { error: BOT_OFF_REFUSAL, code: BOT_OFF_CODE });
+      const targetThreadId = m[2];
+      const ownedThreads = [bot.threadId, ...(bot.tasks ?? []).map((task) => task.threadId)];
+      if (!ownedThreads.includes(targetThreadId)) return json(res, 404, { error: "no such thread for this bot" });
+      if (targetThreadId === bot.threadId) {
+        return json(res, 400, { error: "this is the active thread — post to /api/bots/:id/messages instead" });
+      }
+      const recording = body.recording === undefined ? undefined : incomingRecording(body.recording) ?? undefined;
+      if (body.recording !== undefined && !recording) return json(res, 400, { error: "recording must be a saved WAV attachment" });
+      const idempotencyKey = idempotencyKeyFrom(body.idempotencyKey);
+      if (idempotencyKey === null) return json(res, 400, { error: IDEMPOTENCY_KEY_ERROR });
+      const scopedIdempotencyKey = idempotencyKey && `bot:${bot.id}:${targetThreadId}:${idempotencyKey}`;
+      const userAgent = Array.isArray(req.headers["user-agent"]) ? req.headers["user-agent"][0] : req.headers["user-agent"] ?? "unknown";
+      const origin = req.headers.origin ?? "direct";
+      const fromImessage = isImessageInboundSource(body.source, userAgent);
+      if (fromImessage) {
+        const transport = loadConfig().botDefaults?.imessagePerBot?.[bot.id] ?? "mac-relay";
+        if (transport !== "mac-relay") {
+          console.warn(`[inbound-message] rejecting Mac-relay post for bot ${bot.name} (${bot.id}): imessagePerBot=${transport}`);
+          return json(res, 403, { error: "imessage_transport_disabled", transport });
+        }
+      }
+      const fromLinq = body.source === "linq";
+      const chatIdParsed = z.string().trim().min(1).max(512).safeParse(body.chatId);
+      const linqChatId = fromLinq ? (chatIdParsed.success ? chatIdParsed.data : undefined) : undefined;
+      if (fromLinq) {
+        const transport = loadConfig().botDefaults?.imessagePerBot?.[bot.id];
+        if (transport !== "linq") {
+          console.warn(`[inbound-message] rejecting Linq post for bot ${bot.name} (${bot.id}): imessagePerBot=${transport ?? "unset"}`);
+          return json(res, 403, { error: "imessage_transport_disabled", transport: transport ?? "off" });
+        }
+        if (!linqChatId) return json(res, 400, { error: "chatId required for linq source" });
+      }
+      const messagingCommand =
+        fromImessage || (fromLinq && body.senderVerified === true) ? messagingCommandOf(rawText) : null;
+      if (messagingCommand) {
+        const commandReply = await replyOnce(scopedIdempotencyKey, () =>
+          runMessagingCommand(bot, messagingCommand, fromLinq ? "linq" : "imessage", linqChatId),
+        );
+        return json(res, commandReply.status, commandReply.body);
+      }
+      const text = fromImessage ? wrapImessageInbound(rawText) : rawText;
+      console.log(`[inbound-message] bot=${bot.name} (${bot.id}) thread=${targetThreadId} origin=${origin} ua=${userAgent} imessage=${fromImessage} len=${text.length}`);
+      const recentBotMessages = store.messagesFor(targetThreadId).slice(-5).filter((msg) => msg.role === "bot" && msg.text && !msg.command);
+      const isSelfEcho = recentBotMessages.some((msg) => {
+        const botText = outboundImessageText(msg.text ?? "") ?? msg.text?.trim() ?? "";
+        return botText === rawText || (rawText.length > 50 && botText.includes(rawText));
+      });
+      if (isSelfEcho) {
+        console.warn(`[inbound-message] DROPPING duplicate self-echo for bot ${bot.name} (${bot.id})`);
+        return json(res, 200, { ok: true, ignored: "self_echo" });
+      }
+      const replyTo = resolveReplyTarget(targetThreadId, body.replyToId);
+      const relaySourced = fromImessage || fromLinq;
+      const deliver = async (): Promise<RouteReply> => {
+        if (recording && bot.busy) return { status: 409, body: { error: "wait for the current turn before sending a recording" } };
+        const holdForUpdate = !bot.busy && !recording && updateDrain.active;
+        if (bot.busy || holdForUpdate) {
+          const queued = queueSteeredMessage(bot, text, {
+            threadId: targetThreadId,
+            replyToId: replyTo?.id,
+            prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
+            linqChatId,
+            automationSource: fromImessage ? "imessage" : undefined,
+          });
+          if (relaySourced) relayQueuedMessageIds.add(queued.id);
+          return { status: 202, body: { ok: true, queued: true, queueId: queued.id, threadId: targetThreadId } };
+        }
+        await startTurn(bot.id, text, {
+          threadId: targetThreadId,
+          replyTo,
+          linqChatId,
+          recording,
+          automationSource: fromImessage ? "imessage" : undefined,
+          unattended: relaySourced || undefined,
+          // person-initiated: a person targeted this thread on purpose,
+          // which is how a stopped bot is meant to be woken — `interrupt`
+          // stops automation, not the owner.
+          personInitiated: true,
+        });
+        return { status: 202, body: { ok: true } };
+      };
+      const reply = await replyOnce(scopedIdempotencyKey, deliver);
+      return json(res, reply.status, reply.body);
+    }
+
     m = path.match(/^\/api\/bots\/([\w-]+)\/queue\/([\w-]+)$/);
     if (m && method === "DELETE") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       const queueId = m[2];
-      if (!cancelSteeredMessage(bot.threadId, queueId)) {
+      // A per-context send queues against its own thread, so the active
+      // thread's queue is not the only place a queued id can live.
+      const queuedThreads = [bot.threadId, ...(bot.tasks ?? []).map((task) => task.threadId)];
+      if (!queuedThreads.some((threadId) => cancelSteeredMessage(threadId, queueId))) {
         return json(res, 404, { error: "no such queued message" });
       }
       // A cancelled relayed message must not leave a mark behind: the next

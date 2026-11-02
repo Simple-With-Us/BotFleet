@@ -323,9 +323,13 @@ export function isImessageConversation(origin: CommandOrigin, currentTitle: stri
 }
 
 async function runStop(ctx: CommandContext): Promise<CommandOutcome> {
-  const stopped = await ctx.stop();
-  // typed /stop means stop everything: queued corrections go too
+  // Drop first, then stop: the interrupt's settle drain would otherwise pick
+  // the queue up and run it before the clear below ever sees it — a typed
+  // /stop must leave nothing behind on any thread, including side threads
+  // holding per-context sends.
   const clearedQueued = ctx.dropQueued();
+  // typed /stop means stop everything: queued corrections go too
+  const stopped = await ctx.stop();
   const effects: CommandEffects = {
     stopped: stopped.stopped,
     clearedQueued,
