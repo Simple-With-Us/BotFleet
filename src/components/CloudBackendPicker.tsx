@@ -37,7 +37,7 @@ export function CloudBackendPicker({
             <button
               key={backend}
               disabled={disabled}
-              title={disabled ? "Self-hosted VPS requires Claude or a coding bot" : undefined}
+              title={disabled ? "Self-hosted VPS requires Claude or an ACP engine" : undefined}
               onClick={() => onChange(backend)}
               className={cn(
                 "flex-1 py-1.5 text-[12px]",
