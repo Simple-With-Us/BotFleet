@@ -80,6 +80,56 @@ test("the sidecar runs from its own store, not the harness's", () => {
   );
 });
 
+function runStop(home) {
+  return spawnSync("bash", [SCRIPT, "--stop"], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: home },
+  });
+}
+
+function claimPath(home) {
+  return join(home, ".botfleet-companion", "runtime", "supervisor.json");
+}
+
+test("--stop removes the published runtime claim and does not start", () => {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-stop-"));
+  const home = join(dir, "home");
+  const claim = claimPath(home);
+  mkdirSync(dirname(claim), { recursive: true });
+  writeFileSync(claim, "{\"version\":1}\n");
+
+  const result = runStop(home);
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  assert.equal(existsSync(claim), false, "--stop must remove ~/.botfleet-companion/runtime/supervisor.json");
+  assert.match(result.stdout, /removed the published runtime claim/);
+});
+
+test("--stop is a no-op when no runtime claim is published", () => {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-stop-absent-"));
+  const home = join(dir, "home");
+
+  const first = runStop(home);
+  const second = runStop(home);
+  assert.equal(first.status, 0, `stderr: ${first.stderr}`);
+  assert.equal(second.status, 0, `stderr: ${second.stderr}`);
+  assert.equal(existsSync(claimPath(home)), false);
+});
+
+test("--stop leaves a symlink at the claim path alone", () => {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-stop-symlink-"));
+  const home = join(dir, "home");
+  const claim = claimPath(home);
+  const target = join(dir, "elsewhere.json");
+  mkdirSync(dirname(claim), { recursive: true });
+  writeFileSync(target, "not a claim\n");
+  symlinkSync(target, claim);
+
+  const result = runStop(home);
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  assert.ok(existsSync(claim), "a symlink is not the regular file the supervisor publishes");
+  assert.ok(existsSync(target), "--stop must never follow the claim path to another file");
+});
+
 test("the sidecar still runs from the legacy checkout path when it has no store", () => {
   const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-legacy-"));
   const legacy = join(dir, "botfleet-companion");

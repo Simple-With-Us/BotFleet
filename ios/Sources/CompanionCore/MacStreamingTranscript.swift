@@ -37,6 +37,12 @@ public struct MacRenderedMarkdownBlock: Equatable, Identifiable, Sendable {
             self.codePage = nil
             let approxLines = max(1, (text.count + 69) / 70)
             self.estimatedHeight = Double(approxLines) * 20.0 + 12.0
+        case .table(_, _, let rows):
+            self.codePage = nil
+            // The renderers show at most 200 rows; estimate what is drawn,
+            // not what arrived, or one huge table reserves a screenful of
+            // spacer it never fills.
+            self.estimatedHeight = Double(min(rows.count, 200) + 1) * 24.0 + 20.0
         case .rule:
             self.codePage = nil
             self.estimatedHeight = 16.0

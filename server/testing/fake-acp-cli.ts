@@ -218,8 +218,16 @@ const acpModels = (process.env.FAKE_ACP_SESSION_MODELS ?? "")
     const [modelId, name] = entry.split("|");
     return name ? { modelId, name } : { modelId };
   });
-const sessionModels = () =>
-  acpModels.length ? { currentModelId: acpModels[0].modelId, availableModels: acpModels } : null;
+const sessionModels = (currentModelId?: string) =>
+  acpModels.length
+    ? {
+        currentModelId:
+          currentModelId && acpModels.some((m) => m.modelId === currentModelId)
+            ? currentModelId
+            : acpModels[0].modelId,
+        availableModels: acpModels,
+      }
+    : null;
 
 const argv = process.argv.slice(2);
 const dumpEnv = Object.fromEntries(
@@ -381,6 +389,19 @@ if (process.env.FAKE_ACP_DUMP) {
     }
   }
 }
+
+// A resumed session keeps the model its last accepted set_model pinned, so
+// session/load reports that as current; session/new starts at the first
+// advertised model instead.
+const lastAcceptedModelId = (): string | undefined => {
+  for (let i = configCalls.length - 1; i >= 0; i--) {
+    const call = configCalls[i]!;
+    if (call.method !== "session/set_model") continue;
+    const parsed = z.object({ modelId: z.string() }).safeParse(call.params);
+    if (parsed.success) return parsed.data.modelId;
+  }
+  return undefined;
+};
 
 // pending server→client permission request id → resolver
 let pendingPermissionId: number | null = null;
@@ -650,7 +671,7 @@ function handle(rawMsg: unknown, resumed = false) {
         break;
       }
       const opts = configOptions();
-      const mdls = sessionModels();
+      const mdls = sessionModels(lastAcceptedModelId());
       result(msg.id, { ...(opts ? { configOptions: opts } : {}), ...(mdls ? { models: mdls } : {}) });
       announceCommands(process.env.FAKE_ACP_COMMANDS_REPLAY === "1");
       break;

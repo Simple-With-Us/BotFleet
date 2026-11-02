@@ -1154,6 +1154,11 @@ export class RoutineManager {
     return { ...run };
   }
 
+  /** The status of one run, or undefined once it has been pruned. */
+  runStatus(runId: string): RoutineRunStatus | undefined {
+    return this.runs.find((run) => run.id === runId)?.status;
+  }
+
   activeWebhookRunCount(webhookId: string): number {
     return this.runs.filter(
       (run) => run.webhookId === webhookId && ["queued", "running", "waiting"].includes(run.status),

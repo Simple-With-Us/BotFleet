@@ -789,6 +789,11 @@ describe("harness HTTP API", () => {
     // Control app can name it instead of reporting a bare total.  Each entry
     // is a count and a plain label, and nothing else.
     z.array(z.object({ count: z.number(), label: z.string() }).strict()).parse(response.body.blockingWork);
+    // This fixture spawns the server from source, where no release stamp
+    // exists, so build is null: the legacy unknown-order case the handshake
+    // must keep accepting.  A packaged release bundle stamps the planner's
+    // non-null ordered build instead (BF-2588), covered by the
+    // runtime-identity and stamp-commit-version node tests.
     expect(response.body.serverBuild).toMatchObject({ version: expect.any(String), build: null });
     expect(Object.keys(response.body).sort()).toEqual(["activeBotCount", "blockingWork", "localVms", "persistOnExit", "serverBuild"]);
   });

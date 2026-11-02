@@ -100,6 +100,10 @@ The Mac has to be allowed to reach the server's HTTPS port (`8799`) in the tailn
 - `config/server.env`: the harness launch parameters (`OMB_*`).  These still live on the host and are tracked as a follow-up to move them into Infisical.
 - The engine CLIs' own login files under the service user's home.  Those belong to the CLIs, not to BotFleet.
 
+### V8 Heap Size
+
+`config/server.env` may set `BF_NODE_HEAP_MB` (default `6144`).  `start.sh` passes it to the harness as `--max-old-space-size`, so the V8 heap stays fixed instead of being derived from the unit's cgroup `memory.high`, which `fleet-coding-memory` lowers dynamically: a 1.3 GB ceiling once yielded a 256 MB heap and a boot-time "Reached heap limit" crash in `node:sqlite`.  The value has to be an integer from 512 to 65536; anything else fails the unit at start with exit 2.  It is a command-line flag rather than `NODE_OPTIONS` because Datadog's APM injector appends `--require` to `NODE_OPTIONS`.
+
 ## Install, Update, Uninstall
 
 ```sh
