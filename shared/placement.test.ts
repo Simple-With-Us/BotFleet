@@ -42,8 +42,15 @@ it("retains legacy and placed jobs through the persisted schema, snapshot and SS
     registry.shutdownSync();
     for (const job of fixture.jobs) expect(registry.get(job.id)).toEqual(job);
     for (const job of fixture.jobs.filter(isJobActive)) {
-      expect((await registry.kill(job.id, "owner")).ok).toBe(false);
-      expect(registry.get(job.id)).toEqual(job);
+      if (job.status === "queued") {
+        // The placement queue lets an owner Stop dequeue a queued job on demand.
+        const killed = await registry.kill(job.id, "owner");
+        expect(killed.ok).toBe(true);
+        expect(registry.get(job.id)).toMatchObject({ id: job.id, status: "killed", killedBy: "owner" });
+      } else {
+        expect((await registry.kill(job.id, "owner")).ok).toBe(false);
+        expect(registry.get(job.id)).toEqual(job);
+      }
     }
     expect(spawns).toBe(0);
     const stored = JSON.parse(readFileSync(join(dir, "jobs", "jobs.json"), "utf8"));
@@ -79,11 +86,14 @@ it("preserves a hostless queue owned by this controller rather than adopting a n
     registry.checkLogs();
     expect(await registry.quiesce()).toBe(0);
     registry.shutdownSync();
-    expect((await registry.kill(queued.id, "owner")).ok).toBe(false);
-    expect(registry.get(queued.id)).toEqual(queued);
-    expect(registry.frameJobs(queued.threadId)).toEqual([queued]);
+    // The placement queue lets an owner Stop dequeue a queued job on demand.
+    const killed = await registry.kill(queued.id, "owner");
+    expect(killed.ok).toBe(true);
+    expect(killed.job?.status).toBe("killed");
+    expect(registry.get(queued.id)).toMatchObject({ id: queued.id, status: "killed", killedBy: "owner" });
+    expect(registry.frameJobs(queued.threadId).map((job) => job.id)).toEqual([queued.id]);
     expect(spawns).toBe(0);
-    expect(notices).toBe(0);
-    expect(JSON.parse(readFileSync(join(dir, "jobs", "jobs.json"), "utf8"))[0].status).toBe("queued");
+    expect(notices).toBe(1);
+    expect(JSON.parse(readFileSync(join(dir, "jobs", "jobs.json"), "utf8"))[0]).toMatchObject({ status: "killed", killedBy: "owner" });
   } finally { registry.dispose(); rmSync(dir, { recursive: true, force: true }); }
 });
