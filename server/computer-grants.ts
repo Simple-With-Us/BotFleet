@@ -739,7 +739,7 @@ async function resolveMounts<Lease>(
   let vmFailure: Error | undefined;
   if (wantsVm) {
     if (!reach.vm) {
-      throw new Error("this model engine cannot use the Local VM — choose Claude or an ACP engine, or select another computer destination");
+      throw new Error("this bot cannot use the Local VM — choose Claude or a coding bot, or select another computer destination");
     }
     const vmMayDegrade = runOn !== "vm" && granted.some((destination) => destination !== "vm");
     let stdio: Awaited<ReturnType<typeof deps.acquireLocalVm>> | undefined;
@@ -871,9 +871,9 @@ async function resolveMounts<Lease>(
   if ((wantsCloudFiltered || autoCloud) && cloudBackend === "box" && deps.box.boxConfigured(cfg)) {
     if (!mountsCloudComputer && wantsCloudFiltered) {
       if (shouldThrowOnCloudFailure) {
-        throw new Error("this model engine cannot use computer tools — choose Claude, an ACP engine, or the ASCII.dev Box engine");
+        throw new Error("this bot cannot use computer tools — choose Claude, a coding bot, or ASCII.dev Box");
       }
-      deps.notice("cloud computer not mounted: this model engine cannot use computer tools", false);
+      deps.notice("cloud computer not mounted: this bot cannot use computer tools", false);
     }
     let b = await deps.box.findBox(cfg, bot.id).catch(() => null);
     if (!(await deps.checkpoint())) return stopped();

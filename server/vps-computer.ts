@@ -1768,9 +1768,9 @@ export {
 export function vpsDriverError(driverKind: string, reach: ComputerReach): string | null {
   if (reach.vps) return null;
   if (driverKind === "boxAgent") {
-    return "The ASCII.dev Box engine runs its agent on Box and cannot use a self-hosted VPS — choose Claude or an ACP engine";
+    return "The ASCII.dev Box bot runs on Box and cannot use a self-hosted VPS — choose Claude or a coding bot";
   }
-  return "This model engine cannot mount a self-hosted VPS computer — choose Claude or an ACP engine";
+  return "This bot cannot mount a self-hosted VPS computer — choose Claude or a coding bot";
 }
 
 export async function vpsComputerScreenshot(

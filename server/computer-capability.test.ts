@@ -141,7 +141,7 @@ describe("computer reach, every cell", () => {
       const reach = computerReach(fixture);
       const error = vpsDriverError(fixture.driverKind, reach);
       expect(error === null, `${fixture.displayName} (${fixture.driverKind})`).toBe(reach.vps);
-      if (fixture.driverKind === "boxAgent") expect(error).toMatch(/runs its agent on Box/);
+      if (fixture.driverKind === "boxAgent") expect(error).toMatch(/runs on Box/);
       else if (error) expect(error).toMatch(/cannot mount a self-hosted VPS/);
     }
   });

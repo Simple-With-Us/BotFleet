@@ -44,7 +44,7 @@ public enum CrossPlatformProfileSettings {
         let selected = speechDevices.contains(device)
         var reason: String?
         if !agentVoiceCanSpeakOnClient {
-            reason = "Pick a voice this agent can speak before enabling playback."
+            reason = "Pick a voice this bot can speak before enabling playback."
         } else if device == "mac",
                   isPersonalVoiceId(voice),
                   personalVoicePlaybackAllowed == false {

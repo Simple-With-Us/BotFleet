@@ -181,6 +181,6 @@ export function computerDestinationDisabledReason(
   const engine = instances.find((candidate) => candidate.instanceId === bot.modelSelection.instanceId);
   const name = engine?.displayName ?? "This engine";
   return mode === "vm"
-    ? `${name} cannot drive a Local VM.  Choose Claude or an ACP engine, or another destination.`
-    : `${name} cannot drive a remote desktop.  Choose Claude or an ACP engine, or another destination.`;
+    ? `${name} cannot drive a Local VM.\u00A0 Choose Claude or a coding bot, or another destination.`
+    : `${name} cannot drive a remote desktop.\u00A0 Choose Claude or a coding bot, or another destination.`;
 }

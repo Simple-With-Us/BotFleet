@@ -192,7 +192,7 @@ export function PronunciationSettings({
       <div className="mt-4 border-t border-hairline/40 pt-4">
         <div className="text-[13px] font-medium text-ink">Pronunciations</div>
         <p role="status" className="mt-1 text-[12px] text-ink-secondary">
-          Update the bot server on this computer to edit pronunciations.
+          Update BotFleet on this computer to edit pronunciations.
         </p>
       </div>
     );
@@ -328,7 +328,7 @@ export const AUDIO_RETENTION_OPTIONS: ReadonlyArray<{ days: number; label: strin
 ];
 
 export const AUDIO_RETENTION_HELP =
-  "How long synthesized voice clips and audio attachments are kept on disk before automatic cleanup.\u00A0 Playing an older reply again re-synthesizes its audio on demand.";
+  "How long voice clips and audio attachments are kept on disk before automatic cleanup.\u00A0 Playing an older reply again recreates its audio on demand.";
 
 export function AudioRetentionPicker({
   tts,
