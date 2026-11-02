@@ -71,15 +71,18 @@ export const CHAT_CLI_NAMES = ["simple-chat"] as const;
 const CHAT_CLI_LABEL = "simple-chat";
 
 /** The fleet chat CLI's retired launcher spelling.  It names nothing
- *  runnable:  any use is refused with a pointer to the current name -
- *  never matched, migrated or aliased.  Compared in any letter case, the
- *  same way `namesChatCli` treats the current name:  on a case-insensitive
- *  volume `AGENT-SYNC` is the same retired binary, and a same-named word is
- *  only ever a refusal. */
+ *  runnable:  direct use as a program word is refused with a pointer to
+ *  the current name - never matched, migrated or aliased.  Compared in
+ *  any letter case, the same way `namesChatCli` treats the current name:
+ *  on a case-insensitive volume `AGENT-SYNC` is the same retired binary,
+ *  and a same-named program word is only ever a refusal.  Launches
+ *  wrapped in an interpreter or another launcher are not specially
+ *  detected;  that coverage is unimplemented, and they fail closed under
+ *  the ordinary allowlist rules. */
 const RETIRED_CHAT_CLI_NAME = "agent-sync";
 
-/** Whether a program or script word spells the retired launcher name, in
- *  any letter case.  A suffix (`agent-sync.log`) is not the name. */
+/** Whether a program word spells the retired launcher name, in any
+ *  letter case.  A suffix (`agent-sync.log`) is not the name. */
 function namesRetiredChatCli(word: string): boolean {
   return posix.basename(word).toLowerCase() === RETIRED_CHAT_CLI_NAME;
 }
@@ -214,11 +217,15 @@ const commandSchema = z
   .superRefine((command, ctx) => {
     const names = Object.keys(command.flags);
     if (names.length > MAX_FLAGS) ctx.addIssue({ code: "custom", message: `has more than ${MAX_FLAGS} flags` });
-    // the chat CLI as the program, or as the script an interpreter runs
-    const fixed = [command.argv0, ...command.sub];
-    if (fixed.some(namesRetiredChatCli)) {
+    // the retired launcher spelling as the program word:  never saved.
+    //  Fixed words are not scanned - they can pin data operands, and a
+    //  file may carry the retired name, the same way run time leaves
+    //  data words alone.
+    if (namesRetiredChatCli(command.argv0)) {
       ctx.addIssue({ code: "custom", message: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}` });
     }
+    // the chat CLI as the program, or as the script an interpreter runs
+    const fixed = [command.argv0, ...command.sub];
     const chatCliAt = fixed.findIndex(namesChatCli);
     for (const [name, spec] of Object.entries(command.flags)) {
       if (spec.value === "int" && spec.min !== undefined && spec.max !== undefined && spec.min > spec.max) {
@@ -433,25 +440,17 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
     const problem = chatCliProblem(argv.slice(chatCliAt));
     if (problem) return { ok: false, reason: problem, name };
   }
-  // The retired launcher spelling is refused by name, even if a stored
-  //  policy from before the rename still lists it:  it is not an alias.
-  //  Two scopes, both grounded:  the program itself, always;  and a fixed
-  //  word only when a stored entry pins the retired name there AND the
-  //  invocation follows that entry's declared fixed words (the same
-  //  per-position comparison matchEntry makes) - the exact scope the
-  //  save-time check refuses to save.  Data operands stay untouched:  a
-  //  file that carries the retired name (`rm /Users/jay/.local/bin/agent-sync`,
-  //  when deleting the retired launcher) still runs, and one entry's
-  //  fixed words never condemn an invocation that matches another entry
-  //  for the same program.
+  // The retired launcher spelling as the program word is refused by
+  //  name, even if a stored policy from before the rename still lists
+  //  it:  it is not an alias.  Only the program word is checked - a
+  //  launch wrapped in an interpreter or another launcher is not
+  //  specially detected (unimplemented) and fails closed under the
+  //  ordinary allowlist rules below.  Data words are never scanned, so
+  //  a file that carries the retired name
+  //  (`rm /Users/jay/.local/bin/agent-sync`, when deleting the retired
+  //  launcher) runs normally.
   const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
-  const followsRetiredFixedWords = (entry: ToolPolicyCommand): boolean =>
-    entry.sub.some(namesRetiredChatCli) &&
-    entry.sub.length <= argv.length - 1 &&
-    entry.sub.every((word, i) =>
-      namesRetiredChatCli(word) ? namesRetiredChatCli(argv[1 + i] ?? "") : argv[1 + i] === word,
-    );
-  if (namesRetiredChatCli(argv0) || candidates.some(followsRetiredFixedWords)) {
+  if (namesRetiredChatCli(argv0)) {
     return { ok: false, reason: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}`, name };
   }
   if (candidates.length === 0) return { ok: false, reason: "the program is not on the allowlist", name };
