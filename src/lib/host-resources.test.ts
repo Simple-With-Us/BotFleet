@@ -442,6 +442,9 @@ describe("parseHeadroomEdit", () => {
     expect(parseHeadroomEdit({ reservedCpuCores: "65", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
     expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "-1", minMemoryAvailablePercent: "" }).ok).toBe(false);
     expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "101" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "0x10", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "1e3", reservedRamMb: "", minMemoryAvailablePercent: "" }).ok).toBe(false);
+    expect(parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "1000001", minMemoryAvailablePercent: "" }).ok).toBe(false);
   });
 
   it("refuses an all-empty save as a no-op", () => {
@@ -451,10 +454,46 @@ describe("parseHeadroomEdit", () => {
 });
 
 describe("buildHeadroomPatch", () => {
-  it("builds the PUT /api/config patch under jobs.admission", () => {
-    expect(buildHeadroomPatch({ reservedCpuCores: 2, reservedRamMb: 512 })).toEqual({
-      jobs: { admission: { reservedCpuCores: 2, reservedRamMb: 512 } },
+  it("builds the full-admission PUT /api/config patch so unrelated gates survive", () => {
+    const current = report({
+      admission: {
+        maxSwapPercent: 98,
+        minFreeDiskBytes: 2 * GB,
+        minFreeInodes: 1000,
+        reservedCpuCores: 1,
+        unknownReading: "admit",
+      },
     });
+    expect(buildHeadroomPatch(current, { reservedCpuCores: 2, reservedRamMb: 512 })).toEqual({
+      jobs: {
+        admission: {
+          maxSwapPercent: 98,
+          minFreeDiskMb: 2048,
+          minFreeInodes: 1000,
+          reservedCpuCores: 2,
+          reservedRamMb: 512,
+          minMemoryAvailablePercent: undefined,
+        },
+      },
+    });
+  });
+
+  it("keeps current headroom when boxes are empty", () => {
+    const current = report({
+      admission: {
+        maxSwapPercent: 90,
+        minFreeDiskBytes: 4 * GB,
+        reservedRamBytes: 256 * 1024 * 1024,
+        minMemoryAvailablePercent: 20,
+        unknownReading: "admit",
+      },
+    });
+    const patch = buildHeadroomPatch(current, { reservedCpuCores: 3 });
+    expect(patch.jobs.admission.maxSwapPercent).toBe(90);
+    expect(patch.jobs.admission.minFreeDiskMb).toBe(4096);
+    expect(patch.jobs.admission.reservedCpuCores).toBe(3);
+    expect(patch.jobs.admission.reservedRamMb).toBe(256);
+    expect(patch.jobs.admission.minMemoryAvailablePercent).toBe(20);
   });
 });
 

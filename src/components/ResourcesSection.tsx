@@ -225,15 +225,27 @@ function HeadroomCard({
   const [values, setValues] = React.useState<HeadroomEditValues>(() => headroomEditInitial(report));
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [touched, setTouched] = React.useState(false);
+  const [submitAttempted, setSubmitAttempted] = React.useState(false);
 
   React.useEffect(() => {
     setValues(headroomEditInitial(report));
+    setTouched(false);
+    setSubmitAttempted(false);
+    setError(null);
   }, [report.hostId, report.admission.reservedCpuCores, report.admission.reservedRamBytes, report.admission.minMemoryAvailablePercent]);
 
   const parsed = parseHeadroomEdit(values);
+  const showValidation = !parsed.ok && (touched || submitAttempted);
   const canSave = !saving && parsed.ok;
 
+  const markTouched = (next: HeadroomEditValues) => {
+    setValues(next);
+    setTouched(true);
+  };
+
   const save = () => {
+    setSubmitAttempted(true);
     if (!parsed.ok || saving) {
       setError(!parsed.ok ? parsed.errors[0]?.message ?? "Enter a number." : null);
       return;
@@ -242,7 +254,7 @@ function HeadroomCard({
     setError(null);
     void (async () => {
       try {
-        await saveHeadroomThresholds(values);
+        await saveHeadroomThresholds(values, report);
         onSaved?.();
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : String(caught));
@@ -272,7 +284,7 @@ function HeadroomCard({
             max={64}
             step={1}
             placeholder="Not set"
-            onChange={(e) => setValues((prev) => ({ ...prev, reservedCpuCores: e.target.value }))}
+            onChange={(e) => markTouched({ ...values, reservedCpuCores: e.target.value })}
             aria-label="Reserved CPU cores"
             className={inputClass}
           />
@@ -288,7 +300,7 @@ function HeadroomCard({
             min={0}
             step={1}
             placeholder="Not set"
-            onChange={(e) => setValues((prev) => ({ ...prev, reservedRamMb: e.target.value }))}
+            onChange={(e) => markTouched({ ...values, reservedRamMb: e.target.value })}
             aria-label="Reserved RAM in MB"
             className={inputClass}
           />
@@ -305,13 +317,13 @@ function HeadroomCard({
             max={100}
             step={0.5}
             placeholder="Not set"
-            onChange={(e) => setValues((prev) => ({ ...prev, minMemoryAvailablePercent: e.target.value }))}
+            onChange={(e) => markTouched({ ...values, minMemoryAvailablePercent: e.target.value })}
             aria-label="Minimum available memory percent"
             className={inputClass}
           />
         </div>
       </div>
-      {!parsed.ok && (
+      {showValidation && (
         <div role="alert" className="mt-2 text-[12px] leading-relaxed text-danger">
           {parsed.errors[0]?.message}
         </div>
@@ -334,7 +346,7 @@ function HeadroomCard({
         <span className="text-[12px] text-ink-secondary">Saves via PUT /api/config, then reloads the report.</span>
       </div>
       <div className="mt-2 text-[12px] leading-relaxed text-ink-secondary">
-        Empty means no change — the save only sends boxes with a number.  Clearing back to unset is a file/vault edit. 
+        Empty keeps the current value — the save sends the full admission object so unrelated gates are never erased.  Clearing back to unset is a file/vault edit. 
         {report.admission.reservedRamBytes !== undefined && (
           <>Reserved RAM in force: {formatBytes(report.admission.reservedRamBytes)}. </>
         )}

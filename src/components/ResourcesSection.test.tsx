@@ -108,7 +108,8 @@ describe("ResourcesSectionView", () => {
     expect(html).toContain("Owner-Set Headroom");
     expect(html).toContain("Save headroom");
     expect(html).toContain("Saves via PUT /api/config");
-    expect(html).toContain("Empty means no change");
+    expect(html).toContain("Empty keeps the current value");
+    expect(html).not.toContain("Enter at least one number to save");
     expect(html).toContain("Environment variable names");
     expect(html).toContain("<details");
     expect(html).toContain("BOTFLEET_JOBS_RESERVED_CPU_CORES");
