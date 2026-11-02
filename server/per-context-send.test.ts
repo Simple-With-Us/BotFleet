@@ -246,4 +246,44 @@ posixOnly("explicit per-context send", () => {
     expect((await api("POST", `/api/bots/${botId}/threads/${other}/messages`, { text: "   " })).status).toBe(400);
     expect((await api("POST", `/api/bots/${botId}/threads/"bad id"/messages`, { text: "x" })).status).toBe(404);
   });
+
+  it("answers a malformed idempotency key with a 400, not a 500", async () => {
+    const botId = await makeBot();
+    const active = (await rosterBot(botId))?.threadId;
+    const other = await makeTask(botId, "owned thread");
+    await activateTask(botId, active!);
+    const bad = await api("POST", `/api/bots/${botId}/threads/${other}/messages`, {
+      text: "hello side",
+      idempotencyKey: "not a valid key!!",
+    });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toContain("idempotencyKey must be");
+  });
+
+  it("a typed /stop on the active thread drops a side thread's queue too", async () => {
+    const botId = await makeBot();
+    const active = (await rosterBot(botId))?.threadId;
+    const other = await makeTask(botId, "side thread");
+    await activateTask(botId, active!);
+    engine.queueCompletion(heldUntilReleased("stop-side-parent", says("parent done")));
+    engine.queueCompletion(says("side thread answered"));
+
+    const started = await api("POST", `/api/bots/${botId}/messages`, { text: "long parent job" });
+    expect(started.status).toBe(202);
+    await expect(waitForBotBusy(botId)).resolves.not.toBeNull();
+
+    const queued = await api("POST", `/api/bots/${botId}/threads/${other}/messages`, { text: "queued on the side" });
+    expect(queued.status).toBe(202);
+    expect(queued.body.queued).toBe(true);
+
+    // Typed /stop arrives as an owner command, even mid-turn.
+    const stopped = await api("POST", `/api/bots/${botId}/messages`, { text: "/stop", source: "imessage" });
+    expect(stopped.status).toBe(200);
+
+    engine.releaseGate("stop-side-parent");
+    await expect(waitForBotIdle(botId)).resolves.not.toBeNull();
+    // The side thread's queue died with the stop: nothing drains, nothing runs.
+    expect(await texts(other)).not.toContain("queued on the side");
+    expect(await texts(other)).not.toContain("side thread answered");
+  });
 });

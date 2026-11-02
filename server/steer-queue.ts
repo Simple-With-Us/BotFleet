@@ -331,6 +331,33 @@ export function dropSteeredMessages(threadId: string): number {
   return entry.items.length;
 }
 
+/** The ids of one bot's waiting sends, across every thread it owns, in no
+ *  particular order.  The caller reads them before `dropSteeredMessagesForBot`
+ *  so it can forget what it keyed on them (a relayed message's unattended mark). */
+export function queuedMessageIdsForBot(botId: string): string[] {
+  const ids: string[] = [];
+  for (const entry of queues.values()) {
+    if (entry.botId !== botId) continue;
+    for (const item of entry.items) ids.push(item.messageId);
+  }
+  return ids;
+}
+
+/** Drop every send waiting behind every thread one bot owns, so none of them
+ *  drains.  Per-context sends queue against their own thread, so a typed /stop
+ *  on the active thread must reach the side threads too — stopping everything
+ *  is the whole point of the typed command.  Returns how many were dropped. */
+export function dropSteeredMessagesForBot(botId: string): number {
+  let dropped = 0;
+  // deleting only the entry being visited is safe under Map iteration
+  for (const [threadId, entry] of queues) {
+    if (entry.botId !== botId) continue;
+    queues.delete(threadId);
+    dropped += entry.items.length;
+  }
+  return dropped;
+}
+
 /** Test helper: how many messages remain queued for a thread. */
 export function _queuedCount(threadId: string): number {
   return queues.get(threadId)?.items.length ?? 0;

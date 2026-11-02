@@ -21,7 +21,9 @@ import {
   cancelSteeredMessage,
   drainEveryReadyBatch,
   drainSteeredMessages,
+  dropSteeredMessagesForBot,
   queueSteeredMessage,
+  queuedMessageIdsForBot,
   restoreSteeredEntries,
   takeSteeredEntries,
   _queuedCount,
@@ -357,6 +359,20 @@ describe("steer-queue module", () => {
     drainSteeredMessages(fakeStore([]), run);
     expect(run).not.toHaveBeenCalled();
     expect(_queuedCount("thread-d")).toBe(0);
+  });
+
+  it("drops every thread one bot owns for a typed /stop, and no one else's", () => {
+    const mine = fakeBot("bot-stop-all", "thread-stop-active", true);
+    const other = fakeBot("bot-untouched", "thread-untouched", true);
+    fakeStore([mine, other]);
+    queueSteeredMessage(mine, "on the active thread");
+    queueSteeredMessage(mine, "on a side thread", { threadId: "thread-stop-side" });
+    queueSteeredMessage(other, "not mine");
+    expect(queuedMessageIdsForBot(mine.id)).toHaveLength(2);
+    expect(dropSteeredMessagesForBot(mine.id)).toBe(2);
+    expect(_queuedCount("thread-stop-active")).toBe(0);
+    expect(_queuedCount("thread-stop-side")).toBe(0);
+    expect(_queuedCount("thread-untouched")).toBe(1);
   });
 
 });

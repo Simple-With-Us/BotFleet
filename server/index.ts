@@ -412,13 +412,13 @@ import {
   dropJobNotices,
   dropJobNoticesForBot,
   dropQueuedForOffBot,
-  dropSteeredMessages,
+  dropSteeredMessagesForBot,
   pendingJobNotices,
   queueJobNotice,
   queueSteeredMessage,
   queuedMessageCount,
   queuedMessageCountFor,
-  queuedMessageIds,
+  queuedMessageIdsForBot,
   restoreJobNotices,
   drainEveryReadyBatch,
   restoreSteeredEntries,
@@ -4010,11 +4010,13 @@ function commandsFor(bot: BotRecord, surface: CommandSurface) {
   });
 }
 
-/** Drop every message waiting behind the bot's running turn, and forget the
- * unattended mark a relayed one carried. */
+/** Drop every message waiting behind the bot's running turn, on every thread
+ * it owns, and forget the unattended mark a relayed one carried.  Per-context
+ * sends queue against their own thread, so clearing only the active thread
+ * would let a side thread's queue drain and run after a typed /stop. */
 function dropQueuedMessages(bot: BotRecord): number {
-  for (const queueId of queuedMessageIds(bot.threadId)) relayQueuedMessageIds.delete(queueId);
-  const dropped = dropSteeredMessages(bot.threadId);
+  for (const queueId of queuedMessageIdsForBot(bot.id)) relayQueuedMessageIds.delete(queueId);
+  const dropped = dropSteeredMessagesForBot(bot.id);
   if (dropped > 0) {
     const fresh = store.bot(bot.id);
     if (fresh) broadcast({ kind: "bot", bot: botWithThreadView(fresh) });
@@ -16280,7 +16282,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const recording = body.recording === undefined ? undefined : incomingRecording(body.recording) ?? undefined;
       if (body.recording !== undefined && !recording) return json(res, 400, { error: "recording must be a saved WAV attachment" });
       const idempotencyKey = idempotencyKeyFrom(body.idempotencyKey);
-      if (idempotencyKey === null) return json(res, IDEMPOTENCY_KEY_ERROR);
+      if (idempotencyKey === null) return json(res, 400, { error: IDEMPOTENCY_KEY_ERROR });
       const scopedIdempotencyKey = idempotencyKey && `bot:${bot.id}:${targetThreadId}:${idempotencyKey}`;
       const userAgent = Array.isArray(req.headers["user-agent"]) ? req.headers["user-agent"][0] : req.headers["user-agent"] ?? "unknown";
       const origin = req.headers.origin ?? "direct";
@@ -16293,7 +16295,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
       }
       const fromLinq = body.source === "linq";
-      const chatIdParsed = z.string().trim().min(1).safeParse(body.chatId);
+      const chatIdParsed = z.string().trim().min(1).max(512).safeParse(body.chatId);
       const linqChatId = fromLinq ? (chatIdParsed.success ? chatIdParsed.data : undefined) : undefined;
       if (fromLinq) {
         const transport = loadConfig().botDefaults?.imessagePerBot?.[bot.id];
