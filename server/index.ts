@@ -427,7 +427,7 @@ import { jobsPrompt, noticeWithoutJobTools } from "./jobs/prompt.ts";
 import { JobRegistry, resolveJobsSettings } from "./jobs/registry.ts";
 import { JobWakeCoordinator } from "./jobs/wake.ts";
 import { ZulipHub } from "./zulip/hub.ts";
-import { cachedVaultReader } from "./zulip/credentials.ts";
+import { cachedVaultReader, ZULIP_DEFAULT_INFISICAL_PATH } from "./zulip/credentials.ts";
 import { zulipToolsMounted } from "./zulip/mount.ts";
 import { zulipPeerScreenRules } from "./zulip/format.ts";
 import type { ZulipOrigin } from "./zulip/types.ts";
@@ -20029,7 +20029,7 @@ zulipHub = new ZulipHub({
   vault: cachedVaultReader((location) =>
     location.source
       ? infisical.readSource(location.source, location.secretPath)
-      : infisical.readPath(location.secretPath, { projectId: location.projectId, environment: location.environment }),
+      : infisical.readPath(location.secretPath ?? ZULIP_DEFAULT_INFISICAL_PATH, { projectId: location.projectId, environment: location.environment }),
   ),
   botExists: (botId) => Boolean(store.bot(botId)),
   // A bot holding a crash marker is not free either: its interrupted turn

@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,6 +8,7 @@ import type { InfisicalSettings } from "./config.ts";
 import { dataDir } from "./data-dir.ts";
 import { infisical } from "./infisical.ts";
 import { infisicalSnapshot, setInfisicalSnapshot, vaultNames } from "./secret-map.ts";
+
 
 // Obviously fake, and never sent anywhere real: these exist so the
 // assertions below have credential-shaped strings to look for. Every test
@@ -628,6 +629,51 @@ describe("readSources", () => {
     expect(calls.every((c) => c.authorization?.includes(FLEET_TOKEN))).toBe(true);
   });
 
+  it("rejects an explicit readSource path outside the source's secretPath, with a warning naming source and path and no request", async () => {
+    withSettings({
+      token: SENTINEL_READ_TOKEN,
+      readSources: [{ name: "fleetops-zulip", tokenFile: tokenFile(FLEET_TOKEN), tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
+    });
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ secrets: [{ secretKey: "FLEET_KEY", secretValue: "value-for-FLEET_KEY" }] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(infisical.readSource("fleetops-zulip", "/other")).rejects.toThrow(/fleetops-zulip/);
+      await expect(infisical.readSource("fleetops-zulip", "/other")).rejects.toThrow(/\/other/);
+      // A sibling prefix is not under the source path either.
+      await expect(infisical.readSource("fleetops-zulip", "/zulip-other")).rejects.toThrow(/\/zulip-other/);
+      expect(fetchMock).not.toHaveBeenCalled();
+      const warned = warn.mock.calls.flat().join(" ");
+      expect(warned).toContain("fleetops-zulip");
+      expect(warned).toContain("/other");
+      expect(warned).not.toContain(FLEET_TOKEN);
+      expect(infisical.getStatus().readSources[0]).toMatchObject({ name: "fleetops-zulip", ok: false });
+      // Equal and nested paths are covered.
+      await expect(infisical.readSource("fleetops-zulip", "/zulip")).resolves.toBeInstanceOf(Map);
+      await expect(infisical.readSource("fleetops-zulip", "/zulip/nested")).resolves.toBeInstanceOf(Map);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("lets a root-scoped read source cover any explicit path, and uses the source's own path when none is given", async () => {
+    withSettings({
+      token: SENTINEL_READ_TOKEN,
+      readSources: [
+        { name: "root-source", tokenFile: tokenFile(FLEET_TOKEN), tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/" },
+        { name: "fleetops-zulip", tokenFile: tokenFile(AFC_TOKEN), tokenEnv: "", projectId: "afc-proj", environment: "prod", secretPath: "/zulip" },
+      ],
+    });
+    const { calls, impl } = recordingFetch();
+    vi.stubGlobal("fetch", impl);
+    await expect(infisical.readSource("root-source", "/anything/deep")).resolves.toBeInstanceOf(Map);
+    expect(calls.at(-1)?.url).toContain("secretPath=%2Fanything%2Fdeep");
+    await expect(infisical.readSource("fleetops-zulip")).resolves.toBeInstanceOf(Map);
+    expect(calls.at(-1)?.url).toContain("secretPath=%2Fzulip");
+    expect(calls.at(-1)?.authorization).toContain(AFC_TOKEN);
+  });
+
   it("refuses a token file outside the config directory, a symlink, and a group-readable file", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -677,6 +723,30 @@ describe("readSources", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it("reads a token file through the verified handle and always closes it", async () => {
+    // A swap between check and open cannot be staged deterministically
+    // without mocking fs (barred by lint), so this pins the observable
+    // handle contract instead: the token that reaches the vault call is
+    // the checked file's, and no descriptor is left open afterwards.
+    const path = tokenFile(FLEET_TOKEN);
+    withSettings({
+      token: SENTINEL_READ_TOKEN,
+      readSources: [{ name: "fleetops-zulip", tokenFile: path, tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
+    });
+    const { calls, impl } = recordingFetch();
+    vi.stubGlobal("fetch", impl);
+    const fdDir = "/proc/self/fd";
+    const openFds = () => (existsSync(fdDir) ? readdirSync(fdDir).length : null);
+    const before = openFds();
+    for (let i = 0; i < 3; i += 1) {
+      const values = await infisical.readSource("fleetops-zulip");
+      expect(values.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
+    }
+    expect(calls).toHaveLength(3);
+    expect(calls.every((c) => c.authorization?.includes(FLEET_TOKEN))).toBe(true);
+    if (before !== null) expect(openFds()).toBe(before);
   });
 
   it("warns once and rejects when a source token is refused, without leaking it", async () => {

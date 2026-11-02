@@ -11,7 +11,8 @@
 // leave this module.  `writeSecret` is the one path that sends a value
 // anywhere at all, and it goes straight to Infisical over the connection
 // `login()` already authenticated, never through a log line.
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 
 import { normalizeInfisicalSecretPath, type InfisicalSettings, type ResolvedInfisicalReadSource } from "./config.ts";
@@ -335,8 +336,33 @@ class InfisicalManager {
         if (realCandidate !== realConfigDir && !realCandidate.startsWith(`${realConfigDir}${sep}`)) {
           return { error: `token file ${source.tokenFile} is outside the BotFleet config directory ${configDir}; refusing to read it` };
         }
-        const token = (await readFile(candidate, "utf8")).trim();
-        return token ? { token } : { error: "token file is empty" };
+        // Read through a verified handle, not the path again: open
+        // without following a symlink swapped in since the checks
+        // above, then re-verify on the descriptor (the pattern
+        // `electron/infisical-read.mjs` uses for its bootstrap token).
+        let handle: FileHandle;
+        try {
+          handle = await open(candidate, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+        } catch (e) {
+          if (e instanceof Error && "code" in e && e.code === "ELOOP") {
+            return { error: `token file ${source.tokenFile} is a symlink; refusing to read it` };
+          }
+          throw e;
+        }
+        try {
+          const handleStat = await handle.stat();
+          if (!handleStat.isFile()) return { error: `token file ${source.tokenFile} is not a regular file; refusing to read it` };
+          if (process.platform !== "win32" && (handleStat.mode & 0o077) !== 0) {
+            return { error: `token file ${source.tokenFile} is readable or writable by group or other (mode ${(handleStat.mode & 0o777).toString(8)}); run chmod 600 on it` };
+          }
+          if (handleStat.dev !== st.dev || handleStat.ino !== st.ino) {
+            return { error: `token file ${source.tokenFile} changed while it was read; refusing to read it` };
+          }
+          const token = (await handle.readFile("utf8")).trim();
+          return token ? { token } : { error: "token file is empty" };
+        } finally {
+          await handle.close();
+        }
       } catch (e) {
         const code = e instanceof Error && "code" in e && e.code ? String(e.code) : "error";
         return { error: `token file cannot be read (${code})` };
@@ -349,14 +375,19 @@ class InfisicalManager {
     return { error: "no tokenFile or tokenEnv configured" };
   }
 
+  /** Whether `requestedPath` is the source's own `secretPath` or under
+   * it.  Root "/" covers everything.  Both sides are normalized first,
+   * so a trailing slash never changes the answer. */
+  private sourceCovers(source: ResolvedInfisicalReadSource, requestedPath: string): boolean {
+    const stored = normalizeInfisicalSecretPath(source.secretPath);
+    const requested = normalizeInfisicalSecretPath(requestedPath);
+    return stored === "/" || requested === stored || requested.startsWith(`${stored}/`);
+  }
+
   private findReadSource(settings: InfisicalSettings, projectId: string, environment: string, secretPath: string): ResolvedInfisicalReadSource | undefined {
     const requested = normalizeInfisicalSecretPath(secretPath);
-    const covers = (src: ResolvedInfisicalReadSource) => {
-      const stored = normalizeInfisicalSecretPath(src.secretPath);
-      return stored === "/" || requested === stored || requested.startsWith(`${stored}/`);
-    };
     return (settings.readSources ?? [])
-      .filter((src) => src.projectId === projectId && src.environment === environment && covers(src))
+      .filter((src) => src.projectId === projectId && src.environment === environment && this.sourceCovers(src, requested))
       .sort((a, b) => normalizeInfisicalSecretPath(b.secretPath).length - normalizeInfisicalSecretPath(a.secretPath).length)[0];
   }
 
@@ -409,7 +440,17 @@ class InfisicalManager {
       this.warnReadSource(source, "Infisical is turned off");
       throw this.readSourceFailure(source, "Infisical is turned off", 409);
     }
-    return this.readWithSource(settings, source, normalizeInfisicalSecretPath(secretPath?.trim() || source.secretPath), source.projectId, source.environment);
+    const explicit = secretPath?.trim();
+    if (!explicit) {
+      return this.readWithSource(settings, source, normalizeInfisicalSecretPath(source.secretPath), source.projectId, source.environment);
+    }
+    const requested = normalizeInfisicalSecretPath(explicit);
+    if (!this.sourceCovers(source, requested)) {
+      const detail = `requested path ${requested} is not covered by the source's secretPath ${normalizeInfisicalSecretPath(source.secretPath)}`;
+      this.warnReadSource(source, detail);
+      throw this.readSourceFailure(source, detail, 403);
+    }
+    return this.readWithSource(settings, source, requested, source.projectId, source.environment);
   }
 
   private settings(): InfisicalSettings {

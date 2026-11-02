@@ -1569,6 +1569,10 @@ describe("the secret-store section", () => {
     expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_API_KEY" } } } })).toThrow("credentialSources");
     expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_TOKEN" } } } })).toThrow("credentialSources");
     expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" } } } })).not.toThrow();
+    // `{FIELD}` in an outgoing pattern expands to "" (there is no field),
+    // so it must be rejected rather than produce a double-underscore name.
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_{FIELD}_TOKEN" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{FIELD}_TOKEN" } } } })).toThrow("credentialSources");
     // A per-field project/environment cannot be honoured (the named
     // source's token is scoped to its own project/env), so it is dropped.
     expect(parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}", projectId: "other-proj", environment: "dev" } } } })).toEqual({

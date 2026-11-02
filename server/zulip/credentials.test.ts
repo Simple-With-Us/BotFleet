@@ -131,7 +131,7 @@ describe("the Infisical source", () => {
     const calls: string[] = [];
     const locations: ZulipVaultLocation[] = [];
     const read = async (location: ZulipVaultLocation) => {
-      calls.push(location.secretPath);
+      calls.push(location.secretPath ?? "");
       locations.push(location);
       return new Map(Object.entries(rows));
     };
@@ -340,6 +340,66 @@ describe("the Infisical source", () => {
       { vault: async () => new Map(), realm: REALM },
     );
     await expect(empty!.load("BF-Plumber")).rejects.toMatchObject({ reason: "missing" });
+  });
+
+  it("does not pass the global path for a sourced location with no per-field path, and keeps an explicit per-field path", async () => {
+    const locations: ZulipVaultLocation[] = [];
+    const read = async (location: ZulipVaultLocation) => {
+      locations.push(location);
+      if (location.source === "afc-zulip") return new Map([["ZULIP_OUTGOING_BF_PLUMBER_TOKEN", "fake-outgoing-not-real"]]);
+      return new Map([
+        ["BF_PLUMBER_ZULIP_EMAIL", "bf-plumber-bot@z.test"],
+        ["BF_PLUMBER_ZULIP_API_KEY", FAKE_KEY],
+        ["ZULIP_BF_PLUMBER_EMAIL", "bf-plumber-bot@z.test"],
+        ["ZULIP_BF_PLUMBER_API_KEY", FAKE_KEY],
+      ]);
+    };
+    const source = infisicalCredentialSource(read, {
+      path: "/global-zulip",
+      realm: REALM,
+      credentialSources: {
+        login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" },
+        outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" },
+      },
+    });
+    await source.load("BF-Plumber");
+    expect(locations).toHaveLength(2);
+    expect(locations[0]?.source).toBe("fleetops-zulip");
+    expect(locations[0]?.secretPath).toBeUndefined();
+    expect(locations[1]?.source).toBe("afc-zulip");
+    expect(locations[1]?.secretPath).toBeUndefined();
+    // An explicit per-field path is still passed through.
+    locations.length = 0;
+    const explicit = infisicalCredentialSource(read, {
+      path: "/global-zulip",
+      realm: REALM,
+      credentialSources: {
+        login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}", path: "/custom-login" },
+        outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN", path: "/custom-out" },
+      },
+    });
+    await explicit.load("BF-Plumber");
+    expect(locations.map((l) => l.secretPath)).toEqual(["/custom-login", "/custom-out"]);
+    // Legacy unsourced config is unchanged: the global path is used.
+    locations.length = 0;
+    const legacy = infisicalCredentialSource(read, { path: "/global-zulip", realm: REALM });
+    await legacy.load("BF-Plumber");
+    expect(locations[0]?.secretPath).toBe("/global-zulip");
+    expect(locations[0]?.source).toBeUndefined();
+  });
+
+  it("caches a sourced location with no secretPath consistently", async () => {
+    let reads = 0;
+    const cached = cachedVaultReader(async () => {
+      reads += 1;
+      return new Map([["A", "1"]]);
+    });
+    await cached({ source: "fleetops-zulip" });
+    await cached({ source: "fleetops-zulip" });
+    await cached({ source: "fleetops-zulip", secretPath: undefined });
+    expect(reads).toBe(1);
+    await cached({ source: "fleetops-zulip", secretPath: "/zulip" });
+    expect(reads).toBe(2);
   });
 
   it("reads another project's folder when infisicalProjectId and infisicalEnv are set", async () => {

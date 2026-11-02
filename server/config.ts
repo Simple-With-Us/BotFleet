@@ -272,7 +272,9 @@ const featureConfigSchema = z.object({
 const zulipKeyPatternSchema = z.string().trim().regex(/^[A-Z0-9_{}]+$/).max(200);
 // Without `{ROLE}` every role resolves to the same secret name, so a
 // pattern that omits it must never validate.  The login pattern also
-// needs `{FIELD}`, or EMAIL/API_KEY/SITE collapse onto one name.
+// needs `{FIELD}`, or EMAIL/API_KEY/SITE collapse onto one name.  The
+// outgoing pattern must not carry `{FIELD}`: there is no field to expand
+// it with, so it would become "" and leave a double underscore.
 const zulipLoginCredentialFieldSourceSchema = z.object({
   source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
   keyPattern: zulipKeyPatternSchema
@@ -285,8 +287,8 @@ const zulipLoginCredentialFieldSourceSchema = z.object({
 const zulipOutgoingCredentialFieldSourceSchema = z.object({
   source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
   keyPattern: zulipKeyPatternSchema
-    .refine((value) => value.includes("{ROLE}"), {
-      message: "outgoing keyPattern must contain {ROLE}",
+    .refine((value) => value.includes("{ROLE}") && !value.includes("{FIELD}"), {
+      message: "outgoing keyPattern must contain {ROLE} and must not contain {FIELD}",
     })
     .optional(),
   path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),

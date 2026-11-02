@@ -70,7 +70,10 @@ export interface ZulipCredentialSource {
 
 /** One Infisical folder the Infisical source reads. */
 export interface ZulipVaultLocation {
-  secretPath: string;
+  /** The folder to read.  Unset only for a sourced location with no
+   * per-field `path`: the named read source's own `secretPath` then
+   * decides, not the global Zulip `infisicalPath`. */
+  secretPath?: string;
   /** Name of an `infisical.readSources` entry to read through, when set. */
   source?: string;
   /** Another Infisical project's id.  Unset: the harness's own project. */
@@ -96,7 +99,10 @@ export type ZulipVaultReader = (location: ZulipVaultLocation) => Promise<Readonl
  *  reads `own-project` or `own-env`, since `readPath` falls back to the
  *  harness's own for whichever is unset. */
 export function describeVaultLocation(location: Pick<ZulipVaultLocation, "secretPath" | "projectId" | "environment" | "source">): string {
-  if (location.source?.trim()) return `source ${location.source.trim()} ${location.secretPath}`;
+  if (location.source?.trim()) {
+    const path = location.secretPath?.trim();
+    return path ? `source ${location.source.trim()} ${path}` : `source ${location.source.trim()}`;
+  }
   const projectId = location.projectId?.trim() || undefined;
   const environment = location.environment?.trim() || undefined;
   const parts = [
@@ -313,12 +319,14 @@ export function infisicalCredentialSource(
   const environment = opts.environment?.trim() || undefined;
   const loginSpec = opts.credentialSources?.login;
   const outgoingSpec = opts.credentialSources?.outgoing;
-  const loginLoc: ZulipVaultLocation = loginSpec
-    ? { secretPath: loginSpec.path?.trim() || secretPath, source: loginSpec.source }
-    : { secretPath, projectId, environment };
-  const outgoingLoc: ZulipVaultLocation | null = outgoingSpec
-    ? { secretPath: outgoingSpec.path?.trim() || secretPath, source: outgoingSpec.source }
-    : null;
+  const sourcedLoc = (spec: ZulipCredentialFieldSource): ZulipVaultLocation => {
+    const loc: ZulipVaultLocation = { source: spec.source };
+    const path = spec.path?.trim();
+    if (path) loc.secretPath = path;
+    return loc;
+  };
+  const loginLoc: ZulipVaultLocation = loginSpec ? sourcedLoc(loginSpec) : { secretPath, projectId, environment };
+  const outgoingLoc: ZulipVaultLocation | null = outgoingSpec ? sourcedLoc(outgoingSpec) : null;
   const where = describeVaultLocation(loginLoc);
   const bound = opts.roles?.map((role) => role.trim());
   const split = Boolean(loginSpec || outgoingSpec);
@@ -397,7 +405,7 @@ export function cachedVaultReader(
       location.source?.trim() ?? "",
       location.projectId?.trim() ?? "",
       location.environment?.trim() ?? "",
-      location.secretPath,
+      location.secretPath?.trim() ?? "",
       names,
     ]);
     const hit = cache.get(cacheKey);
