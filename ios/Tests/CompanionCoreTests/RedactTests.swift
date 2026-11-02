@@ -431,29 +431,61 @@ final class RedactTests: XCTestCase {
         )
     }
 
-    func testTreeDepthCapMatchesTypeScript() {
-        // Past depth 12 the walk returns containers verbatim on both sides,
-        // so a deeply nested leaf keeps its text in TS too. Any change here
-        // belongs to `shared/redact.ts` first; the port keeps parity.
-        let leaf = "leaf-" + "sk" + "-ant-" + String(repeating: "0", count: 16)
-        var deep: Any = leaf
+    func testTreeDepthCapMasksPastCap() {
+        // Past depth 12 the walk masks the subtree whole on both sides: keys
+        // survive, every string value is masked with its true length. Any
+        // change here belongs to `shared/redact.ts` first; the port keeps
+        // parity.
+        var deep: Any = ["api_key": "live-secret-value-0000"]
         for i in 0..<15 { deep = ["k\(i)": deep] }
         var node = Redact.redactSecrets(deep)
         for i in (0..<15).reversed() {
             node = (node as? [String: Any])?["k\(i)"]
         }
-        XCTAssertEqual(node as? String, leaf)
+        XCTAssertEqual((node as? [String: Any])?["api_key"] as? String, "«redacted 22 chars»")
     }
 
-    func testLogTeeStraddlingSecretMatchesTypeScript() {
-        // The tee cuts the raw head and redacts it on both sides, so a secret
-        // across the boundary loses its shape in TS too. Redact-then-cut
-        // would diverge; this pins the shared order.
+    func testTreeDepthCapFailsClosedOnBenignStrings() {
+        // Below the cap the walk cannot tell a credential field from a
+        // harmless sibling, so every string is masked rather than trusted.
+        var deep: Any = ["note": "hello world ok"] as [String: Any]
+        for i in 0..<15 { deep = ["k\(i)": deep] }
+        var node = Redact.redactSecrets(deep)
+        for i in (0..<15).reversed() {
+            node = (node as? [String: Any])?["k\(i)"]
+        }
+        XCTAssertEqual((node as? [String: Any])?["note"] as? String, "«redacted 14 chars»")
+    }
+
+    func testTreeShallowRedactionUnchanged() {
+        let out = Redact.redactSecrets(["outer": ["api_key": "live-secret-value-0000", "note": "hello world ok"]]) as? [String: Any]
+        let outer = out?["outer"] as? [String: Any]
+        XCTAssertEqual(outer?["api_key"] as? String, "«redacted 22 chars»")
+        XCTAssertEqual(outer?["note"] as? String, "hello world ok")
+    }
+
+    func testLogTeeOverlapValue() {
+        XCTAssertEqual(Redact.logTeeOverlapChars, 4 * 1024)
+    }
+
+    func testLogTeeStraddlingSecretMasked() {
+        // The tee redacts a window overlapping the cap, then cuts the REDACTED
+        // window back to the cap — a secret across the boundary masks whole
+        // and the cut lands in the marker (TS-verified, byte-identical).
         let sample = "sk" + "-ant-" + String(repeating: "0", count: 16)
-        let big = String(repeating: "A", count: 100) + sample + String(repeating: "B", count: 100)
+        let big = String(repeating: "A", count: 99) + " " + sample + " " + String(repeating: "B", count: 100)
+        let out = Redact.redactSecretsInLogText(big, maxChars: 110)
+        XCTAssertEqual(out, String(repeating: "A", count: 99) + " «redacted [… 114 characters elided from log]")
+        XCTAssertFalse(out.contains("sk" + "-ant-"))
+    }
+
+    func testLogTeeSecretInsideHeadMasked() {
+        // TS-verified, byte-identical.
+        let sample = "sk" + "-ant-" + String(repeating: "0", count: 16)
+        let big = "carry " + sample + " " + String(repeating: "B", count: 200)
         XCTAssertEqual(
             Redact.redactSecretsInLogText(big, maxChars: 110),
-            String(repeating: "A", count: 100) + "sk" + "-ant-" + "000" + "[… 113 characters elided from log]"
+            "carry «redacted 23 chars» " + String(repeating: "B", count: 84) + "[… 120 characters elided from log]"
         )
     }
 }

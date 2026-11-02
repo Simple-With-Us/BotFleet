@@ -769,12 +769,44 @@ public enum Redact {
 
     // MARK: - The tree walk both public deep redactors share
 
+    /// How deep the shared tree walk redacts before it stops trusting the
+    /// shape. Past this a container is masked whole rather than walked:
+    /// returning it verbatim handed every credential field below the cap back
+    /// in the clear.
+    private static let maxRedactDepth = 12
+
+    /// Mask a subtree whose root sits past `maxRedactDepth`, using only the
+    /// existing mask marker. Keys survive so the shape still says WHERE a
+    /// secret was; every string value is masked with its true length, so
+    /// nothing below the cap is trusted. Non-strings pass through.
+    private static func maskDeep(_ input: Any?) -> Any? {
+        if let s = input as? String { return mask(s) }
+        if input == nil || input is NSNull { return input }
+        if let arr = input as? [Any?] {
+            return arr.map { item -> Any? in maskDeep(item) }
+        }
+        if let arr = input as? [Any] {
+            return arr.map { item -> Any? in maskDeep(item) }
+        }
+        if let dict = input as? [String: Any?] {
+            var out: [String: Any?] = [:]
+            for (key, value) in dict { out[key] = maskDeep(value) }
+            return out
+        }
+        if let dict = input as? [String: Any] {
+            var out: [String: Any] = [:]
+            for (key, value) in dict { out[key] = maskDeep(value) as Any }
+            return out
+        }
+        return input
+    }
+
     /// `text` is what every string that is NOT under a secret-shaped key goes
     /// through. A secret-shaped key is masked outright either way.
     private static func redactTree(_ input: Any?, depth: Int, text: (String) -> String) -> Any? {
         if let s = input as? String { return text(s) }
-        if depth > 12 || input == nil { return input }
-        if input is NSNull { return input }
+        if input == nil || input is NSNull { return input }
+        if depth > maxRedactDepth { return maskDeep(input) }
         if let arr = input as? [Any?] {
             return arr.map { item -> Any? in
                 if let dict = item as? [String: Any],
@@ -848,20 +880,29 @@ public enum Redact {
     /// code units — the same unit `String.length` (and the marker) uses.
     public static let logTeeMaxStringChars = 256 * 1024
 
+    /// How far past the cap the log-tee content pass still reads before it
+    /// cuts. A secret straddling the cap has to be WHOLE to match; the margin
+    /// only has to cover the longest pattern floor, so 4 KB is generous.
+    public static let logTeeOverlapChars = 4 * 1024
+
     /// Content pass for the log tee: redact, THEN cut. The order is
-    /// load-bearing — cutting first would end the string in a marker instead,
-    /// and a secret straddling the boundary would ship its prefix in the
-    /// clear. The elided tail is never written, redacted or not.
+    /// load-bearing — the head is redacted over a window overlapping the cap
+    /// by `logTeeOverlapChars`, and the REDACTED window is cut back to the
+    /// cap, so a secret straddling the boundary masks whole and the cut lands
+    /// in the marker, never in the credential. The elided tail is never
+    /// written, redacted or not.
     public static func redactSecretsInLogText(_ text: String, maxChars: Int = logTeeMaxStringChars) -> String {
         if text.utf16.count <= maxChars { return redactSecretsInText(text) }
         let elided = text.utf16.count - maxChars
         // Slice in UTF-16 units like `String.slice`; a boundary that lands
         // inside a surrogate pair drops the dangling high half (a Swift
         // string cannot hold the lone surrogate JavaScript would keep).
-        var headUnits = Array(text.utf16.prefix(maxChars))
-        if let last = headUnits.last, (0xD800...0xDBFF).contains(last) { headUnits.removeLast() }
-        let head = String(decoding: headUnits, as: UTF16.self)
-        return "\(redactSecretsInText(head))[… \(elided) characters elided from log]"
+        var windowUnits = Array(text.utf16.prefix(maxChars + logTeeOverlapChars))
+        if let last = windowUnits.last, (0xD800...0xDBFF).contains(last) { windowUnits.removeLast() }
+        let windowed = redactSecretsInText(String(decoding: windowUnits, as: UTF16.self))
+        var outUnits = Array(windowed.utf16.prefix(maxChars))
+        if let last = outUnits.last, (0xD800...0xDBFF).contains(last) { outUnits.removeLast() }
+        return "\(String(decoding: outUnits, as: UTF16.self))[… \(elided) characters elided from log]"
     }
 
     /// `redactSecrets` for a destination that is a log file rather than a

@@ -1,3 +1,5 @@
+import type { JsonValue } from "./plugin-manifest.ts";
+
 // Keeping secrets out of the native protocol log — and out of the transcript.
 //
 // The native tee writes every provider message verbatim, which is what makes
@@ -1079,6 +1081,42 @@ export function redactSecretsInText(text: string): string {
   return out;
 }
 
+/** How deep the shared tree walk redacts before it stops trusting the shape.
+ * Past this a container is masked whole (see `maskDeep`) rather than walked:
+ * returning it verbatim handed every credential field below the cap back in
+ * the clear. */
+const MAX_REDACT_DEPTH = 12;
+
+/** JSON object branch of `JsonValue` — not arrays or primitives.  Same
+ * `toString`-tag discrimination as `isJsonObject` in
+ * `./plugin-manifest.ts`, local so this module stays dependency-free. */
+function isJsonRecord(value: JsonValue): value is Record<string, JsonValue> {
+  if (value === null || Array.isArray(value)) return false;
+  return Object.prototype.toString.call(value) === "[object Object]";
+}
+
+/** JSON string branch of `JsonValue`.  Local for the same reason. */
+function isJsonString(value: JsonValue): value is string {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
+/** Mask a subtree whose root sits past `MAX_REDACT_DEPTH`, using only the
+ * existing mask marker.  Keys survive so the shape still says WHERE a secret
+ * was; every string value is masked with its true length, so nothing below
+ * the cap is trusted — not secret-shaped keys, not `{name, value}` env
+ * entries, not plain strings that merely contain one.  Non-strings carry no
+ * credential value and pass through. */
+function maskDeep(input: JsonValue): JsonValue {
+  if (input === null) return input;
+  if (Array.isArray(input)) return input.map(maskDeep);
+  if (isJsonRecord(input)) {
+    const out: Record<string, JsonValue> = {};
+    for (const [key, value] of Object.entries(input)) out[key] = maskDeep(value);
+    return out;
+  }
+  return isJsonString(input) ? mask(input) : input;
+}
+
 /** The walk both public deep redactors share.  `text` is what every string
  * that is NOT under a secret-shaped key goes through: the plain content pass
  * for `redactSecrets`, the cap-then-content pass for `redactSecretsForLog`.  A
@@ -1086,7 +1124,11 @@ export function redactSecretsInText(text: string): string {
  * what a known credential field reports. */
 function redactTree(input: unknown, depth: number, text: (value: string) => string): unknown {
   if (typeof input === "string") return text(input);
-  if (depth > 12 || input === null || typeof input !== "object") return input;
+  if (input === null || typeof input !== "object") return input;
+  // SAFETY: only JSON-shaped payloads reach the tree walk (provider messages
+  // and tool results), and maskDeep treats any exotic object as a plain
+  // record of masked values, so the assertion cannot widen what is trusted.
+  if (depth > MAX_REDACT_DEPTH) return maskDeep(input as JsonValue);
 
   if (Array.isArray(input)) {
     return input.map((item) => {
@@ -1152,15 +1194,25 @@ export function redactSecretsWith(input: unknown, text: (value: string) => strin
  * fan-out and `/api/health` waited behind it. */
 export const LOG_TEE_MAX_STRING_CHARS = 256 * 1024;
 
+/** How far past the cap the log-tee content pass still reads before it cuts.
+ *
+ * A secret straddling the cap has to be WHOLE to match: its prefix on its own
+ * is below a pattern floor (`gsk_` needs 40 body characters) or has lost the
+ * closing shape the pattern anchors on.  The margin only has to cover the
+ * longest such floor, so 4 KB is generous; it costs ~1.5% on a capped scan,
+ * against the megabytes of tool output the cap exists to avoid scanning. */
+export const LOG_TEE_OVERLAP_CHARS = 4 * 1024;
+
 /** Content pass for the log tee: redact, THEN cut.
  *
  * The order is load-bearing and is the reason this is not "slice and call
- * `redactSecretsInText`".  `KEY_VALUE_UNTERMINATED` exists because a
- * credential whose closing quote was lost to a clip is still a credential, and
- * it anchors at end-of-text — so the head has to be redacted while the clip is
- * still the last thing in the string.  Cutting first would end it in a marker
- * instead, and a secret straddling the boundary would ship its prefix in the
- * clear.
+ * `redactSecretsInText`".  The head is redacted over a window that overlaps
+ * the cap by `LOG_TEE_OVERLAP_CHARS`, and the REDACTED window is then cut back
+ * to the cap — so a secret straddling the boundary is whole inside the window,
+ * matches, and masks, and the cut lands in the marker, never in the
+ * credential.  Cutting the raw head first instead shipped the straddling
+ * prefix in the clear whenever the piece before the cap was too short to
+ * match on its own.
  *
  * The elided tail is never written, redacted or not, so nothing in it can
  * leak.  A string within the cap takes exactly the path it took before this
@@ -1168,7 +1220,8 @@ export const LOG_TEE_MAX_STRING_CHARS = 256 * 1024;
 export function redactSecretsInLogText(text: string, maxChars = LOG_TEE_MAX_STRING_CHARS): string {
   if (text.length <= maxChars) return redactSecretsInText(text);
   const elided = text.length - maxChars;
-  return `${redactSecretsInText(text.slice(0, maxChars))}[… ${elided} characters elided from log]`;
+  const windowed = redactSecretsInText(text.slice(0, maxChars + LOG_TEE_OVERLAP_CHARS));
+  return `${windowed.slice(0, maxChars)}[… ${elided} characters elided from log]`;
 }
 
 /** `redactSecrets` for a destination that is a log file rather than a live
