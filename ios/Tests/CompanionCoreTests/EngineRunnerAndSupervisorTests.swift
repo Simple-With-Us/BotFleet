@@ -96,7 +96,12 @@ struct EngineRunnerAndSupervisorTests {
             threadId: "t-agy-default",
             botId: "bot-agy",
             prompt: "Run status check",
-            workingDirectory: "/tmp/ws-agy"
+            workingDirectory: "/tmp/ws-agy",
+            environment: [
+                "CUSTOM_ENV": "keep-me",
+                "INFISICAL_CLIENT_SECRET": "strip-me",
+                "XAI_API_KEY": "strip-me"
+            ]
         )
         let defaultSpec = AntigravityStreamRunner.buildSpawnSpec(input: defaultInput)
         #expect(defaultSpec.executable == "agy")
@@ -108,6 +113,10 @@ struct EngineRunnerAndSupervisorTests {
             "--mode", "accept-edits",
             "--model", "gemini-3.1-pro-high"
         ])
+        #expect(defaultSpec.unsetEnvironmentKeys == AntigravityStreamRunner.workspaceCredentialEnvKeys)
+        #expect(defaultSpec.environment["CUSTOM_ENV"] == "keep-me")
+        #expect(defaultSpec.environment["INFISICAL_CLIENT_SECRET"] == nil)
+        #expect(defaultSpec.environment["XAI_API_KEY"] == nil)
 
         // 2. > 64 KiB prompt uses `--print -` and pipes over stdin; fullAuto without host control adds bypass
         let hugePrompt = String(repeating: "X", count: AntigravityStreamRunner.maxArgvPromptUTF8Bytes + 1)
@@ -134,7 +143,8 @@ struct EngineRunnerAndSupervisorTests {
             "--conversation", "conv-resume-99"
         ])
 
-        // 3. Host-control turn strips `--dangerously-skip-permissions` even when `fullAuto == "true"`
+        // 3. Host-control turn strips `--dangerously-skip-permissions` when not auto-approved,
+        // and allows `--dangerously-skip-permissions` when `isAutoApproved` is true and attended.
         let hostControlInput = TurnInput(
             threadId: "t-agy-host",
             botId: "bot-agy",
@@ -145,10 +155,20 @@ struct EngineRunnerAndSupervisorTests {
                 "controlsHostMac": "true"
             ]
         )
-        let hostControlSpec = AntigravityStreamRunner.buildSpawnSpec(input: hostControlInput)
+        let hostControlSpec = AntigravityStreamRunner.buildSpawnSpec(
+            input: hostControlInput,
+            isAutoApproved: false
+        )
         #expect(!hostControlSpec.arguments.contains("--dangerously-skip-permissions"))
         #expect(hostControlSpec.arguments.contains("--mode"))
         #expect(hostControlSpec.arguments.contains("accept-edits"))
+
+        let hostAutoApprovedSpec = AntigravityStreamRunner.buildSpawnSpec(
+            input: hostControlInput,
+            isAutoApproved: true
+        )
+        #expect(hostAutoApprovedSpec.arguments.contains("--dangerously-skip-permissions"))
+        #expect(!hostAutoApprovedSpec.arguments.contains("--mode"))
 
         // 4. Host-control parser refuses `always-proceed` and `proceed-in-sandbox` and ignores trailing lines
         var hostState = AntigravityStreamRunner.AntigravityStreamParserState(

@@ -13,6 +13,38 @@ public actor AntigravityStreamRunner: EngineDriver {
     /// Prompts up to 64 KiB pass on `argv` (`--print <prompt>`); larger prompts pass `--print -` and pipe over `stdin`.
     public static let maxArgvPromptUTF8Bytes = 64 * 1024
 
+    /// Workspace credential environment variables stripped before spawning `agy`, mirroring `WORKSPACE_CREDENTIAL_ENV` in `server/config.ts`.
+    public static let workspaceCredentialEnvKeys: [String] = [
+        "XAI_API_KEY",
+        "OPENAI_COMPAT_API_KEY",
+        "OPENAI_COMPAT_URL",
+        "MINIMAX_API_KEY",
+        "MINIMAX_BASE_URL",
+        "BOTFLEET_LINQAPP_API_KEY",
+        "LINQ_API_TOKEN",
+        "LINQ_WEBHOOK_SECRET",
+        "GITHUB_REQUEST_LOG_WEBHOOK_SECRET",
+        "BOX_TOKEN",
+        "OPENCODE_API_KEY",
+        "OMB_TTS_KEY",
+        "AZURE_SPEECH_KEY",
+        "AZURE_SPEECH_REGION",
+        "META_SPEECH_API_KEY",
+        "GROQ_API_KEY",
+        "ASSEMBLYAI_API_KEY",
+        "OMB_OPENAI_IMAGE_KEY",
+        "COMPOSIO_API_KEY",
+        "OMB_COMPOSIO_BROKER_TOKEN",
+        "DEEPSEEK_API_KEY",
+        "DEEPSEEK_URL",
+        "INFISICAL_CLIENT_ID",
+        "INFISICAL_CLIENT_SECRET",
+        "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
+        "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+        "INFISICAL_TOKEN",
+        "INFISICAL_WRITE_TOKEN"
+    ]
+
     public init(
         engineId: String = "antigravity",
         executable: String = "agy",
@@ -28,7 +60,8 @@ public actor AntigravityStreamRunner: EngineDriver {
     /// Builds the `EngineSpawnSpec` for an Antigravity (`agy`) headless print-mode turn.
     public static func buildSpawnSpec(
         executable: String = "agy",
-        input: TurnInput
+        input: TurnInput,
+        isAutoApproved: Bool = false
     ) -> EngineSpawnSpec {
         let useStdin = input.prompt.utf8.count > maxArgvPromptUTF8Bytes
         var args: [String] = useStdin ? ["--print", "-"] : ["--print", input.prompt]
@@ -44,7 +77,9 @@ public actor AntigravityStreamRunner: EngineDriver {
         ])
 
         let controlsHostMac = (input.configOptions["controlsHostMac"] == "true")
-        let fullAuto = (input.configOptions["fullAuto"] == "true") && !controlsHostMac
+        let unattended = (input.configOptions["unattended"] == "true")
+        let resolvedAutoApproved = (isAutoApproved || (input.configOptions["isAutoApproved"] == "true")) && !unattended
+        let fullAuto = (input.configOptions["fullAuto"] == "true") && (!controlsHostMac || resolvedAutoApproved)
         if fullAuto {
             args.append("--dangerously-skip-permissions")
         } else {
@@ -62,11 +97,17 @@ public actor AntigravityStreamRunner: EngineDriver {
             args.append(contentsOf: ["--conversation", resumeId])
         }
 
+        var env = input.environment
+        for key in workspaceCredentialEnvKeys {
+            env.removeValue(forKey: key)
+        }
+
         return EngineSpawnSpec(
             executable: executable,
             arguments: args,
             workingDirectory: input.workingDirectory,
-            environment: input.environment
+            environment: env,
+            unsetEnvironmentKeys: workspaceCredentialEnvKeys
         )
     }
 
@@ -78,7 +119,14 @@ public actor AntigravityStreamRunner: EngineDriver {
             throw EngineDriverError.turnAlreadyActive(threadId: input.threadId)
         }
 
-        let spec = Self.buildSpawnSpec(executable: executable, input: input)
+        let controlsHostMac = (input.configOptions["controlsHostMac"] == "true")
+        let unattended = (input.configOptions["unattended"] == "true")
+        let isAutoApproved = (input.configOptions["isAutoApproved"] == "true") && !unattended
+        let spec = Self.buildSpawnSpec(
+            executable: executable,
+            input: input,
+            isAutoApproved: isAutoApproved
+        )
         let session = try await launcher.launch(spec: spec, threadId: input.threadId, engineId: engineId)
         let sessionToken = UUID()
         activeSessions[input.threadId] = session
@@ -99,9 +147,6 @@ public actor AntigravityStreamRunner: EngineDriver {
 
         let (stream, continuation) = AsyncStream<TurnEvent>.makeStream()
         let threadId = input.threadId
-        let controlsHostMac = (input.configOptions["controlsHostMac"] == "true")
-        let isAutoApproved = (input.configOptions["isAutoApproved"] == "true")
-            || ((input.configOptions["fullAuto"] == "true") && !controlsHostMac)
 
         Task { [weak self] in
             var parserState = AntigravityStreamParserState(
