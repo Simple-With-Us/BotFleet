@@ -75,10 +75,11 @@ const CHAT_CLI_LABEL = "simple-chat";
  *  the current name - never matched, migrated or aliased.  Compared in
  *  any letter case, the same way `namesChatCli` treats the current name:
  *  on a case-insensitive volume `AGENT-SYNC` is the same retired binary,
- *  and a same-named program word is only ever a refusal.  Launches
- *  wrapped in an interpreter or another launcher are not specially
- *  detected;  that coverage is unimplemented, and they fail closed under
- *  the ordinary allowlist rules. */
+ *  and a same-named program word is only ever a refusal.  A launch
+ *  wrapped in an interpreter or another launcher is not specially
+ *  detected;  that coverage is unimplemented, and whether one runs is
+ *  the ordinary allowlist's call - a genuinely allowed interpreter can
+ *  still execute such a script. */
 const RETIRED_CHAT_CLI_NAME = "agent-sync";
 
 /** Whether a program word spells the retired launcher name, in any
@@ -442,11 +443,12 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
   }
   // The retired launcher spelling as the program word is refused by
   //  name, even if a stored policy from before the rename still lists
-  //  it:  it is not an alias.  Only the program word is checked - a
+  //  it:  it is not an alias.  Only the program word is checked.  A
   //  launch wrapped in an interpreter or another launcher is not
-  //  specially detected (unimplemented) and fails closed under the
-  //  ordinary allowlist rules below.  Data words are never scanned, so
-  //  a file that carries the retired name
+  //  specially detected - that coverage is unimplemented - so whether
+  //  one runs is the ordinary allowlist's call:  a genuinely allowed
+  //  interpreter can still execute such a script.  Data words are never
+  //  scanned, so a file that carries the retired name
   //  (`rm /Users/jay/.local/bin/agent-sync`, when deleting the retired
   //  launcher) runs normally.
   const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
