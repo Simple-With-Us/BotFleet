@@ -673,6 +673,8 @@ import {
 import { createBotPackageExport } from "./package-export.ts";
 import { installTestParentWatchdog } from "./test-parent-watchdog.ts";
 import { installTimestampedConsole } from "./console-timestamps.ts";
+import { installProcessCrashHandlers } from "./process-crash-handler.ts";
+import { healthReadiness } from "./health-readiness.ts";
 import {
   BOOT_RESUME_CONCURRENCY,
   BOOT_RESUME_STAGGER_MS,
@@ -785,6 +787,14 @@ function reloadProviders(): Promise<void> {
 // antigravity-quota, infisical, …) otherwise carries no timestamp at all,
 // so nothing here can be correlated against a companion line by time.
 installTimestampedConsole();
+// A crash after this point is logged, captured to Sentry and exited on,
+// instead of dying under Node's defaults with nothing reported.  Sentry
+// is resolved at crash time, so installing before it initializes is fine.
+installProcessCrashHandlers({
+  logError: (...args) => console.error(...args),
+  getSentry: () => (isSentryActive() ? getSentry() : null),
+  exit: (code) => process.exit(code),
+});
 
 const PORT = resolveHarnessPort();
 const WEBHOOK_PORT = resolveWebhookPort(process.env, PORT);
@@ -836,6 +846,10 @@ const hostResourcesResponse = createHostResourcesResponder({
 // One server, one socket, no window where the port is unbound: the real
 // handler takes over the moment `booting` flips at the end of this file.
 let booting = true;
+// Set when the webhook ingress listener fails during boot (assigned far
+// below); declared here so the boot-phase health handler can read it
+// without a temporal-dead-zone throw on an early request.
+let webhookIngressError: string | null = null;
 let handleRequest: ((req: IncomingMessage, res: ServerResponse) => unknown) | null = null;
 
 function handleBootRequest(req: IncomingMessage, res: ServerResponse): void {
@@ -860,8 +874,7 @@ function handleBootRequest(req: IncomingMessage, res: ServerResponse): void {
       pid: process.pid,
       static: Boolean(STATIC_DIR),
       ownerProof: harnessOwnerProof(harnessOwner, req.headers["x-botfleet-owner-challenge"]),
-      ready: false,
-      booting: true,
+      ...healthReadiness({ booting: true, webhookIngressError }),
     });
   }
   return json(res, 503, { error: "booting" });
@@ -1128,8 +1141,8 @@ infisical.configure(
   () => infisicalSettings(cfg),
   // Fire and forget by necessity — the manager's refresh does not await this
   // — but never unhandled: without the catch a failed apply becomes an
-  // unhandled rejection, and there is no process-level handler in server/ to
-  // stop that terminating the harness.
+  // unhandled rejection, and the process-level handler above would
+  // (correctly, but needlessly) take the harness down for it.
   (reason) => {
     void applyResolvedSecrets(reason).catch((error) => {
       console.error(`[infisical] apply failed (${reason}): ${error instanceof Error ? error.message : String(error)}`);
@@ -8609,7 +8622,6 @@ webhookEphemeralSource = (webhookId) => {
 };
 
 let webhookIngress: WebhookIngress | null = null;
-let webhookIngressError: string | null = null;
 try {
   webhookIngress = await listenWebhookIngress(webhooks, {
     port: WEBHOOK_PORT,
@@ -17170,7 +17182,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         app: "botfleet", pid: process.pid, static: Boolean(STATIC_DIR),
         hostId, version: runtimeBuildIdentity.version,
         ownerProof: harnessOwnerProof(harnessOwner, req.headers["x-botfleet-owner-challenge"]),
-        ready: !booting, booting,
+        ...healthReadiness({ booting, webhookIngressError }),
       });
     }
     if (method === "GET" && path === "/api/host/resources") {
@@ -20009,7 +20021,7 @@ jobRegistry.startTimers();
 // full route table takes over from the boot-phase handler on the very next
 // request.  `/api/health` flips to `ready: true`, and the 503 gate lifts.
 booting = false;
-console.log(`botfleet server ready on http://127.0.0.1:${PORT}`);
+console.log(`botfleet server ready on http://127.0.0.1:${PORT}${webhookIngressError ? " (degraded: webhook receiver unavailable)" : ""}`);
 
 // The Zulip source (docs/zulip.md).  Sessions connect now, but nothing is
 // dispatched until boot recovery has claimed the turns a restart interrupted
