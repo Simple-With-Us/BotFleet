@@ -132,6 +132,20 @@ describe("resolving knobs", () => {
     expect(cfg.jobs?.admission?.minFreeInodes).toBe(1250);
     expect(knobSource("jobs.admission.minFreeInodes")).toBe("infisical");
   });
+  it("applies the migrated computer-call and Claude-session knobs, clamped to their bounds", () => {
+    const cfg: AppConfig = { computerCall: { waitMs: 10_000 } };
+    resolveKnobFields(cfg, new Map([
+      ["BOTFLEET_COMPUTER_CALL_WAIT_MS", "999999"],
+      ["BOTFLEET_COMPUTER_CALL_ACT_WITHIN_MS", "250"],
+      ["BOTFLEET_COMPUTER_CALL_WAIT_MAX_MS", "90000"],
+      ["BOTFLEET_CLAUDE_SESSION_IDLE_MS", "120000"],
+      ["BOTFLEET_CLAUDE_SESSION_IDLE_MIN_MS", "2000"],
+    ]));
+    expect(cfg.computerCall).toEqual({ waitMs: 45_000, actWithinMs: 250, personAwayMs: 90_000 });
+    expect(cfg.claudeSession).toEqual({ idleMs: 120_000, idleMinMs: 2_000 });
+    expect(knobSource("computerCall.waitMs")).toBe("infisical");
+    expect(knobSource("claudeSession.idleMs")).toBe("infisical");
+  });
   it("applies a vault value over the file value", () => {
     const cfg: AppConfig = { jobs: { defaultMinutes: 60 } };
     setInfisicalSnapshot(new Map([["BOTFLEET_JOBS_DEFAULT_MINUTES", "30"]]), ["BOTFLEET_JOBS_DEFAULT_MINUTES"]);
