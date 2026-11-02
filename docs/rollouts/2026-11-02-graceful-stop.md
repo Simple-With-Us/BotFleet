@@ -73,6 +73,12 @@ The local full `pnpm test` run counted 12,491 tests: 12,460 passed, 6 failed and
 
 The lint baseline is unchanged at 4,867 warnings.  The hosted required gate is the merge authority.
 
+## The Follow-up Pull Request
+
+This pull request merged before the fourth round of review was answered.  The sixth finding, the queued-routine-run discount, and a lint repair that the merge itself needed both went into a follow-up pull request, because the discount was a real defect in the wait and the ratchet had to hold for both of them to land.
+
+The lint repair is worth naming:  the fixture's state carried a type assertion with no SAFETY comment, and the ratchet counts every one of them.  The branch this work was developed on had an older base and the counts happened to balance there, so nothing saw it until the merge put main one warning over its own baseline.  The state has a named interface now, and the count is back to the baseline.
+
 ## Limits
 
 The Swift changes cannot be unit-tested on this build host, because it has no Swift toolchain.  The hosted gate is not the same as a test run for the Control app either: `mac-package-gate` builds it, so the Swift half is compile-checked there, and `ci.yml` runs `swift test --package-path ios`, which covers the companion changes, but no workflow runs `swift test --package-path mac-control`.  The two new Control tests are therefore written and committed but unrun.
