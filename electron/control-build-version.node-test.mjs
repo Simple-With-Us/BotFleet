@@ -50,7 +50,44 @@ test("a pinned BOTFLEET_BUILD_VERSION is the version Control carries", () => {
 test("a BOTFLEET_BUILD_VERSION that is not a build version is refused", () => {
   assert.throws(
     () => controlBuildVersion({ env: { BOTFLEET_BUILD_VERSION: "2.1.0-beta" }, repoRoot: "/nonexistent" }),
-    /not a 1\.0\.<count> build version/,
+    /neither an x\.y\.z app version nor a 1\.0\.<count> build version/,
+  );
+});
+
+test("the policy pin carries the app version, the build and the marketing version (BF-2588)", () => {
+  // The release pins the app version (which carries the build in its patch)
+  // and the marketing version a person sees.  The build is the patch, so the
+  // two can never disagree about it.
+  const stamp = controlBuildVersion({
+    env: { BOTFLEET_BUILD_VERSION: "0.1.202611030100", BOTFLEET_MARKETING_VERSION: "0.1.0" },
+    repoRoot: "/nonexistent",
+  });
+  assert.deepEqual(stamp, {
+    version: "0.1.202611030100",
+    build: "202611030100",
+    source: "BOTFLEET_BUILD_VERSION",
+  });
+});
+
+test("a policy pin whose app version disagrees with its marketing version is refused", () => {
+  // The app version takes its major and minor from the marketing version, so
+  // a mismatch means the two pins came from different plans.
+  assert.throws(
+    () => controlBuildVersion({
+      env: { BOTFLEET_BUILD_VERSION: "0.2.202611030100", BOTFLEET_MARKETING_VERSION: "0.1.0" },
+      repoRoot: "/nonexistent",
+    }),
+    /disagree/,
+  );
+});
+
+test("a policy pin with a malformed marketing version is refused", () => {
+  assert.throws(
+    () => controlBuildVersion({
+      env: { BOTFLEET_BUILD_VERSION: "0.1.202611030100", BOTFLEET_MARKETING_VERSION: "0.1" },
+      repoRoot: "/nonexistent",
+    }),
+    /BOTFLEET_MARKETING_VERSION is not an x\.y\.z version/,
   );
 });
 

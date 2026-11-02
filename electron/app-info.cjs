@@ -1,14 +1,14 @@
 // Which build is actually running, in a shape the renderer can print.
 //
 // One thing this file deliberately does NOT do: call the patch component of the
-// version a "build number".  That trick is only valid for the iOS client, which
-// ships as 1.0.<commit_count> (scripts/ios-fleet/ship-testflight.sh).  The Mac
-// app does not — it carries a hand-maintained semver, and its latest release is
-// v0.1.38 — so its "31" is a patch number somebody typed, not a build anybody
-// can go and look for.  Printing `build 31` would be confidently wrong, which is
-// worse than printing nothing.  A real commit identity has to be stamped into
-// the Mac bundle at build time; until that exists, the version is the truth and
-// this file reports it plainly.
+// version a "build number".  That trick is only valid where the patch IS the
+// build, and it now is for the desktop app:  its app version carries the
+// commit's merge stamp in the patch (scripts/electron-release-version.mjs), so
+// 0.1.202610291425 names one build exactly.  That is still not the same thing
+// as reading the build out of the string, and this file does not do it:  the
+// version is reported as it stands, and a build that wants to be named hands
+// its own in.  Printing `build 31` for a version whose patch was a typed patch
+// number would be confidently wrong, which is worse than printing nothing.
 //
 // Every field is derived from values Electron hands us. Nothing here reads the
 // filesystem or the network, so it is safe to call from a settings panel that
