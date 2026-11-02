@@ -454,6 +454,30 @@ describe("the retired launcher spelling", () => {
     if (!decision.ok) throw new Error(`refused rm of the retired launcher: ${decision.reason}`);
   });
 
+  it("refuses a legacy entry that pins the retired name as a fixed word when the invocation follows it", () => {
+    // Save-time refuses to save such an entry;  a stored one from before
+    // the rename is refused the same way at run time.
+    const legacyRmPolicy: ToolPolicy = {
+      ...policy,
+      commands: [{ argv0: "/bin/rm", sub: ["/Users/jay/.local/bin/agent-sync"], flags: {}, args: [], positionals: 0 }],
+    };
+    const decision = evaluateCommand(legacyRmPolicy, "/bin/rm /Users/jay/.local/bin/agent-sync");
+    if (decision.ok) throw new Error("allowed a fixed word that pins the retired spelling");
+    expect(decision.reason).toContain("retired");
+  });
+
+  it("does not let one entry's fixed words condemn an invocation that matches a sibling entry", () => {
+    const mixedPolicy: ToolPolicy = {
+      ...policy,
+      commands: [
+        { argv0: PYTHON, sub: ["legacy", "/Users/jay/apps/fleet/agent-sync"], flags: {}, args: [], positionals: 0 },
+        { argv0: PYTHON, sub: [], flags: {}, args: [], positionals: 2 },
+      ],
+    };
+    const decision = evaluateCommand(mixedPolicy, `${PYTHON} /data/agent-sync report`);
+    if (!decision.ok) throw new Error(`sibling entry poisoned an allowed invocation: ${decision.reason}`);
+  });
+
   it("does not touch a word that only starts with the name", () => {
     const decision = evaluateCommand(policy, "/usr/bin/tail /tmp/agent-sync.log");
     if (decision.ok) throw new Error("allowed an unlisted program");

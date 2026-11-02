@@ -435,14 +435,23 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
   }
   // The retired launcher spelling is refused by name, even if a stored
   //  policy from before the rename still lists it:  it is not an alias.
-  //  Only positions that can launch it are scanned:  the program itself,
-  //  and the fixed words its policy entry declares after it (a verb, or
-  //  the script an interpreter runs) - the same scope the save-time check
-  //  validates.  Data operands stay untouched, so a file that carries the
-  //  retired name (`rm /Users/jay/.local/bin/agent-sync`, when deleting
-  //  the retired launcher) still runs.
+  //  Two scopes, both grounded:  the program itself, always;  and a fixed
+  //  word only when a stored entry pins the retired name there AND the
+  //  invocation follows that entry's declared fixed words (the same
+  //  per-position comparison matchEntry makes) - the exact scope the
+  //  save-time check refuses to save.  Data operands stay untouched:  a
+  //  file that carries the retired name (`rm /Users/jay/.local/bin/agent-sync`,
+  //  when deleting the retired launcher) still runs, and one entry's
+  //  fixed words never condemn an invocation that matches another entry
+  //  for the same program.
   const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
-  if (namesRetiredChatCli(argv0) || candidates.some((entry) => argv.slice(1, 1 + entry.sub.length).some(namesRetiredChatCli))) {
+  const followsRetiredFixedWords = (entry: ToolPolicyCommand): boolean =>
+    entry.sub.some(namesRetiredChatCli) &&
+    entry.sub.length <= argv.length - 1 &&
+    entry.sub.every((word, i) =>
+      namesRetiredChatCli(word) ? namesRetiredChatCli(argv[1 + i] ?? "") : argv[1 + i] === word,
+    );
+  if (namesRetiredChatCli(argv0) || candidates.some(followsRetiredFixedWords)) {
     return { ok: false, reason: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}`, name };
   }
   if (candidates.length === 0) return { ok: false, reason: "the program is not on the allowlist", name };
