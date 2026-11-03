@@ -185,6 +185,40 @@ public final class StartupPolicy {
     private var enabled: URL { dataDirectory.appendingPathComponent("startup-enabled.marker") }
     private var session: URL { dataDirectory.appendingPathComponent("startup-session") }
     private var stopped: URL { dataDirectory.appendingPathComponent("stopped.marker") }
+    private static let maximumStopMarkerBytes = 64 * 1024
+
+    /// Preserve the exact owner marker, or refuse to unpark when it cannot be read safely.
+    private func readStopMarker() throws -> Data? {
+        var status = stat()
+        if lstat(stopped.path, &status) != 0 {
+            if errno == ENOENT { return nil }
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        guard (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              status.st_size >= 0, status.st_size <= Int64(Self.maximumStopMarkerBytes) else {
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        let descriptor = open(stopped.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else {
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        defer { close(descriptor) }
+        guard fstat(descriptor, &status) == 0,
+              (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              status.st_size >= 0, status.st_size <= Int64(Self.maximumStopMarkerBytes) else {
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        var contents = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
+            guard count >= 0, contents.count + count <= Self.maximumStopMarkerBytes else {
+                throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+            }
+            if count == 0 { return contents }
+            contents.append(contentsOf: buffer.prefix(count))
+        }
+    }
 
     /// The label of the BotFleet Server LaunchAgent.
     public static let serverAgentLabel = "app.botfleet.server"
@@ -259,7 +293,7 @@ public final class StartupPolicy {
         let boot = try bootID()
         try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         try Data((boot + "\n").utf8).write(to: session, options: .atomic)
-        let markerContents = files.fileExists(atPath: stopped.path) ? try Data(contentsOf: stopped) : nil
+        let markerContents = try readStopMarker()
         if markerContents != nil { try files.removeItem(at: stopped) }
         do {
             try startAgent(label: StartupPolicy.serverAgentLabel)
@@ -287,7 +321,7 @@ public final class StartupPolicy {
         let boot = try bootID()
         try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         try Data((boot + "\n").utf8).write(to: session, options: .atomic)
-        let markerContents = files.fileExists(atPath: stopped.path) ? try Data(contentsOf: stopped) : nil
+        let markerContents = try readStopMarker()
         if markerContents != nil { try files.removeItem(at: stopped) }
         do {
             try restartAgent(label: StartupPolicy.serverAgentLabel)

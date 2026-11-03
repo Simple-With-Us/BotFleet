@@ -468,6 +468,36 @@ final class ControlTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: marker), contents)
     }
 
+    func testServerStartAndRestartRefuseUnsafeStopMarkers() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let oversized = Data(repeating: 0x41, count: 64 * 1024 + 1)
+        try oversized.write(to: marker)
+        let runner = MockCommands()
+        let startup = StartupPolicy(home: home, commands: runner, uid: 501, environment: [:])
+        XCTAssertThrowsError(try startup.startServer())
+        XCTAssertThrowsError(try startup.restartServer())
+        XCTAssertEqual(try Data(contentsOf: marker), oversized)
+        XCTAssertFalse(runner.calls.contains { $0.contains("launchctl") })
+
+        try FileManager.default.removeItem(at: marker)
+        let target = home.appendingPathComponent("owner-stop-metadata")
+        let contents = Data("owner-stop".utf8)
+        try contents.write(to: target)
+        try FileManager.default.createSymbolicLink(at: marker, withDestinationURL: target)
+        XCTAssertThrowsError(try startup.startServer())
+        XCTAssertThrowsError(try startup.restartServer())
+        XCTAssertEqual(try Data(contentsOf: target), contents)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: marker.path), target.path)
+        XCTAssertFalse(runner.calls.contains { $0.contains("launchctl") })
+    }
+
     func testUnparkedCompanionStartUsesOnlyTheCompanionAgent() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
