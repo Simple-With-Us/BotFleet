@@ -1113,7 +1113,8 @@ export function publicIngressUrl(cfg: AppConfig): string | null {
 }
 
 export function webhookPublicIngressUrl(cfg: AppConfig): string | null {
-  const raw = cfg.ingress?.webhookPublicUrl?.trim() || cfg.ingress?.publicUrl?.trim();
+  const dedicated = cfg.ingress?.webhookPublicUrl?.trim();
+  const raw = dedicated && isAbsoluteHttpUrl(dedicated) ? dedicated : cfg.ingress?.publicUrl?.trim();
   return raw && isAbsoluteHttpUrl(raw) ? raw.replace(/\/+$/, "") : null;
 }
 

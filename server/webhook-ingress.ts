@@ -217,6 +217,7 @@ export function createWebhookIngressHandler(
       }
       const event = eventName(req);
       if (manager.isEventIgnoredAtEdge?.(match[1], event)) {
+        req.resume();
         const result = manager.recordIgnoredAtEdge(match[1], {
           eventName: event,
           contentType: header(req, "content-type"),

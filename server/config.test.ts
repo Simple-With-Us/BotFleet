@@ -1230,6 +1230,14 @@ describe("public ingress URL", () => {
       }),
     ).toBe("https://botfleet.jays.services");
     expect(
+      webhookPublicIngressUrl({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "invalid-url",
+        },
+      }),
+    ).toBe("https://botfleet.jays.services");
+    expect(
       webhookPublicIngressUrlEffective({
         ingress: {
           publicUrl: "https://botfleet.jays.services",

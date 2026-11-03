@@ -1686,7 +1686,7 @@ export class WebhookManager {
 
   isEventIgnoredAtEdge(endpointId: string, eventName?: string): boolean {
     const trigger = this.webhooks.find((candidate) => candidate.endpointId === endpointId);
-    if (!trigger) return false;
+    if (!trigger || trigger.enabled === false) return false;
     const allowed = trigger.eventTypes ?? [];
     if (allowed.length > 0 && (!eventName || !allowed.includes(eventName))) {
       return true;

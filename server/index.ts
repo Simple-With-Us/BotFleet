@@ -8800,7 +8800,7 @@ async function probeIngressUrl(raw: string): Promise<IngressProbeResult> {
     try {
       response = await fetch(parsed.toString(), {
         method: "GET",
-        redirect: "follow",
+        redirect: parsed.pathname === "/hooks/wh_probe/x" ? "manual" : "follow",
         signal: controller.signal,
         headers: { "user-agent": INGRESS_PROBE_USER_AGENT },
       });
