@@ -887,9 +887,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       roomCoordination: "no",
       computerUse: "no",
       voiceChat: "no",
-      webAccess: "unknown",
-      longContext: "unknown",
-      liveResearch: "unknown",
+      webAccess: "yes",
+      longContext: "yes",
+      liveResearch: "no",
     },
     capabilityNotes: {
       connectedApps:
@@ -898,6 +898,12 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         "This driver declares no host-control wiring.  BotFleet does not wire this here.",
       imageAttachments:
         "Turns are sent as text prompts only; BotFleet does not wire attachments into this driver.",
+      webAccess:
+        "The ZCode CLI ships its own WebSearch tool, and this driver's --disallowed-tools only removes AskUserQuestion, EnterPlanMode, and ExitPlanMode, so search stays mounted in headless turns.  Source:  zcode packages/shared/src/tool-identity.ts.",
+      longContext:
+        "GLM-5.3, the default model, documents a 1M-token context window.  Source:  https://docs.z.ai/guides/llm/glm-5.3 (fetched 2026-11-03).",
+      liveResearch:
+        "The CLI's modes are build, edit, plan, yolo, and guarded; there is no dedicated multi-step research pass, only single-shot WebSearch.",
     },
     whyThisEngine: {
       headline: "Z.ai's GLM Coding Plan CLI, driven headless.",
