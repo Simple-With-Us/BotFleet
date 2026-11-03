@@ -26,6 +26,11 @@ const execFileAsync = promisify(execFile);
 /** The stdio MCP server that reports its own launch variables (`dump_env`). */
 export const ENV_PROBE_MCP = join(dirname(fileURLToPath(import.meta.url)), "env-probe-mcp.mjs");
 
+/** The stdio MCP server that stands in for the fleet's simple-chat entry
+ *  (`whoami`), so the test that reads the seat a turn would sign as does not
+ *  depend on which simple-chat the host has installed. */
+export const SIMPLE_CHAT_MCP = join(dirname(fileURLToPath(import.meta.url)), "simple-chat-mcp.mjs");
+
 /** The picker id of the fixture model:  the model id plus the `thinking` mode
  *  mcode gives a custom provider's model.  A BotFleet turn passes it as
  *  `model`, so the driver selects it and never the real MiniMax rows. */

@@ -7,7 +7,14 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { augmentedPath, findCliCandidates, resetPathCache, resetPathCacheForTests, splitCliString } from "./env-path.ts";
+import {
+  augmentedPath,
+  findCliCandidates,
+  resetPathCache,
+  resetPathCacheForTests,
+  setKnownDirsForTests,
+  splitCliString,
+} from "./env-path.ts";
 import { resolveCli } from "./procs.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
 
@@ -380,6 +387,11 @@ describe("augmentedPath", () => {
       // augmentedPath(), so execFile below ran the host binary and failed even
       // when candidates[0] was already the canonical path we planted.
       process.env.PATH = symlinkFarm;
+      // The merge also carries the well-known install dirs, and a host that
+      // has an `mcode` in one of them (/usr/local/bin carries one on some
+      // machines) answers this lookup instead of the fixture.  The known dirs
+      // are the canonical dir this test planted, and nothing else.
+      setKnownDirsForTests([installerDir]);
       resetPathCacheForTests();
       const candidates = findCliCandidates("mcode");
       expect(candidates[0]).toBe(canonical);
@@ -392,6 +404,7 @@ describe("augmentedPath", () => {
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
+      setKnownDirsForTests(null);
       resetPathCacheForTests();
     }
   });
@@ -618,6 +631,10 @@ describe("findCliCandidates", () => {
     const previous = process.env.PATH;
     try {
       process.env.PATH = bin;
+      // No known install dirs:  the merge carries them whatever the inherited
+      // PATH says, and a host with a `dsh` in one of them would answer this
+      // lookup instead of the fixture's own binaries.
+      setKnownDirsForTests([]);
       resetPathCacheForTests();
       writeFileSync(join(bin, "dsh"), "#!/bin/sh\n");
       writeFileSync(join(bin, "clutch"), "#!/bin/sh\n");
@@ -625,6 +642,7 @@ describe("findCliCandidates", () => {
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
+      setKnownDirsForTests(null);
       resetPathCacheForTests();
     }
   });
@@ -635,6 +653,7 @@ describe("findCliCandidates", () => {
     const previous = process.env.PATH;
     try {
       process.env.PATH = bin;
+      setKnownDirsForTests([]);
       resetPathCacheForTests();
       writeFileSync(join(bin, "clutch"), "#!/bin/sh\n");
       // The regression itself: searching the default alone answers empty, so
@@ -644,6 +663,7 @@ describe("findCliCandidates", () => {
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
+      setKnownDirsForTests(null);
       resetPathCacheForTests();
     }
   });
@@ -693,6 +713,7 @@ describe("findCliCandidates", () => {
     const previous = process.env.PATH;
     try {
       process.env.PATH = [real, link].join(delimiter);
+      setKnownDirsForTests([]);
       resetPathCacheForTests();
       const bin = join(real, "dsh");
       writeFileSync(bin, "#!/bin/sh\n");
@@ -701,6 +722,7 @@ describe("findCliCandidates", () => {
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
+      setKnownDirsForTests(null);
       resetPathCacheForTests();
     }
   });

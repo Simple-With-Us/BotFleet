@@ -86,6 +86,24 @@ let cached: string | null = null;
 let probed = false;
 let loginShellPath: string | null = null;
 
+/** Test hook — the well-known install dirs the merge adds, replaced wholesale
+ *  so a test can point the merge at its own fixture dirs.  `null` restores the
+ *  real list, and nothing but a test ever sets it.  Without it a host that has
+ *  a CLI installed in one of the real dirs (/usr/local/bin carries a `dsh` and
+ *  an `mcode` on some machines) answers a lookup that means to exercise a
+ *  fixture, and the suite's result depends on what the machine has installed
+ *  rather than on what the test planted. */
+let knownDirsOverride: readonly string[] | null = null;
+
+/** Point the merged PATH's known install dirs at `dirs` (or restore the real
+ *  list with `null`).  Test hook, like `resetPathCacheForTests` below:  the
+ *  cache is dropped with it, so the next `augmentedPath()` rebuilds the merge
+ *  from the new list. */
+export function setKnownDirsForTests(dirs: readonly string[] | null): void {
+  knownDirsOverride = dirs;
+  resetPathCacheForTests();
+}
+
 /** Drop the memoized PATH so the next augmentedPath() rescans. Called when
  * the app re-probes engines, so "check again" can find something installed
  * since launch instead of answering from the PATH we booted with. `probed`
@@ -112,7 +130,7 @@ export function augmentedPath(): string {
       // Both platforms scan their standard install locations; only the
       // login-shell probe below stays unix-only, since Windows has no
       // equivalent rc file to source.
-      ...(process.platform === "win32" ? windowsKnownDirs() : knownDirs()).filter((d) => existsSync(d)),
+      ...(knownDirsOverride ?? (process.platform === "win32" ? windowsKnownDirs() : knownDirs())).filter((d) => existsSync(d)),
     ]);
   }
   // belt-and-braces: fold in the login shell's PATH once, in the
