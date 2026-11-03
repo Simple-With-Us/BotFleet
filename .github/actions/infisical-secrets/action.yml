@@ -1,7 +1,7 @@
 name: Infisical secrets
 description: >-
-  Fetch named secrets from Infisical (a service token, or a universal-auth
-  machine identity), mask them, and export them into $GITHUB_ENV -- falling
+  Fetch named secrets from Infisical using a dedicated service token,
+  mask them, and export them into $GITHUB_ENV -- falling
   back to a same-named GH_FALLBACK_<NAME> step env var and warning (or
   failing, for a name listed in `required`) when a name stays empty
   everywhere.  Wraps scripts/infisical-fetch.mjs, a dependency-free Node
@@ -42,17 +42,9 @@ inputs:
     default: /
   token:
     description: >-
-      Infisical service token (st.…).  Used instead of the machine identity
-      when set: every app and pipeline outside the agent seats reads the
-      vault through a token scoped to one project, environment and folder.
-    required: false
-    default: ""
-  client-id:
-    description: Universal-auth machine identity client id (agents only).
-    required: false
-    default: ""
-  client-secret:
-    description: Universal-auth machine identity client secret (agents only).
+      Dedicated read-only Infisical service token scoped to this use case,
+      project, environment and exact folders, including approved reference
+      targets; no machine identity fallback is available.
     required: false
     default: ""
   site-url:
@@ -77,7 +69,5 @@ runs:
         INFISICAL_ENVIRONMENT: ${{ inputs.environment }}
         INFISICAL_SECRET_PATH: ${{ inputs.secret-path }}
         INFISICAL_TOKEN: ${{ inputs.token }}
-        INFISICAL_CLIENT_ID: ${{ inputs.client-id }}
-        INFISICAL_CLIENT_SECRET: ${{ inputs.client-secret }}
         INFISICAL_SITE_URL: ${{ inputs.site-url }}
       run: node "$GITHUB_ACTION_PATH/../../../scripts/infisical-fetch.mjs"

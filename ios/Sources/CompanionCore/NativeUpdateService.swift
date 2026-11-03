@@ -108,6 +108,7 @@ public final class NativeUpdateService: ObservableObject {
     public func start() {
         guard !started, let driver else { return }
         started = true
+        state = .unavailable
         driver.onEvent = { [weak self] in self?.receive($0) }
         driver.mayPerformCheck = { [weak self] automatic in self?.beginCheck(automatic: automatic) ?? false }
         applyInterval()
@@ -117,10 +118,12 @@ public final class NativeUpdateService: ObservableObject {
             if state == .unavailable { state = .idle }
             canCheckForUpdates = driver.canCheckForUpdates
             automaticChecksEnabled = driver.automaticChecksEnabled
-            if automaticChecksEnabled && throttle.shouldAutoCheck(now: now(), fingerprint: fingerprint()) {
+            if activeCheck == nil && automaticChecksEnabled && throttle.shouldAutoCheck(now: now(), fingerprint: fingerprint()) {
                 driver.checkForUpdatesOnLaunch()
             }
         } catch {
+            started = false; running = false; activeCheck = nil
+            automaticChecksEnabled = false
             state = .failed; canCheckForUpdates = false
         }
     }
@@ -138,7 +141,7 @@ public final class NativeUpdateService: ObservableObject {
     }
 
     private func beginCheck(automatic: Bool) -> Bool {
-        guard activeCheck == nil, let driver else { return false }
+        guard started, activeCheck == nil, let driver else { return false }
         let stamp = now(), identity = fingerprint()
         guard !automatic || (driver.automaticChecksEnabled && throttle.shouldAutoCheck(now: stamp, fingerprint: identity)) else { return false }
         if !automatic {
@@ -152,6 +155,8 @@ public final class NativeUpdateService: ObservableObject {
     }
 
     private func receive(_ event: NativeUpdateEvent) {
+        // The attempt guard also admits synchronous callbacks during driver startup.
+        guard started else { return }
         switch event {
         case .availabilityChanged(let allowed):
             guard running else { return }

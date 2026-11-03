@@ -24,10 +24,43 @@ test("only the native Mac target links Sparkle and retains explicit public updat
   assert.equal(mac.info.properties.SUAutomaticallyUpdate, false);
   const archive = parseYaml(workflow).jobs["mac-native"].steps.find((step) => step.name === "Archive BotFleetMac");
   for (const setting of ["BOTFLEET_NATIVE_UPDATE_FEED_URL", "BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"]) {
-    assert.equal(archive.env[setting], "${{ vars." + setting + " }}");
+    assert.equal(archive.env[setting], "${{ env." + setting + " }}");
     assert.ok(archive.run.includes(`${setting}="$${setting}"`));
     assert.ok(localScript.includes(setting + '="${' + setting + ':-}"'));
   }
+});
+
+test("the archive consumes only canonical exports after the dedicated read-only metadata gate", () => {
+  const steps = parseYaml(workflow).jobs["mac-native"].steps;
+  const gate = steps.findIndex((step) => step.name === "Verify canonical native update configuration");
+  const archive = steps.findIndex((step) => step.name === "Archive BotFleetMac");
+  assert.ok(gate >= 0 && gate < archive);
+  assert.equal(steps[gate].env.INFISICAL_NATIVE_RELEASE_READ_TOKEN, "${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}");
+  assert.match(steps[gate].run, /node scripts\/native-update-release-config\.mjs --output/);
+  assert.match(steps[gate].run, /cat .* >> "\$GITHUB_ENV"/);
+  for (const name of ["BOTFLEET_NATIVE_UPDATE_FEED_URL", "BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"]) {
+    assert.equal(steps[gate].env[`MIRROR_${name}`], "${{ vars." + name + " }}");
+    assert.equal(steps[archive].env[name], "${{ env." + name + " }}");
+  }
+  assert.doesNotMatch(JSON.stringify(steps[gate]), /GH_FALLBACK|CLIENT_SECRET|CLIENT_ID|allow-unconfigured/);
+  assert.ok(localScript.indexOf("native-update-release-config.mjs") < localScript.indexOf("xcodebuild archive"));
+});
+
+test("trusted native assets are cryptographically verified with the canonical public key after packaging", () => {
+  const parsed = parseYaml(workflow);
+  assert.equal(parsed.on.workflow_dispatch.inputs["unsigned-draft"].default, false);
+  assert.equal(parsed.jobs.draft.if, "${{ inputs.draft && !inputs.unsigned-draft }}");
+  const steps = parsed.jobs["mac-native"].steps;
+  const signing = steps.find((step) => step.name === "Generate and verify the appcast over the final bytes");
+  assert.equal(signing.env.BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY, "${{ env.BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY }}");
+  assert.match(signing.run, /--require-signature --public-key "\$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"/);
+  assert.match(signing.run, /test "\$UNSIGNED_DRAFT" = true \|\|/);
+  const assemble = parsed.jobs.assemble.steps.find((step) => step.name === "Verify the appcast against the actual bytes");
+  assert.equal(assemble.env.INFISICAL_NATIVE_RELEASE_READ_TOKEN, "${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}");
+  assert.match(assemble.run, /native-update-release-config\.mjs/);
+  assert.match(assemble.run, /--require-signature --public-key "\$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"/);
+  assert.match(localScript, /--require-signature --public-key "\$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"/);
+  assert.ok(localScript.indexOf("Sparkle signing key file and sign_update") < localScript.indexOf("xcodebuild archive"));
 });
 
 /** One top-level shell function, taken verbatim out of the script. */

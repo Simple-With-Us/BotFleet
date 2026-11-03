@@ -23,9 +23,8 @@
 #   APPLE_API_KEY_ID   the key's id, and APPLE_API_ISSUER_ID its issuer
 #   NOTARY_PROFILE     notarytool keychain profile (default: AC_PASSWORD)
 #   MAC_SIGN_IDENTITY  Keychain identity (default: Developer ID Application)
-#   SPARKLE_EDDSA_KEY  sign_update private key file; without it (and
-#                       without sign_update on PATH) the appcast is an
-#                       unsigned draft and the output says so
+#   SPARKLE_EDDSA_KEY  sign_update private key file; required with
+#                       sign_update on PATH for distributable packaging
 #   SENTRY_DSN         native Sentry DSN (BF-2541); environment first, then
 #                       Infisical through `fleet-secrets get`, never printed.
 #                       Empty is fine: the package ships with Sentry inert,
@@ -113,6 +112,23 @@ open_api_key() {
 }
 
 echo "packaging BotFleetMac $VERSION (build $BUILD)"
+
+# Only an explicitly nondistributable build may omit public update metadata.
+# Existing local fields are comparison inputs, never canonical configuration.
+export MIRROR_BOTFLEET_NATIVE_UPDATE_FEED_URL="${MIRROR_BOTFLEET_NATIVE_UPDATE_FEED_URL:-${BOTFLEET_NATIVE_UPDATE_FEED_URL:-}}"
+export MIRROR_BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY="${MIRROR_BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY:-${BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY:-}}"
+if [ "$SKIP_NOTARIZE" -eq 1 ]; then
+  node "$ROOT/scripts/native-update-release-config.mjs" --output "$WORK/native-update.env" --allow-unconfigured
+else
+  node "$ROOT/scripts/native-update-release-config.mjs" --output "$WORK/native-update.env"
+fi
+while IFS='=' read -r name value; do export "$name=$value"; done < "$WORK/native-update.env"
+if [ "$SKIP_NOTARIZE" -eq 0 ]; then
+  if [ -z "${SPARKLE_EDDSA_KEY:-}" ] || ! command -v sign_update >/dev/null; then
+    echo "distributable native updates require the Sparkle signing key file and sign_update" >&2
+    exit 69
+  fi
+fi
 
 # The Xcode project is generated, never committed (ios/.gitignore).
 if ! command -v xcodegen >/dev/null; then
@@ -240,14 +256,11 @@ if [ -n "${SPARKLE_EDDSA_KEY:-}" ] && command -v sign_update >/dev/null; then
   printf '%s' "$SIGNATURE" > "$OUT/${APP_NAME}.zip.edsig"
   echo "ok: Sparkle EdDSA signature recorded"
 else
-  echo "note: no Sparkle signing (SPARKLE_EDDSA_KEY unset or sign_update missing); appcast will be an unsigned draft"
+  echo "Sparkle signing is required for distributable native updates" >&2
+  exit 69
 fi
 
 node "$ROOT/scripts/native-appcast.mjs" "$OUT" "$VERSION" "v$VERSION${NATIVE_TAG_SUFFIX}"
-if [ -n "${SPARKLE_EDDSA_KEY:-}" ] && [ -f "$OUT/${APP_NAME}.zip.edsig" ]; then
-  node "$ROOT/scripts/verify-native-release.mjs" "$OUT" "$VERSION" --require-signature
-else
-  node "$ROOT/scripts/verify-native-release.mjs" "$OUT" "$VERSION"
-fi
+node "$ROOT/scripts/verify-native-release.mjs" "$OUT" "$VERSION" --require-signature --public-key "$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"
 
 echo "done: $OUT/${APP_NAME}.zip, $OUT/${APP_NAME}.dmg, $OUT/appcast.xml ($VERSION)"

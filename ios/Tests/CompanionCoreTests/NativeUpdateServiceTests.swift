@@ -29,15 +29,76 @@ final class NativeUpdateServiceTests: XCTestCase {
         XCTAssertFalse(service.canCheckForUpdates)
     }
 
-    func testStartIsIdempotentAndFailureCannotCheck() throws {
+    func testFailedStartCanRetrySameDriverWithoutRetainingAnActiveCheck() throws {
         let driver = Driver(); driver.startFails = true
         let service = try make(driver)
-        service.start(); service.start(); service.checkForUpdates()
+        driver.onStart = { XCTAssertTrue(driver.begin(automatic: true)) }
+        service.start(); service.checkForUpdates()
         driver.onEvent?(.availabilityChanged(true))
         XCTAssertEqual(driver.starts, 1)
         XCTAssertEqual(driver.manualRequests, 0)
         XCTAssertEqual(service.state, .failed)
         XCTAssertFalse(service.canCheckForUpdates)
+        driver.startFails = false; driver.onStart = nil
+        service.start(); service.start()
+        XCTAssertEqual(driver.starts, 2)
+        XCTAssertEqual(service.state, .idle)
+        XCTAssertTrue(service.canCheckForUpdates)
+        service.checkForUpdates()
+        XCTAssertEqual(driver.manualRequests, 1)
+        XCTAssertEqual(service.state, .checking)
+    }
+
+    func testUnstartedAndFailedStartupIgnoreSpuriousProgressAndCancellation() throws {
+        let driver = Driver(), service = try make(driver)
+        let events: [NativeUpdateEvent] = [.availabilityChanged(true), .found(version: "0.1.0"),
+            .downloading(version: "0.1.0"), .downloaded(version: "0.1.0"), .downloadCancelled,
+            .finished(failureClass: nil)]
+        for event in events {
+            driver.onEvent?(event)
+            XCTAssertEqual(service.state, .unavailable)
+            XCTAssertFalse(service.canCheckForUpdates)
+        }
+        driver.startFails = true
+        service.start()
+        for event in events {
+            driver.onEvent?(event)
+            XCTAssertEqual(service.state, .failed)
+            XCTAssertFalse(service.canCheckForUpdates)
+        }
+        XCTAssertFalse(driver.begin(automatic: true))
+        XCTAssertFalse(driver.begin(automatic: false))
+        XCTAssertEqual(service.state, .failed)
+    }
+
+    func testSynchronousStartupAdmissionPreservesReentrantAndBusyGuards() throws {
+        let driver = Driver(), service = try make(driver)
+        driver.onStart = { [weak service] in
+            service?.start()
+            XCTAssertTrue(driver.begin(automatic: true))
+            XCTAssertFalse(driver.begin(automatic: true))
+            driver.onEvent?(.found(version: "0.1.0"))
+        }
+        service.start()
+        XCTAssertEqual(driver.starts, 1)
+        XCTAssertEqual(driver.launchRequests, 0)
+        XCTAssertEqual(service.state, .available("0.1.0"))
+        driver.onEvent?(.finished(failureClass: nil))
+        service.checkForUpdates()
+        XCTAssertEqual(service.state, .checking)
+    }
+
+    func testInitializedDriverProgressDoesNotRequireAnActiveAdmission() throws {
+        let driver = Driver(), service = try make(driver)
+        service.start()
+        driver.onEvent?(.found(version: "0.1.0"))
+        XCTAssertEqual(service.state, .available("0.1.0"))
+        driver.onEvent?(.downloading(version: "0.1.0"))
+        XCTAssertEqual(service.state, .downloading("0.1.0"))
+        driver.onEvent?(.downloaded(version: "0.1.0"))
+        XCTAssertEqual(service.state, .downloaded("0.1.0"))
+        driver.onEvent?(.downloadCancelled)
+        XCTAssertEqual(service.state, .idle)
     }
 
     func testAutomaticCheckRespectsPreferenceAndManualBypassesThrottle() throws {
@@ -230,7 +291,11 @@ final class NativeUpdateServiceTests: XCTestCase {
         var mayPerformCheck: ((Bool) -> Bool)?
         var starts = 0, manualRequests = 0, launchRequests = 0
         var startFails = false
-        func start() throws { starts += 1; if startFails { throw NSError(domain: "fixture", code: 1) } }
+        var onStart: (() -> Void)?
+        func start() throws {
+            starts += 1; onStart?()
+            if startFails { throw NSError(domain: "fixture", code: 1) }
+        }
         func checkForUpdates() { manualRequests += 1; _ = begin(automatic: false) }
         func checkForUpdatesOnLaunch() { launchRequests += 1 }
         func begin(automatic: Bool) -> Bool { mayPerformCheck?(automatic) ?? false }
