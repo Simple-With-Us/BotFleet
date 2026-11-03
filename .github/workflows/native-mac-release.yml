@@ -180,6 +180,8 @@ jobs:
           BUILD: ${{ needs.prepare.outputs.build }}
           SENTRY_DSN: ${{ env.SENTRY_DSN }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.sha }}
+          BOTFLEET_NATIVE_UPDATE_FEED_URL: ${{ vars.BOTFLEET_NATIVE_UPDATE_FEED_URL }}
+          BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY: ${{ vars.BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY }}
         run: |
           build="$BUILD"
           if [ -n "${SENTRY_DSN:-}" ]; then
@@ -196,6 +198,8 @@ jobs:
             CURRENT_PROJECT_VERSION="$build" \
             SENTRY_DSN="$SENTRY_DSN" \
             SOURCE_COMMIT="$SOURCE_COMMIT" \
+            BOTFLEET_NATIVE_UPDATE_FEED_URL="$BOTFLEET_NATIVE_UPDATE_FEED_URL" \
+            BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY="$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Developer ID Application" \
             DEVELOPMENT_TEAM=CC8UTF7ATG

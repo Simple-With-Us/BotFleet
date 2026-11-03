@@ -11,6 +11,25 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = readFileSync(join(ROOT, ".github/workflows/native-mac-release.yml"), "utf8");
 const localScript = readFileSync(join(ROOT, "scripts/mac-package.sh"), "utf8");
 
+test("only the native Mac target links Sparkle and retains explicit public update metadata", () => {
+  const project = parseYaml(readFileSync(join(ROOT, "ios/project.yml"), "utf8"));
+  const mac = project.targets.BotFleetMac;
+  assert.equal(project.packages.Sparkle.exactVersion, "2.9.6");
+  assert.ok(mac.dependencies.some((dependency) => dependency.package === "Sparkle"));
+  assert.ok(!project.targets.BotFleet.dependencies.some((dependency) => dependency.package === "Sparkle"));
+  assert.equal(mac.info.properties.SUFeedURL, "$(BOTFLEET_NATIVE_UPDATE_FEED_URL)");
+  assert.equal(mac.info.properties.SUPublicEDKey, "$(BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY)");
+  assert.equal(mac.settings.base.BOTFLEET_NATIVE_UPDATE_FEED_URL, "");
+  assert.equal(mac.settings.base.BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY, "");
+  assert.equal(mac.info.properties.SUAutomaticallyUpdate, false);
+  const archive = parseYaml(workflow).jobs["mac-native"].steps.find((step) => step.name === "Archive BotFleetMac");
+  for (const setting of ["BOTFLEET_NATIVE_UPDATE_FEED_URL", "BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"]) {
+    assert.equal(archive.env[setting], "${{ vars." + setting + " }}");
+    assert.ok(archive.run.includes(`${setting}="$${setting}"`));
+    assert.ok(localScript.includes(setting + '="${' + setting + ':-}"'));
+  }
+});
+
 /** One top-level shell function, taken verbatim out of the script. */
 function shellFunction(source, name) {
   const match = source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"));
