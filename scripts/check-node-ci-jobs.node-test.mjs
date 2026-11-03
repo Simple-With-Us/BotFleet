@@ -89,6 +89,38 @@ test("a job that only typechecks is a Node desktop job too", () => {
   assert.equal(offenders[0].pattern, "pnpm typecheck");
 });
 
+test("a job that reaches the desktop through a reusable workflow or a matrix is named", () => {
+  const workflow = {
+    jobs: {
+      delegated: {
+        name: "Delegated desktop build",
+        uses: "./.github/workflows/desktop.yml",
+        strategy: { matrix: { run: ["electron-builder --dir"] } },
+      },
+    },
+  };
+  const offenders = findNodeDesktopJobs(workflow, ".github/workflows/ci.yml");
+  const patterns = offenders.map((offender) => offender.pattern);
+  assert.ok(patterns.includes("electron-builder"), "a matrix value that names the desktop must be caught");
+  assert.ok(offenders.every((offender) => offender.job === "delegated"));
+});
+
+test("a workflow that only mentions the command in a prompt is not a desktop job", () => {
+  // An autofix workflow passes the repo's verify command to its agent as
+  // text.  The job does not run the desktop, so naming it would be a false
+  // report and the audit would lose its value.
+  const workflow = {
+    jobs: {
+      autofix: {
+        name: "autofix",
+        with: { prompt: "This repo's verify command: `pnpm typecheck && pnpm test`." },
+        steps: [{ name: "Run the agent", run: "node agent.mjs" }],
+      },
+    },
+  };
+  assert.deepEqual(findNodeDesktopJobs(workflow, ".github/workflows/claude-code-autofix.yml"), []);
+});
+
 test("the gate reads the workflow job set and names every offender", () => {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-node-ci-jobs-"));
   try {

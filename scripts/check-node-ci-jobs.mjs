@@ -70,6 +70,20 @@ export function findNodeDesktopJobs(workflow, fileName) {
         if (mentions(text, pattern)) record(pattern);
       }
     }
+    // A job can reach the Node desktop without naming a command in a step:
+    // through a reusable workflow, or through a matrix value.  Those are read
+    // too, or a job that delegates the desktop build would slip past a gate
+    // that only reads steps.
+    //
+    // A `with:` value is deliberately NOT read.  It is opaque data handed to
+    // another workflow, and a workflow that merely mentions the command in a
+    // prompt is not a Node desktop job;  naming it as one would make this
+    // gate report offenders that do not exist, and an audit that cries wolf
+    // is not an audit.
+    const indirect = [job?.uses ?? "", JSON.stringify(job?.strategy ?? {})].join("\n");
+    for (const pattern of NODE_DESKTOP_PATTERNS) {
+      if (mentions(indirect, pattern)) record(pattern);
+    }
   }
   return offenders;
 }

@@ -151,6 +151,12 @@ test("a state file this tool did not write is refused", () => {
   assert.equal(validateState({ marker: STATE_MARKER, version: STATE_VERSION, ...cleanRecord(1_000) }), null);
 });
 
+test("a state file whose recorded instant and timestamp disagree is refused", () => {
+  const tampered = { marker: STATE_MARKER, version: STATE_VERSION, ...cleanRecord(1_000) };
+  tampered.at = new Date(999_000_000).toISOString();
+  assert.match(validateState(tampered), /recorded instant and its timestamp disagree/);
+});
+
 test("the CLI records the start of the soak and judges the end of it", () => {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-soak-24h-"));
   try {

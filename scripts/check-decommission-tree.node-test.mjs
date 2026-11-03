@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   DECOMMISSION_ROOTS,
   DESKTOP_MANIFESTS,
+  OUT_OF_SCOPE_ROOTS,
   missingTreeConditions,
 } from "./check-decommission-tree.mjs";
 
@@ -129,6 +130,37 @@ test("the gate passes a tree the decommission already cleared", () => {
     const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /the tracked tree carries no server\/, no companion\/ and no desktop Node manifest/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a file that is only staged does not count, because the gate reads the committed tree", () => {
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-decommission-tree-"));
+  try {
+    makeRepo(directory, { "ios/Sources/BotFleet/App.swift": "// app\n" });
+    // Staged for the next commit and never committed: the index carries it,
+    // HEAD does not.  The gate asks what main carries, so it must pass.
+    mkdirSync(join(directory, "server"), { recursive: true });
+    writeFileSync(join(directory, "server", "index.ts"), "export const harness = true;\n");
+    execFileSync("git", ["add", "-A"], { cwd: directory, stdio: ["ignore", "pipe", "pipe"] });
+    const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /server\/ is still tracked/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the gate names the roots another issue owns instead of ignoring them", () => {
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-decommission-tree-"));
+  try {
+    makeRepo(directory, { "ios/Sources/BotFleet/App.swift": "// app\n" });
+    const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    for (const root of OUT_OF_SCOPE_ROOTS) {
+      assert.match(result.stdout, new RegExp(`not checked here[^\\n]*${root}/`));
+    }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

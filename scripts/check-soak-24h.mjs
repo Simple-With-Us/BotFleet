@@ -22,6 +22,11 @@
 // iOS push keeps working, and that continuous observation belongs to whatever
 // samples the window while it runs.  This script is the window's bookend
 // check, and its verdict says so.
+//
+// The state file is a local record, not a sealed one.  It carries a marker and
+// a version, and this script refuses a file it did not write, but a hand
+// edited timestamp can still shorten the window;  the check therefore proves
+// elapsed time and two clean endpoints, and nothing more than that.
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -55,6 +60,9 @@ export function runRebootCheck(scriptPath) {
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
     status: result.status,
+    // The spawn's own failure message, so a check that could not be started
+    // says why instead of failing with an empty reason.
+    error: result.error?.message ?? "",
   };
 }
 
@@ -159,6 +167,9 @@ export function validateState(state) {
     return `the state file version ${String(state.version)} is not the expected ${STATE_VERSION}`;
   }
   if (!Number.isFinite(state.atMs)) return "the state file carries no start timestamp";
+  if (state.at !== new Date(state.atMs).toISOString()) {
+    return "the state file's recorded instant and its timestamp disagree";
+  }
   if (state.verdict === null || state.verdict === undefined) return "the state file carries no reboot verdict";
   if (state.verdict.ok !== true && state.verdict.ok !== false) {
     return "the state file's reboot verdict carries no boolean ok field";
