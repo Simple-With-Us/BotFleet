@@ -3642,6 +3642,14 @@ export async function desktopStartupPreflight(receipt, { appPids, listeners, loc
   return snapshot;
 }
 
+/** An in-place receipt write may be observed between bytes; every retry still validates the whole receipt. */
+export async function observeDesktopStartup({ readReceipt, ...dependencies }) {
+  let receipt;
+  try { receipt = readReceipt(); }
+  catch { return { safe: false, reason: "Desktop startup confirmation is not readable yet" }; }
+  return desktopStartupPreflight(receipt, dependencies);
+}
+
 /** Recovery still attempts every watchdog if the preferred desktop cannot start. */
 export async function restoreDesktopBeforeWatchdogs({ desktop, open, verify, bootstraps, record }) {
   if (desktop) await record(async () => { await open(); await verify(); });
@@ -4326,8 +4334,8 @@ function createOperations(config) {
           await run("open", ["-a", config.appPath, "--args", `--update-startup-receipt=${desktopStartupPath}`]);
         },
         verify: () => waitForStartup({
-          attempt: async () => desktopStartupPreflight(
-            readDesktopStartupReceipt(desktopStartupPath, desktopStartupRequest), {
+          attempt: async () => observeDesktopStartup({
+              readReceipt: () => readDesktopStartupReceipt(desktopStartupPath, desktopStartupRequest),
               appPids: await exactAppPids(config.appPath), listeners: localListenerPids,
               localRuntime: () => runtimeIdentityPreflight(config, prepared),
             }),
@@ -4385,8 +4393,8 @@ function createOperations(config) {
             if (!snapshot.safe || snapshot.mode !== "authenticated") {
               return snapshot.reason || "Updated application did not attach to the authenticated single data owner";
             }
-            const desktop = await desktopStartupPreflight(
-              readDesktopStartupReceipt(desktopStartupPath, desktopStartupRequest), {
+            const desktop = await observeDesktopStartup({
+                readReceipt: () => readDesktopStartupReceipt(desktopStartupPath, desktopStartupRequest),
                 appPids: await exactAppPids(config.appPath), listeners: localListenerPids, localRuntime: async () => snapshot,
               });
             return desktop?.safe ? null : desktop?.reason || "Desktop startup is incomplete";

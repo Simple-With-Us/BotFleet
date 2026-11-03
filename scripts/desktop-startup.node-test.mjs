@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyLocalHealth, desktopStartupPreflight, healthTopologyResult, ownedRuntimePids } from "./update-botfleet-mac.mjs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createDesktopStartupRequest, readDesktopStartupReceipt, writeDesktopStartupReceipt } from "../electron/desktop-startup-receipt.mjs";
+import { classifyLocalHealth, desktopStartupPreflight, healthTopologyResult, observeDesktopStartup, ownedRuntimePids, waitForStartup } from "./update-botfleet-mac.mjs";
 
 const APP_PID = 401;
 const LOCAL_PID = 402;
@@ -18,6 +22,40 @@ function dependencies({ appPids = [APP_PID], socketPids = [APP_PID], runtime = A
     localRuntime: async () => { calls.push(["localRuntime"]); return runtime; },
   };
 }
+
+test("polling retries a torn private receipt then accepts the complete validated response", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "desktop-startup-observation-"));
+  chmodSync(dir, 0o700);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "desktop-startup.json");
+  const build = { app: "botfleet", sourceCommit: "a".repeat(40), sourceDirty: false, version: "0.1.0", apiVersion: 1, uiHash: "b".repeat(64) };
+  const request = createDesktopStartupRequest(file, build);
+  writeDesktopStartupReceipt(file, build, RECEIPT);
+  const complete = readFileSync(file);
+  writeFileSync(file, '{"schemaVersion":');
+  let now = 0;
+  const deps = dependencies();
+  const result = await waitForStartup({
+    attempt: () => observeDesktopStartup({ readReceipt: () => readDesktopStartupReceipt(file, request), ...deps }),
+    now: () => now, wait: async (ms) => { now += ms; writeFileSync(file, complete); },
+    timeoutMs: 100, pollMs: 10, what: "desktop", fallback: "not confirmed",
+  });
+  assert.equal(now, 10);
+  assert.deepEqual(result, { safe: true, mode: "remote-desktop", pid: APP_PID });
+  assert.deepEqual(deps.calls, [["listeners", PORT]]);
+});
+
+test("unreadable confirmation remains unsafe until the bounded polling deadline without leaking its error", async () => {
+  let now = 0;
+  const deps = dependencies();
+  await assert.rejects(waitForStartup({
+    attempt: () => observeDesktopStartup({ readReceipt: () => { throw new Error("private parser input"); }, ...deps }),
+    now: () => now, wait: async (ms) => { now += ms; },
+    timeoutMs: 20, pollMs: 10, what: "desktop", fallback: "not confirmed",
+  }), { message: "Desktop startup confirmation is not readable yet" });
+  assert.equal(now, 20);
+  assert.deepEqual(deps.calls, []);
+});
 
 test("remote desktop readiness requires its exact installed PID and kernel UI socket without consulting local runtime", async () => {
   const deps = dependencies();

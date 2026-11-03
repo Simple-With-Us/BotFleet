@@ -4,7 +4,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createDesktopStartupRequest, desktopStartupReceiptPath, readDesktopStartupReceipt, writeDesktopStartupReceipt } from "./desktop-startup-receipt.mjs";
+import { createDesktopStartupRequest, desktopStartupReceiptPath, desktopStartupUiPort, readDesktopStartupReceipt, writeDesktopStartupReceipt } from "./desktop-startup-receipt.mjs";
 
 const BUILD = { app: "botfleet", sourceCommit: "a".repeat(40), sourceDirty: false,
   version: "0.1.0", apiVersion: 1, uiHash: "b".repeat(64), build: "202611031234" };
@@ -21,6 +21,14 @@ function fixture(t) {
 function store(file, value) {
   writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
 }
+
+test("loopback UI origins retain the effective HTTP port including normalized default 80", () => {
+  for (const origin of ["http://127.0.0.1", "http://127.0.0.1:80/"]) assert.equal(desktopStartupUiPort(origin), 80);
+  assert.equal(desktopStartupUiPort("http://127.0.0.1:18799/"), 18799);
+  for (const origin of ["https://127.0.0.1", "http://localhost:8799", "http://example.com:8799", "http://user@127.0.0.1:8799", "http://127.0.0.1:0", "http://127.0.0.1:65536", "invalid"]) {
+    assert.throws(() => desktopStartupUiPort(origin), GENERIC);
+  }
+});
 
 test("argv accepts one absolute normalized fixed-basename flag", () => {
   const file = join(tmpdir(), "private", "desktop-startup.json");

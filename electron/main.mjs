@@ -51,7 +51,7 @@ import {
 import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity, probeHarness, resolvePackagedServer } from "./server-boot-probe.mjs";
 import { readPackagedBuildIdentity } from "./runtime-identity.mjs";
-import { desktopStartupReceiptPath, writeDesktopStartupReceipt } from "./desktop-startup-receipt.mjs";
+import { desktopStartupReceiptPath, desktopStartupUiPort, writeDesktopStartupReceipt } from "./desktop-startup-receipt.mjs";
 import { readHarnessOwner } from "./harness-ownership.mjs";
 import { startUiShim } from "./attached-ui-shim.mjs";
 import { readKeychainServiceToken, resolveServerTarget } from "./server-target.mjs";
@@ -3126,10 +3126,8 @@ app.whenReady().then(async () => {
     try {
       if (!app.isPackaged || !serverReady) throw new Error("Desktop startup is incomplete");
       const build = readPackagedBuildIdentity(path.join(process.resourcesPath, "server"));
-      const ui = new URL(rendererBaseUrl());
-      if (ui.protocol !== "http:" || ui.hostname !== "127.0.0.1") throw new Error("Invalid desktop UI origin");
       writeDesktopStartupReceipt(updateStartupReceiptPath, build, {
-        pid: process.pid, mode: serverMode === "remote" ? "remote" : "local", uiPort: Number(ui.port),
+        pid: process.pid, mode: serverMode === "remote" ? "remote" : "local", uiPort: desktopStartupUiPort(rendererBaseUrl()),
       });
     } catch {
       console.error("[desktop] update startup confirmation failed");

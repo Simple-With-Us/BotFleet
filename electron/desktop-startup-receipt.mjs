@@ -39,6 +39,16 @@ export function desktopStartupReceiptPath(argv = process.argv) {
 }
 /* oxlint-enable anti-slop/no-runtime-typeof */
 
+/** URL normalizes an explicit HTTP port 80 to the empty string. */
+export function desktopStartupUiPort(origin) {
+  let ui;
+  try { ui = new URL(origin); } catch { throw invalid(); }
+  if (ui.protocol !== "http:" || ui.hostname !== "127.0.0.1" || ui.username || ui.password) throw invalid();
+  const port = ui.port === "" ? 80 : Number(ui.port);
+  if (!positive(port) || port > 65535) throw invalid();
+  return port;
+}
+
 function sameInode(a, b) {
   return a.dev === b.dev && a.ino === b.ino;
 }
