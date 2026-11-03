@@ -22,9 +22,10 @@ if (process.env.FAKE_ZCODE_DUMP) {
     JSON.stringify({
       argv,
       env: {
-        Z_AI_API_KEY: process.env.Z_AI_API_KEY ?? null,
-        GLM_API_KEY: process.env.GLM_API_KEY ?? null,
-        BIGMODEL_API_KEY: process.env.BIGMODEL_API_KEY ?? null,
+        // Presence only: a leaked vendor key must never reach the dump file.
+        Z_AI_API_KEY: process.env.Z_AI_API_KEY !== undefined,
+        GLM_API_KEY: process.env.GLM_API_KEY !== undefined,
+        BIGMODEL_API_KEY: process.env.BIGMODEL_API_KEY !== undefined,
         FAKE_ZCODE_MODE: process.env.FAKE_ZCODE_MODE ?? null,
       },
     }) + "\n",
@@ -47,6 +48,45 @@ const stream = (payload: JsonObject) =>
   write({ type: "model.streaming", sessionId, turnId: "zt-1", seq: 1, timestamp: 1, payload });
 
 switch (mode) {
+  case "no-trailing-newline": {
+    stream({ kind: "text_delta", delta: "Tail" });
+    write({ type: "turn.completed", sessionId, turnId: "zt-1", payload: {} });
+    // The result line arrives without its trailing newline: the driver must
+    // drain the final buffer on close instead of dropping the turn.
+    process.stdout.write(JSON.stringify({
+      type: "result",
+      sessionId,
+      turnId: "zt-1",
+      response: "Tail",
+      usage: { inputTokens: 5, outputTokens: 2 },
+      projection: { status: "idle", turnCount: 1, totalTokenCount: 7, contextUsed: null, contextWindow: null },
+    }));
+    process.exit(0);
+    break;
+  }
+  case "tool-no-ids":
+    write({
+      type: "tool.updated",
+      sessionId,
+      turnId: "zt-1",
+      payload: { kind: "started", toolName: "read_file", input: { path: "a.ts" } },
+    });
+    write({
+      type: "tool.updated",
+      sessionId,
+      turnId: "zt-1",
+      payload: { kind: "result", toolName: "read_file", output: "file body" },
+    });
+    write({
+      type: "result",
+      sessionId,
+      turnId: "zt-1",
+      response: "done",
+      usage: { inputTokens: 7, outputTokens: 1 },
+      projection: { status: "idle", turnCount: 1, totalTokenCount: 8, contextUsed: null, contextWindow: null },
+    });
+    process.exit(0);
+    break;
   case "exit-early":
     process.stderr.write("zcode: catastrophic startup failure\n");
     process.exit(1);

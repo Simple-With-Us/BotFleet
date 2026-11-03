@@ -29,6 +29,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { stripWorkspaceCredentialEnv } from "../config.ts";
+import { applyLaunchIdentity } from "../launch-identity.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
@@ -328,12 +329,14 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       if (turn.model) args.push("--model", turn.model);
       const resumeCursor = isJsonString(turn.resumeCursor) && turn.resumeCursor ? turn.resumeCursor : null;
       if (resumeCursor) args.push("--resume", resumeCursor);
+      // The CLI resolves its workspace from --cwd, not from the spawn cwd.
+      if (turn.cwd) args.push("--cwd", turn.cwd);
 
       const cli = await resolveCli();
       const child = spawnCli(cli, args, {
         stdio: ["ignore", "pipe", "pipe"],
         cwd: turn.cwd,
-        env: zcodeEnvironment({ ...process.env, ...input.environment }),
+        env: applyLaunchIdentity(zcodeEnvironment({ ...process.env, ...input.environment }), turn.launchIdentity),
       });
 
       let buf = "";
@@ -416,8 +419,19 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
         emit({ ...base(threadId, turnId), type: "session.started", sessionId, model: turn.model ?? null });
       };
 
-      const toolItemId = (payload: NonNullable<ZcodeStreamLine["payload"]>) =>
-        String(payload.toolCallId ?? payload.callId ?? payload.id ?? newId());
+      // A CLI that omits call ids still gets one stable fallback id per tool,
+      // so start and completion rows stay correlated.
+      const fallbackToolItemIds = new Map<string, string>();
+      const toolItemId = (payload: NonNullable<ZcodeStreamLine["payload"]>) => {
+        const explicit = payload.toolCallId ?? payload.callId ?? payload.id;
+        if (explicit !== undefined && explicit !== null) return String(explicit);
+        const toolName = typeof payload.toolName === "string" && payload.toolName ? payload.toolName : "tool";
+        const existing = fallbackToolItemIds.get(toolName);
+        if (existing) return existing;
+        const created = newId();
+        fallbackToolItemIds.set(toolName, created);
+        return created;
+      };
 
       const onLine = (line: ZcodeStreamLine) => {
         appendNative(threadId, { dir: "in", source: "zcode.stream", msg: line });
@@ -510,6 +524,17 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
         settle(false);
       });
       child.on("close", (code, signal) => {
+        // Trailing stdout without a final newline still carries the result
+        // line; drain it before judging the turn.
+        if (buf.trim()) {
+          try {
+            const parsed = ZCODE_STREAM_LINE_SCHEMA.safeParse(JSON.parse(buf));
+            if (parsed.success) onLine(parsed.data);
+          } catch {
+            /* skip non-JSON tail */
+          }
+          buf = "";
+        }
         // A close without the result line is a failed turn, never a hang;
         // "close" fires after stderr drained, so the excerpt is whole.
         if (sawResult) {

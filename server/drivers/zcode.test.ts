@@ -160,7 +160,7 @@ describe("ZcodeDriver turns (fake CLI)", () => {
   it("launches with the vendor headless recipe and the requested model", async () => {
     const dump = join(dir, "dump.jsonl");
     await create(undefined, { FAKE_ZCODE_DUMP: dump });
-    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-argv", text: "hi", model: "GLM-5.3-Flash" });
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-argv", text: "hi", model: "GLM-5.3-Flash", cwd: dir });
     await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
 
     const argv = readLaunches(dump)[0]?.argv ?? [];
@@ -169,6 +169,7 @@ describe("ZcodeDriver turns (fake CLI)", () => {
     expect(argv[argv.indexOf("--output-format") + 1]).toBe("stream-json");
     expect(argv[argv.indexOf("--model") + 1]).toBe("GLM-5.3-Flash");
     expect(argv).toContain("--no-color");
+    expect(argv[argv.indexOf("--cwd") + 1]).toBe(dir);
     // The prompt is the positional text after --prompt, never a flag mashup.
     expect(argv[argv.indexOf("--prompt") + 1]).toBe("hi");
   });
@@ -185,9 +186,27 @@ describe("ZcodeDriver turns (fake CLI)", () => {
     await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
 
     const launch = readFileSync(dump, "utf8").trim().split("\n").map((line) => JSON.parse(line))[0];
-    expect(launch.env.Z_AI_API_KEY).toBeNull();
-    expect(launch.env.GLM_API_KEY).toBeNull();
-    expect(launch.env.BIGMODEL_API_KEY).toBeNull();
+    expect(launch.env.Z_AI_API_KEY).toBe(false);
+    expect(launch.env.GLM_API_KEY).toBe(false);
+    expect(launch.env.BIGMODEL_API_KEY).toBe(false);
+  });
+
+  it("settles a turn whose result line arrives without a trailing newline", async () => {
+    await create("no-trailing-newline");
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-tail", text: "hi" });
+    const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    expect(done).toMatchObject({ ok: true, stopReason: "end_turn" });
+  });
+
+  it("correlates tool rows when the CLI omits call ids", async () => {
+    await create("tool-no-ids");
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-noids", text: "hi" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    const started = recorder.events.find((e) => e.type === "item.started");
+    const completed = recorder.events.find((e) => e.type === "item.completed");
+    expect(started).toBeTruthy();
+    expect(completed).toBeTruthy();
+    expect(started?.itemId).toBe(completed?.itemId);
   });
 
   it("fails promptly when the zcode process exits before its result line", async () => {
