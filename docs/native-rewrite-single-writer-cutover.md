@@ -80,9 +80,23 @@ wc -l /tmp/srv-routine-enabled.txt /tmp/srv-webhook-enabled.txt
 
 Expected on Nov 2, 2026: `1` enabled routine and `0` enabled webhooks.
 
+Those two files are the server's own record, on the server.  The comparison below re-fetches
+them on the Mac, because `comm` can only compare two files on one host.
+
 **The overlap:**
 
 ```bash
+# On the Mac.  Both lists are produced here,  so comm compares two local files:
+# a list produced on the server cannot be compared with one on the Mac,  and a
+# missing file makes comm print an error and nothing on stdout,  which is what a
+# passing check looks like.
+for kind in routines webhooks; do
+  code="$(curl -s -o /tmp/srv-$kind.json -w '%{http_code}' -m 10 \
+    -H "x-botfleet-gate-token: $BF_GATE_TOKEN" http://100.69.77.26:8799/api/$kind)"
+  [ "$code" = "200" ] || { echo "FAIL: the server's $kind list answered $code"; exit 1; }
+done
+jq -r '.routines[]|select(.enabled)|.id' /tmp/srv-routines.json | sort > /tmp/srv-routine-enabled.txt
+jq -r '.webhooks[]|select(.enabled)|.endpointId' /tmp/srv-webhooks.json | sort > /tmp/srv-webhook-enabled.txt
 comm -12 /tmp/mac-routine-enabled.txt /tmp/srv-routine-enabled.txt
 comm -12 /tmp/mac-webhook-enabled.txt /tmp/srv-webhook-enabled.txt
 ```
@@ -154,6 +168,17 @@ Expected: `false`.
 ```bash
 curl -sf -m 5 http://127.0.0.1:8799/api/routines \
   | jq -r '.routines[]|select(.enabled)|.id' | sort > /tmp/mac-routine-enabled.txt
+# On the Mac.  Both lists are produced here,  so comm compares two local files:
+# a list produced on the server cannot be compared with one on the Mac,  and a
+# missing file makes comm print an error and nothing on stdout,  which is what a
+# passing check looks like.
+for kind in routines webhooks; do
+  code="$(curl -s -o /tmp/srv-$kind.json -w '%{http_code}' -m 10 \
+    -H "x-botfleet-gate-token: $BF_GATE_TOKEN" http://100.69.77.26:8799/api/$kind)"
+  [ "$code" = "200" ] || { echo "FAIL: the server's $kind list answered $code"; exit 1; }
+done
+jq -r '.routines[]|select(.enabled)|.id' /tmp/srv-routines.json | sort > /tmp/srv-routine-enabled.txt
+jq -r '.webhooks[]|select(.enabled)|.endpointId' /tmp/srv-webhooks.json | sort > /tmp/srv-webhook-enabled.txt
 comm -12 /tmp/mac-routine-enabled.txt /tmp/srv-routine-enabled.txt
 ```
 
@@ -169,7 +194,7 @@ curl -sf -m 5 -X PATCH http://127.0.0.1:8799/api/webhooks/<endpointId> \
 
 Expected: `false`.
 
-**Do not** disable the Mac's remaining fifteen enabled routines as part of this step.  They are Mac-side work with no server-side twin, and the Mac's store is not migrated by this cutover.  They stop firing when the Mac's harness is stopped in Step 5, and the inventory in Step 0 is the record of what they were.
+**Do not** disable the Mac's remaining fifteen enabled routines as part of this step.  They are Mac-side work with no server-side twin, and the Mac's store is not migrated by this cutover.  **They stop firing when the Mac's harness is stopped in Step 5, and the same is true of the six enabled webhooks whose ingress reaches this Mac through the tunnel.**  The inventory in Step 0 is the record of what they were, and before Step 5 runs,  every one of them has to be either migrated onto the server's writer or accepted as stopped by the owner.  The migration of a Mac-only routine is BF-2544's work,  because the Mac's store is not migrated by this cutover;  a webhook's ingress has to be re-pointed at the server before the Mac stops answering it.  A row that was neither migrated nor accepted is a surface that goes dark at Step 5,  so the list of those rows belongs in the BF-2514 issue as evidence,  next to the baseline.
 
 **A failure here** — the `comm` output is not empty — means the double-write is still open.  Do not proceed to Step 5.
 
@@ -221,7 +246,7 @@ curl -sf -m 5 http://127.0.0.1:8799/api/routines \
 
 Expected: no new run since Step 2 disabled it.
 
-This is the soak the decommission runbook's Step 2 names as the precondition for BF-2515: `soak-24h-no-node`.
+This is a soak of the **server** as the writer,  with the Mac's writer still loaded and unused;  call it `soak-24h-server-writer`.  It is not the `soak-24h-no-node` evidence,  because that evidence needs the Mac's Node harness stopped,  and the harness is stopped in Step 5.  The decommission runbook's Step 2 names `soak-24h-no-node` as the precondition for BF-2515,  so the order is:  this soak first,  then the retirement,  then BF-2515's no-node soak.  The contract's one-writer state is reached at the end of the retirement,  not before it.
 
 ## Step 5 — Retire The Mac's Launch Agent
 
@@ -294,7 +319,7 @@ Expected: both removed, and `$BACKUP` holds the two files that were installed.  
 ```bash
 # On the Mac.
 launchctl print gui/$(id -u)/app.botfleet.server
-lsof -nP -iTCP:LISTEN | grep -E ':(8799|8800)\b'
+lsof -nP -iTCP -sTCP:LISTEN | grep -E ':(8799|8800)\b'
 ps -eo pid,command | grep -E 'server/index.ts' | grep -v grep
 ```
 

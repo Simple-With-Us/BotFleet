@@ -37,7 +37,7 @@ Taken from the live hosts on Mon, Nov 2, 2026.  The Mac is `Mac.Jays.Services`,
 | Supervision | `KeepAlive.SuccessfulExit=false` plus `StartInterval=300`; the wrapper probes `:8799` and exits 0 when healthy, so the periodic run is a health check rather than a restart loop |
 | Launch state at survey | Loaded and running: `launchctl print gui/501/app.botfleet.server` reports `state = running`, `runs = 310`, `last exit code = 0` |
 | Launchd job environment | `HOME`, `PATH` and `BOTFLEET_SERVER_ROOT` only, as `launchctl print` reports it |
-| Infisical | **Reports itself off.**  `GET /api/infisical/status` answers `{"configured":false,"enabled":false,"source":"none","projectId":null,"hasClientId":true,"hasClientSecret":false,"vaultCount":0}`. |
+| Infisical | **Reports itself off.**  `GET /api/infisical/status` answers `{"infisical":{"configured":false,"enabled":false,"source":"none","projectId":null,"hasClientId":true,"hasClientSecret":false,"vaultCount":0}}`,  because the route wraps the status in `infisical` and returns the secret field rows beside it. |
 | Zulip bridge | **Disabled for all 12 bots.**  The harness's own Infisical status answers `configured: false` and `enabled: false`, so every scoped read is refused before a request is made, and the log repeats every five minutes: `[zulip] <bot>: disabled — cannot read Infisical 9bf7417a-… prod /zulip: Infisical is not configured and turned on for this workspace.` |
 | Mac-only capabilities it carries today | The public webhook ingress, the Local VM, the iMessage relay, screen capture and desktop control |
 | Public ingress | `https://botfleet.jays.services` reaches the **Mac's** harness:  `curl -sf https://botfleet.jays.services/api/health` answers `{"app":"botfleet","pid":2369,…}`, which is the Mac's pid and not the server's `2239131`.  The tunnel is the Mac's `cloudflared` process |
@@ -54,7 +54,7 @@ Taken from the live hosts on Mon, Nov 2, 2026.  The Mac is `Mac.Jays.Services`,
 | Listeners | `127.0.0.1:8799`, `127.0.0.1:8800`, `100.69.77.26:8799` (tailnet) and `[fd7a:…]:8799` |
 | Owner gate | `deploy/linux-server/owner-gate.mjs` in front of the harness on `127.0.0.1:8798`; a tailnet request carries `x-botfleet-gate-token` |
 | Environment | `EnvironmentFile=/mnt/fleet-extra/apps/botfleet-server/config/server.env`, which sets `INFISICAL_PROJECT_ID` and `INFISICAL_TOKEN` |
-| Infisical | **Configured and live.**  `GET /api/infisical/status` answers `{"configured":true,"enabled":true,"source":"env","projectId":"836aebe2-c8f7-4e09-978e-7e3e82500bce","hasToken":true,"vaultCount":44}`, with no last error |
+| Infisical | **Configured and live.**  `GET /api/infisical/status` answers `{"infisical":{"configured":true,"enabled":true,"source":"env","projectId":"836aebe2-c8f7-4e09-978e-7e3e82500bce","hasToken":true,"vaultCount":44}}`, with no last error and the same `infisical` wrapper as the Mac's |
 | Zulip bridge | **Enabled.**  The server processed a live inbound message for `BF-Director` on Nov 2 at 22:10 UTC and carries a `data/zulip/` spool that the Mac does not have |
 | Sandbox | `ProtectSystem=strict`, `ReadWritePaths=/mnt/fleet-extra`, `PrivateTmp`, `ProtectControlGroups`, `KillMode=mixed`; the unit also has `AllowedCPUs` and `CPUWeight` drop-ins |
 
@@ -116,7 +116,7 @@ Until the native epoch fence in `docs/plans/2026-10-29-native-server-mode.md` la
 | Who is the process? | `launchctl print` names `pid` and `port` | `systemctl show botfleet-server.service -p MainPID` names it |
 | Does it answer? | `curl -sf http://127.0.0.1:8799/health` returns 200 | `curl -sf http://100.69.77.26:8799/health` returns 200 behind the owner gate |
 
-**Exactly one of those two columns may be true.**  If both are true, the deployment has two writers and the contract is violated; that is the alarm condition, and the response is to stop the Mac's harness first, because the server is the writer.  If neither is true, the deployment has no writer and the response is the rollback.
+**Exactly one of those two columns may be true.**  If both are true, the deployment has two writers and the contract is violated; that is the alarm condition, and the response is to stop the Mac's harness first, because the server is the writer.  If neither is true, the deployment has no writer and the response is the rollback.  The cutover's soak runs while the Mac's writer is still loaded,  so it is a proof about the server and not about the contract's state:  the one-writer state is reached at the end of the retirement,  and the no-node soak belongs to BF-2515 after it.
 
 The health route answers `/health` and `/api/health` with `app`, `pid`, `ready` and `booting` ([server/index.ts](../server/index.ts#L885)); the `pid` is what makes the answer checkable rather than a bare liveness string.
 
@@ -137,7 +137,7 @@ Only then does the launch agent get retired.  The decommission runbook's Step 2
 
 The rollback is **restore the old writer**, not restore the code.
 
--  **Restore the launch path.**  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.botfleet.server.plist`, then `launchctl enable gui/$(id -u)/app.botfleet.server`.  The plist and the wrapper stay in the repository and on the Mac until the retirement has actually run.
+-  **Restore the launch path.**  `launchctl enable gui/$(id -u)/app.botfleet.server`, then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.botfleet.server.plist`.  A disabled job refuses a bootstrap,  so the enable has to come first,  and the cutover runbook's rollback uses the same order.  The plist and the wrapper stay in the repository and on the Mac until the retirement has actually run,  and the runbook restores the installed pair from the backup the retirement took.
 -  **Restore the store.**  The Mac's data root is untouched by the cutover: the cutover changes which host is the writer, it does not migrate the Mac's store.  If the Mac's store was archived or re-imported, restore it from the archive the way BF-2515's Step 1 does, and boot the harness against it.
 -  **Re-disable the surfaces the server owns.**  The server's routine and webhook enablement is reverted before the Mac's harness resumes writing, so the double-write does not simply come back.
 -  **Then, and only then, re-enable the Mac's subscriptions.**  Re-enabling the Mac's Zulip bridge needs the Infisical project id and token the LaunchAgent's environment does not carry today; that gap is a finding of this inventory, not a cutover step.
