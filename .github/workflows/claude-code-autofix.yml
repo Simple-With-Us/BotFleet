@@ -43,7 +43,7 @@ jobs:
       # trusted CI actors (owner 2026-10-20).
       allowed_bots: "chatgpt-codex-connector,chatgpt-codex-connector[bot],kody-ai,kody-ai[bot],cursor,cursor[bot],claude,claude[bot],sentry,sentry[bot],swu-echo,swu-echo[bot]"
       prompt: |
-        You are the fleet's autofix bot.  A review bot (Codex, Kody, or Cursor) just reviewed this pull request.
+        You are the fleet's autofix bot.  A review bot (Codex, Kody, Cursor, Claude, or Sentry) just reviewed this pull request.
         1. Read every unresolved review comment from that review.  For each, decide against the current code whether it is a real defect.
         2. Fix real defects with the smallest change that answers the comment.  Do not refactor unrelated code, rename things, or reformat files.
         3. Never edit files under .github/workflows, never add or print secrets, and never weaken a test to make it pass.
