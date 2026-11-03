@@ -105,7 +105,7 @@ export async function isReleaseDirectory(path) {
   return validateReleaseManifest(await readReleaseManifest(path)) !== null;
 }
 
-const MANIFEST_FIELDS = Object.freeze(["schemaVersion", "commit", "promotedAt", "node", "platform"]);
+const MANIFEST_FIELDS = Object.freeze(["schemaVersion", "commit", "promotedAt", "node", "platform", "version", "build"]);
 
 /**
  * Strictly validate a release manifest, or return null.
@@ -140,6 +140,16 @@ export function validateReleaseManifest(manifest) {
   if (manifest.node !== undefined && typeof manifest.node !== "string") return null;
   // oxlint-disable-next-line anti-slop/no-runtime-typeof -- schema field validation
   if (manifest.platform !== undefined && typeof manifest.platform !== "string") return null;
+  // The version the release's runtime reports.  Optional because the first
+  // release schema predates it; absent means the runtime falls back to the
+  // exported package.json, which is exactly what it reports today.  Present,
+  // it is the version the deployer validated for this release — the updater
+  // stamps the prepared build's version, so the post-apply check compares the
+  // runtime against the SAME number the update was prepared with.
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- schema field validation
+  if (manifest.version !== undefined && typeof manifest.version !== "string") return null;
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- schema field validation
+  if (manifest.build !== undefined && typeof manifest.build !== "string") return null;
   return manifest;
 }
 
@@ -196,7 +206,7 @@ async function readReleaseManifest(directory) {
  * complete.  `mkdir` first is the portable way to fail on a cross-device rename
  * with a clear error rather than an obscure one from the kernel.
  */
-export async function promoteStaging({ commit, env = process.env, renameImpl = rename, promotedAt = new Date().toISOString() } = {}) {
+export async function promoteStaging({ commit, env = process.env, renameImpl = rename, promotedAt = new Date().toISOString(), version, build } = {}) {
   const from = stagingPath(commit, env);
   const to = releasePath(commit, env);
   try {
@@ -216,6 +226,19 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
       { stagingPath: from },
     );
   }
+  // The default version is the staged tree's own package.json: that is the
+  // version this code reports about itself, so recording it is a fact, not a
+  // claim.  A deployer that validated a different version (the updater stamps
+  // the prepared build's) passes it explicitly; a tree without a readable
+  // package.json simply records no version rather than inventing one.
+  let resolvedVersion = version;
+  if (resolvedVersion === undefined) {
+    try {
+      resolvedVersion = JSON.parse(await readFile(join(from, "package.json"), "utf8")).version;
+    } catch {
+      resolvedVersion = undefined;
+    }
+  }
   const manifest = {
     schemaVersion: 1,
     commit,
@@ -224,6 +247,8 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
     // without reconstructing the history of the machine.
     node: process.version,
     platform: process.platform,
+    ...(resolvedVersion !== undefined ? { version: resolvedVersion } : {}),
+    ...(build !== undefined ? { build } : {}),
   };
   const manifestPath = join(from, MANIFEST);
   // Remove any leftover first.  A previous attempt may have written the manifest

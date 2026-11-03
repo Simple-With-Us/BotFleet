@@ -44,7 +44,9 @@ function usage() {
       "  (every command accepts --store <root> for a separate store namespace)",
       "  promote <commit>                                  move staging into releases/",
       "  swap <commit>                                     point current at a release",
-      "  activate <commit> [--repo <path>]                 stage, promote and swap",
+      "  activate <commit> [--repo <path>] [--version v]   stage, promote and swap",
+      "  promote/activate stamp --version/--build into the release manifest;",
+      "  without them the staged package.json version is recorded",
       "  status                                            where current points",
       "  list                                              every release in the store",
       "  prune [--keep N]                                  drop old, unheld releases",
@@ -156,7 +158,7 @@ async function main() {
   }
 
   if (command === "promote") {
-    const path = await promoteStaging({ commit, env });
+    const path = await promoteStaging({ commit, env, version: flag(args, "--version"), build: flag(args, "--build") });
     process.stdout.write(`promoted: ${path}\n`);
     return 0;
   }
@@ -201,7 +203,7 @@ async function main() {
       install: true,
       log: (line) => process.stdout.write(`${line}\n`),
     });
-    const path = await promoteStaging({ commit, env });
+    const path = await promoteStaging({ commit, env, version: flag(args, "--version"), build: flag(args, "--build") });
     process.stdout.write(`promoted: ${path}\n`);
     const result = await swapCurrent({ commit, env });
     process.stdout.write(`current: ${releasePath(commit, env)}\n`);
