@@ -157,6 +157,21 @@ test("a state file whose recorded instant and timestamp disagree is refused", ()
   assert.match(validateState(tampered), /recorded instant and its timestamp disagree/);
 });
 
+test("a state file whose start timestamp is out of range is refused, not thrown", () => {
+  // A finite millisecond count outside the range a Date can hold has no ISO
+  // form, and asking for one throws.  The file must be refused instead.
+  const state = {
+    marker: STATE_MARKER,
+    version: STATE_VERSION,
+    atMs: 1e18,
+    at: "not a date",
+    verdict: { ok: true },
+    harnessServicePresent: false,
+  };
+  const reason = validateState(state);
+  assert.match(String(reason), /outside the range a date can hold/);
+});
+
 test("the CLI records the start of the soak and judges the end of it", () => {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-soak-24h-"));
   try {

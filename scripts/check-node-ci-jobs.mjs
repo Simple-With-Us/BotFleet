@@ -55,6 +55,37 @@ function mentions(text, pattern) {
 }
 
 /**
+ * Does this text run a dependency install of the desktop closure?
+ *
+ * A global install is not one.  `pnpm install --global some-cli` installs a
+ * command for the user, the way `npm install --global vercel` does, and it
+ * reads the desktop manifest for nothing.  Naming it as a desktop job would
+ * put an offender in the report that does not exist, and an audit that cries
+ * wolf is not an audit.
+ */
+function mentionsInstall(text) {
+  const haystack = String(text).toLowerCase();
+  const needle = "pnpm install";
+  let index = haystack.indexOf(needle);
+  while (index !== -1) {
+    // The rest of the line carries the flags of this command.
+    const command = haystack.slice(index + needle.length).split("\n")[0];
+    if (!/(^|\s)(--global|-g)(\s|$)/.test(command)) return true;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return false;
+}
+
+/**
+ * The pattern match for one pattern, with the install pattern's global
+ * exception applied.
+ */
+function patternMatches(text, pattern) {
+  if (pattern === "pnpm install") return mentionsInstall(text);
+  return mentions(text, pattern);
+}
+
+/**
  * The offending jobs in one parsed workflow.  Pure over the parsed object
  * so the test suite can hand it a small fixture, while the CLI hands it the
  * real files.  A job is reported once per pattern it trips, and the job's
@@ -73,12 +104,12 @@ export function findNodeDesktopJobs(workflow, fileName) {
       offenders.push({ file: fileName, job: jobId, name: displayName, pattern });
     };
     for (const pattern of NODE_DESKTOP_PATTERNS) {
-      if (mentions(displayName, pattern)) record(pattern);
+      if (patternMatches(displayName, pattern)) record(pattern);
     }
     for (const step of job?.steps ?? []) {
       const text = `${step?.name ?? ""}\n${step?.run ?? ""}`;
       for (const pattern of NODE_DESKTOP_PATTERNS) {
-        if (mentions(text, pattern)) record(pattern);
+        if (patternMatches(text, pattern)) record(pattern);
       }
     }
     // A job can reach the Node desktop without naming a command in a step:
@@ -93,7 +124,7 @@ export function findNodeDesktopJobs(workflow, fileName) {
     // is not an audit.
     const indirect = [job?.uses ?? "", JSON.stringify(job?.strategy ?? {})].join("\n");
     for (const pattern of NODE_DESKTOP_PATTERNS) {
-      if (mentions(indirect, pattern)) record(pattern);
+      if (patternMatches(indirect, pattern)) record(pattern);
     }
   }
   return offenders;

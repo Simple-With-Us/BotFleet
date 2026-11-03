@@ -133,6 +133,30 @@ test("a job that installs the desktop dependency closure is a Node desktop job",
   );
 });
 
+test("a global install is not a desktop install", () => {
+  // `pnpm install --global some-cli` installs a command for the user, the way
+  // `npm install --global vercel` does.  It reads the desktop manifest for
+  // nothing, so naming it a desktop job would report an offender that does
+  // not exist.
+  const workflow = {
+    jobs: {
+      cli: {
+        name: "Install pinned CLI",
+        steps: [{ name: "Install CLI", run: "pnpm install --global @acme/cli@1.2.3" }],
+      },
+      desktop: {
+        name: "Install the closure",
+        steps: [{ name: "Install", run: "pnpm install --frozen-lockfile" }],
+      },
+    },
+  };
+  const offenders = findNodeDesktopJobs(workflow, ".github/workflows/ci.yml");
+  const installs = offenders.filter((offender) => offender.pattern === "pnpm install");
+  assert.equal(installs.length, 1, "only the closure install is a desktop job");
+  assert.equal(installs[0].job, "desktop");
+  assert.ok(!offenders.some((offender) => offender.job === "cli"));
+});
+
 test("a workflow that only mentions the command in a prompt is not a desktop job", () => {
   // An autofix workflow passes the repo's verify command to its agent as
   // text.  The job does not run the desktop, so naming it would be a false

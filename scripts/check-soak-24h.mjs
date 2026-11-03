@@ -167,7 +167,15 @@ export function validateState(state) {
     return `the state file version ${String(state.version)} is not the expected ${STATE_VERSION}`;
   }
   if (!Number.isFinite(state.atMs)) return "the state file carries no start timestamp";
-  if (state.at !== new Date(state.atMs).toISOString()) {
+  // A finite number is not always a date:  a millisecond count outside the
+  // range a Date can hold has no ISO form, and asking for one throws.  The
+  // file is refused instead, because a state file that cannot be read is
+  // never a state file that passed.
+  const atMs = new Date(state.atMs);
+  if (Number.isNaN(atMs.getTime())) {
+    return "the state file's start timestamp is outside the range a date can hold";
+  }
+  if (state.at !== atMs.toISOString()) {
     return "the state file's recorded instant and its timestamp disagree";
   }
   if (state.verdict === null || state.verdict === undefined) return "the state file carries no reboot verdict";
