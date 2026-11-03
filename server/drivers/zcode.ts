@@ -100,7 +100,7 @@ function decodeConfig(raw: ZcodeConfigInput | null | undefined): ZcodeConfig {
   return { cli: parsed.data.cli ?? "zcode" };
 }
 
-function zcodeEnvironment(source: Record<string, string | undefined>): Record<string, string | undefined> {
+function zcodeEnvironment(source: Record<string, string | undefined>) {
   const env: typeof source = { ...source, PATH: augmentedPath() };
   stripWorkspaceCredentialEnv(env);
   for (const key of ZCODE_CREDENTIAL_ENV) delete env[key];
