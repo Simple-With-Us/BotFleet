@@ -822,7 +822,7 @@ final class Session: ObservableObject {
     /// publishes once.
     private func scheduleDeltaFlush() {
         guard deltaFlushTask == nil else { return }
-        deltaFlushTask = Task { [weak self] in
+        deltaFlushTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(Int64(StreamingDeltaBuffer.flushInterval * 1_000)))
             guard !Task.isCancelled, let self else { return }
             self.deltaFlushTask = nil
@@ -870,11 +870,18 @@ final class Session: ObservableObject {
                     if case let .runtime(event) = frame.frame {
                         switch deltaBuffer.enqueue(event) {
                         case .buffered:
-                            bufferedSeq = frame.seq ?? bufferedSeq
+                            if let seq = frame.seq { bufferedSeq = max(bufferedSeq ?? seq, seq) }
                             if deltaBuffer.shouldFlush { flushDeltas() } else { scheduleDeltaFlush() }
                             continue
                         case .dropped:
-                            if let seq = frame.seq { state.advance(to: seq) }
+                            // Never commit past text still held: fold the
+                            // sequence into the pending commit so the flush
+                            // advances once, to the newest sequence seen.
+                            if deltaBuffer.isEmpty {
+                                if let seq = frame.seq { state.advance(to: seq) }
+                            } else if let seq = frame.seq {
+                                bufferedSeq = max(bufferedSeq ?? seq, seq)
+                            }
                             continue
                         case .applyNow:
                             flushDeltas()
