@@ -2,7 +2,7 @@
 
 Status: source-only plan.  No deletion, bootout, deployment, credential change or live cutover is authorized or performed by this document.
 
-Basis: measured on `origin/main` at `1cceee8b` on Nov 3, 2026 with `git ls-files`.  Every line reference below is against that revision.  This plan pairs with BF-2514, which owns the single-writer cutover and the 24-hour no-Node soak.
+Basis: measured on `origin/main` at `1cceee8b` on Nov 3, 2026 with `git ls-files`.  Every tree count below is against that revision.  The counts were re-verified against `main` at `66e64951c`, which changed only `.github/workflows/` and `scripts/ci-change-scope.node-test.mjs`, so the numbers still hold;  the `ci.yml` line references are against `66e64951c`, where the blobless-checkout merge moved them.  This plan pairs with BF-2514, which owns the single-writer cutover and the 24-hour no-Node soak.
 
 ## What the tree holds today
 
@@ -59,5 +59,5 @@ Step 3 is the owner's.  This plan schedules it and assumes none of it.
 
 ## Two open questions for the owners
 
-- The required-check list of ruleset 21771270 is not determinable from the tree.  No local ruleset file exists, and only the identifier survives, at `ci.yml:92` and `ci.yml:184`.  The answer to which job has to go depends on it.
+- The required-check list of ruleset `21771270` is not determinable from the tree.  No local ruleset file exists, and only the identifier survives, at `ci.yml:93` and `ci.yml:186`.  The answer to which job has to go depends on it.
 - The `harness` dependency at `package.json:117` has no import site anywhere in the tree.  Whether it is dead or resolved indirectly needs an owner.
