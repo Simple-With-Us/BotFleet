@@ -47,6 +47,10 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
   assert.equal(isIosPath(".github/workflows/ci.yml"), true);
   assert.equal(isIosPath("scripts/ci-ios-gate.mjs"), true);
   assert.equal(isIosPath("scripts/ci-change-scope.mjs"), true);
+  // The script that computes the changed-path list every workflow reads is
+  // itself a proof path:  a pull request that edits only the script must not
+  // be able to narrow its own scope and skip the build it should trigger.
+  assert.equal(isIosPath("scripts/ci-scope-diff.sh"), true);
   assert.equal(isIosPath("server/index.ts"), false);
 
   for (const path of ["electron/main.mjs", "electron-builder.yml", "third_party/cloudflared/README.md",
@@ -155,6 +159,31 @@ test("the scope is the pull request's own changes,  and both jobs use the one sc
     assert.match(step.run, /scripts\/ci-scope-diff\.sh "\$BASE_SHA" "\$HEAD_SHA"/, name);
     // The workflow never diffs a range itself.
     assert.doesNotMatch(step.run, /git diff/, name);
+  }
+});
+
+test("every workflow that classifies a pull request reads the one shared scope", () => {
+  // The same stale-base bug lived in three workflows.  The classifier in
+  // ci.yml read the stored base SHA to the merge commit,  which folded
+  // main's newer commits into the pull request's scope;  the E2E and Mac
+  // packaging gates did the same.  One script,  one scope,  so a pull
+  // request's cost is the pull request's own changes.
+  const scopeScript = readFileSync(join(ROOT, "scripts/ci-scope-diff.sh"), "utf8");
+  assert.match(scopeScript, /git merge-base "\$base_sha" "\$head_sha"/);
+
+  for (const workflowFile of ["e2e.yml", "mac-package-gate.yml"]) {
+    const source = readFileSync(join(ROOT, ".github/workflows", workflowFile), "utf8");
+    const step = source;
+    // The scope comes from the shared script.
+    assert.match(step, /scripts\/ci-scope-diff\.sh "\$BASE_SHA" "\$HEAD_SHA"/, workflowFile);
+    // The head is the pull request's head,  not the merge commit.
+    assert.match(
+      step,
+      /HEAD_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/,
+      workflowFile,
+    );
+    // The workflow never diffs a range itself.
+    assert.doesNotMatch(step, /git diff --no-renames --name-only/, workflowFile);
   }
 });
 
