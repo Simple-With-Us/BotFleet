@@ -52,6 +52,17 @@ afterEach(() => {
 });
 
 describe.skipIf(process.platform === "win32")("transactional placement authority", () => {
+  it("refuses the actual unsupported runtime before opening a store even with a Linux injection", () => {
+    const absent = join(fixture(), "must-remain-absent");
+    const original = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!original) throw new Error("Missing platform descriptor");
+    try {
+      Object.defineProperty(process, "platform", { ...original, value: "win32" });
+      expect(() => openPlacementStore(absent, controllerId, "linux")).toThrow(/Placement persistence/);
+    } finally { Object.defineProperty(process, "platform", original); }
+    expect(existsSync(absent)).toBe(false);
+  });
+
   it.each(["win32", "freebsd", "aix"] as const)("refuses SQLite activation and reopening on %s without modifying legacy or migrated evidence", (platform) => {
     const absent = join(fixture(), "must-remain-absent");
     expect(() => openPlacementStore(absent, controllerId, platform)).toThrow(/Placement persistence/);
