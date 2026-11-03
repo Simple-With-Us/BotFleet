@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -11,9 +13,48 @@ import {
   inspectLaunchAgents,
   inspectPortListeners,
   inspectProcesses,
+  inspectRunningExecutable,
   isBotFleetNodeProcess,
 } from "./check-post-reboot-node.mjs";
 import { resolveBoardCli } from "./decommission-gate-state.mjs";
+
+test("running executable inspection binds mapped text inode and rejects name-only matches", () => {
+  const root = mkdtempSync(join(tmpdir(), "bf-executable-inspection-"));
+  try {
+    const actual = join(root, "actual", "BotFleet");
+    const wrong = join(root, "wrong", "BotFleet");
+    const alias = join(root, "alias");
+    mkdirSync(dirname(actual));
+    mkdirSync(dirname(wrong));
+    writeFileSync(actual, "native fixture");
+    writeFileSync(wrong, "different binary with same basename");
+    symlinkSync(actual, alias);
+    const mapped = statSync(actual, { bigint: true });
+    const listing = `p123\nftxt\nD0x${mapped.dev.toString(16)}\ni${mapped.ino}\nn${actual}\n`;
+    const nativeLinks = "/System/Library/Frameworks/AppKit.framework/AppKit\n/usr/lib/swift/libswiftCoreFoundation.dylib\n";
+    const command = (tool, args) => {
+      if (tool === "lsof") {
+        assert.deepEqual(args, ["-w", "-nP", "-a", "-p", "123", "-d", "txt", "-FfDin"]);
+        return listing;
+      }
+      assert.equal(tool, "otool");
+      if (args[0] === "-L") {
+        assert.deepEqual(args, ["-L", actual]);
+        return nativeLinks;
+      }
+      assert.deepEqual(args, ["-l", actual]);
+      return "Section\n  sectname __swift5_entry\n";
+    };
+    assert.equal(inspectRunningExecutable(123, actual, { run: command }), "native");
+    assert.equal(inspectRunningExecutable(123, alias, { run: command }), "native");
+    assert.equal(inspectRunningExecutable(123, wrong, { run: command }), "unknown");
+    assert.equal(inspectRunningExecutable(123, actual, { run: (tool) => tool === "otool" ? "Electron.framework/Electron\n" : listing }), "electron");
+    assert.equal(inspectRunningExecutable(123, actual, { run: (tool, args) => tool === "lsof" ? listing : args[0] === "-L" ? nativeLinks : "Section\n  sectname __objc_classlist\n" }), "unknown");
+    assert.equal(inspectRunningExecutable(123, actual, { run: (tool) => tool === "lsof" ? listing.replace(`i${mapped.ino}`, `i${mapped.ino + 1n}`) : nativeLinks }), "unknown");
+    assert.equal(inspectRunningExecutable(123, actual, { run: (tool) => tool === "lsof" ? "p123\nftxt\nnBotFleet\n" : nativeLinks }), "unknown");
+    assert.equal(inspectRunningExecutable(123, actual, { run: () => { throw new Error("probe failed"); } }), "unknown");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("isBotFleetNodeProcess identifies BotFleet Node command lines", () => {
   const sharedMainExecutable = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";

@@ -16,7 +16,7 @@
 // (lingering process, lingering launchd job, lingering port listener, dirty git
 // tree) without requiring a destructive reboot during testing.
 import { execFileSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -56,29 +56,17 @@ const BOTFLEET_MAIN_EXECUTABLE = /(?:^|[\s"'=])(.+\/BotFleet\.app\/Contents\/Mac
  * The native and Electron apps share a bundle and executable path, so argv and
  * bundle naming cannot distinguish them.
  *
- * Read the kernel-reported executable path for the PID, then inspect its
- * linked frameworks without invoking a shell.
+ * Read the first mapped text vnode for the PID and bind its device and inode
+ * to the expected file before inspecting linked frameworks and Swift sections.
  *
  * Any missing or ambiguous evidence is unknown and remains a gate failure.
  */
-export function inspectRunningExecutable(pid, expectedPath) {
+export function inspectRunningExecutable(pid, expectedPath, { run = execFileSync, stat = statSync } = {}) {
   if (!/^[1-9]\d*$/.test(String(pid ?? "")) || !expectedPath) return "unknown";
 
-  let actualPath;
+  let mappedText;
   try {
-    actualPath = execFileSync("ps", ["-p", String(pid), "-o", "comm="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 10_000,
-    }).trim();
-  } catch {
-    return "unknown";
-  }
-  if (!actualPath || actualPath !== expectedPath) return "unknown";
-
-  let linkedLibraries;
-  try {
-    linkedLibraries = execFileSync("otool", ["-L", actualPath], {
+    mappedText = run("lsof", ["-w", "-nP", "-a", "-p", String(pid), "-d", "txt", "-FfDin"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 10_000,
@@ -87,12 +75,55 @@ export function inspectRunningExecutable(pid, expectedPath) {
     return "unknown";
   }
 
+  const textFiles = [];
+  let entry;
+  for (const line of mappedText.split(/\r?\n/)) {
+    if (line.startsWith("f")) {
+      if (entry?.fd === "txt") textFiles.push(entry);
+      entry = { fd: line.slice(1) };
+    } else if (entry && line.startsWith("D")) entry.device = line.slice(1);
+    else if (entry && line.startsWith("i")) entry.inode = line.slice(1);
+    else if (entry && line.startsWith("n")) entry.path = line.slice(1);
+  }
+  if (entry?.fd === "txt") textFiles.push(entry);
+  const executable = textFiles[0];
+  if (!executable?.path?.startsWith("/") || !/^0x[0-9a-f]+$/i.test(executable.device ?? "") || !/^\d+$/.test(executable.inode ?? "")) return "unknown";
+
+  const sameMappedFile = (file) => {
+    const info = stat(file, { bigint: true });
+    return info.isFile() && info.dev === BigInt(executable.device) && info.ino === BigInt(executable.inode);
+  };
+  try {
+    if (!sameMappedFile(executable.path) || !sameMappedFile(expectedPath)) return "unknown";
+  } catch {
+    return "unknown";
+  }
+
+  let linkedLibraries;
+  try {
+    linkedLibraries = run("otool", ["-L", executable.path], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+    });
+    if (!sameMappedFile(executable.path) || !sameMappedFile(expectedPath)) return "unknown";
+  } catch {
+    return "unknown";
+  }
+
   if (/Electron\.framework(?:\/|\s)/i.test(linkedLibraries)) return "electron";
-  if (
-    /(?:SwiftUI|AppKit)\.framework(?:\/|\s)/i.test(linkedLibraries) &&
-    /libswiftCore(?:\.dylib)?/i.test(linkedLibraries)
-  ) {
-    return "native";
+  if (!/(?:SwiftUI|AppKit)\.framework(?:\/|\s)/i.test(linkedLibraries)) return "unknown";
+  try {
+    const loadCommands = run("otool", ["-l", executable.path], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    if (!sameMappedFile(executable.path) || !sameMappedFile(expectedPath)) return "unknown";
+    if (/^\s*sectname __swift5_entry\s*$/m.test(loadCommands)) return "native";
+  } catch {
+    return "unknown";
   }
   return "unknown";
 }

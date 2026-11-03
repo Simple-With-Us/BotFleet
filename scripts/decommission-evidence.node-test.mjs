@@ -166,6 +166,33 @@ test("elapsed wall time alone cannot replace continuous, correctly ordered obser
   }
 });
 
+test("server writer soak accepts bounded daily runs across a partial second day", onPosix, () => {
+  for (const runs of [0, 1, 2, 3]) {
+    const f = fixture();
+    try {
+      const soak = f.receipts["server-writer-soak"];
+      soak.data.endedAt = soak.data.segments[0].endedAt = "2026-10-02T01:00:00Z";
+      soak.data.segments[0].serverSharedRoutineRuns = runs;
+      f.saveReceipt("server-writer-soak", soak);
+      const following = f.receipts["no-mac-node-soak"];
+      following.data.startedAt = following.data.segments[0].startedAt = "2026-10-02T01:00:00Z";
+      following.data.endedAt = following.data.segments[0].endedAt = "2026-10-03T01:00:00Z";
+      f.saveReceipt("no-mac-node-soak", following);
+      assert.equal(f.check().ok, runs === 1 || runs === 2, `runs=${runs}`);
+      if (runs === 0 || runs === 3) {
+        assert.ok(f.check().blockers.includes("server-writer-soak: shared-routine-run-count-mismatch"));
+      }
+    } finally { f.close(); }
+  }
+  const f = fixture();
+  try {
+    const soak = f.receipts["server-writer-soak"];
+    soak.data.segments[0].serverSharedRoutineRuns = 2;
+    f.saveReceipt("server-writer-soak", soak);
+    assert.ok(f.check().blockers.includes("server-writer-soak: shared-routine-run-count-mismatch"));
+  } finally { f.close(); }
+});
+
 test("private bundle reads reject escaped, linked, shared and oversized artifacts", onPosix, () => {
   for (const fault of ["traversal", "absolute", "symlink", "directory-link", "hardlink", "oversize", "public-file", "public-root"]) {
     const f = fixture();

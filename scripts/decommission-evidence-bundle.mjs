@@ -182,7 +182,10 @@ function checkInterval(receipt, bundle) {
     previous = span;
   }
   if (cursor !== end) fail("incomplete-observation-coverage");
-  if (kind === "server-writer-soak" && sharedRuns !== Math.floor((end - start) / (24 * 60 * 60_000))) fail("shared-routine-run-count-mismatch");
+  if (kind === "server-writer-soak") {
+    const elapsedDays = (end - start) / (24 * 60 * 60_000);
+    if (sharedRuns < Math.floor(elapsedDays) || sharedRuns > Math.ceil(elapsedDays)) fail("shared-routine-run-count-mismatch");
+  }
 }
 
 function checkControllerFence(previous, next) {
