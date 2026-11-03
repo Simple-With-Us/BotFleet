@@ -74,6 +74,12 @@ Review follow-up evidence is retained in the Mac validation lane's `codex-bf-260
 
 Fixtures use temporary service roots, a production subprocess with an explicit environment allowlist, synthetic children through the production runner, and injected peer observations only inside the test target.
 
+## Shared Fixture Integration
+
+The final source adopts the merged credential-sync isolation and failed-copy guard from PR #1544, plus the shared packaged-smoke fixture.  All four credential-sync fixtures passed, and the packaged bundle check passed with private HOME and synthetic instance configuration that suppresses unrelated host CLI discovery.  The smoke retains bundled imports, real SDK startup, HTTP identity, all 14 proxy paths and MCP flushing.  This is a bundle check, not installed or packaged-runtime acceptance; earlier failed receipts remain preserved.
+
+The Swift production source is unchanged by this shared script integration, so the complete Swift and unsigned build receipts above still apply to those files.
+
 ## Delivery Boundary
 
 This slice adds no account provisioning, launchd registration, package installer, signing, GUI attachment, provider credential bootstrap or live activation.  Credentials remain unavailable by default, desktop work remains held, and existing accepted or uncertain outcomes are never automatically replayed.

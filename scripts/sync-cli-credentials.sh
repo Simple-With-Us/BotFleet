@@ -258,11 +258,14 @@ sync_to_container() {
   # Stream tar archive into container (staged docker/gnupg transforms use TAR_ROOT)
   # Excludes come from the manifest plan (credentialSyncExcludePatterns) so the
   # shell path and the server path never drift.
-  COPYFILE_DISABLE=1 tar --format=ustar -C "$TAR_ROOT" --no-xattrs \
+  if ! COPYFILE_DISABLE=1 tar --format=ustar -C "$TAR_ROOT" --no-xattrs \
     "${TAR_EXCLUDES[@]}" \
     -cf - \
     "${FOUND[@]}" | \
-    "${docker_cmd[@]}" exec -i -u "$CONTAINER_USER" "$c_name" tar -xf - -C "/home/$CONTAINER_USER"
+    "${docker_cmd[@]}" exec -i -u "$CONTAINER_USER" "$c_name" tar -xf - -C "/home/$CONTAINER_USER"; then
+    echo "Error: Could not sync credentials to '$c_name' ($mode)." >&2
+    return 1
+  fi
 
   # Harden permissions inside container
   "${docker_cmd[@]}" exec -u "$CONTAINER_USER" "$c_name" sh -c "
