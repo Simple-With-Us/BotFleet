@@ -74,6 +74,21 @@ test("a job that runs the Node test chain is named with the pattern it matched",
   assert.ok(offenders.some((offender) => offender.pattern === "typecheck + test"));
 });
 
+test("a job that only typechecks is a Node desktop job too", () => {
+  const workflow = {
+    jobs: {
+      typecheck: {
+        name: "Typecheck",
+        steps: [{ name: "Typecheck", run: "pnpm typecheck" }],
+      },
+    },
+  };
+  const offenders = findNodeDesktopJobs(workflow, ".github/workflows/ci.yml");
+  assert.equal(offenders.length, 1);
+  assert.equal(offenders[0].job, "typecheck");
+  assert.equal(offenders[0].pattern, "pnpm typecheck");
+});
+
 test("the gate reads the workflow job set and names every offender", () => {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-node-ci-jobs-"));
   try {

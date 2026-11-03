@@ -17,12 +17,17 @@ import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
 /**
- * The Node desktop work a surviving CI job would perform.  The first four
+ * The Node desktop work a surviving CI job would perform.  The first five
  * are commands; the last is the display name the Node test job carries, so
  * a job renamed to something harmless still gets caught by what it runs.
+ *
+ * `pnpm typecheck` is in the list on its own: a job that only typechecks
+ * still needs the Node toolchain and the desktop's tsconfig, so it is a Node
+ * desktop job even though it runs no test.
  */
 export const NODE_DESKTOP_PATTERNS = [
   "pnpm test",
+  "pnpm typecheck",
   "pnpm package:",
   "vite build",
   "electron-builder",
