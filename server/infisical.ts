@@ -17,7 +17,7 @@ import { resolve, sep } from "node:path";
 
 import { normalizeInfisicalSecretPath, type InfisicalAuthMethod, type InfisicalSettings, type ResolvedInfisicalReadSource } from "./config.ts";
 import { dataDir } from "./data-dir.ts";
-import { InfisicalError, login, listSecrets, upsertSecret } from "./infisical-client.ts";
+import { InfisicalError, login, listSecrets, upsertSecret, verifyServiceToken } from "./infisical-client.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { SECRET_FIELDS, infisicalSnapshot, setInfisicalSnapshot, vaultNames as snapshotVaultNames } from "./secret-map.ts";
 import { KNOB_FIELDS, KNOB_INFISICAL_NAMES, knobSource } from "./knob-map.ts";
@@ -280,6 +280,7 @@ class InfisicalManager {
   private rejectedTokens = new Map<string, Array<{ token: string; scope: string }>>();
   private warnedReadSources = new Set<string>();
   private readSourceStatus = new Map<string, { ok: boolean; error: string | null }>();
+  private verifiedServiceTokens = new Map<string, number>();
 
 
   /** Live view of app config, installed by the server at boot.  A getter
@@ -299,6 +300,7 @@ class InfisicalManager {
     this.rejectedTokens.clear();
     this.warnedReadSources.clear();
     this.readSourceStatus.clear();
+    this.verifiedServiceTokens.clear();
   }
 
   /** Forget every remembered refusal, so the configured tokens are tried
@@ -311,6 +313,7 @@ class InfisicalManager {
   retryRefusedTokens(): void {
     this.rejectedTokens.clear();
     this.warnedReadSources.clear();
+    this.verifiedServiceTokens.clear();
   }
 
   private warnReadSource(source: ResolvedInfisicalReadSource, detail: string): void {
@@ -422,6 +425,7 @@ class InfisicalManager {
       throw this.readSourceFailure(source, "token was refused by the server", 401);
     }
     try {
+      await this.verifyScopedServiceToken(settings.siteUrl, resolved.token, projectId, environment, secretPath, "read");
       const { values } = await listSecrets({
         siteUrl: settings.siteUrl,
         token: resolved.token,
@@ -539,6 +543,22 @@ class InfisicalManager {
     });
   }
 
+  /** Cache successful scope checks for at most a minute and never past expiry.
+   * Keys stay in process memory and include the credential, site, scope and role. */
+  private async verifyScopedServiceToken(
+    siteUrl: string, token: string, projectId: string, environment: string, secretPath: string, mode: "read" | "write",
+  ): Promise<void> {
+    const key = [siteUrl, token, projectId, environment, normalizeInfisicalSecretPath(secretPath), mode].join("\u0000");
+    const now = Date.now();
+    if ((this.verifiedServiceTokens.get(key) ?? 0) > now) return;
+    this.verifiedServiceTokens.delete(key);
+    const metadata = await verifyServiceToken({ siteUrl, token, projectId, environment, secretPath, mode, timeoutMs: callTimeoutMs() });
+    const validUntil = Math.min(Date.now() + 60_000, metadata.expiresAt ?? Infinity);
+    if (validUntil <= Date.now()) throw new InfisicalError("Infisical service token has expired", 401);
+    while (this.verifiedServiceTokens.size >= 64) this.verifiedServiceTokens.delete(this.verifiedServiceTokens.keys().next().value!);
+    this.verifiedServiceTokens.set(key, validUntil);
+  }
+
   /** Select exactly one credential for the requested scope and operation.
    * Missing or refused service tokens never activate a machine identity. */
   private async withCredential<T>(
@@ -577,6 +597,8 @@ class InfisicalManager {
       throw new InfisicalError(`The configured Infisical ${mode} service token was refused by the server; replace it or retry after correcting its scope.`, 401);
     }
     try {
+      const [projectId, environment, secretPath] = scope.split("\u0000");
+      await this.verifyScopedServiceToken(settings.siteUrl, configured, projectId, environment, secretPath, mode);
       const result = await call(configured);
       if (source) this.readSourceStatus.set(source.name, { ok: true, error: null });
       return result;
@@ -963,9 +985,11 @@ class InfisicalManager {
     if (!isConfigured(settings)) {
       throw new InfisicalError("Add a project id and a service token (or a machine identity) first.", 409);
     }
+    let writeAttempted = false;
     try {
-      await this.withCredential(settings, "write", (token) =>
-        upsertSecret({
+      await this.withCredential(settings, "write", (token) => {
+        writeAttempted = true;
+        return upsertSecret({
           siteUrl: settings.siteUrl,
           token,
           projectId: settings.projectId,
@@ -974,13 +998,13 @@ class InfisicalManager {
           name,
           value,
           timeoutMs: callTimeoutMs(),
-        }),
-      );
+        });
+      });
     } catch (err) {
       // When a timeout or network drop occurs during upsert, the write may
       // have already committed in Infisical before the connection severed.
       // Reconcile by running a refresh to check if the vault holds the value.
-      if (err instanceof InfisicalError && (err.statusCode === 504 || err.statusCode === 502)) {
+      if (writeAttempted && err instanceof InfisicalError && (err.statusCode === 504 || err.statusCode === 502)) {
         const check = await this.refresh("settings").catch(() => null);
         if (check && !check.stale && !check.lastError) {
           const current = infisicalSnapshot();

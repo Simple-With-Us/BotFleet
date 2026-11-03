@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { InfisicalError, listSecrets, login, upsertSecret } from "./infisical-client.ts";
+import { InfisicalError, listSecrets, login, upsertSecret, verifyServiceToken } from "./infisical-client.ts";
 
 // Obviously fake, and never sent anywhere real: these exist so the
 // assertions below have a credential-shaped string to look for. Every test
@@ -10,6 +10,113 @@ const SENTINEL_TOKEN = "sentinel-bearer-token-not-real";
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("verifyServiceToken", () => {
+  const options = { siteUrl: "https://app.infisical.example", token: SENTINEL_TOKEN,
+    projectId: "proj-1", environment: "prod", secretPath: "/folder", mode: "read" as const };
+  const metadata = { workspace: "proj-1", projectId: "proj-1", scopes: [{ environment: "prod", secretPath: "/folder/" }], permissions: ["read"], expiresAt: null };
+
+  it("verifies flat metadata with exact project, role and normalized folder and returns only expiry", async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(url).toBe("https://app.infisical.example/api/v2/service-token");
+      expect(init?.method).toBe("GET");
+      expect(init?.redirect).toBe("error");
+      expect((init?.headers as Record<string, string>).authorization).toBe(`Bearer ${SENTINEL_TOKEN}`);
+      return new Response(JSON.stringify({ ...metadata, secretHash: SENTINEL_CLIENT_SECRET }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await verifyServiceToken(options)).toEqual({ expiresAt: null });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("accepts the serialized scopes array stored by the upstream service-token handler", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...metadata, scopes: JSON.stringify(metadata.scopes) }))));
+    expect(await verifyServiceToken(options)).toEqual({ expiresAt: null });
+  });
+
+  it.each(["*", "?", "[", "]", "{", "}"])("rejects matching wildcard request and grant %s before any secret access", async (character) => {
+    const secretPath = `/folder/${character}`;
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ...metadata,
+      scopes: [{ environment: "prod", secretPath }],
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+    for (const mode of ["read", "write"] as const) {
+      const accessSecrets = async () => {
+        await verifyServiceToken({ ...options, secretPath, mode });
+        if (mode === "read") await listSecrets({ ...options, secretPath, viewValues: false });
+        else await upsertSecret({ ...options, secretPath, name: "FIXTURE", value: "fixture-value" });
+      };
+      await expect(accessSecrets()).rejects.toMatchObject({ statusCode: 403 });
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["*", "?", "[", "]", "{", "}"])("rejects wildcard metadata row %s even alongside a valid exact grant", async (character) => {
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      calls.push(url);
+      return new Response(JSON.stringify({ ...metadata,
+        scopes: [...metadata.scopes, { environment: "staging", secretPath: `/other/${character}` }],
+      }));
+    }));
+    const accessSecrets = async () => {
+      await verifyServiceToken(options);
+      await listSecrets({ ...options, viewValues: false });
+    };
+    await expect(accessSecrets()).rejects.toMatchObject({ statusCode: 502 });
+    expect(calls).toEqual(["https://app.infisical.example/api/v2/service-token"]);
+  });
+
+  it("accepts literal folders with spaces and ordinary punctuation", async () => {
+    const secretPath = "/folder with spaces/(copy)+@!#%&=,;:._-";
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...metadata,
+      scopes: [{ environment: "prod", secretPath: `${secretPath}/` }],
+    }))));
+    expect(await verifyServiceToken({ ...options, secretPath })).toEqual({ expiresAt: null });
+  });
+
+  it.each([
+    { workspace: "another-project" }, { projectId: "another-project" },
+    { scopes: [{ environment: "staging", secretPath: "/folder" }] },
+    { scopes: [{ environment: "prod", secretPath: "/" }] },
+    { scopes: [{ environment: "prod", secretPath: "/folder/child" }] },
+    { scopes: [{ environment: "prod", secretPath: "/folder/*" }] },
+    { permissions: ["read", "write"] }, { permissions: ["write"] },
+    { expiresAt: "2000-01-01T00:00:00Z" },
+  ])("refuses mismatched scope, permission or expiry %#", async (patch) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...metadata, ...patch }))));
+    await expect(verifyServiceToken(options)).rejects.toBeInstanceOf(InfisicalError);
+  });
+
+  it.each([
+    null, [], { serviceToken: metadata }, { ...metadata, workspace: {} },
+    { ...metadata, scopes: "prod" }, { ...metadata, scopes: [null] },
+    { ...metadata, scopes: "{}" }, { ...metadata, scopes: "null" },
+    { ...metadata, scopes: JSON.stringify({ scopes: metadata.scopes }) },
+    { ...metadata, scopes: [{ environment: "prod", secretPath: 1 }] },
+    { ...metadata, permissions: "read" }, { ...metadata, permissions: ["read", "admin"] },
+    { ...metadata, expiresAt: undefined }, { ...metadata, expiresAt: 123 }, { ...metadata, expiresAt: "not-a-date" },
+    { ...metadata, expiresAt: "2999-02-30T00:00:00Z" },
+  ])("fails closed for malformed flat metadata %#", async (body) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(body))));
+    await expect(verifyServiceToken(options)).rejects.toMatchObject({ statusCode: 502 });
+  });
+
+  it.each([["write"], ["read", "write"]])("permits a dedicated write credential with permissions %j", async (...permissions) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...metadata, permissions }))));
+    expect(await verifyServiceToken({ ...options, mode: "write" })).toEqual({ expiresAt: null });
+  });
+
+  it("refuses read-only credentials for writes and never logs an upstream body or transport message", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(metadata))));
+    await expect(verifyServiceToken({ ...options, mode: "write" })).rejects.toMatchObject({ statusCode: 403 });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error(SENTINEL_TOKEN); }));
+    await expect(verifyServiceToken(options)).rejects.not.toThrow(SENTINEL_TOKEN);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(SENTINEL_TOKEN, { status: 403 })));
+    await expect(verifyServiceToken(options)).rejects.toMatchObject({ statusCode: 403 });
+    await expect(verifyServiceToken(options)).rejects.not.toThrow(SENTINEL_TOKEN);
+  });
 });
 
 describe("login", () => {

@@ -1890,14 +1890,43 @@ describe("the secret-store section", () => {
     const patch = parseConfigPatch({ infisical: {
       authMethod: "service-token", projectId: "main", readSources: [{
         name: "staging-settings", projectId: "other", environment: "staging", secretPath: "/settings/",
-        tokenEnv: "BF_TEST_READ", writeTokenEnv: "BF_TEST_WRITE", token: "must-be-stripped",
+        tokenEnv: "BF_TEST_READ", writeTokenEnv: "BF_TEST_WRITE",
       }],
     } });
     saveConfig(patch);
     expect(infisicalSettings(loadConfig()).readSources[0]).toMatchObject({ secretPath: "/settings", writeTokenEnv: "BF_TEST_WRITE" });
-    expect(JSON.stringify(patch)).not.toContain("must-be-stripped");
+    expect(() => parseConfigPatch({ infisical: { readSources: [{
+      name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ", token: "must-be-rejected",
+    }] } })).toThrow("readSources");
     expect(() => parseConfigPatch({ infisical: { authMethod: "auto" } })).toThrow();
     expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "bad", projectId: "p", writeTokenFile: "relative" }] } })).toThrow();
+  });
+
+  it("rejects unknown Infisical request keys while preserving stored-file compatibility", () => {
+    expect(() => parseConfigPatch({ infisical: { writeThru: true } })).toThrow("infisical");
+    expect(() => parseConfigPatch({ infisical: { readSources: [{
+      name: "scope", projectId: "p", tokenEn: "BF_TEST_READ",
+    }] } })).toThrow("readSources");
+    expect(parseStoredConfig({ infisical: {
+      enabled: false, futureOption: true, readSources: [{
+        name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ", futureLocatorOption: true,
+      }],
+    } }).infisical).toEqual({ enabled: false, readSources: [{
+      name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ",
+    }] });
+  });
+
+  it.each([
+    ["tokenFile", `/${"x".repeat(4095)}`, `/${"x".repeat(4096)}`],
+    ["writeTokenFile", `/${"x".repeat(4095)}`, `/${"x".repeat(4096)}`],
+    ["tokenEnv", "X".repeat(256), "X".repeat(257)],
+    ["writeTokenEnv", "X".repeat(256), "X".repeat(257)],
+  ])("bounds source locator %s in requests and bootstrap resolution", (field, allowed, oversized) => {
+    const source = { name: "scope", projectId: "p", [field]: allowed };
+    expect(() => parseConfigPatch({ infisical: { readSources: [source] } })).not.toThrow();
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ ...source, [field]: oversized }] } })).toThrow("readSources");
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([{ ...source, [field]: oversized }]);
+    expect(infisicalSettings(loadConfig()).readSources).toEqual([]);
   });
 
   it("strips dedicated source credential environment names from bot children", () => {
@@ -1919,6 +1948,22 @@ describe("the secret-store section", () => {
       { name: "bad-path", projectId: "p", secretPath: "relative", tokenEnv: "BF_TEST_READ" },
       { name: "bad-token-env", projectId: "p", tokenEnv: "not a variable" },
     ] } }).readSources).toEqual([]);
+  });
+
+  it("strips valid credential env names from malformed routes and retains them after route removal", () => {
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([{
+      name: "bad name", projectId: "../other", environment: "../prod", secretPath: "relative",
+      tokenEnv: " BF_MALFORMED_ROUTE_READ ", writeTokenEnv: " BF_MALFORMED_ROUTE_WRITE ",
+    }]);
+    expect(infisicalSettings(loadConfig()).readSources).toEqual([]);
+    const child = { PATH: "/usr/bin", BF_MALFORMED_ROUTE_READ: "fake-read", BF_MALFORMED_ROUTE_WRITE: "fake-write" };
+    stripWorkspaceCredentialEnv(child);
+    expect(child).toEqual({ PATH: "/usr/bin" });
+    process.env.INFISICAL_READ_SOURCES = "[]";
+    loadConfig();
+    const laterChild = { PATH: "/usr/bin", BF_MALFORMED_ROUTE_READ: "old-read", BF_MALFORMED_ROUTE_WRITE: "old-write" };
+    stripWorkspaceCredentialEnv(laterChild);
+    expect(laterChild).toEqual({ PATH: "/usr/bin" });
   });
 
   it("syncs saved primary tokens and clears identity aliases instead of resurrecting them", () => {
@@ -1967,6 +2012,64 @@ describe("the secret-store section", () => {
     expect(infisicalSettings(cfg).configurationError).toMatch(/one read token reference/);
     expect(() => validateInfisicalConfigPatch(cfg, { infisical: { refreshMinutes: 20 } })).toThrow(/one read token reference/);
     expect(infisicalSettings(cfg).configurationError).not.toContain("fake-primary-read");
+  });
+
+  it.each(["read", "write"] as const)("locked saves include the effective bootstrap primary %s token", (mode) => {
+    saveConfig({ infisical: { projectId: "disk-project", enabled: false } });
+    process.env.INFISICAL_PROJECT_ID = "bootstrap-project";
+    process.env.INFISICAL_TOKEN = "fake-bootstrap-read";
+    process.env.INFISICAL_WRITE_TOKEN = "fake-bootstrap-write";
+    const source = { name: "extra", projectId: "bootstrap-project", secretPath: "/extra",
+      tokenEnv: mode === "read" ? "ANOTHER_READ" : "INFISICAL_TOKEN",
+      ...(mode === "write" ? { writeTokenEnv: "ANOTHER_WRITE" } : {}),
+    };
+    const patch = { infisical: { readSources: [source] } };
+    const before = readFileSync(join(DATA_DIR, "config.json"), "utf8");
+    expect(() => validateInfisicalConfigPatch(loadConfig(), patch)).toThrow(/token reference/);
+    expect(() => saveConfig(patch)).toThrow(/token reference/);
+    expect(readFileSync(join(DATA_DIR, "config.json"), "utf8")).toBe(before);
+  });
+
+  it("locked metadata saves include environment source routes rather than just disk routes", () => {
+    saveConfig({ infisical: { projectId: "p", token: "fake-file-primary" } });
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([
+      { name: "extra", projectId: "p", secretPath: "/extra", tokenEnv: "ANOTHER_READ" },
+    ]);
+    const patch = { infisical: { refreshMinutes: 20 } };
+    const before = readFileSync(join(DATA_DIR, "config.json"), "utf8");
+    expect(() => validateInfisicalConfigPatch(loadConfig(), patch)).toThrow(/token reference/);
+    expect(() => saveConfig(patch)).toThrow(/token reference/);
+    expect(readFileSync(join(DATA_DIR, "config.json"), "utf8")).toBe(before);
+  });
+
+  it("locked saves allow shared bootstrap references without persisting their values", () => {
+    process.env.INFISICAL_PROJECT_ID = "p";
+    process.env.INFISICAL_TOKEN = "fake-bootstrap-read";
+    process.env.INFISICAL_WRITE_TOKEN = "fake-bootstrap-write";
+    const readSources = ["/one", "/two"].map((secretPath, index) => ({
+      name: `scope-${index}`, projectId: "p", secretPath,
+      tokenEnv: "INFISICAL_TOKEN", writeTokenEnv: "INFISICAL_WRITE_TOKEN",
+    }));
+    expect(() => saveConfig({ infisical: { readSources } })).not.toThrow();
+    const disk = JSON.parse(readFileSync(join(DATA_DIR, "config.json"), "utf8"));
+    expect(disk.infisical).toEqual({ readSources });
+    expect(infisicalSettings(loadConfig()).configurationError).toBeUndefined();
+  });
+
+  it("locked save validation lets explicit patch fields replace bootstrap values", () => {
+    process.env.INFISICAL_PROJECT_ID = "p";
+    process.env.INFISICAL_TOKEN = "fake-bootstrap-read";
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([
+      { name: "old", projectId: "p", secretPath: "/extra", tokenEnv: "OLD_READ" },
+    ]);
+    const patch = { infisical: { token: "", readSources: [
+      { name: "replacement", projectId: "p", secretPath: "/extra", tokenEnv: "NEW_READ" },
+    ] } };
+    expect(() => validateInfisicalConfigPatch(loadConfig(), patch)).not.toThrow();
+    expect(() => saveConfig(patch)).not.toThrow();
+    syncCredentialEnv(patch);
+    expect(infisicalSettings(loadConfig()).configurationError).toBeUndefined();
+    expect(loadConfig().infisical?.readSources?.[0]?.name).toBe("replacement");
   });
 
   it("strips the machine identity from a child environment", () => {

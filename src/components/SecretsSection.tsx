@@ -245,7 +245,7 @@ export function SecretsSection() {
     source.projectId === testProjectId && source.environment === testEnvironment &&
     source.secretPath.replace(/\/$/, "") === testPath.replace(/\/$/, "") && source.hasReadToken,
   ));
-  const canTest = Boolean(testProjectId) && (authMethod === "machine-identity"
+  const canTest = enabled && Boolean(testProjectId) && (authMethod === "machine-identity"
     ? Boolean((clientId.trim() || vault?.hasClientId) && (clientSecret.trim() || vault?.hasClientSecret))
     : Boolean(token.trim() || vault?.hasToken || hasScopedReadSource));
 
@@ -676,6 +676,7 @@ export function SecretsSection() {
                 type="button"
                 onClick={() => void testConnection()}
                 disabled={saving || testing || !canTest}
+                title={!enabled ? "Enable Infisical to test the selected connection." : undefined}
                 className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] font-medium text-ink hover:bg-control disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <RefreshCw size={13} className={cn(testing && "animate-spin")} />

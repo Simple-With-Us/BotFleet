@@ -327,12 +327,13 @@ const zulipConfigSchema = z.object({
     .optional(),
 });
 
+const infisicalAuthMethodSchema = z.enum(["service-token", "machine-identity"]);
 const infisicalReadSourceSchema = z.object({
   name: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
-  tokenFile: z.string().trim().min(1).refine((v) => v.startsWith("/"), "tokenFile must be an absolute path").optional(),
-  tokenEnv: z.string().trim().regex(/^[A-Z][A-Z0-9_]*$/).optional(),
-  writeTokenFile: z.string().trim().min(1).refine((v) => v.startsWith("/"), "writeTokenFile must be an absolute path").optional(),
-  writeTokenEnv: z.string().trim().regex(/^[A-Z][A-Z0-9_]*$/).optional(),
+  tokenFile: z.string().trim().min(1).max(4096).refine((v) => v.startsWith("/"), "tokenFile must be an absolute path").optional(),
+  tokenEnv: z.string().trim().max(256).regex(/^[A-Z][A-Z0-9_]*$/).optional(),
+  writeTokenFile: z.string().trim().min(1).max(4096).refine((v) => v.startsWith("/"), "writeTokenFile must be an absolute path").optional(),
+  writeTokenEnv: z.string().trim().max(256).regex(/^[A-Z][A-Z0-9_]*$/).optional(),
   projectId: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/),
   environment: z.string().trim().regex(/^[a-z0-9-]{1,64}$/).optional(),
   secretPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
@@ -611,12 +612,12 @@ const appConfigSchema = z.object({
     uiTracesSampleRate: z.number().min(0).max(1).optional(),
     logsEnabled: z.boolean().optional(),
   }).optional(),
-  // An optional external secret store.  Unconfigured is inert: with no
-  // project id and machine identity, BotFleet resolves exactly as it always
+  // An optional external secret store.  Unconfigured is inert: without the
+  // project and selected method's credentials, BotFleet resolves as it always
   // has.  The kill switch is explicit the same way `ingress` and
   // `observability` are — absent means on once it is configured.
   infisical: z.object({
-    authMethod: z.enum(["service-token", "machine-identity"]).optional(),
+    authMethod: infisicalAuthMethodSchema.optional(),
     enabled: z.boolean().optional(),
     writeThrough: z.boolean().optional(),
     siteUrl: optionalText,
@@ -628,8 +629,8 @@ const appConfigSchema = z.object({
     // The two service tokens.  They are declared here because the schema
     // strips the keys it does not know: a token in the config file that
     // the schema does not mention is dropped on the floor, and the file
-    // would look configured while the server fell back to the machine
-    // identity.  The environment names are the primary route.
+    // would look configured while the server had no usable service token.
+    // The environment names are the primary route.
     token: optionalText,
     writeToken: optionalText,
     readSources: z.array(infisicalReadSourceSchema).max(32).optional(),
@@ -700,7 +701,13 @@ const appConfigSchema = z.object({
 // can show), while a stored file stays lenient (a bad value turns Zulip off).
 const appConfigPatchSchema = appConfigSchema
   .omit({ instances: true, deleteInstance: true })
-  .extend({ zulip: zulipConfigSchema.optional() });
+  .extend({
+    zulip: zulipConfigSchema.optional(),
+    // Stored files stay forward-compatible; requests must not silently accept typos or inline source tokens.
+    infisical: appConfigSchema.shape.infisical.unwrap().extend({
+      readSources: z.array(infisicalReadSourceSchema.strict()).max(32).optional(),
+    }).strict().optional(),
+  });
 const jsonObjectSchema = z.record(z.string(), z.json());
 
 export interface AppConfig {
@@ -1335,7 +1342,7 @@ export const DEFAULT_INFISICAL_REFRESH_MINUTES = 15;
  * defaulted.  Values are used, never rendered: the only fields here a status
  * view may repeat are the site URL, the project id, the environment and the
  * path. */
-export type InfisicalAuthMethod = "service-token" | "machine-identity";
+export type InfisicalAuthMethod = z.infer<typeof infisicalAuthMethodSchema>;
 
 export interface InfisicalReadSource {
   name: string;
@@ -1434,8 +1441,8 @@ export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
         const path = src.secretPath?.trim() ?? "";
         if (env && !INFISICAL_ENVIRONMENT_PATTERN.test(env)) continue;
         if (path && (!/^\/[A-Za-z0-9/_-]*$/.test(path) || path.length > 200)) continue;
-        if ([src.tokenEnv, src.writeTokenEnv].some((value) => value && !/^[A-Z][A-Z0-9_]*$/.test(value.trim()))) continue;
-        if ([src.tokenFile, src.writeTokenFile].some((value) => value && !value.trim().startsWith("/"))) continue;
+        if ([src.tokenEnv, src.writeTokenEnv].some((value) => value && (value.trim().length > 256 || !/^[A-Z][A-Z0-9_]*$/.test(value.trim())))) continue;
+        if ([src.tokenFile, src.writeTokenFile].some((value) => value && (value.trim().length > 4096 || !value.trim().startsWith("/")))) continue;
         seen.add(name);
         out.push({
           name,
@@ -2030,6 +2037,44 @@ function reportStoredConfig(path: string, problem: StoredConfigProblem | null): 
   });
 }
 
+/** Resolve bootstrap credentials and source routes identically for loads and locked saves. */
+function overlayInfisicalBootstrap(stored: AppConfig["infisical"]): NonNullable<AppConfig["infisical"]> {
+  const section = { ...stored };
+  const fields: Array<[field: "clientId" | "clientSecret" | "token" | "writeToken" | "projectId" | "siteUrl" | "environment" | "secretPath", names: string[]]> = [
+    ["clientId", ["INFISICAL_CLIENT_ID", "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"]],
+    ["clientSecret", ["INFISICAL_CLIENT_SECRET", "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"]],
+    ["token", ["INFISICAL_TOKEN"]],
+    ["writeToken", ["INFISICAL_WRITE_TOKEN"]],
+    ["projectId", ["INFISICAL_PROJECT_ID"]],
+    ["siteUrl", ["INFISICAL_SITE_URL", "INFISICAL_DOMAIN"]],
+    ["environment", ["INFISICAL_ENVIRONMENT"]],
+    ["secretPath", ["INFISICAL_SECRET_PATH"]],
+  ];
+  for (const [field, names] of fields) {
+    const name = names.find((candidate) => process.env[candidate] !== undefined);
+    if (name !== undefined) section[field] = process.env[name];
+  }
+  if (process.env.INFISICAL_READ_SOURCES !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(process.env.INFISICAL_READ_SOURCES);
+      if (Array.isArray(parsed)) {
+        section.readSources = parsed.flatMap((entry): InfisicalReadSource[] => {
+          if (!isJsonObject(entry) || !isJsonString(entry.name) || !isJsonString(entry.projectId)) return [];
+          const source: InfisicalReadSource = { name: entry.name, projectId: entry.projectId };
+          if (isJsonString(entry.tokenFile)) source.tokenFile = entry.tokenFile;
+          if (isJsonString(entry.tokenEnv)) source.tokenEnv = entry.tokenEnv;
+          if (isJsonString(entry.writeTokenFile)) source.writeTokenFile = entry.writeTokenFile;
+          if (isJsonString(entry.writeTokenEnv)) source.writeTokenEnv = entry.writeTokenEnv;
+          if (isJsonString(entry.environment)) source.environment = entry.environment;
+          if (isJsonString(entry.secretPath)) source.secretPath = entry.secretPath;
+          return [source];
+        });
+      }
+    } catch { /* Invalid JSON leaves the stored routes unchanged. */ }
+  }
+  return section;
+}
+
 export function loadConfig(): AppConfig {
   const configPath = join(DATA_DIR, "config.json");
   const stored = readStoredConfig(configPath);
@@ -2094,45 +2139,8 @@ export function loadConfig(): AppConfig {
   if (process.env.ASSEMBLYAI_API_KEY !== undefined) cfg.assemblyai.key = process.env.ASSEMBLYAI_API_KEY;
   cfg.imageGen = { ...cfg.imageGen };
   if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
-  // The secret store's own machine identity, which is the one credential pair
-  // that cannot come out of the store.  The alias names mirror the pair the
-  // iOS ship workflow already uses, so a single identity works in CI, on a
-  // headless machine, and in Settings without being renamed on the way.
-  // First defined wins, and env beats the file here for the same reason it
-  // does above: the desktop shell injects it at spawn.
-  cfg.infisical = { ...cfg.infisical };
-  const identity: Array<[field: "clientId" | "clientSecret" | "token" | "writeToken" | "projectId" | "siteUrl" | "environment" | "secretPath", names: string[]]> = [
-    ["clientId", ["INFISICAL_CLIENT_ID", "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"]],
-    ["clientSecret", ["INFISICAL_CLIENT_SECRET", "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"]],
-    ["token", ["INFISICAL_TOKEN"]],
-    ["writeToken", ["INFISICAL_WRITE_TOKEN"]],
-    ["projectId", ["INFISICAL_PROJECT_ID"]],
-    ["siteUrl", ["INFISICAL_SITE_URL", "INFISICAL_DOMAIN"]],
-    ["environment", ["INFISICAL_ENVIRONMENT"]],
-    ["secretPath", ["INFISICAL_SECRET_PATH"]],
-  ];
-  for (const [field, names] of identity) {
-    const name = names.find((candidate) => process.env[candidate] !== undefined);
-    if (name !== undefined) cfg.infisical[field] = process.env[name];
-  }
-  if (process.env.INFISICAL_READ_SOURCES !== undefined) {
-    try {
-      const parsed: unknown = JSON.parse(process.env.INFISICAL_READ_SOURCES);
-      if (Array.isArray(parsed)) {
-        cfg.infisical.readSources = parsed.flatMap((entry): InfisicalReadSource[] => {
-          if (!isJsonObject(entry) || !isJsonString(entry.name) || !isJsonString(entry.projectId)) return [];
-          const source: InfisicalReadSource = { name: entry.name, projectId: entry.projectId };
-          if (isJsonString(entry.tokenFile)) source.tokenFile = entry.tokenFile;
-          if (isJsonString(entry.tokenEnv)) source.tokenEnv = entry.tokenEnv;
-          if (isJsonString(entry.writeTokenFile)) source.writeTokenFile = entry.writeTokenFile;
-          if (isJsonString(entry.writeTokenEnv)) source.writeTokenEnv = entry.writeTokenEnv;
-          if (isJsonString(entry.environment)) source.environment = entry.environment;
-          if (isJsonString(entry.secretPath)) source.secretPath = entry.secretPath;
-          return [source];
-        });
-      }
-    } catch { /* invalid JSON is ignored; infisicalSettings() drops malformed entries */ }
-  }
+  // Bootstrap env beats disk; an inherited machine identity still requires explicit selection.
+  cfg.infisical = overlayInfisicalBootstrap(cfg.infisical);
   cfg.agentProxy = { ...cfg.agentProxy };
   if (process.env.INFISICAL_AGENT_PROXY_ENABLED !== undefined) {
     const raw = process.env.INFISICAL_AGENT_PROXY_ENABLED.trim().toLowerCase();
@@ -2161,8 +2169,10 @@ export function loadConfig(): AppConfig {
   // the vault — they read this resolved `cfg` from memory.
   resolveKnobFields(cfg, infisicalSnapshot());
   for (const source of cfg.infisical?.readSources ?? []) {
-    if (source.tokenEnv) scopedInfisicalCredentialEnv.add(source.tokenEnv);
-    if (source.writeTokenEnv) scopedInfisicalCredentialEnv.add(source.writeTokenEnv);
+    for (const locator of [source.tokenEnv, source.writeTokenEnv]) {
+      const name = locator?.trim();
+      if (name && name.length <= 256 && /^[A-Z][A-Z0-9_]*$/.test(name)) scopedInfisicalCredentialEnv.add(name);
+    }
   }
   // Pin pre-MiniMax key-only installs after env and external-secret resolution.
   // Never persist the injected key to config.json in cleartext.
@@ -2408,7 +2418,7 @@ export function saveConfig(
     const merged = mergeConfigPatch(raw, checkedPatch);
     if (checkedPatch.infisical) {
       const section = appConfigSchema.shape.infisical.parse(merged.infisical);
-      validateInfisicalConfigPatch({}, { infisical: section });
+      validateInfisicalConfigPatch({ infisical: overlayInfisicalBootstrap(section) }, { infisical: checkedPatch.infisical });
     }
     for (const [section, present] of Object.entries(options.externalCredentialSections ?? {})) {
       const current = jsonObjectSchema.safeParse(merged[section]);

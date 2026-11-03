@@ -16,14 +16,17 @@ const RESOLVED = "sentinel-resolved-value-5d1a";
 function stubFetch(vaultSecrets, listUrls = []) {
   return async (url) => {
     const u = String(url);
+    if (u.includes("/api/v2/service-token")) {
+      return new Response(JSON.stringify({
+        workspace: "proj", projectId: "proj", scopes: [{ environment: "prod", secretPath: "/" }],
+        permissions: ["read"], expiresAt: null,
+      }), { status: 200 });
+    }
     if (u.includes("/api/v3/secrets/raw")) {
       listUrls.push(u);
-      return {
-        ok: true,
-        json: async () => ({
-          secrets: Object.entries(vaultSecrets).map(([secretKey, secretValue]) => ({ secretKey, secretValue })),
-        }),
-      };
+      return new Response(JSON.stringify({
+        secrets: Object.entries(vaultSecrets).map(([secretKey, secretValue]) => ({ secretKey, secretValue })),
+      }), { status: 200 });
     }
     throw new Error(`stubFetch: unexpected URL ${u}`);
   };

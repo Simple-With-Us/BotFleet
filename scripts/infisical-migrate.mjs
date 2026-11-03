@@ -29,7 +29,7 @@ import { fileURLToPath } from "node:url";
 
 import { loadConfig, infisicalSettings, infisicalConfigured, normalizeInfisicalSecretPath } from "../server/config.ts";
 import { SECRET_FIELDS } from "../server/secret-map.ts";
-import { listSecrets, upsertSecret } from "../server/infisical-client.ts";
+import { listSecrets, upsertSecret, verifyServiceToken } from "../server/infisical-client.ts";
 
 function sha256(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -86,6 +86,7 @@ export async function run({
   loadConfigImpl = loadConfig,
   listSecretsImpl = listSecrets,
   upsertSecretImpl = upsertSecret,
+  verifyServiceTokenImpl = verifyServiceToken,
 } = {}) {
   const apply = argv.includes("--apply");
 
@@ -123,6 +124,31 @@ export async function run({
   }
   const token = tokens.readToken;
 
+  try {
+    await verifyServiceTokenImpl({
+      siteUrl: settings.siteUrl,
+      token,
+      projectId: settings.projectId,
+      environment: settings.environment,
+      secretPath: settings.secretPath,
+      mode: "read",
+    });
+    if (apply) {
+      await verifyServiceTokenImpl({
+        siteUrl: settings.siteUrl,
+        token: tokens.writeToken,
+        projectId: settings.projectId,
+        environment: settings.environment,
+        secretPath: settings.secretPath,
+        mode: "write",
+      });
+    }
+  } catch {
+    err("Could not verify the configured Infisical service-token scope; no secrets were read or written.");
+    process.exitCode = 1;
+    return;
+  }
+
   let vaultValues;
   try {
     const listed = await listSecretsImpl({
@@ -155,16 +181,6 @@ export async function run({
 
   if (!apply) {
     log("Dry run only -- nothing written.  Re-run with --apply to upsert the rows above not already present-and-same.");
-    return;
-  }
-
-  if (!tokens.writeToken) {
-    err(
-      "This install has no write credential: set INFISICAL_WRITE_TOKEN (or " +
-        "infisical.writeToken in the config file), or keep the machine " +
-        "identity so the script can log in and write as it always did.",
-    );
-    process.exitCode = 1;
     return;
   }
 

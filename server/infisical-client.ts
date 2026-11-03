@@ -101,6 +101,87 @@ export async function login({
   return token;
 }
 
+export interface VerifyServiceTokenOptions {
+  siteUrl: string;
+  token: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+  mode: "read" | "write";
+  timeoutMs?: number;
+}
+
+/** Verify the token's own flat metadata before requesting secrets: the raw
+ * secrets endpoint may clamp a requested folder to a granted folder.
+ * Only expiry leaves this boundary; response bodies and token values never do. */
+export async function verifyServiceToken({
+  siteUrl, token, projectId, environment, secretPath, mode, timeoutMs = DEFAULT_TIMEOUT_MS,
+}: VerifyServiceTokenOptions): Promise<{ expiresAt: number | null }> {
+  const isLiteralFolder = (path: unknown): path is string =>
+    typeof path === "string" && path.startsWith("/") && !/[*?[\]{}]/.test(path);
+  if (!isLiteralFolder(secretPath)) {
+    throw new InfisicalError("Infisical service-token scope must use a literal folder", 403);
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${siteUrl}/api/v2/service-token`, {
+      method: "GET", headers: { authorization: `Bearer ${token}` },
+      redirect: "error", signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    throw new InfisicalError(isTimeoutError(error)
+      ? `Infisical service-token verification timed out after ${timeoutMs} ms`
+      : "Infisical service-token verification failed", isTimeoutError(error) ? 504 : 502);
+  }
+  if (!response.ok) throw httpError("Infisical service-token verification failed", response.status);
+  let raw: unknown;
+  try { raw = await response.json(); }
+  catch { throw new InfisicalError("Infisical service-token verification returned invalid metadata", 502); }
+  const invalid = () => new InfisicalError("Infisical service-token verification returned invalid metadata", 502);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw invalid();
+  const metadata = raw as Record<string, unknown>;
+  let scopes: unknown = metadata.scopes;
+  if (typeof scopes === "string") {
+    try { scopes = JSON.parse(scopes); } catch { throw invalid(); }
+  }
+  if (typeof metadata.workspace !== "string" || !metadata.workspace.trim() ||
+      !Array.isArray(scopes) || !scopes.length ||
+      !Array.isArray(metadata.permissions) || !metadata.permissions.length ||
+      !metadata.permissions.every((permission) => permission === "read" || permission === "write")) throw invalid();
+  if (metadata.projectId !== undefined && typeof metadata.projectId !== "string") throw invalid();
+  if (metadata.workspace !== projectId ||
+      (metadata.projectId !== undefined && metadata.projectId !== projectId)) {
+    throw new InfisicalError("Infisical service token does not belong to the configured project", 403);
+  }
+  const normalizeFolder = (path: string) => path.replace(/\/+$/, "") || "/";
+  let matches = false;
+  for (const rawScope of scopes) {
+    if (!rawScope || typeof rawScope !== "object" || Array.isArray(rawScope)) throw invalid();
+    const scope = rawScope as Record<string, unknown>;
+    if (typeof scope.environment !== "string" || !scope.environment ||
+        !isLiteralFolder(scope.secretPath)) throw invalid();
+    if (scope.environment === environment && normalizeFolder(scope.secretPath) === normalizeFolder(secretPath)) matches = true;
+  }
+  if (!matches) throw new InfisicalError("Infisical service token does not grant the exact configured environment and folder", 403);
+  if (mode === "read" ? !metadata.permissions.includes("read") || metadata.permissions.includes("write")
+    : !metadata.permissions.includes("write")) {
+    throw new InfisicalError(mode === "read" ? "Infisical read credential must be read-only"
+      : "Infisical write credential must grant write permission", 403);
+  }
+  let expiresAt: number | null = null;
+  if (metadata.expiresAt !== null) {
+    if (typeof metadata.expiresAt !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(metadata.expiresAt)) throw invalid();
+    expiresAt = Date.parse(metadata.expiresAt);
+    if (!Number.isFinite(expiresAt)) throw invalid();
+    const date = metadata.expiresAt.slice(0, 10);
+    const calendarDate = Date.parse(`${date}T00:00:00Z`);
+    if (!Number.isFinite(calendarDate) || new Date(calendarDate).toISOString().slice(0, 10) !== date) throw invalid();
+    if (expiresAt <= Date.now()) throw new InfisicalError("Infisical service token has expired", 401);
+  }
+  return { expiresAt };
+}
+
 export interface ListSecretsOptions {
   siteUrl: string;
   token: string;

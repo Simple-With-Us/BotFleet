@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { maskValue, run, writeGithubEnvValue } from "./infisical-fetch.mjs";
+import { listSecretsRaw, maskValue, run, writeGithubEnvValue } from "./infisical-fetch.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = join(ROOT, "scripts", "infisical-fetch.mjs");
@@ -25,17 +25,20 @@ function tempGithubEnv() {
   return { dir, path: join(dir, "github_env") };
 }
 
-/** The stub accepts only a scoped secrets read and never contacts a network. */
+/** The stub accepts only token-metadata verification and the scoped secrets read. */
 function stubFetch(vaultSecrets) {
   return async (url) => {
     const u = String(url);
+    if (u.includes("/api/v2/service-token")) {
+      return new Response(JSON.stringify({
+        workspace: "proj", projectId: "proj", scopes: [{ environment: "prod", secretPath: "/" }],
+        permissions: ["read"], expiresAt: null,
+      }), { status: 200 });
+    }
     if (u.includes("/api/v3/secrets/raw")) {
-      return {
-        ok: true,
-        json: async () => ({
-          secrets: Object.entries(vaultSecrets).map(([secretKey, secretValue]) => ({ secretKey, secretValue })),
-        }),
-      };
+      return new Response(JSON.stringify({
+        secrets: Object.entries(vaultSecrets).map(([secretKey, secretValue]) => ({ secretKey, secretValue })),
+      }), { status: 200 });
     }
     throw new Error(`stubFetch: unexpected URL ${u}`);
   };
@@ -62,27 +65,166 @@ test("a service token replaces the universal-auth login", async () => {
         GITHUB_ENV: path,
       },
       fetchImpl: async (url, init) => {
-        calls.push({ url: String(url), headers: init?.headers ?? {} });
-        return {
-          ok: true,
-          json: async () => ({
+        calls.push({ url: String(url), headers: init?.headers ?? {}, init });
+        if (String(url).includes("/api/v2/service-token")) {
+          return new Response(JSON.stringify({
+            workspace: "proj", projectId: "proj", scopes: JSON.stringify([{ environment: "prod", secretPath: "/" }]),
+            permissions: ["read"], expiresAt: null,
+          }), { status: 200 });
+        }
+        return new Response(JSON.stringify({
             secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }],
-          }),
-        };
+          }), { status: 200 });
       },
       log,
     });
-    assert.equal(calls.length, 1, "a service token must not trigger a login call");
-    assert.match(calls[0].url, /\/api\/v3\/secrets\/raw/);
+    assert.equal(calls.length, 2, "metadata verification and secrets fetch should be the only requests");
+    assert.match(calls[0].url, /\/api\/v2\/service-token$/);
+    assert.match(calls[1].url, /\/api\/v3\/secrets\/raw/);
+    assert.equal(calls[0].init.method, "GET");
+    assert.equal(calls[0].init.redirect, "error");
+    assert.ok(calls[0].init.signal instanceof AbortSignal);
     assert.ok(
-      String(calls[0].headers.authorization ?? "").endsWith("st.test-token"),
-      "the service token must be the bearer credential",
+      calls.every((call) => String(call.headers.authorization ?? "").endsWith("st.test-token")),
+      "the service token must be the bearer credential on both requests",
     );
     assert.match(readFileSync(path, "utf8"), /FOO</);
     assert.ok(lines.some((line) => line === `::add-mask::${SENTINEL_PRESENT}`));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("verification uses the injected fetch and rejects project, scope, permission, expiry, and malformed scopes before secrets", async (t) => {
+  const valid = {
+    workspace: "proj", projectId: "proj", scopes: [{ environment: "prod", secretPath: "/" }],
+    permissions: ["read"], expiresAt: null,
+  };
+  const cases = [
+    ["wrong project", { ...valid, workspace: "other", projectId: "other" }],
+    ["wrong folder", { ...valid, scopes: [{ environment: "prod", secretPath: "/elsewhere" }] }],
+    ["wrong environment", { ...valid, scopes: [{ environment: "staging", secretPath: "/" }] }],
+    ["write token refused as read-only", { ...valid, permissions: ["read", "write"] }],
+    ["expired token", { ...valid, expiresAt: "2020-01-01T00:00:00Z" }],
+    ["missing expiry metadata", (({ expiresAt, ...metadata }) => metadata)(valid)],
+    ["invalid calendar date", { ...valid, expiresAt: "2026-02-30T00:00:00Z" }],
+    ["malformed serialized scopes", { ...valid, scopes: "not-json" }],
+    ["wrapped scopes shape", { ...valid, scopes: { scopes: valid.scopes } }],
+  ];
+  for (const [name, metadata] of cases) {
+    await t.test(name, async () => {
+      const { dir, path } = tempGithubEnv();
+      const order = [];
+      const { lines, log } = collectLines();
+      try {
+        await assert.rejects(run({
+          env: {
+            INFISICAL_NAMES: "FOO", INFISICAL_REQUIRED: "FOO", INFISICAL_PROJECT_ID: "proj",
+            INFISICAL_TOKEN: "st.fixture-only", GITHUB_ENV: path,
+          },
+          fetchImpl: async (url) => {
+            order.push(String(url).includes("/api/v2/service-token") ? "verify" : "secrets");
+            if (String(url).includes("/api/v2/service-token")) return new Response(JSON.stringify(metadata), { status: 200 });
+            throw new Error("must not read secrets");
+          },
+          log,
+        }), /Missing required/);
+        assert.deepEqual(order, ["verify"]);
+        assert.ok(lines.every((line) => !line.includes("st.fixture-only")));
+        assert.equal(existsSync(path), false, "a refused scope must not export values");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("the injected fetch validates serialized exact read scope before secrets", async () => {
+  const { dir, path } = tempGithubEnv();
+  const order = [];
+  try {
+    await run({
+      env: { INFISICAL_NAMES: "FOO", INFISICAL_PROJECT_ID: "proj", INFISICAL_TOKEN: "st.fixture-only", GITHUB_ENV: path },
+      fetchImpl: async (url) => {
+        if (String(url).includes("/api/v2/service-token")) {
+          order.push("verify");
+          return new Response(JSON.stringify({
+            workspace: "proj", projectId: "proj", scopes: JSON.stringify([{ environment: "prod", secretPath: "/" }]),
+            permissions: ["read"], expiresAt: null,
+          }), { status: 200 });
+        }
+        order.push("secrets");
+        assert.match(String(url), /\/api\/v3\/secrets\/raw/);
+        return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }] }), { status: 200 });
+      },
+      log: () => {},
+    });
+    assert.deepEqual(order, ["verify", "secrets"]);
+    assert.match(readFileSync(path, "utf8"), /FOO</);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("matching wildcard request and grant never reach the secret endpoint", async (t) => {
+  for (const character of ["*", "?", "[", "]", "{", "}"]) {
+    await t.test(character, async () => {
+      const secretPath = `/folder/${character}`;
+      const calls = [];
+      await assert.rejects(listSecretsRaw({
+        siteUrl: "https://infisical.example", token: "st.fixture-only", projectId: "proj",
+        environment: "prod", secretPath,
+        fetchImpl: async (url) => {
+          calls.push(String(url));
+          return new Response(JSON.stringify({ workspace: "proj", permissions: ["read"], expiresAt: null,
+            scopes: [{ environment: "prod", secretPath }],
+          }));
+        },
+      }), /literal folder/);
+      assert.deepEqual(calls, [], "invalid request folders must fail before any network access");
+    });
+  }
+});
+
+test("all metadata folders must be literal even when an exact literal grant is present", async (t) => {
+  for (const character of ["*", "?", "[", "]", "{", "}"]) {
+    await t.test(character, async () => {
+      const calls = [];
+      await assert.rejects(listSecretsRaw({
+        siteUrl: "https://infisical.example", token: "st.fixture-only", projectId: "proj",
+        environment: "prod", secretPath: "/folder",
+        fetchImpl: async (url) => {
+          calls.push(String(url));
+          return new Response(JSON.stringify({ workspace: "proj", permissions: ["read"], expiresAt: null,
+            scopes: [{ environment: "prod", secretPath: "/folder" },
+              { environment: "staging", secretPath: `/other/${character}` }],
+          }));
+        },
+      }), /metadata is invalid/);
+      assert.deepEqual(calls, ["https://infisical.example/api/v2/service-token"]);
+    });
+  }
+});
+
+test("literal folders keep spaces and ordinary punctuation", async () => {
+  const secretPath = "/folder with spaces/(copy)+@!#%&=,;:._-";
+  const calls = [];
+  const values = await listSecretsRaw({
+    siteUrl: "https://infisical.example", token: "st.fixture-only", projectId: "proj",
+    environment: "prod", secretPath,
+    fetchImpl: async (url) => {
+      calls.push(String(url));
+      if (String(url).includes("/api/v2/service-token")) {
+        return new Response(JSON.stringify({ workspace: "proj", permissions: ["read"], expiresAt: null,
+          scopes: JSON.stringify([{ environment: "prod", secretPath: `${secretPath}/` }]),
+        }));
+      }
+      return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }] }));
+    },
+  });
+  assert.equal(values.get("FOO"), SENTINEL_PRESENT);
+  assert.equal(calls.length, 2);
+  assert.equal(new URL(calls[1]).searchParams.get("secretPath"), secretPath);
 });
 
 test("the service token wins over a machine identity that is also configured", async () => {
@@ -101,17 +243,18 @@ test("the service token wins over a machine identity that is also configured", a
       },
       fetchImpl: async (url, init) => {
         calls.push({ url: String(url), headers: init?.headers ?? {} });
-        return {
-          ok: true,
-          json: async () => ({
-            secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }],
-          }),
-        };
+        if (String(url).includes("/api/v2/service-token")) {
+          return new Response(JSON.stringify({
+            workspace: "proj", projectId: "proj", scopes: [{ environment: "prod", secretPath: "/" }],
+            permissions: ["read"], expiresAt: null,
+          }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }] }), { status: 200 });
       },
       log,
     });
-    assert.equal(calls.length, 1, "the token path must not also log in");
-    assert.ok(String(calls[0].headers.authorization ?? "").endsWith("st.test-token"));
+    assert.equal(calls.length, 2, "only verification and the secrets list should run");
+    assert.ok(calls.every((call) => String(call.headers.authorization ?? "").endsWith("st.test-token")));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -142,10 +285,14 @@ test("a rejected service token never falls back to another identity or exposes u
     await assert.rejects(run({
       env: { INFISICAL_PROJECT_ID: "proj", INFISICAL_NAMES: "FOO", INFISICAL_REQUIRED: "FOO",
         INFISICAL_TOKEN: "st.refused-fixture", INFISICAL_CLIENT_ID: "unused-id", INFISICAL_CLIENT_SECRET: "unused-secret", GITHUB_ENV: path },
-      fetchImpl: async (url) => { calls.push(String(url)); throw new Error("st.refused-fixture unused-secret"); }, log,
+      fetchImpl: async (url) => {
+        calls.push(String(url));
+        if (String(url).includes("/api/v2/service-token")) return new Response("private error body", { status: 403 });
+        throw new Error("must not read after rejected metadata");
+      }, log,
     }), /Missing required/);
     assert.equal(calls.length, 1);
-    assert.ok(calls.every((url) => url.includes("/api/v3/secrets/raw")));
+    assert.ok(calls.every((url) => url.includes("/api/v2/service-token")));
     assert.ok(lines.every((line) => !line.includes("st.refused-fixture") && !line.includes("unused-secret")));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

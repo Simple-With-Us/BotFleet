@@ -4,6 +4,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { parse } from "yaml";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(join(ROOT, path), "utf8");
@@ -42,6 +45,32 @@ test("native release and Vercel catch-up use their dedicated pending bindings", 
   assert.equal(fetchStep.env.INFISICAL_SECRET_PATH, "/");
   assert.equal(fetchStep.env.INFISICAL_NAMES, "VERCEL_TOKEN");
   assert.equal(fetchStep.env.INFISICAL_REQUIRED, "VERCEL_TOKEN");
+});
+
+test("Vercel catch-up pauses without its binding and admits only the token path when bound", () => {
+  const steps = parse(read(".github/workflows/vercel-catch-up.yml")).jobs.deploy.steps;
+  const gate = steps.find((step) => step.id === "credentials");
+  const fetchStep = steps.find((step) => step.run === "node scripts/infisical-fetch.mjs");
+  assert.equal(fetchStep.if, "steps.credentials.outputs.available == 'true'");
+  assert.equal(steps.find((step) => step.id === "gate").if, fetchStep.if);
+  for (const token of ["", "fixture-not-a-real-token"]) {
+    const dir = mkdtempSync(join(tmpdir(), "vercel-binding-fixture-"));
+    try {
+      const output = join(dir, "output");
+      const summary = join(dir, "summary");
+      writeFileSync(output, "");
+      writeFileSync(summary, "");
+      const result = spawnSync("bash", ["-e", "-c", gate.run], {
+        encoding: "utf8", cwd: dir,
+        env: { PATH: process.env.PATH, INFISICAL_TOKEN: token, GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(readFileSync(output, "utf8").trim(), `available=${Boolean(token)}`);
+      if (!token) assert.match(readFileSync(summary, "utf8"), /paused until its dedicated Infisical service token is bound/);
+      else assert.equal(readFileSync(summary, "utf8"), "");
+      assert.doesNotMatch(result.stdout + result.stderr + readFileSync(output, "utf8") + readFileSync(summary, "utf8"), /fixture-not-a-real-token/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
 });
 
 test("managed helpers have no universal-auth implementation or Automation lookup", () => {
