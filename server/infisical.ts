@@ -572,9 +572,11 @@ class InfisicalManager {
   }
 
   /** Recheck the live switch after any await before another credential or vault operation. */
-  private requireEnabled(settings: InfisicalSettings): void {
+  private requireEnabled(settings: InfisicalSettings, writeLanded = false): void {
     if (settings.enabled !== true || this.settings().enabled !== true) {
-      throw new InfisicalError("Infisical is turned off.", 409);
+      throw new InfisicalError(writeLanded
+        ? "Infisical write landed, but the connection was turned off before verification."
+        : "Infisical is turned off.", 409, writeLanded);
     }
   }
 
@@ -595,7 +597,7 @@ class InfisicalManager {
       const token = await this.machineIdentityToken(settings);
       this.requireEnabled(settings);
       const result = await call(token);
-      if (mode === "read") this.requireEnabled(settings);
+      this.requireEnabled(settings, mode === "write");
       return result;
     }
     const source = (settings.readSources ?? []).find((entry) =>
@@ -627,7 +629,7 @@ class InfisicalManager {
       await this.verifyScopedServiceToken(settings.siteUrl, configured, projectId, environment, secretPath, mode);
       this.requireEnabled(settings);
       const result = await call(configured);
-      if (mode === "read") this.requireEnabled(settings);
+      this.requireEnabled(settings, mode === "write");
       if (source) this.readSourceStatus.set(source.name, { ok: true, error: null });
       return result;
     } catch (err) {
@@ -992,6 +994,7 @@ class InfisicalManager {
       siteUrl: settings.siteUrl, token, projectId: source.projectId,
       environment: source.environment, secretPath: normalizeInfisicalSecretPath(source.secretPath),
       name, value, timeoutMs: callTimeoutMs(),
+      beforeRequest: () => this.requireEnabled(settings),
     }), scopeSignature(source.projectId, source.environment, normalizeInfisicalSecretPath(source.secretPath)));
     if (scopeSignature(source.projectId, source.environment, normalizeInfisicalSecretPath(source.secretPath)) === vaultScope(settings)) {
       const result = await this.refresh("settings");
@@ -1035,6 +1038,7 @@ class InfisicalManager {
           name,
           value,
           timeoutMs: callTimeoutMs(),
+          beforeRequest: () => this.requireEnabled(settings),
         });
       });
     } catch (err) {

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { infisicalSettings, type InfisicalSettings } from "./config.ts";
 import { dataDir } from "./data-dir.ts";
 import { infisical } from "./infisical.ts";
+import type { InfisicalError } from "./infisical-client.ts";
 import { fleetOpsProjectId } from "./infisical.ts";
 import { infisicalSnapshot, setInfisicalSnapshot, vaultNames } from "./secret-map.ts";
 
@@ -819,6 +820,41 @@ describe("readSources", () => {
 });
 
 describe("writeSecret", () => {
+  it.each([
+    { operation: "writeSecret", patchStatus: 200 }, { operation: "writeSource", patchStatus: 200 },
+    { operation: "writeSecret", patchStatus: 404 }, { operation: "writeSource", patchStatus: 404 },
+  ] as const)("preserves the landed state and stops follow-up requests after $operation PATCH $patchStatus finishes disabled", async ({ operation, patchStatus }) => {
+    process.env.BF_TEST_DISABLED_READ = SENTINEL_READ_TOKEN;
+    process.env.BF_TEST_DISABLED_WRITE = SENTINEL_WRITE_TOKEN;
+    const settings = withSettings({ writeThrough: true, token: SENTINEL_READ_TOKEN, writeToken: SENTINEL_WRITE_TOKEN,
+      readSources: [{ name: "primary", projectId: "proj-1", environment: "prod", secretPath: "/",
+        tokenEnv: "BF_TEST_DISABLED_READ", tokenFile: "", writeTokenEnv: "BF_TEST_DISABLED_WRITE" }],
+    });
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const patchStarted = new Promise<void>((resolve) => { started = resolve; });
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; started(); }));
+    stubFetch(fetchMock);
+    try {
+      const write = operation === "writeSecret"
+        ? infisical.writeSecret("COMPOSIO_API_KEY", "new-value")
+        : infisical.writeSource("primary", "COMPOSIO_API_KEY", "new-value");
+      const pending = write.then(() => null, (error: InfisicalError) => error);
+      await patchStarted;
+      settings.enabled = false;
+      finish(new Response("{}", { status: patchStatus }));
+      const error = await pending;
+      expect(error).toMatchObject({ statusCode: 409, writeLanded: patchStatus === 200 });
+      expect(error?.message).toContain(patchStatus === 200 ? "write landed" : "turned off");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(metadataRequests).toHaveLength(1);
+      expect(infisicalSnapshot()).toBeNull();
+    } finally {
+      delete process.env.BF_TEST_DISABLED_READ;
+      delete process.env.BF_TEST_DISABLED_WRITE;
+    }
+  });
+
   it("does not request secrets after a machine login completes with the connection off", async () => {
     const settings = withSettings({});
     let finish!: (response: Response) => void;
@@ -849,7 +885,7 @@ describe("writeSecret", () => {
     try {
       const calls = { refresh: () => infisical.refresh("manual"), probe: () => infisical.probe(),
         readPath: () => infisical.readPath("/"), readSource: () => infisical.readSource("primary") };
-      const pending = calls[operation]().then((value) => ({ value }), (error: unknown) => ({ error }));
+      const pending = calls[operation]().then((value) => ({ value }), (error: InfisicalError) => ({ error }));
       await listStarted;
       settings.enabled = false;
       finish(new Response(JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }] })));
@@ -899,7 +935,7 @@ describe("writeSecret", () => {
         writeSecret: () => infisical.writeSecret("COMPOSIO_API_KEY", "new-value"),
         writeSource: () => infisical.writeSource("primary", "COMPOSIO_API_KEY", "new-value"),
       };
-      const outcome = calls[operation]().then((value) => ({ value }), (error: unknown) => ({ error }));
+      const outcome = calls[operation]().then((value) => ({ value }), (error: InfisicalError) => ({ error }));
       await metadataStarted;
       settings.enabled = false;
       finish(new Response(JSON.stringify({ workspace: "proj-1", environment: "prod", expiresAt: null,

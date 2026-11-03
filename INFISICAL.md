@@ -1,6 +1,8 @@
 # INFISICAL.md — BotFleet
 
-Infisical is optional in BotFleet.  When an install connects it, Infisical is canonical only for the mapped names this app reads and writes.  An install can keep using its local configuration without connecting a vault.  Per-user settings stay in the app's own store and never go in Infisical.
+The managed Infisical connection is optional in BotFleet.  When an install connects it, Infisical is canonical only for the mapped names this app reads and writes.  An install can keep using its local configuration without connecting a vault.  Per-user settings stay in the app's own store and never go in Infisical.
+
+The connection toggle controls the backend and native credential resolvers.  Startup server-target enrollment in the packaged Electron shell and the managed shell launcher bootstrap are separate paths that currently run before this product setting controls access.  BF-2636 tracks an explicit local opt-in before their Keychain, credential-helper or vault access; AFC-600 owns the separate live credential handoff.  An existing remote enrollment must keep its fail-closed behavior rather than silently choose a local server.  Work already initiated while the managed connection was enabled may finish before the next live-state guard; queued refreshes and later credential or HTTP stages do not start after disable, and late read results are discarded.
 
 BotFleet's Infisical project: **BotFleet** (`836aebe2-c8f7-4e09-978e-7e3e82500bce`), environments `dev` / `staging` / `prod`.  The harness reads the `prod` environment by default (`DEFAULT_INFISICAL_ENVIRONMENT` in `server/config.ts`).
 

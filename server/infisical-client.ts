@@ -292,6 +292,7 @@ export interface UpsertSecretOptions {
   name: string;
   value: string;
   timeoutMs?: number;
+  beforeRequest?: () => void;
 }
 
 /** `PATCH {siteUrl}/api/v3/secrets/raw/{name}`, falling back to `POST` with
@@ -308,11 +309,13 @@ export async function upsertSecret({
   name,
   value,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  beforeRequest,
 }: UpsertSecretOptions): Promise<void> {
   const url = `${siteUrl}/api/v3/secrets/raw/${encodeURIComponent(name)}`;
   const headers = { "content-type": "application/json", authorization: `Bearer ${token}` };
 
   let patchRes: Response;
+  beforeRequest?.();
   try {
     patchRes = await fetch(url, {
       method: "PATCH",
@@ -327,6 +330,7 @@ export async function upsertSecret({
   if (patchRes.status !== 404) throw httpError("Infisical secret update failed", patchRes.status);
 
   let postRes: Response;
+  beforeRequest?.();
   try {
     postRes = await fetch(url, {
       method: "POST",
