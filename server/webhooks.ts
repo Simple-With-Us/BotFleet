@@ -197,6 +197,8 @@ export interface WebhookManagerOptions {
   }) => { id: string; status?: string; error?: string };
   cancelQueued?: (webhookId: string, message: string) => void;
   pendingRuns?: (webhookId: string) => number;
+  /** Whether a new delivery for this webhook and bot can be coalesced into an existing queued run. */
+  canCoalesce?: (webhookId: string, botId: string) => boolean;
   /** The current status of a run, when the engine still holds it.  A PR
    *  state whose run failed, was cancelled or was missed did not get
    *  handled, so it must not block a later delivery. */
@@ -1682,6 +1684,41 @@ export class WebhookManager {
     return this.recordRejectedForTrigger(trigger, statusCode, reason, event);
   }
 
+  isEventIgnoredAtEdge(endpointId: string, eventName?: string): boolean {
+    const trigger = this.webhooks.find((candidate) => candidate.endpointId === endpointId);
+    if (!trigger || trigger.enabled === false) return false;
+    const allowed = trigger.eventTypes ?? [];
+    if (allowed.length > 0 && (!eventName || !allowed.includes(eventName))) {
+      return true;
+    }
+    return false;
+  }
+
+  recordIgnoredAtEdge(
+    endpointId: string,
+    meta: { eventName?: string; contentType?: string; deliveryId?: string },
+  ): WebhookReceiveResult {
+    const trigger = this.webhooks.find((candidate) => candidate.endpointId === endpointId);
+    const deliveryId = meta.deliveryId || randomUUID();
+    const reason = meta.eventName
+      ? `Event type “${meta.eventName}” is not enabled`
+      : "Event type is missing";
+    if (trigger) {
+      this.recordIgnoredAttempt(
+        trigger,
+        {
+          payload: {},
+          contentType: meta.contentType ?? "text/plain",
+          eventName: meta.eventName,
+          deliveryId,
+        },
+        deliveryId,
+        reason,
+      );
+    }
+    return { deliveryId, duplicate: false, ignored: true };
+  }
+
   private dispatch(trigger: StoredWebhookTrigger, event: WebhookEvent): WebhookReceiveResult {
     if (!trigger.enabled) fail(409, "This webhook is paused");
     if (this.options.botState(trigger.botId) === "missing") fail(410, "The assigned Bot no longer exists");
@@ -1799,7 +1836,10 @@ export class WebhookManager {
     // A sender retrying an already-accepted delivery must remain idempotent
     // even while this webhook's queue is full. Only new work consumes a slot.
     if ((this.options.pendingRuns?.(trigger.id) ?? 0) >= MAX_PENDING_RUNS) {
-      fail(429, "This webhook already has too many unfinished tasks");
+      const canCoalesce = this.options.canCoalesce?.(trigger.id, route.botId) ?? false;
+      if (!canCoalesce) {
+        fail(429, "This webhook already has too many unfinished tasks");
+      }
     }
 
     const recent = (this.rate.get(trigger.endpointId) ?? []).filter((at) => now - at < RATE_WINDOW_MS);
