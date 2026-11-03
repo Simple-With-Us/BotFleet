@@ -31,6 +31,8 @@ import {
   AUTO_UPDATE_THROTTLE_MS,
   publicIngressUrl,
   publicIngressUrlEffective,
+  webhookPublicIngressUrl,
+  webhookPublicIngressUrlEffective,
   isSentryDsn,
   observabilityEnabled,
   observabilitySettings,
@@ -1160,6 +1162,42 @@ describe("public ingress URL", () => {
       publicIngressUrlEffective({ ingress: { publicUrl: "https://hooks.example.com" } }),
     ).toBe("https://hooks.example.com");
     expect(publicIngressUrlEffective({})).toBeNull();
+  });
+
+  it("webhookPublicIngressUrl prefers dedicated webhookPublicUrl over publicUrl", () => {
+    expect(
+      webhookPublicIngressUrl({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "https://agents.jays.services",
+        },
+      }),
+    ).toBe("https://agents.jays.services");
+    expect(
+      webhookPublicIngressUrl({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+        },
+      }),
+    ).toBe("https://botfleet.jays.services");
+    expect(
+      webhookPublicIngressUrlEffective({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "https://agents.jays.services",
+          enabled: false,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      webhookPublicIngressUrlEffective({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "https://agents.jays.services",
+          enabled: true,
+        },
+      }),
+    ).toBe("https://agents.jays.services");
   });
 });
 

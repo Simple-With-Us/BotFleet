@@ -295,6 +295,7 @@ import {
   observabilitySettings,
   parseConfigPatch,
   publicIngressUrlEffective,
+  webhookPublicIngressUrlEffective,
   roomTurnTimeoutMinutes,
   saveConfig,
   showToolCallsEnabled,
@@ -8643,6 +8644,7 @@ const webhooks = new WebhookManager({
   enqueue: (input) => routines!.enqueueWebhook(input),
   cancelQueued: (webhookId, message) => routines!.cancelQueuedWebhook(webhookId, message),
   pendingRuns: (webhookId) => routines!.activeWebhookRunCount(webhookId),
+  canCoalesce: (webhookId, botId) => routines!.canCoalesceWebhook(webhookId, botId),
   runStatus: (runId) => routines!.runStatus(runId),
 });
 webhookEphemeralSource = (webhookId) => {
@@ -8698,7 +8700,11 @@ try {
 
 const webhookIngressStatus = () => ({
   available: Boolean(webhookIngress),
-  baseUrl: publicIngressUrlEffective(cfg) || webhookIngress?.baseUrl || `http://127.0.0.1:${WEBHOOK_PORT}`,
+  baseUrl:
+    webhookPublicIngressUrlEffective(cfg) ||
+    publicIngressUrlEffective(cfg) ||
+    webhookIngress?.baseUrl ||
+    `http://127.0.0.1:${WEBHOOK_PORT}`,
   ...(webhookIngressError ? { error: webhookIngressError } : {}),
 });
 
@@ -8860,6 +8866,28 @@ async function probeIngressUrl(raw: string): Promise<IngressProbeResult> {
             : `The server answered with HTTP ${status} but did not return a BotFleet health payload.`,
           ...(tunnel ? { tunnel } : {}),
         };
+      }
+    }
+    if (parsed.pathname === "/hooks/wh_probe/x") {
+      if (status === 302 || status === 403) {
+        const out: IngressProbeResult = {
+          ok: false,
+          url: raw,
+          resolved: true,
+          reason: "The public URL is protected by Cloudflare Access and external webhooks cannot reach it.",
+        };
+        if (tunnel) out.tunnel = tunnel;
+        return out;
+      }
+      if (status === 401) {
+        const out: IngressProbeResult = {
+          ok: true,
+          url: raw,
+          resolved: true,
+          reason: "BotFleet webhook receiver is reachable.",
+        };
+        if (tunnel) out.tunnel = tunnel;
+        return out;
       }
     }
     const head = tunnel
