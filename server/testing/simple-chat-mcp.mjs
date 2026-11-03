@@ -17,6 +17,14 @@
 //
 // It answers only what mcode needs: initialize, tools/list, tools/call.
 import { createInterface } from "node:readline";
+import { z } from "zod";
+
+/** The realm's user object, at the trust boundary.  The response comes from
+ *  outside the process,  so it is parsed against a schema before any of it is
+ *  read,  the same rule the server applies to every other external body. */
+const realmUserSchema = z.object({
+  email: z.string().min(1),
+});
 
 /** The seat the launcher bound, if any. */
 function launchSeat() {
@@ -24,8 +32,17 @@ function launchSeat() {
   return seat ? seat.toUpperCase() : "";
 }
 
-/** The seat the entry's `--default-seat` names. */
+/** The seat the entry's `--default-seat` names, in either form:  the
+ *  standalone token with its value after it,  and the `=` form a caller can
+ *  write as one argument.  A fixture that missed the `=` form would resolve
+ *  to nothing and exit,  and the handshake would get no answer,  which is the
+ *  very failure this fixture exists to remove. */
 function defaultSeat(argv) {
+  for (const arg of argv) {
+    if (arg.startsWith("--default-seat=")) {
+      return arg.slice("--default-seat=".length).trim().toUpperCase();
+    }
+  }
   const at = argv.indexOf("--default-seat");
   return at >= 0 ? String(argv[at + 1] || "").trim().toUpperCase() : "";
 }
@@ -61,11 +78,14 @@ async function whoami(resolved) {
     headers: { Authorization: `Basic ${Buffer.from(`${email}:${key}`).toString("base64")}` },
   });
   if (!response.ok) throw new Error(`the realm refused the ${seat} credential`);
-  const who = await response.json();
+  const parsed = realmUserSchema.safeParse(await response.json());
+  if (!parsed.success) {
+    throw new Error("the realm's user object is not the shape this entry needs");
+  }
   const session = (process.env.AGENT_SESSION || "").trim();
   return {
     seat,
-    email: who.email,
+    email: parsed.data.email,
     // A launched turn carries the session in its tag; an ordinary one does not.
     tag_prefix: source === "env" ? `[${seat}·${session}]` : `[${seat}]`,
     session_source: source,

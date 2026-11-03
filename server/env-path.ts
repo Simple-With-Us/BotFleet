@@ -101,7 +101,19 @@ let knownDirsOverride: readonly string[] | null = null;
  *  from the new list. */
 export function setKnownDirsForTests(dirs: readonly string[] | null): void {
   knownDirsOverride = dirs;
-  resetPathCacheForTests();
+  // The cache is dropped here and not through resetPathCacheForTests(),  which
+  // also drops the override:  setting the override and then resetting would
+  // cancel the setting.
+  clearPathCache();
+}
+
+/** Drop the memoized PATH and the login-shell probe.  The known install dirs
+ *  are not part of it:  they are an override,  and only the test hook and the
+ *  test reset touch them. */
+function clearPathCache(): void {
+  cached = null;
+  probed = false;
+  loginShellPath = null;
 }
 
 /** Drop the memoized PATH so the next augmentedPath() rescans. Called when
@@ -243,9 +255,12 @@ function probeLoginShellPath(): void {
 
 /** Test hook — the cache is process-wide otherwise. */
 export function resetPathCacheForTests(): void {
-  cached = null;
-  probed = false;
-  loginShellPath = null;
+  clearPathCache();
+  // The known install dirs are an override,  and an override that outlives
+  // the case that set it redirects every later lookup in the process:  the
+  // global afterEach calls this function,  so clearing the override here is
+  // what makes one test's choice unable to become another test's environment.
+  knownDirsOverride = null;
 }
 
 /** A command name is searchable when it is a bare name: a path is already a
