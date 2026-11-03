@@ -439,6 +439,19 @@ test("CI full-history checkouts preserve the commit graph without downloading hi
   );
 });
 
+test("required E2E and Mac packaging classifiers retain full history with blobless checkouts", () => {
+  for (const workflowFile of ["e2e.yml", "mac-package-gate.yml"]) {
+    const workflow = parse(readFileSync(join(ROOT, ".github/workflows", workflowFile), "utf8"));
+    const job = workflow.jobs.changes ?? workflow.jobs.scope;
+    assert.ok(job, `${workflowFile} classifier job`);
+    const checkout = job.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+    assert.ok(checkout, `${workflowFile} classifier checkout`);
+    assert.equal(checkout.with?.["fetch-depth"], 0, `${workflowFile} must retain full history`);
+    assert.equal(checkout.with?.filter, "blob:none", `${workflowFile} must avoid downloading historic blobs`);
+    assert.match(job.steps.find((step) => /ci-scope-diff\.sh/.test(step.run ?? ""))?.run ?? "", /ci-scope-diff\.sh/);
+  }
+});
+
 test("a later push cannot cancel an earlier main run before it dispatches jobs", () => {
   // GitHub cancels the older pending run in a shared group.  On
   // `ci-${{ github.ref }}` that cancellation happens with zero jobs, so
