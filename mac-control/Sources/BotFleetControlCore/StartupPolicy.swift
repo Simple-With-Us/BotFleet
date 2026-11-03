@@ -249,6 +249,11 @@ public final class StartupPolicy {
     }
 
     public func startServer() throws {
+        _ = try startServerPreservingDeliberateStop()
+    }
+
+    /// Gives callers that observe startup a handle to restore a deliberate stop on known failure.
+    public func startServerPreservingDeliberateStop() throws -> DeliberateStop {
         guard supportsPolicy else { throw StartupPolicyError.updateRequired }
         guard files.fileExists(atPath: agent.path) else { throw StartupPolicyError.launchAgentMissing }
         let boot = try bootID()
@@ -262,6 +267,7 @@ public final class StartupPolicy {
             if wasStopped { try? Data().write(to: stopped, options: .atomic) }
             throw error
         }
+        return DeliberateStop(marker: stopped, files: files, wasStopped: wasStopped)
     }
 
     /// Restarts the BotFleet Server.
@@ -294,44 +300,25 @@ public final class StartupPolicy {
 
     /// Starts the BotFleet Companion LaunchAgent.
     ///
-    /// An explicit start of the companion is a deliberate start of the
-    /// fleet, so the deliberate-stop marker is cleared first: the companion's
-    /// start script stays down while that marker exists, and a start that
-    /// left it in place would report a companion that never came back.
-    /// The marker is put back when the start fails, so a refused start does
-    /// not lift a deliberate stop.
+    /// A companion-only action cannot lift the server's deliberate stop.
+    /// The explicit server start owns that shared marker.
     public func startCompanion() throws {
-        let wasStopped = files.fileExists(atPath: stopped.path)
-        if wasStopped { try files.removeItem(at: stopped) }
-        do {
-            try startAgent(label: StartupPolicy.companionAgentLabel)
-        } catch {
-            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
-            throw error
-        }
+        try requireFleetUnparked()
+        try startAgent(label: StartupPolicy.companionAgentLabel)
     }
 
     /// Restarts the BotFleet Companion LaunchAgent.
     ///
-    /// A restart asks for a fresh copy of the companion, so the deliberate-stop
-    /// marker is cleared first: the companion's start script stays down while that
-    /// marker exists, and a restart that left it in place would report a
-    /// companion that never came back.
-    ///
-    /// The returned handle puts the marker back when the restart does not
-    /// replace the companion, so a refused restart does not lift a
-    /// deliberate stop.
-    @discardableResult
-    public func restartCompanion() throws -> DeliberateStop {
-        let wasStopped = files.fileExists(atPath: stopped.path)
-        if wasStopped { try files.removeItem(at: stopped) }
-        do {
-            try restartAgent(label: StartupPolicy.companionAgentLabel)
-        } catch {
-            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
-            throw error
+    /// Replacing the companion also leaves the server's park state alone.
+    public func restartCompanion() throws {
+        try requireFleetUnparked()
+        try restartAgent(label: StartupPolicy.companionAgentLabel)
+    }
+
+    private func requireFleetUnparked() throws {
+        if files.fileExists(atPath: stopped.path) {
+            throw StartupPolicyError.refused("The fleet is deliberately stopped.\u{00A0} Start the BotFleet Server before starting or restarting the companion.")
         }
-        return DeliberateStop(marker: stopped, files: files, wasStopped: wasStopped)
     }
 
     /// What a restart of the BotFleet Server did to the deliberate-stop
