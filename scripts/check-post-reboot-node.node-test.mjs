@@ -16,6 +16,7 @@ import {
 import { resolveBoardCli } from "./decommission-gate-state.mjs";
 
 test("isBotFleetNodeProcess identifies BotFleet Node command lines", () => {
+  const sharedMainExecutable = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";
   assert.equal(isBotFleetNodeProcess("node server/index.ts"), true);
   assert.equal(
     isBotFleetNodeProcess(
@@ -48,6 +49,81 @@ test("isBotFleetNodeProcess identifies BotFleet Node command lines", () => {
   assert.equal(isBotFleetNodeProcess("node scripts/check-post-reboot-node.mjs"), false);
   assert.equal(isBotFleetNodeProcess(""), false);
   assert.equal(isBotFleetNodeProcess(null), false);
+
+  assert.equal(
+    isBotFleetNodeProcess(sharedMainExecutable, {
+      pid: "101",
+      inspectExecutable: (pid, path) => {
+        assert.equal(pid, "101");
+        assert.equal(path, sharedMainExecutable);
+        return "native";
+      },
+    }),
+    false,
+    "the canonical native executable passes when its identity is positively established",
+  );
+  assert.equal(
+    isBotFleetNodeProcess(sharedMainExecutable, {
+      pid: "102",
+      inspectExecutable: (pid, path) => {
+        assert.equal(pid, "102");
+        assert.equal(path, sharedMainExecutable);
+        return "electron";
+      },
+    }),
+    true,
+    "Electron at the same bundle and executable path remains a failure",
+  );
+  assert.equal(
+    isBotFleetNodeProcess(sharedMainExecutable, {
+      pid: "103",
+      inspectExecutable: () => "unknown",
+    }),
+    true,
+    "unknown executable identity fails closed",
+  );
+  assert.equal(
+    isBotFleetNodeProcess(sharedMainExecutable, {
+      pid: "104",
+      inspectExecutable: () => {
+        throw new Error("inspector command failed");
+      },
+    }),
+    true,
+    "an inspector command failure fails closed",
+  );
+});
+
+test("inspectProcesses uses fixture PIDs to inspect the shared native/Electron executable", () => {
+  const executable = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";
+  const sample = `
+USER       PID  %CPU %MEM      VSZ    RSS   TT  STAT STARTED      TIME COMMAND
+jay        101   0.0  0.2 41500000  25000   ??  S     3Nov26   0:01.05 ${executable}
+jay        102   0.0  0.2 41500000  25000   ??  S     3Nov26   0:01.05 ${executable}
+jay        103   0.0  0.2 41500000  25000   ??  S     3Nov26   0:01.05 ${executable}
+jay        104   0.0  0.2 41500000  25000   ??  S     3Nov26   0:01.05 ${executable}
+`;
+  const identities = new Map([
+    ["101", "native"],
+    ["102", "electron"],
+    ["103", "unknown"],
+  ]);
+  const inspected = [];
+  const processes = inspectProcesses(sample, {
+    inspectExecutable: (pid, path) => {
+      inspected.push({ pid, path });
+      if (pid === "104") throw new Error("fixture command error");
+      return identities.get(pid) ?? "unknown";
+    },
+  });
+
+  assert.deepEqual(inspected, [
+    { pid: "101", path: executable },
+    { pid: "102", path: executable },
+    { pid: "103", path: executable },
+    { pid: "104", path: executable },
+  ]);
+  assert.deepEqual(processes.map(({ pid }) => pid), ["102", "103", "104"]);
 });
 
 test("inspectProcesses detects offending processes in ps aux and ps -ef output", () => {

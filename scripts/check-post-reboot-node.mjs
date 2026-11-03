@@ -44,18 +44,72 @@ export const EXPLICIT_LEGACY_NODE_PATTERNS = [
   /node.*(?:dist\/server|dist-companion)\/index/i,
 ];
 
-export const BOTFLEET_NODE_PATTERNS = [
-  ...EXPLICIT_LEGACY_NODE_PATTERNS,
-  /(?:^|\/)BotFleet\.app\b/i,
+export const BOTFLEET_HELPER_PATTERNS = [
   /\bBotFleet Helper\b/i,
 ];
+
+const BOTFLEET_MAIN_EXECUTABLE = /(?:^|[\s"'=])(.+\/BotFleet\.app\/Contents\/MacOS\/BotFleet)(?=$|[\s"'])/i;
+
+/**
+ * Inspect the executable backing a candidate main-app process.
+ *
+ * The native and Electron apps share a bundle and executable path, so argv and
+ * bundle naming cannot distinguish them.
+ *
+ * Read the kernel-reported executable path for the PID, then inspect its
+ * linked frameworks without invoking a shell.
+ *
+ * Any missing or ambiguous evidence is unknown and remains a gate failure.
+ */
+export function inspectRunningExecutable(pid, expectedPath) {
+  if (!/^[1-9]\d*$/.test(String(pid ?? "")) || !expectedPath) return "unknown";
+
+  let actualPath;
+  try {
+    actualPath = execFileSync("ps", ["-p", String(pid), "-o", "comm="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+    }).trim();
+  } catch {
+    return "unknown";
+  }
+  if (!actualPath || actualPath !== expectedPath) return "unknown";
+
+  let linkedLibraries;
+  try {
+    linkedLibraries = execFileSync("otool", ["-L", actualPath], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+    });
+  } catch {
+    return "unknown";
+  }
+
+  if (/Electron\.framework(?:\/|\s)/i.test(linkedLibraries)) return "electron";
+  if (
+    /(?:SwiftUI|AppKit)\.framework(?:\/|\s)/i.test(linkedLibraries) &&
+    /libswiftCore(?:\.dylib)?/i.test(linkedLibraries)
+  ) {
+    return "native";
+  }
+  return "unknown";
+}
+
+function mainExecutablePath(cmdLine) {
+  return String(cmdLine).match(BOTFLEET_MAIN_EXECUTABLE)?.[1] ?? null;
+}
 
 /**
  * Check if a command line represents a BotFleet-specific Node process.
  * Ignores unrelated Node processes like build tools, test runners, or developer shells,
- * and native macOS Swift binaries (BotFleet Control.app, BotFleetMac).
+ * and a positively identified native BotFleet macOS executable.
  */
-export function isBotFleetNodeProcess(cmdLine) {
+export function isBotFleetNodeProcess(
+  cmdLine,
+  { pid = null, inspectExecutable = inspectRunningExecutable } = {},
+) {
   if (!cmdLine) return false;
   const str = String(cmdLine);
   // Ignore the check script itself or test runners executing it
@@ -66,6 +120,19 @@ export function isBotFleetNodeProcess(cmdLine) {
   if (EXPLICIT_LEGACY_NODE_PATTERNS.some((pattern) => pattern.test(str))) {
     return true;
   }
+  if (BOTFLEET_HELPER_PATTERNS.some((pattern) => pattern.test(str))) return true;
+
+  if (/(?:^|\/)BotFleet\.app\b/i.test(str)) {
+    const executablePath = mainExecutablePath(str);
+    if (!executablePath) return true;
+    // Fail closed when the inspector cannot prove this is the native Swift app.
+    try {
+      return inspectExecutable(pid, executablePath) !== "native";
+    } catch {
+      return true;
+    }
+  }
+
   // Ignore native macOS Swift applications (case-folded per Rule 30)
   const lower = str.toLowerCase();
   if (
@@ -76,14 +143,14 @@ export function isBotFleetNodeProcess(cmdLine) {
   ) {
     return false;
   }
-  return BOTFLEET_NODE_PATTERNS.some((pattern) => pattern.test(str));
+  return false;
 }
 
 /**
  * Parse `ps aux` or `ps -ef` output to find any lingering BotFleet Node processes.
  * Returns array of offending process objects: { pid, user, command }.
  */
-export function inspectProcesses(psOutput) {
+export function inspectProcesses(psOutput, { inspectExecutable = inspectRunningExecutable } = {}) {
   if (!psOutput) return [];
   const lines = String(psOutput).split("\n");
   const offending = [];
@@ -105,7 +172,7 @@ export function inspectProcesses(psOutput) {
       continue;
     }
 
-    if (isBotFleetNodeProcess(command)) {
+    if (isBotFleetNodeProcess(command, { pid, inspectExecutable })) {
       offending.push({ pid, user, command });
     }
   }
