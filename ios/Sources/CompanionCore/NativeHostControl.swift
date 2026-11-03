@@ -116,17 +116,27 @@ public final class NativeHostControlServer: @unchecked Sendable {
         defer { finishConnection(fd) }
         if verb == "status" {
             let state = await host.state.rawValue
-            reply(fd, "{\"ok\":true,\"state\":\"\(state)\"}\n")
+            await replyOffExecutor(fd, "{\"ok\":true,\"state\":\"\(state)\"}\n")
             return
         }
         do {
             try await host.shutdown(deliberateStop: true)
             // The acknowledgement follows checked database close, marker publication and lease release.
-            reply(fd, "{\"ok\":true,\"state\":\"stopped\"}\n")
+            await replyOffExecutor(fd, "{\"ok\":true,\"state\":\"stopped\"}\n")
             close()
             notifyStopped()
         } catch {
-            reply(fd, "{\"ok\":false,\"error\":\"shutdownFailed\"}\n")
+            await replyOffExecutor(fd, "{\"ok\":false,\"error\":\"shutdownFailed\"}\n")
+        }
+    }
+
+    private func replyOffExecutor(_ fd: Int32, _ text: String) async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async { [self] in
+                reply(fd, text)
+                // perform() retains the descriptor until this bounded output attempt finishes.
+                continuation.resume()
+            }
         }
     }
 

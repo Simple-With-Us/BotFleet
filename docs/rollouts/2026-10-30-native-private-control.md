@@ -42,15 +42,35 @@ This is segmented completion of the required checks, preserving both earlier exi
 
 The original non-isolated credential-sync run was reported separately for host audit and is not evidence of live service acceptance.
 
-The final complete Swift run passed all 1,169 XCTest cases and ran 368 Swift Testing cases with one issue in the unchanged `EngineRunnerAndSupervisorTests.swift:352` assertion that SIGKILL recovery finishes in less than two seconds.
+The pre-review complete Swift run passed all 1,169 XCTest cases and ran 368 Swift Testing cases with one issue in the unchanged `EngineRunnerAndSupervisorTests.swift:352` assertion that SIGKILL recovery finishes in less than two seconds.
 
-The affected host, installer and control suites passed in that complete run, while the complete Swift command remains red and no cause for the remaining deadline failure is established.
+The affected host, installer and control suites passed in that complete run, while that complete Swift command remained red and no cause for its deadline failure was established.
 
 Earlier complete runs exposed two control-test observation problems: a fixed 450 ms sleep before status recovery and an inline POSIX `errno` read inside an assertion macro; the fixtures now await observed status recovery within a finite deadline and capture the signal result and error before assertion instrumentation.
 
-The production Swift files are byte-identical between the frozen Node gate, the final Swift checks and both unsigned builds; the later commits refine fixtures and record evidence only.
+The pre-review production Swift files were byte-identical across the frozen Node gate, the final pre-review Swift checks and both initial unsigned builds; the later pre-review commits refined fixtures and recorded evidence only.
 
 Evidence is retained in the `codex-bf2605-resume-*` full-gate, tail-gate, credential-isolation and remaining-tail logs and exit artifacts, and the Mac validation lane's final focused/full Swift and unsigned Mac/iOS build logs.
+
+## Review Follow-Up
+
+Kody finding `4454409364` on PR #1546 identified bounded socket `poll` and `write` calls running inside the Swift task that handled actor-derived control replies.
+
+Code commit `76b44c4e` moves those three output attempts to a utility GCD queue and awaits their continuation before the accepted descriptor can be closed or the connection slot released.
+
+The GCD closure performs the synchronous output directly and resumes only after it finishes, so task cancellation cannot release or reuse the descriptor while an output attempt still holds it.
+
+Authentication and request-error replies already run on GCD and retain that path, while root-only peer authorization, deadlines, connection limits, socket identity checks and checked-shutdown ordering are unchanged.
+
+The foreground executable rebuilt successfully, and all 73 affected host, installer, private-control, runtime, wait and routine-admission fixtures passed across six suites.
+
+One new complete Swift run then passed all 1,169 XCTest cases and all 368 Swift Testing cases across 32 suites with exit 0, preserving the earlier failed receipt without claiming its cause is resolved.
+
+Unsigned universal Mac and generic iOS Simulator builds both passed on the changed Swift source with two build jobs and signing disabled.
+
+The existing tests exercise complete status replies, bounded concurrent clients, checked stop before acknowledgement, failure reporting, descriptor cleanup and socket replacement; no implementation-only test or additional broad Node run was added for this Swift-only change.
+
+Review follow-up evidence is retained in the Mac validation lane's `codex-bf-2605-review-host-build.log`, `codex-bf-2605-review-focused-swift.log`, `codex-bf-2605-review-full-swift.log`, `codex-bf-2605-review-unsigned-mac.log` and `codex-bf-2605-review-unsigned-ios.log` artifacts.
 
 Fixtures use temporary service roots, a production subprocess with an explicit environment allowlist, synthetic children through the production runner, and injected peer observations only inside the test target.
 
