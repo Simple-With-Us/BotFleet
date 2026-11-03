@@ -29,6 +29,17 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const WEBHOOK_PORT = 39000 + Math.floor(Math.random() * 10_000);
 const WEBHOOK_BASE = `http://127.0.0.1:${WEBHOOK_PORT}`;
 
+// The harness server runs as a child process, and its environment is built
+// by hand rather than inherited, so it used to fall back to the machine's
+// own zone while this process ran in whatever zone its environment named.
+// The two then disagreed, and an assertion that compared the zone the server
+// reported against the zone this process saw failed on any host whose
+// environment did not match the machine's — which is every runner that sets
+// TZ.  Pinning the child's zone to this process's own makes the two agree
+// by construction, and the assertions below become a statement about the
+// server rather than about the host.
+const HOST_TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+
 let child: ChildProcess;
 /** stands in for the box provider so config saving never touches the network */
 let boxStub: Server;
@@ -479,6 +490,7 @@ beforeAll(async () => {
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
       HOME: home,
       USERPROFILE: home,
+      TZ: HOST_TIME_ZONE,
       OMB_PORT: String(PORT),
       OMB_WEBHOOK_PORT: String(WEBHOOK_PORT),
       OMB_BOX_API: `http://127.0.0.1:${boxStubPort}`,
@@ -5379,7 +5391,7 @@ describe("harness HTTP API", () => {
       }).toEqual(["card-shown:routine", "user-approved:user"]);
 
       const after = await api("GET", "/api/routines");
-      expect(after.body.timeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+      expect(after.body.timeZone).toBe(HOST_TIME_ZONE);
       expect(after.body.routines.filter((routine: { botId: string }) => routine.botId === bot.id)).toHaveLength(1);
       const duplicate = await api("POST", `/api/threads/${bot.threadId}/respond`, {
         requestId: proposal.requestId,
@@ -5416,7 +5428,7 @@ describe("harness HTTP API", () => {
         });
         bulkRoutineIds.push(bulk.body.routine.id);
       }
-      expect(legacy.body.routine.schedule.timeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+      expect(legacy.body.routine.schedule.timeZone).toBe(HOST_TIME_ZONE);
       const listed = await fetch(
         `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=${encodeURIComponent(bot.threadId)}`,
         { headers: internalHeaders },

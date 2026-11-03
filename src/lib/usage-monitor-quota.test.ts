@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   antigravityQuotaHeadlines,
@@ -15,6 +15,15 @@ import {
 } from "./usage-monitor-quota";
 import { headlinesExhausted, windowHeadlines } from "./quota-display";
 import { parseLocalQuotaSnapshot } from "../../server/local-usage-monitor";
+
+// A reset countdown is rendered from the live clock, so the clock is pinned
+// for the whole file.  Left on the wall clock, the fixture's reset and the
+// clock that reads it were two different instants, and the expected
+// "resets in 1h" depended on how long the test itself took to run.
+const NOW = Date.parse("2026-09-13T12:00:00.000Z");
+
+beforeEach(() => { vi.spyOn(Date, "now").mockReturnValue(NOW); });
+afterEach(() => { vi.restoreAllMocks(); });
 
 function window(overrides: Partial<UsageMonitorQuotaWindow>): UsageMonitorQuotaWindow {
   return {
@@ -125,7 +134,7 @@ describe("Usage Monitor BotFleet quota integration", () => {
   });
 
   it("uses the selected window reset in the headline without changing pool identity", () => {
-    const resetAt = new Date(Date.now() + 3_660_000).toISOString();
+    const resetAt = new Date(NOW + 3_600_000).toISOString();
     const lines = antigravityQuotaHeadlines([
       window({ label: "Gemini Models · 5-hour", window: "5h", remainingPercent: 80, resetAt }),
       window({ label: "Third-Party Models · Weekly", window: "weekly", remainingPercent: 20 }),
