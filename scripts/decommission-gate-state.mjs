@@ -75,7 +75,7 @@ export function resolveBoardCli() {
     execFileSync("which", ["board"], { stdio: "ignore" });
     return "board";
   } catch {
-    return "simple-board";
+    throw new Error("Linear CLI 'board' not found on PATH. Install verified board at ~/.local/bin/board or set BOARD_CLI.");
   }
 }
 

@@ -13,6 +13,7 @@ import {
   inspectProcesses,
   isBotFleetNodeProcess,
 } from "./check-post-reboot-node.mjs";
+import { resolveBoardCli } from "./decommission-gate-state.mjs";
 
 test("isBotFleetNodeProcess identifies BotFleet Node command lines", () => {
   assert.equal(isBotFleetNodeProcess("node server/index.ts"), true);
@@ -26,6 +27,7 @@ test("isBotFleetNodeProcess identifies BotFleet Node command lines", () => {
   assert.equal(isBotFleetNodeProcess("node companion/src/index.ts"), true);
   assert.equal(isBotFleetNodeProcess("node dist/server/index.js"), true);
   assert.equal(isBotFleetNodeProcess("launchd gui/501/app.botfleet.server"), true);
+  assert.equal(isBotFleetNodeProcess("/Applications/BotFleet.app/Contents/MacOS/BotFleet Helper"), true);
 
   // Unrelated processes must not be flagged
   assert.equal(isBotFleetNodeProcess("node /usr/local/bin/vite dev"), false);
@@ -36,8 +38,8 @@ test("isBotFleetNodeProcess identifies BotFleet Node command lines", () => {
   assert.equal(isBotFleetNodeProcess(null), false);
 });
 
-test("inspectProcesses detects offending processes in ps output", () => {
-  const samplePs = `
+test("inspectProcesses detects offending processes in ps aux and ps -ef output", () => {
+  const samplePsAux = `
 USER       PID  %CPU %MEM      VSZ    RSS   TT  STAT STARTED      TIME COMMAND
 root         1   0.1  0.1 41101968  18352   ??  Ss    3Nov26   0:15.22 /sbin/launchd
 jay       1234   0.0  0.2 41500000  25000   ??  S     3Nov26   0:01.05 node /Users/jay/Code/BotFleet/server/index.ts
@@ -45,15 +47,21 @@ jay       5678   0.0  0.1 41400000  20000   ??  S     3Nov26   0:00.50 /usr/loca
 jay       9999   0.0  0.3 41600000  30000   ??  S     3Nov26   0:02.10 node /Users/jay/Code/BotFleet/companion/src/index.ts
 `;
 
-  const offending = inspectProcesses(samplePs);
-  assert.equal(offending.length, 2);
-  assert.equal(offending[0].pid, "1234");
-  assert.equal(offending[0].user, "jay");
-  assert.match(offending[0].command, /server\/index\.ts/);
+  const offendingAux = inspectProcesses(samplePsAux);
+  assert.equal(offendingAux.length, 2);
+  assert.equal(offendingAux[0].pid, "1234");
+  assert.equal(offendingAux[0].user, "jay");
+  assert.match(offendingAux[0].command, /server\/index\.ts/);
 
-  assert.equal(offending[1].pid, "9999");
-  assert.equal(offending[1].user, "jay");
-  assert.match(offending[1].command, /companion\/src\/index\.ts/);
+  const samplePsEf = `
+UID   PID  PPID   C STIME   TTY           TIME CMD
+501  1234     1   0  3Nov26 ??         0:01.05 node /Users/jay/Code/BotFleet/server/index.ts
+501  5678     1   0  3Nov26 ??         0:00.50 /usr/local/bin/vite
+`;
+  const offendingEf = inspectProcesses(samplePsEf);
+  assert.equal(offendingEf.length, 1);
+  assert.equal(offendingEf[0].pid, "1234");
+  assert.equal(offendingEf[0].user, "501");
 });
 
 test("inspectProcesses returns empty array when process list is clean", () => {
@@ -69,16 +77,16 @@ jay       7777   0.0  0.0  4100000   1000 s001  R+    3Nov26   0:00.01 ps aux
 
 test("inspectLaunchAgents flags lingering agents based on probe function", () => {
   const mockProbe = (label) => {
-    if (label === "app.botfleet.server") {
+    if (label === "app.botfleet.server" || label === "com.jay.botfleet-server") {
       return { loaded: true, running: true, rawOutput: "state = running" };
     }
     return { loaded: false, running: false };
   };
 
   const lingering = inspectLaunchAgents(BOTFLEET_AGENTS, mockProbe);
-  assert.equal(lingering.length, 1);
+  assert.equal(lingering.length, 2);
   assert.equal(lingering[0].label, "app.botfleet.server");
-  assert.equal(lingering[0].running, true);
+  assert.equal(lingering[1].label, "com.jay.botfleet-server");
 });
 
 test("inspectLaunchAgents returns empty when no agents are loaded", () => {
@@ -94,16 +102,19 @@ node     1234  jay   22u  IPv4 0x1234567890abcdef      0t0  TCP 127.0.0.1:8799 (
 node     1234  jay   23u  IPv4 0x1234567890abcdee      0t0  TCP 127.0.0.1:8800 (LISTEN)
 python3  9000  jay    4u  IPv4 0x1234567890abcdff      0t0  TCP 127.0.0.1:3000 (LISTEN)
 node     4321  jay   15u  IPv4 0x1234567890abceee      0t0  TCP 127.0.0.1:8810 (LISTEN)
+BotFleet 4322  jay   16u  IPv4 0x1234567890abceef      0t0  TCP 127.0.0.1:8811 (LISTEN)
 `;
 
   const listeners = inspectPortListeners(sampleLsof, BOTFLEET_PORTS);
-  assert.equal(listeners.length, 3);
+  assert.equal(listeners.length, 4);
   assert.equal(listeners[0].port, 8799);
   assert.equal(listeners[0].isNode, true);
   assert.equal(listeners[1].port, 8800);
   assert.equal(listeners[1].isNode, true);
   assert.equal(listeners[2].port, 8810);
   assert.equal(listeners[2].isNode, true);
+  assert.equal(listeners[3].port, 8811);
+  assert.equal(listeners[3].isNode, true);
 });
 
 test("inspectGitFiles flags unapproved files under Mac-local roots while respecting exceptions", () => {
@@ -131,6 +142,7 @@ test("evaluatePostReboot returns PASS when all inspections pass", () => {
     launchAgents: [],
     portListeners: [],
     gitFiles: [],
+    probeErrors: [],
   });
   assert.equal(verdict.ok, true);
   assert.equal(verdict.failures.length, 0);
@@ -142,14 +154,16 @@ test("evaluatePostReboot returns FAIL with diagnostics when checks fail", () => 
     launchAgents: [{ label: "app.botfleet.server", running: true }],
     portListeners: [{ port: 8799, pid: "123", command: "node", isNode: true }],
     gitFiles: ["server/index.ts"],
+    probeErrors: ["probe timed out"],
   });
 
   assert.equal(verdict.ok, false);
-  assert.equal(verdict.failures.length, 4);
-  assert.match(verdict.failures[0], /Lingering BotFleet Node processes/);
-  assert.match(verdict.failures[1], /Lingering BotFleet LaunchAgents/);
-  assert.match(verdict.failures[2], /Lingering Node listeners on BotFleet ports/);
-  assert.match(verdict.failures[3], /Unapproved lingering files/);
+  assert.equal(verdict.failures.length, 5);
+  assert.match(verdict.failures[0], /Inspection probe failures/);
+  assert.match(verdict.failures[1], /Lingering BotFleet Node processes/);
+  assert.match(verdict.failures[2], /Lingering BotFleet LaunchAgents/);
+  assert.match(verdict.failures[3], /Lingering Node listeners on BotFleet ports/);
+  assert.match(verdict.failures[4], /Unapproved lingering files/);
 });
 
 test("check-post-reboot-node.mjs CLI responds with JSON on --json", () => {
@@ -160,4 +174,15 @@ test("check-post-reboot-node.mjs CLI responds with JSON on --json", () => {
   assert.ok(parsed.ok === true || parsed.ok === false);
   assert.ok(Array.isArray(parsed.failures));
   assert.ok(parsed.details);
+});
+
+test("resolveBoardCli resolves BOARD_CLI or board", () => {
+  const orig = process.env.BOARD_CLI;
+  try {
+    process.env.BOARD_CLI = "my-board-cli";
+    assert.equal(resolveBoardCli(), "my-board-cli");
+  } finally {
+    if (orig !== undefined) process.env.BOARD_CLI = orig;
+    else delete process.env.BOARD_CLI;
+  }
 });
