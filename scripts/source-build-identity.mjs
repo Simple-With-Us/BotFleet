@@ -7,6 +7,8 @@ import { HARNESS_API_VERSION, validBuildIdentity } from "../electron/runtime-ide
 import { validateReleaseManifest } from "./harness-release-store.mjs";
 import { repoHasCommit, verifyReleaseAgainstCommit } from "./release-provenance.mjs";
 
+/* oxlint-disable eslint/no-irregular-whitespace -- Owner-required NBSP sentence gaps occur only in prose comments in this extracted module. */
+
 /**
  * How a root presents for identity purposes.
  *
@@ -238,4 +240,6 @@ export function readSourceBuildIdentity(root, { requireGit = false, version = nu
   if (!validBuildIdentity(value)) throw new Error("BotFleet source identity is invalid");
   return value;
 }
+
+/* oxlint-enable eslint/no-irregular-whitespace */
 

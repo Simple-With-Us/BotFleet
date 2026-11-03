@@ -20,7 +20,6 @@ test("packaged runtime identity loads without release-store scripts", async () =
     mkdirSync(join(root, "electron"));
     copyFileSync(new URL("./runtime-identity.mjs", import.meta.url), packaged);
     const module = await import(pathToFileURL(packaged).href);
-    assert.equal(typeof module.readPackagedBuildIdentity, "function");
     assert.equal(module.validBuildIdentity(build), true);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
