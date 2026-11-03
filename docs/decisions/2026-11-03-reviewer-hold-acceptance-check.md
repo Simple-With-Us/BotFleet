@@ -44,7 +44,9 @@ not a state.
 1. **A hold is a record, not a sentence.**  It names the pull request, the reviewer who placed
    it, the head it was placed against, the time, and whether it has been lifted.
 2. **Only the placing reviewer, or the owner, lifts a hold.**  Lifting is an explicit action
-   that removes the record.  It is not inferred.
+   that moves the record into a lifted state, with `liftedBy` and `liftedAt` set.  The record is
+   kept, so the history of a hold survives and can be audited;  it is never deleted, and a lift
+   is never inferred.
 3. **An approval counts only when it names the commit being landed.**  An approval on an older
    commit is not a verdict on the merged head.
 4. **A favorable source note, a passing test, or an approval from another seat is not a hold
