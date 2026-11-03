@@ -113,7 +113,9 @@ import { workspaceCredentialPending } from "../electron/workspace-credentials.mj
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
 import { loadHostId } from "./host-id.ts";
 import { createHostResourcesResponder } from "./host-resources.ts";
-import { openControllerEpochStore, placementIdentityResponse } from "./placement-identity.ts";
+import { placementIdentityResponse } from "./placement-identity.ts";
+import { openPlacementAuthority } from "./placement-store.ts";
+import { PlacementPayloadSpool } from "./placement-payloads.ts";
 import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, type PlacementLeaseAction } from "./placement-leases.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
@@ -827,8 +829,14 @@ if (storageGuard && !storageGuard.initial.online) {
 }
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 const hostId = loadHostId(DATA_DIR);
-const placementControllerStore = openControllerEpochStore(DATA_DIR, hostId);
-const placementLeases = new PlacementLeaseService({ hostId, controller: placementControllerStore.read(), controllerStore: placementControllerStore });
+const placementAuthority = openPlacementAuthority(DATA_DIR, hostId);
+const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeaseService({
+  hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
+}) : new PlacementLeaseService({
+  hostId, controller: placementAuthority.store.readScope().controller, store: placementAuthority.store,
+  payloads: process.platform === "win32" ? undefined : new PlacementPayloadSpool(DATA_DIR),
+  queueWindowMs: () => jobSettings().queueWaitMinutes * 60_000,
+});
 const jobHostProbe = createHostProbe({
   storageState: storageGuard?.sample,
   // The Mac memory-pressure probe runs only while a memory-headroom knob
