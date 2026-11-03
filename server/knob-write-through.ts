@@ -117,6 +117,10 @@ export async function writeThroughKnobs(
   const cleared: string[] = [];
   for (const spec of KNOB_FIELDS) {
     if (clears.has(spec.id)) {
+      // Recorded before the disabled check below: with the vault integration
+      // off the clear is a pure file delete and the merge still unsets the
+      // key, so the result must say so.
+      cleared.push(spec.id);
       if (!deps.enabled) continue;
       if (deps.unreachable) {
         return {
@@ -148,7 +152,6 @@ export async function writeThroughKnobs(
           failed: [spec.id],
         };
       }
-      cleared.push(spec.id);
       continue;
     }
     const requested = readKnobField(patch, spec);

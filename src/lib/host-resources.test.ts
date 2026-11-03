@@ -6,6 +6,7 @@ import type { CapacitySample, EnforcementState, HostResourcesReport } from "../.
 import {
   admissionRows,
   buildHeadroomPatch,
+  currentHeadroomKnobs,
   enforcementSentence,
   formatBytes,
   formatCentralTime,
@@ -450,6 +451,42 @@ describe("parseHeadroomEdit", () => {
   it("refuses an all-empty save as a no-op", () => {
     const parsed = parseHeadroomEdit({ reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "" });
     expect(parsed.ok).toBe(false);
+  });
+
+  it("permits an all-empty edit when it clears a set knob, so the last knob stays unsettable", () => {
+    const empty = { reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "" };
+    expect(parseHeadroomEdit(empty, { reservedCpuCores: 1 })).toEqual({ ok: true, parsed: {} });
+    expect(parseHeadroomEdit(empty, { reservedRamMb: 512 })).toEqual({ ok: true, parsed: {} });
+    expect(parseHeadroomEdit(empty, { minMemoryAvailablePercent: 20 })).toEqual({ ok: true, parsed: {} });
+    expect(parseHeadroomEdit(empty, {})).toEqual({
+      ok: false,
+      errors: [{ field: "reservedCpuCores", message: "Enter at least one number to save." }],
+    });
+    expect(parseHeadroomEdit(empty)).toEqual({
+      ok: false,
+      errors: [{ field: "reservedCpuCores", message: "Enter at least one number to save." }],
+    });
+  });
+
+  it("builds null clears from an all-empty edit over a set report", () => {
+    const current = report({
+      admission: {
+        maxSwapPercent: 90,
+        minFreeDiskBytes: 4 * GB,
+        reservedCpuCores: 1,
+        unknownReading: "admit",
+      },
+    });
+    const parsed = parseHeadroomEdit(
+      { reservedCpuCores: "", reservedRamMb: "", minMemoryAvailablePercent: "" },
+      currentHeadroomKnobs(current.admission),
+    );
+    expect(parsed).toEqual({ ok: true, parsed: {} });
+    if (!parsed.ok) throw new Error("unreachable");
+    const patch = buildHeadroomPatch(current, parsed.parsed);
+    expect(patch.jobs.admission.reservedCpuCores).toBeNull();
+    expect(patch.jobs.admission.reservedRamMb).toBeUndefined();
+    expect(patch.jobs.admission.maxSwapPercent).toBe(90);
   });
 });
 

@@ -530,10 +530,29 @@ final class MacResourcesSettingsTests: XCTestCase {
             XCTAssertEqual(errors.first?.message, message, "\(values)")
         }
 
-        // An all-empty save is a no-op and is refused.
+        // An all-empty save over unset knobs is a no-op and is refused.
         XCTAssertEqual(
             HostResourcesPresentation.parseHeadroomEdit(HeadroomEditValues()),
             .invalid([HeadroomFieldError(field: .reservedCpuCores, message: "Enter at least one number to save.")])
+        )
+
+        // An all-empty edit over set knobs is a clear, not a no-op — the last
+        // set knob stays unsettable from the UI.
+        let empty = HeadroomEditValues()
+        XCTAssertEqual(
+            HostResourcesPresentation.parseHeadroomEdit(empty, current: HeadroomCurrentKnobs(reservedCpuCores: 1)),
+            .valid(HeadroomParsedEdit())
+        )
+        XCTAssertEqual(
+            HostResourcesPresentation.parseHeadroomEdit(empty, current: HeadroomCurrentKnobs(reservedRamMb: 512)),
+            .valid(HeadroomParsedEdit())
+        )
+        XCTAssertEqual(
+            HostResourcesPresentation.headroomConfigPatch(
+                for: makeReport(admission: HostAdmissionThresholds(maxSwapPercent: 90, minFreeDiskBytes: 4 * gb, reservedCpuCores: 1)),
+                parsed: HeadroomParsedEdit()
+            )["reservedCpuCores"] is NSNull,
+            true
         )
     }
 
@@ -635,20 +654,39 @@ final class MacResourcesSettingsTests: XCTestCase {
         )
         await coordinator.load()
 
-        // All-empty is refused before any network call.
+        // All-empty over the set knob is a clear, not a refusal: the saver
+        // receives the null and the save refreshes.
+        try await coordinator.saveHeadroom(values: HeadroomEditValues())
+        XCTAssertEqual(saved.calls, 1)
+        let clearedAdmission = try XCTUnwrap(saved.admission)
+        XCTAssertTrue(clearedAdmission["reservedCpuCores"] is NSNull)
+        XCTAssertEqual(clearedAdmission["maxSwapPercent"] as? Double, 98)
+
+        // All-empty over an unset report is still a no-op refusal, before any
+        // network call.
+        let unsetReport = makeReport()
+        let unsetCoordinator = ResourcesCoordinator(
+            store: FixtureResourceHosts(),
+            tokens: FixtureResourceTokens(),
+            fetcher: { _, _ in unsetReport },
+            saver: { host, credential, admission in
+                saved.record(host: host, credential: credential, admission: admission)
+            }
+        )
+        await unsetCoordinator.load()
         do {
-            try await coordinator.saveHeadroom(values: HeadroomEditValues())
-            XCTFail("all-empty save must throw")
+            try await unsetCoordinator.saveHeadroom(values: HeadroomEditValues())
+            XCTFail("all-empty save over unset knobs must throw")
         } catch {
             XCTAssertEqual(error as? HeadroomSaveError, .invalid("Enter at least one number to save."))
         }
-        XCTAssertEqual(saved.calls, 0)
+        XCTAssertEqual(saved.calls, 1)
 
         // A typed box saves; the emptied set knob clears via null.
         try await coordinator.saveHeadroom(
             values: HeadroomEditValues(reservedCpuCores: "", reservedRamMb: "512", minMemoryAvailablePercent: "")
         )
-        XCTAssertEqual(saved.calls, 1)
+        XCTAssertEqual(saved.calls, 2)
         XCTAssertEqual(saved.host, .thisMac)
         XCTAssertFalse(saved.hadCredential)
         let admission = try XCTUnwrap(saved.admission)
@@ -707,6 +745,28 @@ final class MacResourcesSettingsTests: XCTestCase {
                 return
             }
             XCTAssertTrue(message.contains("BOTFLEET_JOBS_RESERVED_CPU_CORES"), message)
+        }
+
+        // A specific 403 (loopback/tunnel gate) surfaces its message instead
+        // of masking as a credential failure; a bare "unauthorized" stays
+        // authentication.
+        HostResourcesURLProtocol.handler = { _ in
+            (403, Data("{\"error\":\"forbidden: loopback host required\"}".utf8))
+        }
+        do {
+            try await client.saveHeadroom(host: host, credential: credential, admission: [:])
+            XCTFail("HTTP 403 with a message must throw")
+        } catch {
+            XCTAssertEqual(error as? HeadroomSaveError, .server("forbidden: loopback host required"))
+        }
+        HostResourcesURLProtocol.handler = { _ in
+            (403, Data("{\"error\":\"unauthorized\"}".utf8))
+        }
+        do {
+            try await client.saveHeadroom(host: host, credential: credential, admission: [:])
+            XCTFail("HTTP 403 unauthorized must throw")
+        } catch {
+            XCTAssertEqual(error as? SavedHostError, .authentication)
         }
 
         // A remote host without a credential fails before any network call.

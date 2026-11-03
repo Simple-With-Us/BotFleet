@@ -206,6 +206,15 @@ describe("writeThroughKnobs null-clear (slice 7b)", () => {
     expect(writeSecret).not.toHaveBeenCalled();
   });
 
+  it("reports the clear when the vault integration is off: the disk merge still unsets the key", async () => {
+    const writeSecret = vi.fn();
+    const patch: Partial<AppConfig> = { jobs: { admission: { reservedCpuCores: null } } };
+    const result = await writeThroughKnobs(patch, baseDeps({ enabled: false, writeSecret }));
+    expect(result).toEqual({ ok: true, written: [], cleared: ["jobs.admission.reservedCpuCores"] });
+    expect(writeSecret).not.toHaveBeenCalled();
+    expect(patch.jobs?.admission).toEqual({ reservedCpuCores: null });
+  });
+
   it("refuses a clear the vault manages with 409, naming the vault name to remove", async () => {
     const writeSecret = vi.fn();
     const patch: Partial<AppConfig> = { jobs: { admission: { minMemoryAvailablePercent: null } } };

@@ -8,6 +8,7 @@ import { cn } from "@/lib/cn";
 import { Card } from "./SettingsPrimitives";
 import {
   admissionRows,
+  currentHeadroomKnobs,
   fetchHostResources,
   formatBytes,
   headroomEditInitial,
@@ -236,7 +237,7 @@ function HeadroomCard({
     setError(null);
   }, [report.hostId, report.admission.reservedCpuCores, report.admission.reservedRamBytes, report.admission.minMemoryAvailablePercent]);
 
-  const parsed = parseHeadroomEdit(values);
+  const parsed = parseHeadroomEdit(values, currentHeadroomKnobs(report.admission));
   const showValidation = !parsed.ok && (touched || submitAttempted);
   const canSave = !saving && parsed.ok;
 

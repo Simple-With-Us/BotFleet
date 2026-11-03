@@ -231,7 +231,7 @@ private struct HeadroomCard: View {
     }
 
     private var outcome: HeadroomEditOutcome {
-        HostResourcesPresentation.parseHeadroomEdit(values)
+        HostResourcesPresentation.parseHeadroomEdit(values, current: HostResourcesPresentation.headroomCurrentKnobs(report))
     }
 
     private var isValid: Bool {
@@ -348,7 +348,9 @@ private struct HeadroomCard: View {
         guard !saving else { return }
         saving = true
         errorMessage = nil
-        Task {
+        // @MainActor-isolated: the @State writes after the await must publish
+        // on the main actor, or the button can stick in Saving.
+        Task { @MainActor in
             do {
                 try await coordinator.saveHeadroom(values: values)
             } catch {

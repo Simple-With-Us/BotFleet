@@ -541,6 +541,29 @@ export interface HeadroomParsed {
   minMemoryAvailablePercent?: number | null;
 }
 
+/** The knobs a report currently has set, in parse units (RAM in MB), so
+ *  validation can tell "clearing a set knob" (valid) from "editing nothing"
+ *  (a no-op refusal).  An all-empty edit is only valid when it clears at
+ *  least one set knob — otherwise an emptied box over an unset knob would
+ *  save nothing and look like it did. */
+export interface HeadroomCurrentKnobs {
+  reservedCpuCores?: number;
+  reservedRamMb?: number;
+  minMemoryAvailablePercent?: number;
+}
+
+/** The set knobs of a report, in parse units. */
+export function currentHeadroomKnobs(admission: HostResourcesReport["admission"]): HeadroomCurrentKnobs {
+  return {
+    reservedCpuCores: admission.reservedCpuCores,
+    reservedRamMb:
+      admission.reservedRamBytes === undefined
+        ? undefined
+        : Math.round(admission.reservedRamBytes / 1024 / 1024),
+    minMemoryAvailablePercent: admission.minMemoryAvailablePercent,
+  };
+}
+
 /** One parsed number or its validation message. */
 export interface HeadroomNumberResult {
   value?: number;
@@ -564,7 +587,7 @@ function parseHeadroomNumber(field: keyof HeadroomEditValues, raw: string): Head
 /** Validate the three headroom boxes.  Returns the parsed numbers for the
  *  non-empty boxes, or the per-field errors.  At least one number is
  *  required: an all-empty save is a no-op and is refused with a message. */
-export function parseHeadroomEdit(values: HeadroomEditValues):
+export function parseHeadroomEdit(values: HeadroomEditValues, current?: HeadroomCurrentKnobs):
   | { ok: true; parsed: HeadroomParsed }
   | { ok: false; errors: HeadroomFieldError[] } {
   const errors: HeadroomFieldError[] = [];
@@ -580,6 +603,13 @@ export function parseHeadroomEdit(values: HeadroomEditValues):
   else if (mem.value !== undefined) parsed.minMemoryAvailablePercent = mem.value;
   if (errors.length > 0) return { ok: false, errors };
   if (Object.keys(parsed).length === 0) {
+    const clearsASetKnob =
+      current?.reservedCpuCores !== undefined ||
+      current?.reservedRamMb !== undefined ||
+      current?.minMemoryAvailablePercent !== undefined;
+    // An all-empty edit over set knobs is a clear, not a no-op (slice 7b
+    // follow-up: the last set knob must stay unsettable from the UI).
+    if (clearsASetKnob) return { ok: true, parsed };
     return { ok: false, errors: [{ field: "reservedCpuCores", message: "Enter at least one number to save." }] };
   }
   return { ok: true, parsed };
@@ -642,7 +672,7 @@ function clearOrCarry(current: number | undefined): number | null | undefined {
  *  GET, not two GETs.  Uses the store's api() helper so 4xx/5xx arrive as
  *  thrown errors with the server's message (including the Infisical 409). */
 export async function saveHeadroomThresholds(values: HeadroomEditValues, current: HostResourcesReport): Promise<void> {
-  const parsed = parseHeadroomEdit(values);
+  const parsed = parseHeadroomEdit(values, currentHeadroomKnobs(current.admission));
   if (!parsed.ok) {
     throw new Error(parsed.errors[0]?.message ?? "Enter a number.");
   }

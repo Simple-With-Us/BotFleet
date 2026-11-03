@@ -847,10 +847,13 @@ public enum HostResourcesPresentation {
 
     /// Validates the three headroom boxes, mirroring `parseHeadroomEdit` in
     /// `src/lib/host-resources.ts`: numbers for the non-empty boxes, per-field
-    /// messages otherwise, and a refusal when every box is empty (an all-empty
-    /// save is a no-op).  Number spelling is digits with at most one fraction
-    /// point — hex (`0x10`) and exponents (`1e3`) fail, exactly as in TS.
-    public static func parseHeadroomEdit(_ values: HeadroomEditValues) -> HeadroomEditOutcome {
+    /// messages otherwise, and a refusal when every box is empty over unset
+    /// knobs (an all-empty save is a no-op then).  An all-empty edit over set
+    /// knobs is valid — it clears them — so the last set knob stays
+    /// unsettable from the UI.  Number spelling is digits with at most one
+    /// fraction point — hex (`0x10`) and exponents (`1e3`) fail, exactly as
+    /// in TS.
+    public static func parseHeadroomEdit(_ values: HeadroomEditValues, current: HeadroomCurrentKnobs? = nil) -> HeadroomEditOutcome {
         var errors: [HeadroomFieldError] = []
         var parsed = HeadroomParsedEdit()
 
@@ -882,9 +885,24 @@ public enum HostResourcesPresentation {
 
         if !errors.isEmpty { return .invalid(errors) }
         if parsed.reservedCpuCores == nil, parsed.reservedRamMb == nil, parsed.minMemoryAvailablePercent == nil {
+            let clearsASetKnob = current?.reservedCpuCores != nil
+                || current?.reservedRamMb != nil
+                || current?.minMemoryAvailablePercent != nil
+            // An all-empty edit over set knobs is a clear, not a no-op.
+            if clearsASetKnob { return .valid(parsed) }
             return .invalid([HeadroomFieldError(field: .reservedCpuCores, message: "Enter at least one number to save.")])
         }
         return .valid(parsed)
+    }
+
+    /// The set knobs of a report, in parse units (RAM in MB) — mirrors
+    /// `currentHeadroomKnobs` in `src/lib/host-resources.ts`.
+    public static func headroomCurrentKnobs(_ report: HostResourcesReport) -> HeadroomCurrentKnobs {
+        HeadroomCurrentKnobs(
+            reservedCpuCores: report.admission.reservedCpuCores,
+            reservedRamMb: report.admission.reservedRamBytes.map { ($0 / 1024.0 / 1024.0).rounded() },
+            minMemoryAvailablePercent: report.admission.minMemoryAvailablePercent
+        )
     }
 
     private static func isPlainHeadroomNumber(_ text: String) -> Bool {
@@ -956,6 +974,22 @@ public enum HeadroomEditField: String, Equatable, Sendable {
     case reservedCpuCores
     case reservedRamMb
     case minMemoryAvailablePercent
+}
+
+/// The knobs a report currently has set, in parse units (RAM in MB), so
+/// validation can tell "clearing a set knob" (valid) from "editing nothing"
+/// (a no-op refusal) — mirrors `HeadroomCurrentKnobs` in
+/// `src/lib/host-resources.ts`.
+public struct HeadroomCurrentKnobs: Equatable, Sendable {
+    public var reservedCpuCores: Double?
+    public var reservedRamMb: Double?
+    public var minMemoryAvailablePercent: Double?
+
+    public init(reservedCpuCores: Double? = nil, reservedRamMb: Double? = nil, minMemoryAvailablePercent: Double? = nil) {
+        self.reservedCpuCores = reservedCpuCores
+        self.reservedRamMb = reservedRamMb
+        self.minMemoryAvailablePercent = minMemoryAvailablePercent
+    }
 }
 
 /// One validation failure with the box it belongs to.

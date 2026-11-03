@@ -82,6 +82,14 @@ public struct HostResourcesClient: Sendable {
             throw SavedHostError.invalidResponse
         }
         if http.statusCode == 401 || http.statusCode == 403 {
+            // The loopback/origin and tunnel gates answer mutating routes with
+            // specific 403s ("forbidden: loopback host required",
+            // NAMED_TUNNEL_MUTATION_FORBIDDEN, …) — surface those instead of
+            // masking them as a credential failure.  A bare "unauthorized"
+            // stays the gate-token hint it has always been.
+            if let specific = Self.saveAuthSpecificMessage(from: data) {
+                throw HeadroomSaveError.server(specific)
+            }
             throw SavedHostError.authentication
         }
         if [404, 405, 501].contains(http.statusCode) {
@@ -121,6 +129,17 @@ public struct HostResourcesClient: Sendable {
             try credential.authorize(&request)
         }
         return request
+    }
+
+    /// The body's own message for an auth-status save refusal, unless it is
+    /// the bare gate "unauthorized" (a credential failure) or absent — then
+    /// nil, and the caller keeps the `.authentication` mapping.
+    private static func saveAuthSpecificMessage(from data: Data) -> String? {
+        guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        let raw = (obj["error"] as? String) ?? (obj["message"] as? String) ?? ""
+        let message = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if message.isEmpty || message.lowercased() == "unauthorized" { return nil }
+        return message
     }
 
     private static func saveErrorMessage(from data: Data, statusCode: Int) -> String {
@@ -354,7 +373,10 @@ public final class ResourcesCoordinator: ObservableObject {
         guard let report = currentReport else {
             throw HeadroomSaveError.noReport
         }
-        let outcome = HostResourcesPresentation.parseHeadroomEdit(values)
+        let outcome = HostResourcesPresentation.parseHeadroomEdit(
+            values,
+            current: HostResourcesPresentation.headroomCurrentKnobs(report)
+        )
         guard case .valid(let parsed) = outcome else {
             let message: String
             if case .invalid(let errors) = outcome {
