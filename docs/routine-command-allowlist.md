@@ -2,7 +2,7 @@
 
 > Implements **BF-2409** (BFS-1 of the open-loops plan):  the routine command allowlist on the real engines, plus the `BF-DIRECTOR` role seat.  This document is not the place for the GitHub fallback `SENTRY_AUTH_TOKEN` rotation (issue #1042);  that work is its own follow-up.
 
-A routine can carry a `toolPolicy`:  the fixed commands its turns may run and the exact files they may write.  Every BotFleet bot runs with auto-approve, and a routine reads untrusted text (public pull requests, Linear issues, Zulip) while holding the owner's credentials.  A routine that only needs `agent-sync whoami` and one report command must not be talked into anything else.
+A routine can carry a `toolPolicy`:  the fixed commands its turns may run and the exact files they may write.  Every BotFleet bot runs with auto-approve, and a routine reads untrusted text (public pull requests, Linear issues, Zulip) while holding the owner's credentials.  A routine that only needs `simple-chat whoami` and one report command must not be talked into anything else.
 
 Chat turns, webhook turns, resource turns and Zulip wakes are unchanged.  Only a routine's own scheduled or Run Now turns carry the allowlist, and every re-dispatch of that turn keeps it (a model fail-over, a credential card, a boot resume), because the allowlist is stored on the turn's prompt message.
 
@@ -12,9 +12,9 @@ Chat turns, webhook turns, resource turns and Zulip wakes are unchanged.  Only a
 {
   "mode": "allowlist",
   "commands": [
-    { "argv0": "/Users/you/.local/bin/agent-sync", "sub": ["whoami"], "flags": { "--json": { "value": "none" } } },
+    { "argv0": "/Users/you/.local/bin/simple-chat", "sub": ["whoami"], "flags": { "--json": { "value": "none" } } },
     {
-      "argv0": "/Users/you/.local/bin/agent-sync",
+      "argv0": "/Users/you/.local/bin/simple-chat",
       "sub": ["post"],
       "flags": {
         "--topic": { "value": "text", "required": true },
@@ -39,8 +39,8 @@ Chat turns, webhook turns, resource turns and Zulip wakes are unchanged.  Only a
 - `flags` maps each allowed flag, spelled exactly, to its value:  `none` (a switch), `text`, `int` (with `min` and `max`), `oneOf` (with `values`), or `path` (with exact absolute `paths`).  `repeat` lets a flag appear more than once;  `required` makes it mandatory.
 - `args` declares the positional words, in order, each with the same value kinds as a flag (minus the switch), and all of them required.  `positionals` is how many more free text words may follow (default 0).
 - **Any word that names a file, a flag value or a positional, must be a `path`.**  A `text` word that names a file lets the model point the program at any file it can reach:  `tail` with a free positional reads `~/.secrets`.
-- `writePaths` and `readPaths` are exact absolute files.  No directories, no globs, no dotfiles, and nothing under a credential or login directory (`.ssh`, `.secrets`, `.gnupg`, `.aws`, `.config/gh`, `Library/LaunchAgents`, `Library/LaunchDaemons`).  The same rule holds for every `path` value of a flag or positional, and a policy that breaks it is refused when it is saved.  A write path's parent is created owner-only on first use, and the file is written owner-only (0600), as `agent-sync --body-file` requires.
-- At run time every path a command, a read or a write names is checked again, on its own spelling and on where it really lands, before anything is created, read, written or run.  Only links the operating system owns (owner root, such as macOS's `/tmp` and `/var`) are followed.  A path that names a protected place, that runs through any other link (even one into an ordinary directory, since a user-level process could have planted it), that loops, or that names a file with another hard link is refused.  So configure the real path, not a spelling through your own links.  `argv0` is exempt:  a program may be a link (`~/.local/bin/agent-sync` usually is).
+- `writePaths` and `readPaths` are exact absolute files.  No directories, no globs, no dotfiles, and nothing under a credential or login directory (`.ssh`, `.secrets`, `.gnupg`, `.aws`, `.config/gh`, `Library/LaunchAgents`, `Library/LaunchDaemons`).  The same rule holds for every `path` value of a flag or positional, and a policy that breaks it is refused when it is saved.  A write path's parent is created owner-only on first use, and the file is written owner-only (0600), as `simple-chat --body-file` requires.
+- At run time every path a command, a read or a write names is checked again, on its own spelling and on where it really lands, before anything is created, read, written or run.  Only links the operating system owns (owner root, such as macOS's `/tmp` and `/var`) are followed.  A path that names a protected place, that runs through any other link (even one into an ordinary directory, since a user-level process could have planted it), that loops, or that names a file with another hard link is refused.  So configure the real path, not a spelling through your own links.  `argv0` is exempt:  a program may be a link (`~/.local/bin/simple-chat` usually is).
 - A turn that continues a routine's turn keeps its allowlist:  a model fail-over, a credential card, a connector or secret card answered, a boot resume (replayed or continued with a notice), and an edit or retry of the routine's prompt.
 
 `POST /api/routines` and `PATCH /api/routines/:id` take it as `toolPolicy`.  A PATCH that omits it keeps the stored one;  `null` removes it.  A routine with an allowlist must run on the bot (`runOn: "bot"`).  Bot-requested routine changes (routine cards) cannot set or clear it.
@@ -51,7 +51,7 @@ The command is split into words the way a shell would for a narrow grammar:  sin
 
 Then argv[0] must equal an entry's `argv0`, the entry's `sub` words must follow, and every other word must be an allowed flag with a value of its shape, or one of the entry's free positionals.  `--flag=value`, `--`, a repeated flag that is not `repeat`, a combined short flag (`-n50`), and a value or free word starting with `-` or `@` are all refused.
 
-Some rules hold for every `agent-sync` call whatever the policy says, and a policy that tries to allow them is refused when it is saved:
+Some rules hold for every `simple-chat` call whatever the policy says, and a policy that tries to allow them is refused when it is saved:
 
 - never `--as`, `--default-seat`, `--rc`, `--session`, `--no-tag`, `--fleet`, `--to` or `--to-owner`, nor any abbreviation of one (argparse expands `--fl` to `--fleet`);
 - `dm` only with `--owner`.

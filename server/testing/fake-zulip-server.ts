@@ -3,7 +3,7 @@
 // `node:http` on 127.0.0.1 with a random port.  It implements only the
 // endpoints server/zulip/ uses, checks Basic auth, records every request, and
 // can inject faults (429s, an expired queue).  Its semantics follow the
-// fleet's own fake (AFC scripts/agent_sync/tests/fake_zulip.py), which was
+// fleet's own fake (the AFC Python package's fake_zulip test), which was
 // checked against the live realm:
 //
 //   - POST /register creates a queue; GET /events long-polls it (with a short

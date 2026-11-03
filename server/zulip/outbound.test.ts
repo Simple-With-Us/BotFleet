@@ -8,7 +8,7 @@ import type { ZulipUser } from "./types.ts";
 // sits in the source for a scanner or a reviewer to take for a live key.
 const FAKE_ZULIP_KEY = ["FakeZulip", "Key", "0".repeat(16), "aB12"].join("");
 const policy = { postChannels: ["builds"], names: ["BF-Plumber", "BF-Plumber"] };
-const streamOrigin = { kind: "stream" as const, channel: "agent-sync", topic: "BF tunnel" };
+const streamOrigin = { kind: "stream" as const, channel: "Work-In-Progress", topic: "BF tunnel" };
 
 describe("the outbound secret scan", () => {
   it("refuses a loaded key, a credential-shaped value and a Zulip-shaped token", () => {
@@ -31,7 +31,7 @@ describe("the outbound secret scan", () => {
 describe("where a post may go", () => {
   it("sends zulip_reply to the origin and nowhere else", () => {
     expect(resolveTarget("reply", { channel: "elsewhere", topic: "x" }, streamOrigin, policy)).toEqual({
-      target: { kind: "stream", channel: "agent-sync", topic: "BF tunnel" },
+      target: { kind: "stream", channel: "Work-In-Progress", topic: "BF tunnel" },
       toOrigin: true,
     });
     expect(resolveTarget("reply", {}, undefined, policy)).toMatchObject({ error: expect.stringMatching(/not started from Zulip/) });
@@ -93,27 +93,27 @@ describe("where a post may go", () => {
       error: expect.stringMatching(/nor one of this workspace's post channels/),
     });
     // the origin topic is always allowed, under its own spelling
-    expect(resolveTarget("post", { channel: "agent-sync", topic: "bf tunnel" }, streamOrigin, policy)).toEqual({
-      target: { kind: "stream", channel: "agent-sync", topic: "BF tunnel" },
+    expect(resolveTarget("post", { channel: "Work-In-Progress", topic: "bf tunnel" }, streamOrigin, policy)).toEqual({
+      target: { kind: "stream", channel: "Work-In-Progress", topic: "BF tunnel" },
       toOrigin: true,
     });
   });
 
   it("allows a new topic in the channel that woke the turn, even when no post channel is listed", () => {
     const none = { postChannels: [], names: policy.names };
-    expect(resolveTarget("post", { channel: "Agent-Sync", topic: "BF new unit" }, streamOrigin, none)).toEqual({
-      target: { kind: "stream", channel: "Agent-Sync", topic: "BF new unit" },
+    expect(resolveTarget("post", { channel: "Work-in-Progress", topic: "BF new unit" }, streamOrigin, none)).toEqual({
+      target: { kind: "stream", channel: "Work-in-Progress", topic: "BF new unit" },
       toOrigin: false,
     });
     // a new topic there still passes the topic rules
-    expect(resolveTarget("post", { channel: "agent-sync", topic: "BF-Plumber notes" }, streamOrigin, none)).toMatchObject({
+    expect(resolveTarget("post", { channel: "Work-In-Progress", topic: "BF-Plumber notes" }, streamOrigin, none)).toMatchObject({
       error: expect.stringMatching(/after yourself/),
     });
     // another channel is still refused, and a DM origin opens no channel
     expect(resolveTarget("post", { channel: "random", topic: "BF x" }, streamOrigin, none)).toMatchObject({
       error: expect.stringMatching(/neither the channel that woke this turn/),
     });
-    expect(resolveTarget("post", { channel: "agent-sync", topic: "BF x" }, { kind: "dm", userId: 9 }, none)).toMatchObject({
+    expect(resolveTarget("post", { channel: "Work-In-Progress", topic: "BF x" }, { kind: "dm", userId: 9 }, none)).toMatchObject({
       error: expect.any(String),
     });
   });
