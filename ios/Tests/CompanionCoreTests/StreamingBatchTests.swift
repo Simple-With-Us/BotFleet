@@ -42,9 +42,9 @@ final class StreamingBatchTests: XCTestCase {
 
     func testThreadsCoalesceIndependentlyAndDrainInFirstSeenOrder() {
         var buffer = StreamingDeltaBuffer()
-        buffer.enqueue(delta("for two ", thread: "t2"))
-        buffer.enqueue(delta("for one", thread: "t1"))
-        buffer.enqueue(delta("only", thread: "t2"))
+        _ = buffer.enqueue(delta("for two ", thread: "t2"))
+        _ = buffer.enqueue(delta("for one", thread: "t1"))
+        _ = buffer.enqueue(delta("only", thread: "t2"))
         let events = buffer.drain()
         XCTAssertEqual(events.map(\.threadId), ["t2", "t1"])
         XCTAssertEqual(events.first?.delta, "for two only")
@@ -103,16 +103,16 @@ final class StreamingBatchTests: XCTestCase {
 
     func testBoundsTripAtDeltaAndCharacterCaps() {
         var byCount = StreamingDeltaBuffer()
-        for _ in 0..<StreamingDeltaBuffer.maxBufferedDeltas { byCount.enqueue(delta("x")) }
+        for _ in 0..<StreamingDeltaBuffer.maxBufferedDeltas { _ = byCount.enqueue(delta("x")) }
         XCTAssertTrue(byCount.shouldFlush)
         XCTAssertEqual(byCount.coalescedCount, 1)
 
         var byChars = StreamingDeltaBuffer()
-        byChars.enqueue(delta(String(repeating: "y", count: StreamingDeltaBuffer.maxBufferedCharacters)))
+        _ = byChars.enqueue(delta(String(repeating: "y", count: StreamingDeltaBuffer.maxBufferedCharacters)))
         XCTAssertTrue(byChars.shouldFlush)
 
         var small = StreamingDeltaBuffer()
-        small.enqueue(delta("hi"))
+        _ = small.enqueue(delta("hi"))
         XCTAssertFalse(small.shouldFlush)
     }
 
@@ -125,7 +125,7 @@ final class StreamingBatchTests: XCTestCase {
         // 2,000 tokens in burst windows of 40: the shape a fast provider
         // produces against a 50 ms drain.
         for index in 0..<2_000 {
-            buffer.enqueue(delta("tok\(index % 10) "))
+            _ = buffer.enqueue(delta("tok\(index % 10) "))
             if buffer.bufferedDeltaCount == 40 {
                 state.applyCoalesced(buffer.drain())
                 mutations += 1
