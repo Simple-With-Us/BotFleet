@@ -8,6 +8,12 @@
 // Counting is always on: two integer increments per frame is below noise
 // next to one markdown parse, and a probe that needs a rebuild to enable
 // never gets enabled during the stream someone wants to measure.
+//
+// The counters tally body executions, which is the BF-2612 question ("how
+// often does the body re-execute"), not commits.  In dev, StrictMode
+// double-invokes bodies and concurrent React may discard a render, so live
+// dev numbers read up to ~2x the committed frames; production counts and the
+// bail ratio (bodies minus list bodies) are unaffected in kind.
 
 export interface ChatViewRenderSnapshot {
   /** `ChatView` function-body executions since reset. */
