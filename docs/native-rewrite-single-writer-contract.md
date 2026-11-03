@@ -22,7 +22,7 @@ Whatever state both hosts can reach is state that can diverge, and today one rou
 
 ## The Measured Inventory
 
-Taken from the live hosts on Mon, Nov 2, 2026.  The Mac is reachable over `ssh mac`; the server is `fleet-hetzner-nbg1`.
+Taken from the live hosts on Mon, Nov 2, 2026.  The Mac is `Mac.Jays.Services`, reached over the fleet alias `ssh mac`;  the server is `fleet-hetzner-nbg1`.  Those two names are the absolute identities used throughout this document.
 
 ### The Mac's writer
 
@@ -74,6 +74,21 @@ Taken from the live hosts on Mon, Nov 2, 2026.  The Mac is reachable over `ssh 
 The one live double-write is `6d74f498` *Fleet RAG Nightly Ingest*, owned by `BF-Oracle` (`79a3a7f8`).  It is enabled on both hosts, with the same daily 02:30 America/Chicago schedule and the same `nextRunAt`.  After the stores forked, the two schedulers claimed the Nov 2, 2:30am occurrence independently:  the server's run `876fc687` started at 2:30:07am and **failed** with `VPS is not configured`, and the Mac's run `abe48778` is **missed** because that host was offline for more than 12 hours.  So the defect is **double ownership of one occurrence**, not two completed executions of it;  the next occurrence, Nov 3 at 2:30am, is the first in which two completed executions are possible.
 
 ## The Rule
+
+### Every placement names an absolute host and container identity
+
+A placement is named, never merely relative.  "This Mac", "the server", "the local machine" and "the cloud VM" are not identities:  a reader cannot tell which host is meant, and on a phone, or in a desktop app attached to a remote host, they read as the wrong machine.  A placement states the absolute host identity, and where a desktop is involved, the container that carries it.  The two hosts in this contract are `Mac.Jays.Services` and `fleet-hetzner-nbg1`.
+
+Four things are named apart, because they are four different things and the owner acts on them separately:
+
+| Thing | What it is |
+|---|---|
+| Host power | the machine itself, and its own sleep and shutdown |
+| The BotFleet service | the harness that writes the control plane;  the writer this contract governs |
+| The desktop container | the container that runs a desktop inside a host, and that host's own budget covers it |
+| The cloud VM | a separate machine reached over the network, not a desktop container |
+
+So a command that stops one of them says which one it stops.  A row that reports headroom names the host it was measured on and reports the applied value next to the detected one.  A target that cannot be reached says so, and says whether it is unconfigured or down;  it never reads as "no capacity".  A cap the runtime does not enforce is never claimed as enforced.
 
 ### One writer per surface, and one writer per deployment
 
