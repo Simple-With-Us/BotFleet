@@ -119,7 +119,10 @@ Do this while both stores still exist, because it is the only window in which th
 Safe in any order, and safe to do in one commit.  None of these has a production caller.
 
 - `scripts/mcp-server.ts`, `scripts/mcp-sse.ts`, `scripts/start-mcp-sse.sh`, `server/mcp-server-config.ts`, `server/sse-*.ts` test helpers.
-- `scripts/e2e-server.mjs`, `scripts/bundle-server.mjs`, `scripts/plugin-smoke.mjs` and the packaged-server smoke scripts, plus only the dev-proxy configuration within `vite.config.ts`.  Keep the Vite file and Linux build inputs while the retained Linux UI build uses them.
+- The runtime surfaces that bridge owns, or they outlive it as a lie:  the pm2 application `botfleet-mcp` with its ecosystem entry and its launcher, the `127.0.0.1:8794` listener with its `/health` endpoint, and the public route `botfleetadmin.jays.services`, which forwards to that listener.
+
+  **The "no production caller" line above does not hold for this bridge.**  The route was built for a third-party iOS MCP client and answers `502` for every path on the Mac today, because nothing is listening on `:8794` and pm2 still calls the application `online`:  pm2 keeps the record of an application it started after the process is gone, so a stopped adapter reads as a running one.  The caller is already broken, so the deletion does not break it further.  What the deletion must not do is leave the public route and the pm2 record in place afterwards, pointing at nothing and reading as running.  Nothing in the rewrite replaces that route:  the native app's MCP surface is a per-turn loopback mount for engines, on an ephemeral port that is never advertised, so it cannot serve a public hostname.  The route's fate is the owner's decision, and BF-2613 carries it.
+- `scripts/e2e-server.mjs`, `scripts/bundle-server.mjs`, `scripts/plugin-smoke.mjs` and the packaged-server smoke scripts, plus only the dev-proxy configuration within `vite.config.ts`.  Keep the Vite file and Linux build inputs while the retained Linux UI build uses them.
 - `server/testing/*` (28 fakes and harness files), superseded by `ReplayHarness` fixtures.
 - `cloudflare/control-plane/` (a stub with no code left in it).
 - The `e2e` and packaged-server CI jobs that exist only to drive those scripts.
