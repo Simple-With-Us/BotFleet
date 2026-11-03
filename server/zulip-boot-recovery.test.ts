@@ -164,7 +164,7 @@ describe.skipIf(process.platform === "win32")("a restart with a Zulip wake waiti
       .poll(async () => (await bots()).find((b) => b.id === bot.id)?.inflightThreadId, { timeout: 30_000, interval: 250 })
       .toBe(bot.threadId);
 
-    fake.postStream(JAY, "agent-sync", "BF boot", "@**BF-Plumber** check after the restart", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF boot", "@**BF-Plumber** check after the restart", "website");
     await expect.poll(async () => (await zulipBot(bot.id))?.pending, { timeout: 30_000, interval: 250 }).toBe(1);
 
     await stop("SIGTERM");

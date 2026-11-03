@@ -239,6 +239,18 @@ jobs:
           cat build-manifest.json
           echo "artifact=BotFleet-mac-arm64.zip" >> "$GITHUB_OUTPUT"
 
+      # BF-2531: the Mac updater installs this artifact, and the app it
+      # installs never refreshes Control on its own -- the explicit Update
+      # Control path compares the bundled copy against the installed one, and
+      # the handshake compares the server against the Control bundle.  Prove
+      # the packaged bytes agree with the pinned build before upload, or a
+      # stale Control rides to the Mac inside a newer server.
+      - name: "Gate: the bundled Control and server carry the pinned build"
+        run: |
+          node scripts/verify-packaged-versions.mjs release/mac-arm64/BotFleet.app \
+            --version "${{ needs.pin.outputs.version }}" \
+            --build "${{ needs.pin.outputs.build }}"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # Commit-keyed so the Mac updater can resolve an exact build rather

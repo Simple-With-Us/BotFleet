@@ -1,5 +1,5 @@
 // Zulip wake routing plugin.  An optional user-installed integration:
-// the trusted host owns the listener, credentials, dedup, budgets, and
+// the trusted host owns the Zulip reader, credentials, dedup, budgets, and
 // wake execution; this plugin owns the Zulip routing policy.
 //
 // The host emits one envelope per qualifying message (already

@@ -1,6 +1,6 @@
 // Classify one Zulip message for one BF bot and decide whether it wakes the
 // bot.  Pure functions over plain data, ported from the fleet listener's
-// router (AFC scripts/agent_sync/router.py) so a BF bot and a CLI seat read
+// router (the AFC Python package's router) so a BF bot and a CLI seat read
 // the same message the same way.
 //
 // Owner rule (docs/protocols/zulip-fleet-guide.md, Identity and Sessions):

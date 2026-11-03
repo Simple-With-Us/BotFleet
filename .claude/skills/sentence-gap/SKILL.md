@@ -80,7 +80,7 @@ but a shell step can produce one.  Write the text with two ASCII spaces after ea
 then convert it before it leaves your hands:
 `perl -CSDA -pe 's/([.!?])  (?=\S)/$1\x{a0} /g' body.txt > body.nbsp.txt`.  Check that the
 output holds at least one U+00A0 (`grep -c $'\xc2\xa0' body.nbsp.txt`) before passing it to
-`gh pr create --body-file`, `gh pr comment --body-file`, or the text you hand to `agent-sync post`.
+`gh pr create --body-file`, `gh pr comment --body-file`, or the text you hand to `simple-chat post`.
 
 ### Verify, don't assume — run this self-test only on a NEW, unlisted surface
 

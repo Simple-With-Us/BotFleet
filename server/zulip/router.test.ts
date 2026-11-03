@@ -27,7 +27,7 @@ function stream(over: Partial<ZulipMessage>): ZulipMessage {
     sender_id: 50,
     client: "ZulipPython",
     type: "stream",
-    display_recipient: "agent-sync",
+    display_recipient: "Work-In-Progress",
     subject: "BF tunnel",
     content: "@**BF-Plumber** look",
     timestamp: NOW / 1000,

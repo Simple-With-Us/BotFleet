@@ -52,7 +52,7 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
   const emitted: any[] = [];
   const failed: any[] = [];
   const checkInStarts: Array<{ run: any; routine: any }> = [];
-  const checkInFinishes: Array<{ run: any; checkInId: string; ok: boolean }> = [];
+  const checkInFinishes: Array<{ run: any; checkInId: string; ok: boolean; onSettled?: (delivered: boolean) => void }> = [];
   const ephemeralFlags: boolean[] = [];
   const deliveredEphemeral: Array<{
     ownerThreadId: string;
@@ -98,8 +98,8 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
       checkInStarts.push({ run: { ...run }, routine: { ...routine } });
       return `check-in-${++checkInIdSeq}`;
     },
-    checkInFinish: (run, checkInId, ok) => {
-      checkInFinishes.push({ run: { ...run }, checkInId, ok });
+    checkInFinish: (run, checkInId, ok, onSettled) => {
+      checkInFinishes.push({ run: { ...run }, checkInId, ok, onSettled });
     },
   };
   const manager = new RoutineManager(options);
@@ -2227,6 +2227,105 @@ describe("Sentry Crons check-ins", () => {
     expect(reloaded.listRuns()[0]).toMatchObject({ status: "failed", outcomeCode: "runtime_restart" });
     expect(h.checkInFinishes).toHaveLength(1);
     expect(h.checkInFinishes[0]).toMatchObject({ checkInId: "check-in-1", ok: false });
+  });
+
+  it("persists pendingClose until Sentry delivery confirmation, then deletes it", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Pending close test",
+      prompt: "do work",
+      botId: "maus-1",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const run = h.manager.listRuns()[0]!;
+
+    const base = { eventId: "e", provider: "claude" as const, threadId: run.threadId!, createdAt: new Date().toISOString() };
+    h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: true, stopReason: "end_turn" });
+
+    // pendingClose is set on the completed run immediately
+    const completedRun = h.manager.listRuns()[0]!;
+    expect(completedRun.pendingClose).toEqual({
+      status: "ok",
+      attempts: 0,
+      checkInId: "check-in-1",
+    });
+
+    // When delivery is confirmed, pendingClose is deleted
+    expect(h.checkInFinishes).toHaveLength(1);
+    h.checkInFinishes[0].onSettled?.(true);
+
+    const deliveredRun = h.manager.listRuns()[0]!;
+    expect(deliveredRun.pendingClose).toBeUndefined();
+  });
+
+  it("increments pendingClose attempt count when delivery fails", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Pending close retry test",
+      prompt: "do work",
+      botId: "maus-1",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const run = h.manager.listRuns()[0]!;
+
+    const base = { eventId: "e", provider: "claude" as const, threadId: run.threadId!, createdAt: new Date().toISOString() };
+    h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: true, stopReason: "end_turn" });
+
+    expect(h.checkInFinishes).toHaveLength(1);
+    // Notify failure
+    h.checkInFinishes[0].onSettled?.(false);
+
+    const failedRun = h.manager.listRuns()[0]!;
+    expect(failedRun.pendingClose).toEqual({
+      status: "ok",
+      attempts: 1,
+      checkInId: "check-in-1",
+    });
+  });
+
+  it("reconciles unclosed check-ins on manager restart", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Reconcile test",
+      prompt: "do work",
+      botId: "maus-1",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const run = h.manager.listRuns()[0]!;
+
+    const base = { eventId: "e", provider: "claude" as const, threadId: run.threadId!, createdAt: new Date().toISOString() };
+    h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: true, stopReason: "end_turn" });
+
+    // Flush to disk with pendingClose still set (simulating a crash/restart before delivery settled)
+    h.manager.flushNow();
+    expect(h.checkInFinishes).toHaveLength(1);
+
+    // Boot a new RoutineManager from the same disk state
+    const reloadedFinishes: Array<{ run: any; checkInId: string; ok: boolean; onSettled?: (delivered: boolean) => void }> = [];
+    const reloadedOptions = {
+      ...h.options,
+      checkInFinish: (r: any, checkInId: string, ok: boolean, onSettled?: (d: boolean) => void) => {
+        reloadedFinishes.push({ run: { ...r }, checkInId, ok, onSettled });
+      },
+    };
+    const reloaded = new RoutineManager(reloadedOptions);
+
+    // Reconciled the completed run's pendingClose on boot!
+    expect(reloadedFinishes).toHaveLength(1);
+    expect(reloadedFinishes[0]).toMatchObject({
+      checkInId: "check-in-1",
+      ok: true,
+    });
+
+    // Settle delivery on the reloaded manager
+    reloadedFinishes[0].onSettled?.(true);
+    expect(reloaded.listRuns()[0]!.pendingClose).toBeUndefined();
   });
 
   it("never opens a check-in for a webhook, resource, or manual dispatch", async () => {

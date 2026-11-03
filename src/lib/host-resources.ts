@@ -5,8 +5,10 @@
 // thresholds against the applied values, and builds the PUT /api/config
 // patch for the three unset-by-default headroom knobs
 // (reservedCpuCores / reservedRamMb / minMemoryAvailablePercent) through
-// server/knob-map.ts.  Empty stays omitted (no change); clearing back to
-// unset is a file/vault edit, not a PUT.
+// server/knob-map.ts.  A typed box saves; an emptied box over a set knob
+// sends null so the save unsets it; an emptied box over an unset knob stays
+// omitted.  A knob the vault manages cannot be cleared here — the server
+// refuses with 409 and the owner removes it in Infisical.
 //
 // Copy rules (docs/plans/2026-10-29-native-server-mode.md, "Headroom
 // Profiles And What The UI May Say" and docs/verification/headroom.md):
@@ -504,9 +506,9 @@ export function hostSubtitle(report: HostResourcesReport): string {
   return `${platform} · ${version} · ${capabilities}`;
 }
 
-/** Editable headroom inputs, as typed strings.  Empty means omit (no change):
- *  the PUT patch only carries fields with a number, so an untouched box never
- *  clears a saved knob.  Clearing back to unset is a file/vault edit. */
+/** Editable headroom inputs, as typed strings.  A typed box saves; an emptied
+ *  box over a set knob clears it back to unset (the patch sends null); an
+ *  emptied box over an unset knob stays omitted. */
 export interface HeadroomEditValues {
   reservedCpuCores: string;
   reservedRamMb: string;
@@ -528,11 +530,38 @@ export const HEADROOM_BOUNDS = {
   minMemoryAvailablePercent: { min: 0, max: 100, int: false },
 } as const;
 
-/** Parsed headroom numbers for the non-empty boxes. */
+/** Parsed headroom numbers for the non-empty boxes, with explicit nulls for
+ *  boxes the owner cleared: a typed number saves, an empty box over a set
+ *  knob clears it back to unset, and an empty box over an unset knob stays
+ *  omitted.  `null` is the wire spelling the server's merge turns into the
+ *  disk deletion; absent still means "leave it". */
 export interface HeadroomParsed {
+  reservedCpuCores?: number | null;
+  reservedRamMb?: number | null;
+  minMemoryAvailablePercent?: number | null;
+}
+
+/** The knobs a report currently has set, in parse units (RAM in MB), so
+ *  validation can tell "clearing a set knob" (valid) from "editing nothing"
+ *  (a no-op refusal).  An all-empty edit is only valid when it clears at
+ *  least one set knob — otherwise an emptied box over an unset knob would
+ *  save nothing and look like it did. */
+export interface HeadroomCurrentKnobs {
   reservedCpuCores?: number;
   reservedRamMb?: number;
   minMemoryAvailablePercent?: number;
+}
+
+/** The set knobs of a report, in parse units. */
+export function currentHeadroomKnobs(admission: HostResourcesReport["admission"]): HeadroomCurrentKnobs {
+  return {
+    reservedCpuCores: admission.reservedCpuCores,
+    reservedRamMb:
+      admission.reservedRamBytes === undefined
+        ? undefined
+        : Math.round(admission.reservedRamBytes / 1024 / 1024),
+    minMemoryAvailablePercent: admission.minMemoryAvailablePercent,
+  };
 }
 
 /** One parsed number or its validation message. */
@@ -558,7 +587,7 @@ function parseHeadroomNumber(field: keyof HeadroomEditValues, raw: string): Head
 /** Validate the three headroom boxes.  Returns the parsed numbers for the
  *  non-empty boxes, or the per-field errors.  At least one number is
  *  required: an all-empty save is a no-op and is refused with a message. */
-export function parseHeadroomEdit(values: HeadroomEditValues):
+export function parseHeadroomEdit(values: HeadroomEditValues, current?: HeadroomCurrentKnobs):
   | { ok: true; parsed: HeadroomParsed }
   | { ok: false; errors: HeadroomFieldError[] } {
   const errors: HeadroomFieldError[] = [];
@@ -574,6 +603,13 @@ export function parseHeadroomEdit(values: HeadroomEditValues):
   else if (mem.value !== undefined) parsed.minMemoryAvailablePercent = mem.value;
   if (errors.length > 0) return { ok: false, errors };
   if (Object.keys(parsed).length === 0) {
+    const clearsASetKnob =
+      current?.reservedCpuCores !== undefined ||
+      current?.reservedRamMb !== undefined ||
+      current?.minMemoryAvailablePercent !== undefined;
+    // An all-empty edit over set knobs is a clear, not a no-op (slice 7b
+    // follow-up: the last set knob must stay unsettable from the UI).
+    if (clearsASetKnob) return { ok: true, parsed };
     return { ok: false, errors: [{ field: "reservedCpuCores", message: "Enter at least one number to save." }] };
   }
   return { ok: true, parsed };
@@ -584,14 +620,16 @@ export function parseHeadroomEdit(values: HeadroomEditValues):
  *  edited headroom keys would erase maxSwapPercent, minFreeDiskMb and
  *  minFreeInodes.  The client therefore sends the complete admission object:
  *  edited headroom values over the current report, with the disk floor
- *  converted back to MB. */
+ *  converted back to MB.  An emptied box over a set knob sends `null`, which
+ *  the server's merge turns into the deletion that unsets it; an emptied
+ *  box over an already-unset knob stays omitted, which still reads unset. */
 export interface HeadroomFullAdmission {
   maxSwapPercent: number;
   minFreeDiskMb: number;
   minFreeInodes?: number;
-  reservedCpuCores?: number;
-  reservedRamMb?: number;
-  minMemoryAvailablePercent?: number;
+  reservedCpuCores?: number | null;
+  reservedRamMb?: number | null;
+  minMemoryAvailablePercent?: number | null;
 }
 
 /** PUT /api/config patch for the headroom save (full admission). */
@@ -600,8 +638,9 @@ export interface HeadroomPatch {
 }
 
 /** Build the PUT /api/config patch for the parsed headroom knobs over the
- *  current report.  Edited (non-empty) headroom values win; everything else
- *  is carried forward from the report so the server's shallow jobs merge
+ *  current report.  Edited (non-empty) headroom values win; an emptied box
+ *  over a set knob sends `null` so the save unsets it; everything else is
+ *  carried forward from the report so the server's shallow jobs merge
  *  never erases an unrelated admission gate. */
 export function buildHeadroomPatch(current: HostResourcesReport, parsed: HeadroomParsed): HeadroomPatch {
   const currentRamMb =
@@ -611,9 +650,9 @@ export function buildHeadroomPatch(current: HostResourcesReport, parsed: Headroo
   const admission: HeadroomFullAdmission = {
     maxSwapPercent: current.admission.maxSwapPercent,
     minFreeDiskMb: current.admission.minFreeDiskBytes / 1024 / 1024,
-    reservedCpuCores: parsed.reservedCpuCores ?? current.admission.reservedCpuCores,
-    reservedRamMb: parsed.reservedRamMb ?? currentRamMb,
-    minMemoryAvailablePercent: parsed.minMemoryAvailablePercent ?? current.admission.minMemoryAvailablePercent,
+    reservedCpuCores: parsed.reservedCpuCores ?? clearOrCarry(current.admission.reservedCpuCores),
+    reservedRamMb: parsed.reservedRamMb ?? clearOrCarry(currentRamMb),
+    minMemoryAvailablePercent: parsed.minMemoryAvailablePercent ?? clearOrCarry(current.admission.minMemoryAvailablePercent),
   };
   if (current.admission.minFreeInodes !== undefined) {
     admission.minFreeInodes = current.admission.minFreeInodes;
@@ -621,12 +660,19 @@ export function buildHeadroomPatch(current: HostResourcesReport, parsed: Headroo
   return { jobs: { admission } };
 }
 
+/** An emptied box unsets a knob the report has set (`null`) and stays
+ *  omitted over a knob that is already unset (`undefined`, which still
+ *  reads unset). */
+function clearOrCarry(current: number | undefined): number | null | undefined {
+  return current === undefined ? undefined : null;
+}
+
 /** Save the edited headroom knobs through PUT /api/config.  No refetch here:
  *  the caller reloads once via onSaved, so a save costs one PUT plus one
  *  GET, not two GETs.  Uses the store's api() helper so 4xx/5xx arrive as
  *  thrown errors with the server's message (including the Infisical 409). */
 export async function saveHeadroomThresholds(values: HeadroomEditValues, current: HostResourcesReport): Promise<void> {
-  const parsed = parseHeadroomEdit(values);
+  const parsed = parseHeadroomEdit(values, currentHeadroomKnobs(current.admission));
   if (!parsed.ok) {
     throw new Error(parsed.errors[0]?.message ?? "Enter a number.");
   }

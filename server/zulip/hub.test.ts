@@ -577,7 +577,7 @@ describe("waking", () => {
   it("wakes the mentioned bot with an untrusted wrapper, and its reply lands in the origin topic", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check the tunnel", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check the tunnel", "website");
     await waitFor(() => turns.length === 1, "a turn");
     expect(turns[0]!.botId).toBe("bot-plumber");
     const text = turns[0]!.text;
@@ -588,7 +588,7 @@ describe("waking", () => {
     const result = await hub.send({ botId: "bot-plumber", threadId: PLUMBER_THREAD, tool: "reply", args: { content: "Tunnel is up." } });
     expect(result.ok).toBe(true);
     const post = fake.postsBy(PLUMBER).at(-1)!;
-    expect(post.display_recipient).toBe("agent-sync");
+    expect(post.display_recipient).toBe("Work-In-Progress");
     expect(post.subject).toBe("BF tunnel");
     expect(post.content).toBe("[BF-PLUMBER] Tunnel is up.");
   });
@@ -596,10 +596,10 @@ describe("waking", () => {
   it("drops its own posts and Jay's account from an API client, and wakes on a peer's mention", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(PLUMBER, "agent-sync", "BF tunnel", "@**BF-Plumber** note to self", "BotFleet-Zulip");
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** from a script", "ZulipPython");
-    fake.postStream(PEER, "agent-sync", "BF tunnel", "no mention here", "ZulipPython");
-    const peerId = fake.postStream(PEER, "agent-sync", "BF other", "@**BF-Plumber** please look", "ZulipPython");
+    fake.postStream(PLUMBER, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** note to self", "BotFleet-Zulip");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** from a script", "ZulipPython");
+    fake.postStream(PEER, "Work-In-Progress", "BF tunnel", "no mention here", "ZulipPython");
+    const peerId = fake.postStream(PEER, "Work-In-Progress", "BF other", "@**BF-Plumber** please look", "ZulipPython");
     await waitFor(() => turns.length === 1, "the peer's wake");
     await settle();
     expect(turns).toHaveLength(1);
@@ -627,9 +627,9 @@ describe("waking", () => {
     const hub = makeHub();
     await connected(hub);
     busy.add("bot-plumber");
-    const a1 = fake.postStream(JAY, "agent-sync", "topic A", "@**BF-Plumber** one", "website");
-    const a2 = fake.postStream(JAY, "agent-sync", "topic A", "@**BF-Plumber** two", "website");
-    const b1 = fake.postStream(JAY, "agent-sync", "topic B", "@**BF-Plumber** three", "website");
+    const a1 = fake.postStream(JAY, "Work-In-Progress", "topic A", "@**BF-Plumber** one", "website");
+    const a2 = fake.postStream(JAY, "Work-In-Progress", "topic A", "@**BF-Plumber** two", "website");
+    const b1 = fake.postStream(JAY, "Work-In-Progress", "topic B", "@**BF-Plumber** three", "website");
     await waitFor(() => botStatus(hub, "bot-plumber")?.pending === 2, "two units");
     busy.delete("bot-plumber");
     await waitFor(() => turns.length === 1, "the first turn");
@@ -646,7 +646,7 @@ describe("waking", () => {
     settings.dryRun = true;
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check", "website");
     await waitFor(() => logs.some((line) => line.includes("dry run")), "the dry-run log");
     await settle();
     expect(turns).toHaveLength(0);
@@ -662,7 +662,7 @@ describe("credentials and identity", () => {
     expect(botStatus(hub, "bot-fixer")!.reason).toMatch(/no credential file/);
     expect(hub.outboundReady("bot-fixer")).toBe(false);
     expect(hub.outboundReady("bot-plumber")).toBe(true);
-    fake.postStream(JAY, "agent-sync", "BF x", "@**BF-Plumber** @**BF-Fixer** both of you", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF x", "@**BF-Plumber** @**BF-Fixer** both of you", "website");
     await waitFor(() => turns.length === 1, "plumber's wake");
     await settle();
     expect(turns.map((turn) => turn.botId)).toEqual(["bot-plumber"]);
@@ -678,7 +678,7 @@ describe("credentials and identity", () => {
     const hub = makeHub();
     await connected(hub);
     await connected(hub, "bot-fixer");
-    fake.postStream(JAY, "agent-sync", "BF x", "@**BF-Plumber** @**BF-Fixer** both of you", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF x", "@**BF-Plumber** @**BF-Fixer** both of you", "website");
     await waitFor(() => turns.length === 2, "two wakes");
     expect(turns.map((turn) => turn.botId).sort()).toEqual(["bot-fixer", "bot-plumber"]);
   });
@@ -852,7 +852,7 @@ describe("restarts and outages", () => {
     await connected(hub);
     fake.expireQueues(PLUMBER);
     // posted while the bot has no queue: only the backfill can see it
-    const missed = fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** while you were away", "website");
+    const missed = fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** while you were away", "website");
     await waitFor(() => turns.length === 1, "the backfilled wake");
     expect(turns[0]!.text).toContain(`"id":${missed}`);
     const registers = fake.requests.filter((r) => r.path === "register" && r.userId === PLUMBER);
@@ -864,7 +864,7 @@ describe("restarts and outages", () => {
     busy.add("bot-plumber");
     const first = makeHub();
     await connected(first);
-    const id = fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** queued across a restart", "website");
+    const id = fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** queued across a restart", "website");
     await waitFor(() => botStatus(first, "bot-plumber")?.pending === 1, "a queued unit");
     await first.stop();
     expect(turns).toHaveLength(0);
@@ -876,7 +876,7 @@ describe("restarts and outages", () => {
     await finishTurn(second);
     // force a backfill over the same message: it must not wake again
     fake.expireQueues(PLUMBER);
-    const next = fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** a new one", "website");
+    const next = fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** a new one", "website");
     await waitFor(() => turns.length === 2, "the new message");
     await settle();
     expect(turns).toHaveLength(2);
@@ -897,15 +897,15 @@ describe("the loop guard", () => {
     });
     await connected(hub);
     for (let n = 1; n <= 2; n++) {
-      fake.postStream(PEER, "agent-sync", "BF chain", `@**BF-Plumber** round ${n}`, "ZulipPython");
+      fake.postStream(PEER, "Work-In-Progress", "BF chain", `@**BF-Plumber** round ${n}`, "ZulipPython");
       await waitFor(() => turns.length === n, `peer wake ${n}`);
     }
-    fake.postStream(PEER, "agent-sync", "BF chain", "@**BF-Plumber** round 3", "ZulipPython");
+    fake.postStream(PEER, "Work-In-Progress", "BF chain", "@**BF-Plumber** round 3", "ZulipPython");
     await waitFor(() => logs.some((line) => line.includes("loop_guard")), "the loop guard");
     await settle();
     expect(turns).toHaveLength(2);
-    fake.postStream(JAY, "agent-sync", "BF chain", "carry on", "website");
-    fake.postStream(PEER, "agent-sync", "BF chain", "@**BF-Plumber** round 4", "ZulipPython");
+    fake.postStream(JAY, "Work-In-Progress", "BF chain", "carry on", "website");
+    fake.postStream(PEER, "Work-In-Progress", "BF chain", "@**BF-Plumber** round 4", "ZulipPython");
     await waitFor(() => turns.length === 3, "a wake after Jay spoke");
   });
 });
@@ -961,7 +961,7 @@ describe("DMs out", () => {
     fake.addUser({ user_id: GONE, full_name: "Gone Bot" });
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(PEER, "agent-sync", "BF keys", "@**BF-Plumber** rotate the deploy key please", "ZulipPython");
+    fake.postStream(PEER, "Work-In-Progress", "BF keys", "@**BF-Plumber** rotate the deploy key please", "ZulipPython");
     await waitFor(() => turns.length === 1, "the peer's wake");
     return hub;
   }
@@ -1031,9 +1031,9 @@ describe("followed topics", () => {
   it("follows a topic with zulip_follow_topic, wakes on any new message there, and never auto-replies for it", async () => {
     const hub = makeHub();
     await connected(hub);
-    const streamId = fake.streamId("agent-sync");
-    const followed = await follow(hub, { channel: "#agent-sync", topic: "BF watch", follow: true });
-    expect(followed).toMatchObject({ ok: true, text: expect.stringMatching(/^Following #agent-sync > BF watch\./) });
+    const streamId = fake.streamId("Work-In-Progress");
+    const followed = await follow(hub, { channel: "#Work-In-Progress", topic: "BF watch", follow: true });
+    expect(followed).toMatchObject({ ok: true, text: expect.stringMatching(/^Following #Work-In-Progress > BF watch\./) });
     // as the bot itself, through Zulip's own user_topics endpoint
     const call = fake.requests.find((r) => r.method === "POST" && r.path === "user_topics")!;
     expect(call).toMatchObject({ userId: PLUMBER, params: { stream_id: String(streamId), topic: "BF watch", visibility_policy: "3" } });
@@ -1042,7 +1042,7 @@ describe("followed topics", () => {
 
     replies.set("thread-bot-plumber", "Noted.");
     // no mention, another sender, the topic in other case: still the followed topic
-    const id = fake.postStream(PEER, "agent-sync", "bf WATCH", "deploy 4326 finished", "ZulipPython");
+    const id = fake.postStream(PEER, "Work-In-Progress", "bf WATCH", "deploy 4326 finished", "ZulipPython");
     await waitFor(() => turns.length === 1, "the followed topic's wake");
     expect(turns[0]!.text).toContain("new messages in a channel topic you follow");
     expect(turns[0]!.text).toContain(`where no one @-mentioned you: ${id}.`);
@@ -1053,26 +1053,26 @@ describe("followed topics", () => {
     expect(fake.postsBy(PLUMBER)).toHaveLength(0);
 
     // its own post there never wakes it
-    fake.postStream(PLUMBER, "agent-sync", "BF watch", "my own note", "BotFleet-Zulip");
+    fake.postStream(PLUMBER, "Work-In-Progress", "BF watch", "my own note", "BotFleet-Zulip");
     await settle();
     expect(turns).toHaveLength(1);
 
-    const unfollowed = await follow(hub, { channel: "agent-sync", topic: "BF watch", follow: "false" });
-    expect(unfollowed).toMatchObject({ ok: true, text: "Stopped following #agent-sync > BF watch." });
+    const unfollowed = await follow(hub, { channel: "Work-In-Progress", topic: "BF watch", follow: "false" });
+    expect(unfollowed).toMatchObject({ ok: true, text: "Stopped following #Work-In-Progress > BF watch." });
     expect(fake.followedBy(PLUMBER)).toEqual([]);
-    fake.postStream(PEER, "agent-sync", "BF watch", "another update", "ZulipPython");
+    fake.postStream(PEER, "Work-In-Progress", "BF watch", "another update", "ZulipPython");
     await settle(400);
     expect(turns).toHaveLength(1);
   });
 
   it("still auto-replies when a mention joins a followed topic's unit", async () => {
-    fake.followTopic(PLUMBER, "agent-sync", "BF watch");
+    fake.followTopic(PLUMBER, "Work-In-Progress", "BF watch");
     replies.set("thread-bot-plumber", "On it.");
     busy.add("bot-plumber");
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(PEER, "agent-sync", "BF watch", "build is red", "ZulipPython");
-    fake.postStream(JAY, "agent-sync", "BF watch", "@**BF-Plumber** can you look?", "website");
+    fake.postStream(PEER, "Work-In-Progress", "BF watch", "build is red", "ZulipPython");
+    fake.postStream(JAY, "Work-In-Progress", "BF watch", "@**BF-Plumber** can you look?", "website");
     await waitFor(() => botStatus(hub, "bot-plumber")?.pending === 1, "one unit for the topic");
     busy.delete("bot-plumber");
     await waitFor(() => turns.length === 1, "the turn");
@@ -1082,11 +1082,11 @@ describe("followed topics", () => {
   });
 
   it("loads the topics it follows at register, and applies a follow made in the Zulip app", async () => {
-    fake.followTopic(PLUMBER, "agent-sync", "BF app");
+    fake.followTopic(PLUMBER, "Work-In-Progress", "BF app");
     const hub = makeHub();
     await connected(hub);
     expect(botStatus(hub, "bot-plumber")?.following).toBe(1);
-    const id = fake.postStream(JAY, "agent-sync", "BF app", "heads up, deploying now", "website");
+    const id = fake.postStream(JAY, "Work-In-Progress", "BF app", "heads up, deploying now", "website");
     await waitFor(() => turns.length === 1, "Jay's message in the followed topic");
     expect(turns[0]!.text).toContain(`Owner items: ${id}.`);
     fake.followTopic(PLUMBER, "builds", "BF later");
@@ -1094,13 +1094,13 @@ describe("followed topics", () => {
   });
 
   it("backfills a followed topic's messages after the queue expired", async () => {
-    fake.followTopic(PLUMBER, "agent-sync", "BF watch");
+    fake.followTopic(PLUMBER, "Work-In-Progress", "BF watch");
     const hub = makeHub();
     await connected(hub);
     fake.expireQueues(PLUMBER);
     // posted while the bot has no queue, with no mention: only the followed
     // topic's own backfill narrow can see it
-    const missed = fake.postStream(PEER, "agent-sync", "BF watch", "deploy finished while you were away", "ZulipPython");
+    const missed = fake.postStream(PEER, "Work-In-Progress", "BF watch", "deploy finished while you were away", "ZulipPython");
     await waitFor(() => turns.length === 1, "the backfilled wake");
     expect(turns[0]!.text).toContain(`"id":${missed}`);
     expect(
@@ -1114,9 +1114,9 @@ describe("followed topics", () => {
     await connected(hub);
     const refused = await follow(hub, { channel: "secret-room", topic: "BF x", follow: true });
     expect(refused).toMatchObject({ ok: false, text: expect.stringMatching(/not subscribed to #secret-room/) });
-    expect((await follow(hub, { channel: "agent-sync", topic: "BF x" })).ok).toBe(false);
-    expect((await follow(hub, { channel: "agent-sync", topic: "   ", follow: true })).ok).toBe(false);
-    expect((await follow(hub, { channel: "agent-sync", topic: "x".repeat(61), follow: true })).text).toMatch(/at most 60/);
+    expect((await follow(hub, { channel: "Work-In-Progress", topic: "BF x" })).ok).toBe(false);
+    expect((await follow(hub, { channel: "Work-In-Progress", topic: "   ", follow: true })).ok).toBe(false);
+    expect((await follow(hub, { channel: "Work-In-Progress", topic: "x".repeat(61), follow: true })).text).toMatch(/at most 60/);
     expect(fake.requests.some((r) => r.path === "user_topics")).toBe(false);
   });
 });
@@ -1125,7 +1125,7 @@ describe("posting", () => {
   it("auto-replies with the final message when the bot did not reply itself", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check", "website");
     await waitFor(() => turns.length === 1, "a turn");
     replies.set(PLUMBER_THREAD, "All green on the tunnel.");
     await finishTurn(hub);
@@ -1138,7 +1138,7 @@ describe("posting", () => {
   it("sends every outbound text with the sentence gap: reply, channel post, owner DM and auto-reply", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(PEER, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "ZulipPython");
+    fake.postStream(PEER, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check", "ZulipPython");
     await waitFor(() => turns.length === 1, "a turn");
     const send = (tool: "reply" | "post", args: Record<string, string | number>) =>
       hub.send({ botId: "bot-plumber", threadId: PLUMBER_THREAD, tool, args });
@@ -1156,7 +1156,7 @@ describe("posting", () => {
     ]);
     await finishTurn(hub);
 
-    fake.postStream(JAY, "agent-sync", "BF other", "@**BF-Plumber** and this?", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF other", "@**BF-Plumber** and this?", "website");
     await waitFor(() => turns.length === 2, "a second turn");
     replies.set(PLUMBER_THREAD, "Also fine.  Nothing to do.");
     await finishTurn(hub);
@@ -1167,12 +1167,12 @@ describe("posting", () => {
   it("does not auto-reply after the bot replied, or after a failed turn", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF one", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF one", "@**BF-Plumber** check", "website");
     await waitFor(() => turns.length === 1, "a turn");
     await hub.send({ botId: "bot-plumber", threadId: PLUMBER_THREAD, tool: "reply", args: { content: "On it." } });
     replies.set(PLUMBER_THREAD, "Final words.");
     await finishTurn(hub);
-    fake.postStream(JAY, "agent-sync", "BF two", "@**BF-Plumber** again", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF two", "@**BF-Plumber** again", "website");
     await waitFor(() => turns.length === 2, "a second turn");
     await finishTurn(hub, "bot-plumber", false);
     await settle();
@@ -1182,7 +1182,7 @@ describe("posting", () => {
   it("withholds an auto-reply that carries a secret, and says so in the thread", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check", "website");
     await waitFor(() => turns.length === 1, "a turn");
     replies.set(PLUMBER_THREAD, "the key is plumber-test-key");
     await finishTurn(hub);
@@ -1239,7 +1239,7 @@ describe("posting", () => {
 function streamMessage(over: Partial<ZulipMessage> & Pick<ZulipMessage, "id" | "sender_id" | "content">): ZulipMessage {
   return {
     type: "stream",
-    display_recipient: "agent-sync",
+    display_recipient: "Work-In-Progress",
     subject: "BF order",
     timestamp: Math.floor(Date.now() / 1000),
     client: "website",
@@ -1289,9 +1289,9 @@ describe("review fixes: delivery order and races", () => {
       },
     });
     await connected(hub);
-    const first = fake.postStream(JAY, "agent-sync", "BF race", "@**BF-Plumber** first", "website");
+    const first = fake.postStream(JAY, "Work-In-Progress", "BF race", "@**BF-Plumber** first", "website");
     await waitFor(() => turns.length === 1, "the first turn starting");
-    const late = fake.postStream(JAY, "agent-sync", "BF race", "@**BF-Plumber** second", "website");
+    const late = fake.postStream(JAY, "Work-In-Progress", "BF race", "@**BF-Plumber** second", "website");
     const session = sessionOf(hub);
     await waitFor(() => session.state.pending.some((unit) => unit.items.some((item) => item.id === late)), "the late message queued");
     release();
@@ -1308,7 +1308,7 @@ describe("review fixes: delivery order and races", () => {
     let held = true;
     const hub = makeHub({ dispatchHeld: () => held });
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF boot", "@**BF-Plumber** after the restart", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF boot", "@**BF-Plumber** after the restart", "website");
     await waitFor(() => botStatus(hub, "bot-plumber")?.pending === 1, "the queued unit");
     await settle(200);
     expect(turns).toHaveLength(0);
@@ -1327,7 +1327,7 @@ describe("a bot switched Off", () => {
       },
     });
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check", "website");
     await waitFor(() => logs.some((line) => line.includes("the bot is off")), "the drop");
     await settle(300);
     expect(attempts).toBe(1);
@@ -1352,7 +1352,7 @@ describe("review fixes: reconnects", () => {
     await connected(hub);
     const polls = () => fake.requests.filter((r) => r.path === "events" && r.method === "GET" && r.userId === PLUMBER).length;
     await waitFor(() => polls() >= 3, "polls after a timeout");
-    const id = fake.postStream(JAY, "agent-sync", "BF timeout", "@**BF-Plumber** still there?", "website");
+    const id = fake.postStream(JAY, "Work-In-Progress", "BF timeout", "@**BF-Plumber** still there?", "website");
     await waitFor(() => turns.length === 1, "the wake on the same queue");
     expect(turns[0]!.text).toContain(`"id":${id}`);
     expect(fake.requests.filter((r) => r.path === "register" && r.userId === PLUMBER)).toHaveLength(1);
@@ -1382,7 +1382,7 @@ describe("review fixes: reconnects", () => {
     await waitFor(() => sleeps.length >= 3, "three backoffs");
     expect(sleeps.slice(0, 3)).toEqual([20, 40, 80]);
     await connected(hub);
-    const id = fake.postStream(JAY, "agent-sync", "BF backoff", "@**BF-Plumber** back?", "website");
+    const id = fake.postStream(JAY, "Work-In-Progress", "BF backoff", "@**BF-Plumber** back?", "website");
     await waitFor(() => turns.length === 1, "a wake after recovery");
     expect(turns[0]!.text).toContain(`"id":${id}`);
     // every failed queue was deleted before the next register
@@ -1395,7 +1395,7 @@ describe("review fixes: the reply binding belongs to its own turn", () => {
   it("posts a successful Zulip turn's reply even when the next turn in the thread fails", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF bind", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF bind", "@**BF-Plumber** check", "website");
     await waitFor(() => turns.length === 1, "a turn");
     replies.set(PLUMBER_THREAD, "All green.");
     hub.turnCompleted(PLUMBER_THREAD, true);
@@ -1416,7 +1416,7 @@ describe("review fixes: the reply binding belongs to its own turn", () => {
   it("posts nothing for a failed Zulip turn, whatever the next turn in the thread does", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF bind", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF bind", "@**BF-Plumber** check", "website");
     await waitFor(() => turns.length === 1, "a turn");
     replies.set(PLUMBER_THREAD, "half an answer");
     hub.turnCompleted(PLUMBER_THREAD, false);
@@ -1432,7 +1432,7 @@ describe("review fixes: the reply binding belongs to its own turn", () => {
     let offset = 0;
     const hub = makeHub({ now: () => Date.now() + offset });
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF long", "@**BF-Plumber** long deploy", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF long", "@**BF-Plumber** long deploy", "website");
     await waitFor(() => turns.length === 1, "a turn");
     offset = 3 * 3600_000;
     await hub.drain();
@@ -1495,7 +1495,7 @@ describe("review fixes: a response of the wrong shape", () => {
     await connected(hub);
     expect(logs.some((line) => line.includes("unexpected shape"))).toBe(true);
     // and the bot still hears what arrives on the new queue
-    fake.postStream(JAY, "agent-sync", "BF shape", "@**BF-Plumber** still there?", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF shape", "@**BF-Plumber** still there?", "website");
     await waitFor(() => turns.length === 1, "the wake after the retry");
   });
 });
@@ -1503,7 +1503,7 @@ describe("review fixes: a response of the wrong shape", () => {
 describe("review fixes: the first connection's cursor", () => {
   it("starts from now when register names no newest message, and a reconnect before anything arrives does not backfill the mailbox", async () => {
     fake.omitMaxMessageId = true;
-    fake.postStream(JAY, "agent-sync", "BF old", "@**BF-Plumber** from long ago", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF old", "@**BF-Plumber** from long ago", "website");
     const hub = makeHub();
     await connected(hub);
     await settle(150);
@@ -1521,7 +1521,7 @@ describe("review fixes: the first connection's cursor", () => {
     expect(turns).toHaveLength(0);
     expect(sessionOf(hub).state.cursor).toBeNull();
     // the first live message wakes, and sets the cursor
-    const fresh = fake.postStream(JAY, "agent-sync", "BF new", "@**BF-Plumber** now", "website");
+    const fresh = fake.postStream(JAY, "Work-In-Progress", "BF new", "@**BF-Plumber** now", "website");
     await waitFor(() => turns.length === 1, "the live wake");
     expect(turns[0]?.text).not.toContain("from long ago");
     expect(sessionOf(hub).state.cursor).toBe(fresh);
@@ -1544,7 +1544,7 @@ describe("review fixes: the decided-message indexes", () => {
   it("never write the indexes to the state file", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF index", "@**BF-Plumber** one", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF index", "@**BF-Plumber** one", "website");
     const saved = () => {
       try {
         return JSON.parse(readFileSync(join(dataDir, "zulip", "bot-plumber.json"), "utf8"));
@@ -1562,7 +1562,7 @@ describe("review fixes: the decided-message indexes", () => {
     let held = true;
     const first = makeHub({ dispatchHeld: () => held });
     await connected(first);
-    const waiting = fake.postStream(JAY, "agent-sync", "BF restart", "@**BF-Plumber** before the restart", "website");
+    const waiting = fake.postStream(JAY, "Work-In-Progress", "BF restart", "@**BF-Plumber** before the restart", "website");
     await waitFor(() => botStatus(first, "bot-plumber")?.pending === 1, "the queued unit");
     await first.stop();
     const second = makeHub({ dispatchHeld: () => held });
@@ -1604,7 +1604,7 @@ describe("a bot stopped in BotFleet", () => {
       },
     });
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF stopped", "@**BF-Plumber** are you there", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF stopped", "@**BF-Plumber** are you there", "website");
     // unlike an Off bot, a stop can lift (a person starts the bot again), so
     // the work is held and retried rather than dropped on the first refusal
     await waitFor(() => attempts >= 2, "a retry");

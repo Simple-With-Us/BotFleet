@@ -1193,7 +1193,7 @@ const ZULIP_POST: HarnessTool = {
   schema: {
     type: "object",
     properties: {
-      channel: { type: "string", description: "Channel name without the #, for example agent-sync." },
+      channel: { type: "string", description: "Channel name without the #, for example Work-In-Progress." },
       topic: { type: "string", description: "The topic (thread) to post in. Required with channel." },
       dm_user_id: {
         type: "integer",
@@ -1220,7 +1220,7 @@ const ZULIP_FOLLOW_TOPIC: HarnessTool = {
   schema: {
     type: "object",
     properties: {
-      channel: { type: "string", description: "Channel name without the #, for example agent-sync." },
+      channel: { type: "string", description: "Channel name without the #, for example Work-In-Progress." },
       topic: { type: "string", description: "The topic (thread) to follow or stop following." },
       follow: { type: "boolean", description: "true to follow the topic, false to stop following it." },
     },
