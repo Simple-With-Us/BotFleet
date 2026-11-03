@@ -42,6 +42,16 @@ fi
 # identity there so the desktop app can adopt the sidecar.  `--stop` removes it,
 # mirroring `clearManagedCompanionRuntime` in that module.
 RUNTIME_CLAIM="$HOME/.botfleet-companion/runtime/supervisor.json"
+# The fleet's park marker.  The harness's own start script reads this same
+# file and stays down while it is present,  so a fleet that was shut down on
+# purpose does not come back at the next login.  The companion reads it too:
+# before this gate the companion was the one process here that came back
+# anyway,  and it is the one process here that listens off-machine.
+#
+# The marker is the harness's signal and the harness's script is what clears
+# it.  This script never deletes it.  The Control app's explicit Start clears
+# it,  because an explicit Start is a deliberate start (BF-2614 part 2).
+SHUTDOWN_MARKER="${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/stopped.marker}"
 PORT="${BOTFLEET_COMPANION_PORT:-8810}"
 CONTROL_PORT="${BOTFLEET_COMPANION_CONTROL_PORT:-8811}"
 HARNESS_PORT="${BOTFLEET_HARNESS_PORT:-8799}"
@@ -103,6 +113,17 @@ if [ "$STOP" = true ]; then
   else
     log "stop requested; no published runtime claim at $RUNTIME_CLAIM"
   fi
+  exit 0
+fi
+
+# A parked fleet stays parked.  Exit 0 rather than 1,  because the
+# companion's launchd job has KeepAlive and a non-zero exit would be a
+# failed start to restart-loop against.  Nothing is started and nothing is
+# stopped:  the marker means "do not start",  and a companion that is
+# already running is not this script's business.
+if [ -f "$SHUTDOWN_MARKER" ]; then
+  log "stopped.marker present ($SHUTDOWN_MARKER); the fleet was shut down on purpose and the companion stays down."
+  log "Start the BotFleet app, or delete that file, to let it come back."
   exit 0
 fi
 

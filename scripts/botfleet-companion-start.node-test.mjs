@@ -80,6 +80,87 @@ test("the sidecar runs from its own store, not the harness's", () => {
   );
 });
 
+function runStart(home, extraEnv = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-park-"));
+  const release = releaseTree(join(home, ".botfleet-companion"), "c".repeat(40));
+  symlinkSync(release, join(home, ".botfleet-companion", "current"));
+
+  const node = join(dir, "fake-node");
+  writeFileSync(node, fakeNodeScript("ran-here.txt"));
+  chmodSync(node, 0o755);
+
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  return spawnSync("bash", [SCRIPT], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: home,
+      BOTFLEET_COMPANION_PORT: String(port),
+      BOTFLEET_COMPANION_CONTROL_PORT: String(port + 1),
+      BOTFLEET_HARNESS_PORT: String(port + 2),
+      BOTFLEET_NODE: node,
+      ...extraEnv,
+    },
+  });
+}
+
+test("a parked fleet does not start a companion, and the marker is left alone", () => {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-parked-"));
+  const home = join(dir, "home");
+  mkdirSync(join(home, ".botfleet"), { recursive: true });
+  const marker = join(home, ".botfleet", "stopped.marker");
+  writeFileSync(marker, "stopped on purpose\n");
+
+  const result = runStart(home);
+  // Exit 0, not 1:  the companion's launchd job has KeepAlive,  and a
+  // non-zero exit would be a failed start to restart-loop against.
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  assert.match(result.stdout, /stopped\.marker present/);
+  // The companion must not run at all while the fleet is parked.
+  const release = join(home, ".botfleet-companion", "releases", "c".repeat(40));
+  assert.equal(
+    existsSync(join(release, "ran-here.txt")),
+    false,
+    "a parked fleet must not start a companion supervisor",
+  );
+  // The marker is the harness's park signal.  The companion never clears it.
+  assert.ok(existsSync(marker), "the companion must never delete the harness's park marker");
+});
+
+test("an unparked fleet starts the companion as before", () => {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-unparked-"));
+  const home = join(dir, "home");
+  mkdirSync(join(home, ".botfleet"), { recursive: true });
+
+  const result = runStart(home);
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  const release = join(home, ".botfleet-companion", "releases", "c".repeat(40));
+  assert.ok(
+    existsSync(join(release, "ran-here.txt")),
+    "without a park marker the companion must still start",
+  );
+});
+
+test("--stop still works while the fleet is parked", () => {
+  // The gate must not swallow the stop path:  --stop removes the published
+  // runtime claim,  and that has to work whether or not the fleet is parked.
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-parked-stop-"));
+  const home = join(dir, "home");
+  mkdirSync(join(home, ".botfleet"), { recursive: true });
+  writeFileSync(join(home, ".botfleet", "stopped.marker"), "stopped on purpose\n");
+  const claim = claimPath(home);
+  mkdirSync(dirname(claim), { recursive: true });
+  writeFileSync(claim, "{\"version\":1}\n");
+
+  const result = runStop(home);
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  assert.equal(existsSync(claim), false, "--stop must remove the runtime claim while parked");
+  assert.ok(
+    existsSync(join(home, ".botfleet", "stopped.marker")),
+    "--stop must not delete the harness's park marker either",
+  );
+});
+
 function runStop(home) {
   return spawnSync("bash", [SCRIPT, "--stop"], {
     encoding: "utf8",
