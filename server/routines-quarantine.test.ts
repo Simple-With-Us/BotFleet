@@ -22,9 +22,10 @@ function tempFile(): string {
   return join(dir, "routines.json");
 }
 
-const build = (file: string) =>
+const build = (file: string, passive = false) =>
   new RoutineManager({
     file,
+    passive,
     now: () => NOW,
     botState: () => "ready" as const,
     createTask: () => ({ threadId: "thread-1" }),
@@ -75,6 +76,26 @@ describe("RoutineManager with an unusable routines.json", () => {
       expect.objectContaining({ file: "routines.json", kind: "set-aside", setAsideAs: name, writesRefused: false, holdsCleanup: false }),
     ]);
     expect(error.mock.calls.map((call) => String(call[0])).join("\n")).toContain(name!);
+  });
+
+  it.each(["malformed", "partial"])("preserves all %s scheduler bytes and directory entries during passive loading", async (kind) => {
+    const file = tempFile();
+    const seeded = seed(file);
+    const parsed = JSON.parse(seeded);
+    parsed.routines.push(null);
+    const bytes = kind === "malformed" ? seeded.slice(0, 120) : JSON.stringify(parsed);
+    writeFileSync(file, bytes);
+    const dir = join(file, "..");
+    const entries = readdirSync(dir).sort();
+    const manager = build(file, true);
+    manager.start(); await manager.tick(); manager.flushNow(); manager.stop();
+    expect(readFileSync(file, "utf8")).toBe(bytes);
+    expect(readdirSync(dir).sort()).toEqual(entries);
+    expect(manager.listRoutines()).toHaveLength(kind === "partial" ? 2 : 0);
+    expect(listDataFaults()).toEqual([expect.objectContaining({
+      file: "routines.json", kind: kind === "partial" ? "partial" : "unreadable",
+      setAsideAs: null, writesRefused: true, omitted: kind === "partial" ? 1 : 0,
+    })]);
   });
 
   it("saves new routines into a fresh file and leaves the set-aside file alone", () => {

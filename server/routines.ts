@@ -277,6 +277,8 @@ function routineRequestOwnerKey(owner: RoutineRequestOwner): string {
 }
 
 export interface RoutineManagerOptions {
+  /** Preserve interrupted evidence and refuse startup recovery in a bridge. */
+  passive?: boolean;
   file?: string;
   now?: () => number;
   /** Keyed frames only: every payload on this bus is `{ kind, … }`, which
@@ -527,6 +529,7 @@ export class RoutineManager {
   /** True when routines.json could not be read or moved aside, so saving would destroy the only
    * copy of it.  Logged and shown; the one case in which this manager stops saving. */
   private writesRefused = false;
+  private readonly passive: boolean;
   /** When each trigger last STARTED, keyed by `automationThreadKey`.
    *
    * In memory only: a gap is a rate limit on waking a bot, and after a
@@ -598,13 +601,14 @@ export class RoutineManager {
   }
 
   constructor(options: RoutineManagerOptions) {
+    this.passive = options.passive === true;
     this.options = options;
     this.file = options.file ?? join(DATA_DIR, "routines.json");
     this.now = options.now ?? Date.now;
     let runOnMigrated = false;
     // A routines.json that cannot be used is moved aside, never deleted, and reported (store-guard.ts).
     // It used to read as "no routines", and the next save replaced it.
-    const loaded = loadGuarded(this.file, interpretRoutineFile);
+    const loaded = loadGuarded(this.file, interpretRoutineFile, this.now(), { readOnly: this.passive });
     this.writesRefused = loaded.writesRefused;
     const disk = loaded.value ?? {};
     const rawRoutines = Array.isArray(disk.routines) ? disk.routines : [];
@@ -643,6 +647,10 @@ export class RoutineManager {
           this.botSnoozeUntil.set(botId, until);
         }
       }
+    }
+    if (this.passive) {
+      this.writesRefused = true;
+      return;
     }
     if (runOnMigrated) this.save();
     // A local process cannot still own these turns after a full restart.
@@ -1293,6 +1301,7 @@ export class RoutineManager {
   }
 
   start() {
+    if (this.passive) return;
     if (this.timer) return;
     void this.tick();
     this.timer = setInterval(() => void this.tick(), 10_000);
@@ -1330,6 +1339,7 @@ export class RoutineManager {
   }
 
   async tick(): Promise<void> {
+    if (this.passive) return;
     if (this.options.admit?.() === false) return;
     if (this.ticking) return;
     this.ticking = true;
