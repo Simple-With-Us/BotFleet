@@ -12,6 +12,16 @@
 // Every input is treated as untrusted.  A missing or malformed state file is
 // an error, not a pass: the state file is the record of the soak's first
 // end, and an unreadable record cannot prove anything about the second end.
+//
+// What this check does NOT do, stated plainly because a narrower claim is the
+// honest one: it observes the window at its two ends and nowhere in between.
+// A clean observation at the start and a clean observation 24 hours later
+// bound the endpoints; they do not establish that the machine stayed clean
+// for the whole interval.  BF-2514's acceptance asks for 24 hours in which no
+// BotFleet node process runs and every bot, routine, webhook, Zulip event and
+// iOS push keeps working, and that continuous observation belongs to whatever
+// samples the window while it runs.  This script is the window's bookend
+// check, and its verdict says so.
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -19,6 +29,14 @@ import { fileURLToPath } from "node:url";
 
 /** The minimum window the Phase 5 exit condition asks for. */
 export const SOAK_MINIMUM_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * What a green verdict from this script means, and what it does not.  The
+ * words are part of the contract: a reader who takes "soaked" to mean
+ * continuous observation has been told more than the script proved.
+ */
+export const SCOPE_NOTE =
+  "This check observed the window at both ends and nowhere in between.  It does not establish that the machine stayed clean for the whole interval, and it does not stand in for the continuous observation BF-2514's acceptance asks for.";
 
 /** The marker every state file this script writes carries. */
 export const STATE_MARKER = "botfleet-soak-24h";
@@ -104,9 +122,10 @@ export function captureBlockers(record, label) {
 }
 
 /**
- * Decide the soak.  Pure over the two captured records and the clock, so
- * the same window always earns the same verdict and the test suite can
- * replay it.
+ * Decide the window's two bookends.  Pure over the two captured records and
+ * the clock, so the same window always earns the same verdict and the test
+ * suite can replay it.  A green verdict means the window ran long enough and
+ * both ends were clean; it is not a claim about the interval between them.
  */
 export function soakVerdict(start, end, nowMs) {
   const blockers = [...captureBlockers(start, "start"), ...captureBlockers(end, "end")];
@@ -253,6 +272,7 @@ if (isEntryModule()) {
     process.exit(1);
   }
   console.log(
-    `the 24-hour soak is satisfied: the window ran ${formatDuration(Date.now() - state.atMs)} and both ends were clean.`,
+    `the 24-hour window ran ${formatDuration(Date.now() - state.atMs)} with a clean observation at each end.`,
   );
+  console.log(SCOPE_NOTE);
 }

@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  SCOPE_NOTE,
   SOAK_MINIMUM_MS,
   STATE_MARKER,
   STATE_VERSION,
@@ -185,10 +186,21 @@ test("the CLI records the start of the soak and judges the end of it", () => {
       encoding: "utf8",
     });
     assert.equal(finished.status, 0, finished.stderr);
-    assert.match(finished.stdout, /the 24-hour soak is satisfied/);
+    assert.match(finished.stdout, /the 24-hour window ran .* with a clean observation at each end/);
+    // A green verdict must not read as a claim about the interval between the
+    // two observations, so the scope note travels with it and the old
+    // overstating wording is gone.
+    assert.match(finished.stdout, /observed the window at both ends and nowhere in between/);
+    assert.doesNotMatch(finished.stdout, /the 24-hour soak is satisfied/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("a green verdict states what it did not observe", () => {
+  assert.match(SCOPE_NOTE, /both ends and nowhere in between/);
+  assert.match(SCOPE_NOTE, /does not establish/);
+  assert.match(SCOPE_NOTE, /BF-2514/);
 });
 
 test("the CLI refuses a missing, malformed or foreign state file", () => {
