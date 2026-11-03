@@ -1,9 +1,5 @@
-// App settings → Secrets: the machine identity for an optional Infisical
-// vault, and — right underneath it — where every mapped credential in this
-// app actually came from (server/infisical.ts, server/secret-map.ts).  With
-// no project id and identity saved, this card is inert: nothing is fetched,
-// nothing changes, and the values on this computer keep working exactly as
-// they did before this feature existed.
+// App settings → Secrets: optional Infisical authentication, scoped token
+// routes, and the source of each mapped app credential.
 import * as React from "react";
 import { Check, CheckCircle, Loader2, RefreshCw, XCircle } from "lucide-react";
 import { api, fetchSecrets, useStore, type ConfigStatus, type InfisicalStatusPayload } from "@/state/store";
@@ -14,7 +10,10 @@ import {
   buildInfisicalConfigPatch,
   infisicalStatusLabel,
   infisicalSwitchDefault,
+  saveInfisicalSettings,
+  sourceDraftsFromStatus,
   splitInfisicalPatch,
+  type InfisicalSourceDraft,
 } from "@/lib/secret-source";
 
 const secretsInputClass =
@@ -25,6 +24,17 @@ const cnSwitch = (on: boolean) =>
 const cnKnob = (on: boolean) =>
   `absolute top-[3px] h-[18px] w-[18px] rounded-full bg-white transition-all ${on ? "left-[21px]" : "left-[3px]"}`;
 
+const emptySource = (): InfisicalSourceDraft => ({
+  name: "",
+  projectId: "",
+  environment: "prod",
+  secretPath: "/",
+  readSourceType: "env",
+  readSource: "",
+  writeSourceType: "env",
+  writeSource: "",
+});
+
 export function SecretsSection() {
   const { state, dispatch } = useStore();
   const infisicalConfig = state.config?.infisical;
@@ -32,18 +42,23 @@ export function SecretsSection() {
   const [status, setStatus] = React.useState<InfisicalStatusPayload | null>(null);
   const [statusFetchError, setStatusFetchError] = React.useState<string | null>(null);
 
-  // Not `infisicalConfig?.enabled ?? true`: the wire value conflates the kill
-  // switch with the configured state, so an unconfigured install would render
-  // this switch off and the first Save would persist a hard `enabled: false`.
-  // See `infisicalSwitchDefault`.
+  // The raw saved toggle survives even when no credential is configured.
+  // `infisicalSwitchDefault` keeps older-server behavior compatible.
   const [enabled, setEnabled] = React.useState(infisicalSwitchDefault(infisicalConfig));
   const [writeThrough, setWriteThrough] = React.useState(infisicalConfig?.writeThrough ?? false);
+  const [authMethod, setAuthMethod] = React.useState<"service-token" | "machine-identity">(
+    infisicalConfig?.authMethod ?? "service-token",
+  );
   const [siteUrl, setSiteUrl] = React.useState("");
   const [projectId, setProjectId] = React.useState("");
   const [environment, setEnvironment] = React.useState(infisicalConfig?.environment ?? "");
   const [secretPath, setSecretPath] = React.useState("");
   const [clientId, setClientId] = React.useState("");
   const [clientSecret, setClientSecret] = React.useState("");
+  const [token, setToken] = React.useState("");
+  const [writeToken, setWriteToken] = React.useState("");
+  const [readSources, setReadSources] = React.useState<InfisicalSourceDraft[]>([]);
+  const [readSourcesLoaded, setReadSourcesLoaded] = React.useState(false);
   const [refreshMinutes, setRefreshMinutes] = React.useState(15);
 
   const [saving, setSaving] = React.useState(false);
@@ -65,6 +80,9 @@ export function SecretsSection() {
     if (infisicalConfig?.writeThrough !== undefined) setWriteThrough(infisicalConfig.writeThrough);
   }, [infisicalConfig?.writeThrough]);
   React.useEffect(() => {
+    if (infisicalConfig?.authMethod) setAuthMethod(infisicalConfig.authMethod);
+  }, [infisicalConfig?.authMethod]);
+  React.useEffect(() => {
     if (infisicalConfig?.environment !== undefined) setEnvironment(infisicalConfig.environment);
   }, [infisicalConfig?.environment]);
 
@@ -82,11 +100,22 @@ export function SecretsSection() {
   React.useEffect(() => {
     if (vault?.refreshMinutes !== undefined) setRefreshMinutes(vault.refreshMinutes);
   }, [vault?.refreshMinutes]);
+  React.useEffect(() => {
+    if (typeof vault?.enabledSetting === "boolean") setEnabled(vault.enabledSetting);
+  }, [vault?.enabledSetting]);
+  React.useEffect(() => {
+    if (vault?.authMethod) setAuthMethod(vault.authMethod);
+    if (vault?.readSources) {
+      setReadSources(sourceDraftsFromStatus(vault.readSources));
+      setReadSourcesLoaded(true);
+    }
+  }, [vault?.authMethod, vault?.readSources]);
 
   const refreshStatus = React.useCallback(async () => {
     try {
       const data = await fetchSecrets();
       setStatus(data);
+      if (typeof data.infisical.enabledSetting === "boolean") setEnabled(data.infisical.enabledSetting);
       setStatusFetchError(null);
     } catch (caught) {
       // A window without loopback access (or a very old harness) sees this
@@ -106,12 +135,16 @@ export function SecretsSection() {
     const built = buildInfisicalConfigPatch({
       enabled,
       writeThrough,
+      authMethod,
       siteUrl,
       projectId,
       environment,
       secretPath,
       clientId,
       clientSecret,
+      token,
+      writeToken,
+      readSources: readSourcesLoaded ? readSources : undefined,
       refreshMinutes,
     });
     if (!built.ok) {
@@ -123,28 +156,27 @@ export function SecretsSection() {
     setSaveError(null);
     setSaveOk(false);
     try {
-      // The client secret takes the same road every other credential in this
-      // app takes on the desktop: `window.ogb.setCredential` commits it to
-      // the OS-encrypted store first and only then makes it live, and the
-      // PATCH below carries the plain settings.  Sent in the PATCH body
-      // instead, it would land in plaintext `~/.botfleet/config.json` (the
-      // request has no `?secretStorage=external`) and only migrate into
-      // `credentials.bin` on a later launch — for the one credential that can
-      // read every name in the project.  See `splitInfisicalPatch`.
-      const { configPatch, bridgeSecret } = splitInfisicalPatch(built.patch, Boolean(window.ogb?.setCredential));
-      // Settings first, so the server's re-login — which the bridge save
-      // triggers — runs against the project and environment being saved.
-      let config: ConfigStatus = await api("/api/config", {
-        method: "PATCH",
-        body: JSON.stringify({ infisical: configPatch }),
-      });
-      // Non-null only where the split found a bridge to hand it to.
-      if (bridgeSecret) {
-        config = await window.ogb!.setCredential!("infisicalClientSecret", bridgeSecret);
+      // Credential writes trigger a server reload, so stage the requested
+      // destination with reads disabled before updating the encrypted store.
+      const split = splitInfisicalPatch(built.patch, Boolean(window.ogb?.setCredential));
+      if ("error" in split) {
+        setSaveError(split.error);
+        setSaveOk(false);
+        return false;
       }
+      const config = await saveInfisicalSettings<ConfigStatus>(
+        split,
+        (patch) => api("/api/config", {
+          method: "PATCH",
+          body: JSON.stringify({ infisical: patch }),
+        }),
+        async (name, value) => { await window.ogb!.setCredential!(name, value); },
+      );
       dispatch({ type: "configStatus", config });
       if (built.patch.clientId) setClientId("");
       if (built.patch.clientSecret) setClientSecret("");
+      if (built.patch.token) setToken("");
+      if (built.patch.writeToken) setWriteToken("");
       await refreshStatus();
       setSaveOk(true);
       return true;
@@ -168,7 +200,7 @@ export function SecretsSection() {
       const result = await api("/api/infisical/test", { method: "POST" });
       setTestResult({
         ok: Boolean(result.ok),
-        error: result.ok ? null : (result.error || "Infisical did not accept the identity."),
+        error: result.ok ? null : (result.error || "Infisical did not accept the selected authentication method."),
         secretCount: result.secretCount,
       });
       await refreshStatus();
@@ -185,6 +217,7 @@ export function SecretsSection() {
     try {
       const data: InfisicalStatusPayload = await api("/api/infisical/sync", { method: "POST" });
       setStatus(data);
+      if (typeof data.infisical.enabledSetting === "boolean") setEnabled(data.infisical.enabledSetting);
       setStatusFetchError(null);
       // The sync route deliberately does not broadcast a config frame (other
       // open windows pick up fresh counts on their next fetch), so this
@@ -200,10 +233,26 @@ export function SecretsSection() {
     }
   };
 
-  const canTest =
-    Boolean(projectId.trim() || vault?.projectId) &&
-    Boolean(clientId.trim() || vault?.hasClientId) &&
-    Boolean(clientSecret.trim() || vault?.hasClientSecret);
+  const testProjectId = projectId.trim() || vault?.projectId || "";
+  const testEnvironment = environment.trim() || vault?.environment || "prod";
+  const testPath = secretPath.trim() || vault?.secretPath || "/";
+  const hasScopedReadSource = readSources.some((source) =>
+    source.projectId.trim() === testProjectId &&
+    source.environment.trim() === testEnvironment &&
+    source.secretPath.trim().replace(/\/$/, "") === testPath.replace(/\/$/, "") &&
+    Boolean(source.readSource.trim()),
+  ) || Boolean(vault?.readSources?.some((source) =>
+    source.projectId === testProjectId && source.environment === testEnvironment &&
+    source.secretPath.replace(/\/$/, "") === testPath.replace(/\/$/, "") && source.hasReadToken,
+  ));
+  const canTest = Boolean(testProjectId) && (authMethod === "machine-identity"
+    ? Boolean((clientId.trim() || vault?.hasClientId) && (clientSecret.trim() || vault?.hasClientSecret))
+    : Boolean(token.trim() || vault?.hasToken || hasScopedReadSource));
+
+  const updateSource = (index: number, patch: Partial<InfisicalSourceDraft>) => {
+    setReadSources((current) => current.map((source, row) => row === index ? { ...source, ...patch } : source));
+    setSaveOk(false);
+  };
 
   const fields = status?.fields ?? [];
   const unusedNames = vault?.unusedVaultNames ?? [];
@@ -212,7 +261,7 @@ export function SecretsSection() {
     <div className="flex flex-col gap-4">
       <Card
         title="Secret Store"
-        subtitle={"Point BotFleet at an Infisical project and it becomes the source of truth for every credential it holds — before the environment, before the value saved on this computer.\u00A0 Leave this unset and nothing changes."}
+        subtitle={"Point BotFleet at an Infisical project and it becomes the source of truth for every credential it holds — before the environment, before the value saved on this computer.\u00A0 Leave Infisical off and nothing changes."}
       >
         <div className="flex flex-col gap-3 text-[13px]">
           <div className="flex items-center justify-between rounded-xl border border-hairline/30 bg-inset/40 px-3.5 py-2.5">
@@ -270,6 +319,47 @@ export function SecretsSection() {
           )}
 
           <div className="flex flex-col gap-3 rounded-xl border border-hairline/30 bg-inset/20 p-3">
+            <fieldset className="flex flex-col gap-2 border-b border-hairline/30 pb-3">
+              <legend className="pb-1 text-[12px] font-medium text-ink-secondary">Authentication Method</legend>
+              <label className="flex items-start gap-2 rounded-lg border border-hairline/30 bg-inset/40 px-3 py-2.5">
+                <input
+                  type="radio"
+                  name="infisical-auth-method"
+                  value="service-token"
+                  checked={authMethod === "service-token"}
+                  onChange={() => {
+                    setAuthMethod("service-token");
+                    setClientId("");
+                    setClientSecret("");
+                    setSaveOk(false);
+                  }}
+                  className="mt-0.5 accent-accent"
+                />
+                <span>
+                  <span className="block text-[13px] text-ink">Service Tokens</span>
+                  <span className="block text-[11.5px] leading-relaxed text-ink-secondary">Use read and write tokens scoped to the project and folder they need.</span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 rounded-lg border border-hairline/30 bg-inset/40 px-3 py-2.5">
+                <input
+                  type="radio"
+                  name="infisical-auth-method"
+                  value="machine-identity"
+                  checked={authMethod === "machine-identity"}
+                  onChange={() => {
+                    setAuthMethod("machine-identity");
+                    setToken("");
+                    setWriteToken("");
+                    setSaveOk(false);
+                  }}
+                  className="mt-0.5 accent-accent"
+                />
+                <span>
+                  <span className="block text-[13px] text-ink">Machine Identity</span>
+                  <span className="block text-[11.5px] leading-relaxed text-ink-secondary">Use this installation’s Universal Auth identity.{ '\u00A0'} BotFleet will not switch methods automatically.</span>
+                </span>
+              </label>
+            </fieldset>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="flex flex-col gap-1">
                 <label className="text-[12px] font-medium text-ink-secondary" htmlFor="infisical-site-url">
@@ -293,7 +383,6 @@ export function SecretsSection() {
                 <label className="text-[12px] font-medium text-ink-secondary" htmlFor="infisical-project-id">
                   Project ID
                 </label>
-                <p className="text-[11px] leading-snug text-ink-secondary">One Project for Now.</p>
                 <input
                   id="infisical-project-id"
                   type="text"
@@ -344,42 +433,85 @@ export function SecretsSection() {
                   className={secretsInputClass}
                 />
               </div>
-              <div className="flex flex-col gap-1">
-                <label className="text-[12px] font-medium text-ink-secondary" htmlFor="infisical-client-id">
-                  Client ID
-                </label>
-                <input
-                  id="infisical-client-id"
-                  type="text"
-                  value={clientId}
-                  onChange={(e) => {
-                    setClientId(e.target.value);
-                    setSaveOk(false);
-                  }}
-                  onKeyDown={(e) => e.key === "Enter" && void save()}
-                  placeholder={vault?.hasClientId ? "••••••••  (paste to replace)" : "Machine identity client id"}
-                  autoComplete="off"
-                  className={secretsInputClass}
-                />
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="text-[12px] font-medium text-ink-secondary" htmlFor="infisical-client-secret">
-                  Client Secret
-                </label>
-                <input
-                  id="infisical-client-secret"
-                  type="password"
-                  value={clientSecret}
-                  onChange={(e) => {
-                    setClientSecret(e.target.value);
-                    setSaveOk(false);
-                  }}
-                  onKeyDown={(e) => e.key === "Enter" && void save()}
-                  placeholder={vault?.hasClientSecret ? "••••••••  (paste to replace)" : "Machine identity client secret"}
-                  autoComplete="off"
-                  className={secretsInputClass}
-                />
-              </div>
+              {authMethod === "machine-identity" ? (
+                <>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[12px] font-medium text-ink-secondary" htmlFor="infisical-client-id">
+                      Client ID
+                    </label>
+                    <input
+                      id="infisical-client-id"
+                      type="text"
+                      value={clientId}
+                      onChange={(e) => {
+                        setClientId(e.target.value);
+                        setSaveOk(false);
+                      }}
+                      onKeyDown={(e) => e.key === "Enter" && void save()}
+                      placeholder={vault?.hasClientId ? "Saved (paste to replace)" : "Machine identity client ID"}
+                      autoComplete="off"
+                      className={secretsInputClass}
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[12px] font-medium text-ink-secondary" htmlFor="infisical-client-secret">
+                      Client Secret
+                    </label>
+                    <input
+                      id="infisical-client-secret"
+                      type="password"
+                      value={clientSecret}
+                      onChange={(e) => {
+                        setClientSecret(e.target.value);
+                        setSaveOk(false);
+                      }}
+                      onKeyDown={(e) => e.key === "Enter" && void save()}
+                      placeholder={vault?.hasClientSecret ? "Saved (paste to replace)" : "Machine identity client secret"}
+                      autoComplete="new-password"
+                      className={secretsInputClass}
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[12px] font-medium text-ink-secondary" htmlFor="infisical-read-token">
+                      Primary Read Token
+                    </label>
+                    <input
+                      id="infisical-read-token"
+                      type="password"
+                      value={token}
+                      onChange={(e) => {
+                        setToken(e.target.value);
+                        setSaveOk(false);
+                      }}
+                      onKeyDown={(e) => e.key === "Enter" && void save()}
+                      placeholder={vault?.hasToken ? "Saved (paste to replace)" : "Infisical read-only service token"}
+                      autoComplete="new-password"
+                      className={secretsInputClass}
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[12px] font-medium text-ink-secondary" htmlFor="infisical-write-token">
+                      Primary Write Token
+                    </label>
+                    <input
+                      id="infisical-write-token"
+                      type="password"
+                      value={writeToken}
+                      onChange={(e) => {
+                        setWriteToken(e.target.value);
+                        setSaveOk(false);
+                      }}
+                      onKeyDown={(e) => e.key === "Enter" && void save()}
+                      placeholder={vault?.hasWriteToken ? "Saved (paste to replace)" : "Infisical write token, if needed"}
+                      autoComplete="new-password"
+                      className={secretsInputClass}
+                    />
+                  </div>
+                </>
+              )}
               <div className="flex flex-col gap-1">
                 <label className="text-[12px] font-medium text-ink-secondary" htmlFor="infisical-refresh-minutes">
                   Refresh Minutes
@@ -401,6 +533,91 @@ export function SecretsSection() {
                 />
               </div>
             </div>
+
+            {authMethod === "service-token" && (
+              <section className="flex flex-col gap-3 rounded-lg border border-hairline/30 bg-inset/30 p-3" aria-labelledby="infisical-scoped-sources-heading">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h3 id="infisical-scoped-sources-heading" className="text-[12px] font-medium text-ink">Additional Project and Folder Tokens</h3>
+                    <p className="mt-0.5 text-[11px] leading-relaxed text-ink-secondary">Each row names an exact project, environment, and folder scope. Add read and write token locations separately; token values stay in environment variables or owner-only files.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReadSources((current) => [...current, { ...emptySource(), projectId: projectId.trim(), environment: environment.trim() || "prod" }]);
+                      setReadSourcesLoaded(true);
+                      setSaveOk(false);
+                    }}
+                    className="shrink-0 rounded-lg border border-hairline/40 bg-inset px-2.5 py-1.5 text-[12px] text-ink hover:bg-control"
+                  >
+                    Add Source
+                  </button>
+                </div>
+                {readSources.length === 0 && <p className="text-[11px] text-ink-secondary">No additional token sources.</p>}
+                {readSources.map((source, index) => {
+                  const sourceStatus = vault?.readSources?.find((entry) => entry.name === source.name);
+                  return (
+                    <div key={source.name || `source-${index}`} className="flex flex-col gap-3 rounded-lg border border-hairline/30 bg-inset/40 p-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-[12px] font-medium text-ink">Source {index + 1}</span>
+                        <div className="flex items-center gap-3">
+                          {sourceStatus && <span className={cn("text-[11px]", sourceStatus.error ? "text-danger" : "text-ink-secondary")} title={sourceStatus.error || undefined}>{sourceStatus.error || [sourceStatus.hasReadToken ? "Read configured" : "Read missing", sourceStatus.hasWriteToken ? "Write configured" : "Write missing"].join(" · ")}</span>}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReadSources((current) => current.filter((_, row) => row !== index));
+                              setSaveOk(false);
+                            }}
+                            className="rounded px-2 py-1 text-[11px] text-ink-secondary hover:bg-control hover:text-ink"
+                            aria-label={`Remove source ${index + 1}`}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        <label className="flex flex-col gap-1 text-[11px] font-medium text-ink-secondary">
+                          Source Name
+                          <input value={source.name} onChange={(e) => updateSource(index, { name: e.target.value })} placeholder="fleet-ops-cli-logins" autoComplete="off" className={secretsInputClass} />
+                        </label>
+                        <label className="flex flex-col gap-1 text-[11px] font-medium text-ink-secondary">
+                          Project ID
+                          <input value={source.projectId} onChange={(e) => updateSource(index, { projectId: e.target.value })} placeholder="Project ID" autoComplete="off" className={secretsInputClass} />
+                        </label>
+                        <label className="flex flex-col gap-1 text-[11px] font-medium text-ink-secondary">
+                          Environment
+                          <input value={source.environment} onChange={(e) => updateSource(index, { environment: e.target.value })} placeholder="prod" autoComplete="off" className={secretsInputClass} />
+                        </label>
+                        <label className="flex flex-col gap-1 text-[11px] font-medium text-ink-secondary">
+                          Folder
+                          <input value={source.secretPath} onChange={(e) => updateSource(index, { secretPath: e.target.value })} placeholder="/folder" autoComplete="off" className={secretsInputClass} />
+                        </label>
+                        <label className="flex flex-col gap-1 text-[11px] font-medium text-ink-secondary">
+                          Read Token Source
+                          <div className="flex gap-2">
+                            <select aria-label={`Read token source type ${index + 1}`} value={source.readSourceType} onChange={(e) => updateSource(index, { readSourceType: e.target.value as "env" | "file" })} className={cn(secretsInputClass, "w-[132px] shrink-0")}>
+                              <option value="env">Environment</option>
+                              <option value="file">File Path</option>
+                            </select>
+                            <input aria-label={`Read token source locator ${index + 1}`} value={source.readSource} onChange={(e) => updateSource(index, { readSource: e.target.value })} placeholder={source.readSourceType === "env" ? "INFISICAL_READ_TOKEN" : "/absolute/path/read-token"} autoComplete="off" className={cn(secretsInputClass, "min-w-0 flex-1")} />
+                          </div>
+                        </label>
+                        <label className="flex flex-col gap-1 text-[11px] font-medium text-ink-secondary">
+                          Write Token Source
+                          <div className="flex gap-2">
+                            <select aria-label={`Write token source type ${index + 1}`} value={source.writeSourceType} onChange={(e) => updateSource(index, { writeSourceType: e.target.value as "env" | "file" })} className={cn(secretsInputClass, "w-[132px] shrink-0")}>
+                              <option value="env">Environment</option>
+                              <option value="file">File Path</option>
+                            </select>
+                            <input aria-label={`Write token source locator ${index + 1}`} value={source.writeSource} onChange={(e) => updateSource(index, { writeSource: e.target.value })} placeholder={source.writeSourceType === "env" ? "INFISICAL_WRITE_TOKEN" : "/absolute/path/write-token"} autoComplete="off" className={cn(secretsInputClass, "min-w-0 flex-1")} />
+                          </div>
+                        </label>
+                      </div>
+                    </div>
+                  );
+                })}
+              </section>
+            )}
 
             <div className="flex items-center justify-between gap-4 border-t border-hairline/30 pt-3">
               <div className="min-w-0">
@@ -486,12 +703,12 @@ export function SecretsSection() {
                     className="max-w-[320px] truncate"
                     title={
                       testResult.ok
-                        ? `Infisical accepted the identity (${testResult.secretCount ?? 0} secrets)`
+                        ? `Infisical accepted the selected authentication method (${testResult.secretCount ?? 0} secrets)`
                         : testResult.error || "Not reachable"
                     }
                   >
                     {testResult.ok
-                      ? `Infisical accepted the identity (${testResult.secretCount ?? 0} secrets)`
+                      ? `Infisical accepted the selected authentication method (${testResult.secretCount ?? 0} secrets)`
                       : testResult.error || "Not reachable"}
                   </span>
                 </span>
@@ -503,7 +720,7 @@ export function SecretsSection() {
               </div>
             )}
             <div className="text-[12px] leading-relaxed text-ink-secondary">
-              Infisical is optional.{'\u00A0'} With no project id and machine identity, BotFleet uses the values on this computer and nothing changes.{'\u00A0'} When Infisical holds a name, it wins over the environment and over this computer, and the badge beside each value says so.{'\u00A0'} Write Through lets Settings save back into Infisical; with it off, a value Infisical manages can only be changed there.{'\u00A0'} Values are never logged or shown here — names and counts only.
+              Infisical is optional.{'\u00A0'} Select Service Tokens or Machine Identity explicitly; BotFleet never picks a machine identity from an inherited environment.{'\u00A0'} Leave Infisical off to use the environment and this computer.{'\u00A0'} When Infisical holds a name, it wins over the environment and this computer.{'\u00A0'} Write Through lets Settings save managed values back into Infisical; keep it off unless a scoped write token is configured.{'\u00A0'} Token values are never returned by status or displayed after save.
             </div>
           </div>
         </div>

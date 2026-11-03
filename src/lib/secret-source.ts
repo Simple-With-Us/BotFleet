@@ -86,20 +86,15 @@ export function infisicalStatusLabel(
   return { label: "Connected", tone: "active" };
 }
 
-/** Where the Use Infisical switch starts, given `GET /api/config`'s block.
+/** Where the Use Infisical switch starts, given the config/status blocks.
  *
- * The wire's `infisical.enabled` is the server's `configured && enabled`, so
- * an install with no identity saved yet reports `false` — the absence of a
- * store, not an operator's decision.  Seeding the switch straight from it
- * renders the kill switch OFF on a fresh install, and because the patch
- * builder always sends `enabled`, the operator's very first Save persists a
- * hard `enabled: false`: the store authenticates, Test Connection passes, and
- * nothing is ever applied.  The documented default is on once configured
- * (`infisicalEnabled` in server/config.ts), so that is what an install with
- * nothing configured shows. */
+ * Prefer the persisted operator toggle, which remains meaningful before
+ * credentials exist.  Older servers expose only effective `enabled`, so
+ * retain the previous compatibility fallback for those responses. */
 export function infisicalSwitchDefault(
-  config: { configured?: boolean; enabled?: boolean } | null | undefined,
+  config: { configured?: boolean; enabled?: boolean; enabledSetting?: boolean } | null | undefined,
 ): boolean {
+  if (typeof config?.enabledSetting === "boolean") return config.enabledSetting;
   if (!config?.configured) return true;
   return config.enabled !== false;
 }
@@ -123,36 +118,74 @@ function isAbsoluteHttpsUrl(value: string): boolean {
  * fetched status, so resending them is just an echo unless the operator
  * deliberately blanked one.
  *
- * `clientId` and `clientSecret` are different: `GET /api/infisical/status`
- * never echoes either value back (only `hasClientId` / `hasClientSecret`),
- * so an untouched, blank field carries no signal that it should be cleared —
- * sending `""` would silently wipe a saved identity the moment the operator
- * changed an unrelated field like Refresh Minutes.  Both are therefore
- * omitted rather than sent empty, the same rule `usage-config.ts` applies to
- * its tokens: a blank field means "leave it alone", and there is
- * deliberately no way to clear either one from this card short of turning
- * Use Infisical off. */
+ * Credential fields are different: `GET /api/infisical/status` reports only
+ * configured flags, so a blank input means "leave the saved credential
+ * alone" and is omitted from the patch. */
 export type InfisicalConfigPatch = {
   enabled: boolean;
   writeThrough: boolean;
+  authMethod: "service-token" | "machine-identity";
   siteUrl: string;
   projectId: string;
   environment: string;
   secretPath: string;
   clientId?: string;
   clientSecret?: string;
+  token?: string;
+  writeToken?: string;
+  readSources?: InfisicalReadSourcePatch[];
   refreshMinutes: number;
 };
+
+export type InfisicalReadSourcePatch = {
+  name: string;
+  projectId: string;
+  environment?: string;
+  secretPath?: string;
+  tokenFile?: string;
+  tokenEnv?: string;
+  writeTokenFile?: string;
+  writeTokenEnv?: string;
+};
+
+export type InfisicalSourceDraft = {
+  name: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+  readSourceType: "file" | "env";
+  readSource: string;
+  writeSourceType: "file" | "env";
+  writeSource: string;
+};
+
+/** Keep the server's file-before-environment credential precedence on save. */
+export function sourceDraftsFromStatus(sources: readonly InfisicalReadSourcePatch[]): InfisicalSourceDraft[] {
+  return sources.map((source) => ({
+    name: source.name,
+    projectId: source.projectId,
+    environment: source.environment ?? "prod",
+    secretPath: source.secretPath ?? "/",
+    readSourceType: source.tokenFile ? "file" : "env",
+    readSource: source.tokenFile || source.tokenEnv || "",
+    writeSourceType: source.writeTokenFile ? "file" : "env",
+    writeSource: source.writeTokenFile || source.writeTokenEnv || "",
+  }));
+}
 
 export function buildInfisicalConfigPatch(input: {
   enabled: boolean;
   writeThrough: boolean;
+  authMethod: "service-token" | "machine-identity";
   siteUrl: string;
   projectId: string;
   environment: string;
   secretPath: string;
   clientId: string;
   clientSecret: string;
+  token: string;
+  writeToken: string;
+  readSources?: InfisicalSourceDraft[];
   refreshMinutes: number;
 }): { ok: true; patch: InfisicalConfigPatch } | { ok: false; error: string } {
   const siteUrl = input.siteUrl.trim();
@@ -175,55 +208,119 @@ export function buildInfisicalConfigPatch(input: {
     return { ok: false, error: "Refresh Minutes must be between 5 and 1440." };
   }
 
+  const sources: InfisicalReadSourcePatch[] = [];
+  const sourceNames = new Set<string>();
+  const sourceScopes = new Set<string>();
+  for (const [index, draft] of (input.readSources ?? []).entries()) {
+    const name = draft.name.trim();
+    const sourceProjectId = draft.projectId.trim();
+    const sourceEnvironment = draft.environment.trim();
+    const sourcePath = draft.secretPath.trim();
+    const readSource = draft.readSource.trim();
+    const writeSource = draft.writeSource.trim();
+    if (![name, sourceProjectId, sourceEnvironment, sourcePath, readSource, writeSource].some(Boolean)) continue;
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) {
+      return { ok: false, error: `Source ${index + 1}: Name must use lowercase letters, numbers, or dashes.` };
+    }
+    if (sourceNames.has(name)) return { ok: false, error: `Source ${index + 1}: Names must be unique.` };
+    sourceNames.add(name);
+    if (!sourceProjectId || !INFISICAL_PROJECT_ID_PATTERN.test(sourceProjectId)) {
+      return { ok: false, error: `Source ${index + 1}: Project ID must be 1 to 64 letters, numbers, or dashes.` };
+    }
+    if (!sourceEnvironment || !INFISICAL_ENVIRONMENT_PATTERN.test(sourceEnvironment)) {
+      return { ok: false, error: `Source ${index + 1}: Environment must be 1 to 64 lowercase letters, numbers, or dashes.` };
+    }
+    if (!sourcePath || !/^\/[A-Za-z0-9/_-]*$/.test(sourcePath) || sourcePath.length > 200) {
+      return { ok: false, error: `Source ${index + 1}: Folder must be / or an absolute Infisical folder path.` };
+    }
+    const scope = `${sourceProjectId}\u0000${sourceEnvironment}\u0000${sourcePath.replace(/\/$/, "") || "/"}`;
+    if (sourceScopes.has(scope)) return { ok: false, error: `Source ${index + 1}: Project, environment, and folder must be unique.` };
+    sourceScopes.add(scope);
+    if (!readSource && !writeSource) {
+      return { ok: false, error: `Source ${index + 1}: Add a read token source, a write token source, or both.` };
+    }
+    const source: InfisicalReadSourcePatch = { name, projectId: sourceProjectId, environment: sourceEnvironment, secretPath: sourcePath };
+    if (readSource) {
+      if (draft.readSourceType === "env") {
+        if (!/^[A-Z][A-Z0-9_]*$/.test(readSource)) return { ok: false, error: `Source ${index + 1}: Read token environment name is invalid.` };
+        source.tokenEnv = readSource;
+      } else {
+        if (!readSource.startsWith("/")) return { ok: false, error: `Source ${index + 1}: Read token file must be an absolute path.` };
+        source.tokenFile = readSource;
+      }
+    }
+    if (writeSource) {
+      if (draft.writeSourceType === "env") {
+        if (!/^[A-Z][A-Z0-9_]*$/.test(writeSource)) return { ok: false, error: `Source ${index + 1}: Write token environment name is invalid.` };
+        source.writeTokenEnv = writeSource;
+      } else {
+        if (!writeSource.startsWith("/")) return { ok: false, error: `Source ${index + 1}: Write token file must be an absolute path.` };
+        source.writeTokenFile = writeSource;
+      }
+    }
+    sources.push(source);
+  }
+
   const patch: InfisicalConfigPatch = {
     enabled: input.enabled,
     writeThrough: input.writeThrough,
+    authMethod: input.authMethod,
     siteUrl,
     projectId,
     environment,
     secretPath,
     refreshMinutes: Math.trunc(input.refreshMinutes),
   };
+  if (input.readSources !== undefined) patch.readSources = sources;
   const clientId = input.clientId.trim();
   if (clientId) patch.clientId = clientId;
   const clientSecret = input.clientSecret.trim();
   if (clientSecret) patch.clientSecret = clientSecret;
+  const token = input.token.trim();
+  if (token) patch.token = token;
+  const writeToken = input.writeToken.trim();
+  if (writeToken) patch.writeToken = writeToken;
   return { ok: true, patch };
 }
 
 export interface InfisicalPatchSplit {
-  /** Everything that travels in the `PATCH /api/config` body.  Carries the
-   * client secret only when there is no desktop bridge to carry it instead. */
-  configPatch: InfisicalConfigPatch;
-  /** The client secret to hand to `window.ogb.setCredential`, or `null` when
-   * this save has no secret in it or there is no bridge. */
-  bridgeSecret: string | null;
+  /** Noncredential settings and source locators for the config patch. */
+  configPatch: Omit<InfisicalConfigPatch, "clientSecret" | "token" | "writeToken">;
+  /** New credentials handed to Electron's encrypted credential route. */
+  bridgeCredentials: Array<{ name: "infisicalClientSecret" | "infisicalReadToken" | "infisicalWriteToken"; value: string }>;
 }
 
-/** Split a built patch into the part that goes over plain HTTP and the part
- * that goes through Electron's OS-encrypted credential store.
- *
- * Every other credential card in this app already does this — `ApiKeys.tsx`
- * and `BotProfileAvatarCard.tsx` call `window.ogb.setCredential` when the
- * bridge exists and fall back to `/api/config` only outside the desktop
- * shell.  The Secret Store card sending its client secret straight to
- * `/api/config` was the odd one out, and the request carries no
- * `?secretStorage=external`, so the server's normal branch writes
- * `infisical.clientSecret` into plaintext `~/.botfleet/config.json` and only
- * migrates it into `credentials.bin` on some later launch.  The machine
- * identity is the one credential that can read every name in the project, so
- * it is the last one that should be sitting in a plaintext file.
- *
- * The non-secret half still goes over PATCH: site URL, project id,
- * environment, secret path, client id, the two switches and the cadence are
- * plain settings, and `credential:set` only knows how to carry one field.
- * Order matters at the call site — the PATCH lands first so the bridge's own
- * save, which is what triggers the server's re-login, runs with the new
- * project and environment already in place. */
-export function splitInfisicalPatch(patch: InfisicalConfigPatch, hasBridge: boolean): InfisicalPatchSplit {
-  if (!hasBridge || !patch.clientSecret) {
-    return { configPatch: patch, bridgeSecret: null };
+/** Disable reads at the requested destination before a new credential can
+ * trigger a reload, then enable only after every encrypted write succeeds. */
+export async function saveInfisicalSettings<T>(
+  split: InfisicalPatchSplit,
+  saveConfig: (patch: InfisicalPatchSplit["configPatch"]) => Promise<T>,
+  saveCredential: (name: InfisicalPatchSplit["bridgeCredentials"][number]["name"], value: string) => Promise<void>,
+): Promise<T> {
+  if (split.bridgeCredentials.length) {
+    await saveConfig({ ...split.configPatch, enabled: false });
+    try {
+      for (const credential of split.bridgeCredentials) {
+        await saveCredential(credential.name, credential.value);
+      }
+    } catch {
+      throw new Error("The protected credential could not be saved.\u00a0 Infisical was left disabled; retry the save.");
+    }
   }
-  const { clientSecret, ...rest } = patch;
-  return { configPatch: rest, bridgeSecret: clientSecret };
+  return saveConfig(split.configPatch);
+}
+
+/** Split settings and locator metadata from credentials that Electron stores
+ * encrypted.  Without the bridge, a new credential is refused rather than
+ * sent in a plain config request. */
+export function splitInfisicalPatch(patch: InfisicalConfigPatch, hasBridge: boolean): InfisicalPatchSplit | { error: string } {
+  const { clientSecret, token, writeToken, ...configPatch } = patch;
+  const bridgeCredentials: InfisicalPatchSplit["bridgeCredentials"] = [];
+  if (clientSecret) bridgeCredentials.push({ name: "infisicalClientSecret", value: clientSecret });
+  if (token) bridgeCredentials.push({ name: "infisicalReadToken", value: token });
+  if (writeToken) bridgeCredentials.push({ name: "infisicalWriteToken", value: writeToken });
+  if (!hasBridge && bridgeCredentials.length) {
+    return { error: "Save Infisical credentials from the BotFleet desktop app so they stay in its encrypted credential store." };
+  }
+  return { configPatch, bridgeCredentials };
 }

@@ -15,7 +15,7 @@ import { constants } from "node:fs";
 import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 
-import { normalizeInfisicalSecretPath, type InfisicalSettings, type ResolvedInfisicalReadSource } from "./config.ts";
+import { normalizeInfisicalSecretPath, type InfisicalAuthMethod, type InfisicalSettings, type ResolvedInfisicalReadSource } from "./config.ts";
 import { dataDir } from "./data-dir.ts";
 import { InfisicalError, login, listSecrets, upsertSecret } from "./infisical-client.ts";
 import { redactSecretsInText } from "./redact.ts";
@@ -24,12 +24,7 @@ import { KNOB_FIELDS, KNOB_INFISICAL_NAMES, knobSource } from "./knob-map.ts";
 
 export type RefreshReason = "boot" | "timer" | "settings" | "manual";
 
-/** The projects a mapped field may name.
- *
- * `botfleet` is this app's own project.  `fleet-ops` is the fleet's, where
- * the seats' CLI logins live.  Both are read with the SAME machine identity
- * — the server holds one identity and one Infisical site, and the project
- * is what a read is addressed to, not a second credential. */
+/** Named destinations still require credentials dedicated to the requested scope. */
 export type VaultProject = "botfleet" | "fleet-ops";
 
 /** The only environment the fleet's project has.  The fleet refuses a
@@ -43,11 +38,8 @@ export const FLEET_OPS_ENVIRONMENT = "prod";
  * repository — so it comes from the environment, in the variable the
  * fleet's own tools read (`INFISICAL_FLEET_OPS_PROJECT_ID`).
  *
- * A project id is a locator, not a credential:  the credential that reads
- * the folder is the machine identity this manager already holds.  Nothing
- * else is read for it:  the product server does not reach into the fleet's
- * own handoff files for a setting, so a host that has no environment
- * variable has no fleet project to address and is told so. */
+ * A project id is only a locator; it never authorizes using another
+ * project's credential to access the fleet project. */
 export function fleetOpsProjectId(): string {
   return (process.env.INFISICAL_FLEET_OPS_PROJECT_ID ?? "").trim();
 }
@@ -56,8 +48,10 @@ export function fleetOpsProjectId(): string {
  * never ride here — only the site URL, the project id, the environment, the
  * path, names, field ids and counts. */
 export interface InfisicalStatusView {
+  authMethod: InfisicalAuthMethod;
   configured: boolean;
   enabled: boolean;
+  enabledSetting: boolean;
   writeThrough: boolean;
   /** Where the machine identity itself came from.  Env always outranks the
    * config file for these two names, matching `loadConfig()`'s own overlay. */
@@ -70,10 +64,7 @@ export interface InfisicalStatusView {
   hasClientSecret: boolean;
   hasToken: boolean;
   hasWriteToken: boolean;
-  /** The server refused the configured read service token and the manager
-   * fell back to the machine identity.  The token is still configured and
-   * still in Settings:  it is the server's refusal of it that is reported
-   * here, so a dead token cannot hide behind a working sync. */
+  /** The selected read credential was refused; no broader credential is tried. */
   readTokenRefused: boolean;
   /** The same for the write token. */
   writeTokenRefused: boolean;
@@ -95,7 +86,7 @@ export interface InfisicalStatusView {
   knobCount: number;
   appliedKnobs: string[];
   unusedVaultNames: string[];
-  readSources: Array<{ name: string; projectId: string; environment: string; secretPath: string; ok: boolean; error: string | null }>;
+  readSources: Array<{ name: string; projectId: string; environment: string; secretPath: string; hasReadToken: boolean; hasWriteToken: boolean; tokenFile: string; tokenEnv: string; writeTokenFile: string; writeTokenEnv: string; ok: boolean; error: string | null }>;
 }
 
 /** Every Infisical name this process will ever apply, built once from the
@@ -123,6 +114,7 @@ function callTimeoutMs(): number {
  * Used whenever `configure()` has not been called yet, or its getter throws —
  * a status view must never crash the route that asks for one. */
 const UNSET_SETTINGS: InfisicalSettings = {
+  authMethod: "service-token",
   enabled: false,
   writeThrough: false,
   siteUrl: "",
@@ -142,17 +134,12 @@ function bootCapMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_BOOT_CAP_MS;
 }
 
-/** A project id and an identity are required: a project with no identity
- * cannot be read, and an identity with no project has nothing to read.  The
- * identity is a service token when one is configured and the machine identity
- * otherwise.  Mirrors `config.ts`'s `infisicalConfigured`, restated over a
- * resolved `InfisicalSettings` rather than a raw `AppConfig` so this module
- * never needs to import the config shape as a value. */
+/** Only the explicitly selected auth method can configure the primary vault. */
 function isConfigured(settings: InfisicalSettings): boolean {
-  return Boolean(
-    settings.projectId.trim() &&
-      (settings.token.trim() || (settings.clientId.trim() && settings.clientSecret.trim())),
-  );
+  if (!settings.projectId.trim()) return false;
+  if (settings.authMethod === "machine-identity") return hasMachineIdentity(settings);
+  const source = settings.readSources.find((entry) => scopeSignature(entry.projectId, entry.environment, normalizeInfisicalSecretPath(entry.secretPath)) === vaultScope(settings));
+  return source ? Boolean(source.tokenFile || source.tokenEnv) : Boolean(settings.token.trim());
 }
 
 /** The HTTP statuses that mean the BEARER itself was refused.  401 is a
@@ -192,7 +179,7 @@ function scopeSignature(projectId: string, environment: string, secretPath: stri
  * path.  A refresh reads exactly this, so a refusal has to match it to
  * count against the configured token. */
 function vaultScope(settings: InfisicalSettings): string {
-  return scopeSignature(settings.projectId, settings.environment, settings.secretPath);
+  return scopeSignature(settings.projectId, settings.environment, normalizeInfisicalSecretPath(settings.secretPath));
 }
 
 /** The scope a refusal is remembered under when the CREDENTIAL itself was
@@ -209,7 +196,7 @@ function refusalScope(status: number, scope: string): string {
   return status === 401 ? CREDENTIAL_REFUSAL_SCOPE : scope;
 }
 
-/** Whether this install has a machine identity to fall back to. */
+/** Whether the explicitly selected machine identity has both bootstrap values. */
 function hasMachineIdentity(settings: InfisicalSettings): boolean {
   return Boolean(settings.clientId.trim() && settings.clientSecret.trim());
 }
@@ -235,10 +222,12 @@ function afterDelay(ms: number): Promise<typeof BOOT_CAP_REACHED> {
  * `infisicalSettings()`, its own env-over-file overlay has already picked a
  * winner, so this reproduces that same alias order to report which one it
  * was, rather than guessing from the resolved value. */
-function identitySource(configured: boolean): "env" | "config" | "none" {
+function identitySource(configured: boolean, settings: InfisicalSettings): "env" | "config" | "none" {
   if (!configured) return "none";
-  const envToken = (process.env.INFISICAL_TOKEN || "").trim();
-  if (envToken) return "env";
+  if (settings.authMethod !== "machine-identity") {
+    const source = settings.readSources.find((entry) => scopeSignature(entry.projectId, entry.environment, normalizeInfisicalSecretPath(entry.secretPath)) === vaultScope(settings));
+    return source ? (source.tokenEnv ? "env" : "config") : ((process.env.INFISICAL_TOKEN ?? "").trim() ? "env" : "config");
+  }
   const envClientId = (process.env.INFISICAL_CLIENT_ID || process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || "").trim();
   const envClientSecret = (
     process.env.INFISICAL_CLIENT_SECRET || process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || ""
@@ -266,6 +255,7 @@ class InfisicalManager {
   private lastSyncAt: string | null = null;
   private lastAttemptAt: string | null = null;
   private lastSyncMs: number | null = null;
+  private snapshotScope: string | null = null;
   private lastError: string | null = null;
   private stale = false;
   private pendingProviderReload = false;
@@ -302,6 +292,7 @@ class InfisicalManager {
     // question over — mainly so repeated test setup does not inherit a
     // signature from a previous manager configuration.
     this.lastLoggedBootLineSignature = null;
+    this.snapshotScope = null;
     // The same goes for the refused-token memory:  a new settings source is
     // a new credential, and it must be tried on its own merits rather than
     // inherit the previous source's rejection.
@@ -403,13 +394,11 @@ class InfisicalManager {
     return { error: "no tokenFile or tokenEnv configured" };
   }
 
-  /** Whether `requestedPath` is the source's own `secretPath` or under
-   * it.  Root "/" covers everything.  Both sides are normalized first,
-   * so a trailing slash never changes the answer. */
+  /** A folder grant is exact, including root; trailing slashes are normalized. */
   private sourceCovers(source: ResolvedInfisicalReadSource, requestedPath: string): boolean {
     const stored = normalizeInfisicalSecretPath(source.secretPath);
     const requested = normalizeInfisicalSecretPath(requestedPath);
-    return stored === "/" || requested === stored || requested.startsWith(`${stored}/`);
+    return requested === stored;
   }
 
   private findReadSource(settings: InfisicalSettings, projectId: string, environment: string, secretPath: string): ResolvedInfisicalReadSource | undefined {
@@ -420,13 +409,14 @@ class InfisicalManager {
   }
 
   private async readWithSource(settings: InfisicalSettings, source: ResolvedInfisicalReadSource, secretPath: string, projectId: string, environment: string): Promise<ReadonlyMap<string, string>> {
+    if (settings.configurationError) throw new InfisicalError(settings.configurationError, 409);
     const resolved = await this.resolveSourceToken(source);
     if ("error" in resolved) {
       this.warnReadSource(source, resolved.error);
       throw this.readSourceFailure(source, resolved.error, 409);
     }
     const scope = scopeSignature(projectId, environment, secretPath);
-    const mode = `source:${source.name}`;
+    const mode = `source:${source.name}:read`;
     if (this.isRefused(mode, resolved.token, scope)) {
       this.warnReadSource(source, "token was refused by the server");
       throw this.readSourceFailure(source, "token was refused by the server", 401);
@@ -495,6 +485,7 @@ class InfisicalManager {
    * credential itself (a 401) counts everywhere, because the bearer is
    * refused however it is used. */
   private refusedNow(settings: InfisicalSettings, mode: "read" | "write"): boolean {
+    if (settings.authMethod === "machine-identity") return false;
     const configured = (mode === "write" ? settings.writeToken : settings.token).trim();
     if (!configured) return false;
     return this.isRefused(mode, configured, vaultScope(settings));
@@ -538,10 +529,7 @@ class InfisicalManager {
     remembered.shift();
   }
 
-  /** The machine-identity session token for one call.  The universal-auth
-   * login is the fallback for an install whose configured service token the
-   * server refuses, and the only credential for an install that has not
-   * migrated its tokens at all. */
+  /** Authenticate only when the operator explicitly selected machine identity. */
   private async machineIdentityToken(settings: InfisicalSettings): Promise<string> {
     return login({
       siteUrl: settings.siteUrl,
@@ -551,56 +539,55 @@ class InfisicalManager {
     });
   }
 
-  /** Run one vault call with the configured service token, falling back to
-   * the machine identity when the server refuses that token outright.
-   *
-   * The fallback fires on a DEFINITIVE refusal only.  A 401, a 403 and a 404
-   * are definitive;  everything else -- a 429, any 5xx, a timeout, a dropped
-   * connection -- is transient and leaves the token exactly where it was:
-   * it is not refused, it is not reachable right now, and falling back there
-   * would trade one credential for another over a network blip.  The token
-   * stays configured and the next refresh tries it again.
-   *
-   * A refused token is remembered BY VALUE, so a rotated token -- the same
-   * setting carrying a new value -- is tried again rather than inheriting
-   * the old token's rejection.
-   *
-   * A refusal is remembered against the SCOPE it was made under.  A 401 is
-   * a refusal of the credential itself and counts everywhere that token
-   * goes;  a 403 or a 404 is a refusal of one request and counts only
-   * there, so a missing folder cannot deprioritize a good token for the
-   * whole vault.
-   *
-   * With no machine identity to fall back to, the refusal itself is what the
-   * caller sees.  The token is not removed, the vault is not disabled, and
-   * the previous snapshot stays exactly as it was. */
-  private async withServiceTokenFallback<T>(
+  /** Select exactly one credential for the requested scope and operation.
+   * Missing or refused service tokens never activate a machine identity. */
+  private async withCredential<T>(
     settings: InfisicalSettings,
     mode: "read" | "write",
     call: (token: string) => Promise<T>,
     scope: string = vaultScope(settings),
   ): Promise<T> {
-    const configured = (mode === "write" ? settings.writeToken : settings.token).trim();
-    const refused = Boolean(configured) && this.isRefused(mode, configured, scope);
-    if (!configured || refused) {
+    if (settings.configurationError) throw new InfisicalError(settings.configurationError, 409);
+    if (settings.authMethod === "machine-identity" && scope === vaultScope(settings)) {
       if (!hasMachineIdentity(settings)) {
-        throw new InfisicalError(
-          refused
-            ? `The configured Infisical ${mode} service token was refused by the server, and this install has no machine identity to fall back to.`
-            : "No Infisical credential is available:  there is no configured service token and no machine identity.",
-          401,
-        );
+        throw new InfisicalError("The selected Infisical machine identity is not configured.", 409);
       }
       return call(await this.machineIdentityToken(settings));
     }
+    const source = (settings.readSources ?? []).find((entry) =>
+      scopeSignature(entry.projectId, entry.environment, normalizeInfisicalSecretPath(entry.secretPath)) === scope);
+    let configured: string;
+    const refusalMode = source ? `source:${source.name}:${mode}` : mode;
+    if (source) {
+      const locator = mode === "write" ? { ...source, tokenFile: source.writeTokenFile ?? "", tokenEnv: source.writeTokenEnv ?? "" } : source;
+      const resolved = await this.resolveSourceToken(locator);
+      if ("error" in resolved) {
+        this.warnReadSource(source, resolved.error);
+        throw this.readSourceFailure(source, `${mode}: ${resolved.error}`, 409);
+      }
+      configured = resolved.token;
+    } else {
+      if (scope !== vaultScope(settings) || settings.authMethod === "machine-identity") {
+        throw new InfisicalError("No dedicated Infisical credential is configured for this exact project, environment and folder.", 403);
+      }
+      configured = (mode === "write" ? settings.writeToken : settings.token).trim();
+    }
+    if (!configured) throw new InfisicalError(`No Infisical ${mode} service token is configured for this exact scope.`, 409);
+    if (this.isRefused(refusalMode, configured, scope)) {
+      throw new InfisicalError(`The configured Infisical ${mode} service token was refused by the server; replace it or retry after correcting its scope.`, 401);
+    }
     try {
-      return await call(configured);
+      const result = await call(configured);
+      if (source) this.readSourceStatus.set(source.name, { ok: true, error: null });
+      return result;
     } catch (err) {
       const status = rejectionStatus(err);
-      if (status === undefined || !isDefinitiveRejection(status)) throw err;
-      this.rememberRefusal(mode, configured, refusalScope(status, scope));
-      if (!hasMachineIdentity(settings)) throw err;
-      return call(await this.machineIdentityToken(settings));
+      if (status !== undefined && isDefinitiveRejection(status)) this.rememberRefusal(refusalMode, configured, refusalScope(status, scope));
+      if (source) this.warnReadSource(source, `Infisical ${mode} failed (${status ?? 502})`);
+      if (err instanceof Error && err.message.includes(configured)) {
+        throw new InfisicalError(err.message.split(configured).join("[redacted]"), status ?? 502, err instanceof InfisicalError && err.writeLanded);
+      }
+      throw err;
     }
   }
 
@@ -625,6 +612,13 @@ class InfisicalManager {
     const settings = this.settings();
     this.lastAttemptAt = new Date().toISOString();
     const configured = isConfigured(settings);
+
+    if (settings.enabled && settings.configurationError) {
+      setInfisicalSnapshot(null, []);
+      this.lastError = settings.configurationError;
+      this.stale = true;
+      return this.getStatus();
+    }
 
     if (!configured || settings.enabled !== true) {
       setInfisicalSnapshot(null, []);
@@ -685,9 +679,15 @@ class InfisicalManager {
    * records a redacted reason and marks the result stale. */
   private async runRefresh(reason: RefreshReason): Promise<InfisicalStatusView> {
     const settings = this.settings();
+    const snapshotScope = `${settings.siteUrl}\u0000${vaultScope(settings)}`;
+    if (this.snapshotScope !== null && this.snapshotScope !== snapshotScope) {
+      setInfisicalSnapshot(null, []);
+      this.lastSyncAt = null;
+      this.snapshotScope = null;
+    }
     const start = Date.now();
     try {
-      const { names, values } = await this.withServiceTokenFallback(settings, "read", (token) =>
+      const { names, values } = await this.withCredential(settings, "read", (token) =>
         listSecrets({
           siteUrl: settings.siteUrl,
           token,
@@ -698,7 +698,23 @@ class InfisicalManager {
           timeoutMs: callTimeoutMs(),
         }),
       );
+      const current = this.settings();
+      if (!current.enabled || !isConfigured(current)) {
+        setInfisicalSnapshot(null, []);
+        this.snapshotScope = null;
+        this.lastSyncAt = null;
+        this.lastError = null;
+        this.stale = false;
+        return this.getStatus();
+      }
+      if (`${current.siteUrl}\u0000${vaultScope(current)}` !== snapshotScope) {
+        setInfisicalSnapshot(null, []);
+        this.snapshotScope = null;
+        this.lastSyncAt = null;
+        throw new InfisicalError("Infisical connection changed during refresh; the previous scope's response was discarded.", 409);
+      }
       setInfisicalSnapshot(values, names);
+      this.snapshotScope = snapshotScope;
       this.lastSyncAt = new Date().toISOString();
       this.lastSyncMs = Date.now() - start;
       this.lastError = null;
@@ -776,12 +792,14 @@ class InfisicalManager {
     const unusedVaultNames = names.filter((name) => !MAPPED_INFISICAL_NAMES.has(name));
 
     return {
+      authMethod: settings.authMethod ?? "service-token",
       configured,
       enabled: configured && settings.enabled === true,
+      enabledSetting: settings.enabled === true,
       writeThrough: settings.writeThrough === true,
-      source: identitySource(configured),
-      siteUrl: configured ? settings.siteUrl : null,
-      projectId: configured ? settings.projectId : null,
+      source: identitySource(configured, settings),
+      siteUrl: settings.siteUrl,
+      projectId: settings.projectId,
       environment: settings.environment || "prod",
       secretPath: settings.secretPath || "/",
       hasClientId: Boolean(settings.clientId.trim()),
@@ -809,6 +827,12 @@ class InfisicalManager {
         projectId: src.projectId,
         environment: src.environment,
         secretPath: src.secretPath,
+        hasReadToken: Boolean(src.tokenFile || src.tokenEnv),
+        hasWriteToken: Boolean(src.writeTokenFile || src.writeTokenEnv),
+        tokenFile: src.tokenFile,
+        tokenEnv: src.tokenEnv,
+        writeTokenFile: src.writeTokenFile ?? "",
+        writeTokenEnv: src.writeTokenEnv ?? "",
         ok: this.readSourceStatus.get(src.name)?.ok ?? false,
         error: this.readSourceStatus.get(src.name)?.error ?? null,
       })),
@@ -819,17 +843,16 @@ class InfisicalManager {
    * identity works must not change what any bot resolves to mid-session. */
   async probe(): Promise<{ ok: boolean; error: string | null; secretCount: number; names: string[] }> {
     const settings = this.settings();
+    if (!settings.enabled) return { ok: false, error: "Infisical is turned off.", secretCount: 0, names: [] };
+    if (settings.configurationError) return { ok: false, error: settings.configurationError, secretCount: 0, names: [] };
     if (!isConfigured(settings)) {
       return { ok: false, error: "Add a project id and a service token (or a machine identity) first.", secretCount: 0, names: [] };
     }
-    // The probe tests the CONFIGURED credential, not the fallback this
-    // manager would reach for on its behalf:  a token the server refuses is
-    // exactly what the operator needs to hear about, and the remembered
-    // rejection must not turn a dead token into a green probe.
+    // An explicit probe retries the selected credential without changing auth method.
     const configured = settings.token.trim();
+    this.retryRefusedTokens();
     try {
-      const token = configured ? configured : await this.machineIdentityToken(settings);
-      const { names } = await listSecrets({
+      const { names } = await this.withCredential(settings, "read", (token) => listSecrets({
         siteUrl: settings.siteUrl,
         token,
         projectId: settings.projectId,
@@ -837,7 +860,7 @@ class InfisicalManager {
         secretPath: settings.secretPath,
         viewValues: false,
         timeoutMs: callTimeoutMs(),
-      });
+      }));
       return { ok: true, error: null, secretCount: names.length, names: [...names] };
     } catch (err) {
       let error = err instanceof InfisicalError ? err.message : err instanceof Error ? redactSecretsInText(err.message) : "unknown error";
@@ -849,16 +872,9 @@ class InfisicalManager {
     }
   }
 
-  /** One folder, read for a caller that keeps the values to itself: the
-   * Zulip source's per-role bot keys (`server/zulip/credentials.ts`,
-   * docs/zulip.md).  The folder is in the configured project and
-   * environment unless `scope` names another project or environment, which
-   * the same machine identity must be able to read (the fleet keeps the BF
-   * bots' keys in AI Fleet Coordinator's project, not BotFleet's).  It never
-   * touches the snapshot, never writes `process.env`, and never puts a value
-   * in a log line, an error or the status view: the names and values go back
-   * to the caller and nowhere else.  Refuses, with no request, when
-   * Infisical is not configured or is turned off. */
+  /** Read a single exact scope without publishing its values to app config.
+   * A secondary scope requires a dedicated source; primary credentials never
+   * authorize another project, environment or folder. */
   async readPath(
     secretPath: string,
     scope: { projectId?: string; environment?: string } = {},
@@ -867,12 +883,13 @@ class InfisicalManager {
     const projectId = scope.projectId?.trim() || settings.projectId;
     const environment = scope.environment?.trim() || settings.environment;
     secretPath = normalizeInfisicalSecretPath(secretPath);
-    const source = settings.enabled === true ? this.findReadSource(settings, projectId, environment, secretPath) : undefined;
+    const primaryIdentity = settings.authMethod === "machine-identity" && scopeSignature(projectId, environment, secretPath) === vaultScope(settings);
+    const source = settings.enabled === true && !primaryIdentity ? this.findReadSource(settings, projectId, environment, secretPath) : undefined;
     if (source) return this.readWithSource(settings, source, secretPath, projectId, environment);
     if (!isConfigured(settings) || settings.enabled !== true) {
       throw new InfisicalError("Infisical is not configured and turned on for this workspace.", 409);
     }
-    const { values } = await this.withServiceTokenFallback(
+    const { values } = await this.withCredential(
       settings,
       "read",
       (token) =>
@@ -890,18 +907,7 @@ class InfisicalManager {
     return new Map(values);
   }
 
-  /** One folder in a NAMED project, read for a caller that keeps the values
-   * to itself: the fleet's CLI logins (`server/cli-logins.ts`).
-   *
-   * The same machine identity reads BotFleet's own project and the fleet's;
-   * what differs is the project the request is addressed to.  Nothing is
-   * copied between the two, and the snapshot is never touched: these values
-   * are per seat and never become config fields.
-   *
-   * A host with no project id for the fleet's project has nothing to
-   * address, and is told so rather than being pointed at BotFleet's own
-   * project instead — a read of the wrong project would come back with the
-   * wrong rows, or with nothing, and both would look like a missing login. */
+  /** Resolve a named project locator, then require its dedicated scoped source. */
   async readProjectPath(project: VaultProject, secretPath: string): Promise<ReadonlyMap<string, string>> {
     if (project === "botfleet") return this.readPath(secretPath);
     const projectId = fleetOpsProjectId();
@@ -912,6 +918,28 @@ class InfisicalManager {
       );
     }
     return this.readPath(secretPath, { projectId, environment: FLEET_OPS_ENVIRONMENT });
+  }
+
+  /** Write through one explicitly scoped source without borrowing a read
+   * credential or publishing a secondary project's values as app config. */
+  async writeSource(sourceName: string, name: string, value: string): Promise<void> {
+    const settings = this.settings();
+    if (!settings.enabled || !settings.writeThrough) throw new InfisicalError("Infisical write-through is turned off.", 409);
+    if (!value) throw new InfisicalError("Clearing an Infisical-managed value is not supported.", 409);
+    const source = settings.readSources.find((entry) => entry.name === sourceName);
+    if (!source) throw new InfisicalError("The named Infisical source is not configured.", 404);
+    // Resolve the named source itself, even if another entry names the same scope.
+    const scoped = { ...settings, authMethod: "service-token" as const, readSources: [source] };
+    await this.withCredential(scoped, "write", (token) => upsertSecret({
+      siteUrl: settings.siteUrl, token, projectId: source.projectId,
+      environment: source.environment, secretPath: normalizeInfisicalSecretPath(source.secretPath),
+      name, value, timeoutMs: callTimeoutMs(),
+    }), scopeSignature(source.projectId, source.environment, normalizeInfisicalSecretPath(source.secretPath)));
+    if (scopeSignature(source.projectId, source.environment, normalizeInfisicalSecretPath(source.secretPath)) === vaultScope(settings)) {
+      const result = await this.refresh("settings");
+      if (result.stale || result.lastError) throw new InfisicalError("Infisical write landed, but verification failed.", 502, true);
+      if (infisicalSnapshot()?.get(name) !== value) throw new InfisicalError("Infisical write landed, but the vault holds a different value.", 409, true);
+    }
   }
 
   /** A Settings save of a value the vault manages, with Write Through on.
@@ -936,7 +964,7 @@ class InfisicalManager {
       throw new InfisicalError("Add a project id and a service token (or a machine identity) first.", 409);
     }
     try {
-      await this.withServiceTokenFallback(settings, "write", (token) =>
+      await this.withCredential(settings, "write", (token) =>
         upsertSecret({
           siteUrl: settings.siteUrl,
           token,
@@ -998,7 +1026,7 @@ class InfisicalManager {
   bootLine(): string {
     const status = this.getStatus();
     if (!status.configured) {
-      return "[infisical] disabled: not configured (add a machine identity in Settings > Secrets)";
+      return "[infisical] disabled: not configured (select an auth method and add its credentials in Settings > Secrets)";
     }
     if (!status.enabled) {
       return "[infisical] disabled by settings";
