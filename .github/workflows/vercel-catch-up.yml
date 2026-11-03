@@ -52,15 +52,16 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
-      - name: Load deploy token from shared Fleet-OPS secret scope
+      - name: Load deploy token through its dedicated Fleet-OPS read binding
         env:
           INFISICAL_PROJECT_ID: 8dae6d03-8f12-48b2-adf3-e5c1b881c8c5
           INFISICAL_ENVIRONMENT: prod
           INFISICAL_SECRET_PATH: /
           INFISICAL_NAMES: VERCEL_TOKEN
           INFISICAL_REQUIRED: VERCEL_TOKEN
-          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_AUTOMATION_CLIENT_ID }}
-          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_AUTOMATION_CLIENT_SECRET }}
+          # Binding is pending AFC-600 scope and registry verification.
+          # No broad machine identity fallback is permitted.
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_VERCEL_CATCH_UP_READ_TOKEN }}
         run: node scripts/infisical-fetch.mjs
       - name: Check binding, deployed SHA, cooldown and exact-main CI
         id: gate

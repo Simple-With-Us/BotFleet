@@ -54,16 +54,22 @@ rides into a spawned engine CLI.  A row in the vault under a name this table
 does not recognize (`PATH`, `NODE_ENV`, a typo) is reported as
 **"In Infisical, not used by BotFleet"** and otherwise ignored.
 
-## The Kill Switch And The Boot Line
+## Optional Connection And The Boot Line
 
 `infisical.enabled` is explicit both ways, matching `ingress.enabled` and
 `observability.enabled`:
 
-- **Absent** → on, once a project id and a machine identity are both
-  present.  Connecting a project is the deliberate act; nothing else is
-  required to start using it.
+- **Absent** → authentication defaults to `service-token`; Infisical stays
+  inactive until a project and matching read credential are configured.  A
+  project id alone never selects machine identity.
 - **`false`** → off immediately.  The snapshot is cleared, every mapped
   field re-resolves from the environment and the file, and nothing restarts.
+
+Infisical is optional.  An install with no Infisical configuration continues
+to use its local configuration.  Once configured, it is enabled unless the
+operator explicitly disables it.  The default authentication method is
+`service-token`; machine identity is used only after the operator explicitly
+selects `machine-identity` in this BotFleet install.
 
 Absent an explicit Settings save, an install checks Infisical every 15
 minutes (`refreshMinutes`, 5–1440), against site `https://app.infisical.com`,
@@ -74,7 +80,7 @@ never a value:
 
 ```
 [infisical] enabled env=prod path=/ vault=9 applied=4 fields=composio.apiKey,usage.ingestUrl,usage.ingestToken,usage.readToken unused=5 ms=412
-[infisical] disabled: not configured (add a machine identity in Settings > Secrets)
+[infisical] disabled: not configured (configure a service token in Settings > Secrets)
 [infisical] disabled by settings
 [infisical] unavailable: <redacted error>; using environment and config values
 [infisical] credentials changed (timer): xai.key — Sync Now or save Settings to rebuild bots
@@ -174,15 +180,22 @@ Returns `{ infisical: InfisicalStatusView, fields: FieldRow[] }` — booleans,
 counts, names and ids.  `fields` walks the secret map; a `secret: true`
 field's `value` is always `null`, never the real value.
 
-Additional read-only service tokens can be named under `infisical.readSources` (any count): each entry is `{ name, tokenFile | tokenEnv, projectId, environment?, secretPath? }`.  `tokenFile` is an absolute path to an owner-only file whose trimmed contents are the token (read at use time, so rotation needs no restart); `tokenEnv` names an environment variable instead.  A `tokenFile` is refused — with a warning naming the path, and no token read — unless it sits in the BotFleet config directory (the directory `config.json` lives in, `~/.botfleet` or `$OMB_DATA_DIR`) or a subdirectory of it, is a regular file and not a symlink, and is not readable or writable by group or other (`chmod 600`).  Its contents are sent as a bearer token to `siteUrl`, so a path outside that directory is never trusted.  `INFISICAL_READ_SOURCES` (a JSON array of the same entries) overrides the list from the environment.  When a vault read asks for a project, environment and path a source covers, that source's token is used instead of the main read token or machine identity; `readSource(name)` reads a named source directly.  A source whose token file is missing, empty or refused logs one warning naming the source and the file or env name (never the value), rejects that read (callers that must not fail catch it), and never breaks the main vault load.  The status view lists each source's name, project, environment, path and ok/error, with no values.
+BotFleet accepts at most 32 exact-folder source routes.  Each entry names a project, optional environment and exact Infisical folder path, plus a read-token locator (`tokenFile` or `tokenEnv`) and optional separate write-token locator (`writeTokenFile` or `writeTokenEnv`).  A folder path matches that folder only, including `/` as the root; it grants no recursive access to descendants.  A source token is selected only for a matching project, environment, and folder, and a matching source takes precedence for that operation.  Missing or rejected source credentials fail that operation closed; the operation never borrows the primary token or machine identity.  Token values are read from the named environment variable or owner-only file at use time and are never included in status.  A `tokenFile` or `writeTokenFile` must be an absolute path inside the BotFleet config directory (the directory containing `config.json`, `~/.botfleet` or `$OMB_DATA_DIR`) or one of its subdirectories; it must be a regular, non-symlink file with no group or other read/write permission.  Status reports locator metadata and whether a locator is configured without reading token files or exposing values.
 
-`readTokenRefused` and `writeTokenRefused` say the server refused the
-configured service token and the manager fell back to the machine identity.
-The token is still configured and still in Settings, so these flags — not the
-token's absence — are what tell an operator that a dead token is hiding behind
-a working sync.  The same refusal rides the boot line as `read-token-refused`
-and `write-token-refused`.  Neither flag is read by the Secrets card, so the
-status payload and the boot line are where a refusal shows today.
+For each Infisical project, BotFleet allows one distinct read-token reference
+and at most one distinct write-token reference, reused across all folder and
+environment routes.  The effective primary service-token credentials count
+toward those per-project limits when they are selected for the primary scope.
+`INFISICAL_READ_SOURCES` is parsed as configuration input and receives the
+same route and credential-reference validation; the JSON environment override
+cannot bypass these limits.
+
+The status view reports the selected `authMethod`, primary read/write-token
+presence, and configured source locator metadata.  A missing or rejected
+primary token fails the requested Infisical operation; it never falls back to
+machine identity.  A missing or rejected matching source token also fails
+closed instead of borrowing a primary token.  Machine identity is attempted
+only when this install explicitly selects `machine-identity`.
 
 ```
 POST /api/infisical/sync
@@ -202,15 +215,15 @@ wire) — proves the identity and project id are correct without ever
 populating the snapshot.  Returns `{ ok, error, secretCount, names }`.  This
 is what **Test Connection** calls.
 
-The probe tests the **configured** credential rather than the fallback the
-manager would reach for on its behalf, so a token the server refuses is
-reported as a failure instead of going green on the machine identity.  A
-refused token comes back as `ok: false` with an error that says the token was
-refused, and the next refresh uses a token rotated in Settings.
+The probe tests the credential selected by this install's explicit auth
+method and exact source scope.  A refused service token is reported as a
+failure and is never retried with machine identity.  Rotation takes effect
+after the next settings save or refresh.
 
 `GET /api/config` separately carries a small `infisical` block —
-`configured`, `enabled`, `writeThrough`, `environment`, `hasClientSecret`,
-`managedCount`, `lastSyncAt`, `stale`, `hasError`, `pendingProviderReload` —
+`configured`, `enabled`, `authMethod`, `writeThrough`, `environment`,
+`hasClientSecret`, `hasToken`, `hasWriteToken`, `managedCount`, `lastSyncAt`,
+`stale`, `hasError`, `pendingProviderReload` —
 because that frame is broadcast to every open window; the project id, site
 URL and vault names live only on the loopback status route above.
 
@@ -227,13 +240,12 @@ secret to cover:
 ```yaml
 - uses: ./.github/actions/infisical-secrets
   with:
-    names: SENTRY_DSN SENTRY_AUTH_TOKEN
+    names: SENTRY_AUTH_TOKEN
     required: SENTRY_AUTH_TOKEN
     project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-    client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID }}
-    client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET }}
+    token: ${{ secrets.INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN }}
   env:
-    GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+    GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
 ```
 
 Each resolved value is masked (`::add-mask::`) and exported into
@@ -243,72 +255,26 @@ empty from both Infisical and its `GH_FALLBACK_<NAME>` produces a
 `::error::`.  `secrets.*` is never referenced inside an `if:` condition —
 GitHub's dispatch parser rejects that with an HTTP 422.
 
-## A Headless Install's Own Identity
+## BotFleet's Own Infisical Authentication
 
-The automation machine identity is the one pair of credentials that cannot
-resolve through the vault it unlocks — a lock cannot hold its own key.  A
-headless Mac harness gets it one of two ways:
+Infisical is optional.  When enabled, BotFleet defaults to the `service-token`
+auth method, using `INFISICAL_TOKEN` for reads and the separate
+`INFISICAL_WRITE_TOKEN` for writes.  A missing or rejected token never
+activates machine identity; an operator must explicitly select
+`machine-identity` for this app.  Neither auth method is stored in the vault
+it unlocks.
 
-- **Environment**, at process start: `INFISICAL_CLIENT_ID` (alias
-  `INFISICAL_UNIVERSAL_AUTH_CLIENT_ID`), `INFISICAL_CLIENT_SECRET` (alias
-  `INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET`), `INFISICAL_PROJECT_ID`,
-  `INFISICAL_SITE_URL` (alias `INFISICAL_DOMAIN`), `INFISICAL_ENVIRONMENT`,
-  `INFISICAL_SECRET_PATH`.  The alias pairs mirror the names CI already
-  uses, so one identity works unmodified in both places.
-- **One loopback `PATCH /api/config`**, before Settings → Secrets exists or
-  in place of it.
+The approved launch helper can provide the managed harness token bindings
+`BOTFLEET_HARNESS_INFISICAL_READ_TOKEN` and optional
+`BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN`.  Their registry and live helper
+authentication handoff remain pending AFC-600; do not treat the source
+fixtures as proof of provisioning or live access.  See the dated
+[Nov 3 service-token binding reconciliation](rollouts/2026-11-03-service-token-bindings.md)
+for each consumer, exact-scope requirements, and remaining verification.
 
-  The client secret reads every secret in the project, which makes it the
-  single worst value in this design to put on a command line.  Anything in
-  `argv` is readable from `ps` by every process on the machine — including
-  any tool a bot spawns — for as long as the request runs, and the whole
-  command is appended to `~/.zsh_history` forever.  So the values go from a
-  `chmod 600` handoff file into shell variables that are never echoed, the
-  body goes into a `umask 077` temp file, and `curl` reads the body from that
-  file rather than from its own arguments:
-
-  ```bash
-  umask 077                                   # the temp file below is 0600
-  BODY="$(mktemp -t botfleet-infisical)"
-  # Read from a chmod 600 handoff file into variables.  `-m1 … | cut` keeps
-  # the match out of the terminal: no line of that file is ever printed.
-  CLIENT_ID="$(grep -m1 '^INFISICAL_CLIENT_ID=' "$HANDOFF_FILE" | cut -d= -f2-)"
-  CLIENT_SECRET="$(grep -m1 '^INFISICAL_CLIENT_SECRET=' "$HANDOFF_FILE" | cut -d= -f2-)"
-  # jq reads both values out of its own ENVIRONMENT and does the JSON quoting,
-  # so neither ever appears in an argument list, and the body only ever
-  # exists in the 0600 file.
-  PROJECT_ID=your-project-id CLIENT_ID="$CLIENT_ID" CLIENT_SECRET="$CLIENT_SECRET" \
-    jq -n '{infisical:{projectId:env.PROJECT_ID,environment:"prod",clientId:env.CLIENT_ID,clientSecret:env.CLIENT_SECRET}}' \
-    > "$BODY"
-  curl -s -X PATCH http://127.0.0.1:8799/api/config \
-    -H 'content-type: application/json' \
-    --data-binary @"$BODY"
-  rm -P "$BODY"
-  unset CLIENT_ID CLIENT_SECRET
-  ```
-
-  `$HANDOFF_FILE` is whatever `chmod 600` file holds the pair on that
-  machine; never open it, `cat` it, or grep it in a way that prints a whole
-  line.
-  Never a hand edit of `~/.botfleet/config.json` while the harness is
-  running, and never a value inline in the `--data-binary` argument.
-
-The product server **never** reads a fleet secrets-handoff file itself —
-only these two paths feed it an identity — and `server/secret-map.ts` has
-no `infisical.*` row for exactly the reason above: the vault's own
-credentials cannot be one of the things the vault resolves.
-
-The environment path has exactly one sanctioned injector:
-`scripts/botfleet-server-start.sh`, the launchd entry point, which may
-extract `INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET` (canonical names
-first, `INFISICAL_AUTOMATION_*` aliases only as fallback) from the
-`chmod 600` handoff file at process start, and only for values the
-environment does not already set.  It reads the two names line by line and
-never sources the file, so the Node server still receives its identity
-through the environment alone — the handoff file is never opened by
-product code, and the pair is never moved into a LaunchAgent plist, where
-the client secret would sit same-user-readable in a new location for no
-reduction in exposure.
+When a desktop save includes new credentials, Settings first persists the
+connection metadata with Infisical disabled, then writes credentials through
+the encrypted credential store, and finally persists the requested toggle.  If an encrypted credential write fails, the staged connection stays disabled.
 
 ## The Migration Script
 
@@ -328,14 +294,17 @@ Infisical prod at / on https://app.infisical.com (dry run -- pass --apply to wri
   usage.readToken -> USAGE_READ_TOKEN  (local value present, vault: absent)
 ```
 
-**Dry run is the default and prints only this report.**  `--apply` upserts
+**Dry run is the default and prints only this report.**  `--apply` upserts
 every row not already `present-and-same`, one name at a time, printing
 `wrote NAME`, `skipped NAME (unchanged)`, or `failed NAME: <redacted
-error>`.  It never touches `~/.secrets/*` or any other handoff file — the
-identity comes from `infisical.*` in the config file or from
-`INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET` in the environment, the
-same two paths described above — and it never accepts a credential as a
-command-line argument or prints one to the console.
+error>`.  It never touches handoff files or accepts credentials on the
+command line.  It requires the primary `INFISICAL_TOKEN` for its read and
+uses only the separate `INFISICAL_WRITE_TOKEN` for `--apply`; it never
+borrows the read token for writes or falls back to machine identity.  It
+does not read configured source locator tokens; use the app's scoped
+write-through path for those sources.  See the [Nov 3 service-token binding
+reconciliation](rollouts/2026-11-03-service-token-bindings.md) for the
+pending live provisioning boundary.
 
 ---
 
