@@ -404,7 +404,7 @@ test("the weekly full run is registered with the Sentry cron reporter", () => {
   assert.equal(probe.status, 0, probe.stderr);
   const reporter = JSON.parse(probe.stdout);
   assert.equal(reporter.schedules.CI, schedule);
-  assert.ok(reporter.margins.CI >= maxJobTimeout + 15);
+  assert.ok(reporter.margins.CI >= maxJobTimeout + 20);
 });
 
 test("every host runs the canonical complete test chain without masking failures", () => {
