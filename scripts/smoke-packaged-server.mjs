@@ -17,7 +17,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { assertRuntimeExecutable, resolveRuntime } from "./smoke-runtime-mode.mjs";
-import { packagedSmokeConfig } from "./smoke-packaged-fixture.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const port = 21000 + Math.floor(Math.random() * 9000);
@@ -54,11 +53,14 @@ const runtime = (() => {
 
 const staging = mkdtempSync(join(tmpdir(), "omb-smoke-"));
 const home = mkdtempSync(join(tmpdir(), "omb-smoke-home-"));
-// The empty-home default is the full product fleet, whose startup probes
-// discover installed host CLIs through PATH and known install locations.
-// Keep package validation independent of those CLIs and their auth state.
-mkdirSync(join(home, ".botfleet"), { recursive: true });
-writeFileSync(join(home, ".botfleet", "config.json"), JSON.stringify(packagedSmokeConfig(home)));
+const dataDir = join(home, ".botfleet");
+mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+// A one-off shadow instance keeps startup and route coverage while avoiding probes of host-installed CLIs on PATH.
+writeFileSync(
+  join(dataDir, "config.json"),
+  JSON.stringify({ instances: { "smoke-shadow": { driver: "__smoke_shadow__" } } }),
+  { mode: 0o600 },
+);
 
 // OMB_SMOKE_DIST lets the release workflow aim this at a packaged app's
 // Resources/server tree instead of the repo build.
