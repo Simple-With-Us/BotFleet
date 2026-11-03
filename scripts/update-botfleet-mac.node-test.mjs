@@ -3503,7 +3503,6 @@ test("prepareStoreReleaseDeploy proves the staged export before any install hook
   const { home, config } = await makeStoreFixture(t);
   await makeRelease(home, COMMIT_A); // host currently serves COMMIT_A
   await symlink(join(home, ".botfleet", "releases", COMMIT_A), join(home, ".botfleet", "current"));
-  const store = await storeHarnessState(config);
   const calls = [];
   const previous = {};
   const prepared = await prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_B, version: "1.0.32" }, previous, {
@@ -3657,6 +3656,75 @@ test("materializeCandidate prepares the store deploy and rollback-target custody
   assert.deepEqual(calls, [["prepare", COMMIT_B], ["custody", COMMIT_A]],
     "the target's deploy is prepared and the CURRENT release's custody is ready for a rollback, all pre-fence");
   assert.equal(previous.storeDeployPrepared, COMMIT_B);
+});
+
+test("reuse preparation controls package-version failures before proof or pointer changes", async (t) => {
+  const cases = [
+    ["missing package", undefined],
+    ["unreadable package path", "directory"],
+    ["malformed JSON", "{"],
+    ["null package", "null"],
+    ["array package", "[]"],
+    ["missing version", '{"name":"botfleet"}'],
+    ["numeric version", '{"version":42}'],
+    ["null version", '{"version":null}'],
+    ["object version", '{"version":{}}'],
+    ["empty version", '{"version":""}'],
+    ["invalid version syntax", '{"version":"release-next"}'],
+    ["incomplete version", '{"version":"1.0"}'],
+  ];
+  for (const [name, contents] of cases) {
+    await t.test(name, async (context) => {
+      const { home, config } = await makeStoreFixture(context);
+      const current = await makeRelease(home, COMMIT_B);
+      const root = await makeRelease(home, COMMIT_A, {});
+      const packagePath = join(root, "package.json");
+      if (contents === "directory") await mkdir(packagePath);
+      else if (contents !== undefined) await writeFile(packagePath, contents);
+      const pointer = join(home, ".botfleet", "current");
+      await symlink(current, pointer);
+      const previous = { sentinel: "untouched" };
+      let proofCalls = 0;
+      config.storeAdapters = { registerTrustedFingerprint: () => { proofCalls++; } };
+      await assert.rejects(
+        prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_A, version: "1.0.31" }, previous, {
+          installReference: async () => { proofCalls++; throw new Error("unexpected reference install"); },
+          verifyRelease: () => { proofCalls++; throw new Error("unexpected byte proof"); },
+        }),
+        (error) => {
+          assert.match(error.message, /^Existing release a{12} cannot be trusted: package\.json is missing, unreadable or has an invalid runtime version\./);
+          assert.match(error.message, /Discard and re-stage/);
+          assert.equal(error.code, undefined, "no raw filesystem error escapes");
+          return true;
+        },
+      );
+      assert.equal(proofCalls, 0, "invalid package data reaches no reference install, proof or custody registration");
+      assert.deepEqual(previous, { sentinel: "untouched" });
+      assert.equal(await realpath(pointer), await realpath(current), "the previous release remains active");
+    });
+  }
+});
+
+test("reuse preparation keeps the runtime's accepted package-version formats", async (t) => {
+  for (const version of ["0.1.0", "1.0.31", "1.0.202611030400", "1.0.31-beta.1", "1.0.31+build.42", "01.02.003", "1.0.31-beta_build"]) {
+    await t.test(version, async (context) => {
+      const { home, config } = await makeStoreFixture(context);
+      const current = await makeRelease(home, COMMIT_B);
+      const release = await makeRelease(home, COMMIT_A, { "package.json": JSON.stringify({ name: "botfleet", version }) });
+      const pointer = join(home, ".botfleet", "current");
+      await symlink(current, pointer);
+      const reference = join(home, "reference-tree");
+      await mkdir(reference);
+      const previous = {};
+      assert.equal(await prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_A, version }, previous, {
+        installReference: async () => reference,
+        verifyRelease: () => ({ ok: true, checked: 1, dependencies: "absent" }),
+      }), true);
+      assert.equal(await realpath(pointer), await realpath(current), "preparation alone never activates a release");
+      assert.equal(await deployStoreReleaseIfBacked(config, { targetCommit: COMMIT_A, version }, previous), true);
+      assert.equal(await realpath(pointer), await realpath(release), "a proven version still deploys");
+    });
+  }
 });
 
 test("deployStoreReleaseIfBacked refuses to reuse a release whose version is not the prepared one", async (t) => {
