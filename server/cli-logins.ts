@@ -28,6 +28,13 @@
 //   4. A read that fails is a read that failed.  The child runs without a
 //      login, the turn is not failed over it, and the last good value is
 //      kept rather than thrown away.
+//
+// One shape rule, and it is why the read is not awaited by the drivers:
+// every driver claims its thread with a guard and registers the claim a few
+// lines later, and that segment has to stay free of `await` — a suspension
+// point between the two lets a second turn on the same thread walk through
+// the guard the first one already passed.  So the login is resolved from a
+// CACHE, synchronously, and the vault read happens in the background.
 import { CLI_LOGIN_ENV_NAMES, CLI_LOGIN_FIELDS, cliLoginSecretPath } from "./secret-map.ts";
 import { infisical } from "./infisical.ts";
 import { applyLaunchIdentity } from "./launch-identity.ts";
@@ -60,13 +67,8 @@ export function setCliLoginVault(reader: CliLoginVaultReader | null): void {
 export const CLI_LOGIN_TTL_MS = 15 * 60_000;
 
 /** How long a failed read is not tried again.  A vault that is down must not
- * add its timeout to every turn. */
+ * cost every turn a round trip. */
 export const CLI_LOGIN_FAILURE_BACKOFF_MS = 60_000;
-
-/** How long a turn waits for the read before it starts without a login.
- * The read itself keeps running in the background, so the value lands in the
- * cache for the next turn rather than being lost. */
-export const CLI_LOGIN_READ_WAIT_MS = 5_000;
 
 interface SeatEntry {
   /** The last values read for this seat.  Kept even after a later read
@@ -79,7 +81,7 @@ interface SeatEntry {
 }
 
 const cache = new Map<string, SeatEntry>();
-const inflight = new Map<string, Promise<Record<string, string>>>();
+const inflight = new Map<string, Promise<void>>();
 
 /** Forget every cached login.  Used by the tests, and by a settings change
  * that turns the vault off. */
@@ -88,25 +90,12 @@ export function resetCliLoginCache(): void {
   inflight.clear();
 }
 
-/** What `afterDelay` resolves to when the wait wins the race.  A distinct
- * sentinel rather than `undefined`, because "the read finished" and "the
- * wait ran out" have to be told apart:  the first hands back a login, the
- * second hands back whatever was known before. */
-const WAIT_EXPIRED = Symbol("cli-login.wait-expired");
-
-/** Resolves after `ms`, always — never rejects.  Unref'd so a pending read
- * does not keep the process alive on its own. */
-function afterDelay(ms: number): Promise<typeof WAIT_EXPIRED> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(WAIT_EXPIRED), ms);
-    timer.unref?.();
-  });
-}
-
 /** Read the seat's folder and keep only the names the table names.  A row
  * the fleet put there for something else is ignored, and a name the folder
- * does not hold is simply absent. */
-async function readSeat(seat: string, secretPath: string): Promise<Record<string, string>> {
+ * does not hold is simply absent.
+ *
+ * Never rejects:  a failed read is recorded and the last good value stays. */
+async function readSeat(seat: string, secretPath: string): Promise<void> {
   const running = inflight.get(seat);
   if (running) return running;
   const promise = (async () => {
@@ -118,7 +107,6 @@ async function readSeat(seat: string, secretPath: string): Promise<Record<string
         if (value !== undefined && value.length > 0) values[spec.env] = value;
       }
       cache.set(seat, { values, readAt: Date.now(), failedAt: 0 });
-      return values;
     } catch (err) {
       // The reason is logged, redacted, and once per failed read — the
       // backoff below is what bounds it.  A login that silently never
@@ -132,32 +120,50 @@ async function readSeat(seat: string, secretPath: string): Promise<Record<string
         readAt: previous?.readAt ?? 0,
         failedAt: Date.now(),
       });
-      return previous?.values ?? {};
     }
   })().finally(() => inflight.delete(seat));
   inflight.set(seat, promise);
   return promise;
 }
 
-/** The seat's CLI login, as the environment variables a CLI reads.
+/** Make sure the seat's CLI login is on its way.
  *
- * Empty when the seat is not one the fleet's writer could have produced,
- * when the folder holds none of the four names, or when the read failed and
- * nothing was ever read for this seat. */
-export async function cliLoginEnvironment(seat: string | null | undefined): Promise<Record<string, string>> {
+ * A driver calls this at the top of its turn, before it claims the thread,
+ * so the background read is already in flight by the time the child is
+ * spawned.  Fire and forget:  nothing waits for it, and a failed read is
+ * recorded rather than thrown.
+ *
+ * A seat that is not one the fleet's writer could have produced has no
+ * folder, and nothing is read for it. */
+export function primeCliLogin(seat: string | null | undefined): void {
   const secretPath = seat ? cliLoginSecretPath(seat) : null;
-  if (!seat || !secretPath) return {};
+  if (!seat || !secretPath) return;
   const entry = cache.get(seat);
   const now = Date.now();
-  if (entry && now - entry.readAt < CLI_LOGIN_TTL_MS) return entry.values;
-  if (entry?.failedAt && now - entry.failedAt < CLI_LOGIN_FAILURE_BACKOFF_MS) return entry.values;
+  if (entry && now - entry.readAt < CLI_LOGIN_TTL_MS) return;
+  if (entry?.failedAt && now - entry.failedAt < CLI_LOGIN_FAILURE_BACKOFF_MS) return;
+  void readSeat(seat, secretPath);
+}
 
-  const read = readSeat(seat, secretPath);
-  const settled = await Promise.race([read, afterDelay(CLI_LOGIN_READ_WAIT_MS)]);
-  if (settled !== WAIT_EXPIRED) return settled;
-  // The read is still running.  The turn goes on without a login rather than
-  // waiting on the vault, and the value lands in the cache for the next turn.
+/** The seat's cached CLI login, as the environment variables a CLI reads.
+ *
+ * Empty when the seat has none, when the folder holds none of the four
+ * names, or when the read has not landed yet.  The read is started by
+ * `primeCliLogin()`;  the first turn of a seat after the harness starts may
+ * therefore run without the login, and the turns after it have one. */
+export function cliLoginEnvironment(seat: string | null | undefined): Record<string, string> {
+  if (!seat) return {};
   return cache.get(seat)?.values ?? {};
+}
+
+/** Wait for the seat's login read to land, if one is in flight.
+ *
+ * The drivers do not wait for it —  a turn's child is spawned with
+ * whatever the cache holds — but a caller that needs the value now can,
+ * and a test needs it to see a read at all. */
+export async function awaitCliLogin(seat: string | null | undefined): Promise<void> {
+  if (!seat) return;
+  await inflight.get(seat);
 }
 
 /** The driver's own environment with the seat's CLI login applied.
@@ -178,18 +184,19 @@ export function applyCliLogins(env: Record<string, string | undefined>, values: 
 /** The environment a launched child runs with:  the launch identity applied
  * to the driver's own environment, and the seat's CLI login in it.
  *
- * This is the one call a driver makes instead of `applyLaunchIdentity()` on
- * its own, so a login cannot be forgotten on one engine and added on
- * another.
+ * The login is handed in rather than read here, and that is deliberate:  a
+ * driver reads it BEFORE it claims the thread, because the claim and the
+ * registration that follows it have to stay atomic.  A vault read between
+ * the two would suspend the driver there, and a second turn on the same
+ * thread would walk through the guard that the first one already passed.
  *
  * A process that is reused across turns keeps the environment it was
  * spawned with, so a rotated login reaches a new process and not a warm
  * one.  That is the same rule the launch identity already follows. */
-export async function launchedChildEnvironment(
+export function launchedChildEnvironment(
   env: Record<string, string | undefined>,
-  identity?: LaunchIdentity,
-): Promise<Record<string, string | undefined>> {
-  const withIdentity = applyLaunchIdentity(env, identity);
-  const values = await cliLoginEnvironment(identity?.seat);
-  return applyCliLogins(withIdentity, values);
+  identity: LaunchIdentity | undefined,
+  login: Record<string, string>,
+): Record<string, string | undefined> {
+  return applyCliLogins(applyLaunchIdentity(env, identity), login);
 }

@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance, RuntimeEvent } from "../contracts.ts";
-import { resetCliLoginCache, setCliLoginVault } from "../cli-logins.ts";
+import { awaitCliLogin, primeCliLogin, resetCliLoginCache, setCliLoginVault } from "../cli-logins.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import {
@@ -524,6 +524,11 @@ describe("ClaudeDriver turns (fake CLI)", () => {
         return new Map([["GH_TOKEN", "seat-login-not-real"]]);
       },
     });
+    // The login is read in the background, so it is primed and awaited
+    // before the turn:  a turn that starts with a cold cache runs without
+    // the login, and the turns after it have one.
+    primeCliLogin("BF-ORACLE");
+    await awaitCliLogin("BF-ORACLE");
 
     await instance.adapter.sendTurn({
       threadId: "t-cli-login",
@@ -559,6 +564,31 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.env.GH_TOKEN).toBeUndefined();
     // A bot with no seat has no folder, so nothing is read.
     expect(asked).toEqual([]);
+  });
+
+  it("starts the seat's login read for a turn that names a seat", async () => {
+    await create();
+    const dump = join(scratch, "dump-prime.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    const asked: string[] = [];
+    setCliLoginVault({
+      async readProjectPath(_project, secretPath) {
+        asked.push(secretPath);
+        return new Map();
+      },
+    });
+
+    await instance.adapter.sendTurn({
+      threadId: "t-prime",
+      text: "hi",
+      launchIdentity: { seat: "BF-MONITOR", session: "session-2" },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    await awaitCliLogin("BF-MONITOR");
+
+    // The turn itself starts the read, so the turns after it have the
+    // login even when the first one ran with a cold cache.
+    expect(asked).toEqual(["/cli-logins/BF-MONITOR"]);
   });
 
   it("uses instance credentials when launching an injected local model", async () => {

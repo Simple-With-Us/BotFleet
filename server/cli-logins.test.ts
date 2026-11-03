@@ -10,8 +10,10 @@ import {
   CLI_LOGIN_FAILURE_BACKOFF_MS,
   CLI_LOGIN_TTL_MS,
   applyCliLogins,
+  awaitCliLogin,
   cliLoginEnvironment,
   launchedChildEnvironment,
+  primeCliLogin,
   resetCliLoginCache,
   setCliLoginVault,
 } from "./cli-logins.ts";
@@ -90,35 +92,45 @@ describe("reading a seat's CLI login", () => {
   it("reads the seat's own folder out of the fleet's project", async () => {
     const stub = stubVault({ GH_TOKEN: SENTINEL_VAULT });
     setCliLoginVault(stub.reader);
-    const values = await cliLoginEnvironment("BF-ORACLE");
+    primeCliLogin("BF-ORACLE");
+    await awaitCliLogin("BF-ORACLE");
     expect(stub.calls).toEqual([{ project: "fleet-ops", secretPath: "/cli-logins/BF-ORACLE" }]);
-    expect(values).toEqual({ GH_TOKEN: SENTINEL_VAULT });
+    expect(cliLoginEnvironment("BF-ORACLE")).toEqual({ GH_TOKEN: SENTINEL_VAULT });
   });
 
   it("keeps only the names the table names", async () => {
     const stub = stubVault({ GH_TOKEN: SENTINEL_VAULT, SOMETHING_ELSE: "ignored" });
     setCliLoginVault(stub.reader);
-    const values = await cliLoginEnvironment("BF-ORACLE");
-    expect(Object.keys(values)).toEqual(["GH_TOKEN"]);
+    primeCliLogin("BF-ORACLE");
+    await awaitCliLogin("BF-ORACLE");
+    expect(Object.keys(cliLoginEnvironment("BF-ORACLE"))).toEqual(["GH_TOKEN"]);
   });
 
   it("reads once and reuses the value until the window expires", async () => {
     const stub = stubVault({ GH_TOKEN: SENTINEL_VAULT });
     setCliLoginVault(stub.reader);
-    await cliLoginEnvironment("BF-ORACLE");
-    await cliLoginEnvironment("BF-ORACLE");
+    primeCliLogin("BF-ORACLE");
+    await awaitCliLogin("BF-ORACLE");
+    primeCliLogin("BF-ORACLE");
+    await awaitCliLogin("BF-ORACLE");
     expect(stub.calls).toHaveLength(1);
+    expect(cliLoginEnvironment("BF-ORACLE")).toEqual({ GH_TOKEN: SENTINEL_VAULT });
     expect(CLI_LOGIN_TTL_MS).toBeGreaterThan(0);
   });
 
   it("reads nothing for a bot with no seat", async () => {
     const stub = stubVault({ GH_TOKEN: SENTINEL_VAULT });
     setCliLoginVault(stub.reader);
-    expect(await cliLoginEnvironment(null)).toEqual({});
-    expect(await cliLoginEnvironment(undefined)).toEqual({});
-    expect(await cliLoginEnvironment("")).toEqual({});
+    primeCliLogin(null);
+    primeCliLogin(undefined);
+    primeCliLogin("");
     // A seat the fleet could not have written is refused before any read.
-    expect(await cliLoginEnvironment("not-a-seat")).toEqual({});
+    primeCliLogin("not-a-seat");
+    await awaitCliLogin(null);
+    expect(cliLoginEnvironment(null)).toEqual({});
+    expect(cliLoginEnvironment(undefined)).toEqual({});
+    expect(cliLoginEnvironment("")).toEqual({});
+    expect(cliLoginEnvironment("not-a-seat")).toEqual({});
     expect(stub.calls).toEqual([]);
   });
 
@@ -127,18 +139,21 @@ describe("reading a seat's CLI login", () => {
     try {
       const stub = stubVault({ GH_TOKEN: SENTINEL_VAULT });
       setCliLoginVault(stub.reader);
-      expect(await cliLoginEnvironment("BF-ORACLE")).toEqual({ GH_TOKEN: SENTINEL_VAULT });
+      primeCliLogin("BF-ORACLE");
+      await awaitCliLogin("BF-ORACLE");
+      expect(cliLoginEnvironment("BF-ORACLE")).toEqual({ GH_TOKEN: SENTINEL_VAULT });
       // The window expires and the next read fails:  the seat keeps its
       // login rather than losing it.
       await vi.advanceTimersByTimeAsync(CLI_LOGIN_TTL_MS + 1);
-      const failing = stubVault({});
-      setCliLoginVault({
+      const failing = {
         async readProjectPath() {
           throw new Error("the vault is unreachable");
         },
-      });
-      expect(await cliLoginEnvironment("BF-ORACLE")).toEqual({ GH_TOKEN: SENTINEL_VAULT });
-      expect(failing.calls).toEqual([]);
+      };
+      setCliLoginVault(failing);
+      primeCliLogin("BF-ORACLE");
+      await awaitCliLogin("BF-ORACLE");
+      expect(cliLoginEnvironment("BF-ORACLE")).toEqual({ GH_TOKEN: SENTINEL_VAULT });
       expect(CLI_LOGIN_FAILURE_BACKOFF_MS).toBeGreaterThan(0);
     } finally {
       vi.useRealTimers();
@@ -151,7 +166,9 @@ describe("reading a seat's CLI login", () => {
         throw new Error("the vault is unreachable");
       },
     });
-    expect(await cliLoginEnvironment("BF-ORACLE")).toEqual({});
+    primeCliLogin("BF-ORACLE");
+    await awaitCliLogin("BF-ORACLE");
+    expect(cliLoginEnvironment("BF-ORACLE")).toEqual({});
   });
 });
 
@@ -195,7 +212,13 @@ describe("the environment a launched child runs with", () => {
   it("carries the launch identity and the seat's login together", async () => {
     const stub = stubVault({ GH_TOKEN: SENTINEL_VAULT });
     setCliLoginVault(stub.reader);
-    const env = await launchedChildEnvironment({ HOME: "/home/bot" }, { seat: "BF-ORACLE", session: "thread-1" });
+    primeCliLogin("BF-ORACLE");
+    await awaitCliLogin("BF-ORACLE");
+    const env = launchedChildEnvironment(
+      { HOME: "/home/bot" },
+      { seat: "BF-ORACLE", session: "thread-1" },
+      cliLoginEnvironment("BF-ORACLE"),
+    );
     expect(env.AGENT_LAUNCHER).toBe("botfleet");
     expect(env.AGENT_LAUNCH_SEAT).toBe("BF-ORACLE");
     expect(env.AGENT_SESSION).toBe("thread-1");
@@ -205,7 +228,11 @@ describe("the environment a launched child runs with", () => {
   it("gives a child with no seat no login, and none it inherited either", async () => {
     const stub = stubVault({ GH_TOKEN: SENTINEL_VAULT });
     setCliLoginVault(stub.reader);
-    const env = await launchedChildEnvironment({ GH_TOKEN: "somebody-elses-token" }, { seat: null, session: "thread-1" });
+    const env = launchedChildEnvironment(
+      { GH_TOKEN: "somebody-elses-token" },
+      { seat: null, session: "thread-1" },
+      cliLoginEnvironment(null),
+    );
     expect(env.AGENT_LAUNCH_SEAT).toBeUndefined();
     expect(env.GH_TOKEN).toBeUndefined();
     expect(stub.calls).toEqual([]);

@@ -55,7 +55,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
-import { launchedChildEnvironment } from "../cli-logins.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import {
   decodeInjectId,
   encodeInjectId,
@@ -522,6 +522,11 @@ export const PiDriver: ProviderDriver<PiConfig> = {
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
+// The seat's CLI login is read in the BACKGROUND, and the read is started
+// here, before the guard:  the guard and the registration that follows it
+// have to stay free of `await`, or a second turn on this thread would walk
+// through the guard the first one already passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       // Host control always routes through the permission card: the
       // pi-mcp-extension gates every `local-computer` scoped call behind
@@ -572,13 +577,14 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           return spawnCli(config.cli, childArgs, {
             stdio: ["pipe", "pipe", "pipe"],
             cwd: turn.cwd,
-            env: await launchedChildEnvironment(
+            env: launchedChildEnvironment(
               piEnvironment({
                 ...process.env,
                 ...input.environment,
                 ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
               }),
               turn.launchIdentity,
+              cliLoginEnvironment(turn.launchIdentity?.seat),
             ),
           });
         } catch (err) {
