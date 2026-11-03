@@ -49,8 +49,8 @@ RUNTIME_CLAIM="$HOME/.botfleet-companion/runtime/supervisor.json"
 # anyway,  and it is the one process here that listens off-machine.
 #
 # The marker is the harness's signal and the harness's script is what clears
-# it.  This script never deletes it.  The Control app's explicit Start clears
-# it,  because an explicit Start is a deliberate start (BF-2614 part 2).
+# it.  This script never deletes it,  and a companion-only Start does not
+# clear it either:  the app refuses it,  and the server's Start clears it.
 SHUTDOWN_MARKER="${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/stopped.marker}"
 PORT="${BOTFLEET_COMPANION_PORT:-8810}"
 CONTROL_PORT="${BOTFLEET_COMPANION_CONTROL_PORT:-8811}"
