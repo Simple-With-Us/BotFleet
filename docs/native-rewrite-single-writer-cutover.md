@@ -273,13 +273,19 @@ launchctl print-disabled gui/$(id -u) | grep 'app.botfleet.server'
 Expected: `"app.botfleet.server" => true`.
 
 ```bash
-# 6. Remove the installed plist and the wrapper, and keep the tracked source until the
-#    decommission commit removes it.
+# 6. Keep a copy of the installed plist and the wrapper, then remove them.
+#    The rollback restores these exact bytes, so they are saved before the removal.
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BACKUP="$HOME/apps/_retired/bf-2514-harness-$STAMP"
+mkdir -p "$BACKUP"
+cp ~/Library/LaunchAgents/app.botfleet.server.plist "$BACKUP/app.botfleet.server.plist"
+cp ~/apps/botfleet-server-start.sh "$BACKUP/botfleet-server-start.sh"
+printf '%s\n' "$BACKUP" > ~/apps/_retired/bf-2514-harness-latest
 rm ~/Library/LaunchAgents/app.botfleet.server.plist
 rm ~/apps/botfleet-server-start.sh
 ```
 
-Expected: both removed.  The repository copies — [scripts/launchd/app.botfleet.server.plist](../scripts/launchd/app.botfleet.server.plist) and [scripts/botfleet-server-start.sh](../scripts/botfleet-server-start.sh) — stay in the tree until BF-2515's Step 5 deletes them, because the runbook's rollback needs them and because the Linux deployment's source closure is BF-2544's to settle.
+Expected: both removed, and `$BACKUP` holds the two files that were installed.  **The tracked repository copies are not what the rollback restores:**  the installed plist and the installed wrapper differ from the tracked pair on this Mac today (measured Nov 3, 2026), so restoring from the tree would put back a different job than the one that was retired.  The tracked copies stay in the tree until BF-2515's Step 5 deletes them, because the Linux deployment's source closure is BF-2544's to settle.
 
 **Then update the Mac's process inventory** at `/Users/jay/apps/MAC-LOCAL-PROCESSES.md`: the `app.botfleet.server` row and the `~/apps/botfleet-server-start.sh` row become retired, with the date and the reason, and the row states that the job is **always-on** while it existed.  Refresh the Apple Note `[BF, MM] Single-Writer Cutover` in the same change with `apple-notes-coding.sh --update`.
 
@@ -316,14 +322,21 @@ Then the functional set, once each: a bot answers a Zulip message, a routine fir
 The rollback restores the old writer; it does not roll back code.
 
 ```bash
-# On the Mac.
+# On the Mac.  Restore the retired job's own files first:  Step 5 removed the
+# installed plist and the wrapper, and a bootstrap without them fails with a
+# file-not-found error.
+BACKUP="$(cat ~/apps/_retired/bf-2514-harness-latest)"
+cp "$BACKUP/app.botfleet.server.plist" ~/Library/LaunchAgents/app.botfleet.server.plist
+cp "$BACKUP/botfleet-server-start.sh" ~/apps/botfleet-server-start.sh
+chmod +x ~/apps/botfleet-server-start.sh
+
 launchctl enable gui/$(id -u)/app.botfleet.server
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.botfleet.server.plist
 launchctl kickstart -k gui/$(id -u)/app.botfleet.server
 curl -sf -m 5 http://127.0.0.1:8799/health | jq -c .
 ```
 
-Expected: the health object with the Mac's pid.
+Expected: the health object with the Mac's pid.  The restore has to come **before** the bootstrap, and it has to come from the backup Step 5 took rather than from the tracked repository copies, because the installed pair and the tracked pair are not the same files.
 
 Two things have to be true before the Mac's harness resumes writing, or the double-write returns with a new name.
 
@@ -340,8 +353,9 @@ When the cutover runs, the following belong in the BF-2514 issue, and BF-2515's 
 -  The Step 2 `comm` output showing no id enabled on both hosts.
 -  The Step 4 soak: the dates, the inbound-message count, and the single daily run of the shared routine.
 -  The Step 3 output showing the Mac app reaching the server's pid.
--  The Step 5 output showing `Could not find service "app.botfleet.server"` and an empty listener list.
--  The date of the Apple Note refresh and the inventory rows updated.
+-  The Step 5 output showing `Could not find service "app.botfleet.server"` and an empty listener list.
+-  The path of the backup directory Step 5 wrote, and the two files inside it.
+-  The date of the Apple Note refresh and the inventory rows updated.
 
 ## What This Runbook Does Not Cover
 
