@@ -575,6 +575,8 @@ export const TRANSCRIPT_RETENTION_RULES = {
     "An id missing from the store but written within 7 days is kept, so a store read that raced a save cannot delete a live turn.",
   "orphan-stale":
     "An id missing from the store and quiet for 7 days has every generation and stray trim temp removed.",
+  "volume-budget":
+    "Every transcript log together stays under ~8.4 GB — fifty threads at the full per-thread caps.  Over budget reclaims orphaned generations first, then leftover trim temps, then idle-live tails oldest first.  A live thread's logs are never deleted and an open turn is never trimmed; what is still over budget is reported, not taken.",
 } as const;
 
 /** The thread id a transcript log's file name encodes.  Only ever called
@@ -1130,4 +1132,229 @@ export function startIdleLiveTranscriptSweeps(
     clearTimeout(initial);
     clearInterval(timer);
   };
+}
+
+// ── Data-volume byte budget ──────────────────────────────────────────────
+//
+// Everything above bounds one thread: two generations at the per-file cap,
+// the orphan sweep for ids the store has forgotten, the idle trim for live
+// threads that went quiet.  None of them bounds the directories as a whole —
+// fifty threads at the full per-thread caps would hold about 8.6 GB of
+// ndjson beside messages.db — so this tier caps that total.  It reclaims in
+// safety order: orphaned generations first, then leftover trim temps, then
+// idle-live tails oldest first.  It never deletes a live thread's logs and
+// never trims a turn that is open; when that is not enough to get under
+// budget it stops and reports how far over the volume still is, rather than
+// touching live data.  How full the data volume itself is — `du`, statfs,
+// headroom alerts — stays with Housekeeper; this only enforces the
+// transcript share from the sizes these sweeps already stat.  No per-file cap
+// and no admission gate changes here.
+
+/** Worst case one thread may hold across every transcript log, both
+ * generations: two native caps, two events caps, two item-io caps. */
+export const TRANSCRIPT_PER_THREAD_MAX_BYTES =
+  2 * NATIVE_LOG_MAX_BYTES + 2 * EVENTS_LOG_MAX_BYTES + 2 * ITEM_IO_LOG_MAX_BYTES;
+
+/** Total budget for every transcript log on disk: fifty threads at the full
+ * per-thread worst case, 50 × 172 MiB = 8,600 MiB ≈ 8.4 GiB.  Fifty is
+ * headroom, not a roster limit — the orphan and idle sweeps keep ordinary
+ * hosts far below it, so this only bites when threads accumulate faster than
+ * those sweeps reclaim. */
+export const TRANSCRIPT_DATA_VOLUME_BUDGET_BYTES = 50 * TRANSCRIPT_PER_THREAD_MAX_BYTES;
+
+export interface VolumeSweepOptions extends RetentionInventoryOptions {
+  dryRun?: boolean;
+  /** Override for tests and previews.  Production always uses the constant. */
+  budgetBytes?: number;
+  tailBytes?: IdleTailBytes;
+  read?: ReadAt;
+}
+
+export interface VolumeSweepResult {
+  /** Bytes across the transcript dirs when the sweep started, as scanned. */
+  bytesStart: number;
+  /** Bytes across the transcript dirs when the sweep finished.  A dry run
+   * changes nothing, so this equals `bytesStart`. */
+  bytesEnd: number;
+  budgetBytes: number;
+  /** Distinct threads deleted, trimmed, or reaped — or that a dry run would
+   * change. */
+  ids: number;
+  /** Logs deleted or trimmed, plus stale temps removed — or that a dry run
+   * would change. */
+  files: number;
+  /** Bytes a real run actually gave back.  Zero on a dry run: a projection is
+   * not a reclaim. */
+  bytesReclaimed: number;
+  failed: number;
+  dryRun: boolean;
+  /** True when the volume is still over budget after everything this sweep
+   * is allowed to touch.  Live data is never the price of clearing it. */
+  over: boolean;
+}
+
+/** Enforce the total transcript budget, oldest first, without ever deleting a
+ * live thread's logs or trimming a turn that is open.  Orphaned generations
+ * go first (the orphan sweep's own AND rule decides what is orphaned), then
+ * leftover trim temps, then idle-live tails — and the sweep stops the moment
+ * the volume is back inside budget, so it never over-trims.  A dry run
+ * selects exactly what a real run would change and touches nothing. */
+export function sweepTranscriptVolumeBudget(
+  dirs: TranscriptDirs,
+  liveThreadIds: ReadonlySet<string>,
+  inFlightThreadIds: ReadonlySet<string> = new Set(),
+  opts: VolumeSweepOptions = {},
+): VolumeSweepResult {
+  const now = opts.now ?? Date.now();
+  const dryRun = opts.dryRun ?? false;
+  const budgetBytes = opts.budgetBytes ?? TRANSCRIPT_DATA_VOLUME_BUDGET_BYTES;
+  const tails = opts.tailBytes ?? defaultIdleTails();
+  const read = opts.read ?? readSync;
+  const orphanMaxAgeMs = opts.orphanMaxAgeMs ?? ORPHAN_MAX_AGE_MS;
+  const idleMaxAgeMs = opts.idleMaxAgeMs ?? IDLE_LIVE_MAX_AGE_MS;
+
+  const scanned = scanTranscriptThreads(dirs, now);
+  const total = scanned.reduce((sum, thread) => sum + thread.bytes, 0);
+  const result: VolumeSweepResult = {
+    bytesStart: total,
+    bytesEnd: total,
+    budgetBytes,
+    ids: 0,
+    files: 0,
+    bytesReclaimed: 0,
+    failed: 0,
+    dryRun,
+    over: total > budgetBytes,
+  };
+  if (total <= budgetBytes) return result;
+
+  const reasons = new Map<string, RetentionReason>();
+  for (const thread of scanned) {
+    reasons.set(
+      thread.threadId,
+      retentionReason(thread, liveThreadIds, inFlightThreadIds, now, orphanMaxAgeMs, idleMaxAgeMs),
+    );
+  }
+  const deleted = new Set<string>();
+  const changed = new Set<string>();
+  let remaining = total;
+  const touch = (threadId: string, files: number): void => {
+    if (files > 0) {
+      changed.add(threadId);
+      result.files += files;
+    }
+  };
+  const finish = (): VolumeSweepResult => {
+    result.ids = changed.size;
+    if (!dryRun) {
+      result.bytesReclaimed = total - remaining;
+      result.bytesEnd = remaining;
+    }
+    result.over = (dryRun ? total : remaining) > budgetBytes;
+    return result;
+  };
+
+  // 1. Orphaned generations, oldest first: the only whole-thread delete in
+  // this sweep.  Batch the delete like the orphan sweep does, after deciding
+  // how many ids it takes to get back inside budget.
+  const orphans = scanned
+    .filter((thread) => reasons.get(thread.threadId) === "orphan-stale")
+    .sort((a, b) => a.newestMtime - b.newestMtime);
+  const pendingDelete: ScannedThread[] = [];
+  for (const thread of orphans) {
+    if (remaining <= budgetBytes) break;
+    pendingDelete.push(thread);
+    remaining -= thread.bytes;
+  }
+  if (pendingDelete.length > 0) {
+    if (!dryRun) {
+      const ids = pendingDelete.map((thread) => thread.threadId);
+      for (const dir of transcriptDirList(dirs)) removeTranscriptLogs(dir, ids);
+      for (const thread of pendingDelete) {
+        deleted.add(thread.threadId);
+        touch(thread.threadId, thread.files);
+      }
+    } else {
+      for (const thread of pendingDelete) touch(thread.threadId, thread.files);
+    }
+  }
+  if (remaining <= budgetBytes) return finish();
+
+  // 2. Leftover trim temps beside any thread that is not mid-turn.  The scan
+  // already withheld temps whose writer is still alive, so these are litter.
+  for (const thread of scanned) {
+    if (remaining <= budgetBytes) break;
+    if (deleted.has(thread.threadId)) continue;
+    if (reasons.get(thread.threadId) === "in-flight") continue;
+    for (const temp of thread.staleTemps) {
+      if (remaining <= budgetBytes) break;
+      if (dryRun) {
+        touch(thread.threadId, 1);
+        remaining -= temp.size;
+        continue;
+      }
+      try {
+        unlinkSync(temp.path);
+        touch(thread.threadId, 1);
+        remaining -= temp.size;
+      } catch {
+        result.failed += 1;
+      }
+    }
+  }
+  if (remaining <= budgetBytes) return finish();
+
+  // 3. Idle-live tails, oldest first: trim, never delete.  Active, recent,
+  // and in-flight threads are classified and left alone.
+  const idle = scanned
+    .filter((thread) => !deleted.has(thread.threadId) && reasons.get(thread.threadId) === "idle-live")
+    .sort((a, b) => a.newestMtime - b.newestMtime);
+  for (const thread of idle) {
+    if (remaining <= budgetBytes) break;
+    for (const log of thread.logs) {
+      if (remaining <= budgetBytes) break;
+      const cap = tailCap(log.dir, dirs, tails);
+      if (log.size <= cap) continue;
+      if (dryRun) {
+        touch(thread.threadId, 1);
+        remaining -= log.size - cap;
+        continue;
+      }
+      try {
+        const reclaimed = trimToTail(log.path, cap, read);
+        if (reclaimed > 0) {
+          touch(thread.threadId, 1);
+          remaining -= reclaimed;
+        }
+      } catch {
+        result.failed += 1;
+      }
+    }
+  }
+  return finish();
+}
+
+/** One line for the boot or daily log, or null when there was nothing to say
+ * and the volume is inside its budget.  A dry run never quotes a byte count
+ * it did not reclaim; a volume that is still over budget says how far over,
+ * so the line is a cue for Housekeeper's measurement rather than silence. */
+export function describeVolumeSweep(result: VolumeSweepResult): string | null {
+  if (result.files === 0 && result.failed === 0 && !result.over) return null;
+  const sentences: string[] = [];
+  if (result.files > 0) {
+    const logs = result.files === 1 ? "log" : "logs";
+    sentences.push(
+      result.dryRun
+        ? `Would reclaim ${result.files} transcript ${logs} toward the data-volume budget.`
+        : `Reclaimed ${result.bytesReclaimed} bytes across ${result.files} transcript ${logs} toward the data-volume budget.`,
+    );
+  }
+  if (result.over) {
+    const over = (result.dryRun ? result.bytesStart : result.bytesEnd) - result.budgetBytes;
+    sentences.push(`${over} bytes still over the data-volume budget.`);
+  }
+  if (result.failed > 0) {
+    sentences.push(`${result.failed} transcript ${result.failed === 1 ? "log" : "logs"} could not be reclaimed.`);
+  }
+  return `[retention] ${sentences.join("  ")}`;
 }
