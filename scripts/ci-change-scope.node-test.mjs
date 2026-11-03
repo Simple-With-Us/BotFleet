@@ -19,6 +19,10 @@ test("only the explicit non-executable documentation paths take the fast path", 
     packagingChanged: false,
   });
   assert.equal(classifyCIPaths(["README.md", "SECURITY.md"]).docsOnly, true);
+  assert.equal(
+    classifyCIPaths(["marketing/README.md", "marketing/screenshots/README.md"]).docsOnly,
+    true,
+  );
 
   for (const path of [
     "src/App.tsx",
@@ -28,6 +32,8 @@ test("only the explicit non-executable documentation paths take the fast path", 
     "LICENSE",
     "NOTICE",
     "docs/secrets.md",
+    "marketing/screenshots/macos/drafts/screen.png",
+    "marketing/scripts/publish.mjs",
     ".github/workflows/ci.yml",
     "scripts/release.mjs",
   ]) {
