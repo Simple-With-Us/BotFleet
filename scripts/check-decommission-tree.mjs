@@ -7,7 +7,7 @@
 // by hand, and the reboot check looked at running processes.  A leftover
 // server/index.ts on main is invisible to both.  This script asks git, which
 // is the only place that knows what the tree actually contains, and it fails
-// closed: a checkout whose index cannot be read is a blocked gate, never a
+// closed: a checkout whose tree cannot be read is a blocked gate, never a
 // clean tree.
 //
 // The tree it asks about is the committed tree, because the question is what
@@ -159,12 +159,12 @@ if (isEntryModule()) {
 
   if (!isWorkTree(repoRoot)) {
     console.error(`error: could not read the tracked file list from ${repoRoot}: it is not a git work tree`);
-    console.error("refusing to treat an unreadable index as a clean tree");
+    console.error("refusing to treat an unreadable tree as a clean tree");
     process.exit(2);
   }
   if (!hasCommittedTree(repoRoot)) {
     console.error(`error: ${repoRoot} has no commit to read, so its tree cannot be judged`);
-    console.error("refusing to treat an unreadable index as a clean tree");
+    console.error("refusing to treat an unreadable tree as a clean tree");
     process.exit(2);
   }
 
@@ -174,7 +174,7 @@ if (isEntryModule()) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`error: could not read the tracked file list from ${repoRoot}: ${message}`);
-    console.error("refusing to treat an unreadable index as a clean tree");
+    console.error("refusing to treat an unreadable tree as a clean tree");
     process.exit(2);
   }
 

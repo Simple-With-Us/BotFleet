@@ -105,6 +105,32 @@ test("a job that reaches the desktop through a reusable workflow or a matrix is 
   assert.ok(offenders.every((offender) => offender.job === "delegated"));
 });
 
+test("a job that installs the desktop dependency closure is a Node desktop job", () => {
+  // The root manifest and lockfile hold the whole desktop closure, so a job
+  // that installs it cannot outlive the desktop.  A job that only installs a
+  // pinned CLI is a different thing, and must not be named.
+  const workflow = {
+    jobs: {
+      lint: {
+        name: "Lint",
+        steps: [{ name: "Install", run: "pnpm install --frozen-lockfile" }],
+      },
+      cli: {
+        name: "Install pinned CLI",
+        steps: [{ name: "Install CLI", run: "npm install --global vercel@64.5.0" }],
+      },
+    },
+  };
+  const offenders = findNodeDesktopJobs(workflow, ".github/workflows/node-ci.yml");
+  const installers = offenders.filter((offender) => offender.pattern === "pnpm install");
+  assert.equal(installers.length, 1);
+  assert.equal(installers[0].job, "lint");
+  assert.ok(
+    !offenders.some((offender) => offender.job === "cli"),
+    "a job that installs a global CLI does not install the desktop",
+  );
+});
+
 test("a workflow that only mentions the command in a prompt is not a desktop job", () => {
   // An autofix workflow passes the repo's verify command to its agent as
   // text.  The job does not run the desktop, so naming it would be a false
@@ -114,6 +140,22 @@ test("a workflow that only mentions the command in a prompt is not a desktop job
       autofix: {
         name: "autofix",
         with: { prompt: "This repo's verify command: `pnpm typecheck && pnpm test`." },
+        steps: [{ name: "Run the agent", run: "node agent.mjs" }],
+      },
+    },
+  };
+  assert.deepEqual(findNodeDesktopJobs(workflow, ".github/workflows/claude-code-autofix.yml"), []);
+});
+
+test("a prompt that names the install is not a desktop job either", () => {
+  // Same rule, one step further: a prompt that tells an agent to run
+  // `pnpm install` is text, and the job that carries it does not install the
+  // desktop closure.
+  const workflow = {
+    jobs: {
+      autofix: {
+        name: "autofix",
+        with: { prompt: "Start with `pnpm install --frozen-lockfile`." },
         steps: [{ name: "Run the agent", run: "node agent.mjs" }],
       },
     },
@@ -200,4 +242,8 @@ test("the committed workflows still carry a Node desktop job, so the gate fails 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /\.github\/workflows\/ci\.yml: job "test"/);
   assert.match(result.stderr, /matches "pnpm test"/);
+  // The desktop lint workflow installs the closure, so the gate has to name
+  // it as well: a removal that left it behind would break CI on main.
+  assert.match(result.stderr, /\.github\/workflows\/node-ci\.yml: job "lint"/);
+  assert.match(result.stderr, /matches "pnpm install"/);
 });

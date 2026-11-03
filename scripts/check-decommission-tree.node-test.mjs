@@ -16,8 +16,8 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const cli = join(repoRoot, "scripts", "check-decommission-tree.mjs");
 
 /**
- * Build a throwaway git work tree so `git ls-files` really runs against a
- * real index instead of a mocked one.
+ * Build a throwaway git work tree so `git ls-tree` really runs against a
+ * real tree instead of a mocked one.
  */
 function makeRepo(directory, files) {
   execFileSync("git", ["init", "--quiet"], { cwd: directory, stdio: ["ignore", "pipe", "pipe"] });
@@ -79,9 +79,9 @@ test("the gate refuses a directory that is not a git work tree", () => {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-decommission-tree-"));
   try {
     const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
-    assert.equal(result.status, 2, "an unreadable index must be refused, never passed");
+    assert.equal(result.status, 2, "an unreadable tree must be refused, never passed");
     assert.match(result.stderr, /could not read the tracked file list/);
-    assert.match(result.stderr, /refusing to treat an unreadable index as a clean tree/);
+    assert.match(result.stderr, /refusing to treat an unreadable tree as a clean tree/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -92,7 +92,7 @@ test("the gate refuses a checkout with no commit to read", () => {
   try {
     execFileSync("git", ["init", "--quiet"], { cwd: directory, stdio: ["ignore", "pipe", "pipe"] });
     const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
-    assert.equal(result.status, 2, "an empty index must not read as a clean tree");
+    assert.equal(result.status, 2, "an empty tree must not read as a clean tree");
     assert.match(result.stderr, /has no commit to read/);
   } finally {
     rmSync(directory, { recursive: true, force: true });

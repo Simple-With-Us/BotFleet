@@ -17,17 +17,27 @@ import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
 /**
- * The Node desktop work a surviving CI job would perform.  The first five
- * are commands; the last is the display name the Node test job carries, so
- * a job renamed to something harmless still gets caught by what it runs.
+ * The Node desktop work a surviving CI job would perform.  The last entry is
+ * the display name the Node test job carries, so a job renamed to something
+ * harmless still gets caught by what it runs.
  *
  * `pnpm typecheck` is in the list on its own: a job that only typechecks
  * still needs the Node toolchain and the desktop's tsconfig, so it is a Node
  * desktop job even though it runs no test.
+ *
+ * `pnpm install` is in the list one step earlier, for the same reason.  The
+ * root manifest and lockfile hold the whole desktop dependency closure, so a
+ * job that installs it is a job that cannot outlive the desktop.  No workflow
+ * installs a package of its own — `cloudflare/` carries no manifest of its
+ * own, and the two autofix workflows install a pinned CLI instead — so a root
+ * install is a desktop install.  `pnpm lint` is in the list because it runs
+ * the desktop lint toolchain over the tree.
  */
 export const NODE_DESKTOP_PATTERNS = [
   "pnpm test",
   "pnpm typecheck",
+  "pnpm lint",
+  "pnpm install",
   "pnpm package:",
   "vite build",
   "electron-builder",
