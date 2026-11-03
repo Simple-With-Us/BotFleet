@@ -12,7 +12,8 @@
 // anywhere at all, and it goes straight to Infisical over the connection
 // `login()` already authenticated, never through a log line.
 import { constants } from "node:fs";
-import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
+import { lstat, open, readFile, realpath, type FileHandle } from "node:fs/promises";
+import { homedir } from "node:os";
 import { resolve, sep } from "node:path";
 
 import { normalizeInfisicalSecretPath, type InfisicalSettings, type ResolvedInfisicalReadSource } from "./config.ts";
@@ -23,6 +24,42 @@ import { SECRET_FIELDS, infisicalSnapshot, setInfisicalSnapshot, vaultNames as s
 import { KNOB_FIELDS, KNOB_INFISICAL_NAMES, knobSource } from "./knob-map.ts";
 
 export type RefreshReason = "boot" | "timer" | "settings" | "manual";
+
+/** The projects a mapped field may name.
+ *
+ * `botfleet` is this app's own project.  `fleet-ops` is the fleet's, where
+ * the seats' CLI logins live.  Both are read with the SAME machine identity
+ * — the server holds one identity and one Infisical site, and the project
+ * is what a read is addressed to, not a second credential. */
+export type VaultProject = "botfleet" | "fleet-ops";
+
+/** The only environment the fleet's project has.  The fleet refuses a
+ * non-prod environment for it, so a read that named one would be asking for
+ * a project that does not exist. */
+export const FLEET_OPS_ENVIRONMENT = "prod";
+
+/** The fleet's project id, or "" when this host has none.
+ *
+ * It is never committed — the fleet keeps that project id out of every
+ * repository — so it comes from the environment variable the fleet's own
+ * tools read (`INFISICAL_FLEET_OPS_PROJECT_ID`) and then from the fleet's
+ * own `~/.agent-sync/fleet-ops-project-id` file, in that order, exactly as
+ * `fleet-secrets` resolves it.
+ *
+ * A project id is a locator, not a credential: the credential that reads the
+ * folder is the machine identity this manager already holds.  The file holds
+ * a UUID and nothing else, and it is read as a plain file — no symlink
+ * chase, no directory walk. */
+export async function fleetOpsProjectId(): Promise<string> {
+  const fromEnv = (process.env.INFISICAL_FLEET_OPS_PROJECT_ID ?? "").trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const raw = await readFile(resolve(homedir(), ".agent-sync", "fleet-ops-project-id"), "utf8");
+    return raw.split("\n")[0]?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
 
 /** Everything the loopback status route and the Secrets card read.  Values
  * never ride here — only the site URL, the project id, the environment, the
@@ -860,6 +897,30 @@ class InfisicalManager {
       scopeSignature(projectId, environment, secretPath),
     );
     return new Map(values);
+  }
+
+  /** One folder in a NAMED project, read for a caller that keeps the values
+   * to itself: the fleet's CLI logins (`server/cli-logins.ts`).
+   *
+   * The same machine identity reads BotFleet's own project and the fleet's;
+   * what differs is the project the request is addressed to.  Nothing is
+   * copied between the two, and the snapshot is never touched: these values
+   * are per seat and never become config fields.
+   *
+   * A host with no project id for the fleet's project has nothing to
+   * address, and is told so rather than being pointed at BotFleet's own
+   * project instead — a read of the wrong project would come back with the
+   * wrong rows, or with nothing, and both would look like a missing login. */
+  async readProjectPath(project: VaultProject, secretPath: string): Promise<ReadonlyMap<string, string>> {
+    if (project === "botfleet") return this.readPath(secretPath);
+    const projectId = await fleetOpsProjectId();
+    if (!projectId) {
+      throw new InfisicalError(
+        "The fleet's Infisical project is not configured on this host: set INFISICAL_FLEET_OPS_PROJECT_ID.",
+        409,
+      );
+    }
+    return this.readPath(secretPath, { projectId, environment: FLEET_OPS_ENVIRONMENT });
   }
 
   /** A Settings save of a value the vault manages, with Write Through on.

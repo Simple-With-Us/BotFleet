@@ -15,7 +15,7 @@ import type {
   TurnStartResult,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { applyLaunchIdentity } from "../launch-identity.ts";
+import { launchedChildEnvironment } from "../cli-logins.ts";
 import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
 import { describeSpawnFailure, execCli, isProbeTimeout, killCliTree, spawnCli } from "../procs.ts";
@@ -260,7 +260,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
           // handler that keeps a dead child's EPIPE from killing the harness.
           child = spawnCli(config.command, args, {
             cwd: turnInput.cwd ?? homedir(),
-            env: applyLaunchIdentity(childEnv(), turnInput.launchIdentity),
+            env: await launchedChildEnvironment(childEnv(), turnInput.launchIdentity),
             stdio: ["pipe", "pipe", "pipe"],
           });
         } catch (err) {

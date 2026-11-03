@@ -311,3 +311,24 @@ it("hydrates the request-log secret from the managed vault without exposing its 
   expect(JSON.stringify(rows)).not.toContain(SENTINEL_VAULT);
   expect(WORKSPACE_CREDENTIAL_ENV).toContain("GITHUB_REQUEST_LOG_WEBHOOK_SECRET");
 });
+
+describe("the CLI logins", () => {
+  it("claims no config field, so a CLI login never becomes a config value", () => {
+    for (const entry of SECRET_FIELDS) {
+      expect(entry.env).not.toContain("GH_TOKEN");
+      expect(entry.infisicalName).not.toBe("GH_TOKEN");
+    }
+  });
+
+  it("does not come through the config snapshot", () => {
+    // The snapshot is BotFleet's own project, and a CLI login lives in the
+    // fleet's project under a per-seat folder.  A row that happened to
+    // carry one of these names must not be applied here:  it would put one
+    // seat's login into the config of every bot.
+    setInfisicalSnapshot(new Map([["GH_TOKEN", SENTINEL_VAULT]]), ["GH_TOKEN"]);
+    expect(infisicalSnapshot()?.has("GH_TOKEN")).toBe(false);
+    const cfg: AppConfig = {};
+    resolveSecretFields(cfg, {}, infisicalSnapshot());
+    expect(JSON.stringify(cfg)).not.toContain(SENTINEL_VAULT);
+  });
+});

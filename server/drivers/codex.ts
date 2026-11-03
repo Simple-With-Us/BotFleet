@@ -37,7 +37,8 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { applyLaunchIdentity, codexShellPolicyArgs } from "../launch-identity.ts";
+import { launchedChildEnvironment } from "../cli-logins.ts";
+import { codexShellPolicyArgs } from "../launch-identity.ts";
 import {
   decodeCodexSelection,
   readCodexModelCatalogDetailed,
@@ -311,7 +312,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const launchAttempt = async (attempt: number): Promise<void> => {
         // `childEnv()` is the instance's; the launch identity is this bot's
         // and this turn's, so it goes on last (a relaunch rebuilds it).
-        const env = applyLaunchIdentity(childEnv(), turn.launchIdentity);
+        const env = await launchedChildEnvironment(childEnv(), turn.launchIdentity);
         const appServerArgs = [
           "app-server",
           ...codexLocalProviderArgs(env, turn.model),

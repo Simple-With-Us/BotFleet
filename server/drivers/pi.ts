@@ -55,7 +55,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
-import { applyLaunchIdentity } from "../launch-identity.ts";
+import { launchedChildEnvironment } from "../cli-logins.ts";
 import {
   decodeInjectId,
   encodeInjectId,
@@ -565,12 +565,14 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       // spawnCli can throw synchronously (unresolvable CLI); if it does, the
       // 0600 temp file with the box token / composio key / comms token must
       // not be left on disk — settle() never runs because no child existed.
-      const child = (() => {
+      // The IIFE is async because the seat's CLI login is read before the
+      // spawn; the try still covers the spawn itself.
+      const child = await (async () => {
         try {
           return spawnCli(config.cli, childArgs, {
             stdio: ["pipe", "pipe", "pipe"],
             cwd: turn.cwd,
-            env: applyLaunchIdentity(
+            env: await launchedChildEnvironment(
               piEnvironment({
                 ...process.env,
                 ...input.environment,
