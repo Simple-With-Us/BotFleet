@@ -11,12 +11,13 @@
 // test passes on a build that would be dead in the field — which is precisely
 // how the bug escaped. The copy is the whole point; do not "simplify" it away.
 import { execFile, spawn } from "node:child_process";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { assertRuntimeExecutable, resolveRuntime } from "./smoke-runtime-mode.mjs";
+import { packagedSmokeConfig } from "./smoke-packaged-fixture.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const port = 21000 + Math.floor(Math.random() * 9000);
@@ -53,6 +54,11 @@ const runtime = (() => {
 
 const staging = mkdtempSync(join(tmpdir(), "omb-smoke-"));
 const home = mkdtempSync(join(tmpdir(), "omb-smoke-home-"));
+// The empty-home default is the full product fleet, whose startup probes
+// discover installed host CLIs through PATH and known install locations.
+// Keep package validation independent of those CLIs and their auth state.
+mkdirSync(join(home, ".botfleet"), { recursive: true });
+writeFileSync(join(home, ".botfleet", "config.json"), JSON.stringify(packagedSmokeConfig(home)));
 
 // OMB_SMOKE_DIST lets the release workflow aim this at a packaged app's
 // Resources/server tree instead of the repo build.
