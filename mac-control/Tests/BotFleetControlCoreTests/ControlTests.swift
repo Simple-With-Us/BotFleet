@@ -423,11 +423,12 @@ final class ControlTests: XCTestCase {
         try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
         try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
         let marker = home.appendingPathComponent(".botfleet/stopped.marker")
-        try Data().write(to: marker)
+        let contents = Data("owner-stop-start".utf8)
+        try contents.write(to: marker)
         let runner = MockCommands()
         runner.failKickstart = true
         XCTAssertThrowsError(try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).startServer())
-        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(try Data(contentsOf: marker), contents)
     }
 
     func testRestartServerClearsTheDeliberateStopAndReplacesTheRunningInstance() throws {
@@ -459,11 +460,12 @@ final class ControlTests: XCTestCase {
         try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
         try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
         let marker = home.appendingPathComponent(".botfleet/stopped.marker")
-        try Data().write(to: marker)
+        let contents = Data("owner-stop-restart".utf8)
+        try contents.write(to: marker)
         let runner = MockCommands()
         runner.failKickstart = true
         XCTAssertThrowsError(try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).restartServer())
-        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(try Data(contentsOf: marker), contents)
     }
 
     func testUnparkedCompanionStartUsesOnlyTheCompanionAgent() throws {

@@ -259,15 +259,15 @@ public final class StartupPolicy {
         let boot = try bootID()
         try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         try Data((boot + "\n").utf8).write(to: session, options: .atomic)
-        let wasStopped = files.fileExists(atPath: stopped.path)
-        if wasStopped { try files.removeItem(at: stopped) }
+        let markerContents = files.fileExists(atPath: stopped.path) ? try Data(contentsOf: stopped) : nil
+        if markerContents != nil { try files.removeItem(at: stopped) }
         do {
             try startAgent(label: StartupPolicy.serverAgentLabel)
         } catch {
-            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
+            if let markerContents { try? markerContents.write(to: stopped, options: .atomic) }
             throw error
         }
-        return DeliberateStop(marker: stopped, files: files, wasStopped: wasStopped)
+        return DeliberateStop(marker: stopped, files: files, markerContents: markerContents)
     }
 
     /// Restarts the BotFleet Server.
@@ -287,15 +287,15 @@ public final class StartupPolicy {
         let boot = try bootID()
         try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         try Data((boot + "\n").utf8).write(to: session, options: .atomic)
-        let wasStopped = files.fileExists(atPath: stopped.path)
-        if wasStopped { try files.removeItem(at: stopped) }
+        let markerContents = files.fileExists(atPath: stopped.path) ? try Data(contentsOf: stopped) : nil
+        if markerContents != nil { try files.removeItem(at: stopped) }
         do {
             try restartAgent(label: StartupPolicy.serverAgentLabel)
         } catch {
-            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
+            if let markerContents { try? markerContents.write(to: stopped, options: .atomic) }
             throw error
         }
-        return DeliberateStop(marker: stopped, files: files, wasStopped: wasStopped)
+        return DeliberateStop(marker: stopped, files: files, markerContents: markerContents)
     }
 
     /// Starts the BotFleet Companion LaunchAgent.
@@ -331,23 +331,23 @@ public final class StartupPolicy {
     public struct DeliberateStop {
         private let marker: URL
         private let files: FileManager
-        private let wasStopped: Bool
+        private let markerContents: Data?
 
-        fileprivate init(marker: URL, files: FileManager, wasStopped: Bool) {
+        fileprivate init(marker: URL, files: FileManager, markerContents: Data?) {
             self.marker = marker
             self.files = files
-            self.wasStopped = wasStopped
+            self.markerContents = markerContents
         }
 
         /// True when the marker was there before the restart.
-        public var wasStoppedByOwner: Bool { wasStopped }
+        public var wasStoppedByOwner: Bool { markerContents != nil }
 
         /// Puts the deliberate-stop marker back, when it was there before.
         public func restore() {
-            guard wasStopped else { return }
+            guard let markerContents else { return }
             try? files.createDirectory(at: marker.deletingLastPathComponent(),
                                        withIntermediateDirectories: true)
-            try? Data().write(to: marker, options: .atomic)
+            try? markerContents.write(to: marker, options: .atomic)
         }
     }
 

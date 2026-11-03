@@ -697,7 +697,8 @@ final class FleetServicesTests: XCTestCase {
             try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
             try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
             let marker = home.appendingPathComponent(".botfleet/stopped.marker")
-            try Data().write(to: marker)
+            let contents = Data("owner-stop-observed".utf8)
+            try contents.write(to: marker)
             let commands = LaunchAgentCommands()
             commands.listingFails = expected == .unknown
             commands.listing = expected == .running
@@ -707,6 +708,7 @@ final class FleetServicesTests: XCTestCase {
             let observed = try await control.perform(.start, serviceID: FleetServiceRegistry.server.id, attempts: 0)
             XCTAssertEqual(observed, expected)
             XCTAssertEqual(FileManager.default.fileExists(atPath: marker.path), expected == .stopped)
+            if expected == .stopped { XCTAssertEqual(try Data(contentsOf: marker), contents) }
         }
     }
 
