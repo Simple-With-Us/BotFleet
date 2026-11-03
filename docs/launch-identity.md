@@ -2,7 +2,7 @@
 
 BotFleet starts an engine process (claude, codex, an ACP engine, agy, pi, a wrapped CLI) for every bot turn.  Those engines read their own platform's rules files, skills and hooks, and those files name a default seat.  Without a signal from the launcher, a plumber bot on the claude engine would act as the Claude seat and a plumber bot on the codex engine as the Codex seat.  This page is what BotFleet tells each engine process, so the fleet's tools and the bot agree on who it is.
 
-The code is `server/launch-identity.ts`.  The contract with the fleet tools (the `agent-sync` CLI and its hooks) is AI-Fleet-Coordinator `docs/protocols/zulip-fleet-guide.md`, Launcher Contract.
+The code is `server/launch-identity.ts`.  The contract with the fleet tools (the `simple-chat` CLI and its hooks) is AI-Fleet-Coordinator `docs/protocols/zulip-fleet-guide.md`, Launcher Contract.
 
 ## What Every Engine Process Gets
 
@@ -27,17 +27,17 @@ Where it applies:  the Claude, Codex, ACP (every ACP engine), Antigravity, pi an
 
 An mcode turn starts more processes of its own:  the MCP servers it knows, and the commands of its shell tool.  mcode 0.6.2 starts all of them from the `mcode acp` process BotFleet launched, and each one sees the five variables above (the test probes those names only, so it says nothing about the rest of the environment).  That holds for a server listed in the data directory's `mcp.json` (the owner's `~/.minimax/mcp.json`) and for one BotFleet sends in `session/new`.  A server's own `env` block is added on top.  Nothing here is BotFleet code:  it is how mcode starts them, which is why `server/drivers/acp/mcode-launch-seat.test.ts` pins it.
 
-That is what lets the owner's `agent-sync mcp --default-seat MM` entry sign a launched bot's posts as the bot.  agent-sync takes the launcher's seat first and reads `--default-seat` only when no launcher started the session:
+That is what lets the owner's `simple-chat mcp --default-seat MM` entry sign a launched bot's posts as the bot.  simple-chat takes the launcher's seat first and reads `--default-seat` only when no launcher started the session:
 
-| Process | Seat agent-sync serves |
+| Process | Seat simple-chat serves |
 | --- | --- |
 | Launched by BotFleet, seat assigned | The bot's role seat (`BF-MONITOR`), with the credential `BF_MONITOR_ZULIP_KEY` from Infisical Fleet-OPS `/zulip`.  Posts are tagged `[BF-MONITOR·<session>]`. |
-| Launched by BotFleet, no seat (the switch below is off, or the name names no role) | None.  agent-sync exits 3 and the bot is offered no agent-sync tools. |
+| Launched by BotFleet, no seat (the switch below is off, or the name names no role) | None.  simple-chat exits 3 and the bot is offered no simple-chat tools. |
 | Not launched (the owner's own MiniMax Code) | `MM`, from `--default-seat MM`.  Posts are tagged `[MM]`. |
 
 So a bot's post signed `[MM]`, with no session part, did not come from a launched turn of this code:  its process had neither `AGENT_LAUNCHER` nor `AGENT_SESSION`, and every launched turn has both.  The tests show mcode is not what dropped them.  Check in this order:  restart the harness after an update, because a process started before the launcher contract landed keeps running the old code, then look for a spawn path that skips `applyLaunchIdentity`.
 
-Two consequences of the switch.  With `BOTFLEET_FLEET_SEAT_PROMPTS` off, a launched mcode bot cannot post through agent-sync at all, which is the safe failure.  With it on, the bot's credential file must exist (mode 600) in the home mcode runs with, or agent-sync exits 3 for the same reason.
+Two consequences of the switch.  With `BOTFLEET_FLEET_SEAT_PROMPTS` off, a launched mcode bot cannot post through simple-chat at all, which is the safe failure.  With it on, the bot's credential file must exist (mode 600) in the home mcode runs with, or simple-chat exits 3 for the same reason.
 
 ## Linear Board Access
 
@@ -75,4 +75,4 @@ A user's Codex config can narrow the environment of the model's shell commands w
 - `server/drivers/*.test.ts` (claude, codex, acp, antigravity, pi, cli-wrapper):  the real fake engine process sees each bot's own seat, none of the inherited identity, and no Zulip variable.
 - `server/launch-identity-wiring.test.ts`:  the real harness, a 1:1 chat and a room turn, from an environment that holds a seat and a Zulip login.
 - `server/tools/computer.test.ts`, `server/tools/host.test.ts`, `server/jobs/registry.test.ts`:  the `bash` tool and job shells.
-- `server/drivers/acp/mcode-launch-seat.test.ts`:  the real `mcode` CLI against a scripted fake model and a fake Zulip, in a throwaway data directory.  A launched turn's MCP server (from `mcp.json` and from `session/new`) and shell see the five launch variables and no other `AGENT_` name (the probe reports `AGENT_` names only);  the real `agent-sync mcp --default-seat MM` answers `whoami` as `BF-MONITOR` for a launched turn, refuses with no seat, and still answers `MM` for an ordinary MiniMax Code session.  Needs `mcode` (and `agent-sync` for the last group) on the machine;  skips with a message when they are absent, as in CI, or with `BOTFLEET_REAL_MCODE_TESTS=0`.
+- `server/drivers/acp/mcode-launch-seat.test.ts`:  the real `mcode` CLI against a scripted fake model and a fake Zulip, in a throwaway data directory.  A launched turn's MCP server (from `mcp.json` and from `session/new`) and shell see the five launch variables and no other `AGENT_` name (the probe reports `AGENT_` names only);  the real `simple-chat mcp --default-seat MM` answers `whoami` as `BF-MONITOR` for a launched turn, refuses with no seat, and still answers `MM` for an ordinary MiniMax Code session.  Needs `mcode` (and `simple-chat` for the last group) on the machine;  skips with a message when they are absent, as in CI, or with `BOTFLEET_REAL_MCODE_TESTS=0`.

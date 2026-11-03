@@ -4,7 +4,7 @@ PR #831 (`ag/fix-acp-wedged-lock`).  Close the recycled-pgid kill window when an
 
 ## Pre-work Claim
 
-- AGENT-SYNC protocol was read before claiming this work.
+- The fleet handbook was read before claiming this work.
 - A pre-work claim was posted with `repo: BotFleet` as its first body field.
 - Seat `BF-FIXER`, claimed Mon, Oct 5, 2026, state WIP / tip-fix.
 - Claimed scope:  `ag/fix-acp-wedged-lock` `server/procs.ts` `server/procs-group.test.ts` `server/drivers/acp/**` (PR #831).

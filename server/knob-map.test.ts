@@ -5,6 +5,7 @@ import {
   KNOB_FIELDS,
   KNOB_INFISICAL_NAMES,
   canonicalKnobString,
+  clearedHeadroomKnobs,
   deleteKnobField,
   knobProvenance,
   knobSource,
@@ -50,6 +51,21 @@ describe("headroom knobs (P-BF-6 B7)", () => {
     ]));
     expect(cfg.jobs?.admission).toEqual({ reservedCpuCores: 2, reservedRamMb: 4096, minMemoryAvailablePercent: 15 });
     for (const id of ids) expect(rows.find((row) => row.id === id)).toMatchObject({ source: "infisical", hasValue: true });
+  });
+  it("names the headroom knobs a patch clears with an explicit null", () => {
+    expect(clearedHeadroomKnobs({ jobs: { admission: { reservedCpuCores: null } } })).toEqual([
+      "jobs.admission.reservedCpuCores",
+    ]);
+    expect(
+      clearedHeadroomKnobs({ jobs: { admission: { reservedRamMb: null, minMemoryAvailablePercent: null } } }),
+    ).toEqual(["jobs.admission.reservedRamMb", "jobs.admission.minMemoryAvailablePercent"]);
+    // A real value is not a clear, and neither is an absent key or patch.
+    expect(clearedHeadroomKnobs({ jobs: { admission: { reservedCpuCores: 2 } } })).toEqual([]);
+    expect(clearedHeadroomKnobs({ jobs: { admission: {} } })).toEqual([]);
+    expect(clearedHeadroomKnobs({})).toEqual([]);
+    expect(clearedHeadroomKnobs(undefined)).toEqual([]);
+    // An explicit null is not a value either: it reads as absent everywhere.
+    expect(readKnobField({ jobs: { admission: { reservedCpuCores: null } } }, spec("jobs.admission.reservedCpuCores"))).toBeUndefined();
   });
 });
 

@@ -85,7 +85,8 @@ const BACKOFF_MS = [5_000, 30_000, 60_000, 120_000];
 const PAGE = 100;
 const MAX_PAGES = 20;
 /** Followed topics a reconnect backfills, and pages per topic: what was said
- *  there while the queue was down (the fleet listener caps it the same way). */
+ *  there while the queue was down (the Operator's eavesdropper caps it the
+ *  same way). */
 const FOLLOWED_BACKFILL_TOPICS = 25;
 const FOLLOWED_BACKFILL_PAGES = 2;
 /** Zulip's own limit on a topic name. */

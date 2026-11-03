@@ -461,10 +461,29 @@ function kindMatches(spec: KnobFieldSpec, value: unknown): value is KnobValue {
   }
 }
 
+/** The ids of the headroom knobs the patch clears with an explicit JSON null —
+ * the wire spelling of "clear this knob back to unset" (slice 7b).  Only the
+ * three unset-by-default knobs admit null through the patch schema, so the
+ * check reads the typed admission object straight off the zod-validated
+ * patch — the same differential `botDefaults.allowedComputers` and
+ * `callStt.provider` already use — instead of walking blindly.  An absent
+ * key or a real value is not a clear. */
+export function clearedHeadroomKnobs(patch: Partial<AppConfig> | undefined): string[] {
+  const admission = patch?.jobs?.admission;
+  if (!admission) return [];
+  const cleared: string[] = [];
+  if (admission.reservedCpuCores === null) cleared.push("jobs.admission.reservedCpuCores");
+  if (admission.reservedRamMb === null) cleared.push("jobs.admission.reservedRamMb");
+  if (admission.minMemoryAvailablePercent === null) cleared.push("jobs.admission.minMemoryAvailablePercent");
+  return cleared;
+}
+
 /** Read one knob off a config-shaped object, typed.  Returns `undefined`
  * when the field is absent or holds a value of the wrong kind — the schema
  * below this layer is zod-validated, so the wrong-kind case is a caller
- * handing in something unvalidated, not a state the file can be in. */
+ * handing in something unvalidated, not a state the file can be in.
+ * An explicit null (see `knobClearRequested`) is not a value and also reads
+ * as `undefined` here. */
 // SAFETY: `spec.section` is a `keyof AppConfig` from the table above, so
 // indexing a plain config object by it reads a declared section and nothing
 // else.
