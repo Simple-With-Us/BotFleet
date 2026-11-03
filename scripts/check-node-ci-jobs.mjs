@@ -15,6 +15,7 @@ import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
+import { z } from "zod";
 
 /**
  * The Node desktop work a surviving CI job would perform.  The last entry is
@@ -154,6 +155,65 @@ export function compositeActionFiles(repoRoot) {
 }
 
 /**
+ * The shapes this gate reads, validated at the trust boundary.
+ *
+ * A workflow file is untrusted input:  it is YAML on disk that anybody with
+ * write access can edit.  Reading it with optional chaining instead of a
+ * schema means a malformed shape either crashes the gate or, worse, reads as
+ * an empty job set and passes.  So the parsed document is validated, and a
+ * shape that does not match is refused rather than judged.
+ *
+ * `.passthrough()` keeps every key this gate does not read, because a
+ * workflow carries a great deal that is none of the gate's business.
+ */
+const StepSchema = z
+  .object({
+    name: z.string().optional(),
+    run: z.string().optional(),
+    uses: z.string().optional(),
+  })
+  .passthrough();
+
+const JobSchema = z
+  .object({
+    name: z.string().optional(),
+    uses: z.string().optional(),
+    steps: z.array(StepSchema).optional(),
+    strategy: z.unknown().optional(),
+  })
+  .passthrough();
+
+export const WorkflowSchema = z
+  .object({
+    jobs: z.record(z.string(), JobSchema),
+  })
+  .passthrough();
+
+export const CompositeActionSchema = z
+  .object({
+    name: z.string().optional(),
+    runs: z
+      .object({
+        using: z.string().optional(),
+        steps: z.array(StepSchema).optional(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+/**
+ * The short reason a document failed its schema.  The full issue list is long
+ * and names paths the reader cannot act on;  the path and the message are
+ * what says which shape is wrong.
+ */
+function schemaFailure(error) {
+  const issue = error?.issues?.[0];
+  if (!issue) return "the document does not match the expected shape";
+  const path = issue.path?.length ? issue.path.join(".") : "(document)";
+  return `${path}: ${issue.message}`;
+}
+
+/**
  * Read and parse one workflow file.  Throws with the file name attached so
  * the CLI can report exactly which file it could not read.
  */
@@ -172,7 +232,11 @@ export function readWorkflow(filePath) {
   if (parsed.jobs === null || parsed.jobs === undefined) {
     throw new Error(`${filePath} has no jobs: a workflow with no job set cannot be judged clean`);
   }
-  return parsed;
+  const result = WorkflowSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(`${filePath} is not a workflow shape this gate can judge: ${schemaFailure(result.error)}`);
+  }
+  return result.data;
 }
 
 /**
@@ -195,10 +259,11 @@ export function readCompositeAction(filePath) {
   if (parsed === null || parsed === undefined) {
     throw new Error(`${filePath} parsed as an empty document`);
   }
-  if (parsed.runs === null || parsed.runs === undefined) {
-    throw new Error(`${filePath} has no runs: an action with no runs block cannot be judged clean`);
+  const result = CompositeActionSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(`${filePath} is not a composite action shape this gate can judge: ${schemaFailure(result.error)}`);
   }
-  return parsed;
+  return result.data;
 }
 
 // Compare physical paths.  Node's ESM loader realpaths the entry module, so an

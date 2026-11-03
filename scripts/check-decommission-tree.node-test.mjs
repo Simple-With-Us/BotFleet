@@ -75,6 +75,21 @@ test("a manifest that is not at the repository root does not count", () => {
   assert.deepEqual(remaining.roots, ["companion"]);
 });
 
+test("a failing run names the roots it does not assert", () => {
+  // Neither a green nor a red verdict may read as "the whole Node stack is
+  // gone":  shared/ and electron/ belong to other issues, so the gate says so
+  // on every run.
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-decommission-tree-"));
+  try {
+    makeRepo(directory, { "server/index.ts": "export const harness = true;\n" });
+    const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
+    assert.equal(result.status, 1, "the surviving root must block the gate");
+    assert.match(result.stderr, /not asserted here, because another issue owns them: shared\/, electron\//);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("the gate refuses a directory that is not a git work tree", () => {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-decommission-tree-"));
   try {
@@ -159,7 +174,7 @@ test("the gate names the roots another issue owns instead of ignoring them", () 
     const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     for (const root of OUT_OF_SCOPE_ROOTS) {
-      assert.match(result.stdout, new RegExp(`not checked here[^\\n]*${root}/`));
+      assert.match(result.stdout, new RegExp(`not asserted here[^\\n]*${root}/`));
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });

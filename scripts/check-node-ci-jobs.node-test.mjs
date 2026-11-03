@@ -216,6 +216,24 @@ test("a workflow file that cannot be parsed is refused instead of skipped", () =
   }
 });
 
+test("a workflow whose job shape is malformed is refused instead of judged", () => {
+  // A workflow file is untrusted YAML.  A job whose steps are not a list of
+  // steps must not read as a job with no steps, or the gate would pass on a
+  // shape it could not read.
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-node-ci-jobs-"));
+  try {
+    makeCheckout(directory, {
+      "ci.yml": "name: CI\njobs:\n  test:\n    steps: not-a-list\n",
+    });
+    const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
+    assert.equal(result.status, 2, "a malformed shape must not be judged clean");
+    assert.match(result.stderr, /ci\.yml/);
+    assert.match(result.stderr, /not a workflow shape this gate can judge/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a workflow without a job set is refused instead of passing", () => {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-node-ci-jobs-"));
   try {

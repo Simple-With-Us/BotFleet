@@ -179,6 +179,12 @@ if (isEntryModule()) {
   }
 
   const remaining = missingTreeConditions(files);
+  // The roots this gate does not assert are named on every run, failed or
+  // passed, so that neither verdict can be read as "the whole Node stack is
+  // gone".  `shared/` carries native consumers as well as Node ones and
+  // belongs to BF-2544's retained closure;  `electron/` is the Electron half
+  // of the decommission, which BF-2485 owns.
+  const outOfScope = `not asserted here, because another issue owns them: ${OUT_OF_SCOPE_ROOTS.map((root) => `${root}/`).join(", ")}.`;
   if (remaining.roots.length > 0 || remaining.manifests.length > 0) {
     console.error("Node decommission tree gate: FAILED — the tracked tree still carries the Node stack");
     for (const root of remaining.roots) {
@@ -188,13 +194,12 @@ if (isEntryModule()) {
     for (const manifest of remaining.manifests) {
       console.error(`  - ${manifest} is still tracked at the repository root`);
     }
+    console.error(`  - ${outOfScope}`);
     process.exit(1);
   }
 
   console.log(
     `the tracked tree carries no ${DECOMMISSION_ROOTS.map((root) => `${root}/`).join(", no ")} and no desktop Node manifest.`,
   );
-  console.log(
-    `not checked here, because another issue owns them: ${OUT_OF_SCOPE_ROOTS.map((root) => `${root}/`).join(", ")}.`,
-  );
+  console.log(outOfScope);
 }
