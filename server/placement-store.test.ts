@@ -52,6 +52,37 @@ afterEach(() => {
 });
 
 describe.skipIf(process.platform === "win32")("transactional placement authority", () => {
+  it.each(["win32", "freebsd", "aix"] as const)("refuses SQLite activation and reopening on %s without modifying legacy or migrated evidence", (platform) => {
+    const absent = join(fixture(), "must-remain-absent");
+    expect(() => openPlacementStore(absent, controllerId, platform)).toThrow(/Placement persistence/);
+    expect(existsSync(absent)).toBe(false);
+    const legacy = fixture();
+    const path = join(legacy, "placement-controller.json");
+    const bytes = JSON.stringify({ controllerId, epoch: 7 });
+    writeFileSync(path, bytes, { mode: 0o600 });
+    expect(() => openPlacementStore(legacy, controllerId, platform)).toThrow(/Placement persistence/);
+    expect(readdirSync(legacy)).toEqual(["placement-controller.json"]);
+    expect(readFileSync(path, "utf8")).toBe(bytes);
+    const existing = fixture(); open(existing).close();
+    const before = readdirSync(existing).map((name) => ({ name, bytes: readFileSync(join(existing, name)), mode: statSync(join(existing, name)).mode }));
+    expect(() => openPlacementStore(existing, controllerId, platform)).toThrow(/Placement persistence/);
+    expect(() => openPlacementAuthority(existing, controllerId, platform)).toThrow(/Placement persistence/);
+    expect(readdirSync(existing).map((name) => ({ name, bytes: readFileSync(join(existing, name)), mode: statSync(join(existing, name)).mode }))).toEqual(before);
+  });
+
+  it("preserves normal legacy boot on an unsupported placement host without enabling SQLite or private payloads", () => {
+    const dir = fixture();
+    const first = openPlacementAuthority(dir, controllerId, "win32");
+    expect(first.kind).toBe("legacy");
+    if (first.kind !== "legacy") throw new Error("Fixture unexpectedly opened SQLite");
+    expect(first.controllerStore.read()).toEqual(initial);
+    const before = readFileSync(join(dir, "placement-controller.json"));
+    const again = openPlacementAuthority(dir, controllerId, "win32");
+    expect(again.kind).toBe("legacy");
+    expect(readFileSync(join(dir, "placement-controller.json"))).toEqual(before);
+    expect(readdirSync(dir)).toEqual(["placement-controller.json"]);
+  });
+
   it("keeps ordinary bootstrap on strict legacy JSON until an explicit verified activation marker exists", () => {
     const dir = fixture();
     const authority = openPlacementAuthority(dir, controllerId);
@@ -849,6 +880,75 @@ describe.skipIf(process.platform === "win32")("transactional placement authority
       expect(current.store.read().leases).toHaveLength(retained);
       console.info("placement-history measurement", JSON.stringify({ retained, rpcs: 20, initializationMs: Math.round(initializationMs), elapsedMs: Math.round(elapsedMs), payloadReads: reads - beforeReads, terminalRemovals: removals - beforeRemovals, stateWrites: 0 }));
     } finally { db.close(); }
+  });
+
+  it("keeps twenty steady-state heartbeats free of payload I/O with five hundred unresolved commands", () => {
+    const current = create();
+    current.store.transaction((state) => {
+      for (let index = 0; index < PLACEMENT_ACTIVE_LIMIT; index++) {
+        const job = { jobId: `active-${index}`, botId: "fixture", threadId: "heartbeat", cwd: "/fixture", timeoutMs: 1000,
+          payloadDigest: commandDigest("true"), queuedAt: 1000, status: "queued" as const };
+        state.jobs.push({ ...job, fingerprint: placementFingerprint(job) });
+      }
+    });
+    for (const job of current.store.readAll().jobs) current.payloads.put(job, "true");
+    const work = { reads: 0, puts: 0, removals: 0, reconciliations: 0, scannedEntries: 0 };
+    const payloadDir = join(current.dir, "placement-payloads", "pending-commands");
+    const payloads: PlacementPayloads = {
+      put: (job, command) => { work.puts++; current.payloads.put(job, command); },
+      read: (job) => { work.reads++; return current.payloads.read(job); },
+      remove: (job) => { work.removals++; current.payloads.remove(job); },
+      reconcile: (jobs) => { work.reconciliations++; work.scannedEntries += readdirSync(payloadDir).length; current.payloads.reconcile(jobs); },
+    };
+    const service = new PlacementLeaseService({ hostId: controllerId, controller: initial, store: current.store, payloads, now: () => 1000 });
+    ready(service);
+    Object.assign(work, { reads: 0, puts: 0, removals: 0, reconciliations: 0, scannedEntries: 0 });
+    current.store.resetMetrics();
+    const before = current.store.readAll();
+    for (let index = 0; index < 20; index++) expect(service.heartbeat({ ...fence, hostId: workerId, leases: [], admission: { admit: true }, sample })).toMatchObject({ ok: true });
+    console.info("placement-active-heartbeat payload work", JSON.stringify({ active: PLACEMENT_ACTIVE_LIMIT, rpcs: 20, ...work }));
+    expect(work).toEqual({ reads: 0, puts: 0, removals: 0, reconciliations: 0, scannedEntries: 0 });
+    expect(current.store.metrics().rowsWritten).toBe(0);
+    expect(current.store.readAll()).toEqual(before);
+    expect(readdirSync(payloadDir)).toHaveLength(PLACEMENT_ACTIVE_LIMIT);
+    claimed(service.claim({ ...fence, hostId: workerId, jobId: "active-0" }));
+    expect(work.reads).toBe(1);
+    expect(service.dispatch({ ...message("active-1", "true"), timeoutMs: 1000, lease: { ...initial, host: workerId, jobId: "active-1", leaseId: "fixture-dispatch" } })).toMatchObject({ reply: { accepted: true } });
+    expect(work.reads).toBe(2);
+    expect(work.reconciliations).toBe(0);
+    expect(work.removals).toBe(0);
+  });
+
+  it("reconciles admission under its writer lock and removes terminal payload only after a separately witnessed commit", () => {
+    const current = create();
+    const witness = open(current.dir);
+    let insideWriter = false;
+    let reconciliations = 0;
+    const removals: { insideWriter: boolean; committedStatus: string | undefined }[] = [];
+    const store: PlacementStore = { ...current.store, close() {}, transactionScope: (scope, change) => current.store.transactionScope(scope, (state) => {
+      insideWriter = true;
+      try { return change(state); } finally { insideWriter = false; }
+    }) };
+    const payloads: PlacementPayloads = {
+      put: (job, command) => current.payloads.put(job, command), read: (job) => current.payloads.read(job),
+      reconcile: (jobs) => { expect(insideWriter).toBe(true); reconciliations++; current.payloads.reconcile(jobs); },
+      remove: (job) => {
+        removals.push({ insideWriter, committedStatus: witness.readScope({ jobIds: [job.jobId] }).jobs[0]?.status });
+        current.payloads.remove(job);
+      },
+    };
+    const service = new PlacementLeaseService({ hostId: controllerId, controller: initial, store, payloads, now: () => 1000 });
+    expect(reconciliations).toBe(1);
+    service.enqueue(message());
+    expect(reconciliations).toBe(2);
+    ready(service);
+    const lease = claimed(service.claim({ ...fence, hostId: workerId, jobId: "job-1" }));
+    expect(service.report(finalReport(lease))).toMatchObject({ reply: { accepted: true } });
+    expect(removals).toEqual([{ insideWriter: false, committedStatus: "completed" }]);
+    expect(service.report(finalReport(lease))).toMatchObject({ reply: { accepted: true } });
+    service.heartbeat({ ...fence, hostId: workerId, leases: [], admission: { admit: true }, sample });
+    expect(removals).toHaveLength(1);
+    expect(reconciliations).toBe(2);
   });
 
   it("keeps indexed hot-path row work constant at two thousand and twenty thousand retained jobs, including cold pruned IDs", () => {

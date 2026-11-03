@@ -13,7 +13,10 @@ import { harnessReady } from "./testing/harness-ready.ts";
 import { freePortBlock } from "./testing/ports.ts";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
 import { commandDigest, openPlacementStore, placementFingerprint } from "./placement-store.ts";
+import { openRuntimeStore } from "./runtime/store.ts";
+import type { Assignment } from "./runtime/types.ts";
 
 const hostId: HostId = "server:11111111-1111-4111-8111-111111111111";
 const nextId: HostId = "mac:22222222-2222-4222-8222-222222222222";
@@ -326,6 +329,19 @@ describe("durable controller transitions", () => {
       `], { env: { HOME: home, USERPROFILE: home, PATH: process.env.PATH, TZ: "America/Chicago" }, encoding: "utf8" });
       expect(seeded.status, seeded.stderr).toBe(0);
       const continuation = z.object({ botId: z.string(), threadId: z.string(), cardId: z.string() }).parse(JSON.parse(seeded.stdout));
+      const pendingId = randomUUID();
+      const runtime = openRuntimeStore(join(dir, "runtime.db"));
+      const queued: Assignment = {
+        id: pendingId, rootId: pendingId, depth: 0,
+        origin: { kind: "person", source: "chat", ref: continuation.threadId },
+        requester: { kind: "person", threadId: continuation.threadId },
+        assignee: { botId: continuation.botId, destination: { kind: "standing_thread", threadId: continuation.threadId } },
+        mode: "work", reply: "none", brief: "Retained delegated fixture work",
+        status: "queued", level: "ask", levelSource: "own", executions: 0, restarts: 0,
+        createdAt: 1, lastActivityAt: 1, result: "", rework: false, version: 1,
+      };
+      runtime.insert(queued, { kind: "enqueued", at: 1 });
+      runtime.close();
       // The fixture alone may prepare migration; the shipped bootstrap cannot.
       const store = openPlacementStore(dir, legacy.controllerId);
       store.transaction((state) => {
@@ -354,6 +370,11 @@ describe("durable controller transitions", () => {
       writeFileSync(interruptedPath, interruptedBytes);
       await boot();
       expect(await identity()).toMatchObject({ controllerId: nextId, epoch: 7 });
+      const delegated = new DatabaseSync(join(dir, "runtime.db"), { readOnly: true });
+      try {
+        const record = delegated.prepare("SELECT json FROM assignments WHERE id=?").get(pendingId);
+        expect(JSON.parse(String(record?.json))).toEqual(queued);
+      } finally { delegated.close(); }
       const messages = new DatabaseSync(join(dir, "messages.db"), { readOnly: true });
       try {
         const readCard = () => String(messages.prepare("SELECT json FROM messages WHERE thread_id=? AND id=?").get(continuation.threadId, continuation.cardId)?.json);
@@ -377,6 +398,7 @@ describe("durable controller transitions", () => {
         expect(await response.json()).toMatchObject({ placementReadOnly: true, quiescing: true });
       }
       expect((await fetch(`${base}/api/bots`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status).toBe(503);
+      expect((await fetch(`${base}/api/update/run`, { method: "POST", headers: { authorization: `Bearer ${owner.nonce}`, "content-type": "application/json" }, body: "{}" })).status).toBe(503);
       await new Promise((resolve) => setTimeout(resolve, 3000));
       expect(readFileSync(resumePath, "utf8")).toBe(resumeBytes);
       expect(readFileSync(interruptedPath, "utf8")).toBe(interruptedBytes);

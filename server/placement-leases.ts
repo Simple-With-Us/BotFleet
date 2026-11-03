@@ -203,7 +203,7 @@ export class PlacementLeaseService {
     if (this.store) job.command = TERMINAL.includes(job.status) ? "" : this.payloads?.read(this.storedJob(job)) ?? "";
   }
 
-  private mutate<T>(operation: () => T, scope: PlacementScope = {}): T {
+  private mutate<T>(operation: () => T, scope: PlacementScope = {}, reconcileForAdmission = false): T {
     if (!this.store) return operation();
     const before = {
       current: { ...this.current }, reconcile: this.reconcileState,
@@ -214,9 +214,9 @@ export class PlacementLeaseService {
       const result = this.store.transactionScope({ ...scope, active: true }, (state) => {
         this.installState(state);
         this.inTransaction = true;
-        this.reconcilePayloads(state);
-        // Only already-persisted terminal outcomes are eligible here.
-        this.cleanupPayloads();
+        // Orphans are reclaimed only before new payload publication, using
+        // fresh committed references while this writer still owns the lock.
+        if (reconcileForAdmission) this.reconcilePayloads(state);
         const reply = operation();
         state.controller = { ...this.current };
         state.reconcile = this.reconcileState;
@@ -436,7 +436,7 @@ export class PlacementLeaseService {
     // Commit expiry and finish its cleanup before publishing into a full spool;
     // the fresh admission transaction must independently validate its fence.
     if (this.store) this.expireQueued(message);
-    return this.mutate(() => this.enqueueNow(message), { jobIds: [message.jobId] });
+    return this.mutate(() => this.enqueueNow(message), { jobIds: [message.jobId] }, true);
   }
 
   private enqueueNow(message: EnqueueMessage): LeaseResult<EnqueueReply> {

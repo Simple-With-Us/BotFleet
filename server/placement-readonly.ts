@@ -50,7 +50,7 @@ export type RollbackPlacementAuthority =
 
 /** A UUID marker irrevocably selects passive execution for this process,
  * without a migration entrypoint or an override, even after unquiesce. */
-export function openRollbackPlacementAuthority(dataDir: string, hostId: HostId): RollbackPlacementAuthority {
+export function openRollbackPlacementAuthority(dataDir: string, hostId: HostId, platform: NodeJS.Platform = process.platform): RollbackPlacementAuthority {
   try {
     const markerPath = join(dataDir, "placement-controller.json");
     const value = exists(markerPath) ? readMarker(markerPath) : undefined;
@@ -60,15 +60,19 @@ export function openRollbackPlacementAuthority(dataDir: string, hostId: HostId):
       return { kind: "legacy", controllerStore: openControllerEpochStore(dataDir, hostId) };
     }
     const marker = markerSchema.parse(value);
+    // A passive reader must not silently reopen a normalized ledger on a
+    // platform where the authoritative writer refuses SQLite activation.
+    if ((process.platform !== "darwin" && process.platform !== "linux") ||
+        (platform !== "darwin" && platform !== "linux")) throw new PlacementStoreError();
     const directoryPath = realpathSync(dataDir);
     const directory = lstatSync(directoryPath);
-    if (!directory.isDirectory() || (process.platform !== "win32" && (directory.uid !== process.getuid?.() || (directory.mode & 0o022) !== 0))) throw new PlacementStoreError();
+    if (!directory.isDirectory() || directory.uid !== process.getuid?.() || (directory.mode & 0o022) !== 0) throw new PlacementStoreError();
     const path = join(directoryPath, "placement.sqlite");
     const inode = privateFile(path);
     function checkFiles(): void {
       const currentDirectory = lstatSync(directoryPath);
       if (!currentDirectory.isDirectory() || !sameFile(directory, currentDirectory)
-        || (process.platform !== "win32" && (currentDirectory.uid !== process.getuid?.() || (currentDirectory.mode & 0o022) !== 0))
+        || currentDirectory.uid !== process.getuid?.() || (currentDirectory.mode & 0o022) !== 0
         || !sameFile(inode, privateFile(path))) throw new PlacementStoreError();
       for (const suffix of ["-wal", "-shm"]) if (exists(`${path}${suffix}`)) privateFile(`${path}${suffix}`);
       if (markerSchema.parse(readMarker(markerPath)).migrationId !== marker.migrationId) throw new PlacementStoreError();

@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -26,6 +26,21 @@ afterEach(() => {
 });
 
 describe.skipIf(process.platform === "win32")("conservative placement rollback reader", () => {
+  it.each(["win32", "freebsd", "aix"] as const)("refuses normalized rollback on unsupported %s without changing retained bytes", (platform) => {
+    const dir = fixture();
+    writer(dir).close();
+    const before = readdirSync(dir).map((name) => ({ name, bytes: readFileSync(join(dir, name)), mode: statSync(join(dir, name)).mode }));
+    expect(() => openRollbackPlacementAuthority(dir, hostId, platform)).toThrow(/Placement persistence/);
+    expect(readdirSync(dir).map((name) => ({ name, bytes: readFileSync(join(dir, name)), mode: statSync(join(dir, name)).mode }))).toEqual(before);
+    const legacy = fixture();
+    const marker = join(legacy, "placement-controller.json");
+    writeFileSync(marker, JSON.stringify({ controllerId: hostId, epoch: 7 }), { mode: 0o600 });
+    const legacyBefore = readFileSync(marker);
+    expect(openRollbackPlacementAuthority(legacy, hostId, platform).kind).toBe("legacy");
+    expect(readFileSync(marker)).toEqual(legacyBefore);
+    expect(readdirSync(legacy)).toEqual(["placement-controller.json"]);
+  });
+
   it("keeps legacy bootstrap unchanged without creating SQLite or payload storage", () => {
     const dir = fixture();
     const legacy = openRollbackPlacementAuthority(dir, hostId);

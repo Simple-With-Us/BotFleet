@@ -98,6 +98,31 @@ describe("RoutineManager with an unusable routines.json", () => {
     })]);
   });
 
+  it("keeps passive scheduler state unchanged when direct mutators bypass HTTP", async () => {
+    const file = tempFile();
+    seed(file);
+    const active = build(file);
+    active.snoozeBot("bot-1"); active.flushNow();
+    const bytes = readFileSync(file);
+    const manager = build(file, true);
+    const routines = manager.listRoutines();
+    const runs = manager.listRuns();
+    expect(manager.isBotSnoozed("bot-1")).toBe(true);
+    expect(() => manager.create({ name: "Forbidden", prompt: "x", botId: "bot-1", schedule: { type: "daily", time: "09:00", weekdays: [1] } })).toThrow(/passive/);
+    expect(manager.update(routines[0]!.id, { name: "Changed" })).toBeNull();
+    expect(manager.remove(routines[0]!.id)).toBe(false);
+    expect(manager.runNow(routines[0]!.id)).toBeNull();
+    expect(() => manager.enqueueWebhook({ webhookId: "webhook", webhookName: "Webhook", prompt: "x", botId: "bot-1", runOn: "bot", deliveryId: "delivery", receivedAt: NOW })).toThrow(/passive/);
+    expect(await manager.cancelAllRunsForBot("bot-1")).toEqual([]);
+    expect(manager.requeueRun("old-run")).toBe(false);
+    manager.snoozeBot("bot-2"); manager.clearBotSnooze("bot-1"); manager.clearAllBotSnoozes(); manager.disableForBot("bot-1");
+    expect(manager.isBotSnoozed("bot-1")).toBe(true);
+    expect(manager.isBotSnoozed("bot-2")).toBe(false);
+    expect(manager.listRoutines()).toEqual(routines);
+    expect(manager.listRuns()).toEqual(runs);
+    expect(readFileSync(file)).toEqual(bytes);
+  });
+
   it("saves new routines into a fresh file and leaves the set-aside file alone", () => {
     const file = tempFile();
     const truncated = seed(file).slice(0, 90);

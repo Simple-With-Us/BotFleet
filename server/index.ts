@@ -9336,6 +9336,9 @@ export async function executeRoutineRequestRequest(input: {
 
 // Handoffs a previous process queued, and turns a restart cut, live in
 // runtime.db.  Open reconciles them, then the legacy queue is imported once.
+// Passive rollback must not open runtime.db or boot its queued dispatcher:
+// a refused startTurn would otherwise settle retained assignments as failed.
+if (!placementRollbackReadOnly) {
 jobHost = createJobHost({
   store,
   commsBus,
@@ -9362,6 +9365,7 @@ jobHost = createJobHost({
   },
 });
 jobHost.boot();
+}
 
 // Auto-resume only when a previous process died mid-turn.  An external-only
 // custom credential can arrive after the standalone harness starts; keep that
@@ -13385,10 +13389,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (mutatingApiRequest && arrivedViaCloudflareTunnel(req)) {
       return json(res, 403, { error: NAMED_TUNNEL_MUTATION_FORBIDDEN });
     }
-    // A bridge offers diagnostics and the authenticated updater lifecycle,
-    // but cannot accept new work or edits that could create deferred work.
+    // A bridge offers diagnostics and an update check, but cannot install a
+    // replacement that would escape the immutable hold without artifact proof.
     if (placementRollbackReadOnly && mutatingApiRequest && !path.startsWith("/api/placement/") &&
-        path !== "/api/runtime/quiesce" && path !== "/api/update/check" && path !== "/api/update/run") {
+        path !== "/api/runtime/quiesce" && path !== "/api/update/check") {
       return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
     }
     if (runtimeQuiescing && path.startsWith("/api/") && path !== "/api/runtime" && path !== "/api/runtime/quiesce" &&

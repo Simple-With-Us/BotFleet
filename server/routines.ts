@@ -198,6 +198,8 @@ export interface RoutineRunPendingClose {
   checkInId: string;
 }
 
+interface SeenRunsResult { acknowledged: number; runs: RoutineRun[] }
+
 export interface RoutineRequestReceipt {
   requestId: string;
   messageId: string;
@@ -730,15 +732,18 @@ export class RoutineManager {
    *  duration is until a person wakes the bot (a message, respond, or Run
    *  now clears the snooze via `clearBotSnooze`). */
   snoozeBot(botId: string, durationMs = Infinity): void {
+    if (this.passive) return;
     this.botSnoozeUntil.set(botId, durationMs === Infinity ? Infinity : this.now() + durationMs);
     this.save();
   }
 
   clearBotSnooze(botId: string): void {
+    if (this.passive) return;
     if (this.botSnoozeUntil.delete(botId)) this.save();
   }
 
   clearAllBotSnoozes(): void {
+    if (this.passive) return;
     if (this.botSnoozeUntil.size > 0) {
       this.botSnoozeUntil.clear();
       this.save();
@@ -749,7 +754,7 @@ export class RoutineManager {
     const until = this.botSnoozeUntil.get(botId);
     if (!until) return false;
     if (until !== Infinity && this.now() >= until) {
-      this.botSnoozeUntil.delete(botId);
+      if (!this.passive) this.botSnoozeUntil.delete(botId);
       return false;
     }
     return true;
@@ -760,6 +765,7 @@ export class RoutineManager {
    *  something else (a release that resumed it first), and queueing it again
    *  would run the same automation twice. */
   requeueRun(runId: string): boolean {
+    if (this.passive) return false;
     const run = this.runs.find((candidate) => candidate.id === runId);
     if (run && run.status === "cancelled") {
       run.status = "queued";
@@ -774,6 +780,7 @@ export class RoutineManager {
   }
 
   async cancelAllRunsForBot(botId: string): Promise<RoutineRun[]> {
+    if (this.passive) return [];
     const cancelled: RoutineRun[] = [];
     for (const run of this.runs) {
       if (!run.coalescedInto && run.botId === botId && ["queued", "running", "waiting"].includes(run.status)) {
@@ -816,6 +823,7 @@ export class RoutineManager {
    * actionable card may survive indefinitely and must retain its exact-once
    * recovery record for the same lifetime. */
   forgetRoutineRequestReceipt(request: RoutineRequestCommit): boolean {
+    if (this.passive) return false;
     const receipt = this.matchingRoutineRequestReceipt(request);
     if (!receipt) return false;
     const index = this.routineRequestReceipts.indexOf(receipt);
@@ -826,6 +834,7 @@ export class RoutineManager {
   }
 
   forgetRoutineRequestReceiptsForThread(threadId: string): number {
+    if (this.passive) return 0;
     const kept = this.routineRequestReceipts.filter((receipt) => receipt.threadId !== threadId);
     const removed = this.routineRequestReceipts.length - kept.length;
     if (removed === 0) return 0;
@@ -838,6 +847,7 @@ export class RoutineManager {
   /** Drop only receipts whose confirmation transcript no longer exists.
    * Reachable open cards retain exact-once recovery for their full lifetime. */
   reconcileRoutineRequestReceipts(reachable: readonly RoutineRequestOwner[]): number {
+    if (this.passive) return 0;
     const keys = new Set(reachable.map(routineRequestOwnerKey));
     const kept = this.routineRequestReceipts.filter((receipt) => keys.has(routineRequestOwnerKey(receipt)));
     const removed = this.routineRequestReceipts.length - kept.length;
@@ -855,6 +865,7 @@ export class RoutineManager {
   }
 
   create(input: RoutineInput, request?: RoutineRequestCommitFor<"create">): Routine {
+    if (this.passive) throw new Error("Routine manager is passive during placement rollback");
     if (request) {
       const receipt = this.matchingRoutineRequestReceipt(request);
       if (receipt) {
@@ -886,6 +897,7 @@ export class RoutineManager {
     patch: Partial<RoutineInput>,
     request?: RoutineRequestCommitFor<"update" | "pause" | "resume">,
   ): Routine | null {
+    if (this.passive) return null;
     if (request) {
       const receipt = this.matchingRoutineRequestReceipt(request);
       if (receipt) {
@@ -949,6 +961,7 @@ export class RoutineManager {
   }
 
   remove(id: string, request?: RoutineRequestCommitFor<"delete">): boolean {
+    if (this.passive) return false;
     if (request) {
       const receipt = this.matchingRoutineRequestReceipt(request);
       if (receipt) {
@@ -974,6 +987,7 @@ export class RoutineManager {
   }
 
   disableForBot(botId: string) {
+    if (this.passive) return;
     let changed = false;
     for (const routine of this.routines) {
       if (routine.botId !== botId || !routine.enabled) continue;
@@ -996,6 +1010,7 @@ export class RoutineManager {
   }
 
   runNow(id: string, request?: RoutineRequestCommitFor<"run_now">): RoutineRun | null {
+    if (this.passive) return null;
     if (request) {
       const receipt = this.matchingRoutineRequestReceipt(request);
       if (receipt) {
@@ -1057,6 +1072,7 @@ export class RoutineManager {
   }
 
   canCoalesceWebhook(webhookId: string, botId: string): boolean {
+    if (this.passive) return false;
     if (this.options.botState(botId) !== "busy") return false;
     if (this.botIsOff(botId) || this.isBotSnoozed(botId)) return false;
     const key = automationThreadKey({
@@ -1088,6 +1104,7 @@ export class RoutineManager {
     deliveryId: string;
     receivedAt: number;
   }): RoutineRun {
+    if (this.passive) throw new Error("Routine manager is passive during placement rollback");
     if (this.options.botState(input.botId) === "missing") {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
@@ -1156,6 +1173,7 @@ export class RoutineManager {
     deliveryId: string;
     receivedAt: number;
   }): RoutineRun {
+    if (this.passive) throw new Error("Routine manager is passive during placement rollback");
     if (this.options.botState(input.botId) === "missing") {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
@@ -1225,6 +1243,7 @@ export class RoutineManager {
   }
 
   cancelQueuedWebhook(webhookId: string, message: string): void {
+    if (this.passive) return;
     let changed = false;
     for (const run of this.runs) {
       if (run.webhookId !== webhookId || run.status !== "queued") continue;
@@ -1238,6 +1257,7 @@ export class RoutineManager {
   }
 
   async cancelRun(id: string): Promise<RoutineRun | null> {
+    if (this.passive) return null;
     let run = this.runs.find((r) => r.id === id);
     if (run?.coalescedInto) run = this.runs.find((r) => r.id === run!.coalescedInto);
     if (!run || !["queued", "running", "waiting"].includes(run.status)) return null;
@@ -1256,6 +1276,7 @@ export class RoutineManager {
   }
 
   markSeen(id: string): RoutineRun | null {
+    if (this.passive) return null;
     const run = this.runs.find((r) => r.id === id);
     if (!run) return null;
     if (!run.seenAt) {
@@ -1283,7 +1304,8 @@ export class RoutineManager {
    *  `webhookId`, so without the source a webhook and a resource trigger
    *  sharing an id would each clear the other's badge.  A scheduled routine
    *  has no `webhookId`, so a trigger sweep never touches one by accident. */
-  markAllSeen(filter: { triggerId?: string; triggerSource?: RoutineRunTrigger } = {}): { acknowledged: number; runs: RoutineRun[] } {
+  markAllSeen(filter: { triggerId?: string; triggerSource?: RoutineRunTrigger } = {}): SeenRunsResult {
+    if (this.passive) return { acknowledged: 0, runs: [] };
     const seenAt = this.now();
     const acknowledged: RoutineRun[] = [];
     for (const run of this.runs) {
@@ -1765,6 +1787,7 @@ export class RoutineManager {
   }
 
   handleRuntimeEvent(event: RuntimeEvent, opts?: { fallingOver?: boolean }): RoutineRun | null {
+    if (this.passive) return null;
     if (
       event.type !== "session.started" &&
       event.type !== "request.opened" &&
@@ -1866,6 +1889,7 @@ export class RoutineManager {
   }
 
   failThread(threadId: string, message: string, code = routineFailureCode(message)) {
+    if (this.passive) return;
     const run = this.runs.find(
       (r) => !r.coalescedInto && r.threadId === threadId && (r.status === "running" || r.status === "waiting"),
     );
@@ -1892,6 +1916,7 @@ export class RoutineManager {
    * gets a grace so the sweep never races the dispatch that marks the bot
    * busy. Returns the receipts it settled. */
   reconcileOrphanedRuns(now = this.now()): RoutineRun[] {
+    if (this.passive) return [];
     const live = this.options.turnLive;
     if (!live) return [];
     const orphaned: RoutineRun[] = [];
@@ -1999,6 +2024,7 @@ export class RoutineManager {
    *  Running and waiting receipts are left alone: a turn that has started
    *  finishes.  Returns the receipts it settled. */
   skipQueuedRunsForBot(botId: string): RoutineRun[] {
+    if (this.passive) return [];
     const skipped: RoutineRun[] = [];
     for (const run of this.runs) {
       if (run.botId !== botId || run.status !== "queued") continue;
@@ -2169,6 +2195,7 @@ export class RoutineManager {
    * nothing left to catch it.
    */
   private commitMutation(mutate: () => void): void {
+    if (this.passive) throw new Error("Routine manager is passive during placement rollback");
     const before = {
       routines: this.routines.map((routine) => ({ ...routine, schedule: { ...routine.schedule } })),
       runs: this.runs.map((run) => ({ ...run, denials: run.denials ? [...run.denials] : undefined })),
@@ -2226,6 +2253,7 @@ export class RoutineManager {
    * coalesced save is never lost when the process exits. A no-op when
    * nothing is dirty. */
   flushNow(): void {
+    if (this.passive) return;
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
