@@ -116,7 +116,7 @@ Until the native epoch fence in `docs/plans/2026-10-29-native-server-mode.md` la
 | Who is the process? | `launchctl print` names `pid` and `port` | `systemctl show botfleet-server.service -p MainPID` names it |
 | Does it answer? | `curl -sf http://127.0.0.1:8799/health` returns 200 | `curl -sf http://100.69.77.26:8799/health` returns 200 behind the owner gate |
 
-**Exactly one of those two columns may be true.**  If both are true, the deployment has two writers and the contract is violated; that is the alarm condition, and the response is to stop the Mac's harness first, because the server is the writer.  If neither is true, the deployment has no writer and the response is the rollback.  The cutover's soak runs while the Mac's writer is still loaded,  so it is a proof about the server and not about the contract's state:  the one-writer state is reached at the end of the retirement,  and the no-node soak belongs to BF-2515 after it.
+**Exactly one of those two columns may be true.**  If both are true, the deployment has two writers and the contract is violated; that is the alarm condition, and the response is to stop the Mac's harness first, because the server is the writer.  If neither is true, the deployment has no writer and the response is the rollback.  The cutover's soak runs while the Mac's writer is still loaded and unused,  so it is a proof about the server and not about the contract's state:  it is the `soak-24h-server-writer` evidence,  the one-writer state is reached at the end of the retirement,  and BF-2515's `soak-24h-no-node` evidence,  which is a day with the Mac's harness stopped,  belongs after it.
 
 The health route answers `/health` and `/api/health` with `app`, `pid`, `ready` and `booting` ([server/index.ts](../server/index.ts#L885)); the `pid` is what makes the answer checkable rather than a bare liveness string.
 
@@ -128,7 +128,7 @@ Six items.  Each has a command and an expected output in [the cutover runbook](
 2.  **No surface is enabled on both hosts.**  The routine registry, the webhook registry and the bot roster are compared, and every id enabled on the Mac is disabled or migrated first.
 3.  **The Mac app is pointed at the server.**  It reads and writes through the server, and the local `:8799` is no longer its target.
 4.  **Mac-only capability still works.**  Desktop control, screen capture, the Local VM and the iMessage relay are not collateral damage of the cutover; they are the reason the Mac keeps a role.
-5.  **A full day passes with the Mac's harness stopped.**  Every bot answers, every routine fires on schedule, Zulip and Linear round-trip, and the webhook receiver still receives.
+5.  **A full day passes with the Mac's harness loaded and unused.**  Every bot answers, every routine fires on schedule, Zulip and Linear round-trip, and the webhook receiver still receives.  That is the `soak-24h-server-writer` evidence:  the server is the writer,  and the Mac's harness is still loaded and serves nothing.  The `soak-24h-no-node` evidence,  which is a full day with the Mac's harness stopped,  belongs to BF-2515 after the retirement.
 6.  **The rollback has been rehearsed once.**  Restoring the Mac's harness against the archived store has been done, not assumed.
 
 Only then does the launch agent get retired.  The decommission runbook's Step 2 makes the same ordering: "**Precondition:** BF-2514 Done, `soak-24h-no-node` asserted, and `app.botfleet.server` confirmed booted out with `launchctl print` showing no job."

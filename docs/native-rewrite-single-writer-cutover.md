@@ -80,19 +80,25 @@ wc -l /tmp/srv-routine-enabled.txt /tmp/srv-webhook-enabled.txt
 
 Expected on Nov 2, 2026: `1` enabled routine and `0` enabled webhooks.
 
-Those two files are the server's own record, on the server.  The comparison below re-fetches
-them on the Mac, because `comm` can only compare two files on one host.
+Those two files are the server's own record, on the server.  The comparison below re-fetches them on the Mac, because `comm` can only compare two files on one host.  Every overlap check in this runbook has that shape:  it runs on the Mac (`Mac.Jays.Services`),  the server's list is fetched over the tailnet behind the owner gate,  the HTTP status is checked,  and only then are the two local lists compared.
 
 **The overlap:**
 
 ```bash
-# On the Mac.  Both lists are produced here,  so comm compares two local files:
-# a list produced on the server cannot be compared with one on the Mac,  and a
-# missing file makes comm print an error and nothing on stdout,  which is what a
-# passing check looks like.
+# On the Mac (Mac.Jays.Services).  Both lists are produced here,  so comm compares
+# two local files:  a list produced on the server (fleet-hetzner-nbg1) cannot be
+# compared with one on the Mac,  and a missing file makes comm print an error and
+# nothing on stdout,  which is what a passing check looks like.
+# The server's list is fetched over the tailnet behind the owner gate,  and the
+# HTTP status is checked before the comparison runs.
+# The gate token travels in that pipe and never in a process's argv:  curl reads
+# its own header from the configuration on standard input.
 for kind in routines webhooks; do
-  code="$(curl -s -o /tmp/srv-$kind.json -w '%{http_code}' -m 10 \
-    -H "x-botfleet-gate-token: $BF_GATE_TOKEN" http://100.69.77.26:8799/api/$kind)"
+  code="$(curl -s -o /tmp/srv-$kind.json -w '%{http_code}' -m 10 --config - \
+    "http://100.69.77.26:8799/api/$kind" <<EOF
+header = "x-botfleet-gate-token: $BF_GATE_TOKEN"
+EOF
+)"
   [ "$code" = "200" ] || { echo "FAIL: the server's $kind list answered $code"; exit 1; }
 done
 jq -r '.routines[]|select(.enabled)|.id' /tmp/srv-routines.json | sort > /tmp/srv-routine-enabled.txt
@@ -104,6 +110,16 @@ comm -12 /tmp/mac-webhook-enabled.txt /tmp/srv-webhook-enabled.txt
 Expected on Nov 2, 2026: one routine id and nothing else.
 
 ```bash
+# On the Mac (Mac.Jays.Services),  with the server's list fetched again over the
+# tailnet behind the owner gate:  a comparison that reuses a list from an earlier
+# step can compare a stale file and look like a pass.
+code="$(curl -s -o /tmp/srv-routines.json -w '%{http_code}' -m 10 --config - \
+  "http://100.69.77.26:8799/api/routines" <<EOF
+header = "x-botfleet-gate-token: $BF_GATE_TOKEN"
+EOF
+)"
+[ "$code" = "200" ] || { echo "FAIL: the server's routine list answered $code"; exit 1; }
+jq -r '.routines[]|select(.enabled)|.id' /tmp/srv-routines.json | sort > /tmp/srv-routine-enabled.txt
 comm -12 /tmp/mac-routine-enabled.txt /tmp/srv-routine-enabled.txt \
   | while read -r id; do
       curl -sf -m 5 http://127.0.0.1:8799/api/routines | jq -r --arg id "$id" '.routines[]|select(.id==$id)|.name'
@@ -120,10 +136,12 @@ Expected: `Fleet RAG Nightly Ingest`.  That routine is enabled on both hosts wi
 
 ```bash
 # On the server, over the tailnet, behind the owner gate.
-curl -sf -m 10 -H "x-botfleet-gate-token: $BF_GATE_TOKEN" http://100.69.77.26:8799/health | jq -c .
+curl -sf -m 10 --config - http://100.69.77.26:8799/health <<EOF | jq -c .
+header = "x-botfleet-gate-token: $BF_GATE_TOKEN"
+EOF
 ```
 
-Expected: the health object.  The token is read from Infisical (`fleet-secrets get`, never echoed, never in a command line argument that lands in a shell history) and is exported into the environment only for this command.
+Expected: the health object.  The token is read from Infisical (`fleet-secrets get`, never echoed) and is exported into the environment only for this command.  It never enters any process's argv:  curl reads the header from its own configuration on standard input,  so the value travels through a pipe and never through a command line that `ps` can show to another user.
 
 ```bash
 # On the server: the harness's own vault is configured and live.
@@ -168,13 +186,20 @@ Expected: `false`.
 ```bash
 curl -sf -m 5 http://127.0.0.1:8799/api/routines \
   | jq -r '.routines[]|select(.enabled)|.id' | sort > /tmp/mac-routine-enabled.txt
-# On the Mac.  Both lists are produced here,  so comm compares two local files:
-# a list produced on the server cannot be compared with one on the Mac,  and a
-# missing file makes comm print an error and nothing on stdout,  which is what a
-# passing check looks like.
+# On the Mac (Mac.Jays.Services).  Both lists are produced here,  so comm compares
+# two local files:  a list produced on the server (fleet-hetzner-nbg1) cannot be
+# compared with one on the Mac,  and a missing file makes comm print an error and
+# nothing on stdout,  which is what a passing check looks like.
+# The server's list is fetched over the tailnet behind the owner gate,  and the
+# HTTP status is checked before the comparison runs.
+# The gate token travels in that pipe and never in a process's argv:  curl reads
+# its own header from the configuration on standard input.
 for kind in routines webhooks; do
-  code="$(curl -s -o /tmp/srv-$kind.json -w '%{http_code}' -m 10 \
-    -H "x-botfleet-gate-token: $BF_GATE_TOKEN" http://100.69.77.26:8799/api/$kind)"
+  code="$(curl -s -o /tmp/srv-$kind.json -w '%{http_code}' -m 10 --config - \
+    "http://100.69.77.26:8799/api/$kind" <<EOF
+header = "x-botfleet-gate-token: $BF_GATE_TOKEN"
+EOF
+)"
   [ "$code" = "200" ] || { echo "FAIL: the server's $kind list answered $code"; exit 1; }
 done
 jq -r '.routines[]|select(.enabled)|.id' /tmp/srv-routines.json | sort > /tmp/srv-routine-enabled.txt
@@ -204,7 +229,9 @@ Expected: `false`.
 
 ```bash
 # On the Mac, after the app has been pointed at the server.
-curl -sf -m 10 -H "x-botfleet-gate-token: $BF_GATE_TOKEN" http://100.69.77.26:8799/health | jq -c .
+curl -sf -m 10 --config - http://100.69.77.26:8799/health <<EOF | jq -c .
+header = "x-botfleet-gate-token: $BF_GATE_TOKEN"
+EOF
 ```
 
 Expected: the server's health object, carrying the **server's** pid and not the Mac's.  The two pids are different by construction, so this is the check that the app is talking to the writer rather than to a leftover local harness.
@@ -257,7 +284,9 @@ Run on the Mac.
 ```bash
 # 0. Confirm the gate one more time, on the Mac, immediately before.
 launchctl print gui/$(id -u)/app.botfleet.server | grep -E 'state = |pid = '
-curl -sf -m 10 -H "x-botfleet-gate-token: $BF_GATE_TOKEN" http://100.69.77.26:8799/health | jq -c .
+curl -sf -m 10 --config - http://100.69.77.26:8799/health <<EOF | jq -c .
+header = "x-botfleet-gate-token: $BF_GATE_TOKEN"
+EOF
 ```
 
 Expected: the Mac job is `running`, and the server answers.  If either fails, stop and go back to Step 1.
@@ -274,7 +303,7 @@ Expected: no output and exit 0.
 launchctl bootout gui/$(id -u)/app.botfleet.server
 ```
 
-Expected: no output and exit 0.
+Expected: no output.  Either exit is acceptable:  `launchctl bootout` exits nonzero while a teardown is still in progress and when the job was already gone,  so its exit status is never the proof that the retirement took.  The proof is step 3's `launchctl print` showing no job and step 4's listener check showing the port is free.
 
 ```bash
 # 3. Verify the job is gone.
@@ -310,7 +339,7 @@ rm ~/Library/LaunchAgents/app.botfleet.server.plist
 rm ~/apps/botfleet-server-start.sh
 ```
 
-Expected: both removed, and `$BACKUP` holds the two files that were installed.  **The tracked repository copies are not what the rollback restores:**  the installed plist and the installed wrapper differ from the tracked pair on this Mac today (measured Nov 3, 2026), so restoring from the tree would put back a different job than the one that was retired.  The tracked copies stay in the tree until BF-2515's Step 5 deletes them, because the Linux deployment's source closure is BF-2544's to settle.
+Expected: both removed, and `$BACKUP` holds the two files that were installed.  **The tracked repository copies are not what the rollback restores:**  the installed plist and the installed wrapper differ from the tracked pair on this Mac today (measured Nov 3, 2026), so restoring from the tree would put back a different job than the one that was retired.  The tracked copies stay in the tree until BF-2515's Step 5 deletes them, because the Linux deployment's source closure is BF-2544's to settle.
 
 **Then update the Mac's process inventory** at `/Users/jay/apps/MAC-LOCAL-PROCESSES.md`: the `app.botfleet.server` row and the `~/apps/botfleet-server-start.sh` row become retired, with the date and the reason, and the row states that the job is **always-on** while it existed.  Refresh the Apple Note `[BF, MM] Single-Writer Cutover` in the same change with `apple-notes-coding.sh --update`.
 
@@ -335,7 +364,9 @@ Expected: `active`, and the health object.
 
 ```bash
 # From a client, the app still works.
-curl -sf -m 10 -H "x-botfleet-gate-token: $BF_GATE_TOKEN" http://100.69.77.26:8799/health | jq -c .
+curl -sf -m 10 --config - http://100.69.77.26:8799/health <<EOF | jq -c .
+header = "x-botfleet-gate-token: $BF_GATE_TOKEN"
+EOF
 ```
 
 Expected: the health object.
@@ -350,10 +381,15 @@ The rollback restores the old writer; it does not roll back code.
 # On the Mac.  Restore the retired job's own files first:  Step 5 removed the
 # installed plist and the wrapper, and a bootstrap without them fails with a
 # file-not-found error.
+# The restore comes from the backup Step 5 took before the removal,  and not from
+# the tracked repository copies,  because the installed pair and the tracked pair
+# are not the same files.
 BACKUP="$(cat ~/apps/_retired/bf-2514-harness-latest)"
+[ -d "$BACKUP" ] || { echo "FAIL: no retired-harness backup at $BACKUP"; exit 1; }
 cp "$BACKUP/app.botfleet.server.plist" ~/Library/LaunchAgents/app.botfleet.server.plist
 cp "$BACKUP/botfleet-server-start.sh" ~/apps/botfleet-server-start.sh
 chmod +x ~/apps/botfleet-server-start.sh
+ls -l ~/Library/LaunchAgents/app.botfleet.server.plist ~/apps/botfleet-server-start.sh
 
 launchctl enable gui/$(id -u)/app.botfleet.server
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.botfleet.server.plist
@@ -361,7 +397,7 @@ launchctl kickstart -k gui/$(id -u)/app.botfleet.server
 curl -sf -m 5 http://127.0.0.1:8799/health | jq -c .
 ```
 
-Expected: the health object with the Mac's pid.  The restore has to come **before** the bootstrap, and it has to come from the backup Step 5 took rather than from the tracked repository copies, because the installed pair and the tracked pair are not the same files.
+Expected: the health object with the Mac's pid.  The restore has to come **before** the enable and the bootstrap,  and it has to come from the backup Step 5 took rather than from the tracked repository copies (`scripts/launchd/app.botfleet.server.plist` and `scripts/botfleet-server-start.sh`),  because the installed pair and the tracked pair are not the same files.  The `ls -l` line is the proof that both files are back in place before the bootstrap runs.
 
 Two things have to be true before the Mac's harness resumes writing, or the double-write returns with a new name.
 
@@ -376,7 +412,7 @@ When the cutover runs, the following belong in the BF-2514 issue, and BF-2515's 
 
 -  The Step 0 baseline output from both hosts.
 -  The Step 2 `comm` output showing no id enabled on both hosts.
--  The Step 4 soak: the dates, the inbound-message count, and the single daily run of the shared routine.
+-  The Step 4 `soak-24h-server-writer`: the dates, the inbound-message count, and the single daily run of the shared routine.
 -  The Step 3 output showing the Mac app reaching the server's pid.
 -  The Step 5 output showing `Could not find service "app.botfleet.server"` and an empty listener list.
 -  The path of the backup directory Step 5 wrote, and the two files inside it.
