@@ -255,7 +255,7 @@ jobs:
     # still produces a failed required check instead of a skip.
     if: ${{ always() && !cancelled() && needs.changes.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -263,6 +263,8 @@ jobs:
           # GitHub treats 0 as false, and a depth-1 checkout does not contain
           # the pull request base commit the replay has to diff.
           fetch-depth: 0
+          # Scope compares commit/tree metadata, without historical file blobs.
+          filter: blob:none
           persist-credentials: false
       - name: Prove the iOS build ran or that no iOS paths changed
         shell: bash

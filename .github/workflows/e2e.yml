@@ -28,6 +28,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # Scope compares commit/tree metadata, without historical file blobs.
+          filter: blob:none
           persist-credentials: false
       - name: Check whether web-app paths changed
         id: scope

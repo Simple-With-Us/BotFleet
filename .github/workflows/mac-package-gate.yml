@@ -124,7 +124,7 @@ jobs:
     name: "${{ github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true && 'Audit-only: Mac packaging classifier skipped' || 'Classify Mac packaging scope' }}"
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true) }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       run: ${{ steps.scope.outputs.run }}
       reason: ${{ steps.scope.outputs.reason }}
@@ -136,6 +136,8 @@ jobs:
           # answers by running the gate -- correct, but an expensive way to say
           # the diff was unavailable.
           fetch-depth: 0
+          # Scope compares commit/tree metadata, without historical file blobs.
+          filter: blob:none
           persist-credentials: false
       - name: Diff against the base ref
         id: base

@@ -413,8 +413,10 @@ class InfisicalManager {
   }
 
   private async readWithSource(settings: InfisicalSettings, source: ResolvedInfisicalReadSource, secretPath: string, projectId: string, environment: string): Promise<ReadonlyMap<string, string>> {
+    this.requireEnabled(settings);
     if (settings.configurationError) throw new InfisicalError(settings.configurationError, 409);
     const resolved = await this.resolveSourceToken(source);
+    this.requireEnabled(settings);
     if ("error" in resolved) {
       this.warnReadSource(source, resolved.error);
       throw this.readSourceFailure(source, resolved.error, 409);
@@ -427,6 +429,7 @@ class InfisicalManager {
     }
     try {
       await this.verifyScopedServiceToken(settings.siteUrl, resolved.token, projectId, environment, secretPath, "read");
+      this.requireEnabled(settings);
       const { values } = await listSecrets({
         siteUrl: settings.siteUrl,
         token: resolved.token,
@@ -436,6 +439,7 @@ class InfisicalManager {
         viewValues: true,
         timeoutMs: callTimeoutMs(),
       });
+      this.requireEnabled(settings);
       this.readSourceStatus.set(source.name, { ok: true, error: null });
       return new Map(values);
     } catch (err) {
@@ -443,7 +447,7 @@ class InfisicalManager {
       if (status !== undefined && isDefinitiveRejection(status)) this.rememberRefusal(mode, resolved.token, refusalScope(status, scope));
       const raw = err instanceof Error ? err.message : "unknown error";
       const detail = redactSecretsInText(raw).split(resolved.token).join("[redacted]");
-      this.warnReadSource(source, detail);
+      if (this.settings().enabled === true) this.warnReadSource(source, detail);
       throw this.readSourceFailure(source, detail, status ?? 502);
     }
   }
@@ -567,6 +571,13 @@ class InfisicalManager {
     this.verifiedServiceTokens.set(key, validUntil);
   }
 
+  /** Recheck the live switch after any await before another credential or vault operation. */
+  private requireEnabled(settings: InfisicalSettings): void {
+    if (settings.enabled !== true || this.settings().enabled !== true) {
+      throw new InfisicalError("Infisical is turned off.", 409);
+    }
+  }
+
   /** Select exactly one credential for the requested scope and operation.
    * Missing or refused service tokens never activate a machine identity. */
   private async withCredential<T>(
@@ -575,12 +586,17 @@ class InfisicalManager {
     call: (token: string) => Promise<T>,
     scope: string = vaultScope(settings),
   ): Promise<T> {
+    this.requireEnabled(settings);
     if (settings.configurationError) throw new InfisicalError(settings.configurationError, 409);
     if (settings.authMethod === "machine-identity" && scope === vaultScope(settings)) {
       if (!hasMachineIdentity(settings)) {
         throw new InfisicalError("The selected Infisical machine identity is not configured.", 409);
       }
-      return call(await this.machineIdentityToken(settings));
+      const token = await this.machineIdentityToken(settings);
+      this.requireEnabled(settings);
+      const result = await call(token);
+      if (mode === "read") this.requireEnabled(settings);
+      return result;
     }
     const source = (settings.readSources ?? []).find((entry) =>
       scopeSignature(entry.projectId, entry.environment, normalizeInfisicalSecretPath(entry.secretPath)) === scope);
@@ -589,6 +605,7 @@ class InfisicalManager {
     if (source) {
       const locator = mode === "write" ? { ...source, tokenFile: source.writeTokenFile ?? "", tokenEnv: source.writeTokenEnv ?? "" } : source;
       const resolved = await this.resolveSourceToken(locator);
+      this.requireEnabled(settings);
       if ("error" in resolved) {
         this.warnReadSource(source, resolved.error);
         throw this.readSourceFailure(source, `${mode}: ${resolved.error}`, 409);
@@ -606,14 +623,17 @@ class InfisicalManager {
     }
     try {
       const [projectId, environment, secretPath] = scope.split("\u0000");
+      this.requireEnabled(settings);
       await this.verifyScopedServiceToken(settings.siteUrl, configured, projectId, environment, secretPath, mode);
+      this.requireEnabled(settings);
       const result = await call(configured);
+      if (mode === "read") this.requireEnabled(settings);
       if (source) this.readSourceStatus.set(source.name, { ok: true, error: null });
       return result;
     } catch (err) {
       const status = rejectionStatus(err);
       if (status !== undefined && isDefinitiveRejection(status)) this.rememberRefusal(refusalMode, configured, refusalScope(status, scope));
-      if (source) this.warnReadSource(source, `Infisical ${mode} failed (${status ?? 502})`);
+      if (source && this.settings().enabled === true) this.warnReadSource(source, `Infisical ${mode} failed (${status ?? 502})`);
       if (err instanceof Error && err.message.includes(configured)) {
         throw new InfisicalError(err.message.split(configured).join("[redacted]"), status ?? 502, err instanceof InfisicalError && err.writeLanded);
       }
@@ -684,7 +704,7 @@ class InfisicalManager {
           .catch(() => undefined)
           .then(() => {
             if (this.queuedRefresh === queued) this.queuedRefresh = null;
-            return this.startRefresh(reason);
+            return this.refresh(reason);
           });
         this.queuedRefresh = queued;
       }
@@ -757,6 +777,14 @@ class InfisicalManager {
       // executing, killing in-flight turns before the save has even landed.
       if (reason === "boot" || reason === "timer") this.onApplied?.(reason);
     } catch (err) {
+      if (this.settings().enabled !== true) {
+        setInfisicalSnapshot(null, []);
+        this.snapshotScope = null;
+        this.lastSyncAt = null;
+        this.lastError = null;
+        this.stale = false;
+        return this.getStatus();
+      }
       this.lastError = err instanceof InfisicalError ? err.message : err instanceof Error ? redactSecretsInText(err.message) : "unknown error";
       this.stale = true;
     }
@@ -981,6 +1009,7 @@ class InfisicalManager {
    * so the just-written value is what the next resolution sees. */
   async writeSecret(name: string, value: string): Promise<void> {
     const settings = this.settings();
+    this.requireEnabled(settings);
     if (settings.writeThrough !== true) {
       throw new InfisicalError("Write Through to Infisical is turned off.", 409);
     }

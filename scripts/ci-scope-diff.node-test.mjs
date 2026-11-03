@@ -130,6 +130,28 @@ test("the old base-to-merge-commit diff folded main's newer commits into the sco
   }
 });
 
+test("scope classification needs commit and tree history without historical file blobs", () => {
+  const repo = buildFixture();
+  try {
+    const objects = repo.git("rev-list", "--objects", "--all").stdout.trim().split("\n");
+    let removed = 0;
+    for (const row of objects) {
+      const oid = row.split(" ")[0];
+      if (repo.git("cat-file", "-t", oid).stdout.trim() !== "blob") continue;
+      rmSync(join(repo.dir, ".git", "objects", oid.slice(0, 2), oid.slice(2)));
+      removed += 1;
+    }
+    assert.ok(removed > 0);
+    const scoped = scope(repo, repo.base, repo.head);
+    assert.equal(scoped.status, 0, scoped.stderr);
+    assert.deepEqual(scoped.paths, ["docs/decision.md"]);
+    assert.equal(classify(scoped.paths).ios_changed, "false");
+    assert.equal(classify(scoped.paths).docs_only, "true");
+  } finally {
+    rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
 test("a push still reports the commits the push carried", () => {
   const repo = buildFixture();
   try {

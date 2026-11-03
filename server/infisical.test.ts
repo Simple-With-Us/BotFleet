@@ -280,6 +280,38 @@ describe("refresh: a good sync", () => {
 });
 
 describe("refresh: a second caller while one is in flight", () => {
+  it("does not resolve a queued source token or request the vault after being turned off", async () => {
+    const settings = withSettings({ token: SENTINEL_READ_TOKEN,
+      readSources: [{ name: "primary", projectId: "proj-1", environment: "prod", secretPath: "/",
+        tokenEnv: "BF_TEST_QUEUED_READ", tokenFile: "" }],
+    });
+    process.env.BF_TEST_QUEUED_READ = SENTINEL_READ_TOKEN;
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const readStarted = new Promise<void>((resolve) => { started = resolve; });
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; started(); }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    stubFetch(fetchMock);
+    try {
+      const first = infisical.refresh("timer");
+      await readStarted;
+      const queued = infisical.refresh("manual");
+      settings.enabled = false;
+      // Remove the locator credential before the queued operation can start.
+      delete process.env.BF_TEST_QUEUED_READ;
+      finish(new Response(JSON.stringify({ secrets: [] })));
+      await first;
+      expect(await queued).toMatchObject({ enabled: false, stale: false, lastError: null });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(metadataRequests).toHaveLength(1);
+      expect(warn).not.toHaveBeenCalled();
+      expect(infisicalSnapshot()).toBeNull();
+    } finally {
+      delete process.env.BF_TEST_QUEUED_READ;
+      warn.mockRestore();
+    }
+  });
+
   it("queues its own read behind the one going instead of joining it", async () => {
     // The window is real: a timer refresh holds the manager for two HTTP
     // calls (up to 16 s on the default budget) and `preload()`'s losing
@@ -787,6 +819,104 @@ describe("readSources", () => {
 });
 
 describe("writeSecret", () => {
+  it("does not request secrets after a machine login completes with the connection off", async () => {
+    const settings = withSettings({});
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const loginStarted = new Promise<void>((resolve) => { started = resolve; });
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; started(); }));
+    vi.stubGlobal("fetch", fetchMock);
+    const pending = infisical.probe();
+    await loginStarted;
+    settings.enabled = false;
+    finish(new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN })));
+    expect(await pending).toMatchObject({ ok: false, error: "Infisical is turned off." });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["refresh", "probe", "readPath", "readSource"] as const)
+  ("discards %s values when the connection is disabled during the secrets request", async (operation) => {
+    process.env.BF_TEST_DISABLED_READ = SENTINEL_READ_TOKEN;
+    const settings = withSettings({ token: SENTINEL_READ_TOKEN,
+      readSources: [{ name: "primary", projectId: "proj-1", environment: "prod", secretPath: "/",
+        tokenEnv: "BF_TEST_DISABLED_READ", tokenFile: "" }],
+    });
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const listStarted = new Promise<void>((resolve) => { started = resolve; });
+    stubFetch(vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; started(); })));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const calls = { refresh: () => infisical.refresh("manual"), probe: () => infisical.probe(),
+        readPath: () => infisical.readPath("/"), readSource: () => infisical.readSource("primary") };
+      const pending = calls[operation]().then((value) => ({ value }), (error: unknown) => ({ error }));
+      await listStarted;
+      settings.enabled = false;
+      finish(new Response(JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }] })));
+      const result = await pending;
+      if (operation === "refresh") expect(result).toMatchObject({ value: { enabled: false, stale: false, lastError: null } });
+      else if (operation === "probe") expect(result).toMatchObject({ value: { ok: false, error: "Infisical is turned off." } });
+      else expect(result).toMatchObject({ error: { statusCode: 409 } });
+      expect(infisicalSnapshot()).toBeNull();
+      expect(JSON.stringify(result)).not.toContain(SENTINEL_VAULT_VALUE);
+    } finally {
+      delete process.env.BF_TEST_DISABLED_READ;
+      warn.mockRestore();
+    }
+  });
+
+  it("refuses while disabled even with write-through and credentials configured", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    withSettings({ enabled: false, writeThrough: true, token: SENTINEL_READ_TOKEN, writeToken: SENTINEL_WRITE_TOKEN });
+    await expect(infisical.writeSecret("COMPOSIO_API_KEY", "new-value")).rejects.toMatchObject({ statusCode: 409 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["probe", "readPath", "readSource", "writeSecret", "writeSource"] as const)
+  ("stops %s before its vault call when disabled during metadata verification", async (operation) => {
+    process.env.BF_TEST_DISABLED_READ = SENTINEL_READ_TOKEN;
+    process.env.BF_TEST_DISABLED_WRITE = SENTINEL_WRITE_TOKEN;
+    const settings = withSettings({ writeThrough: true, token: SENTINEL_READ_TOKEN, writeToken: SENTINEL_WRITE_TOKEN,
+      readSources: [{ name: "primary", projectId: "proj-1", environment: "prod", secretPath: "/",
+        tokenEnv: "BF_TEST_DISABLED_READ", tokenFile: "", writeTokenEnv: "BF_TEST_DISABLED_WRITE" }],
+    });
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const metadataStarted = new Promise<void>((resolve) => { started = resolve; });
+    const fetchMock = vi.fn((url: string) => {
+      if (String(url).endsWith("/api/v2/service-token")) {
+        return new Promise<Response>((resolve) => { finish = resolve; started(); });
+      }
+      return Promise.resolve(new Response(JSON.stringify({ secrets: [] })));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const calls = {
+        probe: () => infisical.probe(), readPath: () => infisical.readPath("/"),
+        readSource: () => infisical.readSource("primary"),
+        writeSecret: () => infisical.writeSecret("COMPOSIO_API_KEY", "new-value"),
+        writeSource: () => infisical.writeSource("primary", "COMPOSIO_API_KEY", "new-value"),
+      };
+      const outcome = calls[operation]().then((value) => ({ value }), (error: unknown) => ({ error }));
+      await metadataStarted;
+      settings.enabled = false;
+      finish(new Response(JSON.stringify({ workspace: "proj-1", environment: "prod", expiresAt: null,
+        permissions: operation.startsWith("write") ? ["write"] : ["read"],
+        scopes: [{ environment: "prod", secretPath: "/" }],
+      })));
+      const result = await outcome;
+      if (operation === "probe") expect(result).toMatchObject({ value: { ok: false, error: "Infisical is turned off." } });
+      else expect(result).toMatchObject({ error: { statusCode: 409 } });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      delete process.env.BF_TEST_DISABLED_READ;
+      delete process.env.BF_TEST_DISABLED_WRITE;
+      warn.mockRestore();
+    }
+  });
+
   it("refuses with 409 when write-through is off, without a request", async () => {
     const fetchMock = vi.fn();
     stubFetch(fetchMock);
