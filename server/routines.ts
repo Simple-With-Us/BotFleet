@@ -186,6 +186,16 @@ export interface RoutineRun {
    *  close the same one.  Only set for a genuine "schedule" trigger on a
    *  recurring routine — see `checkInStart`/`checkInFinish`. */
   sentryCheckInId?: string;
+  /** A terminal check-in close queued or in flight, persisted across restarts
+   *  so a crashed or dropped delivery can be reconciled on server boot.
+   *  Cleared once Sentry confirms receipt. */
+  pendingClose?: RoutineRunPendingClose;
+}
+
+export interface RoutineRunPendingClose {
+  status: "ok" | "error";
+  attempts: number;
+  checkInId: string;
 }
 
 export interface RoutineRequestReceipt {
@@ -369,8 +379,14 @@ export interface RoutineManagerOptions {
    *  close later, or undefined when there is nothing to check in (Sentry
    *  off, or a one-off routine with no recurrence to watch). */
   checkInStart?: (run: RoutineRun, routine: Routine) => string | undefined;
-  /** Close a check-in `checkInStart` opened. */
-  checkInFinish?: (run: RoutineRun, checkInId: string, ok: boolean) => void;
+  /** Close a check-in `checkInStart` opened.  Optional `onSettled` callback
+   *  notifies when delivery was confirmed (or failed after all retries). */
+  checkInFinish?: (
+    run: RoutineRun,
+    checkInId: string,
+    ok: boolean,
+    onSettled?: (delivered: boolean) => void,
+  ) => void;
   /** Is this run's turn still in flight on the harness? Consulted by the
    * periodic sweep for runs stuck in running/waiting: the completion path
    * settles a run on `turn.completed`, but a harness path that settles the
@@ -652,8 +668,24 @@ export class RoutineManager {
       // or Sentry only learns of the failure when the monitor times out.
       // `this.options` is assigned first thing in the constructor, and the
       // server applies its Sentry settings before building this manager.
-      for (const run of recovered) {
-        if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+      // Pass the canonical run in this.runs so pendingClose persists to disk.
+      for (const rec of recovered) {
+        const canonical = this.runs.find((r) => r.id === rec.id) ?? rec;
+        if (canonical.sentryCheckInId) this.closeCheckIn(canonical, canonical.sentryCheckInId, false);
+      }
+    }
+    // Reconcile unclosed check-ins that were in-flight or pending when the
+    // server stopped or crashed (skipping runs just recovered above).
+    const recoveredIds = new Set(recovered.map((r) => r.id));
+    for (const run of this.runs) {
+      if (run.pendingClose && !recoveredIds.has(run.id) && run.status !== "running" && run.status !== "waiting") {
+        const checkInId = run.pendingClose.checkInId || run.sentryCheckInId;
+        if (checkInId) {
+          const isOk = run.pendingClose.status === "ok";
+          this.options.checkInFinish?.(run, checkInId, isOk, (delivered) => {
+            this.onCheckInSettled(run.id, delivered);
+          });
+        }
       }
     }
   }
@@ -1190,7 +1222,7 @@ export class RoutineManager {
     this.emitRun(run);
     // The later turn.completed cannot close the check-in: handleRuntimeEvent
     // only matches running/waiting runs, and this one is now cancelled.
-    if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+    if (run.sentryCheckInId) this.closeCheckIn(run, run.sentryCheckInId, false);
     if (run.threadId) await this.options.interruptTurn?.(run.botId, run.threadId, normalizeRunOn(run.runOn)).catch(() => {});
     queueMicrotask(() => void this.tick());
     return { ...run };
@@ -1306,7 +1338,7 @@ export class RoutineManager {
           const skipped = this.newRun(routine, scheduledFor, false);
           this.skipForOff(skipped);
           skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
-          if (skipped.sentryCheckInId) this.options.checkInFinish?.(skipped, skipped.sentryCheckInId, false);
+          if (skipped.sentryCheckInId) this.closeCheckIn(skipped, skipped.sentryCheckInId, false);
         } else if (snoozed) {
           const skipped = this.newRun(routine, scheduledFor, false);
           skipped.status = "missed";
@@ -1320,7 +1352,7 @@ export class RoutineManager {
           // is a deliberate pause, not a success — the check-in opens and
           // closes non-ok, because the only statuses Sentry offers are `ok`
           // and `error` and emitting nothing would synthesize `missed`.
-          if (skipped.sentryCheckInId) this.options.checkInFinish?.(skipped, skipped.sentryCheckInId, false);
+          if (skipped.sentryCheckInId) this.closeCheckIn(skipped, skipped.sentryCheckInId, false);
         } else if (late > CATCH_UP_MS) {
           const missed = this.newRun(routine, scheduledFor, false);
           missed.status = "missed";
@@ -1761,7 +1793,7 @@ export class RoutineManager {
         // A cancelled scheduled run did not complete, so Sentry sees it the
         // same as an error — that is what lets an owner ask "did today's
         // Housekeeper run actually happen" and get a real answer.
-        if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+        if (run.sentryCheckInId) this.closeCheckIn(run, run.sentryCheckInId, false);
       } else if (!event.ok) {
         this.failRun(run, reason ?? "The bot did not complete this run", code);
         if (run.ownerThreadId && run.threadId) {
@@ -1783,7 +1815,7 @@ export class RoutineManager {
         run.setupFailed = false;
         run.finishedAt = this.now();
         run.error = undefined;
-        if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, true);
+        if (run.sentryCheckInId) this.closeCheckIn(run, run.sentryCheckInId, true);
       }
       if (run.ownerThreadId && run.threadId && event.ok) {
         this.options.deliverEphemeralResult?.({
@@ -1959,10 +1991,39 @@ export class RoutineManager {
     // any run that never opened a check-in (nothing was running yet, or it
     // was not a "schedule" trigger) leaves sentryCheckInId unset and this
     // is a no-op.
-    if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+    if (run.sentryCheckInId) this.closeCheckIn(run, run.sentryCheckInId, false);
     this.save();
     this.emitRun(run);
     this.options.onRunFailed?.({ ...run });
+  }
+
+  private closeCheckIn(run: RoutineRun, checkInId: string, ok: boolean): void {
+    const canonical = this.runs.find((r) => r.id === run.id) ?? run;
+    canonical.pendingClose = {
+      status: ok ? "ok" : "error",
+      attempts: canonical.pendingClose?.attempts ?? 0,
+      checkInId,
+    };
+    if (run !== canonical) {
+      run.pendingClose = canonical.pendingClose;
+    }
+    this.save();
+    this.flushNow();
+    this.options.checkInFinish?.(canonical, checkInId, ok, (delivered) => {
+      this.onCheckInSettled(canonical.id, delivered);
+    });
+  }
+
+  private onCheckInSettled(runId: string, delivered: boolean): void {
+    const run = this.runs.find((r) => r.id === runId);
+    if (!run?.pendingClose) return;
+    if (delivered) {
+      delete run.pendingClose;
+      this.save();
+    } else {
+      run.pendingClose.attempts = (run.pendingClose.attempts ?? 0) + 1;
+      this.save();
+    }
   }
 
   private initialOccurrence(schedule: RoutineSchedule, now: number): number | null {
