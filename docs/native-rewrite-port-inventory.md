@@ -27,7 +27,7 @@ Owner modules: `DatabaseService` (BF-2480), `ImportTool` (BF-2495),
 `InfisicalResolver` (BF-2506), remaining drivers (BF-2507), native runners
 (BF-2482), per-bot switch (BF-2508), `CUAEngine` (BF-2509), `ZulipEventActor` +
 Linear sync (BF-2512), `LinqEventActor` (BF-2617), `RoutinesScheduler` (BF-2513),
-`CostLedgerService` (BF-2619),
+`CostLedgerService` (BF-2619), `PluginSandboxHost` & `RecallClient` (BF-2620),
 iOS endpoint decision
 (BF-2510) and build (BF-2511), `MenuBarExtra` (BF-2484), `VoiceService`
 (BF-2483), `ScreenCaptureService` (BF-2481), `LifecycleService` (BF-2497),
@@ -153,7 +153,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `electron/credential-*.mjs`, `electron/secure-credential*.mjs`, `electron/workspace-credentials.mjs`, `electron/config-file-lock.mjs` | Keychain/credential restore → `InfisicalResolver` + Keychain BF-2506 |
 | `scripts/start-mcp-sse.sh`, `scripts/mcp-server.ts`, `scripts/mcp-sse.ts`, `server/mcp-server-config.ts`, `server/sse-*.ts` (server-side test helpers) | Dev MCP bridges → retired Phase 6 (in-process tools, no seats MCP token) |
 | `server/mcp-{directory,gate,gate-config,registry,trim,probe,oauth,oauth-discovery,oauth-store,http,schema-validator}.ts`, `server/composio*.ts`, `server/connector-proxy.ts`, `connector-verdict.ts` | MCP catalog + OAuth + Composio bridge → `EngineDriver` MCP lane BF-2504; connected-app OAuth follow-up folds into BF-2506* |
-| `server/plugin-*.ts`, `server/plugins.ts`, `server/skill-*.ts`, `server/skills.ts`, `server/qdrant-*.ts` (recall via `tools/recall.ts`, `recall-*.ts`) | Plugin/skill/recall hosts → Phase 4* (no covering issue; sandbox host + recall client follow-ups) |
+| `server/plugin-*.ts`, `server/plugins.ts`, `server/skill-*.ts`, `server/skills.ts` (recall via `tools/recall.ts`, `recall-*.ts`) | Plugin/skill/recall hosts → `PluginSandboxHost` Phase 4 (BF-2620) beside `EngineDriver` MCP lane (BF-2504), `RecallClient` (BF-2620) reaching fleet recall service; plugin platform follows BF-2517 / BF-2611; Node harness files retire Phase 6 BF-2515 |
 | `server/bot-stop-policy.ts`, `server/turn-safety.ts` dispatch guards, `bot-power.ts` + `conversation-mode.ts` (shared) | Stop/power/mode semantics → `RoutinesScheduler` + UI BF-2513/BF-2501 |
 | `server/redact.ts` → `shared/redact.ts`, `server/tool-activity.ts` (shared), `server/speech-spans.ts`, `spoken-script.ts`, `karaoke-align.ts`, `pronunciations.ts`, `voice-*.ts` (shared) | Portable domain logic → direct Swift ports, no owner issue needed; `redact` + `karaoke-align` are the two biggest algorithm ports |
 | `server/terminology.ts` (shared), `conversation-mode.ts`, `thread-snooze.ts`, `busy-send-default.ts`, `workspace-settings.ts`, `bot-commands.ts`, `bot-avatar.ts`, `bot-profile.ts`, `model-lineage.ts`, `model-safety.ts`, `model-limits.ts`, `local-hosts.ts`, `local-auto-consent.ts`, `tool-scope*.ts`, `bypass-coverage.ts`, `container-runtime-name.ts`, `context-injection.ts`, `credential-request.ts`, `data-fault.ts`, `delegation-message.ts`, `helpers.ts`, `imessage-message.ts`, `item-io.ts`, `jobs.ts`, `outbound.ts`, `peer-refusals.ts`, `plugin-events.ts`, `plugin-manifest.ts`, `plugin-net-allow.ts`, `quota-plan-metadata.ts`, `routine-outcomes.ts`, `routine-request.ts`, `routine-retention.ts`, `run-on.ts`, `sign-in-request.ts`, `sts-tokens.ts`, `task-workspace-context.ts`, `text-format.ts`, `time-zone.ts` | All `shared/*.ts` → Swift value types Phase 1–4 alongside their feature owner; none are Node-blocked |
