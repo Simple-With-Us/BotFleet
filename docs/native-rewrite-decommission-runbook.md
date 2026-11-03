@@ -108,7 +108,7 @@ Do this while both stores still exist, because it is the only window in which th
 
 ### Step 2 — The Cutover Belongs To BF-2514, Not Here
 
-`app.botfleet.server` is booted out, the native app becomes the single writer, and the 24-hour no-Node soak runs under BF-2514.  Phase 6 does not repeat that work and does not shorten it.
+`app.botfleet.server` is booted out, the native app becomes the single writer, and the 24-hour no-Node soak runs under BF-2514.  Phase 6 does not repeat that work and does not shorten it.  The rule that decides which host writes, and the ordered commands that retire the LaunchAgent, are in [the single-writer contract](native-rewrite-single-writer-contract.md) and [its cutover runbook](native-rewrite-single-writer-cutover.md).
 
 **Precondition:** BF-2514 Done, `soak-24h-no-node` asserted, and `app.botfleet.server` confirmed booted out with `launchctl print` showing no job.
 

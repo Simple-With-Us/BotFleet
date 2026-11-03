@@ -468,6 +468,12 @@ const appConfigSchema = z.object({
       .refine((value) => value === undefined || value === "" || isAbsoluteHttpUrl(value), {
         message: "must be an absolute http(s) URL",
       }),
+    webhookPublicUrl: z
+      .string()
+      .optional()
+      .refine((value) => value === undefined || value === "" || isAbsoluteHttpUrl(value), {
+        message: "must be an absolute http(s) URL",
+      }),
     /** Whether the public URL is applied at all. Off keeps the stored URL
      * for the next time the toggle is flipped on, but the webhook receiver
      * does not advertise it. */
@@ -791,7 +797,7 @@ export interface AppConfig {
     allowedSenders?: string[];
     allowVoiceByDefault?: boolean;
   };
-  ingress?: { publicUrl?: string; enabled?: boolean };
+  ingress?: { publicUrl?: string; enabled?: boolean; webhookPublicUrl?: string };
   /** The Zulip source (docs/zulip.md, server/zulip/types.ts). */
   zulip?: import("./zulip/types.ts").ZulipSettings;
   /** Shared preserves the historical singleton. Per-bot gives every bot a
@@ -1106,6 +1112,12 @@ export function publicIngressUrl(cfg: AppConfig): string | null {
   return raw && isAbsoluteHttpUrl(raw) ? raw.replace(/\/+$/, "") : null;
 }
 
+export function webhookPublicIngressUrl(cfg: AppConfig): string | null {
+  const dedicated = cfg.ingress?.webhookPublicUrl?.trim();
+  const raw = dedicated && isAbsoluteHttpUrl(dedicated) ? dedicated : cfg.ingress?.publicUrl?.trim();
+  return raw && isAbsoluteHttpUrl(raw) ? raw.replace(/\/+$/, "") : null;
+}
+
 /** The public URL that should actually be advertised.  Disabled
  * (`ingress.enabled === false`) keeps the stored value on disk for the next
  * time the user flips the switch, but the harness behaves as if the URL
@@ -1114,6 +1126,11 @@ export function publicIngressUrl(cfg: AppConfig): string | null {
 export function publicIngressUrlEffective(cfg: AppConfig): string | null {
   if (cfg.ingress?.enabled === false) return null;
   return publicIngressUrl(cfg);
+}
+
+export function webhookPublicIngressUrlEffective(cfg: AppConfig): string | null {
+  if (cfg.ingress?.enabled === false) return null;
+  return webhookPublicIngressUrl(cfg);
 }
 
 

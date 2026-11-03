@@ -2205,4 +2205,15 @@ describe("GitHub PR state dedupe for classify wakes", () => {
     const third = manager.receive(webhook.endpointId, secret, prEvent("pr-fail-3"));
     expect(third.ignored).toBeUndefined();
   });
+  it("isEventIgnoredAtEdge returns true for non-enabled events on enabled triggers and false for disabled triggers", () => {
+    const h = harness();
+    const manager = new WebhookManager(h.options);
+    const { webhook } = manager.create({ ...uiPass, eventTypes: ["pull_request"] });
+    expect(manager.isEventIgnoredAtEdge(webhook.endpointId, "workflow_run")).toBe(true);
+    expect(manager.isEventIgnoredAtEdge(webhook.endpointId, "pull_request")).toBe(false);
+    expect(manager.isEventIgnoredAtEdge(webhook.endpointId, undefined)).toBe(true);
+
+    manager.update(webhook.id, { enabled: false });
+    expect(manager.isEventIgnoredAtEdge(webhook.endpointId, "workflow_run")).toBe(false);
+  });
 });
