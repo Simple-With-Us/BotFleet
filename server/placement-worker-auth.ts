@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, type Stats } from "node:fs";
+import { constants, type Stats } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { join } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
@@ -19,7 +20,7 @@ export const WorkerAuthorizationSchema = z.object({
 }).strict();
 export type WorkerAuthorization = z.infer<typeof WorkerAuthorizationSchema>;
 export interface WorkerPrincipal { credentialId: string; hostId: HostId; audience: HostId; role: "execution-worker" }
-export interface WorkerAuthorizationSource { read(credentialId: string): WorkerAuthorization }
+export interface WorkerAuthorizationSource { read(credentialId: string): WorkerAuthorization | Promise<WorkerAuthorization> }
 
 /** Dynamic digest-only authorization state, not settings or secret custody.
  * Missing state never creates a directory, enrolls a worker or grants authority. */
@@ -31,42 +32,43 @@ export function privateWorkerAuthorizationSource(dataDir: string): WorkerAuthori
     if ((directory ? !stat.isDirectory() : !stat.isFile() || stat.nlink !== 1) ||
         stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== (directory ? 0o700 : 0o600)) throw new Error("Worker authorization is unavailable");
   };
-  return { read(credentialId) {
+  return { async read(credentialId) {
     idSchema.parse(credentialId);
-    const parent = lstatSync(directory); privateOwned(parent, true);
+    const parent = await lstat(directory); privateOwned(parent, true);
     if (boundDirectory && !same(boundDirectory, parent)) throw new Error("Worker authorization is unavailable");
     const path = join(directory, `${credentialId}.json`);
-    const visible = lstatSync(path); privateOwned(visible);
-    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const visible = await lstat(path); privateOwned(visible);
+    const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
-      const file = fstatSync(fd); privateOwned(file);
+      const file = await fd.stat(); privateOwned(file);
       // The metadata format is deliberately small and contains no raw credential.
       if (!same(file, visible) || file.size > 16_384) throw new Error("Worker authorization is unavailable");
       const buffer = Buffer.alloc(16_385);
       let length = 0;
       while (length < buffer.length) {
-        const count = readSync(fd, buffer, length, buffer.length - length, length);
-        if (count === 0) break;
-        length += count;
+        const { bytesRead } = await fd.read(buffer, length, buffer.length - length, length);
+        if (bytesRead === 0) break;
+        length += bytesRead;
       }
-      const after = fstatSync(fd); privateOwned(after);
-      const finalParent = lstatSync(directory); privateOwned(finalParent, true);
-      const finalFile = lstatSync(path); privateOwned(finalFile);
+      const after = await fd.stat(); privateOwned(after);
+      const finalParent = await lstat(directory); privateOwned(finalParent, true);
+      const finalFile = await lstat(path); privateOwned(finalFile);
       if (length > 16_384 || !same(finalParent, parent) || !same(finalFile, file) ||
           after.size !== file.size || after.mtimeMs !== file.mtimeMs || after.ctimeMs !== file.ctimeMs) throw new Error("Worker authorization is unavailable");
+      if (boundDirectory && !same(boundDirectory, parent)) throw new Error("Worker authorization is unavailable");
       boundDirectory = parent;
       return WorkerAuthorizationSchema.parse(JSON.parse(buffer.subarray(0, length).toString("utf8")));
-    } finally { closeSync(fd); }
+    } finally { await fd.close(); }
   } };
 }
 
 export function workerVerifier(source: WorkerAuthorizationSource, audience: HostId, now = Date.now) {
   const observed = new Map<string, WorkerAuthorization>();
   const refused = new Set<string>();
-  return (credentialId: string, secret: string): WorkerPrincipal | null => {
+  return async (credentialId: string, secret: string): Promise<WorkerPrincipal | null> => {
     try {
       idSchema.parse(credentialId);
-      const record = WorkerAuthorizationSchema.parse(source.read(credentialId));
+      const record = WorkerAuthorizationSchema.parse(await source.read(credentialId));
       if (refused.has(credentialId)) return null;
       const previous = observed.get(credentialId);
       if (previous && (record.credentialId !== credentialId || record.audience !== audience ||
@@ -114,12 +116,12 @@ export function createWorkerRequestBoundary(options: {
     if (request.kind !== "worker" || !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "")) {
       answer(res, 403, "Worker request refused"); return true;
     }
-    const principal = verify(request.credentialId, request.secret);
+    const principal = await verify(request.credentialId, request.secret);
     if (!principal) { answer(res, 403, "Worker request refused"); return true; }
     let body: unknown;
     try { body = await options.readBody(req); }
     catch { answer(res, 400, "Worker request body is invalid"); return true; }
-    const current = verify(request.credentialId, request.secret);
+    const current = await verify(request.credentialId, request.secret);
     if (!current || !workerEnvelopeMatches(current, body)) { answer(res, 403, "Worker request refused"); return true; }
     // No transport operation, lease, payload or owner diagnostic is accessed.
     answer(res, 503, "Worker transport is not active");

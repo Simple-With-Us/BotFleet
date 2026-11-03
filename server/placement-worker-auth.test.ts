@@ -78,60 +78,60 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32")("placement worker authentication", () => {
-  it("does not enroll a worker or initialize absent authorization state", () => {
+  it("does not enroll a worker or initialize absent authorization state", async () => {
     const dir = fixture(); const value = credential();
     const source = privateWorkerAuthorizationSource(dir);
     expect(readdirSync(dir)).toEqual([]);
-    expect(workerVerifier(source, audience)(value.credentialId, value.secret)).toBeNull();
+    expect(await workerVerifier(source, audience)(value.credentialId, value.secret)).toBeNull();
     expect(readdirSync(dir)).toEqual([]);
   });
-  it("strictly binds the principal and rejects unknown schema, roles, audience, expiry and secrets", () => {
+  it("strictly binds the principal and rejects unknown schema, roles, audience, expiry and secrets", async () => {
     const value = credential();
     let encoded = JSON.stringify(value.record);
     const source = { read: () => WorkerAuthorizationSchema.parse(JSON.parse(encoded)) };
     const verify = workerVerifier(source, audience, () => 1000);
-    expect(verify(value.credentialId, value.secret)).toEqual({ credentialId: value.credentialId, hostId: worker, audience, role: "execution-worker" });
-    expect(verify(value.credentialId, randomBytes(32).toString("hex"))).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toEqual({ credentialId: value.credentialId, hostId: worker, audience, role: "execution-worker" });
+    expect(await verify(value.credentialId, randomBytes(32).toString("hex"))).toBeNull();
     for (const change of [{ version: 2 }, { role: "controller" }, { audience: other }, { expiresAt: 999 }, { secretSha256: "bad" }, { rawSecret: "forbidden field" }, { credentialId: randomUUID() }]) {
       encoded = JSON.stringify({ ...value.record, revision: 2, ...change });
-      expect(workerVerifier(source, audience, () => 1000)(value.credentialId, value.secret)).toBeNull();
+      expect(await workerVerifier(source, audience, () => 1000)(value.credentialId, value.secret)).toBeNull();
     }
     expect(WorkerAuthorizationSchema.safeParse({ ...value.record, capabilities: ["owner"] }).success).toBe(false);
   });
 
-  it("reads revocation afresh and refuses observed rollback or binding changes without revision", () => {
+  it("reads revocation afresh and refuses observed rollback or binding changes without revision", async () => {
     const dir = fixture(); const value = credential(); const path = save(dir, value.record);
     const verify = workerVerifier(privateWorkerAuthorizationSource(dir), audience);
-    expect(verify(value.credentialId, value.secret)?.hostId).toBe(worker);
+    expect((await verify(value.credentialId, value.secret))?.hostId).toBe(worker);
     save(dir, { ...value.record, hostId: other });
-    expect(verify(value.credentialId, value.secret)).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toBeNull();
     save(dir, { ...value.record, revision: 2, revoked: true });
-    expect(verify(value.credentialId, value.secret)).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toBeNull();
     save(dir, value.record);
-    expect(verify(value.credentialId, value.secret)).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toBeNull();
     save(dir, { ...value.record, revision: 3 });
-    expect(verify(value.credentialId, value.secret)).toBeNull();
-    expect(verify(value.credentialId, value.secret)).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toBeNull();
     rmSync(path);
-    expect(verify(value.credentialId, value.secret)).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toBeNull();
     expect(existsSync(path)).toBe(false);
   });
 
-  it("retains trusted revocation observed with a wrong secret after metadata restoration", () => {
+  it("retains trusted revocation observed with a wrong secret after metadata restoration", async () => {
     const value = credential(); let record = value.record;
     const verify = workerVerifier({ read: () => record }, audience);
-    expect(verify(value.credentialId, value.secret)?.hostId).toBe(worker);
+    expect((await verify(value.credentialId, value.secret))?.hostId).toBe(worker);
     record = { ...value.record, revision: 2, revoked: true };
-    expect(verify(value.credentialId, "wrong-secret")).toBeNull();
+    expect(await verify(value.credentialId, "wrong-secret")).toBeNull();
     record = value.record;
-    expect(verify(value.credentialId, value.secret)).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toBeNull();
     record = { ...value.record, revision: 3 };
-    expect(verify(value.credentialId, value.secret)).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toBeNull();
     const unrelated = credential(); record = unrelated.record;
-    expect(verify(unrelated.credentialId, unrelated.secret)?.hostId).toBe(worker);
+    expect((await verify(unrelated.credentialId, unrelated.secret))?.hostId).toBe(worker);
   });
 
-  it("latches trusted binding drift and same-revision changes after metadata restoration", () => {
+  it("latches trusted binding drift and same-revision changes after metadata restoration", async () => {
     const changes: Partial<WorkerAuthorization>[] = [
       { revision: 2, hostId: other }, { revision: 2, audience: other },
       { revision: 2, credentialId: randomUUID() }, { revision: 2, secretSha256: "0".repeat(64) },
@@ -140,45 +140,45 @@ describe.skipIf(process.platform === "win32")("placement worker authentication",
     for (const change of changes) {
       const value = credential(); let record = value.record;
       const verify = workerVerifier({ read: () => record }, audience);
-      expect(verify(value.credentialId, value.secret)?.hostId).toBe(worker);
+      expect((await verify(value.credentialId, value.secret))?.hostId).toBe(worker);
       record = { ...value.record, ...change };
-      expect(verify(value.credentialId, value.secret)).toBeNull();
+      expect(await verify(value.credentialId, value.secret)).toBeNull();
       record = value.record;
-      expect(verify(value.credentialId, value.secret)).toBeNull();
+      expect(await verify(value.credentialId, value.secret)).toBeNull();
       record = { ...value.record, revision: 3 };
-      expect(verify(value.credentialId, value.secret)).toBeNull();
+      expect(await verify(value.credentialId, value.secret)).toBeNull();
     }
   });
 
-  it("retains a higher trusted revision observed with a wrong secret and latches its rollback", () => {
+  it("retains a higher trusted revision observed with a wrong secret and latches its rollback", async () => {
     const value = credential(); let record = value.record;
     const verify = workerVerifier({ read: () => record }, audience);
-    expect(verify(value.credentialId, value.secret)?.hostId).toBe(worker);
+    expect((await verify(value.credentialId, value.secret))?.hostId).toBe(worker);
     record = { ...value.record, revision: 2 };
-    expect(verify(value.credentialId, "wrong-secret")).toBeNull();
+    expect(await verify(value.credentialId, "wrong-secret")).toBeNull();
     record = value.record;
-    expect(verify(value.credentialId, value.secret)).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toBeNull();
     record = { ...value.record, revision: 3 };
-    expect(verify(value.credentialId, value.secret)).toBeNull();
+    expect(await verify(value.credentialId, value.secret)).toBeNull();
   });
 
-  it("does not poison a credential from wrong secrets or malformed or foreign first records", () => {
+  it("does not poison a credential from wrong secrets or malformed or foreign first records", async () => {
     const value = credential(); let record = value.record;
     const verify = workerVerifier({ read: () => record }, audience);
-    expect(verify(value.credentialId, "wrong-secret")).toBeNull();
-    expect(verify(value.credentialId, value.secret)?.hostId).toBe(worker);
-    expect(verify(value.credentialId, "another-wrong-secret")).toBeNull();
-    expect(verify(value.credentialId, value.secret)?.hostId).toBe(worker);
+    expect(await verify(value.credentialId, "wrong-secret")).toBeNull();
+    expect((await verify(value.credentialId, value.secret))?.hostId).toBe(worker);
+    expect(await verify(value.credentialId, "another-wrong-secret")).toBeNull();
+    expect((await verify(value.credentialId, value.secret))?.hostId).toBe(worker);
     for (const change of [{ secretSha256: "malformed" }, { credentialId: randomUUID() }, { audience: other }]) {
       const freshVerifier = workerVerifier({ read: () => record }, audience);
       record = { ...value.record, ...change };
-      expect(freshVerifier(value.credentialId, value.secret)).toBeNull();
+      expect(await freshVerifier(value.credentialId, value.secret)).toBeNull();
       record = value.record;
-      expect(freshVerifier(value.credentialId, value.secret)?.hostId).toBe(worker);
+      expect((await freshVerifier(value.credentialId, value.secret))?.hostId).toBe(worker);
     }
   });
 
-  it.each(["missing", "public", "public-directory", "link", "symlink", "directory-symlink", "corrupt", "oversized"])("refuses %s metadata without repairing files or following links", (damage) => {
+  it.each(["missing", "public", "public-directory", "link", "symlink", "directory-symlink", "corrupt", "oversized"])("refuses %s metadata without repairing files or following links", async (damage) => {
     const dir = fixture(); const value = credential(); const path = save(dir, value.record);
     const parent = join(dir, "placement-worker-authorizations");
     if (damage === "missing") rmSync(path);
@@ -193,7 +193,7 @@ describe.skipIf(process.platform === "win32")("placement worker authentication",
     const bytes = existsSync(path) ? readFileSync(path) : null;
     const mode = existsSync(path) ? statSync(path).mode : null;
     const directoryMode = statSync(parent).mode;
-    expect(workerVerifier(privateWorkerAuthorizationSource(dir), audience)(value.credentialId, value.secret)).toBeNull();
+    expect(await workerVerifier(privateWorkerAuthorizationSource(dir), audience)(value.credentialId, value.secret)).toBeNull();
     expect(readdirSync(parent)).toEqual(entries);
     expect(statSync(parent).mode).toBe(directoryMode);
     if (bytes) { expect(readFileSync(path)).toEqual(bytes); expect(statSync(path).mode).toBe(mode); }
@@ -203,7 +203,14 @@ describe.skipIf(process.platform === "win32")("placement worker authentication",
   it("rejects malformed or owner-route claims before metadata, and rechecks revocation after a body wait", async () => {
     const value = credential(); let reads = 0; let ownerCalls = 0; let record = value.record;
     const boundary = createWorkerRequestBoundary({ audience, source: { read: () => { reads++; return record; } }, readBody: async () => { record = { ...record, revision: 2, revoked: true }; return envelope; } });
-    const port = await listen(createServer((req, res) => { void boundary(req, res).then((handled) => { if (!handled) { ownerCalls++; res.end("owner"); } }); }));
+    const port = await listen(createServer((req, res) => {
+      void boundary(req, res).then((handled) => {
+        if (!handled) { ownerCalls++; res.end("owner"); }
+      }).catch(() => {
+        if (!res.headersSent) { res.statusCode = 500; res.end(); }
+        else res.destroy();
+      });
+    }));
     expect((await send(port, value.authorization, "/api/config", undefined, "GET")).status).toBe(403);
     expect((await send(port, "BotFleet-Worker malformed")).status).toBe(403);
     expect((await send(port, value.authorization, undefined, undefined, undefined, { origin: "https://elsewhere.invalid" })).status).toBe(403);
