@@ -37,7 +37,9 @@ function stubFetch(vaultSecrets) {
     }
     if (u.includes("/api/v3/secrets/raw")) {
       return new Response(JSON.stringify({
-        secrets: Object.entries(vaultSecrets).map(([secretKey, secretValue]) => ({ secretKey, secretValue })),
+        secrets: Object.entries(vaultSecrets).map(([secretKey, secretValue]) => ({
+          secretKey, secretValue, workspace: "proj", environment: "prod", secretValueHidden: false,
+        })),
       }), { status: 200 });
     }
     throw new Error(`stubFetch: unexpected URL ${u}`);
@@ -73,7 +75,7 @@ test("a service token replaces the universal-auth login", async () => {
           }), { status: 200 });
         }
         return new Response(JSON.stringify({
-            secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }],
+            secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT, workspace: "proj", environment: "prod", secretValueHidden: false }],
           }), { status: 200 });
       },
       log,
@@ -106,7 +108,7 @@ test("verification uses the injected fetch and rejects project, scope, permissio
     ["wrong environment", { ...valid, scopes: [{ environment: "staging", secretPath: "/" }] }],
     ["write token refused as read-only", { ...valid, permissions: ["read", "write"] }],
     ["expired token", { ...valid, expiresAt: "2020-01-01T00:00:00Z" }],
-    ["missing expiry metadata", (({ expiresAt, ...metadata }) => metadata)(valid)],
+    ["missing expiry metadata", (({ expiresAt: _expiresAt, ...metadata }) => metadata)(valid)],
     ["invalid calendar date", { ...valid, expiresAt: "2026-02-30T00:00:00Z" }],
     ["malformed serialized scopes", { ...valid, scopes: "not-json" }],
     ["wrapped scopes shape", { ...valid, scopes: { scopes: valid.scopes } }],
@@ -155,7 +157,8 @@ test("the injected fetch validates serialized exact read scope before secrets", 
         }
         order.push("secrets");
         assert.match(String(url), /\/api\/v3\/secrets\/raw/);
-        return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }] }), { status: 200 });
+        return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT,
+          workspace: "proj", environment: "prod", secretValueHidden: false }] }), { status: 200 });
       },
       log: () => {},
     });
@@ -219,7 +222,8 @@ test("literal folders keep spaces and ordinary punctuation", async () => {
           scopes: JSON.stringify([{ environment: "prod", secretPath: `${secretPath}/` }]),
         }));
       }
-      return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }] }));
+      return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT,
+        workspace: "proj", environment: "prod", secretPath, secretValueHidden: false }] }));
     },
   });
   assert.equal(values.get("FOO"), SENTINEL_PRESENT);
@@ -249,7 +253,8 @@ test("the service token wins over a machine identity that is also configured", a
             permissions: ["read"], expiresAt: null,
           }), { status: 200 });
         }
-        return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT }] }), { status: 200 });
+        return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT,
+          workspace: "proj", environment: "prod", secretValueHidden: false }] }), { status: 200 });
       },
       log,
     });

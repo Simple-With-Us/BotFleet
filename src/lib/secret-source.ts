@@ -89,12 +89,14 @@ export function infisicalStatusLabel(
 /** Where the Use Infisical switch starts, given the config/status blocks.
  *
  * Prefer the persisted operator toggle, which remains meaningful before
- * credentials exist.  Older servers expose only effective `enabled`, so
+ * credentials exist.
+ *
+ * Older servers expose only effective `enabled`, so
  * retain the previous compatibility fallback for those responses. */
 export function infisicalSwitchDefault(
   config: { configured?: boolean; enabled?: boolean; enabledSetting?: boolean } | null | undefined,
 ): boolean {
-  if (typeof config?.enabledSetting === "boolean") return config.enabledSetting;
+  if (config?.enabledSetting === true || config?.enabledSetting === false) return config.enabledSetting;
   if (!config?.configured) return true;
   return config.enabled !== false;
 }

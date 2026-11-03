@@ -338,6 +338,23 @@ const infisicalReadSourceSchema = z.object({
   environment: z.string().trim().regex(/^[a-z0-9-]{1,64}$/).optional(),
   secretPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
 });
+const infisicalConfigSchema = z.object({
+  authMethod: infisicalAuthMethodSchema.optional(),
+  enabled: z.boolean().optional(),
+  writeThrough: z.boolean().optional(),
+  siteUrl: optionalText,
+  projectId: optionalText,
+  environment: optionalText,
+  secretPath: optionalText,
+  clientId: optionalText,
+  clientSecret: optionalText,
+  // Primary tokens must survive stored-file parsing rather than being stripped as unknown fields.
+  token: optionalText,
+  writeToken: optionalText,
+  readSources: z.array(infisicalReadSourceSchema).max(32).optional(),
+  credentialStorage: externalCredentialStorage,
+  refreshMinutes: z.number().int().min(5).max(1440).optional(),
+});
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -612,31 +629,13 @@ const appConfigSchema = z.object({
     uiTracesSampleRate: z.number().min(0).max(1).optional(),
     logsEnabled: z.boolean().optional(),
   }).optional(),
-  // An optional external secret store.  Unconfigured is inert: without the
+  // An optional external secret store.
+  //
+  // Unconfigured is inert: without the
   // project and selected method's credentials, BotFleet resolves as it always
   // has.  The kill switch is explicit the same way `ingress` and
   // `observability` are — absent means on once it is configured.
-  infisical: z.object({
-    authMethod: infisicalAuthMethodSchema.optional(),
-    enabled: z.boolean().optional(),
-    writeThrough: z.boolean().optional(),
-    siteUrl: optionalText,
-    projectId: optionalText,
-    environment: optionalText,
-    secretPath: optionalText,
-    clientId: optionalText,
-    clientSecret: optionalText,
-    // The two service tokens.  They are declared here because the schema
-    // strips the keys it does not know: a token in the config file that
-    // the schema does not mention is dropped on the floor, and the file
-    // would look configured while the server had no usable service token.
-    // The environment names are the primary route.
-    token: optionalText,
-    writeToken: optionalText,
-    readSources: z.array(infisicalReadSourceSchema).max(32).optional(),
-    credentialStorage: externalCredentialStorage,
-    refreshMinutes: z.number().int().min(5).max(1440).optional(),
-  }).optional(),
+  infisical: infisicalConfigSchema.optional(),
   // Infisical Agent Proxy settings. Off by default. When enabled, agent CLIs
   // and child processes route through the local Infisical Agent Proxy
   // daemon (HTTP_PROXY/HTTPS_PROXY/NO_PROXY and TLS CA certificate injection).
@@ -704,7 +703,7 @@ const appConfigPatchSchema = appConfigSchema
   .extend({
     zulip: zulipConfigSchema.optional(),
     // Stored files stay forward-compatible; requests must not silently accept typos or inline source tokens.
-    infisical: appConfigSchema.shape.infisical.unwrap().extend({
+    infisical: infisicalConfigSchema.extend({
       readSources: z.array(infisicalReadSourceSchema.strict()).max(32).optional(),
     }).strict().optional(),
   });
@@ -1444,16 +1443,17 @@ export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
         if ([src.tokenEnv, src.writeTokenEnv].some((value) => value && (value.trim().length > 256 || !/^[A-Z][A-Z0-9_]*$/.test(value.trim())))) continue;
         if ([src.tokenFile, src.writeTokenFile].some((value) => value && (value.trim().length > 4096 || !value.trim().startsWith("/")))) continue;
         seen.add(name);
-        out.push({
+        const source: ResolvedInfisicalReadSource = {
           name,
           tokenFile: src.tokenFile?.trim() ?? "",
           tokenEnv: src.tokenEnv?.trim() ?? "",
-          ...(src.writeTokenFile ? { writeTokenFile: src.writeTokenFile.trim() } : {}),
-          ...(src.writeTokenEnv ? { writeTokenEnv: src.writeTokenEnv.trim() } : {}),
           projectId,
           environment: INFISICAL_ENVIRONMENT_PATTERN.test(env) ? env : (stored.environment?.trim() || DEFAULT_INFISICAL_ENVIRONMENT),
           secretPath: path.startsWith("/") ? normalizeInfisicalSecretPath(path) : DEFAULT_INFISICAL_SECRET_PATH,
-        });
+        };
+        if (src.writeTokenFile) source.writeTokenFile = src.writeTokenFile.trim();
+        if (src.writeTokenEnv) source.writeTokenEnv = src.writeTokenEnv.trim();
+        out.push(source);
       }
       return out;
     })(),
@@ -2417,7 +2417,7 @@ export function saveConfig(
   updateConfigFile(p, (raw) => {
     const merged = mergeConfigPatch(raw, checkedPatch);
     if (checkedPatch.infisical) {
-      const section = appConfigSchema.shape.infisical.parse(merged.infisical);
+      const section = infisicalConfigSchema.parse(merged.infisical);
       validateInfisicalConfigPatch({ infisical: overlayInfisicalBootstrap(section) }, { infisical: checkedPatch.infisical });
     }
     for (const [section, present] of Object.entries(options.externalCredentialSections ?? {})) {

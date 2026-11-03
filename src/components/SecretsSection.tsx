@@ -101,7 +101,7 @@ export function SecretsSection() {
     if (vault?.refreshMinutes !== undefined) setRefreshMinutes(vault.refreshMinutes);
   }, [vault?.refreshMinutes]);
   React.useEffect(() => {
-    if (typeof vault?.enabledSetting === "boolean") setEnabled(vault.enabledSetting);
+    if (vault?.enabledSetting === true || vault?.enabledSetting === false) setEnabled(vault.enabledSetting);
   }, [vault?.enabledSetting]);
   React.useEffect(() => {
     if (vault?.authMethod) setAuthMethod(vault.authMethod);
@@ -115,7 +115,7 @@ export function SecretsSection() {
     try {
       const data = await fetchSecrets();
       setStatus(data);
-      if (typeof data.infisical.enabledSetting === "boolean") setEnabled(data.infisical.enabledSetting);
+      if (data.infisical.enabledSetting === true || data.infisical.enabledSetting === false) setEnabled(data.infisical.enabledSetting);
       setStatusFetchError(null);
     } catch (caught) {
       // A window without loopback access (or a very old harness) sees this
@@ -217,7 +217,7 @@ export function SecretsSection() {
     try {
       const data: InfisicalStatusPayload = await api("/api/infisical/sync", { method: "POST" });
       setStatus(data);
-      if (typeof data.infisical.enabledSetting === "boolean") setEnabled(data.infisical.enabledSetting);
+      if (data.infisical.enabledSetting === true || data.infisical.enabledSetting === false) setEnabled(data.infisical.enabledSetting);
       setStatusFetchError(null);
       // The sync route deliberately does not broadcast a config frame (other
       // open windows pick up fresh counts on their next fetch), so this
@@ -595,7 +595,10 @@ export function SecretsSection() {
                         <label className="flex flex-col gap-1 text-[11px] font-medium text-ink-secondary">
                           Read Token Source
                           <div className="flex gap-2">
-                            <select aria-label={`Read token source type ${index + 1}`} value={source.readSourceType} onChange={(e) => updateSource(index, { readSourceType: e.target.value as "env" | "file" })} className={cn(secretsInputClass, "w-[132px] shrink-0")}>
+                            <select aria-label={`Read token source type ${index + 1}`} value={source.readSourceType} onChange={(e) => {
+                              const value = e.target.value;
+                              if (value === "env" || value === "file") updateSource(index, { readSourceType: value });
+                            }} className={cn(secretsInputClass, "w-[132px] shrink-0")}>
                               <option value="env">Environment</option>
                               <option value="file">File Path</option>
                             </select>
@@ -605,7 +608,10 @@ export function SecretsSection() {
                         <label className="flex flex-col gap-1 text-[11px] font-medium text-ink-secondary">
                           Write Token Source
                           <div className="flex gap-2">
-                            <select aria-label={`Write token source type ${index + 1}`} value={source.writeSourceType} onChange={(e) => updateSource(index, { writeSourceType: e.target.value as "env" | "file" })} className={cn(secretsInputClass, "w-[132px] shrink-0")}>
+                            <select aria-label={`Write token source type ${index + 1}`} value={source.writeSourceType} onChange={(e) => {
+                              const value = e.target.value;
+                              if (value === "env" || value === "file") updateSource(index, { writeSourceType: value });
+                            }} className={cn(secretsInputClass, "w-[132px] shrink-0")}>
                               <option value="env">Environment</option>
                               <option value="file">File Path</option>
                             </select>

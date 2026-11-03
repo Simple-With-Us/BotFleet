@@ -103,13 +103,16 @@ test("the workflow classifies cheaply and packages only when told to", () => {
     .split("\n")
     .filter((line) => !/^\s*#/.test(line))
     .join("\n");
+  const packagingStart = body.indexOf("\n  scope:");
+  assert.notEqual(packagingStart, -1);
+  const packagingBody = body.slice(packagingStart);
 
   // Must run on every pull request: a path filter would make this a required
   // check that never reports, which blocks a pull request forever.
   assert.match(yml, /pull_request:\n\s+types: \[opened, synchronize, reopened, ready_for_review]/);
   assert.doesNotMatch(body, /paths:/);
 
-  assert.match(yml, /if: \$\{\{ needs\.scope\.outputs\.run == 'true' && !cancelled\(\) \}\}/);
+  assert.match(yml, /if: \$\{\{ needs\.scope\.outputs\.run == 'true' && !cancelled\(\) && !\(github\.event_name == 'workflow_dispatch' && inputs\.audit_infisical_bindings == true\) \}\}/);
   assert.match(yml, /runs-on: macos-26/);
 
   // Unsigned, and provably so.  Note that arm64 bundles are always ad-hoc
@@ -121,11 +124,12 @@ test("the workflow classifies cheaply and packages only when told to", () => {
   assert.match(body, /must exercise the unsigned path/);
   assert.doesNotMatch(body, /if codesign -dv "\$app" >\/dev\/null/);
   // No certificate, no notarization, no artifact publication.
-  assert.doesNotMatch(body, /security import/);
-  assert.doesNotMatch(body, /notariz/i);
-  assert.doesNotMatch(body, /MAC_CERT/);
-  assert.doesNotMatch(body, /upload-artifact/);
-  assert.doesNotMatch(body, /codesign --verify/);
+  assert.doesNotMatch(packagingBody, /security import/);
+  assert.doesNotMatch(packagingBody, /notariz/i);
+  assert.doesNotMatch(packagingBody, /MAC_CERT/);
+  assert.doesNotMatch(packagingBody, /INFISICAL_.*TOKEN/);
+  assert.doesNotMatch(packagingBody, /upload-artifact/);
+  assert.doesNotMatch(packagingBody, /codesign --verify/);
 
   // Both #943 and #946 must be reachable from here.
   assert.match(body, /run: pnpm build:cua/);

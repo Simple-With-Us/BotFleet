@@ -51,8 +51,7 @@ const metadataRequests: string[] = [];
 
 // Existing success fixtures supply explicit token metadata separately from their
 // secrets response; security rejection fixtures below stub the whole wire.
-function stubFetch(impl: unknown): void {
-  const handler = impl as (url: string, init?: RequestInit) => Promise<Response>;
+function stubFetch(handler: (url: string, init?: RequestInit) => Promise<Response>): void {
   vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
     if (!String(url).endsWith("/api/v2/service-token")) return handler(url, init);
     metadataRequests.push(String(url));
@@ -73,7 +72,9 @@ function stubFetch(impl: unknown): void {
 }
 
 function withSettings(overrides: Partial<InfisicalSettings>): InfisicalSettings {
-  const merged: InfisicalSettings = { ...BASE_SETTINGS, ...(overrides.token ? { authMethod: "service-token" as const } : {}), ...overrides };
+  const defaults = { ...BASE_SETTINGS };
+  if (overrides.token) defaults.authMethod = "service-token";
+  const merged: InfisicalSettings = { ...defaults, ...overrides };
   fixtureSettings = merged;
   infisical.configure(() => merged);
   return merged;
@@ -1321,11 +1322,18 @@ describe("explicit auth and scope isolation", () => {
 });
 
 describe("service token metadata gate", () => {
-  const grant = (permissions = ["read"], patch: Record<string, unknown> = {}) => ({
+  interface ServiceTokenMetadataFixture {
+    workspace: string;
+    projectId: string;
+    scopes: Array<{ environment: string; secretPath: string } | null>;
+    permissions: string[];
+    expiresAt?: string | null;
+  }
+  const grant = (permissions = ["read"], patch: Partial<ServiceTokenMetadataFixture> = {}) => ({
     workspace: "proj-1", projectId: "proj-1", scopes: [{ environment: "prod", secretPath: "/requested/" }],
     permissions, expiresAt: null, ...patch,
   });
-  function wire(readMetadata: unknown, writeMetadata: unknown = grant(["write"])) {
+  function wire(readMetadata: ServiceTokenMetadataFixture, writeMetadata: ServiceTokenMetadataFixture = grant(["write"])) {
     const calls: Array<{ path: string; method: string }> = [];
     vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
       const path = new URL(String(url)).pathname;
@@ -1354,9 +1362,10 @@ describe("service token metadata gate", () => {
     ["expired token", { expiresAt: "2000-01-01T00:00:00Z" }],
     ["missing expiry metadata", { expiresAt: undefined }],
     ["malformed scopes", { scopes: [null] }],
-  ])("prevents secret reads for %s without MI fallback", async (_label, patch) => {
+  ] satisfies Array<[string, Partial<ServiceTokenMetadataFixture>]>)
+  ("prevents secret reads for %s without MI fallback", async (_label, patch) => {
     settings();
-    const calls = wire(grant(["read"], patch as Record<string, unknown>));
+    const calls = wire(grant(["read"], patch));
     const result = await infisical.refresh("manual");
     expect(result.stale).toBe(true);
     expect(result.lastError).not.toBeNull();
@@ -1372,9 +1381,10 @@ describe("service token metadata gate", () => {
     ["read-only write credential", { permissions: ["read"] }],
     ["expired token", { expiresAt: "2000-01-01T00:00:00Z" }],
     ["malformed expiry", { expiresAt: "not-a-date" }],
-  ])("prevents writes and reconciliation reads for %s", async (_label, patch) => {
+  ] satisfies Array<[string, Partial<ServiceTokenMetadataFixture>]>)
+  ("prevents writes and reconciliation reads for %s", async (_label, patch) => {
     settings();
-    const calls = wire(grant(), grant(["write"], patch as Record<string, unknown>));
+    const calls = wire(grant(), grant(["write"], patch));
     await expect(infisical.writeSecret("COMPOSIO_API_KEY", "replacement")).rejects.toBeInstanceOf(Error);
     expect(calls).toHaveLength(1);
     expect(secretCalls(calls)).toEqual([]);

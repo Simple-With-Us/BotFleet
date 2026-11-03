@@ -78,9 +78,10 @@ test("the package fixture never expands the product fleet or probes a PATH-insta
       `assert.equal(existsSync(${JSON.stringify(marker)}), true, "the safe fixture CLI control never ran");`,
       'await registry.disposeAll();',
     ].join("\n"));
+    const env = { PATH: bin, HOME: home, USERPROFILE: home };
+    if (process.env.SystemRoot) env.SystemRoot = process.env.SystemRoot;
     const result = spawnSync(process.execPath, [probe], {
-      env: { PATH: bin, HOME: home, USERPROFILE: home,
-        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
+      env,
       encoding: "utf8", timeout: 15_000,
     });
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);

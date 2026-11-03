@@ -74,4 +74,13 @@ test("visual: optional Infisical with explicit auth and scoped service-token sou
     maxDiffPixelRatio: 0.02,
     threshold: 0.2,
   });
+
+  await fixture.getByLabel("Primary Read Token", { exact: true }).fill("fixture-not-a-real-token");
+  const testConnection = fixture.getByRole("button", { name: "Test Connection", exact: true });
+  await expect(testConnection).toBeEnabled();
+  await fixture.getByRole("switch", { name: "Use Infisical", exact: true }).click();
+  await expect(testConnection).toBeDisabled();
+  await expect(testConnection).toHaveAttribute("title", "Enable Infisical to test the selected connection.");
+  await fixture.getByRole("switch", { name: "Use Infisical", exact: true }).click();
+  await expect(testConnection).toBeEnabled();
 });

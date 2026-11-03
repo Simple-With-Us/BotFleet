@@ -33,6 +33,7 @@ function stripTrailingSlash(url) {
 /** Validate the flat service-token record returned by Infisical before listing
  * secrets.  Keep this helper local so the hosted workflow stays dependency-free
  * and all network access remains injectable through `fetchImpl`. */
+/* oxlint-disable anti-slop/no-runtime-typeof -- These HTTP boundaries validate token and secret metadata without dependencies because CI runs before pnpm install. */
 export async function verifyServiceTokenMetadata({
   siteUrl, token, projectId, environment, secretPath, mode, fetchImpl = fetch, timeoutMs = 30_000,
 }) {
@@ -119,13 +120,11 @@ export async function verifyServiceTokenMetadata({
  * script only ever runs where values are needed (it exists to populate
  * GITHUB_ENV), unlike the probe path in server/infisical.ts.
  *
- * expandSecretReferences is "true": a secret whose stored value is a bare
- * reference such as ${prod.some-folder.NAME} (the Fleet-OPS root, OPS-818) comes
- * back as the referenced value.  With "false" the literal reference string
- * would land in GITHUB_ENV as if it were the credential.  Expanding needs the
- * reading identity to be able to read the referenced folder too. */
+ * References, imports, and descendants stay disabled so returned values cannot
+ * be resolved from another folder before their provenance is checked. */
 export async function listSecretsRaw({
   siteUrl, token, projectId, environment, secretPath, fetchImpl = fetch, timeoutMs = 30_000,
+  names, log = () => {},
 }) {
   await verifyServiceTokenMetadata({ siteUrl, token, projectId, environment, secretPath, mode: "read", fetchImpl, timeoutMs });
   const qs = new URLSearchParams({
@@ -133,8 +132,9 @@ export async function listSecretsRaw({
     environment,
     secretPath,
     viewSecretValue: "true",
-    expandSecretReferences: "true",
+    expandSecretReferences: "false",
     include_imports: "false",
+    recursive: "false",
   });
   const res = await fetchImpl(`${siteUrl}/api/v3/secrets/raw?${qs.toString()}`, {
     method: "GET",
@@ -145,14 +145,29 @@ export async function listSecretsRaw({
     throw new Error(`Infisical secrets list failed: HTTP ${res.status}`);
   }
   const body = await res.json();
+  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.secrets)) {
+    throw new Error("Infisical secrets list returned invalid metadata.");
+  }
+  const selected = names === undefined ? null : new Set(names);
+  const normalizeFolder = (path) => path.replace(/\/+$/, "") || "/";
   const values = new Map();
-  for (const s of body?.secrets ?? []) {
-    if (s && s.secretKey && s.secretValue) {
-      values.set(s.secretKey, s.secretValue);
+  for (const secret of body.secrets) {
+    if (!secret || typeof secret !== "object" || Array.isArray(secret) ||
+        typeof secret.secretKey !== "string" || !secret.secretKey) continue;
+    if (selected && !selected.has(secret.secretKey)) continue;
+    // v3 requires workspace/environment/hidden, while secretPath is optional on list rows.
+    if (secret.workspace !== projectId || secret.environment !== environment ||
+        secret.secretValueHidden !== false || typeof secret.secretValue !== "string" ||
+        (secret.secretPath !== undefined && (typeof secret.secretPath !== "string" ||
+          !secret.secretPath.startsWith("/") || normalizeFolder(secret.secretPath) !== normalizeFolder(secretPath)))) {
+      log(`::warning::${secret.secretKey} has invalid or out-of-scope Infisical metadata; trying its existing GitHub secret fallback.`);
+      continue;
     }
+    values.set(secret.secretKey, secret.secretValue);
   }
   return values;
 }
+/* oxlint-enable anti-slop/no-runtime-typeof */
 
 /** Registers each LINE of the value as its own mask, and never the joined
  * value.
@@ -194,11 +209,8 @@ export function writeGithubEnvValue(path, name, value, appendFileImpl = appendFi
   appendFileImpl(path, `${name}<<${delimiter}\n${value}\n${delimiter}\n`);
 }
 
-/** A value that is still a bare Infisical reference such as
- * ${prod.some-folder.NAME}: the server did not expand it (target missing, or
- * the reading identity cannot read the referenced folder).  Exporting it would
- * hand a workflow the literal reference string as if it were the credential. */
-export const UNRESOLVED_REFERENCE = /^\$\{[^}]+\}$/;
+/** Any embedded reference expression would make the value depend on another vault name. */
+export const UNRESOLVED_REFERENCE = /\$\{[^}]*\}/;
 
 export function isUnresolvedReference(value) {
   return UNRESOLVED_REFERENCE.test(String(value ?? "").trim());
@@ -209,7 +221,7 @@ export function isUnresolvedReference(value) {
  * caller proceeds on GH_FALLBACK_<NAME> alone.
  *
  * Machine identities are deliberately unavailable to managed CI. */
-async function resolveVaultValues({ siteUrl, projectId, token, environment, secretPath, fetchImpl, log }) {
+async function resolveVaultValues({ siteUrl, projectId, token, environment, secretPath, fetchImpl, log, names }) {
   const serviceToken = String(token ?? "").trim();
   if (!projectId) return new Map();
   if (!serviceToken) {
@@ -218,7 +230,7 @@ async function resolveVaultValues({ siteUrl, projectId, token, environment, secr
   }
   try {
     return await listSecretsRaw({
-      siteUrl, token: serviceToken, projectId, environment, secretPath, fetchImpl,
+      siteUrl, token: serviceToken, projectId, environment, secretPath, fetchImpl, names, log,
     });
   } catch {
     // Never interpolate the raw error body -- Infisical error payloads have
@@ -242,15 +254,22 @@ export async function run({
   const githubEnvPath = env.GITHUB_ENV || "";
 
   const vaultValues = await resolveVaultValues({
-    siteUrl, projectId, token, environment, secretPath, fetchImpl, log,
+    siteUrl, projectId, token, environment, secretPath, fetchImpl, log, names,
   });
 
   const missingRequired = [];
-  const unresolved = [];
   for (const name of names) {
     let value = vaultValues.get(name) || "";
+    if (isUnresolvedReference(value)) {
+      log(`::warning::${name} contains an Infisical reference expression; trying its existing GitHub secret fallback.`);
+      value = "";
+    }
     if (!value) {
       value = env[`GH_FALLBACK_${name}`] || "";
+      if (isUnresolvedReference(value)) {
+        log(`::warning::${name} has a GitHub secret fallback containing a reference expression; the value is unavailable.`);
+        value = "";
+      }
     }
     if (!value) {
       const message = `${name} is empty after the Infisical ${environment} export and the GitHub secret fallback.`;
@@ -262,18 +281,8 @@ export async function run({
       }
       continue;
     }
-    if (isUnresolvedReference(value)) {
-      // Name the KEY only -- never the value, even though it is a reference.
-      unresolved.push(name);
-      log(`::error::${name} is still an unresolved Infisical secret reference after the ${environment} export; check the target exists and the CI identity can read the referenced folder.`);
-      continue;
-    }
     maskValue(value, log);
     writeGithubEnvValue(githubEnvPath, name, value);
-  }
-
-  if (unresolved.length > 0) {
-    throw new Error(`Unresolved Infisical secret reference(s): ${unresolved.join(", ")}`);
   }
 
   if (missingRequired.length > 0) {

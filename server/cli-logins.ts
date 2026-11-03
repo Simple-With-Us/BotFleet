@@ -43,7 +43,9 @@ import type { LaunchIdentity } from "./contracts.ts";
 /** The read a CLI login comes from.
  *
  * A seam, so a test can hand in a stub instead of the live manager.  The
- * project is named, never a credential.  A matching source must provide a
+ * project is named, never a credential.
+ *
+ * A matching source must provide a
  * token for this exact project and folder; it cannot borrow the primary
  * project token or activate machine identity. */
 export interface CliLoginVaultReader {

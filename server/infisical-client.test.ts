@@ -22,7 +22,7 @@ describe("verifyServiceToken", () => {
       expect(url).toBe("https://app.infisical.example/api/v2/service-token");
       expect(init?.method).toBe("GET");
       expect(init?.redirect).toBe("error");
-      expect((init?.headers as Record<string, string>).authorization).toBe(`Bearer ${SENTINEL_TOKEN}`);
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${SENTINEL_TOKEN}`);
       return new Response(JSON.stringify({ ...metadata, secretHash: SENTINEL_CLIENT_SECRET }));
     });
     vi.stubGlobal("fetch", fetchMock);

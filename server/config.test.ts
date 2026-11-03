@@ -60,6 +60,7 @@ import {
   DEFAULT_AGENT_PROXY_ADDRESS,
   isHttpsUrl,
   type AppConfig,
+  type InfisicalReadSource,
 } from "./config.ts";
 import { isSentryDsn as isBrowserSentryDsn } from "../src/lib/observability-config.ts";
 
@@ -2019,10 +2020,10 @@ describe("the secret-store section", () => {
     process.env.INFISICAL_PROJECT_ID = "bootstrap-project";
     process.env.INFISICAL_TOKEN = "fake-bootstrap-read";
     process.env.INFISICAL_WRITE_TOKEN = "fake-bootstrap-write";
-    const source = { name: "extra", projectId: "bootstrap-project", secretPath: "/extra",
+    const source: InfisicalReadSource = { name: "extra", projectId: "bootstrap-project", secretPath: "/extra",
       tokenEnv: mode === "read" ? "ANOTHER_READ" : "INFISICAL_TOKEN",
-      ...(mode === "write" ? { writeTokenEnv: "ANOTHER_WRITE" } : {}),
     };
+    if (mode === "write") source.writeTokenEnv = "ANOTHER_WRITE";
     const patch = { infisical: { readSources: [source] } };
     const before = readFileSync(join(DATA_DIR, "config.json"), "utf8");
     expect(() => validateInfisicalConfigPatch(loadConfig(), patch)).toThrow(/token reference/);
