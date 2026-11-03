@@ -1,15 +1,29 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { authorizedRuntime, buildCompatibility, hashStaticUi, readPackagedBuildIdentity, readSourceBuildIdentity, validBuildIdentity } from "./runtime-identity.mjs";
+import { authorizedRuntime, buildCompatibility, hashStaticUi, readPackagedBuildIdentity, validBuildIdentity } from "./runtime-identity.mjs";
+import { readSourceBuildIdentity } from "../scripts/source-build-identity.mjs";
 import { harnessOwnerProof } from "./harness-ownership.mjs";
 import { probeHarness, resolvePackagedServer } from "./server-boot-probe.mjs";
 
 const build = { app: "botfleet", sourceCommit: "a".repeat(40), sourceDirty: false, apiVersion: 1, version: "1.0.30", uiHash: "e".repeat(64) };
 const owner = { version: 1, pid: 4242, port: 8799, nonce: "b".repeat(64) };
+
+test("packaged runtime identity loads without release-store scripts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "bf-packaged-identity-"));
+  try {
+    const packaged = join(root, "electron", "runtime-identity.mjs");
+    mkdirSync(join(root, "electron"));
+    copyFileSync(new URL("./runtime-identity.mjs", import.meta.url), packaged);
+    const module = await import(pathToFileURL(packaged).href);
+    assert.equal(typeof module.readPackagedBuildIdentity, "function");
+    assert.equal(module.validBuildIdentity(build), true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("release build metadata is optional for old identities and preserves the shared timestamp verbatim", () => {
   assert.equal(validBuildIdentity(build), true);

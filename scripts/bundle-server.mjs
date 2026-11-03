@@ -22,7 +22,8 @@ import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { controlBuildVersion } from "../electron/control-build-version.mjs";
-import { hashStaticUi, readSourceBuildIdentity } from "../electron/runtime-identity.mjs";
+import { hashStaticUi } from "../electron/runtime-identity.mjs";
+import { readSourceBuildIdentity } from "./source-build-identity.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const server = join(root, "server");

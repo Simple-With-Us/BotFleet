@@ -2960,7 +2960,7 @@ app.whenReady().then(async () => {
   const serverTargetRead = app.isPackaged
     ? readServerTargetFromInfisical().catch((error) => serverTargetFailure(error))
     : null;
-  if (app.isPackaged) {
+  if (app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU !== "1" && process.env.OMB_SMOKE_TEST !== "1") {
     app.setAsDefaultProtocolClient("botfleet");
   }
   // if (process.platform === "darwin") app.dock.setIcon(APP_ICON);
