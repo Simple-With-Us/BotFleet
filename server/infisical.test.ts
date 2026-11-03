@@ -1447,6 +1447,47 @@ describe("service token metadata gate", () => {
     } finally { now.mockRestore(); }
   });
 
+  it("evicts the least recently used credential when the 64-entry cache fills", async () => {
+    const configured = settings();
+    const clock = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(clock);
+    const calls = wire(grant());
+    const checks = () => calls.filter((call) => call.path === "/api/v2/service-token").length;
+    const read = async (index: number) => {
+      configured.token = `fake-lru-token-${index}`;
+      expect((await infisical.refresh("manual")).lastError).toBeNull();
+    };
+    try {
+      for (let index = 0; index < 64; index++) await read(index);
+      expect(checks()).toBe(64);
+      await read(0);
+      expect(checks()).toBe(64);
+      await read(64);
+      expect(checks()).toBe(65);
+      await read(0);
+      expect(checks()).toBe(65);
+      await read(1);
+      expect(checks()).toBe(66);
+    } finally { now.mockRestore(); }
+  });
+
+  it("promotes cache hits without extending their original verification lifetime", async () => {
+    settings();
+    let clock = Date.now();
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const calls = wire(grant());
+    const checks = () => calls.filter((call) => call.path === "/api/v2/service-token").length;
+    try {
+      await infisical.refresh("manual");
+      clock += 30_000;
+      await infisical.refresh("timer");
+      expect(checks()).toBe(1);
+      clock += 30_001;
+      await infisical.refresh("timer");
+      expect(checks()).toBe(2);
+    } finally { now.mockRestore(); }
+  });
+
   it("does not use a cached read-only grant to authorize the same credential for a write", async () => {
     withSettings({ secretPath: "/requested", token: SENTINEL_READ_TOKEN, writeToken: SENTINEL_READ_TOKEN, writeThrough: true });
     const calls = wire(grant());

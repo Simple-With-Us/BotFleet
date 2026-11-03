@@ -15,9 +15,30 @@
 // this file cannot quietly start leaking a credential just by adding detail
 // to a thrown message.
 import { redactSecretsInText } from "./redact.ts";
-import { isJsonObject, isJsonString, parseJson } from "./schema.ts";
+import { z } from "zod";
+import { parseJson } from "./schema.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const serviceTokenFolderSchema = z.string().startsWith("/").refine((path) => !/[*?[\]{}]/.test(path));
+const vendorServiceTokenScopesSchema = z.array(z.looseObject({
+  environment: z.string().min(1),
+  secretPath: serviceTokenFolderSchema,
+})).min(1);
+const serializedServiceTokenScopesSchema = z.string().transform((encoded, context) => {
+  try {
+    const parsed = vendorServiceTokenScopesSchema.safeParse(parseJson(encoded));
+    if (parsed.success) return parsed.data;
+  } catch { /* Invalid JSON is reported through the same vendor schema boundary. */ }
+  context.addIssue({ code: "custom", message: "Invalid serialized service-token scopes" });
+  return z.NEVER;
+});
+const vendorServiceTokenMetadataSchema = z.looseObject({
+  workspace: z.string().refine((project) => Boolean(project.trim())),
+  projectId: z.string().optional(),
+  scopes: z.union([vendorServiceTokenScopesSchema, serializedServiceTokenScopesSchema]),
+  permissions: z.array(z.enum(["read", "write"])).min(1),
+  expiresAt: z.string().nullable(),
+});
 
 export class InfisicalError extends Error {
   readonly statusCode: number;
@@ -118,8 +139,16 @@ export interface VerifyServiceTokenOptions {
 export async function verifyServiceToken({
   siteUrl, token, projectId, environment, secretPath, mode, timeoutMs = DEFAULT_TIMEOUT_MS,
 }: VerifyServiceTokenOptions): Promise<{ expiresAt: number | null }> {
-  const isLiteralFolder = (path: string) => path.startsWith("/") && !/[*?[\]{}]/.test(path);
-  if (!isJsonString(secretPath) || !isLiteralFolder(secretPath)) {
+  try {
+    if (siteUrl !== siteUrl.trim()) throw new Error("Invalid service-token site");
+    const site = new URL(siteUrl);
+    const authority = /^https:\/\/([^/?#\\]*)/i.exec(siteUrl)?.[1];
+    if (!authority || authority.includes("@") || site.protocol !== "https:" || !site.hostname ||
+        site.username || site.password || /[?#\\]/.test(siteUrl)) throw new Error("Invalid service-token site");
+  } catch {
+    throw new InfisicalError("Infisical service-token site must be an absolute HTTPS URL without userinfo, query or fragment", 403);
+  }
+  if (!serviceTokenFolderSchema.safeParse(secretPath).success) {
     throw new InfisicalError("Infisical service-token scope must use a literal folder", 403);
   }
   let response: Response;
@@ -138,28 +167,16 @@ export async function verifyServiceToken({
   try { raw = await response.json(); }
   catch { throw new InfisicalError("Infisical service-token verification returned invalid metadata", 502); }
   const invalid = () => new InfisicalError("Infisical service-token verification returned invalid metadata", 502);
-  if (!isJsonObject(raw)) throw invalid();
-  let scopes = raw.scopes;
-  if (isJsonString(scopes)) {
-    try { scopes = parseJson(scopes); } catch { throw invalid(); }
-  }
-  const metadata = raw;
-  if (!isJsonString(metadata.workspace) || !metadata.workspace.trim() ||
-      !Array.isArray(scopes) || !scopes.length ||
-      !Array.isArray(metadata.permissions) || !metadata.permissions.length ||
-      !metadata.permissions.every((permission) => permission === "read" || permission === "write")) throw invalid();
-  if (metadata.projectId !== undefined && !isJsonString(metadata.projectId)) throw invalid();
+  const parsed = vendorServiceTokenMetadataSchema.safeParse(raw);
+  if (!parsed.success) throw invalid();
+  const metadata = parsed.data;
   if (metadata.workspace !== projectId ||
       (metadata.projectId !== undefined && metadata.projectId !== projectId)) {
     throw new InfisicalError("Infisical service token does not belong to the configured project", 403);
   }
   const normalizeFolder = (path: string) => path.replace(/\/+$/, "") || "/";
-  let matches = false;
-  for (const scope of scopes) {
-    if (!isJsonObject(scope) || !isJsonString(scope.environment) || !scope.environment ||
-        !isJsonString(scope.secretPath) || !isLiteralFolder(scope.secretPath)) throw invalid();
-    if (scope.environment === environment && normalizeFolder(scope.secretPath) === normalizeFolder(secretPath)) matches = true;
-  }
+  const matches = metadata.scopes.some((scope) => scope.environment === environment &&
+    normalizeFolder(scope.secretPath) === normalizeFolder(secretPath));
   if (!matches) throw new InfisicalError("Infisical service token does not grant the exact configured environment and folder", 403);
   if (mode === "read" ? !metadata.permissions.includes("read") || metadata.permissions.includes("write")
     : !metadata.permissions.includes("write")) {
@@ -168,8 +185,7 @@ export async function verifyServiceToken({
   }
   let expiresAt: number | null = null;
   if (metadata.expiresAt !== null) {
-    if (!isJsonString(metadata.expiresAt) ||
-        !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(metadata.expiresAt)) throw invalid();
+    if (!/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(metadata.expiresAt)) throw invalid();
     expiresAt = Date.parse(metadata.expiresAt);
     if (!Number.isFinite(expiresAt)) throw invalid();
     const date = metadata.expiresAt.slice(0, 10);

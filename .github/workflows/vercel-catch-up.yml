@@ -56,20 +56,21 @@ jobs:
         id: credentials
         env:
           INFISICAL_TOKEN: ${{ secrets.INFISICAL_VERCEL_CATCH_UP_READ_TOKEN }}
+          INFISICAL_SECRET_PATH: ${{ vars.INFISICAL_VERCEL_CATCH_UP_SECRET_PATH }}
         run: |
-          if [ -n "$INFISICAL_TOKEN" ]; then
+          if [ -n "$INFISICAL_TOKEN" ] && [ -n "$INFISICAL_SECRET_PATH" ] && [ "$INFISICAL_SECRET_PATH" != '/' ]; then
             echo 'available=true' >> "$GITHUB_OUTPUT"
           else
             echo 'available=false' >> "$GITHUB_OUTPUT"
-            echo '::notice::Vercel catch-up is paused until its dedicated Infisical service token is bound.'
-            echo 'Vercel catch-up is paused until its dedicated Infisical service token is bound.' >> "$GITHUB_STEP_SUMMARY"
+            echo '::notice::Vercel catch-up is paused until its dedicated token and non-root Infisical folder are bound.'
+            echo 'Vercel catch-up is paused until its dedicated token and non-root Infisical folder are bound.' >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Load deploy token through its dedicated Fleet-OPS read binding
         if: steps.credentials.outputs.available == 'true'
         env:
           INFISICAL_PROJECT_ID: 8dae6d03-8f12-48b2-adf3-e5c1b881c8c5
           INFISICAL_ENVIRONMENT: prod
-          INFISICAL_SECRET_PATH: /
+          INFISICAL_SECRET_PATH: ${{ vars.INFISICAL_VERCEL_CATCH_UP_SECRET_PATH }}
           INFISICAL_NAMES: VERCEL_TOKEN
           INFISICAL_REQUIRED: VERCEL_TOKEN
           # Binding is pending AFC-600 scope and registry verification.

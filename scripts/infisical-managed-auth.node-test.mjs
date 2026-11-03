@@ -42,7 +42,7 @@ test("native release and Vercel catch-up use their dedicated pending bindings", 
   const fetchStep = vercel.jobs.deploy.steps.find((step) => step.run === "node scripts/infisical-fetch.mjs");
   assert.equal(fetchStep.env.INFISICAL_TOKEN, "${{ secrets.INFISICAL_VERCEL_CATCH_UP_READ_TOKEN }}");
   assert.equal(fetchStep.env.INFISICAL_ENVIRONMENT, "prod");
-  assert.equal(fetchStep.env.INFISICAL_SECRET_PATH, "/");
+  assert.equal(fetchStep.env.INFISICAL_SECRET_PATH, "${{ vars.INFISICAL_VERCEL_CATCH_UP_SECRET_PATH }}");
   assert.equal(fetchStep.env.INFISICAL_NAMES, "VERCEL_TOKEN");
   assert.equal(fetchStep.env.INFISICAL_REQUIRED, "VERCEL_TOKEN");
 });
@@ -53,7 +53,14 @@ test("Vercel catch-up pauses without its binding and admits only the token path 
   const fetchStep = steps.find((step) => step.run === "node scripts/infisical-fetch.mjs");
   assert.equal(fetchStep.if, "steps.credentials.outputs.available == 'true'");
   assert.equal(steps.find((step) => step.id === "gate").if, fetchStep.if);
-  for (const token of ["", "fixture-not-a-real-token"]) {
+  const cases = [
+    { token: "", secretPath: "", available: false },
+    { token: "fixture-not-a-real-token", secretPath: "", available: false },
+    { token: "fixture-not-a-real-token", secretPath: "/", available: false },
+    { token: "", secretPath: "/fleet/vercel", available: false },
+    { token: "fixture-not-a-real-token", secretPath: "/fleet/vercel", available: true },
+  ];
+  for (const { token, secretPath, available } of cases) {
     const dir = mkdtempSync(join(tmpdir(), "vercel-binding-fixture-"));
     try {
       const output = join(dir, "output");
@@ -62,11 +69,11 @@ test("Vercel catch-up pauses without its binding and admits only the token path 
       writeFileSync(summary, "");
       const result = spawnSync("bash", ["-e", "-c", gate.run], {
         encoding: "utf8", cwd: dir,
-        env: { PATH: process.env.PATH, INFISICAL_TOKEN: token, GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
+        env: { PATH: process.env.PATH, INFISICAL_TOKEN: token, INFISICAL_SECRET_PATH: secretPath, GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
       });
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(readFileSync(output, "utf8").trim(), `available=${Boolean(token)}`);
-      if (!token) assert.match(readFileSync(summary, "utf8"), /paused until its dedicated Infisical service token is bound/);
+      assert.equal(readFileSync(output, "utf8").trim(), `available=${available}`);
+      if (!available) assert.match(readFileSync(summary, "utf8"), /paused until its dedicated token and non-root Infisical folder are bound/);
       else assert.equal(readFileSync(summary, "utf8"), "");
       assert.doesNotMatch(result.stdout + result.stderr + readFileSync(output, "utf8") + readFileSync(summary, "utf8"), /fixture-not-a-real-token/);
     } finally { rmSync(dir, { recursive: true, force: true }); }

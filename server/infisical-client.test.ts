@@ -35,6 +35,33 @@ describe("verifyServiceToken", () => {
     expect(await verifyServiceToken(options)).toEqual({ expiresAt: null });
   });
 
+  it.each([
+    "http://vault.example.test", "ftp://vault.example.test", "vault.example.test",
+    "https:", "https://", "https:///vault.example.test", "https:vault.example.test",
+    "https:/vault.example.test", "https://user@vault.example.test", "https://user:password@vault.example.test",
+    "https://@vault.example.test", "https://vault.example.test?mode=unsafe", "https://vault.example.test?",
+    "https://vault.example.test#fragment", "https://vault.example.test#", "https://vault.example.test\\other",
+    " https://vault.example.test", "https://vault.example.test ",
+  ])("refuses unsafe site %s before sending any bearer request", async (siteUrl) => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(metadata)));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(verifyServiceToken({ ...options, siteUrl })).rejects.toMatchObject({ statusCode: 403 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts a secure custom endpoint with a port, base path and unrelated vendor fields", async () => {
+    const siteUrl = "https://vault.example.test:8443/infisical";
+    const fetchMock = vi.fn(async (url: string) => {
+      expect(url).toBe(`${siteUrl}/api/v2/service-token`);
+      return new Response(JSON.stringify({ ...metadata, futureVendorMetadata: { enabled: true },
+        scopes: [{ ...metadata.scopes[0], futureVendorScope: "accepted" }],
+      }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await verifyServiceToken({ ...options, siteUrl })).toEqual({ expiresAt: null });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it.each(["*", "?", "[", "]", "{", "}"])("rejects matching wildcard request and grant %s before any secret access", async (character) => {
     const secretPath = `/folder/${character}`;
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ...metadata,
@@ -93,11 +120,15 @@ describe("verifyServiceToken", () => {
     null, [], { serviceToken: metadata }, { ...metadata, workspace: {} },
     { ...metadata, scopes: "prod" }, { ...metadata, scopes: [null] },
     { ...metadata, scopes: "{}" }, { ...metadata, scopes: "null" },
+    { ...metadata, scopes: "[null]" }, { ...metadata, scopes: "123" }, { ...metadata, scopes: [] },
+    { ...metadata, scopes: [{ environment: "", secretPath: "/folder" }] },
+    { ...metadata, scopes: [{ environment: 123, secretPath: "/folder" }] },
     { ...metadata, scopes: JSON.stringify({ scopes: metadata.scopes }) },
     { ...metadata, scopes: [{ environment: "prod", secretPath: 1 }] },
     { ...metadata, permissions: "read" }, { ...metadata, permissions: ["read", "admin"] },
     { ...metadata, expiresAt: undefined }, { ...metadata, expiresAt: 123 }, { ...metadata, expiresAt: "not-a-date" },
     { ...metadata, expiresAt: "2999-02-30T00:00:00Z" },
+    { ...metadata, expiresAt: true }, { ...metadata, workspace: " " },
   ])("fails closed for malformed flat metadata %#", async (body) => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(body))));
     await expect(verifyServiceToken(options)).rejects.toMatchObject({ statusCode: 502 });

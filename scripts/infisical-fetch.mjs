@@ -30,6 +30,24 @@ function stripTrailingSlash(url) {
   return String(url ?? "").replace(/\/+$/, "");
 }
 
+function validateInfisicalSiteUrl(siteUrl) {
+  const raw = String(siteUrl ?? "");
+  const invalid = () => new Error("Infisical site URL must be a valid HTTPS URL without userinfo, query, or fragment.");
+  if (!raw || raw !== raw.trim() || /[?#\\]/.test(raw)) throw invalid();
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw invalid();
+  }
+  const authority = raw.match(/^https:\/\/([^/\\?#]*)/i)?.[1];
+  if (parsed.protocol !== "https:" || !parsed.hostname || !authority || authority.includes("@") ||
+      authority.includes("\\") || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw invalid();
+  }
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+}
+
 /** Validate the flat service-token record returned by Infisical before listing
  * secrets.  Keep this helper local so the hosted workflow stays dependency-free
  * and all network access remains injectable through `fetchImpl`. */
@@ -37,6 +55,7 @@ function stripTrailingSlash(url) {
 export async function verifyServiceTokenMetadata({
   siteUrl, token, projectId, environment, secretPath, mode, fetchImpl = fetch, timeoutMs = 30_000,
 }) {
+  const baseUrl = validateInfisicalSiteUrl(siteUrl);
   const isLiteralFolder = (path) =>
     typeof path === "string" && path.startsWith("/") && !/[*?[\]{}]/.test(path);
   if (!isLiteralFolder(secretPath)) {
@@ -44,7 +63,7 @@ export async function verifyServiceTokenMetadata({
   }
   let response;
   try {
-    response = await fetchImpl(`${siteUrl}/api/v2/service-token`, {
+    response = await fetchImpl(`${baseUrl}/api/v2/service-token`, {
       method: "GET",
       headers: { authorization: `Bearer ${token}` },
       redirect: "error",
@@ -126,7 +145,8 @@ export async function listSecretsRaw({
   siteUrl, token, projectId, environment, secretPath, fetchImpl = fetch, timeoutMs = 30_000,
   names, log = () => {},
 }) {
-  await verifyServiceTokenMetadata({ siteUrl, token, projectId, environment, secretPath, mode: "read", fetchImpl, timeoutMs });
+  const baseUrl = validateInfisicalSiteUrl(siteUrl);
+  await verifyServiceTokenMetadata({ siteUrl: baseUrl, token, projectId, environment, secretPath, mode: "read", fetchImpl, timeoutMs });
   const qs = new URLSearchParams({
     workspaceId: projectId,
     environment,
@@ -136,7 +156,7 @@ export async function listSecretsRaw({
     include_imports: "false",
     recursive: "false",
   });
-  const res = await fetchImpl(`${siteUrl}/api/v3/secrets/raw?${qs.toString()}`, {
+  const res = await fetchImpl(`${baseUrl}/api/v3/secrets/raw?${qs.toString()}`, {
     method: "GET",
     headers: { authorization: `Bearer ${token}` },
     signal: AbortSignal.timeout(timeoutMs),

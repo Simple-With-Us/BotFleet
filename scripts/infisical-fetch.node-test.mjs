@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { listSecretsRaw, maskValue, run, writeGithubEnvValue } from "./infisical-fetch.mjs";
+import { listSecretsRaw, maskValue, run, verifyServiceTokenMetadata, writeGithubEnvValue } from "./infisical-fetch.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = join(ROOT, "scripts", "infisical-fetch.mjs");
@@ -139,6 +139,69 @@ test("verification uses the injected fetch and rejects project, scope, permissio
       }
     });
   }
+});
+
+test("service-token URL preflight rejects insecure, malformed, credentialed, query, and fragment URLs before fetch", async (t) => {
+  const invalidUrls = [
+    "http://infisical.example",
+    "http://127.0.0.1:8080",
+    "https://",
+    "https:///missing-host/path",
+    "https://user:password@infisical.example",
+    "https://@infisical.example",
+    "https://infisical.example/path?token=fixture-secret",
+    "https://infisical.example/path#fragment",
+    "https://infisical.example\\@attacker.example/path",
+    "https://infisical.example/path?",
+    "https://infisical.example/path#",
+  ];
+  for (const siteUrl of invalidUrls) {
+    await t.test(siteUrl.startsWith("http://") ? "insecure URL" : "invalid URL components", async () => {
+      let calls = 0;
+      const options = {
+        siteUrl,
+        token: "st.fixture-only",
+        projectId: "proj",
+        environment: "prod",
+        secretPath: "/",
+        mode: "read",
+        fetchImpl: async () => { calls++; throw new Error("must not fetch"); },
+      };
+      await assert.rejects(verifyServiceTokenMetadata(options), (error) => {
+        assert.match(error.message, /valid HTTPS URL/);
+        assert.ok(!error.message.includes(siteUrl));
+        assert.ok(!error.message.includes("fixture-secret"));
+        return true;
+      });
+      await assert.rejects(listSecretsRaw(options), /valid HTTPS URL/);
+      assert.equal(calls, 0);
+    });
+  }
+});
+
+test("service-token URL preflight preserves HTTPS path prefixes and redirects:error", async () => {
+  const calls = [];
+  const values = await listSecretsRaw({
+    siteUrl: "https://infisical.example/prefix/",
+    token: "st.fixture-only",
+    projectId: "proj",
+    environment: "prod",
+    secretPath: "/",
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      if (String(url).includes("/api/v2/service-token")) {
+        return new Response(JSON.stringify({ workspace: "proj", projectId: "proj",
+          scopes: [{ environment: "prod", secretPath: "/" }], permissions: ["read"], expiresAt: null }));
+      }
+      return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: "fixture-value",
+        workspace: "proj", environment: "prod", secretValueHidden: false }] }));
+    },
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url, "https://infisical.example/prefix/api/v2/service-token");
+  assert.equal(calls[0].init.redirect, "error");
+  assert.equal(new URL(calls[1].url).pathname, "/prefix/api/v3/secrets/raw");
+  assert.equal(values.get("FOO"), "fixture-value");
 });
 
 test("the injected fetch validates serialized exact read scope before secrets", async () => {

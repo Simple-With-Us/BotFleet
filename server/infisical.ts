@@ -12,6 +12,7 @@
 // anywhere at all, and it goes straight to Infisical over the connection
 // `login()` already authenticated, never through a log line.
 import { constants } from "node:fs";
+import { createHash } from "node:crypto";
 import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 
@@ -544,13 +545,20 @@ class InfisicalManager {
   }
 
   /** Cache successful scope checks for at most a minute and never past expiry.
-   * Keys stay in process memory and include the credential, site, scope and role. */
+   *
+   * Keys include a credential digest, site, scope and role, and hits retain their original expiry. */
   private async verifyScopedServiceToken(
     siteUrl: string, token: string, projectId: string, environment: string, secretPath: string, mode: "read" | "write",
   ): Promise<void> {
-    const key = [siteUrl, token, projectId, environment, normalizeInfisicalSecretPath(secretPath), mode].join("\u0000");
+    const credentialDigest = createHash("sha256").update(token).digest("hex");
+    const key = [siteUrl, credentialDigest, projectId, environment, normalizeInfisicalSecretPath(secretPath), mode].join("\u0000");
     const now = Date.now();
-    if ((this.verifiedServiceTokens.get(key) ?? 0) > now) return;
+    const cachedUntil = this.verifiedServiceTokens.get(key);
+    if (cachedUntil !== undefined && cachedUntil > now) {
+      this.verifiedServiceTokens.delete(key);
+      this.verifiedServiceTokens.set(key, cachedUntil);
+      return;
+    }
     this.verifiedServiceTokens.delete(key);
     const metadata = await verifyServiceToken({ siteUrl, token, projectId, environment, secretPath, mode, timeoutMs: callTimeoutMs() });
     const validUntil = Math.min(Date.now() + 60_000, metadata.expiresAt ?? Infinity);
