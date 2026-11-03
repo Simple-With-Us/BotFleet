@@ -588,7 +588,7 @@ test("an unreadable dependency root is unverifiable, never absent", (t) => {
 // and stays out of the custody fingerprint.
 test("pnpm bookkeeping hashes semantically: volatile fields waived, stable install behavior covered", (t) => {
   const { dir, git } = makeRepo(t);
-  const commit = commitTree(git, dir, { "a.txt": "one\n" });
+  commitTree(git, dir, { "a.txt": "one\n" });
   const makeTree = (label, { storeDir = "/same/store", linker = "isolated" } = {}) => {
     const root = join(dir, `tree-${label}-${linker}`);
     mkdirSync(join(root, "node_modules", "dep"), { recursive: true });

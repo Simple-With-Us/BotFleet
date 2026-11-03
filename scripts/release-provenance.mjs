@@ -200,6 +200,7 @@ const PNPM_VOLATILE_KEYS = new Set(["lastValidatedTimestamp", "recordedAtNs", "c
 
 function canonicalJsonValue(value) {
   if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- this recursive JSON boundary accepts every JSON node and distinguishes object entries from scalar leaves
   if (value && typeof value === "object") {
     const keys = Object.keys(value).filter((key) => !PNPM_VOLATILE_KEYS.has(key)).sort();
     const absoluteKeys = keys.filter((key) => key.startsWith("/"));

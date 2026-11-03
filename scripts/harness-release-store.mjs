@@ -247,9 +247,9 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
     // without reconstructing the history of the machine.
     node: process.version,
     platform: process.platform,
-    ...(resolvedVersion !== undefined ? { version: resolvedVersion } : {}),
-    ...(build !== undefined ? { build } : {}),
   };
+  if (resolvedVersion !== undefined) manifest.version = resolvedVersion;
+  if (build !== undefined) manifest.build = build;
   const manifestPath = join(from, MANIFEST);
   // Remove any leftover first.  A previous attempt may have written the manifest
   // read-only, and fs.writeFile applies `mode` only when it CREATES a file — so

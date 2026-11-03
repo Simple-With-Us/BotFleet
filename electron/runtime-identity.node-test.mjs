@@ -274,7 +274,7 @@ test("a release no repository can check reports the manifest's claim, still dirt
 });
 
 test("a manifest naming a different commit than its directory is not a release", (t) => {
-  const { dir, commit, release } = makeReleaseFixture(t);
+  const { dir, release } = makeReleaseFixture(t);
   writeManifest(release, "f".repeat(40));
   const identity = withProvenanceRepo(dir, () => readSourceBuildIdentity(release));
   assert.equal(identity.sourceCommit, "0".repeat(40), "falls through to the git path, which finds no .git");
@@ -305,7 +305,7 @@ test("requireGit admits a verified release and refuses an unverified claim", (t)
 test("a commit-named GIT worktree with a manifest is never release mode: dirty git answers", (t) => {
   // Release mode must not bypass git's own dirty detection: a checkout that
   // happens to be named by a commit and carry a manifest is a checkout.
-  const { dir, git, commit } = makeReleaseFixture(t);
+  const { dir, commit } = makeReleaseFixture(t);
   // Use the repo itself as the "commit-named" root: rename is not possible, so
   // create a worktree whose directory name is the commit.
   const worktree = join(dir, "wt", commit);

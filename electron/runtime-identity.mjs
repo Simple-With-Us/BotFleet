@@ -202,8 +202,8 @@ function readReleaseStoreIdentity(root, release, { requireGit, version, build, u
     sourceCommit,
     sourceDirty,
     uiHash: null,
-    ...(release.build !== undefined || build !== null ? { build: build ?? release.build } : {}),
   };
+  if (release.build !== undefined || build !== null) value.build = build ?? release.build;
   if (!validBuildIdentity(value)) throw new Error("BotFleet release identity is invalid");
   return value;
 }

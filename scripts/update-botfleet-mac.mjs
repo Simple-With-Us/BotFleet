@@ -58,7 +58,7 @@ import {
   swapCurrent,
   validateReleaseManifest,
 } from "./harness-release-store.mjs";
-import { dependencyScopeFingerprint, dependencyScopeStatus, verifyReleaseAgainstCommit } from "./release-provenance.mjs";
+import { dependencyScopeStatus, verifyReleaseAgainstCommit } from "./release-provenance.mjs";
 
 const EXPECTED_TEAM_ID = "CC8UTF7ATG";
 // Transition release: main still BUILDS com.botfleet.app (LEGACY_BUNDLE_ID).
@@ -1083,6 +1083,24 @@ async function readRunningReleaseManifest(root) {
   }
 }
 
+async function readReleasePackageVersion(root, commit) {
+  try {
+    const value = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+    // Bootstrap archives have no node_modules; these checks parse the consumed JSON boundary without a third-party schema dependency.
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- dependency-free JSON boundary parse
+    if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, "version")) throw new Error("invalid package object");
+    // Keep the same version syntax as validBuildIdentity, rather than introduce a stricter release dialect here.
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- dependency-free JSON boundary parse
+    if (typeof value.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(value.version)) throw new Error("invalid package version");
+    return value.version;
+  } catch {
+    throw new Error(
+      `Existing release ${commit.slice(0, 12)} cannot be trusted: package.json is missing, unreadable or has an invalid runtime version.\u00A0 ` +
+        "Discard and re-stage it before retrying.",
+    );
+  }
+}
+
 /** The two refusals a store-backed harness can legitimately need cleared by
  *  EXTERNAL verification: its runtime predates release identity reporting
  *  (all-zeros commit), or it could not verify itself at boot.  Anything else
@@ -1298,7 +1316,13 @@ export async function prepareStoreReleaseDeploy(config, prepared, previous, adap
     // exported package.json version, the same value the runtime would report.
     const manifest = await readRunningReleaseManifest(releaseDir);
     const releaseVersion = manifest?.version
-      ?? JSON.parse(await readFile(join(releaseDir, "package.json"), "utf8")).version;
+      ?? await readReleasePackageVersion(releaseDir, commit);
+    if (!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(releaseVersion)) {
+      throw new Error(
+        `Existing release ${commit.slice(0, 12)} cannot be trusted: its stamped runtime version is invalid.\u00A0 ` +
+          "Discard and re-stage it before retrying.",
+      );
+    }
     if (releaseVersion !== prepared.version) {
       throw new Error(
         `Existing release ${commit.slice(0, 12)} carries version ${releaseVersion}, but this update prepared ${prepared.version}.  ` +
@@ -1351,7 +1375,7 @@ export async function prepareStoreReleaseDeploy(config, prepared, previous, adap
  * is a hard refusal — never a fallback install with the harness down.  A
  * standalone caller runs prepareStoreReleaseDeploy first, explicitly.
  */
-export async function deployStoreReleaseIfBacked(config, prepared, previous, adapters = {}) {
+export async function deployStoreReleaseIfBacked(config, prepared, previous, _adapters = {}) {
   const store = await storeHarnessState(config);
   if (store.mode !== "release") return false;
   const commit = prepared.targetCommit;
@@ -1470,7 +1494,7 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle, deps
     // A store-backed harness whose runtime cannot self-prove is not refused
     // yet: the updater verifies the running release's bytes itself, against
     // git objects, before it believes or disbelieves anything.
-    const storeAdapters = { ...(config.storeAdapters ?? {}) };
+    const storeAdapters = { ...config.storeAdapters };
     if (depsFingerprint && storeAdapters.expectedDepsFingerprint == null) {
       storeAdapters.expectedDepsFingerprint = depsFingerprint;
     }
@@ -4017,7 +4041,7 @@ export function createOperations(config) {
     return fingerprint;
   };
   config.storeAdapters = {
-    ...(config.storeAdapters ?? {}),
+    ...config.storeAdapters,
     expectedDepsFingerprintFor: config.storeAdapters?.expectedDepsFingerprintFor ?? referenceFingerprintFor,
     registerTrustedFingerprint: (commit, fingerprint) => {
       storeReferenceFingerprints.set(commit, fingerprint);
@@ -4532,7 +4556,7 @@ export function createOperations(config) {
       // dependency custody ready too, so a mid-transaction rollback never
       // needs an install inside its own fence.
       if (previous.releaseCommit && previous.releaseCommit !== prepared.targetCommit) {
-        await referenceFingerprintFor(previous.releaseCommit);
+        await (config.storeAdapters?.expectedDepsFingerprintFor ?? referenceFingerprintFor)(previous.releaseCommit);
       }
     },
 
