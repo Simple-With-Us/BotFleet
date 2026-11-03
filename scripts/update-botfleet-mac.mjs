@@ -1317,6 +1317,12 @@ export async function prepareStoreReleaseDeploy(config, prepared, previous, adap
     const manifest = await readRunningReleaseManifest(releaseDir);
     const releaseVersion = manifest?.version
       ?? await readReleasePackageVersion(releaseDir, commit);
+    if (!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(releaseVersion)) {
+      throw new Error(
+        `Existing release ${commit.slice(0, 12)} cannot be trusted: its stamped runtime version is invalid.\u00A0 ` +
+          "Discard and re-stage it before retrying.",
+      );
+    }
     if (releaseVersion !== prepared.version) {
       throw new Error(
         `Existing release ${commit.slice(0, 12)} carries version ${releaseVersion}, but this update prepared ${prepared.version}.  ` +
@@ -4550,7 +4556,7 @@ export function createOperations(config) {
       // dependency custody ready too, so a mid-transaction rollback never
       // needs an install inside its own fence.
       if (previous.releaseCommit && previous.releaseCommit !== prepared.targetCommit) {
-        await config.storeAdapters.expectedDepsFingerprintFor(previous.releaseCommit);
+        await (config.storeAdapters?.expectedDepsFingerprintFor ?? referenceFingerprintFor)(previous.releaseCommit);
       }
     },
 

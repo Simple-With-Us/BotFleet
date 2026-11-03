@@ -3658,6 +3658,55 @@ test("materializeCandidate prepares the store deploy and rollback-target custody
   assert.equal(previous.storeDeployPrepared, COMMIT_B);
 });
 
+test("reuse preparation refuses malformed stamped versions before proof or pointer changes", async (t) => {
+  for (const version of ["", "release-next", "1.0", "1.0.31 private detail"]) {
+    await t.test(version || "empty", async (context) => {
+      const { home, config } = await makeStoreFixture(context);
+      const current = await makeRelease(home, COMMIT_B);
+      const release = await makeRelease(home, COMMIT_A);
+      const manifestPath = join(release, ".botfleet-release.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+      await writeFile(manifestPath, JSON.stringify({ ...manifest, version }));
+      const pointer = join(home, ".botfleet", "current");
+      await symlink(current, pointer);
+      const previous = { sentinel: "untouched" };
+      let proofCalls = 0;
+      await assert.rejects(
+        prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_A, version }, previous, {
+          installReference: async () => { proofCalls++; throw new Error("unexpected reference install"); },
+          verifyRelease: () => { proofCalls++; throw new Error("unexpected byte proof"); },
+        }),
+        /cannot be trusted: its stamped runtime version is invalid\./,
+      );
+      assert.equal(proofCalls, 0);
+      assert.deepEqual(previous, { sentinel: "untouched" });
+      assert.equal(await realpath(pointer), await realpath(current));
+    });
+  }
+});
+
+test("materializeCandidate retains trusted custody when adapters are replaced after initialization", { skip: process.platform !== "darwin" ? "candidate copy uses APFS clonefile" : false }, async (t) => {
+  for (const replacement of ["missing", "registration-only"]) {
+    await t.test(replacement, async (context) => {
+      const { home, config } = await makeStoreFixture(context);
+      const root = await makeRelease(home, COMMIT_A);
+      await symlink(root, join(home, ".botfleet", "current"));
+      config.parsed = { components: "server" };
+      config.storeDeployPreparer = async (_cfg, prepared, previous) => { previous.storeDeployPrepared = prepared.targetCommit; return true; };
+      const sourceDeps = join(home, "prepared-node_modules");
+      await mkdir(sourceDeps);
+      await writeFile(join(sourceDeps, "marker"), "deps");
+      const ops = createOperations(config);
+      const register = config.storeAdapters.registerTrustedFingerprint;
+      register(COMMIT_A, "previously verified custody");
+      config.storeAdapters = replacement === "missing" ? undefined : { registerTrustedFingerprint: register };
+      const previous = { candidateDependencies: join(home, ".candidate-node_modules"), releaseCommit: COMMIT_A };
+      await ops.materializeCandidate({ targetCommit: COMMIT_B, dependenciesPath: sourceDeps, dependencyFingerprint: await dependencyFingerprint(sourceDeps) }, previous);
+      assert.equal(previous.storeDeployPrepared, COMMIT_B);
+    });
+  }
+});
+
 test("reuse preparation controls package-version failures before proof or pointer changes", async (t) => {
   const cases = [
     ["missing package", undefined],
