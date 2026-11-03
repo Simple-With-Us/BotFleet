@@ -365,8 +365,25 @@ test("the iOS gate keeps changed paths out of workflow-command stdout", () => {
 test("the weekly full run is registered with the Sentry cron reporter", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const schedule = workflow.on.schedule[0].cron;
+  const testJob = workflow.jobs.test;
+  const testMatrix = testJob.strategy.matrix.include;
+  const testTimeoutExpression = "${{ matrix.os == 'macos-15' && 35 || 25 }}";
+  const matrixBudgets = testMatrix.map(({ os, check }) => [
+    check,
+    os === "macos-15" ? 35 : os === "ubuntu-latest" ? 25 : null,
+  ]);
+  assert.equal(testJob["timeout-minutes"], testTimeoutExpression);
+  assert.deepEqual(matrixBudgets, [
+    ["macos-latest", 35],
+    ["ubuntu-latest", 25],
+  ]);
+  const otherJobTimeouts = Object.values(workflow.jobs)
+    .filter((job) => job !== testJob)
+    .map((job) => job["timeout-minutes"] ?? 0);
+  assert.ok(otherJobTimeouts.every(Number.isFinite));
   const maxJobTimeout = Math.max(
-    ...Object.values(workflow.jobs).map((job) => job["timeout-minutes"] ?? 0),
+    ...otherJobTimeouts,
+    ...matrixBudgets.map(([, minutes]) => minutes),
   );
   const probe = spawnSync(
     "python3",
