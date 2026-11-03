@@ -10,10 +10,11 @@
  *  `worker-unreachable`; they are never requeued or re-dispatched from a
  *  timer, so a job can never run twice because a link went quiet.
  *
- *  What this file is not yet: durable persistence across controller restarts.
- *  Leases are the controller's live book; the job records a person reads stay
- *  in the job registry. */
+ *  Controller epochs persist before acknowledgement; leases and queue state
+ *  remain the controller's live book, without restart persistence.
+ *  The job records a person reads stay in the job registry. */
 import { randomUUID } from "node:crypto";
+import type { ControllerEpochStore } from "./placement-identity.ts";
 import { z } from "zod";
 import { derivedCapability, hostCanRunCommand } from "../shared/mac-only-capabilities.ts";
 import {
@@ -84,6 +85,8 @@ interface WorkerBook {
 export interface PlacementLeaseDeps {
   hostId: HostId;
   controller: ControllerEpoch;
+  /** Required by the server; omitted only for isolated in-memory fixtures. */
+  controllerStore?: ControllerEpochStore;
   now?: () => number;
   /** A worker unseen for this long is unreachable.  Injectable: the plan
    *  leaves the value to the heartbeat knobs, which are not set yet. */
@@ -99,6 +102,7 @@ export const MAX_TAKEOVER_EPOCH_JUMP = 100_000;
 
 export class PlacementLeaseService {
   private current: ControllerEpoch;
+  private readonly controllerStore?: ControllerEpochStore;
   private reconcileState = false;
   private readonly workers = new Map<HostId, WorkerBook>();
   private readonly jobs = new Map<string, PlacementJob>();
@@ -108,14 +112,51 @@ export class PlacementLeaseService {
   private readonly newLeaseId: () => string;
 
   constructor(deps: PlacementLeaseDeps) {
-    this.current = { ...deps.controller };
+    this.controllerStore = deps.controllerStore;
+    this.current = { ...(deps.controllerStore?.read() ?? deps.controller) };
     this.now = deps.now ?? Date.now;
     this.unreachableAfterMs = deps.unreachableAfterMs ?? 30_000;
     this.newLeaseId = deps.newLeaseId ?? (() => `lease_${randomUUID()}`);
   }
 
   controller(): ControllerEpoch {
+    this.refreshController();
     return { ...this.current };
+  }
+
+  private refreshController(): void {
+    const stored = this.controllerStore?.read();
+    if (stored && (stored.controllerId !== this.current.controllerId || stored.epoch !== this.current.epoch)) {
+      if (stored.epoch <= this.current.epoch) throw new Error("persisted controller epoch regressed");
+      this.current = { ...stored };
+      this.reconcileState = true;
+      this.markOrphanedJobs();
+    }
+  }
+
+  private markOrphanedJobs(): string[] {
+    const orphanedJobIds: string[] = [];
+    for (const job of this.jobs.values()) {
+      if (job.status === "dispatching" || job.status === "running" || job.status === "worker-unreachable") {
+        job.ranAfterTakeover = true;
+        orphanedJobIds.push(job.jobId);
+      }
+    }
+    return orphanedJobIds;
+  }
+
+  private commitController(next: ControllerEpoch): string | null {
+    try {
+      const result = this.controllerStore?.compareAndSet(this.current, next);
+      if (result && !result.accepted) {
+        this.refreshController();
+        return "Controller epoch changed; retry with the current fence";
+      }
+    } catch {
+      return "Controller epoch could not be persisted; transition refused";
+    }
+    this.current = { ...next };
+    return null;
   }
 
   reconciling(): boolean {
@@ -137,6 +178,7 @@ export class PlacementLeaseService {
    *  and queue messages too, never adopted outside `takeover`, so no skewed
    *  or forged worker bump can invalidate outstanding leases. */
   private fence(message: PlacementMessage): string | null {
+    this.refreshController();
     if (message.version !== PLACEMENT_WIRE_VERSION) {
       return `placement version ${message.version} is not spoken here (this host speaks ${PLACEMENT_WIRE_VERSION})`;
     }
@@ -372,7 +414,9 @@ export class PlacementLeaseService {
       return refuse("Settle all active jobs with terminal reports before releasing the controller");
     }
     const previousEpoch = this.current.epoch;
-    this.current = { controllerId: message.toControllerId, epoch: previousEpoch + 1 };
+    if (!Number.isSafeInteger(previousEpoch + 1)) return refuse("Controller epoch is exhausted");
+    const failed = this.commitController({ controllerId: message.toControllerId, epoch: previousEpoch + 1 });
+    if (failed) return refuse(failed);
     this.reconcileState = false;
     return {
       ok: true,
@@ -393,21 +437,17 @@ export class PlacementLeaseService {
       ok: true,
       reply: { accepted: false, reconcile: false, orphanedJobIds: [], reason, ...this.current },
     });
+    this.refreshController();
     if (message.version !== PLACEMENT_WIRE_VERSION) {
       return refuse(`placement version ${message.version} is not spoken here (this host speaks ${PLACEMENT_WIRE_VERSION})`);
     }
-    if (message.epoch <= this.current.epoch || message.epoch > this.current.epoch + MAX_TAKEOVER_EPOCH_JUMP) {
+    if (!Number.isSafeInteger(message.epoch) || message.epoch <= this.current.epoch || message.epoch - this.current.epoch > MAX_TAKEOVER_EPOCH_JUMP) {
       return refuse(`takeover epoch ${message.epoch} must exceed current epoch ${this.current.epoch} on ${this.current.controllerId} within bounds`);
     }
-    this.current = { controllerId: message.controllerId, epoch: message.epoch };
+    const failed = this.commitController({ controllerId: message.controllerId, epoch: message.epoch });
+    if (failed) return refuse(failed);
     this.reconcileState = message.reconcile;
-    const orphanedJobIds: string[] = [];
-    for (const job of this.jobs.values()) {
-      if (job.status === "dispatching" || job.status === "running" || job.status === "worker-unreachable") {
-        job.ranAfterTakeover = true;
-        orphanedJobIds.push(job.jobId);
-      }
-    }
+    const orphanedJobIds = this.markOrphanedJobs();
     return {
       ok: true,
       reply: {

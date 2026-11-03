@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, rmdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   HOST_ID_PATTERN,
@@ -15,26 +15,14 @@ const controllerEpochSchema = z.object({
   epoch: z.number().int().nonnegative().safe(),
 }).strict();
 
-/**
- * The controller fence belongs to the data directory, beside `host-id`.
- * A host that has never handed control away is its own controller at epoch 0;
- * damaged state is preserved and blocks startup rather than silently
- * resetting the epoch every placement message is fenced by.
- */
-export function loadControllerEpoch(dataDir: string, hostId: HostId): ControllerEpoch {
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  const path = join(dataDir, "placement-controller.json");
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch (error) {
-    // SAFETY: read failures from node:fs carry a string `code`; anything
-    // without ENOENT here is rethrown untouched on the next line.
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    const initial: ControllerEpoch = { controllerId: hostId, epoch: 0 };
-    writeFileAtomic(path, `${JSON.stringify(initial)}\n`, { mode: 0o600 });
-    return initial;
-  }
+export interface ControllerEpochStore {
+  read(): ControllerEpoch;
+  compareAndSet(expected: ControllerEpoch, next: ControllerEpoch):
+    { accepted: true } | { accepted: false; controller: ControllerEpoch };
+}
+
+function readControllerEpoch(path: string): ControllerEpoch {
+  const raw = readFileSync(path, "utf8");
   const invalid = new Error("placement-controller is invalid; preserve it and restore the controller epoch before starting");
   let json: unknown;
   try {
@@ -47,6 +35,62 @@ export function loadControllerEpoch(dataDir: string, hostId: HostId): Controller
   // SAFETY: the schema matched controllerId against HOST_ID_PATTERN,
   // which is exactly the HostId shape TypeScript cannot narrow to.
   return { controllerId: parsed.data.controllerId as HostId, epoch: parsed.data.epoch };
+}
+
+/** Startup and live transitions share the private fence beside host-id.
+ * Only opening the store initializes missing state; later loss fails closed. */
+export function openControllerEpochStore(dataDir: string, hostId: HostId): ControllerEpochStore {
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const path = join(dataDir, "placement-controller.json");
+  const lock = join(dataDir, "placement-controller.lock");
+  function locked<T>(operation: () => T): T {
+    // Never steal a lock from another writer, including a crashed writer.
+    mkdirSync(lock, { mode: 0o700 });
+    try {
+      return operation();
+    } finally {
+      rmdirSync(lock);
+    }
+  }
+  function persist(controller: ControllerEpoch): void {
+    writeFileAtomic(path, `${JSON.stringify(controller)}\n`, { mode: 0o600, exactMode: true });
+    // Placement is unsupported on Windows, where directories cannot be fsynced.
+    if (process.platform === "win32") return;
+    // Flush the atomic rename before acknowledging the new fence.
+    const fd = openSync(dataDir, "r");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  }
+  locked(() => {
+    try {
+      readControllerEpoch(path);
+    } catch (error) {
+      // SAFETY: only ENOENT permits first-start initialization.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      persist({ controllerId: hostId, epoch: 0 });
+    }
+  });
+  return {
+    read: () => readControllerEpoch(path),
+    compareAndSet: (expected, next) => locked(() => {
+      const current = readControllerEpoch(path);
+      if (current.controllerId !== expected.controllerId || current.epoch !== expected.epoch) {
+        return { accepted: false, controller: current };
+      }
+      if (!controllerEpochSchema.safeParse(next).success || next.epoch <= current.epoch) {
+        throw new Error("controller epoch transition must advance a valid fence");
+      }
+      persist(next);
+      return { accepted: true };
+    }),
+  };
+}
+
+export function loadControllerEpoch(dataDir: string, hostId: HostId): ControllerEpoch {
+  return openControllerEpochStore(dataDir, hostId).read();
 }
 
 export interface PlacementIdentityDeps {
