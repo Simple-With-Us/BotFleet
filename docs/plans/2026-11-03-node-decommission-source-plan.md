@@ -33,7 +33,7 @@ That is the floor, not a deletion target.  [docs/native-rewrite-linux-source-re
 
 ## The three Done conditions and what answers them today
 
-BF-2515's own Done condition is the first row below, and it carries an owner-qualified exception: the issue asks for no `server/`, `companion/` or desktop `package.json` on main "or only the ruled companion host", so the Phase 5 ruling can leave a slimmed `server/` behind.  These three rows are the conditions BF-2515 owns.  They are NOT the complete deletion gate.  The authoritative gate is [scripts/check-decommission-gates.mjs](../../scripts/check-decommission-gates.mjs), and it requires the `control-disposition` evidence, which is BotFleet Control's post-Node disposition under BF-2583, and the `linux-server-preservation` evidence, which is BF-2544's maintained Linux source, build, update and rollback closure, alongside `placement-evidence`, `replay-parity`, `final-import-parity` and the 24-hour soak that BF-2514 owns.  Nothing in this plan replaces or relaxes any of them, and a green row below is not permission to delete.
+BF-2515's own Done condition is the first row below, and it carries an owner-qualified exception: the issue asks for no `server/`, `companion/` or desktop `package.json` on main "or only the ruled companion host", so the Phase 5 ruling can leave a slimmed `server/` behind.  These three rows are the conditions BF-2515 owns.  They are NOT the complete deletion gate.  The authoritative gate is [scripts/check-decommission-gates.mjs](../../scripts/check-decommission-gates.mjs), and it requires the `control-disposition` evidence, which is BotFleet Control's post-Node disposition under BF-2583, and the `linux-server-preservation` evidence, which is BF-2544's maintained Linux source, build, update and rollback closure, alongside `placement-evidence`, `replay-parity`, `final-import-parity` and the 24-hour soak that BF-2514 owns.  Nothing in this plan replaces or relaxes any of them, and a green row below is not permission to delete.  The three rows are measured after the deletion, not before it: the tree and the CI job set can only be observed  once the roots are gone, and the reboot question can only be answered after a real reboot.  They are therefore not a precondition of the deletion, and they do not authorise one; the pre-deletion gate in the  Order section does.
 
 | Condition | State | What answers it |
 | --- | --- | --- |
@@ -53,11 +53,17 @@ Each is source-only, each carries a node test, and each is wired next to the exi
 
 ## Order
 
-1. Land the three scripts and their tests.
-2. Let the gate answer the three conditions honestly while the runtime is still present.
-3. Only then propose the owner-gated steps: boot out the Mac harness, delete the retired roots, run the reboot check, then the soak.
+BF-2515's three conditions are measured after the deletion, not before it, and the deletion is authorised by a different gate.  The order is:
 
-Step 3 is the owner's.  This plan schedules it and assumes none of it.  It is also not the whole gate: [scripts/check-decommission-gates.mjs](../../scripts/check-decommission-gates.mjs) decides whether the deletion may happen at all, and it needs the Control disposition and the Linux preservation evidence asserted as well as BF-2515's three conditions.  A green row in the table above is not permission to delete.
+1. Land the three scripts and their tests.
+2. Stop the Mac harness, then run BF-2514's cutover and the 24-hour no-Node soak.  That is BF-2514's work, and it  produces the `soak-24h-no-node` evidence the deletion gate asks for.
+3. The authoritative pre-deletion gate, [scripts/check-decommission-gates.mjs](../../scripts/check-decommission-gates.mjs),  decides whether the deletion may happen.  It asks for the replacement issues to be Done (BF-2510, BF-2511, BF-2512,  BF-2513, BF-2503, BF-2504 and BF-2514), for the evidence to be asserted (`placement-evidence`, `soak-24h-no-node`,  `replay-parity`, `final-import-parity`, `inventory-clean`, `control-disposition` and `linux-server-preservation`), and for  the Mac no longer running the Node harness.
+4. The owner deletes the retired roots and the desktop manifest.  That step is irreversible, and it is the owner's.
+5. Only now are the three conditions above measurable, and that is what the three scripts are for: the tree gate reads the  committed tree, the CI gate names the surviving Node desktop jobs, and the reboot check answers the process question  after a real reboot.
+
+The soak gate holds the 24-hour window on the two ends it observes; BF-2514's continuous observation remains the acceptance  for the window itself.
+
+Steps 2 and 4 are the owner's and BF-2514's.  This plan schedules them and assumes none of them.  A green row in the  table above is not permission to delete: the table is measured after the deletion, and the deletion is authorised by the  gate in step 3.
 
 ## Two open questions for the owners
 
