@@ -859,6 +859,60 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     ],
   },
 
+  zcode: {
+    id: "zcode",
+    displayName: "ZCode",
+    capabilityBadgeColor: "bg-indigo-700 text-white",
+    group: "Cloud",
+    pricing: {
+      kind: "subscription",
+      subscription: {
+        // The plan tiers are account-side; the quota endpoint names the
+        // active one as "GLM Coding <Level>".  costPerMonth is null so the
+        // pricing chip does not invent a billed amount.
+        tierLabel: "GLM Coding Plan",
+        costPerMonth: null,
+        includedQuota: "Rolling 5-hour and weekly token windows plus a monthly MCP-call window, reported by the plan quota endpoint",
+        notes:
+          "GLM Coding Plan subscription.  BotFleet does not register a separate z.ai API rate for this engine.  Source:  https://z.ai/subscribe",
+      },
+    },
+    capabilities: {
+      files: "yes",
+      terminal: "yes",
+      thisComputer: "no",
+      imageAttachments: "no",
+      connectedApps: "no",
+      crossBotCoordination: "no",
+      roomCoordination: "no",
+      computerUse: "no",
+      voiceChat: "no",
+      webAccess: "unknown",
+      longContext: "unknown",
+      liveResearch: "unknown",
+    },
+    capabilityNotes: {
+      connectedApps:
+        "This driver spawns the ZCode CLI directly and declares no MCP wiring, so BotFleet's servers are not mounted for it.  BotFleet does not wire this here.",
+      computerUse:
+        "This driver declares no host-control wiring.  BotFleet does not wire this here.",
+      imageAttachments:
+        "Turns are sent as text prompts only; BotFleet does not wire attachments into this driver.",
+    },
+    whyThisEngine: {
+      headline: "Z.ai's GLM Coding Plan CLI, driven headless.",
+      prose: [
+        "BotFleet drives the ZCode CLI headless.  One prompt per turn, NDJSON events back, resume by session id.  Files and terminal are available inside the CLI's own workspace.",
+        "This computer, connected apps, computer use, cross-bot coordination, and rooms are not wired on this driver; voice chat and image attachments are not available.",
+        "Turns ride the GLM Coding Plan behind the Mac's own ZCode sign-in, so a reported cost is notional.",
+      ],
+    },
+    defaultModels: [
+      { id: "GLM-5.3", display: "GLM-5.3" },
+      { id: "GLM-5.3-Flash", display: "GLM-5.3 Flash" },
+    ],
+  },
+
   droid: {
     id: "droid",
     displayName: "Droid",
@@ -1297,6 +1351,7 @@ export const ENGINE_DISPLAY_ORDER: string[] = [
   "mcode",
   "muse",
   "kimi",
+  "zcode",
   "droid",
   "opencode",
   "qwen",
@@ -1333,6 +1388,7 @@ export function engineAccessLabel(entry: EngineCapabilityEntry): string {
     case "mcode":
     case "muse":
     case "kimi":
+    case "zcode":
     case "droid":
     case "opencode":
     case "qwen":
