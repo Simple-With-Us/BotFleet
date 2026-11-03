@@ -73,20 +73,22 @@ jobs:
         id: base
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          base="${BASE_SHA:-}"
-          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            base="$(git merge-base HEAD origin/"${GITHUB_REF_NAME}")"
-          fi
-          if [ -z "$base" ]; then
-            # No base at all: emit nothing and let the classifier fail closed.
+          # The pull request's own two ends,  computed by the same script
+          # ci.yml's classifier uses.  The stored base SHA is the base
+          # branch's tip at the last synchronisation and HEAD is the merge
+          # commit,  so the old diff folded main's newer commits into the
+          # scope:  a pull request that touched nothing here took a hosted
+          # macOS runner because main had moved a packaging file.
+          if ! bash scripts/ci-scope-diff.sh "$BASE_SHA" "$HEAD_SHA" > changed-paths.z; then
+            # No usable scope:  emit nothing and let the classifier fail closed.
             echo "base_sha=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git diff --no-renames --name-only -z "$base" HEAD > changed-paths.z
-          echo "base_sha=$base" >> "$GITHUB_OUTPUT"
-          echo "changed $(tr -cd '\0' < changed-paths.z | wc -c | tr -d ' ') path(s) against ${base:0:9}"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "changed $(tr -cd '\0' < changed-paths.z | wc -c | tr -d ' ') path(s) against ${BASE_SHA:0:9}"
       - name: Decide whether to package
         id: scope
         env:
