@@ -425,7 +425,7 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       const toolItemId = (payload: NonNullable<ZcodeStreamLine["payload"]>) => {
         const explicit = payload.toolCallId ?? payload.callId ?? payload.id;
         if (explicit !== undefined && explicit !== null) return String(explicit);
-        const toolName = typeof payload.toolName === "string" && payload.toolName ? payload.toolName : "tool";
+        const toolName = payload.toolName || "tool";
         const existing = fallbackToolItemIds.get(toolName);
         if (existing) return existing;
         const created = newId();
