@@ -123,8 +123,8 @@ Naming convention `app.<name>.<platform>` for executables, `app.<name>` for the 
 | Surface | Bundle ID | Where it lives |
 |---|---|---|
 | macOS app (Electron main) | `app.botfleet.macos` | `electron-builder.yml` `appId`, `electron/main.mjs` `setAppUserModelId`, `electron/cua.mjs`, `electron/cua-linux-runtime.cjs` |
-| macOS Recorder helper | `app.botfleet.recorder.macos` | `electron/resources/recorder-helper-Info.plist` |
-| macOS Speech helper | `app.botfleet.speech.macos` | `electron/resources/speech-helper-Info.plist` |
+| macOS Recorder helper | `app.botfleet.recorder.macos` | `native/helpers/recorder-helper-Info.plist` |
+| macOS Speech helper | `app.botfleet.speech.macos` | `native/helpers/speech-helper-Info.plist` |
 | Always-on LaunchAgent (harness) | `app.botfleet.server` | `~/Library/LaunchAgents/app.botfleet.server.plist` `Label` |
 | iOS app | `app.botfleet.ios` (ASC appleId `6820175685`) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `ios/Sources/CompanionCore/TestFlightUpdateCheck.swift`, `scripts/ios-fleet/apps.json` |
 | iOS widgets | `app.botfleet.ios.widgets` (registered in Developer Portal) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `scripts/ios-fleet/apps.json` `extraBundleIds` |

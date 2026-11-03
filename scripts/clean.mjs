@@ -6,8 +6,9 @@ const generatedPaths = [
   "dist-native",
   "dist-server",
   "release",
-  "electron/resources/speech-helper",
-  "electron/resources/BotFleet Speech.app",
+  "native/helpers/speech-helper",
+  "native/helpers/BotFleet Speech.app",
+  "native/helpers/BotFleet Recorder.app",
   "electron/resources/BotFleet Control.app",
 ];
 

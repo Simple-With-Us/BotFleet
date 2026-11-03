@@ -14,8 +14,9 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const projectDir = dirname(HERE);
 const speechSource = readFileSync(join(HERE, "speech.mjs"), "utf8");
-const helperSource = readFileSync(join(HERE, "resources", "speech-helper.swift"), "utf8");
+const helperSource = readFileSync(join(projectDir, "native", "helpers", "speech-helper.swift"), "utf8");
 
 describe("Personal Voice helper contract", () => {
   it("keeps reply text off argv", () => {

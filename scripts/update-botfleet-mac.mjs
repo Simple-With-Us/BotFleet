@@ -64,6 +64,8 @@ const BUILDER_SIGN_SELECTOR = "Jay Wedgeworth, LLC (CC8UTF7ATG)";
 export const DEFAULT_PORTS = [8799, 18799, 28799];
 const BUILD_MANIFEST_RELATIVE = "Contents/Resources/server/build-identity.json";
 const GENERATED_PATHS = [
+  "native/helpers/BotFleet Recorder.app/Contents/MacOS/recorder-helper",
+  "native/helpers/BotFleet Speech.app/Contents/MacOS/speech-helper",
   "electron/resources/BotFleet Recorder.app/Contents/MacOS/recorder-helper",
   "electron/resources/BotFleet Speech.app/Contents/MacOS/speech-helper",
   "electron/vendor/electron-updater.cjs",
