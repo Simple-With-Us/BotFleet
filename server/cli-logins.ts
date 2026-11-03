@@ -70,6 +70,14 @@ export const CLI_LOGIN_TTL_MS = 15 * 60_000;
  * cost every turn a round trip. */
 export const CLI_LOGIN_FAILURE_BACKOFF_MS = 60_000;
 
+/** How many seats' logins are kept at once.
+ *
+ * The fleet has a dozen seats at most, so this is more than it needs.  The
+ * bound exists so a seat string nobody expected cannot grow the map for the
+ * life of the process, and the least recently used seat is the one that goes
+ * when the map is over it. */
+export const CLI_LOGIN_CACHE_MAX = 32;
+
 interface SeatEntry {
   /** The last values read for this seat.  Kept even after a later read
    * fails:  a stale login beats no login. */
@@ -83,11 +91,50 @@ interface SeatEntry {
 const cache = new Map<string, SeatEntry>();
 const inflight = new Map<string, Promise<void>>();
 
+/** Bumped by every reset.  A read that started before the bump and lands
+ * after it must not write, because a settings change that turns the vault off
+ * has to be able to hold. */
+let cacheGeneration = 0;
+
 /** Forget every cached login.  Used by the tests, and by a settings change
- * that turns the vault off. */
+ * that turns the vault off.
+ *
+ * A read that was in flight when this is called does not write its value
+ * back, so the reset holds. */
 export function resetCliLoginCache(): void {
+  cacheGeneration++;
   cache.clear();
   inflight.clear();
+}
+
+/** The seat's entry, and the seat moved to the most recently used end of the
+ * map. */
+function readEntry(seat: string): SeatEntry | undefined {
+  const entry = cache.get(seat);
+  if (entry === undefined) return undefined;
+  cache.delete(seat);
+  cache.set(seat, entry);
+  return entry;
+}
+
+/** Keep the seat's entry, and drop the least recently used seat when the map
+ * is over its bound.
+ *
+ * An evicted seat is not remembered, so the next read of it reads it again. */
+function writeEntry(seat: string, entry: SeatEntry): void {
+  cache.delete(seat);
+  cache.set(seat, entry);
+  while (cache.size > CLI_LOGIN_CACHE_MAX) {
+    const oldest = cache.keys().next();
+    if (oldest.done) return;
+    cache.delete(oldest.value);
+  }
+}
+
+/** How many seats' logins the cache holds.  The bound is what keeps the map
+ * from growing with the seat strings it is handed. */
+export function cliLoginCacheSize(): number {
+  return cache.size;
 }
 
 /** Read the seat's folder and keep only the names the table names.  A row
@@ -98,6 +145,9 @@ export function resetCliLoginCache(): void {
 async function readSeat(seat: string, secretPath: string): Promise<void> {
   const running = inflight.get(seat);
   if (running) return running;
+  // The generation is taken before the read starts, so a reset that lands
+  // while the read is in flight is visible when the read does.
+  const generation = cacheGeneration;
   const promise = (async () => {
     try {
       const all = await vault.readProjectPath("fleet-ops", secretPath);
@@ -106,7 +156,10 @@ async function readSeat(seat: string, secretPath: string): Promise<void> {
         const value = all.get(spec.env);
         if (value !== undefined && value.length > 0) values[spec.env] = value;
       }
-      cache.set(seat, { values, readAt: Date.now(), failedAt: 0 });
+      // A reset cleared the cache while this read was in flight, so the
+      // login it carries is one the reset meant to drop.
+      if (generation !== cacheGeneration) return;
+      writeEntry(seat, { values, readAt: Date.now(), failedAt: 0 });
     } catch (err) {
       // The reason is logged, redacted, and once per failed read — the
       // backoff below is what bounds it.  A login that silently never
@@ -114,14 +167,22 @@ async function readSeat(seat: string, secretPath: string): Promise<void> {
       // own message is already generic.
       const detail = err instanceof Error ? redactSecretsInText(err.message) : "unknown error";
       console.warn(`[cli-login] ${seat}: the seat's CLI login could not be read (${detail}); the child runs without one`);
+      // The same rule as the read that succeeded:  a reset that landed
+      // while this read was in flight means the cache is meant to stay
+      // empty, so the failure is not written into it either.
+      if (generation !== cacheGeneration) return;
       const previous = cache.get(seat);
-      cache.set(seat, {
+      writeEntry(seat, {
         values: previous?.values ?? {},
         readAt: previous?.readAt ?? 0,
         failedAt: Date.now(),
       });
     }
-  })().finally(() => inflight.delete(seat));
+  })().finally(() => {
+    // Only this read's own promise is removed, so a reset that cleared the
+    // map and a new read that took its place do not lose the new one.
+    if (inflight.get(seat) === promise) inflight.delete(seat);
+  });
   inflight.set(seat, promise);
   return promise;
 }
@@ -138,7 +199,7 @@ async function readSeat(seat: string, secretPath: string): Promise<void> {
 export function primeCliLogin(seat: string | null | undefined): void {
   const secretPath = seat ? cliLoginSecretPath(seat) : null;
   if (!seat || !secretPath) return;
-  const entry = cache.get(seat);
+  const entry = readEntry(seat);
   const now = Date.now();
   if (entry && now - entry.readAt < CLI_LOGIN_TTL_MS) return;
   if (entry?.failedAt && now - entry.failedAt < CLI_LOGIN_FAILURE_BACKOFF_MS) return;
@@ -153,7 +214,7 @@ export function primeCliLogin(seat: string | null | undefined): void {
  * therefore run without the login, and the turns after it have one. */
 export function cliLoginEnvironment(seat: string | null | undefined): Record<string, string> {
   if (!seat) return {};
-  return cache.get(seat)?.values ?? {};
+  return readEntry(seat)?.values ?? {};
 }
 
 /** Wait for the seat's login read to land, if one is in flight.

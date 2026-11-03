@@ -7,10 +7,12 @@ import {
   cliLoginSecretPath,
 } from "./secret-map.ts";
 import {
+  CLI_LOGIN_CACHE_MAX,
   CLI_LOGIN_FAILURE_BACKOFF_MS,
   CLI_LOGIN_TTL_MS,
   applyCliLogins,
   awaitCliLogin,
+  cliLoginCacheSize,
   cliLoginEnvironment,
   launchedChildEnvironment,
   primeCliLogin,
@@ -33,6 +35,21 @@ function stubVault(values: Record<string, string>) {
     },
   };
   return { calls, reader };
+}
+
+/** A vault whose read waits for the test to open the gate. */
+function gatedVault() {
+  let open: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    open = () => resolve(undefined);
+  });
+  const reader = {
+    async readProjectPath() {
+      await gate;
+      return new Map([["GH_TOKEN", SENTINEL_VAULT]]);
+    },
+  };
+  return { reader, open };
 }
 
 afterEach(() => {
@@ -158,6 +175,45 @@ describe("reading a seat's CLI login", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("does not put a login back when a read lands after a reset", async () => {
+    const { reader, open } = gatedVault();
+    setCliLoginVault(reader);
+    primeCliLogin("BF-ORACLE");
+    // The read is still in flight when the reset lands.
+    resetCliLoginCache();
+    open();
+    // A macrotask wait lets the read's own continuation finish, so the
+    // cache is inspected after the value would have been written.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(cliLoginEnvironment("BF-ORACLE")).toEqual({});
+  });
+
+  it("keeps the cache inside its bound, and keeps the seat in use", async () => {
+    const stub = stubVault({ GH_TOKEN: SENTINEL_VAULT });
+    setCliLoginVault(stub.reader);
+    const seats = Array.from(
+      { length: CLI_LOGIN_CACHE_MAX + 4 },
+      (_, index) => `SEAT-${String(index).padStart(2, "0")}`,
+    );
+    for (const seat of seats) {
+      primeCliLogin(seat);
+      await awaitCliLogin(seat);
+      expect(cliLoginCacheSize()).toBeLessThanOrEqual(CLI_LOGIN_CACHE_MAX);
+    }
+    // The bound is real:  the seats beyond it were dropped, not kept.
+    expect(cliLoginCacheSize()).toBe(CLI_LOGIN_CACHE_MAX);
+    // The seat in use is still cached.
+    expect(cliLoginEnvironment(seats[seats.length - 1])).toEqual({ GH_TOKEN: SENTINEL_VAULT });
+    // The least recently used seat was evicted, and is read again rather
+    // than remembered.
+    expect(cliLoginEnvironment(seats[0])).toEqual({});
+    const callsBefore = stub.calls.length;
+    primeCliLogin(seats[0]);
+    await awaitCliLogin(seats[0]);
+    expect(stub.calls).toHaveLength(callsBefore + 1);
+    expect(cliLoginEnvironment(seats[0])).toEqual({ GH_TOKEN: SENTINEL_VAULT });
   });
 
   it("hands back nothing when the very first read fails", async () => {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV, type AppConfig } from "./config.ts";
 import {
+  CLI_LOGIN_ENV_NAMES,
   INFISICAL_NAME_PATTERN,
   SECRET_FIELDS,
   credentialFingerprint,
@@ -314,9 +315,14 @@ it("hydrates the request-log secret from the managed vault without exposing its 
 
 describe("the CLI logins", () => {
   it("claims no config field, so a CLI login never becomes a config value", () => {
+    // Every name a CLI login may use, and not only one of them:  a row that
+    // claimed any of the four would put one seat's login into the config of
+    // every bot.
     for (const entry of SECRET_FIELDS) {
-      expect(entry.env).not.toContain("GH_TOKEN");
-      expect(entry.infisicalName).not.toBe("GH_TOKEN");
+      for (const name of CLI_LOGIN_ENV_NAMES) {
+        expect(entry.env).not.toContain(name);
+        expect(entry.infisicalName).not.toBe(name);
+      }
     }
   });
 
