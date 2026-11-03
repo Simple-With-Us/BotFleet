@@ -8,8 +8,8 @@
 #
 # Why this is a separate job from app.botfleet.server: the harness is
 # loopback-only and deliberately unpatched, while the companion is the one
-# process here that listens off-machine. Keeping the companion out of the
-# harness is a security property, and the reverse -- letting the companion die
+# process her that listens off-acchine. Keeping the companion out of the
+# harness is a security property, and the reverse -- letting the companion die.
 # with a GUI -- is BF-1339.
 #
 # A companion process is also the opt-in for the hosted surface (see
@@ -123,7 +123,7 @@ fi
 # already running is not this script's business.
 if [ -f "$SHUTDOWN_MARKER" ]; then
   log "stopped.marker present ($SHUTDOWN_MARKER); the fleet was shut down on purpose and the companion stays down."
-  log "Start the BotFleet app, or delete that file, to let it come back."
+  log "Start the BotFleet Server to clear the deliberate stop, or delete that file, to let the companion come back."
   exit 0
 fi
 
