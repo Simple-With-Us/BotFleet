@@ -27,6 +27,7 @@ Owner modules: `DatabaseService` (BF-2480), `ImportTool` (BF-2495),
 `InfisicalResolver` (BF-2506), remaining drivers (BF-2507), native runners
 (BF-2482), per-bot switch (BF-2508), `CUAEngine` (BF-2509), `ZulipEventActor` +
 Linear sync (BF-2512), `LinqEventActor` (BF-2617), `RoutinesScheduler` (BF-2513),
+`CostLedgerService` (BF-2619),
 iOS endpoint decision
 (BF-2510) and build (BF-2511), `MenuBarExtra` (BF-2484), `VoiceService`
 (BF-2483), `ScreenCaptureService` (BF-2481), `LifecycleService` (BF-2497),
@@ -143,7 +144,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/desktop-open.ts`, `server/sts-access.ts`, `server/sts-tokens.ts` (shared), `electron/sts-tokens.mjs` | Remote wake + STS minting → BF-2489 (done) + iOS endpoint BF-2510 |
 | `server/desktop-probe.ts`, `server/screen-poller.ts` | Screen polling → `ScreenCaptureService` BF-2481 |
 | `server/data-faults.ts`, `server/observability.ts`, `server/sentry*.ts`, `server/telemetry*.ts` | Crash/span reporting: Node harness telemetry & Sentry retire in Phase 6 BF-2515 (native crash/span reporting → Sentry Cocoa Phase 3 BF-2541, done); fault banners → native UI view / `TextKitTranscript` BF-2501 (BF-2618) |
-| `server/gen-ai-cost.ts`, `server/rolling-spend.ts`, `server/ai-usage.ts`, `server/usage-quota.ts`, `server/usage-telemetry.ts`, `server/local-usage-monitor.ts`, `server/quota-window-map.ts`, `server/child-session-ids.ts`, `server/claude-billed-call.ts`, `server/*-balance.ts`, `server/*-quota.ts` | Spend/quota ledgers, including exact single-call billing proof → Phase 4* (no covering issue;-native cost ledger follow-up) |
+| `server/gen-ai-cost.ts`, `server/rolling-spend.ts`, `server/ai-usage.ts`, `server/usage-quota.ts`, `server/local-usage-monitor.ts`, `server/quota-window-map.ts`, `server/child-session-ids.ts`, `server/claude-billed-call.ts`, `server/antigravity-quota.ts`, `server/deepseek-balance.ts`, `server/grok-quota.ts`, `server/minimax-balance.ts` | Spend/quota ledgers, including exact single-call billing proof → `CostLedgerService` Phase 4 (BF-2619); provider balance and quota probes fold into `EngineDriver` Phase 4 / `InfisicalResolver` BF-2506; Node harness files retire in Phase 6 under BF-2515 |
 | `electron/cua*.mjs/cjs`, `server/local-computer.ts`, `local-routing.ts`, `container-computer.ts`, `container-mcp.ts`, `container-runtime-guard.ts`, `local-vm-*.ts`, `desktop-open` viewers, `electron/desktop-*.cjs`, `screen-preview`, `skin-overlay` | CUA + Local VM → `CUAEngine` BF-2509; viewers → `ScreenCaptureService` BF-2481 |
 | `server/vps-computer.ts`, `vps-container-mcp.ts`, `vps-shared-session.ts`, `server/remote-computer.ts` | BYO-VPS/self-host computers → retired, no Mac story in Option A |
 | `server/box.ts`, `box-gateway-grant.ts` | Cloud-box computer → BF-2509 (confirm Mac story; hosted, no local runtime) |
