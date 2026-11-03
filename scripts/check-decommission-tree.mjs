@@ -13,6 +13,12 @@
 // The tree it asks about is the committed tree, because the question is what
 // main carries.  A file that is only staged, or only untracked, is a local
 // accident: judging the index would report a tree that nobody merged.
+//
+// The contract asserted here is the full removal of the Node roots.  BF-2515
+// qualifies its own condition with "or only the ruled companion host", so if
+// the Phase 5 ruling keeps a slimmed server/, that ruling is what changes
+// this contract, and the gate would then have to name the host it accepts
+// rather than assert that no server/ remains.
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
