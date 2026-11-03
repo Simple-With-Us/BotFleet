@@ -15,7 +15,8 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative as relativePath } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { packagedSmokeConfig } from "./smoke-packaged-fixture.mjs";
 import {
   assertRuntimeExecutable,
   buildGateEnv,
@@ -35,6 +36,57 @@ import {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SMOKE = join(ROOT, "scripts", "smoke-packaged-server.mjs");
 const MODE = join(ROOT, "scripts", "smoke-runtime-mode.mjs");
+
+test("the package fixture never expands the product fleet or probes a PATH-installed CLI", () => {
+  const { dir, cleanup } = scratch();
+  try {
+    const home = join(dir, "home");
+    const bin = join(dir, "bin");
+    mkdirSync(home, { recursive: true });
+    mkdirSync(bin, { recursive: true });
+    const trap = join(bin, "claude-fixture.mjs");
+    const marker = join(dir, "cli-called");
+    writeFileSync(trap, `#!${process.execPath}\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'called');\nprocess.exit(1);\n`);
+    const cli = join(bin, process.platform === "win32" ? "claude.cmd" : "claude");
+    writeFileSync(cli, process.platform === "win32"
+      ? `@echo off\r\n"${process.execPath}" "${trap}" %*\r\n`
+      : `#!${process.execPath}\nimport ${JSON.stringify(pathToFileURL(trap).href)};\n`);
+    chmodSync(cli, 0o755);
+    const probe = join(dir, "probe.mjs");
+    const fixture = packagedSmokeConfig(home);
+    assert.equal(isAbsolute(fixture.instances["package-smoke"].config.cli), true);
+    writeFileSync(probe, [
+      'import assert from "node:assert/strict";',
+      'import { existsSync } from "node:fs";',
+      `import { instanceConfigs } from ${JSON.stringify(pathToFileURL(join(ROOT, "server/config.ts")).href)};`,
+      `import { ProviderRegistry } from ${JSON.stringify(pathToFileURL(join(ROOT, "server/harness/registry.ts")).href)};`,
+      `import { ClaudeDriver } from ${JSON.stringify(pathToFileURL(join(ROOT, "server/drivers/claude.ts")).href)};`,
+      `const config = ${JSON.stringify(fixture)};`,
+      'const configured = instanceConfigs(config);',
+      'assert.deepEqual(Object.keys(configured), ["package-smoke"]);',
+      'assert.ok(Object.keys(instanceConfigs({})).length > 1);',
+      'const registry = new ProviderRegistry([ClaudeDriver]);',
+      'await registry.load(configured);',
+      'const described = await registry.describe();',
+      'assert.equal(described.length, 1);',
+      'assert.equal(described[0].snapshot.state, "unavailable");',
+      `assert.equal(existsSync(${JSON.stringify(marker)}), false, "a host PATH CLI was invoked");`,
+      'await registry.disposeAll();',
+      `config.instances["package-smoke"].config.cli = ${JSON.stringify(`${JSON.stringify(process.execPath)} ${JSON.stringify(trap)}`)};`,
+      'await registry.load(instanceConfigs(config));',
+      'await registry.describe();',
+      `assert.equal(existsSync(${JSON.stringify(marker)}), true, "the safe fixture CLI control never ran");`,
+      'await registry.disposeAll();',
+    ].join("\n"));
+    const env = { PATH: bin, HOME: home, USERPROFILE: home };
+    if (process.env.SystemRoot) env.SystemRoot = process.env.SystemRoot;
+    const result = spawnSync(process.execPath, [probe], {
+      env,
+      encoding: "utf8", timeout: 15_000,
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  } finally { cleanup(); }
+});
 
 /** A scratch directory that cleans itself up. */
 function scratch() {
