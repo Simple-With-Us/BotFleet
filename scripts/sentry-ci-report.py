@@ -85,9 +85,8 @@ CRON_SCHEDULES = {
 DEFAULT_CHECKIN_MARGIN_MINUTES = 15
 CRON_CHECKIN_MARGIN_OVERRIDES = {
     "Vercel production catch-up": 75,
-    # ci.yml's longest job has timeout-minutes: 25; +20 for queueing, the
-    # classifier, and this reporter's own dispatch/run time.
-    "CI": 45,
+    # ci.yml's longest job is macOS 35m; +15m for queueing and reporter runtime.
+    "CI": 50,
     # ios-ship.yml's job sets `timeout-minutes: 90`; +15 for queueing and
     # this reporter's own dispatch/run time.
     "iOS TestFlight ship (GitHub-hosted macOS)": 105,
