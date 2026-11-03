@@ -13,8 +13,9 @@ import {
   realpath,
   rename,
   rm,
+  mkdtemp,
   stat,
-  writeFile,
+  writeFile
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -46,6 +47,18 @@ import {
   ResolutionError,
   updateSourcePolicy,
 } from "./ci-build-resolver.mjs";
+import {
+  currentCommit as storeCurrentCommit,
+  currentLink as storeCurrentLink,
+  promoteStaging,
+  releasePath as storeReleasePath,
+  resolveCurrent as resolveStoreCurrent,
+  stageRelease,
+  stagingPath as storeStagingPath,
+  swapCurrent,
+  validateReleaseManifest,
+} from "./harness-release-store.mjs";
+import { dependencyScopeStatus, verifyReleaseAgainstCommit } from "./release-provenance.mjs";
 
 const EXPECTED_TEAM_ID = "CC8UTF7ATG";
 // Transition release: main still BUILDS com.botfleet.app (LEGACY_BUNDLE_ID).
@@ -1025,6 +1038,399 @@ async function readOwner(dataDirectory) {
   return state === "live" ? owner : null;
 }
 
+/** Environment handed to the release-store helpers: the updater's own, with
+ *  HOME pinned to the account this config was built for. */
+function storeEnvFor(config) {
+  return { ...process.env, HOME: config.home ?? homedir() };
+}
+
+/**
+ * Whether this host's launcher will start the harness from the release store.
+ * Mirrors botfleet-server-start.sh: BOTFLEET_SERVER_ROOT overrides the
+ * pointer, the pointer wins when it exists (even dangling, which the launcher
+ * also treats as present), and the checkout is the fallback.  A store-backed
+ * host deploys through the store; a checkout-backed host deploys as it always
+ * has, and this file's store paths never touch it.
+ */
+export async function storeHarnessState(config) {
+  const env = storeEnvFor(config);
+  if (process.env.BOTFLEET_SERVER_ROOT) return { mode: "checkout", env };
+  let pointerPresent = false;
+  try {
+    await lstat(storeCurrentLink(env));
+    pointerPresent = true;
+  } catch { /* an absent pointer is the fallback case */ }
+  if (!pointerPresent) return { mode: "checkout", env };
+  return { mode: "release", env, physical: await resolveStoreCurrent(env) };
+}
+
+/** The physical directory a process runs from, via its cwd descriptor. */
+async function runningRootOfPid(pid) {
+  const result = await run("lsof", ["-Fn", "-a", "-p", String(pid), "-d", "cwd"], { allowFailure: true });
+  if (result.code !== 0) return null;
+  const line = result.stdout.split("\n").find((entry) => entry.startsWith("n/"));
+  return line ? line.slice(1) : null;
+}
+
+/** A release manifest that binds to its own directory name, or null. */
+async function readRunningReleaseManifest(root) {
+  try {
+    const manifest = validateReleaseManifest(JSON.parse(await readFile(join(root, ".botfleet-release.json"), "utf8")));
+    if (!manifest || manifest.commit !== basename(root)) return null;
+    return manifest;
+  } catch {
+    return null;
+  }
+}
+
+async function readReleasePackageVersion(root, commit) {
+  try {
+    const value = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+    // Bootstrap archives have no node_modules; these checks parse the consumed JSON boundary without a third-party schema dependency.
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- dependency-free JSON boundary parse
+    if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, "version")) throw new Error("invalid package object");
+    // Keep the same version syntax as validBuildIdentity, rather than introduce a stricter release dialect here.
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- dependency-free JSON boundary parse
+    if (typeof value.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(value.version)) throw new Error("invalid package version");
+    return value.version;
+  } catch {
+    throw new Error(
+      `Existing release ${commit.slice(0, 12)} cannot be trusted: package.json is missing, unreadable or has an invalid runtime version.\u00A0 ` +
+        "Discard and re-stage it before retrying.",
+    );
+  }
+}
+
+/** The two refusals a store-backed harness can legitimately need cleared by
+ *  EXTERNAL verification: its runtime predates release identity reporting
+ *  (all-zeros commit), or it could not verify itself at boot.  Anything else
+ *  — wrong app, wrong pid, wrong commit, wrong build, work in flight — is
+ *  never overridden. */
+const STORE_CLEARABLE_IDENTITY_ERRORS = new Set([
+  "Authenticated runtime did not report an exact source commit",
+  "Authenticated runtime reports a dirty or unknown source checkout",
+]);
+
+/**
+ * Prove the RUNNING harness's identity from outside the process when the
+ * runtime cannot prove it itself: resolve the owner process's real working
+ * directory (not the mutable pointer — between a swap and a restart the two
+ * name different releases), require it to be a manifest-bound store release,
+ * and verify the exported bytes against the commit's tree objects in the
+ * updater's checkout.  The release's own manifest supplies only WHICH commit
+ * to check; the proof comes from git's objects, which a writer inside the
+ * release cannot recompute.  Returns null when identity is proven, else the
+ * refusal to report.
+ */
+export async function clearStoreIdentityError(config, owner, runtime, expectedBuild, identityError, { requireIdle = false } = {}, adapters = {}) {
+  if (!STORE_CLEARABLE_IDENTITY_ERRORS.has(identityError)) return identityError;
+  const store = await (adapters.storeState ?? storeHarnessState)(config);
+  if (store.mode !== "release") return identityError;
+  const root = await (adapters.runningRoot ?? runningRootOfPid)(owner.pid);
+  const physicalRoot = root ? await realpath(root).catch(() => null) : null;
+  const manifest = physicalRoot ? await readRunningReleaseManifest(physicalRoot) : null;
+  if (!manifest) {
+    return "Harness runs from a tree that is not a manifest-bound store release; its identity cannot be proven";
+  }
+  // Root association: the launcher cd's (physically) into the release before
+  // exec, the verified server source contains no chdir, so the owner pid's
+  // cwd IS the root its code was loaded from — and that root must be the very
+  // directory the STORE names for this commit, not an arbitrary manifest-
+  // carrying tree elsewhere.  Residue: a same-UID writer with repo control is
+  // outside this check's scope, as the verifier's header states.
+  const storeRoot = await realpath(storeReleasePath(manifest.commit, store.env)).catch(() => null);
+  if (!storeRoot || physicalRoot !== storeRoot) {
+    return `Harness runs from ${physicalRoot}, which is not the store's release ${storeRoot ?? "(unresolvable)"} for ${manifest.commit.slice(0, 12)}`;
+  }
+  let expectedDepsFingerprint = adapters.expectedDepsFingerprint ?? null;
+  if (adapters.expectedDepsFingerprintFor) {
+    // The updater's per-commit custody: a fingerprint it captured while
+    // holding that commit's dependency scope known-good THIS run, or one it
+    // builds now from a fresh install of that commit's byte-verified
+    // lockfile.  Never the release's own snapshot of itself.
+    try {
+      expectedDepsFingerprint = (await adapters.expectedDepsFingerprintFor(manifest.commit)) ?? expectedDepsFingerprint;
+    } catch (error) {
+      return `Running release's dependency scope cannot be proven: ${error?.message || error}`;
+    }
+  }
+  const verdict = await (adapters.verify ?? verifyReleaseAgainstCommit)({
+    releaseRoot: physicalRoot,
+    commit: manifest.commit,
+    repo: config.checkout,
+    referenceDeps: adapters.referenceDeps ?? null,
+    expectedDepsFingerprint,
+  });
+  if (!verdict?.ok) {
+    return verdict?.reason === "drift"
+      ? `Running release is not the commit it names: ${verdict.detail}`
+      : `Running release cannot be verified against the updater's checkout: ${verdict?.detail ?? "verification unavailable"}`;
+  }
+  // The remaining gates run in the SAME order authenticatedRuntimeError would
+  // have run them had the self-report been complete: commit, then build, then
+  // idleness.  Clearing the first refusal must never mask a later one.
+  if (expectedBuild && manifest.commit !== expectedBuild.targetCommit) {
+    return `Harness is running ${manifest.commit.slice(0, 12)}, expected ${expectedBuild.targetCommit.slice(0, 12)}`;
+  }
+  if (expectedBuild && (runtime.version !== expectedBuild.version || runtime.apiVersion !== expectedBuild.apiVersion ||
+      (runtime.uiHash !== null && runtime.uiHash !== expectedBuild.uiHash))) {
+    return "Harness runtime identity does not match the prepared application build";
+  }
+  // Whole-runtime proof at EVERY gate, pre- or post-apply.  This clear
+  // overrides a refusal to move the harness; a verified source tree says
+  // nothing about the executable dependency scope, and unknown executable
+  // bytes are never cleared on a source-only claim.  The pre-apply question
+  // (WHICH commit serves, for rollback targeting) is answered by the
+  // verified source; the gate to ACT on that answer needs the whole runtime.
+  if (verdict.dependencies === "unverified") {
+    return "Running release's dependency tree cannot be verified; identity requires whole-runtime proof";
+  }
+  const activeWorkCount = runtime?.activeWorkCount ?? runtime?.activeWork?.count;
+  if (requireIdle && (runtime.safeToRestart !== true || activeWorkCount !== 0)) {
+    return `${Number.isInteger(activeWorkCount) ? activeWorkCount : "Unknown"} active operations prevent update`;
+  }
+  return null;
+}
+
+/**
+ * Deploy the prepared commit through the release store when the launcher is
+ * store-backed: stage the export (with dependencies, from the checkout the
+ * transaction just advanced), promote it with the prepared build's version
+ * stamped into the manifest, and move the pointer.  The running process keeps
+ * serving its own release until startHarness restarts it — the pointer is a
+ * launch-time decision, so swapping it here interrupts nothing.
+ */
+/**
+ * Fingerprint a dependency scope this run holds known-good.  A scope whose
+ * links reach outside the tree can never be trusted: its fingerprint records
+ * target text for bytes nobody hashed.
+ */
+function captureDepsFingerprint(root) {
+  const status = dependencyScopeStatus(root);
+  if (status.linkProblems.length) {
+    throw new Error(`dependency scope has links outside the tree's custody: ${status.linkProblems[0]}`);
+  }
+  return status.fingerprint;
+}
+
+/**
+ * Build a fresh, throwaway dependency reference for a commit: export the
+ * commit's tree from git objects, prove the exported source bytes BEFORE any
+ * install hook runs, install from that verified tree's lockfile, and prove
+ * the hooks left the source alone.  The result is the ONE dependency tree
+ * this run holds known-good, used to prove an existing release whose staging
+ * custody this run never saw.  The caller removes the directory.
+ */
+export async function installReferenceDeps(config, commit, env, adapters = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "botfleet-ref-"));
+  const archive = join(dir, ".botfleet-reference-source.tar");
+  const verify = adapters.verifyRelease ?? verifyReleaseAgainstCommit;
+  try {
+    await run("git", ["-C", config.checkout, "archive", "--format=tar", "--output", archive, commit], { timeout: 300_000 });
+    await run("tar", ["-xf", archive, "-C", dir], { timeout: 300_000 });
+    await rm(archive, { force: true });
+    const exported = verify({ releaseRoot: dir, commit, repo: config.checkout });
+    if (!exported.ok) {
+      throw new Error(`reference export of ${commit.slice(0, 12)} is not the commit's tree before install: ${exported.detail}`);
+    }
+    if (exported.dependencies !== "absent") {
+      throw new Error(`reference export of ${commit.slice(0, 12)} already carries a dependency scope before install`);
+    }
+    await (adapters.install ?? (async (target) => {
+      await run("pnpm", ["install", "--frozen-lockfile"], {
+        cwd: target,
+        timeout: 30 * 60_000,
+        maxBuffer: 32 * 1024 * 1024,
+        env: { ...env },
+      });
+    }))(dir);
+    const settled = verify({ releaseRoot: dir, commit, repo: config.checkout });
+    if (!settled.ok) {
+      throw new Error(`dependency install mutated the reference source of ${commit.slice(0, 12)}: ${settled.detail}`);
+    }
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+    throw new Error(`Could not build a trusted dependency reference for ${commit.slice(0, 12)}: ${error?.message || error}`);
+  }
+  return dir;
+}
+
+/**
+ * PREPARE the release-store deploy, entirely outside the interruption
+ * window: stage the export, prove the exported source bytes BEFORE any
+ * install hook runs (git archive honors attributes; the export is the tree
+ * the lockfile will be interpreted against), install, prove the hooks left
+ * the source alone, promote, and capture dependency custody.  An existing
+ * release is proven against a fresh trusted reference instead.  Every slow
+ * failure mode here — minutes of install, network, drift — fires while the
+ * harness still serves; the boundary itself only swaps the pointer.
+ */
+export async function prepareStoreReleaseDeploy(config, prepared, previous, adapters = {}) {
+  const store = await storeHarnessState(config);
+  if (store.mode !== "release") return false;
+  const commit = prepared.targetCommit;
+  const releaseDir = storeReleasePath(commit, store.env);
+  const stage = adapters.stageRelease ?? stageRelease;
+  const install = adapters.install ?? (async (dir) => {
+    await run("pnpm", ["install", "--frozen-lockfile"], {
+      cwd: dir,
+      timeout: 30 * 60_000,
+      maxBuffer: 32 * 1024 * 1024,
+      env: { ...store.env },
+    });
+  });
+  const verify = adapters.verifyRelease ?? verifyReleaseAgainstCommit;
+  let trustedDepsFingerprint = null;
+  if (!(await isReleaseDirectoryForUpdater(releaseDir))) {
+    await stage({
+      commit,
+      repo: config.checkout,
+      env: store.env,
+      install: false,
+      log: (line) => console.log(line),
+    });
+    const staging = storeStagingPath(commit, store.env);
+    const exported = verify({ releaseRoot: staging, commit, repo: config.checkout });
+    if (!exported.ok) {
+      throw new Error(`Staged export of ${commit.slice(0, 12)} is not the commit's tree before install: ${exported.detail}`);
+    }
+    if (exported.dependencies !== "absent") {
+      throw new Error(`Staged export of ${commit.slice(0, 12)} already carries a dependency scope before install`);
+    }
+    await install(staging);
+    const settled = verify({ releaseRoot: staging, commit, repo: config.checkout });
+    if (!settled.ok) {
+      throw new Error(`Dependency install mutated the staged source of ${commit.slice(0, 12)}: ${settled.detail}`);
+    }
+    await promoteStaging({ commit, env: store.env, version: prepared.version, build: prepared.build });
+    // Installed from the byte-verified lockfile by THIS run, over a source
+    // tree verified before AND after the hooks: the dependency scope is
+    // known-good now, and the fingerprint keeps that custody through the
+    // pointer swap and restart.
+    trustedDepsFingerprint = captureDepsFingerprint(releaseDir);
+  } else {
+    // Reusing an existing release: its stamped version must BE the prepared
+    // one.  The manifest is only transport — the updater's expectedBuild is
+    // the authority — so a mismatch is a refusal before the pointer moves,
+    // never a post-apply surprise.  An unstamped manifest falls back to the
+    // exported package.json version, the same value the runtime would report.
+    const manifest = await readRunningReleaseManifest(releaseDir);
+    const releaseVersion = manifest?.version
+      ?? await readReleasePackageVersion(releaseDir, commit);
+    if (!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(releaseVersion)) {
+      throw new Error(
+        `Existing release ${commit.slice(0, 12)} cannot be trusted: its stamped runtime version is invalid.\u00A0 ` +
+          "Discard and re-stage it before retrying.",
+      );
+    }
+    if (releaseVersion !== prepared.version) {
+      throw new Error(
+        `Existing release ${commit.slice(0, 12)} carries version ${releaseVersion}, but this update prepared ${prepared.version}.  ` +
+          "Refusing to point the store at a release whose version was not the validated one; discard and re-stage it first.",
+      );
+    }
+    // An existing release was staged by an earlier run whose custody this
+    // run cannot see; snapshotting its own dependency tree would prove only
+    // stability, never that the bytes came from the lockfile.  Prove it
+    // instead against a FRESH reference installed right now from git objects
+    // plus the byte-verified lockfile — source bytes AND dependency scope
+    // must both match, or the store never points at it.
+    const referenceDir = await (adapters.installReference ?? installReferenceDeps)(config, commit, store.env);
+    let referenceFingerprint = null;
+    try {
+      referenceFingerprint = captureDepsFingerprint(referenceDir);
+    } finally {
+      await rm(referenceDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+    }
+    const verify = adapters.verifyRelease ?? verifyReleaseAgainstCommit;
+    const verdict = verify({
+      releaseRoot: releaseDir,
+      commit,
+      repo: config.checkout,
+      expectedDepsFingerprint: referenceFingerprint,
+    });
+    if (!verdict.ok || (referenceFingerprint ? verdict.dependencies !== "verified" : verdict.dependencies !== "absent")) {
+      throw new Error(
+        `Existing release ${commit.slice(0, 12)} cannot be trusted: ${verdict.ok ? "its dependency scope could not be proven against a fresh install" : verdict.detail}  ` +
+          "Discard and re-stage it instead of pointing the store at unproven bytes.",
+      );
+    }
+    trustedDepsFingerprint = referenceFingerprint;
+  }
+  // The post-apply gates compare the RUNNING release against the fingerprint
+  // captured while the updater held the dependency scope known-good, closing
+  // the window between install and restart.
+  if (previous) {
+    previous.releaseDepsFingerprint = trustedDepsFingerprint;
+    previous.storeDeployPrepared = commit;
+  }
+  await (config.storeAdapters?.registerTrustedFingerprint ?? (() => {}))(commit, trustedDepsFingerprint);
+  return true;
+}
+
+/**
+ * The boundary half of the store deploy: preparation already proved the
+ * release outside the interruption window, so inside the fence the deploy is
+ * the pointer swap and NOTHING else.  It fails closed: an unprepared commit
+ * is a hard refusal — never a fallback install with the harness down.  A
+ * standalone caller runs prepareStoreReleaseDeploy first, explicitly.
+ */
+export async function deployStoreReleaseIfBacked(config, prepared, previous, _adapters = {}) {
+  const store = await storeHarnessState(config);
+  if (store.mode !== "release") return false;
+  const commit = prepared.targetCommit;
+  if (previous?.storeDeployPrepared !== commit) {
+    throw new Error(`Release ${commit.slice(0, 12)} was not prepared outside the boundary by this run; refusing to deploy unprepared (no install inside the fence)`);
+  }
+  const result = await swapCurrent({ commit, env: store.env });
+  if (result.activated !== storeReleasePath(commit, store.env)) {
+    throw new Error(`Release store did not activate ${commit.slice(0, 12)}`);
+  }
+  console.log(`Release store now points at ${commit.slice(0, 12)}.`);
+  return true;
+}
+
+/**
+ * Post-apply, on a store-backed host: the owner process must run from the
+ * release the prepared commit was activated into, and that release must
+ * verify byte-for-byte against the commit's tree in the checkout.  Both
+ * checks are external to the process being checked.
+ */
+async function assertStoreReleaseRunning(config, prepared, previous) {
+  const store = await storeHarnessState(config);
+  if (store.mode !== "release") return;
+  const owner = await readOwner(config.dataDirectory);
+  if (!owner) throw new Error("Updated harness has no live owner record for release verification");
+  const root = await runningRootOfPid(owner.pid);
+  const physicalRoot = root ? await realpath(root).catch(() => null) : null;
+  const expectedRoot = await realpath(storeReleasePath(prepared.targetCommit, store.env)).catch(() => null);
+  if (!physicalRoot || !expectedRoot || physicalRoot !== expectedRoot) {
+    throw new Error(`Updated harness runs from ${physicalRoot ?? "an unknown root"}, not the activated release ${expectedRoot ?? storeReleasePath(prepared.targetCommit, store.env)}`);
+  }
+  const verdict = verifyReleaseAgainstCommit({
+    releaseRoot: physicalRoot,
+    commit: prepared.targetCommit,
+    repo: config.checkout,
+    expectedDepsFingerprint: previous?.releaseDepsFingerprint ?? null,
+  });
+  if (!verdict.ok) {
+    throw new Error(`Activated release failed byte verification: ${verdict.detail}`);
+  }
+  // The dependency scope is executable code git never exported: when the
+  // updater holds a known-good fingerprint the scope must still match it,
+  // and a scope the verifier could not see (unverified while one exists) is
+  // a refusal, never a skip.
+  if (previous?.releaseDepsFingerprint && verdict.dependencies !== "verified") {
+    throw new Error("Activated release's dependency scope changed between install and verification");
+  }
+}
+
+// The store's own isReleaseDirectory, aliased at import time would shadow
+// nothing, but the call sites read better when the check names its subject.
+async function isReleaseDirectoryForUpdater(path) {
+  return (await readRunningReleaseManifest(path)) !== null;
+}
+
 export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle }) {
   const activeWorkCount = runtime?.activeWorkCount ?? runtime?.activeWork?.count;
   if (runtime?.app !== "botfleet" || runtime?.pid !== owner.pid ||
@@ -1054,7 +1460,7 @@ export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requi
  *  is a slow harness, not a wrong one, and worth asking again. */
 const TOPOLOGY_UNAVAILABLE = /unavailable or ambiguous/;
 
-async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
+async function strictRuntimePreflight(config, expectedBuild, { requireIdle, depsFingerprint = null }) {
   const { state, owner } = await ownerRecordState(config.dataDirectory);
   // A record naming a dead pid is a stopped or crashed harness, not an
   // unadopted one.  Say which it is, so the operator restarts the app instead
@@ -1084,7 +1490,17 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   }
   const runtime = response.body;
   const identityError = authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle });
-  if (identityError) return { safe: false, reason: identityError };
+  if (identityError) {
+    // A store-backed harness whose runtime cannot self-prove is not refused
+    // yet: the updater verifies the running release's bytes itself, against
+    // git objects, before it believes or disbelieves anything.
+    const storeAdapters = { ...config.storeAdapters };
+    if (depsFingerprint && storeAdapters.expectedDepsFingerprint == null) {
+      storeAdapters.expectedDepsFingerprint = depsFingerprint;
+    }
+    const standing = await clearStoreIdentityError(config, owner, runtime, expectedBuild, identityError, { requireIdle }, storeAdapters);
+    if (standing) return { safe: false, reason: standing };
+  }
   const topology = await healthTopology(config.ports, { timeoutMs: PATIENT_REQUEST_MS });
   if (!topology.safe || topology.pid !== owner.pid) {
     return {
@@ -1165,12 +1581,12 @@ export function rollbackFenceConfig(config) {
   return { ...config, fenceNow: waitForIdleFor(config) > 0 ? "idle" : "force" };
 }
 
-export async function runtimePreflight(config, expectedBuild, adapters = {}) {
+export async function runtimePreflight(config, expectedBuild, adapters = {}, { depsFingerprint = null } = {}) {
   // Work in flight is never a reason to stop here: the fence step decides
   // what happens to it.  What this checks is that the harness is the one this
   // Mac owns, and a harness too slow to say so is asked again.
   const strict = await retryTransient(
-    () => (adapters.strictPreflight ?? strictRuntimePreflight)(config, expectedBuild, { requireIdle: false }),
+    () => (adapters.strictPreflight ?? strictRuntimePreflight)(config, expectedBuild, { requireIdle: false, depsFingerprint }),
     {
       windowMs: Number.isFinite(config?.preflightRetryMs) ? config.preflightRetryMs : DEFAULT_PREFLIGHT_RETRY_MS,
       now: adapters.now,
@@ -1181,8 +1597,8 @@ export async function runtimePreflight(config, expectedBuild, adapters = {}) {
   return { safe: false, reason: "Runtime does not expose complete authenticated readiness; manual first adoption is required" };
 }
 
-async function runtimeIdentityPreflight(config, expectedBuild) {
-  const strict = await strictRuntimePreflight(config, expectedBuild, { requireIdle: false });
+async function runtimeIdentityPreflight(config, expectedBuild, { depsFingerprint = null } = {}) {
+  const strict = await strictRuntimePreflight(config, expectedBuild, { requireIdle: false, depsFingerprint });
   return strict || { safe: false, reason: "Expected build does not expose authenticated runtime identity" };
 }
 
@@ -3494,6 +3910,7 @@ export async function stageEntries(config, generations = []) {
 function createConfig(parsed) {
   const home = homedir();
   return {
+    home,
     checkout: resolve(process.env.BOTFLEET_CHECKOUT || join(home, "apps/botfleet-server")),
     appPath: resolve(process.env.BOTFLEET_APP_PATH || "/Applications/BotFleet.app"),
     dataDirectory: resolve(process.env.BOTFLEET_DATA_DIR || join(home, ".botfleet")),
@@ -3601,8 +4018,35 @@ export async function restoreDesktopBeforeWatchdogs({ desktop, open, verify, boo
   for (const bootstrap of bootstraps) await record(bootstrap);
 }
 
-function createOperations(config) {
+export function createOperations(config) {
   let lastPreflight;
+  const storeDeployPreparer = config.storeDeployPreparer ?? prepareStoreReleaseDeploy;
+  // Trusted dependency custody for the release store, scoped to THIS run: a
+  // fingerprint enters only from a tree this run installed from the
+  // byte-verified lockfile (fresh stage or fresh reference), never from a
+  // release's own snapshot of itself.  Built lazily during preflight or
+  // preparation — always BEFORE the fence, never inside the interruption.
+  const storeReferenceFingerprints = new Map();
+  const referenceFingerprintFor = async (commit) => {
+    if (storeReferenceFingerprints.has(commit)) return storeReferenceFingerprints.get(commit);
+    const store = await storeHarnessState(config);
+    const dir = await installReferenceDeps(config, commit, store.env);
+    let fingerprint = null;
+    try {
+      fingerprint = captureDepsFingerprint(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+    }
+    storeReferenceFingerprints.set(commit, fingerprint);
+    return fingerprint;
+  };
+  config.storeAdapters = {
+    ...config.storeAdapters,
+    expectedDepsFingerprintFor: config.storeAdapters?.expectedDepsFingerprintFor ?? referenceFingerprintFor,
+    registerTrustedFingerprint: (commit, fingerprint) => {
+      storeReferenceFingerprints.set(commit, fingerprint);
+    },
+  };
   const componentFlags = () => resolveUpdateComponentFlags(config.parsed.components);
   const git = (cwd, args, options) => run("git", ["-C", cwd, ...args], options);
   const gitOutput = (cwd, args, options) => output("git", ["-C", cwd, ...args], options);
@@ -3980,6 +4424,18 @@ function createOperations(config) {
     capturePrevious: async (prepared) => {
       const { updateApp } = componentFlags();
       const checkoutCommit = await gitOutput(config.checkout, ["rev-parse", "HEAD"]);
+      // What the store-backed launcher currently serves, so rollback can
+      // point the store back at it.  Null on a checkout-backed host.
+      const storeState = await storeHarnessState(config);
+      const releaseCommit = storeState.mode === "release" ? await storeCurrentCommit(storeState.env) : null;
+      if (storeState.mode === "release" && !releaseCommit) {
+        // The pointer exists but names nothing resolvable (a dangling link, a
+        // non-commit directory, or a manifest that does not bind to it).  A
+        // capture with no prior release would let rollback restore the
+        // checkout while the FAILED release kept serving, so refuse here,
+        // before anything moves.
+        throw new Error("Release store pointer is present but unresolvable; refusing update until the store is cleared");
+      }
       const dirty = await gitOutput(config.checkout, ["status", "--porcelain"]);
       if (dirty) {
         // Name them.  An untracked directory left by an earlier failure blocks
@@ -4049,6 +4505,7 @@ function createOperations(config) {
       }
       return {
         checkoutCommit,
+        releaseCommit,
         installedIdentity,
         installedCommit,
         installedDependencyFingerprint,
@@ -4088,6 +4545,18 @@ function createOperations(config) {
         if (await dependencyFingerprint(previous.candidateDependencies) !== prepared.dependencyFingerprint) {
           throw new Error("Materialized dependency candidate does not match the prepared tree");
         }
+      }
+      // The release-store deploy is PREPARED here, before the fence: staging,
+      // source verification, the dependency install, and any trusted
+      // reference build are minutes of work and network failure modes that
+      // must never sit inside the interruption window.  The boundary itself
+      // (advanceCheckout) only swaps the pointer.
+      await storeDeployPreparer(config, prepared, previous);
+      // A rollback would restore the release serving NOW: keep its trusted
+      // dependency custody ready too, so a mid-transaction rollback never
+      // needs an install inside its own fence.
+      if (previous.releaseCommit && previous.releaseCommit !== prepared.targetCommit) {
+        await (config.storeAdapters?.expectedDepsFingerprintFor ?? referenceFingerprintFor)(previous.releaseCommit);
       }
     },
 
@@ -4165,10 +4634,16 @@ function createOperations(config) {
       });
     },
 
-    advanceCheckout: async (targetCommit) => {
+    advanceCheckout: async (prepared, previous) => {
+      const targetCommit = prepared.targetCommit;
       await git(config.checkout, ["checkout", "--detach", targetCommit]);
       const head = await gitOutput(config.checkout, ["rev-parse", "HEAD"]);
       if (head !== targetCommit) throw new Error("Live checkout did not advance to the prepared commit");
+      // The checkout is the updater's source of truth either way.  What RUNS
+      // is a second question: a store-backed launcher serves the release the
+      // pointer names, so the deploy is not done until the store holds this
+      // commit and the pointer says so.  A checkout-backed host is untouched.
+      await deployStoreReleaseIfBacked(config, prepared, previous);
     },
 
     installCandidate: async (prepared, previous) => {
@@ -4261,7 +4736,7 @@ function createOperations(config) {
         desktop: shouldStartDesktop({ updateApp: componentFlags().updateApp, openApplication: config.parsed.openApplication }),
         open: () => run("open", [config.appPath]),
         verify: () => waitForStartup({
-          attempt: () => runtimeIdentityPreflight(config, prepared),
+          attempt: () => runtimeIdentityPreflight(config, prepared, { depsFingerprint: previous?.releaseDepsFingerprint ?? null }),
           timeoutMs: config.startupTimeoutMs,
           what: "the packaged version",
           fallback: "Installed application did not prove its expected build and ownership",
@@ -4275,7 +4750,7 @@ function createOperations(config) {
       // A slow boot is waited out, with progress; only a harness that has really
       // died (its launchd job exited) ends the wait early.
       await waitForStartup({
-        attempt: () => runtimeIdentityPreflight(config, prepared),
+        attempt: () => runtimeIdentityPreflight(config, prepared, { depsFingerprint: previous?.releaseDepsFingerprint ?? null }),
         crashed: () => launchdExitReason(
           [previous?.startedHarnessLabel ?? config.label],
           { print: (label) => run("launchctl", ["print", `${config.domain}/${label}`], { allowFailure: true }) },
@@ -4285,6 +4760,11 @@ function createOperations(config) {
         fallback: "Updated harness did not prove its expected build and ownership before timeout",
         report: config.reportDetail,
       });
+      // The runtime's own answer is not the whole proof on a store-backed
+      // host: also verify, from outside the process, that the owner runs from
+      // the activated release and that the release's bytes ARE the prepared
+      // commit's tree.  A runtime can only claim; this checks.
+      await assertStoreReleaseRunning(config, prepared, previous);
     },
 
     startApplication: async (_prepared, previous, options) => {
@@ -4302,7 +4782,7 @@ function createOperations(config) {
     verifySingleOwner: async (prepared, previous) => {
       const { updateApp } = componentFlags();
       if (!updateApp) {
-        const snapshot = await runtimeIdentityPreflight(config, prepared);
+        const snapshot = await runtimeIdentityPreflight(config, prepared, { depsFingerprint: previous?.releaseDepsFingerprint ?? null });
         if (!snapshot.safe || snapshot.mode !== "authenticated") {
           throw new Error(snapshot.reason || "Updated harness did not prove authenticated single ownership");
         }
@@ -4312,7 +4792,7 @@ function createOperations(config) {
         await waitForStableApplication({
           samplePids: () => exactAppPids(config.appPath),
           attachmentError: async () => {
-            const snapshot = await runtimeIdentityPreflight(config, prepared);
+            const snapshot = await runtimeIdentityPreflight(config, prepared, { depsFingerprint: previous?.releaseDepsFingerprint ?? null });
             if (!snapshot.safe || snapshot.mode !== "authenticated") {
               return snapshot.reason || "Updated application did not attach to the authenticated single data owner";
             }
@@ -4322,7 +4802,7 @@ function createOperations(config) {
           report: config.reportDetail,
         });
       } else {
-        const snapshot = await runtimeIdentityPreflight(config, prepared);
+        const snapshot = await runtimeIdentityPreflight(config, prepared, { depsFingerprint: previous?.releaseDepsFingerprint ?? null });
         if (!snapshot.safe || snapshot.mode !== "authenticated") {
           throw new Error(snapshot.reason || "Updated application did not attach to the authenticated single data owner");
         }
@@ -4515,6 +4995,14 @@ function createOperations(config) {
         }
       });
       await record(async () => { await git(config.checkout, ["checkout", "--detach", previous.checkoutCommit]); });
+      await record(async () => {
+        if (previous.releaseCommit) {
+          // The launcher serves the release the pointer names: restoring the
+          // checkout without restoring the pointer would leave the FAILED
+          // release serving under a restored checkout.
+          await swapCurrent({ commit: previous.releaseCommit, env: storeEnvFor(config) });
+        }
+      });
       await record(async () => { await rm(previous.candidatePath, { recursive: true, force: true }); });
       await record(async () => { await rm(previous.candidateDependencies, { recursive: true, force: true }); });
       // The receipt describes two copies, the bundle and the dependency tree,
@@ -4532,6 +5020,10 @@ function createOperations(config) {
       await record(async () => {
         const head = await gitOutput(config.checkout, ["rev-parse", "HEAD"]);
         if (head !== previous.checkoutCommit) throw new Error("Rollback did not restore the prior checkout commit");
+        if (previous.releaseCommit) {
+          const current = await storeCurrentCommit(storeEnvFor(config));
+          if (current !== previous.releaseCommit) throw new Error("Rollback did not restore the prior release pointer");
+        }
         const identity = await signatureIdentity(config.appPath, {
           allowLegacyBundleId: previous.installedIdentity.bundleIdentifier === LEGACY_BUNDLE_ID,
         });
