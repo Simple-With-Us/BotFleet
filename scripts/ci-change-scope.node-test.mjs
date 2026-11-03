@@ -414,6 +414,29 @@ test("the test job checks out full history so the effort ledger guard can find i
   const checkout = workflow.jobs.test.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
   assert.ok(checkout, "the test job must check out the repository");
   assert.equal(checkout.with?.["fetch-depth"], 0);
+  assert.equal(checkout.with?.filter, "blob:none");
+});
+
+test("CI full-history checkouts preserve the commit graph without downloading historic blobs", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const checkouts = Object.values(workflow.jobs).flatMap((job) =>
+    (job.steps ?? []).filter((step) => String(step.uses ?? "").startsWith("actions/checkout@")),
+  );
+  const fullHistoryCheckouts = checkouts.filter((step) => step.with?.["fetch-depth"] === 0);
+
+  assert.equal(fullHistoryCheckouts.length, 3);
+  for (const checkout of fullHistoryCheckouts) {
+    assert.equal(checkout.with.filter, "blob:none");
+  }
+
+  const ledgerGuard = workflow.jobs.changes.steps.find((step) =>
+    /effort-log-integrity\.node-test\.mjs/.test(step.run ?? ""),
+  );
+  assert.ok(ledgerGuard, "the history guard must remain present");
+  assert.match(
+    readFileSync(join(ROOT, "scripts/effort-log-integrity.node-test.mjs"), "utf8"),
+    /git", \["show"/,
+  );
 });
 
 test("a later push cannot cancel an earlier main run before it dispatches jobs", () => {
@@ -439,6 +462,7 @@ test("a documentation-only change still runs the effort ledger guard", () => {
   const steps = workflow.jobs.changes.steps;
   const checkout = steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
   assert.equal(checkout.with["fetch-depth"], 0);
+  assert.equal(checkout.with.filter, "blob:none");
   const guard = steps.find((step) => /effort-log-integrity\.node-test\.mjs/.test(step.run ?? ""));
   assert.ok(guard, "the changes job must run the effort ledger guard");
   assert.equal(guard.if, checkout.if, "the guard runs exactly when the checkout does");
