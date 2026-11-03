@@ -44,6 +44,7 @@ const stamp = buildVersion ? controlBuildVersion({ repoRoot: root }) : null;
 const buildIdentity = {
   ...readSourceBuildIdentity(root, { requireGit: true, version: stamp?.version ?? null, build: stamp?.build ?? null }),
   uiHash: hashStaticUi(join(root, "dist")),
+  desktopStartupProtocol: 1,
 };
 
 // yaml's Node export is CommonJS and contains dynamic requires that cannot run
