@@ -53,6 +53,9 @@ import type {
   RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
+import { z } from "zod";
+
+import { isJsonString, schemaIssue } from "../schema.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "zcodeAgent";
@@ -80,20 +83,24 @@ const ZCODE_CREDENTIAL_ENV = [
   "ZHIPU_API_KEY",
 ];
 
+const ZCODE_CONFIG_SCHEMA = z
+  .object({ cli: z.string().trim().min(1) })
+  .partial()
+  .passthrough();
+type ZcodeConfigInput = z.input<typeof ZCODE_CONFIG_SCHEMA>;
+
 interface ZcodeConfig {
   cli: string;
 }
 
-function decodeConfig(raw: unknown): ZcodeConfig {
-  if (raw === null || raw === undefined) return { cli: "zcode" };
-  if (typeof raw !== "object") throw new Error("zcode config must be an object");
-  const obj = raw as { cli?: unknown };
-  if (obj.cli !== undefined && typeof obj.cli !== "string") throw new Error("zcode config `cli` must be a string");
-  return { cli: obj.cli && obj.cli.trim() ? obj.cli.trim() : "zcode" };
+function decodeConfig(raw: ZcodeConfigInput | null | undefined): ZcodeConfig {
+  const parsed = ZCODE_CONFIG_SCHEMA.safeParse(raw ?? {});
+  if (!parsed.success) throw new Error(`zcode: ${schemaIssue(parsed.error, "invalid engine config")}`);
+  return { cli: parsed.data.cli ?? "zcode" };
 }
 
 function zcodeEnvironment(source: Record<string, string | undefined>): Record<string, string | undefined> {
-  const env: Record<string, string | undefined> = { ...source, PATH: augmentedPath() };
+  const env: typeof source = { ...source, PATH: augmentedPath() };
   stripWorkspaceCredentialEnv(env);
   for (const key of ZCODE_CREDENTIAL_ENV) delete env[key];
   return env;
@@ -109,36 +116,68 @@ function zcodeAuthenticated(env: Record<string, string | undefined>): boolean {
 }
 
 /** The stream-json line shapes this driver reads (prompt-command.ts +
- *  session-mapper.ts). Everything else passes through untouched. */
-interface ZcodeStreamLine {
-  type?: string;
-  sessionId?: string;
-  turnId?: string;
-  payload?: {
-    kind?: string;
-    delta?: string;
-    toolCallId?: string;
-    callId?: string;
-    id?: string;
-    toolName?: string;
-    name?: string;
-    input?: unknown;
-    args?: unknown;
-    arguments?: unknown;
-    output?: unknown;
-    result?: unknown;
-    error?: unknown;
-    message?: string;
-  };
-  // result line (the stream terminator)
-  response?: string;
-  usage?: {
-    inputTokens?: number;
-    outputTokens?: number;
-    cacheReadTokens?: number;
-    cacheWriteTokens?: number;
-    reasoningTokens?: number;
-  };
+ *  session-mapper.ts), decoded at the stdout boundary. Unknown event types
+ *  and fields pass through untouched. */
+const ZCODE_USAGE_SCHEMA = z
+  .object({
+    inputTokens: z.number().optional(),
+    outputTokens: z.number().optional(),
+    cacheReadTokens: z.number().optional(),
+    cacheWriteTokens: z.number().optional(),
+    reasoningTokens: z.number().optional(),
+  })
+  .passthrough();
+
+const ZCODE_PAYLOAD_SCHEMA = z
+  .object({
+    kind: z.string().optional(),
+    delta: z.string().optional(),
+    toolCallId: z.string().optional(),
+    callId: z.string().optional(),
+    id: z.string().optional(),
+    toolName: z.string().optional(),
+    name: z.string().optional(),
+    input: z.unknown().optional(),
+    args: z.unknown().optional(),
+    arguments: z.unknown().optional(),
+    output: z.unknown().optional(),
+    result: z.unknown().optional(),
+    error: z.unknown().optional(),
+    message: z.string().optional(),
+  })
+  .passthrough();
+
+const ZCODE_STREAM_LINE_SCHEMA = z
+  .object({
+    type: z.string().optional(),
+    sessionId: z.string().optional(),
+    turnId: z.string().optional(),
+    payload: ZCODE_PAYLOAD_SCHEMA.optional(),
+    // result line (the stream terminator)
+    response: z.string().optional(),
+    usage: ZCODE_USAGE_SCHEMA.optional(),
+  })
+  .passthrough();
+
+type ZcodeStreamLine = z.infer<typeof ZCODE_STREAM_LINE_SCHEMA>;
+type ZcodeStreamUsage = ZcodeStreamLine["usage"];
+
+interface ZcodeTurnUsage {
+  input: number;
+  output: number;
+  cachedInput?: number;
+  reasoning?: number;
+}
+
+/** ModelUsage semantics (packages/contracts ModelUsage): cache reads and
+ *  writes are folded into the input figure when no explicit inputTokens
+ *  arrives, and cachedInput is reported as the subset. */
+function buildTurnUsage(usage: ZcodeStreamUsage, input: number | undefined): ZcodeTurnUsage | undefined {
+  if (!usage || input === undefined) return undefined;
+  const out: ZcodeTurnUsage = { input, output: usage.outputTokens ?? 0 };
+  if (usage.cacheReadTokens) out.cachedInput = usage.cacheReadTokens;
+  if (usage.reasoningTokens) out.reasoning = usage.reasoningTokens;
+  return out;
 }
 
 export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
@@ -166,7 +205,7 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
     const active = new Map<string, { stop: () => void; turnId: string }>();
 
     const emit = (event: RuntimeEvent) => {
-      for (const l of [...listeners]) l(event);
+      for (const l of Array.from(listeners)) l(event);
     };
     const base = (threadId: string, turnId: string) => ({
       eventId: newEventId(),
@@ -193,8 +232,8 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
         "--mode", "yolo",
         "--disallowed-tools", "AskUserQuestion EnterPlanMode ExitPlanMode",
       ];
-      if (typeof turn.model === "string" && turn.model) args.push("--model", turn.model);
-      const resumeCursor = typeof turn.resumeCursor === "string" && turn.resumeCursor ? turn.resumeCursor : null;
+      if (turn.model) args.push("--model", turn.model);
+      const resumeCursor = isJsonString(turn.resumeCursor) && turn.resumeCursor ? turn.resumeCursor : null;
       if (resumeCursor) args.push("--resume", resumeCursor);
 
       const child = spawnCli(config.cli, args, {
@@ -237,33 +276,21 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       const settle = (
         ok: boolean,
         stopReason?: string | null,
-        usage?: ZcodeStreamLine["usage"],
+        usage?: ZcodeStreamUsage,
       ) => {
         if (settled) return;
         settled = true;
         flushAssistantText();
-        // ModelUsage semantics (packages/contracts ModelUsage): cache reads
-        // and writes are folded into the input figure when no explicit
-        // inputTokens arrives, and cachedInput is reported as the subset.
         const input = usage
           ? usage.inputTokens ?? ((usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0))
           : undefined;
-        emit({
-          ...base(threadId, turnId),
-          type: "turn.completed",
-          ok,
-          stopReason: stopReason ?? (ok ? "end_turn" : "failed"),
-          ...(usage && input !== undefined
-            ? {
-                usage: {
-                  input,
-                  output: usage.outputTokens ?? 0,
-                  ...(usage.cacheReadTokens ? { cachedInput: usage.cacheReadTokens } : {}),
-                  ...(usage.reasoningTokens ? { reasoning: usage.reasoningTokens } : {}),
-                },
-              }
-            : {}),
-        });
+        const usageField = buildTurnUsage(usage, input);
+        const stop = stopReason ?? (ok ? "end_turn" : "failed");
+        emit(
+          usageField
+            ? { ...base(threadId, turnId), type: "turn.completed", ok, stopReason: stop, usage: usageField }
+            : { ...base(threadId, turnId), type: "turn.completed", ok, stopReason: stop },
+        );
         try {
           killCliTree(child);
         } catch {
@@ -289,8 +316,8 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       };
       active.set(threadId, { stop, turnId });
 
-      const noteSession = (candidate: unknown) => {
-        if (sessionId || typeof candidate !== "string" || !candidate) return;
+      const noteSession = (candidate: string | null | undefined) => {
+        if (sessionId || !candidate) return;
         sessionId = candidate;
         emit({ ...base(threadId, turnId), type: "session.started", sessionId, model: turn.model ?? null });
       };
@@ -305,10 +332,10 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
           case "model.streaming": {
             const payload = line.payload;
             if (!payload) return;
-            if (payload.kind === "text_delta" && typeof payload.delta === "string") {
+            if (payload.kind === "text_delta" && payload.delta !== undefined) {
               assistantText += payload.delta;
               emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: payload.delta });
-            } else if (payload.kind === "reasoning_delta" && typeof payload.delta === "string") {
+            } else if (payload.kind === "reasoning_delta" && payload.delta !== undefined) {
               emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "reasoning_text", delta: payload.delta });
             }
             // tool_input_* fragments are preview stream; the tool.updated
@@ -343,20 +370,19 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
             return;
           }
           case "turn.failed": {
-            const message =
-              line.payload && typeof line.payload.message === "string" && line.payload.message.trim()
-                ? line.payload.message
-                : "zcode turn failed";
+            const payloadMessage = line.payload?.message;
+            const message = payloadMessage && payloadMessage.trim() ? payloadMessage : "zcode turn failed";
             fail("failed", message);
             return;
           }
           case "result": {
             // The terminator: nothing may follow it on the stream.
             sawResult = true;
-            if (typeof line.response === "string" && line.response.trim() && !assistantText.trim()) {
+            const response = line.response;
+            if (response && response.trim() && !assistantText.trim()) {
               // No streamed deltas (or they were flushed by tool rows): the
               // final text still lands as one transcript item.
-              assistantText = line.response;
+              assistantText = response;
             }
             settle(true, "end_turn", line.usage);
             return;
@@ -375,13 +401,15 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
           buf = buf.slice(nl + 1);
           if (!line.trim()) continue;
           try {
-            onLine(JSON.parse(line) as ZcodeStreamLine);
+            const parsed = ZCODE_STREAM_LINE_SCHEMA.safeParse(JSON.parse(line));
+            if (parsed.success) onLine(parsed.data);
           } catch {
             /* skip non-JSON line */
           }
         }
       });
       child.on("error", (err) => {
+        // SAFETY: a ChildProcess "error" event delivers the spawn errno exception.
         const spawnFailure = describeSpawnFailure(err as NodeJS.ErrnoException, config.cli);
         if (settled) return;
         emit({ ...base(threadId, turnId), type: "runtime.error", message: spawnFailure.message, setup: spawnFailure.setup });
@@ -415,6 +443,7 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
             env: zcodeEnvironment({ ...process.env, ...input.environment }),
           });
         } catch (error) {
+          // SAFETY: spawnCli throws Error instances synchronously on a bad spawn.
           resolve({ version: null, error: error as Error });
           return;
         }
@@ -469,14 +498,11 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       // ZCode keeps its sign-in in its own data root and has no sign-in
       // subcommand to probe, so read the file its Connect flow writes.
       const authenticated = zcodeAuthenticated({ ...process.env, ...input.environment });
-      return {
-        state: "available",
-        version,
-        authenticated,
-        // Turns ride the GLM Coding Plan behind the local sign-in, so a
-        // reported cost is notional.
-        ...(authenticated ? { billing: "subscription" as const } : {}),
-      };
+      const available: ProviderSnapshot = { state: "available", version, authenticated };
+      // Turns ride the GLM Coding Plan behind the local sign-in, so a
+      // reported cost is notional.
+      if (authenticated) available.billing = "subscription";
+      return available;
     };
 
     return {

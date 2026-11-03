@@ -11,6 +11,8 @@
 
 import { appendFileSync } from "node:fs";
 
+import type { JsonObject } from "../schema.ts";
+
 const mode = process.env.FAKE_ZCODE_MODE ?? "happy";
 const argv = process.argv.slice(2);
 
@@ -40,8 +42,8 @@ const argValue = (name: string) => {
 };
 
 const sessionId = argValue("--resume") ?? "zs-fake-1";
-const write = (obj: Record<string, unknown>) => process.stdout.write(JSON.stringify(obj) + "\n");
-const stream = (payload: Record<string, unknown>) =>
+const write = (obj: JsonObject) => process.stdout.write(JSON.stringify(obj) + "\n");
+const stream = (payload: JsonObject) =>
   write({ type: "model.streaming", sessionId, turnId: "zt-1", seq: 1, timestamp: 1, payload });
 
 switch (mode) {

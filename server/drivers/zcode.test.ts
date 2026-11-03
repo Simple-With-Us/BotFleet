@@ -13,11 +13,27 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ensureDirs } from "../config.ts";
+import { isJsonObject, isJsonString, parseJson } from "../schema.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { ZcodeDriver } from "./zcode.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-zcode-cli.ts");
+
+/** The fake CLI's FAKE_ZCODE_DUMP rows, decoded at the file boundary. */
+const readLaunches = (path: string) =>
+  readFileSync(path, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => {
+      const row = parseJson(line);
+      if (!isJsonObject(row)) throw new Error("fake launch row is not an object");
+      const argv = row.argv;
+      if (!Array.isArray(argv) || !argv.every(isJsonString)) {
+        throw new Error("fake launch row argv is not a string array");
+      }
+      return { argv };
+    });
 
 describe("ZcodeDriver turns (fake CLI)", () => {
   let instance: ProviderInstance;
@@ -25,14 +41,22 @@ describe("ZcodeDriver turns (fake CLI)", () => {
   let dir: string;
 
   const create = async (mode?: string, environment: Record<string, string> = {}) => {
+    const childEnv = { ...environment };
+    if (mode) childEnv.FAKE_ZCODE_MODE = mode;
     instance = await ZcodeDriver.create({
       instanceId: "zcode-test",
       displayName: "ZCode Test",
-      environment: { ...environment, ...(mode ? { FAKE_ZCODE_MODE: mode } : {}) },
+      environment: childEnv,
       enabled: true,
       config: { cli: FAKE_CLI },
     });
     recorder = recordEvents(instance.adapter);
+  };
+
+  const sessionStarted = (forTurnId: string) => {
+    const event = recorder.events.find((e) => e.type === "session.started" && e.turnId === forTurnId);
+    if (event?.type !== "session.started") throw new Error(`no session.started for ${forTurnId}`);
+    return event;
   };
 
   beforeEach(() => {
@@ -69,10 +93,8 @@ describe("ZcodeDriver turns (fake CLI)", () => {
     const session = recorder.events.find((e) => e.type === "session.started")!;
     expect(session).toMatchObject({ sessionId: "zs-fake-1", model: "GLM-5.3" });
 
-    const text = recorder.events.find(
-      (e) => e.type === "item.completed" && (e as { itemType: string }).itemType === "assistant_text",
-    )!;
-    expect((text as { text: string }).text).toBe("Hello from zcode");
+    const text = recorder.events.find((e) => e.type === "item.completed" && e.itemType === "assistant_text");
+    expect(text).toMatchObject({ text: "Hello from zcode" });
 
     const done = recorder.events.at(-1)!;
     expect(done).toMatchObject({
@@ -91,7 +113,7 @@ describe("ZcodeDriver turns (fake CLI)", () => {
 
     const started = recorder.events.find((e) => e.type === "item.started")!;
     expect(started).toMatchObject({ itemType: "tool", title: "read_file" });
-    const completed = recorder.events.find((e) => e.type === "item.completed" && (e as { itemType: string }).itemType === "tool")!;
+    const completed = recorder.events.find((e) => e.type === "item.completed" && e.itemType === "tool");
     expect(completed).toMatchObject({ ok: true });
     expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 30, output: 9 } });
   });
@@ -101,26 +123,22 @@ describe("ZcodeDriver turns (fake CLI)", () => {
     await create(undefined, { FAKE_ZCODE_DUMP: dump });
     const first = await instance.adapter.sendTurn({ threadId: "t-resume", text: "first" });
     await recorder.until((e) => e.type === "turn.completed" && e.turnId === first.turnId);
-    const firstSession = recorder.events.find((e) => e.type === "session.started" && e.turnId === first.turnId) as
-      | { sessionId: string }
-      | undefined;
-    expect(firstSession?.sessionId).toBe("zs-fake-1");
+    const firstSession = sessionStarted(first.turnId);
+    expect(firstSession.sessionId).toBe("zs-fake-1");
 
     const second = await instance.adapter.sendTurn({
       threadId: "t-resume",
       text: "second",
-      resumeCursor: firstSession!.sessionId,
+      resumeCursor: firstSession.sessionId,
     });
     await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
-    const secondSession = recorder.events.find((e) => e.type === "session.started" && e.turnId === second.turnId) as
-      | { sessionId: string }
-      | undefined;
-    expect(secondSession?.sessionId).toBe("zs-fake-1");
+    const secondSession = sessionStarted(second.turnId);
+    expect(secondSession.sessionId).toBe("zs-fake-1");
 
-    const launches = readFileSync(dump, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-    const resumed = launches.find((l) => (l.argv as string[]).includes("--resume"));
+    const launches = readLaunches(dump);
+    const resumed = launches.find((l) => l.argv.includes("--resume"));
     expect(resumed).toBeTruthy();
-    expect(resumed.argv[resumed.argv.indexOf("--resume") + 1]).toBe("zs-fake-1");
+    expect(resumed?.argv[resumed.argv.indexOf("--resume") + 1]).toBe("zs-fake-1");
   });
 
   it("launches with the vendor headless recipe and the requested model", async () => {
@@ -129,8 +147,7 @@ describe("ZcodeDriver turns (fake CLI)", () => {
     const { turnId } = await instance.adapter.sendTurn({ threadId: "t-argv", text: "hi", model: "GLM-5.3-Flash" });
     await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
 
-    const launch = readFileSync(dump, "utf8").trim().split("\n").map((line) => JSON.parse(line))[0];
-    const argv = launch.argv as string[];
+    const argv = readLaunches(dump)[0]?.argv ?? [];
     expect(argv[argv.indexOf("--mode") + 1]).toBe("yolo");
     expect(argv[argv.indexOf("--disallowed-tools") + 1]).toBe("AskUserQuestion EnterPlanMode ExitPlanMode");
     expect(argv[argv.indexOf("--output-format") + 1]).toBe("stream-json");
