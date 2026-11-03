@@ -93,6 +93,16 @@ test("source identity stays pinned after the checkout advances; packaged identit
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("source identity refuses missing or malformed package metadata without leaking parse errors", () => {
+  const root = mkdtempSync(join(tmpdir(), "bf-build-identity-invalid-package-"));
+  try {
+    assert.throws(() => readSourceBuildIdentity(root), /BotFleet source identity is invalid/);
+    writeFileSync(join(root, "package.json"), "{");
+    assert.throws(() => readSourceBuildIdentity(root), /BotFleet source identity is invalid/);
+    assert.equal(readSourceBuildIdentity(root, { version: "0.1.0" }).version, "0.1.0");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 // A checkout the server starts from may have no usable git: a GUI launch with a
 // thin PATH, a stripped container, a source archive.  The server still boots,
 // and says its commit is unknown and its build dirty, which buildCompatibility

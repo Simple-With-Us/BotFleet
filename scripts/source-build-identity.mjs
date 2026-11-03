@@ -218,6 +218,12 @@ export function readSourceBuildIdentity(root, { requireGit = false, version = nu
     // sourceDirty true (the safe default), matching the documented fallback.
     /* commit stays unknown when HEAD never arrived; otherwise keep what we have */
   }
+  let packageVersion;
+  if (version === null) {
+    try {
+      packageVersion = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
+    } catch { /* missing or malformed metadata is rejected by validBuildIdentity below */ }
+  }
   const value = {
     app: "botfleet",
     // A build supplies its own version instead of editing package.json.  That
@@ -225,7 +231,7 @@ export function readSourceBuildIdentity(root, { requireGit = false, version = nu
     // version stamped into the source file would make every Mac build report
     // sourceDirty and fail the very gate that proves the build came from a
     // committed tree.
-    version: version ?? JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,
+    version: version ?? packageVersion,
     apiVersion: HARNESS_API_VERSION, sourceCommit, sourceDirty, uiHash: null,
   };
   // The shared release planner supplies this value; a source run without
