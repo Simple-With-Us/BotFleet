@@ -90,6 +90,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: 360,
   },
   {
+    id: "jobs.queueWaitMinutes",
+    label: "Maximum job queue wait",
+    section: "jobs",
+    path: ["queueWaitMinutes"],
+    infisicalName: "BOTFLEET_JOBS_QUEUE_WAIT_MINUTES",
+    kind: "int",
+    min: 1,
+    max: 10080,
+  },
+  {
     id: "jobs.cpuCores",
     label: "Job CPU cores",
     section: "jobs",
