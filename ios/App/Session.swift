@@ -653,6 +653,9 @@ final class Session: ObservableObject {
         guard client != nil else { return }
         if let existing = streamTask {
             if case .offline = status {
+                // Same stale-cursor hazard as `restartStream()`: publish
+                // held deltas before the replacement stream resumes.
+                flushDeltas()
                 existing.cancel()
                 streamTask = nil
             } else {
@@ -716,6 +719,11 @@ final class Session: ObservableObject {
     /// cursor survives, so this is a gap, not a reset.
     private func restartStream() {
         guard streamTask != nil else { return }
+        // Publish held deltas and commit their cursor first: the new stream
+        // resumes from that cursor, so anything left buffered would be both
+        // replayed by the server and flushed locally — the same tokens
+        // appended twice, with no dedupe on live text (BF-2608).
+        flushDeltas()
         streamTask?.cancel()
         streamTask = nil
         connect()
@@ -798,8 +806,13 @@ final class Session: ObservableObject {
         let events = deltaBuffer.drain()
         let seq = bufferedSeq
         bufferedSeq = nil
-        state.applyCoalesced(events)
-        if let seq { state.advance(to: seq) }
+        // One assignment, one publish: mutating the `@Published` struct per
+        // coalesced event plus once for the cursor would re-invalidate the
+        // transcript once per stream key and defeat the batching.
+        var next = state
+        next.applyCoalesced(events)
+        if let seq { next.advance(to: seq) }
+        state = next
         NotificationCoordinator.shared.setBadge(state.unreadCount)
     }
 
