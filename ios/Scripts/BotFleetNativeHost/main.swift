@@ -10,6 +10,16 @@ struct BotFleetNativeHostMain {
         #if os(macOS)
         do {
             let arguments = Array(CommandLine.arguments.dropFirst())
+            if arguments == ["--identity"] {
+                do {
+                    let identity = try NativeHostArtifactIdentity.encoded()
+                    FileHandle.standardOutput.write(identity + Data([0x0a]))
+                } catch {
+                    FileHandle.standardError.write(Data("Native host artifact identity is unavailable.\n".utf8))
+                    exit(78)
+                }
+                return
+            }
             guard arguments.count == 2, arguments[0] == "--service-data", arguments[1].hasPrefix("/") else {
                 FileHandle.standardError.write(Data("Usage: BotFleetNativeHost --service-data /absolute/private/service-root\n".utf8))
                 exit(64)
