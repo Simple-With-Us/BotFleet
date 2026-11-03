@@ -268,6 +268,18 @@ jobs:
             echo "::error::cloudflared is not signed by the app's Developer ID team in $app"; exit 1; }
           echo "ok: $app"
 
+      # BF-2531: the feed orders by the app version, the Control update by the
+      # bundled Control's Info.plist, and the handshake by the server's
+      # build-identity.json.  The three are stamped in three places, so prove
+      # the packaged bytes agree with the pinned release before notarization:
+      # a stale Control (or server) riding inside a new release would outlive
+      # its server with every other gate green.
+      - name: "Gate: the bundled Control and server carry the pinned release"
+        run: |
+          node scripts/verify-packaged-versions.mjs "${{ matrix.app }}" \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --build "${{ needs.prepare.outputs.build }}"
+
       - name: "Gate: the packaged server starts and every helper path resolves (runtime pass or bundle check)"
         env:
           MAC_APP: ${{ matrix.app }}
