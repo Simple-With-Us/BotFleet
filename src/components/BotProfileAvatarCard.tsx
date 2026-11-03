@@ -6,7 +6,6 @@ import { guessImageMime, imageAttachmentFromFile } from "@/lib/composer-attachme
 import { cn } from "@/lib/cn";
 import { productErrorHeadline } from "@/lib/product-error";
 import {
-  PICKABLE_STATES,
   BOT_COLORS,
   BOT_COLOR_NAMES,
   type BotMotion,
@@ -20,8 +19,7 @@ import {
 } from "../../shared/bot-avatar";
 import { extractAvatarManifest } from "../../shared/avatar-manifest";
 import { toManifestBytes } from "./avatar-file/bytes";
-import { BotAvatar, BotMascot } from "./Avatar";
-import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
+import { BotAvatar } from "./Avatar";
 
 type AvatarPatch = Partial<
   Pick<Bot, "avatarCrop" | "avatarUrl" | "color" | "mascotExpression">
@@ -185,7 +183,7 @@ export function BotProfileAvatarCard({
           )}
         </div>
         <div className="mt-1.5 text-[11.5px] text-ink-secondary">Drop an image onto the avatar.  PNG, JPEG, GIF, WebP, HEIC, BMP, or SVG · up to 10 MB</div>
-        <div className="mt-1 text-[11.5px] text-ink-secondary">An animated WebP that carries its own manifest plays as one avatar file.</div>
+        <div className="mt-1 text-[11.5px] text-ink-secondary">An animated WebP that carries its own manifest plays as one avatar file.  Pre-colored TV-Face packs are not recolored; mascot and TV-Face skins still use the Color row.</div>
 
         <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
           Shape
@@ -196,7 +194,23 @@ export function BotProfileAvatarCard({
               key={candidate}
               type="button"
               aria-pressed={crop === candidate}
-              onClick={() => onPatch({ avatarCrop: candidate })}
+              onClick={() => {
+                if (candidate === "tvface") {
+                  // TV-Face is situation-driven; clear a pinned expression and keep
+                  // the bot's color so the matching skin (or orange default) shows.
+                  onPatch({
+                    avatarCrop: "tvface",
+                    mascotExpression: null,
+                    color: bot.color || "orange",
+                  });
+                  return;
+                }
+                if (candidate === "mascot") {
+                  onPatch({ avatarCrop: "mascot", mascotExpression: null });
+                  return;
+                }
+                onPatch({ avatarCrop: candidate });
+              }}
               className={cn(
                 "py-1.5 text-[12.5px]",
                 index > 0 && "border-l border-hairline/40",
@@ -211,34 +225,11 @@ export function BotProfileAvatarCard({
         {(crop === "mascot" || crop === "tvface") && (
           <>
             <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
-              Expression
-            </div>
-            <div className="grid grid-cols-5 gap-2">
-              {PICKABLE_STATES.map((expression) => (
-                <button
-                  key={expression}
-                  type="button"
-                  aria-pressed={activeState === expression}
-                  onClick={() => onPatch({ mascotExpression: expression })}
-                  className={cn(
-                    "flex h-[58px] items-center justify-center rounded-xl bg-inset transition-colors hover:bg-control",
-                    activeState === expression && "ring-2 ring-accent-border",
-                  )}
-                  title={expression.charAt(0).toUpperCase() + expression.slice(1)}
-                  aria-label={`Use ${expression} expression`}
-                >
-                  {crop === "tvface" ? (
-                    <TVFaceAvatar color={bot.color} state={expression} size={42} animated={false} />
-                  ) : (
-                    <BotMascot color={bot.color} state={expression} size={42} animated={false} />
-                  )}
-                </button>
-              ))}
-            </div>
-
-            <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
               Color
             </div>
+            <p className="mb-2 text-[11.5px] text-ink-secondary">
+              Expressions follow the bot's situation.  There is no manual expression picker.
+            </p>
             <div className="flex flex-wrap gap-2.5">
               {BOT_COLOR_NAMES.map((color) => (
                 <button
