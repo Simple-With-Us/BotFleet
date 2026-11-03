@@ -26,6 +26,7 @@ import { randomUUID } from "node:crypto";
 import {
   appendFileSync,
   closeSync,
+  existsSync,
   fstatSync,
   fsyncSync,
   openSync,
@@ -1213,6 +1214,12 @@ export function sweepTranscriptVolumeBudget(
   const orphanMaxAgeMs = opts.orphanMaxAgeMs ?? ORPHAN_MAX_AGE_MS;
   const idleMaxAgeMs = opts.idleMaxAgeMs ?? IDLE_LIVE_MAX_AGE_MS;
 
+  // VolumeSweepOptions inherits inFlightThreadIds from
+  // RetentionInventoryOptions, so an open turn may arrive either way.  Both
+  // sets protect a turn: reading only the parameter would let a caller that
+  // passes ids via opts get a live turn deleted or trimmed as stale.
+  const inFlight = new Set<string>([...inFlightThreadIds, ...(opts.inFlightThreadIds ?? [])]);
+
   const scanned = scanTranscriptThreads(dirs, now);
   const total = scanned.reduce((sum, thread) => sum + thread.bytes, 0);
   const result: VolumeSweepResult = {
@@ -1232,7 +1239,7 @@ export function sweepTranscriptVolumeBudget(
   for (const thread of scanned) {
     reasons.set(
       thread.threadId,
-      retentionReason(thread, liveThreadIds, inFlightThreadIds, now, orphanMaxAgeMs, idleMaxAgeMs),
+      retentionReason(thread, liveThreadIds, inFlight, now, orphanMaxAgeMs, idleMaxAgeMs),
     );
   }
   const deleted = new Set<string>();
@@ -1261,22 +1268,43 @@ export function sweepTranscriptVolumeBudget(
     .filter((thread) => reasons.get(thread.threadId) === "orphan-stale")
     .sort((a, b) => a.newestMtime - b.newestMtime);
   const pendingDelete: ScannedThread[] = [];
-  for (const thread of orphans) {
-    if (remaining <= budgetBytes) break;
-    pendingDelete.push(thread);
-    remaining -= thread.bytes;
+  {
+    let projected = remaining;
+    for (const thread of orphans) {
+      if (projected <= budgetBytes) break;
+      pendingDelete.push(thread);
+      projected -= thread.bytes;
+    }
   }
   if (pendingDelete.length > 0) {
     if (!dryRun) {
       const ids = pendingDelete.map((thread) => thread.threadId);
       for (const dir of transcriptDirList(dirs)) removeTranscriptLogs(dir, ids);
-    }
-    // Marked in both modes: a dry run projects exactly what a real run
-    // would change, so later passes must skip these threads' leftover temps
-    // the same way — otherwise the preview double-counts them.
-    for (const thread of pendingDelete) {
-      deleted.add(thread.threadId);
-      touch(thread.threadId, thread.files);
+      // removeTranscriptLogs is best-effort per file: only credit what is
+      // actually gone, so a failed unlink cannot clear `over` on paper while
+      // the bytes are still on disk.
+      for (const thread of pendingDelete) {
+        const paths = [
+          ...thread.logs.map((log) => log.path),
+          ...thread.staleTemps.map((temp) => temp.path),
+        ];
+        if (paths.every((path) => !existsSync(path))) {
+          deleted.add(thread.threadId);
+          touch(thread.threadId, thread.files);
+          remaining -= thread.bytes;
+        } else {
+          result.failed += 1;
+        }
+      }
+    } else {
+      // Marked in both modes: a dry run projects exactly what a real run
+      // would change, so later passes must skip these threads' leftover temps
+      // the same way — otherwise the preview double-counts them.
+      for (const thread of pendingDelete) {
+        deleted.add(thread.threadId);
+        touch(thread.threadId, thread.files);
+        remaining -= thread.bytes;
+      }
     }
   }
   if (remaining <= budgetBytes) return finish();

@@ -2,7 +2,7 @@
 // the cap displaces is still readable until the generation after next. The
 // caps themselves are 64 MB and 16 MB in production; every test here passes
 // its own small cap, so the behaviour is pinned without writing megabytes.
-import { type appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, readSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { type appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -1141,6 +1141,59 @@ describe("transcript data-volume budget", () => {
     expect(result.files).toBe(0);
     expect(result.over).toBe(true);
     expect(readFileSync(file, "utf8")).toBe(text);
+  });
+
+  it("protects an open turn passed only via opts.inFlightThreadIds", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const width = Buffer.byteLength(record(1));
+    const text = body(10);
+    const file = join(nativeDir, "open.ndjson");
+    writeFileSync(file, text);
+    age(file, QUIET);
+
+    // The ids arrive through the options object, not the positional
+    // parameter — an open turn must be safe either way.  The tail override
+    // matters: with production tails this small log would never trim, and
+    // the test would pass even without the fix.
+    const result = sweepTranscriptVolumeBudget(
+      { eventsDir, nativeDir },
+      new Set(["open"]),
+      new Set(),
+      {
+        now: NOW,
+        inFlightThreadIds: new Set(["open"]),
+        budgetBytes: 1,
+        tailBytes: tails(width * 3 + Math.floor(width / 2)),
+      },
+    );
+    expect(result.ids).toBe(0);
+    expect(result.files).toBe(0);
+    expect(result.over).toBe(true);
+    expect(readFileSync(file, "utf8")).toBe(text);
+  });
+
+  it("counts an orphan delete that fails instead of claiming its bytes", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    // A non-empty directory where the log should be: the scan stats it as a
+    // thread log, but no unlink can remove it — even for root — so the sweep
+    // must report the failure rather than the bytes.
+    const impostor = join(nativeDir, "orphan.ndjson");
+    mkdirSync(impostor);
+    writeFileSync(join(impostor, "nested.txt"), "held\n");
+    age(impostor, STALE);
+
+    const result = sweep({ eventsDir, nativeDir }, [], { budgetBytes: 1 });
+    expect(result.failed).toBe(1);
+    expect(result.ids).toBe(0);
+    expect(result.files).toBe(0);
+    expect(result.bytesReclaimed).toBe(0);
+    expect(result.over).toBe(true);
+    expect(existsSync(impostor)).toBe(true);
+    expect(describeVolumeSweep(result)).toBe(
+      `[retention] ${result.bytesStart - 1} bytes still over the data-volume budget.  1 transcript log could not be reclaimed.`,
+    );
   });
 
   it("keeps a recent orphan even when over budget", () => {
