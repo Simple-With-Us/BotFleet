@@ -1159,10 +1159,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
-// The seat's CLI login is read in the BACKGROUND, and the read is started
-// here, before the guard:  the guard and the registration that follows it
-// have to stay free of `await`, or a second turn on this thread would walk
-// through the guard the first one already passed.
+      // The seat's CLI login is read in the BACKGROUND, and the read is started
+      // here, before the guard:  the guard and the registration that follows it
+      // have to stay free of `await`, or a second turn on this thread would walk
+      // through the guard the first one already passed.
       primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
