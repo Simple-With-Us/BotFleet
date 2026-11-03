@@ -14,12 +14,12 @@ Set per bot and per turn, in the environment of the process that runs the turn. 
 | `AGENT_LAUNCH_SEAT` | The role seat BotFleet assigned.  Only the launcher writes it. |
 | `AGENT_SEAT` | The same value, for older readers. |
 | `AGENT_SESSION` | BotFleet's id for the thread the turn runs on (a room turn uses the room's thread). |
-| `AGENT_SYNC_ATTACH` | `0`.  The Claude hooks plugin never attaches a session BotFleet launched. |
+| `SIMPLE_TOOLS_ATTACH` | `0`.  The Claude hooks plugin never attaches a session BotFleet launched. |
 | `OTEL_RESOURCE_ATTRIBUTES` | The inherited value with `agent.launcher=botfleet` and `agent.launcher.session=<thread id>` appended (comma-joined, the thread id percent-encoded).  An inherited entry for either key is replaced, never duplicated.  A child that exports its own OpenTelemetry (Claude Code, Codex) carries them, so Usage Monitor can tell its native events belong to a BotFleet turn and count the turn once. |
 
-A bot whose name names no role still gets `AGENT_LAUNCHER`, `AGENT_SYNC_ATTACH` and `AGENT_SESSION`, and no seat.  The fleet tools then refuse to act, instead of falling back to a platform default.
+A bot whose name names no role still gets `AGENT_LAUNCHER`, `SIMPLE_TOOLS_ATTACH` and `AGENT_SESSION`, and no seat.  The fleet tools then refuse to act, instead of falling back to a platform default.
 
-BotFleet first removes everything that could carry a different identity or a Zulip login from the environment it inherited:  `AGENT_SEAT`, `AGENT_TAG`, `AGENT_SESSION`, `CLAUDE_CODE_SESSION_ID`, and every name starting `AGENT_LAUNCH`, `AGENT_SYNC_` or `ZULIP_`.  That covers the harness's own environment and an engine instance's configured environment alike, so a harness started from a seat's terminal cannot pass that seat on.  Role bots post through BotFleet's own Zulip support (`docs/zulip.md`), so no engine process is given a key.
+BotFleet first removes everything that could carry a different identity or a Zulip login from the environment it inherited:  `AGENT_SEAT`, `AGENT_TAG`, `AGENT_SESSION`, `CLAUDE_CODE_SESSION_ID`, and every name starting `AGENT_LAUNCH`, `AGENT_SYNC_`, `SIMPLE_TOOLS_` or `ZULIP_`.  `AGENT_SYNC_` is the fleet tools' retired prefix:  seat shells still export names under it until the fleet rename lands, and stripping them on sight is what keeps a retired identity out of a child.  That covers the harness's own environment and an engine instance's configured environment alike, so a harness started from a seat's terminal cannot pass that seat on.  Role bots post through BotFleet's own Zulip support (`docs/zulip.md`), so no engine process is given a key.
 
 Where it applies:  the Claude, Codex, ACP (every ACP engine), Antigravity, pi and CLI-wrapper drivers, the shell of the HTTP-lane `bash` tool, and a background job's shell.  The Claude driver also keys its warm process on the seat and session, so a second bot on the same thread starts its own process.  The Codex driver additionally passes `-c shell_environment_policy.set.<NAME>=...` for the five variables, because Codex runs the model's shell commands under its own environment policy.
 
@@ -67,7 +67,7 @@ The seat sentence is `bots/_seat.md`.  It says the bot's seat, that BotFleet ass
 
 ## Codex Environment Policy
 
-A user's Codex config can narrow the environment of the model's shell commands with `shell_environment_policy.include_only`.  Depending on the Codex build, the `-c ...set...` overrides above may not survive that filter.  If `include_only` is set in the Codex config BotFleet's Codex engine uses, add `AGENT_SEAT`, `AGENT_LAUNCH_SEAT`, `AGENT_LAUNCHER`, `AGENT_SESSION` and `AGENT_SYNC_ATTACH` to it.  Whether `set` survives `include_only` has not been checked against a live Codex.
+A user's Codex config can narrow the environment of the model's shell commands with `shell_environment_policy.include_only`.  Depending on the Codex build, the `-c ...set...` overrides above may not survive that filter.  If `include_only` is set in the Codex config BotFleet's Codex engine uses, add `AGENT_SEAT`, `AGENT_LAUNCH_SEAT`, `AGENT_LAUNCHER`, `AGENT_SESSION` and `SIMPLE_TOOLS_ATTACH` to it.  Whether `set` survives `include_only` has not been checked against a live Codex.
 
 ## Tests
 

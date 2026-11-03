@@ -39,6 +39,7 @@ const KNOWN_ENGINE_IDS = [
   "mcode",
   "muse",
   "kimi",
+  "zcode",
   "droid",
   "opencode",
   "qwen",

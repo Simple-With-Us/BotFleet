@@ -17,6 +17,7 @@ import { HermesAgentDriver } from "./acp/hermes.ts";
 import { MuseAgentDriver } from "./acp/muse.ts";
 import { OpenAICompatDriver } from "./openai-compat.ts";
 import { PiDriver } from "./pi.ts";
+import { ZcodeDriver } from "./zcode.ts";
 import { MinimaxDriver } from "./minimax.ts";
 import { CliWrapperDriver } from "./cli-wrapper.ts";
 
@@ -37,6 +38,7 @@ export const BUILT_IN_DRIVERS: readonly AnyProviderDriver[] = [
   HermesAgentDriver,
   MuseAgentDriver,
   PiDriver,
+  ZcodeDriver,
   OpenAICompatDriver,
   ClaudeDriver,
   CodexDriver,

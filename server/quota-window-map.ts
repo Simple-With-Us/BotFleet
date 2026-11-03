@@ -64,6 +64,7 @@ export const QUOTA_PROVIDERS: ReadonlySet<string> = new Set([
   "minimax",
   "deepseek",
   "dsh",
+  "zcode",
 ]);
 
 /** Product and vendor spellings either app can emit, folded onto the
@@ -82,6 +83,11 @@ export const QUOTA_PROVIDER_ALIASES: Readonly<Record<string, string>> = {
   grok: "xai",
   "grok-build": "xai",
   "minimax-code": "minimax",
+  "z.ai": "zcode",
+  "z-ai": "zcode",
+  zai: "zcode",
+  glm: "zcode",
+  "glm-coding": "zcode",
 };
 
 /** Providers a collector somewhere in the fleet reads but BotFleet has no
@@ -133,6 +139,7 @@ const DRIVER_KIND_PROVIDERS: Readonly<Record<string, string>> = {
   deepseek: "deepseek",
   deepseekAgent: "deepseek",
   dshAgent: "dsh",
+  zcodeAgent: "zcode",
 };
 
 export function quotaProviderForDriver(driverKind: string): string | null {
@@ -203,6 +210,10 @@ export function driverKindsForWindow(window: QuotaWindowMatch): string[] {
   // raw Usage Monitor windows table this PR removed was the only place a
   // Kimi window stayed visible without this mapping.
   if (hay.includes("kimi") || hay.includes("moonshot")) return ["kimiAgent"];
+  // ZCode windows arrive from CodeCaps under providerKey "zcode"; telemetry
+  // (inferProviderAndService) reports the engine under provider "zcode" too,
+  // and a window labeled with the vendor ("z.ai" / "GLM") is the same plan.
+  if (hay.includes("zcode") || hay.includes("z.ai") || hay.includes("glm")) return ["zcodeAgent"];
   if (hay.includes("dsh")) return ["dshAgent"];
   if (hay.includes("deepseek")) return ["deepseekAgent", "deepseek"];
   // Factory is droid's real commercial product/subscription (droid.ts:

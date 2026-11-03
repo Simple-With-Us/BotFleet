@@ -54,7 +54,7 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
   assert.equal(isIosPath("server/index.ts"), false);
 
   for (const path of ["electron/main.mjs", "electron-builder.yml", "third_party/cloudflared/README.md",
-    "scripts/prepare-cloudflared.mjs", "scripts/prepare-cua-linux.mjs", "package.json", "pnpm-lock.yaml"]) {
+    "native/helpers/speech-helper.swift", "scripts/prepare-cloudflared.mjs", "scripts/prepare-cua-linux.mjs", "package.json", "pnpm-lock.yaml"]) {
     assert.equal(isPackagingPath(path), true, path);
   }
   assert.equal(isPackagingPath(".github/workflows/ci.yml"), false);

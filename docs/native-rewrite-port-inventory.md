@@ -26,7 +26,8 @@ Owner modules: `DatabaseService` (BF-2480), `ImportTool` (BF-2495),
 `EngineCoordinator` (BF-2504), `ACPActor` (BF-2505),
 `InfisicalResolver` (BF-2506), remaining drivers (BF-2507), native runners
 (BF-2482), per-bot switch (BF-2508), `CUAEngine` (BF-2509), `ZulipEventActor` +
-Linear sync (BF-2512), `RoutinesScheduler` (BF-2513), iOS endpoint decision
+Linear sync (BF-2512), `LinqEventActor` (BF-2617), `RoutinesScheduler` (BF-2513),
+iOS endpoint decision
 (BF-2510) and build (BF-2511), `MenuBarExtra` (BF-2484), `VoiceService`
 (BF-2483), `ScreenCaptureService` (BF-2481), `LifecycleService` (BF-2497),
 `TextKitTranscript` (BF-2501), `UpdateService`/Sparkle (BF-2486), daily-driver
@@ -79,6 +80,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | Node file(s) | Swift owner |
 |---|---|
 | `server/infisical.ts`, `infisical-client.ts`, `secret-map.ts` | `InfisicalResolver` BF-2506 |
+| `server/cli-logins.ts` | Seat-scoped CLI login read for one launched child (the fleet project's `/cli-logins/<SEAT>` folder) → `InfisicalResolver` BF-2506 for the vault read, with the launch identity's seat carried by `EngineDriver` BF-2504; the optional Linux server retains the read under the Linux preservation gate. |
 | `server/knob-map.ts`, `knob-write-through.ts`, `config.ts`, `config-reload-keys.ts`, `server/feature-flags.ts` + `feature-flags.json` | `InfisicalResolver` + app settings BF-2506; flags migrate to native settings store |
 | `server/peer-approval-key.ts`, `permission-allow-key.ts`, `provider-tool-allow.ts`, `peer-approval.ts`, `server/tools/approvals.ts`, `server/auto-approve.ts`, `command-guard.ts`, `path-containment.ts`, `tool-policy.ts`, `review-watch.ts`, `auto-review.ts` | Approval/permission policy → `EngineDriver` turn lane BF-2504 (policy tables port as data) |
 | `server/env-path.ts` | GUI-launch PATH augmentation → app startup BF-2497 (Finder-launch env) |
@@ -106,11 +108,11 @@ cutover (BF-2498), signing/TCC (BF-2499).
 
 | Node file(s) | Swift owner |
 |---|---|
-| `server/zulip/*` (23 files: client, hub, router, outbound, webhook, wire, credentials, format, mount, state, sentence-gap, outgoing-spool, types and their siblings) + `server/tools/zulip.ts`, `server/plugin-zulip-dispatch.ts` | `ZulipEventActor` + Linear sync BF-2512 |
+| `server/zulip/*` (23 files: client, hub, router, outbound, webhook, wire, credentials, format, mount, state, sentence-gap, outgoing-spool, types and their siblings) + `server/tools/zulip.ts` | `ZulipEventActor` + Linear sync BF-2512 |
 | `server/webhooks.ts`, `webhook-ingress.ts`, `webhook-payload.ts`, `server/routes/linq-webhook.ts` | Webhook ingress → `RoutinesScheduler` BF-2513 |
 | `server/request-log.ts`, `server/routes/github-request-log.ts`, `scripts/github-request-log-{runner,reconcile}.mjs` + their `.test.ts`/`.node-test.mjs` twins, `docs/operations/github-request-log.md` | GitHub request log: metadata-only Markdown consumer of webhook attempts (durable spool, HMAC GitHub route mirroring the Linq route, GET-only reconciler; ops tooling prepared, not installed) → `RoutinesScheduler` BF-2513 |
 | `server/routines.ts` (engine), `routine-requests.ts`, `resource-triggers.ts`, `trigger-gap.ts`, `automation-rollover.ts`, `ephemeral-dispatch.ts`, `room-queue.ts`, `room-turn-timeout.ts`, `room-cwd.ts`, `steer-queue.ts`, `member-turn.ts`, `delegations.ts`, `server/runtime/{runtime,envelope,level,tree,invariants,types}.ts`, `server/jobs/{admission,engine-fixtures,engine-lanes,mcp-lane,prompt,runner,sweep,wake,wake-usage}.ts`, `server/job-host.ts`, `server/update-turn-starter.ts`, `server/update-drain.ts`, `server/task-title.ts` | Scheduler + delegation runtime → `RoutinesScheduler` BF-2513; `update-drain` admission fence → cutover procedure BF-2514 |
-| `server/linq/{client,dispatch,outbound,types}.ts`, `server/routes/linq-webhook.ts`, `server/tools/linq.ts` | Linq partner channel → Phase 4* (no covering issue; file follow-up: third comms actor or fold into `ZulipEventActor` pattern) |
+| `server/linq/{client,dispatch,outbound,types}.ts`, `server/tools/linq.ts` | `LinqEventActor` BF-2617 — the iMessage partner channel (`imessagePerBot: "linq"`), beside `ZulipEventActor` BF-2512:  REST client, webhook-push ingress, turn-scoped chat binding, `send_voice_message` tool;  credential via `InfisicalResolver` BF-2506, TTS via `VoiceService` BF-2483.  `server/routes/linq-webhook.ts` stays with the webhook-ingress row (BF-2513). |
 | `server/notify.ts`, `server/sentry-crons.ts`, `server/comms-visibility.ts`, `server/chat-commands.ts`, `command-registry.ts` | Notifications + commands → Phase 4 (BF-2513 scheduler surfaces; command registry → native composer) |
 | `server/sse-broadcast.ts`, `server/serialized-preview.ts` | SSE fan-out → in-process observation (no socket) Phase 4; backpressure tests become unit tests |
 
@@ -175,7 +177,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 - Electron main + helpers + speech/recorder helpers — BF-2485, native shell BF-2479 replaces.
 - Node updater + `update-botfleet*` scripts + feed tooling — BF-2486 Sparkle replaces.
 - LaunchAgent plists + start scripts + healthcheck + watchdog test — BF-2514 retires supervision into the app login item.
-- MCP SSE bridge + seat tokens, `e2e-server`, smoke/bundle scripts, vite dev proxy — dev-only, Phase 6.
+- MCP SSE bridge + seat tokens, `e2e-server`, smoke/bundle scripts, vite dev proxy — Phase 6.  The bridge's runtime surfaces retire with it:  the pm2 application `botfleet-mcp`, the `:8794` listener with its health endpoint, and the public route `botfleetadmin.jays.services` that forwards to it.  Its supervisors retire with it:  BotFleet Control's `McpServerControl`, `FleetServices` and `ProcessMonitor`, the Mac's `mac-process-watch` entry for the application, the tunnel ingress rule that forwards the route, and the register rows.  The route had a third-party iOS client and already answers `502`, and the native MCP surface is a per-turn loopback mount that is never advertised, so nothing in this rewrite replaces that route.
 - VPS/BYO computer paths (`vps-*.ts`, `remote-computer.ts`) — no Mac story in Option A.
 - Android USB phone proxy — no Mac story in Option A.
 - `server/testing/*` fakes — superseded by `ReplayHarness` fixtures BF-2503.

@@ -55,6 +55,8 @@ export const ENGINE_FIXTURES: readonly EngineFixture[] = [
   },
   { displayName: "DSH", driverKind: "dshAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Kimi", driverKind: "kimiAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
+  // ZCode's driver spawns the CLI headless and declares no host MCP wiring.
+  { displayName: "ZCode", driverKind: "zcodeAgent", capabilities: {} },
   { displayName: "Droid", driverKind: "droidAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Cursor", driverKind: "cursorAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "OpenCode", driverKind: "opencodeGo", capabilities: { computerMcp: true, localComputerMcp: true } },

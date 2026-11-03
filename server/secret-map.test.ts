@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV, type AppConfig } from "./config.ts";
 import {
+  CLI_LOGIN_ENV_NAMES,
   INFISICAL_NAME_PATTERN,
   SECRET_FIELDS,
   credentialFingerprint,
@@ -310,4 +311,30 @@ it("hydrates the request-log secret from the managed vault without exposing its 
   expect(rows.find((row) => row.id === "githubRequestLog.webhookSecret")).toMatchObject({ source: "infisical", hasValue: true });
   expect(JSON.stringify(rows)).not.toContain(SENTINEL_VAULT);
   expect(WORKSPACE_CREDENTIAL_ENV).toContain("GITHUB_REQUEST_LOG_WEBHOOK_SECRET");
+});
+
+describe("the CLI logins", () => {
+  it("claims no config field, so a CLI login never becomes a config value", () => {
+    // Every name a CLI login may use, and not only one of them:  a row that
+    // claimed any of the four would put one seat's login into the config of
+    // every bot.
+    for (const entry of SECRET_FIELDS) {
+      for (const name of CLI_LOGIN_ENV_NAMES) {
+        expect(entry.env).not.toContain(name);
+        expect(entry.infisicalName).not.toBe(name);
+      }
+    }
+  });
+
+  it("does not come through the config snapshot", () => {
+    // The snapshot is BotFleet's own project, and a CLI login lives in the
+    // fleet's project under a per-seat folder.  A row that happened to
+    // carry one of these names must not be applied here:  it would put one
+    // seat's login into the config of every bot.
+    setInfisicalSnapshot(new Map([["GH_TOKEN", SENTINEL_VAULT]]), ["GH_TOKEN"]);
+    expect(infisicalSnapshot()?.has("GH_TOKEN")).toBe(false);
+    const cfg: AppConfig = {};
+    resolveSecretFields(cfg, {}, infisicalSnapshot());
+    expect(JSON.stringify(cfg)).not.toContain(SENTINEL_VAULT);
+  });
 });

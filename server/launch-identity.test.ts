@@ -131,7 +131,7 @@ describe("launchEnvironment", () => {
   it("carries the launcher contract for a bot with a seat", () => {
     expect(launchEnvironment({ seat: "BF-PLUMBER", session: "abc-123" })).toEqual({
       AGENT_LAUNCHER: "botfleet",
-      AGENT_SYNC_ATTACH: "0",
+      SIMPLE_TOOLS_ATTACH: "0",
       AGENT_LAUNCH_SEAT: "BF-PLUMBER",
       AGENT_SEAT: "BF-PLUMBER",
       AGENT_SESSION: "abc-123",
@@ -141,10 +141,10 @@ describe("launchEnvironment", () => {
   it("carries the launcher and no seat for a bot with no role, and for no identity at all", () => {
     expect(launchEnvironment({ seat: null, session: "abc-123" })).toEqual({
       AGENT_LAUNCHER: "botfleet",
-      AGENT_SYNC_ATTACH: "0",
+      SIMPLE_TOOLS_ATTACH: "0",
       AGENT_SESSION: "abc-123",
     });
-    expect(launchEnvironment(undefined)).toEqual({ AGENT_LAUNCHER: "botfleet", AGENT_SYNC_ATTACH: "0" });
+    expect(launchEnvironment(undefined)).toEqual({ AGENT_LAUNCHER: "botfleet", SIMPLE_TOOLS_ATTACH: "0" });
   });
 
   it("never carries a Zulip variable: BF bots post natively", () => {
@@ -183,7 +183,7 @@ describe("applyLaunchIdentity", () => {
       OMB_ZULIP_REALM: "https://realm.example.invalid",
       UNDEFINED_ONE: undefined,
       AGENT_LAUNCHER: "botfleet",
-      AGENT_SYNC_ATTACH: "0",
+      SIMPLE_TOOLS_ATTACH: "0",
       AGENT_LAUNCH_SEAT: "BF-ORACLE",
       AGENT_SEAT: "BF-ORACLE",
       AGENT_SESSION: "thread-9",
@@ -243,7 +243,7 @@ describe("applyLaunchIdentity", () => {
   });
 
   it("recognizes the names it scrubs, in any case, and nothing else", () => {
-    for (const name of ["AGENT_SEAT", "agent_tag", "AGENT_SESSION", "AGENT_LAUNCH_SEAT", "AGENT_LAUNCHER", "AGENT_SYNC_HOME", "CLAUDE_CODE_SESSION_ID", "ZULIP_RC", "Zulip_Email", "ZULIP_API_KEY", "ZULIP_SITE"]) {
+    for (const name of ["AGENT_SEAT", "agent_tag", "AGENT_SESSION", "AGENT_LAUNCH_SEAT", "AGENT_LAUNCHER", "AGENT_SYNC_HOME", "SIMPLE_TOOLS_STATE_DIR", "CLAUDE_CODE_SESSION_ID", "ZULIP_RC", "Zulip_Email", "ZULIP_API_KEY", "ZULIP_SITE"]) {
       expect(isLaunchIdentityName(name), name).toBe(true);
     }
     for (const name of ["PATH", "HOME", "OMB_ZULIP", "OMB_ZULIP_DISABLE", "AGENT", "AGENTS_MD", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT"]) {
@@ -256,7 +256,7 @@ describe("codexShellPolicyArgs", () => {
   it("sets the launch variables in the policy Codex runs the model's shell under, values quoted", () => {
     expect(codexShellPolicyArgs({ seat: "BF-PLUMBER", session: "thread-1" })).toEqual([
       "-c", 'shell_environment_policy.set.AGENT_LAUNCHER="botfleet"',
-      "-c", 'shell_environment_policy.set.AGENT_SYNC_ATTACH="0"',
+      "-c", 'shell_environment_policy.set.SIMPLE_TOOLS_ATTACH="0"',
       "-c", 'shell_environment_policy.set.AGENT_LAUNCH_SEAT="BF-PLUMBER"',
       "-c", 'shell_environment_policy.set.AGENT_SEAT="BF-PLUMBER"',
       "-c", 'shell_environment_policy.set.AGENT_SESSION="thread-1"',
