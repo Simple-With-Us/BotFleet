@@ -122,8 +122,19 @@ if (isEntryModule()) {
       }
       return value;
     };
-    if (arg === "--version") version = take(arg);
-    else if (arg === "--build") build = take(arg);
+    if (arg === "--version") {
+      if (version !== "") {
+        console.error("duplicate --version");
+        process.exit(2);
+      }
+      version = take(arg);
+    } else if (arg === "--build") {
+      if (build !== "") {
+        console.error("duplicate --build");
+        process.exit(2);
+      }
+      build = take(arg);
+    }
     else {
       console.error(`unknown argument: ${arg}`);
       console.error(usage());

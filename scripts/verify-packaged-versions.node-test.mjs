@@ -171,6 +171,21 @@ test("the CLI passes a consistent set and refuses a stale one", (t) => {
   );
 });
 
+test("the CLI refuses a repeated version or build flag instead of last-wins", () => {
+  const script = fileURLToPath(new URL("./verify-packaged-versions.mjs", import.meta.url));
+  for (const flag of ["--version", "--build"]) {
+    assert.throws(
+      () =>
+        execFileSync(
+          process.execPath,
+          [script, "BotFleet.app", flag, "1.0.1", flag, "1.0.2"],
+          { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+        ),
+      new RegExp(`duplicate ${flag}`),
+    );
+  }
+});
+
 test("the CLI refuses a flag where a value belongs", () => {
   const script = fileURLToPath(new URL("./verify-packaged-versions.mjs", import.meta.url));
   assert.throws(
