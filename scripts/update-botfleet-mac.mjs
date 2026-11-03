@@ -920,6 +920,9 @@ export function classifyLocalHealth(body, port, listeners, owner) {
 async function probeHealth(port, { timeoutMs = 3_000, dataDirectory } = {}) {
   const result = await requestJson(`http://127.0.0.1:${port}/api/health`, { accept: [200], timeoutMs });
   if (result.kind !== "ok") return result;
+  if (result.body?.app !== "botfleet" || !Number.isSafeInteger(result.body?.pid) || result.body.pid <= 0) {
+    return { kind: "foreign" };
+  }
   const directory = dataDirectory ?? resolve(process.env.BOTFLEET_DATA_DIR || join(homedir(), ".botfleet"));
   const [listeners, state] = await Promise.all([localListenerPids(port), ownerRecordState(directory)]);
   return classifyLocalHealth(result.body, port, listeners, state.state === "live" ? state.owner : null);
@@ -4039,7 +4042,7 @@ export async function desktopStartupPreflight(receipt, { appPids, listeners, loc
   if (!receipt || !["local", "remote"].includes(receipt.mode) ||
       !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0 ||
       !Number.isSafeInteger(receipt.uiPort) || receipt.uiPort < 1 || receipt.uiPort > 65535 ||
-      appPids.length !== 1 || appPids[0] !== receipt.pid) {
+      !Array.isArray(appPids) || appPids.length !== 1 || appPids[0] !== receipt.pid) {
     return { safe: false, reason: "Installed desktop has not confirmed its exact running process" };
   }
   const uiListeners = await listeners(receipt.uiPort);

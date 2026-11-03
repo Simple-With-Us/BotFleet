@@ -65,8 +65,9 @@ test("remote desktop readiness requires its exact installed PID and kernel UI so
 });
 
 test("a remote GUI receipt cannot authorize a missing, different or ambiguous installed process", async () => {
-  for (const appPids of [[], [LOCAL_PID], [APP_PID, LOCAL_PID], [APP_PID, APP_PID]]) {
-    const deps = dependencies({ appPids });
+  for (const appPids of [undefined, null, 401, {}, [], [LOCAL_PID], [APP_PID, LOCAL_PID], [APP_PID, APP_PID]]) {
+    const deps = dependencies();
+    deps.appPids = appPids;
     assert.equal((await desktopStartupPreflight(RECEIPT, deps)).safe, false);
     assert.deepEqual(deps.calls, []);
   }
