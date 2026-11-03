@@ -29,7 +29,12 @@ test("isBotFleetNodeProcess identifies BotFleet Node command lines", () => {
   assert.equal(isBotFleetNodeProcess("launchd gui/501/app.botfleet.server"), true);
   assert.equal(isBotFleetNodeProcess("/Applications/BotFleet.app/Contents/MacOS/BotFleet Helper"), true);
 
-  // Unrelated processes must not be flagged
+  // Unrelated processes and native Swift macOS apps must not be flagged
+  assert.equal(
+    isBotFleetNodeProcess("/Users/jay/Applications/BotFleet Control.app/Contents/MacOS/BotFleetControl"),
+    false,
+  );
+  assert.equal(isBotFleetNodeProcess("/Applications/BotFleetMac.app/Contents/MacOS/BotFleetMac"), false);
   assert.equal(isBotFleetNodeProcess("node /usr/local/bin/vite dev"), false);
   assert.equal(isBotFleetNodeProcess("node /usr/local/bin/pnpm test"), false);
   assert.equal(isBotFleetNodeProcess("oxlint --fix"), false);

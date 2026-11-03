@@ -41,19 +41,30 @@ export const BOTFLEET_NODE_PATTERNS = [
   /com\.jay\.botfleet-server/i,
   /com\.jay\.botfleet-companion/i,
   /ELECTRON_RUN_AS_NODE=1/i,
-  /BotFleet(?:\.app|\s+Helper)?/i,
+  /(?:^|\/)BotFleet\.app(?:\/|$)/i,
+  /\bBotFleet Helper\b/i,
   /node.*(?:dist\/server|dist-companion)\/index/i,
 ];
 
 /**
  * Check if a command line represents a BotFleet-specific Node process.
- * Ignores unrelated Node processes like build tools, test runners, or developer shells.
+ * Ignores unrelated Node processes like build tools, test runners, or developer shells,
+ * and native macOS Swift binaries (BotFleet Control.app, BotFleetMac).
  */
 export function isBotFleetNodeProcess(cmdLine) {
   if (!cmdLine) return false;
   const str = String(cmdLine);
   // Ignore the check script itself or test runners executing it
   if (str.includes("check-post-reboot-node") || str.includes("decommission-gates")) {
+    return false;
+  }
+  // Ignore native macOS Swift applications
+  if (
+    str.includes("BotFleet Control.app") ||
+    str.includes("BotFleetControl") ||
+    str.includes("BotFleetMac.app") ||
+    str.includes("BotFleetMac")
+  ) {
     return false;
   }
   return BOTFLEET_NODE_PATTERNS.some((pattern) => pattern.test(str));
