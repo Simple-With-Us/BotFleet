@@ -1,6 +1,6 @@
 # Linux Server Source Retention Contract
 
-Source audit: `main` at `3f1f2ca25d07bbe6f02a7f1f600cb094123f7f1d`.  This records the source contract required by BF-2585, BF-2515 and BF-2544.  It does not establish live deployment or native parity.
+Source audit: `main` at `1cceee8b8d6e0c4ba7f2ca3edacf1573ffd92b2c`, re-audited Nov 3, 2026.  The original audit was `main` at `3f1f2ca25d07bbe6f02a7f1f600cb094123f7f1d`.  This records the source contract required by BF-2585, BF-2515 and BF-2544.  It does not establish live deployment or native parity.
 
 ## Scope
 
@@ -13,7 +13,7 @@ This note records the source files and build inputs visibly required by today's 
 - [deploy/linux-server/common.sh](../deploy/linux-server/common.sh#L15) defaults `BF_ROOT` to `/mnt/fleet-extra/apps/botfleet-server`, `BF_CODE` to `/mnt/fleet-extra/Code/BotFleet-server`, `BF_REPO` to the BotFleet repository, and `BF_REF` to `main` (lines 15–21).  The data/runtime root and source checkout are separate.
 - [deploy/linux-server/install.sh](../deploy/linux-server/install.sh#L138) fetches or clones `BF_CODE`, refuses a dirty checkout, and checks out `origin/$BF_REF` detached (lines 142–160).  It runs frozen `pnpm install` and `pnpm exec vite build` from that checkout (lines 162–169).
 - [deploy/linux-server/update.sh](../deploy/linux-server/update.sh#L45) repeats the clean-checkout check, fetches `origin`, checks out detached `origin/$BF_REF`, installs dependencies, runs Vite, and restarts both units (lines 45–61).  Updates and rollbacks therefore need the configured source repository and deployable refs to remain fetchable.
-- [deploy/linux-server/botfleet-server.service.in](../deploy/linux-server/botfleet-server.service.in#L21) sets `OMB_STATIC_DIR` to `@BF_CODE@/dist` and starts `@BF_CODE@/server/index.ts` with the private Node runtime (lines 21–25).  The generated UI's static directory is inside the source checkout; it is not a separate retained artifact today.
+- [deploy/linux-server/botfleet-server.service.in](../deploy/linux-server/botfleet-server.service.in#L28) sets `OMB_STATIC_DIR` to `@BF_CODE@/dist` (line 23) and runs `@BF_ROOT@/bin/start.sh` (line 28); that wrapper execs `@BF_CODE@/server/index.ts` at [deploy/linux-server/start.sh](../deploy/linux-server/start.sh#L95) with the private Node runtime.  The generated UI's static directory is inside the source checkout; it is not a separate retained artifact today.
 - [deploy/linux-server/README.md](../deploy/linux-server/README.md#L7) describes the harness and owner-gate services; the owner gate is separately launched from `deploy/linux-server/owner-gate.mjs` by its own service template.
 
 ## Minimum Visible Retention Boundary
