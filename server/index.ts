@@ -834,7 +834,7 @@ const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeas
   hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
 }) : new PlacementLeaseService({
   hostId, controller: placementAuthority.store.readScope().controller, store: placementAuthority.store,
-  payloads: process.platform === "win32" ? undefined : new PlacementPayloadSpool(DATA_DIR),
+  payloads: new PlacementPayloadSpool(DATA_DIR),
   queueWindowMs: () => jobSettings().queueWaitMinutes * 60_000,
 });
 const jobHostProbe = createHostProbe({

@@ -210,8 +210,9 @@ export class PlacementLeaseService {
       jobs: structuredClone(this.jobs), leases: structuredClone(this.leases),
       workers: structuredClone(this.workers), pendingStops: structuredClone(this.pendingStops),
     };
+    let result: T;
     try {
-      const result = this.store.transactionScope({ ...scope, active: true }, (state) => {
+      result = this.store.transactionScope({ ...scope, active: true }, (state) => {
         this.installState(state);
         this.inTransaction = true;
         // Orphans are reclaimed only before new payload publication, using
@@ -225,9 +226,6 @@ export class PlacementLeaseService {
         state.pendingStops = [...this.pendingStops].flatMap(([hostId, ids]) => [...ids].map((leaseId) => ({ hostId, leaseId })));
         return reply;
       });
-      // Raw payload removal follows irreversible terminal commit.
-      this.cleanupPayloads();
-      return result;
     } catch {
       this.current = before.current;
       this.reconcileState = before.reconcile;
@@ -237,6 +235,10 @@ export class PlacementLeaseService {
       restoreMap(this.pendingStops, before.pendingStops);
       throw new PlacementStoreError();
     } finally { this.inTransaction = false; }
+    // A post-commit cleanup failure must not roll memory back or report a failed write.
+    try { this.cleanupPayloads(); }
+    catch { /* The next mutation retries cleanup against committed metadata. */ }
+    return result;
   }
 
   controller(): ControllerEpoch {
