@@ -1326,8 +1326,19 @@ export function sweepTranscriptVolumeBudget(
         unlinkSync(temp.path);
         touch(thread.threadId, 1);
         remaining -= temp.size;
-      } catch {
-        result.failed += 1;
+      } catch (error) {
+        // SAFETY: read as a possible system error and nothing more — only the
+        // ENOENT string is acted on; anything else counts a failure.
+        if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+          // Already gone: phase 1's batch removed this temp before
+          // verification failed on the thread's logs.  The end state is what
+          // a reap would have produced, so credit it the same way instead of
+          // counting the retry as another failure.
+          touch(thread.threadId, 1);
+          remaining -= temp.size;
+        } else {
+          result.failed += 1;
+        }
       }
     }
   }

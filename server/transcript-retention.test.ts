@@ -1196,6 +1196,34 @@ describe("transcript data-volume budget", () => {
     );
   });
 
+  it("does not count an already-removed temp as a second failure", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    // Phase 1's batch removes the temp but cannot remove the log (a
+    // non-empty directory), so verification fails on the thread — and phase
+    // 2 must credit the temp's absence instead of failing on it again.
+    const impostor = join(nativeDir, "orphan.ndjson");
+    mkdirSync(impostor);
+    writeFileSync(join(impostor, "nested.txt"), "held\n");
+    age(impostor, STALE);
+    const temp = join(nativeDir, "orphan.ndjson.2147480000.123e4567-e89b-42d3-a456-426614174000.tmp");
+    writeFileSync(temp, "orphan\n");
+    age(temp, STALE);
+
+    const result = sweep({ eventsDir, nativeDir }, [], { budgetBytes: 1 });
+    expect(result.failed).toBe(1);
+    expect(result.ids).toBe(1);
+    expect(result.files).toBe(1);
+    expect(result.bytesReclaimed).toBe(Buffer.byteLength("orphan\n"));
+    expect(result.over).toBe(true);
+    expect(existsSync(impostor)).toBe(true);
+    expect(existsSync(temp)).toBe(false);
+    expect(describeVolumeSweep(result)).toBe(
+      `[retention] Reclaimed ${Buffer.byteLength("orphan\n")} bytes across 1 transcript log toward the data-volume budget.  ` +
+        `${result.bytesEnd - 1} bytes still over the data-volume budget.  1 transcript log could not be reclaimed.`,
+    );
+  });
+
   it("keeps a recent orphan even when over budget", () => {
     const eventsDir = tmp();
     const nativeDir = tmp();
