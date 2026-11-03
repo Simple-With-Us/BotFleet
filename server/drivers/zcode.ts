@@ -1,0 +1,532 @@
+// ZCode (z.ai's GLM Coding Plan agent) as a BotFleet engine: the `zcode`
+// CLI in its own documented headless mode, one process per turn.
+//
+// Headless contract (apps/zcode-cli/docs/usage/13-automation.md in
+// zai-org/ZCode): `zcode --prompt <text> --cwd <dir> --mode yolo
+// --disallowed-tools "AskUserQuestion EnterPlanMode ExitPlanMode"
+// --output-format stream-json --no-color` writes one JSON event per line and
+// closes with a `{type:"result", response, usage, sessionId, ...}` line.
+// Headless mode cannot answer the interactive ask tools, which is why the
+// recipe removes them; nothing here synthesizes an answer the model was
+// waiting for.
+//
+// Session continuity: the result line's sessionId is the resume handle the
+// harness persists as resumeCursor; the next turn passes `--resume <id>`.
+//
+// Billing: turns ride the GLM Coding Plan subscription behind the local
+// ZCode sign-in (~/.zcode/v2/credentials.json, written by the desktop app's
+// Connect flow), not an API key. Stray Z_AI/GLM/BIGMODEL key env vars are
+// stripped from the child so an inherited key cannot silently flip billing
+// off the subscription (the same rule kimi.ts applies to MOONSHOT/KIMI keys).
+//
+// Verified against zai-org/ZCode: packages/cli/src/prompt-command.ts (result
+// line shape, terminator semantics), packages/bootstrap/src/zcode-protocol/
+// session-mapper.ts (event types + model.streaming payload kinds), and
+// packages/shared/src/official-glm-model-id.ts (built-in model ids).
+
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
+import { stripWorkspaceCredentialEnv } from "../config.ts";
+import { augmentedPath } from "../env-path.ts";
+import { toolFields } from "../tool-fields.ts";
+import { describeResult } from "../../shared/tool-activity.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
+import { STDERR_EXCERPT_HEAD, STDERR_EXCERPT_TAIL, stderrExcerpt } from "../stderr-excerpt.ts";
+
+import { newEventId, newId } from "../contracts.ts";
+import type {
+  DriverCreateInput,
+  ModelCatalog,
+  ProviderDriver,
+  ProviderInstance,
+  ProviderSnapshot,
+  RuntimeEvent,
+  RuntimeEventListener,
+  SendTurnInput,
+} from "../contracts.ts";
+import { appendNative } from "./native.ts";
+
+const DRIVER_KIND = "zcodeAgent";
+const PROVIDER_LABEL = "ZCode";
+
+/** ZCode's built-in Coding Plan models (packages/shared/src/
+ *  official-glm-model-id.ts; the docs name GLM-5.3 and GLM-5.3-Flash as the
+ *  built-ins). Ids are passed to `--model` verbatim. */
+const ZCODE_MODELS: ModelCatalog = {
+  default: "GLM-5.3",
+  options: [
+    { id: "GLM-5.3", label: "GLM-5.3" },
+    { id: "GLM-5.3-Flash", label: "GLM-5.3 Flash" },
+  ],
+};
+
+/** Keys that would silently move a turn off the Coding Plan subscription and
+ *  onto metered API billing if inherited. */
+const ZCODE_CREDENTIAL_ENV = [
+  "Z_AI_API_KEY",
+  "ZAI_API_KEY",
+  "GLM_API_KEY",
+  "BIGMODEL_API_KEY",
+  "ZHIPUAI_API_KEY",
+  "ZHIPU_API_KEY",
+];
+
+interface ZcodeConfig {
+  cli: string;
+}
+
+function decodeConfig(raw: unknown): ZcodeConfig {
+  if (raw === null || raw === undefined) return { cli: "zcode" };
+  if (typeof raw !== "object") throw new Error("zcode config must be an object");
+  const obj = raw as { cli?: unknown };
+  if (obj.cli !== undefined && typeof obj.cli !== "string") throw new Error("zcode config `cli` must be a string");
+  return { cli: obj.cli && obj.cli.trim() ? obj.cli.trim() : "zcode" };
+}
+
+function zcodeEnvironment(source: Record<string, string | undefined>): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...source, PATH: augmentedPath() };
+  stripWorkspaceCredentialEnv(env);
+  for (const key of ZCODE_CREDENTIAL_ENV) delete env[key];
+  return env;
+}
+
+function zcodeCredentialsPath(env: Record<string, string | undefined>): string {
+  const base = env.ZCODE_DATA_BASE_DIR || env.HOME || env.USERPROFILE || "";
+  return join(base, ".zcode", "v2", "credentials.json");
+}
+
+function zcodeAuthenticated(env: Record<string, string | undefined>): boolean {
+  return existsSync(zcodeCredentialsPath(env));
+}
+
+/** The stream-json line shapes this driver reads (prompt-command.ts +
+ *  session-mapper.ts). Everything else passes through untouched. */
+interface ZcodeStreamLine {
+  type?: string;
+  sessionId?: string;
+  turnId?: string;
+  payload?: {
+    kind?: string;
+    delta?: string;
+    toolCallId?: string;
+    callId?: string;
+    id?: string;
+    toolName?: string;
+    name?: string;
+    input?: unknown;
+    args?: unknown;
+    arguments?: unknown;
+    output?: unknown;
+    result?: unknown;
+    error?: unknown;
+    message?: string;
+  };
+  // result line (the stream terminator)
+  response?: string;
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    reasoningTokens?: number;
+  };
+}
+
+export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
+  driverKind: DRIVER_KIND,
+  metadata: {
+    displayName: PROVIDER_LABEL,
+    supportsMultipleInstances: true,
+    access: "custom",
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: false, computerMcp: false, composioMcp: false, localComputerMcp: false, images: false },
+  },
+  install: {
+    // The `zcode` command ships with the desktop app (its "CLI distribution");
+    // there is no official standalone installer one-liner.
+    docsUrl: "https://zcode.z.ai/en/docs/install",
+  },
+  models: ZCODE_MODELS,
+  decodeConfig,
+  defaultConfig: () => decodeConfig({}),
+
+  async create(input: DriverCreateInput<ZcodeConfig>): Promise<ProviderInstance> {
+    const { instanceId, config } = input;
+    const listeners = new Set<RuntimeEventListener>();
+    // one active turn per thread
+    const active = new Map<string, { stop: () => void; turnId: string }>();
+
+    const emit = (event: RuntimeEvent) => {
+      for (const l of [...listeners]) l(event);
+    };
+    const base = (threadId: string, turnId: string) => ({
+      eventId: newEventId(),
+      provider: DRIVER_KIND,
+      providerInstanceId: instanceId,
+      threadId,
+      turnId,
+      createdAt: new Date().toISOString(),
+    });
+
+    const sendTurn = async (turn: SendTurnInput) => {
+      const { threadId } = turn;
+      if (active.has(threadId)) throw new Error("a turn is already running on this thread");
+      const turnId = newId();
+      let settled = false;
+
+      const message = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
+      const args = [
+        "--prompt", message,
+        "--output-format", "stream-json",
+        "--no-color",
+        // The vendor's headless recipe: unattended runs cannot answer the
+        // interactive ask tools, so they are taken away rather than faked.
+        "--mode", "yolo",
+        "--disallowed-tools", "AskUserQuestion EnterPlanMode ExitPlanMode",
+      ];
+      if (typeof turn.model === "string" && turn.model) args.push("--model", turn.model);
+      const resumeCursor = typeof turn.resumeCursor === "string" && turn.resumeCursor ? turn.resumeCursor : null;
+      if (resumeCursor) args.push("--resume", resumeCursor);
+
+      const child = spawnCli(config.cli, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        cwd: turn.cwd,
+        env: zcodeEnvironment({ ...process.env, ...input.environment }),
+      });
+
+      let buf = "";
+      let assistantText = "";
+      let sessionId: string | null = null;
+      let sawResult = false;
+      // Bounded stderr head + tail: an undrained stderr pipe would block the
+      // child on its own write and hang the turn (pi.ts's lesson).
+      let stderrHead = "";
+      let stderrTail = "";
+      let stderrTotal = 0;
+      child.stderr?.setEncoding("utf8");
+      child.stderr?.on("data", (chunk: string) => {
+        stderrTotal += chunk.length;
+        if (stderrHead.length < STDERR_EXCERPT_HEAD) {
+          const room = STDERR_EXCERPT_HEAD - stderrHead.length;
+          stderrHead += chunk.slice(0, room);
+          chunk = chunk.slice(room);
+        }
+        if (chunk) stderrTail = (stderrTail + chunk).slice(-STDERR_EXCERPT_TAIL);
+      });
+      const stderrSummary = () =>
+        stderrTotal <= stderrHead.length + stderrTail.length
+          ? stderrExcerpt(stderrHead + stderrTail)
+          : stderrExcerpt(`${stderrHead}\n${stderrTail}`);
+
+      const flushAssistantText = () => {
+        const text = assistantText;
+        assistantText = "";
+        if (!text.trim()) return;
+        emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text });
+      };
+
+      const settle = (
+        ok: boolean,
+        stopReason?: string | null,
+        usage?: ZcodeStreamLine["usage"],
+      ) => {
+        if (settled) return;
+        settled = true;
+        flushAssistantText();
+        // ModelUsage semantics (packages/contracts ModelUsage): cache reads
+        // and writes are folded into the input figure when no explicit
+        // inputTokens arrives, and cachedInput is reported as the subset.
+        const input = usage
+          ? usage.inputTokens ?? ((usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0))
+          : undefined;
+        emit({
+          ...base(threadId, turnId),
+          type: "turn.completed",
+          ok,
+          stopReason: stopReason ?? (ok ? "end_turn" : "failed"),
+          ...(usage && input !== undefined
+            ? {
+                usage: {
+                  input,
+                  output: usage.outputTokens ?? 0,
+                  ...(usage.cacheReadTokens ? { cachedInput: usage.cacheReadTokens } : {}),
+                  ...(usage.reasoningTokens ? { reasoning: usage.reasoningTokens } : {}),
+                },
+              }
+            : {}),
+        });
+        try {
+          killCliTree(child);
+        } catch {
+          /* already gone */
+        }
+        active.delete(threadId);
+      };
+
+      const fail = (stopReason: string, message: string) => {
+        if (settled) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message: message.slice(0, 2_000) });
+        settle(false, stopReason);
+      };
+
+      const stop = () => {
+        try {
+          killCliTree(child);
+        } catch {
+          /* ignore */
+        }
+        // A person stopped this turn: interrupted, not a success.
+        settle(false, "interrupted");
+      };
+      active.set(threadId, { stop, turnId });
+
+      const noteSession = (candidate: unknown) => {
+        if (sessionId || typeof candidate !== "string" || !candidate) return;
+        sessionId = candidate;
+        emit({ ...base(threadId, turnId), type: "session.started", sessionId, model: turn.model ?? null });
+      };
+
+      const toolItemId = (payload: NonNullable<ZcodeStreamLine["payload"]>) =>
+        String(payload.toolCallId ?? payload.callId ?? payload.id ?? newId());
+
+      const onLine = (line: ZcodeStreamLine) => {
+        appendNative(threadId, { dir: "in", source: "zcode.stream", msg: line });
+        noteSession(line.sessionId);
+        switch (line.type) {
+          case "model.streaming": {
+            const payload = line.payload;
+            if (!payload) return;
+            if (payload.kind === "text_delta" && typeof payload.delta === "string") {
+              assistantText += payload.delta;
+              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: payload.delta });
+            } else if (payload.kind === "reasoning_delta" && typeof payload.delta === "string") {
+              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "reasoning_text", delta: payload.delta });
+            }
+            // tool_input_* fragments are preview stream; the tool.updated
+            // lifecycle below owns the transcript rows.
+            return;
+          }
+          case "tool.updated": {
+            const payload = line.payload;
+            if (!payload) return;
+            if (payload.kind === "started" || payload.kind === "scheduled") {
+              flushAssistantText();
+              emit({
+                ...base(threadId, turnId),
+                type: "item.started",
+                itemType: "tool",
+                itemId: toolItemId(payload),
+                title: String(payload.toolName ?? payload.name ?? "tool").slice(0, 80),
+                ...toolFields(payload.toolName ?? payload.name, payload.input ?? payload.args ?? payload.arguments),
+                ...captureInput(payload.input ?? payload.args ?? payload.arguments),
+              });
+            } else if (payload.kind === "result" || payload.kind === "error") {
+              emit({
+                ...base(threadId, turnId),
+                type: "item.completed",
+                itemType: "tool",
+                itemId: toolItemId(payload),
+                ok: payload.kind === "result",
+                detail: describeResult(payload.output ?? payload.result ?? payload.error),
+                ...captureOutput(payload.output ?? payload.result ?? payload.error),
+              });
+            }
+            return;
+          }
+          case "turn.failed": {
+            const message =
+              line.payload && typeof line.payload.message === "string" && line.payload.message.trim()
+                ? line.payload.message
+                : "zcode turn failed";
+            fail("failed", message);
+            return;
+          }
+          case "result": {
+            // The terminator: nothing may follow it on the stream.
+            sawResult = true;
+            if (typeof line.response === "string" && line.response.trim() && !assistantText.trim()) {
+              // No streamed deltas (or they were flushed by tool rows): the
+              // final text still lands as one transcript item.
+              assistantText = line.response;
+            }
+            settle(true, "end_turn", line.usage);
+            return;
+          }
+          default:
+            return;
+        }
+      };
+
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        buf += chunk;
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (!line.trim()) continue;
+          try {
+            onLine(JSON.parse(line) as ZcodeStreamLine);
+          } catch {
+            /* skip non-JSON line */
+          }
+        }
+      });
+      child.on("error", (err) => {
+        const spawnFailure = describeSpawnFailure(err as NodeJS.ErrnoException, config.cli);
+        if (settled) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message: spawnFailure.message, setup: spawnFailure.setup });
+        settle(false);
+      });
+      child.on("close", (code, signal) => {
+        // A close without the result line is a failed turn, never a hang;
+        // "close" fires after stderr drained, so the excerpt is whole.
+        if (sawResult) {
+          settle(true);
+          return;
+        }
+        fail("exit_before_result", `zcode exited ${code ?? signal ?? "unexpectedly"} before its result line${stderrSummary() ? `: ${stderrSummary()}` : ""}`);
+      });
+
+      emit({ ...base(threadId, turnId), type: "turn.started" });
+      return { turnId };
+    };
+
+    // Last good `--version`, so one probe that runs out of time on a busy
+    // Mac does not flip a working zcode to "not installed".
+    const lastKnownVersion = new LastKnownAnswer<string>();
+    const snapshot = async (): Promise<ProviderSnapshot> => {
+      const versionOrder = lastKnownVersion.begin();
+      const startedAt = Date.now();
+      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
+        let child: ReturnType<typeof spawnCli>;
+        try {
+          child = spawnCli(config.cli, ["--version"], {
+            stdio: ["ignore", "pipe", "pipe"],
+            env: zcodeEnvironment({ ...process.env, ...input.environment }),
+          });
+        } catch (error) {
+          resolve({ version: null, error: error as Error });
+          return;
+        }
+        let out = "";
+        let done = false;
+        const finish = (value: { version: string | null; error: Error | null }) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
+        child.stdout?.setEncoding("utf8");
+        child.stdout?.on("data", (c: string) => (out += c));
+        child.stderr?.resume();
+        const timer = setTimeout(() => {
+          try {
+            killCliTree(child);
+          } catch {
+            /* ignore */
+          }
+          finish({
+            version: null,
+            error: Object.assign(new Error(`\`${config.cli}\` did not exit within 20000ms`), { timedOut: true }),
+          });
+        }, 20000);
+        timer.unref?.();
+        child.on("error", (error) => finish({ version: null, error }));
+        child.on("close", (code) =>
+          finish({
+            version: out.trim() || null,
+            error: out.trim() ? null : Object.assign(new Error(`exit ${code}`), { code }),
+          }),
+        );
+      });
+      let version = probed.version;
+      if (version) {
+        lastKnownVersion.record(version, versionOrder);
+      } else {
+        const elapsed = Date.now() - startedAt;
+        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+        const failure = classifyVersionProbeFailure(probed.error, config.cli, input.displayName || PROVIDER_LABEL, elapsed, 20000);
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
+          version = remembered;
+        } else {
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
+        }
+      }
+      // ZCode keeps its sign-in in its own data root and has no sign-in
+      // subcommand to probe, so read the file its Connect flow writes.
+      const authenticated = zcodeAuthenticated({ ...process.env, ...input.environment });
+      return {
+        state: "available",
+        version,
+        authenticated,
+        // Turns ride the GLM Coding Plan behind the local sign-in, so a
+        // reported cost is notional.
+        ...(authenticated ? { billing: "subscription" as const } : {}),
+      };
+    };
+
+    return {
+      instanceId,
+      driverKind: DRIVER_KIND,
+      displayName: input.displayName,
+      enabled: input.enabled,
+      get models() {
+        return ZCODE_MODELS;
+      },
+      refreshModels: async () => {},
+      snapshot,
+      adapter: {
+        provider: DRIVER_KIND,
+        capabilities: {
+          // Model is a per-turn --model flag; a resumed session takes the
+          // next turn's value, matching the other spawn-per-turn CLIs.
+          sessionModelSwitch: "in-session",
+          agentsMcp: false,
+          computerMcp: false,
+          composioMcp: false,
+          phoneMcp: false,
+          qdrantMcp: false,
+          localComputerMcp: false,
+          images: false,
+          // The headless recipe runs yolo with the ask tools removed: steps
+          // stream as tool.updated rows review can watch, but the engine
+          // never pauses to ask.
+          reviewHook: "after",
+          backgroundJobs: "none",
+          helpers: "none",
+        },
+        sendTurn,
+        interruptTurn: async (threadId) => active.get(threadId)?.stop(),
+        // Headless zcode never opens an ask (the interactive tools are
+        // disallowed), so there is nobody to take an answer.
+        respondToRequest: async () => "unavailable",
+        hasSession: (threadId) => active.has(threadId),
+        stopAll: async () => {
+          for (const { stop } of active.values()) stop();
+        },
+        onEvent: (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      },
+      dispose: async () => {
+        for (const { stop } of active.values()) stop();
+        listeners.clear();
+      },
+    };
+  },
+};

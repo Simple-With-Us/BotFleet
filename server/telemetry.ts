@@ -241,6 +241,9 @@ const PROVIDER_BY_ENGINE = new Map<string, string>(Object.entries({
   dsh: "dsh",
   kimi: "moonshot",
   moonshot: "moonshot",
+  zcode: "zcode",
+  zai: "zcode",
+  glm: "zcode",
   cursor: "cursor",
   minimax: "minimax",
   mcode: "minimax",
@@ -314,6 +317,9 @@ export function inferProviderAndService(
   }
   if (inst.includes("kimi") || model.includes("moonshot")) {
     return { provider: "moonshot", service: modelId || "unknown" };
+  }
+  if (inst.includes("zcode") || model.includes("glm")) {
+    return { provider: "zcode", service: modelId || "unknown" };
   }
 
   // Still nothing: an OpenAI-compatible instance reports itself honestly

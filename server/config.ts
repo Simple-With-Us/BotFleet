@@ -2742,6 +2742,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   };
   const CUSTOM_ONLY = {
     kimi: { driver: "kimiAgent" },
+    zcode: { driver: "zcodeAgent" },
     qwen: { driver: "qwenAgent" },
     hermes: { driver: "hermesAgent" },
     pi: { driver: "piAgent" },
