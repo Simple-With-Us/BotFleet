@@ -31,7 +31,7 @@ export const MAC_LOCAL_ROOTS = ["server", "companion", "electron"];
 // Note: deploy/linux-server/ is retained for Linux hosting and is outside MAC_LOCAL_ROOTS.
 export const RETAINED_EXCEPTIONS = [];
 
-export const BOTFLEET_NODE_PATTERNS = [
+export const EXPLICIT_LEGACY_NODE_PATTERNS = [
   /app\.botfleet\.server/i,
   /botfleet-server-start\.sh/i,
   /server\/(?:index|local-vm-offline-cli)\.(?:ts|js|mjs)/i,
@@ -41,9 +41,13 @@ export const BOTFLEET_NODE_PATTERNS = [
   /com\.jay\.botfleet-server/i,
   /com\.jay\.botfleet-companion/i,
   /ELECTRON_RUN_AS_NODE=1/i,
-  /(?:^|\/)BotFleet\.app(?:\/|$)/i,
-  /\bBotFleet Helper\b/i,
   /node.*(?:dist\/server|dist-companion)\/index/i,
+];
+
+export const BOTFLEET_NODE_PATTERNS = [
+  ...EXPLICIT_LEGACY_NODE_PATTERNS,
+  /(?:^|\/)BotFleet\.app\b/i,
+  /\bBotFleet Helper\b/i,
 ];
 
 /**
@@ -58,12 +62,17 @@ export function isBotFleetNodeProcess(cmdLine) {
   if (str.includes("check-post-reboot-node") || str.includes("decommission-gates")) {
     return false;
   }
-  // Ignore native macOS Swift applications
+  // If an explicit legacy Node indicator is present, flag it immediately
+  if (EXPLICIT_LEGACY_NODE_PATTERNS.some((pattern) => pattern.test(str))) {
+    return true;
+  }
+  // Ignore native macOS Swift applications (case-folded per Rule 30)
+  const lower = str.toLowerCase();
   if (
-    str.includes("BotFleet Control.app") ||
-    str.includes("BotFleetControl") ||
-    str.includes("BotFleetMac.app") ||
-    str.includes("BotFleetMac")
+    lower.includes("botfleet control.app") ||
+    lower.includes("botfleetcontrol") ||
+    lower.includes("botfleetmac.app") ||
+    lower.includes("botfleetmac")
   ) {
     return false;
   }
