@@ -66,11 +66,19 @@ interface TestFile {
   source: string;
 }
 
+/** The remembered result of the scan, so the tree is walked once per
+ *  worker however many rules read the result. */
+let scannedFiles: TestFile[] | null = null;
+
 /** Every test file in the tree, read as text.  Walked by hand rather than
  *  with `import.meta.glob` so the scan has no build-time magic in it: a
  *  guard that depends on the bundler is a guard that silently scans
- *  nothing. */
+ *  nothing.
+ *
+ *  The walk is deferred to the first test that asks for it, so it never runs
+ *  while the worker is still collecting files. */
 function testFiles(): TestFile[] {
+  if (scannedFiles) return scannedFiles;
   const out: TestFile[] = [];
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir)) {
@@ -92,6 +100,7 @@ function testFiles(): TestFile[] {
     if (!existsSync(full)) continue;
     walk(full);
   }
+  scannedFiles = out;
   return out;
 }
 
@@ -432,7 +441,12 @@ function readsHostZone(file: TestFile): Violation[] {
 function calendarHelperReadsTheClock(file: TestFile): Violation[] {
   const violations: Violation[] = [];
   const source = file.source;
-  const needsPin: string[] = [];
+  // Comments and string bodies are blanked, so a fixture spelled out in a
+  // comment is not read as code.
+  const code = blankCommentsAndStrings(source);
+  // One finding per helper and per field, not one per call site: a helper
+  // called from three places is one thing to fix, not three.
+  const needsPin = new Set<string>();
 
   for (const [name, clockPosition] of CONTRACT.defaults) {
     const needle = `${name}(`;
@@ -456,14 +470,26 @@ function calendarHelperReadsTheClock(file: TestFile): Violation[] {
       }
       const field = CONTRACT.substituted.get(name);
       if (field) {
-        const unset = new RegExp(`\\b${escapeRegExp(field)}\\s*:\\s*(?:null|undefined)`);
-        if (unset.test(source)) needsPin.push(`${name}() while ${field} is left unset`);
+        // The call site's own arguments decide the case when they name the
+        // field: an explicit instant is not a live-clock read, and a call
+        // that pins the field is not a finding.  When the arguments do not
+        // name the field, the value can still arrive from a fixture built
+        // elsewhere in the file, so the file is what decides — and the
+        // finding names the file rather than blaming this call site.
+        const named = new RegExp(`\\b${escapeRegExp(field)}\\s*:`);
+        const unset = new RegExp(`\\b${escapeRegExp(field)}\\s*:\\s*(?:null|undefined)\\b`);
+        const site = args.join(",");
+        if (named.test(site)) {
+          if (unset.test(site)) needsPin.add(`${name}() while ${field} is left unset`);
+        } else if (unset.test(code)) {
+          needsPin.add(`${name}() while a fixture leaves ${field} unset`);
+        }
       }
-      if (CONTRACT.direct.has(name)) needsPin.push(`${name}() reads the clock itself`);
+      if (CONTRACT.direct.has(name)) needsPin.add(`${name}() reads the clock itself`);
     }
   }
 
-  if (needsPin.length > 0 && !pinsTheClock(source)) {
+  if (needsPin.size > 0 && !pinsTheClock(source)) {
     for (const detail of needsPin) {
       violations.push({
         path: file.path,
@@ -482,16 +508,15 @@ const RULES: Array<{ name: string; check: (file: TestFile) => Violation[] }> = [
 ];
 
 describe("wall-clock independence of the test tree", () => {
-  const files = testFiles();
-
   it("finds the test files to scan", () => {
+    const files = testFiles();
     expect(files.length).toBeGreaterThan(100);
     expect(files.some((file) => file.path.endsWith("src/lib/routine-calendar.test.ts"))).toBe(true);
   });
 
   for (const rule of RULES) {
     it(`has no test with ${rule.name}`, () => {
-      const violations = files.flatMap(rule.check);
+      const violations = testFiles().flatMap(rule.check);
       expect(violations.map((violation) => `${violation.path}: ${violation.detail}`)).toEqual([]);
     });
   }
