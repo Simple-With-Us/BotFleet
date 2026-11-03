@@ -4,10 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync, type ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { removeTempDir } from "../testing/cleanup.ts";
+import { removeTempDir, spawnDetached, waitForExit } from "../testing/cleanup.ts";
 import { PendingCommandSpool, PENDING_PAYLOAD_MAX_BYTES, type PendingIdentity } from "./pending-spool.ts";
 import { DEFAULT_JOBS_SETTINGS, JobRegistry, resolveJobsSettings, type JobRegistryDeps } from "./registry.ts";
 import type { JobSpawnSpec } from "./runner.ts";
+import type { JobProcess } from "./sweep.ts";
 
 const dirs: string[] = [];
 const registries: JobRegistry[] = [];
@@ -85,15 +86,39 @@ describe.skipIf(process.platform === "win32")("private pending-command recovery"
     expect(readdirSync(join(f.dir, "pending-commands"))).toEqual([]);
   });
 
-  it("never replays a crash at the claim/spawn boundary", async () => {
+  it.each([false, true])("never replays an abrupt process exit after claim (executor side effect=%s)", async (sideEffect) => {
     const f = fixture();
-    const first = f.registry({ spawn: () => { throw new Error("simulated process crash after claim"); } });
+    const first = f.registry();
     const job = f.start(first);
-    f.clear();
-    expect(() => first.drainQueue()).toThrow("simulated process crash");
+    first.dispose();
+    const moduleUrl = new URL("./registry.ts", import.meta.url).href;
+    const child = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `
+      import { writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      const { JobRegistry, DEFAULT_JOBS_SETTINGS } = await import(${JSON.stringify(moduleUrl)});
+      const root = process.argv[1];
+      const registry = new JobRegistry({
+        dir: join(root, "jobs"), dataDir: root,
+        settings: () => ({ ...DEFAULT_JOBS_SETTINGS }),
+        spendBlocked: () => false, broadcast: () => undefined,
+        probe: { swapUsedPercent: () => 0, freeDiskBytes: () => 100 * 1024 ** 3 },
+        now: () => ${job.startedAt + 1000}, listProcesses: async () => [],
+        spawn: (spec) => {
+          if (process.argv[2] === "side-effect") writeFileSync(join(root, "executed"), spec.env.BOTFLEET_JOB_ID);
+          process.exit(73);
+        },
+      });
+      await registry.adopt();
+      registry.drainQueue();
+      process.exit(74);
+    `, f.root, sideEffect ? "side-effect" : "before-effect"], { encoding: "utf8", timeout: 5000, env: { ...process.env, VITEST: "true" } });
+    expect(child.status, child.stderr || child.error?.message).toBe(73);
+    expect(existsSync(join(f.root, "executed"))).toBe(sideEffect);
+    if (sideEffect) expect(readFileSync(join(f.root, "executed"), "utf8")).toBe(job.id);
     expect(existsSync(f.path(job.id))).toBe(false);
     const second = f.registry();
     const result = await second.adopt();
+    f.clear();
     second.drainQueue();
     expect(result.lost).toBe(1);
     expect(second.get(job.id)?.status).toBe("lost");
@@ -122,12 +147,95 @@ describe.skipIf(process.platform === "win32")("private pending-command recovery"
     } });
     const job = f.start(first);
     f.clear();
-    expect(() => first.drainQueue()).toThrow("uncertain child");
+    expect(() => first.drainQueue()).not.toThrow();
+    expect(first.get(job.id)?.status).toBe("lost");
     const second = f.registry();
     await second.adopt();
     second.drainQueue();
     expect(f.commands).toHaveLength(1);
     expect(second.get(job.id)?.status).toBe("lost");
+  });
+
+  it("isolates queued launch throws and refusals from a new start and the next waiter", async () => {
+    const f = fixture();
+    const attempted: string[] = [];
+    const registry = f.registry({ spawn: (spec) => {
+      expect(existsSync(f.path(spec.env.BOTFLEET_JOB_ID!))).toBe(false);
+      attempted.push(spec.command);
+      if (spec.command === "uncertain") throw new Error("private executor detail");
+      if (spec.command === "refused") return { ok: false, error: "private refusal detail" };
+      // SAFETY: the registry uses only the fake child's EventEmitter.on exit/error surface.
+      return { ok: true, pid: 2_000_000_001, child: new EventEmitter() as ChildProcess };
+    } });
+    const uncertain = f.start(registry, "uncertain", "a", "a");
+    const refused = f.start(registry, "refused", "b", "b");
+    const next = f.start(registry, "next waiter", "c", "c");
+    f.clear();
+    const arrival = registry.start({ command: "new arrival", cwd: f.root, botId: "d", threadId: "d", onComplete: "notice" });
+    expect(arrival).toMatchObject({ ok: true, job: { status: "running" } });
+    expect(attempted).toEqual(["uncertain", "refused", "next waiter", "new arrival"]);
+    expect(registry.get(uncertain.id)).toMatchObject({ status: "lost", reason: "The queued background job launch could not be confirmed" });
+    expect(registry.get(refused.id)).toMatchObject({ status: "failed", reason: "The queued background job could not be started" });
+    expect(registry.get(next.id)?.status).toBe("running");
+    expect(readdirSync(join(f.dir, "pending-commands"))).toEqual([]);
+    expect(JSON.stringify(registry.list()) + f.logs.join("\n")).not.toContain("private executor detail");
+    expect(JSON.stringify(registry.list()) + f.logs.join("\n")).not.toContain("private refusal detail");
+    registry.dispose();
+    const recovered = f.registry();
+    await recovered.adopt();
+    recovered.drainQueue();
+    expect(f.commands).toEqual([]);
+    expect(recovered.get(uncertain.id)?.status).toBe("lost");
+    expect(recovered.get(refused.id)?.status).toBe("failed");
+  });
+
+  it("returns a structured refusal and retains an uncertain immediate launch without replay", async () => {
+    const f = fixture();
+    const registry = f.registry({ spawn: (spec) => {
+      f.commands.push(spec.command);
+      throw new Error("private executor detail");
+    } });
+    f.clear();
+    expect(registry.start({ command: "uncertain immediate", cwd: f.root, botId: "bot", threadId: "thread", onComplete: "notice" })).toEqual({ ok: false, error: "The background job launch could not be confirmed" });
+    const [job] = registry.list();
+    expect(job?.status).toBe("lost");
+    expect(JSON.stringify(job) + f.logs.join("\n")).not.toContain("private executor detail");
+    const recovered = f.registry();
+    await recovered.adopt();
+    recovered.drainQueue();
+    expect(f.commands).toEqual(["uncertain immediate"]);
+    expect(recovered.get(job!.id)?.status).toBe("lost");
+  });
+
+  it("sweeps the isolated child of an executor that throws after starting it", async () => {
+    const f = fixture();
+    let child: ChildProcess | undefined;
+    let listed: JobProcess[] = [];
+    const registry = f.registry({
+      graceMs: 10,
+      listProcesses: async () => listed,
+      spawn: (spec) => {
+        child = spawnDetached(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { cwd: f.root, env: spec.env, stdio: "ignore" });
+        if (!child.pid) throw new Error("fixture child did not start");
+        listed = [{ pid: child.pid, pgid: child.pid, jobId: spec.env.BOTFLEET_JOB_ID! }];
+        throw new Error("executor failed after starting its child");
+      },
+    });
+    const job = f.start(registry);
+    f.clear();
+    try {
+      registry.drainQueue();
+      if (!child) throw new Error("fixture executor was not invoked");
+      expect(registry.get(job.id)?.status).toBe("lost");
+      const exited = new Promise<void>((resolve) => child!.once("exit", () => resolve()));
+      expect(await registry.sweep()).toBe(1);
+      await exited;
+      expect(child.signalCode).toBe("SIGTERM");
+      registry.drainQueue();
+      expect(existsSync(f.path(job.id))).toBe(false);
+    } finally {
+      if (child) await waitForExit(child, { signal: "SIGKILL", graceMs: 100 });
+    }
   });
 
   it("keeps commands private and supports Stop before and after recovery", async () => {
@@ -150,6 +258,47 @@ describe.skipIf(process.platform === "win32")("private pending-command recovery"
     expect(existsSync(f.path(b.id))).toBe(false);
     f.clear(); second.drainQueue();
     expect(f.commands).toEqual([]);
+  });
+
+  it.each([false, true])("retries Stop safely after durable cleanup fails (recovered=%s)", async (recover) => {
+    const f = fixture();
+    const first = f.registry();
+    const job = f.start(first);
+    const registry = recover ? f.registry() : first;
+    if (recover) await registry.adopt();
+    const path = join(f.dir, "pending-commands");
+    chmodSync(path, 0o500);
+    try {
+      expect(await registry.kill(job.id, "owner")).toMatchObject({ ok: false, job: { status: "queued" }, error: expect.stringContaining("try Stop again") });
+      expect(existsSync(f.path(job.id))).toBe(true);
+      expect(f.commands).toEqual([]);
+    } finally { chmodSync(path, 0o700); }
+    expect(await registry.kill(job.id, "owner")).toMatchObject({ ok: true, job: { status: "killed" } });
+    expect(existsSync(f.path(job.id))).toBe(false);
+    f.clear();
+    registry.drainQueue();
+    expect(f.commands).toEqual([]);
+    const recovered = f.registry();
+    await recovered.adopt();
+    recovered.drainQueue();
+    expect(recovered.get(job.id)?.status).toBe("killed");
+    expect(f.commands).toEqual([]);
+  });
+
+  it("keeps a refused Stop's queued command eligible when durable storage recovers", async () => {
+    const f = fixture();
+    const registry = f.registry();
+    const job = f.start(registry, "still queued");
+    const path = join(f.dir, "pending-commands");
+    chmodSync(path, 0o500);
+    try { expect((await registry.kill(job.id, "owner")).ok).toBe(false); }
+    finally { chmodSync(path, 0o700); }
+    f.clear();
+    registry.drainQueue();
+    registry.drainQueue();
+    expect(registry.get(job.id)?.status).toBe("running");
+    expect(f.commands).toEqual(["still queued"]);
+    expect(existsSync(f.path(job.id))).toBe(false);
   });
 
   it("expires old payloads at boot and does not wait for a periodic tick to prevent launch", async () => {

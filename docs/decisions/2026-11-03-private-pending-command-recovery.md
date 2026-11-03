@@ -43,3 +43,17 @@ After isolating packaged smoke from host CLI discovery with a private shadow ins
 The remaining chain from `pnpm test:ios-ship` through the final HTML sentence-gap and iOS screenshot Node fixtures completed with exit 0: 444 tests passed, zero failed, zero skipped.  The credential-sync stage passed all four fixtures, including the refused-copy case.  The earlier 45-second and 60-second packaged-readiness failures remain preserved as failed runtime-readiness attempts; the bundle-check result does not explain or erase them.
 
 `pnpm lint` passed in the lane with 4,867 warnings, equal to the existing baseline of 4,867.
+
+## Review Failure Recovery
+
+A refused Stop now retains the in-memory waiting command until private payload removal succeeds, so a temporary cleanup failure leaves the job findable and eligible after storage recovers.
+
+Retrying Stop removes the durable payload before settling the job, both before and after restart recovery.
+
+A throwing executor now settles its individual job as lost with a generic reason, retains ownership for the stray-process sweep, and never replays the consumed command.
+
+Explicit queued spawn refusals still settle as failed, and neither a refusal nor an uncertain launch prevents the next waiter or a new start request from receiving its result.
+
+Review verification passed 81 tests across the private spool, placement queue, and registry suites, plus the complete frontend and server typechecks and the unchanged lint baseline.
+
+The failure fixtures include cleanup refusal followed by retry or resumed scheduling, abrupt native-process exits after the durable claim both before and after a synthetic executor side effect, and an isolated actual child that the stray sweep terminates after its executor throws.

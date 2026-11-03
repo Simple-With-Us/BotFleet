@@ -723,8 +723,12 @@ export class JobRegistry {
   }
 
   private discardPending(record: JobRecord): boolean {
-    this.pending.delete(record.id);
-    try { this.spool?.remove(record.id); return this.spool !== null; }
+    try {
+      if (!this.spool) return false;
+      this.spool.remove(record.id);
+      this.pending.delete(record.id);
+      return true;
+    }
     catch { this.deps.log?.("[jobs] private pending command cleanup failed"); return false; }
   }
 
@@ -819,7 +823,15 @@ export class JobRegistry {
       return { ok: true, job: this.snapshot(record), note: note ? `${note}  ${queuedNote}` : queuedNote };
     }
     this.save();
-    const spawnError = this.launch(record, command, minutes, settings);
+    let spawnError: string | null;
+    try { spawnError = this.launch(record, command, minutes, settings); }
+    catch {
+      // The executor may already have started a child: retain its record for
+      // the stray sweep, never retry its command, and never expose its error.
+      record.reason = "The background job launch could not be confirmed";
+      this.finish(record, "lost");
+      return { ok: false, error: record.reason };
+    }
     if (spawnError) {
       this.records.delete(id);
       this.removeFiles(record);
@@ -922,7 +934,15 @@ export class JobRegistry {
           this.finish(record, "lost");
           continue;
         }
-        const error = this.launch(record, command, pending.minutes, settings);
+        let error: string | null;
+        try { error = this.launch(record, command, pending.minutes, settings); }
+        catch {
+          // A thrown executor may have created a child before failing.
+          // The claim stays consumed and the record remains sweepable.
+          record.reason = "The queued background job launch could not be confirmed";
+          this.finish(record, "lost");
+          continue;
+        }
         if (error) {
           record.reason = "The queued background job could not be started";
           this.finish(record, "failed");
