@@ -9,6 +9,9 @@ const generatedPaths = [
   "native/helpers/speech-helper",
   "native/helpers/BotFleet Speech.app",
   "native/helpers/BotFleet Recorder.app",
+  "electron/resources/speech-helper",
+  "electron/resources/BotFleet Speech.app",
+  "electron/resources/BotFleet Recorder.app",
   "electron/resources/BotFleet Control.app",
 ];
 

@@ -49,6 +49,10 @@ files:
   - from: dist-shared
     to: shared
   - "!electron/**/*.test.*"
+  - "!electron/resources/speech-helper*"
+  - "!electron/resources/recorder-helper*"
+  - "!electron/resources/BotFleet Speech.app/**"
+  - "!electron/resources/BotFleet Recorder.app/**"
   - "!electron/resources/BotFleet Control.app/**"
   - "!**/node_modules/**"
   - package.json
