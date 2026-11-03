@@ -1322,6 +1322,19 @@ describe("explicit auth and scope isolation", () => {
 });
 
 describe("service token metadata gate", () => {
+  it.each(["//", "///", "/./", "/fleet/../", "/folder//", "/folder/./child", "/folder//child"])
+  ("rejects malformed stored primary folder %s before any network request", async (secretPath) => {
+    withSettings(infisicalSettings({ infisical: { authMethod: "service-token", projectId: "proj-1",
+      secretPath, token: SENTINEL_READ_TOKEN,
+    } }));
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ secrets: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await infisical.refresh("manual");
+    expect(result.lastError).toMatch(/literal folder/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(infisicalSnapshot()).toBeNull();
+  });
+
   interface ServiceTokenMetadataFixture {
     workspace: string;
     projectId: string;

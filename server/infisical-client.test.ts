@@ -16,6 +16,8 @@ describe("verifyServiceToken", () => {
   const options = { siteUrl: "https://app.infisical.example", token: SENTINEL_TOKEN,
     projectId: "proj-1", environment: "prod", secretPath: "/folder", mode: "read" as const };
   const metadata = { workspace: "proj-1", projectId: "proj-1", scopes: [{ environment: "prod", secretPath: "/folder/" }], permissions: ["read"], expiresAt: null };
+  const malformedFolders = ["//", "///", "/./", "/../", "/fleet/../", "/fleet/./vercel",
+    "/fleet//vercel", "/fleet/vercel//", "/fleet/.", "/fleet/.."];
 
   it("verifies flat metadata with exact project, role and normalized folder and returns only expiry", async () => {
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
@@ -62,8 +64,8 @@ describe("verifyServiceToken", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it.each(["*", "?", "[", "]", "{", "}"])("rejects matching wildcard request and grant %s before any secret access", async (character) => {
-    const secretPath = `/folder/${character}`;
+  it.each([...malformedFolders, ...["*", "?", "[", "]", "{", "}"].map((character) => `/folder/${character}`)])
+  ("rejects matching nonliteral request and grant %s before any secret access", async (secretPath) => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ...metadata,
       scopes: [{ environment: "prod", secretPath }],
     })));
@@ -79,12 +81,13 @@ describe("verifyServiceToken", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it.each(["*", "?", "[", "]", "{", "}"])("rejects wildcard metadata row %s even alongside a valid exact grant", async (character) => {
+  it.each([...malformedFolders, ...["*", "?", "[", "]", "{", "}"].map((character) => `/other/${character}`)])
+  ("rejects nonliteral metadata row %s even alongside a valid exact grant", async (secretPath) => {
     const calls: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
       calls.push(url);
       return new Response(JSON.stringify({ ...metadata,
-        scopes: [...metadata.scopes, { environment: "staging", secretPath: `/other/${character}` }],
+        scopes: [...metadata.scopes, { environment: "staging", secretPath }],
       }));
     }));
     const accessSecrets = async () => {
@@ -93,6 +96,15 @@ describe("verifyServiceToken", () => {
     };
     await expect(accessSecrets()).rejects.toMatchObject({ statusCode: 502 });
     expect(calls).toEqual(["https://app.infisical.example/api/v2/service-token"]);
+  });
+
+  it.each(["/", "/folder", "/folder/", "/folder/.hidden/v1..2", "/folder/%2e%2e"])
+  ("accepts canonical literal folder %s without decoding its segments", async (secretPath) => {
+    const grantedPath = secretPath.replace(/\/$/, "") || "/";
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...metadata,
+      scopes: [{ environment: "prod", secretPath: grantedPath }],
+    }))));
+    expect(await verifyServiceToken({ ...options, secretPath })).toEqual({ expiresAt: null });
   });
 
   it("accepts literal folders with spaces and ordinary punctuation", async () => {

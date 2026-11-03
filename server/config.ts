@@ -1356,12 +1356,12 @@ export interface InfisicalReadSource {
   secretPath?: string;
 }
 
-/** Strip one trailing slash (except root), so `/zulip/` and `/zulip`
+/** Strip a single trailing slash (except root), so `/zulip/` and `/zulip`
  * name the same folder everywhere paths are stored or compared. */
 export function normalizeInfisicalSecretPath(path: string): string {
   const trimmed = path.trim();
   if (!trimmed) return "/";
-  return trimmed.length > 1 && trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+  return trimmed.length > 1 && trimmed.endsWith("/") && !trimmed.endsWith("//") ? trimmed.slice(0, -1) : trimmed;
 }
 
 export interface ResolvedInfisicalReadSource {

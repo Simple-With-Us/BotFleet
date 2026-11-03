@@ -59,8 +59,14 @@ test("Vercel catch-up pauses without its binding and admits only the token path 
     { token: "", secretPath: "", available: false },
     { token: "fixture-not-a-real-token", secretPath: "", available: false },
     { token: "fixture-not-a-real-token", secretPath: "/", available: false },
+    ...["//", "///", "/./", "/../", "/fleet/../", "/fleet/./vercel", "/fleet//vercel", "/fleet/vercel//",
+      "/fleet/.", "/fleet/..", "fleet/vercel", "/fleet/*", "/fleet/?", "/fleet/[", "/fleet/]", "/fleet/{", "/fleet/}"]
+      .map((secretPath) => ({ token: "fixture-not-a-real-token", secretPath, available: false })),
     { token: "", secretPath: "/fleet/vercel", available: false },
     { token: "fixture-not-a-real-token", secretPath: "/fleet/vercel", available: true },
+    { token: "fixture-not-a-real-token", secretPath: "/fleet/vercel/", available: true },
+    { token: "fixture-not-a-real-token", secretPath: "/fleet/.vercel/v1..2", available: true },
+    { token: "fixture-not-a-real-token", secretPath: "/fleet/%2e%2e", available: true },
   ];
   for (const { token, secretPath, available } of cases) {
     const dir = mkdtempSync(join(tmpdir(), "vercel-binding-fixture-"));

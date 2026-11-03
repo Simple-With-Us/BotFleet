@@ -52,12 +52,15 @@ function validateInfisicalSiteUrl(siteUrl) {
  * secrets.  Keep this helper local so the hosted workflow stays dependency-free
  * and all network access remains injectable through `fetchImpl`. */
 /* oxlint-disable anti-slop/no-runtime-typeof -- These HTTP boundaries validate token and secret metadata without dependencies because CI runs before pnpm install. */
+function isLiteralFolder(path) {
+  return typeof path === "string" && path.startsWith("/") && !/[*?[\]{}]/.test(path) &&
+    !path.includes("//") && !path.split("/").some((segment) => segment === "." || segment === "..");
+}
+
 export async function verifyServiceTokenMetadata({
   siteUrl, token, projectId, environment, secretPath, mode, fetchImpl = fetch, timeoutMs = 30_000,
 }) {
   const baseUrl = validateInfisicalSiteUrl(siteUrl);
-  const isLiteralFolder = (path) =>
-    typeof path === "string" && path.startsWith("/") && !/[*?[\]{}]/.test(path);
   if (!isLiteralFolder(secretPath)) {
     throw new Error("Infisical service-token scope must use a literal folder.");
   }
@@ -178,8 +181,8 @@ export async function listSecretsRaw({
     // v3 requires workspace/environment/hidden, while secretPath is optional on list rows.
     if (secret.workspace !== projectId || secret.environment !== environment ||
         secret.secretValueHidden !== false || typeof secret.secretValue !== "string" ||
-        (secret.secretPath !== undefined && (typeof secret.secretPath !== "string" ||
-          !secret.secretPath.startsWith("/") || normalizeFolder(secret.secretPath) !== normalizeFolder(secretPath)))) {
+        (secret.secretPath !== undefined && (!isLiteralFolder(secret.secretPath) ||
+          normalizeFolder(secret.secretPath) !== normalizeFolder(secretPath)))) {
       log(`::warning::${secret.secretKey} has invalid or out-of-scope Infisical metadata; trying its existing GitHub secret fallback.`);
       continue;
     }

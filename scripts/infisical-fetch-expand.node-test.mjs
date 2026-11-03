@@ -181,6 +181,9 @@ test("wrong or missing required row provenance never exports a vault value", asy
     ["descendant folder", { secretPath: "/nested/child" }],
     ["malformed optional folder", { secretPath: null }],
     ["empty optional folder", { secretPath: "" }],
+    ["duplicate root separator", { secretPath: "///" }],
+    ["dot root alias", { secretPath: "/./" }],
+    ["parent root alias", { secretPath: "/fleet/../" }],
     ["hidden value", { secretValueHidden: true }],
     ["missing hidden flag", { secretValueHidden: undefined }],
     ["malformed hidden flag", { secretValueHidden: "false" }],
@@ -218,7 +221,7 @@ test("wrong or missing required row provenance never exports a vault value", asy
 });
 
 test("v3 optional folder provenance may be omitted or exactly match with trailing slashes", async (t) => {
-  for (const rowOverrides of [{}, { secretPath: "/" }, { secretPath: "///" }]) {
+  for (const rowOverrides of [{}, { secretPath: "/" }]) {
     await t.test(`folder ${rowOverrides.secretPath ?? "omitted"}`, async () => {
       const dir = mkdtempSync(join(tmpdir(), "bf-row-folder-"));
       try {

@@ -13,6 +13,8 @@ const SCRIPT = join(ROOT, "scripts", "infisical-fetch.mjs");
 
 const SENTINEL_PRESENT = "sentinel-value-in-vault-9f2c";
 const SENTINEL_FALLBACK = "sentinel-value-fallback-4b1e";
+const MALFORMED_FOLDERS = ["//", "///", "/./", "/../", "/fleet/../", "/fleet/./vercel",
+  "/fleet//vercel", "/fleet/vercel//", "/fleet/.", "/fleet/.."];
 // The shape a `base64 < cert.p12` actually has: wrapped at a column, so the
 // value the vault hands back is several lines long.  A single-line
 // `::add-mask::` registers only the first of them and prints the rest.
@@ -232,10 +234,9 @@ test("the injected fetch validates serialized exact read scope before secrets", 
   }
 });
 
-test("matching wildcard request and grant never reach the secret endpoint", async (t) => {
-  for (const character of ["*", "?", "[", "]", "{", "}"]) {
-    await t.test(character, async () => {
-      const secretPath = `/folder/${character}`;
+test("matching nonliteral request and grant never reach the secret endpoint", async (t) => {
+  for (const secretPath of [...MALFORMED_FOLDERS, ...["*", "?", "[", "]", "{", "}"].map((character) => `/folder/${character}`)]) {
+    await t.test(secretPath, async () => {
       const calls = [];
       await assert.rejects(listSecretsRaw({
         siteUrl: "https://infisical.example", token: "st.fixture-only", projectId: "proj",
@@ -253,8 +254,8 @@ test("matching wildcard request and grant never reach the secret endpoint", asyn
 });
 
 test("all metadata folders must be literal even when an exact literal grant is present", async (t) => {
-  for (const character of ["*", "?", "[", "]", "{", "}"]) {
-    await t.test(character, async () => {
+  for (const secretPath of [...MALFORMED_FOLDERS, ...["*", "?", "[", "]", "{", "}"].map((character) => `/other/${character}`)]) {
+    await t.test(secretPath, async () => {
       const calls = [];
       await assert.rejects(listSecretsRaw({
         siteUrl: "https://infisical.example", token: "st.fixture-only", projectId: "proj",
@@ -263,11 +264,37 @@ test("all metadata folders must be literal even when an exact literal grant is p
           calls.push(String(url));
           return new Response(JSON.stringify({ workspace: "proj", permissions: ["read"], expiresAt: null,
             scopes: [{ environment: "prod", secretPath: "/folder" },
-              { environment: "staging", secretPath: `/other/${character}` }],
+              { environment: "staging", secretPath }],
           }));
         },
       }), /metadata is invalid/);
       assert.deepEqual(calls, ["https://infisical.example/api/v2/service-token"]);
+    });
+  }
+});
+
+test("canonical root and non-root folder spellings remain compatible without path decoding", async (t) => {
+  for (const secretPath of ["/", "/folder", "/folder/", "/folder/.hidden/v1..2", "/folder/%2e%2e"]) {
+    await t.test(secretPath, async () => {
+      const grantedPath = secretPath.replace(/\/$/, "") || "/";
+      const calls = [];
+      const values = await listSecretsRaw({
+        siteUrl: "https://infisical.example", token: "st.fixture-only", projectId: "proj",
+        environment: "prod", secretPath,
+        fetchImpl: async (url) => {
+          calls.push(String(url));
+          if (String(url).includes("/api/v2/service-token")) {
+            return new Response(JSON.stringify({ workspace: "proj", permissions: ["read"], expiresAt: null,
+              scopes: [{ environment: "prod", secretPath: grantedPath }],
+            }));
+          }
+          return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT,
+            workspace: "proj", environment: "prod", secretPath: grantedPath, secretValueHidden: false }] }));
+        },
+      });
+      assert.equal(values.get("FOO"), SENTINEL_PRESENT);
+      assert.equal(calls.length, 2);
+      assert.equal(new URL(calls[1]).searchParams.get("secretPath"), secretPath);
     });
   }
 });

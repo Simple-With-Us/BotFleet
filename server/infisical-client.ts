@@ -19,7 +19,8 @@ import { z } from "zod";
 import { parseJson } from "./schema.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const serviceTokenFolderSchema = z.string().startsWith("/").refine((path) => !/[*?[\]{}]/.test(path));
+const serviceTokenFolderSchema = z.string().startsWith("/").refine((path) => !/[*?[\]{}]/.test(path) &&
+  !path.includes("//") && !path.split("/").some((segment) => segment === "." || segment === ".."));
 const vendorServiceTokenScopesSchema = z.array(z.looseObject({
   environment: z.string().min(1),
   secretPath: serviceTokenFolderSchema,

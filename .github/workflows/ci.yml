@@ -194,7 +194,7 @@ jobs:
     # This job is not a ruleset context.  It runs only when the classifier
     # says iOS work is in scope, and every step is the real build.
     runs-on: xcode-27
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
