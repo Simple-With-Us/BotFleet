@@ -834,4 +834,156 @@ public enum HostResourcesPresentation {
         }
         return host.origin.url.absoluteString
     }
+
+    // MARK: - Headroom editing (slice 7b)
+
+    /// Bounds mirroring `HEADROOM_BOUNDS` in `src/lib/host-resources.ts`.
+    /// Reserved RAM tops out at 1,000,000 MB (~1 TB): larger survives neither
+    /// the MB-to-bytes conversion nor any host, and the knob table carries no
+    /// max to clamp it.
+    public static let headroomBoundsCpu = (min: 0.0, max: 64.0, integer: true)
+    public static let headroomBoundsRamMb = (min: 0.0, max: 1_000_000.0, integer: true)
+    public static let headroomBoundsMemoryPercent = (min: 0.0, max: 100.0, integer: false)
+
+    /// Validates the three headroom boxes, mirroring `parseHeadroomEdit` in
+    /// `src/lib/host-resources.ts`: numbers for the non-empty boxes, per-field
+    /// messages otherwise, and a refusal when every box is empty (an all-empty
+    /// save is a no-op).  Number spelling is digits with at most one fraction
+    /// point — hex (`0x10`) and exponents (`1e3`) fail, exactly as in TS.
+    public static func parseHeadroomEdit(_ values: HeadroomEditValues) -> HeadroomEditOutcome {
+        var errors: [HeadroomFieldError] = []
+        var parsed = HeadroomParsedEdit()
+
+        func parseField(_ field: HeadroomEditField, _ raw: String, bounds: (min: Double, max: Double, integer: Bool)) {
+            let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return }
+            guard isPlainHeadroomNumber(text), let num = Double(text), num.isFinite else {
+                errors.append(HeadroomFieldError(field: field, message: "Enter a number."))
+                return
+            }
+            if bounds.integer, num.truncatingRemainder(dividingBy: 1) != 0 {
+                errors.append(HeadroomFieldError(field: field, message: "Enter a whole number."))
+                return
+            }
+            if num < bounds.min || num > bounds.max {
+                errors.append(HeadroomFieldError(field: field, message: "Enter \(formatNumericValue(bounds.min))–\(formatNumericValue(bounds.max))."))
+                return
+            }
+            switch field {
+            case .reservedCpuCores: parsed.reservedCpuCores = num
+            case .reservedRamMb: parsed.reservedRamMb = num
+            case .minMemoryAvailablePercent: parsed.minMemoryAvailablePercent = num
+            }
+        }
+
+        parseField(.reservedCpuCores, values.reservedCpuCores, bounds: headroomBoundsCpu)
+        parseField(.reservedRamMb, values.reservedRamMb, bounds: headroomBoundsRamMb)
+        parseField(.minMemoryAvailablePercent, values.minMemoryAvailablePercent, bounds: headroomBoundsMemoryPercent)
+
+        if !errors.isEmpty { return .invalid(errors) }
+        if parsed.reservedCpuCores == nil, parsed.reservedRamMb == nil, parsed.minMemoryAvailablePercent == nil {
+            return .invalid([HeadroomFieldError(field: .reservedCpuCores, message: "Enter at least one number to save.")])
+        }
+        return .valid(parsed)
+    }
+
+    private static func isPlainHeadroomNumber(_ text: String) -> Bool {
+        text.range(of: #"^-?\d+(\.\d+)?$"#, options: .regularExpression) != nil
+    }
+
+    /// Builds the admission object for the `PUT /api/config` patch from the
+    /// parsed headroom knobs over the current report, mirroring
+    /// `buildHeadroomPatch` in `src/lib/host-resources.ts` (the client wraps
+    /// it as `["jobs": ["admission": …]]`, exactly the TS wire shape).
+    /// Edited values win; an emptied box over a set knob sends `NSNull` so
+    /// the save unsets it; an emptied box over an already-unset knob is
+    /// omitted.  Everything else rides along so the server's shallow jobs
+    /// merge never erases an unrelated admission gate.
+    public static func headroomConfigPatch(for report: HostResourcesReport, parsed: HeadroomParsedEdit) -> [String: Any] {
+        var admission: [String: Any] = [
+            "maxSwapPercent": report.admission.maxSwapPercent,
+            "minFreeDiskMb": report.admission.minFreeDiskBytes / 1024.0 / 1024.0,
+        ]
+        if let inodes = report.admission.minFreeInodes {
+            admission["minFreeInodes"] = inodes
+        }
+        if let cpu = parsed.reservedCpuCores {
+            admission["reservedCpuCores"] = cpu
+        } else if report.admission.reservedCpuCores != nil {
+            admission["reservedCpuCores"] = NSNull()
+        }
+        let currentRamMb = report.admission.reservedRamBytes.map { ($0 / 1024.0 / 1024.0).rounded() }
+        if let ram = parsed.reservedRamMb {
+            admission["reservedRamMb"] = ram
+        } else if currentRamMb != nil {
+            admission["reservedRamMb"] = NSNull()
+        }
+        if let mem = parsed.minMemoryAvailablePercent {
+            admission["minMemoryAvailablePercent"] = mem
+        } else if report.admission.minMemoryAvailablePercent != nil {
+            admission["minMemoryAvailablePercent"] = NSNull()
+        }
+        return admission
+    }
+
+    /// Edit strings for a report: set knobs render as numbers, unset as
+    /// empty — mirrors `headroomEditInitial` in `src/lib/host-resources.ts`.
+    public static func headroomEditInitial(_ report: HostResourcesReport) -> HeadroomEditValues {
+        HeadroomEditValues(
+            reservedCpuCores: report.admission.reservedCpuCores.map(formatNumericValue) ?? "",
+            reservedRamMb: report.admission.reservedRamBytes.map { "\(Int(($0 / 1024.0 / 1024.0).rounded()))" } ?? "",
+            minMemoryAvailablePercent: report.admission.minMemoryAvailablePercent.map(formatNumericValue) ?? ""
+        )
+    }
+}
+
+/// Editable headroom inputs, as typed strings — mirrors `HeadroomEditValues`
+/// in `src/lib/host-resources.ts`.
+public struct HeadroomEditValues: Equatable, Sendable {
+    public var reservedCpuCores: String
+    public var reservedRamMb: String
+    public var minMemoryAvailablePercent: String
+
+    public init(reservedCpuCores: String = "", reservedRamMb: String = "", minMemoryAvailablePercent: String = "") {
+        self.reservedCpuCores = reservedCpuCores
+        self.reservedRamMb = reservedRamMb
+        self.minMemoryAvailablePercent = minMemoryAvailablePercent
+    }
+}
+
+/// One headroom box, for validation errors.
+public enum HeadroomEditField: String, Equatable, Sendable {
+    case reservedCpuCores
+    case reservedRamMb
+    case minMemoryAvailablePercent
+}
+
+/// One validation failure with the box it belongs to.
+public struct HeadroomFieldError: Equatable, Sendable {
+    public var field: HeadroomEditField
+    public var message: String
+
+    public init(field: HeadroomEditField, message: String) {
+        self.field = field
+        self.message = message
+    }
+}
+
+/// Parsed headroom numbers for the non-empty boxes.
+public struct HeadroomParsedEdit: Equatable, Sendable {
+    public var reservedCpuCores: Double?
+    public var reservedRamMb: Double?
+    public var minMemoryAvailablePercent: Double?
+
+    public init(reservedCpuCores: Double? = nil, reservedRamMb: Double? = nil, minMemoryAvailablePercent: Double? = nil) {
+        self.reservedCpuCores = reservedCpuCores
+        self.reservedRamMb = reservedRamMb
+        self.minMemoryAvailablePercent = minMemoryAvailablePercent
+    }
+}
+
+/// The validation outcome for the three headroom boxes.
+public enum HeadroomEditOutcome: Equatable, Sendable {
+    case valid(HeadroomParsedEdit)
+    case invalid([HeadroomFieldError])
 }

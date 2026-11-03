@@ -64,6 +64,73 @@ public struct HostResourcesClient: Sendable {
         self.session = session
     }
 
+    /// Saves the full-admission headroom object via `PUT /api/config`,
+    /// mirroring `saveHeadroomThresholds` in `src/lib/host-resources.ts`.
+    /// `admission` is the complete admission dictionary (numbers, with
+    /// `NSNull` for knobs cleared back to unset) — the server's shallow jobs
+    /// merge replaces admission wholesale, so a partial object would erase
+    /// unrelated gates.  Authentication mirrors the GET above: the gate
+    /// credential on a remote host, loopback on This Mac.
+    public func saveHeadroom(host: HostRecord, credential: HostGateCredential?, admission: [String: Any]) async throws {
+        let request = try Self.headroomSaveRequest(host: host, credential: credential, admission: admission)
+        let (data, response) = try await session.data(
+            for: request,
+            delegate: HostOriginRedirectPolicy(origin: host.origin)
+        )
+        guard let http = response as? HTTPURLResponse,
+              http.url.map(host.origin.contains) == true else {
+            throw SavedHostError.invalidResponse
+        }
+        if http.statusCode == 401 || http.statusCode == 403 {
+            throw SavedHostError.authentication
+        }
+        if [404, 405, 501].contains(http.statusCode) {
+            throw SavedHostError.missingPlacementRoutes
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw HeadroomSaveError.server(Self.saveErrorMessage(from: data, statusCode: http.statusCode))
+        }
+    }
+
+    /// Builds the `PUT /api/config` request for a headroom save, exposed for
+    /// tests: the stubbed session never delivers the body to a `URLProtocol`,
+    /// so the wire shape (method, path, gate header, `jobs.admission`
+    /// wrapping with `NSNull` clears) is asserted on the request itself.
+    public static func headroomSaveRequest(
+        host: HostRecord,
+        credential: HostGateCredential?,
+        admission: [String: Any]
+    ) throws -> URLRequest {
+        try host.validate()
+        guard host.isLocal || credential != nil else {
+            throw SavedHostError.credentialUnavailable
+        }
+        guard let url = URL(string: "/api/config", relativeTo: host.origin.url)?.absoluteURL else {
+            throw SavedHostError.invalidOrigin
+        }
+        let body: [String: Any] = ["jobs": ["admission": admission]]
+        let payload = try JSONSerialization.data(withJSONObject: body)
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.timeoutInterval = 20
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = payload
+        if let credential {
+            try credential.authorize(&request)
+        }
+        return request
+    }
+
+    private static func saveErrorMessage(from data: Data, statusCode: Int) -> String {
+        if let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            if let error = obj["error"] as? String, !error.isEmpty { return error }
+            if let message = obj["message"] as? String, !message.isEmpty { return message }
+        }
+        return "BotFleet Server refused the headroom save (HTTP \(statusCode))."
+    }
+
     public func fetchResources(host: HostRecord, credential: HostGateCredential?) async throws -> HostResourcesReport {
         try host.validate()
         guard host.isLocal || credential != nil else {
@@ -110,10 +177,30 @@ public struct HostResourcesClient: Sendable {
     }
 }
 
+/// What a headroom save can fail with.  Validation messages read exactly as
+/// the TS tab's (`parseHeadroomEdit`), and server refusals carry the body's
+/// own `error`/`message` (the 409 that names the Infisical name to remove,
+/// the 503 while the store is unreachable).
+public enum HeadroomSaveError: Error, LocalizedError, Equatable, Sendable {
+    case noReport
+    case invalid(String)
+    case server(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .noReport:
+            return "There is no host report to save against yet."
+        case .invalid(let message), .server(let message):
+            return message
+        }
+    }
+}
+
 /// Coordinates host selection and `GET /api/host/resources` polling for `Settings › Resources`.
 @MainActor
 public final class ResourcesCoordinator: ObservableObject {
     public typealias Fetcher = @Sendable (HostRecord, HostGateCredential?) async throws -> HostResourcesReport
+    public typealias Saver = @Sendable (HostRecord, HostGateCredential?, [String: Any]) async throws -> Void
 
     @Published public private(set) var hosts: [HostRecord] = [.thisMac]
     @Published public var selectedHostID: String = HostRecord.localID
@@ -123,6 +210,7 @@ public final class ResourcesCoordinator: ObservableObject {
     private let store: any ServersHostStore
     private let credentials: ResourcesCredentials
     private let fetcher: Fetcher
+    private let saver: Saver
     private var inflightByHostID: [String: UUID] = [:]
     private var hostsCancellable: AnyCancellable?
 
@@ -130,13 +218,17 @@ public final class ResourcesCoordinator: ObservableObject {
         store: any ServersHostStore,
         tokens: any HostTokenStore = KeychainHostTokenStore(),
         session: URLSession = .shared,
-        fetcher: Fetcher? = nil
+        fetcher: Fetcher? = nil,
+        saver: Saver? = nil
     ) {
         self.store = store
         self.credentials = ResourcesCredentials(tokens)
         let client = HostResourcesClient(session: session)
         self.fetcher = fetcher ?? { host, credential in
             try await client.fetchResources(host: host, credential: credential)
+        }
+        self.saver = saver ?? { host, credential, admission in
+            try await client.saveHeadroom(host: host, credential: credential, admission: admission)
         }
     }
 
@@ -251,6 +343,40 @@ public final class ResourcesCoordinator: ObservableObject {
                 state = failure
             }
         }
+    }
+
+    /// Saves edited headroom knobs via `PUT /api/config` for the selected
+    /// host, then refreshes so the card shows what the server actually
+    /// stored — mirroring the TS tab's save-then-`onSaved` reload.  Throws
+    /// `HeadroomSaveError.invalid` for a validation message and
+    /// `HeadroomSaveError.server` for a refused save.
+    public func saveHeadroom(values: HeadroomEditValues) async throws {
+        guard let report = currentReport else {
+            throw HeadroomSaveError.noReport
+        }
+        let outcome = HostResourcesPresentation.parseHeadroomEdit(values)
+        guard case .valid(let parsed) = outcome else {
+            let message: String
+            if case .invalid(let errors) = outcome {
+                message = errors.first?.message ?? "Enter a number."
+            } else {
+                message = "Enter a number."
+            }
+            throw HeadroomSaveError.invalid(message)
+        }
+        let admission = HostResourcesPresentation.headroomConfigPatch(for: report, parsed: parsed)
+        let host = selectedHost
+        let credential: HostGateCredential?
+        if host.isLocal {
+            credential = nil
+        } else {
+            credential = try await credentials.read(host)
+            guard credential != nil else {
+                throw SavedHostError.credentialUnavailable
+            }
+        }
+        try await saver(host, credential, admission)
+        await refresh()
     }
 
     private static func safeMessage(_ error: Error, host: HostRecord) -> String {

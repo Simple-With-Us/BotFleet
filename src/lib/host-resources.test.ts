@@ -478,7 +478,7 @@ describe("buildHeadroomPatch", () => {
     });
   });
 
-  it("keeps current headroom when boxes are empty", () => {
+  it("clears set knobs whose boxes are empty, and omits already-unset ones", () => {
     const current = report({
       admission: {
         maxSwapPercent: 90,
@@ -492,8 +492,26 @@ describe("buildHeadroomPatch", () => {
     expect(patch.jobs.admission.maxSwapPercent).toBe(90);
     expect(patch.jobs.admission.minFreeDiskMb).toBe(4096);
     expect(patch.jobs.admission.reservedCpuCores).toBe(3);
-    expect(patch.jobs.admission.reservedRamMb).toBe(256);
-    expect(patch.jobs.admission.minMemoryAvailablePercent).toBe(20);
+    // Emptied over a set knob: null unsets it on save.
+    expect(patch.jobs.admission.reservedRamMb).toBeNull();
+    expect(patch.jobs.admission.minMemoryAvailablePercent).toBeNull();
+  });
+
+  it("omits emptied boxes over already-unset knobs", () => {
+    const current = report({
+      admission: {
+        maxSwapPercent: 90,
+        minFreeDiskBytes: 4 * GB,
+        unknownReading: "admit",
+      },
+    });
+    const patch = buildHeadroomPatch(current, { reservedCpuCores: 3 });
+    expect(patch.jobs.admission.reservedCpuCores).toBe(3);
+    expect(patch.jobs.admission.reservedRamMb).toBeUndefined();
+    expect(patch.jobs.admission.minMemoryAvailablePercent).toBeUndefined();
+    // undefined keys never reach the wire: JSON.stringify drops them, so the
+    // server reads the knob as absent (still unset).
+    expect(JSON.parse(JSON.stringify(patch)).jobs.admission.reservedRamMb).toBeUndefined();
   });
 });
 

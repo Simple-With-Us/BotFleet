@@ -210,9 +210,10 @@ function ResourcesReportView({
 }
 
 /** The three unset-by-default headroom knobs, editable with write-through.
- *  Empty means omit (no change); the PUT patch only carries fields with a
- *  number, so an untouched box never clears a saved knob.  Clearing back to
- *  unset is a file/vault edit. */
+ *  A typed box saves; emptying a box over a set knob clears it back to unset
+ *  (the PUT patch sends null, which the server's merge turns into the
+ *  deletion).  A knob the vault manages cannot be cleared here — the server
+ *  refuses with 409 and the owner removes it in Infisical. */
 function HeadroomCard({
   report,
   highlightClass,
@@ -346,7 +347,7 @@ function HeadroomCard({
         <span className="text-[12px] text-ink-secondary">Saves via PUT /api/config, then reloads the report.</span>
       </div>
       <div className="mt-2 text-[12px] leading-relaxed text-ink-secondary">
-        Empty keeps the current value — the save sends the full admission object so unrelated gates are never erased.  Clearing back to unset is a file/vault edit. 
+        Empty clears a set knob back to unset — the save sends the full admission object so unrelated gates are never erased.  A vault-managed knob is refused; remove it in Infisical to unset it. 
         {report.admission.reservedRamBytes !== undefined && (
           <>Reserved RAM in force: {formatBytes(report.admission.reservedRamBytes)}. </>
         )}

@@ -5,8 +5,10 @@
 // thresholds against the applied values, and builds the PUT /api/config
 // patch for the three unset-by-default headroom knobs
 // (reservedCpuCores / reservedRamMb / minMemoryAvailablePercent) through
-// server/knob-map.ts.  Empty stays omitted (no change); clearing back to
-// unset is a file/vault edit, not a PUT.
+// server/knob-map.ts.  A typed box saves; an emptied box over a set knob
+// sends null so the save unsets it; an emptied box over an unset knob stays
+// omitted.  A knob the vault manages cannot be cleared here — the server
+// refuses with 409 and the owner removes it in Infisical.
 //
 // Copy rules (docs/plans/2026-10-29-native-server-mode.md, "Headroom
 // Profiles And What The UI May Say" and docs/verification/headroom.md):
@@ -504,9 +506,9 @@ export function hostSubtitle(report: HostResourcesReport): string {
   return `${platform} · ${version} · ${capabilities}`;
 }
 
-/** Editable headroom inputs, as typed strings.  Empty means omit (no change):
- *  the PUT patch only carries fields with a number, so an untouched box never
- *  clears a saved knob.  Clearing back to unset is a file/vault edit. */
+/** Editable headroom inputs, as typed strings.  A typed box saves; an emptied
+ *  box over a set knob clears it back to unset (the patch sends null); an
+ *  emptied box over an unset knob stays omitted. */
 export interface HeadroomEditValues {
   reservedCpuCores: string;
   reservedRamMb: string;
@@ -528,11 +530,15 @@ export const HEADROOM_BOUNDS = {
   minMemoryAvailablePercent: { min: 0, max: 100, int: false },
 } as const;
 
-/** Parsed headroom numbers for the non-empty boxes. */
+/** Parsed headroom numbers for the non-empty boxes, with explicit nulls for
+ *  boxes the owner cleared: a typed number saves, an empty box over a set
+ *  knob clears it back to unset, and an empty box over an unset knob stays
+ *  omitted.  `null` is the wire spelling the server's merge turns into the
+ *  disk deletion; absent still means "leave it". */
 export interface HeadroomParsed {
-  reservedCpuCores?: number;
-  reservedRamMb?: number;
-  minMemoryAvailablePercent?: number;
+  reservedCpuCores?: number | null;
+  reservedRamMb?: number | null;
+  minMemoryAvailablePercent?: number | null;
 }
 
 /** One parsed number or its validation message. */
@@ -584,14 +590,16 @@ export function parseHeadroomEdit(values: HeadroomEditValues):
  *  edited headroom keys would erase maxSwapPercent, minFreeDiskMb and
  *  minFreeInodes.  The client therefore sends the complete admission object:
  *  edited headroom values over the current report, with the disk floor
- *  converted back to MB. */
+ *  converted back to MB.  An emptied box over a set knob sends `null`, which
+ *  the server's merge turns into the deletion that unsets it; an emptied
+ *  box over an already-unset knob stays omitted, which still reads unset. */
 export interface HeadroomFullAdmission {
   maxSwapPercent: number;
   minFreeDiskMb: number;
   minFreeInodes?: number;
-  reservedCpuCores?: number;
-  reservedRamMb?: number;
-  minMemoryAvailablePercent?: number;
+  reservedCpuCores?: number | null;
+  reservedRamMb?: number | null;
+  minMemoryAvailablePercent?: number | null;
 }
 
 /** PUT /api/config patch for the headroom save (full admission). */
@@ -600,8 +608,9 @@ export interface HeadroomPatch {
 }
 
 /** Build the PUT /api/config patch for the parsed headroom knobs over the
- *  current report.  Edited (non-empty) headroom values win; everything else
- *  is carried forward from the report so the server's shallow jobs merge
+ *  current report.  Edited (non-empty) headroom values win; an emptied box
+ *  over a set knob sends `null` so the save unsets it; everything else is
+ *  carried forward from the report so the server's shallow jobs merge
  *  never erases an unrelated admission gate. */
 export function buildHeadroomPatch(current: HostResourcesReport, parsed: HeadroomParsed): HeadroomPatch {
   const currentRamMb =
@@ -611,14 +620,21 @@ export function buildHeadroomPatch(current: HostResourcesReport, parsed: Headroo
   const admission: HeadroomFullAdmission = {
     maxSwapPercent: current.admission.maxSwapPercent,
     minFreeDiskMb: current.admission.minFreeDiskBytes / 1024 / 1024,
-    reservedCpuCores: parsed.reservedCpuCores ?? current.admission.reservedCpuCores,
-    reservedRamMb: parsed.reservedRamMb ?? currentRamMb,
-    minMemoryAvailablePercent: parsed.minMemoryAvailablePercent ?? current.admission.minMemoryAvailablePercent,
+    reservedCpuCores: parsed.reservedCpuCores ?? clearOrCarry(current.admission.reservedCpuCores),
+    reservedRamMb: parsed.reservedRamMb ?? clearOrCarry(currentRamMb),
+    minMemoryAvailablePercent: parsed.minMemoryAvailablePercent ?? clearOrCarry(current.admission.minMemoryAvailablePercent),
   };
   if (current.admission.minFreeInodes !== undefined) {
     admission.minFreeInodes = current.admission.minFreeInodes;
   }
   return { jobs: { admission } };
+}
+
+/** An emptied box unsets a knob the report has set (`null`) and stays
+ *  omitted over a knob that is already unset (`undefined`, which still
+ *  reads unset). */
+function clearOrCarry(current: number | undefined): number | null | undefined {
+  return current === undefined ? undefined : null;
 }
 
 /** Save the edited headroom knobs through PUT /api/config.  No refetch here:
