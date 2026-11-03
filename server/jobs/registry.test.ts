@@ -981,7 +981,7 @@ posix("before boot finishes", () => {
   });
 });
 
-describe("refusing before the ask", () => {
+posix("refusing before the ask", () => {
   it("names every refusal that does not depend on the command", () => {
     const { spawnFn } = fakeSpawn();
     const h = harness({ spawn: spawnFn });

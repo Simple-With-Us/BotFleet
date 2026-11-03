@@ -571,6 +571,7 @@ const appConfigSchema = z.object({
     cliLanes: z.boolean().optional(),
     defaultMinutes: z.number().int().min(1).max(360).optional(),
     maxMinutes: z.number().int().min(1).max(360).optional(),
+    queueWaitMinutes: z.number().int().min(1).max(10080).optional(),
     cpuCores: z.number().min(1).max(64).optional(),
     admission: z.object({
       maxSwapPercent: z.number().min(1).max(100).optional(),
@@ -843,6 +844,7 @@ export interface AppConfig {
     cliLanes?: boolean;
     defaultMinutes?: number;
     maxMinutes?: number;
+    queueWaitMinutes?: number;
     cpuCores?: number;
     admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number | null; reservedRamMb?: number | null; minMemoryAvailablePercent?: number | null };
     /** Minutes a hot host may park a webhook before the wake dispatches

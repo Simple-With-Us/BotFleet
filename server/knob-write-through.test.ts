@@ -153,7 +153,7 @@ describe("writeThroughKnobs", () => {
   it("serialises every knob kind the way the resolver reads it back", async () => {
     const calls = new Map<string, string>();
     const patch: Partial<AppConfig> = {
-      jobs: { defaultMinutes: 30, cpuCores: 4, admission: { minFreeInodes: 1250 } },
+      jobs: { defaultMinutes: 30, queueWaitMinutes: 1440, cpuCores: 4, admission: { minFreeInodes: 1250 } },
       observability: { tracesSampleRate: 0.5 },
       usage: { spendCeilingUsd: 25.5 },
       infisical: { refreshMinutes: 10 },
@@ -170,6 +170,7 @@ describe("writeThroughKnobs", () => {
     );
     expect(result.ok).toBe(true);
     expect(calls.get("BOTFLEET_JOBS_DEFAULT_MINUTES")).toBe("30");
+    expect(calls.get("BOTFLEET_JOBS_QUEUE_WAIT_MINUTES")).toBe("1440");
     expect(calls.get("BOTFLEET_JOBS_CPU_CORES")).toBe("4");
     expect(calls.get("BOTFLEET_JOBS_MIN_FREE_INODES")).toBe("1250");
     expect(calls.get("BOTFLEET_TRACES_SAMPLE_RATE")).toBe("0.5");
@@ -186,7 +187,7 @@ describe("writeThroughKnobs", () => {
     // deliberately: the count is here so that adding or dropping a knob is
     // a decision someone reads rather than an edit that slips through --
     // it is what caught nineteen rows disappearing at once.
-    expect(KNOB_FIELDS.length).toBe(32);
+    expect(KNOB_FIELDS.length).toBe(33);
   });
 });
 
