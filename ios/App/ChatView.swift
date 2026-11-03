@@ -456,14 +456,24 @@ struct ChatView: View {
         let newestSettled = BottomFollow.newestSettledId(in: transcript)
         return ScrollViewReader { proxy in
                 ScrollView {
-                    // VStack, not LazyVStack. A lazy stack does not know how
-                    // tall it is until its rows have been built, so
+                    // VStack, not LazyVStack — measured, not assumed
+                    // (BF-2609). A lazy stack does not know how tall it is
+                    // until its rows have been built, so
                     // `.defaultScrollAnchor(.bottom)` anchors against an
                     // estimate and the chat opens somewhere in the middle of
                     // the conversation. Building all of it up front makes the
                     // height exact and the anchor land on the newest message.
-                    // A thread holds 50 messages until you ask for more, so
-                    // there is nothing here worth being lazy about.
+                    // At the 50-message default page the eager cost is the
+                    // grouping pass plus 50 row bodies (~3x the ~15 rows a
+                    // lazy stack would build, and sub-millisecond of
+                    // grouping on the bench in StreamingBatchTests'
+                    // companion probe); expanded history is reader-paced,
+                    // not streamed, so it never pays that cost per token.
+                    // Lazy only wins at several hundred held rows, which
+                    // today takes many deliberate Load Earlier taps — if
+                    // the default page ever grows to that scale, re-measure
+                    // before swapping, because the anchor cost above is a
+                    // correctness loss, not a performance trade.
                     VStack(alignment: .leading, spacing: 6) {
                         if session.state.hasMore[displayedThreadId] == true {
                             Button("Load earlier messages") {

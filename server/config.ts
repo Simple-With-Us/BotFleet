@@ -557,9 +557,16 @@ const appConfigSchema = z.object({
       minFreeDiskMb: z.number().min(0).optional(),
       minFreeInodes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
       // Headroom (P-BF-6 B7): absent means unset — no gate and no default.
-      reservedCpuCores: z.number().int().min(0).max(64).optional(),
-      reservedRamMb: z.number().int().min(0).optional(),
-      minMemoryAvailablePercent: z.number().min(0).max(100).optional(),
+      // `null` is the wire spelling of "clear this knob back to unset" and is
+      // what a client sends when the owner empties a previously-set box.
+      // Absent still means "leave it"; only an explicit null deletes, the
+      // same differential `botDefaults.allowedComputers` and
+      // `callStt.provider` already use.  The merge below turns null into the
+      // deletion itself, so a stored file never holds null and resolution
+      // keeps reading `number | undefined`.
+      reservedCpuCores: z.number().int().min(0).max(64).nullable().optional(),
+      reservedRamMb: z.number().int().min(0).nullable().optional(),
+      minMemoryAvailablePercent: z.number().min(0).max(100).nullable().optional(),
     }).optional(),
     // How long a webhook may sit queued while the host is hot before the
     // scheduler dispatches it anyway.  Absent means 20 minutes
@@ -828,7 +835,7 @@ export interface AppConfig {
     defaultMinutes?: number;
     maxMinutes?: number;
     cpuCores?: number;
-    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number; reservedRamMb?: number; minMemoryAvailablePercent?: number };
+    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number | null; reservedRamMb?: number | null; minMemoryAvailablePercent?: number | null };
     /** Minutes a hot host may park a webhook before the wake dispatches
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;
@@ -2394,6 +2401,28 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
     if (stored.success) {
       const { allowedComputers: _cleared, ...rest } = stored.data;
       disk.botDefaults = rest;
+    }
+  }
+  // Headroom null-clear (P-BF-6 slice 7b): the generic section merge above
+  // would persist a JSON null, so an explicit null on any of the three
+  // unset-by-default knobs deletes the stored key instead — the file keeps
+  // reading "unset", exactly as before the knob was set.  Only an explicit
+  // null deletes; an absent key still leaves the stored value alone.
+  {
+    const admission = checkedPatch.jobs?.admission;
+    if (admission && (admission.reservedCpuCores === null || admission.reservedRamMb === null || admission.minMemoryAvailablePercent === null)) {
+      const stored = jsonObjectSchema.safeParse(disk.jobs);
+      if (stored.success) {
+        const storedAdmission = jsonObjectSchema.safeParse(stored.data.admission);
+        if (storedAdmission.success) {
+          const next = { ...storedAdmission.data };
+          if (admission.reservedCpuCores === null) delete next.reservedCpuCores;
+          if (admission.reservedRamMb === null) delete next.reservedRamMb;
+          if (admission.minMemoryAvailablePercent === null) delete next.minMemoryAvailablePercent;
+          stored.data.admission = next;
+        }
+        disk.jobs = stored.data;
+      }
     }
   }
   if (checkedPatch.vps !== undefined) disk.vps = normalizeVpsConfig(checkedPatch.vps);

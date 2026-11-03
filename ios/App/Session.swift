@@ -139,6 +139,17 @@ final class Session: ObservableObject {
     /// and persisted — when a stream goes live.
     private var rotation = CandidateRotation(hosts: [])
     private var streamTask: Task<Void, Never>?
+    /// Streamed deltas held between publishes (BF-2608). The buffer is pure
+    /// policy in CompanionCore; the clock and every flush decision live here.
+    /// `bufferedSeq` is the newest sequence a held delta carried: the cursor
+    /// commits when the buffer drains, not per token, because touching the
+    /// `@Published` state to advance it would publish anyway and defeat the
+    /// batching. A crash inside one 50 ms window replays those deltas on
+    /// reconnect, which is safe — live text is not persisted, and settled
+    /// messages dedupe by id.
+    private var deltaBuffer = StreamingDeltaBuffer()
+    private var deltaFlushTask: Task<Void, Never>?
+    private var bufferedSeq: Int?
     /// Best-effort authenticated route refresh started by the latest live SSE
     /// hello. Kept separate so endpoint discovery never stalls event delivery.
     private var endpointRefreshTask: Task<Void, Never>?
@@ -583,6 +594,7 @@ final class Session: ObservableObject {
 
     func signOut() {
         stopVoice()
+        discardDeltas()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
@@ -641,6 +653,9 @@ final class Session: ObservableObject {
         guard client != nil else { return }
         if let existing = streamTask {
             if case .offline = status {
+                // Same stale-cursor hazard as `restartStream()`: publish
+                // held deltas before the replacement stream resumes.
+                flushDeltas()
                 existing.cancel()
                 streamTask = nil
             } else {
@@ -704,6 +719,11 @@ final class Session: ObservableObject {
     /// cursor survives, so this is a gap, not a reset.
     private func restartStream() {
         guard streamTask != nil else { return }
+        // Publish held deltas and commit their cursor first: the new stream
+        // resumes from that cursor, so anything left buffered would be both
+        // replayed by the server and flushed locally — the same tokens
+        // appended twice, with no dedupe on live text (BF-2608).
+        flushDeltas()
         streamTask?.cancel()
         streamTask = nil
         connect()
@@ -717,6 +737,9 @@ final class Session: ObservableObject {
     /// requests, not this stream, and the `audio` background mode keeps it
     /// playing after the linger window closes.  Sign-out still stops it.
     func disconnect() {
+        // Held deltas publish before the stream goes away, so backgrounding
+        // never strands the tail of a reply mid-window (BF-2608).
+        flushDeltas()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
@@ -766,6 +789,58 @@ final class Session: ObservableObject {
         lingerTask = .invalid
     }
 
+    /// Publish every held delta as one state mutation, and commit the
+    /// cursor those deltas arrived with. Called on the flush interval, on
+    /// the buffer's own bounds, before any frame that must observe or clear
+    /// the live text, and when the stream ends — so the text a turn-ending
+    /// frame clears, and the text a settled message supersedes, is always
+    /// the complete text.
+    private func flushDeltas() {
+        deltaFlushTask?.cancel()
+        deltaFlushTask = nil
+        guard !deltaBuffer.isEmpty else {
+            if let bufferedSeq { state.advance(to: bufferedSeq) }
+            bufferedSeq = nil
+            return
+        }
+        let events = deltaBuffer.drain()
+        let seq = bufferedSeq
+        bufferedSeq = nil
+        // One assignment, one publish: mutating the `@Published` struct per
+        // coalesced event plus once for the cursor would re-invalidate the
+        // transcript once per stream key and defeat the batching.
+        var next = state
+        next.applyCoalesced(events)
+        if let seq { next.advance(to: seq) }
+        state = next
+        NotificationCoordinator.shared.setBadge(state.unreadCount)
+    }
+
+    /// Hold deltas until the flush interval, unless the bounds trip first.
+    /// The first delta of a burst arms the timer; later ones join the same
+    /// window, so a steady stream publishes at the interval and a burst
+    /// publishes once.
+    private func scheduleDeltaFlush() {
+        guard deltaFlushTask == nil else { return }
+        deltaFlushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int64(StreamingDeltaBuffer.flushInterval * 1_000)))
+            guard !Task.isCancelled, let self else { return }
+            self.deltaFlushTask = nil
+            self.flushDeltas()
+        }
+    }
+
+    /// Drop held deltas without publishing. Sign-out replaces the whole
+    /// state, so draining into it first would only publish text nobody
+    /// keeps; a cancelled stream, by contrast, flushes (see `run()`),
+    /// because the state survives it.
+    private func discardDeltas() {
+        deltaFlushTask?.cancel()
+        deltaFlushTask = nil
+        _ = deltaBuffer.drain()
+        bufferedSeq = nil
+    }
+
     private func run() async {
         while !Task.isCancelled {
             guard let client else { return }
@@ -787,6 +862,33 @@ final class Session: ObservableObject {
                 ) {
                     if Task.isCancelled { return }
                     reconnectBackoff.reset()
+
+                    // BF-2608: hold streamed deltas for one publish window.
+                    // Anything else first publishes what is held, so a
+                    // settled message, a turn ending or a reconnect never
+                    // observes a live bubble missing its buffered tail.
+                    if case let .runtime(event) = frame.frame {
+                        switch deltaBuffer.enqueue(event) {
+                        case .buffered:
+                            if let seq = frame.seq { bufferedSeq = max(bufferedSeq ?? seq, seq) }
+                            if deltaBuffer.shouldFlush { flushDeltas() } else { scheduleDeltaFlush() }
+                            continue
+                        case .dropped:
+                            // Never commit past text still held: fold the
+                            // sequence into the pending commit so the flush
+                            // advances once, to the newest sequence seen.
+                            if deltaBuffer.isEmpty {
+                                if let seq = frame.seq { state.advance(to: seq) }
+                            } else if let seq = frame.seq {
+                                bufferedSeq = max(bufferedSeq ?? seq, seq)
+                            }
+                            continue
+                        case .applyNow:
+                            flushDeltas()
+                        }
+                    } else if !deltaBuffer.isEmpty {
+                        flushDeltas()
+                    }
 
                     if case let .hello(cursor, resumed) = frame.frame {
                         log.info("stream live, resumed=\(resumed, privacy: .public)")
@@ -862,6 +964,10 @@ final class Session: ObservableObject {
                         applyInstances(fetched, describedAt: describedAt)
                     }
                 }
+                // Publish anything still held: the state survives the
+                // reconnect, and dropping the tail would truncate the reply
+                // the reader is watching (BF-2608).
+                flushDeltas()
                 // the stream ended without an error — the harness went away
                 log.notice("stream ended without an error")
                 offlineMessage = "Lost the connection."

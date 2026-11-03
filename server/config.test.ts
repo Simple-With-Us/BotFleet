@@ -1079,6 +1079,55 @@ describe("operator-level computer allowlist", () => {
   });
 });
 
+describe("headroom null-clear (slice 7b)", () => {
+  it("accepts null for the three headroom knobs and rejects it elsewhere in admission", () => {
+    expect(parseConfigPatch({ jobs: { admission: { reservedCpuCores: null, reservedRamMb: null, minMemoryAvailablePercent: null } } })).toEqual({
+      jobs: { admission: { reservedCpuCores: null, reservedRamMb: null, minMemoryAvailablePercent: null } },
+    });
+    expect(() => parseConfigPatch({ jobs: { admission: { maxSwapPercent: null } } })).toThrow();
+    expect(() => parseConfigPatch({ jobs: { admission: { minFreeInodes: null } } })).toThrow();
+  });
+
+  it("deletes a stored headroom knob on null instead of persisting the null", () => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    try {
+      saveConfig({ jobs: { admission: { maxSwapPercent: 98, minFreeDiskMb: 2048, reservedCpuCores: 2, reservedRamMb: 512 } } });
+      expect(loadConfig().jobs?.admission?.reservedCpuCores).toBe(2);
+
+      // The headroom clients always send the complete admission object (the
+      // shallow jobs merge replaces it wholesale — see buildHeadroomPatch),
+      // so the clear rides with the carried-forward siblings.
+      saveConfig(parseConfigPatch({ jobs: { admission: { maxSwapPercent: 98, minFreeDiskMb: 2048, reservedCpuCores: null, reservedRamMb: 512 } } }));
+      const after = loadConfig();
+      expect(after.jobs?.admission?.reservedCpuCores).toBeUndefined();
+      // and only that knob is cleared — the sibling knobs and gates stand.
+      expect(after.jobs?.admission?.reservedRamMb).toBe(512);
+      expect(after.jobs?.admission?.maxSwapPercent).toBe(98);
+      expect("reservedCpuCores" in (after.jobs?.admission ?? {})).toBe(false);
+    } finally {
+      rmSync(join(DATA_DIR, "config.json"), { force: true });
+    }
+  });
+
+  it("leaves a stored headroom knob alone when the admission section is absent", () => {
+    // Admission merges wholesale at the section level, so "absent leaves
+    // alone" holds at the section boundary: an unrelated save never touches
+    // the stored knobs.  Only an explicit null deletes.
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    try {
+      saveConfig({ jobs: { admission: { maxSwapPercent: 98, minMemoryAvailablePercent: 20 } } });
+      saveConfig(parseConfigPatch({ profile: { name: "Jay" } }));
+      const after = loadConfig();
+      expect(after.jobs?.admission?.minMemoryAvailablePercent).toBe(20);
+      expect(after.jobs?.admission?.maxSwapPercent).toBe(98);
+    } finally {
+      rmSync(join(DATA_DIR, "config.json"), { force: true });
+    }
+  });
+});
+
 describe("autoUpdate throttle", () => {
   it("treats the first run as due when no lastCheckMs is recorded and the toggle is on", () => {
     const now = 1_700_000_000_000;

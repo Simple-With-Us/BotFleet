@@ -77,6 +77,7 @@ struct MacResourcesSettings: View {
                             showEnvNames: $showThresholdEnvNames
                         )
                         HeadroomCard(
+                            coordinator: coordinator,
                             report: report,
                             showEnvNames: $showHeadroomEnvNames
                         )
@@ -213,14 +214,41 @@ private struct ThresholdsCard: View {
 }
 
 private struct HeadroomCard: View {
+    @ObservedObject var coordinator: ResourcesCoordinator
     let report: HostResourcesReport
     @Binding var showEnvNames: Bool
+    @State private var values: HeadroomEditValues
+    @State private var saving = false
+    @State private var errorMessage: String?
+    @State private var touched = false
+    @State private var submitAttempted = false
+
+    init(coordinator: ResourcesCoordinator, report: HostResourcesReport, showEnvNames: Binding<Bool>) {
+        _coordinator = ObservedObject(wrappedValue: coordinator)
+        self.report = report
+        _showEnvNames = showEnvNames
+        _values = State(initialValue: HostResourcesPresentation.headroomEditInitial(report))
+    }
+
+    private var outcome: HeadroomEditOutcome {
+        HostResourcesPresentation.parseHeadroomEdit(values, current: HostResourcesPresentation.headroomCurrentKnobs(report))
+    }
+
+    private var isValid: Bool {
+        if case .valid = outcome { return true }
+        return false
+    }
+
+    private var firstMessage: String? {
+        if case .invalid(let errors) = outcome { return errors.first?.message }
+        return nil
+    }
+
+    private var showValidation: Bool {
+        !isValid && (touched || submitAttempted)
+    }
 
     var body: some View {
-        let reservedCpuText = report.admission.reservedCpuCores.map(HostResourcesPresentation.formatNumericValue) ?? ""
-        let reservedRamText = report.admission.reservedRamBytes.map { "\(Int(($0 / 1024.0 / 1024.0).rounded()))" } ?? ""
-        let minMemoryPercentText = report.admission.minMemoryAvailablePercent.map(HostResourcesPresentation.formatNumericValue) ?? ""
-
         GroupBox("Owner-Set Headroom") {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Reserved capacity for everything else on this host.\u{00A0} Absent means unset: no gate, exactly as before.")
@@ -232,24 +260,56 @@ private struct HeadroomCard: View {
                         Text("Reserved CPU cores")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
-                        TextField("Not set", text: .constant(reservedCpuText))
-                            .disabled(true)
+                        TextField("Not set", text: $values.reservedCpuCores)
+                            .disabled(saving)
+                            .onChange(of: values.reservedCpuCores) { touched = true }
                     }
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Reserved RAM (MB)")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
-                        TextField("Not set", text: .constant(reservedRamText))
-                            .disabled(true)
+                        TextField("Not set", text: $values.reservedRamMb)
+                            .disabled(saving)
+                            .onChange(of: values.reservedRamMb) { touched = true }
                     }
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Minimum available memory (%)")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
-                        TextField("Not set", text: .constant(minMemoryPercentText))
-                            .disabled(true)
+                        TextField("Not set", text: $values.minMemoryAvailablePercent)
+                            .disabled(saving)
+                            .onChange(of: values.minMemoryAvailablePercent) { touched = true }
                     }
                 }
+
+                if showValidation, let message = firstMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
+
+                Button {
+                    save()
+                } label: {
+                    HStack(spacing: 6) {
+                        if saving {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(saving ? "Saving…" : "Save headroom")
+                    }
+                }
+                .disabled(!isValid || saving)
+
+                Text("Saves via PUT /api/config, then reloads the report.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 Text(headroomFooter)
                     .font(.caption)
@@ -271,10 +331,37 @@ private struct HeadroomCard: View {
             .padding(8)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .onChange(of: report) { newReport in
+            values = HostResourcesPresentation.headroomEditInitial(newReport)
+            touched = false
+            submitAttempted = false
+            errorMessage = nil
+        }
+    }
+
+    private func save() {
+        submitAttempted = true
+        guard isValid else {
+            errorMessage = firstMessage
+            return
+        }
+        guard !saving else { return }
+        saving = true
+        errorMessage = nil
+        // @MainActor-isolated: the @State writes after the await must publish
+        // on the main actor, or the button can stick in Saving.
+        Task { @MainActor in
+            do {
+                try await coordinator.saveHeadroom(values: values)
+            } catch {
+                errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+            saving = false
+        }
     }
 
     private var headroomFooter: String {
-        var parts = ["The owner sets these numbers — this tab shows them read-only and editing is disabled here."]
+        var parts = ["Empty clears a set knob back to unset.\u{00A0} A vault-managed knob is refused; remove it in Infisical to unset it."]
         if let reservedRam = report.admission.reservedRamBytes {
             parts.append("Reserved RAM in force: \(HostResourcesPresentation.formatBytes(reservedRam)).")
         }

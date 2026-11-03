@@ -119,11 +119,16 @@ export interface JobsConfigInput {
   cliLanes?: boolean;
   defaultMinutes?: number;
   maxMinutes?: number;
-  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number; reservedRamMb?: number; minMemoryAvailablePercent?: number };
+  // The three headroom knobs arrive as `number | null` on the wire (`null`
+  // clears back to unset); `finite` below already reads null as absent, so
+  // resolution keeps emitting `number | undefined` and every downstream
+  // `!== undefined` check is unchanged.
+  admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number | null; reservedRamMb?: number | null; minMemoryAvailablePercent?: number | null };
   cpuCores?: number;
 }
 
-const finite = (value: number | undefined): value is number => value !== undefined && Number.isFinite(value);
+const finite = (value: number | null | undefined): value is number =>
+  value !== undefined && value !== null && Number.isFinite(value);
 
 /** Resolve the owner's `jobs` config against the defaults and the hard
  *  ceilings: no setting can lift the run limit past 6 hours. */

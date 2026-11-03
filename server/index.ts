@@ -492,7 +492,7 @@ import { getSentry, isSentryActive } from "./sentry.ts";
 import { infisical, type RefreshReason } from "./infisical.ts";
 import { InfisicalError } from "./infisical-client.ts";
 import { credentialFingerprint, SECRET_FIELDS, secretProvenance, secretSource, vaultNames, type SecretFieldSpec } from "./secret-map.ts";
-import { KNOB_FIELDS, knobSource, readKnobField } from "./knob-map.ts";
+import { KNOB_FIELDS, clearedHeadroomKnobs, knobSource, readKnobField } from "./knob-map.ts";
 import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write-through.ts";
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
 import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
@@ -19461,10 +19461,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // identity) would land the knob write in the OLD project before the
       // connection moves.  Refuse the combination outright.  A patch that
       // carries only `infisical.refreshMinutes` is a knob write like any
-      // other and is handled below.
+      // other and is handled below.  An explicit null clear counts as a knob
+      // write here too: the refusal must fire before any vault answer is
+      // trusted, not only when a value rides along.
       if (
         patchChangesInfisicalConnection(patch) &&
-        KNOB_FIELDS.some((spec) => readKnobField(patch, spec) !== undefined)
+        (KNOB_FIELDS.some((spec) => readKnobField(patch, spec) !== undefined) ||
+          clearedHeadroomKnobs(patch).length > 0)
       ) {
         return json(res, 400, {
           error: "Updating the Infisical connection and managed settings in the same request is not supported.\u00A0 Save the Infisical connection first.",
