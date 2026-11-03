@@ -157,7 +157,7 @@ test("check-post-reboot-node.mjs CLI responds with JSON on --json", () => {
   const res = spawnSync("node", [scriptPath, "--json"], { encoding: "utf8" });
   assert.ok(res.stdout.startsWith("{"));
   const parsed = JSON.parse(res.stdout);
-  assert.equal(typeof parsed.ok, "boolean");
+  assert.ok(parsed.ok === true || parsed.ok === false);
   assert.ok(Array.isArray(parsed.failures));
   assert.ok(parsed.details);
 });

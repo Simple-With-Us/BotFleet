@@ -40,12 +40,13 @@ export const BOTFLEET_NODE_PATTERNS = [
  * Ignores unrelated Node processes like build tools, test runners, or developer shells.
  */
 export function isBotFleetNodeProcess(cmdLine) {
-  if (!cmdLine || typeof cmdLine !== "string") return false;
+  if (!cmdLine) return false;
+  const str = String(cmdLine);
   // Ignore the check script itself or test runners executing it
-  if (cmdLine.includes("check-post-reboot-node") || cmdLine.includes("decommission-gates")) {
+  if (str.includes("check-post-reboot-node") || str.includes("decommission-gates")) {
     return false;
   }
-  return BOTFLEET_NODE_PATTERNS.some((pattern) => pattern.test(cmdLine));
+  return BOTFLEET_NODE_PATTERNS.some((pattern) => pattern.test(str));
 }
 
 /**
@@ -53,8 +54,8 @@ export function isBotFleetNodeProcess(cmdLine) {
  * Returns array of offending process objects: { pid, user, command }.
  */
 export function inspectProcesses(psOutput) {
-  if (!psOutput || typeof psOutput !== "string") return [];
-  const lines = psOutput.split("\n");
+  if (!psOutput) return [];
+  const lines = String(psOutput).split("\n");
   const offending = [];
 
   for (const line of lines) {
@@ -112,8 +113,8 @@ export function realLaunchctlProbe(label) {
  * Returns array of offending listeners on loopback: { port, pid, command }.
  */
 export function inspectPortListeners(lsofOutput, watchedPorts = BOTFLEET_PORTS) {
-  if (!lsofOutput || typeof lsofOutput !== "string") return [];
-  const lines = lsofOutput.split("\n");
+  if (!lsofOutput) return [];
+  const lines = String(lsofOutput).split("\n");
   const listeners = [];
 
   for (const line of lines) {
