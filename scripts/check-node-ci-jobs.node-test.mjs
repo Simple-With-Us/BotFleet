@@ -7,6 +7,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   NODE_DESKTOP_PATTERNS,
+  compositeActionFiles,
+  findNodeDesktopActionSteps,
   findNodeDesktopJobs,
 } from "./check-node-ci-jobs.mjs";
 
@@ -193,7 +195,7 @@ jobs:
     });
     const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /1 workflow file\(s\) read, no job runs the Node desktop/);
+    assert.match(result.stdout, /1 workflow file\(s\) and 0 composite action\(s\) read, no job runs the Node desktop/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -237,6 +239,87 @@ test("a checkout with no workflow directory is refused", () => {
   }
 });
 
+test("a composite action that runs the Node desktop is named", () => {
+  // A job that calls a local composite action delegates its steps to that
+  // action, so a step that lives in the action still runs the desktop.
+  const action = {
+    name: "Desktop build",
+    runs: {
+      using: "composite",
+      steps: [{ name: "Run the desktop tests", run: "pnpm test" }],
+    },
+  };
+  const offenders = findNodeDesktopActionSteps(action, ".github/actions/build/action.yml", "build");
+  assert.equal(offenders.length, 1);
+  assert.equal(offenders[0].job, "build");
+  assert.equal(offenders[0].name, "Desktop build");
+  assert.equal(offenders[0].pattern, "pnpm test");
+});
+
+test("a composite action that runs no desktop work is clean", () => {
+  const action = {
+    name: "Infisical secrets",
+    runs: {
+      using: "composite",
+      steps: [{ name: "Fetch secrets", run: "node \"$GITHUB_ACTION_PATH/../../../scripts/infisical-fetch.mjs\"" }],
+    },
+  };
+  assert.deepEqual(findNodeDesktopActionSteps(action, ".github/actions/secrets/action.yml", "secrets"), []);
+});
+
+test("a checkout with no composite actions carries nothing to judge", () => {
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-node-ci-jobs-"));
+  try {
+    assert.deepEqual(compositeActionFiles(directory), []);
+    makeCheckout(directory, { "ci.yml": "name: CI\njobs:\n  ios:\n    steps:\n      - run: swift test\n" });
+    mkdirSync(join(directory, ".github", "actions", "build"), { recursive: true });
+    writeFileSync(
+      join(directory, ".github", "actions", "build", "action.yml"),
+      "name: Build\nruns:\n  using: composite\n  steps:\n    - run: pnpm test\n",
+    );
+    const found = compositeActionFiles(directory);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].id, "build");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the gate names a composite action that runs the Node desktop", () => {
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-node-ci-jobs-"));
+  try {
+    makeCheckout(directory, {
+      "ci.yml": "name: CI\njobs:\n  desktop:\n    name: Desktop\n    steps:\n      - uses: ./.github/actions/build\n",
+    });
+    mkdirSync(join(directory, ".github", "actions", "build"), { recursive: true });
+    writeFileSync(
+      join(directory, ".github", "actions", "build", "action.yml"),
+      "name: Desktop build\nruns:\n  using: composite\n  steps:\n    - run: pnpm test\n",
+    );
+    const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
+    assert.equal(result.status, 1, "the Node desktop job must block the gate");
+    assert.match(result.stderr, /\.github\/actions\/build\/action\.yml: job "build"/);
+    assert.match(result.stderr, /matches "pnpm test"/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a composite action that cannot be parsed is refused instead of skipped", () => {
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-node-ci-jobs-"));
+  try {
+    makeCheckout(directory, { "ci.yml": "name: CI\njobs:\n  ios:\n    steps:\n      - run: swift test\n" });
+    mkdirSync(join(directory, ".github", "actions", "broken"), { recursive: true });
+    writeFileSync(join(directory, ".github", "actions", "broken", "action.yml"), "name: Broken\nruns: [unclosed\n");
+    const result = spawnSync("node", [cli, "--repo-root", directory], { encoding: "utf8" });
+    assert.equal(result.status, 2, "an unreadable composite action must not be skipped");
+    assert.match(result.stderr, /broken\/action\.yml/);
+    assert.match(result.stderr, /refusing to skip a composite action this gate could not read/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("the committed workflows still carry a Node desktop job, so the gate fails today", () => {
   const result = spawnSync("node", [cli], { encoding: "utf8", cwd: repoRoot });
   assert.equal(result.status, 1);
@@ -246,4 +329,7 @@ test("the committed workflows still carry a Node desktop job, so the gate fails 
   // it as well: a removal that left it behind would break CI on main.
   assert.match(result.stderr, /\.github\/workflows\/node-ci\.yml: job "lint"/);
   assert.match(result.stderr, /matches "pnpm install"/);
+  // The repository's own composite action runs a dependency-free script, so
+  // reading it must not invent an offender.
+  assert.doesNotMatch(result.stderr, /\.github\/actions\//);
 });

@@ -11,7 +11,7 @@
 // an error, never a silently skipped file: a gate that quietly ignores the
 // one file it could not understand is a gate that passes on an unreadable
 // input.
-import { readdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
@@ -99,6 +99,61 @@ export function findNodeDesktopJobs(workflow, fileName) {
 }
 
 /**
+ * The Node desktop work inside one composite action.  A job that calls a
+ * local composite action delegates its steps to that action, so the action's
+ * own steps are read for the same reason reusable workflows and matrix
+ * values are read: a step that lives in the action still runs the desktop.
+ *
+ * Pure over the parsed object, like the workflow scan above.
+ */
+export function findNodeDesktopActionSteps(action, fileName, actionId) {
+  const offenders = [];
+  const steps = action?.runs?.steps ?? [];
+  const displayName = String(action?.name ?? actionId);
+  const seen = new Set();
+  for (const step of steps) {
+    const text = `${step?.name ?? ""}\n${step?.run ?? ""}`;
+    for (const pattern of NODE_DESKTOP_PATTERNS) {
+      if (!mentions(text, pattern)) continue;
+      if (seen.has(pattern)) continue;
+      seen.add(pattern);
+      offenders.push({ file: fileName, job: actionId, name: displayName, pattern });
+    }
+  }
+  return offenders;
+}
+
+/**
+ * The composite actions a checkout carries, as absolute paths.  GitHub reads
+ * an action from `.github/actions/<name>/action.yml` or `action.yaml`, one
+ * directory deep, so that is what is collected here.
+ *
+ * A checkout with no `.github/actions` directory carries no composite action
+ * and is not an error;  a directory that exists but cannot be read is one,
+ * because a gate that quietly ignores the one place it could not look is a
+ * gate that passes on an unreadable input.
+ */
+export function compositeActionFiles(repoRoot) {
+  const actionsDir = join(repoRoot, ".github", "actions");
+  let entries;
+  try {
+    entries = readdirSync(actionsDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  const files = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    for (const name of ["action.yml", "action.yaml"]) {
+      const candidate = join(actionsDir, entry.name, name);
+      if (existsSync(candidate)) files.push({ path: candidate, id: entry.name });
+    }
+  }
+  return files.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+/**
  * Read and parse one workflow file.  Throws with the file name attached so
  * the CLI can report exactly which file it could not read.
  */
@@ -116,6 +171,32 @@ export function readWorkflow(filePath) {
   }
   if (parsed.jobs === null || parsed.jobs === undefined) {
     throw new Error(`${filePath} has no jobs: a workflow with no job set cannot be judged clean`);
+  }
+  return parsed;
+}
+
+/**
+ * Read and parse one composite action file.  Throws with the file name
+ * attached so the CLI can report exactly which file it could not read.
+ *
+ * An action is not a workflow and carries no `jobs:` key, so it is read on
+ * its own terms: a composite action has `runs.steps`, and a docker or
+ * JavaScript action has no steps to read at all.
+ */
+export function readCompositeAction(filePath) {
+  const text = readFileSync(filePath, "utf8");
+  let parsed;
+  try {
+    parsed = parse(text);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${filePath} is not valid YAML: ${message}`);
+  }
+  if (parsed === null || parsed === undefined) {
+    throw new Error(`${filePath} parsed as an empty document`);
+  }
+  if (parsed.runs === null || parsed.runs === undefined) {
+    throw new Error(`${filePath} has no runs: an action with no runs block cannot be judged clean`);
   }
   return parsed;
 }
@@ -178,6 +259,33 @@ if (isEntryModule()) {
     offenders.push(...findNodeDesktopJobs(workflow, label));
   }
 
+  // The composite actions the workflows call.  A job that delegates its steps
+  // to a local action runs the desktop through the action, so the action's
+  // own steps are read here for the same reason the reusable workflow and
+  // matrix references are read above.
+  let actionFiles = [];
+  try {
+    actionFiles = compositeActionFiles(repoRoot);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`error: could not read the composite action directory: ${message}`);
+    console.error("refusing to skip a composite action this gate could not read");
+    process.exit(2);
+  }
+  for (const { path: actionPath, id } of actionFiles) {
+    let action;
+    try {
+      action = readCompositeAction(actionPath);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`error: ${message}`);
+      console.error("refusing to skip a composite action this gate could not read");
+      process.exit(2);
+    }
+    const label = relative(repoRoot, actionPath);
+    offenders.push(...findNodeDesktopActionSteps(action, label, id));
+  }
+
   if (offenders.length > 0) {
     console.error(`Node desktop CI gate: FAILED — ${offenders.length} job match(es) still build or test the Node desktop`);
     for (const offender of offenders) {
@@ -190,6 +298,6 @@ if (isEntryModule()) {
   }
 
   console.log(
-    `Node desktop CI gate: ${files.length} workflow file(s) read, no job runs the Node desktop.`,
+    `Node desktop CI gate: ${files.length} workflow file(s) and ${actionFiles.length} composite action(s) read, no job runs the Node desktop.`,
   );
 }
