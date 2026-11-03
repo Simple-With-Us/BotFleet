@@ -1048,6 +1048,25 @@ export class RoutineManager {
     return { ...existing };
   }
 
+  canCoalesceWebhook(webhookId: string, botId: string): boolean {
+    if (this.options.botState(botId) !== "busy") return false;
+    if (this.botIsOff(botId) || this.isBotSnoozed(botId)) return false;
+    const key = automationThreadKey({
+      routineId: webhookId,
+      webhookId,
+      triggerSource: "webhook",
+    });
+    return Boolean(
+      this.runs.find(
+        (run) =>
+          run.status === "queued" &&
+          !run.coalescedInto &&
+          run.botId === botId &&
+          automationThreadKey(run) === key,
+      ),
+    );
+  }
+
   /** Queue an event-driven job without inventing a calendar schedule. Webhook
    * definitions live in their own store; the execution receipt deliberately
    * reuses this manager so busy-bot ordering, task creation and VM routing stay

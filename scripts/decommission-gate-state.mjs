@@ -25,7 +25,7 @@
 //   node scripts/decommission-gate-state.mjs --out /tmp/phase6-state.json
 //   node scripts/decommission-gate-state.mjs --board-json <nodes.json> --out out.json
 import { execFileSync } from "node:child_process";
-import { readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -64,10 +64,36 @@ export function unwrapNodes(raw) {
   return envelope;
 }
 
+/**
+ * Resolve the CLI binary to query Linear. Prefers explicit BOARD_CLI env,
+ * prefers verified board at ~/.local/bin/board, and guards against legacy
+ * mac-collab binary shadows when resolving from PATH.
+ */
+export function resolveBoardCli() {
+  if (process.env.BOARD_CLI) return process.env.BOARD_CLI;
+  const verifiedDefault = join(process.env.HOME ?? "", ".local", "bin", "board");
+  if (existsSync(verifiedDefault)) {
+    return verifiedDefault;
+  }
+  try {
+    const whichOut = execFileSync("which", ["board"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (whichOut) {
+      const real = realpathSync(whichOut);
+      if (!real.includes("mac-collab")) {
+        return whichOut;
+      }
+    }
+  } catch {
+    // fall through to fail-closed throw
+  }
+  throw new Error("Linear CLI 'board' not found on PATH or at ~/.local/bin/board. Set BOARD_CLI or install verified board at ~/.local/bin/board.");
+}
+
 /** One Linear page through the board CLI.  Throws rather than returning []. */
 export function fetchLinearPage(after) {
+  const cli = resolveBoardCli();
   const out = execFileSync(
-    "board",
+    cli,
     ["api", "query", "--max-chars", "64000", linearPageQuery(after), "--json"],
     { encoding: "utf8", timeout: 120_000 },
   );

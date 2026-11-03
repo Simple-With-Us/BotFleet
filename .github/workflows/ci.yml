@@ -41,6 +41,7 @@ jobs:
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           # Scheduled and manually dispatched runs keep the full gate: every
@@ -55,17 +56,26 @@ jobs:
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$BASE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+          # The scope is this pull request's own changes: the branch point to
+          # the head, not the stored base SHA to the merge commit.  The stored
+          # base SHA is the base branch's tip at the last synchronisation, and
+          # the merge commit is built on a newer tip, so diffing from the base
+          # SHA folded main's newer commits into this pull request's scope and
+          # a one-file documentation change paid for a macOS runner and an
+          # xcode-27 runner.  The scope script prints nothing and fails when
+          # the commits are not in this checkout, and this fails open.
+          scope_paths="$(mktemp)"
+          trap 'rm -f "$scope_paths"' EXIT
+          if bash scripts/ci-scope-diff.sh "$BASE_SHA" "$HEAD_SHA" > "$scope_paths"; then
+            node scripts/ci-change-scope.mjs < "$scope_paths" >> "$GITHUB_OUTPUT"
+          else
             {
               echo "docs_only=false"
               echo "changed_count=0"
               echo "ios_changed=true"
               echo "packaging_changed=true"
             } >> "$GITHUB_OUTPUT"
-            exit 0
           fi
-          git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" |
-            node scripts/ci-change-scope.mjs >> "$GITHUB_OUTPUT"
       # The effort ledger only ever grows, and a documentation-only pull
       # request skips the test job's full chain, so this is the one place a
       # ledger-only change is checked.  This job already has full history; the
@@ -261,6 +271,7 @@ jobs:
           IOS_CHANGED: ${{ needs.changes.outputs.ios_changed }}
           IOS_BUILD_RESULT: ${{ needs.ios-build.result }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
@@ -271,9 +282,14 @@ jobs:
             printf '' | node scripts/ci-ios-gate.mjs
             exit $?
           fi
-          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$BASE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
-            echo "ERROR: Cannot replay changed paths for an auditable gate (missing base SHA)." >&2
+          # The same scope the classifier used: the branch point to the head.
+          # A different diff here would make this gate disagree with the
+          # classifier and fail the required check on a mismatch.
+          scope_paths="$(mktemp)"
+          trap 'rm -f "$scope_paths"' EXIT
+          if ! bash scripts/ci-scope-diff.sh "$BASE_SHA" "$HEAD_SHA" > "$scope_paths"; then
+            echo "ERROR: Cannot replay changed paths for an auditable gate (the base or head commit is not in this checkout)." >&2
             exit 1
           fi
-          git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" | node scripts/ci-ios-gate.mjs
+          node scripts/ci-ios-gate.mjs < "$scope_paths"
 
