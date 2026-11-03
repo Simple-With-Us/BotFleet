@@ -199,6 +199,11 @@ function blankCommentsAndStrings(source: string): string {
   return out.join("");
 }
 
+interface ComparisonMatcher {
+  name: string;
+  argument: string | null;
+}
+
 interface ExpectCall {
   argument: string;
   matcher: string;
@@ -241,7 +246,7 @@ function expectCalls(source: string): ExpectCall[] {
 
 /** The matcher name and the argument it is given, from the chain that
  *  follows a comparison. */
-function matcherOf(chain: string): { name: string; argument: string | null } {
+function matcherOf(chain: string): ComparisonMatcher {
   const trimmed = chain.trimStart();
   const name = /^\.([A-Za-z]+)/.exec(trimmed);
   if (!name) return { name: "", argument: null };
@@ -283,7 +288,7 @@ function callArguments(source: string, from: number, to: number): string[] {
  *  that calls one of these can pick up the calendar through it. */
 const CALENDAR_MODULES = ["src/lib/routine-calendar.ts", "shared/time-zone.ts"];
 
-interface CalendarShape {
+interface CalendarContract {
   /** Helper name -> the position of a parameter that defaults to the live
    *  clock, or -1 when it has none. */
   defaults: Map<string, number>;
@@ -295,7 +300,7 @@ interface CalendarShape {
   direct: Set<string>;
 }
 
-function calendarShape(): CalendarShape {
+function calendarContract(): CalendarContract {
   const defaults = new Map<string, number>();
   const substituted = new Map<string, string>();
   const direct = new Set<string>();
@@ -330,7 +335,7 @@ function calendarShape(): CalendarShape {
   return { defaults, substituted, direct };
 }
 
-const SHAPE = calendarShape();
+const CONTRACT = calendarContract();
 
 /** Does this file pin the clock?  Fake timers, a set system time, or a
  *  mocked clock function all count. */
@@ -422,7 +427,7 @@ function calendarHelperReadsTheClock(file: TestFile): Violation[] {
   const source = file.source;
   const needsPin: string[] = [];
 
-  for (const [name, clockPosition] of SHAPE.defaults) {
+  for (const [name, clockPosition] of CONTRACT.defaults) {
     const needle = `${name}(`;
     let i = 0;
     for (;;) {
@@ -442,12 +447,12 @@ function calendarHelperReadsTheClock(file: TestFile): Violation[] {
         });
         continue;
       }
-      const field = SHAPE.substituted.get(name);
+      const field = CONTRACT.substituted.get(name);
       if (field) {
         const unset = new RegExp(`\\b${escapeRegExp(field)}\\s*:\\s*(?:null|undefined)`);
         if (unset.test(source)) needsPin.push(`${name}() while ${field} is left unset`);
       }
-      if (SHAPE.direct.has(name)) needsPin.push(`${name}() reads the clock itself`);
+      if (CONTRACT.direct.has(name)) needsPin.push(`${name}() reads the clock itself`);
     }
   }
 
