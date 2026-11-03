@@ -21,8 +21,13 @@ import { extractAvatarManifest } from "../../shared/avatar-manifest";
 import { toManifestBytes } from "./avatar-file/bytes";
 import { BotAvatar } from "./Avatar";
 
+/** BF-2626 A/B/C:
+ *  A — no expression picker (situation-driven only)
+ *  B — TV-Face switch keeps bot.color (auto-color match; default orange)
+ *  C — recolorable flag set on manifest WebP upload
+ */
 type AvatarPatch = Partial<
-  Pick<Bot, "avatarCrop" | "avatarUrl" | "color" | "mascotExpression">
+  Pick<Bot, "avatarCrop" | "avatarUrl" | "color" | "mascotExpression" | "recolorable">
 >;
 
 const CROP_LABEL = {
@@ -53,6 +58,9 @@ export function BotProfileAvatarCard({
   const cropRef = useRef(crop);
   cropRef.current = crop;
 
+  const showColorRow =
+    crop === "mascot" || crop === "tvface" || (crop === "animated" && bot.recolorable === true);
+
   const upload = async (file: File | undefined) => {
     if (!file) return;
     setUploading(true);
@@ -79,9 +87,12 @@ export function BotProfileAvatarCard({
       // follows the file.  Anything else keeps the crop an upload would
       // have had, which is what stops a plain picture from being left in a
       // crop that cannot draw it.
+      // C: flag recolorable when the pack carries a manifest (shell/full
+      // recolor is decided later by product; first cut = true for TV-Face packs).
       onPatch({
         avatarUrl,
         avatarCrop: carriesManifest ? "animated" : avatarCropAfterUpload(latestCrop),
+        ...(carriesManifest ? { recolorable: true } : { recolorable: false }),
       });
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
@@ -93,14 +104,22 @@ export function BotProfileAvatarCard({
 
   const removeImage = () => {
     setError(null);
-    onPatch({ avatarUrl: null, avatarCrop: "mascot" });
+    onPatch({ avatarUrl: null, avatarCrop: "mascot", recolorable: false });
   };
+
   return (
     <div className="overflow-hidden rounded-xl border border-hairline/40 bg-card">
       <div className="flex items-center justify-between border-b border-hairline/40 px-3 py-2.5">
         <span className="rounded-lg bg-control px-3 py-1.5 text-[14px] font-medium text-ink">Avatar</span>
         <button
-          onClick={() => onPatch({ avatarCrop: "mascot", color: "green", mascotExpression: null })}
+          onClick={() =>
+            onPatch({
+              avatarCrop: "mascot",
+              color: "green",
+              mascotExpression: null,
+              recolorable: false,
+            })
+          }
           className="rounded-md px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-control hover:text-ink"
         >
           Reset mascot
@@ -182,8 +201,12 @@ export function BotProfileAvatarCard({
             </button>
           )}
         </div>
-        <div className="mt-1.5 text-[11.5px] text-ink-secondary">Drop an image onto the avatar.  PNG, JPEG, GIF, WebP, HEIC, BMP, or SVG · up to 10 MB</div>
-        <div className="mt-1 text-[11.5px] text-ink-secondary">An animated WebP that carries its own manifest plays as one avatar file.  Pre-colored TV-Face packs are not recolored; mascot and TV-Face skins still use the Color row.</div>
+        <div className="mt-1.5 text-[11.5px] text-ink-secondary">
+          Drop an image onto the avatar.  PNG, JPEG, GIF, WebP, HEIC, BMP, or SVG · up to 10 MB
+        </div>
+        <div className="mt-1 text-[11.5px] text-ink-secondary">
+          An animated WebP that carries its own manifest plays as one avatar file.  TV-Face and mascot expressions follow the bot's situation (no manual picker).
+        </div>
 
         <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
           Shape
@@ -196,8 +219,8 @@ export function BotProfileAvatarCard({
               aria-pressed={crop === candidate}
               onClick={() => {
                 if (candidate === "tvface") {
-                  // TV-Face is situation-driven; clear a pinned expression and keep
-                  // the bot's color so the matching skin (or orange default) shows.
+                  // B: restore auto-color match — keep bot.color (fallback orange).
+                  // A: clear pinned expression so TV-Face stays situation-driven.
                   onPatch({
                     avatarCrop: "tvface",
                     mascotExpression: null,
@@ -214,7 +237,9 @@ export function BotProfileAvatarCard({
               className={cn(
                 "py-1.5 text-[12.5px]",
                 index > 0 && "border-l border-hairline/40",
-                crop === candidate ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                crop === candidate
+                  ? "bg-control text-ink"
+                  : "text-ink-secondary hover:bg-control/60 hover:text-ink",
               )}
             >
               {CROP_LABEL[candidate]}
@@ -222,7 +247,7 @@ export function BotProfileAvatarCard({
           ))}
         </div>
 
-        {(crop === "mascot" || crop === "tvface") && (
+        {showColorRow && (
           <>
             <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
               Color
@@ -250,8 +275,11 @@ export function BotProfileAvatarCard({
           </>
         )}
 
-
-        {error && <div role="alert" className="mt-3 text-[12px] text-danger" title={error}>{productErrorHeadline(error)}</div>}
+        {error && (
+          <div role="alert" className="mt-3 text-[12px] text-danger" title={error}>
+            {productErrorHeadline(error)}
+          </div>
+        )}
       </div>
     </div>
   );

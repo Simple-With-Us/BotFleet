@@ -15877,7 +15877,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // body may carry the six organize fields and nothing else.
       const organize = checkBotOrganizeBody(body, req.headers["x-botfleet-companion"] === "1");
       if (!organize.ok) return json(res, organize.status, { error: organize.error });
-      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
+      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "recolorable", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       if (normalizedSelection) {
