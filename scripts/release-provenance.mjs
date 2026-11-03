@@ -37,7 +37,8 @@
 // WHAT IS NOT IN THE TREE.  Two kinds of content legitimately exist in a
 // release without being in the commit tree, and are excluded from the source
 // comparison: `.botfleet-release.json` (the store's own manifest, written at
-// promote time) and `.DS_Store` (written by Finder).  Anything else present on
+// promote time) and `.DS_Store` (written by Finder, and waived only when its
+// bytes prove they ARE Finder metadata).  Anything else present on
 // disk but absent from the tree — or absent on disk but present in the tree,
 // or present with different bytes or a different type — is drift, and drift
 // means the release is NOT the commit it names.
@@ -53,7 +54,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
-import { join, posix } from "node:path";
+import { basename, join, posix } from "node:path";
 
 const FULL_COMMIT = /^[a-f0-9]{40}$/;
 
@@ -113,7 +114,23 @@ export function listTreeObjects(repo, commit) {
   return entries;
 }
 
-const EXCLUDED_BASENAMES = new Set([".DS_Store"]);
+// The .DS_Store waiver exists for Finder, and Finder's files are the only
+// ones it may waive: real ones start with the Bud1 magic and are small.  A
+// payload planted under that name has neither property, so it is compared -
+// and as bytes no commit exported, it is drift.
+const DS_STORE_MAGIC = Buffer.from([0, 0, 0, 1, 0x42, 0x75, 0x64, 0x31]); // "\0\0\0\1Bud1"
+const DS_STORE_MAX_BYTES = 262144;
+
+function isRealDSStore(absolutePath) {
+  try {
+    const stat = lstatSync(absolutePath);
+    if (!stat.isFile() || stat.size < DS_STORE_MAGIC.length || stat.size > DS_STORE_MAX_BYTES) return false;
+    const bytes = readFileSync(absolutePath);
+    return bytes.subarray(0, DS_STORE_MAGIC.length).equals(DS_STORE_MAGIC);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Content fingerprint of a dependency tree: every regular file's bytes and
@@ -256,9 +273,12 @@ export function hashDependencyTree(root, { confineTo = root, pathPrefix = "" } =
 }
 const MANIFEST_NAME = ".botfleet-release.json";
 
-function isExcluded(relativePath, isRootLevel) {
+function isExcluded(relativePath, isRootLevel, releaseRoot) {
   if (isRootLevel && relativePath === MANIFEST_NAME) return true;
-  return relativePath.split("/").some((segment) => EXCLUDED_BASENAMES.has(segment));
+  // Only the final segment: a DIRECTORY named .DS_Store is walked, and its
+  // contents are never waived under their own names.
+  if (basename(relativePath) === ".DS_Store") return isRealDSStore(join(releaseRoot, relativePath));
+  return false;
 }
 
 /**
@@ -340,7 +360,7 @@ function hashReleaseTree(releaseRoot) {
         }
         continue;
       }
-      if (isExcluded(name, !relative)) continue;
+      if (isExcluded(name, !relative, releaseRoot)) continue;
       try {
         if (entry.isDirectory()) {
           walk(name);

@@ -20,7 +20,9 @@
 // swap, and the harness is restarted separately (launchd's periodic tick
 // picks up the new pointer).
 
+import { realpathSync } from "node:fs";
 import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   currentCommit,
   listReleases,
@@ -55,10 +57,14 @@ function usage() {
   );
 }
 
-function flag(args, name) {
+export function flag(args, name) {
   const index = args.indexOf(name);
   if (index === -1) return undefined;
-  return args[index + 1];
+  const value = args[index + 1];
+  // A missing value, or the NEXT flag, is not a value: "promote C --version
+  // --build X" must not stamp the string "--build" as the release version.
+  if (value === undefined || value.startsWith("--")) return undefined;
+  return value;
 }
 
 /**
@@ -217,11 +223,26 @@ async function main() {
   return 2;
 }
 
-process.exitCode = await main().catch((error) => {
+// Only run the CLI when this file is the entry module: the unit tests import
+// the helpers, and an unconditional main() would run under the test runner.
+// Compare physical paths, the way update-botfleet-mac.mjs does.
+function isEntryModule() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
+  process.exitCode = await main().catch((error) => {
   // An operator gets the reason, not a stack trace.  The cause code is the
   // stable part (a missing commit, a failed export, a cross-device
   // rename), and the message already says what to do about it.
   const cause = error?.cause ? ` (${error.cause})` : "";
-  process.stderr.write(`harness-release: ${error?.message || error}${cause}\n`);
-  return 1;
-});
+    process.stderr.write(`harness-release: ${error?.message || error}${cause}\n`);
+    return 1;
+  });
+}

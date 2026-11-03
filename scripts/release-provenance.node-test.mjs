@@ -90,17 +90,63 @@ test("a missing file and an extra file are both drift, named separately", (t) =>
   assert.deepEqual(verdict.extra, ["c.txt"]);
 });
 
-test("node_modules, the store manifest and .DS_Store are legitimate non-tree content", (t) => {
+// Real Finder .DS_Store files open with the Bud1 magic; the waiver proves
+// the bytes are Finder metadata instead of trusting the name.
+const DS_STORE_BYTES = Buffer.concat([Buffer.from([0, 0, 0, 1]), Buffer.from("Bud1"), Buffer.alloc(64, 1)]);
+
+test("node_modules, the store manifest and a genuine .DS_Store are legitimate non-tree content", (t) => {
   const { dir, git } = makeRepo(t);
   const commit = commitTree(git, dir, { "a.txt": "one\n" });
   const root = exportTree(git, dir, commit);
   mkdirSync(join(root, "node_modules", "left-pad"), { recursive: true });
   writeFileSync(join(root, "node_modules", "left-pad", "index.js"), "module.exports = 1;\n");
   writeFileSync(join(root, ".botfleet-release.json"), '{"schemaVersion":1}\n');
-  writeFileSync(join(root, ".DS_Store"), "finder");
+  writeFileSync(join(root, ".DS_Store"), DS_STORE_BYTES);
   const verdict = verifyReleaseAgainstCommit({ releaseRoot: root, commit, repo: dir });
   assert.equal(verdict.ok, true);
   assert.equal(verdict.checked, 1);
+});
+
+test("a nested .DS_Store with genuine Finder magic is waived at any depth", (t) => {
+  const { dir, git } = makeRepo(t);
+  const commit = commitTree(git, dir, { "a.txt": "one\n" });
+  const root = exportTree(git, dir, commit);
+  mkdirSync(join(root, "server", "deep"), { recursive: true });
+  writeFileSync(join(root, "server", "deep", ".DS_Store"), DS_STORE_BYTES);
+  const verdict = verifyReleaseAgainstCommit({ releaseRoot: root, commit, repo: dir });
+  assert.equal(verdict.ok, true, "Finder writes metadata in whatever folder it touches");
+});
+
+test("bytes planted under the .DS_Store name are drift, never waived", (t) => {
+  const { dir, git } = makeRepo(t);
+  const commit = commitTree(git, dir, { "a.txt": "one\n" });
+  const root = exportTree(git, dir, commit);
+  mkdirSync(join(root, "server"), { recursive: true });
+  writeFileSync(join(root, "server", ".DS_Store"), "require('child_process').execSync('id')\n");
+  const verdict = verifyReleaseAgainstCommit({ releaseRoot: root, commit, repo: dir });
+  assert.equal(verdict.ok, false, "a script named .DS_Store is not Finder metadata");
+  assert.deepEqual(verdict.extra, ["server/.DS_Store"]);
+});
+
+test("an implausibly large .DS_Store is drift, magic or not", (t) => {
+  const { dir, git } = makeRepo(t);
+  const commit = commitTree(git, dir, { "a.txt": "one\n" });
+  const root = exportTree(git, dir, commit);
+  writeFileSync(join(root, ".DS_Store"), Buffer.concat([DS_STORE_BYTES, Buffer.alloc(300 * 1024, 2)]));
+  const verdict = verifyReleaseAgainstCommit({ releaseRoot: root, commit, repo: dir });
+  assert.equal(verdict.ok, false);
+  assert.deepEqual(verdict.extra, [".DS_Store"]);
+});
+
+test("a directory named .DS_Store is walked, and its contents are never waived", (t) => {
+  const { dir, git } = makeRepo(t);
+  const commit = commitTree(git, dir, { "a.txt": "one\n" });
+  const root = exportTree(git, dir, commit);
+  mkdirSync(join(root, ".DS_Store"));
+  writeFileSync(join(root, ".DS_Store", "payload"), DS_STORE_BYTES);
+  const verdict = verifyReleaseAgainstCommit({ releaseRoot: root, commit, repo: dir });
+  assert.equal(verdict.ok, false, "Finder never makes a .DS_Store directory; nothing inside is waived");
+  assert.deepEqual(verdict.extra, [".DS_Store/payload"]);
 });
 
 test("a symlink in the tree verifies by its target bytes, and a changed target is drift", (t) => {

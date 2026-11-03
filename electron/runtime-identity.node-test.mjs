@@ -241,6 +241,19 @@ test("a release without a stamped version reports the exported package.json vers
   assert.equal(identity.sourceDirty, false);
 });
 
+test("a release with no stamped version and no readable package.json is a controlled invalid identity, never a crash", (t) => {
+  const { dir, commit, release } = makeReleaseFixture(t, { "server/index.ts": "export {};\n" });
+  writeManifest(release, commit);
+  assert.throws(
+    () => withProvenanceRepo(dir, () => readSourceBuildIdentity(release)),
+    (error) => {
+      assert.match(error.message, /identity is invalid/, "the same refusal every invalid identity takes");
+      assert.doesNotMatch(error.message, /ENOENT/, "a missing package.json is not an I/O exception");
+      return true;
+    },
+  );
+});
+
 test("a release whose bytes drifted from its commit refuses the commit entirely", (t) => {
   const { dir, commit, release } = makeReleaseFixture(t);
   writeManifest(release, commit);

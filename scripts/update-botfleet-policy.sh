@@ -492,6 +492,8 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
         if git -C "$BOTFLEET_CHECKOUT" archive "$BOOTSTRAP_COMMIT" -- \
           scripts/update-botfleet-mac.mjs \
           scripts/mac-update-transaction.mjs \
+          scripts/harness-release-store.mjs \
+          scripts/release-provenance.mjs \
           scripts/update-progress.mjs \
           scripts/ci-build-resolver.mjs \
           scripts/stage-entries.mjs \

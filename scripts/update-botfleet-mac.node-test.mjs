@@ -465,6 +465,8 @@ test("the stable wrapper bootstraps updater policy from the fetched target", asy
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
     "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
     "scripts/failed-install-retention.mjs",
@@ -536,6 +538,8 @@ test("the stable wrapper rejects an unmerged --target before running any of its 
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
       "scripts/failed-install-retention.mjs",
@@ -591,6 +595,8 @@ test("the stable wrapper resolves a revision-expression --target instead of fetc
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
       "scripts/failed-install-retention.mjs",
@@ -645,6 +651,8 @@ test("unquiesce ignores update targets and bootstraps the recovery from origin/m
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
       "scripts/failed-install-retention.mjs",
@@ -704,6 +712,8 @@ test("the stable wrapper resolves env and equals-form targets to the pinned vali
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
       "scripts/failed-install-retention.mjs",
@@ -758,6 +768,8 @@ test("the stable wrapper builds the commit it validated, even when main moves mi
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
     "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
     "scripts/failed-install-retention.mjs",
@@ -834,6 +846,8 @@ test("the stable wrapper runs with no arguments and no update target", { skip: p
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
     "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
     "scripts/failed-install-retention.mjs",
@@ -878,6 +892,8 @@ test("the stable wrapper detects a linked worktree checkout, where .git is a fil
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
     "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
     "scripts/failed-install-retention.mjs",
@@ -929,6 +945,8 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
       "scripts/failed-install-retention.mjs",
@@ -1060,6 +1078,8 @@ test("apply bootstraps the updater recorded in the stage manifest, not a newer o
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
       "scripts/failed-install-retention.mjs",
@@ -2260,6 +2280,8 @@ test("the updater runs its entry point when invoked through a symlinked director
   const { linked, root } = await symlinkedCopy(t, [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
     "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
     "scripts/failed-install-retention.mjs",
@@ -2582,6 +2604,8 @@ async function newestGreenFixture(t, { resolver } = {}) {
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
       "scripts/ci-build-resolver.mjs",
       "scripts/stage-entries.mjs",
       "scripts/failed-install-retention.mjs",
@@ -3152,6 +3176,52 @@ test("storeHarnessState follows the launcher's root order: override, pointer, ch
     if (override === undefined) delete process.env.BOTFLEET_SERVER_ROOT;
     else process.env.BOTFLEET_SERVER_ROOT = override;
   }
+});
+
+async function makeCaptureFixture(t) {
+  const { home, config } = await makeStoreFixture(t);
+  config.parsed = {};
+  config.appPath = join(home, "BotFleet.app");
+  await mkdir(config.checkout, { recursive: true });
+  const git = (...args) => execFileSync("git", ["-C", config.checkout, ...args], { stdio: "pipe" });
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "test@example.invalid");
+  git("config", "user.name", "Test");
+  await writeFile(join(config.checkout, "file.txt"), "x\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "init");
+  return { home, config };
+}
+
+test("capturePrevious refuses a store-backed host whose release pointer is unresolvable", async (t) => {
+  const { home, config } = await makeCaptureFixture(t);
+  // A dangling pointer still lstat()s, so the host reads as store-backed, but
+  // no commit can be resolved from it.  Capturing nothing here would let a
+  // later rollback restore the checkout while the failed release kept serving.
+  await mkdir(join(home, ".botfleet"), { recursive: true });
+  await symlink(join(home, ".botfleet", "releases", "g".repeat(40)), join(home, ".botfleet", "current"));
+  await assert.rejects(
+    () => createOperations(config).capturePrevious({ stageDirectory: join(home, "stage") }),
+    /pointer is present but unresolvable/,
+  );
+});
+
+test("capturePrevious accepts a resolvable release pointer and a checkout-backed host", async (t) => {
+  const { home, config } = await makeCaptureFixture(t);
+  const ops = createOperations(config);
+  // No pointer: checkout-backed, nothing to restore - the capture proceeds
+  // past the pointer guard and refuses only on the missing fixture app.
+  await assert.rejects(
+    () => ops.capturePrevious({ stageDirectory: join(home, "stage") }),
+    /Installed BotFleet app is missing/,
+  );
+  // A manifest-bound release the pointer resolves to: also past the guard.
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  await assert.rejects(
+    () => ops.capturePrevious({ stageDirectory: join(home, "stage") }),
+    /Installed BotFleet app is missing/,
+  );
 });
 
 test("clearStoreIdentityError only ever clears the two identity refusals", async (t) => {

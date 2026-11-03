@@ -185,12 +185,19 @@ function readReleaseStoreIdentity(root, release, { requireGit, version, build, u
   if (requireGit && !verified) {
     throw new Error(`cannot verify release identity for ${root}: no repository confirmed the exported bytes are ${release.commit}`);
   }
+  // A release tree without a readable package.json is not a crash: with no
+  // version left to report, validBuildIdentity rejects the identity below,
+  // which is the controlled refusal every other invalid identity takes.
+  let packageVersion;
+  try {
+    packageVersion = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
+  } catch { /* absence is an invalid identity, not an exception */ }
   const value = {
     app: "botfleet",
     // The manifest's version is the one the deployer validated for this
     // release; the tree's package.json is what the same code reports when no
     // version was stamped.  A caller-supplied version still wins for a build.
-    version: version ?? release.version ?? JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,
+    version: version ?? release.version ?? packageVersion,
     apiVersion: HARNESS_API_VERSION,
     sourceCommit,
     sourceDirty,

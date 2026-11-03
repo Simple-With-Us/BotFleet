@@ -4404,6 +4404,14 @@ export function createOperations(config) {
       // point the store back at it.  Null on a checkout-backed host.
       const storeState = await storeHarnessState(config);
       const releaseCommit = storeState.mode === "release" ? await storeCurrentCommit(storeState.env) : null;
+      if (storeState.mode === "release" && !releaseCommit) {
+        // The pointer exists but names nothing resolvable (a dangling link, a
+        // non-commit directory, or a manifest that does not bind to it).  A
+        // capture with no prior release would let rollback restore the
+        // checkout while the FAILED release kept serving, so refuse here,
+        // before anything moves.
+        throw new Error("Release store pointer is present but unresolvable; refusing update until the store is cleared");
+      }
       const dirty = await gitOutput(config.checkout, ["status", "--porcelain"]);
       if (dirty) {
         // Name them.  An untracked directory left by an earlier failure blocks
