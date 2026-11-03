@@ -17654,7 +17654,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         localOwner: isLoopbackAddress(req.socket.remoteAddress),
         fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
         viaNamedTunnel: arrivedViaCloudflareTunnel(req),
-      }, { hostId, controller: placementLeases.controller(), platform: process.platform });
+      }, { hostId, controller: () => placementLeases.controller(), platform: process.platform });
       return json(res, response.status, response.body);
     }
     // Saved data that could not be read or used, for the notice at the top of the app.  File base names

@@ -40,3 +40,11 @@ After isolating packaged smoke from host CLI discovery with a private shadow ins
 The remaining chain from `pnpm test:ios-ship` through the final HTML sentence-gap and iOS screenshot Node fixtures completed with exit 0: 444 tests passed, zero failed, zero skipped.  Credential-sync passed all four fixtures, including the refused-copy case.  Earlier 45-second and 60-second packaged-readiness failures remain preserved as failed runtime-readiness attempts; the bundle-check result does not explain or erase them.
 
 `pnpm lint` passed in the lane with 4,867 warnings, equal to the existing baseline of 4,867.
+
+## Review Follow-Up
+
+Identity authorization now precedes the lazy durable-controller read.  Unauthorized callers and unsupported platforms never invoke that reader; an authorized read failure returns a generic 503 without private parser details.  Placement mutations similarly return their existing structured refusal shape when a fence read fails, including missing, corrupt and regressed state, preserving the last verified pair only as refusal context.  No mutation proceeds using it.
+
+The affected 35 fixtures, frontend and server typechecks, unchanged 4,867-warning lint ceiling and diff check passed.  The HTTP fixture now parses its fetched controller pair with a host-id and safe nonnegative epoch schema.  An initial follow-up run preserved a failed claim-response expectation and a shared Clutch export preparation failure; the corrected run used a private compiled Clutch copy and verified the shared export hash was unchanged by that preparation.
+
+The suggested timed fence cache is declined: another process can commit a takeover between two messages, and accepting the cached pair until a timer fires would allow stale mutations.  Existing independent-service and competing-writer fixtures require immediate convergence.  This slice retains one fresh durable read per fenced message; transactional indexed persistence is a separate follow-up and does not justify weakening this fence.

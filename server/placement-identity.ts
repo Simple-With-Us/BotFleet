@@ -95,12 +95,12 @@ export function loadControllerEpoch(dataDir: string, hostId: HostId): Controller
 
 export interface PlacementIdentityDeps {
   hostId: HostId;
-  controller: ControllerEpoch;
+  controller: () => ControllerEpoch;
   platform: NodeJS.Platform;
 }
 export type PlacementIdentityResponse =
   | { status: 200; body: PlacementIdentity }
-  | { status: 403 | 501; body: { error: string } };
+  | { status: 403 | 501 | 503; body: { error: string } };
 interface PlacementIdentityCaller { localOwner: boolean; fromCompanion: boolean; viaNamedTunnel: boolean }
 
 /** The companion Bearer is intentionally outside the host-owner boundary. */
@@ -114,12 +114,18 @@ export function placementIdentityResponse(
   if (deps.platform !== "darwin" && deps.platform !== "linux") {
     return { status: 501, body: { error: "Placement identity is not available on this platform" } };
   }
+  let controller: ControllerEpoch;
+  try {
+    controller = deps.controller();
+  } catch {
+    return { status: 503, body: { error: "Controller epoch could not be verified; placement identity is unavailable" } };
+  }
   return {
     status: 200,
     body: {
       hostId: deps.hostId,
-      controllerId: deps.controller.controllerId,
-      epoch: deps.controller.epoch,
+      controllerId: controller.controllerId,
+      epoch: controller.epoch,
       // The placement wire version, never the product version health reports.
       version: PLACEMENT_WIRE_VERSION,
       platform: deps.platform,

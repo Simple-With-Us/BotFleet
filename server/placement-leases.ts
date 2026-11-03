@@ -145,6 +145,15 @@ export class PlacementLeaseService {
     return orphanedJobIds;
   }
 
+  private verifyController(): string | null {
+    try {
+      this.refreshController();
+      return null;
+    } catch {
+      return "Controller epoch could not be verified; placement refused";
+    }
+  }
+
   private commitController(next: ControllerEpoch): string | null {
     try {
       const result = this.controllerStore?.compareAndSet(this.current, next);
@@ -178,7 +187,8 @@ export class PlacementLeaseService {
    *  and queue messages too, never adopted outside `takeover`, so no skewed
    *  or forged worker bump can invalidate outstanding leases. */
   private fence(message: PlacementMessage): string | null {
-    this.refreshController();
+    const failure = this.verifyController();
+    if (failure) return failure;
     if (message.version !== PLACEMENT_WIRE_VERSION) {
       return `placement version ${message.version} is not spoken here (this host speaks ${PLACEMENT_WIRE_VERSION})`;
     }
@@ -192,7 +202,9 @@ export class PlacementLeaseService {
   }
 
   private refused<T>(reason: string): LeaseResult<T> {
-    return { ok: false, reason, controller: this.controller() };
+    // A refusal may follow a failed durable read; return only the last
+    // verified pair as context, never as authorization to mutate state.
+    return { ok: false, reason, controller: { ...this.current } };
   }
 
   private clearPendingStop(hostId: HostId | undefined, leaseId: string | undefined): void {
@@ -437,7 +449,8 @@ export class PlacementLeaseService {
       ok: true,
       reply: { accepted: false, reconcile: false, orphanedJobIds: [], reason, ...this.current },
     });
-    this.refreshController();
+    const failure = this.verifyController();
+    if (failure) return refuse(failure);
     if (message.version !== PLACEMENT_WIRE_VERSION) {
       return refuse(`placement version ${message.version} is not spoken here (this host speaks ${PLACEMENT_WIRE_VERSION})`);
     }

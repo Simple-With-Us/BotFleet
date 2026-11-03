@@ -11,6 +11,8 @@ import { spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 import { freePortBlock } from "./testing/ports.ts";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
+import { HOST_ID_PATTERN } from "../shared/placement.ts";
 
 const hostId: HostId = "server:11111111-1111-4111-8111-111111111111";
 const nextId: HostId = "mac:22222222-2222-4222-8222-222222222222";
@@ -167,13 +169,40 @@ describe("durable controller transitions", () => {
     leases.takeover({ ...fence, epoch: 2, reconcile: true });
     const path = join(dir, "placement-controller.json");
     writeFileSync(path, JSON.stringify(initial));
-    expect(() => leases.release({ ...fence, toControllerId: nextId })).toThrow(/regressed/);
+    expect(leases.release({ ...fence, toControllerId: nextId }))
+      .toMatchObject({ reply: { accepted: false, reason: "Controller epoch could not be verified; placement refused", epoch: 2 } });
     writeFileSync(path, "damaged");
     expect(() => leases.controller()).toThrow(/invalid/);
     expect(readFileSync(path, "utf8")).toBe("damaged");
     rmSync(path);
-    expect(() => leases.takeover({ ...fence, epoch: 3, reconcile: true })).toThrow();
+    expect(leases.takeover({ ...fence, epoch: 3, reconcile: true }))
+      .toMatchObject({ reply: { accepted: false, reason: "Controller epoch could not be verified; placement refused", epoch: 2 } });
     expect(() => store.read()).toThrow();
+  });
+
+  it("returns structured refusals without changing jobs when the durable fence is unavailable", () => {
+    const dir = fixture();
+    const leases = service(dir);
+    const path = join(dir, "placement-controller.json");
+    const enqueue = { ...fence, jobId: "held", botId: "bot", threadId: "thread", command: "true", cwd: dir, timeoutMs: 1000 };
+    leases.enqueue(enqueue);
+    const before = leases.jobsList();
+    for (const damaged of ["private damaged fixture", JSON.stringify({ ...initial, epoch: -1 }), null]) {
+      if (damaged === null) rmSync(path); else writeFileSync(path, damaged);
+      expect(placementLeaseRoute(owner, "claim", { ...fence, hostId: nextId, jobId: "held" }, leases))
+        .toEqual({ status: 200, body: { accepted: false, reason: "Controller epoch could not be verified; placement refused", ...initial } });
+      expect(placementLeaseRoute(owner, "heartbeat", { ...fence, hostId: nextId, leases: [], admission: { admit: true }, sample }, leases))
+        .toMatchObject({ status: 409, body: { error: "Controller epoch could not be verified; placement refused" } });
+      expect(placementLeaseRoute(owner, "enqueue", { ...enqueue, jobId: "new" }, leases))
+        .toMatchObject({ status: 200, body: { accepted: false, reason: "Controller epoch could not be verified; placement refused" } });
+      expect(placementLeaseRoute(owner, "takeover", { ...fence, epoch: 3, reconcile: true }, leases))
+        .toMatchObject({ status: 200, body: { accepted: false, reason: "Controller epoch could not be verified; placement refused" } });
+      expect(leases.jobsList()).toEqual(before);
+      expect(leases.reconciling()).toBe(false);
+    }
+    writeFileSync(path, JSON.stringify(initial));
+    expect(placementLeaseRoute(owner, "enqueue", { ...enqueue, jobId: "new" }, leases))
+      .toMatchObject({ status: 200, body: { accepted: true } });
   });
 
   it("refuses release overflow at the largest valid epoch", () => {
@@ -217,8 +246,13 @@ describe("durable controller transitions", () => {
     const identity = async () => {
       const response = await fetch(`${base}/api/placement/identity`);
       expect(response.status).toBe(200);
-      // SAFETY: the identity route's fixture response is validated by the assertions below.
-      return await response.json() as ControllerEpoch;
+      return z.object({
+        controllerId: z.string().regex(HOST_ID_PATTERN).transform((value) => {
+          // SAFETY: HOST_ID_PATTERN validates the HostId shape at this HTTP boundary.
+          return value as HostId;
+        }),
+        epoch: z.number().int().nonnegative().safe(),
+      }).parse(await response.json());
     };
     const transition = async (action: "release-controller" | "takeover", body: ReleaseMessage | TakeoverMessage) => {
       const response = await fetch(`${base}/api/placement/${action}`, {
