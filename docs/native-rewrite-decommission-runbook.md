@@ -149,7 +149,7 @@ This is the irreversible one, and it is the step the whole gate exists for.
 - `scripts/launchd/app.botfleet.server.plist`, `scripts/botfleet-server-start.sh`, `scripts/botfleet-server-healthcheck.sh`, `scripts/launchd/harness-watchdog.node-test.mjs`.
 - Mac-specific CI jobs that build and test the Mac harness.  Preserve or replace Linux install/build/update coverage needed by BF-2544.
 
-**Verification:** a cold boot with no Mac-local BotFleet Node process, every bot answering a turn, routines firing on schedule, Zulip and Linear round-tripping, and the reboot check from BF-2515 passing twice.  Verify the retained Linux runtime separately; unrelated Node processes are outside this decommission.
+**Verification:** a cold boot with no Mac-local BotFleet Node process, every bot answering a turn, routines firing on schedule, Zulip and Linear round-tripping, and the reboot check from BF-2515 (`node scripts/check-post-reboot-node.mjs`) passing twice.  Verify the retained Linux runtime separately; unrelated Node processes are outside this decommission.
 
 **What breaks if skipped:** the Mac app has no runtime.  Linux remains a separate deployment: deleting its shared harness source or build inputs also breaks Linux, even after the Mac LaunchAgent is gone.
 
@@ -176,7 +176,7 @@ This is the irreversible one, and it is the step the whole gate exists for.
 
 ### Step 8 — Post-Deletion Checks
 
-- Cold boot on a clean data root, and again after a reboot.
+- Cold boot on a clean data root, and again after a reboot, verified by `node scripts/check-post-reboot-node.mjs` (processes, launchd jobs, and loopback port listeners).
 - One full day of routines, Zulip traffic and a phone session.
 - `node scripts/audit-node-decommission.mjs` reports zero unowned files under the Mac-local roots, and reports the Linux deployment as both retained and dependent on source being deleted.
 - The gate script reports green only when `inventory-clean`, `linux-server-preservation`, the other evidence, issue states and Mac-harness absence are all asserted.  Linux preservation remains a separately verified claim; a green inventory or Mac soak alone cannot satisfy it.

@@ -64,10 +64,26 @@ export function unwrapNodes(raw) {
   return envelope;
 }
 
+/**
+ * Resolve the CLI binary to query Linear.  Prefers explicit BOARD_CLI env,
+ * checks if `board` is on PATH, and falls back to `simple-board` (the modern
+ * fleet implementation).
+ */
+export function resolveBoardCli() {
+  if (process.env.BOARD_CLI) return process.env.BOARD_CLI;
+  try {
+    execFileSync("which", ["board"], { stdio: "ignore" });
+    return "board";
+  } catch {
+    return "simple-board";
+  }
+}
+
 /** One Linear page through the board CLI.  Throws rather than returning []. */
 export function fetchLinearPage(after) {
+  const cli = resolveBoardCli();
   const out = execFileSync(
-    "board",
+    cli,
     ["api", "query", "--max-chars", "64000", linearPageQuery(after), "--json"],
     { encoding: "utf8", timeout: 120_000 },
   );
