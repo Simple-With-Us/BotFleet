@@ -21,7 +21,7 @@
 // matches its own source, and the calendar shapes in rule 4 are derived from
 // the production code rather than listed by hand — a new clock-substituting
 // helper is picked up without anyone remembering to add it.
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -84,7 +84,14 @@ function testFiles(): TestFile[] {
       out.push({ path: full.slice(ROOT.length), source: readFileSync(full, "utf8") });
     }
   };
-  for (const dir of TEST_DIRECTORIES) walk(join(ROOT, dir));
+  for (const dir of TEST_DIRECTORIES) {
+    // A tree that is not there is a tree with no tests in it.  The
+    // Electron and companion directories are on their way out, and a guard
+    // that hard-failed on a missing one would stop guarding anything.
+    const full = join(ROOT, dir);
+    if (!existsSync(full)) continue;
+    walk(full);
+  }
   return out;
 }
 
