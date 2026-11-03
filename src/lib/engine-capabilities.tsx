@@ -899,9 +899,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       imageAttachments:
         "Turns are sent as text prompts only; BotFleet does not wire attachments into this driver.",
       webAccess:
-        "The ZCode CLI ships its own WebSearch tool, and this driver's --disallowed-tools only removes AskUserQuestion, EnterPlanMode, and ExitPlanMode, so search stays mounted in headless turns.  Source:  zcode packages/shared/src/tool-identity.ts.",
+        "The ZCode CLI registers WebSearch as a core read-only tool (apps/zcode-cli/packages/core/src/tool/scheduler.ts, implemented in tool/handlers/websearch.ts).  This driver runs --mode yolo and its --disallowed-tools only removes AskUserQuestion, EnterPlanMode, and ExitPlanMode, so search stays mounted in headless turns.",
       longContext:
-        "GLM-5.3, the default model, documents a 1M-token context window.  Source:  https://docs.z.ai/guides/llm/glm-5.3 (fetched 2026-11-03).",
+        "This driver defaults to --model GLM-5.3 (server/drivers/zcode.ts), and GLM-5.3 documents a 1M-token context window.  Source:  https://docs.z.ai/guides/llm/glm-5.3 (fetched 2026-11-03).",
       liveResearch:
         "The CLI's modes are build, edit, plan, yolo, and guarded; there is no dedicated multi-step research pass, only single-shot WebSearch.",
     },
