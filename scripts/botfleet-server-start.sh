@@ -472,45 +472,24 @@ reset_fail_ledger
 # this point can still exit without ever touching the log file.
 rotate_log_if_large
 
-# --- the Infisical machine identity --------------------------------------
+# --- the Infisical service tokens ----------------------------------------
 # Recovered through `fleet-secrets get`, and nothing else out of it.
 #
-# This one credential is deliberately not in the vault -- a lock cannot hold
-# its own key -- and not in config.json, which is plaintext, because it can
-# read every name in the project.  That leaves exactly one place a
-# launchd-started harness can get it, and without it the harness comes up
-# "Infisical is not configured" and silently drops every vault-backed
-# credential: the speech-to-speech keys, Zulip's per-role keys, the lot.
+# The helper's own approved bootstrap is managed separately from these app
+# credentials.  Its replacement access must be verified before rollout;
+# fetching a dedicated name does not itself migrate the helper's identity.
+# The desktop can replay protected app credentials while attached, while
+# this optional bootstrap also serves an independently started harness.
 #
-# The desktop app can also replay the identity into a running harness, but
-# only while it is attached -- `before-quit` stops the replay on purpose,
-# because the always-on harness outlives it.  A crash, an update, or a manual
-# restart therefore leaves nothing to restore it, which is exactly when it
-# is most needed.
-#
-# The Node server never calls fleet-secrets.  This wrapper is the launchd entry
-# point, and it copies only the machine-identity pair into the environment
-# loadConfig() already prefers.  The values are fetched one name at a time
-# rather than injected wholesale (`fleet-secrets run` would also refuse every
-# INFISICAL_* name):  `ps eww` prints a process environment and Fleet-OPS holds
-# every fleet secret, so only the identity belongs in this process.  When both
-# halves are already in the environment, nothing is fetched.  A missing helper
-# or a failed fetch is not fatal -- the harness still starts, and the desktop
-# app can still supply the identity in memory.
-#
-# The helper is addressed by its absolute path, $HOME/.local/bin/fleet-secrets,
-# because a LaunchAgent's PATH is minimal.  It authenticates from the login
-# Keychain machine identity (see INFISICAL.md in AI-Fleet-Coordinator).
-#
-# An empty string must not be exported.  loadConfig() treats a defined env var
-# as present (`process.env[name] !== undefined`), so INFISICAL_CLIENT_ID=""
-# would hide config.json and the INFISICAL_UNIVERSAL_AUTH_* aliases.  A half
-# pair would do the same to one side.  Apply the fetched values only when they
-# yield both halves, and only into names that are still empty.  Documented
-# keys (INFISICAL_CLIENT_*) win;  the automation names are the fallback.
+# The managed launcher fetches only the existing dedicated harness tokens.
+# It never provisions or borrows a machine identity.  Explicit product machine
+# identity settings remain the backend's responsibility; inherited values are
+# left untouched and cannot activate that option implicitly.
+# A missing helper or token does not prevent an optional Infisical install
+# from starting; writes still require their separate write credential.
 fleet_secret() {
   local name="$1" bin="$HOME/.local/bin/fleet-secrets"
-  # Anything but an executable file is "no identity"; keep going.
+  # A missing executable helper leaves optional vault access unconfigured.
   [ -f "$bin" ] && [ -x "$bin" ] || return 0
   # The value goes to stdout only; errors are dropped so no fragment is shown.
   "$bin" get "$name" 2>/dev/null | tr -d '\r' || true
@@ -532,55 +511,19 @@ first_fleet_secret() {
 }
 
 load_infisical_identity() {
-  # A service token wins over the machine identity: one read-only token for
-  # the folders this install reads, one write token for the folders it
-  # writes.  Both come from Fleet-OPS, the fleet's credential store, and the
-  # machine identity stays as the fallback for an install that has not been
-  # provisioned with tokens yet.
-  local fetched_id="" fetched_secret="" fetched_token="" fetched_write_token=""
-  if [ -f "$HOME/.local/bin/fleet-secrets" ] && [ -x "$HOME/.local/bin/fleet-secrets" ]; then
+  local fetched_token="" fetched_write_token=""
+  # Preserve configured tokens; consult the approved helper only for a
+  # missing dedicated token and never request a generic identity.
+  if [ -z "${INFISICAL_TOKEN:-}" ]; then
     fetched_token="$(first_fleet_secret BOTFLEET_HARNESS_INFISICAL_READ_TOKEN)"
+    if [ -n "$fetched_token" ]; then INFISICAL_TOKEN="$fetched_token"; fi
+  fi
+  if [ -z "${INFISICAL_WRITE_TOKEN:-}" ]; then
     fetched_write_token="$(first_fleet_secret BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN)"
+    if [ -n "$fetched_write_token" ]; then INFISICAL_WRITE_TOKEN="$fetched_write_token"; fi
   fi
-  if [ -n "$fetched_token" ] && [ -z "${INFISICAL_TOKEN:-}" ]; then
-    INFISICAL_TOKEN="$fetched_token"
-  fi
-  if [ -n "$fetched_write_token" ] && [ -z "${INFISICAL_WRITE_TOKEN:-}" ]; then
-    INFISICAL_WRITE_TOKEN="$fetched_write_token"
-  fi
-  if [ -n "${INFISICAL_TOKEN:-}" ]; then
-    export INFISICAL_TOKEN
-  fi
-  if [ -n "${INFISICAL_WRITE_TOKEN:-}" ]; then
-    export INFISICAL_WRITE_TOKEN
-  fi
-  # No early return here.  The token is the PREFERRED identity, not the only
-  # one: the machine identity below stays as the fallback for the two cases
-  # a token cannot cover -- a write with no write token provisioned, and a
-  # read of another project than the token's own.  Returning as soon as the
-  # token is set would leave a token-only host with neither, and the write
-  # would fail at login with an error that reads like a broken vault.
-  if [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
-    export INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET
-    return 0
-  fi
-  [ -f "$HOME/.local/bin/fleet-secrets" ] && [ -x "$HOME/.local/bin/fleet-secrets" ] || return 0
-  fetched_id="$(first_fleet_secret INFISICAL_CLIENT_ID INFISICAL_AUTOMATION_CLIENT_ID)"
-  fetched_secret="$(first_fleet_secret INFISICAL_CLIENT_SECRET INFISICAL_AUTOMATION_CLIENT_SECRET)"
-  if [ -n "$fetched_id" ] && [ -n "$fetched_secret" ]; then
-    if [ -z "${INFISICAL_CLIENT_ID:-}" ]; then
-      INFISICAL_CLIENT_ID="$fetched_id"
-    fi
-    if [ -z "${INFISICAL_CLIENT_SECRET:-}" ]; then
-      INFISICAL_CLIENT_SECRET="$fetched_secret"
-    fi
-  fi
-  if [ -n "${INFISICAL_CLIENT_ID:-}" ]; then
-    export INFISICAL_CLIENT_ID
-  fi
-  if [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
-    export INFISICAL_CLIENT_SECRET
-  fi
+  if [ -n "${INFISICAL_TOKEN:-}" ]; then export INFISICAL_TOKEN; fi
+  if [ -n "${INFISICAL_WRITE_TOKEN:-}" ]; then export INFISICAL_WRITE_TOKEN; fi
 }
 
 load_infisical_identity

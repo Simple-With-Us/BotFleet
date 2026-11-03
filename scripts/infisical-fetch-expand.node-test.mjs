@@ -12,14 +12,10 @@ import { isUnresolvedReference, run } from "./infisical-fetch.mjs";
 const REFERENCE = "${prod.global-api-keys.SENTINEL_KEY_ref_3c9e}";
 const RESOLVED = "sentinel-resolved-value-5d1a";
 
-/** Stub Infisical: login succeeds, the list call returns the fixture secrets
- * and records every list URL so a test can assert on the query string. */
+/** Stub only the secrets read and record its URL for query-string assertions. */
 function stubFetch(vaultSecrets, listUrls = []) {
   return async (url) => {
     const u = String(url);
-    if (u.includes("/api/v1/auth/universal-auth/login")) {
-      return { ok: true, json: async () => ({ accessToken: "test-token", expiresIn: 3600 }) };
-    }
     if (u.includes("/api/v3/secrets/raw")) {
       listUrls.push(u);
       return {
@@ -37,8 +33,7 @@ function baseEnv(githubEnv, names) {
   return {
     INFISICAL_NAMES: names,
     INFISICAL_PROJECT_ID: "proj",
-    INFISICAL_CLIENT_ID: "id",
-    INFISICAL_CLIENT_SECRET: "secret",
+    INFISICAL_TOKEN: "st.fixture",
     GITHUB_ENV: githubEnv,
   };
 }

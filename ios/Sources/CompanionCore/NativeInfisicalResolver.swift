@@ -165,8 +165,8 @@ public enum InfisicalServiceTokenReadStatus: Equatable, Sendable, CustomStringCo
 /// The part of the vault a read is scoped to: the site, the project, the
 /// environment and the path inside the project.
 ///
-/// The scope is explicit and configurable because a service token carries no
-/// scope of its own: the token says WHO may read, the scope says WHAT is read.
+/// The requested scope is explicit and configurable and must match the token's
+/// granted project and folder; requesting a path does not widen that grant.
 public struct InfisicalVaultScope: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     public let siteUrl: String
     public let projectId: String
@@ -197,14 +197,26 @@ public struct InfisicalVaultScope: Equatable, Sendable, CustomStringConvertible,
     public var debugDescription: String { description }
 }
 
+public enum InfisicalAuthMethod: String, Codable, CaseIterable, Sendable {
+    case serviceToken = "service-token"
+    case machineIdentity = "machine-identity"
+
+    public var title: String {
+        switch self {
+        case .serviceToken: return "Service Tokens"
+        case .machineIdentity: return "Machine Identity"
+        }
+    }
+}
+
 /// Errors thrown by `NativeInfisicalResolver`.  Error descriptions never echo
 /// upstream response bodies or raw secret material.
 public enum InfisicalResolverError: LocalizedError, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
-    /// No usable vault credential is available: the Keychain holds neither a
-    /// read-only service token nor a valid machine identity.
+    case integrationDisabled
+    /// No usable credential is available for the selected authentication method.
     ///
     /// The name is the original one and is kept because the direct LLM client
-    /// maps it; the message names both credentials that can open the vault.
+    /// maps it to a missing provider key.
     case missingMachineIdentity
     case keychainUnavailable(status: OSStatus, message: String)
     case keychainWriteFailed(status: OSStatus)
@@ -220,8 +232,10 @@ public enum InfisicalResolverError: LocalizedError, Equatable, Sendable, CustomS
 
     public var errorDescription: String? {
         switch self {
+        case .integrationDisabled:
+            return "Infisical is disabled."
         case .missingMachineIdentity:
-            return "No Infisical credential is available: the macOS Keychain holds neither a read-only service token nor a valid machine identity."
+            return "No credential is available for the selected Infisical authentication method."
         case .keychainUnavailable(let status, let message):
             return "macOS Keychain is unavailable (OSStatus \(status)): \(message)"
         case .keychainWriteFailed(let status):
@@ -394,11 +408,9 @@ public struct URLSessionInfisicalTransport: InfisicalHTTPTransportProtocol {
 
 /// In-memory-only Infisical secret resolver with Keychain credential storage.
 ///
-/// Two credentials can open the vault and the service token wins.  A read-only
-/// Infisical service token is the credential the fleet moved to: it is the
-/// bearer token itself, so the service-token path sends NO Universal Auth
-/// login request at all.  The machine identity is the fallback for an install
-/// that has not been provisioned with a token yet.
+/// Vault resolution is disabled until explicitly enabled, and then uses only
+/// the selected authentication method.  Service tokens are bearers themselves;
+/// only explicitly selected machine identity authentication can log in.
 ///
 /// Security invariants:
 /// 1. The service token lives in the macOS Keychain under the same item the
@@ -443,6 +455,8 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
     private let keychain: InfisicalKeychainStoreProtocol
     private let serviceTokenStore: InfisicalKeychainStoreProtocol?
     private let scope: InfisicalVaultScope
+    private let enabled: Bool
+    private let authMethod: InfisicalAuthMethod
     private let transport: InfisicalHTTPTransportProtocol
     private let ttlSeconds: TimeInterval
     private let now: @Sendable () -> Date
@@ -453,6 +467,8 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
     private var cachedServiceToken: CachedServiceToken?
 
     /// - Parameters:
+    ///   - enabled: Opts into vault resolution; disabled instances use only process overrides.
+    ///   - authMethod: Selects one credential method without automatic fallback.
     ///   - keychain: Where the machine identity lives.
     ///   - serviceTokenStore: Where the read-only service token lives.  `nil`
     ///     means the production Keychain item the Electron main process reads,
@@ -463,12 +479,14 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
     ///     login Keychain behind the caller's back.  That is what keeps every
     ///     unit test deterministic on any machine.
     ///   - scope: The site, project, environment and path a service-token read
-    ///     is scoped to.  A service token carries no scope of its own.
+    ///     is scoped to; it must match that token's grants.
     ///   - transport: How requests leave the process.
     ///   - ttlSeconds: How long a resolved secret or a bearer stays in memory.
     ///   - now: The clock, injectable for tests.
     ///   - sleepMs: The backoff sleep, injectable for tests.
     public init(
+        enabled: Bool = false,
+        authMethod: InfisicalAuthMethod = .serviceToken,
         keychain: InfisicalKeychainStoreProtocol = MacKeychainInfisicalStore(),
         serviceTokenStore: InfisicalKeychainStoreProtocol? = nil,
         scope: InfisicalVaultScope = .botFleetServer,
@@ -479,6 +497,8 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
             try? await Task.sleep(nanoseconds: ms * 1_000_000)
         }
     ) {
+        self.enabled = enabled
+        self.authMethod = authMethod
         self.keychain = keychain
         self.serviceTokenStore = serviceTokenStore ?? NativeInfisicalResolver.productionServiceTokenStore(for: keychain)
         self.scope = scope
@@ -635,8 +655,7 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
     /// is never logged or echoed.
     ///
     /// Fails closed before making any network request when the Keychain holds
-    /// no usable credential: the service token is `.empty`, `.invalid` or
-    /// `.unavailable`, and so is the machine identity.
+    /// no usable credential for the selected method, or when the integration is disabled.
     public func resolveSecret(forKey key: String) async throws -> RedactedSecret {
         let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedKey.isEmpty else {
@@ -649,6 +668,8 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
                 return RedactedSecret(trimmedValue)
             }
         }
+
+        guard enabled else { throw InfisicalResolverError.integrationDisabled }
 
         let currentTime = now()
         if let entry = secretCache[trimmedKey], entry.expiresAt > currentTime, !entry.secret.isEmpty {
@@ -668,31 +689,31 @@ public actor NativeInfisicalResolver: CustomStringConvertible, CustomDebugString
     /// `/api/v3/secrets/raw`.  Returns only the list of secret names present in
     /// the vault, never raw values.
     ///
-    /// Two credentials can open the vault, and the service token wins:
-    ///
-    /// 1. A read-only service token, when one is stored.  It is the bearer
-    ///    token itself, so this path sends NO Universal Auth login request.
-    /// 2. Otherwise the machine identity, which is exchanged for a bearer token
-    ///    through `/api/v1/auth/universal-auth/login`.
+    /// Only the explicitly selected authentication method can open the vault.
+    /// Service tokens never fall back to Universal Auth, and disabled resolution
+    /// performs no credential-store read or network request.
     ///
     /// Fails closed before any network request is opened: an unreadable
     /// credential store, a stored value that is not a service token, and a
     /// missing credential are all reported, never worked around.
     @discardableResult
     public func refreshSecretsSnapshot() async throws -> [String] {
-        switch await serviceTokenStatus() {
-        case .ok(let token):
-            return try await fetchSecretsRaw(
-                scope: scope,
-                bearerToken: token.exposeSecret(),
-                expandSecretReferences: true
-            )
-        case .empty:
-            break
-        case .invalid:
-            throw InfisicalResolverError.invalidServiceToken
-        case .unavailable(let status, let message):
-            throw InfisicalResolverError.keychainUnavailable(status: status, message: message)
+        guard enabled else { throw InfisicalResolverError.integrationDisabled }
+        if authMethod == .serviceToken {
+            switch await serviceTokenStatus() {
+            case .ok(let token):
+                return try await fetchSecretsRaw(
+                    scope: scope,
+                    bearerToken: token.exposeSecret(),
+                    expandSecretReferences: true
+                )
+            case .empty:
+                throw InfisicalResolverError.missingMachineIdentity
+            case .invalid:
+                throw InfisicalResolverError.invalidServiceToken
+            case .unavailable(let status, let message):
+                throw InfisicalResolverError.keychainUnavailable(status: status, message: message)
+            }
         }
 
         let identity: InfisicalMachineIdentity

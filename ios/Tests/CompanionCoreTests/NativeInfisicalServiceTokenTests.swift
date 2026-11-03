@@ -133,12 +133,76 @@ private func queryPairs(of request: URLRequest) -> [String] {
 @Suite("Native Infisical service-token authentication")
 struct NativeInfisicalServiceTokenTests {
 
+    @Test("Disabled native resolution reads no credential store and makes no request")
+    func disabledIntegrationIsInert() async throws {
+        let identity = ScriptedKeychainStore(scripted: [.statusError(errSecNotAvailable)])
+        let token = ScriptedKeychainStore(stored: Data(fixtureServiceToken.utf8))
+        let transport = RecordingInfisicalTransport()
+        let resolver = NativeInfisicalResolver(keychain: identity, serviceTokenStore: token, transport: transport)
+        await #expect(throws: InfisicalResolverError.integrationDisabled) { try await resolver.refreshSecretsSnapshot() }
+        await #expect(throws: InfisicalResolverError.integrationDisabled) { try await resolver.resolveSecret(forKey: fixtureSecretName) }
+        #expect(identity.queryCount == 0)
+        #expect(token.queryCount == 0)
+        #expect(transport.requests.isEmpty)
+    }
+
+    @Test("A missing service token never falls back to a stored machine identity")
+    func missingTokenNeverSelectsMachineIdentity() async throws {
+        let identity = InfisicalMachineIdentity(clientId: "fixture-app", clientSecret: "fixture-secret", projectId: "fixture-project")
+        let identityStore = ScriptedKeychainStore(stored: try JSONEncoder().encode(identity))
+        let transport = RecordingInfisicalTransport()
+        let resolver = NativeInfisicalResolver(enabled: true, keychain: identityStore,
+            serviceTokenStore: ScriptedKeychainStore(), transport: transport)
+        await #expect(throws: InfisicalResolverError.missingMachineIdentity) { try await resolver.refreshSecretsSnapshot() }
+        #expect(identityStore.queryCount == 0)
+        #expect(transport.requests.isEmpty)
+    }
+
+    @Test("Explicit machine identity authentication never consults the service token store")
+    func explicitIdentityDoesNotReadTokenStore() async throws {
+        let identity = InfisicalMachineIdentity(clientId: "fixture-app", clientSecret: "fixture-secret", projectId: "fixture-project")
+        let identityStore = ScriptedKeychainStore(stored: try JSONEncoder().encode(identity))
+        let tokenStore = ScriptedKeychainStore(scripted: [.statusError(errSecNotAvailable)])
+        let transport = RecordingInfisicalTransport()
+        let resolver = NativeInfisicalResolver(enabled: true, authMethod: .machineIdentity,
+            keychain: identityStore, serviceTokenStore: tokenStore, transport: transport)
+        _ = try await resolver.refreshSecretsSnapshot()
+        #expect(tokenStore.queryCount == 0)
+        #expect(transport.requests.count == 2)
+        #expect(transport.requests.first?.httpMethod == "POST")
+    }
+
+    @Test("Independent project resolvers keep credentials, scopes and same-name cached secrets separate")
+    func projectsRemainIsolated() async throws {
+        let firstToken = ScriptedKeychainStore(stored: Data(fixtureServiceToken.utf8))
+        let secondValue = "st." + String(repeating: "b", count: 40)
+        let secondToken = ScriptedKeychainStore(stored: Data(secondValue.utf8))
+        let firstTransport = RecordingInfisicalTransport(secrets: [fixtureSecretName: "first-project"])
+        let secondTransport = RecordingInfisicalTransport(secrets: [fixtureSecretName: "second-project"])
+        let first = NativeInfisicalResolver(enabled: true, keychain: ScriptedKeychainStore(), serviceTokenStore: firstToken,
+            scope: .init(siteUrl: "https://vault.test", projectId: "first", environment: "prod", secretPath: "/one"), transport: firstTransport)
+        let second = NativeInfisicalResolver(enabled: true, keychain: ScriptedKeychainStore(), serviceTokenStore: secondToken,
+            scope: .init(siteUrl: "https://vault.test", projectId: "second", environment: "dev", secretPath: "/two"), transport: secondTransport)
+        #expect(try await first.resolveSecret(forKey: fixtureSecretName).exposeSecret() == "first-project")
+        #expect(try await second.resolveSecret(forKey: fixtureSecretName).exposeSecret() == "second-project")
+        #expect(try await first.resolveSecret(forKey: fixtureSecretName).exposeSecret() == "first-project")
+        #expect(firstTransport.requests.count == 1)
+        #expect(secondTransport.requests.count == 1)
+        #expect(firstTransport.requests[0].value(forHTTPHeaderField: "Authorization") == "Bearer \(fixtureServiceToken)")
+        #expect(secondTransport.requests[0].value(forHTTPHeaderField: "Authorization") == "Bearer \(secondValue)")
+        #expect(queryPairs(of: firstTransport.requests[0]).contains("workspaceId=first"))
+        #expect(queryPairs(of: secondTransport.requests[0]).contains("workspaceId=second"))
+        #expect(queryPairs(of: firstTransport.requests[0]).contains("secretPath=/one"))
+        #expect(queryPairs(of: secondTransport.requests[0]).contains("secretPath=/two"))
+    }
+
     @Test("A stored service token is the bearer and no Universal Auth login is sent")
     func testServiceTokenAuthenticatesWithoutALoginRequest() async throws {
         let tokenStore = ScriptedKeychainStore(stored: Data(fixtureServiceToken.utf8))
         let identityStore = ScriptedKeychainStore()
         let transport = RecordingInfisicalTransport(secrets: ["BOTFLEET_SERVER_MODE": "local"])
         let resolver = NativeInfisicalResolver(
+            enabled: true,
             keychain: identityStore,
             serviceTokenStore: tokenStore,
             transport: transport
@@ -160,6 +224,7 @@ struct NativeInfisicalServiceTokenTests {
         let tokenStore = ScriptedKeychainStore(stored: Data(fixtureServiceToken.utf8))
         let transport = RecordingInfisicalTransport()
         let resolver = NativeInfisicalResolver(
+            enabled: true,
             keychain: ScriptedKeychainStore(),
             serviceTokenStore: tokenStore,
             transport: transport
@@ -195,6 +260,7 @@ struct NativeInfisicalServiceTokenTests {
         let tokenStore = ScriptedKeychainStore(stored: Data(fixtureServiceToken.utf8))
         let transport = RecordingInfisicalTransport()
         let resolver = NativeInfisicalResolver(
+            enabled: true,
             keychain: ScriptedKeychainStore(),
             serviceTokenStore: tokenStore,
             scope: scope,
@@ -233,6 +299,7 @@ struct NativeInfisicalServiceTokenTests {
         let tokenStore = ScriptedKeychainStore(stored: Data("not-a-service-token".utf8))
         let transport = RecordingInfisicalTransport()
         let resolver = NativeInfisicalResolver(
+            enabled: true,
             keychain: ScriptedKeychainStore(),
             serviceTokenStore: tokenStore,
             transport: transport
@@ -250,6 +317,7 @@ struct NativeInfisicalServiceTokenTests {
         let identityStore = ScriptedKeychainStore()
         let transport = RecordingInfisicalTransport()
         let resolver = NativeInfisicalResolver(
+            enabled: true,
             keychain: identityStore,
             serviceTokenStore: tokenStore,
             transport: transport
@@ -269,6 +337,7 @@ struct NativeInfisicalServiceTokenTests {
         let identityStore = ScriptedKeychainStore()
         let transport = RecordingInfisicalTransport()
         let resolver = NativeInfisicalResolver(
+            enabled: true,
             keychain: identityStore,
             serviceTokenStore: tokenStore,
             transport: transport,
@@ -300,6 +369,7 @@ struct NativeInfisicalServiceTokenTests {
             scripted: Array(repeating: .statusError(errSecNotAvailable), count: 10)
         )
         let resolver = NativeInfisicalResolver(
+            enabled: true,
             keychain: ScriptedKeychainStore(),
             serviceTokenStore: tokenStore,
             transport: RecordingInfisicalTransport(),
@@ -316,8 +386,8 @@ struct NativeInfisicalServiceTokenTests {
         #expect(osStatus == errSecNotAvailable)
     }
 
-    @Test("Without a service token the machine identity still opens the vault through Universal Auth")
-    func testMachineIdentityFallbackStillLogsIn() async throws {
+    @Test("Only explicit machine identity authentication opens the vault through Universal Auth")
+    func testExplicitMachineIdentityLogsIn() async throws {
         let identity = InfisicalMachineIdentity(
             clientId: "cid-fixture",
             clientSecret: "client-secret-fixture",
@@ -328,6 +398,8 @@ struct NativeInfisicalServiceTokenTests {
         let tokenStore = ScriptedKeychainStore()
         let transport = RecordingInfisicalTransport(secrets: ["BOTFLEET_SERVER_MODE": "local"])
         let resolver = NativeInfisicalResolver(
+            enabled: true,
+            authMethod: .machineIdentity,
             keychain: identityStore,
             serviceTokenStore: tokenStore,
             transport: transport
@@ -345,6 +417,7 @@ struct NativeInfisicalServiceTokenTests {
     func testInjectedCredentialStoreKeepsTheResolverDeterministic() async throws {
         let identityStore = ScriptedKeychainStore()
         let resolver = NativeInfisicalResolver(
+            enabled: true,
             keychain: identityStore,
             transport: RecordingInfisicalTransport()
         )
@@ -367,6 +440,7 @@ struct NativeInfisicalServiceTokenTests {
         let tokenStore = ScriptedKeychainStore(stored: Data(fixtureServiceToken.utf8))
         let transport = RecordingInfisicalTransport(secrets: [fixtureSecretName: secretValue])
         let resolver = NativeInfisicalResolver(
+            enabled: true,
             keychain: ScriptedKeychainStore(),
             serviceTokenStore: tokenStore,
             transport: transport
@@ -397,6 +471,7 @@ struct NativeInfisicalServiceTokenTests {
         let tokenStore = ScriptedKeychainStore(stored: Data(fixtureServiceToken.utf8))
         let transport = RecordingInfisicalTransport(secrets: [fixtureSecretName: "cached-value"])
         let resolver = NativeInfisicalResolver(
+            enabled: true,
             keychain: ScriptedKeychainStore(),
             serviceTokenStore: tokenStore,
             transport: transport

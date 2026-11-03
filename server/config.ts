@@ -3,7 +3,7 @@
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
 import { readFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 
 import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
@@ -331,6 +331,8 @@ const infisicalReadSourceSchema = z.object({
   name: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
   tokenFile: z.string().trim().min(1).refine((v) => v.startsWith("/"), "tokenFile must be an absolute path").optional(),
   tokenEnv: z.string().trim().regex(/^[A-Z][A-Z0-9_]*$/).optional(),
+  writeTokenFile: z.string().trim().min(1).refine((v) => v.startsWith("/"), "writeTokenFile must be an absolute path").optional(),
+  writeTokenEnv: z.string().trim().regex(/^[A-Z][A-Z0-9_]*$/).optional(),
   projectId: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/),
   environment: z.string().trim().regex(/^[a-z0-9-]{1,64}$/).optional(),
   secretPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
@@ -614,6 +616,7 @@ const appConfigSchema = z.object({
   // has.  The kill switch is explicit the same way `ingress` and
   // `observability` are — absent means on once it is configured.
   infisical: z.object({
+    authMethod: z.enum(["service-token", "machine-identity"]).optional(),
     enabled: z.boolean().optional(),
     writeThrough: z.boolean().optional(),
     siteUrl: optionalText,
@@ -908,6 +911,7 @@ export interface AppConfig {
    * non-agent consumer uses.  They are read from this section or from
    * `INFISICAL_TOKEN` / `INFISICAL_WRITE_TOKEN`. */
   infisical?: {
+    authMethod?: InfisicalAuthMethod;
     enabled?: boolean;
     writeThrough?: boolean;
     siteUrl?: string;
@@ -1331,10 +1335,14 @@ export const DEFAULT_INFISICAL_REFRESH_MINUTES = 15;
  * defaulted.  Values are used, never rendered: the only fields here a status
  * view may repeat are the site URL, the project id, the environment and the
  * path. */
+export type InfisicalAuthMethod = "service-token" | "machine-identity";
+
 export interface InfisicalReadSource {
   name: string;
   tokenFile?: string;
   tokenEnv?: string;
+  writeTokenFile?: string;
+  writeTokenEnv?: string;
   projectId: string;
   environment?: string;
   secretPath?: string;
@@ -1352,12 +1360,16 @@ export interface ResolvedInfisicalReadSource {
   name: string;
   tokenFile: string;
   tokenEnv: string;
+  writeTokenFile?: string;
+  writeTokenEnv?: string;
   projectId: string;
   environment: string;
   secretPath: string;
 }
 
 export interface InfisicalSettings {
+  authMethod?: InfisicalAuthMethod;
+  configurationError?: string;
   enabled: boolean;
   writeThrough: boolean;
   siteUrl: string;
@@ -1377,11 +1389,12 @@ export interface InfisicalSettings {
  * identity with no project has nothing to read.  Unconfigured is inert — no
  * request is ever made, and nothing about resolution changes. */
 export function infisicalConfigured(cfg: AppConfig): boolean {
-  return Boolean(
-    cfg.infisical?.projectId?.trim() &&
-      (cfg.infisical?.token?.trim() ||
-        (cfg.infisical?.clientId?.trim() && cfg.infisical?.clientSecret?.trim())),
-  );
+  const settings = infisicalSettings(cfg);
+  if (!settings.projectId) return false;
+  if (settings.authMethod === "machine-identity") return Boolean(settings.clientId && settings.clientSecret);
+  const source = settings.readSources.find((entry) => entry.projectId === settings.projectId &&
+    entry.environment === settings.environment && entry.secretPath === settings.secretPath);
+  return source ? Boolean(source.tokenEnv || source.tokenFile) : Boolean(settings.token);
 }
 
 /** The explicit kill switch.  Absent means on once configured, matching
@@ -1398,13 +1411,14 @@ export function infisicalEnabled(cfg: AppConfig): boolean {
 export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
   const stored = cfg.infisical ?? {};
   const refresh = stored.refreshMinutes;
-  return {
+  const resolved: InfisicalSettings = {
+    authMethod: stored.authMethod ?? "service-token",
     enabled: infisicalEnabled(cfg),
     writeThrough: stored.writeThrough === true,
     siteUrl: (stored.siteUrl?.trim() || DEFAULT_INFISICAL_SITE_URL).replace(/\/+$/, ""),
     projectId: stored.projectId?.trim() ?? "",
     environment: stored.environment?.trim() || DEFAULT_INFISICAL_ENVIRONMENT,
-    secretPath: stored.secretPath?.trim() || DEFAULT_INFISICAL_SECRET_PATH,
+    secretPath: normalizeInfisicalSecretPath(stored.secretPath || DEFAULT_INFISICAL_SECRET_PATH),
     clientId: stored.clientId?.trim() ?? "",
     clientSecret: stored.clientSecret ?? "",
     token: stored.token?.trim() ?? "",
@@ -1416,13 +1430,19 @@ export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
         const name = src.name?.trim() ?? "";
         const projectId = src.projectId?.trim() ?? "";
         if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name) || !INFISICAL_PROJECT_ID_PATTERN.test(projectId) || seen.has(name)) continue;
-        seen.add(name);
         const env = src.environment?.trim() ?? "";
         const path = src.secretPath?.trim() ?? "";
+        if (env && !INFISICAL_ENVIRONMENT_PATTERN.test(env)) continue;
+        if (path && (!/^\/[A-Za-z0-9/_-]*$/.test(path) || path.length > 200)) continue;
+        if ([src.tokenEnv, src.writeTokenEnv].some((value) => value && !/^[A-Z][A-Z0-9_]*$/.test(value.trim()))) continue;
+        if ([src.tokenFile, src.writeTokenFile].some((value) => value && !value.trim().startsWith("/"))) continue;
+        seen.add(name);
         out.push({
           name,
           tokenFile: src.tokenFile?.trim() ?? "",
           tokenEnv: src.tokenEnv?.trim() ?? "",
+          ...(src.writeTokenFile ? { writeTokenFile: src.writeTokenFile.trim() } : {}),
+          ...(src.writeTokenEnv ? { writeTokenEnv: src.writeTokenEnv.trim() } : {}),
           projectId,
           environment: INFISICAL_ENVIRONMENT_PATTERN.test(env) ? env : (stored.environment?.trim() || DEFAULT_INFISICAL_ENVIRONMENT),
           secretPath: path.startsWith("/") ? normalizeInfisicalSecretPath(path) : DEFAULT_INFISICAL_SECRET_PATH,
@@ -1435,6 +1455,48 @@ export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
         ? Math.min(Math.max(Math.trunc(refresh), 5), 1440)
         : DEFAULT_INFISICAL_REFRESH_MINUTES,
   };
+  const error = infisicalTokenScopeError(resolved);
+  if (error) resolved.configurationError = error;
+  return resolved;
+}
+
+/** One read reference and one optional write reference per project may be
+ * reused across environment/folder routes; credentials never appear in errors. */
+export function infisicalTokenScopeError(settings: InfisicalSettings): string | null {
+  if (settings.readSources.length > 32) return "Infisical supports at most 32 service-token folder routes.";
+  const projects = new Map<string, { read: Set<string>; write: Set<string> }>();
+  const add = (project: string, mode: "read" | "write", reference: string) => {
+    if (!project || !reference) return;
+    const refs = projects.get(project) ?? { read: new Set<string>(), write: new Set<string>() };
+    refs[mode].add(reference);
+    projects.set(project, refs);
+  };
+  const reference = (file?: string, env?: string) => file?.trim()
+    ? `file:${resolve(file.trim())}` : env?.trim() ? `env:${env.trim()}` : "";
+  for (const source of settings.readSources) {
+    add(source.projectId, "read", reference(source.tokenFile, source.tokenEnv));
+    add(source.projectId, "write", reference(source.writeTokenFile, source.writeTokenEnv));
+  }
+  const primarySource = settings.readSources.some((source) => source.projectId === settings.projectId &&
+    source.environment === settings.environment && normalizeInfisicalSecretPath(source.secretPath) === normalizeInfisicalSecretPath(settings.secretPath));
+  if (settings.authMethod !== "machine-identity" && !primarySource) {
+    if (settings.token.trim()) add(settings.projectId, "read", "env:INFISICAL_TOKEN");
+    if (settings.writeToken.trim()) add(settings.projectId, "write", "env:INFISICAL_WRITE_TOKEN");
+  }
+  for (const [project, refs] of projects) {
+    if (refs.read.size > 1 || refs.write.size > 1) {
+      return `Infisical project ${project} permits one read token reference and at most one write token reference; reuse those references across its folder and environment routes.`;
+    }
+  }
+  return null;
+}
+
+/** Validate against resolved current config, including bootstrap environment
+ * overlays, before a settings save can persist or activate another token. */
+export function validateInfisicalConfigPatch(cfg: AppConfig, patch: Partial<AppConfig>): void {
+  if (!patch.infisical) return;
+  const candidate = infisicalSettings({ infisical: { ...cfg.infisical, ...patch.infisical } });
+  if (candidate.configurationError) throw Object.assign(new Error(candidate.configurationError), { status: 400 });
 }
 
 export const DEFAULT_AGENT_PROXY_ADDRESS = "127.0.0.1:17322";
@@ -2062,6 +2124,8 @@ export function loadConfig(): AppConfig {
           const source: InfisicalReadSource = { name: entry.name, projectId: entry.projectId };
           if (isJsonString(entry.tokenFile)) source.tokenFile = entry.tokenFile;
           if (isJsonString(entry.tokenEnv)) source.tokenEnv = entry.tokenEnv;
+          if (isJsonString(entry.writeTokenFile)) source.writeTokenFile = entry.writeTokenFile;
+          if (isJsonString(entry.writeTokenEnv)) source.writeTokenEnv = entry.writeTokenEnv;
           if (isJsonString(entry.environment)) source.environment = entry.environment;
           if (isJsonString(entry.secretPath)) source.secretPath = entry.secretPath;
           return [source];
@@ -2096,6 +2160,10 @@ export function loadConfig(): AppConfig {
   // are no-ops when the store is unconfigured.  Runtime reads never consult
   // the vault — they read this resolved `cfg` from memory.
   resolveKnobFields(cfg, infisicalSnapshot());
+  for (const source of cfg.infisical?.readSources ?? []) {
+    if (source.tokenEnv) scopedInfisicalCredentialEnv.add(source.tokenEnv);
+    if (source.writeTokenEnv) scopedInfisicalCredentialEnv.add(source.writeTokenEnv);
+  }
   // Pin pre-MiniMax key-only installs after env and external-secret resolution.
   // Never persist the injected key to config.json in cleartext.
   migrateLegacyElevenLabsTtsProvider(cfg);
@@ -2146,6 +2214,8 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
     // keep shadowing the one just saved in Settings, and the card would report
     // a store the operator has already replaced.
     [patch.infisical?.clientSecret, "INFISICAL_CLIENT_SECRET"],
+    [patch.infisical?.token, "INFISICAL_TOKEN"],
+    [patch.infisical?.writeToken, "INFISICAL_WRITE_TOKEN"],
   ];
   for (const [value, name] of secrets) {
     if (value === undefined) continue;
@@ -2169,9 +2239,23 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
     else delete process.env["AZURE_SPEECH_REGION"];
   }
   if (patch.infisical?.clientId !== undefined) {
+    delete process.env["INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"];
     if (patch.infisical.clientId) process.env["INFISICAL_CLIENT_ID"] = patch.infisical.clientId;
     else delete process.env["INFISICAL_CLIENT_ID"];
   }
+  if (patch.infisical?.clientSecret !== undefined) delete process.env["INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"];
+  const vaultPointers = [
+    ["projectId", "INFISICAL_PROJECT_ID"], ["siteUrl", "INFISICAL_SITE_URL"],
+    ["environment", "INFISICAL_ENVIRONMENT"], ["secretPath", "INFISICAL_SECRET_PATH"],
+  ] as const;
+  for (const [field, envName] of vaultPointers) {
+    const value = patch.infisical?.[field];
+    if (value === undefined) continue;
+    if (value) process.env[envName] = value;
+    else delete process.env[envName];
+  }
+  if (patch.infisical?.siteUrl !== undefined) delete process.env.INFISICAL_DOMAIN;
+  if (patch.infisical?.readSources !== undefined) process.env.INFISICAL_READ_SOURCES = JSON.stringify(patch.infisical.readSources);
 }
 
 /** Env names of every workspace credential this process may be holding —
@@ -2236,8 +2320,11 @@ export const WORKSPACE_CREDENTIAL_ENV = [
 ] as const;
 
 /** Drop every workspace credential from a child-process env (in place). */
+const scopedInfisicalCredentialEnv = new Set<string>();
+
 export function stripWorkspaceCredentialEnv(env: Record<string, string | undefined>): void {
   for (const key of WORKSPACE_CREDENTIAL_ENV) delete env[key];
+  for (const key of scopedInfisicalCredentialEnv) delete env[key];
 }
 
 /** Env names a provider CLI might read as its own billing identity. A spawned
@@ -2319,6 +2406,10 @@ export function saveConfig(
   // stale snapshot, and vice versa.  (PR #251 review, board a2a3a586.)
   updateConfigFile(p, (raw) => {
     const merged = mergeConfigPatch(raw, checkedPatch);
+    if (checkedPatch.infisical) {
+      const section = appConfigSchema.shape.infisical.parse(merged.infisical);
+      validateInfisicalConfigPatch({}, { infisical: section });
+    }
     for (const [section, present] of Object.entries(options.externalCredentialSections ?? {})) {
       const current = jsonObjectSchema.safeParse(merged[section]);
       const next: JsonObject = current.success ? { ...current.data } : {};

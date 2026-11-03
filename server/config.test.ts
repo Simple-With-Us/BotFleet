@@ -53,6 +53,7 @@ import {
   infisicalConfigured,
   infisicalEnabled,
   infisicalSettings,
+  validateInfisicalConfigPatch,
   agentProxyEnabled,
   agentProxySettings,
   applyAgentProxyEnv,
@@ -1512,6 +1513,9 @@ describe("the secret-store section", () => {
     "INFISICAL_DOMAIN",
     "INFISICAL_ENVIRONMENT",
     "INFISICAL_SECRET_PATH",
+    "INFISICAL_READ_SOURCES",
+    "INFISICAL_TOKEN",
+    "INFISICAL_WRITE_TOKEN",
   ] as const;
   let saved: Record<string, string | undefined>;
 
@@ -1627,7 +1631,8 @@ describe("the secret-store section", () => {
       projectId: PROJECT_ID,
       secretPath: "/botfleet",
     });
-    expect(infisicalConfigured(cfg)).toBe(true);
+    expect(infisicalConfigured(cfg)).toBe(false);
+    expect(infisicalConfigured({ ...cfg, infisical: { ...cfg.infisical, authMethod: "machine-identity" } })).toBe(true);
 
     delete process.env.INFISICAL_CLIENT_ID;
     expect(loadConfig().infisical?.clientId).toBe("from-alias");
@@ -1659,6 +1664,7 @@ describe("the secret-store section", () => {
 
   it("defaults the site, environment, path, cadence, and write-through", () => {
     expect(infisicalSettings({})).toEqual({
+      authMethod: "service-token",
       enabled: true,
       writeThrough: false,
       siteUrl: DEFAULT_INFISICAL_SITE_URL,
@@ -1689,7 +1695,8 @@ describe("the secret-store section", () => {
     expect(infisicalConfigured({ infisical: { projectId: "p" } })).toBe(false);
     expect(
       infisicalConfigured({ infisical: { projectId: "p", clientId: "id", clientSecret: "secret" } }),
-    ).toBe(true);
+    ).toBe(false);
+    expect(infisicalConfigured({ infisical: { authMethod: "machine-identity", projectId: "p", clientId: "id", clientSecret: "secret" } })).toBe(true);
     expect(
       infisicalSettings({ infisical: { projectId: "p", token: " st.read ", writeToken: " st.write " } }),
     ).toMatchObject({ token: "st.read", writeToken: "st.write" });
@@ -1877,6 +1884,89 @@ describe("the secret-store section", () => {
     syncCredentialEnv({ infisical: { clientId: "", clientSecret: "" } });
     expect(process.env.INFISICAL_CLIENT_ID).toBeUndefined();
     expect(process.env.INFISICAL_CLIENT_SECRET).toBeUndefined();
+  });
+
+  it("persists explicit auth and independent source write locators without inline source credentials", () => {
+    const patch = parseConfigPatch({ infisical: {
+      authMethod: "service-token", projectId: "main", readSources: [{
+        name: "staging-settings", projectId: "other", environment: "staging", secretPath: "/settings/",
+        tokenEnv: "BF_TEST_READ", writeTokenEnv: "BF_TEST_WRITE", token: "must-be-stripped",
+      }],
+    } });
+    saveConfig(patch);
+    expect(infisicalSettings(loadConfig()).readSources[0]).toMatchObject({ secretPath: "/settings", writeTokenEnv: "BF_TEST_WRITE" });
+    expect(JSON.stringify(patch)).not.toContain("must-be-stripped");
+    expect(() => parseConfigPatch({ infisical: { authMethod: "auto" } })).toThrow();
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "bad", projectId: "p", writeTokenFile: "relative" }] } })).toThrow();
+  });
+
+  it("strips dedicated source credential environment names from bot children", () => {
+    saveConfig({ infisical: { readSources: [{ name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ", writeTokenEnv: "BF_TEST_WRITE" }] } });
+    loadConfig();
+    const childEnv = { PATH: "/usr/bin", BF_TEST_READ: "fake-read", BF_TEST_WRITE: "fake-write" };
+    stripWorkspaceCredentialEnv(childEnv);
+    expect(childEnv).toEqual({ PATH: "/usr/bin" });
+    saveConfig({ infisical: { readSources: [] } });
+    loadConfig();
+    const laterChild = { PATH: "/usr/bin", BF_TEST_READ: "old-read", BF_TEST_WRITE: "old-write" };
+    stripWorkspaceCredentialEnv(laterChild);
+    expect(laterChild).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("drops malformed source routing instead of defaulting it into another environment or folder", () => {
+    expect(infisicalSettings({ infisical: { readSources: [
+      { name: "bad-env", projectId: "p", environment: "../prod", tokenEnv: "BF_TEST_READ" },
+      { name: "bad-path", projectId: "p", secretPath: "relative", tokenEnv: "BF_TEST_READ" },
+      { name: "bad-token-env", projectId: "p", tokenEnv: "not a variable" },
+    ] } }).readSources).toEqual([]);
+  });
+
+  it("syncs saved primary tokens and clears identity aliases instead of resurrecting them", () => {
+    process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID = "fake-old-id";
+    process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET = "fake-old-secret";
+    syncCredentialEnv({ infisical: { token: "fake-read", writeToken: "fake-write", clientId: "", clientSecret: "", projectId: "new-project" } });
+    expect(process.env.INFISICAL_TOKEN).toBe("fake-read");
+    expect(process.env.INFISICAL_WRITE_TOKEN).toBe("fake-write");
+    expect(process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID).toBeUndefined();
+    expect(process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET).toBeUndefined();
+    expect(process.env.INFISICAL_PROJECT_ID).toBe("new-project");
+  });
+
+  it("reuses one read/write reference pair across project folders and environments", () => {
+    const sources = ["/one", "/two"].flatMap((secretPath) => ["prod", "staging"].map((environment, index) => ({
+      name: `${secretPath.slice(1)}-${index}`, projectId: "p", environment, secretPath,
+      tokenEnv: "SCOPE_READ", writeTokenEnv: "SCOPE_WRITE",
+    })));
+    expect(infisicalSettings({ infisical: { readSources: sources } }).configurationError).toBeUndefined();
+    expect(() => saveConfig({ infisical: { readSources: sources } })).not.toThrow();
+  });
+
+  it("caps primary and secondary credential references per project without leaking values", () => {
+    const cfg = { infisical: { projectId: "p", token: "fake-primary-read", writeToken: "fake-primary-write" } };
+    const extra = { name: "extra", projectId: "p", secretPath: "/extra", tokenEnv: "ANOTHER_READ" };
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [extra] } })).toThrow(/one read token reference/);
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [{ ...extra, tokenEnv: "INFISICAL_TOKEN", writeTokenEnv: "ANOTHER_WRITE" }] } })).toThrow(/one write token reference/);
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [{ ...extra, tokenEnv: "INFISICAL_TOKEN", writeTokenEnv: "INFISICAL_WRITE_TOKEN" }] } })).not.toThrow();
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [{ ...extra, secretPath: "/", tokenEnv: "NEW_READ", writeTokenEnv: "NEW_WRITE" }] } })).not.toThrow();
+    saveConfig(cfg);
+    expect(() => saveConfig({ infisical: { readSources: [extra] } })).toThrow(/one read token reference/);
+    expect(loadConfig().infisical?.readSources).toBeUndefined();
+  });
+
+  it("deduplicates file paths and applies the cap to environment JSON overlays", () => {
+    expect(infisicalSettings({ infisical: { readSources: [
+      { name: "first", projectId: "p", secretPath: "/one", tokenFile: "/fixture/dir/../read" },
+      { name: "second", projectId: "p", secretPath: "/two", tokenFile: "/fixture/read" },
+    ] } }).configurationError).toBeUndefined();
+    process.env.INFISICAL_PROJECT_ID = "p";
+    process.env.INFISICAL_TOKEN = "fake-primary-read";
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([
+      { name: "extra", projectId: "p", secretPath: "/extra", tokenEnv: "ANOTHER_READ" },
+    ]);
+    const cfg = loadConfig();
+    expect(infisicalSettings(cfg).configurationError).toMatch(/one read token reference/);
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { refreshMinutes: 20 } })).toThrow(/one read token reference/);
+    expect(infisicalSettings(cfg).configurationError).not.toContain("fake-primary-read");
   });
 
   it("strips the machine identity from a child environment", () => {

@@ -1,6 +1,4 @@
-// CI-side Infisical fetch: a service token when one is configured (the
-// normal case for an app or a pipeline), otherwise a universal-auth login,
-// then one bulk secrets list, then
+// Managed CI uses only a dedicated service token and one bulk secrets list, then
 // per requested name mask + export into $GITHUB_ENV -- falling back to a
 // same-named GH_FALLBACK_<NAME> step env var, warning when a name stays
 // empty everywhere, and failing only for a name listed in `required`.
@@ -30,28 +28,6 @@ function splitNames(raw) {
 
 function stripTrailingSlash(url) {
   return String(url ?? "").replace(/\/+$/, "");
-}
-
-/** POST .../api/v1/auth/universal-auth/login -- returns the bearer token
- * string only.  Body is built with JSON.stringify, never string
- * interpolation, so a client secret containing a quote cannot break the
- * request shape. */
-export async function loginUniversalAuth({ siteUrl, clientId, clientSecret, fetchImpl = fetch, timeoutMs = 30_000 }) {
-  const res = await fetchImpl(`${siteUrl}/api/v1/auth/universal-auth/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ clientId, clientSecret }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok) {
-    throw new Error(`Infisical login failed: HTTP ${res.status}`);
-  }
-  const body = await res.json();
-  const token = body && body.accessToken;
-  if (!token) {
-    throw new Error("Infisical login response carried no accessToken");
-  }
-  return token;
 }
 
 /** GET .../api/v3/secrets/raw for the whole path in one call -- returns a
@@ -145,26 +121,21 @@ export function isUnresolvedReference(value) {
  * failed) -- never throws; a failure is reported through `log` and the
  * caller proceeds on GH_FALLBACK_<NAME> alone.
  *
- * A service token wins over the machine identity when one is configured: a
- * token is scoped to one project, environment and folder, and every
- * non-agent consumer uses one.  The universal-auth login stays for the
- * agent identities that still hold a machine identity. */
-async function resolveVaultValues({ siteUrl, projectId, clientId, clientSecret, token, environment, secretPath, fetchImpl, log }) {
+ * Machine identities are deliberately unavailable to managed CI. */
+async function resolveVaultValues({ siteUrl, projectId, token, environment, secretPath, fetchImpl, log }) {
   const serviceToken = String(token ?? "").trim();
-  if (!projectId || (!serviceToken && (!clientId || !clientSecret))) {
+  if (!projectId) return new Map();
+  if (!serviceToken) {
+    log("::warning::Infisical service token is not configured; migration is pending and only existing GitHub secret fallbacks can be used.");
     return new Map();
   }
   try {
-    const bearer = serviceToken
-      ? serviceToken
-      : await loginUniversalAuth({ siteUrl, clientId, clientSecret, fetchImpl });
-    return await listSecretsRaw({ siteUrl, token: bearer, projectId, environment, secretPath, fetchImpl });
-  } catch (err) {
+    return await listSecretsRaw({ siteUrl, token: serviceToken, projectId, environment, secretPath, fetchImpl });
+  } catch {
     // Never interpolate the raw error body -- Infisical error payloads have
     // echoed request fields on some 4xx responses in the past, and none of
     // that belongs in a public Actions log.
-    const reason = err instanceof Error ? err.message : "unknown error";
-    log(`::warning::Infisical ${environment} fetch unavailable (${reason}); using GitHub secret fallbacks only.`);
+    log(`::warning::Infisical ${environment} fetch unavailable; using existing GitHub secret fallbacks only.`);
     return new Map();
   }
 }
@@ -176,12 +147,10 @@ export async function run({ env = process.env, fetchImpl = fetch, log = (line) =
   const projectId = env.INFISICAL_PROJECT_ID || "";
   const environment = env.INFISICAL_ENVIRONMENT || "prod";
   const secretPath = env.INFISICAL_SECRET_PATH || "/";
-  const clientId = env.INFISICAL_CLIENT_ID || "";
-  const clientSecret = env.INFISICAL_CLIENT_SECRET || "";
   const token = env.INFISICAL_TOKEN || "";
   const githubEnvPath = env.GITHUB_ENV || "";
 
-  const vaultValues = await resolveVaultValues({ siteUrl, projectId, clientId, clientSecret, token, environment, secretPath, fetchImpl, log });
+  const vaultValues = await resolveVaultValues({ siteUrl, projectId, token, environment, secretPath, fetchImpl, log });
 
   const missingRequired = [];
   const unresolved = [];

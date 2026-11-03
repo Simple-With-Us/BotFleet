@@ -3,12 +3,8 @@
 //
 // Reads the same config `loadConfig()` would resolve for a running server —
 // ~/.botfleet/config.json (or $OMB_DATA_DIR/config.json), with the env
-// overlay `loadConfig()` already applies, INCLUDING the Infisical machine
-// identity itself (`infisical.*` in the file, or `INFISICAL_CLIENT_ID` /
-// `INFISICAL_CLIENT_SECRET` in the environment, env winning — see
-// `server/config.ts`'s `loadConfig()`).  That reuse is deliberate: the
-// identity-resolution rule lives in exactly one place, so this script cannot
-// drift from what the server itself would have used to reach the vault.
+// overlay that loadConfig() already applies.  This managed helper accepts only
+// dedicated primary-scope service tokens and never authenticates a machine identity.
 //
 // Walks `SECRET_FIELDS` (`server/secret-map.ts`) and, for every field that
 // has a non-empty LOCAL value, reports whether Infisical already holds that
@@ -31,9 +27,9 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { loadConfig, infisicalSettings, infisicalConfigured } from "../server/config.ts";
+import { loadConfig, infisicalSettings, infisicalConfigured, normalizeInfisicalSecretPath } from "../server/config.ts";
 import { SECRET_FIELDS } from "../server/secret-map.ts";
-import { login, listSecrets, upsertSecret } from "../server/infisical-client.ts";
+import { listSecrets, upsertSecret } from "../server/infisical-client.ts";
 
 function sha256(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -71,39 +67,16 @@ export function rowsWithLocalValues(cfg) {
   return rows;
 }
 
-/** The token each side of the vault uses.
- *
- * A read token and a write token are two different credentials, and a read
- * token cannot write.  So the write side uses the write token when there is
- * one, falls back to the machine identity when there is not, and reports NO
- * write credential when neither is there: passing the read token to a write
- * fails with a 403 that reads like a broken vault rather than a missing
- * write credential.
- *
- * Returns `{ readToken, writeToken }`.  `writeToken` is the EMPTY string when
- * this install has no write credential at all, and the caller says so rather
- * than trying the write anyway.  A failed machine login throws, exactly as
- * the previous inline login did. */
-export async function resolveVaultTokens(settings, { loginImpl = login } = {}) {
+/** Managed migrations use a dedicated read token and a separate write token.
+ * Product machine identity selection never authorizes this helper to log in. */
+export async function resolveVaultTokens(settings) {
+  if (settings.authMethod === "machine-identity") throw new Error("Managed migration requires service-token authentication; machine identities are not used.");
+  const matchingSource = (settings.readSources ?? []).find((source) => source.projectId === settings.projectId &&
+    source.environment === settings.environment && normalizeInfisicalSecretPath(source.secretPath) === normalizeInfisicalSecretPath(settings.secretPath));
+  if (matchingSource) throw new Error("This migration helper does not load scoped source locators; use the app write-through path for that configured source.");
   const readToken = settings.token.trim();
-  const writeToken = settings.writeToken.trim();
-  const loginArgs = {
-    siteUrl: settings.siteUrl,
-    clientId: settings.clientId,
-    clientSecret: settings.clientSecret,
-  };
-  if (readToken) {
-    if (writeToken) return { readToken, writeToken };
-    // The read token cannot write, so the write falls back to the machine
-    // identity when this host still has one.
-    try {
-      return { readToken, writeToken: await loginImpl(loginArgs) };
-    } catch {
-      return { readToken, writeToken: "" };
-    }
-  }
-  const machine = await loginImpl(loginArgs);
-  return { readToken: machine, writeToken: writeToken || machine };
+  if (!readToken) throw new Error("Managed migration requires a dedicated Infisical read service token.");
+  return { readToken, writeToken: settings.writeToken.trim() };
 }
 
 export async function run({
@@ -111,7 +84,6 @@ export async function run({
   log = (line) => console.log(line),
   err = (line) => console.error(line),
   loadConfigImpl = loadConfig,
-  loginImpl = login,
   listSecretsImpl = listSecrets,
   upsertSecretImpl = upsertSecret,
 } = {}) {
@@ -121,10 +93,7 @@ export async function run({
 
   if (!infisicalConfigured(cfg)) {
     err(
-      "Infisical is not configured -- add a project id and an identity first " +
-        "(INFISICAL_TOKEN / INFISICAL_WRITE_TOKEN, or INFISICAL_CLIENT_ID / " +
-        "INFISICAL_CLIENT_SECRET, in the environment, infisical.* in " +
-        "~/.botfleet/config.json, or Settings > Secrets once the harness is running).",
+      "Infisical migration is pending: configure a project and a dedicated read service token; --apply also requires a separate write service token.",
     );
     process.exitCode = 1;
     return;
@@ -138,12 +107,17 @@ export async function run({
     return;
   }
 
-  // A service token is the identity; the machine identity is the fallback.
+  // Managed helpers never activate the product machine identity option.
   let tokens;
   try {
-    tokens = await resolveVaultTokens(settings, { loginImpl });
+    tokens = await resolveVaultTokens(settings);
   } catch (caught) {
-    err(`Could not log in to Infisical: ${caught instanceof Error ? caught.message : "unknown error"}`);
+    err(`Could not select Infisical migration credentials: ${caught instanceof Error ? caught.message : "unknown error"}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (apply && !tokens.writeToken) {
+    err("Infisical migration is pending: --apply requires a dedicated write service token for this exact scope.");
     process.exitCode = 1;
     return;
   }
@@ -160,8 +134,8 @@ export async function run({
       viewValues: true,
     });
     vaultValues = listed.values;
-  } catch (caught) {
-    err(`Could not list Infisical secrets: ${caught instanceof Error ? caught.message : "unknown error"}`);
+  } catch {
+    err("Could not list Infisical secrets with the configured service token; no alternate identity was tried.");
     process.exitCode = 1;
     return;
   }
@@ -180,7 +154,6 @@ export async function run({
   }
 
   if (!apply) {
-    log("");
     log("Dry run only -- nothing written.  Re-run with --apply to upsert the rows above not already present-and-same.");
     return;
   }
@@ -195,7 +168,6 @@ export async function run({
     return;
   }
 
-  log("");
   for (const { spec, local, status } of classified) {
     if (status === "present-and-same") {
       log(`skipped ${spec.infisicalName} (unchanged)`);
@@ -215,8 +187,9 @@ export async function run({
         value: local,
       });
       log(`wrote ${spec.infisicalName}`);
-    } catch (caught) {
-      err(`failed ${spec.infisicalName}: ${caught instanceof Error ? caught.message : "unknown error"}`);
+    } catch {
+      err(`failed ${spec.infisicalName}: the configured write service token could not complete the upsert.`);
+      process.exitCode = 1;
     }
   }
 }
