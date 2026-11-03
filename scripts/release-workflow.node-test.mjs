@@ -254,6 +254,21 @@ test("the desktop release carries the shared version and build (BF-2588)", () =>
   const control = readFileSync(join(ROOT, "electron/build-control-app.mjs"), "utf8");
   assert.match(control, /CFBundleShortVersionString<\/key><string>\$\{version\}<\/string>/);
   assert.match(control, /CFBundleVersion<\/key><string>\$\{buildNumber\}<\/string>/);
+  // Wiring alone cannot prove the shipped bytes agree: the stampers are
+  // covered in isolation while nothing reads the packaged app back, so a
+  // Control bundle on the retired number could ride inside a release whose
+  // feed and server carry the merge stamp with every gate green (BF-2531).
+  // Both shippers of an installable Mac app prove the bytes against the pin.
+  assert.match(
+    workflow,
+    /node scripts\/verify-packaged-versions\.mjs "\$\{\{ matrix\.app \}\}" \\\n\s+--version "\$\{\{ needs\.prepare\.outputs\.version \}\}" \\\n\s+--build "\$\{\{ needs\.prepare\.outputs\.build \}\}"/,
+    "release.yml verifies the packaged bundle set against the pinned release",
+  );
+  assert.match(
+    commitBuild,
+    /node scripts\/verify-packaged-versions\.mjs release\/mac-arm64\/BotFleet\.app \\\n\s+--version "\$\{\{ needs\.pin\.outputs\.version \}\}" \\\n\s+--build "\$\{\{ needs\.pin\.outputs\.build \}\}"/,
+    "mac-commit-build.yml verifies the packaged bundle set against the pinned build",
+  );
 });
 
 test("release tags must resolve to the pinned build, including nested annotated tags", async () => {
