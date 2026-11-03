@@ -39,8 +39,10 @@ test("native release and Vercel catch-up use their dedicated pending bindings", 
     }
   }
   const vercel = parse(read(".github/workflows/vercel-catch-up.yml"));
+  const bindingStep = vercel.jobs.deploy.steps.find((step) => step.id === "credentials");
   const fetchStep = vercel.jobs.deploy.steps.find((step) => step.run === "node scripts/infisical-fetch.mjs");
-  assert.equal(fetchStep.env.INFISICAL_TOKEN, "${{ secrets.INFISICAL_VERCEL_CATCH_UP_READ_TOKEN }}");
+  assert.equal(bindingStep.env.INFISICAL_TOKEN, "${{ secrets.BOTFLEET_VERCEL_CATCHUP_READ_TOKEN }}");
+  assert.equal(fetchStep.env.INFISICAL_TOKEN, "${{ secrets.BOTFLEET_VERCEL_CATCHUP_READ_TOKEN }}");
   assert.equal(fetchStep.env.INFISICAL_ENVIRONMENT, "prod");
   assert.equal(fetchStep.env.INFISICAL_SECRET_PATH, "${{ vars.INFISICAL_VERCEL_CATCH_UP_SECRET_PATH }}");
   assert.equal(fetchStep.env.INFISICAL_NAMES, "VERCEL_TOKEN");

@@ -55,7 +55,7 @@ jobs:
       - name: Check Dedicated Service Token Binding
         id: credentials
         env:
-          INFISICAL_TOKEN: ${{ secrets.INFISICAL_VERCEL_CATCH_UP_READ_TOKEN }}
+          INFISICAL_TOKEN: ${{ secrets.BOTFLEET_VERCEL_CATCHUP_READ_TOKEN }}
           INFISICAL_SECRET_PATH: ${{ vars.INFISICAL_VERCEL_CATCH_UP_SECRET_PATH }}
         run: |
           if [ -n "$INFISICAL_TOKEN" ] && [ -n "$INFISICAL_SECRET_PATH" ] && [ "$INFISICAL_SECRET_PATH" != '/' ]; then
@@ -75,7 +75,7 @@ jobs:
           INFISICAL_REQUIRED: VERCEL_TOKEN
           # Binding is pending AFC-600 scope and registry verification.
           # No broad machine identity fallback is permitted.
-          INFISICAL_TOKEN: ${{ secrets.INFISICAL_VERCEL_CATCH_UP_READ_TOKEN }}
+          INFISICAL_TOKEN: ${{ secrets.BOTFLEET_VERCEL_CATCHUP_READ_TOKEN }}
         run: node scripts/infisical-fetch.mjs
       - name: Check binding, deployed SHA, cooldown and exact-main CI
         if: steps.credentials.outputs.available == 'true'
