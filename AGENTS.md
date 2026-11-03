@@ -84,7 +84,7 @@ Plans, designs, reviews, handoffs, rollouts, and completion notes also go to App
 
 ## Copy Rules (owner — ALL agents, ALL surfaces)
 
-Two spaces between sentences in every paragraph a human reads: product UI, App Store fields, docs, PR bodies, commit messages, Zulip posts, Apple Notes, this file (a real U+00A0 plus a space, as below).  Title Case headings.  System theme is the first-visit default (follows OS appearance; marketing captures default light).  The product word is "bot", not "agent".  No agent seat names on public surfaces (botfleet.app, App Store, TestFlight notes).  Timestamps in Central Time.
+Two spaces between sentences in every paragraph a human reads: product UI, App Store fields, docs, PR bodies, commit messages, Zulip posts, Apple Notes, this file (a real U+00A0 plus a space, as below).  Title Case headings.  System theme is the first-visit default (follows OS appearance; marketing captures default light).  The product word is "bot", not "agent".  No agent seat names on public surfaces (botfleet.app, App Store, TestFlight notes).  Times are the owner's clock, 12-hour, and the zone is never named (see **Times** below).
 
 **HOW to emit it (owner ruling 2026-10-23, reaffirmed 2026-10-25, the same on every surface but the two chat panes named below):**  between sentences, write a real U+00A0 (no-break space) followed by a normal space.  This covers chat replies, Zulip, GitHub PR and issue text, Linear, commit messages, repo docs, UI copy, skills and agent instructions.
 
@@ -95,6 +95,10 @@ Two spaces between sentences in every paragraph a human reads: product UI, App S
 - Product copy in source, by language:  Swift string literals `"\u{00A0} "`;  JS/TS string literals `"\u00A0 "`;  JSX text `{'\u00A0'}` followed by a space, or `&#160;` inside JSX text;  HTML markup source `&#160;` (markup only, never prose);  or the repo's shared `SENTENCE_GAP` constant where one exists.
 - Code, identifiers and machine-readable config never get a U+00A0.  If a surface strips U+00A0, leave the text as it is rather than switching to the entity, and report that surface in #Work-In-Progress so it can be given a working mechanism.
 - This replaces the earlier per-surface rules (the entity in chat panes or on GitHub, and two plain ASCII spaces in files, commits and terminals), except for the two chat panes named above.
+
+## Times: Owner's Clock, 12-Hour, Never Named (owner — ALL agents, ALL surfaces)
+
+Say every time on the owner's clock: 12-hour, with am or pm.  That clock is `America/Chicago`.  The zone is assumed and never named:  write `9:27am`, never `9:27am Central`, never `9:27am CST`, never `9:27am CDT`, never `9:27am CT` and never `9:27am America/Chicago`.  Convert every other zone first, including times read from logs, APIs, CI and dashboards, and never leave a UTC stamp beside the time:  a log line at `11:42Z` is `6:42am`.  Convert with `TZ=America/Chicago date` or Python `ZoneInfo("America/Chicago")`;  never guess the conversion.  Machine-readable fields that are ISO-8601 by contract (API responses, JSON payloads, log lines, DB columns) stay UTC.  This binds every agent, every bot and every platform, in every sentence the owner reads:  chat, Zulip, Linear, PRs, Notes, commits, release notes and bot-to-bot.  Owner ruling 2026-10-29, reaffirmed 2026-11-03.  Canonical: `/Users/jay/apps/FLEET-PROTOCOL.md` § Timestamps, and the `owner-copy` skill in every seat's pack.
 
 ## App Icon And Logo Policy: Full-Bleed Square Only, Never Squircle
 
