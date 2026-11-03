@@ -24,7 +24,7 @@ export type ZulipOrigin =
   | { kind: "dm"; userId: number };
 
 /** One message the bot was woken for, as it is persisted and handed to the
- *  model.  `owner` is the listener's own verdict (user id AND a human
+ *  model.  `owner` is the Zulip hub's own verdict (user id AND a human
  *  client), never the message's claim about itself. */
 export interface ZulipInboundItem {
   id: number;
