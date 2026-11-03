@@ -155,14 +155,14 @@ export class PlacementLeaseService {
   }
 
   private commitController(next: ControllerEpoch): string | null {
+    let result: ReturnType<ControllerEpochStore["compareAndSet"]> | undefined;
     try {
-      const result = this.controllerStore?.compareAndSet(this.current, next);
-      if (result && !result.accepted) {
-        this.refreshController();
-        return "Controller epoch changed; retry with the current fence";
-      }
+      result = this.controllerStore?.compareAndSet(this.current, next);
     } catch {
       return "Controller epoch could not be persisted; transition refused";
+    }
+    if (result && !result.accepted) {
+      return this.verifyController() ?? "Controller epoch changed; retry with the current fence";
     }
     this.current = { ...next };
     return null;

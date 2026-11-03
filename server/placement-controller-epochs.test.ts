@@ -158,6 +158,30 @@ describe("durable controller transitions", () => {
     expect(store.read()).toEqual({ controllerId: nextId, epoch: 9 });
   });
 
+  it.each(["missing", "damaged"])("refuses a contended transition whose refresh becomes %s without reporting a write failure", (damage) => {
+    const dir = fixture();
+    const store = openControllerEpochStore(dir, hostId);
+    const path = join(dir, "placement-controller.json");
+    const leases = new PlacementLeaseService({
+      hostId, controller: initial,
+      controllerStore: {
+        read: () => store.read(),
+        compareAndSet: (expected, next) => {
+          store.compareAndSet(expected, { controllerId: nextId, epoch: 9 });
+          const result = store.compareAndSet(expected, next);
+          if (damage === "missing") rmSync(path); else writeFileSync(path, "damaged");
+          return result;
+        },
+      },
+    });
+    expect(leases.takeover({ ...fence, epoch: 2, reconcile: true }))
+      .toMatchObject({ reply: { accepted: false, reason: "Controller epoch could not be verified; placement refused", epoch: 0 } });
+    expect(leases.reconciling()).toBe(false);
+    expect(leases.jobsList()).toEqual([]);
+    if (damage === "damaged") expect(readFileSync(path, "utf8")).toBe("damaged");
+    else expect(() => readFileSync(path)).toThrow();
+  });
+
   it("rejects unsafe or non-advancing epochs and never resets missing, damaged or regressed state", () => {
     const dir = fixture();
     const store = openControllerEpochStore(dir, hostId);
