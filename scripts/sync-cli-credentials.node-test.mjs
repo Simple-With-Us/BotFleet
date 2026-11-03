@@ -6,7 +6,7 @@
 // fake HOME and no reachable container, forcing the empty-targets JSON
 // path; the source assertion pins the guard so a refactor cannot drop it.
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,21 +33,26 @@ test("json no-targets path uses the bash 3.2-safe empty-array idiom", () => {
 test("--json with no synced target exits 0 and prints an empty targets list", { skip: !bashAvailable }, () => {
   const home = mkdtempSync(join(tmpdir(), "cred-sync-"));
   try {
+    const bin = join(home, "fixture-bin");
+    const probes = join(home, "container-probes");
+    mkdirSync(bin);
+    for (const executable of ["docker", "podman"]) {
+      writeFileSync(join(bin, executable), '#!/bin/sh\nprintf "%s\\n" "${1:-missing}" >> "$CRED_SYNC_FIXTURE_PROBES"\nexit 1\n', { mode: 0o755 });
+    }
     // One credential candidate so the run reaches the sync stage.
     writeFileSync(join(home, ".gitconfig"), "[user]\n\tname = T\n");
     let stdout = "";
     try {
-      // No docker/podman on this runner: every sync attempt fails, so
-      // SYNCED_TARGETS stays empty and the JSON summary takes the
-      // empty-array path.  set -e aborts inside command substitutions do
-      // not kill the script because the JSON block is the last thing run.
+      // Refusing fixture runtimes shadow any real Docker or podman on the host.
+      // The script must take the empty-target path without executing in a container.
       stdout = execFileSync("bash", [SCRIPT, "--target", "local", "--home", home, "--json"], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
         env: {
           ...process.env,
           HOME: home,
-          PATH: `${process.execPath.replace(/\/node$/, "")}:/usr/bin:/bin`,
+          PATH: `${bin}:${process.execPath.replace(/\/node$/, "")}:/usr/bin:/bin`,
+          CRED_SYNC_FIXTURE_PROBES: probes,
         },
       });
     } catch (err) {
@@ -57,6 +62,9 @@ test("--json with no synced target exits 0 and prints an empty targets list", { 
     const summary = JSON.parse(lastLine);
     assert.equal(summary.ok, true);
     assert.deepEqual(summary.targets, []);
+    const verbs = readFileSync(probes, "utf8").trim().split("\n");
+    assert.ok(verbs.length > 0, "the fixture must intercept runtime probes");
+    assert.deepEqual([...new Set(verbs)], ["inspect"], "no container exec is attempted");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
