@@ -48,6 +48,7 @@ export function isPackagingPath(path) {
     path === "package.json" ||
     path === "pnpm-lock.yaml" ||
     path.startsWith("electron/") ||
+    path.startsWith("native/") ||
     path.startsWith("third_party/") ||
     path.startsWith("scripts/prepare-") ||
     path.startsWith("scripts/package-")
