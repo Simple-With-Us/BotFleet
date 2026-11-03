@@ -439,16 +439,21 @@ test("CI full-history checkouts preserve the commit graph without downloading hi
   );
 });
 
-test("required E2E and Mac packaging classifiers retain full history with blobless checkouts", () => {
-  for (const workflowFile of ["e2e.yml", "mac-package-gate.yml"]) {
+test("required full-history workflows use blobless checkouts", () => {
+  const workflows = [
+    { file: "e2e.yml", jobName: "changes", proof: /ci-scope-diff\.sh/ },
+    { file: "mac-package-gate.yml", jobName: "scope", proof: /ci-scope-diff\.sh/ },
+    { file: "node-ci.yml", jobName: "lint", proof: /check-lint-baseline\.mjs/ },
+  ];
+  for (const { file: workflowFile, jobName, proof } of workflows) {
     const workflow = parse(readFileSync(join(ROOT, ".github/workflows", workflowFile), "utf8"));
-    const job = workflow.jobs.changes ?? workflow.jobs.scope;
-    assert.ok(job, `${workflowFile} classifier job`);
+    const job = workflow.jobs[jobName];
+    assert.ok(job, `${workflowFile} job`);
     const checkout = job.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
-    assert.ok(checkout, `${workflowFile} classifier checkout`);
+    assert.ok(checkout, `${workflowFile} checkout`);
     assert.equal(checkout.with?.["fetch-depth"], 0, `${workflowFile} must retain full history`);
     assert.equal(checkout.with?.filter, "blob:none", `${workflowFile} must avoid downloading historic blobs`);
-    assert.match(job.steps.find((step) => /ci-scope-diff\.sh/.test(step.run ?? ""))?.run ?? "", /ci-scope-diff\.sh/);
+    assert.match(job.steps.map((step) => step.run ?? "").join("\n"), proof);
   }
 });
 
