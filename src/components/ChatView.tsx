@@ -51,6 +51,7 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
 import { modelChip } from "@/lib/model-chip";
 import { ChatMarkdown } from "./ChatMarkdown";
+import { recordChatViewBody, recordMessagesListBody } from "./chatViewRenderProbe";
 import { splitVoiceSummary, stripVoiceSummaryTags, writtenReply } from "../../shared/voice-summary";
 import { useMessageKaraoke } from "@/lib/tts/useMessageKaraoke";
 import { MentionText } from "./MentionText";
@@ -822,6 +823,7 @@ const MessagesList = memo(function MessagesList({
   onRegenerate: () => void;
   onReply: (message: Message) => void;
 }) {
+  recordMessagesListBody();
   const { state, dispatch } = useStore();
   const showToolCalls = showToolCallsEnabled(state.config);
   const summarizeToolCalls = summarizeToolCallsEnabled(state.config);
@@ -1147,6 +1149,7 @@ function formatHoverTime(at: number) {
 }
 
 export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; explicitThreadId?: string }) {
+  recordChatViewBody();
   const { state, dispatch } = useStore();
   // A pin onto a different thread for App views and busy-time browsing.
   // The derived bot reads that thread's own cached transcript — never
