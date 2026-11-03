@@ -489,6 +489,10 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
         BOOTSTRAP_ASSEMBLED=1
       else
         BOOTSTRAP_ASSEMBLED=0
+        OPTIONAL_STARTUP_RECEIPT=()
+        if git -C "$BOTFLEET_CHECKOUT" cat-file -e "$BOOTSTRAP_COMMIT:electron/desktop-startup-receipt.mjs" 2>/dev/null; then
+          OPTIONAL_STARTUP_RECEIPT=(electron/desktop-startup-receipt.mjs)
+        fi
         if git -C "$BOTFLEET_CHECKOUT" archive "$BOOTSTRAP_COMMIT" -- \
           scripts/update-botfleet-mac.mjs \
           scripts/mac-update-transaction.mjs \
@@ -496,7 +500,8 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
           scripts/ci-build-resolver.mjs \
           scripts/stage-entries.mjs \
           scripts/failed-install-retention.mjs \
-          electron/update-credential-preparation.mjs | tar -x -C "$BOOTSTRAP_DIR"; then
+          electron/update-credential-preparation.mjs \
+          ${OPTIONAL_STARTUP_RECEIPT[@]+"${OPTIONAL_STARTUP_RECEIPT[@]}"} | tar -x -C "$BOOTSTRAP_DIR"; then
           BOOTSTRAP_ASSEMBLED=1
         fi
       fi

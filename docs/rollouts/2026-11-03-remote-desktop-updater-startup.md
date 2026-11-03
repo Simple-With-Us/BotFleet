@@ -1,0 +1,21 @@
+# Remote Desktop Updater Startup
+
+Refs BF-2606.
+
+The updater previously treated the remote desktop's forwarded health response as local process evidence, then waited for that desktop to own the local harness.  A remote desktop instead serves its bundled UI locally and forwards API requests to the selected server.
+
+The installed desktop now answers a private per-update startup request after its UI shim or local server starts.  The request binds a random identifier and exact commit; its response also binds the version, API version, UI hash and optional build number.  Both ends validate the owned private directory and single-link regular file through open descriptors, reject symlinks and oversized or malformed data, and keep configuration and credentials out of the receipt.  The updater separately checks the installed executable's exact PID and the kernel's local socket owner before accepting the response.
+
+Remote desktop readiness permits the local watchdog to start independently.  Final success still requires the authenticated local harness to report the prepared identity and sole database ownership; remote readiness alone cannot complete the transaction.  A local desktop must also prove authenticated local runtime readiness and a UI socket owned by the desktop or that runtime.
+
+Local health probes now require agreement between the kernel listener, private local owner record and health PID.  A forwarded PID contributes no local runtime identity, including when its number happens to match a local process.  Authentication, fencing and rollback do not send local owner credentials through an unverified listener.
+
+The packaged build advertises startup protocol 1.  A candidate lacking that protocol is refused before apply changes live files when the desktop is requested; server-only and no-open paths retain their existing behavior.  The stable loader includes the helper through its immutable import graph.  Direct legacy bootstrap includes it only when the selected historical commit contains it.
+
+## Validation
+
+The isolated Mac-updater suite passed 359 tests with eight platform skips.  It includes 15 receipt filesystem/identity tests, 14 topology and startup behavior tests, historical bootstrap targets without the helper, and a current target importing it.  The lint baseline passed without changing its counts.  The required typecheck and full test gate remain pending at this source checkpoint.
+
+An initial wider updater run exposed two unchanged release-store fixture assumptions under the server's private umask, plus three source-contract assertions needing the new explicit data directory and conditional archive argument.  After fixing the affected assertions, the suite passed with a process-local 022 umask; private receipt modes remain explicit 0600/0700.  No production permissions were broadened.
+
+PR #1539 separately addresses source-release provenance.  This startup change preserves that separate dependency and does not establish an installed update, before-login acceptance or a native service cutover.  No live process, user database, remote server, credential, launchd registration or installed bundle was changed during validation.

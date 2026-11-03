@@ -51,6 +51,7 @@ import {
 import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity, probeHarness, resolvePackagedServer } from "./server-boot-probe.mjs";
 import { readPackagedBuildIdentity } from "./runtime-identity.mjs";
+import { desktopStartupReceiptPath, writeDesktopStartupReceipt } from "./desktop-startup-receipt.mjs";
 import { readHarnessOwner } from "./harness-ownership.mjs";
 import { startUiShim } from "./attached-ui-shim.mjs";
 import { readKeychainServiceToken, resolveServerTarget } from "./server-target.mjs";
@@ -137,10 +138,12 @@ if (app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU === "1") {
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
 const { appRuntimeInfo, appRuntimeSummary } = appInfoModule;
 let updateCredentialPreparationPath;
+let updateStartupReceiptPath;
 try {
   updateCredentialPreparationPath = updateCredentialReceiptPath(process.argv);
+  updateStartupReceiptPath = desktopStartupReceiptPath(process.argv);
 } catch {
-  console.error("[desktop] invalid update credential preparation request");
+  console.error("[desktop] invalid private update request");
   process.exit(1);
 }
 const nativeActions = nativeDesktopActions(process.platform);
@@ -3119,6 +3122,21 @@ app.whenReady().then(async () => {
     void startDesktopCompanion({ waitForHosted: false, remember: false });
   }
   const win = createWindow();
+  if (updateStartupReceiptPath) {
+    try {
+      if (!app.isPackaged || !serverReady) throw new Error("Desktop startup is incomplete");
+      const build = readPackagedBuildIdentity(path.join(process.resourcesPath, "server"));
+      const ui = new URL(rendererBaseUrl());
+      if (ui.protocol !== "http:" || ui.hostname !== "127.0.0.1") throw new Error("Invalid desktop UI origin");
+      writeDesktopStartupReceipt(updateStartupReceiptPath, build, {
+        pid: process.pid, mode: serverMode === "remote" ? "remote" : "local", uiPort: Number(ui.port),
+      });
+    } catch {
+      console.error("[desktop] update startup confirmation failed");
+      app.quit();
+      return;
+    }
+  }
   // Reconcile incomplete setup and resume interrupted sign-out only after the
   // local app is usable. This background network work never gates LAN pairing
   // or the first window.

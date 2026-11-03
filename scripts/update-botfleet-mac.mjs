@@ -27,6 +27,7 @@ import {
   outcomeMessage,
 } from "./update-progress.mjs";
 import { validUpdateCredentialReceipt } from "../electron/update-credential-preparation.mjs";
+import { createDesktopStartupRequest, readDesktopStartupReceipt } from "../electron/desktop-startup-receipt.mjs";
 import { stageIsPrunable } from "./stage-entries.mjs";
 import {
   FAILED_INSTALL_KEEP,
@@ -871,10 +872,10 @@ async function requestJson(url, { headers = {}, method = "GET", timeoutMs = 3_00
   return { kind: "ok", status: response.status, body };
 }
 
-async function probeHealthWithRetry(port, { attempts = 3, backoffMs = 250 } = {}) {
+async function probeHealthWithRetry(port, { attempts = 3, backoffMs = 250, dataDirectory } = {}) {
   let result;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    result = await probeHealth(port);
+    result = await probeHealth(port, { dataDirectory });
     // none, botfleet, foreign and http are all definitive; only an
     // unreachable or ambiguous response is worth asking again, because a
     // single three-second timeout is not evidence that a port is owned.
@@ -884,20 +885,31 @@ async function probeHealthWithRetry(port, { attempts = 3, backoffMs = 250 } = {}
   return { ...result, port };
 }
 
-async function probeHealth(port, { timeoutMs = 3_000 } = {}) {
+export async function localListenerPids(port) {
+  const result = await run("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { allowFailure: true });
+  if (![0, 1].includes(result.code)) return [];
+  return [...new Set(result.stdout.split(/\s+/).filter(Boolean).map(Number)
+    .filter((pid) => Number.isSafeInteger(pid) && pid > 0))];
+}
+
+export function classifyLocalHealth(body, port, listeners, owner) {
+  if (body?.app !== "botfleet" || !Number.isSafeInteger(body?.pid) || body.pid <= 0) return { kind: "foreign" };
+  if (listeners.length !== 1) return { kind: "unavailable", reason: "local listener ownership is ambiguous", port };
+  // A UI shim forwards the far end's health unchanged; its PID is never a local process identity.
+  if (listeners[0] !== body.pid || (owner && owner.port !== port)) return { kind: "proxy", port };
+  if (!owner || owner.pid !== body.pid || owner.port !== port) {
+    return { kind: "unavailable", reason: "local runtime has no matching private owner record", port };
+  }
+  if (body.ready === false || body.booting === true) return { kind: "unavailable", reason: "booting", port };
+  return { kind: "botfleet", pid: body.pid, static: Boolean(body.static), port };
+}
+
+async function probeHealth(port, { timeoutMs = 3_000, dataDirectory } = {}) {
   const result = await requestJson(`http://127.0.0.1:${port}/api/health`, { accept: [200], timeoutMs });
   if (result.kind !== "ok") return result;
-  if (result.body?.app !== "botfleet" || !Number.isInteger(result.body?.pid) || result.body.pid <= 0) {
-    return { kind: "foreign" };
-  }
-  // The harness binds its port before the boot work and answers health with
-  // `ready: false` until that work finishes, 503-ing every other route
-  // meanwhile.  Alive but not yet serving is exactly what "unavailable" means
-  // here — and it is the one kind probeHealthWithRetry asks again about.
-  if (result.body.ready === false || result.body.booting === true) {
-    return { kind: "unavailable", reason: "booting", port };
-  }
-  return { kind: "botfleet", pid: result.body.pid, static: Boolean(result.body.static), port };
+  const directory = dataDirectory ?? resolve(process.env.BOTFLEET_DATA_DIR || join(homedir(), ".botfleet"));
+  const [listeners, state] = await Promise.all([localListenerPids(port), ownerRecordState(directory)]);
+  return classifyLocalHealth(result.body, port, listeners, state.state === "live" ? state.owner : null);
 }
 
 async function sqliteHolders(dataDirectory) {
@@ -927,7 +939,7 @@ export function healthTopologyResult(results, { allowMultiple = false } = {}) {
 }
 
 async function healthTopology(ports, options = {}) {
-  const probe = (port) => probeHealth(port, options.timeoutMs ? { timeoutMs: options.timeoutMs } : undefined);
+  const probe = (port) => probeHealth(port, options);
   return healthTopologyResult(await Promise.all(ports.map(probe)), options);
 }
 
@@ -1022,7 +1034,9 @@ async function ownerRecordState(dataDirectory) {
 
 async function readOwner(dataDirectory) {
   const { state, owner } = await ownerRecordState(dataDirectory);
-  return state === "live" ? owner : null;
+  if (state !== "live") return null;
+  const listeners = await localListenerPids(owner.port);
+  return listeners.length === 1 && listeners[0] === owner.pid ? owner : null;
 }
 
 export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle }) {
@@ -1071,6 +1085,10 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
     return { safe: false, reason: `BotFleet harness (pid ${owner.pid}) is not running` };
   }
   if (state !== "live") return null;
+  const listeners = await localListenerPids(owner.port);
+  if (listeners.length !== 1 || listeners[0] !== owner.pid) {
+    return { safe: false, reason: "Private runtime owner does not own the local listening socket" };
+  }
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime`, {
     headers: harnessAuthorizationHeader(owner),
     accept: [200],
@@ -1085,7 +1103,7 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   const runtime = response.body;
   const identityError = authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle });
   if (identityError) return { safe: false, reason: identityError };
-  const topology = await healthTopology(config.ports, { timeoutMs: PATIENT_REQUEST_MS });
+  const topology = await healthTopology(config.ports, { timeoutMs: PATIENT_REQUEST_MS, dataDirectory: config.dataDirectory });
   if (!topology.safe || topology.pid !== owner.pid) {
     return {
       safe: false,
@@ -1748,7 +1766,7 @@ async function fenceWithin(config, owner, { request, inspectTopology, inspectHol
   try {
     [topology, settled] = await Promise.all([
       retryTransient(async () => {
-        const result = await inspectTopology(config.ports);
+        const result = await inspectTopology(config.ports, { dataDirectory: config.dataDirectory });
         return { ...result, transient: !stop.stoppedBy && !result.safe && TOPOLOGY_UNAVAILABLE.test(result.reason || "") };
       }, { windowMs: 30_000, now, wait: pause }),
       // A bot's own tool holding the database for a moment is waited out,
@@ -1918,7 +1936,11 @@ export async function validateBuiltBundle(bundlePath, expectedCommit) {
   // Transition release: main still builds the legacy bundle ID, so a built
   // candidate may carry either accepted ID; applicationIdentitiesCanTransition()
   // decides which installed app it may replace.
-  return { ...(await signatureIdentity(bundlePath, { allowLegacyBundleId: true })), version: build.version, apiVersion: build.apiVersion, uiHash: build.uiHash };
+  const identity = { ...(await signatureIdentity(bundlePath, { allowLegacyBundleId: true })), version: build.version,
+    apiVersion: build.apiVersion, uiHash: build.uiHash };
+  if (build.build !== undefined) identity.build = build.build;
+  if (build.desktopStartupProtocol !== undefined) identity.desktopStartupProtocol = build.desktopStartupProtocol;
+  return identity;
 }
 
 // ---------------------------------------------------------------------------
@@ -3595,6 +3617,31 @@ export async function startDesktopBeforeWatchdog({ desktop, open, verify, bootst
   await bootstrap();
 }
 
+/** A receipt is accepted only after the installed app and its local socket are independently observed. */
+export async function desktopStartupPreflight(receipt, { appPids, listeners, localRuntime }) {
+  if (!receipt || !["local", "remote"].includes(receipt.mode) ||
+      !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0 ||
+      !Number.isSafeInteger(receipt.uiPort) || receipt.uiPort < 1 || receipt.uiPort > 65535 ||
+      appPids.length !== 1 || appPids[0] !== receipt.pid) {
+    return { safe: false, reason: "Installed desktop has not confirmed its exact running process" };
+  }
+  const uiListeners = await listeners(receipt.uiPort);
+  if (receipt.mode === "remote") {
+    return uiListeners.length === 1 && uiListeners[0] === receipt.pid
+      ? { safe: true, mode: "remote-desktop", pid: receipt.pid }
+      : { safe: false, reason: "Remote desktop does not own its local UI listening socket" };
+  }
+  const snapshot = await localRuntime();
+  if (!snapshot?.safe || snapshot.mode !== "authenticated") {
+    return { safe: false, reason: snapshot?.reason || "Local desktop has no authenticated runtime owner" };
+  }
+  const uiOwner = uiListeners.length === 1 ? uiListeners[0] : null;
+  if (uiOwner !== receipt.pid && uiOwner !== snapshot.pid) {
+    return { safe: false, reason: "Desktop UI socket is not owned by the app or its authenticated local harness" };
+  }
+  return snapshot;
+}
+
 /** Recovery still attempts every watchdog if the preferred desktop cannot start. */
 export async function restoreDesktopBeforeWatchdogs({ desktop, open, verify, bootstraps, record }) {
   if (desktop) await record(async () => { await open(); await verify(); });
@@ -3603,6 +3650,8 @@ export async function restoreDesktopBeforeWatchdogs({ desktop, open, verify, boo
 
 function createOperations(config) {
   let lastPreflight;
+  let desktopStartupRequest;
+  let desktopStartupPath;
   const componentFlags = () => resolveUpdateComponentFlags(config.parsed.components);
   const git = (cwd, args, options) => run("git", ["-C", cwd, ...args], options);
   const gitOutput = (cwd, args, options) => output("git", ["-C", cwd, ...args], options);
@@ -3867,6 +3916,8 @@ function createOperations(config) {
         version: identity.version,
         apiVersion: identity.apiVersion,
         uiHash: identity.uiHash,
+        build: identity.build,
+        desktopStartupProtocol: identity.desktopStartupProtocol,
         teamIdentifier: identity.teamIdentifier,
         bundleIdentifier: identity.bundleIdentifier,
         designatedRequirement: identity.designatedRequirement,
@@ -3890,10 +3941,15 @@ function createOperations(config) {
 
     validatePrepared: async (prepared) => {
       const identity = await validateBuiltBundle(prepared.bundlePath, prepared.targetCommit);
+      if (shouldStartDesktop({ updateApp: componentFlags().updateApp, openApplication: config.parsed.openApplication }) &&
+          identity.desktopStartupProtocol !== 1) {
+        throw new Error("The candidate predates desktop startup confirmation; a newer verified build is required");
+      }
       if (identity.teamIdentifier !== prepared.teamIdentifier ||
           identity.bundleIdentifier !== prepared.bundleIdentifier ||
           identity.designatedRequirement !== prepared.designatedRequirement ||
-          identity.version !== prepared.version || identity.apiVersion !== prepared.apiVersion || identity.uiHash !== prepared.uiHash) {
+          identity.version !== prepared.version || identity.apiVersion !== prepared.apiVersion || identity.uiHash !== prepared.uiHash ||
+          identity.build !== prepared.build || identity.desktopStartupProtocol !== prepared.desktopStartupProtocol) {
         throw new Error("Prepared bundle identity no longer matches its immutable manifest");
       }
       if (await dependencyFingerprint(prepared.dependenciesPath) !== prepared.dependencyFingerprint) {
@@ -3941,7 +3997,7 @@ function createOperations(config) {
     // stale owner record does not refuse every later update) and after every
     // failure.  A no-op when a harness answers.
     ensureRunning: async () => ensureBotFleetRunning({
-      answers: async () => (await Promise.all(config.ports.map((port) => probeHealthWithRetry(port))))
+      answers: async () => (await Promise.all(config.ports.map((port) => probeHealthWithRetry(port, { dataDirectory: config.dataDirectory }))))
         .some((item) => item.kind === "botfleet"),
       bundleBusy: () => bundleProcessPids(config.appPath),
       mismatch: async () => {
@@ -4115,7 +4171,7 @@ function createOperations(config) {
       await waitOutUnrecognizedHolders(async () => {
         const [currentHolders, health] = await Promise.all([
           sqliteHolders(config.dataDirectory),
-          Promise.all(config.ports.map(probeHealth)),
+          Promise.all(config.ports.map((port) => probeHealth(port, { dataDirectory: config.dataDirectory }))),
         ]);
         const currentBundlePids = updateApp ? await bundleProcessPids(config.appPath) : [];
         const current = ownedRuntimePids({ holders: currentHolders, bundlePids: currentBundlePids, health });
@@ -4155,7 +4211,7 @@ function createOperations(config) {
             return { reason: `BotFleet process ${appPids.join(", ")} still runs from inside ${config.appPath} after graceful shutdown`, pids: appPids };
           }
         }
-        const health = await Promise.all(config.ports.map((port) => probeHealthWithRetry(port)));
+        const health = await Promise.all(config.ports.map((port) => probeHealthWithRetry(port, { dataDirectory: config.dataDirectory })));
         const portError = quiescedPortError(health);
         return portError ? { reason: portError, pids: [] } : null;
       }, {
@@ -4259,9 +4315,22 @@ function createOperations(config) {
       if (previous) previous.startedHarnessLabel = await startedHarnessLabel(config, plist);
       await startDesktopBeforeWatchdog({
         desktop: shouldStartDesktop({ updateApp: componentFlags().updateApp, openApplication: config.parsed.openApplication }),
-        open: () => run("open", [config.appPath]),
+        open: async () => {
+          desktopStartupPath = join(prepared.stageDirectory, "desktop-startup.json");
+          await rm(desktopStartupPath, { force: true });
+          const startupIdentity = {
+            sourceCommit: prepared.targetCommit, version: prepared.version, apiVersion: prepared.apiVersion, uiHash: prepared.uiHash,
+          };
+          if (prepared.build !== undefined) startupIdentity.build = prepared.build;
+          desktopStartupRequest = createDesktopStartupRequest(desktopStartupPath, startupIdentity);
+          await run("open", ["-a", config.appPath, "--args", `--update-startup-receipt=${desktopStartupPath}`]);
+        },
         verify: () => waitForStartup({
-          attempt: () => runtimeIdentityPreflight(config, prepared),
+          attempt: async () => desktopStartupPreflight(
+            readDesktopStartupReceipt(desktopStartupPath, desktopStartupRequest), {
+              appPids: await exactAppPids(config.appPath), listeners: localListenerPids,
+              localRuntime: () => runtimeIdentityPreflight(config, prepared),
+            }),
           timeoutMs: config.startupTimeoutMs,
           what: "the packaged version",
           fallback: "Installed application did not prove its expected build and ownership",
@@ -4316,7 +4385,11 @@ function createOperations(config) {
             if (!snapshot.safe || snapshot.mode !== "authenticated") {
               return snapshot.reason || "Updated application did not attach to the authenticated single data owner";
             }
-            return applicationAttachmentError(snapshot, true);
+            const desktop = await desktopStartupPreflight(
+              readDesktopStartupReceipt(desktopStartupPath, desktopStartupRequest), {
+                appPids: await exactAppPids(config.appPath), listeners: localListenerPids, localRuntime: async () => snapshot,
+              });
+            return desktop?.safe ? null : desktop?.reason || "Desktop startup is incomplete";
           },
           timeoutMs: config.startupTimeoutMs,
           report: config.reportDetail,
@@ -4362,7 +4435,7 @@ function createOperations(config) {
       const [holders, appPids, health] = await Promise.all([
         sqliteHolders(config.dataDirectory),
         updateApp ? bundleProcessPids(config.appPath) : Promise.resolve([]),
-        Promise.all(config.ports.map(probeHealth)),
+        Promise.all(config.ports.map((port) => probeHealth(port, { dataDirectory: config.dataDirectory }))),
       ]);
       const runtimePids = health.filter((item) => item.kind === "botfleet").map((item) => item.pid);
       const runningPids = [...new Set([...holders, ...appPids, ...runtimePids])];
@@ -4449,7 +4522,7 @@ function createOperations(config) {
           const [holders, bundlePids, health, owner] = await Promise.all([
             sqliteHolders(config.dataDirectory),
             updateApp ? bundleProcessPids(config.appPath) : Promise.resolve([]),
-            Promise.all(config.ports.map((port) => probeHealthWithRetry(port))),
+            Promise.all(config.ports.map((port) => probeHealthWithRetry(port, { dataDirectory: config.dataDirectory }))),
             readOwner(config.dataDirectory).catch(() => null),
           ]);
           const stranger = health.filter((item) => item.kind === "foreign" || item.kind === "http");
