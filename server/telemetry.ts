@@ -241,6 +241,9 @@ const PROVIDER_BY_ENGINE = new Map<string, string>(Object.entries({
   dsh: "dsh",
   kimi: "moonshot",
   moonshot: "moonshot",
+  zcode: "zcode",
+  zai: "zcode",
+  glm: "zcode",
   cursor: "cursor",
   minimax: "minimax",
   mcode: "minimax",
@@ -314,6 +317,12 @@ export function inferProviderAndService(
   }
   if (inst.includes("kimi") || model.includes("moonshot")) {
     return { provider: "moonshot", service: modelId || "unknown" };
+  }
+  // No model check here: GLM weights served over an OpenAI-compatible
+  // instance (OpenRouter, Ollama, ...) are that instance's traffic, and the
+  // zcode engine itself is already attributed by providerForEngine above.
+  if (inst.includes("zcode")) {
+    return { provider: "zcode", service: modelId || "unknown" };
   }
 
   // Still nothing: an OpenAI-compatible instance reports itself honestly

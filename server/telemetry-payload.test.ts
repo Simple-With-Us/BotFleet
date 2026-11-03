@@ -685,6 +685,13 @@ describe("provider naming stays inside Usage Monitor's canon", () => {
     expect(inferProviderAndService("computer", undefined, "boxAgent").provider).toBe("box");
   });
 
+  it("does not attribute OpenAI-compatible GLM traffic to zcode", () => {
+    // GLM weights served over an OpenAI-compatible instance are that
+    // instance's traffic; the zcode engine is attributed by providerForEngine.
+    expect(inferProviderAndService("openrouter", "glm-4.6", "openai-compat").provider).toBe("openai-compat");
+    expect(inferProviderAndService("zcode", "GLM-5.3", "zcode").provider).toBe("zcode");
+  });
+
   it("keeps the two-argument form working exactly as before", () => {
     expect(inferProviderAndService("claude", "claude-sonnet-5")).toEqual({
       provider: "anthropic",
