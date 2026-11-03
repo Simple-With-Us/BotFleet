@@ -1783,35 +1783,16 @@ describe("service token refusal: scope and visibility", () => {
 });
 
 describe("the fleet's project", () => {
-  // `os.homedir()` reads $HOME on POSIX, so a temporary home is enough to
-  // point the file lookup somewhere else.  HOME itself is not in ENV_KEYS:
-  // deleting it for every test in this file would move `dataDir()` too.
-  const savedHome = process.env.HOME;
-  let home = "";
-  beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "omb-fleet-ops-home-"));
-    process.env.HOME = home;
-  });
-  afterEach(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+  it("comes from the environment variable the fleet's own tools read", () => {
+    process.env.INFISICAL_FLEET_OPS_PROJECT_ID = "  a-project-id  ";
+    expect(fleetOpsProjectId()).toBe("a-project-id");
   });
 
-  it("takes the project id from the environment first", async () => {
-    mkdirSync(join(home, ".agent-sync"), { recursive: true });
-    writeFileSync(join(home, ".agent-sync", "fleet-ops-project-id"), "from-the-file\n");
-    process.env.INFISICAL_FLEET_OPS_PROJECT_ID = "from-the-environment";
-    expect(await fleetOpsProjectId()).toBe("from-the-environment");
-  });
-
-  it("falls back to the fleet's own file, first line only", async () => {
-    mkdirSync(join(home, ".agent-sync"), { recursive: true });
-    writeFileSync(join(home, ".agent-sync", "fleet-ops-project-id"), "from-the-file\nsecond-line\n");
-    expect(await fleetOpsProjectId()).toBe("from-the-file");
-  });
-
-  it("is empty when the host has neither", async () => {
-    expect(await fleetOpsProjectId()).toBe("");
+  it("is empty when the host has no such variable", () => {
+    // The product server reads nothing else for it:  the fleet keeps that
+    // project id out of every repository, and the server does not reach
+    // into the fleet's own handoff files for a setting.
+    expect(fleetOpsProjectId()).toBe("");
   });
 });
 
@@ -1849,17 +1830,9 @@ describe("readProjectPath", () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
     withSettings({});
-    const home = mkdtempSync(join(tmpdir(), "omb-fleet-ops-home-"));
-    const savedHome = process.env.HOME;
-    process.env.HOME = home;
-    try {
-      await expect(infisical.readProjectPath("fleet-ops", "/cli-logins/BF-ORACLE")).rejects.toThrow(
-        /fleet's Infisical project is not configured/,
-      );
-      expect(fetchMock).not.toHaveBeenCalled();
-    } finally {
-      if (savedHome === undefined) delete process.env.HOME;
-      else process.env.HOME = savedHome;
-    }
+    await expect(infisical.readProjectPath("fleet-ops", "/cli-logins/BF-ORACLE")).rejects.toThrow(
+      /fleet's Infisical project is not configured/,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

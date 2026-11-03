@@ -12,8 +12,7 @@
 // anywhere at all, and it goes straight to Infisical over the connection
 // `login()` already authenticated, never through a log line.
 import { constants } from "node:fs";
-import { lstat, open, readFile, realpath, type FileHandle } from "node:fs/promises";
-import { homedir } from "node:os";
+import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 
 import { normalizeInfisicalSecretPath, type InfisicalSettings, type ResolvedInfisicalReadSource } from "./config.ts";
@@ -41,24 +40,16 @@ export const FLEET_OPS_ENVIRONMENT = "prod";
 /** The fleet's project id, or "" when this host has none.
  *
  * It is never committed — the fleet keeps that project id out of every
- * repository — so it comes from the environment variable the fleet's own
- * tools read (`INFISICAL_FLEET_OPS_PROJECT_ID`) and then from the fleet's
- * own `~/.agent-sync/fleet-ops-project-id` file, in that order, exactly as
- * `fleet-secrets` resolves it.
+ * repository — so it comes from the environment, in the variable the
+ * fleet's own tools read (`INFISICAL_FLEET_OPS_PROJECT_ID`).
  *
- * A project id is a locator, not a credential: the credential that reads the
- * folder is the machine identity this manager already holds.  The file holds
- * a UUID and nothing else, and it is read as a plain file — no symlink
- * chase, no directory walk. */
-export async function fleetOpsProjectId(): Promise<string> {
-  const fromEnv = (process.env.INFISICAL_FLEET_OPS_PROJECT_ID ?? "").trim();
-  if (fromEnv) return fromEnv;
-  try {
-    const raw = await readFile(resolve(homedir(), ".agent-sync", "fleet-ops-project-id"), "utf8");
-    return raw.split("\n")[0]?.trim() ?? "";
-  } catch {
-    return "";
-  }
+ * A project id is a locator, not a credential:  the credential that reads
+ * the folder is the machine identity this manager already holds.  Nothing
+ * else is read for it:  the product server does not reach into the fleet's
+ * own handoff files for a setting, so a host that has no environment
+ * variable has no fleet project to address and is told so. */
+export function fleetOpsProjectId(): string {
+  return (process.env.INFISICAL_FLEET_OPS_PROJECT_ID ?? "").trim();
 }
 
 /** Everything the loopback status route and the Secrets card read.  Values
@@ -913,7 +904,7 @@ class InfisicalManager {
    * wrong rows, or with nothing, and both would look like a missing login. */
   async readProjectPath(project: VaultProject, secretPath: string): Promise<ReadonlyMap<string, string>> {
     if (project === "botfleet") return this.readPath(secretPath);
-    const projectId = await fleetOpsProjectId();
+    const projectId = fleetOpsProjectId();
     if (!projectId) {
       throw new InfisicalError(
         "The fleet's Infisical project is not configured on this host: set INFISICAL_FLEET_OPS_PROJECT_ID.",
