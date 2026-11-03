@@ -39,6 +39,33 @@ function releaseTree(root, commit) {
   return dir;
 }
 
+/**
+ * The environment a fixture run gets.
+ *
+ * The script resolves the park marker as
+ * `${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/stopped.marker}`,
+ * so an inherited `BOTFLEET_SHUTDOWN_MARKER` or an inherited `OMB_DATA_DIR`
+ * points the gate at some other file,  and the parked cases then stop
+ * exercising the marker they wrote:  the gate reads a path that holds no
+ * marker,  the companion starts,  and the case fails for a reason that has
+ * nothing to do with the behaviour it is about.  The marker path is pinned to
+ * this fixture's home and the inherited data directory is dropped,  so the
+ * only marker the gate can see is the one the fixture wrote.
+ */
+function fixtureEnv(home, { port, node }) {
+  const env = {
+    ...process.env,
+    HOME: home,
+    BOTFLEET_SHUTDOWN_MARKER: join(home, ".botfleet", "stopped.marker"),
+    BOTFLEET_COMPANION_PORT: String(port),
+    BOTFLEET_COMPANION_CONTROL_PORT: String(port + 1),
+    BOTFLEET_HARNESS_PORT: String(port + 2),
+    BOTFLEET_NODE: node,
+  };
+  delete env.OMB_DATA_DIR;
+  return env;
+}
+
 test("the sidecar runs from its own store, not the harness's", () => {
   const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-store-"));
   const home = join(dir, "home");
@@ -57,14 +84,7 @@ test("the sidecar runs from its own store, not the harness's", () => {
   const port = 20000 + Math.floor(Math.random() * 20000);
   const result = spawnSync("bash", [SCRIPT], {
     encoding: "utf8",
-    env: {
-      ...process.env,
-      HOME: home,
-      BOTFLEET_COMPANION_PORT: String(port),
-      BOTFLEET_COMPANION_CONTROL_PORT: String(port + 1),
-      BOTFLEET_HARNESS_PORT: String(port + 2),
-      BOTFLEET_NODE: node,
-    },
+    env: fixtureEnv(home, { port, node }),
   });
   // The sidecar's own release is where the marker must land.  Landing in
   // the harness's release would mean the two programs share a pointer, and
@@ -92,15 +112,7 @@ function runStart(home, extraEnv = {}) {
   const port = 20000 + Math.floor(Math.random() * 20000);
   return spawnSync("bash", [SCRIPT], {
     encoding: "utf8",
-    env: {
-      ...process.env,
-      HOME: home,
-      BOTFLEET_COMPANION_PORT: String(port),
-      BOTFLEET_COMPANION_CONTROL_PORT: String(port + 1),
-      BOTFLEET_HARNESS_PORT: String(port + 2),
-      BOTFLEET_NODE: node,
-      ...extraEnv,
-    },
+    env: { ...fixtureEnv(home, { port, node }), ...extraEnv },
   });
 }
 
@@ -116,6 +128,13 @@ test("a parked fleet does not start a companion, and the marker is left alone", 
   // non-zero exit would be a failed start to restart-loop against.
   assert.equal(result.status, 0, `stderr: ${result.stderr}`);
   assert.match(result.stdout, /stopped\.marker present/);
+  // The gate must have read THIS fixture's marker,  not one the environment
+  // pointed it at:  the log line names the path it looked at,  so the path in
+  // the output is the proof that the parked case tested the parked behaviour.
+  assert.ok(
+    result.stdout.includes(marker),
+    `the gate must read the fixture's own marker; stdout: ${result.stdout}`,
+  );
   // The companion must not run at all while the fleet is parked.
   const release = join(home, ".botfleet-companion", "releases", "c".repeat(40));
   assert.equal(
@@ -127,8 +146,7 @@ test("a parked fleet does not start a companion, and the marker is left alone", 
   assert.ok(existsSync(marker), "the companion must never delete the harness's park marker");
 });
 
-test("an unparked fleet starts the companion as before", () => {
-  const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-unparked-"));
+test("an unparked fleet starts the companion as before", () => {  const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-unparked-"));
   const home = join(dir, "home");
   mkdirSync(join(home, ".botfleet"), { recursive: true });
 
@@ -139,6 +157,39 @@ test("an unparked fleet starts the companion as before", () => {
     existsSync(join(release, "ran-here.txt")),
     "without a park marker the companion must still start",
   );
+});
+
+test("an inherited marker override cannot move the gate off the fixture's marker", () => {
+  // The script prefers BOTFLEET_SHUTDOWN_MARKER over the home it was given,
+  // so a case that inherited one would look at a file it never wrote:  the
+  // gate would find no marker there,  start the companion,  and the parked
+  // behaviour would never be exercised at all.  The fixture pins the path,  so
+  // this case holds even with an override in the environment.
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-companion-inherited-"));
+  const home = join(dir, "home");
+  mkdirSync(join(home, ".botfleet"), { recursive: true });
+  const marker = join(home, ".botfleet", "stopped.marker");
+  writeFileSync(marker, "stopped on purpose\n");
+
+  const previous = process.env.BOTFLEET_SHUTDOWN_MARKER;
+  process.env.BOTFLEET_SHUTDOWN_MARKER = join(dir, "elsewhere.marker");
+  try {
+    const result = runStart(home);
+    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+    assert.ok(
+      result.stdout.includes(marker),
+      `the gate must read the fixture's own marker; stdout: ${result.stdout}`,
+    );
+    const release = join(home, ".botfleet-companion", "releases", "c".repeat(40));
+    assert.equal(
+      existsSync(join(release, "ran-here.txt")),
+      false,
+      "a parked fleet must not start a companion supervisor",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.BOTFLEET_SHUTDOWN_MARKER;
+    else process.env.BOTFLEET_SHUTDOWN_MARKER = previous;
+  }
 });
 
 test("--stop still works while the fleet is parked", () => {
