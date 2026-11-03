@@ -189,6 +189,9 @@ public final class StartupPolicy {
     /// The label of the BotFleet Server LaunchAgent.
     public static let serverAgentLabel = "app.botfleet.server"
 
+    /// The label of the BotFleet Companion LaunchAgent.
+    public static let companionAgentLabel = "app.botfleet.companion"
+
     /// The LaunchAgent plist that installs a label.
     public func launchAgentPlist(label: String) -> URL {
         home.appendingPathComponent("Library/LaunchAgents/\(label).plist")
@@ -282,6 +285,48 @@ public final class StartupPolicy {
         if wasStopped { try files.removeItem(at: stopped) }
         do {
             try restartAgent(label: StartupPolicy.serverAgentLabel)
+        } catch {
+            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
+            throw error
+        }
+        return DeliberateStop(marker: stopped, files: files, wasStopped: wasStopped)
+    }
+
+    /// Starts the BotFleet Companion LaunchAgent.
+    ///
+    /// An explicit start of the companion is a deliberate start of the
+    /// fleet, so the deliberate-stop marker is cleared first: the companion's
+    /// start script stays down while that marker exists, and a start that
+    /// left it in place would report a companion that never came back.
+    /// The marker is put back when the start fails, so a refused start does
+    /// not lift a deliberate stop.
+    public func startCompanion() throws {
+        let wasStopped = files.fileExists(atPath: stopped.path)
+        if wasStopped { try files.removeItem(at: stopped) }
+        do {
+            try startAgent(label: StartupPolicy.companionAgentLabel)
+        } catch {
+            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
+            throw error
+        }
+    }
+
+    /// Restarts the BotFleet Companion LaunchAgent.
+    ///
+    /// A restart asks for a fresh copy of the companion, so the deliberate-stop
+    /// marker is cleared first: the companion's start script stays down while that
+    /// marker exists, and a restart that left it in place would report a
+    /// companion that never came back.
+    ///
+    /// The returned handle puts the marker back when the restart does not
+    /// replace the companion, so a refused restart does not lift a
+    /// deliberate stop.
+    @discardableResult
+    public func restartCompanion() throws -> DeliberateStop {
+        let wasStopped = files.fileExists(atPath: stopped.path)
+        if wasStopped { try files.removeItem(at: stopped) }
+        do {
+            try restartAgent(label: StartupPolicy.companionAgentLabel)
         } catch {
             if wasStopped { try? Data().write(to: stopped, options: .atomic) }
             throw error

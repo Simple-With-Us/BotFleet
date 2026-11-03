@@ -154,6 +154,15 @@ public final class FleetServiceControl {
                         await self.state(of: descriptor)
                     }
                 }
+            } else if descriptor.id == FleetServiceRegistry.companion.id {
+                // The BotFleet Companion start script honors the fleet's
+                // deliberate-stop marker and stays down while it exists,
+                // so an explicit start clears the marker first.
+                if running {
+                    try startup.startCompanion()
+                } else {
+                    try await startup.stopAgent(label: label)
+                }
             } else if running {
                 try startup.startAgent(label: label)
             } else {
@@ -212,6 +221,19 @@ public final class FleetServiceControl {
                     throw FleetServiceError.refused(observed == .unknown
                         ? "The BotFleet Server could not be checked after the restart, so nothing can be said about it."
                         : "The BotFleet Server was not replaced: its LaunchAgent owns no process, so the server that is running was not started by launchd.")
+                }
+                return observed
+            } else if descriptor.id == FleetServiceRegistry.companion.id {
+                // The BotFleet Companion also clears the deliberate-stop marker
+                // so a restart while parked comes back up.
+                let deliberateStop = try startup.restartCompanion()
+                let observed = await ManagedServices.settle(to: .running,
+                                                            attempts: attempts,
+                                                            interval: 0.25) {
+                    startup.state(ofAgent: label).managedState
+                }
+                if observed != .running && observed != .unknown {
+                    deliberateStop.restore()
                 }
                 return observed
             }

@@ -591,6 +591,64 @@ final class FleetServicesTests: XCTestCase {
         XCTAssertFalse(commands.calls.contains("/bin/launchctl enable gui/501/app.botfleet.companion"))
     }
 
+    func testStartingTheCompanionThroughFleetServicesClearsDeliberateStopMarker() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+        let commands = LaunchAgentCommands()
+        commands.listing = "PID\tStatus\tLabel\n1234\t0\tapp.botfleet.companion"
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil)
+        let state = try await control.perform(.start, serviceID: FleetServiceRegistry.companion.id)
+        XCTAssertEqual(state, .running)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(commands.calls.contains("/bin/launchctl enable gui/501/app.botfleet.companion"))
+        XCTAssertTrue(commands.calls.contains("/bin/launchctl kickstart gui/501/app.botfleet.companion"))
+    }
+
+    func testRestartingTheCompanionThroughFleetServicesClearsDeliberateStopMarker() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+        let commands = LaunchAgentCommands()
+        commands.loaded = true
+        commands.listing = "PID\tStatus\tLabel\n1234\t0\tapp.botfleet.companion"
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil)
+        let state = try await control.perform(.restart, serviceID: FleetServiceRegistry.companion.id)
+        XCTAssertEqual(state, .running)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(commands.calls.contains("/bin/launchctl kickstart -k gui/501/app.botfleet.companion"))
+    }
+
+    func testFailedRestartOfCompanionThroughFleetServicesRestoresDeliberateStopMarker() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+        let commands = LaunchAgentCommands()
+        commands.loaded = false
+        // Listing does not contain companion PID, so state(ofAgent:) remains stopped
+        commands.listing = "PID\tStatus\tLabel\n-\t0\tother.service"
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil)
+        let state = try await control.perform(.restart, serviceID: FleetServiceRegistry.companion.id, attempts: 2)
+        XCTAssertEqual(state, .stopped)
+        // Deliberate stop should be restored because observed state was not running
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+    }
+
     func testAPrintThatFailedForAnotherReasonIsNotReadAsUnloaded() async throws {
         // Only "Could not find service" proves the job is gone.  A print that
         // failed with any other complaint, here a domain launchd would not

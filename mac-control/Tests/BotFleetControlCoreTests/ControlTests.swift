@@ -466,6 +466,54 @@ final class ControlTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
     }
 
+    func testStartCompanionClearsTheDeliberateStopAndStartsTheAgent() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.companion.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+        let runner = MockCommands()
+        try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).startCompanion()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(runner.calls, [
+            "/bin/launchctl enable gui/501/app.botfleet.companion",
+            "/bin/launchctl print gui/501/app.botfleet.companion",
+            "/bin/launchctl bootstrap gui/501 \(home.path)/Library/LaunchAgents/app.botfleet.companion.plist",
+            "/bin/launchctl kickstart gui/501/app.botfleet.companion"
+        ])
+    }
+
+    func testFailedCompanionKickstartRestoresDeliberateStop() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.companion.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+        let runner = MockCommands()
+        runner.failKickstart = true
+        XCTAssertThrowsError(try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).startCompanion())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testRestartCompanionClearsTheDeliberateStopAndReplacesTheRunningInstance() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.companion.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+        let runner = MockCommands()
+        runner.agentIsLoaded = true
+        try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).restartCompanion()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(runner.calls.contains("/bin/launchctl kickstart -k gui/501/app.botfleet.companion"))
+    }
+
     private func mockSession() -> URLSession {
         MockURLProtocol.requests = []
         let configuration = URLSessionConfiguration.ephemeral
