@@ -213,11 +213,11 @@ export type PlacementAuthority =
 
 /** Ordinary updates retain the epoch-aware JSON rollback contract.
  * Only a prior verified activation's UUID marker selects SQLite in production. */
-export function openPlacementAuthority(dataDir: string, hostId: HostId): PlacementAuthority {
+export function openPlacementAuthority(dataDir: string, hostId: HostId, platform: NodeJS.Platform = process.platform): PlacementAuthority {
   const path = join(dataDir, "placement-controller.json");
   if (exists(path)) {
     const value = readPrivateJson(path);
-    if (markerSchema.safeParse(value).success) return { kind: "sqlite", store: openPlacementStore(dataDir, hostId) };
+    if (markerSchema.safeParse(value).success) return { kind: "sqlite", store: openPlacementStore(dataDir, hostId, platform) };
   }
   // An unexplained database cannot become a second ignored authority.
   if (exists(join(dataDir, "placement.sqlite"))) throw new PlacementStoreError();
@@ -225,12 +225,16 @@ export function openPlacementAuthority(dataDir: string, hostId: HostId): Placeme
 }
 
 /** Requires the harness ownership fence before production migration.
- * SQLite owns all live placement state; the strict JSON becomes only a UUID marker. */
-export function openPlacementStore(dataDir: string, hostId: HostId): PlacementStore {
+ * SQLite owns all live placement state; the strict JSON becomes only a UUID marker.
+ * The injected platform can only add a refusal, never enable an unsupported runtime. */
+export function openPlacementStore(dataDir: string, hostId: HostId, platform: NodeJS.Platform = process.platform): PlacementStore {
+  // No unsupported host may create/open SQLite or replace the rollback marker.
+  if ((process.platform !== "darwin" && process.platform !== "linux") ||
+      (platform !== "darwin" && platform !== "linux")) throw new PlacementStoreError();
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const dir = realpathSync(dataDir);
   const directory = lstatSync(dir);
-  if (!directory.isDirectory() || (process.platform !== "win32" && (directory.uid !== process.getuid?.() || (directory.mode & 0o022) !== 0))) throw new PlacementStoreError();
+  if (!directory.isDirectory() || directory.uid !== process.getuid?.() || (directory.mode & 0o022) !== 0) throw new PlacementStoreError();
   const path = join(dir, "placement.sqlite");
   const legacyPath = join(dir, "placement-controller.json");
   const lock = join(dir, "placement-controller.lock");
@@ -328,7 +332,7 @@ export function openPlacementStore(dataDir: string, hostId: HostId): PlacementSt
   }
   function checkFiles(): void {
     const currentDirectory = lstatSync(dir);
-    if (closed || !sameInode(directory, currentDirectory) || (process.platform !== "win32" && (currentDirectory.uid !== process.getuid?.() || (currentDirectory.mode & 0o022) !== 0))
+    if (closed || !sameInode(directory, currentDirectory) || currentDirectory.uid !== process.getuid?.() || (currentDirectory.mode & 0o022) !== 0
       || !sameInode(inode, privateFile(path))) throw new PlacementStoreError();
     checkSidecars(path);
     const marker = markerSchema.parse(readPrivateJson(legacyPath));
