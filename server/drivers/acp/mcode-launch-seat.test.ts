@@ -7,7 +7,7 @@
 // in ~/.minimax/mcp.json would never see AGENT_LAUNCHER and AGENT_LAUNCH_SEAT
 // and would fall back to its default seat.  Run against mcode 0.6.2 that is
 // not what happens:  mcode hands the five launch variables (AGENT_LAUNCHER,
-// AGENT_LAUNCH_SEAT, AGENT_SEAT, AGENT_SESSION, AGENT_SYNC_ATTACH) to an MCP
+// AGENT_LAUNCH_SEAT, AGENT_SEAT, AGENT_SESSION, SIMPLE_TOOLS_ATTACH) to an MCP
 // server it starts, whether the server is listed in mcp.json or comes in over
 // ACP, and to the shell tool as well.  (The probe reports only AGENT_ and
 // X_FIXTURE_ names, so these tests do not claim anything about the rest of the
@@ -75,7 +75,7 @@ function launchedAs(seat: string, session: string) {
     AGENT_LAUNCH_SEAT: seat,
     AGENT_SEAT: seat,
     AGENT_SESSION: session,
-    AGENT_SYNC_ATTACH: "0",
+    SIMPLE_TOOLS_ATTACH: "0",
   };
 }
 
@@ -155,7 +155,7 @@ withMcode("a BotFleet turn on the real mcode keeps its seat in the MCP servers a
     async () => {
       const steps: ModelStep[] = [
         { tool: /dump_env$/, input: {} },
-        { tool: /^bash$/i, input: { command: "env | grep -E '^AGENT_' | sort" } },
+        { tool: /^bash$/i, input: { command: "env | grep -E '^(AGENT_|SIMPLE_TOOLS_)' | sort" } },
       ];
       model = new FakeModel(steps);
       await model.start();
@@ -172,7 +172,7 @@ withMcode("a BotFleet turn on the real mcode keeps its seat in the MCP servers a
       expect(model.missingTools).toEqual([]);
       const [mcpReport, shellReport] = model.toolResults;
       // Exactly the five launch variables:  the harness's own AGENT_SEAT,
-      // AGENT_TAG, AGENT_SYNC_STATE_DIR and the rest were scrubbed first.
+      // AGENT_TAG, SIMPLE_TOOLS_STATE_DIR and the rest were scrubbed first.
       expect(jsonAfter(mcpReport, "MCP_ENV")).toEqual(launchedAs("BF-MONITOR", "thread-monitor-1"));
       expect(parseEnvLines(shellReport)).toEqual(launchedAs("BF-MONITOR", "thread-monitor-1"));
     },
@@ -269,7 +269,7 @@ withMcodeAndSimpleChat("the simple-chat MCP entry the owner registered (`--defau
       command: SIMPLE_CHAT!,
       args: ["mcp", "--default-seat", "MM"],
       env: {
-        AGENT_SYNC_REALM: zulip.url,
+        SIMPLE_TOOLS_REALM: zulip.url,
         ...zulipCredentialEnv({
           site: zulip.url,
           bots: [
