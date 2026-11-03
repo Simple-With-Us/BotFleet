@@ -209,6 +209,47 @@ describe("ZcodeDriver turns (fake CLI)", () => {
     expect(started?.itemId).toBe(completed?.itemId);
   });
 
+  it("rejects a second turn on the same thread while the first is still starting", async () => {
+    // The guard slot is reserved synchronously, before the CLI probe await:
+    // an immediate second sendTurn must throw instead of double-spawning.
+    await create();
+    const first = instance.adapter.sendTurn({ threadId: "t-race", text: "one" });
+    await expect(instance.adapter.sendTurn({ threadId: "t-race", text: "two" })).rejects.toThrow(
+      "a turn is already running on this thread",
+    );
+    const { turnId } = await first;
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+  });
+
+  it("settles a turn whose result line carries a mistyped usage field", async () => {
+    await create("mistyped-usage");
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-mistyped", text: "hi" });
+    const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    expect(done).toMatchObject({ ok: true, stopReason: "end_turn" });
+  });
+
+  it("falls back to the default cli when the saved cli string is empty", () => {
+    // Saved configs from before validation may carry an empty cli string;
+    // decoding must fall back to the default instead of throwing.
+    expect(ZcodeDriver.decodeConfig({ cli: "   " })).toEqual({ cli: "zcode" });
+    expect(ZcodeDriver.decodeConfig({ cli: "" })).toEqual({ cli: "zcode" });
+    expect(ZcodeDriver.decodeConfig({})).toEqual({ cli: "zcode" });
+    expect(ZcodeDriver.decodeConfig({ cli: "/usr/local/bin/zcode" })).toEqual({ cli: "/usr/local/bin/zcode" });
+  });
+
+  it("gives repeated same-name tool calls without ids their own row pairs", async () => {
+    await create("tool-repeat-noids");
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-repeat", text: "hi" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    const starts = recorder.events.filter((e) => e.type === "item.started" && e.itemType === "tool");
+    const finishes = recorder.events.filter((e) => e.type === "item.completed" && e.itemType === "tool");
+    expect(starts).toHaveLength(2);
+    expect(finishes).toHaveLength(2);
+    expect(starts[0]?.itemId).not.toBe(starts[1]?.itemId);
+    expect(starts[0]?.itemId).toBe(finishes[0]?.itemId);
+    expect(starts[1]?.itemId).toBe(finishes[1]?.itemId);
+  });
+
   it("fails promptly when the zcode process exits before its result line", async () => {
     await create("exit-early");
     const { turnId } = await instance.adapter.sendTurn({ threadId: "t-exit", text: "hi" });

@@ -85,8 +85,14 @@ const ZCODE_CREDENTIAL_ENV = [
   "ZHIPU_API_KEY",
 ];
 
+const DEFAULT_CLI = "zcode";
+
 const ZCODE_CONFIG_SCHEMA = z
-  .object({ cli: z.string().trim().min(1) })
+  .object({
+    // An empty saved cli ("" or whitespace) predates validation; fall back to
+    // the default rather than breaking engine creation.
+    cli: z.string().trim().min(1).catch(DEFAULT_CLI),
+  })
   .partial()
   .passthrough();
 type ZcodeConfigInput = z.input<typeof ZCODE_CONFIG_SCHEMA>;
@@ -122,42 +128,45 @@ function zcodeAuthenticated(env: Record<string, string | undefined>): boolean {
  *  and fields pass through untouched. */
 const ZCODE_USAGE_SCHEMA = z
   .object({
-    inputTokens: z.number().optional(),
-    outputTokens: z.number().optional(),
-    cacheReadTokens: z.number().optional(),
-    cacheWriteTokens: z.number().optional(),
-    reasoningTokens: z.number().optional(),
+    // Per-field catches: one mistyped optional field degrades to undefined
+    // instead of failing the whole line (which used to swallow the result
+    // terminator and fail the turn as exit_before_result).
+    inputTokens: z.number().optional().catch(undefined),
+    outputTokens: z.number().optional().catch(undefined),
+    cacheReadTokens: z.number().optional().catch(undefined),
+    cacheWriteTokens: z.number().optional().catch(undefined),
+    reasoningTokens: z.number().optional().catch(undefined),
   })
   .passthrough();
 
 const ZCODE_PAYLOAD_SCHEMA = z
   .object({
-    kind: z.string().optional(),
-    delta: z.string().optional(),
-    toolCallId: z.string().optional(),
-    callId: z.string().optional(),
-    id: z.string().optional(),
-    toolName: z.string().optional(),
-    name: z.string().optional(),
+    kind: z.string().optional().catch(undefined),
+    delta: z.string().optional().catch(undefined),
+    toolCallId: z.string().optional().catch(undefined),
+    callId: z.string().optional().catch(undefined),
+    id: z.string().optional().catch(undefined),
+    toolName: z.string().optional().catch(undefined),
+    name: z.string().optional().catch(undefined),
     input: z.unknown().optional(),
     args: z.unknown().optional(),
     arguments: z.unknown().optional(),
     output: z.unknown().optional(),
     result: z.unknown().optional(),
     error: z.unknown().optional(),
-    message: z.string().optional(),
+    message: z.string().optional().catch(undefined),
   })
   .passthrough();
 
 const ZCODE_STREAM_LINE_SCHEMA = z
   .object({
-    type: z.string().optional(),
-    sessionId: z.string().optional(),
-    turnId: z.string().optional(),
-    payload: ZCODE_PAYLOAD_SCHEMA.optional(),
+    type: z.string().optional().catch(undefined),
+    sessionId: z.string().optional().catch(undefined),
+    turnId: z.string().optional().catch(undefined),
+    payload: ZCODE_PAYLOAD_SCHEMA.optional().catch(undefined),
     // result line (the stream terminator)
-    response: z.string().optional(),
-    usage: ZCODE_USAGE_SCHEMA.optional(),
+    response: z.string().optional().catch(undefined),
+    usage: ZCODE_USAGE_SCHEMA.optional().catch(undefined),
   })
   .passthrough();
 
@@ -182,7 +191,6 @@ function buildTurnUsage(usage: ZcodeStreamUsage, input: number | undefined): Zco
   return out;
 }
 
-const DEFAULT_CLI = "zcode";
 const VERSION_PROBE_TIMEOUT_MS = 20000;
 
 // The official desktop app ships the CLI as a node bundle inside the app
@@ -314,6 +322,9 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       const { threadId } = turn;
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
+      // Reserve the slot synchronously: the awaits below would otherwise let
+      // a second sendTurn on the same thread pass the guard above.
+      active.set(threadId, { stop: () => {}, turnId });
       let settled = false;
 
       const message = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
@@ -332,12 +343,19 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       // The CLI resolves its workspace from --cwd, not from the spawn cwd.
       if (turn.cwd) args.push("--cwd", turn.cwd);
 
-      const cli = await resolveCli();
-      const child = spawnCli(cli, args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        cwd: turn.cwd,
-        env: applyLaunchIdentity(zcodeEnvironment({ ...process.env, ...input.environment }), turn.launchIdentity),
-      });
+      let cli: string;
+      let child: ReturnType<typeof spawnCli>;
+      try {
+        cli = await resolveCli();
+        child = spawnCli(cli, args, {
+          stdio: ["ignore", "pipe", "pipe"],
+          cwd: turn.cwd,
+          env: applyLaunchIdentity(zcodeEnvironment({ ...process.env, ...input.environment }), turn.launchIdentity),
+        });
+      } catch (err) {
+        active.delete(threadId);
+        throw err;
+      }
 
       let buf = "";
       let assistantText = "";
@@ -419,15 +437,20 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
         emit({ ...base(threadId, turnId), type: "session.started", sessionId, model: turn.model ?? null });
       };
 
-      // A CLI that omits call ids still gets one stable fallback id per tool,
-      // so start and completion rows stay correlated.
+      // A CLI that omits call ids still gets a stable fallback id, scoped to
+      // a single started/result pair: the entry is consumed by the first
+      // completion that claims it, so a repeated same-name tool gets a fresh
+      // id instead of conflating two invocations under one row.
       const fallbackToolItemIds = new Map<string, string>();
-      const toolItemId = (payload: NonNullable<ZcodeStreamLine["payload"]>) => {
+      const toolItemId = (payload: NonNullable<ZcodeStreamLine["payload"]>, phase: "start" | "finish") => {
         const explicit = payload.toolCallId ?? payload.callId ?? payload.id;
         if (explicit !== undefined && explicit !== null) return String(explicit);
         const toolName = payload.toolName || "tool";
         const existing = fallbackToolItemIds.get(toolName);
-        if (existing) return existing;
+        if (existing !== undefined) {
+          if (phase === "finish") fallbackToolItemIds.delete(toolName);
+          return existing;
+        }
         const created = newId();
         fallbackToolItemIds.set(toolName, created);
         return created;
@@ -459,7 +482,7 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
                 ...base(threadId, turnId),
                 type: "item.started",
                 itemType: "tool",
-                itemId: toolItemId(payload),
+                itemId: toolItemId(payload, "start"),
                 title: String(payload.toolName ?? payload.name ?? "tool").slice(0, 80),
                 ...toolFields(payload.toolName ?? payload.name, payload.input ?? payload.args ?? payload.arguments),
                 ...captureInput(payload.input ?? payload.args ?? payload.arguments),
@@ -469,7 +492,7 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
                 ...base(threadId, turnId),
                 type: "item.completed",
                 itemType: "tool",
-                itemId: toolItemId(payload),
+                itemId: toolItemId(payload, "finish"),
                 ok: payload.kind === "result",
                 detail: describeResult(payload.output ?? payload.result ?? payload.error),
                 ...captureOutput(payload.output ?? payload.result ?? payload.error),
@@ -509,6 +532,11 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
           buf = buf.slice(nl + 1);
           if (!line.trim()) continue;
           try {
+            // Boundary stays zod-decoded.  The line schema already treats
+            // payload/usage as optional and unknown-typed fields pass through,
+            // so a mistyped optional field can no longer swallow the line -
+            // including the result terminator - the way a strict whole-line
+            // schema did.  Non-JSON lines are still skipped.
             const parsed = ZCODE_STREAM_LINE_SCHEMA.safeParse(JSON.parse(line));
             if (parsed.success) onLine(parsed.data);
           } catch {

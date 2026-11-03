@@ -87,6 +87,47 @@ switch (mode) {
     });
     process.exit(0);
     break;
+  case "mistyped-usage": {
+    stream({ kind: "text_delta", delta: "Tail" });
+    // The terminator carries a mistyped usage field (string tokens): the line
+    // must still terminate the turn, not be dropped as exit_before_result.
+    write({
+      type: "result",
+      sessionId,
+      turnId: "zt-1",
+      response: "Tail",
+      usage: { inputTokens: "5", outputTokens: 2 },
+    });
+    process.exit(0);
+    break;
+  }
+  case "tool-repeat-noids": {
+    // Two same-name tool invocations with no call ids: each started/result
+    // pair must get its own fallback item id.
+    for (const path of ["a.ts", "b.ts"]) {
+      write({
+        type: "tool.updated",
+        sessionId,
+        turnId: "zt-1",
+        payload: { kind: "started", toolName: "read_file", input: { path } },
+      });
+      write({
+        type: "tool.updated",
+        sessionId,
+        turnId: "zt-1",
+        payload: { kind: "result", toolName: "read_file", output: `body of ${path}` },
+      });
+    }
+    write({
+      type: "result",
+      sessionId,
+      turnId: "zt-1",
+      response: "done",
+      usage: { inputTokens: 7, outputTokens: 1 },
+    });
+    process.exit(0);
+    break;
+  }
   case "exit-early":
     process.stderr.write("zcode: catastrophic startup failure\n");
     process.exit(1);
