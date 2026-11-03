@@ -52,6 +52,9 @@ test("running executable inspection binds mapped text inode and rejects name-onl
     assert.equal(inspectRunningExecutable(123, actual, { run: (tool, args) => tool === "lsof" ? listing : args[0] === "-L" ? nativeLinks : "Section\n  sectname __objc_classlist\n" }), "unknown");
     assert.equal(inspectRunningExecutable(123, actual, { run: (tool) => tool === "lsof" ? listing.replace(`i${mapped.ino}`, `i${mapped.ino + 1n}`) : nativeLinks }), "unknown");
     assert.equal(inspectRunningExecutable(123, actual, { run: (tool) => tool === "lsof" ? "p123\nftxt\nnBotFleet\n" : nativeLinks }), "unknown");
+    const other = statSync(wrong, { bigint: true });
+    const frameworkFirst = `p123\nftxt\nD0x${other.dev.toString(16)}\ni${other.ino}\nn${wrong}\nftxt\nD0x${mapped.dev.toString(16)}\ni${mapped.ino}\nn${actual}\n`;
+    assert.equal(inspectRunningExecutable(123, actual, { run: (tool) => tool === "lsof" ? frameworkFirst : nativeLinks }), "unknown");
     assert.equal(inspectRunningExecutable(123, actual, { run: () => { throw new Error("probe failed"); } }), "unknown");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -165,6 +168,12 @@ jay        104   0.0  0.2 41500000  25000   ??  S     3Nov26   0:01.05 ${executa
     { pid: "104", path: executable },
   ]);
   assert.deepEqual(processes.map(({ pid }) => pid), ["102", "103", "104"]);
+  assert.deepEqual(processes.map(({ identity }) => identity), ["electron", "unknown", "unknown"]);
+  const verdict = evaluatePostReboot({ processes });
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.failures[0], /PID 102 \[electron\]/);
+  assert.match(verdict.failures[0], /PID 103 \[unknown\]/);
+  assert.doesNotMatch(verdict.failures[0], /Lingering BotFleet Node processes/);
 });
 
 test("inspectProcesses detects offending processes in ps aux and ps -ef output", () => {
@@ -306,7 +315,7 @@ test("evaluatePostReboot returns FAIL with diagnostics when checks fail", () => 
   assert.equal(verdict.ok, false);
   assert.equal(verdict.failures.length, 5);
   assert.match(verdict.failures[0], /Inspection probe failures/);
-  assert.match(verdict.failures[1], /Lingering BotFleet Node processes/);
+  assert.match(verdict.failures[1], /BotFleet processes requiring investigation/);
   assert.match(verdict.failures[2], /Lingering BotFleet LaunchAgents/);
   assert.match(verdict.failures[3], /Lingering Node listeners on BotFleet ports/);
   assert.match(verdict.failures[4], /Unapproved lingering files/);
