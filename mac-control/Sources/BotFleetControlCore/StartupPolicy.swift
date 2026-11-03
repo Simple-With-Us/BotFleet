@@ -290,10 +290,10 @@ public final class StartupPolicy {
     public func startServerPreservingDeliberateStop() throws -> DeliberateStop {
         guard supportsPolicy else { throw StartupPolicyError.updateRequired }
         guard files.fileExists(atPath: agent.path) else { throw StartupPolicyError.launchAgentMissing }
+        let markerContents = try readStopMarker()
         let boot = try bootID()
         try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         try Data((boot + "\n").utf8).write(to: session, options: .atomic)
-        let markerContents = try readStopMarker()
         if markerContents != nil { try files.removeItem(at: stopped) }
         do {
             try startAgent(label: StartupPolicy.serverAgentLabel)
@@ -318,10 +318,10 @@ public final class StartupPolicy {
     public func restartServer() throws -> DeliberateStop {
         guard supportsPolicy else { throw StartupPolicyError.updateRequired }
         guard files.fileExists(atPath: agent.path) else { throw StartupPolicyError.launchAgentMissing }
+        let markerContents = try readStopMarker()
         let boot = try bootID()
         try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         try Data((boot + "\n").utf8).write(to: session, options: .atomic)
-        let markerContents = try readStopMarker()
         if markerContents != nil { try files.removeItem(at: stopped) }
         do {
             try restartAgent(label: StartupPolicy.serverAgentLabel)

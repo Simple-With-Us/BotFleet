@@ -477,6 +477,9 @@ final class ControlTests: XCTestCase {
         try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
         try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
         let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let session = home.appendingPathComponent(".botfleet/startup-session")
+        let priorSession = Data("original-boot-session\n".utf8)
+        try priorSession.write(to: session)
         let oversized = Data(repeating: 0x41, count: 64 * 1024 + 1)
         try oversized.write(to: marker)
         let runner = MockCommands()
@@ -484,7 +487,8 @@ final class ControlTests: XCTestCase {
         XCTAssertThrowsError(try startup.startServer())
         XCTAssertThrowsError(try startup.restartServer())
         XCTAssertEqual(try Data(contentsOf: marker), oversized)
-        XCTAssertFalse(runner.calls.contains { $0.contains("launchctl") })
+        XCTAssertEqual(try Data(contentsOf: session), priorSession)
+        XCTAssertTrue(runner.calls.isEmpty)
 
         try FileManager.default.removeItem(at: marker)
         let target = home.appendingPathComponent("owner-stop-metadata")
@@ -495,7 +499,8 @@ final class ControlTests: XCTestCase {
         XCTAssertThrowsError(try startup.restartServer())
         XCTAssertEqual(try Data(contentsOf: target), contents)
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: marker.path), target.path)
-        XCTAssertFalse(runner.calls.contains { $0.contains("launchctl") })
+        XCTAssertEqual(try Data(contentsOf: session), priorSession)
+        XCTAssertTrue(runner.calls.isEmpty)
     }
 
     func testUnparkedCompanionStartUsesOnlyTheCompanionAgent() throws {
