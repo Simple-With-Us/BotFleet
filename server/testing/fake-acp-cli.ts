@@ -258,7 +258,7 @@ const dumpEnv = Object.fromEntries(
     "KIMI_MODEL_DISPLAY_NAME",
     "TEST_TURN_MODEL",
   ]
-    .concat(Object.keys(process.env).filter((key) => /^(AGENT_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(key)))
+    .concat(Object.keys(process.env).filter((key) => /^(AGENT_|SIMPLE_TOOLS_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(key)))
     .flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
 );
 const dumpState: Record<string, unknown> = { argv, env: dumpEnv };
