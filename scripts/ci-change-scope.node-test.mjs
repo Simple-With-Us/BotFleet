@@ -108,7 +108,10 @@ test("every protected check stays present and takes the same fail-closed scope o
   const classifier = workflow.jobs.changes.steps.find((step) => step.id === "scope");
   assert.match(classifier.run, /EVENT_NAME.*!= "push".*EVENT_NAME.*!= "pull_request"/s);
   assert.match(classifier.run, /echo "docs_only=false"/);
-  assert.match(classifier.run, /BASE_SHA.*\^\[0-9a-f\]\{40\}\$/);
+  // The scope comes from the shared script,  and the commit-shaped check
+  // the workflow used to hold lives with it.
+  assert.match(classifier.run, /scripts\/ci-scope-diff\.sh "\$BASE_SHA" "\$HEAD_SHA"/);
+  assert.match(readFileSync(join(ROOT, "scripts/ci-scope-diff.sh"), "utf8"), /\^\[0-9a-f\]\{40\}\$/);
 
   for (const jobId of requiredJobs) {
     const job = workflow.jobs[jobId];
@@ -124,8 +127,35 @@ test("every protected check stays present and takes the same fail-closed scope o
   }
 
   const source = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
-  assert.match(source, /git diff --no-renames --name-only -z/);
   assert.doesNotMatch(source, /paths-ignore:/);
+});
+
+test("the scope is the pull request's own changes,  and both jobs use the one script", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const scopeScript = readFileSync(join(ROOT, "scripts/ci-scope-diff.sh"), "utf8");
+
+  // The script computes the branch point to the head:  the pull request's own
+  // two ends.  Diffing from the stored base SHA to the merge commit folded
+  // main's newer commits into the pull request's scope.
+  assert.match(scopeScript, /git merge-base "\$base_sha" "\$head_sha"/);
+  assert.match(scopeScript, /git diff --no-renames --name-only -z "\$scope_base" "\$head_sha"/);
+
+  const classifier = workflow.jobs.changes.steps.find((step) => step.id === "scope");
+  const gate = workflow.jobs.ios.steps.find(
+    (step) => step.name === "Prove the iOS build ran or that no iOS paths changed",
+  );
+
+  for (const [name, step] of [["changes", classifier], ["ios", gate]]) {
+    assert.ok(step, name);
+    // The head is the pull request's head,  not the merge commit.
+    assert.equal(step.env.HEAD_SHA, "${{ github.event.pull_request.head.sha || github.sha }}", name);
+    assert.equal(step.env.BASE_SHA, "${{ github.event.pull_request.base.sha || github.event.before }}", name);
+    // One script,  one diff,  so the classifier and the required check's
+    // replay can never drift apart.
+    assert.match(step.run, /scripts\/ci-scope-diff\.sh "\$BASE_SHA" "\$HEAD_SHA"/, name);
+    // The workflow never diffs a range itself.
+    assert.doesNotMatch(step.run, /git diff/, name);
+  }
 });
 
 test("no Linux packaging job remains in ci.yml (BF-2500 clean break)", () => {
@@ -194,7 +224,7 @@ test("the required iOS check is a diff replay, not an echo, and the build job ha
   const verify = gate.steps.find((step) => step.name === "Prove the iOS build ran or that no iOS paths changed");
   assert.ok(verify);
   assert.match(verify.run, /ci-ios-gate\.mjs/);
-  assert.match(verify.run, /git diff --no-renames --name-only -z/);
+  assert.match(verify.run, /scripts\/ci-scope-diff\.sh "\$BASE_SHA" "\$HEAD_SHA"/);
   assert.doesNotMatch(verify.run, /^echo /m);
 });
 
