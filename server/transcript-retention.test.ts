@@ -1021,6 +1021,35 @@ describe("transcript data-volume budget", () => {
     );
   });
 
+  it("a dry run does not double-count a deleted orphan's leftover temps", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const text = body(10);
+    const log = join(nativeDir, "orphan.ndjson");
+    writeFileSync(log, text);
+    age(log, STALE);
+    const temp = join(nativeDir, "orphan.ndjson.2147480000.123e4567-e89b-42d3-a456-426614174000.tmp");
+    writeFileSync(temp, "orphan\n");
+    age(temp, STALE);
+
+    const dry = sweep({ eventsDir, nativeDir }, [], { dryRun: true, budgetBytes: 10 });
+    // one log plus one temp, counted once — not once for the delete and
+    // again for the temp reap a real run skips
+    expect(dry.ids).toBe(1);
+    expect(dry.files).toBe(2);
+    expect(dry.bytesReclaimed).toBe(0);
+    expect(dry.over).toBe(true);
+    expect(existsSync(log)).toBe(true);
+    expect(existsSync(temp)).toBe(true);
+
+    const real = sweep({ eventsDir, nativeDir }, [], { budgetBytes: 10 });
+    expect(real.ids).toBe(1);
+    expect(real.files).toBe(2);
+    expect(real.over).toBe(false);
+    expect(existsSync(log)).toBe(false);
+    expect(existsSync(temp)).toBe(false);
+  });
+
   it("deletes the oldest orphans first and keeps live threads", () => {
     const eventsDir = tmp();
     const nativeDir = tmp();

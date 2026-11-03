@@ -1270,12 +1270,13 @@ export function sweepTranscriptVolumeBudget(
     if (!dryRun) {
       const ids = pendingDelete.map((thread) => thread.threadId);
       for (const dir of transcriptDirList(dirs)) removeTranscriptLogs(dir, ids);
-      for (const thread of pendingDelete) {
-        deleted.add(thread.threadId);
-        touch(thread.threadId, thread.files);
-      }
-    } else {
-      for (const thread of pendingDelete) touch(thread.threadId, thread.files);
+    }
+    // Marked in both modes: a dry run projects exactly what a real run
+    // would change, so later passes must skip these threads' leftover temps
+    // the same way — otherwise the preview double-counts them.
+    for (const thread of pendingDelete) {
+      deleted.add(thread.threadId);
+      touch(thread.threadId, thread.files);
     }
   }
   if (remaining <= budgetBytes) return finish();
