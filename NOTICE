@@ -4,3 +4,7 @@ Copyright 2026 Milind Soni and OpenMausBot contributors
 OpenMausBot was relicensed from the MIT License to the Apache License,
 Version 2.0, with the consent of all contributors whose copyright was
 incorporated before the transition.
+
+The native macOS app uses Sparkle 2.9.6, distributed by the Sparkle Project
+(https://github.com/sparkle-project/Sparkle).  Its copyright and license
+notices are included in the native app's Sparkle-LICENSE.txt resource.
