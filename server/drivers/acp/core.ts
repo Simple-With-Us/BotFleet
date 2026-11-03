@@ -81,7 +81,7 @@ import type {
   ProviderErrorCode,
 } from "../../contracts.ts";
 import { newEventId, newId } from "../../contracts.ts";
-import { applyLaunchIdentity } from "../../launch-identity.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../../cli-logins.ts";
 import { hostToolPrefix, turnComputerMounts } from "../../computer-grants.ts";
 import { augmentedPath } from "../../env-path.ts";
 
@@ -949,6 +949,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const toolPolicy = turn.toolPolicy;
         const turnConfig: AcpConfig =
           (controlsHost || turn.holdForReview === true || toolPolicy) && config.fullAuto ? { ...config, fullAuto: false } : config;
+        // The seat's CLI login is read in the BACKGROUND, and the read is
+        // started here, before the guard:  the guard and the registration
+        // that follows it have to stay free of `await`, or a second turn on
+        // this thread would walk through the guard the first one already
+        // passed.
+        primeCliLogin(turn.launchIdentity?.seat);
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
         // Carried across a relaunch (see maybeRetry): `attempt` is how many
@@ -1073,7 +1079,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           };
           // Last, over the instance's env and a wrapper's additions alike:
           // the launch identity is this bot's and this turn's.
-          launchEnv = applyLaunchIdentity(spawned.env ? { ...env, ...spawned.env } : env, turn.launchIdentity);
+          launchEnv = launchedChildEnvironment(
+            spawned.env ? { ...env, ...spawned.env } : env,
+            turn.launchIdentity,
+            cliLoginEnvironment(turn.launchIdentity?.seat),
+          );
           child = spawnCli(spawned.cli, spawned.args, {
             cwd,
             env: launchEnv,

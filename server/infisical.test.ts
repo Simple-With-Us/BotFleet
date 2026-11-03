@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { InfisicalSettings } from "./config.ts";
 import { dataDir } from "./data-dir.ts";
 import { infisical } from "./infisical.ts";
+import { fleetOpsProjectId } from "./infisical.ts";
 import { infisicalSnapshot, setInfisicalSnapshot, vaultNames } from "./secret-map.ts";
 
 
@@ -79,6 +80,7 @@ const ENV_KEYS = [
   "INFISICAL_WRITE_TOKEN",
   "OMB_INFISICAL_BOOT_TIMEOUT_MS",
   "OMB_INFISICAL_CALL_TIMEOUT_MS",
+  "INFISICAL_FLEET_OPS_PROJECT_ID",
 ] as const;
 const savedEnv = new Map<string, string | undefined>();
 
@@ -1777,5 +1779,60 @@ describe("service token refusal: scope and visibility", () => {
     expect(status.readTokenRefused).toBe(false);
     expect(status.writeTokenRefused).toBe(false);
     expect(infisical.bootLine()).not.toContain("token-refused");
+  });
+});
+
+describe("the fleet's project", () => {
+  it("comes from the environment variable the fleet's own tools read", () => {
+    process.env.INFISICAL_FLEET_OPS_PROJECT_ID = "  a-project-id  ";
+    expect(fleetOpsProjectId()).toBe("a-project-id");
+  });
+
+  it("is empty when the host has no such variable", () => {
+    // The product server reads nothing else for it:  the fleet keeps that
+    // project id out of every repository, and the server does not reach
+    // into the fleet's own handoff files for a setting.
+    expect(fleetOpsProjectId()).toBe("");
+  });
+});
+
+describe("readProjectPath", () => {
+  it("addresses the fleet's project with the same machine identity", async () => {
+    process.env.INFISICAL_FLEET_OPS_PROJECT_ID = "fleet-ops-project-id";
+    withSettings({});
+    const fetchMock = loginThenList([{ secretKey: "GH_TOKEN", secretValue: SENTINEL_VAULT_VALUE }]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const values = await infisical.readProjectPath("fleet-ops", "/cli-logins/BF-ORACLE");
+
+    expect(values.get("GH_TOKEN")).toBe(SENTINEL_VAULT_VALUE);
+    const listUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
+    expect(listUrl.searchParams.get("workspaceId")).toBe("fleet-ops-project-id");
+    expect(listUrl.searchParams.get("environment")).toBe("prod");
+    expect(listUrl.searchParams.get("secretPath")).toBe("/cli-logins/BF-ORACLE");
+    // One login, with the harness's own identity:  a second project is not a
+    // second credential.
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/login"))).toHaveLength(1);
+  });
+
+  it("reads BotFleet's own project when the caller names that one", async () => {
+    const settings = withSettings({});
+    const fetchMock = loginThenList([{ secretKey: "XAI_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await infisical.readProjectPath("botfleet", "/");
+
+    const listUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
+    expect(listUrl.searchParams.get("workspaceId")).toBe(settings.projectId);
+  });
+
+  it("refuses with no request when this host has no project id for the fleet's project", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    withSettings({});
+    await expect(infisical.readProjectPath("fleet-ops", "/cli-logins/BF-ORACLE")).rejects.toThrow(
+      /fleet's Infisical project is not configured/,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

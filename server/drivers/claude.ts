@@ -51,7 +51,7 @@ export { STATIC_CLAUDE_MODELS };
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { applyLaunchIdentity } from "../launch-identity.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import {
   applyClaudeInject,
@@ -1159,6 +1159,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
+      // The seat's CLI login is read in the BACKGROUND, and the read is started
+      // here, before the guard:  the guard and the registration that follows it
+      // have to stay free of `await`, or a second turn on this thread would walk
+      // through the guard the first one already passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
       let preflightCancelled = false;
@@ -1364,7 +1369,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // The launch identity is per bot and per turn (`turnEnvironment` is the
       // instance's), and a retained process keeps the env it was spawned with,
       // so it is part of the contract key below.
-      const env = applyLaunchIdentity(claudeEnvironment(turnModel, turnEnvironment), turn.launchIdentity);
+      const env = launchedChildEnvironment(
+        claudeEnvironment(turnModel, turnEnvironment),
+        turn.launchIdentity,
+        cliLoginEnvironment(turn.launchIdentity?.seat),
+      );
       const cwd = turn.cwd ?? homedir();
       // everything that shapes the process, minus session/turn specifics
       // (the --mcp-config file is a fresh temp path each time; its CONTENT

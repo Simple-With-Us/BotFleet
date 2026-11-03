@@ -17,6 +17,7 @@ BotFleet's Infisical project: **BotFleet** (`836aebe2-c8f7-4e09-978e-7e3e82500bc
 2. **Never fetch per-request.**  `settings.get`-style reads do not exist here as network calls at all: runtime code reads the resolved `cfg` object from memory (`server/jobs/registry.ts` re-resolves job settings from `cfg.jobs` at each use; `observabilitySettings(cfg)` reads `cfg.observability`).  A per-request, per-tick or per-event call to Infisical is the one forbidden pattern.
 3. **Background refresh.**  The `InfisicalManager` (`server/infisical.ts`) re-lists the vault on an interval (default 15 minutes, tunable via the `BOTFLEET_INFISICAL_REFRESH_MINUTES` knob — the cadence is itself stored in Infisical) and on demand (`Sync Now` in Settings > Secrets, any Settings save that touches the `infisical` section, `SIGHUP` where the server installs one).  Refresh failures log loudly, mark the status stale, and keep serving the last-known-good snapshot — settings staleness is safer than an outage.  An unparsable knob value is logged and ignored; the configured value stands.
 4. **Write-through on admin save.**  `PUT /api/config` writes vault-managed values to Infisical FIRST (`infisical.writeSecret`, which upserts), then drops the local copy from the patch bound for disk — an empty-string tombstone for credentials, a deleted key for knobs — so the file never shadows the store.  If the Infisical write fails, the save fails (409 for a policy refusal, 502 for the store failing to answer, 503 when the store is unreachable and cannot say what it manages) and nothing is written locally.  The cache and Infisical never diverge silently.
+5. **A per-seat credential is not a config value.**  The CLI logins (see the inventory below) are the one credential this app reads outside the snapshot:  they are read per seat, out of the fleet's own project, and handed to one launched child.  They never become a config field, so the snapshot filter, the write-through and the status views do not apply to them — and nothing may make them apply, or one seat's login would land in every bot's config.
 
 ## Admin gating
 
@@ -55,6 +56,23 @@ BotFleet is a single-user local harness: the server binds loopback-only (`127.0.
 | `SENTRY_FLEET_DSN` | observability.sentryFleetDsn | secret |
 
 "config" rows are non-secret values (URLs, collection names) that travel the same vault path; the Secrets card shows them the way `GET /api/config` already does.
+
+### CLI logins (`server/secret-map.ts`, `server/cli-logins.ts`)
+
+A seat's CLI login — the GitHub CLI's token, the Copilot CLI's token — lives in the fleet's own Infisical project, not in BotFleet's.  The protocol is the fleet's (AI-Fleet-Coordinator, `docs/protocols/cli-login-sync.md`):  the project **Fleet-OPS**, environment `prod`, one folder per seat at `/cli-logins/<SEAT>`, and inside it the names the CLIs read out of their environment.
+
+The seat is the bot's role seat, the one the launch identity carries (`BF-ORACLE`, `BF-MONITOR`, …), so the folder to sync is `/cli-logins/BF-ORACLE` and not the folder of a coding seat that happens to work on the same machine.  The fleet's writer accepts that shape under the same path pattern it accepts every other seat with.
+
+| Infisical name | Delivered as | Read by |
+|---|---|---|
+| `GH_TOKEN` | `GH_TOKEN` | the GitHub CLI, and anything else that speaks to GitHub as the owner |
+| `GITHUB_TOKEN` | `GITHUB_TOKEN` | the same, for a tool that looks for that name |
+| `GH_ENTERPRISE_TOKEN` | `GH_ENTERPRISE_TOKEN` | the GitHub CLI against a GitHub Enterprise host |
+| `COPILOT_GITHUB_TOKEN` | `COPILOT_GITHUB_TOKEN` | the Copilot CLI |
+
+These four are not config fields, so they are not in the snapshot above and not in `loadConfig()`.  The seat comes from the launch identity, so one bot's login goes to that bot's launched child process and to no other.  The value goes from the vault into that child's environment and nowhere else:  never into `cfg`, never into `process.env`, never into a log line, an error message or the status view.  A child never inherits a login from the harness process — the four names are removed from the child's environment before the seat's own value goes in — so a bot with no seat gets no login at all, rather than somebody else's.
+
+The read is per seat, cached for 15 minutes, and happens in the BACKGROUND (`server/cli-logins.ts`).  A turn's child is spawned with whatever the cache holds, and a turn that names a seat starts the read:  the turns after the first have the login.  The read is deliberately not awaited in the turn path, because a vault read there would suspend the driver between the turn's guard and the registration that follows it, and a second turn on the same thread would then walk through a guard the first one already passed.  A failed read keeps the last good value and is not retried for a minute.  The credential is the machine identity the harness already holds:  the second project is addressed with a project id, not with a second credential.  That project id is never committed — it comes from the environment variable the fleet's own tools read, `INFISICAL_FLEET_OPS_PROJECT_ID`, and the product server reads nothing else for it.  A host without that variable has no fleet project to address, and is told so instead of reading BotFleet's own project.
 
 ### Tunable knobs (`server/knob-map.ts`)
 
@@ -127,4 +145,4 @@ Change it in Infisical (or save it in Settings with Write Through on).  The next
 
 ## For agents
 
-`AGENTS.md` points here.  When adding a new tunable or credential: add it to the table in `server/knob-map.ts` or `server/secret-map.ts` (one row — the snapshot filter, resolution, provenance, write-through and status views all follow the table), add the default to the vault's `prod` environment when one exists, and cover it in `server/knob-map.test.ts` / `server/secret-map.test.ts`.  Never add a `process.env` read for a setting that belongs in these tables; never fetch Infisical per-request.
+`AGENTS.md` points here.  When adding a new tunable or credential: add it to the table in `server/knob-map.ts` or `server/secret-map.ts` (one row — the snapshot filter, resolution, provenance, write-through and status views all follow the table), add the default to the vault's `prod` environment when one exists, and cover it in `server/knob-map.test.ts` / `server/secret-map.test.ts`.  Never add a `process.env` read for a setting that belongs in these tables; never fetch Infisical per-request.  A credential that belongs to a seat rather than to the app is a CLI login:  it is a row in `CLI_LOGIN_FIELDS` (`server/secret-map.ts`), it is read per seat by `server/cli-logins.ts`, and it is never a config field.
