@@ -95,6 +95,23 @@ test("inspectLaunchAgents returns empty when no agents are loaded", () => {
   assert.deepEqual(lingering, []);
 });
 
+test("inspectLaunchAgents records probe error into probeErrors", () => {
+  const probeErrors = [];
+  const mockFailingProbe = (label) => ({
+    loaded: false,
+    running: false,
+    error: `timed out querying launchd for ${label}`,
+  });
+  const lingering = inspectLaunchAgents(["app.botfleet.server"], mockFailingProbe, probeErrors);
+  assert.deepEqual(lingering, []);
+  assert.equal(probeErrors.length, 1);
+  assert.ok(probeErrors[0].includes("timed out querying launchd for app.botfleet.server"));
+
+  const verdict = evaluatePostReboot({ probeErrors });
+  assert.equal(verdict.ok, false);
+  assert.ok(verdict.failures.some((f) => f.includes("timed out querying launchd")));
+});
+
 test("inspectPortListeners parses lsof output for BotFleet ports", () => {
   const sampleLsof = `
 COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
@@ -184,5 +201,27 @@ test("resolveBoardCli resolves BOARD_CLI or board", () => {
   } finally {
     if (orig !== undefined) process.env.BOARD_CLI = orig;
     else delete process.env.BOARD_CLI;
+  }
+});
+
+test("resolveBoardCli throws fail-closed error when board binary is unavailable", () => {
+  const origCli = process.env.BOARD_CLI;
+  const origHome = process.env.HOME;
+  const origPath = process.env.PATH;
+  try {
+    delete process.env.BOARD_CLI;
+    process.env.HOME = "/tmp/nonexistent-home-dir-for-tests";
+    process.env.PATH = "/tmp/nonexistent-empty-bin-dir";
+    assert.throws(
+      () => resolveBoardCli(),
+      /Linear CLI 'board' not found on PATH or at ~\/\.local\/bin\/board/,
+    );
+  } finally {
+    if (origCli !== undefined) process.env.BOARD_CLI = origCli;
+    else delete process.env.BOARD_CLI;
+    if (origHome !== undefined) process.env.HOME = origHome;
+    else delete process.env.HOME;
+    if (origPath !== undefined) process.env.PATH = origPath;
+    else delete process.env.PATH;
   }
 });

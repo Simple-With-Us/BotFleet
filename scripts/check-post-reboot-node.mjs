@@ -94,12 +94,15 @@ export function inspectProcesses(psOutput) {
 
 /**
  * Inspect launchd status for BotFleet agents.
- * `probeFn(agentLabel)` should return { loaded: boolean, running: boolean, rawOutput?: string }.
+ * `probeFn(agentLabel)` should return { loaded: boolean, running: boolean, rawOutput?: string, error?: string }.
  */
-export function inspectLaunchAgents(agentLabels = BOTFLEET_AGENTS, probeFn) {
+export function inspectLaunchAgents(agentLabels = BOTFLEET_AGENTS, probeFn, probeErrors = null) {
   const active = [];
   for (const label of agentLabels) {
     const status = probeFn(label);
+    if (status.error && Array.isArray(probeErrors)) {
+      probeErrors.push(`launchctl probe error for ${label}: ${status.error}`);
+    }
     if (status.loaded || status.running) {
       active.push({ label, running: status.running, details: status.rawOutput ?? "loaded" });
     }
@@ -111,6 +114,9 @@ export function inspectLaunchAgents(agentLabels = BOTFLEET_AGENTS, probeFn) {
  * Real system probe for launchctl on macOS.
  */
 export function realLaunchctlProbe(label) {
+  if (process.platform !== "darwin") {
+    return { loaded: false, running: false, skipped: true };
+  }
   try {
     const uid = process.getuid ? process.getuid() : 501;
     const out = execFileSync("launchctl", ["print", `gui/${uid}/${label}`], {
@@ -120,8 +126,19 @@ export function realLaunchctlProbe(label) {
     });
     const running = out.includes("state = running");
     return { loaded: true, running, rawOutput: out.split("\n").slice(0, 5).join("; ") };
-  } catch {
-    return { loaded: false, running: false };
+  } catch (error) {
+    const stderr = String(error.stderr || error.stdout || "");
+    const isNotFound =
+      error.status === 113 ||
+      /Could not find service|No such process|Bad request/i.test(stderr);
+    if (isNotFound) {
+      return { loaded: false, running: false };
+    }
+    return {
+      loaded: false,
+      running: false,
+      error: error.message || `launchctl exit ${error.status}: ${stderr.trim()}`,
+    };
   }
 }
 
@@ -281,7 +298,7 @@ if (isEntryModule()) {
   }
 
   const processes = inspectProcesses(psOut);
-  const launchAgents = inspectLaunchAgents(BOTFLEET_AGENTS, realLaunchctlProbe);
+  const launchAgents = inspectLaunchAgents(BOTFLEET_AGENTS, realLaunchctlProbe, probeErrors);
   const portListeners = inspectPortListeners(lsofOut, BOTFLEET_PORTS);
   const gitFiles = checkGit ? inspectGitFiles(gitTracked) : [];
 
