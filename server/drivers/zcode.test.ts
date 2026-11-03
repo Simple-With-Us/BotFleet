@@ -70,6 +70,22 @@ describe("ZcodeDriver turns (fake CLI)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("falls back to the app-bundled CLI when zcode is not on PATH", async () => {
+    // ZCODE_BUNDLED_CLI replaces the resolution candidates; the fake CLI
+    // answers --version exactly like the app bundle's zcode.cjs.
+    instance = await ZcodeDriver.create({
+      instanceId: "zcode-bundled",
+      displayName: "ZCode Bundled",
+      environment: { ZCODE_BUNDLED_CLI: FAKE_CLI },
+      enabled: true,
+      config: { cli: "zcode" },
+    });
+    recorder = recordEvents(instance.adapter);
+    const snap = await instance.snapshot();
+    expect(snap.state).toBe("available");
+    expect(snap.version).toBe("zcode 3.17.1");
+  });
+
   it("normalizes a full turn into the canonical event sequence", async () => {
     await create();
     const { turnId } = await instance.adapter.sendTurn({

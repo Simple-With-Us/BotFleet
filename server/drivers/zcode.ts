@@ -25,6 +25,7 @@
 // packages/shared/src/official-glm-model-id.ts (built-in model ids).
 
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { stripWorkspaceCredentialEnv } from "../config.ts";
@@ -180,6 +181,71 @@ function buildTurnUsage(usage: ZcodeStreamUsage, input: number | undefined): Zco
   return out;
 }
 
+const DEFAULT_CLI = "zcode";
+const VERSION_PROBE_TIMEOUT_MS = 20000;
+
+// The official desktop app ships the CLI as a node bundle inside the app
+// (executable, node shebang) but installs no PATH wrapper — resolve it
+// where the app puts it. Only the user-facing `zcode` CLI is a candidate;
+// the app bundle's internal agent binaries are not a supported entrypoint.
+const BUNDLED_CLI_CANDIDATES =
+  process.platform === "darwin"
+    ? [
+        "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+        join(homedir(), "Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"),
+      ]
+    : [];
+
+/** One `--version` run: version stdout when the CLI exits 0 within the
+ *  timeout, else an error explaining the miss. A candidate that cannot
+ *  answer `--version` is not a usable headless CLI. */
+function probeVersion(
+  cli: string,
+  env: Record<string, string | undefined>,
+  timeoutMs: number,
+): Promise<{ version: string | null; error: Error | null }> {
+  return new Promise((resolve) => {
+    let child: ReturnType<typeof spawnCli>;
+    try {
+      child = spawnCli(cli, ["--version"], { stdio: ["ignore", "pipe", "pipe"], env });
+    } catch (error) {
+      // SAFETY: spawnCli throws Error instances synchronously on a bad spawn.
+      resolve({ version: null, error: error as Error });
+      return;
+    }
+    let out = "";
+    let done = false;
+    const finish = (value: { version: string | null; error: Error | null }) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (c: string) => (out += c));
+    child.stderr?.resume();
+    const timer = setTimeout(() => {
+      try {
+        killCliTree(child);
+      } catch {
+        /* ignore */
+      }
+      finish({
+        version: null,
+        error: Object.assign(new Error(`\`${cli}\` did not exit within ${timeoutMs}ms`), { timedOut: true }),
+      });
+    }, timeoutMs);
+    timer.unref?.();
+    child.on("error", (error) => finish({ version: null, error }));
+    child.on("close", (code) =>
+      finish({
+        version: code === 0 ? out.trim() || null : null,
+        error: code === 0 && out.trim() ? null : Object.assign(new Error(`exit ${code}`), { code }),
+      }),
+    );
+  });
+}
+
 export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
   driverKind: DRIVER_KIND,
   metadata: {
@@ -203,6 +269,33 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
     const listeners = new Set<RuntimeEventListener>();
     // one active turn per thread
     const active = new Map<string, { stop: () => void; turnId: string }>();
+
+    // CLI resolution: an explicit config.cli wins. The default probes PATH
+    // first, then the desktop app's bundled CLI — each candidate must answer
+    // `--version` to count. ZCODE_BUNDLED_CLI replaces the candidate list
+    // (driver tests point it at the fake CLI).
+    const cliOverride = input.environment.ZCODE_BUNDLED_CLI || null;
+    let resolvedCli: string | null = config.cli === DEFAULT_CLI ? null : config.cli;
+    let resolving: Promise<string> | null = null;
+    const resolveCli = (): Promise<string> => {
+      if (resolvedCli !== null) return Promise.resolve(resolvedCli);
+      resolving ??= (async () => {
+        const env = zcodeEnvironment({ ...process.env, ...input.environment });
+        const candidates = cliOverride !== null ? [cliOverride] : [DEFAULT_CLI, ...BUNDLED_CLI_CANDIDATES];
+        for (const candidate of candidates) {
+          const probe = await probeVersion(candidate, env, 5000);
+          if (probe.version !== null) {
+            resolvedCli = candidate;
+            return candidate;
+          }
+        }
+        // Nothing answered: fall back to the default name so the snapshot's
+        // failure names `zcode` with the install docs.
+        resolvedCli = DEFAULT_CLI;
+        return DEFAULT_CLI;
+      })();
+      return resolving;
+    };
 
     const emit = (event: RuntimeEvent) => {
       for (const l of Array.from(listeners)) l(event);
@@ -236,7 +329,8 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       const resumeCursor = isJsonString(turn.resumeCursor) && turn.resumeCursor ? turn.resumeCursor : null;
       if (resumeCursor) args.push("--resume", resumeCursor);
 
-      const child = spawnCli(config.cli, args, {
+      const cli = await resolveCli();
+      const child = spawnCli(cli, args, {
         stdio: ["ignore", "pipe", "pipe"],
         cwd: turn.cwd,
         env: zcodeEnvironment({ ...process.env, ...input.environment }),
@@ -410,7 +504,7 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
       });
       child.on("error", (err) => {
         // SAFETY: a ChildProcess "error" event delivers the spawn errno exception.
-        const spawnFailure = describeSpawnFailure(err as NodeJS.ErrnoException, config.cli);
+        const spawnFailure = describeSpawnFailure(err as NodeJS.ErrnoException, cli);
         if (settled) return;
         emit({ ...base(threadId, turnId), type: "runtime.error", message: spawnFailure.message, setup: spawnFailure.setup });
         settle(false);
@@ -435,56 +529,19 @@ export const ZcodeDriver: ProviderDriver<ZcodeConfig> = {
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const versionOrder = lastKnownVersion.begin();
       const startedAt = Date.now();
-      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
-        let child: ReturnType<typeof spawnCli>;
-        try {
-          child = spawnCli(config.cli, ["--version"], {
-            stdio: ["ignore", "pipe", "pipe"],
-            env: zcodeEnvironment({ ...process.env, ...input.environment }),
-          });
-        } catch (error) {
-          // SAFETY: spawnCli throws Error instances synchronously on a bad spawn.
-          resolve({ version: null, error: error as Error });
-          return;
-        }
-        let out = "";
-        let done = false;
-        const finish = (value: { version: string | null; error: Error | null }) => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          resolve(value);
-        };
-        child.stdout?.setEncoding("utf8");
-        child.stdout?.on("data", (c: string) => (out += c));
-        child.stderr?.resume();
-        const timer = setTimeout(() => {
-          try {
-            killCliTree(child);
-          } catch {
-            /* ignore */
-          }
-          finish({
-            version: null,
-            error: Object.assign(new Error(`\`${config.cli}\` did not exit within 20000ms`), { timedOut: true }),
-          });
-        }, 20000);
-        timer.unref?.();
-        child.on("error", (error) => finish({ version: null, error }));
-        child.on("close", (code) =>
-          finish({
-            version: out.trim() || null,
-            error: out.trim() ? null : Object.assign(new Error(`exit ${code}`), { code }),
-          }),
-        );
-      });
+      const cli = await resolveCli();
+      const probed = await probeVersion(
+        cli,
+        zcodeEnvironment({ ...process.env, ...input.environment }),
+        VERSION_PROBE_TIMEOUT_MS,
+      );
       let version = probed.version;
       if (version) {
         lastKnownVersion.record(version, versionOrder);
       } else {
         const elapsed = Date.now() - startedAt;
-        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
-        const failure = classifyVersionProbeFailure(probed.error, config.cli, input.displayName || PROVIDER_LABEL, elapsed, 20000);
+        logProbeFailure(instanceId, `${cli} --version`, probed.error, elapsed);
+        const failure = classifyVersionProbeFailure(probed.error, cli, input.displayName || PROVIDER_LABEL, elapsed, VERSION_PROBE_TIMEOUT_MS);
         const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
         if (remembered) {
           version = remembered;
