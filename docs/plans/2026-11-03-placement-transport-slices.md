@@ -32,7 +32,7 @@ The design says "The worker pulls;  the controller never dials the Mac", so prod
 | `assignment` | Ask for work | New selection of the oldest job eligible for this host, then the existing `claim` compare-and-set.  The same issuing lease replays after a restart.  The reply carries the lease and no command |
 | `payload` | Fetch the command for a lease this host holds | New read through `server/placement-payloads.ts`, checked against the immutable digest.  It never consumes the claim |
 | `report` | Report a terminal result | `report`, idempotent on the job |
-| `stop-receipt` | Acknowledge a delivered stop | New, records delivery only.  `report` still settles the lease |
+| `stop-receipt` | Acknowledge a delivered stop | New, checks the lease and stores nothing.  `report` still settles the lease |
 
 `dispatch` stays out of the worker path and gets no production caller.  The owner routes for `release`, `release-controller` and `takeover` stay owner routes.  Every worker body keeps #1565's strict envelope and adds the controller and epoch fence, and a stale epoch is refused with the current pair.
 
@@ -43,7 +43,7 @@ Sizes are rough.  "First" names who must merge first where two slices share a f
 | Slice | Goal | Files | Needs | Proof | Size |
 | --- | --- | --- | --- | --- | --- |
 | T1 | Worker client and fsynced report spool, behind an injected link | New `server/placement-worker-client.ts`, `server/placement-report-spool.ts` | #1565, this mapping | A dropped acknowledgement then replay settles once, against an in-process lease service | M |
-| T2 | Worker routes that replace the 503, plus job selection and payload read | `server/placement-worker-auth.ts`, new `server/placement-worker-routes.ts`, `server/placement-leases.ts`, one line in `server/index.ts` | #1565 | Route tests over a real harness child, and refusals for an owner credential, a wrong host, a stale epoch and a replay | M |
+| T2 | Worker routes behind an optional transport argument, plus job selection and payload read.  `server/index.ts` does not pass one, so production keeps answering 503 until T9 | `server/placement-worker-auth.ts`, new `server/placement-worker-routes.ts`, `server/placement-leases.ts` | #1565 | Route tests over a real harness child, and refusals for an owner credential, a wrong host, a stale epoch and a replay | M |
 | T3 | Server mode record and the applied acknowledgement | New `server/placement-mode-store.ts`, a route in `server/index.ts` | Shares the lease service's epoch, with no second epoch | Mode and epoch survive restart, and a stale `PUT` is refused | S to M |
 | T4 | Registry bridge:  `job_start` becomes `enqueue` in a server mode, and the sweep timer starts | `server/jobs/registry.ts`, new `server/placement-controller-bridge.ts`, `server/index.ts` | T3 | `placement-queue.test.ts` still passes, and `localOnly` behavior is unchanged | L |
 | T5 | Worker runtime:  heartbeat, assignment, lease record before spawn, stop, report, restart reconciliation | New `server/placement-worker-runtime.ts`, a hook in `server/jobs/registry.ts` | T1, T2, T4 first | The T6b scenarios | L |
@@ -53,7 +53,7 @@ Sizes are rough.  "First" names who must merge first where two slices share a f
 | T8 | Evidence recipes in `docs/verification/`, with `placement-evidence.json` left false | Docs | T6b | A human asserts later, from real runs | S |
 | T9 | Reviewed activation | To be designed | #1556 built and retained first, T6b | Needs an exact packet and the owner's decision | Not sized |
 
-T1, T3, T6a and T7 can run at the same time.  Single writers:  `placement-worker-auth.ts` and `placement-leases.ts` belong to T2, and `jobs/registry.ts` goes to T4 and then T5.  `server/index.ts` merges in the order T2, T3, T4, with small hunks, and #1556 and #1565 touch it first.
+T1, T3, T6a and T7 can run at the same time.  Single writers:  `placement-worker-auth.ts` and `placement-leases.ts` belong to T2, and `jobs/registry.ts` goes to T4 and then T5.  `server/index.ts` merges in the order T3, T4, with small hunks, and T9 is what finally passes the worker transport to it.
 
 ## Authority And The Rollback Bridge
 
@@ -69,4 +69,8 @@ Still open:
 - **Credential custody:**  who enrolls workers and writes the authorization records.  #1565 reads them and does not issue them.
 - **Timing knobs:**  the design names heartbeat and unreachable-window knobs, `server/knob-map.ts` has none, and the unreachable window is a hard-coded default.  T4 or T5 adds the rows.
 
-Not yet determined:  whether #1565's new loopback check changes behavior on the gateway path, whether `JobRegistry`'s public API is enough for T5, and whether a marker exists on any live data directory.  Nobody should assume an answer to these.
+#1565's new loopback check does not change behavior, because `handleBootRequest` and `handleRequest` already apply the same test on main.
+
+A worker client must not use `fetch`:  it adds a `sec-fetch-mode` header, and the boundary refuses every `sec-*` header.
+
+Not yet determined:  whether `JobRegistry`'s public API is enough for T5, and whether a marker exists on any live data directory.  Nobody should assume an answer to these.
