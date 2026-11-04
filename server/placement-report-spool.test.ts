@@ -261,11 +261,12 @@ describe("settle-once against the in-process lease service", () => {
     expect(spool.add(message)).toBe(true);
 
     // First delivery: the controller applies the report, then the
-    // acknowledgement is dropped on the way back.
+    // acknowledgement is dropped on the way back.  A dropped or dead link is
+    // an outage, not a refusal, so it burns no attempt.
     const first = await settlePendingReports(spool, client(leases, { dropReportAck: true }));
     expect(first).toHaveLength(1);
     expect(first[0]).toMatchObject({ jobId: "job-1", result: "kept" });
-    expect(first[0]?.attempts).toBe(1);
+    expect(first[0]?.attempts).toBe(0);
     // The controller's lease book already holds the terminal result.
     const applied = leases.job("job-1");
     expect(applied?.status).toBe("completed");
@@ -312,10 +313,36 @@ describe("settle-once against the in-process lease service", () => {
     const { leaseId } = claimOneJob(leases);
     const spool = new PlacementReportSpool(dir);
     spool.add(terminalMessage(leaseId));
+    // Exhaustion requires the controller itself to refuse the row repeatedly;
+    // a hard refusal is recorded here to stand in for that contradiction.
     for (let attempt = 0; attempt < PLACEMENT_REPORT_MAX_ATTEMPTS; attempt += 1) spool.recordFailure("job-1");
     const outcomes = await settlePendingReports(spool, client(leases));
     expect(outcomes[0]).toMatchObject({ jobId: "job-1", result: "exhausted", attempts: PLACEMENT_REPORT_MAX_ATTEMPTS });
     expect(spool.has("job-1")).toBe(true);
+  });
+
+  it("a long outage never exhausts a terminal report", async () => {
+    const dir = fixtureDir();
+    const { leases } = leaseFixture();
+    const { leaseId } = claimOneJob(leases);
+    const spool = new PlacementReportSpool(dir);
+    spool.add(terminalMessage(leaseId));
+    // Every round of a dead link keeps the attempt count at zero, so a
+    // report survives arbitrarily long outages instead of being skipped.
+    const down = new PlacementWorkerClient({
+      credential, workerHostId: worker, audience,
+      controller: { controllerId: audience, epoch: 0 }, baseUrl,
+      fetchImpl: async () => { throw new Error("connection refused"); },
+    });
+    for (let round = 0; round < PLACEMENT_REPORT_MAX_ATTEMPTS + 3; round += 1) {
+      const outcomes = await settlePendingReports(spool, down);
+      expect(outcomes[0]).toMatchObject({ jobId: "job-1", result: "kept", attempts: 0 });
+    }
+    expect(spool.has("job-1")).toBe(true);
+    // When the link comes back, the very next drain settles the row.
+    const back = await settlePendingReports(spool, client(leases));
+    expect(back[0]).toMatchObject({ jobId: "job-1", result: "settled" });
+    expect(spool.has("job-1")).toBe(false);
   });
 
   it("an inactive transport keeps every row without accounting attempts", async () => {

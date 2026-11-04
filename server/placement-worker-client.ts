@@ -16,6 +16,7 @@
  *  or wires a production caller, because slice T5 owns the worker runtime
  *  that will.  This file alone cannot move a live job.
  */
+import { request as httpRequest } from "node:http";
 import { z } from "zod";
 import {
   HOST_ID_PATTERN,
@@ -36,6 +37,58 @@ import {
 const WORKER_ROUTE = "/api/placement/worker/";
 const CREDENTIAL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CREDENTIAL_SECRET_PATTERN = /^[0-9a-f]{64}$/;
+
+/** A fetch-shaped link built on node:http, so a request carries exactly the
+ *  headers the client names.  Node's fetch injects `sec-fetch-mode`, and the
+ *  worker boundary refuses every `sec-*` header, so the standard fetch
+ *  always draws a bare 403 before the credential is ever read.  This is
+ *  the link slice T5 wires; tests inject it the same way. */
+export function nodeHttpWorkerLink(): typeof fetch {
+  return (url, init) => new Promise((resolve, reject) => {
+    let target: URL;
+    try {
+      target = new URL(String(url));
+    } catch (error) {
+      reject(error instanceof Error ? error : new TypeError("the worker link URL is invalid"));
+      return;
+    }
+    if (target.protocol !== "http:") {
+      reject(new TypeError("the node:http worker link speaks only http origins"));
+      return;
+    }
+    // The worker link's own contract: this client serializes its JSON body
+    // itself, so the body reaches the link as the string it sent.
+    const body = init?.body === undefined || init?.body === null ? undefined : String(init.body);
+    const headers = new Headers(init?.headers);
+    if (body !== undefined) headers.set("content-length", Buffer.byteLength(body).toString());
+    const req = httpRequest(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port,
+        path: `${target.pathname}${target.search}`,
+        method: init?.method ?? "GET",
+        headers: Object.fromEntries(headers),
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        res.on("error", reject);
+        res.on("end", () => {
+          const responseHeaders = new Headers();
+          for (const [name, values] of Object.entries(res.headers)) {
+            for (const value of Array.isArray(values) ? values : [values]) {
+              if (value !== undefined) responseHeaders.append(name, value);
+            }
+          }
+          resolve(new Response(Buffer.concat(chunks), { status: res.statusCode ?? 0, headers: responseHeaders }));
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end(body);
+  });
+}
 
 export interface WorkerCredential {
   credentialId: string;
@@ -62,12 +115,16 @@ export type WorkerCallOutcome<T> =
  *  lease and no command.  Slice T2's route ratifies the parse. */
 export type AssignmentReply = ClaimReply;
 /** The plan's payload reply: the command read through the controller's
- *  payload store, checked against its immutable digest.  A read never
- *  consumes the claim.  Slice T2's route ratifies the parse. */
+ *  payload store, with the working directory and timeout the job needs, so
+ *  the worker can run it without a second call.  The digest is not sent
+ *  back, because the controller checks it against the immutable binding
+ *  when it reads the spool.  A read never consumes the claim.  Slice T2's
+ *  route ratifies the parse. */
 export interface PayloadReply extends ControllerEpoch {
   accepted: boolean;
   command?: string;
-  payloadDigest?: string;
+  cwd?: string;
+  timeoutMs?: number;
   reason?: string;
 }
 /** The plan's stop receipt records delivery only; the report still settles
@@ -130,7 +187,8 @@ const payloadReply = z.object({
   ...pairFields,
   accepted: z.boolean(),
   command: z.string().optional(),
-  payloadDigest: z.string().optional(),
+  cwd: z.string().optional(),
+  timeoutMs: z.number().optional(),
   reason: z.string().optional(),
 }).strip();
 const stopReceiptReply = z.object({

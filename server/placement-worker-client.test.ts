@@ -1,7 +1,14 @@
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { PLACEMENT_WIRE_VERSION, type CapacitySample, type HostId } from "../shared/placement.ts";
-import { PlacementWorkerClient, workerAuthorizationHeader, type WorkerCredential } from "./placement-worker-client.ts";
+import { writeFileAtomic } from "./atomic.ts";
+import { createWorkerRequestBoundary, privateWorkerAuthorizationSource, type WorkerAuthorization } from "./placement-worker-auth.ts";
+import { nodeHttpWorkerLink, PlacementWorkerClient, workerAuthorizationHeader, type WorkerCredential } from "./placement-worker-client.ts";
 
 const audience: HostId = "server:11111111-1111-4111-8111-111111111111";
 const worker: HostId = "mac:22222222-2222-4222-8222-222222222222";
@@ -46,7 +53,8 @@ interface FixtureReply {
   epoch?: number;
   pendingStops?: string[];
   command?: string;
-  payloadDigest?: string;
+  cwd?: string;
+  timeoutMs?: number;
   jobId?: string;
   leaseId?: string;
   lease?: { controllerId: string; epoch: number; leaseId: string; jobId: string; host: string };
@@ -206,13 +214,89 @@ describe("worker client reply handling", () => {
   });
 
   it("parses the payload and stop-receipt reply shapes the plan names", async () => {
-    const payload = scriptedLink(() => jsonResponse(200, { controllerId: audience, epoch: 0, accepted: true, command: "true", payloadDigest: "ab".repeat(32) }));
+    const payload = scriptedLink(() => jsonResponse(200, { controllerId: audience, epoch: 0, accepted: true, command: "true", cwd: "/tmp", timeoutMs: 60_000 }));
     const payloadReply = await payload.client.payload({ jobId: "job-1", leaseId: "lease-1" });
     expect(payloadReply.outcome === "accepted" && payloadReply.reply.command).toBe("true");
+    expect(payloadReply.outcome === "accepted" && payloadReply.reply.cwd).toBe("/tmp");
+    expect(payloadReply.outcome === "accepted" && payloadReply.reply.timeoutMs).toBe(60_000);
     expect(payload.requests[0]?.url).toBe(`${baseUrl}/api/placement/worker/payload`);
     const receipt = scriptedLink(() => jsonResponse(200, { controllerId: audience, epoch: 0, accepted: true, jobId: "job-1", leaseId: "lease-1" }));
     const receiptReply = await receipt.client.stopReceipt({ jobId: "job-1", leaseId: "lease-1" });
     expect(receiptReply.outcome === "accepted" && receiptReply.reply.jobId).toBe("job-1");
     expect(receipt.requests[0]?.url).toBe(`${baseUrl}/api/placement/worker/stop-receipt`);
+  });
+
+  it("gets through the real boundary over the real node:http link", async () => {
+    // The whole chain is real here: the node:http link builds the request,
+    // #1565's createWorkerRequestBoundary classifies and verifies it, and
+    // the boundary's own 503 answer is what the client parses.  A standard
+    // fetch would fail this chain before the credential is read, because it
+    // injects sec-fetch-mode and the boundary refuses every sec-* header.
+    const dir = mkdtempSync(join(tmpdir(), "bf-worker-link-"));
+    const parent = join(dir, "placement-worker-authorizations");
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    const record: WorkerAuthorization = {
+      format: "botfleet-placement-worker", version: 1, credentialId: credential.credentialId, revision: 1,
+      hostId: worker, audience, role: "execution-worker",
+      secretSha256: createHash("sha256").update(credential.secret).digest("hex"),
+      revoked: false, expiresAt: null,
+    };
+    writeFileAtomic(join(parent, `${record.credentialId}.json`), JSON.stringify(record), { mode: 0o600, exactMode: true });
+    const boundary = createWorkerRequestBoundary({
+      audience,
+      source: privateWorkerAuthorizationSource(dir),
+      readBody: (req) => new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        req.on("error", reject);
+        req.on("end", () => {
+          try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+          catch (error) { reject(error); }
+        });
+      }),
+    });
+    const server = createServer((req, res) => { void boundary(req, res); });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    // SAFETY: the listen callback above resolved, so the address is the
+    // listening IPv4 address and its port is the one to dial.
+    const port = (server.address() as { port: number }).port;
+    const live = new PlacementWorkerClient({
+      credential, workerHostId: worker, audience,
+      controller: { controllerId: audience, epoch: 0 },
+      baseUrl: `http://127.0.0.1:${port}`,
+      fetchImpl: nodeHttpWorkerLink(),
+    });
+    try {
+      // A request whose body is exactly the reserved envelope gets through
+      // the whole chain over the real link: the boundary classifies it,
+      // verifies the credential against the private source, and answers its
+      // own 503, which is not the 403 an unclassified request would draw.
+      const envelopeOnly = await nodeHttpWorkerLink()(`http://127.0.0.1:${port}/api/placement/worker/register`, {
+        method: "POST",
+        headers: { "authorization": workerAuthorizationHeader(credential), "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ authVersion: "1", hostId: worker, audience, role: "execution-worker" }),
+      });
+      expect(envelopeOnly.status).toBe(503);
+      expect(await envelopeOnly.json()).toEqual({ error: "Worker transport is not active" });
+      // A wrong secret is refused by the boundary itself.
+      const impostor = new PlacementWorkerClient({
+        credential: { credentialId: credential.credentialId, secret: "bb".repeat(32) },
+        workerHostId: worker, audience,
+        controller: { controllerId: audience, epoch: 0 },
+        baseUrl: `http://127.0.0.1:${port}`,
+        fetchImpl: nodeHttpWorkerLink(),
+      });
+      const refused = await impostor.register({ capabilities: ["shell"], sample });
+      expect(refused).toMatchObject({ outcome: "refused", status: 403, reason: "Worker request refused" });
+      // The client's real body adds the fence and intent fields to the
+      // envelope, and #1565's strict whole-body envelope parse refuses that
+      // today; #1577 changes the check to the reserved-key subset this
+      // slice's plan requires, and this assertion is where it lands.
+      const enriched = await live.register({ capabilities: ["shell"], sample });
+      expect(enriched).toMatchObject({ outcome: "refused", status: 403, reason: "Worker request refused" });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

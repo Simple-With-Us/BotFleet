@@ -173,12 +173,16 @@ function outcomeReason(outcome: WorkerCallOutcome<unknown>): string | undefined 
 }
 
 /** Deliver every pending terminal report once.  A row leaves the spool only
- *  on the controller's accepted acknowledgement; a stale-epoch refusal is
+ *  on the controller's accepted acknowledgement.  A stale-epoch refusal is
  *  not counted as an attempt because convergence after a takeover is the
- *  expected next step, while every other refusal, an inactive transport
- *  count and a link failure each burn one attempt.  Rows past the attempt
- *  cap are left in place and reported exhausted: terminal evidence is never
- *  silently dropped. */
+ *  expected next step, and neither is a link failure or an inactive
+ *  transport, because an outage must never exhaust a terminal result: the
+ *  report is the last word on the job, and giving up on it would leave the
+ *  lease unsettled forever.  Only a controller's explicit refusal of the row
+ *  itself burns an attempt, so exhaustion means the controller refused this
+ *  exact result repeatedly, which is a contradiction worth surfacing, not a
+ *  network condition.  Rows past the cap are left in place and reported
+ *  exhausted; terminal evidence is never silently dropped. */
 export async function settlePendingReports(spool: PlacementReportSpool, client: PlacementWorkerClient): Promise<SettleOutcome[]> {
   const outcomes: SettleOutcome[] = [];
   for (const row of spool.pending()) {
@@ -200,14 +204,15 @@ export async function settlePendingReports(spool: PlacementReportSpool, client: 
       outcomes.push({ jobId: row.message.jobId, result: "settled", attempts: row.attempts });
       continue;
     }
-    if (reply.outcome === "inactive") {
-      // The transport as a whole is off; no per-row accounting.
-      outcomes.push({ jobId: row.message.jobId, result: "kept", attempts: row.attempts, reason: reply.reason });
+    const reason = outcomeReason(reply);
+    if (reply.outcome === "refused" && !/stale controller epoch/.test(reply.reason)) {
+      outcomes.push({ jobId: row.message.jobId, result: "kept", attempts: spool.recordFailure(row.message.jobId), reason });
       continue;
     }
-    const staleEpoch = reply.outcome === "refused" && /stale controller epoch/.test(reply.reason);
-    const attempts = staleEpoch ? row.attempts : spool.recordFailure(row.message.jobId);
-    outcomes.push({ jobId: row.message.jobId, result: "kept", attempts, reason: outcomeReason(reply) });
+    // A stale epoch, an inactive transport and a link failure all keep the
+    // row at its current attempt count: none of them is the controller
+    // refusing this result.
+    outcomes.push({ jobId: row.message.jobId, result: "kept", attempts: row.attempts, reason });
     if (reply.outcome === "link-failed") break;
   }
   return outcomes;
