@@ -3,7 +3,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/infisical-binding-preflight.yml
-      - scripts/infisical-ci-binding-audit*
+      - scripts/infisical-binding-preflight*
       - scripts/infisical-audit-fetch.mjs
   workflow_dispatch:
     inputs:
@@ -30,7 +30,7 @@ jobs:
           node-version: 26
           package-manager-cache: false
       - run: npm install --prefix "$RUNNER_TEMP/audit-deps" --no-package-lock --ignore-scripts yaml@2.8.2 && ln -s "$RUNNER_TEMP/audit-deps/node_modules" node_modules
-      - run: node --test scripts/infisical-ci-binding-audit.node-test.mjs
+      - run: node --test scripts/infisical-binding-preflight.node-test.mjs
   audit-infisical-bindings:
     name: Read-only Infisical binding audit
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected == true }}
@@ -87,5 +87,5 @@ jobs:
           GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN != '' }}
           GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN != '' }}
           GH_FALLBACK_SENTRY_FLEET_DSN: ${{ secrets.SENTRY_FLEET_DSN != '' }}
-        run: node scripts/infisical-ci-binding-audit.mjs
+        run: node scripts/infisical-binding-preflight.mjs
 

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { parse } from "yaml";
-import { runAudit } from "./infisical-ci-binding-audit.mjs";
+import { runAudit } from "./infisical-binding-preflight.mjs";
 
 const tokenNames = [
   "INFISICAL_IOS_SHIP_READ_TOKEN",
