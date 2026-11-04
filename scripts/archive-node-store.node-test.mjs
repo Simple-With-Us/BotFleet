@@ -16,6 +16,7 @@ import test from "node:test";
 import {
   ARCHIVE_MARKER,
   MAX_PACKET_BYTES,
+  assertRollbackJournalMode,
   archiveStore,
   emitReceipts,
   exclusionReason,
@@ -355,6 +356,47 @@ test("the redaction keeps a JSON document and an ndjson log parsable", { skip: R
 
   const lines = readFileSync(join(outDir, "tree", "already-masked.ndjson"), "utf8").split("\n").filter((line) => line.trim());
   for (const line of lines) JSON.parse(line);
+});
+
+test("the archived database opens read-only on its own, with nothing beside it", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  // The live store's database is in WAL mode, and a backup of a WAL database
+  // is still a WAL database.  Read through a truly read-only connection a
+  // WAL database wants a -shm sibling it cannot create beside a read-only
+  // file, and the archive deliberately carries no siblings:  the live
+  // database's -wal and -shm are excluded because the snapshot supersedes
+  // them.  So the snapshot is taken out of WAL mode, and the Swift importer,
+  // which opens the source read-only, can read it.
+  const database = new DatabaseSync(join(store, "messages.db"));
+  database.exec("PRAGMA journal_mode = WAL");
+  database.exec("CREATE TABLE wal_probe (id INTEGER)");
+  database.prepare("INSERT INTO wal_probe (id) VALUES (1)").run();
+  database.close();
+
+  const parent = privateScratch("capture-");
+  const { manifest, outDir } = await archiveStore({ storeRoot: store, outDir: join(parent, "capture") });
+
+  const snapshot = join(outDir, "tree", "messages.db");
+  assert.equal(existsSync(`${snapshot}-wal`), false, "no wal sibling is carried");
+  assert.equal(existsSync(`${snapshot}-shm`), false, "no shm sibling is carried");
+  const opened = new DatabaseSync(snapshot, { readOnly: true });
+  try {
+    const mode = opened.prepare("PRAGMA journal_mode").get();
+    assert.equal(mode.journal_mode, "delete", "the snapshot is not in WAL mode");
+    assert.equal(opened.prepare("SELECT count(*) AS n FROM wal_probe").get().n, 1, "the rows came through");
+  } finally {
+    opened.close();
+  }
+  const row = manifest.files.find((entry) => entry.path === "messages.db");
+  assert.equal(row.journalMode, "delete", "the manifest says which journal mode the snapshot is in");
+});
+
+test("a snapshot that stayed in WAL mode is refused, not sealed", () => {
+  // The enforcement is the point:  a WAL snapshot is a database the read-only
+  // importer cannot open, so it must never be sealed and shipped.
+  assert.throws(() => assertRollbackJournalMode("wal", "/tmp/x.sqlite"), /journal mode "wal"/);
+  assert.throws(() => assertRollbackJournalMode("memory", "/tmp/x.sqlite"), /journal mode "memory"/);
+  assert.doesNotThrow(() => assertRollbackJournalMode("delete", "/tmp/x.sqlite"));
 });
 
 test("a credential inside the database is counted in the manifest, not hidden", { skip: ROOT_IS_ROOT }, async () => {
