@@ -20,7 +20,9 @@
 // swap, and the harness is restarted separately (launchd's periodic tick
 // picks up the new pointer).
 
+import { realpathSync } from "node:fs";
 import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   currentCommit,
   listReleases,
@@ -44,7 +46,9 @@ function usage() {
       "  (every command accepts --store <root> for a separate store namespace)",
       "  promote <commit>                                  move staging into releases/",
       "  swap <commit>                                     point current at a release",
-      "  activate <commit> [--repo <path>]                 stage, promote and swap",
+      "  activate <commit> [--repo <path>] [--version v]   stage, promote and swap",
+      "  promote/activate stamp --version/--build into the release manifest;",
+      "  without them the staged package.json version is recorded",
       "  status                                            where current points",
       "  list                                              every release in the store",
       "  prune [--keep N]                                  drop old, unheld releases",
@@ -53,10 +57,14 @@ function usage() {
   );
 }
 
-function flag(args, name) {
+export function flag(args, name) {
   const index = args.indexOf(name);
   if (index === -1) return undefined;
-  return args[index + 1];
+  const value = args[index + 1];
+  // A missing value, or the NEXT flag, is not a value: "promote C --version
+  // --build X" must not stamp the string "--build" as the release version.
+  if (value === undefined || value.startsWith("--")) return undefined;
+  return value;
 }
 
 /**
@@ -156,7 +164,7 @@ async function main() {
   }
 
   if (command === "promote") {
-    const path = await promoteStaging({ commit, env });
+    const path = await promoteStaging({ commit, env, version: flag(args, "--version"), build: flag(args, "--build") });
     process.stdout.write(`promoted: ${path}\n`);
     return 0;
   }
@@ -201,7 +209,7 @@ async function main() {
       install: true,
       log: (line) => process.stdout.write(`${line}\n`),
     });
-    const path = await promoteStaging({ commit, env });
+    const path = await promoteStaging({ commit, env, version: flag(args, "--version"), build: flag(args, "--build") });
     process.stdout.write(`promoted: ${path}\n`);
     const result = await swapCurrent({ commit, env });
     process.stdout.write(`current: ${releasePath(commit, env)}\n`);
@@ -215,11 +223,26 @@ async function main() {
   return 2;
 }
 
-process.exitCode = await main().catch((error) => {
+// Only run the CLI when this file is the entry module: the unit tests import
+// the helpers, and an unconditional main() would run under the test runner.
+// Compare physical paths, the way update-botfleet-mac.mjs does.
+function isEntryModule() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
+  process.exitCode = await main().catch((error) => {
   // An operator gets the reason, not a stack trace.  The cause code is the
   // stable part (a missing commit, a failed export, a cross-device
   // rename), and the message already says what to do about it.
   const cause = error?.cause ? ` (${error.cause})` : "";
-  process.stderr.write(`harness-release: ${error?.message || error}${cause}\n`);
-  return 1;
-});
+    process.stderr.write(`harness-release: ${error?.message || error}${cause}\n`);
+    return 1;
+  });
+}

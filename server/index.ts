@@ -113,7 +113,9 @@ import { workspaceCredentialPending } from "../electron/workspace-credentials.mj
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
 import { loadHostId } from "./host-id.ts";
 import { createHostResourcesResponder } from "./host-resources.ts";
-import { openControllerEpochStore, placementIdentityResponse } from "./placement-identity.ts";
+import { placementIdentityResponse } from "./placement-identity.ts";
+import { openPlacementAuthority } from "./placement-store.ts";
+import { PlacementPayloadSpool } from "./placement-payloads.ts";
 import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, type PlacementLeaseAction } from "./placement-leases.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
@@ -331,6 +333,7 @@ import {
   startIdleLiveTranscriptSweeps,
   startOrphanTranscriptSweeps,
   startTranscriptRetentionSweeps,
+  startVolumeTranscriptSweeps,
   sweepTranscriptRetention,
   removeTranscriptLogs,
 } from "./transcript-retention.ts";
@@ -827,8 +830,14 @@ if (storageGuard && !storageGuard.initial.online) {
 }
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 const hostId = loadHostId(DATA_DIR);
-const placementControllerStore = openControllerEpochStore(DATA_DIR, hostId);
-const placementLeases = new PlacementLeaseService({ hostId, controller: placementControllerStore.read(), controllerStore: placementControllerStore });
+const placementAuthority = openPlacementAuthority(DATA_DIR, hostId);
+const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeaseService({
+  hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
+}) : new PlacementLeaseService({
+  hostId, controller: placementAuthority.store.readScope().controller, store: placementAuthority.store,
+  payloads: new PlacementPayloadSpool(DATA_DIR),
+  queueWindowMs: () => jobSettings().queueWaitMinutes * 60_000,
+});
 const jobHostProbe = createHostProbe({
   storageState: storageGuard?.sample,
   // The Mac memory-pressure probe runs only while a memory-headroom knob
@@ -3126,6 +3135,21 @@ const stopOrphanTranscriptSweeps = startOrphanTranscriptSweeps(transcriptDirs, l
 // generations at the full cap forever.  The idle sweep trims one that has
 // been quiet, and skips a turn that is open right now.
 const stopIdleLiveTranscriptSweeps = startIdleLiveTranscriptSweeps(
+  transcriptDirs,
+  liveThreadIds,
+  inFlightThreadIds,
+  console.log,
+  {
+    dryRun: retentionDryRun,
+    hold: () => cleanupHoldReason(DATA_DIR),
+  },
+);
+// Data-volume budget (BF-2463): every transcript log together stays under
+// ~8.4 GB.  Boot run is deferred off the request path (the starter's initial
+// delay), then daily alongside the other retention timers.  What is still
+// over budget is reported through describeVolumeSweep, never taken from
+// live data.  No per-file cap or admission change here.
+const stopVolumeTranscriptSweeps = startVolumeTranscriptSweeps(
   transcriptDirs,
   liveThreadIds,
   inFlightThreadIds,
@@ -20704,6 +20728,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     stopTranscriptSweeps();
     stopOrphanTranscriptSweeps();
     stopIdleLiveTranscriptSweeps();
+    stopVolumeTranscriptSweeps();
     // A flush that throws (disk full, data dir gone) must not skip the rest
     // of shutdown — above all bus.flush() below — so each one is guarded.
     const flushOnShutdown = (label: string, flush: () => void) => {

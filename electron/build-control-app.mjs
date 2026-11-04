@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { controlBuildVersion } from "./control-build-version.mjs";
 import { installServerControls } from "./server-controls.mjs";
-import { readSourceBuildIdentity } from "./runtime-identity.mjs";
+import { readSourceBuildIdentity } from "../scripts/source-build-identity.mjs";
 
 const project = fileURLToPath(new URL("../", import.meta.url));
 const bundle = path.join(project, "electron/resources/BotFleet Control.app");

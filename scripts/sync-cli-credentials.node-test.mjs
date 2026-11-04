@@ -62,8 +62,9 @@ test("--json with no synced target exits 0 and prints an empty targets list", { 
     const summary = JSON.parse(lastLine);
     assert.equal(summary.ok, true);
     assert.deepEqual(summary.targets, []);
-    assert.match(readFileSync(calls, "utf8"), /^inspect /);
-    assert.doesNotMatch(readFileSync(calls, "utf8"), /(?:^|\n)exec /);
+    const intercepted = readFileSync(calls, "utf8").trim().split("\n");
+    assert.deepEqual([...new Set(intercepted.map((line) => line.split(" ")[0]))], ["inspect"]);
+    assert.doesNotMatch(intercepted.join("\n"), /(?:^|\n)exec /);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
