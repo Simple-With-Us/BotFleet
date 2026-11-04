@@ -1826,6 +1826,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // on `turnUsage` above.
             case "usage_update": {
               const used = u.used;
+              // `size` is the model's context window, so `used / size` is the
+              // occupancy; carried on the live event only when it is sane.
+              const size = u.size;
+              const contextWindow =
+                typeof size === "number" && Number.isFinite(size) && size > 0 ? Math.trunc(size) : undefined;
               if (typeof used === "number" && Number.isFinite(used)) {
                 // Spread, not a literal `output: turnUsage?.output` — that
                 // would always create the key (value undefined when
@@ -1842,6 +1847,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   type: "thread.token-usage.updated",
                   input: turnUsage.input,
                   ...(turnUsage.output != null ? { output: turnUsage.output } : {}),
+                  ...(contextWindow !== undefined ? { contextWindow } : {}),
                 });
               }
               break;
