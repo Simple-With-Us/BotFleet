@@ -1,5 +1,3 @@
-import { realpathSync } from "node:fs";
-import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { listSecretsRaw, isUnresolvedReference } from "./infisical-fetch.mjs";
 
@@ -299,9 +297,7 @@ export async function runAudit({ env = process.env, fetchImpl = fetch, logger = 
   return { ok: rows.every((row) => row.auditPassed), bindings: rows, vercel: "paused: dedicated binding pending" };
 }
 
-let isDirectEntry = false;
-try { isDirectEntry = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href; } catch { /* Imported or nonexistent entry. */ }
-if (isDirectEntry) {
+if (import.meta.url === `file://${process.argv[1]}`) {
   runAudit().then((result) => {
     if (!result.ok) process.exitCode = 1;
   }).catch(() => {
