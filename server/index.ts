@@ -113,11 +113,7 @@ import { workspaceCredentialPending } from "../electron/workspace-credentials.mj
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
 import { loadHostId } from "./host-id.ts";
 import { createHostResourcesResponder } from "./host-resources.ts";
-import { placementIdentityResponse } from "./placement-identity.ts";
-import { createWorkerRequestBoundary, privateWorkerAuthorizationSource } from "./placement-worker-auth.ts";
-import { classifyWorkerRequest } from "../shared/placement-worker-http.mjs";
-import { openPlacementAuthority } from "./placement-store.ts";
-import { PlacementPayloadSpool } from "./placement-payloads.ts";
+import { openControllerEpochStore, placementIdentityResponse } from "./placement-identity.ts";
 import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, type PlacementLeaseAction } from "./placement-leases.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
@@ -831,14 +827,8 @@ if (storageGuard && !storageGuard.initial.online) {
 }
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 const hostId = loadHostId(DATA_DIR);
-const placementAuthority = openPlacementAuthority(DATA_DIR, hostId);
-const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeaseService({
-  hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
-}) : new PlacementLeaseService({
-  hostId, controller: placementAuthority.store.readScope().controller, store: placementAuthority.store,
-  payloads: new PlacementPayloadSpool(DATA_DIR),
-  queueWindowMs: () => jobSettings().queueWaitMinutes * 60_000,
-});
+const placementControllerStore = openControllerEpochStore(DATA_DIR, hostId);
+const placementLeases = new PlacementLeaseService({ hostId, controller: placementControllerStore.read(), controllerStore: placementControllerStore });
 const jobHostProbe = createHostProbe({
   storageState: storageGuard?.sample,
   // The Mac memory-pressure probe runs only while a memory-headroom knob
@@ -907,26 +897,13 @@ function handleBootRequest(req: IncomingMessage, res: ServerResponse): void {
   return json(res, 503, { error: "booting" });
 }
 
-const workerRequestBoundary = createWorkerRequestBoundary({
-  audience: hostId, source: privateWorkerAuthorizationSource(DATA_DIR), readBody,
-});
 const server = createServer((req, res) => {
-  void (async () => {
-    if (!isLoopbackHost(req.headers.host)) return json(res, 403, { error: "forbidden: loopback host required" });
-    if (await workerRequestBoundary(req, res)) return;
-    if (booting || !handleRequest) return handleBootRequest(req, res);
-    await handleRequest(req, res);
-  })().catch((error: unknown) => {
+  if (booting || !handleRequest) return handleBootRequest(req, res);
+  void Promise.resolve(handleRequest(req, res)).catch((error: unknown) => {
     console.error("[request] unhandled route failure:", error);
     if (!res.headersSent) json(res, 500, { error: "internal error" });
     else res.destroy();
   });
-});
-// No worker WebSocket protocol exists; an upgrade cannot bypass the HTTP guard.
-server.on("upgrade", (req, socket) => {
-  if (classifyWorkerRequest(req).kind !== "none") {
-    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-  } else socket.destroy();
 });
 server.on("error", (error: NodeJS.ErrnoException) => {
   if (listenErrorDisposition(error) === "named-exit") {
