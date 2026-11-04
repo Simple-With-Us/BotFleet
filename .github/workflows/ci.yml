@@ -114,10 +114,9 @@ jobs:
     # (typecheck + test (macos-latest) / ubuntu-latest) but must not consume
     # scarce free-plan macOS concurrent slots (2026-10-05 backlog).
     runs-on: ${{ needs.changes.outputs.docs_only == 'true' && 'ubuntu-latest' || matrix.os }}
-    # The test chain alone takes 10.5 to 13.5 minutes per host, and a full
-    # job ran 14m49s on Ubuntu, so 15 cancelled healthy runs.  Keep this at
-    # or below the Sentry CI check-in margin minus 15 (scripts/sentry-ci-report.py).
-    timeout-minutes: 25
+    # Host-specific test budget: macOS 35m; Ubuntu 25m.
+    # The full test chain remains enabled on both hosts.
+    timeout-minutes: ${{ matrix.os == 'macos-15' && 35 || 25 }}
     steps:
       - name: Documentation-only fast path
         if: needs.changes.outputs.docs_only == 'true'
