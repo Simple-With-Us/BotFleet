@@ -21,13 +21,15 @@ jobs:
   changes:
     name: Classify E2E scope
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       web_changed: ${{ steps.scope.outputs.web_changed }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # Scope compares commit/tree metadata, without historical file blobs.
+          filter: blob:none
           persist-credentials: false
       - name: Check whether web-app paths changed
         id: scope

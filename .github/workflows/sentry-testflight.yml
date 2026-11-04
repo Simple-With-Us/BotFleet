@@ -9,8 +9,9 @@ on:
     inputs:
       token:
         description: >-
-          Infisical service token for the reporting app.  Optional: a caller
-          that has not migrated yet falls back to the machine identity.
+          Dedicated read-only Infisical service token for this reporting use case,
+          with the existing reporting-token binding used when omitted and the
+          same-name GitHub secret fallback retained when vault access is unavailable.
         required: false
         default: ""
         type: string
@@ -70,8 +71,8 @@ jobs:
           names: SENTRY_AUTH_TOKEN
           required: SENTRY_AUTH_TOKEN
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          # A caller with a service token passes one; the machine identity
-          # stays for the callers that have not migrated yet.
+          # Use the caller's dedicated read token or the existing reporting-token
+          # binding; the same-name GitHub Sentry secret remains the value fallback.
           token: ${{ inputs.token || secrets.INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN }}
         env:
           GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
