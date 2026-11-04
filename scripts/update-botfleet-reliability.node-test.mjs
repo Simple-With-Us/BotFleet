@@ -10,15 +10,13 @@
 // harness is a loopback server on an ephemeral port.
 import assert from "node:assert/strict";
 import { closeSync, openSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import test from "node:test";
 import { runtimePreflight } from "./update-botfleet-mac.mjs";
 
-const scripts = dirname(fileURLToPath(import.meta.url));
 const posixOnly = { skip: process.platform === "win32" ? "POSIX ownership, modes and lsof" : false };
 const COMMIT = "b".repeat(40);
 
