@@ -1468,6 +1468,7 @@
     {"path":"server/permission-proxy.ts","category":"runtime-asset","reason":"Declared subprocess in server/proxy-paths.ts"},
     {"path":"server/placement-identity.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/placement-leases.ts","category":"runtime","reason":"Import from server/index.ts"},
+    {"path":"server/placement-mode-store.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/placement-payloads.ts","category":"runtime","reason":"Import from server/placement-leases.ts"},
     {"path":"server/placement-readonly.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/placement-store.ts","category":"runtime","reason":"Import from server/placement-leases.ts"},
