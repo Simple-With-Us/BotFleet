@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { prepareCursorEnvironment } from "./cursor-cloud-bootstrap.mjs";
+import { trustedPythonInterpreter } from "./cursor-cloud-output.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 // Fixture-only values are never sent to a real provider.
@@ -947,4 +948,152 @@ test("malformed, multiple or post-mutation journal temps remain untouched with a
       } finally { f.cleanup(); }
     });
   }
+});
+
+test("crash after exclusive canonical lock creation leaves a reusable private empty sentinel", { skip: process.platform === "win32" }, async () => {
+  const f = fixture();
+  try {
+    const lock = join(f.outputDir, ".BotFleet.lock");
+    rmSync(lock);
+    const childFile = join(f.root, "crash-lock-create.mjs");
+    writeFileSync(childFile, `
+      import { prepareCursorEnvironment } from ${JSON.stringify(pathToFileURL(join(ROOT, "scripts/cursor-cloud-bootstrap.mjs")).href)};
+      await prepareCursorEnvironment({env:${JSON.stringify(f.env)},log:()=>{},operations:{onLockCreated:()=>process.exit(91)},fetchImpl:async()=>{throw new Error('must not fetch');}});
+      process.exit(92);
+    `);
+    const child = spawnSync(process.execPath, [childFile], { env: { HOME: f.homeDir, PATH: process.env.PATH }, encoding: "utf8", timeout: 5000 });
+    assert.equal(child.status, 91, child.stderr);
+    assert.equal(readFileSync(lock, "utf8"), "");
+    const before = statSync(lock);
+    assert.equal(before.mode & 0o777, 0o600);
+    let calls = 0;
+    assert.equal((await prepareCursorEnvironment({ env: { ...f.env, INFISICAL_TOKEN: "" }, homeDir: f.homeDir,
+      log: () => {}, fetchImpl: async () => { calls++; throw new Error("off hook must not fetch"); } })).state, "disabled");
+    assert.equal(calls, 0);
+    assert.equal(statSync(lock).ino, before.ino);
+    assert.equal(readFileSync(lock, "utf8"), "");
+    assert.equal(readdirSync(f.outputDir).some((name) => name.startsWith(".BotFleet.lock-new-")), false);
+    assertInvalidated(f);
+  } finally { f.cleanup(); }
+});
+
+test("concurrent first creators share one persistent sentinel without lock staging", async () => {
+  const f = fixture();
+  try {
+    const lock = join(f.outputDir, ".BotFleet.lock");
+    rmSync(lock);
+    let creations = 0;
+    const options = { env: { ...f.env, INFISICAL_TOKEN: "" }, homeDir: f.homeDir, log: () => {},
+      operations: { onLockCreated: () => { creations++; } }, fetchImpl: async () => { throw new Error("off hook must not fetch"); } };
+    const results = await Promise.all([prepareCursorEnvironment(options), prepareCursorEnvironment(options)]);
+    assert.deepEqual(results.map((result) => result.state), ["disabled", "disabled"]);
+    assert.equal(creations, 1);
+    assert.equal(readFileSync(lock, "utf8"), "");
+    assert.equal(statSync(lock).mode & 0o777, 0o600);
+    assert.equal(readdirSync(f.outputDir).some((name) => name.startsWith(".BotFleet.lock-new-")), false);
+    assertInvalidated(f);
+  } finally { f.cleanup(); }
+});
+
+test("the legacy private lock marker remains unchanged and usable", async () => {
+  const f = fixture();
+  try {
+    const lock = join(f.outputDir, ".BotFleet.lock");
+    const contents = readFileSync(lock, "utf8");
+    const before = statSync(lock);
+    assert.equal((await prepareCursorEnvironment({ env: f.env, homeDir: f.homeDir, fetchImpl: provider(f).fetchImpl, log: () => {} })).state, "written");
+    assert.equal(readFileSync(lock, "utf8"), contents);
+    assert.equal(statSync(lock).ino, before.ino);
+    assert.equal(statSync(lock).mtimeMs, before.mtimeMs);
+  } finally { f.cleanup(); }
+});
+
+test("unknown content, permissive modes and symlink lock sentinels are preserved without network", { skip: process.platform === "win32" }, async (t) => {
+  for (const change of ["content", "mode", "symlink"]) {
+    await t.test(change, async () => {
+      const f = fixture();
+      try {
+        const lock = join(f.outputDir, ".BotFleet.lock");
+        const external = join(f.root, "external-lock");
+        if (change === "content") writeFileSync(lock, "user lock sentinel");
+        if (change === "mode") chmodSync(lock, 0o644);
+        if (change === "symlink") { writeFileSync(external, "external sentinel", { mode: 0o600 }); rmSync(lock); symlinkSync(external, lock); }
+        const contents = readFileSync(lock, "utf8");
+        const before = activeSnapshot(f);
+        let calls = 0;
+        assert.equal((await prepareCursorEnvironment({ env: f.env, homeDir: f.homeDir,
+          fetchImpl: async () => { calls++; throw new Error("must not fetch"); }, log: () => {} })).state, "unavailable");
+        assert.equal(calls, 0);
+        assert.equal(readFileSync(lock, "utf8"), contents);
+        assert.deepEqual(activeSnapshot(f), before);
+      } finally { f.cleanup(); }
+    });
+  }
+});
+
+function interpreterFilesystem(change) {
+  const item = (kind, mode = 0o755, uid = 0) => ({ uid, mode,
+    isFile: () => kind === "file", isDirectory: () => kind === "directory", isSymbolicLink: () => kind === "symlink" });
+  const files = new Map([["/", item("directory")], ["/usr", item("directory")], ["/usr/bin", item("directory")],
+    ["/usr/bin/python3", item("symlink", 0o777)], ["/usr/bin/python3.13", item("file")]]);
+  let target = "python3.13";
+  if (change === "missing") files.delete("/usr/bin/python3");
+  if (change === "file-owner") files.set("/usr/bin/python3.13", item("file", 0o755, 1000));
+  if (change === "link-owner") files.set("/usr/bin/python3", item("symlink", 0o777, 1000));
+  if (change === "file-writable") files.set("/usr/bin/python3.13", item("file", 0o775));
+  if (change === "ancestor-writable") files.set("/usr", item("directory", 0o775));
+  if (change === "ancestor-owner") files.set("/usr/bin", item("directory", 0o755, 1000));
+  if (change === "non-executable") files.set("/usr/bin/python3.13", item("file", 0o644));
+  if (change === "cycle") target = "python3";
+  if (change === "unsafe-target") { target = "/tmp/python3"; files.set("/tmp", item("directory", 0o1777)); files.set("/tmp/python3", item("file")); }
+  return { platform: "linux", lstatImpl: async (path) => {
+    if (!files.has(path)) throw Object.assign(new Error("missing fixture path"), { code: "ENOENT" });
+    return files.get(path);
+  }, readlinkImpl: async () => target, accessImpl: async () => {
+    if (change === "access-denied") throw Object.assign(new Error("denied fixture access"), { code: "EACCES" });
+  } };
+}
+
+test("trusted interpreter selection validates every system path component and never falls back to PATH", async (t) => {
+  assert.equal(await trustedPythonInterpreter(interpreterFilesystem("valid")), "/usr/bin/python3.13");
+  for (const change of ["missing", "file-owner", "link-owner", "file-writable", "ancestor-writable", "ancestor-owner", "non-executable", "cycle", "unsafe-target", "access-denied"]) {
+    await t.test(change, async () => {
+      await assert.rejects(trustedPythonInterpreter(interpreterFilesystem(change)), /trusted system Python3 interpreter is unavailable/);
+    });
+  }
+  await assert.rejects(trustedPythonInterpreter({ platform: "unsupported" }), /trusted system Python3 interpreter is unavailable/);
+});
+
+test("supported CI platforms provide an absolute trusted interpreter with fcntl", { skip: !["linux", "darwin"].includes(process.platform) }, async () => {
+  const interpreter = await trustedPythonInterpreter();
+  assert.ok(interpreter.startsWith("/"));
+  const child = spawnSync(interpreter, ["-I", "-S", "-c", "import fcntl; print('system-lock-ready')"], { env: { LANG: "C" }, encoding: "utf8" });
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.stdout, "system-lock-ready\n");
+});
+
+test("a malicious python3 on inherited PATH is never selected", { skip: process.platform === "win32" }, () => {
+  const f = fixture();
+  try {
+    const fakeBin = join(f.root, "fake-bin");
+    mkdirSync(fakeBin);
+    const marker = join(f.root, "malicious-helper-ran");
+    const shim = join(fakeBin, "python3");
+    writeFileSync(shim, `#!/bin/sh\n: > '${marker.replace(/'/g, "'\\''")}'\nexit 93\n`, { mode: 0o755 });
+    const childFile = join(f.root, "fake-path.mjs");
+    writeFileSync(childFile, `
+      import { prepareCursorEnvironment } from ${JSON.stringify(pathToFileURL(join(ROOT, "scripts/cursor-cloud-bootstrap.mjs")).href)};
+      const env = ${JSON.stringify(f.env)};
+      let calls = 0;
+      const result = await prepareCursorEnvironment({env,homeDir:env.HOME,log:()=>{},fetchImpl:async(url)=>{
+        calls++;
+        if(String(url).includes('/api/v2/service-token'))return new Response(JSON.stringify({workspace:'cursor-project',scopes:[{environment:'prod',secretPath:'/cursor'}],permissions:['read'],expiresAt:null}));
+        return new Response(JSON.stringify({secrets:[{secretKey:'CURSOR_FIXTURE_KEY',secretValue:'fixture-value',workspace:'cursor-project',environment:'prod',secretPath:'/cursor',secretValueHidden:false}]}));
+      }});
+      if(result.state!=='written'||calls!==2)process.exit(92);
+    `);
+    const child = spawnSync(process.execPath, [childFile], { env: { HOME: f.homeDir, PATH: fakeBin, PYTHONPATH: fakeBin }, encoding: "utf8", timeout: 5000 });
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(existsSync(marker), false);
+  } finally { f.cleanup(); }
 });

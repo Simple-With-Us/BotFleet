@@ -591,6 +591,127 @@ final class FleetServicesTests: XCTestCase {
         XCTAssertFalse(commands.calls.contains("/bin/launchctl enable gui/501/app.botfleet.companion"))
     }
 
+    func testParkedCompanionActionsPreserveServerMarkerWithoutCallingLaunchd() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let contents = Data("owner-stop".utf8)
+        try contents.write(to: marker)
+        let commands = LaunchAgentCommands()
+        commands.listing = "PID\tStatus\tLabel\n1234\t0\tapp.botfleet.companion"
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil)
+        for action in [ManagedServiceAction.start, .restart] {
+            do {
+                _ = try await control.perform(action, serviceID: FleetServiceRegistry.companion.id, attempts: 0)
+                XCTFail("A companion-only action must not unpark the server")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("Start the BotFleet Server"))
+            }
+            XCTAssertEqual(try Data(contentsOf: marker), contents)
+            XCTAssertTrue(commands.calls.isEmpty)
+        }
+    }
+
+    func testUnparkedCompanionStartWaitsForObservedRunning() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let commands = LaunchAgentCommands()
+        commands.loaded = true
+        commands.listingAnswers = ["PID\tStatus\tLabel", "PID\tStatus\tLabel\n1234\t0\tapp.botfleet.companion"]
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil)
+        let state = try await control.perform(.start, serviceID: FleetServiceRegistry.companion.id, attempts: 1)
+        XCTAssertEqual(state, .running)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(commands.calls.contains("/bin/launchctl kickstart gui/501/app.botfleet.companion"))
+        XCTAssertEqual(commands.calls.filter { $0 == "/bin/launchctl list" }.count, 2)
+    }
+
+    func testFailedRestartOfUnparkedCompanionDoesNotCreateServerMarker() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let commands = LaunchAgentCommands()
+        commands.loaded = false
+        // Listing does not contain companion PID, so state(ofAgent:) remains stopped
+        commands.listing = "PID\tStatus\tLabel\n-\t0\tother.service"
+        let control = FleetServiceControl(
+            pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]),
+            mcpServer: nil)
+        let state = try await control.perform(.restart, serviceID: FleetServiceRegistry.companion.id, attempts: 2)
+        XCTAssertEqual(state, .stopped)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testUnparkedCompanionActionsReportActualStateWithoutCreatingMarker() async throws {
+        for action in [ManagedServiceAction.start, .restart] {
+            for expected in [ManagedServiceState.running, .stopped, .unknown] {
+                let home = try makeHome()
+                defer { try? FileManager.default.removeItem(at: home) }
+                let commands = LaunchAgentCommands()
+                commands.loaded = true
+                commands.listingFails = expected == .unknown
+                commands.listing = expected == .running
+                    ? "PID\tStatus\tLabel\n1234\t0\tapp.botfleet.companion" : "PID\tStatus\tLabel"
+                let control = FleetServiceControl(pm2: pm2(FleetServiceCommands()),
+                    startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]))
+                let observed = try await control.perform(action, serviceID: FleetServiceRegistry.companion.id, attempts: 0)
+                XCTAssertEqual(observed, expected)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/stopped.marker").path))
+                XCTAssertFalse(commands.calls.contains { $0.contains("app.botfleet.server") })
+            }
+        }
+    }
+
+    func testCompanionCommandFailureDoesNotInventFleetPark() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let commands = LaunchAgentCommands()
+        commands.enableFailure = StartupPolicyError.commandFailed
+        let control = FleetServiceControl(pm2: pm2(FleetServiceCommands()),
+            startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]))
+        for action in [ManagedServiceAction.start, .restart] {
+            do {
+                _ = try await control.perform(action, serviceID: FleetServiceRegistry.companion.id, attempts: 0)
+                XCTFail("A refused command cannot report success")
+            } catch { }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/stopped.marker").path))
+        }
+    }
+
+    func testExplicitServerStartRestoresParkOnlyForKnownNonrunningOutcome() async throws {
+        for expected in [ManagedServiceState.running, .stopped, .unknown] {
+            let home = try makeHome(serverInstalled: true)
+            defer { try? FileManager.default.removeItem(at: home) }
+            try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+            try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+            let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+            let contents = Data("owner-stop-observed".utf8)
+            try contents.write(to: marker)
+            let commands = LaunchAgentCommands()
+            commands.listingFails = expected == .unknown
+            commands.listing = expected == .running
+                ? "PID\tStatus\tLabel\n1234\t0\tapp.botfleet.server" : "PID\tStatus\tLabel"
+            let control = FleetServiceControl(pm2: pm2(FleetServiceCommands()),
+                startup: StartupPolicy(home: home, commands: commands, uid: 501, environment: [:]))
+            let observed = try await control.perform(.start, serviceID: FleetServiceRegistry.server.id, attempts: 0)
+            XCTAssertEqual(observed, expected)
+            XCTAssertEqual(FileManager.default.fileExists(atPath: marker.path), expected == .stopped)
+            if expected == .stopped { XCTAssertEqual(try Data(contentsOf: marker), contents) }
+        }
+    }
+
     func testAPrintThatFailedForAnotherReasonIsNotReadAsUnloaded() async throws {
         // Only "Could not find service" proves the job is gone.  A print that
         // failed with any other complaint, here a domain launchd would not
@@ -1320,6 +1441,7 @@ private final class LaunchAgentCommands: CommandRunning {
     var loaded = false
     /// True when launchctl cannot be asked at all.
     var listingFails = false
+    var listingAnswers: [String] = []
     /// The failure `launchctl bootout` raises, when it raises one.
     var bootoutFailure: Error?
     /// The failure `launchctl disable` raises, when it raises one.
@@ -1353,7 +1475,7 @@ private final class LaunchAgentCommands: CommandRunning {
         }
         if arguments == ["list"] {
             if listingFails { throw StartupPolicyError.commandFailed }
-            return listing
+            return listingAnswers.isEmpty ? listing : listingAnswers.removeFirst()
         }
         if arguments.first == "print" {
             if let printFailure { throw printFailure }
