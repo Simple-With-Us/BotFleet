@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer as createNetServer } from "node:net";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { PLACEMENT_WIRE_VERSION, type CapacitySample, type HostId } from "../shared/placement.ts";
@@ -312,5 +313,30 @@ describe("worker client reply handling", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("nodeHttpWorkerLink origins", () => {
+  it("opens TLS for an https origin, so an off-host controller is reachable", async () => {
+    // No certificate lives in the repository:  the first byte a TLS client
+    // sends is the handshake record type, which is all this needs to see.
+    const firstByte = new Promise<number>((resolve) => {
+      const listener = createNetServer((socket) => {
+        socket.once("data", (chunk) => {
+          resolve(chunk[0] ?? -1);
+          socket.destroy();
+          listener.close();
+        });
+      });
+      listener.listen(0, "127.0.0.1", () => {
+        const { port } = z.object({ port: z.number() }).parse(listener.address());
+        void nodeHttpWorkerLink()(`https://127.0.0.1:${port}/`, { method: "POST", body: "{}" }).catch(() => undefined);
+      });
+    });
+    expect(await firstByte).toBe(0x16);
+  });
+
+  it("refuses any other protocol", async () => {
+    await expect(nodeHttpWorkerLink()("ftp://127.0.0.1/", { method: "POST" })).rejects.toThrow(/only http and https/);
   });
 });

@@ -42,7 +42,9 @@ async function setup(link: typeof fetch) {
       req.on("end", () => { try { resolve(JSON.parse(Buffer.concat(parts).toString("utf8"))); } catch (error) { reject(error); } });
     }),
   });
-  server = createServer((req, res) => { void boundary(req, res); });
+  server = createServer((req, res) => {
+    void boundary(req, res).catch(() => { res.destroy(); });
+  });
   await new Promise<void>((resolve) => server?.listen(0, "127.0.0.1", resolve));
   const { port } = z.object({ port: z.number() }).parse(server.address());
   const client = new PlacementWorkerClient({ credential: { credentialId, secret }, workerHostId: workerId, audience: controllerId, controller: { controllerId, epoch: 0 }, baseUrl: `http://127.0.0.1:${port}/`, fetchImpl: link });

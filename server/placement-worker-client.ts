@@ -17,6 +17,7 @@
  *  that will.  This file alone cannot move a live job.
  */
 import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { z } from "zod";
 import {
   HOST_ID_PATTERN,
@@ -38,7 +39,7 @@ const WORKER_ROUTE = "/api/placement/worker/";
 const CREDENTIAL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CREDENTIAL_SECRET_PATTERN = /^[0-9a-f]{64}$/;
 
-/** A fetch-shaped link built on node:http, so a request carries exactly the
+/** A fetch-shaped link built on node:http and node:https, so a request carries exactly the
  *  headers the client names.  Node's fetch injects `sec-fetch-mode`, and the
  *  worker boundary refuses every `sec-*` header, so the standard fetch
  *  always draws a bare 403 before the credential is ever read.  This is
@@ -52,16 +53,18 @@ export function nodeHttpWorkerLink(): typeof fetch {
       reject(error instanceof Error ? error : new TypeError("the worker link URL is invalid"));
       return;
     }
-    if (target.protocol !== "http:") {
-      reject(new TypeError("the node:http worker link speaks only http origins"));
+    if (target.protocol !== "http:" && target.protocol !== "https:") {
+      reject(new TypeError("the worker link speaks only http and https origins"));
       return;
     }
+    // An off-host controller is https, as the client's constructor requires.
+    const send = target.protocol === "https:" ? httpsRequest : httpRequest;
     // The worker link's own contract: this client serializes its JSON body
     // itself, so the body reaches the link as the string it sent.
     const body = init?.body === undefined || init?.body === null ? undefined : String(init.body);
     const headers = new Headers(init?.headers);
     if (body !== undefined) headers.set("content-length", Buffer.byteLength(body).toString());
-    const req = httpRequest(
+    const req = send(
       {
         protocol: target.protocol,
         hostname: target.hostname,
