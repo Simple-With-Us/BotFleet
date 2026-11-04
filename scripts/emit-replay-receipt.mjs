@@ -37,10 +37,33 @@
 import { readFileSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
 import { evidenceRef, validateBundleRequest } from "./archive-node-store.mjs";
 
 export const REPLAY_RECEIPT_VERSION = 1;
 export const REPLAY_RECEIPT_FILE = "replay.receipt.json";
+
+/**
+ * The report's shape, as far as the receipt reads it.
+ *
+ * The report is the probe's own output and it is parsed at the boundary
+ * rather than narrowed as it is used:  the receipt needs the engine id and
+ * the verdict, and a report that does not carry them is refused here, where
+ * the reason can be said, instead of being read loosely and turned into an
+ * exit code.
+ */
+const ReplayReportSchema = z.looseObject({
+  version: z.literal(1),
+  requestedEngines: z.array(z.string()),
+  isFullyVerified: z.boolean(),
+  engines: z.array(z.looseObject({
+    engineId: z.string(),
+    isFullyVerified: z.boolean(),
+  })),
+});
+
+/** The provenance source has to be an https URL, because the receipt says where the run came from. */
+const ProvenanceSourceSchema = z.string().startsWith("https://");
 
 /**
  * Whether the report says the engine held.
@@ -51,11 +74,8 @@ export const REPLAY_RECEIPT_FILE = "replay.receipt.json";
  * engine nobody replayed.
  */
 export function replayVerdict(report, engineId) {
-  const engines = Array.isArray(report?.engines) ? report.engines : null;
-  if (!engines) return false;
-  const entry = engines.find((item) => item && item.engineId === engineId);
-  if (!entry || typeof entry.isFullyVerified !== "boolean") return false;
-  return entry.isFullyVerified === true;
+  const entry = report.engines.find((item) => item.engineId === engineId);
+  return entry !== undefined && entry.isFullyVerified;
 }
 
 /**
@@ -72,18 +92,14 @@ export function readReplayReport(reportPath) {
   } catch {
     throw new Error(`the replay report could not be read as JSON: ${reportPath}`);
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`the replay report is not a JSON object: ${reportPath}`);
+  const result = ReplayReportSchema.safeParse(parsed);
+  if (!result.success) {
+    const issues = result.error.issues
+      .map((issue) => `${issue.path.join(".") || "report"}: ${issue.message}`)
+      .join("; ");
+    throw new Error(`the replay report does not match the contract: ${issues}`);
   }
-  if (!Array.isArray(parsed.engines)) {
-    throw new Error(`the replay report has no \`engines\` list: ${reportPath}`);
-  }
-  for (const entry of parsed.engines) {
-    if (!entry || typeof entry.engineId !== "string" || typeof entry.isFullyVerified !== "boolean") {
-      throw new Error(`the replay report holds an engine entry that names no verdict: ${reportPath}`);
-    }
-  }
-  return parsed;
+  return result.data;
 }
 
 /**
@@ -111,7 +127,8 @@ export function emitReplayReceipt({ captureDir, request, provenance, reportPath 
   const capture = resolve(captureDir);
   assertPrivateCaptureDir(capture);
   const bundle = validateBundleRequest(request);
-  if (typeof provenance?.source !== "string" || !provenance.source.startsWith("https://")) {
+  const source = ProvenanceSourceSchema.safeParse(provenance?.source);
+  if (!source.success) {
     throw new Error("the provenance source must be an https URL");
   }
   const report = readReplayReport(reportPath);

@@ -130,13 +130,13 @@ test("a report that cannot be read is refused rather than turned into a verdict"
 test("a report with no engines list is refused", () => {
   const captureDir = mkdtempSync(join(tmpdir(), "replay-capture-"));
   writeFileSync(join(captureDir, "replay-parity.json"), JSON.stringify({ version: 1 }), { mode: 0o600 });
-  assert.throws(() => readReplayReport(join(captureDir, "replay-parity.json")), /no `engines` list/);
+  assert.throws(() => readReplayReport(join(captureDir, "replay-parity.json")), /does not match the contract/);
 });
 
 test("a report whose engine entry names no verdict is refused", () => {
   const captureDir = mkdtempSync(join(tmpdir(), "replay-capture-"));
   writeFileSync(join(captureDir, "replay-parity.json"), JSON.stringify({ version: 1, engines: [{ engineId: "claude" }] }), { mode: 0o600 });
-  assert.throws(() => readReplayReport(join(captureDir, "replay-parity.json")), /names no verdict/);
+  assert.throws(() => readReplayReport(join(captureDir, "replay-parity.json")), /does not match the contract/);
 });
 
 test("a capture directory other people can read is refused", () => {
