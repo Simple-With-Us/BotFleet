@@ -32,6 +32,8 @@ export class PlacementPayloadSpool implements PlacementPayloads {
   private readonly directory: string;
 
   constructor(dataDir: string, maxCount = JOB_RECORD_MAX) {
+    // The root may not exist yet, and canonicalizing a missing path throws.
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     const root = realpathSync(dataDir);
     const dir = join(root, "placement-payloads");
     mkdirSync(dir, { recursive: true, mode: 0o700 });

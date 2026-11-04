@@ -52,6 +52,12 @@ afterEach(() => {
 });
 
 describe.skipIf(process.platform === "win32")("transactional placement authority", () => {
+  it("creates a missing data root before canonicalizing it", () => {
+    const root = join(fixture(), "missing", "data");
+    expect(() => new PlacementPayloadSpool(root)).not.toThrow();
+    expect(statSync(join(root, "placement-payloads", "pending-commands")).mode & 0o777).toBe(0o700);
+  });
+
   it("reopens a symlinked data root with the same durable authority and private payload namespace", () => {
     const root = fixture();
     const actual = join(root, "actual");
