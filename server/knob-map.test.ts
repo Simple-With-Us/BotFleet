@@ -70,6 +70,14 @@ describe("headroom knobs (P-BF-6 B7)", () => {
 });
 
 describe("the knob table", () => {
+  it("resolves queue wait from the vault and strips it from file snapshots independently of run time", () => {
+    const cfg: AppConfig = { jobs: { maxMinutes: 30 } };
+    resolveKnobFields(cfg, new Map([["BOTFLEET_JOBS_QUEUE_WAIT_MINUTES", "20000"]]));
+    expect(cfg.jobs).toMatchObject({ maxMinutes: 30, queueWaitMinutes: 10080 });
+    expect(parseKnobValue(spec("jobs.queueWaitMinutes"), "0")).toBe(1);
+    expect(stripVaultManagedKnobs(cfg)).toContain("jobs.queueWaitMinutes");
+    expect(cfg.jobs?.queueWaitMinutes).toBeUndefined();
+  });
   it("has unique ids, paths and Infisical names", () => {
     const ids = KNOB_FIELDS.map((entry) => entry.id);
     const names = KNOB_FIELDS.map((entry) => entry.infisicalName);

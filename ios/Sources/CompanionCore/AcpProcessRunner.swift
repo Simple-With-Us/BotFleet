@@ -10,7 +10,7 @@ public enum AcpHarnessKind: String, Equatable, Sendable, Codable, CaseIterable {
         switch self {
         case .grok: return "grok"
         case .mcode: return "mcode"
-        case .muse: return "muse"
+        case .muse: return "muse-code-acp"
         }
     }
 
@@ -31,7 +31,7 @@ public enum AcpHarnessKind: String, Equatable, Sendable, Codable, CaseIterable {
         case .mcode:
             return ["acp"]
         case .muse:
-            return ["acp"]
+            return []
         }
     }
 }
@@ -48,6 +48,14 @@ public enum McodeModelSelection: Equatable, Sendable {
     /// The session advertises no `model` config option: the switch is skipped and the session keeps its own default.
     case unsupported
     /// The advertised wire value for the requested model, sent back verbatim.
+    case wireValue(String)
+}
+
+/// Outcome of matching a Muse picker model against the adapter's advertised `model` config option.
+public enum MuseModelSelection: Equatable, Sendable {
+    /// Muse keeps the account's startup model when no explicit selection was supplied.
+    case keepDefault
+    /// The adapter's provider/profile-qualified option value, sent back verbatim.
     case wireValue(String)
 }
 
@@ -133,7 +141,7 @@ public enum GrokAcpAuthMethod {
 }
 
 /// Pure-Swift JSON-RPC 2.0 ACP runner supporting Grok Build (`grok agent stdio`),
-/// MiniMax Code (`mcode acp`), and Muse (`muse acp`).
+/// MiniMax Code (`mcode acp`), and Muse (`muse-code-acp`).
 /// Enforces the double replay gate on `session/load`, round-trip config verification on
 /// `session/set_config_option`, and fail-closed permission handling on `session/request_permission`.
 public actor AcpProcessRunner: EngineQuietActivityReporting {
@@ -331,6 +339,24 @@ public actor AcpProcessRunner: EngineQuietActivityReporting {
                     }
                 }
 
+                if kind == .muse {
+                    let requestedConfigModel = input.configOptions["model"]
+                    switch try Self.resolveMuseModelSelection(
+                        requestedModel: input.modelId,
+                        requestedConfigModel: requestedConfigModel,
+                        sessionReply: sessionReply
+                    ) {
+                    case .keepDefault:
+                        break
+                    case .wireValue(let wireValue):
+                        try await coordinator.applyConfigOption(
+                            sessionId: sessionId,
+                            configId: "model",
+                            requestedValue: wireValue
+                        )
+                    }
+                }
+
                 if kind == .grok, let modelId = input.modelId, !modelId.isEmpty {
                     let models = sessionReply["models"] as? [String: Any]
                     let currentModelId = models?["currentModelId"] as? String
@@ -352,7 +378,7 @@ public actor AcpProcessRunner: EngineQuietActivityReporting {
 
                 // Apply any explicit `configOptions` passed on `TurnInput` (sorted by key for determinism).
                 for key in input.configOptions.keys.sorted() {
-                    if key == "permissionMode" || (kind == .grok && key == "effort") {
+                    if key == "permissionMode" || (kind == .grok && key == "effort") || (kind == .muse && key == "model") {
                         continue
                     }
                     if let val = input.configOptions[key] {
@@ -486,6 +512,108 @@ public actor AcpProcessRunner: EngineQuietActivityReporting {
             code: "unknown_model",
             message: "MiniMax Code does not offer \(requestedModel) for this login - available: \(names.isEmpty ? "none" : names)"
         )
+    }
+
+    /// Resolves a Muse picker id against the adapter's advertised `model` config option.
+    ///
+    /// Muse's ACP adapter exposes provider-qualified values as
+    /// `muse-model:<encodeURIComponent(JSON([providerId, profileId|null, modelId]))>`.  The native client must send that value back unchanged; it must never synthesize an
+    /// adapter value or send an unadvertised model id.  Named profiles are rejected by the
+    /// adapter itself on supported hosts, so only profile-free catalog entries are selectable.
+    /// A nil selection or the matrix's `muse-default` sentinel leaves the account startup model
+    /// unchanged when no config-only model was supplied.  If both model inputs are supplied, the
+    /// config-only value must resolve to the same advertised option as the selected model.
+    public static func resolveMuseModelSelection(
+        requestedModel: String?,
+        requestedConfigModel: String? = nil,
+        sessionReply: [String: Any]
+    ) throws -> MuseModelSelection {
+        let trimmedModel = requestedModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedModel = trimmedModel.flatMap { $0.isEmpty || $0 == "muse-default" ? nil : $0 }
+        let configOptions = sessionReply["configOptions"] as? [[String: Any]] ?? []
+        let modelOption = configOptions.first(where: { ($0["id"] as? String) == "model" })
+        let options = modelOption?["options"] as? [[String: Any]] ?? []
+        let explicitConfigModel = requestedConfigModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let configModel = explicitConfigModel.flatMap { $0.isEmpty ? nil : $0 }
+        let selectionModel = requestedModel ?? (configModel == "muse-default" ? nil : configModel)
+
+        guard let selectionModel else {
+            return .keepDefault
+        }
+
+        let exactWireRequest = selectionModel.hasPrefix("muse-model:")
+            ? MuseModelWireValue.parse(selectionModel)
+            : nil
+        let matches = options.compactMap { option -> (String, MuseModelWireValue)? in
+            guard let raw = option["value"] as? String else { return nil }
+            let decoded = MuseModelWireValue.parse(raw)
+                ?? (raw.hasPrefix("muse-model:") ? nil : MuseModelWireValue(providerId: "", profileId: nil, modelId: raw))
+            guard let decoded else { return nil }
+            if let exactWireRequest {
+                return decoded == exactWireRequest ? (raw, decoded) : nil
+            }
+            if selectionModel == raw || selectionModel == decoded.modelId {
+                return (raw, decoded)
+            }
+            return nil
+        }
+
+        guard matches.count == 1, let (wireValue, decoded) = matches.first,
+              decoded.profileId == nil else {
+            throw EngineDriverError.protocolError(
+                code: "unknown_model",
+                message: "Muse does not advertise one unambiguous selectable option for this model"
+            )
+        }
+        if requestedModel != nil, configModel == "muse-default" {
+            throw EngineDriverError.protocolError(
+                code: "model_config_mismatch",
+                message: "Muse model config conflicts with the selected model"
+            )
+        }
+        if let requestedModel, let configModel, configModel != wireValue {
+            let configMatches = options.compactMap { option -> String? in
+                guard let raw = option["value"] as? String else { return nil }
+                if raw == configModel { return raw }
+                return MuseModelWireValue.parse(raw)?.modelId == configModel ? raw : nil
+            }
+            guard configMatches.count == 1, configMatches[0] == wireValue else {
+                throw EngineDriverError.protocolError(
+                    code: "model_config_mismatch",
+                    message: "Muse model config conflicts with the selected model"
+                )
+            }
+        }
+        return .wireValue(wireValue)
+    }
+}
+
+/// Decoded Muse adapter model value.  The adapter's value is opaque at the ACP boundary,
+/// but its documented URI payload lets the client match the selected model without inventing IDs.
+public struct MuseModelWireValue: Equatable, Sendable {
+    public let providerId: String
+    public let profileId: String?
+    public let modelId: String
+
+    public static func parse(_ raw: String) -> MuseModelWireValue? {
+        guard raw.hasPrefix("muse-model:"),
+              let payload = String(raw.dropFirst("muse-model:".count)).removingPercentEncoding,
+              let data = payload.data(using: .utf8),
+              let values = try? JSONSerialization.jsonObject(with: data) as? [Any],
+              values.count == 3,
+              let providerId = values[0] as? String, !providerId.isEmpty,
+              let modelId = values[2] as? String, !modelId.isEmpty else {
+            return nil
+        }
+        let profileId: String?
+        if values[1] is NSNull {
+            profileId = nil
+        } else if let value = values[1] as? String {
+            profileId = value
+        } else {
+            return nil
+        }
+        return MuseModelWireValue(providerId: providerId, profileId: profileId, modelId: modelId)
     }
 }
 

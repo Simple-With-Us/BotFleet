@@ -2,13 +2,27 @@
 
 Date: Oct 30, 2026
 
-## Scope And Evidence
+## Nov 3 Status And Handoff
+
+PR [#1460](https://github.com/Simple-With-Us/BotFleet/pull/1460) (commit `644a3f29`) now injects `NativeMacCompanionRuntime` into the `MacSession` companion listener.  The graph supplies a database-backed registered-bot workspace source and a process-ownership source backed by `NativeHostProcessLedger`; the Oct 30 statements that MacSession injection and production workspace/process sources were absent are historical.  Its default `UnavailableMacExecutionContext` returns `.held(.credentialsUnavailable)`: the interactive composition still lacks safe registered native drivers, service credentials, and a bot-import path, so satisfied waits are not dispatched.  This is not a native engine cutover or live acceptance.
+
+PR [#1479](https://github.com/Simple-With-Us/BotFleet/pull/1479) (commit `f2f840fc`) adds `LocalNativeMCPMountProvider` through `NativeTurnToolsActor.localProduction()`, which `NativeHeadlessHost.start` uses by default.  MacSession's interactive runtime does not yet compose that tool actor; mount routes still require explicit per-bot configuration and a credential resolver for credential references.
+
+PR [#1476](https://github.com/Simple-With-Us/BotFleet/pull/1476) (commit `16cf18a8`) ports `NativeOwnFileReads` behind opt-in `NativeOwnFileReadPolicy` for ACP and Codex runners.  The source and tests exist, but no production composition currently passes a policy to those runners, so no own-file approval shortcut is active.  Fail-closed behavior remains the default; do not broaden the shortcut or infer guest-turn safety from the port.
+
+MC owns the remaining app-native bot-import, driver, and credential composition.  The original P-BF-6 task owns BF-2604, BF-2605, and BF-2606; AG owns BF-2515 and BF-2485 decommission; MM owns BF-2514.  These are existing handoff boundaries, not new claims.
+
+BF-2621 corrects two remaining native behaviors.  A healthy active peer on the exact engine/model now clears previously recorded transient capacity holds, while hard quotas and unrelated routes remain intact.  Muse now launches the installed `muse-code-acp` adapter with no arguments and applies exactly one advertised model option before prompting.  Default selection preserves the account's startup model; unavailable or ambiguous explicit choices fail before the prompt.  The recovery regression failed three effective-hold assertions before its fix, then all nine recovery tests passed; the combined recovery and Muse fixtures passed 15 tests.  These fixtures make no live model request.
+
+This update did not launch, install, or restart an app or service, and it makes no assertion about which runtimes are currently running.  No live acceptance or runtime cutover is claimed.
+
+## Oct 30 Scope And Evidence
 
 Compared OpenMausBot v0.1.129 through v0.1.134, released Oct 27–29, 2026, against the current BotFleet native Mac sources in the BF-2592 lane.  Reviewed all 15 required PRs and four nice-to-have PRs listed below; verified each merge commit through the upstream pull request records.  The full reference ledger is [`docs/upstream/PORTED.md`](../upstream/PORTED.md).
 
 Validation completed: `swift test --package-path ios --jobs 2` passed 256 tests in 23 suites; unsigned BotFleetMac and iOS builds passed; `pnpm typecheck`, `pnpm lint`, `pnpm broker:check`, 17 broker tests, and 23 cloudflared preparation tests passed.  The local full Node gate counted 12,220 tests: 12,157 passed, 37 failed and 26 skipped across six unchanged suites (plugin sandbox exits, subprocess stdin mocks, CLI lookup and Recall timeout).  Hosted Ubuntu/macOS Node jobs, Swift/performance/iOS build/simulator capture, lint and packaging gates subsequently passed on reviewed head `58322b54`.  PR [#1418](https://github.com/Simple-With-Us/BotFleet/pull/1418) merged as `a0b34c3ecd1da063dc2872740815c0ff40d1b68a`; the reviewed tree was verified in `origin/main`.  No live engine or app runtime was activated.
 
-## Required Upstream Changes
+## Oct 30 Required Upstream Changes
 
 | PR | Finding or behavior | Current native status |
 |---|---|---|
@@ -30,7 +44,7 @@ Validation completed: `swift test --package-path ios --jobs 2` passed 256 tests 
 
 The four nice-to-have references are [#3759](https://github.com/milind-soni/OpenMausBot/pull/3759) for Claude MCP tool search, [#3791](https://github.com/milind-soni/OpenMausBot/pull/3791) for own-file approval, [#3708](https://github.com/milind-soni/OpenMausBot/pull/3708) for serialized cloud-sync writes, and [#3710](https://github.com/milind-soni/OpenMausBot/pull/3710) for routine-save and stale-run handling.  Claude's private ToolSearch preference is implemented in `NativeClaudeToolSearch` and applied by the Claude runner; the Mac tests passed.  Own-file approval and cloud-sync writes are absent from the native stack.  Scheduler regression fixtures cover routine revision, shutdown, and stale webhook retry boundaries; the Mac tests passed.
 
-## Native Boundaries And Remaining Gaps
+## Oct 30 Native Boundaries Snapshot
 
 - `CodexAppServerRunner.swift`, `AcpProcessRunner.swift`, `ClaudeStreamRunner.swift`, `EngineDriver.swift`, and `EngineReplayHarness.swift` contain the native protocol work for Codex early-tool replay protection, Grok authentication/model selection, and Claude ToolSearch.  `EngineCoordinatorActor` prepares connected-app tools before dispatch and routes provider-limit/quiet outcomes through recovery.  Prepared MCP context on `TurnInput` is excluded from Codable wire encoding and remains trusted in-process state.  The Swift package tests and unsigned BotFleetMac build passed.
 - `NativeTurnTools.swift` provides identity-scoped catalog preparation, aliases, schema compaction, the combined tool cap, and local-only MCP mount serialization.  Coordinator wiring is present, but a production mount provider is still an injected interface.
@@ -47,6 +61,6 @@ The four nice-to-have references are [#3759](https://github.com/milind-soni/Open
 
 The official [cloudflared 2026.10.3 release](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.3) includes commit [`8bedf82b3c58024d41fe0f315595b613a8fa5af4`](https://github.com/cloudflare/cloudflared/commit/8bedf82b3c58024d41fe0f315595b613a8fa5af4), which changes the Debian container base image CA store.  The lane pins 2026.10.3 and verifies archive and executable hashes for packaged targets; all 23 preparation tests passed.  The upstream CA-store change does not establish that BotFleet's packaged macOS executable has the corresponding CA bundle fix.
 
-## Follow-Up
+## Oct 30 Follow-Up Snapshot
 
-BF-2592 in project P-BF-6 passed 256 Swift tests across 23 suites, unsigned BotFleetMac and iOS builds, Linux `pnpm typecheck`, `pnpm lint`, 23 cloudflared tests, and 17 Composio broker tests plus `broker:check`.  The local full Node gate counted 12,220 tests: 12,157 passed, 37 failed and 26 skipped across six unchanged suites (plugin sandbox exits, subprocess stdin mocks, CLI lookup and Recall timeout).  Hosted Ubuntu/macOS Node jobs, Swift/performance/iOS build/simulator capture, lint and packaging gates subsequently passed on reviewed head `58322b54`.  PR #1418 merged as `a0b34c3ecd1da063dc2872740815c0ff40d1b68a`; the reviewed tree was verified in `origin/main`.  `MacSession` remains on the HTTP-backed path; no live engine or app runtime was activated.  Re-scan upstream after v0.1.134 and record further ports only after comparison with the released behavior.
+BF-2592 in project P-BF-6 passed 256 Swift tests across 23 suites, unsigned BotFleetMac and iOS builds, Linux `pnpm typecheck`, `pnpm lint`, 23 cloudflared tests, and 17 Composio broker tests plus `broker:check`.  The local full Node gate counted 12,220 tests: 12,157 passed, 37 failed and 26 skipped across six unchanged suites (plugin sandbox exits, subprocess stdin mocks, CLI lookup and Recall timeout).  Hosted Ubuntu/macOS Node jobs, Swift/performance/iOS build/simulator capture, lint and packaging gates subsequently passed on reviewed head `58322b54`.  PR #1418 merged as `a0b34c3ecd1da063dc2872740815c0ff40d1b68a`; the reviewed tree was verified in `origin/main`.  `MacSession` remains on the HTTP-backed path; no live engine or app runtime was activated.  That Oct 30 request to re-scan after v0.1.134 was completed through v0.1.138 and is recorded in [`docs/upstream/PORTED.md`](../upstream/PORTED.md).
