@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { parse } from "yaml";
 import { runAudit } from "./infisical-ci-binding-audit.mjs";
 
 const tokenNames = [
@@ -15,7 +17,9 @@ const tokenNames = [
 
 function fixtureEnv(overrides = {}) {
   return {
-    GITHUB_REF: "refs/heads/codex/bf-2622-infisical-auth",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_REF: "refs/heads/main",
+    GITHUB_REF_PROTECTED: "true",
     GITHUB_SHA: "a".repeat(40),
     EXPECTED_HEAD_SHA: "a".repeat(40),
     INFISICAL_PROJECT_ID: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
@@ -247,7 +251,7 @@ test("native name-only observation stays unknown when any row provenance is not 
   assert.equal(native.nativeConfigNames.sparklePrivateKeyLiteralValuePresent, null);
 });
 
-test("branch and expected SHA are checked before any network call", async () => {
+test("expected SHA metadata is checked before any network call", async () => {
   let calls = 0;
   const logs = [];
   const result = await runAudit({
@@ -258,6 +262,36 @@ test("branch and expected SHA are checked before any network call", async () => 
   assert.equal(result.ok, false);
   assert.equal(calls, 0);
   assert.match(logs[0], /refused/);
+});
+
+test("untrusted dispatch contexts are rejected before project or token reads", async (t) => {
+  const cases = [
+    ["unprotected branch", { GITHUB_REF: "refs/heads/codex/untrusted", GITHUB_REF_PROTECTED: "false" }],
+    ["protected branch", { GITHUB_REF: "refs/heads/codex/untrusted" }],
+    ["unprotected main", { GITHUB_REF_PROTECTED: "false" }],
+    ["missing protection metadata", { GITHUB_REF_PROTECTED: undefined }],
+    ["noncanonical protection metadata", { GITHUB_REF_PROTECTED: "TRUE" }],
+    ["tag", { GITHUB_REF: "refs/tags/main" }],
+    ["pull request event", { GITHUB_EVENT_NAME: "pull_request" }],
+    ["mismatched expected SHA", { EXPECTED_HEAD_SHA: "b".repeat(40) }],
+    ["missing expected SHA", { EXPECTED_HEAD_SHA: undefined }],
+  ];
+  for (const [name, overrides] of cases) {
+    await t.test(name, async () => {
+      const env = fixtureEnv(overrides);
+      let reads = 0;
+      let calls = 0;
+      for (const key of ["INFISICAL_PROJECT_ID", ...tokenNames]) {
+        Object.defineProperty(env, key, { get() { reads++; throw new Error("binding must not be read"); } });
+      }
+      const result = await runAudit({ env, logger: () => {},
+        fetchImpl: async () => { calls++; throw new Error("network must not be called"); } });
+      assert.equal(result.ok, false);
+      assert.deepEqual(result.bindings, []);
+      assert.equal(reads, 0);
+      assert.equal(calls, 0);
+    });
+  }
 });
 
 test("invalid project locator is rejected before querying or being logged", async () => {
@@ -273,6 +307,29 @@ test("invalid project locator is rejected before querying or being logged", asyn
   assert.equal(result.ok, false);
   assert.ok(result.bindings.every((row) => row.reason === "project-binding-invalid"));
   assert.ok(!logs.join("\n").includes(invalidProject));
+});
+
+test("the actual dispatch validation shell rejects untrusted contexts before its next step", { skip: process.platform === "win32" }, () => {
+  const workflow = parse(readFileSync(new URL("../.github/workflows/mac-package-gate.yml", import.meta.url), "utf8"));
+  const validation = workflow.jobs["audit-infisical-bindings"].steps.find((step) =>
+    step.name === "Validate dispatch ref and expected commit before credential reads");
+  const cases = [
+    [true, {}],
+    [false, { REF: "refs/heads/codex/untrusted" }],
+    [false, { REF_PROTECTED: "false" }],
+    [false, { REF_PROTECTED: "" }],
+    [false, { EVENT_NAME: "pull_request" }],
+    [false, { EXPECTED_SHA: "b".repeat(40) }],
+    [false, { EXPECTED_SHA: "not-a-sha" }],
+  ];
+  for (const [allowed, overrides] of cases) {
+    const result = spawnSync("bash", ["-c", `${validation.run}\nprintf 'trusted-dispatch-ready\\n'`], {
+      encoding: "utf8", env: { EVENT_NAME: "workflow_dispatch", REF: "refs/heads/main",
+        REF_PROTECTED: "true", ACTUAL_SHA: "a".repeat(40), EXPECTED_SHA: "a".repeat(40), ...overrides },
+    });
+    assert.equal(result.status === 0, allowed, JSON.stringify(overrides));
+    assert.equal(result.stdout, allowed ? "trusted-dispatch-ready\n" : "");
+  }
 });
 
 test("workflow audit mode skips all normal package jobs without replacing their check names", () => {
@@ -295,7 +352,19 @@ test("workflow audit mode skips all normal package jobs without replacing their 
   assert.match(jobSection("package"), /'Audit-only: unsigned package skipped'/);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/);
   assert.match(workflow, /expected_head_sha/);
-  assert.match(workflow, /\[\[ "\$REF" == refs\/heads\/codex\/\* \]\]/);
+  assert.match(workflow, /\[\[ "\$REF" == refs\/heads\/main \]\]/);
+  assert.match(workflow, /\[\[ "\$REF_PROTECTED" == true \]\]/);
+  const audit = parse(workflow).jobs["audit-infisical-bindings"];
+  assert.equal(audit.if, "${{ github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true && github.ref == 'refs/heads/main' && github.ref_protected == true }}");
+  const checkouts = audit.steps.filter((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+  assert.equal(checkouts.length, 1);
+  assert.equal(checkouts[0].with.ref, "${{ github.sha }}");
+  assert.equal(checkouts[0].with["persist-credentials"], false);
+  const validation = audit.steps.find((step) => step.name === "Validate dispatch ref and expected commit before credential reads");
+  assert.equal(validation.env.REF_PROTECTED, "${{ github.ref_protected }}");
+  const execution = audit.steps.find((step) => step.run === "node scripts/infisical-ci-binding-audit.mjs");
+  assert.equal(execution.env.GITHUB_EVENT_NAME, "${{ github.event_name }}");
+  assert.equal(execution.env.GITHUB_REF_PROTECTED, "${{ github.ref_protected }}");
   assert.match(workflow, /format\('mac-package-audit-/);
   assert.match(workflow, /format\('mac-package-gate-/);
   assert.match(workflow, /node-version: 26/);

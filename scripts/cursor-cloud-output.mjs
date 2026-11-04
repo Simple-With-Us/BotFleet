@@ -1,9 +1,9 @@
 import { constants, realpathSync } from "node:fs";
-import { link, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir } from "node:fs/promises";
+import { access, link, lstat, mkdir, mkdtemp, open, readdir, readlink, rename, rm, rmdir } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const OWNER = "botfleet-cursor-bootstrap";
@@ -35,19 +35,80 @@ const matchesSerial = (record, expected) => record === null || expected === null
   record.dev === expected.dev && record.ino === expected.ino;
 const lockMarker = JSON.stringify({ owner: OWNER, version: 1 }) + "\n";
 
+const interpreterCandidates = {
+  linux: ["/usr/bin/python3"],
+  darwin: ["/usr/bin/python3", "/Library/Developer/CommandLineTools/usr/bin/python3"],
+};
+
+export async function trustedPythonInterpreter({
+  platform = process.platform, lstatImpl = lstat, readlinkImpl = readlink, accessImpl = access,
+} = {}) {
+  const inspect = async (path, seen = new Set()) => {
+    if (seen.size >= 32 || seen.has(path)) throw new Error("Interpreter symlink chain is invalid.");
+    seen.add(path);
+    const parts = path.split("/").filter(Boolean);
+    let current = "/";
+    for (let index = -1; index < parts.length; index++) {
+      if (index >= 0) current = join(current, parts[index]);
+      const info = await lstatImpl(current);
+      if (info.uid !== 0) throw new Error("Interpreter path is not system-owned.");
+      if (info.isSymbolicLink()) {
+        // Symlink permission bits do not control retargeting; checked parents do.
+        const target = resolve(dirname(current), await readlinkImpl(current), ...parts.slice(index + 1));
+        return inspect(target, seen);
+      }
+      if ((info.mode & 0o022) !== 0) throw new Error("Interpreter path is writable outside its owner.");
+      const last = index === parts.length - 1;
+      if (last ? !info.isFile() || (info.mode & 0o111) === 0 : !info.isDirectory()) throw new Error("Interpreter path has an invalid type or mode.");
+    }
+    await accessImpl(current, constants.X_OK);
+    return current;
+  };
+  for (const candidate of interpreterCandidates[platform] ?? []) {
+    try { return await inspect(candidate); }
+    catch { /* Try only the next fixed system candidate. */ }
+  }
+  throw new Error("A trusted system Python3 interpreter is unavailable.");
+}
+
+async function readLockSentinel(path, file) {
+  const info = await file.stat();
+  if (!info.isFile() || (info.mode & 0o777) !== 0o600 ||
+      (process.getuid && info.uid !== process.getuid()) ||
+      ![0, Buffer.byteLength(lockMarker)].includes(info.size)) throw new Error("Lock sentinel is not private and owned.");
+  const bytes = Buffer.alloc(Buffer.byteLength(lockMarker) + 1);
+  const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+  const content = bytes.subarray(0, bytesRead).toString("utf8");
+  if (content !== "" && content !== lockMarker) throw new Error("Unverified lock sentinel content.");
+  const named = await lstat(path);
+  if (!named.isFile() || named.isSymbolicLink() || named.dev !== info.dev || named.ino !== info.ino ||
+      named.uid !== info.uid || named.size !== info.size || (named.mode & 0o777) !== 0o600) throw new Error("Lock sentinel pathname changed.");
+  return { content, mode: info.mode & 0o777, uid: info.uid, dev: info.dev, ino: info.ino };
+}
+
+async function openLockSentinel(path, operations) {
+  let file;
+  let created = false;
+  try {
+    file = await open(path, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+    created = true;
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    file = await open(path, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0));
+  }
+  try {
+    if (created) await operations.onLockCreated?.();
+    const record = await readLockSentinel(path, file);
+    return { file, record };
+  } catch (error) { await file.close(); throw error; }
+}
+
 async function acquireOsLock(outputDir, waitMs, operations) {
+  const interpreter = await trustedPythonInterpreter();
   const path = join(outputDir, ".BotFleet.lock");
-  const temporary = join(outputDir, `.BotFleet.lock-new-${randomUUID()}`);
-  const staging = await open(temporary, "wx", 0o600);
-  try { await staging.writeFile(lockMarker); await staging.sync(); } finally { await staging.close(); }
-  try { await link(temporary, path); }
-  catch (error) { if (error.code !== "EEXIST") throw error; }
-  finally { await rm(temporary); }
-  const record = await readRecord(path);
-  if (!record || record.content !== lockMarker) throw new Error("Unverified lock file.");
-  const file = await open(path, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0));
-  const child = spawn("python3", ["-I", "-S", "-c", "import fcntl,sys; fcntl.flock(3,fcntl.LOCK_EX); print('LOCKED',flush=True); sys.stdin.buffer.read()"], {
-    stdio: ["pipe", "pipe", "pipe", file.fd], env: { PATH: process.env.PATH, LANG: "C" },
+  const { file, record } = await openLockSentinel(path, operations);
+  const child = spawn(interpreter, ["-I", "-S", "-c", "import fcntl,sys; fcntl.flock(3,fcntl.LOCK_EX); print('LOCKED',flush=True); sys.stdin.buffer.read()"], {
+    stdio: ["pipe", "pipe", "pipe", file.fd], env: { LANG: "C" },
   });
   let releasing = false;
   let lost = false;
@@ -71,7 +132,7 @@ async function acquireOsLock(outputDir, waitMs, operations) {
     });
     await operations.onLockAcquired?.(child.pid);
     assertHeld();
-    if (!sameRecord(await readRecord(path), record)) throw new Error("Output lock pathname changed.");
+    if (!sameRecord(await readLockSentinel(path, file), record)) throw new Error("Output lock pathname changed.");
     assertHeld();
     return { assertHeld, release: async () => {
       releasing = true;

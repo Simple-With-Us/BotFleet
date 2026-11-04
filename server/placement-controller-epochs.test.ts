@@ -1,18 +1,22 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PLACEMENT_WIRE_VERSION, type CapacitySample, type ControllerEpoch, type HostId, type ReleaseMessage, type TakeoverMessage } from "../shared/placement.ts";
+import { z } from "zod";
+import { HOST_ID_PATTERN, PLACEMENT_WIRE_VERSION, type CapacitySample, type ClaimMessage, type ControllerEpoch, type EnqueueMessage, type HeartbeatMessage, type HostId, type RegisterMessage, type ReleaseMessage, type ReportMessage, type StopMessage, type TakeoverMessage } from "../shared/placement.ts";
 import * as atomic from "./atomic.ts";
 import { loadControllerEpoch, openControllerEpochStore } from "./placement-identity.ts";
-import { PlacementLeaseService, placementLeaseRoute } from "./placement-leases.ts";
+import { PlacementLeaseService, placementLeaseRoute, type PlacementLeaseAction } from "./placement-leases.ts";
 import { spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 import { freePortBlock } from "./testing/ports.ts";
 import { fileURLToPath } from "node:url";
-import { z } from "zod";
-import { HOST_ID_PATTERN } from "../shared/placement.ts";
+import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
+import { commandDigest, openPlacementStore, placementFingerprint } from "./placement-store.ts";
+import { openRuntimeStore } from "./runtime/store.ts";
+import type { Assignment } from "./runtime/types.ts";
 
 const hostId: HostId = "server:11111111-1111-4111-8111-111111111111";
 const nextId: HostId = "mac:22222222-2222-4222-8222-222222222222";
@@ -33,7 +37,7 @@ function fixture() {
 }
 function service(dir: string) {
   const controllerStore = openControllerEpochStore(dir, hostId);
-  return new PlacementLeaseService({ hostId, controller: controllerStore.read(), controllerStore });
+  return new PlacementLeaseService({ volatileForTests: true, hostId, controller: controllerStore.read(), controllerStore });
 }
 afterEach(() => {
   vi.restoreAllMocks();
@@ -142,6 +146,7 @@ describe("durable controller transitions", () => {
     const dir = fixture();
     const store = openControllerEpochStore(dir, hostId);
     const leases = new PlacementLeaseService({
+      volatileForTests: true,
       hostId, controller: initial,
       controllerStore: {
         read: () => store.read(),
@@ -278,7 +283,7 @@ describe("durable controller transitions", () => {
         epoch: z.number().int().nonnegative().safe(),
       }).parse(await response.json());
     };
-    const transition = async (action: "release-controller" | "takeover", body: ReleaseMessage | TakeoverMessage) => {
+    const transition = async (action: PlacementLeaseAction, body: ReleaseMessage | TakeoverMessage | EnqueueMessage | RegisterMessage | HeartbeatMessage | ClaimMessage | StopMessage | ReportMessage) => {
       const response = await fetch(`${base}/api/placement/${action}`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
       });
@@ -286,20 +291,128 @@ describe("durable controller transitions", () => {
       return response.json();
     };
     try {
+      // Ordinary updates preserve the existing strict epoch/rollback contract.
       await boot();
-      const start = await identity();
-      expect(start.epoch).toBe(0);
-      const currentFence = { ...fence, controllerId: start.controllerId };
+      const legacy = await identity();
+      expect(loadControllerEpoch(dir, legacy.controllerId)).toEqual({ controllerId: legacy.controllerId, epoch: 0 });
+      expect(existsSync(join(dir, "placement.sqlite"))).toBe(false);
+      expect(existsSync(join(dir, "placement-payloads"))).toBe(false);
+      const currentFence = { ...fence, controllerId: legacy.controllerId };
       expect(await transition("release-controller", { ...currentFence, toControllerId: nextId })).toMatchObject({ accepted: true, epoch: 1 });
       expect(await identity()).toMatchObject({ controllerId: nextId, epoch: 1 });
       expect(await transition("takeover", { ...fence, epoch: 5, reconcile: true })).toMatchObject({ accepted: true, epoch: 5 });
       expect(await identity()).toMatchObject({ controllerId: hostId, epoch: 5 });
+      const legacyPath = join(dir, "placement-controller.json");
+      const regressed = JSON.stringify({ controllerId: nextId, epoch: 1 });
+      writeFileSync(legacyPath, regressed);
+      const unauthorized = await fetch(`${base}/api/placement/identity`, { headers: { "x-botfleet-companion": "1" } });
+      expect(unauthorized.status).toBe(403);
+      const failedIdentity = await fetch(`${base}/api/placement/identity`);
+      expect(failedIdentity.status).toBe(503);
+      expect(await failedIdentity.json()).toEqual({ error: "Controller epoch could not be verified; placement identity is unavailable" });
+      expect(readFileSync(legacyPath, "utf8")).toBe(regressed);
+      writeFileSync(legacyPath, JSON.stringify({ controllerId: hostId, epoch: 5 }));
+      expect(await identity()).toMatchObject({ controllerId: hostId, epoch: 5 });
       if (!child) throw new Error("fixture child missing");
       await waitForExit(child, { signal: "SIGTERM" });
+      const seeded = spawnSync(process.execPath, ["--input-type=module", "-e", `
+        import { Store } from ${JSON.stringify(fileURLToPath(new URL("./store.ts", import.meta.url)))};
+        import { closeMessageDb } from ${JSON.stringify(fileURLToPath(new URL("./message-db.ts", import.meta.url)))};
+        const store = new Store(() => ({ instanceId: "ghost", model: "fixture" }));
+        const bot = store.createBot();
+        const room = store.createGroup("Bridge Continuation", [bot.id]);
+        const card = store.appendMessage(room.threadId, { role: "bot", botId: bot.id, kind: "connector", connector: {
+          slug: "fixture", label: "Fixture", description: "Saved continuation", status: "connected", resumeKey: "bridge-resume", resumed: false,
+        } });
+        store.flushBotsNow(); closeMessageDb();
+        console.log(JSON.stringify({ botId: bot.id, threadId: room.threadId, cardId: card.id }));
+      `], { env: { HOME: home, USERPROFILE: home, PATH: process.env.PATH, TZ: "America/Chicago" }, encoding: "utf8" });
+      expect(seeded.status, seeded.stderr).toBe(0);
+      const continuation = z.object({ botId: z.string(), threadId: z.string(), cardId: z.string() }).parse(JSON.parse(seeded.stdout));
+      const pendingId = randomUUID();
+      const runtime = openRuntimeStore(join(dir, "runtime.db"));
+      const queued: Assignment = {
+        id: pendingId, rootId: pendingId, depth: 0,
+        origin: { kind: "person", source: "chat", ref: continuation.threadId },
+        requester: { kind: "person", threadId: continuation.threadId },
+        assignee: { botId: continuation.botId, destination: { kind: "standing_thread", threadId: continuation.threadId } },
+        mode: "work", reply: "none", brief: "Retained delegated fixture work",
+        status: "queued", level: "ask", levelSource: "own", executions: 0, restarts: 0,
+        createdAt: 1, lastActivityAt: 1, result: "", rework: false, version: 1,
+      };
+      runtime.insert(queued, { kind: "enqueued", at: 1 });
+      runtime.close();
+      // The fixture alone may prepare migration; the shipped bootstrap cannot.
+      const store = openPlacementStore(dir, legacy.controllerId);
+      store.transaction((state) => {
+        state.controller = { controllerId: nextId, epoch: 7 }; state.reconcile = true;
+        for (const [jobId, status] of [["held", "worker-unreachable"], ["settled", "completed"], ["released", "queued"]] as const) {
+          const metadata = { jobId, botId: "fixture-bot", threadId: "fixture-thread", cwd: dir, timeoutMs: 1000, payloadDigest: commandDigest("no executable payload exists") };
+          const job = { ...metadata, fingerprint: placementFingerprint(metadata), status, queuedAt: 1 };
+          if (status === "queued") {
+            state.jobs.push(job);
+            state.leases.push({ controllerId: hostId, epoch: 3, host: hostId, jobId, leaseId: "released-lease", state: "released", revocationId: "fixture-verified-never-started" });
+          } else {
+            const leaseId = `${jobId}-lease`;
+            const leased = { ...job, host: hostId, leaseId, ranAfterTakeover: true };
+            state.jobs.push(status === "completed" ? { ...leased, report: { status, exitCode: 0, signal: null, endedAt: 2 } } : leased);
+            state.leases.push({ controllerId: hostId, epoch: 3, host: hostId, jobId, leaseId, state: status === "completed" ? "settled" : "active" });
+            if (status === "worker-unreachable") state.pendingStops.push({ hostId, leaseId });
+          }
+        }
+      });
+      const before = store.readAll();
+      const resumePath = join(dir, "pending-update-resume.json");
+      const interruptedPath = join(dir, "interrupted-turns.json");
+      const resumeBytes = JSON.stringify({ interruptedRuns: [{ id: "preserve-me" }], interruptedBots: [] });
+      writeFileSync(resumePath, resumeBytes);
+      const interruptedBytes = JSON.stringify({ version: 1, recordedAt: 1, turns: [{ botId: "held-bot", threadId: "held-thread", at: 1, reason: "shutdown" }], failures: [] });
+      writeFileSync(interruptedPath, interruptedBytes);
       await boot();
-      expect(await identity()).toMatchObject({ controllerId: hostId, epoch: 5 });
-      expect(await transition("release-controller", { ...currentFence, toControllerId: nextId }))
-        .toMatchObject({ accepted: false, controllerId: hostId, epoch: 5 });
+      expect(await identity()).toMatchObject({ controllerId: nextId, epoch: 7 });
+      const delegated = new DatabaseSync(join(dir, "runtime.db"), { readOnly: true });
+      try {
+        const record = delegated.prepare("SELECT json FROM assignments WHERE id=?").get(pendingId);
+        expect(JSON.parse(String(record?.json))).toEqual(queued);
+      } finally { delegated.close(); }
+      const messages = new DatabaseSync(join(dir, "messages.db"), { readOnly: true });
+      try {
+        const readCard = () => String(messages.prepare("SELECT json FROM messages WHERE thread_id=? AND id=?").get(continuation.threadId, continuation.cardId)?.json);
+        const beforeCard = readCard();
+        expect(JSON.parse(beforeCard)).toMatchObject({ connector: { resumed: false } });
+        const response = await fetch(`${base}/api/bots/${continuation.botId}/connector-cards/${continuation.cardId}/status?threadId=${continuation.threadId}`);
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ connected: true, placementReadOnly: true });
+        expect(readCard()).toBe(beforeCard);
+      } finally { messages.close(); }
+      for (const action of ["register", "heartbeat", "claim", "dispatch", "stop", "release", "release-controller", "takeover", "enqueue", "report"]) {
+        const response = await fetch(`${base}/api/placement/${action}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...fence, controllerId: nextId, epoch: 7, hostId, leases: ["held-lease"], admission: { admit: true }, sample }) });
+        expect(response.status, action).toBe(503);
+      }
+      const denied = await fetch(`${base}/api/placement/heartbeat`, { method: "POST", headers: { "content-type": "application/json", "x-botfleet-companion": "1" }, body: "{}" });
+      expect(denied.status).toBe(403);
+      const owner = z.object({ nonce: z.string().regex(/^[a-f0-9]{64}$/) }).parse(JSON.parse(readFileSync(join(dir, "harness-owner.json"), "utf8")));
+      for (const method of ["POST", "DELETE"]) {
+        const response = await fetch(`${base}/api/runtime/quiesce?force=1`, { method, headers: { authorization: `Bearer ${owner.nonce}` } });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ placementReadOnly: true, quiescing: true });
+      }
+      expect((await fetch(`${base}/api/bots`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status).toBe(503);
+      expect((await fetch(`${base}/api/update/run`, { method: "POST", headers: { authorization: `Bearer ${owner.nonce}`, "content-type": "application/json" }, body: "{}" })).status).toBe(503);
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      expect(readFileSync(resumePath, "utf8")).toBe(resumeBytes);
+      expect(readFileSync(interruptedPath, "utf8")).toBe(interruptedBytes);
+      expect(store.readAll()).toEqual(before);
+      store.transactionScope({ active: true }, (state) => { state.controller = { controllerId: hostId, epoch: 9 }; });
+      expect(await identity()).toMatchObject({ controllerId: hostId, epoch: 9 });
+      const advanced = store.readAll();
+      await waitForExit(child, { signal: "SIGTERM" });
+      await boot();
+      expect(await identity()).toMatchObject({ controllerId: hostId, epoch: 9 });
+      expect(store.readAll()).toEqual(advanced);
+      expect(readFileSync(resumePath, "utf8")).toBe(resumeBytes);
+      expect(readFileSync(interruptedPath, "utf8")).toBe(interruptedBytes);
+      store.close();
     } finally {
       if (child) await waitForExit(child, { signal: "SIGTERM" });
     }

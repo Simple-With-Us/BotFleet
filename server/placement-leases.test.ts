@@ -32,6 +32,7 @@ function service(nowValue = 1_000) {
   return {
     now,
     leases: new PlacementLeaseService({
+      volatileForTests: true,
       hostId: controllerId,
       controller: { controllerId, epoch: 0 },
       now: () => now.value,
