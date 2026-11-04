@@ -315,6 +315,9 @@ test("the actual dispatch validation shell rejects untrusted contexts before its
     step.name === "Validate dispatch ref and expected commit before credential reads");
   const cases = [
     [true, {}],
+    [true, { EXPECTED_SHA: "A".repeat(40) }],
+    [true, { ACTUAL_SHA: "A".repeat(40) }],
+    [true, { ACTUAL_SHA: "aA".repeat(20), EXPECTED_SHA: "Aa".repeat(20) }],
     [false, { REF: "refs/heads/codex/untrusted" }],
     [false, { REF_PROTECTED: "false" }],
     [false, { REF_PROTECTED: "" }],
@@ -323,7 +326,7 @@ test("the actual dispatch validation shell rejects untrusted contexts before its
     [false, { EXPECTED_SHA: "not-a-sha" }],
   ];
   for (const [allowed, overrides] of cases) {
-    const result = spawnSync("bash", ["-c", `${validation.run}\nprintf 'trusted-dispatch-ready\\n'`], {
+    const result = spawnSync("bash", ["--noprofile", "--norc", "-p", "-c", `${validation.run}\nprintf 'trusted-dispatch-ready\\n'`], {
       encoding: "utf8", env: { EVENT_NAME: "workflow_dispatch", REF: "refs/heads/main",
         REF_PROTECTED: "true", ACTUAL_SHA: "a".repeat(40), EXPECTED_SHA: "a".repeat(40), ...overrides },
     });
@@ -373,4 +376,23 @@ test("workflow audit mode skips all normal package jobs without replacing their 
   assert.match(workflow, /^  workflow_dispatch:/m);
   assert.match(workflow, /^  pull_request:/m);
   assert.doesNotMatch(workflow, /secrets\.INFISICAL_VERCEL_CATCH_UP_READ_TOKEN/);
+});
+
+test("relative CLI entry refuses before network without protected dispatch", () => {
+  const result = spawnSync(process.execPath, ["scripts/infisical-ci-binding-audit.mjs"], {
+    encoding: "utf8", cwd: new URL("../", import.meta.url), env: {},
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /an exact protected-main dispatch is required/);
+});
+test("raw audit helper refuses redirect responses", async () => {
+  const { listSecretsRaw } = await import("./infisical-fetch.mjs");
+  let calls = 0;
+  await assert.rejects(listSecretsRaw({siteUrl: "https://app.infisical.com", token: "fixture-token", projectId: validMetadata().workspace, environment: "prod", secretPath: "/", fetchImpl: async (url, init) => {
+    assert.equal(init.redirect, "error");
+    calls++;
+    if (url.endsWith("/service-token")) return response(validMetadata());
+    throw new Error("redirect refused");
+  }}));
+  assert.equal(calls, 2);
 });

@@ -162,6 +162,7 @@ export async function listSecretsRaw({
   const res = await fetchImpl(`${baseUrl}/api/v3/secrets/raw?${qs.toString()}`, {
     method: "GET",
     headers: { authorization: `Bearer ${token}` },
+    redirect: "error",
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
