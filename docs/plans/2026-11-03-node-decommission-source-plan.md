@@ -57,7 +57,14 @@ BF-2515's three conditions are measured after the deletion, not before it, and t
 
 1. Land the three scripts and their tests.
 2. Stop the Mac harness, then run BF-2514's cutover and the 24-hour no-Node soak.  That is BF-2514's work, and it  produces the `soak-24h-no-node` evidence the deletion gate asks for.
-3. The authoritative pre-deletion gate, [scripts/check-decommission-gates.mjs](../../scripts/check-decommission-gates.mjs),  decides whether the deletion may happen.  It asks for the replacement issues to be Done (BF-2510, BF-2511, BF-2512,  BF-2513, BF-2503, BF-2504 and BF-2514), for the evidence to be asserted (`placement-evidence`, `soak-24h-no-node`,  `replay-parity`, `final-import-parity`, `inventory-clean`, `control-disposition` and `linux-server-preservation`), and for  the Mac no longer running the Node harness.
+3. The authoritative pre-deletion gate, [scripts/check-decommission-gates.mjs](../../scripts/check-decommission-gates.mjs),  decides whether the deletion may happen.  It asks for the replacement issues to be Done (BF-2510, BF-2511, BF-2512,  BF-2513, BF-2503, BF-2504 and BF-2514), for the evidence to be asserted (`placement-evidence`, `soak-24h-no-node`,  `replay-parity`, `final-import-parity`, `inventory-clean`, `control-disposition` and `linux-server-preservation`), and for  the Mac no longer running the Node harness.  It also requires the private final evidence bundle, so the issue states and the  evidence booleans alone cannot permit the deletion:
+
+   ```
+   node scripts/check-decommission-gates.mjs <state.json> --bundle <bundle.json> \
+     --source-sha <exact-source-sha> --build <exact-build> --artifact-sha256 <signed-artifact-sha256>
+   ```
+
+   The bundle binds every receipt to one candidate, hashes every artifact it cites,  and carries the owner's explicit acceptance, so a passing run proves the bindings are  consistent rather than that the evidence is true.  The runbook's Step 0 is the canonical command to copy.
 4. The owner deletes the retired roots and the desktop manifest.  That step is irreversible, and it is the owner's.
 5. Only now are the three conditions above measurable, and that is what the three scripts are for: the tree gate reads the  committed tree, the CI gate names the surviving Node desktop jobs, and the reboot check answers the process question  after a real reboot.
 
