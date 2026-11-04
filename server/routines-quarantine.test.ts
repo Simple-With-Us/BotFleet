@@ -22,9 +22,10 @@ function tempFile(): string {
   return join(dir, "routines.json");
 }
 
-const build = (file: string) =>
+const build = (file: string, passive = false) =>
   new RoutineManager({
     file,
+    passive,
     now: () => NOW,
     botState: () => "ready" as const,
     createTask: () => ({ threadId: "thread-1" }),
@@ -75,6 +76,51 @@ describe("RoutineManager with an unusable routines.json", () => {
       expect.objectContaining({ file: "routines.json", kind: "set-aside", setAsideAs: name, writesRefused: false, holdsCleanup: false }),
     ]);
     expect(error.mock.calls.map((call) => String(call[0])).join("\n")).toContain(name!);
+  });
+
+  it.each(["malformed", "partial"])("preserves all %s scheduler bytes and directory entries during passive loading", async (kind) => {
+    const file = tempFile();
+    const seeded = seed(file);
+    const parsed = JSON.parse(seeded);
+    parsed.routines.push(null);
+    const bytes = kind === "malformed" ? seeded.slice(0, 120) : JSON.stringify(parsed);
+    writeFileSync(file, bytes);
+    const dir = join(file, "..");
+    const entries = readdirSync(dir).sort();
+    const manager = build(file, true);
+    manager.start(); await manager.tick(); manager.flushNow(); manager.stop();
+    expect(readFileSync(file, "utf8")).toBe(bytes);
+    expect(readdirSync(dir).sort()).toEqual(entries);
+    expect(manager.listRoutines()).toHaveLength(kind === "partial" ? 2 : 0);
+    expect(listDataFaults()).toEqual([expect.objectContaining({
+      file: "routines.json", kind: kind === "partial" ? "partial" : "unreadable",
+      setAsideAs: null, writesRefused: true, omitted: kind === "partial" ? 1 : 0,
+    })]);
+  });
+
+  it("keeps passive scheduler state unchanged when direct mutators bypass HTTP", async () => {
+    const file = tempFile();
+    seed(file);
+    const active = build(file);
+    active.snoozeBot("bot-1"); active.flushNow();
+    const bytes = readFileSync(file);
+    const manager = build(file, true);
+    const routines = manager.listRoutines();
+    const runs = manager.listRuns();
+    expect(manager.isBotSnoozed("bot-1")).toBe(true);
+    expect(() => manager.create({ name: "Forbidden", prompt: "x", botId: "bot-1", schedule: { type: "daily", time: "09:00", weekdays: [1] } })).toThrow(/passive/);
+    expect(manager.update(routines[0]!.id, { name: "Changed" })).toBeNull();
+    expect(manager.remove(routines[0]!.id)).toBe(false);
+    expect(manager.runNow(routines[0]!.id)).toBeNull();
+    expect(() => manager.enqueueWebhook({ webhookId: "webhook", webhookName: "Webhook", prompt: "x", botId: "bot-1", runOn: "bot", deliveryId: "delivery", receivedAt: NOW })).toThrow(/passive/);
+    expect(await manager.cancelAllRunsForBot("bot-1")).toEqual([]);
+    expect(manager.requeueRun("old-run")).toBe(false);
+    manager.snoozeBot("bot-2"); manager.clearBotSnooze("bot-1"); manager.clearAllBotSnoozes(); manager.disableForBot("bot-1");
+    expect(manager.isBotSnoozed("bot-1")).toBe(true);
+    expect(manager.isBotSnoozed("bot-2")).toBe(false);
+    expect(manager.listRoutines()).toEqual(routines);
+    expect(manager.listRuns()).toEqual(runs);
+    expect(readFileSync(file)).toEqual(bytes);
   });
 
   it("saves new routines into a fresh file and leaves the set-aside file alone", () => {

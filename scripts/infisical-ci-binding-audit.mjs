@@ -283,8 +283,9 @@ export async function runAudit({ env = process.env, fetchImpl = fetch, logger = 
   const actualSha = String(env.GITHUB_SHA ?? "").toLowerCase();
   const expectedSha = String(env.EXPECTED_HEAD_SHA ?? "").toLowerCase();
   const ref = String(env.GITHUB_REF ?? "");
-  if (!/^refs\/heads\/codex\/[A-Za-z0-9._/-]+$/.test(ref) || !/^[0-9a-f]{40}$/.test(expectedSha) || actualSha !== expectedSha) {
-    logger("Infisical binding audit refused: expected SHA and CODEX branch ref must match.");
+  if (env.GITHUB_EVENT_NAME !== "workflow_dispatch" || ref !== "refs/heads/main" ||
+      String(env.GITHUB_REF_PROTECTED) !== "true" || !/^[0-9a-f]{40}$/.test(expectedSha) || actualSha !== expectedSha) {
+    logger("Infisical binding audit refused: an exact protected-main dispatch is required.");
     return { ok: false, bindings: [], vercel: "paused: dedicated binding pending" };
   }
   const projectId = String(env.INFISICAL_PROJECT_ID ?? "").trim();
