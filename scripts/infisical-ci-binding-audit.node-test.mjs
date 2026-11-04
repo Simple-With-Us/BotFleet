@@ -315,6 +315,9 @@ test("the actual dispatch validation shell rejects untrusted contexts before its
     step.name === "Validate dispatch ref and expected commit before credential reads");
   const cases = [
     [true, {}],
+    [true, { EXPECTED_SHA: "A".repeat(40) }],
+    [true, { ACTUAL_SHA: "A".repeat(40) }],
+    [true, { ACTUAL_SHA: "aA".repeat(20), EXPECTED_SHA: "Aa".repeat(20) }],
     [false, { REF: "refs/heads/codex/untrusted" }],
     [false, { REF_PROTECTED: "false" }],
     [false, { REF_PROTECTED: "" }],
@@ -323,7 +326,7 @@ test("the actual dispatch validation shell rejects untrusted contexts before its
     [false, { EXPECTED_SHA: "not-a-sha" }],
   ];
   for (const [allowed, overrides] of cases) {
-    const result = spawnSync("bash", ["-c", `${validation.run}\nprintf 'trusted-dispatch-ready\\n'`], {
+    const result = spawnSync("bash", ["--noprofile", "--norc", "-p", "-c", `${validation.run}\nprintf 'trusted-dispatch-ready\\n'`], {
       encoding: "utf8", env: { EVENT_NAME: "workflow_dispatch", REF: "refs/heads/main",
         REF_PROTECTED: "true", ACTUAL_SHA: "a".repeat(40), EXPECTED_SHA: "a".repeat(40), ...overrides },
     });
