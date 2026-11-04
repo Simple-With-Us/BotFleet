@@ -6,10 +6,14 @@ import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, re
 import { createServer } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const MAX_HEALTH_BYTES = 16_384;
 const HEALTH_WAIT_MS = 90_000;
 const PROCESS_STOP_MS = 10_000;
+const MAX_PORT_ATTEMPTS = 32;
+// The fixture stays inside the checkout that runs it, whichever lane that is.
+const OWNED_CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 export function assertIsolatedNetwork() {
   if (process.platform !== 'linux' || Object.keys(networkInterfaces()).some((name) => name !== 'lo')) {
@@ -80,14 +84,15 @@ function port() {
   });
 }
 
-async function distinctPorts() {
-  for (;;) {
-    const ports = [await port(), await port(), await port()];
+export async function distinctPorts(next = port, attempts = MAX_PORT_ATTEMPTS) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const ports = [await next(), await next(), await next()];
     if (new Set(ports).size === 3 && ports.every((value) => value > 1024 && value !== 8799)) return ports;
   }
+  throw new Error('Retained fixture could not find three distinct free ports');
 }
 
-async function boundedBody(response, maxBytes) {
+export async function boundedBody(response, maxBytes) {
   const reader = response.body?.getReader();
   if (!reader) throw new Error('Retained fixture response has no body');
   const parts = [];
@@ -97,7 +102,11 @@ async function boundedBody(response, maxBytes) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > maxBytes) throw new Error('Retained fixture response is oversized');
+      if (size > maxBytes) {
+        // Close the stream now, so the socket does not wait for garbage collection.
+        await reader.cancel().catch(() => undefined);
+        throw new Error('Retained fixture response is oversized');
+      }
       parts.push(value);
     }
   } finally { reader.releaseLock(); }
@@ -152,11 +161,23 @@ export async function stopOwnedProcess(child, {
   if (!await waitChild(child, timeoutMs)) throw new Error('Retained fixture child did not join');
 }
 
+// Try every process even after one refuses to stop.  A process that would not
+// stop stays listed, so the caller sees a failed cleanup instead of an orphan.
+export async function stopEveryOwnedProcess(commands, live, { stop = stopOwnedProcess, close = closeSync } = {}) {
+  for (const child of commands) {
+    try { await stop(child); commands.delete(child); } catch { /* Reported below. */ }
+  }
+  for (const [slot, state] of live) {
+    try { await stop(state.child); close(state.log); live.delete(slot); } catch { /* Reported below. */ }
+  }
+  return commands.size === 0 && live.size === 0;
+}
+
 export function createActualLinuxAdapters({ root, node, pnpm }) {
   assertIsolatedNetwork();
   const fixtureRoot = resolve(root);
-  if (!fixtureRoot.startsWith('/mnt/fleet-extra/apps/lanes/BotFleet/codex-bf-2633-linux-retained-closure-20261103/')) {
-    throw new Error('Actual retained fixture must stay in the owned BF-2633 lane');
+  if (!fixtureRoot.startsWith(`${OWNED_CHECKOUT}/`)) {
+    throw new Error('Actual retained fixture must stay inside the checkout that runs it');
   }
   privateDirectory(fixtureRoot);
   assertPrivateEnvironment(fixtureRoot);
@@ -303,12 +324,6 @@ export function createActualLinuxAdapters({ root, node, pnpm }) {
         }
       }
     },
-    cleanup: async () => {
-      for (const child of commands) {
-        await stopOwnedProcess(child);
-        commands.delete(child);
-      }
-      return { ok: commands.size === 0 };
-    },
+    cleanup: async () => ({ ok: await stopEveryOwnedProcess(commands, live) }),
   };
 }

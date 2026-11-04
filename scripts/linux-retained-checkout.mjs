@@ -19,6 +19,8 @@ export function filteredCheckoutCost(source, receipt) {
 
 /** Configure only a new fixture, after checkout; never smudge or fetch. */
 export async function materializeOfflineLfs({ repo, source, receipt, env }) {
+  // Nothing to clean, and git refuses the empty pathspec an empty list would send.
+  if (!receipt.files.some((file) => file.lfs)) return;
   const objects = join(repo, ".git/lfs/objects");
   const contract = {};
   for (const entry of receipt.files.filter((file) => file.lfs)) {

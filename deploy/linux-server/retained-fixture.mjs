@@ -10,12 +10,12 @@ import { createFilteredLinuxCheckout } from "../../scripts/linux-retained-checko
 export const FIXTURE_ACTIONS = ["installDependencies", "buildUi", "start", "health", "stop"];
 
 const portEvidence = z.number().int().min(1025).max(65535).refine((value) => value !== 8799).optional();
-const evidenceSchema = z.strictObject({
+export const evidenceSchema = z.strictObject({
   pid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
   httpPort: portEvidence, webhookPort: portEvidence, uiPort: portEvidence,
   uiHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   version: z.string().regex(/^[A-Za-z0-9.+_-]{1,128}$/).optional(),
-  executable: z.string().min(1).max(512).refine((value) => value.startsWith("/") && !/[\r\n\0]/.test(value)).optional(),
+  executable: z.string().min(1).max(512).refine((value) => value.startsWith("/") && !/[\r\n\0\u0085\u2028\u2029]/.test(value)).optional(),
   joined: z.boolean().optional(), sourceSha: z.string().regex(/^[0-9a-f]{40}$/).optional(),
 });
 

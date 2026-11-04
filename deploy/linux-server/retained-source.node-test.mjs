@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { collectLinuxClosure, discoverLinuxRetention, immutableGitSource, LINUX_ENTRY_POINTS, LINUX_REQUIRED_INPUTS, MAX_RETENTION_MANIFEST_BYTES, MissingLfsObjects, readPrivateRetentionReceipt, RETENTION_POLICY_PATH, sourceHash, verifyLinuxClosure, verifyRetainedWorkingTree } from "../../scripts/linux-retained-source.mjs";
+import { collectLinuxClosure, discoverLinuxRetention, immutableGitSource, LINUX_ENTRY_POINTS, LINUX_REQUIRED_INPUTS, MAX_RETENTION_MANIFEST_BYTES, MissingLfsObjects, pathSchema, readPrivateRetentionReceipt, RETENTION_POLICY_PATH, sourceHash, verifyLinuxClosure, verifyRetainedWorkingTree } from "../../scripts/linux-retained-source.mjs";
 import { exportLinuxClosure } from "../../scripts/collect-linux-retained-source.mjs";
 import { inspectGitFiles, MAC_LOCAL_ROOTS } from "../../scripts/check-post-reboot-node.mjs";
-import { linuxFixturePlan, runLinuxClosureFixture } from "./retained-fixture.mjs";
+import { evidenceSchema, linuxFixturePlan, runLinuxClosureFixture } from "./retained-fixture.mjs";
 import { waitForExit } from "../../server/testing/cleanup.ts";
 import { createFilteredLinuxCheckout, materializeOfflineLfs } from "../../scripts/linux-retained-checkout.mjs";
 
@@ -25,7 +25,8 @@ setTimeout(() => process.exit(0), 15000).unref();
 // A generated throwaway repository, never a fleet checkout or a production
 // receipt; it has no remote, credential, account or service configuration.
 async function fixture() {
-  const root = mkdtempSync(join(tmpdir(), "bf-linux-closure-"));
+  // macOS links its temp folder through /private, and the fixture refuses a linked root.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "bf-linux-closure-")));
   const source = join(root, "source");
   mkdirSync(source, { mode: 0o700 });
   const put = (path, content) => {
@@ -385,4 +386,18 @@ test("LFS closure refuses missing objects and binds/materializes offline content
     const status = spawnSync("git", ["-C", output, "status", "--porcelain", "--untracked-files=no"], { env: { PATH: process.env.PATH, HOME: join(output, ".git/fixture-home"), GIT_CONFIG_NOSYSTEM: "1", GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0", GIT_LFS_SKIP_SMUDGE: "1" }, encoding: "utf8" });
     assert.ok(status.status !== 0 || status.stdout.trim() !== "", "Git must refuse or report changed materialized bytes");
   } finally { f.close(); }
+});
+
+test("a receipt with no LFS files needs no offline clean and runs no git", async () => {
+  const receipt = { files: [{ path: "server/index.ts", blob: "a".repeat(40), mode: "100644", sha256: "b".repeat(64) }] };
+  await materializeOfflineLfs({ repo: "/nonexistent/bf-linux-closure", source: null, receipt, env: {} });
+});
+
+test("paths and evidence refuse Unicode line terminators", () => {
+  assert.equal(pathSchema.safeParse("server/index.ts").success, true);
+  assert.equal(evidenceSchema.safeParse({ executable: "/usr/bin/node" }).success, true);
+  for (const mark of ["\u0085", "\u2028", "\u2029"]) {
+    assert.equal(pathSchema.safeParse(`server/in${mark}dex.ts`).success, false);
+    assert.equal(evidenceSchema.safeParse({ executable: `/usr/bin/no${mark}de` }).success, false);
+  }
 });

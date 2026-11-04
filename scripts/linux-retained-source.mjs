@@ -17,7 +17,7 @@ const sourceSha = z.string().regex(/^[0-9a-f]{40}$/);
 const hash = z.string().regex(/^[0-9a-f]{64}$/);
 const policyPathSchema = z.string().regex(/^deploy\/linux-server\/retained-source(?:-[0-9a-f]{40})?\.json$/);
 // oxlint-disable-next-line eslint/no-control-regex -- Reject control bytes at the untrusted relative-path boundary.
-const pathSchema = text.refine((path) => !path.startsWith("/") && !/[\u0000-\u001f\\:]/.test(path) && path.split("/").every((part) => part !== "" && part !== "." && part !== ".."));
+export const pathSchema = text.refine((path) => !path.startsWith("/") && !/[\u0000-\u001f\u0085\u2028\u2029\\:]/.test(path) && path.split("/").every((part) => part !== "" && part !== "." && part !== ".."));
 const category = z.enum(["runtime", "ui-build", "install", "deploy", "runtime-asset", "verification"]);
 const entry = z.strictObject({ path: pathSchema, category, reason: text });
 export const RetentionPolicySchema = z.strictObject({
