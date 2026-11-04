@@ -1127,6 +1127,7 @@ describe("harness HTTP API", () => {
     const SLOW = { timeout: 30_000, interval: 250 };
     // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
     const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      activeWorkCount: number;
       quiescing: boolean;
       fencing: boolean;
       draining: boolean;
@@ -1155,12 +1156,14 @@ describe("harness HTTP API", () => {
 
       // A request still reading its body keeps the forced quiesce settling
       // (it waits up to 15 seconds for work in flight to clear).
+      const activeBeforeHeld = (await runtime()).activeWorkCount;
       heldMutation = request({
         hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
         headers: { "content-type": "application/json", "content-length": "2" },
       });
       heldMutation.on("error", () => {});
       heldMutation.write("{");
+      await expect.poll(async () => (await runtime()).activeWorkCount, SLOW).toBeGreaterThan(activeBeforeHeld);
       const forced = quiesce("POST", "?force=true");
       await expect.poll(async () => (await runtime()).fencing, SLOW).toBe(true);
 
