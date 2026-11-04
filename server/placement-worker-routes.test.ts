@@ -87,28 +87,29 @@ async function harness(service: PlacementLeaseService | null, hosts: readonly Ho
         res.on("end", () => resolve({ status: res.statusCode ?? 0, body: replySchema.parse(JSON.parse(Buffer.concat(parts).toString("utf8"))) }));
       });
       req.on("error", reject);
-      req.end(JSON.stringify({ authVersion: "1", hostId: envelopeHost, audience: controllerId, role: "execution-worker", message }));
+      req.end(JSON.stringify({ ...message, authVersion: "1", hostId: envelopeHost, audience: controllerId, role: "execution-worker" }));
     });
   };
   return { send };
 }
 
 const job = (jobId = "job-1", command = "printf 'fixture-payload'") => ({ ...fence, jobId, botId: "bot-a", threadId: "thread-a", cwd: "/fixture", timeoutMs: 60_000, command });
-const register = (hostId: HostId = workerId) => ({ ...fence, hostId, role: "worker", capabilities: ["shell"], sample });
-const heartbeat = (leases: string[] = [], hostId: HostId = workerId, admit = true) => ({ ...fence, hostId, leases, admission: { admit }, sample });
-const report = (leaseId: string, jobId = "job-1") => ({ ...fence, jobId, leaseId, hostId: workerId, status: "completed", exitCode: 0, signal: null, endedAt: 2000 });
+const register = () => ({ ...fence, capabilities: ["shell"], sample });
+const heartbeat = (leases: string[] = [], admit = true) => ({ ...fence, leases, admission: { admit }, sample });
+const report = (leaseId: string, jobId = "job-1") => ({ ...fence, jobId, leaseId, status: "completed", exitCode: 0, signal: null, endedAt: 2000 });
 async function enrolled(send: Awaited<ReturnType<typeof harness>>["send"], hostId: HostId = workerId) {
-  expect((await send("register", register(hostId), hostId)).body).toMatchObject({ accepted: true });
-  expect((await send("heartbeat", heartbeat([], hostId), hostId)).status).toBe(200);
+  expect((await send("register", register(), hostId)).body).toMatchObject({ accepted: true });
+  expect((await send("heartbeat", heartbeat(), hostId)).status).toBe(200);
 }
 const leaseIdOf = (body: Reply) =>z.object({ lease: z.object({ leaseId: z.string() }) }).parse(body).lease.leaseId;
 
 describe("placement worker routes", () => {
-  it("still answers 503 for a valid envelope when no transport is passed", async () => {
+  it("with no transport, answers exactly as production does", async () => {
     const { send } = await harness(null);
-    const answer = await send("register", register());
+    const answer = await send("register", {});
     expect(answer.status).toBe(503);
     expect(answer.body).toEqual({ error: "Worker transport is not active" });
+    expect((await send("register", register())).status).toBe(403);
   });
 
   it("runs one job from assignment to report", async () => {
@@ -192,7 +193,7 @@ describe("placement worker routes", () => {
     const { send } = await harness(service);
     service.enqueue(job());
     await send("register", register());
-    await send("heartbeat", heartbeat([], workerId, false));
+    await send("heartbeat", heartbeat([], false));
     expect((await send("assignment", fence)).body).toMatchObject({ accepted: false });
     expect(service.job("job-1")?.status).toBe("queued");
   });
@@ -221,25 +222,24 @@ describe("placement worker routes", () => {
     expect((await send("payload", { ...fence, jobId: "job-1", leaseId }, otherId)).body).toMatchObject({ accepted: false });
     expect(JSON.stringify((await send("payload", { ...fence, jobId: "job-1", leaseId }, otherId)).body)).not.toContain("fixture-payload");
     expect((await send("stop-receipt", { ...fence, jobId: "job-1", leaseId }, otherId)).body).toMatchObject({ accepted: false });
-    expect((await send("report", { ...report(leaseId), hostId: otherId }, otherId)).body).toMatchObject({ accepted: false });
+    expect((await send("report", report(leaseId), otherId)).body).toMatchObject({ accepted: false });
     expect(service.job("job-1")?.status).toBe("dispatching");
   });
 
-  it("refuses a body that names another host, and a worker claiming the controller role", async () => {
+  it("refuses an envelope naming another host, whatever the intent", async () => {
     const { service } = controller();
     const { send } = await harness(service);
-    expect((await send("register", register(otherId))).status).toBe(403);
-    expect((await send("register", { ...register(), role: "controller" })).status).toBe(403);
-    expect((await send("heartbeat", heartbeat([], otherId))).status).toBe(403);
-    expect((await send("report", { ...report("lease-x"), hostId: otherId })).status).toBe(403);
-    expect((await send("register", register(), workerId, otherId)).status).toBe(403);
+    for (const [intent, message] of [["register", register()], ["heartbeat", heartbeat()], ["assignment", fence], ["report", report("lease-x")]] as const) {
+      expect((await send(intent, message, workerId, otherId)).status, intent).toBe(403);
+    }
   });
 
-  it("does not let assignment or payload name a host at all", async () => {
+  it("registers a worker as a worker on the credential's own host", async () => {
     const { service } = controller();
     const { send } = await harness(service);
-    expect((await send("assignment", { ...fence, hostId: otherId })).status).toBe(400);
-    expect((await send("payload", { ...fence, hostId: otherId, jobId: "j", leaseId: "l" })).status).toBe(400);
+    await enrolled(send);
+    service.enqueue(job());
+    expect((await send("assignment", fence)).body).toMatchObject({ lease: { host: workerId } });
   });
 
   it("answers 400 for a malformed message", async () => {
