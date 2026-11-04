@@ -185,6 +185,40 @@ public final class StartupPolicy {
     private var enabled: URL { dataDirectory.appendingPathComponent("startup-enabled.marker") }
     private var session: URL { dataDirectory.appendingPathComponent("startup-session") }
     private var stopped: URL { dataDirectory.appendingPathComponent("stopped.marker") }
+    private static let maximumStopMarkerBytes = 64 * 1024
+
+    /// Preserve the exact owner marker, or refuse to unpark when it cannot be read safely.
+    private func readStopMarker() throws -> Data? {
+        var status = stat()
+        if lstat(stopped.path, &status) != 0 {
+            if errno == ENOENT { return nil }
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        guard (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              status.st_size >= 0, status.st_size <= Int64(Self.maximumStopMarkerBytes) else {
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        let descriptor = open(stopped.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else {
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        defer { close(descriptor) }
+        guard fstat(descriptor, &status) == 0,
+              (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              status.st_size >= 0, status.st_size <= Int64(Self.maximumStopMarkerBytes) else {
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        var contents = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
+            guard count >= 0, contents.count + count <= Self.maximumStopMarkerBytes else {
+                throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+            }
+            if count == 0 { return contents }
+            contents.append(contentsOf: buffer.prefix(count))
+        }
+    }
 
     /// The label of the BotFleet Server LaunchAgent.
     public static let serverAgentLabel = "app.botfleet.server"
@@ -249,19 +283,25 @@ public final class StartupPolicy {
     }
 
     public func startServer() throws {
+        _ = try startServerPreservingDeliberateStop()
+    }
+
+    /// Gives callers that observe startup a handle to restore a deliberate stop on known failure.
+    public func startServerPreservingDeliberateStop() throws -> DeliberateStop {
         guard supportsPolicy else { throw StartupPolicyError.updateRequired }
         guard files.fileExists(atPath: agent.path) else { throw StartupPolicyError.launchAgentMissing }
+        let markerContents = try readStopMarker()
         let boot = try bootID()
         try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         try Data((boot + "\n").utf8).write(to: session, options: .atomic)
-        let wasStopped = files.fileExists(atPath: stopped.path)
-        if wasStopped { try files.removeItem(at: stopped) }
+        if markerContents != nil { try files.removeItem(at: stopped) }
         do {
             try startAgent(label: StartupPolicy.serverAgentLabel)
         } catch {
-            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
+            if let markerContents { try? markerContents.write(to: stopped, options: .atomic) }
             throw error
         }
+        return DeliberateStop(marker: stopped, files: files, markerContents: markerContents)
     }
 
     /// Restarts the BotFleet Server.
@@ -278,60 +318,41 @@ public final class StartupPolicy {
     public func restartServer() throws -> DeliberateStop {
         guard supportsPolicy else { throw StartupPolicyError.updateRequired }
         guard files.fileExists(atPath: agent.path) else { throw StartupPolicyError.launchAgentMissing }
+        let markerContents = try readStopMarker()
         let boot = try bootID()
         try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         try Data((boot + "\n").utf8).write(to: session, options: .atomic)
-        let wasStopped = files.fileExists(atPath: stopped.path)
-        if wasStopped { try files.removeItem(at: stopped) }
+        if markerContents != nil { try files.removeItem(at: stopped) }
         do {
             try restartAgent(label: StartupPolicy.serverAgentLabel)
         } catch {
-            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
+            if let markerContents { try? markerContents.write(to: stopped, options: .atomic) }
             throw error
         }
-        return DeliberateStop(marker: stopped, files: files, wasStopped: wasStopped)
+        return DeliberateStop(marker: stopped, files: files, markerContents: markerContents)
     }
 
     /// Starts the BotFleet Companion LaunchAgent.
     ///
-    /// An explicit start of the companion is a deliberate start of the
-    /// fleet, so the deliberate-stop marker is cleared first: the companion's
-    /// start script stays down while that marker exists, and a start that
-    /// left it in place would report a companion that never came back.
-    /// The marker is put back when the start fails, so a refused start does
-    /// not lift a deliberate stop.
+    /// A companion-only action cannot lift the server's deliberate stop.
+    /// The explicit server start owns that shared marker.
     public func startCompanion() throws {
-        let wasStopped = files.fileExists(atPath: stopped.path)
-        if wasStopped { try files.removeItem(at: stopped) }
-        do {
-            try startAgent(label: StartupPolicy.companionAgentLabel)
-        } catch {
-            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
-            throw error
-        }
+        try requireFleetUnparked()
+        try startAgent(label: StartupPolicy.companionAgentLabel)
     }
 
     /// Restarts the BotFleet Companion LaunchAgent.
     ///
-    /// A restart asks for a fresh copy of the companion, so the deliberate-stop
-    /// marker is cleared first: the companion's start script stays down while that
-    /// marker exists, and a restart that left it in place would report a
-    /// companion that never came back.
-    ///
-    /// The returned handle puts the marker back when the restart does not
-    /// replace the companion, so a refused restart does not lift a
-    /// deliberate stop.
-    @discardableResult
-    public func restartCompanion() throws -> DeliberateStop {
-        let wasStopped = files.fileExists(atPath: stopped.path)
-        if wasStopped { try files.removeItem(at: stopped) }
-        do {
-            try restartAgent(label: StartupPolicy.companionAgentLabel)
-        } catch {
-            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
-            throw error
+    /// Replacing the companion also leaves the server's park state alone.
+    public func restartCompanion() throws {
+        try requireFleetUnparked()
+        try restartAgent(label: StartupPolicy.companionAgentLabel)
+    }
+
+    private func requireFleetUnparked() throws {
+        if files.fileExists(atPath: stopped.path) {
+            throw StartupPolicyError.refused("The fleet is deliberately stopped.\u{00A0} Start the BotFleet Server before starting or restarting the companion.")
         }
-        return DeliberateStop(marker: stopped, files: files, wasStopped: wasStopped)
     }
 
     /// What a restart of the BotFleet Server did to the deliberate-stop
@@ -344,23 +365,23 @@ public final class StartupPolicy {
     public struct DeliberateStop {
         private let marker: URL
         private let files: FileManager
-        private let wasStopped: Bool
+        private let markerContents: Data?
 
-        fileprivate init(marker: URL, files: FileManager, wasStopped: Bool) {
+        fileprivate init(marker: URL, files: FileManager, markerContents: Data?) {
             self.marker = marker
             self.files = files
-            self.wasStopped = wasStopped
+            self.markerContents = markerContents
         }
 
         /// True when the marker was there before the restart.
-        public var wasStoppedByOwner: Bool { wasStopped }
+        public var wasStoppedByOwner: Bool { markerContents != nil }
 
         /// Puts the deliberate-stop marker back, when it was there before.
         public func restore() {
-            guard wasStopped else { return }
+            guard let markerContents else { return }
             try? files.createDirectory(at: marker.deletingLastPathComponent(),
                                        withIntermediateDirectories: true)
-            try? Data().write(to: marker, options: .atomic)
+            try? markerContents.write(to: marker, options: .atomic)
         }
     }
 
