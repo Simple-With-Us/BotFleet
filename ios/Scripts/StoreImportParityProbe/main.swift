@@ -36,9 +36,12 @@ usage: StoreImportParityProbe --source <node-store-directory> --out <report.json
 
 /// A flag's value, or nil when the flag is absent.
 func flagValue(_ args: [String], _ flag: String) -> String? {
-    let index = args.firstIndex(of: flag)
-    guard index != nil, index! + 1 < args.count else { return nil }
-    return args[index! + 1]
+    guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return nil }
+    let value = args[index + 1]
+    // A flag with no value is a usage error, not a path that happens to be
+    // the next flag's name.
+    guard !value.hasPrefix("--") else { return nil }
+    return value
 }
 
 /// Run the import and write the report.
@@ -66,9 +69,41 @@ func run() async throws {
         ])
     }
 
+    // The target's parent has to exist before the database is opened, or a
+    // fresh --out directory fails instead of importing.  It is created
+    // owner-only, because the imported database and its journal siblings
+    // hold the message bodies the report names.
+    let outDirectory = out.deletingLastPathComponent()
+    let targetDirectory = URL(fileURLWithPath: targetPath).deletingLastPathComponent()
+    try FileManager.default.createDirectory(
+        at: outDirectory,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    try FileManager.default.createDirectory(
+        at: targetDirectory,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    // A directory that already existed does not get those permissions from
+    // the creation above, and it is the directory that holds the imported
+    // database and its journal siblings.
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: outDirectory.path)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: targetDirectory.path)
+
     let target = try DatabaseService(path: targetPath)
     let importer = StoreImporter(batchSize: 2_000)
     let report = try await importer.importStore(from: source, into: target)
+    // The imported database holds the same message bodies the report names,
+    // so it is owner-only like the report, and so are the journal siblings
+    // that hold the rows written since the last checkpoint.
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetPath)
+    for suffix in ["-wal", "-shm"] {
+        let sibling = targetPath + suffix
+        if FileManager.default.fileExists(atPath: sibling) {
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sibling)
+        }
+    }
 
     // The struct's own encoding, plus the two verdicts it computes but cannot
     // encode.  This is the whole point of the probe.
@@ -81,10 +116,6 @@ func run() async throws {
     object["isFullyVerified"] = report.isFullyVerified
 
     let bytes = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-    try FileManager.default.createDirectory(
-        at: out.deletingLastPathComponent(),
-        withIntermediateDirectories: true
-    )
     try bytes.write(to: out, options: [.atomic])
     // The report may hold message bodies, so it is owner-only.
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: out.path)

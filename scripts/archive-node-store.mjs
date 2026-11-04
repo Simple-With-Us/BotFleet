@@ -488,6 +488,20 @@ export function convertOutOfWalMode(path) {
 }
 
 /**
+ * Refuse a snapshot that is not in rollback-journal mode.
+ *
+ * A WAL snapshot cannot be read through a truly read-only connection without
+ * a `-shm` sibling, and the archive carries no siblings on purpose.  So a
+ * snapshot that stayed in WAL mode is a snapshot the importer cannot open,
+ * and it is refused here rather than sealed and shipped.
+ */
+export function assertRollbackJournalMode(journalMode, path) {
+  if (journalMode !== "delete") {
+    throw new Error(`the SQLite snapshot is still in journal mode "${journalMode}": ${path}`);
+  }
+}
+
+/**
  * Prove a SQLite file opens and answers a query.
  *
  * A file that cannot be opened is not evidence of anything, so the snapshot
@@ -525,10 +539,14 @@ async function captureFile(source, destination, storeRelativePath, { readOnly })
       database.close();
     }
     // The snapshot has to open on its own, with nothing beside it, so it is
-    // taken out of WAL mode and then opened and asked a question.
+    // taken out of WAL mode, the mode it ended up in is ENFORCED, and the
+    // sealed file is then opened and asked a question.  A snapshot that
+    // stayed in WAL mode is a database the read-only importer cannot open,
+    // so it is refused here rather than shipped.
     const journalMode = convertOutOfWalMode(destination);
-    assertOpensReadOnly(destination);
+    assertRollbackJournalMode(journalMode, destination);
     if (readOnly) chmodSync(destination, ARCHIVE_FILE_MODE);
+    assertOpensReadOnly(destination);
     const credentialMatches = countCredentialMatches(destination);
     return {
       path: storeRelativePath,

@@ -16,6 +16,7 @@ import test from "node:test";
 import {
   ARCHIVE_MARKER,
   MAX_PACKET_BYTES,
+  assertRollbackJournalMode,
   archiveStore,
   emitReceipts,
   exclusionReason,
@@ -388,6 +389,14 @@ test("the archived database opens read-only on its own, with nothing beside it",
   }
   const row = manifest.files.find((entry) => entry.path === "messages.db");
   assert.equal(row.journalMode, "delete", "the manifest says which journal mode the snapshot is in");
+});
+
+test("a snapshot that stayed in WAL mode is refused, not sealed", () => {
+  // The enforcement is the point:  a WAL snapshot is a database the read-only
+  // importer cannot open, so it must never be sealed and shipped.
+  assert.throws(() => assertRollbackJournalMode("wal", "/tmp/x.sqlite"), /journal mode "wal"/);
+  assert.throws(() => assertRollbackJournalMode("memory", "/tmp/x.sqlite"), /journal mode "memory"/);
+  assert.doesNotThrow(() => assertRollbackJournalMode("delete", "/tmp/x.sqlite"));
 });
 
 test("a credential inside the database is counted in the manifest, not hidden", { skip: ROOT_IS_ROOT }, async () => {
