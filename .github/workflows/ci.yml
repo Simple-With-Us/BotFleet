@@ -34,6 +34,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'push' || github.event_name == 'pull_request'
         with:
+          filter: blob:none
           fetch-depth: 0
           persist-credentials: false
       - name: Classify changed paths
@@ -124,6 +125,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.outputs.docs_only != 'true'
         with:
+          filter: blob:none
           # Full history: the effort ledger guard in the test chain compares the
           # ledger with `git merge-base origin/main HEAD`.  A depth-1 checkout
           # has no origin/main, so the guard used to skip itself here.
@@ -259,6 +261,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          filter: blob:none
           # Literal 0.  An expression like `&& 0 || 1` collapses to 1 because
           # GitHub treats 0 as false, and a depth-1 checkout does not contain
           # the pull request base commit the replay has to diff.
