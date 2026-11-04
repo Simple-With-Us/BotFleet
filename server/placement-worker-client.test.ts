@@ -323,7 +323,7 @@ describe("nodeHttpWorkerLink origins", () => {
     const firstByte = new Promise<number>((resolve) => {
       const listener = createNetServer((socket) => {
         socket.once("data", (chunk) => {
-          resolve(chunk[0] ?? -1);
+          resolve(Buffer.from(chunk)[0] ?? -1);
           socket.destroy();
           listener.close();
         });
