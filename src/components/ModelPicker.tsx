@@ -39,6 +39,7 @@ import { ProviderMark } from "./ProviderIcons";
 import { EngineQuotasPanel } from "./EngineQuotasPanel";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
 import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
+import { formatWindowPairLabel } from "@/lib/quota-display";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
 import { cn } from "@/lib/cn";
@@ -1195,7 +1196,7 @@ export function ModelPicker({
                               onClick={() => setShowAll(true)}
                               className="mt-1 flex w-full items-center justify-between rounded-lg border-t border-hairline/40 px-2.5 py-2 text-[12.5px] font-medium text-ink-secondary hover:bg-control/60 hover:text-ink"
                             >
-                              Show all {official.length} models{windowsLabel ? ` (${windowsLabel})` : ""} <ChevronDown size={13} />
+                              Show all {official.length} models{windowsLabel ? ` (${formatWindowPairLabel(windowsLabel)})` : ""} <ChevronDown size={13} />
                             </button>
                           )}
                           {!query && showAll && official.length > COMPACT_MODEL_COUNT && (
