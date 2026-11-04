@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -87,7 +87,7 @@ describe("the placement mode record", () => {
     const stale = store.apply(serverFirst);
     expect(stale.ok).toBe(false);
     expect(stale.ok ? "" : stale.reason).toMatch(/stale controller epoch 0/);
-    expect(stale.ok ? null : stale.controller).toEqual({ controllerId: otherController, epoch: 1 });
+    expect(stale.ok || stale.kind !== "stale-fence" ? null : stale.controller).toEqual({ controllerId: otherController, epoch: 1 });
     // The refused write changed nothing.
     expect(store.read().record.mode).toBe("serverFirst");
     expect(store.read().acknowledged).toBe(false);
@@ -134,12 +134,71 @@ describe("the placement mode record", () => {
     const noServer = store.apply({ ...serverFirst, serverId: null });
     expect(noServer.ok).toBe(false);
     expect(noServer.ok ? "" : noServer.reason).toMatch(/needs a server/);
+    expect(noServer.ok || noServer.kind !== "invalid-mode" ? "wrong" : "invalid-mode").toBe("invalid-mode");
     const otherServer = store.apply({ ...serverFirst, serverId: otherController });
     expect(otherServer.ok).toBe(false);
     expect(otherServer.ok ? "" : otherServer.reason).toMatch(/names server/);
     const localWithServer = store.apply({ mode: "localOnly", controllerId, epoch: 0, serverId: controllerId, allowOverflowToThisMac: false });
     expect(localWithServer.ok).toBe(false);
     expect(localWithServer.ok ? "" : localWithServer.reason).toMatch(/names no server/);
+  });
+
+  it("answers 400 for a mode that does not match its server, and carries no controller state", () => {
+    const { store } = fixture();
+    const response = placementModeWrite(owner, { ...serverFirst, serverId: null }, store);
+    expect(response.status).toBe(400);
+    expect(response.status === 400 ? response.body : null).toEqual({ error: expect.stringMatching(/needs a server/) });
+  });
+
+  it("reports a post-commit flush failure without reporting a failed write", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bf-placement-mode-"));
+    const epochStore = openControllerEpochStore(dir, controllerId);
+    const leases = new PlacementLeaseService({
+      hostId: controllerId,
+      controller: epochStore.read(),
+      controllerStore: epochStore,
+    });
+    const logged: string[] = [];
+    const jobsDir = join(dir, "jobs");
+    // Write and traverse, but no read:  the record can be written, and the
+    // directory cannot be opened for the flush that follows the commit.
+    mkdirSync(jobsDir, { recursive: true, mode: 0o300 });
+    const store = new PlacementModeStore(jobsDir, {
+      controller: () => leases.controller(),
+      hostId: controllerId,
+      now: () => 1_700_000_000_000,
+      log: (message) => logged.push(message),
+    });
+    const write = store.apply(serverFirst);
+    // The rename is the commit, so the record is written and the write is
+    // acknowledged, and the flush failure is reported instead of refused.
+    expect(write.ok).toBe(true);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatch(/directory flush failed/);
+    expect(store.read().acknowledged).toBe(true);
+    chmodSync(jobsDir, 0o700);
+  });
+
+  it("refuses a write that could not be committed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bf-placement-mode-"));
+    const epochStore = openControllerEpochStore(dir, controllerId);
+    const leases = new PlacementLeaseService({
+      hostId: controllerId,
+      controller: epochStore.read(),
+      controllerStore: epochStore,
+    });
+    const jobsDir = join(dir, "jobs");
+    // Read and traverse, but no write:  the record cannot be written at all.
+    mkdirSync(jobsDir, { recursive: true, mode: 0o500 });
+    const store = new PlacementModeStore(jobsDir, {
+      controller: () => leases.controller(),
+      hostId: controllerId,
+      now: () => 1_700_000_000_000,
+    });
+    const response = placementModeWrite(owner, serverFirst, store);
+    expect(response.status).toBe(503);
+    expect(response.status === 503 ? response.body : null).toMatchObject({ error: expect.stringMatching(/could not be written/) });
+    chmodSync(jobsDir, 0o700);
   });
 
   it("removes its temporary files", () => {

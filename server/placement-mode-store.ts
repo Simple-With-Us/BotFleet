@@ -80,9 +80,13 @@ export interface PlacementModeView {
   reason: string | null;
 }
 
+/** What a refused write refused on.  A stale fence and an invalid mode are
+ *  different answers:  the first is retried with the current controller pair,
+ *  and the second never succeeds on a retry, so the two are told apart. */
 export type PlacementModeWrite =
   | { ok: true; view: PlacementModeView }
-  | { ok: false; reason: string; controller: ControllerEpoch };
+  | { ok: false; kind: "stale-fence"; reason: string; controller: ControllerEpoch }
+  | { ok: false; kind: "invalid-mode"; reason: string };
 
 /** The mode record could not be read or written.  A failure never rewrites the
  *  record:  it is preserved for the owner to restore. */
@@ -95,6 +99,8 @@ export interface PlacementModeStoreDeps {
    *  system, so a record naming another server is refused. */
   hostId: HostId;
   now?: () => number;
+  /** Where a post-commit failure is reported. */
+  log?: (message: string) => void;
 }
 
 /** The durable mode record, fenced on the lease service's epoch. */
@@ -141,6 +147,11 @@ export class PlacementModeStore {
     return { record, appliedAt };
   }
 
+  /** Write the record.  The atomic rename is the commit:  after it the record
+   *  is on disk and every later read sees it, so a failure after the rename
+   *  must not report a failed write.  The directory flush that follows is
+   *  post-commit, and it is the same shape as the lease book's post-commit
+   *  cleanup:  a failure there is reported and the next write retries it. */
   private persist(record: PlacementModeRecord, appliedAt: number): void {
     const stored = { schema: 1 as const, ...record, appliedAt };
     try {
@@ -151,12 +162,21 @@ export class PlacementModeStore {
     }
     // Placement is unsupported on Windows, where directories cannot be fsynced.
     if (process.platform === "win32") return;
-    // Flush the atomic rename before the record is acknowledged.
-    const fd = openSync(this.dir, "r");
     try {
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+      // Flush the atomic rename, so the record survives a crash.
+      const fd = openSync(this.dir, "r");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // The record is already written, so refusing here would report a failed
+      // write for a write that happened.  It is logged instead, and the next
+      // write to this path flushes the directory again.  A record that a crash
+      // reverted reads as unacknowledged at the current fence, which is what a
+      // stale record is for.
+      this.deps.log?.("[placement] the mode record was written but its directory flush failed; the next write retries it");
     }
   }
 
@@ -196,13 +216,14 @@ export class PlacementModeStore {
     if (input.controllerId !== controller.controllerId || input.epoch !== controller.epoch) {
       return {
         ok: false,
+        kind: "stale-fence",
         reason: `stale controller epoch ${input.epoch}; the controller is ${controller.controllerId} at epoch ${controller.epoch}`,
         controller,
       };
     }
     const serverId = input.serverId ?? null;
     const refusal = this.modeRefusal(input.mode, serverId);
-    if (refusal) return { ok: false, reason: refusal, controller };
+    if (refusal) return { ok: false, kind: "invalid-mode", reason: refusal };
     const appliedAt = this.deps.now?.() ?? Date.now();
     this.persist(
       { mode: input.mode, controllerId: controller.controllerId, epoch: controller.epoch, serverId, allowOverflowToThisMac: input.allowOverflowToThisMac },
@@ -301,6 +322,12 @@ export function placementModeWrite(
   } catch {
     return { status: 503, body: { error: "The mode record could not be written; the placement mode is unavailable" } };
   }
-  if (!result.ok) return { status: 409, body: { error: result.reason, ...result.controller } };
+  if (!result.ok) {
+    // A stale fence is retried with the current pair, so it carries that pair
+    // back.  An invalid mode never succeeds on a retry, so it carries no
+    // controller state:  the body is wrong, and the pair would not fix it.
+    if (result.kind === "stale-fence") return { status: 409, body: { error: result.reason, ...result.controller } };
+    return { status: 400, body: { error: result.reason } };
+  }
   return { status: 200, body: modeBody(result.view) };
 }
