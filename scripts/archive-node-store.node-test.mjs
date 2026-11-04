@@ -15,6 +15,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   ARCHIVE_MARKER,
+  MAX_PACKET_BYTES,
   archiveStore,
   emitReceipts,
   exclusionReason,
@@ -24,6 +25,7 @@ import {
   restoredHealth,
   restoreArchive,
   sha256,
+  writeBoundedReport,
 } from "./archive-node-store.mjs";
 import { parseEvidenceReceipt } from "./decommission-evidence-bundle.mjs";
 
@@ -265,4 +267,122 @@ test("the manifest carries the archive marker and hashes every file it names", {
     const bytes = readFileSync(join(outDir, "tree", ...row.path.split("/")));
     assert.equal(sha256(bytes), row.sha256, `${row.path} hashes as the manifest says`);
   }
+});
+
+test("the redaction keeps a JSON document and an ndjson log parsable", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  // A value the harness had already masked, next to a live credential:  the
+  // shared redactor re-masks the first one, and a naive whole-text redaction
+  // takes the closing quote with it and the document stops parsing.
+  writeFileSync(join(store, "already-masked.json"), JSON.stringify({
+    note: `re-arm «redacted 11 chars»\n\nBut careful`,
+    key: TOKEN,
+  }));
+  writeFileSync(join(store, "already-masked.ndjson"),
+    `{"note":"re-arm «redacted 11 chars»\\n\\nBut careful","key":"${TOKEN}"}\n`);
+
+  const parent = privateScratch("capture-");
+  const { outDir } = await archiveStore({ storeRoot: store, outDir: join(parent, "capture") });
+
+  const document = JSON.parse(readFileSync(join(outDir, "tree", "already-masked.json"), "utf8"));
+  assert.ok(document.note.includes("«redacted 11 chars»"), "the already-masked value survives");
+  assert.ok(!document.note.includes(TOKEN), "the live credential does not");
+  assert.ok(!document.key.includes(TOKEN), "the credential field is masked");
+
+  const lines = readFileSync(join(outDir, "tree", "already-masked.ndjson"), "utf8").split("\n").filter((line) => line.trim());
+  for (const line of lines) JSON.parse(line);
+});
+
+test("a credential inside the database is counted in the manifest, not hidden", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const database = new DatabaseSync(join(store, "messages.db"));
+  database.exec("CREATE TABLE notes (body TEXT)");
+  database.prepare("INSERT INTO notes (body) VALUES (?)").run(`the key is ${TOKEN}`);
+  database.close();
+
+  const parent = privateScratch("capture-");
+  const { manifest, outDir } = await archiveStore({ storeRoot: store, outDir: join(parent, "capture") });
+  const row = manifest.files.find((entry) => entry.path === "messages.db");
+  assert.ok(row.credentialMatches > 0, "the manifest counts the credential shapes the snapshot holds");
+  const report = JSON.parse(readFileSync(join(outDir, "archive-report.json"), "utf8"));
+  assert.ok(report.credentialMatches > 0, "the report that travels counts them too");
+});
+
+test("a report that would not fit in the bundle is refused here", () => {
+  const parent = privateScratch("capture-");
+  const target = join(parent, "too-big.json");
+  assert.throws(() => writeBoundedReport(target, { blob: "x".repeat(MAX_PACKET_BYTES + 10) }), /over the/);
+  const ok = writeBoundedReport(target, { blob: "x".repeat(10) });
+  assert.ok(ok > 0);
+});
+
+test("the archive report binds the manifest by hash and stays inside the limit", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const { outDir } = await archiveStore({ storeRoot: store, outDir: join(parent, "capture") });
+  const report = JSON.parse(readFileSync(join(outDir, "archive-report.json"), "utf8"));
+  const manifestBytes = readFileSync(join(outDir, "manifest.json"));
+  assert.equal(report.manifestSha256, sha256(manifestBytes));
+  assert.equal(report.readOnlyProved, true);
+  assert.ok(statSync(join(outDir, "archive-report.json")).size <= MAX_PACKET_BYTES);
+});
+
+test("a failed rehearsal earns a failing exit code, not a passing one", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  const rehearsal = restoreArchive({ archiveDir: captureDir, intoDir: join(parent, "restored") });
+  const health = restoredHealth(join(parent, "restored"));
+  writeBoundedReport(join(captureDir, "restore-health.json"), health);
+  writeFileSync(join(captureDir, "provenance.txt"), "captured on the server by the MM seat\n", { mode: 0o600 });
+
+  // Break the archive after the rehearsal, so the report says the rehearsal
+  // failed and the receipt has to say so too.
+  const broken = { ...rehearsal, ok: false, mismatches: [{ path: "bots.json", reason: "archive-hash-mismatch" }] };
+  writeBoundedReport(join(captureDir, "restore-report.json"), broken);
+  writeBoundedReport(join(captureDir, "restore-health.json"), { ...health, ok: false });
+
+  emitReceipts({
+    captureDir,
+    request: makeRequest(),
+    provenance: {
+      by: "MM",
+      at: new Date().toISOString(),
+      source: "https://example.invalid/capture",
+      record: join(captureDir, "provenance.txt"),
+    },
+  });
+  const receipt = parseEvidenceReceipt("rollback", readFileSync(join(captureDir, "rollback.receipt.json")));
+  const codes = Object.fromEntries(receipt.data.checks.map((check) => [check.name, check.exitCode]));
+  assert.equal(codes["restore-rehearsal"], 1);
+  assert.equal(codes["restored-health"], 1);
+});
+
+test("a parity report that does not say it is verified earns a failing exit code", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  restoreArchive({ archiveDir: captureDir, intoDir: join(parent, "restored") });
+  const health = restoredHealth(join(parent, "restored"));
+  writeBoundedReport(join(captureDir, "restore-health.json"), health);
+  writeFileSync(join(captureDir, "provenance.txt"), "captured on the server by the MM seat\n", { mode: 0o600 });
+  writeFileSync(join(captureDir, "import-parity.json"), '{"isFullyVerified":false}\n', { mode: 0o600 });
+
+  emitReceipts({
+    captureDir,
+    request: makeRequest(),
+    provenance: {
+      by: "MM",
+      at: new Date().toISOString(),
+      source: "https://example.invalid/capture",
+      record: join(captureDir, "provenance.txt"),
+    },
+    parityReportPath: join(captureDir, "import-parity.json"),
+  });
+  const receipt = parseEvidenceReceipt("import", readFileSync(join(captureDir, "import.receipt.json")));
+  const codes = Object.fromEntries(receipt.data.checks.map((check) => [check.name, check.exitCode]));
+  assert.equal(codes["parity"], 1);
+  assert.equal(codes["read-only-archive"], 0);
 });

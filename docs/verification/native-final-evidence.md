@@ -50,7 +50,7 @@ POSIX ownership is required; hosts unable to prove it refuse the final check.
 
 Passing command results require the exact named checks exported in `REQUIRED_CHECKS`, exit code zero and a hashed artifact; a free-form success sentence cannot replace them.
 
-The `import` and `rollback` receipts have a producer: `scripts/archive-node-store.mjs` captures the Node store read-only, rehearses its restore and emits both receipts in the shape this bundle validates.   Two of their named checks still need an input the producer cannot make for itself: `parity` needs the importer's parity report, and `restored-health` is a statement about the restored data root rather than about a running harness.   The `replay` receipt has no producer at all, and the `placement` receipt's sixteen recipes are still unrun.
+The `import` and `rollback` receipts have a producer: `scripts/archive-node-store.mjs` captures the Node store read-only, rehearses its restore and emits both receipts in the shape this bundle validates.  Each exit code in those receipts is read out of the report it names, so a failed rehearsal earns a failing code and this bundle refuses it.  Two of their named checks still need an input the producer cannot make for itself: `parity` needs the importer's parity report, and `restored-health` is a statement about the restored data root rather than about a running harness.  The `replay` receipt has no producer at all, and the `placement` receipt's sixteen recipes are still unrun.
 
 The existing committed `placement-evidence.json` retains all sixteen false assertions; this work does not promote any recipe or live gate to passed.
 
