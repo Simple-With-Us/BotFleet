@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import "./retained-source.node-test.mjs";
 import test from "node:test";
 
 const directory = dirname(fileURLToPath(import.meta.url));
