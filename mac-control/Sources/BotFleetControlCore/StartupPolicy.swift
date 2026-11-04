@@ -282,12 +282,28 @@ public final class StartupPolicy {
         }
     }
 
-    public func startServer() throws {
-        _ = try startServerPreservingDeliberateStop()
+    /// Starts the BotFleet Server and waits to see whether it came up.
+    ///
+    /// A kickstart that succeeds does not prove the server is running, so a
+    /// deliberate stop goes back when the server is then seen not running.
+    /// An unknown state means launchctl could not be asked, so the marker is
+    /// not re-created on it.
+    @discardableResult
+    public func startServerAndSettle(attempts: Int = PM2Client.settleAttempts) async throws -> ManagedServiceState {
+        let deliberateStop = try startServer()
+        let observed = await ManagedServices.settle(to: .running, attempts: attempts, interval: 0.25) {
+            self.state(ofAgent: StartupPolicy.serverAgentLabel).managedState
+        }
+        if observed != .running && observed != .unknown { deliberateStop.restore() }
+        return observed
     }
 
-    /// Gives callers that observe startup a handle to restore a deliberate stop on known failure.
-    public func startServerPreservingDeliberateStop() throws -> DeliberateStop {
+    /// Starts the BotFleet Server.
+    ///
+    /// The returned handle puts back a deliberate stop this start cleared.
+    /// Callers that do not watch the result should use `startServerAndSettle`.
+    @discardableResult
+    public func startServer() throws -> DeliberateStop {
         guard supportsPolicy else { throw StartupPolicyError.updateRequired }
         guard files.fileExists(atPath: agent.path) else { throw StartupPolicyError.launchAgentMissing }
         let markerContents = try readStopMarker()

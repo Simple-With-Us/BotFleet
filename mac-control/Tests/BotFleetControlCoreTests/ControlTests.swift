@@ -431,6 +431,31 @@ final class ControlTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: marker), contents)
     }
 
+    func testSettledStartRestoresTheDeliberateStopWhenTheServerNeverRuns() async throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let contents = Data("owner-stop-settled".utf8)
+        try contents.write(to: marker)
+        // The kickstart succeeds, and the job never shows a process.
+        let runner = MockCommands()
+        let policy = StartupPolicy(home: home, commands: runner, uid: 501, environment: [:])
+        let stopped = try await policy.startServerAndSettle(attempts: 0)
+        XCTAssertNotEqual(stopped, .running)
+        XCTAssertTrue(runner.calls.contains("/bin/launchctl kickstart gui/501/app.botfleet.server"))
+        XCTAssertEqual(try Data(contentsOf: marker), contents)
+        // The same start that comes up leaves the stop lifted.
+        runner.launchctlListing = "PID\tStatus\tLabel\n1234\t0\tapp.botfleet.server"
+        let running = try await policy.startServerAndSettle(attempts: 0)
+        XCTAssertEqual(running, .running)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
     func testRestartServerClearsTheDeliberateStopAndReplacesTheRunningInstance() throws {
         // The installed wrapper stays down while the deliberate-stop marker
         // exists, so a restart that left the marker in place would report a

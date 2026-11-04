@@ -139,10 +139,7 @@ public final class FleetServiceControl {
                 // the installed wrapper and clears the deliberate-stop
                 // marker, so the server stays up afterwards.
                 if running {
-                    let deliberateStop = try startup.startServerPreservingDeliberateStop()
-                    let observed = await settleStartedAgent(label, attempts: attempts)
-                    if observed != .running && observed != .unknown { deliberateStop.restore() }
-                    return observed
+                    return try await startup.startServerAndSettle(attempts: attempts)
                 } else {
                     guard let stopServer else {
                         throw FleetServiceError.refused("The BotFleet Server has to stop itself, and the Control app could not ask it to.")
