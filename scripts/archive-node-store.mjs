@@ -720,15 +720,48 @@ export function restoreArchive({ archiveDir, intoDir, restoredAt = new Date().to
 }
 
 /**
- * The structural health of a restored store.  This is a statement about the
- * DATA: the database opens and passes SQLite's own integrity check, the JSON
- * stores parse, and the newline-delimited logs parse line by line.  It is
- * not a statement about a running harness.
+ * The structural health of a restored store.
+ *
+ * This is a statement about the RESTORE, not about the store:  a file that
+ * was already unparsable in the source is not a restore failure, and a file
+ * that parsed in the archive and does not parse in the restore is exactly a
+ * restore failure.  The archive is the reference, because the archive is
+ * what was restored.
+ *
+ * It is also not a statement about a running harness.  The database opens and
+ * passes SQLite's own integrity check, the JSON stores parse, and the
+ * newline-delimited logs parse line by line, and that is the whole of it.
  */
-export function restoredHealth(restoreDir) {
+export function restoredHealth(restoreDir, { referenceDir } = {}) {
   const root = resolve(restoreDir);
+  const reference = referenceDir ? resolve(referenceDir) : null;
   const checks = [];
   const record = (name, ok, detail) => checks.push({ name, ok, detail });
+
+  /** Whether a file's content parses as the kind of file it claims to be. */
+  const parses = (absolute, storeRelative) => {
+    if (storeRelative.endsWith(".json")) {
+      try {
+        JSON.parse(readFileSync(absolute, "utf8"));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    if (storeRelative.endsWith(".ndjson") || storeRelative.endsWith(".jsonl")) {
+      const text = readFileSync(absolute, "utf8");
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          JSON.parse(line);
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    }
+    return true;
+  };
 
   const databasePath = join(root, "messages.db");
   if (existsSync(databasePath)) {
@@ -754,26 +787,21 @@ export function restoredHealth(restoreDir) {
         continue;
       }
       if (!entry.isFile()) continue;
-      if (storeRelative.endsWith(".json")) {
-        try {
-          JSON.parse(readFileSync(absolute, "utf8"));
-          record(`json:${storeRelative}`, true, "parsed");
-        } catch (error) {
-          record(`json:${storeRelative}`, false, error.message);
-        }
-      } else if (storeRelative.endsWith(".ndjson") || storeRelative.endsWith(".jsonl")) {
-        const text = readFileSync(absolute, "utf8");
-        let broken = 0;
-        for (const line of text.split("\n")) {
-          if (!line.trim()) continue;
-          try {
-            JSON.parse(line);
-          } catch {
-            broken += 1;
-          }
-        }
-        record(`ndjson:${storeRelative}`, broken === 0, broken === 0 ? "parsed" : `${broken} unparsable lines`);
+      const isStructured = storeRelative.endsWith(".json") || storeRelative.endsWith(".ndjson") || storeRelative.endsWith(".jsonl");
+      if (!isStructured) continue;
+      const parsesHere = parses(absolute, storeRelative);
+      const parsesBefore = reference ? parses(join(reference, ...storeRelative.split("/")), storeRelative) : parsesHere;
+      if (!parsesHere && !parsesBefore) {
+        // The source was already unparsable, so the restore reproduced it
+        // faithfully.  That is a fact about the store, not a failed restore.
+        record(`${storeRelative.endsWith(".json") ? "json" : "ndjson"}:${storeRelative}`, true, "unparsable in the archive too");
+        continue;
       }
+      if (!parsesHere) {
+        record(`${storeRelative.endsWith(".json") ? "json" : "ndjson"}:${storeRelative}`, false, "parses in the archive and does not parse in the restore");
+        continue;
+      }
+      record(`${storeRelative.endsWith(".json") ? "json" : "ndjson"}:${storeRelative}`, true, "parsed");
     }
   };
   walk(root, "");
@@ -926,7 +954,7 @@ if (isEntry) {
       const intoDir = flagValue(args, "--into");
       if (!archiveDir || !intoDir) throw new Error("--archive <capture-directory> and --into <scratch-root> are required");
       const rehearsal = restoreArchive({ archiveDir, intoDir });
-      const health = restoredHealth(intoDir);
+      const health = restoredHealth(intoDir, { referenceDir: join(resolve(archiveDir), "tree") });
       writeBoundedReport(join(resolve(archiveDir), "restore-health.json"), health);
       console.log(JSON.stringify({
         restored: rehearsal.ok,

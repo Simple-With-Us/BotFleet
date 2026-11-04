@@ -257,6 +257,41 @@ test("exclusion and text decisions are made on names and shapes, not on contents
   assert.equal(looksTextual("blob.bin", Buffer.from([0, 1, 2])), false);
 });
 
+test("a file that was already unparsable in the source is not a restore failure", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  // A scratch file the store happens to hold empty, and a fixture that is
+  // deliberately not strict JSONL:  both are unparsable in the source, so a
+  // faithful restore reproduces them and the restore is still healthy.
+  writeFileSync(join(store, "scratch.json"), "");
+  writeFileSync(join(store, "weird.jsonl"), "not json at all\n{\"ok\":true}\n");
+
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  restoreArchive({ archiveDir: captureDir, intoDir: join(parent, "restored") });
+  const health = restoredHealth(join(parent, "restored"), { referenceDir: join(captureDir, "tree") });
+
+  assert.equal(health.ok, true, JSON.stringify(health.checks.filter((check) => !check.ok)));
+});
+
+test("a file that parses in the archive and not in the restore is a restore failure", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  restoreArchive({ archiveDir: captureDir, intoDir: join(parent, "restored") });
+
+  // Corrupt the RESTORED copy, leaving the archive alone.
+  chmodSync(join(parent, "restored", "bots.json"), 0o644);
+  writeFileSync(join(parent, "restored", "bots.json"), "{ this is not json");
+
+  const health = restoredHealth(join(parent, "restored"), { referenceDir: join(captureDir, "tree") });
+  assert.equal(health.ok, false);
+  const failure = health.checks.find((check) => !check.ok);
+  assert.equal(failure.name, "json:bots.json");
+  assert.match(failure.detail, /archive/);
+});
+
 test("the manifest carries the archive marker and hashes every file it names", { skip: ROOT_IS_ROOT }, async () => {
   const store = makeStore();
   const parent = privateScratch("capture-");
