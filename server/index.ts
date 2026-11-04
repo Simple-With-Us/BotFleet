@@ -333,6 +333,7 @@ import {
   startIdleLiveTranscriptSweeps,
   startOrphanTranscriptSweeps,
   startTranscriptRetentionSweeps,
+  startVolumeTranscriptSweeps,
   sweepTranscriptRetention,
   removeTranscriptLogs,
 } from "./transcript-retention.ts";
@@ -3134,6 +3135,21 @@ const stopOrphanTranscriptSweeps = startOrphanTranscriptSweeps(transcriptDirs, l
 // generations at the full cap forever.  The idle sweep trims one that has
 // been quiet, and skips a turn that is open right now.
 const stopIdleLiveTranscriptSweeps = startIdleLiveTranscriptSweeps(
+  transcriptDirs,
+  liveThreadIds,
+  inFlightThreadIds,
+  console.log,
+  {
+    dryRun: retentionDryRun,
+    hold: () => cleanupHoldReason(DATA_DIR),
+  },
+);
+// Data-volume budget (BF-2463): every transcript log together stays under
+// ~8.4 GB.  Boot run is deferred off the request path (the starter's initial
+// delay), then daily alongside the other retention timers.  What is still
+// over budget is reported through describeVolumeSweep, never taken from
+// live data.  No per-file cap or admission change here.
+const stopVolumeTranscriptSweeps = startVolumeTranscriptSweeps(
   transcriptDirs,
   liveThreadIds,
   inFlightThreadIds,
@@ -20712,6 +20728,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     stopTranscriptSweeps();
     stopOrphanTranscriptSweeps();
     stopIdleLiveTranscriptSweeps();
+    stopVolumeTranscriptSweeps();
     // A flush that throws (disk full, data dir gone) must not skip the rest
     // of shutdown — above all bus.flush() below — so each one is guarded.
     const flushOnShutdown = (label: string, flush: () => void) => {
