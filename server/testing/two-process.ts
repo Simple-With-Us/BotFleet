@@ -40,12 +40,26 @@ export async function startFixtureChild(spec: FixtureChildSpec): Promise<Fixture
     if (child.exitCode === null && child.signalCode === null) await waitForExit(child, { signal: "SIGTERM" });
   };
   const deadline = Date.now() + (spec.timeoutMs ?? 30_000);
+  // A probe that hangs must not outlive the deadline, and a child must not
+  // outlive a probe that throws:  both would leave its ports and files held.
+  const probe = async (): Promise<boolean> => {
+    let timer: NodeJS.Timeout | undefined;
+    const expiry = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now())); });
+    try { return await Promise.race([spec.ready(), expiry]); } finally { clearTimeout(timer); }
+  };
   for (;;) {
     if (child.exitCode !== null || child.signalCode !== null) {
       throw new Error(`${spec.label} exited before it was ready: ${stderr}`);
     }
-    if (await spec.ready()) break;
-    if (Date.now() > deadline) {
+    let ready: boolean;
+    try {
+      ready = await probe();
+    } catch (error) {
+      await stop();
+      throw error;
+    }
+    if (ready) break;
+    if (Date.now() >= deadline) {
       await stop();
       throw new Error(`${spec.label} was not ready in time: ${stderr}`);
     }
@@ -73,8 +87,12 @@ export async function startFixturePair(specs: { controller: FixtureChildSpec; wo
   return {
     controller, worker,
     stop: async () => {
-      await worker.stop();
-      await controller.stop();
+      // The controller stops even when stopping the worker fails.
+      try {
+        await worker.stop();
+      } finally {
+        await controller.stop();
+      }
     },
   };
 }
@@ -83,7 +101,9 @@ export async function startFixturePair(specs: { controller: FixtureChildSpec; wo
 export function nonceRuns(directory: string, nonce: string): number[] {
   const prefix = `${nonce}.`;
   return readdirSync(directory)
-    .filter((name) => name.startsWith(prefix) && name.endsWith(".run"))
-    .map((name) => Number(name.slice(prefix.length, -".run".length)))
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => /^([1-9]\d*)\.[0-9a-f-]{36}\.run$/.exec(name.slice(prefix.length)))
+    .filter((match): match is RegExpExecArray => match !== null)
+    .map((match) => Number(match[1]))
     .sort((a, b) => a - b);
 }

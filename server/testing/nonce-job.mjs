@@ -3,9 +3,10 @@
 //
 // Usage: node nonce-job.mjs <directory> <nonce> [holdMilliseconds]
 //
-// Every run creates its own `<nonce>.<pid>.run` file before doing anything
-// else.  One run leaves one file and two runs leave two, however either of
-// them ended.
+// Every run creates its own `<nonce>.<pid>.<uuid>.run` file before doing
+// anything else.  One run leaves one file and two runs leave two, however either
+// of them ended, and the uuid keeps a reused pid from colliding.
+import { randomUUID } from "node:crypto";
 import { closeSync, constants, openSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
@@ -14,7 +15,7 @@ if (!directory || !nonce || !/^[A-Za-z0-9_-]+$/.test(nonce)) {
   console.error("usage: nonce-job.mjs <directory> <nonce> [holdMilliseconds]");
   process.exit(2);
 }
-const fd = openSync(join(directory, `${nonce}.${process.pid}.run`), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+const fd = openSync(join(directory, `${nonce}.${process.pid}.${randomUUID()}.run`), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
 writeSync(fd, `${process.pid}\n`);
 closeSync(fd);
 const holdMs = Number(hold);

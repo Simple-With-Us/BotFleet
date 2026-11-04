@@ -8,7 +8,7 @@
 import { createServer, request, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 
-/** One request the proxy accepted, whatever became of it. */
+/** One request the proxy read in full, whatever became of it. */
 export interface ProxiedExchange {
   method: string;
   path: string;
@@ -43,17 +43,20 @@ export interface FaultProxy {
 
 const MAX_BODY_BYTES = 1024 * 1024;
 
-function readBody(req: IncomingMessage): Promise<Buffer | null> {
-  return new Promise((resolve, reject) => {
+/** The whole body, "too-large" past the limit, or "aborted" when the connection went first. */
+function readBody(req: IncomingMessage): Promise<Buffer | "too-large" | "aborted"> {
+  return new Promise((resolve) => {
     const parts: Buffer[] = [];
     let total = 0;
     req.on("data", (part: Buffer) => {
       total += part.length;
-      if (total > MAX_BODY_BYTES) { resolve(null); return; }
+      if (total > MAX_BODY_BYTES) { parts.length = 0; resolve("too-large"); return; }
       parts.push(part);
     });
     req.on("end", () => resolve(Buffer.concat(parts)));
-    req.on("error", reject);
+    // A cut connection fires close with no end, and a promise settles only once.
+    req.on("error", () => resolve("aborted"));
+    req.on("close", () => resolve("aborted"));
   });
 }
 
@@ -81,7 +84,12 @@ export async function startFaultProxy(options: { targetPort: number; targetHost?
         },
         (res) => {
           const parts: Buffer[] = [];
-          res.on("data", (part: Buffer) => parts.push(part));
+          let total = 0;
+          res.on("data", (part: Buffer) => {
+            total += part.length;
+            if (total > MAX_BODY_BYTES) { res.destroy(new Error("upstream answer is too large")); return; }
+            parts.push(part);
+          });
           res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(parts) }));
           res.on("error", reject);
         },
@@ -92,7 +100,8 @@ export async function startFaultProxy(options: { targetPort: number; targetHost?
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const body = await readBody(req);
-    if (body === null) { res.writeHead(413).end(); return; }
+    if (body === "aborted") return;
+    if (body === "too-large") { res.writeHead(413, { connection: "close" }).end(); return; }
     const exchange: ProxiedExchange = {
       method: req.method ?? "GET", path: req.url ?? "/", headers: req.headers, body, upstreamStatus: null, fault: null,
     };
@@ -133,7 +142,7 @@ export async function startFaultProxy(options: { targetPort: number; targetHost?
   return {
     // SAFETY: address() on a server listening on TCP is an AddressInfo, never a string or null.
     port: (server.address() as AddressInfo).port,
-    exchanges: () => exchanges,
+    exchanges: () => [...exchanges],
     dropNext: (phase, matches = () => true) => { armed.push({ phase, matches }); },
     cutConnections,
     setRefusing: (value) => { refusing = value; },
