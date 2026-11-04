@@ -64,7 +64,7 @@ BF-2515's three conditions are measured after the deletion, not before it, and t
      --source-sha <exact-source-sha> --build <exact-build> --artifact-sha256 <signed-artifact-sha256>
    ```
 
-   The bundle binds every receipt to one candidate, hashes every artifact it cites,  and carries the owner's explicit acceptance, so a passing run proves the bindings are  consistent rather than that the evidence is true.  The runbook's Step 0 is the command to copy, and it is the only place the four flags  are spelled out.
+   The bundle binds every receipt to one candidate, hashes every artifact it cites,  and carries the owner's explicit acceptance, so a passing run proves the bindings are  consistent rather than that the evidence is true.  The runbook's Step 0 is the canonical command to copy.
 4. The owner deletes the retired roots and the desktop manifest.  That step is irreversible, and it is the owner's.
 5. Only now are the three conditions above measurable, and that is what the three scripts are for: the tree gate reads the  committed tree, the CI gate names the surviving Node desktop jobs, and the reboot check answers the process question  after a real reboot.
 
