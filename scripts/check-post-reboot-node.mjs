@@ -19,6 +19,7 @@ import { execFileSync } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readPrivateRetentionReceipt, verifyRetainedWorkingTree } from "./linux-retained-source.mjs";
 
 export const BOTFLEET_PORTS = [8799, 8800, 8810, 8811];
 export const BOTFLEET_AGENTS = [
@@ -27,7 +28,7 @@ export const BOTFLEET_AGENTS = [
   "com.jay.botfleet-server",
   "com.jay.botfleet-companion",
 ];
-export const MAC_LOCAL_ROOTS = ["server", "companion", "electron"];
+export const MAC_LOCAL_ROOTS = ["server", "companion", "shared", "electron"];
 // Note: deploy/linux-server/ is retained for Linux hosting and is outside MAC_LOCAL_ROOTS.
 export const RETAINED_EXCEPTIONS = [];
 
@@ -305,11 +306,12 @@ export function inspectPortListeners(lsofOutput, watchedPorts = BOTFLEET_PORTS) 
 export function inspectGitFiles(filesList, roots = MAC_LOCAL_ROOTS, exceptions = RETAINED_EXCEPTIONS) {
   if (!Array.isArray(filesList)) return [];
   const lingering = [];
+  const approved = new Set(exceptions);
 
   for (const file of filesList) {
     const matchesRoot = roots.some((root) => file === root || file.startsWith(`${root}/`));
     if (!matchesRoot) continue;
-    const isException = exceptions.some((exc) => file === exc || file.startsWith(`${exc}/`));
+    const isException = approved.has(file);
     if (!isException) {
       lingering.push(file);
     }
@@ -384,6 +386,12 @@ if (isEntryModule()) {
   const args = process.argv.slice(2);
   const jsonMode = args.includes("--json");
   const checkGit = args.includes("--check-git");
+  const retainedIndex = args.indexOf("--retained-manifest");
+  const retainedManifest = retainedIndex === -1 ? null : args[retainedIndex + 1];
+  if (retainedIndex !== -1 && (!checkGit || !retainedManifest || retainedManifest.startsWith("--"))) {
+    console.error("--retained-manifest requires --check-git and a private exact-source receipt");
+    process.exit(2);
+  }
 
   const probeErrors = [];
   let psOut = "";
@@ -409,14 +417,19 @@ if (isEntryModule()) {
   }
 
   let gitTracked = [];
+  let retainedFiles = [];
   if (checkGit) {
     try {
       const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-      const out = execFileSync("git", ["-C", repoRoot, "ls-files", "--", ...MAC_LOCAL_ROOTS], {
+      const out = execFileSync("git", ["-C", repoRoot, "ls-files", "--cached", "--others", "--exclude-standard", "--", ...MAC_LOCAL_ROOTS], {
         encoding: "utf8",
         timeout: 30_000,
       });
       gitTracked = out.split("\n").filter(Boolean);
+      if (retainedManifest) {
+        const head = execFileSync("git", ["-C", repoRoot, "rev-parse", "HEAD"], { encoding: "utf8", timeout: 30_000 }).trim();
+        retainedFiles = [...await verifyRetainedWorkingTree(repoRoot, readPrivateRetentionReceipt(retainedManifest), head)];
+      }
     } catch (error) {
       probeErrors.push(`git ls-files probe failed: ${error.message}`);
       console.error("warning: unable to read git ls-files:", error.message);
@@ -426,7 +439,7 @@ if (isEntryModule()) {
   const processes = inspectProcesses(psOut);
   const launchAgents = inspectLaunchAgents(BOTFLEET_AGENTS, realLaunchctlProbe, probeErrors);
   const portListeners = inspectPortListeners(lsofOut, BOTFLEET_PORTS);
-  const gitFiles = checkGit ? inspectGitFiles(gitTracked) : [];
+  const gitFiles = checkGit ? inspectGitFiles(gitTracked, MAC_LOCAL_ROOTS, retainedFiles) : [];
 
   const verdict = evaluatePostReboot({ processes, launchAgents, portListeners, gitFiles, probeErrors });
 
