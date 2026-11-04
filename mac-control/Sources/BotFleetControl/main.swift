@@ -1069,7 +1069,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // The server is wanted running, so wait for its process to appear
         // before the managed services decide what the MCP server should be doing.
         run(settlesWhen: [.running, .notInstalled]) { [self] in
-            try await Task.detached(priority: .userInitiated) { try self.startup.startServer() }.value
+            _ = try await Task.detached(priority: .userInitiated) { try await self.startup.startServerAndSettle() }.value
         }
     }
 

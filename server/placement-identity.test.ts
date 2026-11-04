@@ -44,7 +44,7 @@ describe("controller epoch persistence", () => {
 describe("placement identity route boundary", () => {
   it("serves the PlacementIdentity shape with defaults to the local owner", () => {
     const controller = loadControllerEpoch(fixture(), hostId);
-    const response = placementIdentityResponse(owner, { hostId, controller, platform: "linux" });
+    const response = placementIdentityResponse(owner, { hostId, controller: () => controller, platform: "linux" });
     expect(response).toEqual({
       status: 200,
       body: {
@@ -60,17 +60,17 @@ describe("placement identity route boundary", () => {
 
   it("reports the same platform capabilities as host resources and the stored fence", () => {
     const controller = { controllerId: otherHostId, epoch: 3 };
-    const mac = placementIdentityResponse(owner, { hostId, controller, platform: "darwin" });
+    const mac = placementIdentityResponse(owner, { hostId, controller: () => controller, platform: "darwin" });
     expect(mac.status === 200 && mac.body).toEqual({
       hostId, controllerId: otherHostId, epoch: 3,
       version: PLACEMENT_WIRE_VERSION, platform: "darwin", capabilities: ["shell", "macos", "desktop"],
     });
-    const server = placementIdentityResponse(owner, { hostId, controller, platform: "linux" });
+    const server = placementIdentityResponse(owner, { hostId, controller: () => controller, platform: "linux" });
     expect(server.status === 200 && server.body.capabilities).toEqual(["shell"]);
   });
 
   it("refuses remote, companion and named-tunnel callers, mirroring host resources", () => {
-    const deps: PlacementIdentityDeps = { hostId, controller: { controllerId: hostId, epoch: 0 }, platform: "linux" };
+    const deps: PlacementIdentityDeps = { hostId, controller: () => ({ controllerId: hostId, epoch: 0 }), platform: "linux" };
     for (const caller of [
       { localOwner: false, fromCompanion: false, viaNamedTunnel: false },
       { localOwner: true, fromCompanion: true, viaNamedTunnel: false },
@@ -81,8 +81,24 @@ describe("placement identity route boundary", () => {
   });
 
   it("answers 501 on unsupported platforms, after the owner gate", () => {
-    const deps: PlacementIdentityDeps = { hostId, controller: { controllerId: hostId, epoch: 0 }, platform: "win32" };
+    const deps: PlacementIdentityDeps = { hostId, controller: () => ({ controllerId: hostId, epoch: 0 }), platform: "win32" };
     expect(placementIdentityResponse(owner, deps).status).toBe(501);
     expect(placementIdentityResponse({ ...owner, fromCompanion: true }, deps).status).toBe(403);
+  });
+
+  it("authorizes before reading durable state and contains read failures", () => {
+    let reads = 0;
+    const deps: PlacementIdentityDeps = {
+      hostId, platform: "linux", controller: () => { reads += 1; throw new Error("private fixture detail"); },
+    };
+    for (const caller of [
+      { ...owner, localOwner: false }, { ...owner, fromCompanion: true }, { ...owner, viaNamedTunnel: true },
+    ]) expect(placementIdentityResponse(caller, deps).status).toBe(403);
+    expect(placementIdentityResponse(owner, { ...deps, platform: "win32" }).status).toBe(501);
+    expect(reads).toBe(0);
+    expect(placementIdentityResponse(owner, deps)).toEqual({
+      status: 503, body: { error: "Controller epoch could not be verified; placement identity is unavailable" },
+    });
+    expect(reads).toBe(1);
   });
 });

@@ -337,8 +337,8 @@ public enum EngineMatrixRegistry {
             id: .muse,
             displayName: "Muse",
             driverKind: "museAgent",
-            executable: "muse",
-            baseArguments: ["acp"],
+            executable: "muse-code-acp",
+            baseArguments: [],
             wireProtocol: .acpJSONRPC,
             authRequirement: .cliManagedLogin(cliBinary: "muse"),
             defaultModel: "muse-default"

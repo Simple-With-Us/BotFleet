@@ -113,6 +113,41 @@ function fakeSpawn() {
 const start = (h: Harness, command: string, threadId = "thread-a", botId = "bot-a", extra: { timeoutMinutes?: number } = {}) =>
   h.registry.start({ botId, threadId, command, cwd: h.dir, onComplete: "wake", ...extra });
 
+it("keeps a placement rollback registry passive across recovery, timers, stop and shutdown", async () => {
+  const spawn = fakeSpawn();
+  const original = harness({ spawn: spawn.spawnFn });
+  const started = start(original, "printf bridge-must-never-rerun");
+  expect(started.ok).toBe(true);
+  original.registry.dispose();
+  const before = readFileSync(join(original.dir, "jobs", "jobs.json"));
+  const files = readdirSync(join(original.dir, "jobs")).sort();
+  const passive = harness({ passive: true, spawn: () => { throw new Error("passive registry spawned"); }, listProcesses: async () => { throw new Error("passive registry scanned processes"); } }, original.dir);
+  expect(passive.registry.list()).toEqual(original.registry.list());
+  expect(start(passive, "printf forbidden")).toMatchObject({ ok: false, error: expect.stringMatching(/read-only/) });
+  expect(await passive.registry.adopt()).toEqual({ settled: 0, lost: 0 });
+  passive.registry.startTimers(1);
+  passive.registry.drainQueue(); passive.registry.tick(); passive.registry.checkLogs();
+  expect(await passive.registry.sweep()).toBe(0);
+  const id = passive.registry.list()[0]!.id;
+  expect(await passive.registry.kill(id, "owner")).toMatchObject({ ok: false, error: expect.stringMatching(/read-only/) });
+  expect(await passive.registry.killWhere(() => true, "removed", { forget: true })).toBe(0);
+  passive.registry.markNoticesDelivered([id]);
+  expect(await passive.registry.quiesce()).toBe(0);
+  passive.registry.shutdownSync();
+  expect(passive.registry.list()).toEqual(original.registry.list());
+  expect(readFileSync(join(original.dir, "jobs", "jobs.json"))).toEqual(before);
+  expect(readdirSync(join(original.dir, "jobs")).sort()).toEqual(files);
+  passive.registry.dispose();
+});
+
+it("does not create a jobs or pending-command directory for a passive registry", () => {
+  const root = mkdtempSync(join(tmpdir(), "omb-jobs-passive-"));
+  const passive = harness({ passive: true }, root);
+  expect(existsSync(join(root, "jobs"))).toBe(false);
+  expect(start(passive, "true")).toMatchObject({ ok: false });
+  expect(existsSync(join(root, "jobs"))).toBe(false);
+});
+
 async function until<T>(read: () => T | undefined | null | false, ms = 15_000): Promise<T> {
   const deadline = Date.now() + ms;
   for (;;) {
@@ -981,7 +1016,7 @@ posix("before boot finishes", () => {
   });
 });
 
-describe("refusing before the ask", () => {
+posix("refusing before the ask", () => {
   it("names every refusal that does not depend on the command", () => {
     const { spawnFn } = fakeSpawn();
     const h = harness({ spawn: spawnFn });

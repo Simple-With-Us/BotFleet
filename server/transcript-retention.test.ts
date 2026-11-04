@@ -5,7 +5,7 @@
 import { type appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   appendBounded,
@@ -32,6 +32,7 @@ import {
   sweepTranscriptLogs,
   sweepTranscriptRetention,
   sweepTranscriptVolumeBudget,
+  startVolumeTranscriptSweeps,
   TRANSCRIPT_DATA_VOLUME_BUDGET_BYTES,
   TRANSCRIPT_PER_THREAD_MAX_BYTES,
   transcriptLogPaths,
@@ -1302,5 +1303,145 @@ describe("transcript data-volume budget", () => {
       expect.objectContaining({ ids: 0, files: 0, bytesReclaimed: 0, failed: 0, over: false }),
     );
     expect(describeVolumeSweep(result)).toBeNull();
+  });
+});
+
+describe("startVolumeTranscriptSweeps boot + daily timer", () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  it("does not sweep synchronously; the boot run reaps a leftover temp and logs through describeVolumeSweep", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const logText = record(1) + record(2);
+    const logFile = join(nativeDir, "x.ndjson");
+    writeFileSync(logFile, logText);
+    const temp = join(nativeDir, "x.ndjson.2147480000.123e4567-e89b-42d3-a456-426614174000.tmp");
+    writeFileSync(temp, "y".repeat(100));
+    const budgetBytes = Buffer.byteLength(logText) + 1;
+
+    vi.useFakeTimers();
+    try {
+      const lines: string[] = [];
+      const stop = startVolumeTranscriptSweeps(
+        { eventsDir, nativeDir },
+        () => ["x"],
+        () => [],
+        (line) => lines.push(line),
+        { budgetBytes, initialDelayMs: 1000 },
+      );
+      try {
+        // Non-blocking boot: nothing has run yet.
+        expect(existsSync(temp)).toBe(true);
+        expect(lines).toEqual([]);
+
+        vi.advanceTimersByTime(1000);
+        expect(existsSync(temp)).toBe(false);
+        expect(readFileSync(logFile, "utf8")).toBe(logText);
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toMatch(/^\[retention\] Reclaimed 100 bytes across 1 transcript log toward the data-volume budget\./);
+      } finally {
+        stop();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("registers the daily timer: an over-budget volume still reports its overage every day", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const text = record(1) + record(2);
+    const file = join(nativeDir, "live.ndjson");
+    writeFileSync(file, text);
+
+    vi.useFakeTimers();
+    try {
+      const lines: string[] = [];
+      let liveCalls = 0;
+      const stop = startVolumeTranscriptSweeps(
+        { eventsDir, nativeDir },
+        () => {
+          liveCalls += 1;
+          return ["live"];
+        },
+        () => [],
+        (line) => lines.push(line),
+        { budgetBytes: 1, initialDelayMs: 1000 },
+      );
+      try {
+        vi.advanceTimersByTime(1000);
+        expect(liveCalls).toBe(1);
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toMatch(/still over the data-volume budget/);
+
+        // Daily cadence alongside the other retention timers.
+        vi.advanceTimersByTime(DAY_MS);
+        expect(liveCalls).toBe(2);
+        expect(lines).toHaveLength(2);
+        expect(lines[1]).toMatch(/still over the data-volume budget/);
+      } finally {
+        stop();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays silent inside budget and the stopper clears both timers", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(nativeDir, "live.ndjson");
+    writeFileSync(file, record(1));
+
+    vi.useFakeTimers();
+    try {
+      const lines: string[] = [];
+      const stop = startVolumeTranscriptSweeps(
+        { eventsDir, nativeDir },
+        () => ["live"],
+        () => [],
+        (line) => lines.push(line),
+        { budgetBytes: 1024 * 1024, initialDelayMs: 1000 },
+      );
+      vi.advanceTimersByTime(1000);
+      expect(lines).toEqual([]);
+      vi.advanceTimersByTime(DAY_MS);
+      expect(lines).toEqual([]);
+
+      stop();
+      vi.advanceTimersByTime(DAY_MS * 2);
+      expect(lines).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds off while cleanupHoldReason reports a set-aside and logs the skip once", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    writeFileSync(join(nativeDir, "live.ndjson"), record(1));
+
+    vi.useFakeTimers();
+    try {
+      const lines: string[] = [];
+      const stop = startVolumeTranscriptSweeps(
+        { eventsDir, nativeDir },
+        () => ["live"],
+        () => [],
+        (line) => lines.push(line),
+        { budgetBytes: 1, initialDelayMs: 1000, hold: () => "bots.json set aside" },
+      );
+      try {
+        vi.advanceTimersByTime(1000);
+        expect(lines).toEqual(["[retention] volume transcript sweep skipped: bots.json set aside."]);
+        vi.advanceTimersByTime(DAY_MS);
+        // Same hold reason: logged on change only, like the orphan/idle starters.
+        expect(lines).toHaveLength(1);
+      } finally {
+        stop();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

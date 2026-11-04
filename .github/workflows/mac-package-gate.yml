@@ -68,6 +68,7 @@ jobs:
           # answers by running the gate -- correct, but an expensive way to say
           # the diff was unavailable.
           fetch-depth: 0
+          filter: blob:none
           persist-credentials: false
       - name: Diff against the base ref
         id: base
