@@ -583,7 +583,51 @@ load_infisical_identity() {
   fi
 }
 
-load_infisical_identity
+read_startup_enrollment() {
+  # Match botfleetDataDir(): trim the override and ignore a blank value.
+  local data_dir="${OMB_DATA_DIR:-}"
+  data_dir="${data_dir#"${data_dir%%[![:space:]]*}"}"
+  data_dir="${data_dir%"${data_dir##*[![:space:]]}"}"
+  local preference="${data_dir:-$HOME/.botfleet}/startup-enrollment.json"
+  if [ ! -e "$preference" ] && [ ! -L "$preference" ]; then
+    printf '%s' missing
+    return 0
+  fi
+  "$NODE" --input-type=module -e '
+// BF_STARTUP_ENROLLMENT_V1
+import fs from "node:fs";
+let fd;
+try {
+  fd = fs.openSync(process.argv[1], fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  const stat = fs.fstatSync(fd);
+  if (!stat.isFile() || stat.size > 1024) process.exit(1);
+  const value = JSON.parse(fs.readFileSync(fd, "utf8"));
+  if (value === null || typeof value !== "object" || Array.isArray(value) ||
+      Object.keys(value).length !== 2 || !Object.hasOwn(value, "version") ||
+      value.version !== 1 || !Object.hasOwn(value, "mode") ||
+      (value.mode !== "local" && value.mode !== "remote")) process.exit(1);
+  process.stdout.write(value.mode);
+} catch { process.exitCode = 1; }
+finally { if (fd !== undefined) fs.closeSync(fd); }
+' -- "$preference"
+}
+
+if ! startup_mode="$(read_startup_enrollment)"; then
+  log_err "startup choice is invalid; open BotFleet Server Setup before starting"
+  exit 1
+fi
+case "$startup_mode" in
+  remote) load_infisical_identity ;;
+  local) log "starting this Mac without Infisical bootstrap" ;;
+  missing)
+    log "startup setup is required; open BotFleet to choose this Mac or Infisical server settings"
+    exit 0
+    ;;
+  *)
+    log_err "startup choice could not be read; open BotFleet Server Setup before starting"
+    exit 1
+    ;;
+esac
 
 cd "$ROOT"
 exec "$NODE" --experimental-strip-types server/index.ts

@@ -54,7 +54,8 @@ import { readPackagedBuildIdentity } from "./runtime-identity.mjs";
 import { desktopStartupReceiptPath, desktopStartupUiPort, writeDesktopStartupReceipt } from "./desktop-startup-receipt.mjs";
 import { readHarnessOwner } from "./harness-ownership.mjs";
 import { startUiShim } from "./attached-ui-shim.mjs";
-import { readKeychainServiceToken, resolveServerTarget } from "./server-target.mjs";
+import { readKeychainServiceToken, resolveServerTarget, SERVER_TARGET_FILE } from "./server-target.mjs";
+import { readStartupEnrollment, resolveEnrolledServerTarget, writeStartupEnrollment } from "./startup-enrollment.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
@@ -421,7 +422,7 @@ let serverReady = true;
 let serverMode = "spawned";
 // Which BotFleet server this launch talks to: the harness on this Mac
 // ("local") or a remote server Infisical points the app at ("remote").
-// Read once at boot from Infisical; see server-target.mjs.
+// Local startup is explicit; enrolled startup reads Infisical after consent.
 let serverTarget = { mode: "local", source: "", legacyFile: false };
 // Why the remote server could not be used (an invalid gate token, say).  The
 // error page shows it instead of the generic "could not reach it" line.
@@ -1291,10 +1292,8 @@ async function startServerPackaged() {
   return false;
 }
 
-// Which server this launch should use.  Infisical is the sole source of
-// truth, so this is a vault read and nothing else: no file, no environment
-// variable, no fallback.  An unreadable vault is an error the owner has to
-// see, not a reason to talk to a different server.
+// Enrolled server addresses and tokens come only from Infisical.
+// An unreadable vault never selects a different server.
 function serverTargetFailure(error) {
   return {
     mode: "error",
@@ -1315,6 +1314,30 @@ function readServerTargetFromInfisical() {
     });
   }
   return resolveServerTarget({ userDataDir });
+}
+
+async function readStartupServerTarget({ forceChoice = false } = {}) {
+  const dataDir = botfleetDataDir();
+  return resolveEnrolledServerTarget({
+    readEnrollment: () => readStartupEnrollment(dataDir),
+    writeEnrollment: (mode) => writeStartupEnrollment(mode, dataDir),
+    legacyFile: fs.existsSync(path.join(app.getPath("userData"), SERVER_TARGET_FILE)),
+    forceChoice,
+    chooseMode: async () => {
+      const { response } = await dialog.showMessageBox({
+        type: "question",
+        title: "Server Setup",
+        message: "How Should BotFleet Start?",
+        detail: "Start with this Mac’s server, or read your enrolled server settings from Infisical.\u00a0 You can change this in the Server menu.",
+        buttons: ["Use This Mac", "Use Infisical Server Settings", "Not Now"],
+        defaultId: 2,
+        cancelId: 2,
+        noLink: true,
+      });
+      return response === 0 ? "local" : response === 1 ? "remote" : null;
+    },
+    readRemoteTarget: readServerTargetFromInfisical,
+  });
 }
 
 // The host of a validated remote origin, for the Server menu.
@@ -1464,13 +1487,14 @@ async function runServerMenuSmoke() {
 // Read the server target from Infisical again.  A failed read changes
 // nothing: the app keeps talking to the server it is on, and the owner is
 // told why the reload did nothing.
-async function reloadServerTargetFromInfisical() {
+async function reloadServerTargetFromInfisical({ forceChoice = false } = {}) {
   let target;
   try {
-    target = await readServerTargetFromInfisical();
+    target = await readStartupServerTarget({ forceChoice });
   } catch (error) {
     target = serverTargetFailure(error);
   }
+  if (target.mode === "cancelled") return target;
   if (target.mode === "error") {
     if (serverMenuSmokeEnabled()) {
       slog(`smoke: the reload from Infisical failed: ${target.message}`);
@@ -2658,13 +2682,11 @@ function setupApplicationMenu() {
     }
   };
 
-  // Which BotFleet server this app talks to.  The target comes from
-  // Infisical, so the menu only shows where the app is pointed and offers to
-  // read the vault again.
+  // The menu shows the active server and offers an explicit startup choice.
   const serverSubmenu = () => {
     const mode = serverTarget?.mode ?? "local";
     const origin = serverTarget?.origin ?? "";
-    const enrolled = serverTarget?.source !== "not-enrolled";
+    const enrolled = serverTarget?.source === "infisical";
     return [
       {
         label: "This Mac",
@@ -2687,11 +2709,18 @@ function setupApplicationMenu() {
       {
         label: enrolled
           ? "From Infisical"
-          : "No Infisical Token In The Keychain",
+          : "Infisical Server Lookup Off",
         enabled: false,
       },
       {
+        label: "Server Setup…",
+        click: () => reloadServerTargetFromInfisical({ forceChoice: true }).catch(() => {
+          dialog.showErrorBox("Server Setup Failed", "BotFleet could not save its startup choice.");
+        }),
+      },
+      {
         label: "Reload From Infisical",
+        enabled: enrolled,
         // The promise is returned so the smoke can wait for it; the catch is
         // the backstop for a menu click nobody awaits, and it logs only the
         // message, never a target or a token.
@@ -2952,14 +2981,21 @@ app.whenReady().then(async () => {
     return;
   }
   setupApplicationMenu();
-  // The Keychain and vault read for the server target starts now and runs
-  // alongside the credential load, the boot migrations and the CUA start
-  // below, so the first window waits on it only as long as it is still
-  // outstanding.  It is awaited before any server is chosen: there is no
-  // fallback to this Mac while it is in flight or when it fails.
+  // Resolve the explicit startup choice before any credential preparation.
   const serverTargetRead = app.isPackaged
-    ? readServerTargetFromInfisical().catch((error) => serverTargetFailure(error))
+    ? await readStartupServerTarget().catch((error) => serverTargetFailure(error))
     : null;
+  if (serverTargetRead?.mode === "cancelled" || serverTargetRead?.mode === "error") {
+    if (serverTargetRead.mode === "error") {
+      if (serverMenuSmokeEnabled()) {
+        await writeServerMenuSmokeReport({ ...serverMenuSmokeReport(), error: serverTargetRead.message });
+      } else {
+        dialog.showErrorBox("BotFleet Could Not Complete Server Setup", serverTargetRead.message);
+      }
+    }
+    app.quit();
+    return;
+  }
   if (app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU !== "1" && process.env.OMB_SMOKE_TEST !== "1") {
     app.setAsDefaultProtocolClient("botfleet");
   }
@@ -3083,14 +3119,12 @@ app.whenReady().then(async () => {
         })
       : Promise.resolve({ mode: "unavailable", reason: "unsupported-platform" });
   if (app.isPackaged) {
-    // Infisical decides which BotFleet server this launch talks to: the one
-    // on this Mac, or a remote one.  There is no file and no environment
-    // variable to fall back on.
-    const target = await serverTargetRead;
+    // The startup choice has settled before any local server can start.
+    const target = serverTargetRead;
     serverTarget = target;
     smokeStep(`server target ${target.mode} (${target.source})`);
     if (target.legacyFile) {
-      slog("server-target.json is no longer read; the server target and gate token come from Infisical (BotFleet prod /botfleet-server).\u00a0 Delete the file.");
+      slog("server-target.json is no longer read.\u00a0 Use Server Setup to choose this Mac or enrolled Infisical server settings.");
     }
     if (target.mode === "error") {
       // The vault could not be read, or what it says is unusable.  Falling
