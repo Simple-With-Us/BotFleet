@@ -11,7 +11,7 @@
 // test passes on a build that would be dead in the field — which is precisely
 // how the bug escaped. The copy is the whole point; do not "simplify" it away.
 import { execFile, spawn } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,14 +53,6 @@ const runtime = (() => {
 
 const staging = mkdtempSync(join(tmpdir(), "omb-smoke-"));
 const home = mkdtempSync(join(tmpdir(), "omb-smoke-home-"));
-const dataDir = join(home, ".botfleet");
-mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-// A one-off shadow instance keeps startup and route coverage while avoiding probes of host-installed CLIs on PATH.
-writeFileSync(
-  join(dataDir, "config.json"),
-  JSON.stringify({ instances: { "smoke-shadow": { driver: "__smoke_shadow__" } } }),
-  { mode: 0o600 },
-);
 
 // OMB_SMOKE_DIST lets the release workflow aim this at a packaged app's
 // Resources/server tree instead of the repo build.
