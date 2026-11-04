@@ -148,6 +148,18 @@ describe("worker client request shape", () => {
       baseUrl: "ftp://127.0.0.1:8799",
       fetchImpl: async () => jsonResponse(200, {}),
     })).toThrow(TypeError);
+    // Cleartext http is loopback-only: the credential rides in a header.
+    expect(() => new PlacementWorkerClient({
+      credential, workerHostId: worker, audience, controller: { controllerId: audience, epoch: 0 },
+      baseUrl: "http://10.0.0.5:8799",
+      fetchImpl: async () => jsonResponse(200, {}),
+    })).toThrow(TypeError);
+    const httpsAway = new PlacementWorkerClient({
+      credential, workerHostId: worker, audience, controller: { controllerId: audience, epoch: 0 },
+      baseUrl: "https://controller.example.internal",
+      fetchImpl: async () => jsonResponse(200, {}),
+    });
+    expect(httpsAway.controller()).toEqual({ controllerId: audience, epoch: 0 });
   });
 });
 
@@ -289,9 +301,11 @@ describe("worker client reply handling", () => {
       const refused = await impostor.register({ capabilities: ["shell"], sample });
       expect(refused).toMatchObject({ outcome: "refused", status: 403, reason: "Worker request refused" });
       // The client's real body adds the fence and intent fields to the
-      // envelope, and #1565's strict whole-body envelope parse refuses that
-      // today; #1577 changes the check to the reserved-key subset this
-      // slice's plan requires, and this assertion is where it lands.
+      // envelope, and the transportless boundary keeps #1565's strict
+      // whole-body envelope parse by design: production must behave exactly
+      // as it does on main, so this 403 is correct before and after #1577.
+      // The reserved-key subset check applies only once a transport is
+      // passed, which the full client-boundary-lease contract test covers.
       const enriched = await live.register({ capabilities: ["shell"], sample });
       expect(enriched).toMatchObject({ outcome: "refused", status: 403, reason: "Worker request refused" });
     } finally {

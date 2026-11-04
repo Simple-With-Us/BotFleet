@@ -252,6 +252,16 @@ export class PlacementWorkerClient {
     if (base.protocol !== "http:" && base.protocol !== "https:") {
       throw new TypeError("the worker base URL must be an http or https origin");
     }
+    // The credential travels in a header, so cleartext http is allowed only
+    // to a loopback controller, where #1565's gate confines callers to this
+    // host anyway; anything off-host must use https.
+    if (base.protocol === "http:") {
+      const host = base.hostname;
+      const loopback = host === "127.0.0.1" || host === "::1" || host === "[::1]" || host === "localhost";
+      if (!loopback) {
+        throw new TypeError("cleartext http is allowed only to a loopback controller; use https off-host");
+      }
+    }
     this.credential = options.credential;
     this.workerHostId = options.workerHostId;
     this.audience = options.audience;
