@@ -89,6 +89,24 @@ export function queueSteeredMessage(
   return { id };
 }
 
+/** Pending sends at which a drained turn stops guessing an order.  Under it a
+ * backlog is an ordinary run of follow-ups and the bot just works through
+ * them; at or above it the turn asks the user what to take first (BF-2442).
+ * Exported so the line is tunable and directly testable. */
+export const STEER_BACKLOG_THRESHOLD = 3;
+
+/** The instruction a backed-up turn carries, or null while the queue is short
+ * enough to answer in order without bothering the user.  Prepended so it reads
+ * as the governing instruction for the turn rather than as one more ask. */
+export function steerBacklogInstruction(pending: number): string | null {
+  if (pending < STEER_BACKLOG_THRESHOLD) return null;
+  return (
+    `${pending} messages were sent while the bot was busy and are running together as this turn. ` +
+    `Do not guess which one matters most.  List them in one short line each, say which you would ` +
+    `start with and why, and ask the user to confirm or reorder before you do the work.`
+  );
+}
+
 /** Drain every queue whose bot is idle: append the held lines (leaf is now
  * the finished turn's last item), then one run per thread whose prompt is
  * the texts joined with newlines. `userMessage` is the last appended line
@@ -182,7 +200,15 @@ export function drainSteeredMessages(
     const last = appended.at(-1);
     if (!last) continue;
     started.add(entry.botId);
-    const prompt = batch.map((item) => item.prompt).join("\n");
+    const joined = batch.map((item) => item.prompt).join("\n");
+    // Keyed on THIS batch, not the queue still behind it: the instruction claims
+    // the messages are "running together as this turn", and that is only true
+    // of the batch.  A Linq or committed boundary hands the bot one chat per
+    // turn while a long tail waits — counting the tail would have it claim a
+    // pile it is not answering, and would ask the user to prioritise on every
+    // turn of a sequential pipeline instead of once.
+    const backlog = steerBacklogInstruction(batch.length);
+    const prompt = backlog ? `${backlog}\n\n${joined}` : joined;
     void run(
       entry.botId,
       threadId,

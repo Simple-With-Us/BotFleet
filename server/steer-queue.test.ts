@@ -25,7 +25,9 @@ import {
   queueSteeredMessage,
   queuedMessageIdsForBot,
   restoreSteeredEntries,
+  steerBacklogInstruction,
   takeSteeredEntries,
+  STEER_BACKLOG_THRESHOLD,
   _queuedCount,
   type SteerStore,
 } from "./steer-queue.ts";
@@ -77,6 +79,54 @@ function fakeStore(bots: BotRecord[]): SteerStore & { messages: Message[] } {
 }
 
 describe("steer-queue module", () => {
+  it("asks the user what to do only once the backlog reaches the threshold", () => {
+    expect(steerBacklogInstruction(0)).toBeNull();
+    expect(steerBacklogInstruction(STEER_BACKLOG_THRESHOLD - 1)).toBeNull();
+    const deep = steerBacklogInstruction(STEER_BACKLOG_THRESHOLD);
+    expect(deep).toContain(`${STEER_BACKLOG_THRESHOLD} messages were sent`);
+    expect(deep).toMatch(/ask the user/i);
+  });
+
+  it("drains a short queue in plain order and a deep one as an ask", () => {
+    const short = fakeBot("bot-short", "thread-short", true);
+    const deep = fakeBot("bot-deep", "thread-deep", true);
+    const store = fakeStore([short, deep]);
+    queueSteeredMessage(short, "one");
+    queueSteeredMessage(short, "two");
+    for (const text of ["alpha", "beta", "gamma", "delta"]) queueSteeredMessage(deep, text);
+    short.busy = false;
+    deep.busy = false;
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    const promptFor = (botId: string) => run.mock.calls.find(([id]) => id === botId)?.[2] as string;
+
+    // Under the threshold the turn is just the messages, in order.
+    expect(promptFor("bot-short")).toBe("one\ntwo");
+    // Over it, the turn opens by handing the choice back, and still carries
+    // every waiting message — the ask is not a filter.
+    const deepPrompt = promptFor("bot-deep");
+    expect(deepPrompt).toContain("4 messages were sent");
+    expect(deepPrompt).toMatch(/ask the user/i);
+    expect(deepPrompt.endsWith("alpha\nbeta\ngamma\ndelta")).toBe(true);
+  });
+
+  it("asks about the batch, not the tail still queued behind it", () => {
+    // A Linq boundary hands the bot one chat per turn while a long tail waits.
+    // The ask is about the messages running together NOW, so a one-message
+    // turn must not claim a pile it is not answering — and must not stall the
+    // pipeline by asking the user to prioritise on every turn (BF-2442).
+    const bot = fakeBot("bot-linq-tail", "thread-linq-tail", true);
+    const store = fakeStore([bot]);
+    for (let chat = 0; chat < 6; chat += 1) queueSteeredMessage(bot, `chat ${chat}`, { linqChatId: `chat-${chat}` });
+    bot.busy = false;
+    const run = vi.fn();
+    drainEveryReadyBatch(store, run);
+    expect(run).toHaveBeenCalledTimes(6);
+    // Every turn carried exactly one chat and asked about exactly one chat,
+    // even though five waited behind it.
+    expect(run.mock.calls.map((call) => call[2])).toEqual(Array.from({ length: 6 }, (_, chat) => `chat ${chat}`));
+  });
+
   it("lets an update carry a bot's waiting sends off the transcript and put them back in line", () => {
     const interrupted = fakeBot("bot-carry", "thread-carry", true);
     const other = fakeBot("bot-stay", "thread-stay", true);
