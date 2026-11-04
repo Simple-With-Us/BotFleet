@@ -56,6 +56,15 @@ function rowName(jobId: string): string {
   return `report-${createHash("sha256").update(jobId).digest("hex").slice(0, 32)}.json`;
 }
 
+function sameReport(a: ReportMessage, b: ReportMessage): boolean {
+  // Field-by-field, never a serialized-key comparison: two durably equal
+  // results must stay equal however their object keys happen to be ordered.
+  return a.version === b.version && a.controllerId === b.controllerId && a.epoch === b.epoch
+    && a.jobId === b.jobId && a.leaseId === b.leaseId && a.hostId === b.hostId
+    && a.status === b.status && a.exitCode === b.exitCode && a.signal === b.signal
+    && a.endedAt === b.endedAt && a.reason === b.reason;
+}
+
 export class PlacementReportSpool {
   readonly directory: string;
   private damagedRows = 0;
@@ -79,7 +88,7 @@ export class PlacementReportSpool {
     const path = join(this.directory, rowName(message.jobId));
     const existing = this.readRow(path);
     if (existing) {
-      if (JSON.stringify(existing.message) !== JSON.stringify(message)) {
+      if (!sameReport(existing.message, message)) {
         throw new Error("a different terminal result is already durable for this job");
       }
       // A prior attempt may have installed the row and then failed the
@@ -87,8 +96,11 @@ export class PlacementReportSpool {
       this.fsyncDirectory();
       return false;
     }
-    const pending = this.pending();
-    if (pending.length >= PLACEMENT_REPORT_MAX_PENDING) throw new Error("the terminal report spool is full");
+    // The capacity bound counts names, not rows: every name in this
+    // directory was written by this class, so a malformed row still holds
+    // its slot, and the check costs one readdir with no parsing.
+    const count = this.readDirectory(this.directory).filter((entry) => ROW_NAME.test(entry)).length;
+    if (count >= PLACEMENT_REPORT_MAX_PENDING) throw new Error("the terminal report spool is full");
     writeFileAtomic(path, `${JSON.stringify({ message })}\n`, { mode: 0o600 });
     this.fsyncDirectory();
     return true;
@@ -205,7 +217,7 @@ export async function settlePendingReports(spool: PlacementReportSpool, client: 
       continue;
     }
     const reason = outcomeReason(reply);
-    if (reply.outcome === "refused" && !/stale controller epoch/.test(reply.reason)) {
+    if (reply.outcome === "refused" && !/stale (?:controller|lease) epoch/.test(reply.reason)) {
       outcomes.push({ jobId: row.message.jobId, result: "kept", attempts: spool.recordFailure(row.message.jobId), reason });
       continue;
     }

@@ -222,6 +222,14 @@ describe("report spool durability", () => {
     const spool = new PlacementReportSpool(dir);
     expect(spool.add(terminalMessage("lease-1"))).toBe(true);
     expect(spool.add(terminalMessage("lease-1"))).toBe(false);
+    // Key order is not identity: a semantically equal result built with its
+    // object keys in another order is still the same durable row.
+    const reordered: ReportMessage = {
+      status: "completed", signal: null, exitCode: 0, endedAt: 1_005,
+      hostId: worker, leaseId: "lease-1", jobId: "job-1",
+      controllerId: audience, epoch: 0, version: PLACEMENT_WIRE_VERSION,
+    };
+    expect(spool.add(reordered)).toBe(false);
     expect(spool.pending()).toHaveLength(1);
     expect(() => spool.add(terminalMessage("lease-1", 9_999))).toThrow(/already durable/);
     expect(() => spool.add(terminalMessage("lease-2", 1_005, "job-2"))).not.toThrow();
@@ -304,6 +312,25 @@ describe("settle-once against the in-process lease service", () => {
     const outcomes = await settlePendingReports(spool, client(leases));
     expect(outcomes[0]).toMatchObject({ jobId: "job-1", result: "kept", attempts: 0 });
     expect(spool.pending()).toHaveLength(1);
+    expect(spool.pending()[0]?.attempts).toBe(0);
+  });
+
+  it("a stale lease epoch refusal is exempt from attempts the same way", async () => {
+    const dir = fixtureDir();
+    const { leases } = leaseFixture();
+    const { leaseId } = claimOneJob(leases);
+    const spool = new PlacementReportSpool(dir);
+    spool.add(terminalMessage(leaseId));
+    // Some refusals name the lease's own epoch rather than the controller's;
+    // both are stale-fence answers, and neither is the controller rejecting
+    // this result, so neither burns an attempt.
+    const staleLease = new PlacementWorkerClient({
+      credential, workerHostId: worker, audience,
+      controller: { controllerId: audience, epoch: 0 }, baseUrl,
+      fetchImpl: async () => jsonResponse(409, { controllerId: audience, epoch: 0, error: "stale lease epoch 0; the lease was issued at epoch 0" }),
+    });
+    const outcomes = await settlePendingReports(spool, staleLease);
+    expect(outcomes[0]).toMatchObject({ jobId: "job-1", result: "kept", attempts: 0 });
     expect(spool.pending()[0]?.attempts).toBe(0);
   });
 
