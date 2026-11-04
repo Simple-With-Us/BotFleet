@@ -109,6 +109,20 @@ Do this while both stores still exist, because it is the only window in which th
 - Record the read-only archive location in BF-2515 before the deletion commit, so the archive is discoverable after the code that wrote it is gone.
 - Rehearse the rollback once: restore the archive into a scratch data root and boot the native app against it.
 
+**The archive and the rehearsal have a producer.**   `scripts/archive-node-store.mjs` captures the Node store into a private capture directory, snapshots its SQLite database through SQLite's own online backup rather than copying a live WAL file, redacts credential shapes out of the text it copies, makes the copy read-only and proves that claim by trying to write to it.   It then restores the archive into a scratch data root, verifies every file against the archive's own hash manifest, and reports the restored store's structural health.   It emits the `rollback` receipt, and the `import` receipt when an import parity report is supplied, in the shape `scripts/decommission-evidence-bundle.mjs` validates.
+
+```sh
+node scripts/archive-node-store.mjs archive --store "$OMB_DATA_DIR" --out /private/captures/capture
+node scripts/archive-node-store.mjs restore --archive /private/captures/capture --into /private/scratch/store
+node scripts/archive-node-store.mjs receipt --capture /private/captures/capture \
+  --request /private/captures/request.json \
+  --provenance-record /private/captures/capture/provenance.txt \
+  --provenance-source "$PROVENANCE_URL" --provenance-by "$WHO" \
+  --parity-report /private/captures/capture/import-parity.json
+```
+
+**What the producer does not prove.**   It says nothing about whether the Swift store holds the same data: that is the import parity report, which the producer only carries.   Its `restored-health` is a statement about the restored DATA root — the database opens and passes SQLite's own integrity check, the JSON stores parse and the newline-delimited logs parse line by line — and not about a running harness.   The archive never carries a credential: files whose names mark them as credential stores are excluded, text is redacted, and a binary holding a recognizable credential is left out rather than copied, with every exclusion named in the manifest.
+
 **What breaks if skipped:** a parity bug found after the deletion has no reference to compare against, and the Node store becomes the only copy of a history nobody can read.
 
 ### Step 2 — The Cutover Belongs To BF-2514, Not Here
