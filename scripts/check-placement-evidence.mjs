@@ -59,29 +59,39 @@ export function checkPlacementEvidenceFile(path) {
     const part = relative(bundle, candidate);
     return part !== "" && !isAbsolute(part) && part !== ".." && !part.startsWith(`..${sep}`);
   };
+  return checkPlacementEvidenceArtifacts(state, (artifact) => {
+    const target = resolve(bundle, artifact);
+    if (isAbsolute(artifact) || !inside(target)) throw new Error("artifact escapes the bundle");
+    let component = bundle;
+    for (const name of relative(bundle, target).split(sep)) {
+      component = join(component, name);
+      if (lstatSync(component).isSymbolicLink()) throw new Error("artifact path contains a link");
+    }
+    if (!inside(realpathSync(target))) throw new Error("artifact resolves outside the bundle");
+    const fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      if (!inside(realpathSync(target)) || !openedFileIsListedSync(fstatSync(fd), target)) throw new Error("artifact handle differs from bundle entry");
+      readSync(fd, Buffer.alloc(1), 0, 1, 0);
+      if (!inside(realpathSync(target)) || !openedFileIsListedSync(fstatSync(fd), target)) throw new Error("artifact changed while reading");
+    } finally { closeSync(fd); }
+  });
+}
+
+/** The same recipe and artifact check over a caller's verified snapshot. */
+export function checkPlacementEvidenceArtifacts(raw, readArtifact) {
+  const state = PlacementEvidenceSchema.parse(raw);
   const verdict = evaluatePlacementEvidence(state);
   const artifacts = [
     ...Object.entries(state.handRun ?? {}).map(([key, run]) => [`handRun ${key}`, run.log]),
     ...Object.entries(state.inventory ?? {}).map(([key, artifact]) => [`inventory ${key}`, artifact]),
   ];
   for (const [key, artifact] of artifacts) {
-    let fd;
     try {
-      const target = resolve(bundle, artifact);
-      if (isAbsolute(artifact) || !inside(target)) throw new Error("artifact escapes the bundle");
-      let component = bundle;
-      for (const name of relative(bundle, target).split(sep)) {
-        component = join(component, name);
-        if (lstatSync(component).isSymbolicLink()) throw new Error("artifact path contains a link");
-      }
-      if (!inside(realpathSync(target))) throw new Error("artifact resolves outside the bundle");
-      fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      if (!inside(realpathSync(target)) || !openedFileIsListedSync(fstatSync(fd), target)) throw new Error("artifact handle differs from bundle entry");
-      readSync(fd, Buffer.alloc(1), 0, 1, 0);
-      if (!inside(realpathSync(target)) || !openedFileIsListedSync(fstatSync(fd), target)) throw new Error("artifact changed while reading");
+      if (isAbsolute(artifact) || artifact.includes("\\") || artifact.split("/").some((part) => part === ".." || part === "." || part === "")) throw new Error("artifact escapes the bundle");
+      readArtifact(artifact);
     } catch {
-      verdict.blockers.push(`${key}: artifact must be a readable single-link file within this evidence bundle: ${artifact}`);
-    } finally { if (fd !== undefined) closeSync(fd); }
+      verdict.blockers.push(`${key}: artifact must be a readable single-link file within this evidence bundle`);
+    }
   }
   verdict.ok = verdict.blockers.length === 0;
   return verdict;

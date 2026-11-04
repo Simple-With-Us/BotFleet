@@ -1374,6 +1374,56 @@ export function sweepTranscriptVolumeBudget(
   return finish();
 }
 
+/** Runs the volume-budget sweep once shortly after boot (default 60 s, off
+ * the request path so a large `native/`/`events/` directory never delays
+ * `server.listen`) and then on the same daily cadence as the cap sweep.
+ * `getLiveThreadIds` and `getInFlightThreadIds` are called fresh on every
+ * run, never cached, so a thread created or deleted after boot is still read
+ * correctly a day later.  Both timers are unref'd.  `opts.hold` returns a
+ * reason to skip a run (or null to go ahead).  Over-budget remainder is
+ * reported through `describeVolumeSweep`, never taken from live data.
+ * Returns the stopper. */
+export function startVolumeTranscriptSweeps(
+  dirs: TranscriptDirs,
+  getLiveThreadIds: () => Iterable<string>,
+  getInFlightThreadIds: () => Iterable<string> = () => [],
+  log: (line: string) => void = console.log,
+  opts: {
+    dryRun?: boolean;
+    initialDelayMs?: number;
+    hold?: () => string | null;
+    budgetBytes?: number;
+    tailBytes?: IdleTailBytes;
+  } = {},
+): () => void {
+  const dryRun = opts.dryRun ?? false;
+  let lastHold: string | null = null;
+  const run = () => {
+    const held = opts.hold?.();
+    if (held) {
+      if (held !== lastHold) log(`[retention] volume transcript sweep skipped: ${held}.`);
+      lastHold = held;
+      return;
+    }
+    lastHold = null;
+    const result = sweepTranscriptVolumeBudget(dirs, new Set(getLiveThreadIds()), new Set(getInFlightThreadIds()), {
+      dryRun,
+      budgetBytes: opts.budgetBytes,
+      tailBytes: opts.tailBytes,
+    });
+    const line = describeVolumeSweep(result);
+    if (line) log(line);
+  };
+  const initial = setTimeout(run, opts.initialDelayMs ?? 60_000);
+  initial.unref?.();
+  const timer = setInterval(run, DAILY_SWEEP_MS);
+  timer.unref?.();
+  return () => {
+    clearTimeout(initial);
+    clearInterval(timer);
+  };
+}
+
 /** One line for the boot or daily log, or null when there was nothing to say
  * and the volume is inside its budget.  A dry run never quotes a byte count
  * it did not reclaim; a volume that is still over budget says how far over,
