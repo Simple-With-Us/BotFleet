@@ -21,7 +21,7 @@ struct NativeHeadlessHostInstallerTests {
         #expect(result.plistURL == fixture.destination)
         let parsed = try #require(NativeHeadlessHostInstaller.parsedPlist(at: fixture.destination))
         #expect(parsed["Label"] as? String == "app.botfleet.nativehost")
-        #expect(parsed["ProgramArguments"] as? [String] == [fixture.executable.path, "--service-data", fixture.dataRoot.path])
+        #expect(parsed["ProgramArguments"] as? [String] == [fixture.executable.path, "--service-data", fixture.dataRoot.path, "--automatic"])
         #expect(parsed["RunAtLoad"] as? Bool == true)
         #expect(parsed["UserName"] == nil)
         #expect(installer.verifyInstalled())
@@ -33,6 +33,42 @@ struct NativeHeadlessHostInstallerTests {
         #expect(FileManager.default.fileExists(atPath: sentinel.path))
         #expect(!installer.verifyInstalled())
         #expect(try !installer.uninstall())
+    }
+
+    @Test("Installed RunAtLoad arguments preserve an owner Stop before recovery")
+    func installedAutomaticStartPreservesStop() async throws {
+        let fixture = try InstallerFixture()
+        defer { fixture.remove() }
+        let installer = fixture.installer()
+        _ = try installer.install()
+        let plist = try #require(NativeHeadlessHostInstaller.parsedPlist(at: fixture.destination))
+        let argv = try #require(plist["ProgramArguments"] as? [String])
+        let launch = try NativeHostLaunchArguments(arguments: Array(argv.dropFirst()))
+        #expect(launch.intent == .automatic)
+        #expect(launch.serviceData == fixture.dataRoot)
+        let paths = try NativeServicePaths(serviceData: fixture.dataRoot)
+        let marker = Data("{\"stopped\":true}\n".utf8)
+        try marker.write(to: paths.stoppedMarker)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.stoppedMarker.path)
+        let result = try await NativeHeadlessHost.launch(serviceData: launch.serviceData, intent: launch.intent)
+        guard case .stoppedByOwner = result else { Issue.record("Installed automatic startup ignored Stop"); return }
+        #expect(try Data(contentsOf: paths.stoppedMarker) == marker)
+        #expect(!FileManager.default.fileExists(atPath: paths.database.path))
+        #expect(!FileManager.default.fileExists(atPath: paths.home.path))
+        #expect(installer.verifyInstalled())
+    }
+
+    @Test("A managed definition written before automatic intent upgrades in place")
+    func managedLegacyArgumentsUpgrade() throws {
+        let fixture = try InstallerFixture()
+        defer { fixture.remove() }
+        var legacy = try fixture.installer().renderedPlistDictionary()
+        legacy["ProgramArguments"] = [fixture.executable.path, "--service-data", fixture.dataRoot.path]
+        try PropertyListSerialization.data(fromPropertyList: legacy, format: .xml, options: 0).write(to: fixture.destination)
+        #expect(!fixture.installer().verifyInstalled())
+        #expect(try fixture.installer().install().outcome == .updated)
+        #expect(fixture.installer().verifyInstalled())
+        #expect(try fixture.installer().uninstall())
     }
 
     @Test("The rendered plist carries no credential material or credential environment")
@@ -137,7 +173,7 @@ struct NativeHeadlessHostInstallerTests {
         let upgrading = fixture.installer(executable: released)
         #expect(try upgrading.install().outcome == .updated)
         let parsed = try #require(NativeHeadlessHostInstaller.parsedPlist(at: fixture.destination))
-        #expect(parsed["ProgramArguments"] as? [String] == [released.path, "--service-data", fixture.dataRoot.path])
+        #expect(parsed["ProgramArguments"] as? [String] == [released.path, "--service-data", fixture.dataRoot.path, "--automatic"])
         #expect(parsed["BotFleetInstallerManaged"] as? Bool == true)
         #expect(upgrading.verifyInstalled())
         #expect(try upgrading.uninstall())
