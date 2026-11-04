@@ -46,6 +46,8 @@
     {"path":"public/gemini-mark.webp","category":"runtime-asset","reason":"Vite copies this public asset into the Linux UI"},
     {"path":"public/tv-face/fleet-demo.html","category":"runtime-asset","reason":"Vite copies this public asset into the Linux UI"},
     {"path":"public/tv-face/fleet-live.html","category":"runtime-asset","reason":"Vite copies this public asset into the Linux UI"},
+    {"path":"public/tv-face/packs/tvface-default.webp","category":"runtime-asset","reason":"Vite copies this public asset into the Linux UI"},
+    {"path":"public/tv-face/packs/tvface-thinking.webp","category":"runtime-asset","reason":"Vite copies this public asset into the Linux UI"},
     {"path":"public/tv-face/skins/black/gifs/alerting_hold.gif","category":"runtime-asset","reason":"Vite copies this public asset into the Linux UI"},
     {"path":"public/tv-face/skins/black/gifs/angry_hold.gif","category":"runtime-asset","reason":"Vite copies this public asset into the Linux UI"},
     {"path":"public/tv-face/skins/black/gifs/anticipate.gif","category":"runtime-asset","reason":"Vite copies this public asset into the Linux UI"},
