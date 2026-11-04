@@ -368,6 +368,8 @@ export interface Bot {
   avatarUrl?: string | null;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
+  /** When true, an animated one-file pack may use the Color row (shell recolor). */
+  recolorable?: boolean;
   unread: boolean;
   busy?: boolean;
   activityStartedAt?: number;

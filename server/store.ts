@@ -644,6 +644,8 @@ export interface BotRecord {
   avatarUrl?: string;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
+  /** Animated one-file packs that accept the Color row. */
+  recolorable?: boolean;
   unread: boolean;
   modelSelection: ModelSelection;
   /** The model selection that actually ran on the most recent turn (post-fallback). */

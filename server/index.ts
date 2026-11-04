@@ -21,7 +21,7 @@ import { z } from "zod";
 import { instanceModelsSchema } from "./instance-models.ts";
 import { ScreenPollers } from "./screen-poller.ts";
 import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
-import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
+import { BOT_AVATAR_CROPS, botAvatarRecolorableSchema, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, lowerRoomLabels, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
@@ -118,6 +118,7 @@ import { createWorkerRequestBoundary, privateWorkerAuthorizationSource } from ".
 import { classifyWorkerRequest } from "../shared/placement-worker-http.mjs";
 import { openRollbackPlacementAuthority, PLACEMENT_ROLLBACK_REFUSAL } from "./placement-readonly.ts";
 import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, type PlacementLeaseAction } from "./placement-leases.ts";
+import { PlacementModeStore, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
 import {
@@ -838,6 +839,17 @@ const placementRollbackReadOnly = placementAuthority.kind === "readonly";
 const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeaseService({
   hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
 }) : null;
+// The server's copy of the mode record, beside `jobs.json`.  It shares the
+// lease service's epoch and keeps no epoch of its own, so the record can
+// never name a fence the controller does not hold.
+const placementModeStore = new PlacementModeStore(join(DATA_DIR, "jobs"), {
+  hostId,
+  controller: () => {
+    if (placementAuthority.kind === "readonly") return placementAuthority.reader.controller();
+    if (!placementLeases) throw new Error("Placement authority is unavailable");
+    return placementLeases.controller();
+  },
+});
 const jobHostProbe = createHostProbe({
   storageState: storageGuard?.sample,
   // The Mac memory-pressure probe runs only while a memory-headroom knob
@@ -15947,9 +15959,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // not a guard.  The six organize fields are parsed together.
       // From a paired phone (the sidecar stamps `x-botfleet-companion`) the
       // body may carry the six organize fields and nothing else.
+      if (!botAvatarRecolorableSchema.safeParse(body.recolorable).success) {
+        return json(res, 400, { error: "recolorable must be a boolean" });
+      }
       const organize = checkBotOrganizeBody(body, req.headers["x-botfleet-companion"] === "1");
       if (!organize.ok) return json(res, organize.status, { error: organize.error });
-      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
+      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "recolorable", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       if (normalizedSelection) {
@@ -17748,6 +17763,31 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (!placementLeases) throw new Error("Placement authority is unavailable");
         return placementLeases.controller();
       }, platform: process.platform });
+      return json(res, response.status, response.body);
+    }
+    if ((method === "GET" || method === "PUT") && path === "/api/placement/mode") {
+      // The same owner boundary as placement identity and host resources:
+      // the local owner or the authenticated server gate, never the companion
+      // lane or the named tunnel.
+      const caller = {
+        localOwner: isLoopbackAddress(req.socket.remoteAddress),
+        fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
+        viaNamedTunnel: arrivedViaCloudflareTunnel(req),
+      };
+      if (method === "GET") {
+        const response = placementModeRead(caller, placementModeStore);
+        return json(res, response.status, response.body);
+      }
+      // A rollback build holds placement state:  it reads the mode record and
+      // never writes one.
+      if (placementRollbackReadOnly) return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
+      let body: unknown;
+      try {
+        body = await readBody(req);
+      } catch {
+        return json(res, 400, { error: "invalid placement mode message" });
+      }
+      const response = placementModeWrite(caller, body, placementModeStore);
       return json(res, response.status, response.body);
     }
     // Saved data that could not be read or used, for the notice at the top of the app.  File base names

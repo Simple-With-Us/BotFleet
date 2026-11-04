@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
+import { botAvatarRecolorableSchema,
   avatarCropAfterUpload,
   BOT_AVATAR_CROPS,
   GROUP_AVATAR_CROPS,
@@ -39,5 +39,16 @@ describe("the crop lists behind the shape selectors", () => {
 
   it("offers groups only the crops GroupAvatar can draw", () => {
     expect(GROUP_AVATAR_CROPS).toEqual(["circle", "rounded", "square"]);
+  });
+});
+
+describe("botAvatarRecolorableSchema", () => {
+  it("takes a boolean or nothing, and refuses anything else", () => {
+    expect(botAvatarRecolorableSchema.safeParse(true).success).toBe(true);
+    expect(botAvatarRecolorableSchema.safeParse(false).success).toBe(true);
+    expect(botAvatarRecolorableSchema.safeParse(undefined).success).toBe(true);
+    for (const value of ["true", 1, null, {}]) {
+      expect(botAvatarRecolorableSchema.safeParse(value).success).toBe(false);
+    }
   });
 });
