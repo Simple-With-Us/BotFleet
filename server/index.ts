@@ -21,7 +21,7 @@ import { z } from "zod";
 import { instanceModelsSchema } from "./instance-models.ts";
 import { ScreenPollers } from "./screen-poller.ts";
 import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
-import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
+import { BOT_AVATAR_CROPS, botAvatarRecolorableSchema, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, lowerRoomLabels, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
@@ -15933,6 +15933,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // not a guard.  The six organize fields are parsed together.
       // From a paired phone (the sidecar stamps `x-botfleet-companion`) the
       // body may carry the six organize fields and nothing else.
+      if (!botAvatarRecolorableSchema.safeParse(body.recolorable).success) {
+        return json(res, 400, { error: "recolorable must be a boolean" });
+      }
       const organize = checkBotOrganizeBody(body, req.headers["x-botfleet-companion"] === "1");
       if (!organize.ok) return json(res, organize.status, { error: organize.error });
       for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "recolorable", "pinned", "hidden"] as const) {

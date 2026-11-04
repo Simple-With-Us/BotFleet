@@ -21,14 +21,20 @@ import { extractAvatarManifest } from "../../shared/avatar-manifest";
 import { toManifestBytes } from "./avatar-file/bytes";
 import { BotAvatar } from "./Avatar";
 
-/** BF-2626 A/B/C:
- *  A — no expression picker (situation-driven only)
- *  B — TV-Face switch keeps bot.color (auto-color match; default orange)
- *  C — recolorable flag set on manifest WebP upload
- */
 type AvatarPatch = Partial<
   Pick<Bot, "avatarCrop" | "avatarUrl" | "color" | "mascotExpression" | "recolorable">
 >;
+
+/**
+ * What choosing a crop changes.  Expressions follow the bot's situation, so
+ * the mascot and TV-Face crops clear any pinned expression.  TV-Face keeps the
+ * bot's color.
+ */
+export function patchForCrop(next: NonNullable<Bot["avatarCrop"]>, color: Bot["color"] | undefined): AvatarPatch {
+  if (next === "tvface") return { avatarCrop: "tvface", mascotExpression: null, color: color || "orange" };
+  if (next === "mascot") return { avatarCrop: "mascot", mascotExpression: null };
+  return { avatarCrop: next };
+}
 
 const CROP_LABEL = {
   mascot: "Mascot",
@@ -58,9 +64,6 @@ export function BotProfileAvatarCard({
   const cropRef = useRef(crop);
   cropRef.current = crop;
 
-  const showColorRow =
-    crop === "mascot" || crop === "tvface" || (crop === "animated" && bot.recolorable === true);
-
   const upload = async (file: File | undefined) => {
     if (!file) return;
     setUploading(true);
@@ -87,12 +90,12 @@ export function BotProfileAvatarCard({
       // follows the file.  Anything else keeps the crop an upload would
       // have had, which is what stops a plain picture from being left in a
       // crop that cannot draw it.
-      // C: flag recolorable when the pack carries a manifest (shell/full
-      // recolor is decided later by product; first cut = true for TV-Face packs).
+      // A pack that carries a manifest is flagged recolorable.  Nothing draws
+      // that recolor yet, so the Color row stays off for the animated crop.
       onPatch({
         avatarUrl,
         avatarCrop: carriesManifest ? "animated" : avatarCropAfterUpload(latestCrop),
-        ...(carriesManifest ? { recolorable: true } : { recolorable: false }),
+        recolorable: carriesManifest,
       });
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
@@ -202,10 +205,10 @@ export function BotProfileAvatarCard({
           )}
         </div>
         <div className="mt-1.5 text-[11.5px] text-ink-secondary">
-          Drop an image onto the avatar.  PNG, JPEG, GIF, WebP, HEIC, BMP, or SVG · up to 10 MB
+          Drop an image onto the avatar.&#160; PNG, JPEG, GIF, WebP, HEIC, BMP, or SVG · up to 10 MB
         </div>
         <div className="mt-1 text-[11.5px] text-ink-secondary">
-          An animated WebP that carries its own manifest plays as one avatar file.  TV-Face and mascot expressions follow the bot's situation (no manual picker).
+          An animated WebP that carries its own manifest plays as one avatar file.
         </div>
 
         <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
@@ -217,23 +220,7 @@ export function BotProfileAvatarCard({
               key={candidate}
               type="button"
               aria-pressed={crop === candidate}
-              onClick={() => {
-                if (candidate === "tvface") {
-                  // B: restore auto-color match — keep bot.color (fallback orange).
-                  // A: clear pinned expression so TV-Face stays situation-driven.
-                  onPatch({
-                    avatarCrop: "tvface",
-                    mascotExpression: null,
-                    color: bot.color || "orange",
-                  });
-                  return;
-                }
-                if (candidate === "mascot") {
-                  onPatch({ avatarCrop: "mascot", mascotExpression: null });
-                  return;
-                }
-                onPatch({ avatarCrop: candidate });
-              }}
+              onClick={() => onPatch(patchForCrop(candidate, bot.color))}
               className={cn(
                 "py-1.5 text-[12.5px]",
                 index > 0 && "border-l border-hairline/40",
@@ -247,13 +234,13 @@ export function BotProfileAvatarCard({
           ))}
         </div>
 
-        {showColorRow && (
+        {(crop === "mascot" || crop === "tvface") && (
           <>
             <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
               Color
             </div>
             <p className="mb-2 text-[11.5px] text-ink-secondary">
-              Expressions follow the bot's situation.  There is no manual expression picker.
+              Expressions follow the bot's situation.
             </p>
             <div className="flex flex-wrap gap-2.5">
               {BOT_COLOR_NAMES.map((color) => (
