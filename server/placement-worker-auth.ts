@@ -6,6 +6,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import { HOST_ID_PATTERN, type HostId } from "../shared/placement.ts";
 import { classifyWorkerRequest } from "../shared/placement-worker-http.mjs";
+import type { WorkerTransport } from "./placement-worker-routes.ts";
 
 const idSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
 const hostSchema = z.string().regex(HOST_ID_PATTERN).transform((value) => {
@@ -89,10 +90,11 @@ export function workerVerifier(source: WorkerAuthorizationSource, audience: Host
   };
 }
 
-// This validates only the reserved authentication envelope, never an execution
-// receipt protocol or an advertisement that such a protocol is implemented.
+// This validates the authentication envelope.  Its `message` is opaque here and
+// is parsed per intent by the transport, when one exists.
 const WorkerEnvelopeSchema = z.object({
   authVersion: z.literal("1"), hostId: hostSchema, audience: hostSchema, role: z.literal("execution-worker"),
+  message: z.unknown().optional(),
 }).strict();
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- validation boundary: the JSON body is safeParse-checked before host/audience use
 export function workerEnvelopeMatches(principal: WorkerPrincipal, body: unknown): boolean {
@@ -102,6 +104,8 @@ export function workerEnvelopeMatches(principal: WorkerPrincipal, body: unknown)
 
 export function createWorkerRequestBoundary(options: {
   audience: HostId; source: WorkerAuthorizationSource;
+  /** Absent in production:  a valid envelope answers 503 until a reviewed activation passes one. */
+  transport?: WorkerTransport;
   // oxlint-disable-next-line anti-slop/no-unknown-returns -- HTTP boundary: parse the untrusted JSON with WorkerEnvelopeSchema before granting any intent
   readBody: (req: IncomingMessage) => Promise<unknown>;
 }) {
@@ -123,8 +127,16 @@ export function createWorkerRequestBoundary(options: {
     catch { answer(res, 400, "Worker request body is invalid"); return true; }
     const current = await verify(request.credentialId, request.secret);
     if (!current || !workerEnvelopeMatches(current, body)) { answer(res, 403, "Worker request refused"); return true; }
-    // No transport operation, lease, payload or owner diagnostic is accessed.
-    answer(res, 503, "Worker transport is not active");
+    if (!options.transport) {
+      // No transport operation, lease, payload or owner diagnostic is accessed.
+      answer(res, 503, "Worker transport is not active");
+      return true;
+    }
+    // The envelope matched just above, so `message` is the only field still unparsed.
+    const parsed = WorkerEnvelopeSchema.parse(body);
+    const response = options.transport.handle(current.hostId, request.intent, parsed.message);
+    res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
+    res.end(JSON.stringify(response.body));
     return true;
   };
 }
