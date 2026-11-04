@@ -111,7 +111,9 @@ const cleanup = () => {
   }
 };
 
-const deadline = Date.now() + 45_000;
+// Match the packaged desktop's owned-child boot allowance in electron/main.mjs.
+// This remains a readiness and packaging check, not a startup performance benchmark.
+const deadline = Date.now() + 60_000;
 let listening = false;
 while (Date.now() < deadline) {
   if (child.exitCode !== null) break;
