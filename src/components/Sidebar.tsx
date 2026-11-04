@@ -1665,6 +1665,8 @@ function SectionPicker({
   );
 }
 
+// Exported for tests/e2e/sidebar-menu-hover.visual.spec.ts, which mounts the
+// real menu so a change to the hover fill cannot silently regress.
 export function BotContextMenu({
   menu,
   onClose,
