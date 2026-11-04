@@ -9,6 +9,8 @@ import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import {
+  botNameFromPersona,
+  buildMcodePromptText,
   MCODE_EFFORT_CONFIG_ID,
   MCODE_M31_EFFORT_LEVELS,
   McodeAgentDriver,
@@ -717,5 +719,43 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     await create();
 
     expect(instance!.adapter.capabilities?.effortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+});
+
+describe("botNameFromPersona", () => {
+  it("reads the name the harness persona opens with", () => {
+    const persona = "You are Fixer (display: Fixer), a bot in BotFleet. Role: Engineer.";
+    expect(botNameFromPersona(persona)).toBe("Fixer");
+  });
+
+  it("reads it out of the room persona too", () => {
+    const persona = 'You are Deployer (display: Deployer), a bot in the room "Ops" in BotFleet.';
+    expect(botNameFromPersona(persona)).toBe("Deployer");
+  });
+
+  it("is null for anything that is not a BotFleet persona", () => {
+    expect(botNameFromPersona(undefined)).toBeNull();
+    expect(botNameFromPersona("")).toBeNull();
+    expect(botNameFromPersona("Summarise this file.")).toBeNull();
+    // A leading preamble defeats the anchored read on purpose: better no
+    // marker than a marker naming the wrong thing.
+    expect(botNameFromPersona("Note: You are Fixer (display: Fixer).")).toBeNull();
+  });
+});
+
+describe("mcode thread titles", () => {
+  it("leads the first message with [BF-<bot>] so the title starts there", () => {
+    const first = buildMcodePromptText({ system: "You are Fixer (display: Fixer), a bot in BotFleet.", text: "deploy the thing" });
+    expect(first.startsWith("[BF-Fixer]")).toBe(true);
+    expect(first).toContain("You are Fixer");
+    expect(first.endsWith("deploy the thing")).toBe(true);
+  });
+
+  it("leaves a turn with no persona exactly as it was", () => {
+    expect(buildMcodePromptText({ text: "hello" })).toBe("hello");
+  });
+
+  it("leaves a non-BotFleet system prompt unmarked", () => {
+    expect(buildMcodePromptText({ system: "Be brief.", text: "hi" })).toBe("Be brief.\n\nhi");
   });
 });

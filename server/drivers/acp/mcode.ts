@@ -208,6 +208,36 @@ function reportedConfigValue(reply: ConfigOptionReply | null | undefined, config
   return Array.isArray(options) ? options.find((option) => option?.id === configId)?.currentValue : undefined;
 }
 
+/** The bot's own name as the persona declares it: the harness opens every
+ *  persona with `You are <name> (display: <name>), a bot in BotFleet.`  Read
+ *  back out of the system prompt rather than threaded through the turn
+ *  contract, because that is the one place the name is already present and
+ *  adding a field to SendTurnInput for a label would touch every driver. */
+export function botNameFromPersona(system: string | undefined): string | null {
+  if (!system) return null;
+  const match = /^You are (.+?) \(display:/.exec(system.trim());
+  const name = match?.[1]?.trim();
+  return name ? name : null;
+}
+
+/** mcode titles a session from its first user message, and this driver's first
+ *  user message IS the persona — which is why an engine panel full of BotFleet
+ *  threads shows "You are Fixer (display: Fixer), a bot in BotFleet…" repeated
+ *  down the sidebar.  mcode's ACP exposes no title surface (`session/new`
+ *  returns only sessionId, modes and configOptions, and the advertised config
+ *  options are permissionMode, model and thinkingEffort), so the first message
+ *  is the only lever a host has.
+ *
+ *  Leading the message with `[BF-<bot>]` puts the marker at the front of the
+ *  title, which is what makes those threads identifiable and sortable in the
+ *  mcode sidebar.  Scoped to this driver on purpose: the persona is byte-for-
+ *  byte unchanged for every other engine. */
+export function buildMcodePromptText(turn: { system?: string; text: string }): string {
+  if (!turn.system) return turn.text;
+  const name = botNameFromPersona(turn.system);
+  return name ? `[BF-${name}]\n\n${turn.system}\n\n${turn.text}` : `${turn.system}\n\n${turn.text}`;
+}
+
 const support: AcpSupport = {
   driverKind: "mcodeAgent",
   displayName: "MiniMax Code",
@@ -255,7 +285,7 @@ const support: AcpSupport = {
   // this instance's HOME, not the server process's: an instance can carry
   // its own, and probing the wrong one reports another account's login
   isAuthenticated: (env) => mcodeAuthenticated(env),
-  buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
+  buildPromptText: buildMcodePromptText,
   // Reasoning effort.  mcode advertises `thinkingEffort` (default, low, medium,
   // high, xhigh, max) only for M3.1, and `session/set_config_option` sets it
   // for this session without touching config.yaml.
