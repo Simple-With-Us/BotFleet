@@ -423,11 +423,37 @@ final class ControlTests: XCTestCase {
         try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
         try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
         let marker = home.appendingPathComponent(".botfleet/stopped.marker")
-        try Data().write(to: marker)
+        let contents = Data("owner-stop-start".utf8)
+        try contents.write(to: marker)
         let runner = MockCommands()
         runner.failKickstart = true
         XCTAssertThrowsError(try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).startServer())
-        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(try Data(contentsOf: marker), contents)
+    }
+
+    func testSettledStartRestoresTheDeliberateStopWhenTheServerNeverRuns() async throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let contents = Data("owner-stop-settled".utf8)
+        try contents.write(to: marker)
+        // The kickstart succeeds, and the job never shows a process.
+        let runner = MockCommands()
+        let policy = StartupPolicy(home: home, commands: runner, uid: 501, environment: [:])
+        let stopped = try await policy.startServerAndSettle(attempts: 0)
+        XCTAssertNotEqual(stopped, .running)
+        XCTAssertTrue(runner.calls.contains("/bin/launchctl kickstart gui/501/app.botfleet.server"))
+        XCTAssertEqual(try Data(contentsOf: marker), contents)
+        // The same start that comes up leaves the stop lifted.
+        runner.launchctlListing = "PID\tStatus\tLabel\n1234\t0\tapp.botfleet.server"
+        let running = try await policy.startServerAndSettle(attempts: 0)
+        XCTAssertEqual(running, .running)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
     func testRestartServerClearsTheDeliberateStopAndReplacesTheRunningInstance() throws {
@@ -459,11 +485,97 @@ final class ControlTests: XCTestCase {
         try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
         try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
         let marker = home.appendingPathComponent(".botfleet/stopped.marker")
-        try Data().write(to: marker)
+        let contents = Data("owner-stop-restart".utf8)
+        try contents.write(to: marker)
         let runner = MockCommands()
         runner.failKickstart = true
         XCTAssertThrowsError(try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).restartServer())
+        XCTAssertEqual(try Data(contentsOf: marker), contents)
+    }
+
+    func testServerStartAndRestartRefuseUnsafeStopMarkers() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let session = home.appendingPathComponent(".botfleet/startup-session")
+        let priorSession = Data("original-boot-session\n".utf8)
+        try priorSession.write(to: session)
+        let oversized = Data(repeating: 0x41, count: 64 * 1024 + 1)
+        try oversized.write(to: marker)
+        let runner = MockCommands()
+        let startup = StartupPolicy(home: home, commands: runner, uid: 501, environment: [:])
+        XCTAssertThrowsError(try startup.startServer())
+        XCTAssertThrowsError(try startup.restartServer())
+        XCTAssertEqual(try Data(contentsOf: marker), oversized)
+        XCTAssertEqual(try Data(contentsOf: session), priorSession)
+        XCTAssertTrue(runner.calls.isEmpty)
+
+        try FileManager.default.removeItem(at: marker)
+        let target = home.appendingPathComponent("owner-stop-metadata")
+        let contents = Data("owner-stop".utf8)
+        try contents.write(to: target)
+        try FileManager.default.createSymbolicLink(at: marker, withDestinationURL: target)
+        XCTAssertThrowsError(try startup.startServer())
+        XCTAssertThrowsError(try startup.restartServer())
+        XCTAssertEqual(try Data(contentsOf: target), contents)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: marker.path), target.path)
+        XCTAssertEqual(try Data(contentsOf: session), priorSession)
+        XCTAssertTrue(runner.calls.isEmpty)
+    }
+
+    func testUnparkedCompanionStartUsesOnlyTheCompanionAgent() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.companion.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let runner = MockCommands()
+        try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).startCompanion()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(runner.calls, [
+            "/bin/launchctl enable gui/501/app.botfleet.companion",
+            "/bin/launchctl print gui/501/app.botfleet.companion",
+            "/bin/launchctl bootstrap gui/501 \(home.path)/Library/LaunchAgents/app.botfleet.companion.plist",
+            "/bin/launchctl kickstart gui/501/app.botfleet.companion"
+        ])
+    }
+
+    func testParkedCompanionStartAndRestartRefuseBeforeAnyCommand() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.companion.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+        let runner = MockCommands()
+        let startup = StartupPolicy(home: home, commands: runner, uid: 501, environment: [:])
+        XCTAssertThrowsError(try startup.startCompanion()) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Start the BotFleet Server"))
+        }
+        XCTAssertThrowsError(try startup.restartCompanion())
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(runner.calls.isEmpty)
+    }
+
+    func testUnparkedCompanionRestartReplacesOnlyItsOwnInstance() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.companion.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let runner = MockCommands()
+        runner.agentIsLoaded = true
+        try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).restartCompanion()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(runner.calls.contains("/bin/launchctl kickstart -k gui/501/app.botfleet.companion"))
     }
 
     private func mockSession() -> URLSession {

@@ -22,7 +22,8 @@ import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { controlBuildVersion } from "../electron/control-build-version.mjs";
-import { hashStaticUi, readSourceBuildIdentity } from "../electron/runtime-identity.mjs";
+import { hashStaticUi } from "../electron/runtime-identity.mjs";
+import { readSourceBuildIdentity } from "./source-build-identity.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const server = join(root, "server");
@@ -44,6 +45,7 @@ const stamp = buildVersion ? controlBuildVersion({ repoRoot: root }) : null;
 const buildIdentity = {
   ...readSourceBuildIdentity(root, { requireGit: true, version: stamp?.version ?? null, build: stamp?.build ?? null }),
   uiHash: hashStaticUi(join(root, "dist")),
+  desktopStartupProtocol: 1,
 };
 
 // yaml's Node export is CommonJS and contains dynamic requires that cannot run

@@ -19,6 +19,10 @@ test("only the explicit non-executable documentation paths take the fast path", 
     packagingChanged: false,
   });
   assert.equal(classifyCIPaths(["README.md", "SECURITY.md"]).docsOnly, true);
+  assert.equal(
+    classifyCIPaths(["marketing/README.md", "marketing/screenshots/README.md"]).docsOnly,
+    true,
+  );
 
   for (const path of [
     "src/App.tsx",
@@ -28,6 +32,8 @@ test("only the explicit non-executable documentation paths take the fast path", 
     "LICENSE",
     "NOTICE",
     "docs/secrets.md",
+    "marketing/screenshots/macos/drafts/screen.png",
+    "marketing/scripts/publish.mjs",
     ".github/workflows/ci.yml",
     "scripts/release.mjs",
   ]) {
@@ -359,8 +365,25 @@ test("the iOS gate keeps changed paths out of workflow-command stdout", () => {
 test("the weekly full run is registered with the Sentry cron reporter", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const schedule = workflow.on.schedule[0].cron;
+  const testJob = workflow.jobs.test;
+  const testMatrix = testJob.strategy.matrix.include;
+  const testTimeoutExpression = "${{ matrix.os == 'macos-15' && 35 || 25 }}";
+  const matrixBudgets = testMatrix.map(({ os, check }) => [
+    check,
+    os === "macos-15" ? 35 : os === "ubuntu-latest" ? 25 : null,
+  ]);
+  assert.equal(testJob["timeout-minutes"], testTimeoutExpression);
+  assert.deepEqual(matrixBudgets, [
+    ["macos-latest", 35],
+    ["ubuntu-latest", 25],
+  ]);
+  const otherJobTimeouts = Object.values(workflow.jobs)
+    .filter((job) => job !== testJob)
+    .map((job) => job["timeout-minutes"] ?? 0);
+  assert.ok(otherJobTimeouts.every(Number.isFinite));
   const maxJobTimeout = Math.max(
-    ...Object.values(workflow.jobs).map((job) => job["timeout-minutes"] ?? 0),
+    ...otherJobTimeouts,
+    ...matrixBudgets.map(([, minutes]) => minutes),
   );
   const probe = spawnSync(
     "python3",
@@ -381,7 +404,7 @@ test("the weekly full run is registered with the Sentry cron reporter", () => {
   assert.equal(probe.status, 0, probe.stderr);
   const reporter = JSON.parse(probe.stdout);
   assert.equal(reporter.schedules.CI, schedule);
-  assert.ok(reporter.margins.CI >= maxJobTimeout + 15);
+  assert.ok(reporter.margins.CI >= maxJobTimeout + 20);
 });
 
 test("every host runs the canonical complete test chain without masking failures", () => {
@@ -414,6 +437,47 @@ test("the test job checks out full history so the effort ledger guard can find i
   const checkout = workflow.jobs.test.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
   assert.ok(checkout, "the test job must check out the repository");
   assert.equal(checkout.with?.["fetch-depth"], 0);
+  assert.equal(checkout.with?.filter, "blob:none");
+});
+
+test("CI full-history checkouts preserve the commit graph without downloading historic blobs", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const checkouts = Object.values(workflow.jobs).flatMap((job) =>
+    (job.steps ?? []).filter((step) => String(step.uses ?? "").startsWith("actions/checkout@")),
+  );
+  const fullHistoryCheckouts = checkouts.filter((step) => step.with?.["fetch-depth"] === 0);
+
+  assert.equal(fullHistoryCheckouts.length, 3);
+  for (const checkout of fullHistoryCheckouts) {
+    assert.equal(checkout.with.filter, "blob:none");
+  }
+
+  const ledgerGuard = workflow.jobs.changes.steps.find((step) =>
+    /effort-log-integrity\.node-test\.mjs/.test(step.run ?? ""),
+  );
+  assert.ok(ledgerGuard, "the history guard must remain present");
+  assert.match(
+    readFileSync(join(ROOT, "scripts/effort-log-integrity.node-test.mjs"), "utf8"),
+    /git", \["show"/,
+  );
+});
+
+test("required full-history workflows use blobless checkouts", () => {
+  const workflows = [
+    { file: "e2e.yml", jobName: "changes", proof: /ci-scope-diff\.sh/ },
+    { file: "mac-package-gate.yml", jobName: "scope", proof: /ci-scope-diff\.sh/ },
+    { file: "node-ci.yml", jobName: "lint", proof: /check-lint-baseline\.mjs/ },
+  ];
+  for (const { file: workflowFile, jobName, proof } of workflows) {
+    const workflow = parse(readFileSync(join(ROOT, ".github/workflows", workflowFile), "utf8"));
+    const job = workflow.jobs[jobName];
+    assert.ok(job, `${workflowFile} job`);
+    const checkout = job.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+    assert.ok(checkout, `${workflowFile} checkout`);
+    assert.equal(checkout.with?.["fetch-depth"], 0, `${workflowFile} must retain full history`);
+    assert.equal(checkout.with?.filter, "blob:none", `${workflowFile} must avoid downloading historic blobs`);
+    assert.match(job.steps.map((step) => step.run ?? "").join("\n"), proof);
+  }
 });
 
 test("a later push cannot cancel an earlier main run before it dispatches jobs", () => {
@@ -439,6 +503,7 @@ test("a documentation-only change still runs the effort ledger guard", () => {
   const steps = workflow.jobs.changes.steps;
   const checkout = steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
   assert.equal(checkout.with["fetch-depth"], 0);
+  assert.equal(checkout.with.filter, "blob:none");
   const guard = steps.find((step) => /effort-log-integrity\.node-test\.mjs/.test(step.run ?? ""));
   assert.ok(guard, "the changes job must run the effort ledger guard");
   assert.equal(guard.if, checkout.if, "the guard runs exactly when the checkout does");

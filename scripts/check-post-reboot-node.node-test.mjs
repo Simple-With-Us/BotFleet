@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -11,11 +13,54 @@ import {
   inspectLaunchAgents,
   inspectPortListeners,
   inspectProcesses,
+  inspectRunningExecutable,
   isBotFleetNodeProcess,
 } from "./check-post-reboot-node.mjs";
 import { resolveBoardCli } from "./decommission-gate-state.mjs";
 
+test("running executable inspection binds mapped text inode and rejects name-only matches", () => {
+  const root = mkdtempSync(join(tmpdir(), "bf-executable-inspection-"));
+  try {
+    const actual = join(root, "actual", "BotFleet");
+    const wrong = join(root, "wrong", "BotFleet");
+    const alias = join(root, "alias");
+    mkdirSync(dirname(actual));
+    mkdirSync(dirname(wrong));
+    writeFileSync(actual, "native fixture");
+    writeFileSync(wrong, "different binary with same basename");
+    symlinkSync(actual, alias);
+    const mapped = statSync(actual, { bigint: true });
+    const listing = `p123\nftxt\nD0x${mapped.dev.toString(16)}\ni${mapped.ino}\nn${actual}\n`;
+    const nativeLinks = "/System/Library/Frameworks/AppKit.framework/AppKit\n/usr/lib/swift/libswiftCoreFoundation.dylib\n";
+    const command = (tool, args) => {
+      if (tool === "lsof") {
+        assert.deepEqual(args, ["-w", "-nP", "-a", "-p", "123", "-d", "txt", "-FfDin"]);
+        return listing;
+      }
+      assert.equal(tool, "otool");
+      if (args[0] === "-L") {
+        assert.deepEqual(args, ["-L", actual]);
+        return nativeLinks;
+      }
+      assert.deepEqual(args, ["-l", actual]);
+      return "Section\n  sectname __swift5_entry\n";
+    };
+    assert.equal(inspectRunningExecutable(123, actual, { run: command }), "native");
+    assert.equal(inspectRunningExecutable(123, alias, { run: command }), "native");
+    assert.equal(inspectRunningExecutable(123, wrong, { run: command }), "unknown");
+    assert.equal(inspectRunningExecutable(123, actual, { run: (tool) => tool === "otool" ? "Electron.framework/Electron\n" : listing }), "electron");
+    assert.equal(inspectRunningExecutable(123, actual, { run: (tool, args) => tool === "lsof" ? listing : args[0] === "-L" ? nativeLinks : "Section\n  sectname __objc_classlist\n" }), "unknown");
+    assert.equal(inspectRunningExecutable(123, actual, { run: (tool) => tool === "lsof" ? listing.replace(`i${mapped.ino}`, `i${mapped.ino + 1n}`) : nativeLinks }), "unknown");
+    assert.equal(inspectRunningExecutable(123, actual, { run: (tool) => tool === "lsof" ? "p123\nftxt\nnBotFleet\n" : nativeLinks }), "unknown");
+    const other = statSync(wrong, { bigint: true });
+    const frameworkFirst = `p123\nftxt\nD0x${other.dev.toString(16)}\ni${other.ino}\nn${wrong}\nftxt\nD0x${mapped.dev.toString(16)}\ni${mapped.ino}\nn${actual}\n`;
+    assert.equal(inspectRunningExecutable(123, actual, { run: (tool) => tool === "lsof" ? frameworkFirst : nativeLinks }), "unknown");
+    assert.equal(inspectRunningExecutable(123, actual, { run: () => { throw new Error("probe failed"); } }), "unknown");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("isBotFleetNodeProcess identifies BotFleet Node command lines", () => {
+  const sharedMainExecutable = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";
   assert.equal(isBotFleetNodeProcess("node server/index.ts"), true);
   assert.equal(
     isBotFleetNodeProcess(
@@ -48,6 +93,87 @@ test("isBotFleetNodeProcess identifies BotFleet Node command lines", () => {
   assert.equal(isBotFleetNodeProcess("node scripts/check-post-reboot-node.mjs"), false);
   assert.equal(isBotFleetNodeProcess(""), false);
   assert.equal(isBotFleetNodeProcess(null), false);
+
+  assert.equal(
+    isBotFleetNodeProcess(sharedMainExecutable, {
+      pid: "101",
+      inspectExecutable: (pid, path) => {
+        assert.equal(pid, "101");
+        assert.equal(path, sharedMainExecutable);
+        return "native";
+      },
+    }),
+    false,
+    "the canonical native executable passes when its identity is positively established",
+  );
+  assert.equal(
+    isBotFleetNodeProcess(sharedMainExecutable, {
+      pid: "102",
+      inspectExecutable: (pid, path) => {
+        assert.equal(pid, "102");
+        assert.equal(path, sharedMainExecutable);
+        return "electron";
+      },
+    }),
+    true,
+    "Electron at the same bundle and executable path remains a failure",
+  );
+  assert.equal(
+    isBotFleetNodeProcess(sharedMainExecutable, {
+      pid: "103",
+      inspectExecutable: () => "unknown",
+    }),
+    true,
+    "unknown executable identity fails closed",
+  );
+  assert.equal(
+    isBotFleetNodeProcess(sharedMainExecutable, {
+      pid: "104",
+      inspectExecutable: () => {
+        throw new Error("inspector command failed");
+      },
+    }),
+    true,
+    "an inspector command failure fails closed",
+  );
+});
+
+test("inspectProcesses uses fixture PIDs to inspect the shared native/Electron executable", () => {
+  const executable = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";
+  const sample = `
+USER       PID  %CPU %MEM      VSZ    RSS   TT  STAT STARTED      TIME COMMAND
+jay        101   0.0  0.2 41500000  25000   ??  S     3Nov26   0:01.05 ${executable}
+jay        102   0.0  0.2 41500000  25000   ??  S     3Nov26   0:01.05 ${executable}
+jay        103   0.0  0.2 41500000  25000   ??  S     3Nov26   0:01.05 ${executable}
+jay        104   0.0  0.2 41500000  25000   ??  S     3Nov26   0:01.05 ${executable}
+`;
+  const identities = new Map([
+    ["101", "native"],
+    ["102", "electron"],
+    ["103", "unknown"],
+  ]);
+  const inspected = [];
+  const processes = inspectProcesses(sample, {
+    inspectExecutable: (pid, path) => {
+      inspected.push({ pid, path });
+      if (pid === "104") throw new Error("fixture command error");
+      return identities.get(pid) ?? "unknown";
+    },
+  });
+
+  assert.deepEqual(inspected, [
+    { pid: "101", path: executable },
+    { pid: "102", path: executable },
+    { pid: "103", path: executable },
+    { pid: "104", path: executable },
+  ]);
+  assert.deepEqual(processes.map(({ pid }) => pid), ["102", "103", "104"]);
+  assert.deepEqual(processes.map(({ identity }) => identity), ["electron", "unknown", "unknown"]);
+  const verdict = evaluatePostReboot({ processes });
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.failures[0], /PID 102 \[electron\]/);
+  assert.match(verdict.failures[0], /PID 103 \[unknown\]/);
+  assert.doesNotMatch(verdict.failures[0], /Lingering BotFleet Node processes/);
 });
 
 test("inspectProcesses detects offending processes in ps aux and ps -ef output", () => {
@@ -189,7 +315,7 @@ test("evaluatePostReboot returns FAIL with diagnostics when checks fail", () => 
   assert.equal(verdict.ok, false);
   assert.equal(verdict.failures.length, 5);
   assert.match(verdict.failures[0], /Inspection probe failures/);
-  assert.match(verdict.failures[1], /Lingering BotFleet Node processes/);
+  assert.match(verdict.failures[1], /BotFleet processes requiring investigation/);
   assert.match(verdict.failures[2], /Lingering BotFleet LaunchAgents/);
   assert.match(verdict.failures[3], /Lingering Node listeners on BotFleet ports/);
   assert.match(verdict.failures[4], /Unapproved lingering files/);

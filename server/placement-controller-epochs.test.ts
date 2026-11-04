@@ -1,18 +1,18 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PLACEMENT_WIRE_VERSION, type CapacitySample, type ControllerEpoch, type HostId, type ReleaseMessage, type TakeoverMessage } from "../shared/placement.ts";
+import { z } from "zod";
+import { HOST_ID_PATTERN, PLACEMENT_WIRE_VERSION, type CapacitySample, type ClaimMessage, type ControllerEpoch, type EnqueueMessage, type HeartbeatMessage, type HostId, type RegisterMessage, type ReleaseMessage, type ReportMessage, type StopMessage, type TakeoverMessage } from "../shared/placement.ts";
 import * as atomic from "./atomic.ts";
 import { loadControllerEpoch, openControllerEpochStore } from "./placement-identity.ts";
-import { PlacementLeaseService, placementLeaseRoute } from "./placement-leases.ts";
+import { PlacementLeaseService, placementLeaseRoute, type PlacementLeaseAction } from "./placement-leases.ts";
 import { spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 import { freePortBlock } from "./testing/ports.ts";
 import { fileURLToPath } from "node:url";
-import { z } from "zod";
-import { HOST_ID_PATTERN } from "../shared/placement.ts";
+import { openPlacementStore } from "./placement-store.ts";
 
 const hostId: HostId = "server:11111111-1111-4111-8111-111111111111";
 const nextId: HostId = "mac:22222222-2222-4222-8222-222222222222";
@@ -33,7 +33,7 @@ function fixture() {
 }
 function service(dir: string) {
   const controllerStore = openControllerEpochStore(dir, hostId);
-  return new PlacementLeaseService({ hostId, controller: controllerStore.read(), controllerStore });
+  return new PlacementLeaseService({ volatileForTests: true, hostId, controller: controllerStore.read(), controllerStore });
 }
 afterEach(() => {
   vi.restoreAllMocks();
@@ -142,6 +142,7 @@ describe("durable controller transitions", () => {
     const dir = fixture();
     const store = openControllerEpochStore(dir, hostId);
     const leases = new PlacementLeaseService({
+      volatileForTests: true,
       hostId, controller: initial,
       controllerStore: {
         read: () => store.read(),
@@ -278,7 +279,7 @@ describe("durable controller transitions", () => {
         epoch: z.number().int().nonnegative().safe(),
       }).parse(await response.json());
     };
-    const transition = async (action: "release-controller" | "takeover", body: ReleaseMessage | TakeoverMessage) => {
+    const transition = async (action: PlacementLeaseAction, body: ReleaseMessage | TakeoverMessage | EnqueueMessage | RegisterMessage | HeartbeatMessage | ClaimMessage | StopMessage | ReportMessage) => {
       const response = await fetch(`${base}/api/placement/${action}`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
       });
@@ -286,6 +287,16 @@ describe("durable controller transitions", () => {
       return response.json();
     };
     try {
+      // Ordinary updates preserve the existing strict epoch/rollback contract.
+      await boot();
+      const legacy = await identity();
+      expect(loadControllerEpoch(dir, legacy.controllerId)).toEqual({ controllerId: legacy.controllerId, epoch: 0 });
+      expect(existsSync(join(dir, "placement.sqlite"))).toBe(false);
+      expect(existsSync(join(dir, "placement-payloads"))).toBe(false);
+      if (!child) throw new Error("fixture child missing");
+      await waitForExit(child, { signal: "SIGTERM" });
+      // Explicit isolated fixture migration stands in for the later verified activation.
+      openPlacementStore(dir, legacy.controllerId).close();
       await boot();
       const start = await identity();
       expect(start.epoch).toBe(0);
@@ -300,6 +311,29 @@ describe("durable controller transitions", () => {
       expect(await identity()).toMatchObject({ controllerId: hostId, epoch: 5 });
       expect(await transition("release-controller", { ...currentFence, toControllerId: nextId }))
         .toMatchObject({ accepted: false, controllerId: hostId, epoch: 5 });
+      const liveFence = { ...fence, epoch: 5 };
+      const enqueue = { ...liveFence, jobId: "http-restart", botId: "fixture-bot", threadId: "fixture-thread", command: "true", cwd: dir, timeoutMs: 1000 };
+      expect(await transition("enqueue", enqueue)).toMatchObject({ accepted: true });
+      const register = { ...liveFence, hostId: nextId, role: "worker" as const, capabilities: ["shell"] as const, sample };
+      const heartbeat = { ...liveFence, hostId: nextId, leases: [], admission: { admit: true }, sample };
+      await transition("register", { ...register, capabilities: ["shell"] });
+      await transition("heartbeat", heartbeat);
+      const claim = { ...liveFence, hostId: nextId, jobId: enqueue.jobId };
+      const claimed = await transition("claim", claim);
+      expect(claimed).toMatchObject({ accepted: true });
+      const leaseId = z.object({ lease: z.object({ leaseId: z.string().min(1) }) }).parse(claimed).lease.leaseId;
+      await transition("stop", { ...liveFence, jobId: enqueue.jobId, leaseId, reason: "fixture stop" });
+      await waitForExit(child, { signal: "SIGTERM" });
+      await boot();
+      expect(await transition("claim", claim)).toMatchObject({ accepted: false });
+      await transition("register", { ...register, capabilities: ["shell"] });
+      expect(await transition("heartbeat", heartbeat)).toMatchObject({ pendingStops: [leaseId] });
+      expect(await transition("claim", claim)).toMatchObject({ accepted: true, lease: { leaseId } });
+      const report: ReportMessage = { ...liveFence, jobId: enqueue.jobId, hostId: nextId, leaseId, status: "killed", exitCode: null, signal: "SIGTERM", endedAt: 2000 };
+      expect(await transition("report", report)).toMatchObject({ accepted: true });
+      expect(await transition("heartbeat", heartbeat)).toMatchObject({ pendingStops: [] });
+      expect(await transition("report", report)).toMatchObject({ accepted: true });
+      expect(await transition("enqueue", enqueue)).toMatchObject({ accepted: true, duplicate: true, status: "killed" });
     } finally {
       if (child) await waitForExit(child, { signal: "SIGTERM" });
     }

@@ -12,7 +12,11 @@ const ROOT_DOCUMENTS = new Set([
 const FULL_CI_DOCUMENTS = new Set(["docs/secrets.md"]);
 
 export function isDocumentationPath(path) {
-  return !FULL_CI_DOCUMENTS.has(path) && (ROOT_DOCUMENTS.has(path) || path.startsWith("docs/"));
+  const marketingMarkdown = path.startsWith("marketing/") && path.endsWith(".md");
+  return (
+    !FULL_CI_DOCUMENTS.has(path) &&
+    (ROOT_DOCUMENTS.has(path) || path.startsWith("docs/") || marketingMarkdown)
+  );
 }
 
 // Per-area path filters feeding the expensive jobs' own `if` gates (mirrors

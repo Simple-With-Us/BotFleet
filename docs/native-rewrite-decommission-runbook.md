@@ -13,10 +13,11 @@ That is not a formality.  Deleting `server/`, `companion/` or the Node build ch
 ## The Gate
 
 ```
-node scripts/check-decommission-gates.mjs <state.json>
+node scripts/check-decommission-gates.mjs <state.json> --bundle <bundle.json> \
+  --source-sha <exact-source-sha> --build <exact-build> --artifact-sha256 <signed-artifact-sha256>
 ```
 
-The state file is plain JSON, so the check itself needs no network:
+The state file is plain JSON, so the check itself needs no network; the final CLI additionally requires the [private final evidence bundle](verification/native-final-evidence.md), including exact candidate and artifact bindings, linked runtime receipts, separate observation intervals and explicit external owner acceptance.
 
 ```json
 {
@@ -29,7 +30,7 @@ The state file is plain JSON, so the check itself needs no network:
 }
 ```
 
-Seven issues must be Done, six evidence items asserted, and the Mac-local harness asserted to be gone:
+Seven issues must be Done, seven evidence items asserted, and the Mac-local harness asserted to be gone:
 
 | Gate | Why it blocks the deletion |
 |---|---|
@@ -43,6 +44,7 @@ Seven issues must be Done, six evidence items asserted, and the Mac-local harnes
 
 | Evidence | What must be true |
 |---|---|
+| `placement-evidence` | All sixteen placement recipes pass the existing artifact validator with both host inventories and the required hand-run logs; the final bundle binds their exact bytes. |
 | `soak-24h-no-node` | 24 hours with the Node harness stopped and its launchd job booted out, every bot answering. |
 | `replay-parity` | Each engine's recorded turns replay through `EngineDriver` with the same ordered `TurnEvent` kinds the Node harness recorded. |
 | `final-import-parity` | The final import parity report matches, the Node store is archived read-only, and rollback has been rehearsed once. |
@@ -52,13 +54,13 @@ Seven issues must be Done, six evidence items asserted, and the Mac-local harnes
 
 Anything that is not a completed state counts as unmet, including `In Review`.  The gate exists to stop nearly-done from reading as done.  A cancelled or duplicate issue is not a completed state either: the replacement never landed, so deleting the code it was to replace stops the bots instead of cleaning up after a finished job.
 
-Refresh the state file from Linear at run time rather than editing it by hand.  A stale all-Done file is the one input that defeats the guard, so the gate prints the age of the file it read.
+Refresh the state file from Linear at run time rather than editing it by hand.  Issue states and evidence booleans remain necessary prerequisites, but cannot pass the final CLI without their hash-bound evidence packet.  Offline validation establishes binding and consistency, not the authenticity or truth of the captured claims.
 
 ```
-node scripts/decommission-gate-state.mjs --out /tmp/phase6-state.json
+node scripts/decommission-gate-state.mjs --out /private/captures/state.json
 ```
 
-That reads the seven issue states through the board CLI, derives `inventory-clean` by running the audit against the committed tree, and pre-fills the approved `deploy/linux-server/` retention.  It leaves all five human-only evidence items and `macLocalHarness.present` blocking: the soak, replay parity and final import require Mac-side verification; `control-disposition` requires the selected Control disposition to be implemented and landed; and `linux-server-preservation` requires verification of the Linux source/build/update/rollback closure or a replacement.  The generator never asserts these items.  The owner’s Option C ruling alone does not assert `control-disposition`.  A failed Linear read exits non-zero instead of writing a partial file, so a refresh that did not happen cannot read as one that did.  After verifying the Mac harness is gone and each evidence claim is true, the responsible human updates the state before deletion.
+That reads the seven issue states through the board CLI, derives `inventory-clean` by running the audit against the committed tree, and pre-fills the approved `deploy/linux-server/` retention.  It leaves external evidence and `macLocalHarness.present` blocking: the soak, replay parity and final import require Mac-side verification; `control-disposition` requires the selected Control disposition to be implemented and landed; and `linux-server-preservation` requires verification of the Linux source/build/update/rollback closure or a replacement.  The generator never asserts these items.  The owner’s Option C ruling alone does not assert `control-disposition`.  A failed Linear read exits non-zero instead of writing a partial file, so a refresh that did not happen cannot read as one that did.  Use a fresh `0600` state file inside a private `0700` capture directory.  After actual verification and the responsible human's updates, collect the linked receipts into the final private bundle; editing the state cannot replace them.
 
 `inventory-clean` is checked for you.  `pnpm test:native-release` runs `scripts/decommission-gates.node-test.mjs`, whose last test audits the committed tree against both inventory documents, so inventory drift fails CI on the pull request that caused it rather than surfacing during a rebase months later.
 
@@ -66,7 +68,7 @@ That reads the seven issue states through the board CLI, derives `inventory-clea
 
 BotFleet may also run with the server as the primary BotFleet server, and `deploy/linux-server/` deploys the same `server/` code as that optional deployment (BF-2544).  The deployment directory remains retained, and its dependency on shared server/build sources is separately reported by the audit and blocked by `linux-server-preservation`.
 
-The gate separately asks whether the Mac runs the Node stack through `macLocalHarness.present`.  Linux evidence must be asserted after verifying that a maintained source/ref and build path preserve the harness, served UI, runtime, update and rollback closure, or that a replacement has been verified.  The boolean is supplied in the gate state; neither the gate nor its state generator performs live deployment, artifact, or rollback verification.  `macLocalHarness.retained` and the audit's retained-path output only show that the deployment directory remains present; they are not preservation evidence.
+The gate separately asks whether the Mac runs the Node stack through `macLocalHarness.present`.  Linux evidence must be asserted after verifying that a maintained source/ref and build path preserve the harness, served UI, runtime, update and rollback closure, or that a replacement has been verified.  The final evidence bundle requires a separate Linux receipt with pinned source refs, closure manifest and build/install/update/rollback results; the checker validates its bindings without performing live deployment or proving the claims true.  `macLocalHarness.retained` and the audit's retained-path output only show that the deployment directory remains present; they are not preservation evidence.
 
 A retained path that is not the optional server deployment blocks the gate: sparing Mac-local code quietly is exactly what the gate exists to prevent.
 
@@ -87,13 +89,16 @@ So the sequence runs from the leaves inward: dev-only and already-superseded sur
 ### Step 0 — Prove The Gate
 
 ```
-node scripts/decommission-gate-state.mjs --out /tmp/phase6-state.json
-node scripts/check-decommission-gates.mjs /tmp/phase6-state.json
+node scripts/decommission-gate-state.mjs --out /private/captures/state.json
+node scripts/collect-decommission-evidence.mjs /private/captures/request.json --out /private/review-packet
+node scripts/check-decommission-gates.mjs /private/review-packet/state.json \
+  --bundle /private/review-packet/bundle.json \
+  --source-sha "$CANDIDATE_SOURCE_SHA" --build "$CANDIDATE_BUILD" --artifact-sha256 "$CANDIDATE_ARTIFACT_SHA256"
 ```
 
-Both must be green before anything else in this document.  If the gate blocks, stop here; the blockers name the issues to finish, and the rest of this runbook is not yet in scope.
+Prepare and review the complete receipt request before collection; the collector's default is a blocked read-only preview with no production host readers.  The final checker must pass before deletion.  Archiving, preparing the candidate and observing acceptance supply its evidence under their own existing authority; the gate does not grant that authority.  If the final gate blocks, its blockers name the evidence to finish before the destructive steps.
 
-**Verification:** `every audited file has an inventory row, or is a deliberately retained path`, then `Phase 6 decommission gates: all green.`
+**Verification:** every audited file has an inventory row or deliberate retention, and the final CLI reports consistent evidence bindings and assertions.  Confirm authentic provenance and actual owner authorization separately; an offline pass does not prove runtime acceptance or grant deletion permission.
 
 ### Step 1 — Archive Before Anything Moves
 
