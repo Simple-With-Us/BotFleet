@@ -434,7 +434,7 @@ struct NativeHeadlessHostTests {
     }
 }
 
-private struct HostFixture {
+struct HostFixture {
     let parent: URL
     var root: URL { parent.appendingPathComponent("service", isDirectory: true) }
     var database: URL { root.appendingPathComponent("host.sqlite") }
@@ -442,8 +442,9 @@ private struct HostFixture {
     var pid: URL { URL(fileURLWithPath: output.path + ".pid") }
     var executable: URL { parent.appendingPathComponent("fixture-cli") }
 
-    init() throws {
-        parent = FileManager.default.temporaryDirectory.appendingPathComponent("native-host-\(UUID().uuidString)", isDirectory: true)
+    init(shortPath: Bool = false) throws {
+        let base = shortPath ? URL(fileURLWithPath: "/tmp", isDirectory: true).resolvingSymlinksInPath() : FileManager.default.temporaryDirectory
+        parent = base.appendingPathComponent("native-host-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         let script = #"""
         #!/bin/sh
@@ -477,7 +478,7 @@ private struct HostFixture {
     func remove() { try? FileManager.default.removeItem(at: parent) }
 }
 
-private struct FixtureServiceCredentials: NativeServiceCredentialSource {
+struct FixtureServiceCredentials: NativeServiceCredentialSource {
     let output: URL
     var hang = false
     func credentials(forBotId botId: String) async throws -> NativeServiceCredentialResult {
