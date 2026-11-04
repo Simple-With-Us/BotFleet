@@ -2229,6 +2229,23 @@ describe("Sentry Crons check-ins", () => {
     expect(h.checkInFinishes[0]).toMatchObject({ checkInId: "check-in-1", ok: false });
   });
 
+  it("preserves interrupted scheduler evidence and check-ins in a passive placement bridge", async () => {
+    const h = harness();
+    const routine = h.manager.create({ name: "Held bridge", prompt: "never rerun", botId: "maus-1", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick(); h.manager.flushNow(); h.manager.stop();
+    const before = readFileSync(h.options.file!);
+    const started = h.started.length;
+    const options = { ...h.options, passive: true };
+    const bridge = new RoutineManager(options);
+    options.passive = false;
+    bridge.start(); await bridge.tick(); bridge.stop();
+    expect(bridge.listRuns()[0]).toMatchObject({ status: "running", sentryCheckInId: "check-in-1" });
+    expect(h.started).toHaveLength(started);
+    expect(h.checkInFinishes).toHaveLength(0);
+    expect(readFileSync(h.options.file!)).toEqual(before);
+  });
+
   it("persists pendingClose until Sentry delivery confirmation, then deletes it", async () => {
     const h = harness();
     const routine = h.manager.create({
