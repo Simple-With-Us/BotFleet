@@ -48,6 +48,16 @@
 // rather than corrupted, because a corrupted binary is worse than an absent
 // one.
 //
+// A fourth gate covers the files the redactor cannot handle.  A malformed
+// JSON document or a truncated log line has no structure to walk and no key
+// to read, so the only redaction available is the prose pass;  the result
+// keeps no credential shape, but it may no longer parse.  Such a file is
+// COUNTED as a redaction failure, the original text is never kept, and the
+// capture does not certify itself clean while that count is above zero.
+// The count travels in the archive report and it gates the receipt, so a
+// capture that could not redact something cannot be presented as one that
+// did.
+//
 // A binary above the redaction bound is copied byte for byte and its bytes
 // are NOT inspected for credentials, because a file that large cannot be
 // held in a string and a compressed pack file would hide a credential from
@@ -67,10 +77,11 @@ import {
   openSync, readFileSync, readdirSync, readSync, realpathSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { backup, DatabaseSync } from "node:sqlite";
-import { redactSecretsInText } from "../shared/redact.ts";
+import { redactSecrets, redactSecretsInText } from "../shared/redact.ts";
+import { EvidenceBundleSchema } from "./decommission-evidence-bundle.mjs";
 
 /** The marker every archive manifest this script writes carries. */
 export const ARCHIVE_MARKER = "botfleet-node-store-archive";
@@ -130,6 +141,13 @@ const EXCLUDED_NAME_PATTERNS = [
   /(^|\/)secrets?(\..*)?$/,
   /\.(pem|key|p12|pfx|asc)$/,
   /(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/,
+  // A plugin's own secret store.  The name does not begin with "secret", so
+  // the pattern above does not catch it, and the values it holds are generic
+  // webhook secrets with no recognizable prefix for the shape pass to find.
+  /(^|\/)plugin-secrets\.json$/i,
+  // Everything under a plugin's broker directory is plugin runtime state,
+  // and a broker holds the credentials its plugins run with.
+  /(^|\/)\.broker(\/|$)/,
 ];
 
 /** Extensions treated as text for the redaction pass. */
@@ -166,10 +184,10 @@ export function exclusionReason(storeRelativePath) {
 export function looksTextual(storeRelativePath, bytes) {
   if (TEXT_EXTENSIONS.has(storeRelativePath.slice(storeRelativePath.lastIndexOf(".")).toLowerCase())) return true;
   if (bytes.length === 0) return true;
-  for (let index = 0; index < bytes.length; index += 1) {
-    if (bytes[index] === 0) return false;
-  }
-  return true;
+  // A native scan, not an interpreted loop:  the store holds files up to the
+  // redaction bound, and a per-byte loop over one of those is tens of
+  // millions of interpreted iterations for a single decision.
+  return !bytes.includes(0);
 }
 
 /** The read-only mode every archived file carries, and every archived directory. */
@@ -349,17 +367,15 @@ export function boundChecks(checks) {
  * the quote that closes it can disappear together — and the result is a file
  * that no longer parses.  So a structured file is redacted one value at a
  * time, and the structure is rebuilt around the masked values.
+ *
+ * The walk keeps the KEY in hand, which is the part that matters.  A value
+ * under a secret-shaped name — "token", "password", "api_key" — is masked
+ * whatever it looks like, because a generic password has no recognizable
+ * prefix for a shape pass to find.  A walk that only ever saw the value
+ * would walk straight past it.
  */
 export function redactJsonValues(value) {
-  const kind = Object.prototype.toString.call(value);
-  if (kind === "[object String]") return redactSecretsInText(String(value));
-  if (Array.isArray(value)) return value.map((item) => redactJsonValues(item));
-  if (kind === "[object Object]") {
-    const out = {};
-    for (const [key, item] of Object.entries(value)) out[key] = redactJsonValues(item);
-    return out;
-  }
-  return value;
+  return redactSecrets(value);
 }
 
 /**
@@ -367,9 +383,13 @@ export function redactJsonValues(value) {
  *
  * The cheap path is tried first:  redact the line as text and check that it
  * still parses.  When it does not, the line is parsed and redacted value by
- * value instead.  When that does not work either, the original line is kept
- * and counted as a line this producer could not redact, because a line that
- * is broken is worse than a line that is honestly reported.
+ * value instead.  When that does not work either, the line is malformed AND
+ * it holds a credential shape, and the ORIGINAL TEXT IS NOT KEPT.  A line
+ * this producer could not redact is a line it has no business writing into
+ * the capture, so what is kept is the prose-redacted text —  which carries no
+ * credential shape even where it no longer parses —  and the failure is
+ * counted so the report says so instead of the file quietly holding a
+ * credential.
  */
 export function redactNdjsonLine(line) {
   const redacted = redactSecretsInText(line);
@@ -384,7 +404,7 @@ export function redactNdjsonLine(line) {
     const parsed = JSON.parse(line);
     return { text: JSON.stringify(redactJsonValues(parsed)), changed: true, failed: false };
   } catch {
-    return { text: line, changed: false, failed: true };
+    return { text: redacted, changed: true, failed: true };
   }
 }
 
@@ -421,7 +441,10 @@ export function redactJsonText(text) {
     const parsed = JSON.parse(text);
     return { text: JSON.stringify(redactJsonValues(parsed)), changed: true, failed: false };
   } catch {
-    return { text, changed: false, failed: true };
+    // The document is malformed and it holds a credential shape.  The
+    // original is not kept:  the prose-redacted text is, and the failure is
+    // counted rather than swallowed.
+    return { text: redacted, changed: true, failed: true };
   }
 }
 
@@ -612,13 +635,15 @@ export async function archiveStore({ storeRoot, outDir, maxBytes = DEFAULT_MAX_B
 
   const probe = manifestFiles.length ? proveReadOnly(join(tree, ...manifestFiles[0].path.split("/"))) : { ok: false, reason: "empty-archive" };
 
+  const redactionFailures = manifestFiles.reduce((sum, row) => sum + (row.redactionFailures ?? 0), 0);
+  const redactionFailedFiles = manifestFiles.filter((row) => (row.redactionFailures ?? 0) > 0).length;
   const manifest = {
     marker: ARCHIVE_MARKER,
     version: ARCHIVE_VERSION,
     capturedAt,
     source,
     readOnlyProved: probe.ok,
-    totals: { files: manifestFiles.length, bytes: totalBytes, excluded: excluded.length },
+    totals: { files: manifestFiles.length, bytes: totalBytes, excluded: excluded.length, redactionFailures },
     files: manifestFiles,
     excluded,
   };
@@ -644,7 +669,9 @@ export async function archiveStore({ storeRoot, outDir, maxBytes = DEFAULT_MAX_B
     excludedCount: manifest.excluded.length,
     excludedTruncated: manifest.excluded.length > MAX_REPORT_ROWS,
     credentialMatches: manifest.files.reduce((sum, row) => sum + (row.credentialMatches ?? 0), 0),
-    scope: "The archive is a private copy of the owner's own store, and it holds what the store holds.  The text in it is redacted;  a database snapshot is copied whole and the credential shapes it holds are counted here.  This report travels in the packet;  the archive itself does not.",
+    redactionFailures,
+    redactionFailedFiles,
+    scope: "The archive is a private copy of the owner's own store, and it holds what the store holds.  The text in it is redacted;  a database snapshot is copied whole and the credential shapes it holds are counted here.  A file the redactor could not parse is counted as a redaction failure here rather than kept quietly, and the capture does not certify itself clean while that count is above zero.  This report travels in the packet;  the archive itself does not.",
   };
   writeBoundedReport(join(target, "archive-report.json"), report);
   return { manifest, report, outDir: target };
@@ -657,6 +684,28 @@ function rmQuietly(path) {
   } catch {
     /* the file was never created */
   }
+}
+
+/**
+ * Resolve a manifest path inside a root, or null when it escapes.
+ *
+ * A manifest is a document this producer wrote, but a restore reads one from
+ * disk, and a tampered one names a path with ".." in it.  Joined without a
+ * check, such a path reads outside the archive tree and writes outside the
+ * restore root, so every path is resolved and then required to stay inside
+ * the root it was resolved against.
+ */
+export function resolveInside(root, storeRelativePath) {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- a manifest is untyped JSON, so the path it names has to be checked before it is split.
+  if (typeof storeRelativePath !== "string" || !storeRelativePath) return null;
+  if (isAbsolute(storeRelativePath)) return null;
+  const segments = storeRelativePath.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return null;
+  const base = resolve(root);
+  const resolved = resolve(base, ...segments);
+  const inside = relative(base, resolved);
+  if (!inside || inside.startsWith("..") || isAbsolute(inside)) return null;
+  return resolved;
 }
 
 /**
@@ -678,9 +727,25 @@ export function restoreArchive({ archiveDir, intoDir, restoredAt = new Date().to
   const mismatches = [];
   let restoredBytes = 0;
   for (const row of manifest.files) {
-    const from = join(tree, ...row.path.split("/"));
-    const to = join(target, ...row.path.split("/"));
-    if (hashFile(from) !== row.sha256) {
+    // A manifest names paths, and a tampered one names a path that leaves the
+    // tree.  Both the read and the write are resolved against their root and
+    // refused when they escape it.
+    const from = resolveInside(tree, row.path);
+    const to = resolveInside(target, row.path);
+    if (!from || !to) {
+      mismatches.push({ path: row.path, reason: "unsafe-manifest-path" });
+      continue;
+    }
+    let archivedHash;
+    try {
+      archivedHash = hashFile(from);
+    } catch (error) {
+      // A missing or unreadable archive file is a mismatch, not a crash:  the
+      // rehearsal has to finish and write a report that says so.
+      mismatches.push({ path: row.path, reason: "archive-hash-mismatch", detail: error.code ?? "unreadable" });
+      continue;
+    }
+    if (archivedHash !== row.sha256) {
       mismatches.push({ path: row.path, reason: "archive-hash-mismatch" });
       continue;
     }
@@ -749,7 +814,15 @@ export function restoredHealth(restoreDir, { referenceDir } = {}) {
       }
     }
     if (storeRelative.endsWith(".ndjson") || storeRelative.endsWith(".jsonl")) {
-      const text = readFileSync(absolute, "utf8");
+      let text;
+      try {
+        text = readFileSync(absolute, "utf8");
+      } catch {
+        // A file that cannot be read is a file that does not parse.  A
+        // transient deletion or a permission error must produce a verdict,
+        // not a crash that leaves the restore without a report.
+        return false;
+      }
       for (const line of text.split("\n")) {
         if (!line.trim()) continue;
         try {
@@ -767,10 +840,21 @@ export function restoredHealth(restoreDir, { referenceDir } = {}) {
   if (existsSync(databasePath)) {
     try {
       const database = new DatabaseSync(databasePath, { readOnly: true });
-      const result = database.prepare("PRAGMA integrity_check").all();
-      const verdict = result.length === 1 && result[0].integrity_check === "ok" ? "ok" : "failed";
-      database.close();
-      record("sqlite-integrity", verdict === "ok", verdict);
+      try {
+        const result = database.prepare("PRAGMA integrity_check").all();
+        const verdict = result.length === 1 && result[0].integrity_check === "ok" ? "ok" : "failed";
+        record("sqlite-integrity", verdict === "ok", verdict);
+      } catch (error) {
+        record("sqlite-integrity", false, error.message);
+      } finally {
+        // Closed on every path, so an integrity check that throws does not
+        // leak the descriptor on a corrupt restore.
+        try {
+          database.close();
+        } catch {
+          /* the handle is already gone */
+        }
+      }
     } catch (error) {
       record("sqlite-integrity", false, error.message);
     }
@@ -832,12 +916,6 @@ export function evidenceRef(captureDir, filePath) {
 }
 
 /**
- * Emit the `rollback` receipt, and the `import` receipt when an import
- * parity report is supplied.  The candidate, mode and hosts come from the
- * bundle request the operator prepared, so the receipt is bound to the same
- * candidate as the rest of the packet.
- */
-/**
  * The exit code a check earns, read from the artifact it points at.
  *
  * A receipt that says a check passed when the artifact says it failed is
@@ -862,6 +940,27 @@ export function checkExitCode(reportPath, readVerdict) {
 }
 
 /**
+ * Validate a bundle request against the bundle's own schema.
+ *
+ * The request is untrusted input:  it is a file on disk, and an unvalidated
+ * one lets a receipt carry a candidate, a mode or a host list that the
+ * collector will refuse.  So it is checked against the same schema the
+ * collector enforces, and a request that does not match is refused here,
+ * where the reason can be said, rather than at the collector, where the
+ * reason is "malformed-schema".
+ */
+export function validateBundleRequest(request) {
+  const parsed = EvidenceBundleSchema.safeParse(request);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((issue) => `${issue.path.join(".") || "request"}: ${issue.message}`)
+      .join("; ");
+    throw new Error(`the bundle request does not match the contract: ${issues}`);
+  }
+  return parsed.data;
+}
+
+/**
  * Emit the `rollback` receipt, and the `import` receipt when an import
  * parity report is supplied.  The candidate, mode and hosts come from the
  * bundle request the operator prepared, so the receipt is bound to the same
@@ -869,11 +968,12 @@ export function checkExitCode(reportPath, readVerdict) {
  */
 export function emitReceipts({ captureDir, request, provenance, parityReportPath }) {
   const capture = resolve(captureDir);
+  const bundle = validateBundleRequest(request);
   const receiptBase = {
     version: 1,
-    candidate: request.candidate,
-    mode: request.mode,
-    hosts: request.hosts,
+    candidate: bundle.candidate,
+    mode: bundle.mode,
+    hosts: bundle.hosts,
     provenance: {
       by: provenance.by,
       at: provenance.at,
@@ -907,7 +1007,11 @@ export function emitReceipts({ captureDir, request, provenance, parityReportPath
     },
     {
       name: "read-only-archive",
-      exitCode: checkExitCode(join(capture, "archive-report.json"), (report) => report.readOnlyProved === true),
+      // The check says the archive is read-only AND that it carries nothing
+      // this producer could not redact.  A capture with a redaction failure in
+      // it does not earn this check:  the packet would then certify an
+      // archive whose text may hold a credential the producer could not mask.
+      exitCode: checkExitCode(join(capture, "archive-report.json"), (report) => report.readOnlyProved === true && report.redactionFailures === 0),
       artifact: evidenceRef(capture, join(capture, "archive-report.json")),
     },
   ];
@@ -973,7 +1077,7 @@ if (isEntry) {
       if (!captureDir || !requestPath || !provenanceRecord || !provenanceSource || !provenanceBy) {
         throw new Error("--capture, --request, --provenance-record, --provenance-source and --provenance-by are required");
       }
-      const request = JSON.parse(readFileSync(requestPath, "utf8"));
+      const request = validateBundleRequest(JSON.parse(readFileSync(requestPath, "utf8")));
       const parityReportPath = flagValue(args, "--parity-report");
       const emitted = emitReceipts({
         captureDir,

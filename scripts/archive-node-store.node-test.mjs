@@ -9,7 +9,7 @@
 // nobody notices until a rollback.
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -21,10 +21,12 @@ import {
   exclusionReason,
   looksTextual,
   proveReadOnly,
+  resolveInside,
   resolveStoreRoot,
   restoredHealth,
   restoreArchive,
   sha256,
+  validateBundleRequest,
   writeBoundedReport,
 } from "./archive-node-store.mjs";
 import { parseEvidenceReceipt } from "./decommission-evidence-bundle.mjs";
@@ -255,6 +257,33 @@ test("exclusion and text decisions are made on names and shapes, not on contents
   assert.equal(exclusionReason("bots.json"), null);
   assert.equal(looksTextual("bots.json", Buffer.from("{}")), true);
   assert.equal(looksTextual("blob.bin", Buffer.from([0, 1, 2])), false);
+  // The NUL test is a native scan, so a large file is decided in one call
+  // rather than a million interpreted iterations.
+  assert.equal(looksTextual("big.bin", Buffer.alloc(1024 * 1024, 0x41)), true);
+  assert.equal(looksTextual("big.bin", Buffer.alloc(1024 * 1024)), false);
+});
+
+test("a plugin's secret store and broker directory are excluded", () => {
+  assert.equal(exclusionReason("plugins/.broker/linear/plugin-secrets.json"), "credential-material");
+  assert.equal(exclusionReason("nested/plugin-secrets.json"), "credential-material");
+  assert.equal(exclusionReason("plugins/.broker/linear/state.json"), "credential-material");
+  assert.equal(exclusionReason("server/plugin-secrets.ts"), null, "a source file that shares the name is not a credential store");
+});
+
+test("a manifest path is resolved inside its root, or refused", () => {
+  assert.equal(resolveInside("/tmp/example", "a/b.txt"), "/tmp/example/a/b.txt");
+  assert.equal(resolveInside("/tmp/example", "../escape"), null);
+  assert.equal(resolveInside("/tmp/example", "a/../../escape"), null);
+  assert.equal(resolveInside("/tmp/example", "/etc/passwd"), null);
+  assert.equal(resolveInside("/tmp/example", ""), null);
+  assert.equal(resolveInside("/tmp/example", "a//b"), null);
+});
+
+test("a request that does not match the bundle contract is refused", () => {
+  assert.doesNotThrow(() => validateBundleRequest(makeRequest()));
+  assert.throws(() => validateBundleRequest({ candidate: "not a candidate" }), /does not match the contract/);
+  assert.throws(() => validateBundleRequest({ ...makeRequest(), mode: "whenever" }), /does not match the contract/);
+  assert.throws(() => validateBundleRequest({ ...makeRequest(), unexpected: true }), /does not match the contract/);
 });
 
 test("a file that was already unparsable in the source is not a restore failure", { skip: ROOT_IS_ROOT }, async () => {
@@ -420,4 +449,148 @@ test("a parity report that does not say it is verified earns a failing exit code
   const codes = Object.fromEntries(receipt.data.checks.map((check) => [check.name, check.exitCode]));
   assert.equal(codes["parity"], 1);
   assert.equal(codes["read-only-archive"], 0);
+});
+
+test("a line the redactor cannot parse is counted, and its credential is not kept", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  // A truncated log line that still holds a credential shape.  The line has
+  // no structure to walk and no key to read, so the prose pass is the only
+  // redaction available:  the credential goes, the line stays broken, and the
+  // failure is counted rather than swallowed.
+  writeFileSync(join(store, "events", "broken.ndjson"), `{"kind":"turn","key":"${TOKEN}"\n`);
+
+  const parent = privateScratch("capture-");
+  const { outDir } = await archiveStore({ storeRoot: store, outDir: join(parent, "capture") });
+
+  const archived = readFileSync(join(outDir, "tree", "events", "broken.ndjson"), "utf8");
+  assert.ok(!archived.includes(TOKEN), "the raw credential never reaches the capture");
+  const report = JSON.parse(readFileSync(join(outDir, "archive-report.json"), "utf8"));
+  assert.ok(report.redactionFailures > 0, "the failure is counted in the report that travels");
+  assert.ok(report.redactionFailedFiles > 0, "the file it came from is counted too");
+});
+
+test("a value under a secret-shaped key is masked even with no credential shape", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  // "hunter2" has no prefix for a shape pass to find:  only the KEY says it
+  // is a credential, so the redaction has to keep the key in hand.
+  writeFileSync(join(store, "account.json"), JSON.stringify({ user: "jay", password: "hunter2-correct-horse" }));
+
+  const parent = privateScratch("capture-");
+  const { outDir } = await archiveStore({ storeRoot: store, outDir: join(parent, "capture") });
+
+  const document = JSON.parse(readFileSync(join(outDir, "tree", "account.json"), "utf8"));
+  assert.equal(document.user, "jay", "an ordinary value survives");
+  assert.notEqual(document.password, "hunter2-correct-horse", "the password does not");
+});
+
+test("a capture with a redaction failure does not certify itself clean", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  writeFileSync(join(store, "events", "broken.ndjson"), `{"kind":"turn","key":"${TOKEN}"\n`);
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  restoreArchive({ archiveDir: captureDir, intoDir: join(parent, "restored") });
+  const health = restoredHealth(join(parent, "restored"));
+  writeBoundedReport(join(captureDir, "restore-health.json"), health);
+  writeFileSync(join(captureDir, "provenance.txt"), "captured on the server by the MM seat\n", { mode: 0o600 });
+  writeFileSync(join(captureDir, "import-parity.json"), '{"isFullyVerified":true}\n', { mode: 0o600 });
+
+  emitReceipts({
+    captureDir,
+    request: makeRequest(),
+    provenance: {
+      by: "MM",
+      at: new Date().toISOString(),
+      source: "https://example.invalid/capture",
+      record: join(captureDir, "provenance.txt"),
+    },
+    parityReportPath: join(captureDir, "import-parity.json"),
+  });
+  const receipt = parseEvidenceReceipt("import", readFileSync(join(captureDir, "import.receipt.json")));
+  const codes = Object.fromEntries(receipt.data.checks.map((check) => [check.name, check.exitCode]));
+  assert.equal(codes["parity"], 0, "the parity report is still its own verdict");
+  assert.equal(codes["read-only-archive"], 1, "but the archive does not certify itself clean");
+});
+
+test("a manifest that names a path outside the tree is refused, not written", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+
+  // Tamper with the manifest:  a row that climbs out of the tree.
+  const manifestPath = join(captureDir, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.files.push({
+    path: "../../escaped.txt",
+    bytes: 4,
+    sha256: sha256(Buffer.from("evil")),
+    mode: "0444",
+    kind: "text",
+    redacted: false,
+  });
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+
+  const rehearsal = restoreArchive({ archiveDir: captureDir, intoDir: join(parent, "restored") });
+  assert.equal(rehearsal.ok, false, "the rehearsal refuses the escaped path");
+  assert.ok(rehearsal.mismatches.some((row) => row.reason === "unsafe-manifest-path"));
+  assert.ok(!existsSync(join(parent, "escaped.txt")), "nothing was written outside the restore root");
+});
+
+test("a manifest that names a file the archive does not hold is a mismatch, not a crash", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+
+  const manifestPath = join(captureDir, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.files.push({
+    path: "gone.txt",
+    bytes: 4,
+    sha256: sha256(Buffer.from("gone")),
+    mode: "0444",
+    kind: "text",
+    redacted: false,
+  });
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+
+  const rehearsal = restoreArchive({ archiveDir: captureDir, intoDir: join(parent, "restored") });
+  assert.equal(rehearsal.ok, false);
+  const row = rehearsal.mismatches.find((entry) => entry.path === "gone.txt");
+  assert.ok(row, "the missing file is a mismatch row");
+  assert.equal(row.reason, "archive-hash-mismatch");
+});
+
+test("a structured file the health check cannot read is a verdict, not a crash", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  restoreArchive({ archiveDir: captureDir, intoDir: join(parent, "restored") });
+
+  // The restored log is unreadable underneath the health check.
+  chmodSync(join(parent, "restored", "events", "turn-1.ndjson"), 0o000);
+
+  const health = restoredHealth(join(parent, "restored"), { referenceDir: join(captureDir, "tree") });
+  assert.equal(health.ok, false);
+  const failure = health.checks.find((check) => !check.ok);
+  assert.equal(failure.name, "ndjson:events/turn-1.ndjson");
+});
+
+test("a database that fails its integrity check is a verdict, and its handle is closed", { skip: ROOT_IS_ROOT }, async () => {
+  const store = makeStore();
+  const parent = privateScratch("capture-");
+  const captureDir = join(parent, "capture");
+  await archiveStore({ storeRoot: store, outDir: captureDir });
+  restoreArchive({ archiveDir: captureDir, intoDir: join(parent, "restored") });
+
+  // A file that is not a database at all, in the place the database goes.
+  chmodSync(join(parent, "restored", "messages.db"), 0o644);
+  writeFileSync(join(parent, "restored", "messages.db"), "this is not a database");
+
+  const health = restoredHealth(join(parent, "restored"), { referenceDir: join(captureDir, "tree") });
+  assert.equal(health.ok, false);
+  const failure = health.checks.find((check) => check.name === "sqlite-integrity");
+  assert.equal(failure.ok, false);
 });
