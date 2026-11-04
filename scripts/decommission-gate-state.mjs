@@ -238,7 +238,7 @@ if (isEntryModule()) {
     console.error(`refusing to write ${outPath}: could not read issue states — ${error.message}`);
     process.exit(1);
   }
-  writeFileSync(outPath, `${JSON.stringify(state, null, 2)}\n`);
+  writeFileSync(outPath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   for (const gate of REQUIRED_ISSUES) console.log(`${gate.id}  ${state.issues[gate.id]}`);
   console.log(`inventory-clean  ${state.evidence["inventory-clean"]}`);
   console.log(

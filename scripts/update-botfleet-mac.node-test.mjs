@@ -1685,7 +1685,7 @@ test("quiesce re-resolves current holders, bundle processes and port owners befo
   assert.ok(quiesce >= 0 && assertQuiesced > quiesce);
   const body = source.slice(quiesce, assertQuiesced);
   assert.match(body, /await bootOutHarnessForQuiesce\(config, previous\)/);
-  assert.match(body, /Promise\.all\(config\.ports\.map\(probeHealth\)\)/);
+  assert.match(body, /Promise\.all\(config\.ports\.map\(\(port\) => probeHealth\(port, \{ dataDirectory: config\.dataDirectory \}\)\)\)/);
   assert.match(body, /ownedRuntimePids\(\{ holders: currentHolders, bundlePids: currentBundlePids, health \}\)/);
   assert.match(body, /\{ current \}/);
 });
@@ -2289,6 +2289,7 @@ test("the updater runs its entry point when invoked through a symlinked director
     "scripts/harness-release-store.mjs",
     "scripts/release-provenance.mjs",
     "electron/update-credential-preparation.mjs",
+    "electron/desktop-startup-receipt.mjs",
   ]);
   // --help returns before any configuration, lock, network or data directory
   // is touched.  HOME and the BotFleet paths still point at scratch so a
@@ -2582,7 +2583,7 @@ const wrapperOnly = { skip: process.platform === "win32" ? "the stable wrapper r
  * so the stand-in is identical in both.  The stub updater records the label of
  * the commit it was archived from, its arguments, and the hand-off variable.
  */
-async function newestGreenFixture(t, { resolver } = {}) {
+async function newestGreenFixture(t, { resolver, receiptHelper = false } = {}) {
   const fixture = await mkdtemp(join(tmpdir(), "ubf-newest-green-"));
   t.after(() => rm(fixture, { recursive: true, force: true }));
   const remote = join(fixture, "remote");
@@ -2611,13 +2612,17 @@ async function newestGreenFixture(t, { resolver } = {}) {
       "scripts/failed-install-retention.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
+      ...(receiptHelper ? ["electron/desktop-startup-receipt.mjs"] : []),
     ]) {
       await mkdir(dirname(join(remote, path)), { recursive: true });
       let text = "// placeholder\n";
       if (path.endsWith("update-botfleet-mac.mjs")) {
         text = `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ label: ${JSON.stringify(label)}, args: process.argv.slice(2), hint: process.env.BOTFLEET_UPDATE_SELECTION_FAILURE ?? null }));\n`;
+        if (receiptHelper) text = `import { receiptMarker } from "../electron/desktop-startup-receipt.mjs";\nif (receiptMarker !== "present") throw new Error("Missing startup receipt helper");\n${text}`;
       } else if (path.endsWith("ci-build-resolver.mjs")) {
         text = fakeResolver;
+      } else if (path.endsWith("desktop-startup-receipt.mjs")) {
+        text = 'export const receiptMarker = "present";\n';
       }
       await writeFile(join(remote, path), text);
     }
@@ -2667,6 +2672,13 @@ async function newestGreenFixture(t, { resolver } = {}) {
   };
   return { fixture, checkout, older, evil, tip, invoke };
 }
+
+test("the wrapper archives a current target's imported desktop startup receipt helper", wrapperOnly, async (t) => {
+  const { older, invoke } = await newestGreenFixture(t, { receiptHelper: true });
+  const result = await invoke(["--target", older]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(result.executed, { label: "older", args: ["--target", older], hint: null });
+});
 
 test("with no target the wrapper installs the chosen commit, using that commit's own updater", wrapperOnly, async (t) => {
   const { fixture, checkout, older, tip, invoke } = await newestGreenFixture(t);

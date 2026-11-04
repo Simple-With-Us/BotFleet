@@ -139,7 +139,7 @@ public final class FleetServiceControl {
                 // the installed wrapper and clears the deliberate-stop
                 // marker, so the server stays up afterwards.
                 if running {
-                    try startup.startServer()
+                    return try await startup.startServerAndSettle(attempts: attempts)
                 } else {
                     guard let stopServer else {
                         throw FleetServiceError.refused("The BotFleet Server has to stop itself, and the Control app could not ask it to.")
@@ -153,6 +153,14 @@ public final class FleetServiceControl {
                                                         interval: FleetServiceControl.settleInterval) {
                         await self.state(of: descriptor)
                     }
+                }
+            } else if descriptor.id == FleetServiceRegistry.companion.id {
+                // Companion-only actions preserve the server's deliberate stop.
+                if running {
+                    try startup.startCompanion()
+                    return await settleStartedAgent(label, attempts: attempts)
+                } else {
+                    try await startup.stopAgent(label: label)
                 }
             } else if running {
                 try startup.startAgent(label: label)
@@ -214,9 +222,18 @@ public final class FleetServiceControl {
                         : "The BotFleet Server was not replaced: its LaunchAgent owns no process, so the server that is running was not started by launchd.")
                 }
                 return observed
+            } else if descriptor.id == FleetServiceRegistry.companion.id {
+                try startup.restartCompanion()
+                return await settleStartedAgent(label, attempts: attempts)
             }
             try startup.restartAgent(label: label)
             return startup.state(ofAgent: label).managedState
+        }
+    }
+
+    private func settleStartedAgent(_ label: String, attempts: Int) async -> ManagedServiceState {
+        await ManagedServices.settle(to: .running, attempts: attempts, interval: 0.25) {
+            startup.state(ofAgent: label).managedState
         }
     }
 

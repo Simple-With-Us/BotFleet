@@ -16,7 +16,7 @@
 // (lingering process, lingering launchd job, lingering port listener, dirty git
 // tree) without requiring a destructive reboot during testing.
 import { execFileSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -44,28 +44,128 @@ export const EXPLICIT_LEGACY_NODE_PATTERNS = [
   /node.*(?:dist\/server|dist-companion)\/index/i,
 ];
 
-export const BOTFLEET_NODE_PATTERNS = [
-  ...EXPLICIT_LEGACY_NODE_PATTERNS,
-  /(?:^|\/)BotFleet\.app\b/i,
+export const BOTFLEET_HELPER_PATTERNS = [
   /\bBotFleet Helper\b/i,
 ];
 
+const BOTFLEET_MAIN_EXECUTABLE = /(?:^|[\s"'=])(.+\/BotFleet\.app\/Contents\/MacOS\/BotFleet)(?=$|[\s"'])/i;
+
 /**
- * Check if a command line represents a BotFleet-specific Node process.
- * Ignores unrelated Node processes like build tools, test runners, or developer shells,
- * and native macOS Swift binaries (BotFleet Control.app, BotFleetMac).
+ * Inspect the executable backing a candidate main-app process.
+ *
+ * The native and Electron apps share a bundle and executable path, so argv and
+ * bundle naming cannot distinguish them.
+ *
+ * Read the first mapped text vnode for the PID and bind its device and inode
+ * to the expected file before inspecting linked frameworks and Swift sections.
+ *
+ * Any missing or ambiguous evidence is unknown and remains a gate failure.
  */
-export function isBotFleetNodeProcess(cmdLine) {
-  if (!cmdLine) return false;
+export function inspectRunningExecutable(pid, expectedPath, { run = execFileSync, stat = statSync } = {}) {
+  if (!/^[1-9]\d*$/.test(String(pid ?? "")) || !expectedPath) return "unknown";
+
+  let mappedText;
+  try {
+    mappedText = run("lsof", ["-w", "-nP", "-a", "-p", String(pid), "-d", "txt", "-FfDin"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+    });
+  } catch {
+    return "unknown";
+  }
+
+  const textFiles = [];
+  let entry;
+  for (const line of mappedText.split(/\r?\n/)) {
+    if (line.startsWith("f")) {
+      if (entry?.fd === "txt") textFiles.push(entry);
+      entry = { fd: line.slice(1) };
+    } else if (entry && line.startsWith("D")) entry.device = line.slice(1);
+    else if (entry && line.startsWith("i")) entry.inode = line.slice(1);
+    else if (entry && line.startsWith("n")) entry.path = line.slice(1);
+  }
+  if (entry?.fd === "txt") textFiles.push(entry);
+  const executable = textFiles[0];
+  if (!executable?.path?.startsWith("/") || !/^0x[0-9a-f]+$/i.test(executable.device ?? "") || !/^\d+$/.test(executable.inode ?? "")) return "unknown";
+
+  const sameMappedFile = (file) => {
+    const info = stat(file, { bigint: true });
+    return info.isFile() && info.dev === BigInt(executable.device) && info.ino === BigInt(executable.inode);
+  };
+  try {
+    if (!sameMappedFile(executable.path) || !sameMappedFile(expectedPath)) return "unknown";
+  } catch {
+    return "unknown";
+  }
+
+  let linkedLibraries;
+  try {
+    linkedLibraries = run("otool", ["-L", executable.path], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+    });
+    if (!sameMappedFile(executable.path) || !sameMappedFile(expectedPath)) return "unknown";
+  } catch {
+    return "unknown";
+  }
+
+  if (/Electron\.framework(?:\/|\s)/i.test(linkedLibraries)) return "electron";
+  if (!/(?:SwiftUI|AppKit)\.framework(?:\/|\s)/i.test(linkedLibraries)) return "unknown";
+  try {
+    const loadCommands = run("otool", ["-l", executable.path], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    if (!sameMappedFile(executable.path) || !sameMappedFile(expectedPath)) return "unknown";
+    if (/^\s*sectname __swift5_entry\s*$/m.test(loadCommands)) return "native";
+  } catch {
+    return "unknown";
+  }
+  return "unknown";
+}
+
+function mainExecutablePath(cmdLine) {
+  return String(cmdLine).match(BOTFLEET_MAIN_EXECUTABLE)?.[1] ?? null;
+}
+
+/**
+ * Classify a BotFleet process candidate without treating an unverified native
+ * executable as a confirmed Node process.
+ * Ignores unrelated Node processes like build tools, test runners, or developer shells,
+ * and a positively identified native BotFleet macOS executable.
+ */
+function classifyBotFleetProcess(
+  cmdLine,
+  { pid = null, inspectExecutable = inspectRunningExecutable } = {},
+) {
+  if (!cmdLine) return null;
   const str = String(cmdLine);
   // Ignore the check script itself or test runners executing it
   if (str.includes("check-post-reboot-node") || str.includes("decommission-gates")) {
-    return false;
+    return null;
   }
   // If an explicit legacy Node indicator is present, flag it immediately
   if (EXPLICIT_LEGACY_NODE_PATTERNS.some((pattern) => pattern.test(str))) {
-    return true;
+    return "node";
   }
+  if (BOTFLEET_HELPER_PATTERNS.some((pattern) => pattern.test(str))) return "electron-helper";
+
+  if (/(?:^|\/)BotFleet\.app\b/i.test(str)) {
+    const executablePath = mainExecutablePath(str);
+    if (!executablePath) return "unknown";
+    // Fail closed when the inspector cannot prove this is the native Swift app.
+    try {
+      const identity = inspectExecutable(pid, executablePath);
+      return identity === "native" ? null : identity === "electron" ? "electron" : "unknown";
+    } catch {
+      return "unknown";
+    }
+  }
+
   // Ignore native macOS Swift applications (case-folded per Rule 30)
   const lower = str.toLowerCase();
   if (
@@ -74,16 +174,21 @@ export function isBotFleetNodeProcess(cmdLine) {
     lower.includes("botfleetmac.app") ||
     lower.includes("botfleetmac")
   ) {
-    return false;
+    return null;
   }
-  return BOTFLEET_NODE_PATTERNS.some((pattern) => pattern.test(str));
+  return null;
+}
+
+/** Preserve the boolean predicate used by existing callers. */
+export function isBotFleetNodeProcess(cmdLine, options = {}) {
+  return classifyBotFleetProcess(cmdLine, options) !== null;
 }
 
 /**
- * Parse `ps aux` or `ps -ef` output to find any lingering BotFleet Node processes.
- * Returns array of offending process objects: { pid, user, command }.
+ * Parse `ps aux` or `ps -ef` output for BotFleet process candidates.
+ * Returns array of offending process objects: { pid, user, command, identity }.
  */
-export function inspectProcesses(psOutput) {
+export function inspectProcesses(psOutput, { inspectExecutable = inspectRunningExecutable } = {}) {
   if (!psOutput) return [];
   const lines = String(psOutput).split("\n");
   const offending = [];
@@ -105,8 +210,9 @@ export function inspectProcesses(psOutput) {
       continue;
     }
 
-    if (isBotFleetNodeProcess(command)) {
-      offending.push({ pid, user, command });
+    const identity = classifyBotFleetProcess(command, { pid, inspectExecutable });
+    if (identity !== null) {
+      offending.push({ pid, user, command, identity });
     }
   }
   return offending;
@@ -230,7 +336,7 @@ export function evaluatePostReboot({
 
   if (processes.length > 0) {
     failures.push(
-      `Lingering BotFleet Node processes detected (${processes.length}): ${processes.map((p) => `PID ${p.pid} (${p.command.slice(0, 60)})`).join("; ")}`,
+      `BotFleet processes requiring investigation (${processes.length}): ${processes.map((p) => `PID ${p.pid} [${p.identity ?? "unknown"}] (${p.command.slice(0, 60)})`).join("; ")}`,
     );
   }
 
