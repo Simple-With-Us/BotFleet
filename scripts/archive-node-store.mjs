@@ -464,6 +464,45 @@ export function redactTextFile(text, storeRelativePath) {
 }
 
 /**
+ * Put a SQLite file into rollback-journal mode, and report the mode it ended
+ * up in.
+ *
+ * A backup of a WAL database is still a WAL database, and a WAL database read
+ * through a truly read-only connection wants a `-shm` sibling it cannot
+ * create beside a read-only file.  The archive deliberately carries no
+ * siblings:  the live database's `-wal` and `-shm` are excluded because the
+ * snapshot supersedes them.  So a WAL snapshot inside the archive is a
+ * snapshot nobody can open, and the Swift importer — which opens the source
+ * read-only — could never read it.  Converting it out of WAL mode leaves a
+ * database that opens on its own, with nothing beside it.
+ */
+export function convertOutOfWalMode(path) {
+  const database = new DatabaseSync(path);
+  try {
+    database.exec("PRAGMA journal_mode = DELETE");
+    const row = database.prepare("PRAGMA journal_mode").get();
+    return String(row?.journal_mode ?? "unknown");
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * Prove a SQLite file opens and answers a query.
+ *
+ * A file that cannot be opened is not evidence of anything, so the snapshot
+ * is opened and asked a question before it is sealed.
+ */
+export function assertOpensReadOnly(path) {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    database.prepare("SELECT count(*) AS n FROM sqlite_master").get();
+  } finally {
+    database.close();
+  }
+}
+
+/**
  * Copy one store file into the archive, redacting it when it is text, and
  * snapshotting it when it is a SQLite database.  Returns the manifest row.
  *
@@ -485,6 +524,10 @@ async function captureFile(source, destination, storeRelativePath, { readOnly })
     } finally {
       database.close();
     }
+    // The snapshot has to open on its own, with nothing beside it, so it is
+    // taken out of WAL mode and then opened and asked a question.
+    const journalMode = convertOutOfWalMode(destination);
+    assertOpensReadOnly(destination);
     if (readOnly) chmodSync(destination, ARCHIVE_FILE_MODE);
     const credentialMatches = countCredentialMatches(destination);
     return {
@@ -495,7 +538,8 @@ async function captureFile(source, destination, storeRelativePath, { readOnly })
       kind: "sqlite-snapshot",
       redacted: false,
       credentialMatches,
-      note: "the database is copied whole:  a binary cannot be redacted without corrupting it, and the credential shapes it holds are counted rather than removed",
+      journalMode,
+      note: "the database is copied whole:  a binary cannot be redacted without corrupting it, and the credential shapes it holds are counted rather than removed.  It is taken out of WAL mode so that it opens read-only with nothing beside it.",
     };
   }
   if (size > MAX_REDACT_BYTES) {
