@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, constants, fsyncSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, constants, fsyncSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { JOB_RECORD_MAX } from "../shared/jobs.ts";
 import { PendingCommandSpool, type PendingIdentity } from "./jobs/pending-spool.ts";
@@ -32,12 +32,13 @@ export class PlacementPayloadSpool implements PlacementPayloads {
   private readonly directory: string;
 
   constructor(dataDir: string, maxCount = JOB_RECORD_MAX) {
-    const dir = join(dataDir, "placement-payloads");
+    const root = realpathSync(dataDir);
+    const dir = join(root, "placement-payloads");
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     this.spool = new PendingCommandSpool(dir, maxCount);
     this.directory = join(dir, "pending-commands");
     // Persist both new directory names before any enqueue can reference them.
-    for (const path of [dir, dataDir]) this.sync(path);
+    for (const path of [dir, root]) this.sync(path);
   }
 
   private sync(path: string): void {

@@ -52,6 +52,44 @@ afterEach(() => {
 });
 
 describe.skipIf(process.platform === "win32")("transactional placement authority", () => {
+  it("reopens a symlinked data root with the same durable authority and private payload namespace", () => {
+    const root = fixture();
+    const actual = join(root, "actual");
+    const alias = join(root, "alias");
+    mkdirSync(actual, { mode: 0o700 });
+    symlinkSync(actual, alias);
+    const first = create(alias);
+    expect(first.service.enqueue(message())).toMatchObject({ reply: { accepted: true } });
+    const before = readdirSync(join(actual, "placement-payloads", "pending-commands"));
+    first.store.close();
+    const authority = openPlacementAuthority(alias, controllerId);
+    expect(authority.kind).toBe("sqlite");
+    if (authority.kind !== "sqlite") throw new Error("Fixture unexpectedly opened legacy authority");
+    stores.push(authority.store);
+    const payloads = new PlacementPayloadSpool(alias);
+    const service = new PlacementLeaseService({ hostId: controllerId, controller: initial, store: authority.store, payloads, now: () => first.clock.now });
+    expect(service.job("job-1")?.command).toBe(message().command);
+    expect(service.enqueue(message())).toMatchObject({ reply: { accepted: true, duplicate: true } });
+    expect(readdirSync(join(actual, "placement-payloads", "pending-commands"))).toEqual(before);
+    expect(statSync(join(actual, "placement-payloads", "pending-commands")).mode & 0o777).toBe(0o700);
+  });
+
+  it.each(["placement-payloads", "pending-commands"])("still refuses a symlinked %s inside a symlinked data root", (component) => {
+    const root = fixture();
+    const actual = join(root, "actual");
+    const alias = join(root, "alias");
+    const outside = join(root, "outside");
+    mkdirSync(actual, { mode: 0o700 });
+    mkdirSync(outside, { mode: 0o700 });
+    symlinkSync(actual, alias);
+    const parent = component === "placement-payloads" ? actual : join(actual, "placement-payloads");
+    if (parent !== actual) mkdirSync(parent, { mode: 0o700 });
+    symlinkSync(outside, join(parent, component));
+    expect(() => new PlacementPayloadSpool(alias)).toThrow();
+    expect(readdirSync(outside)).toEqual([]);
+    expect(lstatSync(join(parent, component)).isSymbolicLink()).toBe(true);
+  });
+
   it("refuses the actual unsupported runtime before opening a store even with a Linux injection", () => {
     const absent = join(fixture(), "must-remain-absent");
     const original = Object.getOwnPropertyDescriptor(process, "platform");
