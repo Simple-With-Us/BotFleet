@@ -11,6 +11,16 @@ struct BotFleetNativeHostMain {
     static func main() async {
         #if os(macOS)
         do {
+            if Array(CommandLine.arguments.dropFirst()) == ["--identity"] {
+                do {
+                    let identity = try NativeHostArtifactIdentity.encoded()
+                    FileHandle.standardOutput.write(identity + Data([0x0a]))
+                } catch {
+                    FileHandle.standardError.write(Data("Native host artifact identity is unavailable.\n".utf8))
+                    exit(78)
+                }
+                return
+            }
             let arguments: NativeHostLaunchArguments
             do {
                 arguments = try NativeHostLaunchArguments(arguments: Array(CommandLine.arguments.dropFirst()))
