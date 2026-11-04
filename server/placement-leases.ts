@@ -110,6 +110,11 @@ export interface PlacementLeaseDeps {
 
 export type LeaseResult<T> = { ok: true; reply: T } | { ok: false; reason: string; controller: ControllerEpoch };
 
+export interface WorkerAssignmentMessage extends PlacementMessage { hostId: HostId }
+export interface WorkerLeaseMessage extends WorkerAssignmentMessage { jobId: string; leaseId: string }
+export type WorkerPayloadReply = ({ accepted: true; command: string; cwd: string; timeoutMs: number } | { accepted: false; reason: string }) & ControllerEpoch;
+export type WorkerStopReceiptReply = ({ accepted: true } | { accepted: false; reason: string }) & ControllerEpoch;
+
 const TERMINAL: readonly PlacementJobStatus[] = ["completed", "failed", "killed", "lost"];
 function restoreMap<K, V>(target: Map<K, V>, source: Map<K, V>): void {
   target.clear();
@@ -525,6 +530,70 @@ export class PlacementLeaseService {
     return { ok: true, reply: { accepted: true, lease, ...this.current } };
   }
 
+  /** Pull-side assignment: the worker asks for work and the controller picks.
+   *  A job this host already holds an unstarted lease on comes first, so a
+   *  lost acknowledgement replays the same lease rather than issuing another,
+   *  and that job stays offered until a heartbeat reports the lease as held.
+   *  Otherwise the oldest queued job this host can run is claimed, through the
+   *  same compare-and-set as `claim`. */
+  assign(message: WorkerAssignmentMessage): LeaseResult<ClaimReply> {
+    return this.mutate(() => this.assignNow(message));
+  }
+
+  private assignNow(message: WorkerAssignmentMessage): LeaseResult<ClaimReply> {
+    const stale = this.fence(message);
+    if (stale) return { ok: true, reply: { accepted: false, reason: stale, ...this.current } };
+    const queuedOrder = (job: PlacementJob) => job.queuedAt ?? 0;
+    const held = [...this.jobs.values()].filter((job) => job.status === "dispatching" && job.host === message.hostId);
+    const queued = [...this.jobs.values()].filter((job) => job.status === "queued")
+      .sort((a, b) => queuedOrder(a) - queuedOrder(b) || a.jobId.localeCompare(b.jobId));
+    let reason = "no job is eligible for this host";
+    for (const job of [...held, ...queued]) {
+      const result = this.claimNow({ ...message, jobId: job.jobId });
+      if (!result.ok || result.reply.accepted) return result;
+      reason = result.reply.reason;
+    }
+    return { ok: true, reply: { accepted: false, reason, ...this.current } };
+  }
+
+  /** The job this host holds an active lease on, or the reason it does not. */
+  private leasedJob(message: WorkerLeaseMessage): { job: PlacementJob } | { refusal: string } {
+    const stale = this.fence(message);
+    if (stale) return { refusal: stale };
+    const job = this.jobs.get(message.jobId);
+    if (!job || job.leaseId !== message.leaseId || job.host !== message.hostId) {
+      return { refusal: `lease ${message.leaseId} does not hold job ${message.jobId}` };
+    }
+    const lease = this.leases.get(message.leaseId);
+    if (this.store && lease?.state !== "active") return { refusal: `lease ${message.leaseId} is not active` };
+    if (job.status !== "dispatching" && job.status !== "running") return { refusal: `job ${message.jobId} is ${job.status}` };
+    return { job };
+  }
+
+  /** The command for a lease this host holds.  Reading it never consumes the
+   *  claim, so a worker that lost this answer can ask again. */
+  leasePayload(message: WorkerLeaseMessage): LeaseResult<WorkerPayloadReply> {
+    return this.mutate(() => {
+      const found = this.leasedJob(message);
+      if ("refusal" in found) return { ok: true, reply: { accepted: false, reason: found.refusal, ...this.current } };
+      this.loadJobCommand(found.job);
+      if (!found.job.command) {
+        return { ok: true, reply: { accepted: false, reason: "Private placement payload is missing or damaged; the job is held without execution", ...this.current } };
+      }
+      return { ok: true, reply: { accepted: true, command: found.job.command, cwd: found.job.cwd, timeoutMs: found.job.timeoutMs, ...this.current } };
+    }, { jobIds: [message.jobId], leaseIds: [message.leaseId] });
+  }
+
+  /** Confirms a stop reached the host holding the lease.  It stores nothing:
+   *  the stop stays pending until `report` settles the lease. */
+  stopReceipt(message: WorkerLeaseMessage): LeaseResult<WorkerStopReceiptReply> {
+    return this.mutate(() => {
+      const found = this.leasedJob(message);
+      if ("refusal" in found) return { ok: true, reply: { accepted: false, reason: found.refusal, ...this.current } };
+      return { ok: true, reply: { accepted: true, ...this.current } };
+    }, { jobIds: [message.jobId], leaseIds: [message.leaseId] });
+  }
+
   /** Push-side lease assignment: fenced on both the message and the embedded
    *  lease epoch, idempotent on an exact replay of the active lease, and
    *  refused when the job already holds a different lease or is no longer
@@ -832,7 +901,7 @@ const hostId = z.string().max(64).regex(HOST_ID_PATTERN).transform((value) => {
   // HostId type TypeScript cannot narrow to.
   return value as HostId;
 });
-const fenced = {
+export const placementFence = {
   controllerId: hostId,
   epoch: z.number().int().nonnegative().safe(),
   version: z.string().min(1),
@@ -863,6 +932,7 @@ const sample = z.object({
     reason: z.string().optional(),
   }).strict().nullable().optional(),
 }).strict();
+const fenced = placementFence;
 const capabilities = z.array(z.enum(["shell", "macos", "desktop"]));
 const leaseSchema = z.object({
   controllerId: hostId,
@@ -871,7 +941,7 @@ const leaseSchema = z.object({
   jobId: z.string().min(1),
   host: hostId,
 }).strict();
-const schemas = {
+export const placementMessageSchemas = {
   register: z.object({ ...fenced, hostId, role: z.enum(["controller", "worker"]), capabilities, sample }).strict(),
   heartbeat: z.object({
     ...fenced, hostId, leases: z.array(z.string().min(1)),
@@ -903,9 +973,8 @@ const schemas = {
 /** One placement lease route under `/api/placement/`, behind exactly the
  *  owner boundary `/api/placement/identity` and `/api/host/resources` keep:
  *  the local owner or the authenticated server gate, never the companion
- *  lane or the named tunnel.  A worker-scoped credential class is the
- *  plan's open question 3; until Jay answers it no new credential type is
- *  invented here. */
+ *  lane or the named tunnel.  Workers use their own credential class and
+ *  routes:  see `server/placement-worker-routes.ts`. */
 export function placementLeaseRoute(
   caller: PlacementCaller,
   action: PlacementLeaseAction,
@@ -916,7 +985,7 @@ export function placementLeaseRoute(
   if (!caller.localOwner || caller.fromCompanion || caller.viaNamedTunnel) {
     return { status: 403, body: { error: "Placement routes are available only through the local owner or authenticated server gate" } };
   }
-  const parsed = schemas[action].safeParse(body);
+  const parsed = placementMessageSchemas[action].safeParse(body);
   if (!parsed.success) return { status: 400, body: { error: `invalid ${action} message` } };
   const message = parsed.data;
   // SAFETY: each branch below runs only for the action whose schema just
