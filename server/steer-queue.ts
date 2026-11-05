@@ -89,7 +89,31 @@ class JournaledQueues extends Map<string, QueueEntry> {
 const queues = new JournaledQueues(); // threadId → waiting sends
 
 let onQueueChanged: (() => void) | null = null;
+/** While a drain pass runs, the journal is written once at its end: a send
+ *  leaves the map before its transcript line is appended, and a journal that
+ *  dropped it in between would lose it to a crash in that gap.  Written after
+ *  the appends, a crash leaves it in the journal AND the thread (boot skips it
+ *  by its `queueId`) rather than in neither. */
+let journalHeld = 0;
+let journalDirty = false;
+function holdJournal(work: () => void): void {
+  journalHeld += 1;
+  try {
+    work();
+  } finally {
+    journalHeld -= 1;
+    if (journalHeld === 0 && journalDirty) {
+      journalDirty = false;
+      queueChanged();
+    }
+  }
+}
+
 function queueChanged(): void {
+  if (journalHeld > 0) {
+    journalDirty = true;
+    return;
+  }
   try {
     onQueueChanged?.();
   } catch (error) {
@@ -160,7 +184,7 @@ export function steerBacklogInstruction(pending: number): string | null {
  * so transcript-replay adapters do not also see earlier queued texts.
  * Entries leave the map BEFORE running so a settle racing another settle
  * can never fire the same queue twice. */
-export function drainSteeredMessages(
+function drainSteeredMessagesPass(
   store: SteerStore,
   run: (
     botId: string,
@@ -300,6 +324,14 @@ export function dropQueuedForOffBot(store: SteerStore, botId: string): number {
     dropForOffBot(store, threadId, entry);
   }
   return dropped;
+}
+
+/** Drain every queue whose bot is idle (see `drainSteeredMessagesPass`). */
+export function drainSteeredMessages(
+  store: SteerStore,
+  run: Parameters<typeof drainSteeredMessagesPass>[1],
+): void {
+  holdJournal(() => drainSteeredMessagesPass(store, run));
 }
 
 /** Drain every batch that can drain now, pass after pass, until the queue is

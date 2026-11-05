@@ -463,8 +463,19 @@ export function writeQueueJournal(dataDir: string, queued: readonly HeldQueueEnt
     }
     const file = { version: 1, ...HeldWorkSchema.parse({ sends: [], queued: [...queued], rooms: [] }) };
     const temporary = `${path}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(file)}\n`, { mode: 0o600 });
-    renameSync(temporary, path);
+    try {
+      writeFileSync(temporary, `${JSON.stringify(file)}\n`, { mode: 0o600 });
+      renameSync(temporary, path);
+    } catch (error) {
+      // A full disk leaves the last good journal in place; do not leave a
+      // half-written sibling behind it.
+      try {
+        unlinkSync(temporary);
+      } catch {
+        // Nothing to clean up.
+      }
+      throw error;
+    }
     return null;
   } catch (error) {
     return error instanceof Error ? error : new Error(String(error));
@@ -479,7 +490,14 @@ export function readQueueJournal(dataDir: string, log?: (line: string) => void):
   try {
     return readHeldWorkFile(path).queued;
   } catch (error) {
-    log?.(`[steer-queue] could not read ${STEER_JOURNAL_FILE}: ${error instanceof Error ? error.message : String(error)}`);
+    // Never log the parser's message: a JSON syntax error quotes the text.  The
+    // unreadable file is set aside, not overwritten, so its words stay on disk.
+    log?.(`[steer-queue] could not read ${STEER_JOURNAL_FILE} (${error instanceof SyntaxError ? "not valid JSON" : "unknown shape"}); keeping it as ${STEER_JOURNAL_FILE}.unreadable`);
+    try {
+      renameSync(path, `${path}.unreadable`);
+    } catch {
+      // Left where it is.
+    }
     return [];
   }
 }

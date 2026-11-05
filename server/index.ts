@@ -6770,10 +6770,16 @@ function steerJournalEntries(): HeldQueueEntry[] {
   return [...live, ...unrestoredQueueJournal];
 }
 
+/** Why the last journal write failed, or null when it succeeded.  A queued
+ *  send is only acknowledged while this is null: a send the journal could not
+ *  save is refused, not accepted into a memory-only queue. */
+let steerJournalFailure: string | null = null;
 function writeSteerJournal() {
   if (placementRollbackReadOnly) return;
   const failure = writeQueueJournal(DATA_DIR, steerJournalEntries());
-  if (failure) console.warn("[steer-queue] could not write the crash journal:", failure.message);
+  // Only the error code is logged: nothing a user wrote ever reaches a log line.
+  steerJournalFailure = failure ? ((failure as NodeJS.ErrnoException).code ?? failure.name) : null;
+  if (failure) console.warn(`[steer-queue] could not write the crash journal (${steerJournalFailure})`);
 }
 setSteerQueueObserver(writeSteerJournal);
 
@@ -16663,6 +16669,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             ...(fromImessage ? { automationSource: "imessage" as const } : {}),
             relayed: relaySourced,
           });
+          if (steerJournalFailure) {
+            // Not durable: refuse rather than acknowledge a send a crash would lose.
+            const failedWith = steerJournalFailure;
+            cancelSteeredMessage(bot.threadId, queued.id);
+            return { status: 503, body: { error: `could not save the queued message (${failedWith}); send it again` } };
+          }
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           // The same answer a busy bot's queued send gets: the client's
           // response schema is strict, and the pending chip is already right.
@@ -16776,6 +16788,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             automationSource: fromImessage ? "imessage" : undefined,
             relayed: relaySourced,
           });
+          if (steerJournalFailure) {
+            // Not durable: refuse rather than acknowledge a send a crash would lose.
+            const failedWith = steerJournalFailure;
+            cancelSteeredMessage(targetThreadId, queued.id);
+            return { status: 503, body: { error: `could not save the queued message (${failedWith}); send it again` } };
+          }
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           return { status: 202, body: { ok: true, queued: true, queueId: queued.id, threadId: targetThreadId } };
         }

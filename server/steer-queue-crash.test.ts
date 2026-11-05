@@ -2,7 +2,7 @@
 // send accepted while the bot is busy is journaled (steer-queue-journal.json)
 // and put back at the next boot (BF-2442: queue is now the default busy mode).
 import type { ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -119,6 +119,53 @@ describe("steer-queue crash journal e2e", () => {
       const final = await botById(bot.id);
       expect(final.messages.filter((m: any) => m.role === "user" && m.text === "survive the crash")).toHaveLength(1);
       await until(async () => !existsSync(journal), "the journal to empty");
+    },
+    120_000,
+  );
+
+  it(
+    "refuses a queued send it cannot journal instead of acknowledging it",
+    async () => {
+      if (child && child.exitCode === null) await waitForExit(child, { signal: "SIGTERM" });
+      child = null;
+      if (home) rmSync(home, { recursive: true, force: true });
+      chmodSync(FAKE_CLI, 0o755);
+      home = mkdtempSync(join(tmpdir(), "omb-steer-nojournal-"));
+      mkdirSync(join(home, ".botfleet"), { recursive: true });
+      mkdirSync(join(home, "gates"), { recursive: true });
+      writeFileSync(
+        join(home, ".botfleet", "config.json"),
+        JSON.stringify({
+          instances: {
+            steer: {
+              driver: "grokAgent",
+              environment: { FAKE_ACP_MODE: "echo-gated", FAKE_ACP_GATE_FILE: join(home, "gates", "drain.gate") },
+              config: { cli: FAKE_CLI, fullAuto: true },
+            },
+          },
+        }),
+      );
+      await start();
+      const bot = (await api("POST", "/api/bots")).body.bot;
+      await api("PATCH", `/api/bots/${bot.id}`, { name: "NoJournal", modelSelection: { instanceId: "steer", model: "fake-model" } });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "long job" })).status).toBe(202);
+      expect((await botById(bot.id)).busy).toBe(true);
+
+      // A directory where the journal file goes makes every journal write fail, as a full disk would.
+      mkdirSync(join(home, ".botfleet", STEER_JOURNAL_FILE));
+      const refused = await api("POST", `/api/bots/${bot.id}/messages`, { text: "cannot be saved" });
+      expect(refused.status).toBe(503);
+      expect(refused.body.queued).toBeUndefined();
+      expect(String(refused.body.error)).toMatch(/could not save/);
+      // The words are not left behind in memory: nothing queued, nothing in the thread.
+      expect((await botById(bot.id)).messages.some((m: any) => m.text === "cannot be saved")).toBe(false);
+      expect(stderr).not.toContain("cannot be saved");
+
+      // Once journaling works again the same send is accepted.
+      rmSync(join(home, ".botfleet", STEER_JOURNAL_FILE), { recursive: true });
+      const accepted = await api("POST", `/api/bots/${bot.id}/messages`, { text: "cannot be saved" });
+      expect(accepted.body).toMatchObject({ ok: true, queued: true });
+      expect(readFileSync(join(home, ".botfleet", STEER_JOURNAL_FILE), "utf8")).toContain("cannot be saved");
     },
     120_000,
   );
