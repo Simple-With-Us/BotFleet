@@ -403,7 +403,7 @@ import { TurnStatsTracker } from "./turn-stats.ts";
 import { ChildSessionIds } from "./child-session-ids.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
-import { isLocalModelEndpoint } from "./drivers/openai-compat.ts";
+import { isLocalModelEndpoint, REPLY_WAIT_RANGE_MESSAGE, ReplyWaitMinutesSchema } from "./drivers/openai-compat.ts";
 // Read-only probe for the Secrets card: whether ~/.mmx/config.json holds a
 // MiniMax key at all.  The driver's own resolver is the authority on
 // precedence; this only reports what the secret map structurally cannot see.
@@ -2346,7 +2346,7 @@ function instancesPayload(described: DescribedInstance[]) {
     if (entry?.driver !== "openai-compat") return instance;
     const config = z.object({
       url: z.string().optional(),
-      replyWaitMinutes: z.number().int().min(5).max(60).optional(),
+      replyWaitMinutes: ReplyWaitMinutesSchema.optional(),
     }).safeParse(entry.config);
     if (!config.success || !config.data.url || !isLocalModelEndpoint(config.data.url)) return instance;
     const available = Object.assign({}, instance, { localModelWaitAvailable: true });
@@ -18262,9 +18262,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
 
       if (body?.replyWaitMinutes !== undefined) {
-        const replyWaitMinutes = z.union([z.number().int().min(5).max(60), z.null()]).safeParse(body.replyWaitMinutes);
+        const replyWaitMinutes = z.union([ReplyWaitMinutesSchema, z.null()]).safeParse(body.replyWaitMinutes);
         if (!replyWaitMinutes.success) {
-          return json(res, 400, { error: "replyWaitMinutes must be a whole number from 5 to 60" });
+          return json(res, 400, { error: REPLY_WAIT_RANGE_MESSAGE });
         }
         const configured = instanceConfigs(cfg)[instancePatch[1]];
         if (!configured) return json(res, 404, { error: `unknown instance "${instancePatch[1]}"` });
