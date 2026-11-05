@@ -183,8 +183,8 @@ describe("createStsCallRecorder", () => {
   it("never throws into the call when a frame is not a buffer", () => {
     const recorder = createStsCallRecorder();
     recorder.write("user", pcm(160, 1));
-    // Reflect.apply is untyped, so the bad frame needs no type assertion.
-    expect(() => Reflect.apply(recorder.write, recorder, ["bot", null])).not.toThrow();
+    // SAFETY: a null frame is exactly the bad input this test feeds the recorder.
+    expect(() => recorder.write("bot", null as never)).not.toThrow();
     // The rest of the recording survives the bad frame.
     expect(recorder.stop()).not.toBeNull();
   });
