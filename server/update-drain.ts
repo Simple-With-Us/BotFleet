@@ -511,7 +511,9 @@ export function takeHeldWork(dataDir: string, log?: (line: string) => void): Hel
   try {
     work = readHeldWorkFile(path);
   } catch (error) {
-    log?.(`[update-drain] could not read ${HELD_SENDS_FILE}: ${error instanceof Error ? error.message : String(error)}`);
+    // Never log the parser's message: a JSON syntax error quotes the file's text,
+    // and this file holds user sends.
+    log?.(`[update-drain] could not read ${HELD_SENDS_FILE} (${error instanceof SyntaxError ? "not valid JSON" : "unknown shape"}); it was removed`);
   }
   try {
     unlinkSync(path);

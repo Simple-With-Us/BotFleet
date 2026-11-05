@@ -12,7 +12,14 @@ import {
   snapshotSteerQueue,
   type SteerStore,
 } from "./steer-queue.ts";
-import { readQueueJournal, STEER_JOURNAL_FILE, writeQueueJournal, type HeldQueueEntry } from "./update-drain.ts";
+import {
+  HELD_SENDS_FILE,
+  readQueueJournal,
+  STEER_JOURNAL_FILE,
+  takeHeldWork,
+  writeQueueJournal,
+  type HeldQueueEntry,
+} from "./update-drain.ts";
 import type { BotRecord, Message } from "./store.ts";
 
 // These tests drive the queue with the few fields it reads, not whole store records.
@@ -65,6 +72,16 @@ describe("steer queue crash journal", () => {
     expect(JSON.stringify(log.mock.calls)).not.toContain("SECRET-USER-WORDS");
     expect(existsSync(join(dir, STEER_JOURNAL_FILE))).toBe(false);
     expect(readFileSync(join(dir, `${STEER_JOURNAL_FILE}.unreadable`), "utf8")).toContain("SECRET-USER-WORDS");
+  });
+
+  it("never logs the text of an unreadable held-sends file", () => {
+    const dir = tmp();
+    writeFileSync(join(dir, HELD_SENDS_FILE), '{"version":1,"sends":[ SECRET-USER-WORDS');
+    const log = vi.fn();
+    expect(takeHeldWork(dir, log)).toEqual({ sends: [], queued: [], rooms: [] });
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(log.mock.calls)).not.toContain("SECRET-USER-WORDS");
+    expect(existsSync(join(dir, HELD_SENDS_FILE))).toBe(false);
   });
 
   it("journals a drain once, after the transcript lines are appended", () => {
