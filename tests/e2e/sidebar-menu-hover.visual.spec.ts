@@ -16,7 +16,7 @@ import { test, expect, type Page } from '@playwright/test';
 const LINUX_CHROME_UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-const stableShot = { animations: 'disabled' as const, caret: 'hide' as const };
+const stableShot: { animations: 'disabled'; caret: 'hide' } = { animations: 'disabled', caret: 'hide' };
 
 test.use({
   viewport: { width: 520, height: 520 },
