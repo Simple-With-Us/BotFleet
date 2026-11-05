@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { recordEvents } from "../testing/events.ts";
+import { TurnWatchdog, type WatchedTurn } from "../turn-watchdog.ts";
 import { OpenAICompatDriver, watchLocalModelServer } from "./openai-compat.ts";
 
 afterEach(() => {
@@ -224,4 +225,77 @@ it("skips the liveness probe while response bytes are arriving and reports the s
   expect(fetchMock).toHaveBeenCalledTimes(1);
   expect(alive.mock.calls.length).toBeGreaterThanOrEqual(2);
   cleanup();
+});
+
+// The real watchdog and a real driver adapter on one fake clock: the same
+// liveThreadIds seam server/index.ts wires, with the 20-minute stall limit.
+async function silentLocalTurn(modelsProbe: () => Promise<Response>, threadId: string) {
+  // Sockets stay real (the 60-minute wait uses the Undici transport); only the clock is fake.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  let chatSeen: () => void = () => undefined;
+  const chatArrived = new Promise<void>((resolve) => { chatSeen = resolve; });
+  const server = createServer((request) => {
+    if (request.url?.endsWith("/chat/completions")) chatSeen();
+    // never answered: a model that is thinking silently
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  // SAFETY: listen(0, "127.0.0.1") returns AddressInfo, never a pipe name.
+  const address = server.address() as AddressInfo;
+  const realFetch = globalThis.fetch;
+  vi.stubGlobal("fetch", (input: string | URL | Request, init?: RequestInit) =>
+    String(input).endsWith("/models") ? modelsProbe() : realFetch(input, init));
+  const instance = await OpenAICompatDriver.create({
+    instanceId: `custom-ollama-${threadId}`,
+    displayName: "Silent loopback fixture",
+    enabled: true,
+    config: { url: `http://127.0.0.1:${address.port}/v1`, apiKeyEnv: "FIXTURE_KEY", models: ["fixture"], replyWaitMinutes: 60 },
+    environment: { FIXTURE_KEY: "synthetic-key" },
+  });
+  const recorder = recordEvents(instance.adapter);
+  const stalls: WatchedTurn[] = [];
+  const dog = new TurnWatchdog({
+    stallMs: 20 * 60_000,
+    checkMs: 60_000,
+    onStall: (turn) => stalls.push(turn),
+    liveThreadIds: () => instance.adapter.liveTurnThreadIds?.() ?? [],
+  });
+  dog.watch(threadId, "bot-1");
+  await instance.adapter.sendTurn({ threadId, text: "fixture", model: "fixture" });
+  await chatArrived;
+  const minute = async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+    dog.sweep();
+  };
+  const close = async () => { recorder.stop(); await instance.dispose(); server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); };
+  return { instance, recorder, stalls, dog, minute, close };
+}
+
+it("a silent local turn whose server keeps answering survives the 20 and 30 minute limits and ends at its own 60 minute wait", async () => {
+  const { instance, recorder, stalls, minute, close } = await silentLocalTurn(
+    () => Promise.resolve(new Response(null, { status: 503 })),
+    "healthy-silent",
+  );
+  try {
+    for (let m = 0; m < 45; m++) await minute();
+    expect(stalls).toEqual([]);
+    expect(recorder.events.some((event) => event.type === "turn.completed")).toBe(false);
+    // Past the driver's own 30-minute sweep as well: still running.
+    expect(await instance.adapter.sweepStuckTurns?.(30 * 60_000)).toEqual([]);
+    for (let m = 0; m < 17; m++) await minute();
+    // The configured 60-minute idle wait, not the watchdog, ended it.
+    expect(recorder.events.find((event) => event.type === "turn.completed")).toMatchObject({ ok: false });
+    expect(stalls).toEqual([]);
+  } finally {
+    await close();
+  }
+});
+
+it("a silent local turn whose probes never answer is still stalled by the 20 minute watchdog", async () => {
+  const { stalls, minute, close } = await silentLocalTurn(() => new Promise<Response>(() => undefined), "wedged-silent");
+  try {
+    for (let m = 0; m < 25; m++) await minute();
+    expect(stalls).toEqual([expect.objectContaining({ threadId: "wedged-silent" })]);
+  } finally {
+    await close();
+  }
 });

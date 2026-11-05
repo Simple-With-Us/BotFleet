@@ -4457,9 +4457,9 @@ function scheduleStalledTurnRelease(
 const watchdog = new TurnWatchdog({
   stallMs: TURN_STALL_MS,
   checkMs: 60_000,
+  liveThreadIds: () => registry.instances().flatMap((instance) => instance.adapter.liveTurnThreadIds?.() ?? []),
   onSweep: () => {
     for (const instance of registry.instances()) {
-      for (const threadId of instance.adapter.liveTurnThreadIds?.() ?? []) watchdog.touch(threadId);
       const sweep = instance.adapter.sweepStuckTurns;
       if (!sweep) continue;
       void sweep
