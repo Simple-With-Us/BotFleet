@@ -67,7 +67,49 @@ interface QueueEntry {
   items: Array<QueuedItem>;
 }
 
-const queues = new Map<string, QueueEntry>(); // threadId → waiting sends
+/** The queue map, reporting every change so a crash journal can follow it.
+ *  Every mutation in this file goes through `set`/`delete`/`clear`. */
+class JournaledQueues extends Map<string, QueueEntry> {
+  override set(key: string, value: QueueEntry): this {
+    super.set(key, value);
+    queueChanged();
+    return this;
+  }
+  override delete(key: string): boolean {
+    const had = super.delete(key);
+    if (had) queueChanged();
+    return had;
+  }
+  override clear(): void {
+    super.clear();
+    queueChanged();
+  }
+}
+
+const queues = new JournaledQueues(); // threadId → waiting sends
+
+let onQueueChanged: (() => void) | null = null;
+function queueChanged(): void {
+  try {
+    onQueueChanged?.();
+  } catch (error) {
+    console.warn("[steer-queue] journal observer failed:", error);
+  }
+}
+
+/** Follow every change to the queue (the crash journal).  Null stops it. */
+export function setSteerQueueObserver(observer: (() => void) | null): void {
+  onQueueChanged = observer;
+}
+
+/** The queue as it is now, left in place, for the crash journal. */
+export function snapshotSteerQueue(): SteerQueueSnapshot[] {
+  return [...queues].map(([threadId, entry]) => ({
+    threadId,
+    botId: entry.botId,
+    items: entry.items.map((item) => ({ ...item })),
+  }));
+}
 
 /** Hold a mid-turn send off the transcript until drain. */
 export function queueSteeredMessage(
@@ -302,6 +344,7 @@ export interface SteerQueueSnapshot {
     linqChatId?: string;
     automationSource?: Message["automationSource"];
     committed?: CommittedBatch;
+    relayed?: boolean;
   }>;
 }
 

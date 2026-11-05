@@ -126,8 +126,10 @@ import {
   drainViewOf,
   inFlightCounts,
   partitionByAge,
+  readQueueJournal,
   takeHeldWork,
   UpdateDrain,
+  writeQueueJournal,
   type UpdateDrainView,
   type HeldQueueEntry,
   type HeldRoomRound,
@@ -431,6 +433,8 @@ import {
   restoreJobNotices,
   drainEveryReadyBatch,
   restoreSteeredEntries,
+  setSteerQueueObserver,
+  snapshotSteerQueue,
   takeSteeredEntries,
   type SteerQueueSnapshot,
   type JobNoticeItem,
@@ -6726,6 +6730,75 @@ function drainRoomQueue() {
  *  typed text runs unattended — the conservative reading. */
 const relayQueuedMessageIds = new Set<string>();
 
+/** The steer queue lives in memory, so a crash or kill between accepting a
+ *  queued send and draining it would lose the user's words.  Every change to
+ *  the queue is therefore written to a small journal (steer-queue-journal.json
+ *  in the data directory), and the entries a previous run left are put back at
+ *  boot through the same path an update's held sends take, so the age rule and
+ *  the in-thread notice for a too-old send apply to them too. */
+let unrestoredQueueJournal: HeldQueueEntry[] = placementRollbackReadOnly
+  ? []
+  : readQueueJournal(DATA_DIR, (line) => console.warn(line));
+/** When each live queued send was first journaled, so rewriting the journal
+ *  never makes an old send look new to the age rule. */
+const queuedFirstSeen = new Map<string, number>();
+
+function steerJournalEntries(): HeldQueueEntry[] {
+  const now = Date.now();
+  const live = snapshotSteerQueue().map((entry): HeldQueueEntry => {
+    let heldAt = now;
+    const items = entry.items.map((item): HeldQueueEntry["items"][number] => {
+      const seen = queuedFirstSeen.get(item.messageId) ?? now;
+      queuedFirstSeen.set(item.messageId, seen);
+      heldAt = Math.min(heldAt, item.committed ? item.committed.heldAt : seen);
+      const held: HeldQueueEntry["items"][number] = {
+        messageId: item.messageId,
+        text: item.text,
+        prompt: item.prompt,
+        relayed: item.committed ? item.committed.relayed : Boolean(item.relayed) || relayQueuedMessageIds.has(item.messageId),
+      };
+      if (item.replyToId) held.replyToId = item.replyToId;
+      if (item.linqChatId) held.linqChatId = item.linqChatId;
+      if (item.automationSource) held.automationSource = item.automationSource;
+      if (item.committed) held.committed = { ...item.committed, excludeIds: [...item.committed.excludeIds] };
+      return held;
+    });
+    return { botId: entry.botId, threadId: entry.threadId, heldAt, items } as HeldQueueEntry;
+  });
+  const liveIds = new Set(live.flatMap((entry) => entry.items.map((item) => item.messageId)));
+  for (const id of queuedFirstSeen.keys()) if (!liveIds.has(id)) queuedFirstSeen.delete(id);
+  return [...live, ...unrestoredQueueJournal];
+}
+
+function writeSteerJournal() {
+  if (placementRollbackReadOnly) return;
+  const failure = writeQueueJournal(DATA_DIR, steerJournalEntries());
+  if (failure) console.warn("[steer-queue] could not write the crash journal:", failure.message);
+}
+setSteerQueueObserver(writeSteerJournal);
+
+/** What the last run's journal still holds that is not already running or
+ *  carried: a send that was drained into its thread before the journal caught
+ *  up (its `queueId` is on a transcript line), or that an update carried, is
+ *  dropped here so nothing runs twice. */
+function takeRecoveredQueueJournal(carried: HeldWork): HeldQueueEntry[] {
+  const carriedIds = new Set<string>([
+    ...carried.sends.map((send) => send.userMessageId),
+    ...carried.queued.flatMap((entry) => entry.items.map((item) => item.messageId)),
+  ]);
+  const recovered: HeldQueueEntry[] = [];
+  for (const entry of unrestoredQueueJournal) {
+    const inThread = new Set(store.messagesFor(entry.threadId).flatMap((message) => (message.queueId ? [message.queueId] : [])));
+    const items = entry.items.filter((item) =>
+      item.committed
+        ? !carriedIds.has(item.committed.userMessageId) && store.hasMessage(entry.threadId, item.committed.userMessageId)
+        : !carriedIds.has(item.messageId) && !inThread.has(item.messageId));
+    if (items.length > 0) recovered.push({ ...entry, items } as HeldQueueEntry);
+  }
+  unrestoredQueueJournal = [];
+  return recovered;
+}
+
 /** Whether a drained batch carried any relayed line, consuming the marks.
  *  Read back off the transcript lines drain just appended (their `queueId`). */
 function takeRelayMark(threadId: string, excludeIds: readonly string[]): boolean {
@@ -6929,6 +7002,7 @@ function restoreHeldWork(work: HeldWork, context: string) {
           const restored: SteerQueueSnapshot["items"][number] = { messageId: item.messageId, text: item.text, prompt: item.prompt };
           if (item.replyToId) restored.replyToId = item.replyToId;
           if (item.linqChatId) restored.linqChatId = item.linqChatId;
+          if (item.relayed && !item.committed) restored.relayed = true;
           if (item.automationSource) {
             // SAFETY: the carrier only ever holds what `persistHeldWork` copied
             // out of a steer-queue item, whose automationSource is this type.
@@ -20739,7 +20813,13 @@ if (!placementRollbackReadOnly) setTimeout(() => {
   void runBootRecovery()
     .catch((error) => console.error("[boot-recovery] failed:", error))
     .finally(() => {
-      restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-held");
+      const carried = takeHeldWork(DATA_DIR, (line) => console.warn(line));
+      const recovered = takeRecoveredQueueJournal(carried);
+      if (recovered.length > 0) console.warn(`[boot-recovery] ${recovered.length} queued send batch(es) survived a crash in the journal`);
+      restoreHeldWork({ ...carried, queued: [...carried.queued, ...recovered] }, "update-held");
+      // The journal must now say what is in memory, even when nothing changed
+      // the queue (a too-old send was written into its thread instead).
+      writeSteerJournal();
       drainQueuedSends();
       drainRoomQueue();
     });

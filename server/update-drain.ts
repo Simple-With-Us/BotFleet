@@ -446,6 +446,44 @@ export function appendHeldWork(dataDir: string, work: Partial<HeldWork>): void {
   renameSync(temporary, path);
 }
 
+/** The steer queue's crash journal: the same entries the update carrier holds,
+ *  rewritten whenever the in-memory queue changes, so a crash or kill before a
+ *  queued send drains cannot lose the user's words.  It is read once at boot and
+ *  its entries go back through `restoreHeldWork` (age rules, thread notices). */
+export const STEER_JOURNAL_FILE = "steer-queue-journal.json";
+
+/** Replace the journal with the queue as it is now.  Never throws: a journal
+ *  that cannot be written is reported to the caller, which keeps serving. */
+export function writeQueueJournal(dataDir: string, queued: readonly HeldQueueEntry[]): Error | null {
+  const path = join(dataDir, STEER_JOURNAL_FILE);
+  try {
+    if (queued.length === 0) {
+      if (existsSync(path)) unlinkSync(path);
+      return null;
+    }
+    const file = { version: 1, ...HeldWorkSchema.parse({ sends: [], queued: [...queued], rooms: [] }) };
+    const temporary = `${path}.${process.pid}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(file)}\n`, { mode: 0o600 });
+    renameSync(temporary, path);
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+}
+
+/** The journal a previous run left, entry by entry; an unreadable file reads
+ *  as empty and is reported. */
+export function readQueueJournal(dataDir: string, log?: (line: string) => void): HeldQueueEntry[] {
+  const path = join(dataDir, STEER_JOURNAL_FILE);
+  if (!existsSync(path)) return [];
+  try {
+    return readHeldWorkFile(path).queued;
+  } catch (error) {
+    log?.(`[steer-queue] could not read ${STEER_JOURNAL_FILE}: ${error instanceof Error ? error.message : String(error)}`);
+    return [];
+  }
+}
+
 /** Read and remove the carrier.  An unreadable file is removed too (and
  *  reported), so it cannot fail every boot after it. */
 export function takeHeldWork(dataDir: string, log?: (line: string) => void): HeldWork {
