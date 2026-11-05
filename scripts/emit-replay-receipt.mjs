@@ -34,7 +34,7 @@
 //     --request <bundle-request.json> --report <replay-parity.json> \
 //     --provenance-record <file-in-capture-dir> \
 //     --provenance-source <https-url> --provenance-by <who>
-import { readFileSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { readFileSync, realpathSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -172,7 +172,11 @@ function flagValue(args, flag) {
 
 let isEntry = false;
 try {
-  isEntry = resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+  // `realpathSync`, not `resolve`:  Node's ESM loader resolves symlinks for
+  // `import.meta.url` and leaves `process.argv[1]` as it was typed, so a
+  // script invoked through a symlink would otherwise look like an import and
+  // quietly do nothing.
+  isEntry = realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
 } catch {
   /* imported */
 }

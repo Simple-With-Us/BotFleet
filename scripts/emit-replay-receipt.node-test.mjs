@@ -7,10 +7,12 @@
 // fixture that fails against a broken implementation, so a regression is a
 // red test rather than a receipt that certifies a replay nobody ran.
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { emitReplayReceipt, readReplayReport, replayVerdict } from "./emit-replay-receipt.mjs";
 import { assertReceiptBinding, parseEvidenceReceipt } from "./decommission-evidence-bundle.mjs";
 
@@ -199,4 +201,19 @@ test("an artifact outside the capture directory is refused", () => {
     reportPath: outsideReport,
     provenance: { ...PROVENANCE, record: join(captureDir, "provenance.txt") },
   }), /not inside the capture directory/);
+});
+
+test("the CLI runs when the script is invoked through a symlink", () => {
+  // Node's ESM loader resolves symlinks for `import.meta.url` and leaves
+  // `process.argv[1]` as it was typed, so an entry check that compared the two
+  // unresolved paths would look like an import and quietly do nothing.
+  const directory = mkdtempSync(join(tmpdir(), "replay-link-"));
+  const link = join(directory, "emit-replay-receipt.mjs");
+  symlinkSync(fileURLToPath(new URL("./emit-replay-receipt.mjs", import.meta.url)), link);
+
+  const proc = spawnSync(process.execPath, [link], { encoding: "utf8" });
+  // The CLI refuses without its arguments and says so;  an import would print
+  // nothing at all and exit zero.
+  assert.match(proc.stderr, /emit-replay-receipt refused/);
+  assert.notEqual(proc.status, 0);
 });
