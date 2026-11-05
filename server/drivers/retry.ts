@@ -237,10 +237,6 @@ export function classifyError(err: FailureInput): ErrorClassification {
   const text = messageOf(err);
   const exit = err && "exitCode" in err ? err : null;
   if (exit && exit.exitCode !== null && exit.exitCode < 0) return { transient: false, reason: "interrupted" };
-  // POSIX 143/137 (SIGTERM/SIGKILL as an exit status): the CLI was reaped under
-  // us (BOTFLEET-R, SessionEnd hook), so another spawn is worth it.  A driver
-  // interrupt sets retry.cancelled and uses a negative code, handled above.
-  if (exit && (exit.exitCode === 143 || exit.exitCode === 137)) return { transient: true, reason: "signaled" };
 
   for (const { pattern, reason } of PRIORITY_TERMINAL_PATTERNS) {
     if (pattern.test(text)) return { transient: false, reason };
@@ -251,6 +247,12 @@ export function classifyError(err: FailureInput): ErrorClassification {
   for (const { pattern, reason } of TERMINAL_PATTERNS) {
     if (pattern.test(text)) return { transient: false, reason };
   }
+  // POSIX 143/137 (SIGTERM/SIGKILL as an exit status): the CLI was reaped under
+  // us (BOTFLEET-R, SessionEnd hook), so another spawn is worth it.  This reads
+  // only after stderr had its say: auth, quota and the other terminal shapes
+  // keep their verdict even when the process also died with 143/137.  A driver
+  // interrupt sets retry.cancelled and uses a negative code, handled above.
+  if (exit && (exit.exitCode === 143 || exit.exitCode === 137)) return { transient: true, reason: "signaled" };
   const byCode = classifyByStatusCode(text);
   if (byCode) return byCode;
   if (exit && exit.exitCode !== null && exit.exitCode !== 0 && !text.trim()) {

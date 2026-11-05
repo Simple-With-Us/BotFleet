@@ -1420,6 +1420,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // Reuse the live process when it is idle, unchanged, and is the session
       // the harness wants resumed. Anything else: close it and spawn fresh
       // (with --resume, so the conversation continues in the new process).
+      // One user turn announces turn.started exactly once, even when a reused
+      // session fails its stdin write and the turn falls through to a fresh spawn.
+      let turnStartedEmitted = false;
       const live = sessions.get(threadId);
       if (live && !live.turn && !live.unsolicited && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
@@ -1441,6 +1444,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           broker: live.broker,
         });
         emit({ ...base(threadId, turnId), type: "turn.started" });
+        turnStartedEmitted = true;
         const plan = planTurnText(live.sessionId ?? sessionId ?? newSessionId!);
         live.pendingReceipt = plan.pending;
         const written = await writeUser(live, threadId, plan.text, plan.bare);
@@ -2195,7 +2199,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         killCliTree(child);
       };
       active.set(threadId, { stop, turnId, broker });
-      emit({ ...base(threadId, turnId), type: "turn.started" });
+      if (!turnStartedEmitted) emit({ ...base(threadId, turnId), type: "turn.started" });
 
       // prompt over stdin as a stream-json message — never argv (ARG_MAX).
       // stdin stays OPEN: that is what keeps the session alive for a

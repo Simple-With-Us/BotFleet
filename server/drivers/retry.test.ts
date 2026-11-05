@@ -157,6 +157,11 @@ describe("classifyError", () => {
     });
   });
 
+  it("keeps a terminal stderr verdict when the CLI also died with 143/137", () => {
+    expect(classifyError({ exitCode: 143, stderr: "invalid api key" })).toEqual({ transient: false, reason: "auth" });
+    expect(classifyError({ exitCode: 137, stderr: "Unauthorized" })).toEqual({ transient: false, reason: "auth" });
+  });
+
   it("prefers the transient reading when stderr carries both shapes", () => {
     // a crash whose stderr mentions throttling is worth one more try
     expect(classifyError({ exitCode: 1, stderr: "error: 429 too many requests" })).toEqual({
