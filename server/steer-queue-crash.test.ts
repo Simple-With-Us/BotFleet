@@ -22,7 +22,7 @@ describe("steer-queue crash journal e2e", () => {
   let home = "";
   let stderr = "";
 
-  const api = async (method: string, path: string, body?: object): Promise<{ status: number; body: any }> => {
+  const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
     const res = await fetch(`${BASE}${path}`, {
       method,
       headers: body ? { "content-type": "application/json" } : undefined,

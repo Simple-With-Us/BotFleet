@@ -15,8 +15,9 @@ import {
 import { readQueueJournal, STEER_JOURNAL_FILE, writeQueueJournal, type HeldQueueEntry } from "./update-drain.ts";
 import type { BotRecord, Message } from "./store.ts";
 
-// SAFETY: these tests drive the queue with the few fields it reads, not whole store records.
-function fake<T>(value: object): T {
+// These tests drive the queue with the few fields it reads, not whole store records.
+function fake<T>(value: unknown): T {
+  // SAFETY: a partial stand-in for a store record, used only by these tests.
   return value as T;
 }
 

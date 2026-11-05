@@ -6778,7 +6778,8 @@ function writeSteerJournal() {
   if (placementRollbackReadOnly) return;
   const failure = writeQueueJournal(DATA_DIR, steerJournalEntries());
   // Only the error code is logged: nothing a user wrote ever reaches a log line.
-  steerJournalFailure = failure ? String(Reflect.get(failure, "code") ?? failure.name) : null;
+  // SAFETY: the journal writer only reports fs errors, which carry an optional string code.
+  steerJournalFailure = failure ? ((failure as NodeJS.ErrnoException).code ?? failure.name) : null;
   if (failure) console.warn(`[steer-queue] could not write the crash journal (${steerJournalFailure})`);
 }
 setSteerQueueObserver(writeSteerJournal);
