@@ -15,7 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChildProcess } from "node:child_process";
 
 import { PLACEMENT_WIRE_VERSION, type CapacitySample, type EnqueueMessage, type HostId } from "../shared/placement.ts";
-import { JOB_CAP_PER_BOT, JOB_CAP_PER_HOST, JOB_CAP_PER_THREAD } from "../shared/jobs.ts";
+import { JOB_CAP_PER_BOT, JOB_CAP_PER_HOST, JOB_CAP_PER_THREAD, JOB_RECORD_MAX } from "../shared/jobs.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
 import { openControllerEpochStore } from "./placement-identity.ts";
 import { PlacementLeaseService } from "./placement-leases.ts";
@@ -495,6 +495,36 @@ describe("the registry under the bridge", () => {
     if (!queued.ok) return;
     expect(queued.job.status).toBe("queued");
     expect(children).toHaveLength(JOB_CAP_PER_HOST);
+  });
+
+  it("refuses a start when the controller's queue is full", () => {
+    const { bridge, leases } = fixture();
+    // The controller's queue is the authority's own bound:  the registry's
+    // queue cap never sees a bridged job, because the job never reaches the
+    // registry's records.
+    const fence = { ...leases.controller(), version: PLACEMENT_WIRE_VERSION };
+    for (let index = 0; index < JOB_RECORD_MAX; index += 1) {
+      leases.enqueue({
+        ...fence,
+        jobId: `job-full-${index}`,
+        botId: "bot_full",
+        threadId: "thread_full",
+        command: "true",
+        cwd: "/tmp",
+        timeoutMs: 60_000,
+      });
+    }
+    expect(leases.activeJobs()).toHaveLength(JOB_RECORD_MAX);
+    const { registry, root, children } = registryHarness({
+      placementBridge: bridge,
+      placementMode: () => bridge.mode(),
+      placementActiveJobs: () => leases.activeJobs(),
+    });
+    const result = startJob(registry, root);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("placement queue is full");
+    expect(children).toHaveLength(0);
   });
 
   it("counts the bot's and the conversation's caps from the controller's queue", () => {

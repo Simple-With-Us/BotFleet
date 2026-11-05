@@ -121,6 +121,7 @@ import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, ty
 import { PlacementModeStore, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
 import {
   PlacementControllerBridge,
+  DEFAULT_PLACEMENT_HEARTBEAT_SECONDS,
   DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS,
 } from "./placement-controller-bridge.ts";
 import { createHostProbe } from "./jobs/admission.ts";
@@ -851,6 +852,13 @@ let placementConfig: AppConfig | null = null;
  *  worker, so a knob change applies without a restart. */
 const placementUnreachableAfterMs = (): number =>
   (placementConfig?.placement?.unreachableAfterSeconds ?? DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS) * 1000;
+/** How often a worker says it is alive.  The controller's sweep runs at the
+ *  same cadence:  the sweep exists to notice that a worker's heartbeat
+ *  stopped, so the controller re-checks liveness as often as workers report
+ *  it, and a quiet worker is marked unreachable within one period of the
+ *  window closing rather than within a whole window. */
+const placementHeartbeatMs = (): number =>
+  (placementConfig?.placement?.heartbeatSeconds ?? DEFAULT_PLACEMENT_HEARTBEAT_SECONDS) * 1000;
 const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeaseService({
   hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
   unreachableAfterMs: placementUnreachableAfterMs,
@@ -20665,9 +20673,9 @@ jobRegistry.startTimers();
 // The unreachable sweep (slice T4).  It is the one part of the lease service
 // that had no production caller:  a controller runs it to notice a worker
 // that went quiet, and nothing is requeued when it does.  The period is the
-// unreachable window, so a quiet worker is noticed within one window, and a
-// knob change applies on the next tick.
-if (placementLeases) placementBridge.startUnreachableSweep(placementUnreachableAfterMs);
+// heartbeat period, so the controller looks as often as workers report, and
+// a knob change applies on the next tick.
+if (placementLeases) placementBridge.startUnreachableSweep(placementHeartbeatMs);
 // Boot is done: the socket has been open since the top of this file, and the
 // full route table takes over from the boot-phase handler on the very next
 // request.  `/api/health` flips to `ready: true`, and the 503 gate lifts.

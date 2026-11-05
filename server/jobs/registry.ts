@@ -695,6 +695,13 @@ export class JobRegistry {
     // owns, so the bot's and the conversation's caps are counted there
     // instead:  the controller's queue is the only place a job record lives.
     const placed = this.mode() === "localOnly" ? [] : (this.deps.placementActiveJobs?.() ?? []);
+    // A bridged job goes into the controller's queue, and that queue is
+    // bounded by the authority's own unresolved-record limit.  The registry's
+    // queue bound below never sees a bridged job, because the job never
+    // reaches `this.records`.
+    if (placed.length >= JOB_RECORD_MAX) {
+      return "The controller's placement queue is full; wait for a job to finish or stop a waiting job.";
+    }
     const threadJobs = active.filter((record) => record.threadId === request.threadId).length
       + placed.filter((job) => job.threadId === request.threadId).length;
     if (threadJobs >= JOB_CAP_PER_THREAD) {
