@@ -2,7 +2,7 @@
 
 Refs BF-2559, BF-2544, BF-2634 and BF-2632.  This splits the remaining placement transport work into pieces different agents can take without writing the same file at once.  The design stays `docs/plans/2026-10-29-native-server-mode.md`;  this document only sequences it against the source as it stands.
 
-It was read from the source on Nov 3, 2026, with #1565 and #1556 read as open pull requests,  and re-read against main on Nov 5, 2026, when T1, T2, T3 and T6a had landed.  Nothing here was run, and "exists" means present in source, not proven working.  All sixteen placement assertions stay false, and no slice may change them.  Every row that moved names the slice that moved it, so a reader knows what a slice left behind and what is still unwired.
+It was read from the source on Nov 3, 2026, with #1565 and #1556 read as open pull requests,  and re-read against main on Nov 5, 2026, when T1, T2, T3, T4 and T6a had landed.  Nothing here was run, and "exists" means present in source, not proven working.  All sixteen placement assertions stay false, and no slice may change them.  Every row that moved names the slice that moved it, so a reader knows what a slice left behind and what is still unwired.
 
 ## What Exists
 
