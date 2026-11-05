@@ -16,7 +16,7 @@ import { readQueueJournal, STEER_JOURNAL_FILE, writeQueueJournal, type HeldQueue
 import type { BotRecord, Message } from "./store.ts";
 
 // These tests drive the queue with the few fields it reads, not whole store records.
-function fake<T>(value: unknown): T {
+function fake<T>(value: Partial<T>): T {
   // SAFETY: a partial stand-in for a store record, used only by these tests.
   return value as T;
 }
