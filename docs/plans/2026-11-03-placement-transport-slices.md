@@ -2,7 +2,7 @@
 
 Refs BF-2559, BF-2544, BF-2634 and BF-2632.  This splits the remaining placement transport work into pieces different agents can take without writing the same file at once.  The design stays `docs/plans/2026-10-29-native-server-mode.md`;  this document only sequences it against the source as it stands.
 
-It was read from the source on Nov 3, 2026, with #1565 and #1556 read as open pull requests.  Nothing here was run, and "exists" means present in source, not proven working.  All sixteen placement assertions stay false, and no slice may change them.
+It was read from the source on Nov 3, 2026, with #1565 and #1556 read as open pull requests,  and re-read against main on Nov 5, 2026, when T1, T2, T3 and T6a had landed.  Nothing here was run, and "exists" means present in source, not proven working.  All sixteen placement assertions stay false, and no slice may change them.  Every row that moved names the slice that moved it, so a reader knows what a slice left behind and what is still unwired.
 
 ## What Exists
 
@@ -10,16 +10,16 @@ It was read from the source on Nov 3, 2026, with #1565 and #1556 read as open pu
 | --- | --- | --- |
 | Controller lease book and routes | Exists, controller side only | `server/placement-leases.ts`, mounted in `server/index.ts` |
 | Durable controller state | Exists, no production writer | `server/placement-store.ts` is selected only by a UUID marker, and nothing in production writes one |
-| Worker authentication | In #1565, answers 503 by design | `server/placement-worker-auth.ts`, `shared/placement-worker-http.mjs` |
-| Rollback read-only authority | In #1556 | `server/placement-readonly.ts` |
-| Queue and `JobRegistry` registration | Absent | The registry queues locally and never calls `enqueue` |
-| Server placement mode record | Absent | `JobRegistry` defaults to `localOnly`, and the server stores no mode |
-| Worker client and runtime | Absent | No `fetch` to the placement routes from `server/`, and Swift only reads identity |
-| Worker job discovery and payload delivery | Absent | `claim` needs a `jobId` the worker cannot learn, and its reply carries no command |
-| Durable report spool | Absent | `server/zulip/outgoing-spool.ts` is the pattern to copy |
-| Unreachable sweep | Exists, never called | `sweepUnreachable` has no production caller |
-| Applied-mode acknowledgement | Swift side only | `ServersCoordinator.confirmPlacementApplied` takes an acknowledgement nothing fetches |
-| Two-process fixtures | Partial | Child-process store tests and one harness child;  no controller and worker pair, fault link or nonce job |
+| Worker authentication | Exists since #1565, answers 503 by design | `server/placement-worker-auth.ts`, `shared/placement-worker-http.mjs` |
+| Rollback read-only authority | Exists since #1556 | `server/placement-readonly.ts` |
+| Queue and `JobRegistry` registration | Exists since T4 | A job start in a server mode calls `enqueue` on the controller, and a host that does not hold the controller refuses with a reason instead of queueing locally |
+| Server placement mode record | Exists since T3 | The server stores the mode beside `jobs.json`, and the registry bridge reads it since T4 |
+| Worker client and runtime | Exists since T1, no production caller | `server/placement-worker-client.ts` speaks to the worker routes, and nothing in production constructs it;  Swift only reads identity |
+| Worker job discovery and payload delivery | Exists since T2, no production caller | The `assignment` intent hands the worker a job id and a lease, and the `payload` intent delivers the command, checked against the immutable digest |
+| Durable report spool | Exists since T1, no production caller | `server/placement-report-spool.ts` is the durable report spool, and no production caller wires it yet |
+| Unreachable sweep | Exists, called since T4 | `sweepUnreachable` runs on the controller's heartbeat period, and nothing is requeued |
+| Applied-mode acknowledgement | Exists on the server since T3 | `GET /api/placement/mode` returns it, and the Swift client that reads it is T7 |
+| Two-process fixtures | Exists since T6a | `server/testing/two-process.ts` starts a controller and a worker pair, `server/testing/fault-proxy.ts` is the fault link and `server/testing/nonce-job.mjs` is the nonce job;  the T6b scenarios are still to come |
 
 ## The Wire Mapping
 
