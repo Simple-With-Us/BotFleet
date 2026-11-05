@@ -507,10 +507,10 @@ describe("OpenAICompatDriver", () => {
 });
 
 describe("local OpenAI-compatible reply wait", () => {
-  it("accepts optional whole-minute waits from 5 to 60 and rejects invalid values", () => {
-    expect(OpenAICompatDriver.decodeConfig({ url: "http://127.0.0.1:11434/v1", replyWaitMinutes: 20 })).toMatchObject({ replyWaitMinutes: 20 });
+  it("accepts optional whole-minute waits from 5 to 15 and rejects invalid values", () => {
+    expect(OpenAICompatDriver.decodeConfig({ url: "http://127.0.0.1:11434/v1", replyWaitMinutes: 15 })).toMatchObject({ replyWaitMinutes: 15 });
     expect(OpenAICompatDriver.decodeConfig({ url: "http://127.0.0.1:11434/v1" })).not.toHaveProperty("replyWaitMinutes");
-    for (const value of [1, 4, 61, 2.5, "20", null]) {
+    for (const value of [1, 4, 16, 20, 60, 2.5, "15", null]) {
       expect(() => OpenAICompatDriver.decodeConfig({ url: "http://127.0.0.1:11434/v1", replyWaitMinutes: value })).toThrow(/replyWaitMinutes/);
     }
   });
@@ -518,23 +518,23 @@ describe("local OpenAI-compatible reply wait", () => {
   it("keeps the 3-minute local default and the 2-minute cloud timeout", () => {
     expect(replyWaitTimeoutMs("http://127.0.0.1:11434/v1")).toBe(180_000);
     expect(replyWaitTimeoutMs("http://127.0.0.1:11434/v1", 5)).toBe(300_000);
-    expect(replyWaitTimeoutMs("http://127.0.0.1:11434/v1", 60)).toBe(3_600_000);
+    expect(replyWaitTimeoutMs("http://127.0.0.1:11434/v1", 15)).toBe(900_000);
     expect(replyWaitTimeoutMs("https://api.example.test/v1", 20)).toBe(120_000);
   });
 
-  it("gives a configured 60-minute local wait bounded request and turn headroom", () => {
+  it("gives a configured 15-minute local wait bounded request and turn headroom", () => {
     const localDefault = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("http://127.0.0.1:11434/v1") };
     expect(localDefault.requestTimeoutMs).toBe(DEFAULT_TURN_LOOP_BUDGET.requestTimeoutMs);
     expect(localDefault.wallClockMs).toBe(DEFAULT_TURN_LOOP_BUDGET.wallClockMs);
 
-    const local60 = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("http://127.0.0.1:11434/v1", 60) };
-    expect(local60.requestIdleMs).toBe(3_600_000);
+    const local60 = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("http://127.0.0.1:11434/v1", 15) };
+    expect(local60.requestIdleMs).toBe(900_000);
     expect(local60.requestTimeoutMs).toBeGreaterThan(local60.requestIdleMs);
-    expect(local60.requestTimeoutMs).toBe(3_900_000);
+    expect(local60.requestTimeoutMs).toBe(1_200_000);
     expect(local60.wallClockMs).toBeGreaterThan(local60.requestTimeoutMs);
-    expect(local60.wallClockMs).toBe(4_500_000);
+    expect(local60.wallClockMs).toBe(1_800_000);
 
-    const cloud60 = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("https://api.example.test/v1", 60) };
+    const cloud60 = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("https://api.example.test/v1", 15) };
     expect(cloud60).toEqual(DEFAULT_TURN_LOOP_BUDGET);
   });
 

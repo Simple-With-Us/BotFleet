@@ -84,7 +84,7 @@ it("keeps a slow first token alive while local /models probes keep answering", a
     const completed = recorder.until((event) => event.type === "turn.completed", 200_000);
     for (let attempt = 0; attempt < 20 && !streamController; attempt++) await Promise.resolve();
     expect(streamController).toBeDefined();
-    await vi.advanceTimersByTimeAsync(90_000);
+    await vi.advanceTimersByTimeAsync(135_000);
     expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/models"))).toHaveLength(3);
     expect(recorder.events.some((event) => event.type === "turn.completed")).toBe(false);
     const encoder = new TextEncoder();
@@ -193,7 +193,7 @@ it("ends a local turn on dead-server probes before the 3-minute default expires"
     for (let attempt = 0; attempt < 10 && !fetchMock.mock.calls.some(([input]) => String(input).endsWith("/chat/completions")); attempt++) {
       await Promise.resolve();
     }
-    await vi.advanceTimersByTimeAsync(90_000);
+    await vi.advanceTimersByTimeAsync(135_000);
     expect(await completed).toMatchObject({ ok: false });
     expect(recorder.events.find((event) => event.type === "runtime.error")).toMatchObject({
       message: expect.stringContaining("stopped answering"),

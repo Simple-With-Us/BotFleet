@@ -48,7 +48,25 @@ const DRIVER_KIND = "openai-compat";
 const REQUEST_TIMEOUT_MS = 120_000;
 const DEFAULT_LOCAL_REPLY_WAIT_MS = 180_000;
 const NODE_FETCH_NO_BYTE_TIMEOUT_MS = 300_000;
-const LOCAL_MODEL_PROBE_INTERVAL_MS = 30_000;
+
+/** The harness stall watchdog (TURN_STALL_MS, 20 minutes) stops a turn whose
+ *  thread emitted nothing.  A silent local model emits nothing while it
+ *  generates, so a wait at or past that limit could never elapse.  Keep the
+ *  longest wait clearly under it. */
+export const MAX_REPLY_WAIT_MINUTES = 15;
+export const ReplyWaitMinutesSchema = z.number().int().min(5).max(MAX_REPLY_WAIT_MINUTES);
+export type ReplyWaitMinutes = z.infer<typeof ReplyWaitMinutesSchema>;
+export const REPLY_WAIT_RANGE_MESSAGE = `replyWaitMinutes must be a whole number from 5 to ${MAX_REPLY_WAIT_MINUTES}`;
+
+// Only the fields read before building a Response; extra fields pass through.
+const UpstreamResponseSchema = z.object({
+  status: z.number().int().min(200).max(599),
+  statusText: z.string(),
+});
+// Three misses at this interval (135 s) must still land inside the 3-minute
+// default wait, so a dead server is noticed before the turn would time out.
+// A longer wait adds at most one probe per 45 s to the busy inference server.
+const LOCAL_MODEL_PROBE_INTERVAL_MS = 45_000;
 const LOCAL_MODEL_PROBE_TIMEOUT_MS = 5_000;
 const LOCAL_MODEL_PROBE_MISSES = 3;
 const LOCAL_REPLY_REQUEST_HEADROOM_MS = 300_000;
@@ -120,14 +138,15 @@ function fetchWithoutNodeNoByteTimeout(url: string, init: RequestInit): Promise<
     dispatcher: noByteTimeoutAgent,
   };
   return undiciFetch(url, options).then((upstream) => {
+    const meta = UpstreamResponseSchema.parse(upstream);
     const headers = new Headers();
     upstream.headers.forEach((value, key) => headers.append(key, value));
     // SAFETY: Undici's response body is a Node stream type for the same WHATWG
     // ReadableStream consumed by this driver; only its ambient declarations differ.
     const body = upstream.body as ConstructorParameters<typeof Response>[0];
     return new Response(body, {
-      status: upstream.status,
-      statusText: upstream.statusText,
+      status: meta.status,
+      statusText: meta.statusText,
       headers,
     });
   });
@@ -156,7 +175,7 @@ export function watchLocalModelServer(
       timedOut = true;
       probe.abort(new DOMException("Local model liveness probe timed out", "TimeoutError"));
     }, Math.min(intervalMs / 2, LOCAL_MODEL_PROBE_TIMEOUT_MS));
-    void (async () => {
+    (async () => {
       try {
         const headers = new Headers();
         if (apiKey) headers.set("authorization", `Bearer ${apiKey}`);
@@ -182,7 +201,11 @@ export function watchLocalModelServer(
         if (activeProbe === probe) activeProbe = undefined;
         checking = false;
       }
-    })();
+    })().catch((error: unknown) => {
+      // Backstop so a probe can never raise an unhandled rejection.  Only the
+      // error name is logged: no key, URL or payload.
+      console.warn(`[openai-compat] local liveness probe failed (${error instanceof Error ? error.name : "unknown"})`);
+    });
   }, intervalMs);
   stop.signal.addEventListener("abort", abortProbe);
   timer.unref?.();
@@ -222,7 +245,7 @@ export interface OpenAICompatConfig {
   /** Custom icon URL or data URL (SVG, PNG, etc.) */
   iconUrl?: string;
   /** Per-server idle wait, in whole minutes. Absent keeps the local default. */
-  replyWaitMinutes?: number;
+  replyWaitMinutes?: ReplyWaitMinutes;
 }
 
 // Sentry's gen_ai.provider.name for whoever is actually answering.  Every
@@ -264,9 +287,9 @@ export function maxOutputParamForUrl(url: string): "max_tokens" | "max_completio
 
 function decodeConfig(raw: unknown): OpenAICompatConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
-  const parsedReplyWait = z.number().int().min(5).max(60).optional().safeParse(o.replyWaitMinutes);
+  const parsedReplyWait = ReplyWaitMinutesSchema.optional().safeParse(o.replyWaitMinutes);
   if (!parsedReplyWait.success) {
-    throw new Error("replyWaitMinutes must be a whole number from 5 to 60");
+    throw new Error(REPLY_WAIT_RANGE_MESSAGE);
   }
   const envUrl = process.env.OPENAI_COMPAT_URL;
   const rawModels = Array.isArray(o.models) ? o.models : undefined;
