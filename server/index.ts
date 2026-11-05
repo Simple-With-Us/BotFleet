@@ -4459,6 +4459,7 @@ const watchdog = new TurnWatchdog({
   checkMs: 60_000,
   onSweep: () => {
     for (const instance of registry.instances()) {
+      for (const threadId of instance.adapter.liveTurnThreadIds?.() ?? []) watchdog.touch(threadId);
       const sweep = instance.adapter.sweepStuckTurns;
       if (!sweep) continue;
       void sweep
