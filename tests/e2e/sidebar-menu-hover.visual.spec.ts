@@ -64,7 +64,8 @@ async function paintedPixel(page: Page, row: Locator): Promise<[number, number, 
     if (!ctx) throw new Error('no 2d context');
     ctx.drawImage(bitmap, 0, 0);
     const [r, g, b] = ctx.getImageData(2, 2, 1, 1).data;
-    return [r, g, b] as [number, number, number];
+    const painted: [number, number, number] = [r, g, b];
+    return painted;
   }, png.toString('base64'));
 }
 
