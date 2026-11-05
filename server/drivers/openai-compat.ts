@@ -205,7 +205,7 @@ export function watchLocalModelServer(
         if (activeProbe === probe) activeProbe = undefined;
         checking = false;
       }
-    })().catch((error: unknown) => {
+    })().catch((error) => {
       // Backstop so a probe can never raise an unhandled rejection.  Only the
       // error name is logged: no key, URL or payload.
       console.warn(`[openai-compat] local liveness probe failed (${error instanceof Error ? error.name : "unknown"})`);
