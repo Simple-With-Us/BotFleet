@@ -37,7 +37,7 @@ interface ProbeResult {
   message?: string;
 }
 
-const LOCAL_REPLY_WAIT_CHOICES = [5, 10, 20, 30, 60] as const;
+const LOCAL_REPLY_WAIT_CHOICES = [5, 10, 15] as const;
 
 /** Default the toggle to ON when the persisted config never had the field
  * — the registry treats absent `enabled` as `true` and the UI must match. */
@@ -517,7 +517,7 @@ export function EngineRow({
               disabled={isBusy || !enabled || deleting}
               onChange={(event) => {
                 const value = event.target.value;
-                void patchWithLocalError({ replyWaitMinutes: value ? Number(value) : null });
+                patchWithLocalError({ replyWaitMinutes: value ? Number(value) : null }).catch(() => undefined);
               }}
               className="rounded-md border border-hairline/60 bg-inset px-1.5 py-1 text-[11.5px] text-ink disabled:opacity-50"
             >
