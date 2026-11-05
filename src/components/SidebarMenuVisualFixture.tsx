@@ -11,7 +11,9 @@ import { useEffect } from "react";
 import { StoreProvider, useStore, type Bot } from "@/state/store";
 import { BotContextMenu } from "./Sidebar";
 
-const director: Bot = {
+// SAFETY: the fixture seeds only the fields the context menu reads; the rest of Bot is
+// filled by the store on hydrate and is irrelevant to the hover fill.
+const director = {
   id: "bot-menu-fixture",
   threadId: "thread-menu-fixture",
   name: "Director",

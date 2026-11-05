@@ -34,7 +34,7 @@ const MIN_CHANNEL_STEP = 5;
 type Row = { label: string; rest: string; hover: string; overSurface: string; step: number };
 
 async function measureRows(page: Page): Promise<{ surface: string; rows: Row[] }> {
-  return page.evaluate((minStep) => {
+  return page.evaluate(() => {
     const menu = document.querySelector('[data-bot-menu]');
     if (!menu) throw new Error('bot menu did not render');
     const buttons = Array.from(menu.querySelectorAll('button'));
@@ -96,7 +96,7 @@ async function measureRows(page: Page): Promise<{ surface: string; rows: Row[] }
       rows.push({ label, rest, hover, overSurface, step });
     }
     return { surface, rows };
-  }, MIN_CHANNEL_STEP);
+  });
 }
 
 test.describe('bot context menu hover fill', () => {

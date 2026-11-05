@@ -1819,6 +1819,7 @@
     {"path":"src/components/SettingsSearchResultsView.tsx","category":"ui-build","reason":"Import from src/components/SettingsModal.tsx"},
     {"path":"src/components/SharedVpsRuntimeCard.tsx","category":"ui-build","reason":"Import from src/components/RuntimeCardsVisualFixture.tsx"},
     {"path":"src/components/Sidebar.tsx","category":"ui-build","reason":"Import from src/App.tsx"},
+    {"path":"src/components/SidebarMenuVisualFixture.tsx","category":"ui-build","reason":"Import from src/main.tsx"},
     {"path":"src/components/SidebarPhoneButton.tsx","category":"ui-build","reason":"Import from src/components/Sidebar.tsx"},
     {"path":"src/components/SidebarThreadRow.tsx","category":"ui-build","reason":"Import from src/components/Sidebar.tsx"},
     {"path":"src/components/SignInRequestCard.tsx","category":"ui-build","reason":"Import from src/components/SignInRequestCardVisualFixture.tsx"},
