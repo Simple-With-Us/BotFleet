@@ -125,6 +125,33 @@ node scripts/archive-node-store.mjs receipt --capture /private/captures/capture 
 
 **What breaks if skipped:** a parity bug found after the deletion has no reference to compare against, and the Node store becomes the only copy of a history nobody can read.
 
+### The Replay Corpus Has A Producer Too
+
+**`replay-parity` had no producer.**  The bundle's `replay` receipt names one check per engine — `engine:<id>`, for every id in the packet's own `engines` list — and nothing in the tree produced those checks, so the receipt could only ever be asserted by a person.  There are two halves now.  `ios/Scripts/EngineReplayParityProbe` is the measurement:  it replays each engine's recorded turns through the native `EngineDriver` and writes a per-engine report.  `scripts/emit-replay-receipt.mjs` is the receipt:  it reads that report and emits the `replay` receipt in the shape `scripts/decommission-evidence-bundle.mjs` validates.
+
+**The producer does not pick the engine vocabulary.**  The bundle derives its check names from `bundle.engines`, so the probe reads the engine list from the bundle request and names its checks from that list.  A packet that names an engine with no replay family behind it earns a failing check with the reason named — never a passing one, and never a silent skip.
+
+**How an engine id finds its family.**  The thirteen engines in the runtime matrix are not thirteen replay families.  Three of them (`grok-api`, `minimax-api`, `gemini-api`) speak HTTPS to a provider and launch no CLI at all, and four more (`cursor`, `gemini-cli`, `dsh`, `opencode`) launch a CLI the harness does not script.  So an engine id is resolved by the executable its driver would launch — a fact `EngineMatrixRegistry` already states — and the family that drives that executable is found in the corpus.  Six matrix ids resolve to a family:  `antigravity`, `claude`, `codex`, `grok-acp`, `mcode` and `muse`.  The other seven resolve to nothing, and each one that a packet names earns a failing check that says why.  The mapping is derived from the tree rather than written down as a table, so a family that changes its executable is a failed check instead of a silent mismatch.
+
+**The corpus is the numbered turns plus the standalone protocol fixtures.**  The twenty numbered turns per family do not cover the auth-priority rule, the model-selection rules, the mismatched tool owner, or the early tool before the turn-start acknowledgement, so the nine standalone fixtures are replayed with them.  One of them is expected to be REFUSED rather than replayed:  the ACP driver must reject tool preparation owned by another bot before it launches anything, and the probe checks both that the turn was refused and that nothing was launched.  Treating that refusal as a failure would be measuring the wrong thing.
+
+**The exit codes are read out of the report, never asserted.**  Every `engine:<id>` check takes its exit code from the report it names, so a replay that did not hold earns a failing code and the bundle refuses the packet.
+
+```sh
+swift run --package-path ios EngineReplayParityProbe -- \
+  --request /private/captures/request.json \
+  --out /private/captures/capture/replay-parity.json
+node scripts/emit-replay-receipt.mjs \
+  --capture /private/captures/capture \
+  --request /private/captures/request.json \
+  --report /private/captures/capture/replay-parity.json \
+  --provenance-record /private/captures/capture/replay-provenance.txt \
+  --provenance-source "$PROVENANCE_URL" --provenance-by "$WHO"
+```
+
+**What the producer does not prove.**  It does not record the recorded stdin trace, because the Claude family's user frame carries a fresh UUID per call and that trace is not byte-stable across runs;  it records the stdin guard's verdict instead, which is the part that is stable.  It does not record the spawn spec's environment either, because that names the variables an engine expects.  It says nothing about whether a live bot answers:  the replay runs against recorded turns, in memory, with no process launched and no network touched.
+
+**What breaks if skipped:** a parity bug in an engine's wire protocol is found only after the Node harness is gone, and the claim that the native drivers replay what the Node harness recorded rests on a person's word.
 ### Step 2 — The Cutover Belongs To BF-2514, Not Here
 
 `app.botfleet.server` is booted out, the native app becomes the single writer, and the 24-hour no-Node soak runs under BF-2514.  Phase 6 does not repeat that work and does not shorten it.  The rule that decides which host writes, and the ordered commands that retire the LaunchAgent, are in [the single-writer contract](native-rewrite-single-writer-contract.md) and [its cutover runbook](native-rewrite-single-writer-cutover.md).
