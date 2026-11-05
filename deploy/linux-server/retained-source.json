@@ -1466,6 +1466,7 @@
     {"path":"server/peer-approval.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/permission-allow-key.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/permission-proxy.ts","category":"runtime-asset","reason":"Declared subprocess in server/proxy-paths.ts"},
+    {"path":"server/placement-controller-bridge.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/placement-identity.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/placement-leases.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/placement-mode-store.ts","category":"runtime","reason":"Import from server/index.ts"},
