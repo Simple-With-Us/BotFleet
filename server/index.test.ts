@@ -6901,6 +6901,17 @@ describe("instance CLI override API", () => {
     expect(found.snapshot.state).toBe("available");
     expect(found.snapshot.authenticated).toBe(true);
     expect(found.models.options.map((m: any) => m.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
+    expect(found.localModelWaitAvailable).toBe(true);
+
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 20 })).status).toBe(200);
+    const configured = await api("GET", "/api/instances");
+    expect(configured.body.instances.find((i: any) => i.instanceId === instanceId).replyWaitMinutes).toBe(20);
+    for (const invalid of [1, 4, 61, 2.5, "20"]) {
+      expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: invalid })).status).toBe(400);
+    }
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: null })).status).toBe(200);
+    const reset = await api("GET", "/api/instances");
+    expect(reset.body.instances.find((i: any) => i.instanceId === instanceId)).not.toHaveProperty("replyWaitMinutes");
 
     const botRes = await api("POST", "/api/bots", {
       name: "Local Bot",

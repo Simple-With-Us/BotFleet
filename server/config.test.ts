@@ -599,6 +599,33 @@ describe("Instance CLI override", () => {
   });
 });
 
+describe("OpenAI-compatible reply wait override", () => {
+  it("stores and clears minutes on only that instance config", () => {
+    const cfg: AppConfig = {
+      instances: {
+        "custom-ollama": {
+          driver: "openai-compat",
+          config: { url: "http://127.0.0.1:11434/v1", models: ["fixture"], key: "synthetic-key" },
+        },
+      },
+    };
+    const set = patchInstanceConfig(cfg, "custom-ollama", { replyWaitMinutes: 20 });
+    expect(set.config.instances!["custom-ollama"].config).toEqual({
+      url: "http://127.0.0.1:11434/v1",
+      models: ["fixture"],
+      key: "synthetic-key",
+      replyWaitMinutes: 20,
+    });
+    const cleared = patchInstanceConfig(set.config, "custom-ollama", { replyWaitMinutes: null });
+    expect(cleared.config.instances!["custom-ollama"].config).toEqual({
+      url: "http://127.0.0.1:11434/v1",
+      models: ["fixture"],
+      key: "synthetic-key",
+    });
+    expect(cfg.instances!["custom-ollama"].config).not.toHaveProperty("replyWaitMinutes");
+  });
+});
+
 describe("general config patch schema", () => {
   it("keeps deleteInstance out of PATCH /api/config — only the dedicated DELETE route may delete an engine", () => {
     // PATCH /api/config has none of DELETE /api/instances/:id's
