@@ -27,6 +27,11 @@
  * hop-by-hop header is dropped so the harness only ever sees a plain loopback
  * caller.
  *
+ * Reserved BotFleet-Worker requests take a separate exact-path HTTP policy.
+ * Their credential is preserved for independent harness verification, never
+ * exchanged for loopback owner authority; browser/ambiguous/upgrade requests
+ * and worker redirects refuse.  The harness transport remains inactive.
+ *
  * Configuration comes from Infisical, and from nowhere else: Infisical is the
  * sole source of truth for every secret, setting and on/off switch, so the
  * gate reads no environment variable and has no fallback chain.  It reads the
@@ -59,6 +64,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import net from 'node:net';
 import { pathToFileURL } from 'node:url';
+import { classifyWorkerRequest } from '../../shared/placement-worker-http.mjs';
 
 import {
   InfisicalReadError,
@@ -423,7 +429,7 @@ export function defaultLog(message) {
  * @param {import('node:http').Agent} agent
  * @param {(message: string) => void} log
  */
-function proxyRequest(req, res, harnessHost, harnessPort, agent, log) {
+function proxyRequest(req, res, harnessHost, harnessPort, agent, log, worker = false) {
   const upstream = http.request(
     {
       host: harnessHost,
@@ -434,8 +440,15 @@ function proxyRequest(req, res, harnessHost, harnessPort, agent, log) {
       agent,
     },
     (upstreamRes) => {
-      res.writeHead(upstreamRes.statusCode ?? 502, downstreamHeaders(upstreamRes.headers));
       upstreamRes.on('error', () => res.destroy());
+      if (worker && upstreamRes.statusCode >= 300 && upstreamRes.statusCode < 400) {
+        upstreamRes.resume();
+        respondJson(res, 502, { error: 'worker redirect refused' });
+        return;
+      }
+      const headers = downstreamHeaders(upstreamRes.headers);
+      if (worker) { delete headers['set-cookie']; delete headers.location; }
+      res.writeHead(upstreamRes.statusCode ?? 502, headers);
       upstreamRes.pipe(res);
     },
   );
@@ -506,15 +519,22 @@ export function createOwnerGate({
   const upstreamAgent = new http.Agent({ keepAlive: false });
 
   const server = http.createServer((req, res) => {
-    const decision = gateDecision({
+    const worker = classifyWorkerRequest(req);
+    const decision = worker.kind === 'none' ? gateDecision({
       remoteAddress: req.socket?.remoteAddress,
       headers: req.headers,
       owners: allowlist,
       publicOrigin: origin,
       tokenSha256: tokenDigest,
-    });
+    }) : worker.kind === 'worker' && isLoopbackAddress(req.socket?.remoteAddress)
+      ? { ok: true } : { ok: false, status: 403, reason: 'worker request refused' };
 
     if (!decision.ok) {
+      if (worker.kind !== 'none') {
+        logger('[owner-gate] worker request refused');
+        respondJson(res, 403, { error: 'worker request refused' });
+        return;
+      }
       const login = presentedLogin(req.headers);
       logger(
         `[owner-gate] refused ${req.method} ${pathOf(req.url)}: ${decision.reason}` +
@@ -529,7 +549,7 @@ export function createOwnerGate({
       return;
     }
 
-    proxyRequest(req, res, harnessHost, port, upstreamAgent, logger);
+    proxyRequest(req, res, harnessHost, port, upstreamAgent, logger, worker.kind === 'worker');
   });
 
   //  A long server-sent event stream must never be cut short by a timeout.
@@ -539,18 +559,19 @@ export function createOwnerGate({
   server.keepAliveTimeout = 65_000;
 
   server.on('upgrade', (req, socket, head) => {
-    const decision = gateDecision({
+    const worker = classifyWorkerRequest(req);
+    const decision = worker.kind === 'none' ? gateDecision({
       remoteAddress: socket.remoteAddress,
       headers: req.headers,
       owners: allowlist,
       publicOrigin: origin,
       tokenSha256: tokenDigest,
-    });
+    }) : { ok: false, status: 403, reason: 'worker request refused' };
 
     if (!decision.ok) {
-      const login = presentedLogin(req.headers);
+      const login = worker.kind === 'none' ? presentedLogin(req.headers) : '';
       logger(
-        `[owner-gate] refused upgrade ${pathOf(req.url)}: ${decision.reason}` +
+        `[owner-gate] refused upgrade ${worker.kind === 'none' ? pathOf(req.url) : 'worker'}: ${decision.reason}` +
           (login ? ` (login=${login})` : ''),
       );
       const body = Buffer.from(JSON.stringify({ error: decision.reason }));

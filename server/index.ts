@@ -21,7 +21,7 @@ import { z } from "zod";
 import { instanceModelsSchema } from "./instance-models.ts";
 import { ScreenPollers } from "./screen-poller.ts";
 import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
-import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
+import { BOT_AVATAR_CROPS, botAvatarRecolorableSchema, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, lowerRoomLabels, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
@@ -114,9 +114,11 @@ import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./run
 import { loadHostId } from "./host-id.ts";
 import { createHostResourcesResponder } from "./host-resources.ts";
 import { placementIdentityResponse } from "./placement-identity.ts";
-import { openPlacementAuthority } from "./placement-store.ts";
-import { PlacementPayloadSpool } from "./placement-payloads.ts";
+import { createWorkerRequestBoundary, privateWorkerAuthorizationSource } from "./placement-worker-auth.ts";
+import { classifyWorkerRequest } from "../shared/placement-worker-http.mjs";
+import { openRollbackPlacementAuthority, PLACEMENT_ROLLBACK_REFUSAL } from "./placement-readonly.ts";
 import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, type PlacementLeaseAction } from "./placement-leases.ts";
+import { PlacementModeStore, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
 import {
@@ -830,13 +832,22 @@ if (storageGuard && !storageGuard.initial.online) {
 }
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 const hostId = loadHostId(DATA_DIR);
-const placementAuthority = openPlacementAuthority(DATA_DIR, hostId);
+const placementAuthority = openRollbackPlacementAuthority(DATA_DIR, hostId);
+// Immutable for this process: updater unquiesce cannot grant execution authority.
+const placementRollbackReadOnly = placementAuthority.kind === "readonly";
 const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeaseService({
   hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
-}) : new PlacementLeaseService({
-  hostId, controller: placementAuthority.store.readScope().controller, store: placementAuthority.store,
-  payloads: new PlacementPayloadSpool(DATA_DIR),
-  queueWindowMs: () => jobSettings().queueWaitMinutes * 60_000,
+}) : null;
+// The server's copy of the mode record, beside `jobs.json`.  It shares the
+// lease service's epoch and keeps no epoch of its own, so the record can
+// never name a fence the controller does not hold.
+const placementModeStore = new PlacementModeStore(join(DATA_DIR, "jobs"), {
+  hostId,
+  controller: () => {
+    if (placementAuthority.kind === "readonly") return placementAuthority.reader.controller();
+    if (!placementLeases) throw new Error("Placement authority is unavailable");
+    return placementLeases.controller();
+  },
 });
 const jobHostProbe = createHostProbe({
   storageState: storageGuard?.sample,
@@ -906,13 +917,26 @@ function handleBootRequest(req: IncomingMessage, res: ServerResponse): void {
   return json(res, 503, { error: "booting" });
 }
 
+const workerRequestBoundary = createWorkerRequestBoundary({
+  audience: hostId, source: privateWorkerAuthorizationSource(DATA_DIR), readBody,
+});
 const server = createServer((req, res) => {
-  if (booting || !handleRequest) return handleBootRequest(req, res);
-  void Promise.resolve(handleRequest(req, res)).catch((error: unknown) => {
+  void (async () => {
+    if (!isLoopbackHost(req.headers.host)) return json(res, 403, { error: "forbidden: loopback host required" });
+    if (await workerRequestBoundary(req, res)) return;
+    if (booting || !handleRequest) return handleBootRequest(req, res);
+    await handleRequest(req, res);
+  })().catch((error: unknown) => {
     console.error("[request] unhandled route failure:", error);
     if (!res.headersSent) json(res, 500, { error: "internal error" });
     else res.destroy();
   });
+});
+// No worker WebSocket protocol exists; an upgrade cannot bypass the HTTP guard.
+server.on("upgrade", (req, socket) => {
+  if (classifyWorkerRequest(req).kind !== "none") {
+    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+  } else socket.destroy();
 });
 server.on("error", (error: NodeJS.ErrnoException) => {
   if (listenErrorDisposition(error) === "named-exit") {
@@ -938,7 +962,9 @@ server.listen(PORT, "127.0.0.1", () => {
 // it now rather than at recovery time also means a crash DURING recovery
 // cannot replay the record on the next boot — the surviving
 // `inflightThreadId` markers are the fallback, and they are evidence enough.
-const interruptedAtLastStop = takeInterruptedTurns(DATA_DIR);
+const interruptedAtLastStop = placementRollbackReadOnly
+  ? { version: 1 as const, recordedAt: 0, turns: [], failures: [] }
+  : takeInterruptedTurns(DATA_DIR);
 /** `botId:threadId` of every resume that already failed terminally.  Mirrors
  * the on-disk list so the common dispatch touches no disk at all. */
 const rememberedResumeFailures = new Set(
@@ -949,7 +975,7 @@ const rememberedResumeFailures = new Set(
 // (server/tools/process-group.ts), so they no longer die with this process
 // the way launchd's job cleanup used to make them.  Groups a crashed or
 // killed run recorded and never saw end are stopped now, before any turn.
-void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
+if (!placementRollbackReadOnly) void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
   console.error("could not stop process groups an earlier run left running", error);
 });
 
@@ -1815,6 +1841,7 @@ function dispatchHoldFor(
   runOn: RoutineRunOn,
   opts: { count?: boolean } = {},
 ): DispatchHold | undefined {
+  if (placementRollbackReadOnly) return { reason: PLACEMENT_ROLLBACK_REFUSAL };
   const bot = store.bot(botId);
   if (!bot) return undefined;
   const task = threadId ? store.taskByThread(bot.id, threadId) : undefined;
@@ -2904,6 +2931,7 @@ function jobStopReason(job: JobSnapshot): { reason: string; forget: boolean } | 
   return null;
 }
 const jobRegistry = new JobRegistry({
+  passive: placementRollbackReadOnly,
   dir: join(DATA_DIR, "jobs"),
   dataDir: DATA_DIR,
   probe: jobHostProbe,
@@ -2925,7 +2953,7 @@ const jobWakeUsage = new JobWakeUsage(join(DATA_DIR, "jobs"));
 // a bot deleted while the harness was down has no row to keep
 jobWakeUsage.retainBots((botId) => Boolean(store.bot(botId)));
 const jobWakes = new JobWakeCoordinator({
-  wakeEnabled: () => jobSettings().wake,
+  wakeEnabled: () => !placementRollbackReadOnly && jobSettings().wake,
   isRoom: (threadId) => Boolean(store.groupByThread(threadId)),
   botBusy: (botId) => Boolean(store.bot(botId)?.busy),
   // The engine the bot is on NOW: it may have been switched since the job
@@ -6647,7 +6675,7 @@ bus.subscribe((event: RuntimeEvent) => {
 function drainRoomQueue() {
   // Held for an update, like the steer queue: released or carried, never
   // started into a fence that would refuse it.
-  if (updateDrain.active || runtimeQuiescing) return;
+  if (placementRollbackReadOnly || updateDrain.active || runtimeQuiescing) return;
   drainRoomRounds(store, Date.now(), (round) => {
     credentialPendingRoomRounds.delete(`${round.groupId}:${round.threadId}:${round.botId}`);
     // The drained round runs on the room's operation queue, behind any
@@ -6760,7 +6788,7 @@ function drainQueuedSends() {
   // new work, so it stays queued.  It is either released (`releaseHeldWork`)
   // or carried across the restart (`persistHeldWork`) —
   // never started into a fence that would refuse it.
-  if (!updateDrain.active && !runtimeQuiescing) {
+  if (!placementRollbackReadOnly && !updateDrain.active && !runtimeQuiescing) {
     drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId, carried) =>
       runQueuedSend(
         {
@@ -6998,6 +7026,7 @@ async function startTurn(
     command?: EngineCommandRun;
   },
 ) {
+  if (placementRollbackReadOnly) throw Object.assign(new Error(PLACEMENT_ROLLBACK_REFUSAL), { status: 503 });
   if (runtimeQuiescing) {
     throw Object.assign(new Error("BotFleet is quiescing for an update"), { status: 503 });
   }
@@ -8283,6 +8312,7 @@ const webhookRequestLog = createRequestLog({
 });
 webhookRequestLog.replay();
 routines = new RoutineManager({
+  passive: placementRollbackReadOnly,
   emit: (event) => {
     webhookRequestLog.routineSubscriber(event);
     broadcast(event);
@@ -8294,7 +8324,7 @@ routines = new RoutineManager({
   // then tick them after the authenticated credential has landed.
   // An update drain holds every run here too: routine, webhook and resource
   // receipts stay `queued` in routines.json, which a restart keeps as-is.
-  admit: () => !runtimeQuiescing && !providerConfigBusy && !updateDrain.active,
+  admit: () => !placementRollbackReadOnly && !runtimeQuiescing && !providerConfigBusy && !updateDrain.active,
   // Defer new webhook wakes while the host is hot, and say so on the
   // receipt.  The probe is the jobs admission swap cache (non-blocking)
   // plus the ACP init load reading.  Resource wakes are not shed: that is
@@ -8931,7 +8961,7 @@ async function probeIngressUrl(raw: string): Promise<IngressProbeResult> {
 
 const resourceTriggers = new ResourceTriggerManager({
   emit: broadcast,
-  admit: () => !runtimeQuiescing,
+  admit: () => !placementRollbackReadOnly && !runtimeQuiescing,
   botState: (botId) => {
     const bot = store.bot(botId);
     return !bot ? "missing" : botIsOff(bot) ? "off" : bot.busy ? "busy" : "ready";
@@ -9349,6 +9379,9 @@ export async function executeRoutineRequestRequest(input: {
 
 // Handoffs a previous process queued, and turns a restart cut, live in
 // runtime.db.  Open reconciles them, then the legacy queue is imported once.
+// Passive rollback must not open runtime.db or boot its queued dispatcher:
+// a refused startTurn would otherwise settle retained assignments as failed.
+if (!placementRollbackReadOnly) {
 jobHost = createJobHost({
   store,
   commsBus,
@@ -9375,6 +9408,7 @@ jobHost = createJobHost({
   },
 });
 jobHost.boot();
+}
 
 // Auto-resume only when a previous process died mid-turn.  An external-only
 // custom credential can arrive after the standalone harness starts; keep that
@@ -9749,6 +9783,7 @@ async function runGroupMemberTurn(
   // it has its own dispatch path and its own `sendTurn` call).
   toolPolicy?: ToolPolicy,
 ): Promise<boolean> {
+  if (placementRollbackReadOnly) return false;
   if (isCancelled?.()) return false;
   const group = store.group(groupId);
   const bot = store.bot(botId);
@@ -10762,6 +10797,7 @@ function markConnectorResumeFailed(threadId: string, resumeKey: string, error: s
 }
 
 function dispatchConnectorResume(entry: { botId: string; threadId: string; resumeKey: string; labels: string[] }) {
+  if (placementRollbackReadOnly) return;
   const owner = connectorThread(entry.botId, entry.threadId);
   if (!owner) return;
   if (providerReloadInProgress) {
@@ -10832,6 +10868,7 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
 }
 
 function maybeResumeConnectors(botId: string, threadId: string, resumeKey: string) {
+  if (placementRollbackReadOnly) return false;
   const cards = connectorCards(threadId, resumeKey);
   if (!cards.length || cards.some((message) => message.connector?.dismissed || message.connector?.status !== "connected")) return false;
   if (cards.every((message) => message.connector?.resumed)) return true;
@@ -10844,6 +10881,7 @@ function maybeResumeConnectors(botId: string, threadId: string, resumeKey: strin
 }
 
 function drainConnectorResumes() {
+  if (placementRollbackReadOnly) return;
   for (const [key, entry] of pendingConnectorResumes) {
     if (store.bot(entry.botId)?.busy) continue;
     pendingConnectorResumes.delete(key);
@@ -12604,7 +12642,7 @@ function settleWorkForOffBot(botId: string): void {
 }
 
 function beginUpdateAdmission(): (() => void) | null {
-  if (runtimeQuiescing) return null;
+  if (placementRollbackReadOnly || runtimeQuiescing) return null;
   activeUpdateAdmissions += 1;
   let released = false;
   return () => {
@@ -12751,6 +12789,7 @@ function resumePausedWork(
   context: string,
   extra: { runs?: readonly RoutineRun[]; bots?: readonly InterruptedBotResumeEntry[] } = {},
 ): Promise<void> | null {
+  if (placementRollbackReadOnly) return null;
   const path = join(DATA_DIR, PENDING_RESUME_FILE);
   const saved = readResumeSnapshot();
   const paused = mergeResumeSnapshots(saved, extra.runs ?? [], extra.bots ?? []);
@@ -12940,6 +12979,7 @@ function releaseAfterDrain() {
  *  inside a route answers before the turns it lets loose start, and a no-op
  *  while something still holds them (the fence, or a drain). */
 function releaseHeldWork() {
+  if (placementRollbackReadOnly) return;
   queueMicrotask(() => {
     if (runtimeQuiescing || updateDrain.active) return;
     restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-released");
@@ -13392,6 +13432,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (mutatingApiRequest && arrivedViaCloudflareTunnel(req)) {
       return json(res, 403, { error: NAMED_TUNNEL_MUTATION_FORBIDDEN });
     }
+    // A bridge offers diagnostics and an update check, but cannot install a
+    // replacement that would escape the immutable hold without artifact proof.
+    if (placementRollbackReadOnly && mutatingApiRequest && !path.startsWith("/api/placement/") &&
+        path !== "/api/runtime/quiesce" && path !== "/api/update/check") {
+      return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
+    }
     if (runtimeQuiescing && path.startsWith("/api/") && path !== "/api/runtime" && path !== "/api/runtime/quiesce" &&
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: controlShutdownPending ? "server shutdown is in progress" : "BotFleet is quiescing for an update" });
@@ -13403,7 +13449,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         : { error: UNSUPPORTED_JSON_BODY });
     }
     let ownAdmissionActive = false;
-    if (mutatingApiRequest) {
+    if (mutatingApiRequest && !placementRollbackReadOnly) {
       const releaseAdmission = beginUpdateAdmission();
       if (!releaseAdmission) return json(res, 503, { error: "BotFleet is quiescing for an update" });
       ownAdmissionActive = true;
@@ -15899,9 +15945,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // not a guard.  The six organize fields are parsed together.
       // From a paired phone (the sidecar stamps `x-botfleet-companion`) the
       // body may carry the six organize fields and nothing else.
+      if (!botAvatarRecolorableSchema.safeParse(body.recolorable).success) {
+        return json(res, 400, { error: "recolorable must be a boolean" });
+      }
       const organize = checkBotOrganizeBody(body, req.headers["x-botfleet-companion"] === "1");
       if (!organize.ok) return json(res, organize.status, { error: organize.error });
-      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
+      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "recolorable", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       if (normalizedSelection) {
@@ -17502,6 +17551,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!isLoopbackAddress(req.socket.remoteAddress) || !authorizedRuntime(harnessOwner, req.headers.authorization)) {
         return json(res, 401, { error: "unauthorized" });
       }
+      if (placementRollbackReadOnly) {
+        // Neither force, drain, lease expiry nor DELETE may claim old work or
+        // release the immutable bridge capability or claim existing jobs.
+        return json(res, 200, {
+          ...runtimeBuildIdentity, pid: process.pid, ...currentRuntimeReadiness(),
+          quiescing: true, fencing: false, placementReadOnly: true, lease: null,
+          placementController: placementAuthority.kind === "readonly" ? placementAuthority.reader.controller() : null,
+          dataOwner: { pid: harnessOwner.pid, port: harnessOwner.port },
+        });
+      }
       // What a quiesce or release asks for, checked against a strict shape:
       // a malformed flag or window is refused with 400, never read loosely
       // into drain, fence or lease state.
@@ -17654,6 +17713,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // The same owner boundary as placement identity and host resources.
       // No worker-scoped credential class exists yet (the plan's open
       // question 3), so these routes invent none.
+      if (!placementLeases) {
+        if (!isLoopbackAddress(req.socket.remoteAddress) || req.headers["x-botfleet-companion"] !== undefined || arrivedViaCloudflareTunnel(req)) {
+          return json(res, 403, { error: "Placement routes are available only through the local owner or authenticated server gate" });
+        }
+        return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
+      }
       // SAFETY: the guard above accepted only segments in
       // PLACEMENT_LEASE_ACTIONS, so this slice is one of them.
       const action = path.slice("/api/placement/".length) as PlacementLeaseAction;
@@ -17678,7 +17743,36 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         localOwner: isLoopbackAddress(req.socket.remoteAddress),
         fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
         viaNamedTunnel: arrivedViaCloudflareTunnel(req),
-      }, { hostId, controller: () => placementLeases.controller(), platform: process.platform });
+      }, { hostId, controller: () => {
+        if (placementAuthority.kind === "readonly") return placementAuthority.reader.controller();
+        if (!placementLeases) throw new Error("Placement authority is unavailable");
+        return placementLeases.controller();
+      }, platform: process.platform });
+      return json(res, response.status, response.body);
+    }
+    if ((method === "GET" || method === "PUT") && path === "/api/placement/mode") {
+      // The same owner boundary as placement identity and host resources:
+      // the local owner or the authenticated server gate, never the companion
+      // lane or the named tunnel.
+      const caller = {
+        localOwner: isLoopbackAddress(req.socket.remoteAddress),
+        fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
+        viaNamedTunnel: arrivedViaCloudflareTunnel(req),
+      };
+      if (method === "GET") {
+        const response = placementModeRead(caller, placementModeStore);
+        return json(res, response.status, response.body);
+      }
+      // A rollback build holds placement state:  it reads the mode record and
+      // never writes one.
+      if (placementRollbackReadOnly) return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
+      let body: unknown;
+      try {
+        body = await readBody(req);
+      } catch {
+        return json(res, 400, { error: "invalid placement mode message" });
+      }
+      const response = placementModeWrite(caller, body, placementModeStore);
       return json(res, response.status, response.body);
     }
     // Saved data that could not be read or used, for the notice at the top of the app.  File base names
@@ -20172,6 +20266,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
       }
       if (m[3] === "status" && method === "GET") {
+        if (placementRollbackReadOnly) {
+          return json(res, 200, {
+            connected: connector.status === "connected", pending: connector.status === "authorizing",
+            status: connector.status, placementReadOnly: true,
+          });
+        }
         const state = (await composio.connectionStatus(cfg, [connector.slug]))[connector.slug];
         const failed = /failed|expired|revoked|error/i.test(state?.status ?? "");
         const next = {
@@ -20428,7 +20528,7 @@ if (!process.env.OMB_DISABLE_GROK_QUOTA) {
 // Post-update resumption: If an update quiesced active work and rebooted successfully,
 // clear all bot snoozes, requeue interrupted runs, and resume routines on this new build.
 const pendingResumePath = join(DATA_DIR, "pending-update-resume.json");
-if (existsSync(pendingResumePath)) {
+if (!placementRollbackReadOnly && existsSync(pendingResumePath)) {
   try {
     const raw = readFileSync(pendingResumePath, "utf-8");
     const resumeState = JSON.parse(raw);
@@ -20498,7 +20598,7 @@ await localVmStartupProbe.catch(() => {});
 await jobRegistry.adopt().catch((error) => {
   console.error(`[jobs] could not settle earlier jobs: ${error instanceof Error ? error.message : String(error)}`);
 });
-try {
+if (!placementRollbackReadOnly) try {
   const interrupted = store.settleInterruptedHelpers(Date.now());
   if (interrupted > 0) console.log(`[helpers] boot: ${interrupted} helper(s) stopped by the restart`);
 } catch (error) {
@@ -20541,7 +20641,7 @@ zulipHub = new ZulipHub({
   },
   busyThread: (botId) => store.bot(botId)?.inflightThreadId,
   turnStarter: (threadId) => zulipTurnStarter(store.activePath(threadId))?.id,
-  dispatchHeld: () => !bootRecoveryDone,
+  dispatchHeld: () => placementRollbackReadOnly || !bootRecoveryDone,
   startTurn: async (botId, text, conversation) => {
     const bot = store.bot(botId);
     if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
@@ -20627,7 +20727,7 @@ zulipHub.start();
 // Everything the recovery coordinator reads now exists: the store, the
 // provider fleet, the shutdown record read at the top of this file, and the
 // post-update snapshot folded into it a few lines above.
-setTimeout(() => {
+if (!placementRollbackReadOnly) setTimeout(() => {
   // Messages an update held for this restart (update-held-sends.json) go
   // back in their bots' queues only now: after `jobRegistry.adopt()` settled
   // the jobs an earlier run left (no turn starts before that), and after
@@ -20697,7 +20797,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     // is settled below, after bus.flush(), and a stop whose drain never
     // finishes leaves a record that cannot license a replay.
     const interrupted: InterruptedTurnRecord[] = [];
-    for (const bot of store.bots) {
+    for (const bot of placementRollbackReadOnly ? [] : store.bots) {
       if (!bot.busy) continue;
       const threadId = bot.inflightThreadId ?? bot.threadId;
       // Room turns are not re-dispatchable (startGroupTurn always appends the

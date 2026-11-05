@@ -274,6 +274,9 @@ export interface OwnerOutput {
 }
 
 export interface JobRegistryDeps {
+  /** Immutable rollback capability, established before any startup recovery.
+   * Passive registries observe records without claiming, settling, or killing. */
+  passive?: boolean;
   /** `<data folder>/jobs`. */
   dir: string;
   /** The data folder itself — whose disk admission measures. */
@@ -510,6 +513,7 @@ function utf8Boundary(buffer: Buffer, length: number): number {
 }
 
 export class JobRegistry {
+  private readonly passive: boolean;
   private readonly records = new Map<string, JobRecord>();
   private readonly deps: JobRegistryDeps;
   private readonly now: () => number;
@@ -557,6 +561,7 @@ export class JobRegistry {
 
   constructor(deps: JobRegistryDeps) {
     this.deps = deps;
+    this.passive = deps.passive === true;
     this.now = deps.now ?? Date.now;
     this.awakeNow = deps.awakeNow ?? (() => performance.now());
     this.probe = deps.probe ?? createHostProbe();
@@ -575,6 +580,11 @@ export class JobRegistry {
     this.finishedMaxAgeMs = deps.finishedMaxAgeMs ?? JOB_FINISHED_MAX_AGE_MS;
     this.lastTick = this.awakeNow();
     this.lastLogCheck = this.awakeNow();
+    if (this.passive) {
+      this.spool = null;
+      this.load();
+      return;
+    }
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
     try { this.spool = new PendingCommandSpool(deps.dir, this.recordMax); }
     catch { this.spool = null; this.deps.log?.("[jobs] private pending command storage is unavailable"); }
@@ -658,6 +668,7 @@ export class JobRegistry {
    *  that could never start; `start()` asks it again, because the answer can
    *  change while a card waits. */
   refusal(request: Pick<JobStartRequest, "botId" | "threadId">): string | null {
+    if (this.passive) return "Background jobs are held by this read-only placement rollback build.";
     if (this.platform === "win32") {
       return "Background jobs are not available on Windows yet: BotFleet cannot reliably stop every process a job starts there.  Run short commands with bash instead.";
     }
@@ -846,6 +857,7 @@ export class JobRegistry {
   /** Spawn a record's process and mark it running.  Returns the spawn
    *  error, or null once the leader exists. */
   private launch(record: JobRecord, command: string, minutes: number, settings: JobsSettings): string | null {
+    if (this.passive) return "Background jobs are held by this read-only placement rollback build.";
     const spawned = this.spawnJob({
       command,
       cwd: record.cwd,
@@ -871,6 +883,7 @@ export class JobRegistry {
    *  earlier one that is still waiting, while another bot's job may pass a
    *  bot whose own caps are full.  Runs on the tick and whenever a job ends. */
   drainQueue(): void {
+    if (this.passive) return;
     if (this.draining) return;
     this.draining = true;
     try {
@@ -1060,6 +1073,7 @@ export class JobRegistry {
    *  Resolves once it is settled.  `model` suppresses the notice; `owner`
    *  and `system` tell the bot without waking it; `timeout` wakes it. */
   async kill(id: string, by: JobKilledBy, reason?: string): Promise<{ ok: boolean; job: JobSnapshot | null; error?: string }> {
+    if (this.passive) return { ok: false, job: this.get(id), error: "This read-only rollback build cannot change or stop placement-owned jobs." };
     const record = this.records.get(id);
     if (!record) return { ok: false, job: null, error: "no such job" };
     const inFlight = this.stopping.get(id);
@@ -1113,6 +1127,7 @@ export class JobRegistry {
    *  the way deleting a conversation deletes its transcript.  Resolves with
    *  how many were running. */
   async killWhere(match: (job: JobSnapshot) => boolean, reason: string, options: { forget?: boolean } = {}): Promise<number> {
+    if (this.passive) return 0;
     const targets = [...this.records.values()].filter((record) => match(this.snapshot(record)));
     const running = targets.filter(isJobActive);
     await Promise.all(running.map((record) => this.kill(record.id, "system", reason)));
@@ -1208,6 +1223,7 @@ export class JobRegistry {
 
   /** The bot was told; it is never told again. */
   markNoticesDelivered(ids: readonly string[]): void {
+    if (this.passive) return;
     let dirty = false;
     for (const id of ids) {
       const record = this.records.get(id);
@@ -1227,6 +1243,7 @@ export class JobRegistry {
    *  it ever does: a late tick on a loaded Mac still credits every awake
    *  second, and a sleep never expires a job. */
   tick(): void {
+    if (this.passive) return;
     const awake = this.awakeNow();
     const credit = Math.max(0, Math.min(awake - this.lastTick, this.maxTickCreditMs));
     this.lastTick = awake;
@@ -1282,6 +1299,7 @@ export class JobRegistry {
    *  and stop one printing faster than any log is read.  Between two 5 s
    *  ticks a runaway (`yes`, an error loop) can write gigabytes. */
   checkLogs(): void {
+    if (this.passive) return;
     const awake = this.awakeNow();
     const seconds = Math.max(0.001, (awake - this.lastLogCheck) / 1000);
     this.lastLogCheck = awake;
@@ -1352,6 +1370,7 @@ export class JobRegistry {
   /** Stop every process still carrying the id of a job of ours that is
    *  over.  Resolves with how many it stopped. */
   async sweep(): Promise<number> {
+    if (this.passive) return 0;
     // Listing every process's environment is the expensive part, and there
     // is nothing to find unless a job of ours ended lately (or was deleted).
     if (!this.mayHaveStrays()) return 0;
@@ -1392,6 +1411,7 @@ export class JobRegistry {
 
   /** Start the tick and the sweep, and stop every job if the process exits. */
   startTimers(sweepMs: number = this.deps.sweepMs ?? 5 * 60_000): void {
+    if (this.passive) return;
     this.lastTick = this.awakeNow();
     this.lastLogCheck = this.awakeNow();
     this.tickTimer ??= setInterval(() => this.tick(), this.tickMs);
@@ -1431,6 +1451,7 @@ export class JobRegistry {
    *  updater's ordinary quiesce, which can still be rolled back — a job
    *  killed for a restart that never came would be work lost for nothing. */
   async quiesce(reason = JOB_STOPPED_REASON): Promise<number> {
+    if (this.passive) return 0;
     const active = [...this.records.values()].filter((record) => this.ownsLocalProcess(record));
     await Promise.all(
       active.map(async (record) => {
@@ -1448,6 +1469,7 @@ export class JobRegistry {
   /** The process is exiting: there is no time for a grace period, so every
    *  running job's group is SIGKILLed now and the job marked lost on disk. */
   shutdownSync(): void {
+    if (this.passive) return;
     let dirty = false;
     for (const record of this.records.values()) {
       if (!this.ownsLocalProcess(record)) continue;
@@ -1467,6 +1489,7 @@ export class JobRegistry {
    *  read at construction).  Wakes nobody: a settled job's notice waits for
    *  the bot's next turn. */
   async adopt(): Promise<{ settled: number; lost: number }> {
+    if (this.passive) return { settled: 0, lost: 0 };
     const loaded = [...this.adoptable].map((id) => this.records.get(id)).filter((record) => record !== undefined);
     this.adoptable.clear();
     let settled = 0;
@@ -1636,6 +1659,7 @@ export class JobRegistry {
   }
 
   private save(durable = false): boolean {
+    if (this.passive) return false;
     const records = [...this.records.values()].map((record) => {
       // file paths are derived from the id on load; never persisted
       const { logPath: _log, exitPath: _exit, ...stored } = record;

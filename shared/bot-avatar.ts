@@ -70,3 +70,9 @@ export function botAvatarProfile(value: BotAvatarProfileInput): BotAvatarProfile
   if (url.success) profile.avatarUrl = url.data;
   return profile;
 }
+
+/** Whether an uploaded / shipped avatar can take the Color row.
+ *  Manifest one-file WebPs (TV-Face shell packs) set this true on upload.
+ *  Plain images set false.  Mascot and TV-Face crops always show Color. */
+export const botAvatarRecolorableSchema = z.boolean().optional();
+export type BotAvatarRecolorable = z.infer<typeof botAvatarRecolorableSchema>;
