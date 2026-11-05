@@ -37,7 +37,7 @@ interface ProbeResult {
   message?: string;
 }
 
-const LOCAL_REPLY_WAIT_CHOICES = [5, 10, 15] as const;
+const LOCAL_REPLY_WAIT_CHOICES = [5, 10, 20, 30, 60] as const;
 
 /** Default the toggle to ON when the persisted config never had the field
  * — the registry treats absent `enabled` as `true` and the UI must match. */

@@ -8,7 +8,7 @@ const initialInstance: InstanceInfo = {
   displayName: "Ollama Local",
   enabled: true,
   localModelWaitAvailable: true,
-  replyWaitMinutes: 15,
+  replyWaitMinutes: 20,
   snapshot: { state: "available", authenticated: true },
   models: { default: "fixture-model", options: [{ id: "fixture-model", label: "Fixture Model" }] },
 };
