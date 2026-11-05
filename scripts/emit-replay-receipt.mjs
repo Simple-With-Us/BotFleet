@@ -60,6 +60,22 @@ const ReplayReportSchema = z.looseObject({
     engineId: z.string(),
     isFullyVerified: z.boolean(),
   })),
+}).superRefine((report, ctx) => {
+  // One engine id, one verdict.  The verdict is read by first match, so a
+  // report that names the same engine twice could hide a failing verdict
+  // behind a passing one, and the receipt would certify a replay that did
+  // not hold.  The report is refused here instead.
+  const seen = new Set();
+  report.engines.forEach((entry, index) => {
+    if (seen.has(entry.engineId)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["engines", index, "engineId"],
+        message: `the report names the engine "${entry.engineId}" more than once`,
+      });
+    }
+    seen.add(entry.engineId);
+  });
 });
 
 /** The provenance source has to be an https URL, because the receipt says where the run came from. */
@@ -74,8 +90,12 @@ const ProvenanceSourceSchema = z.string().startsWith("https://");
  * engine nobody replayed.
  */
 export function replayVerdict(report, engineId) {
-  const entry = report.engines.find((item) => item.engineId === engineId);
-  return entry !== undefined && entry.isFullyVerified;
+  const matches = report.engines.filter((item) => item.engineId === engineId);
+  // Exactly one verdict, or none.  Two verdicts for one engine are refused
+  // by the schema, so a second match here means the report never went
+  // through the boundary, and a verdict that is ambiguous is not a pass.
+  if (matches.length !== 1) return false;
+  return matches[0].isFullyVerified === true;
 }
 
 /**

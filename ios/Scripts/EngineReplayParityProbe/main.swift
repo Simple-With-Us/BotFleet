@@ -80,6 +80,13 @@ func requestedEngines(in requestPath: String) throws -> [String] {
         guard let id = entry as? String, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ProbeError("the bundle request's `engines` list holds something that is not an engine id")
         }
+        // The engine id is the exact vocabulary, so it is stored exactly as
+        // it was named.  A padded id would clear the emptiness check and
+        // then miss the family lookup, which would earn a check under a
+        // misnamed id rather than a refusal.
+        guard id == id.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            throw ProbeError("the bundle request's `engines` list holds an engine id with surrounding whitespace")
+        }
         ids.append(id)
     }
     guard !ids.isEmpty else {
@@ -218,13 +225,20 @@ func run() async throws {
         "requestedEngines": engines,
         "isFullyVerified": fullyVerified,
         "engines": reports.map { report -> [String: Any] in
-            [
+            var entry: [String: Any] = [
                 "engine": report.engineId,
                 "measured": report.measured,
                 "fixtures": report.fixtureCount,
                 "passed": report.passedCount,
-                "unmeasuredReason": report.unmeasuredReason as Any,
             ]
+            // The reason is left out when there is none.  `JSONSerialization`
+            // refuses an `Optional.none` boxed as `Any`, so a summary that
+            // carried one would fail to print on a fully measured run, which
+            // is the run that has nothing to report.
+            if let reason = report.unmeasuredReason {
+                entry["unmeasuredReason"] = reason
+            }
+            return entry
         },
     ]
     print(String(data: try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys]), encoding: .utf8) ?? "{}")

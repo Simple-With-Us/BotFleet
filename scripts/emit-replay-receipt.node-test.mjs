@@ -141,6 +141,39 @@ test("a report whose engine entry names no verdict is refused", () => {
   assert.throws(() => readReplayReport(join(captureDir, "replay-parity.json")), /does not match the contract/);
 });
 
+test("a report that names the same engine twice is refused, so a failing verdict cannot hide", () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "replay-capture-"));
+  const report = {
+    version: 1,
+    requestedEngines: ["claude"],
+    isFullyVerified: false,
+    engines: [
+      { engineId: "claude", isFullyVerified: true },
+      { engineId: "claude", isFullyVerified: false },
+    ],
+  };
+  writeFileSync(join(captureDir, "replay-parity.json"), JSON.stringify(report), { mode: 0o600 });
+  assert.throws(
+    () => readReplayReport(join(captureDir, "replay-parity.json")),
+    /names the engine "claude" more than once/,
+  );
+});
+
+test("a verdict that is ambiguous is not a pass", () => {
+  // The report never went through the boundary, so the duplicate is still
+  // there.  Two verdicts for one engine are not a verdict.
+  const report = {
+    version: 1,
+    requestedEngines: ["claude"],
+    isFullyVerified: false,
+    engines: [
+      { engineId: "claude", isFullyVerified: true },
+      { engineId: "claude", isFullyVerified: false },
+    ],
+  };
+  assert.equal(replayVerdict(report, "claude"), false);
+});
+
 test("a capture directory other people can read is refused", () => {
   const request = makeRequest(["claude"]);
   const captureDir = makeCapture(makeReport([

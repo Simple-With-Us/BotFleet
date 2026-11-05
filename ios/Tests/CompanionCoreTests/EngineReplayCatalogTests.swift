@@ -76,4 +76,51 @@ struct EngineReplayCatalogTests {
             #expect(outcome.passed, "\(outcome.fixtureId) failed: \(outcome.failureReason ?? "no reason given")")
         }
     }
+
+    @Test("A refusal with a different error is named as such, not as no refusal at all")
+    func refusalWithAnotherErrorHasItsOwnReason() {
+        // The driver refused for the wrong reason.  That is a different bug
+        // from a driver that never refused, and the reason has to say which
+        // one it was, or the report hides the wrong-error refusal behind the
+        // plain no-refusal case.
+        #expect(
+            EngineReplayCatalog.refusalFailureReason(
+                refused: false,
+                refusedWithAnotherError: true,
+                launched: false,
+                wroteStdin: false
+            ) == "the driver refused the mismatched tool owner with a different error"
+        )
+        #expect(
+            EngineReplayCatalog.refusalFailureReason(
+                refused: false,
+                refusedWithAnotherError: false,
+                launched: false,
+                wroteStdin: false
+            ) == "the driver did not refuse the mismatched tool owner"
+        )
+    }
+
+    @Test("A driver that launched or wrote to stdin is named ahead of the refusal reason")
+    func launchAndStdinReasonsComeFirst() {
+        // A driver that launched the engine failed closed only after it had
+        // already run, so that is the reason a report carries, whatever else
+        // the driver did.
+        #expect(
+            EngineReplayCatalog.refusalFailureReason(
+                refused: false,
+                refusedWithAnotherError: true,
+                launched: true,
+                wroteStdin: true
+            ) == "the driver launched the engine instead of refusing the mismatched tool owner"
+        )
+        #expect(
+            EngineReplayCatalog.refusalFailureReason(
+                refused: false,
+                refusedWithAnotherError: true,
+                launched: false,
+                wroteStdin: true
+            ) == "the driver wrote to the engine's stdin before refusing the mismatched tool owner"
+        )
+    }
 }

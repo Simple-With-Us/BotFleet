@@ -204,28 +204,31 @@ public enum EngineReplayCatalog {
         let launcher = ScriptedProcessLauncher(fixture: fixture)
         let runner = AcpProcessRunner(harnessKind: kind, launcher: launcher)
         var refused = false
+        // A refusal with a different error is not the same as no refusal at
+        // all, and the two are told apart here:  the driver that refused for
+        // the wrong reason failed in a way the caller has to see, while the
+        // driver that never refused did not guard the identity at all.
+        var refusedWithAnotherError = false
         do {
             _ = try await runner.sendTurn(input: fixture.input)
         } catch let error as NativeTurnToolError {
-            refused = error == .wrongIdentity
+            if error == .wrongIdentity {
+                refused = true
+            } else {
+                refusedWithAnotherError = true
+            }
         } catch {
-            refused = false
+            refusedWithAnotherError = true
         }
         let launched = await launcher.getCapturedSpawnSpec() != nil
         let wroteStdin = await launcher.getCapturedStdinLines().isEmpty == false
         let passed = refused && !launched && !wroteStdin
-        var reason: String?
-        if !passed {
-            if launched {
-                reason = "the driver launched the engine instead of refusing the mismatched tool owner"
-            } else if wroteStdin {
-                reason = "the driver wrote to the engine's stdin before refusing the mismatched tool owner"
-            } else if refused {
-                reason = "the driver refused the mismatched tool owner with a different error"
-            } else {
-                reason = "the driver did not refuse the mismatched tool owner"
-            }
-        }
+        let reason = passed ? nil : refusalFailureReason(
+            refused: refused,
+            refusedWithAnotherError: refusedWithAnotherError,
+            launched: launched,
+            wroteStdin: wroteStdin
+        )
         return EngineReplayOutcome(
             fixtureId: fixture.id,
             title: fixture.title,
@@ -237,6 +240,35 @@ public enum EngineReplayCatalog {
             failureReason: reason,
             executable: nil
         )
+    }
+
+    /// Why a refusal measurement failed, in words.
+    ///
+    /// The three failures are told apart, because they are different bugs in
+    /// the driver and a report that names only one of them hides the rest:
+    /// a driver that launched the engine, a driver that wrote to the engine's
+    /// stdin, and a driver that refused for a reason other than the identity
+    /// error.  The last one is not the same as a driver that never refused,
+    /// and the two carry different reasons.
+    public static func refusalFailureReason(
+        refused: Bool,
+        refusedWithAnotherError: Bool,
+        launched: Bool,
+        wroteStdin: Bool
+    ) -> String {
+        if launched {
+            return "the driver launched the engine instead of refusing the mismatched tool owner"
+        }
+        if wroteStdin {
+            return "the driver wrote to the engine's stdin before refusing the mismatched tool owner"
+        }
+        if refusedWithAnotherError {
+            return "the driver refused the mismatched tool owner with a different error"
+        }
+        if refused {
+            return "the driver refused the mismatched tool owner and the fixture still failed"
+        }
+        return "the driver did not refuse the mismatched tool owner"
     }
 
     /// Measure every fixture behind one family.
