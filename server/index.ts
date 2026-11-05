@@ -6763,7 +6763,7 @@ function steerJournalEntries(): HeldQueueEntry[] {
       if (item.committed) held.committed = { ...item.committed, excludeIds: [...item.committed.excludeIds] };
       return held;
     });
-    return { botId: entry.botId, threadId: entry.threadId, heldAt, items } as HeldQueueEntry;
+    return { botId: entry.botId, threadId: entry.threadId, heldAt, items };
   });
   const liveIds = new Set(live.flatMap((entry) => entry.items.map((item) => item.messageId)));
   for (const id of queuedFirstSeen.keys()) if (!liveIds.has(id)) queuedFirstSeen.delete(id);
@@ -6778,7 +6778,7 @@ function writeSteerJournal() {
   if (placementRollbackReadOnly) return;
   const failure = writeQueueJournal(DATA_DIR, steerJournalEntries());
   // Only the error code is logged: nothing a user wrote ever reaches a log line.
-  steerJournalFailure = failure ? ((failure as NodeJS.ErrnoException).code ?? failure.name) : null;
+  steerJournalFailure = failure ? String(Reflect.get(failure, "code") ?? failure.name) : null;
   if (failure) console.warn(`[steer-queue] could not write the crash journal (${steerJournalFailure})`);
 }
 setSteerQueueObserver(writeSteerJournal);
@@ -6799,7 +6799,7 @@ function takeRecoveredQueueJournal(carried: HeldWork): HeldQueueEntry[] {
       item.committed
         ? !carriedIds.has(item.committed.userMessageId) && store.hasMessage(entry.threadId, item.committed.userMessageId)
         : !carriedIds.has(item.messageId) && !inThread.has(item.messageId));
-    if (items.length > 0) recovered.push({ ...entry, items } as HeldQueueEntry);
+    if (items.length > 0) recovered.push({ ...entry, items });
   }
   unrestoredQueueJournal = [];
   return recovered;

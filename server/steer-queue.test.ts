@@ -98,6 +98,7 @@ describe("steer-queue module", () => {
     deep.busy = false;
     const run = vi.fn();
     drainSteeredMessages(store, run);
+    // SAFETY: the mocked runner is always called with the prompt string in slot 2.
     const promptFor = (botId: string) => run.mock.calls.find(([id]) => id === botId)?.[2] as string;
 
     // Under the threshold the turn is just the messages, in order.

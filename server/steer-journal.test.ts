@@ -15,6 +15,11 @@ import {
 import { readQueueJournal, STEER_JOURNAL_FILE, writeQueueJournal, type HeldQueueEntry } from "./update-drain.ts";
 import type { BotRecord, Message } from "./store.ts";
 
+// SAFETY: these tests drive the queue with the few fields it reads, not whole store records.
+function fake<T>(value: object): T {
+  return value as T;
+}
+
 const entry = (text: string): HeldQueueEntry => ({
   botId: "bot-1",
   threadId: "thread-1",
@@ -62,18 +67,18 @@ describe("steer queue crash journal", () => {
   });
 
   it("journals a drain once, after the transcript lines are appended", () => {
-    const bot = { id: "bot-order", threadId: "thread-order", busy: true, power: "on" } as unknown as BotRecord;
+    const bot = fake<BotRecord>({ id: "bot-order", threadId: "thread-order", busy: true, power: "on" });
     const messages: Message[] = [];
-    const store = {
+    const store = fake<SteerStore>({
       bot: () => bot,
       messagesFor: () => messages,
       patchMessage: () => null,
       appendMessage: (_thread: string, message: Omit<Message, "id" | "at">) => {
-        const full = { ...message, id: `m${messages.length}`, at: 1 } as Message;
+        const full: Message = { ...message, id: `m${messages.length}`, at: 1 };
         messages.push(full);
         return full;
       },
-    } as unknown as SteerStore;
+    });
     queueSteeredMessage(bot, "one");
     queueSteeredMessage(bot, "two");
     const seen: Array<{ appended: number; queued: number }> = [];
@@ -85,7 +90,7 @@ describe("steer queue crash journal", () => {
   });
 
   it("journals every accept and every drop", () => {
-    const bot = { id: "bot-accept", threadId: "thread-accept", busy: true } as unknown as BotRecord;
+    const bot = fake<BotRecord>({ id: "bot-accept", threadId: "thread-accept", busy: true });
     const sizes: number[] = [];
     setSteerQueueObserver(() => sizes.push(snapshotSteerQueue().flatMap((e) => e.items).length));
     queueSteeredMessage(bot, "a");

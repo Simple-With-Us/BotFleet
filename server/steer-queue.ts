@@ -147,14 +147,15 @@ export function queueSteeredMessage(
   const threadId = options.threadId ?? bot.threadId;
   const id = newId();
   const entry = queues.get(threadId) ?? { botId: bot.id, items: [] };
-  entry.items.push({
+  const item: (typeof entry.items)[number] = {
     messageId: id,
     text,
     prompt: options.prompt ?? text,
     replyToId: options.replyToId,
     linqChatId: options.linqChatId,
-    ...(options.relayed ? { relayed: true } : {}),
-  });
+  };
+  if (options.relayed) item.relayed = true;
+  entry.items.push(item);
   queues.set(threadId, entry);
   return { id };
 }
