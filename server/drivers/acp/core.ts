@@ -1829,8 +1829,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // `size` is the model's context window, so `used / size` is the
               // occupancy; carried on the live event only when it is sane.
               const size = u.size;
-              const contextWindow =
-                typeof size === "number" && Number.isFinite(size) && size > 0 ? Math.trunc(size) : undefined;
+              // Number.isFinite is false for every non-number, so no typeof is needed.
+              const contextWindow = Number.isFinite(size) && Number(size) > 0 ? Math.trunc(Number(size)) : undefined;
               if (typeof used === "number" && Number.isFinite(used)) {
                 // Spread, not a literal `output: turnUsage?.output` — that
                 // would always create the key (value undefined when
@@ -1842,13 +1842,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   input: Math.max(0, Math.trunc(used)),
                   ...(turnUsage?.output != null ? { output: turnUsage.output } : {}),
                 };
-                emit({
+                const usageEvent: Extract<RuntimeEvent, { type: "thread.token-usage.updated" }> = {
                   ...base(threadId, turnId),
                   type: "thread.token-usage.updated",
                   input: turnUsage.input,
                   ...(turnUsage.output != null ? { output: turnUsage.output } : {}),
-                  ...(contextWindow !== undefined ? { contextWindow } : {}),
-                });
+                };
+                // Set after the literal so the key is absent, not undefined, when unknown.
+                if (contextWindow !== undefined) usageEvent.contextWindow = contextWindow;
+                emit(usageEvent);
               }
               break;
             }
