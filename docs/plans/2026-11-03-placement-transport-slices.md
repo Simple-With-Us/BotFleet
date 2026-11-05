@@ -66,9 +66,10 @@ The handoff records the owner's choice of the recommended Server First defaults,
 
 Still open:
 
-- **Question 10:**  whether the server's probe fails closed on an unknown reading.  The design proposes it and states no recommendation in the question.  T4 needs an answer.
-- **Credential custody:**  who enrolls workers and writes the authorization records.  #1565 reads them and does not issue them.
-- **Timing knobs:**  the design names heartbeat and unreachable-window knobs, `server/knob-map.ts` has none, and the unreachable window is a hard-coded default.  T4 or T5 adds the rows.
+- **Question 10:**  whether the server's probe fails closed on an unknown reading.  The design proposes it and states no recommendation in the question.  T4 landed and kept today's behaviour, so an unknown reading still admits and the proposed fail-closed change is unwired;  the question is still the owner's.
+- **Credential custody:**  who enrolls workers and writes the authorization records.  #1565 reads them and does not issue them.
+
+Closed by T4:  the timing knobs.  `server/knob-map.ts` holds `placement.heartbeatSeconds` and `placement.unreachableAfterSeconds`, and the unreachable window is read live through a getter, so it is no longer a hard-coded default.
 
 #1565's new loopback check does not change behavior, because `handleBootRequest` and `handleRequest` already apply the same test on main.
 
