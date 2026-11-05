@@ -11,7 +11,7 @@ const ENROLLMENT_ERROR = "BotFleet could not read its startup choice.\u00a0 Choo
 /** This nonsecret preference grants startup permission, not a server address. */
 export function parseStartupEnrollment(value) {
   if (
-    value === null || typeof value !== "object" || Array.isArray(value) ||
+    Object.prototype.toString.call(value) !== "[object Object]" ||
     Object.keys(value).length !== 2 || !Object.hasOwn(value, "version") || value.version !== 1 ||
     !Object.hasOwn(value, "mode") || (value.mode !== "local" && value.mode !== "remote")
   ) {
