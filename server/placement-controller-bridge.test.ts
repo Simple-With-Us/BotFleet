@@ -15,7 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChildProcess } from "node:child_process";
 
 import { PLACEMENT_WIRE_VERSION, type CapacitySample, type EnqueueMessage, type HostId } from "../shared/placement.ts";
-import { JOB_CAP_PER_HOST } from "../shared/jobs.ts";
+import { JOB_CAP_PER_BOT, JOB_CAP_PER_HOST, JOB_CAP_PER_THREAD } from "../shared/jobs.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
 import { openControllerEpochStore } from "./placement-identity.ts";
 import { PlacementLeaseService } from "./placement-leases.ts";
@@ -495,5 +495,38 @@ describe("the registry under the bridge", () => {
     if (!queued.ok) return;
     expect(queued.job.status).toBe("queued");
     expect(children).toHaveLength(JOB_CAP_PER_HOST);
+  });
+
+  it("counts the bot's and the conversation's caps from the controller's queue", () => {
+    const { bridge, leases } = fixture();
+    const { registry, root, children } = registryHarness({
+      placementBridge: bridge,
+      placementMode: () => bridge.mode(),
+      placementActiveJobs: () => leases.activeJobs(),
+    });
+    // Fill the bot's cap in the controller's queue.  The registry holds no
+    // copy of any of them, so the count has to come from the queue.
+    for (let index = 0; index < JOB_CAP_PER_BOT; index += 1) {
+      const started = startJob(registry, root, "bot_busy", `thread_${index}`);
+      expect(started.ok).toBe(true);
+    }
+    expect(leases.activeJobs()).toHaveLength(JOB_CAP_PER_BOT);
+    const refused = startJob(registry, root, "bot_busy", "thread_other");
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.error).toContain("the most a bot may");
+    // A different bot is not refused by another bot's jobs.
+    const other = startJob(registry, root, "bot_free", "thread_other");
+    expect(other.ok).toBe(true);
+    // The conversation's own cap refuses the fourth job in one conversation.
+    for (let index = 0; index < JOB_CAP_PER_THREAD; index += 1) {
+      const started = startJob(registry, root, `bot_thread_${index}`, "thread_busy");
+      expect(started.ok).toBe(true);
+    }
+    const threadRefused = startJob(registry, root, "bot_thread_other", "thread_busy");
+    expect(threadRefused.ok).toBe(false);
+    if (threadRefused.ok) return;
+    expect(threadRefused.error).toContain("the most it may");
+    expect(children).toHaveLength(0);
   });
 });

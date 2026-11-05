@@ -338,6 +338,12 @@ export interface JobRegistryDeps {
    *  this registry keeps no copy of it.  Absent is This Mac Only, where the
    *  registry runs the job exactly as it always has. */
   placementBridge?: PlacementControllerBridge;
+  /** The jobs the controller's queue still holds, named by their bot and
+   *  their conversation.  In a server mode this registry keeps no copy of a
+   *  controller-owned job, so the per-bot and per-thread caps count them
+   *  from there.  Absent is This Mac Only, where the local records are the
+   *  only ones and the caps count them alone. */
+  placementActiveJobs?: () => Array<{ botId: string; threadId: string }>;
   /** How long a queued job may wait for a host before it expires unrun.
    *  Absent: DEFAULT_QUEUE_WINDOW_MS, so the queue always expires. */
   queueWindowMs?: number;
@@ -685,10 +691,18 @@ export class JobRegistry {
     const active = [...this.records.values()].filter(
       (record) => isJobActive(record) && (record.status !== "queued" || this.ownsPending(record)),
     );
-    if (active.filter((record) => record.threadId === request.threadId).length >= JOB_CAP_PER_THREAD) {
+    // In a server mode this registry holds no copy of a job the controller
+    // owns, so the bot's and the conversation's caps are counted there
+    // instead:  the controller's queue is the only place a job record lives.
+    const placed = this.mode() === "localOnly" ? [] : (this.deps.placementActiveJobs?.() ?? []);
+    const threadJobs = active.filter((record) => record.threadId === request.threadId).length
+      + placed.filter((job) => job.threadId === request.threadId).length;
+    if (threadJobs >= JOB_CAP_PER_THREAD) {
       return `This conversation already has ${JOB_CAP_PER_THREAD} jobs running, the most it may.  Wait for one to finish, or stop one with job_kill.`;
     }
-    if (active.filter((record) => record.botId === request.botId).length >= JOB_CAP_PER_BOT) {
+    const botJobs = active.filter((record) => record.botId === request.botId).length
+      + placed.filter((job) => job.botId === request.botId).length;
+    if (botJobs >= JOB_CAP_PER_BOT) {
       return `You already have ${JOB_CAP_PER_BOT} jobs running, the most a bot may.  Wait for one to finish, or stop one with job_kill.`;
     }
     // The per-host cap refuses only in This Mac Only; in a server mode it is

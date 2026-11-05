@@ -319,6 +319,21 @@ export class PlacementLeaseService {
     });
   }
 
+  /** The jobs this authority still holds, named by their bot and their
+   *  conversation.  In a server mode this is the whole system's placeable
+   *  work, because the controller's queue is the only place a job record
+   *  lives.  The command is never loaded:  a count needs the owner, not the
+   *  payload. */
+  activeJobs(): Array<{ botId: string; threadId: string }> {
+    if (this.store) this.refreshController({ active: true, recent: true });
+    const active: Array<{ botId: string; threadId: string }> = [];
+    for (const job of this.jobs.values()) {
+      if (job.hidden || TERMINAL.includes(job.status)) continue;
+      active.push({ botId: job.botId, threadId: job.threadId });
+    }
+    return active;
+  }
+
   /** The epoch fence every state-changing message crosses first: versions
    *  before epochs, and only the current pair passes.  A lower pair is
    *  refused so the sender converges; a higher pair is refused on worker

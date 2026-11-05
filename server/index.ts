@@ -2989,6 +2989,10 @@ const jobRegistry = new JobRegistry({
   // Only:  in a server mode the cap is an eligibility input and the job
   // queues instead.
   placementMode: () => placementBridge.mode(),
+  // The jobs the controller's queue still holds.  In a server mode the
+  // registry keeps no copy of them, so the per-bot and per-thread caps count
+  // them from there.
+  placementActiveJobs: () => placementLeases?.activeJobs() ?? [],
   // A job is a shell the model started: it carries its bot's launch identity
   // the way the engine's own children do (server/launch-identity.ts).
   launchEnv: (botId, threadId) => {
