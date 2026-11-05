@@ -68,7 +68,7 @@ describe("steer queue crash journal", () => {
   });
 
   it("journals a drain once, after the transcript lines are appended", () => {
-    const bot = fake<BotRecord>({ id: "bot-order", threadId: "thread-order", busy: true, power: "on" });
+    const bot = fake<BotRecord>({ id: "bot-order", threadId: "thread-order", busy: true });
     const messages: Message[] = [];
     const store = fake<SteerStore>({
       bot: () => bot,
