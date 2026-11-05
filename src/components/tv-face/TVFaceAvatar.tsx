@@ -10,6 +10,8 @@ import {
   TVFACE_MANIFEST,
   type TVFaceExpression,
 } from "./manifest";
+import { tvFaceOneFilePackUrl } from "./packs";
+import { AnimatedFileAvatar } from "../avatar-file/AnimatedFileAvatar";
 
 /** The expression an idle bot rests on. */
 const RESTING: TVFaceExpression = "resting";
@@ -291,6 +293,43 @@ function initialFrameMedia(
 }
 
 export function TVFaceAvatar({
+  state = "idle",
+  color = "orange",
+  size = 44,
+  label,
+  animated = true,
+  transitionSpeed = 1,
+}: TVFaceAvatarProps) {
+  // One-file pack path:  play the embedded-manifest WebP through the shared
+  // avatar-file player.  Colors without a shipped pack keep the multi-GIF tree.
+  const oneFileSrc = tvFaceOneFilePackUrl(color, state);
+  if (oneFileSrc) {
+    return (
+      <AnimatedFileAvatar
+        src={oneFileSrc}
+        state={state}
+        size={size}
+        alt={label || `Bot TV-Face`}
+        radius="0"
+        animated={animated}
+      />
+    );
+  }
+
+  return (
+    <TVFaceGifAvatar
+      state={state}
+      color={color}
+      size={size}
+      label={label}
+      animated={animated}
+      transitionSpeed={transitionSpeed}
+    />
+  );
+}
+
+/** Legacy multi-GIF / still player.  Used when no one-file pack ships for the color. */
+function TVFaceGifAvatar({
   state = "idle",
   color = "orange",
   size = 44,
