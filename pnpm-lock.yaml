@@ -211,7 +211,7 @@ importers:
         version: 12.2.0
       posthog-js:
         specifier: ^1.415.6
-        version: 1.443.0(@types/react@19.3.0)(react@19.3.1)
+        version: 1.444.0(@types/react@19.3.0)(react@19.3.1)
       qrcode.react:
         specifier: ^4.2.0
         version: 4.2.0(react@19.3.1)
@@ -287,7 +287,7 @@ importers:
         version: 3.0.1(ajv@8.20.0)
       electron:
         specifier: ^45.0.0
-        version: 45.1.0(supports-color@10.2.2)
+        version: 45.2.1(supports-color@10.2.2)
       electron-builder:
         specifier: 26.18.0
         version: 26.18.0(electron-builder-squirrel-windows@26.18.0)(supports-color@10.2.2)
@@ -6401,8 +6401,8 @@ packages:
     resolution: {integrity: sha512-bO3y10YikuUwUuDUQRM4KfwNkKhnpVO7IPdbsrejwN9/AABJzzTQ4GeHwyzNSrVO+tEH3/Np255a3sVZpZDjvg==}
     engines: {node: '>=8.0.0'}
 
-  electron@45.1.0:
-    resolution: {integrity: sha512-i7qKVAh/KR5v1pf56NhGGX2QYHcdjvLgS7koL6ui50c+zUDGLRunR95nXcTpHPURKOQ4GDBG8BmXiDgOQ8DD0A==}
+  electron@45.2.1:
+    resolution: {integrity: sha512-t433yuo8Kh8WG/mTStnPRT/NtpWw8A+caNLJgeU0tS/FlfOkeNEntFsac4ViLgDxZOmDe7BeSkOANVqrqNHhDA==}
     engines: {node: '>= 22.12.0'}
     hasBin: true
 
@@ -7892,8 +7892,8 @@ packages:
     resolution: {integrity: sha512-LJlKCCAUFKOuZxipUdYw1NzIITEsPcgyOG9LkvRJvuKj/bRzbuRY0ARXvL0pWGpsZvn8jku+LMep2eU0seHp8g==}
     engines: {node: ^10 || ^12 || >=14}
 
-  posthog-js@1.443.0:
-    resolution: {integrity: sha512-PpfvtZ4cj5uDhXrILlfoV8/Qva+ZBntp75Px+HR7kcKHMSdHIsBVpj5rdMLLgH94APsoP13ZMz8bXO4kwrrZ+Q==}
+  posthog-js@1.444.0:
+    resolution: {integrity: sha512-4m+QsAFi1h5Zt8eFq6ciJGD8bcLMt1P/O1cLlo26RrX5F4oMOIKZsNIlf1SIMZWlRNNCFemSpzn6HhwtkZMrnA==}
     peerDependencies:
       '@types/react': '>=16.8.0'
       react: '>=16.8.0'
@@ -15753,7 +15753,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  electron@45.1.0(supports-color@10.2.2):
+  electron@45.2.1(supports-color@10.2.2):
     dependencies:
       '@electron-internal/extract-zip': 1.0.5
       '@electron/get': 5.1.0(supports-color@10.2.2)
@@ -17741,7 +17741,7 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.2
 
-  posthog-js@1.443.0(@types/react@19.3.0)(react@19.3.1):
+  posthog-js@1.444.0(@types/react@19.3.0)(react@19.3.1):
     dependencies:
       '@posthog/browser-common': 0.10.2
       '@posthog/core': 1.62.0
