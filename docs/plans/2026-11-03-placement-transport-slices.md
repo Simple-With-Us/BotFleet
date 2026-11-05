@@ -18,7 +18,7 @@ It was read from the source on Nov 3, 2026, with #1565 and #1556 read as open pu
 | Worker job discovery and payload delivery | Exists since T2, no production caller | The `assignment` intent hands the worker a job id and a lease, and the `payload` intent delivers the command, checked against the immutable digest |
 | Durable report spool | Exists since T1, no production caller | `server/placement-report-spool.ts` is the durable report spool, and no production caller wires it yet |
 | Unreachable sweep | Exists, called since T4 | `sweepUnreachable` runs on the controller's heartbeat period, and nothing is requeued |
-| Applied-mode acknowledgement | Exists on the server since T3 | `GET /api/placement/mode` returns it, and the Swift client that reads it is T7 |
+| Applied-mode acknowledgement | Exists on the server since T3 | `GET /api/placement/mode` returns it;  it states that the controller holds the record at the fence and never what this computer runs,  and the registry bridge reads it since T4 |
 | Two-process fixtures | Exists since T6a | `server/testing/two-process.ts` starts a controller and a worker pair, `server/testing/fault-proxy.ts` is the fault link and `server/testing/nonce-job.mjs` is the nonce job;  the T6b scenarios are still to come |
 
 ## The Wire Mapping
