@@ -49,11 +49,7 @@ const REQUEST_TIMEOUT_MS = 120_000;
 const DEFAULT_LOCAL_REPLY_WAIT_MS = 180_000;
 const NODE_FETCH_NO_BYTE_TIMEOUT_MS = 300_000;
 
-/** The harness stall watchdog (TURN_STALL_MS, 20 minutes) stops a turn whose
- *  thread emitted nothing.  A silent local model emits nothing while it
- *  generates, so a wait at or past that limit could never elapse.  Keep the
- *  longest wait clearly under it. */
-export const MAX_REPLY_WAIT_MINUTES = 15;
+export const MAX_REPLY_WAIT_MINUTES = 60;
 export const ReplyWaitMinutesSchema = z.number().int().min(5).max(MAX_REPLY_WAIT_MINUTES);
 export type ReplyWaitMinutes = z.infer<typeof ReplyWaitMinutesSchema>;
 export const REPLY_WAIT_RANGE_MESSAGE = `replyWaitMinutes must be a whole number from 5 to ${MAX_REPLY_WAIT_MINUTES}`;
@@ -63,10 +59,7 @@ const UpstreamResponseSchema = z.object({
   status: z.number().int().min(200).max(599),
   statusText: z.string(),
 });
-// Three misses at this interval (135 s) must still land inside the 3-minute
-// default wait, so a dead server is noticed before the turn would time out.
-// A longer wait adds at most one probe per 45 s to the busy inference server.
-const LOCAL_MODEL_PROBE_INTERVAL_MS = 45_000;
+const LOCAL_MODEL_PROBE_INTERVAL_MS = 30_000;
 const LOCAL_MODEL_PROBE_TIMEOUT_MS = 5_000;
 const LOCAL_MODEL_PROBE_MISSES = 3;
 const LOCAL_REPLY_REQUEST_HEADROOM_MS = 300_000;
@@ -157,6 +150,11 @@ export function watchLocalModelServer(
   apiKey: string,
   stop: AbortController,
   intervalMs = LOCAL_MODEL_PROBE_INTERVAL_MS,
+  /** When the last response byte arrived.  A probe is only needed once the
+   *  stream has been silent for a whole interval; bytes already prove life. */
+  lastByteAt?: () => number,
+  /** Called whenever the server is proven alive (bytes or an HTTP answer). */
+  onAlive?: () => void,
 ): () => void {
   if (!isLocalModelEndpoint(url)) return () => undefined;
   let misses = 0;
@@ -167,6 +165,11 @@ export function watchLocalModelServer(
   const abortProbe = () => activeProbe?.abort(stop.signal.reason);
   const timer = setInterval(() => {
     if (checking || stopped || stop.signal.aborted) return;
+    if (lastByteAt && Date.now() - lastByteAt() < intervalMs) {
+      misses = 0;
+      onAlive?.();
+      return;
+    }
     checking = true;
     const probe = new AbortController();
     activeProbe = probe;
@@ -186,6 +189,7 @@ export function watchLocalModelServer(
         // Any HTTP response proves the server is alive; auth and model-list
         // status are unrelated to whether its chat endpoint is progressing.
         misses = 0;
+        onAlive?.();
         await response.body?.cancel().catch(() => undefined);
       } catch (error) {
         // A slow probe says nothing about an active generation.  Only
@@ -375,7 +379,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         : (process.env[config.apiKeyEnv] ?? process.env["OPENAI_COMPAT_API_KEY"])) ??
       "";
     const listeners = new Set<RuntimeEventListener>();
-    const active = new Map<string, { abort: AbortController; turnId: string; startedAt: number }>();
+    const active = new Map<string, { abort: AbortController; turnId: string; startedAt: number; aliveAt: number; maxMs: number }>();
     // The output-limit field is endpoint-level for the providers above, so
     // every option of a recognized endpoint carries supportsMaxOutput; an
     // unrecognized endpoint's catalog stays unmarked and the picker hides
@@ -412,6 +416,8 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         signal?: AbortSignal;
         tools?: any[];
         onChunk?: () => void;
+        /** The local server answered a liveness probe or sent bytes. */
+        onAlive?: () => void;
         onDelta?: (d: string, streamKind?: "assistant_text" | "reasoning_text") => void;
         onUsage?: (usage: TurnUsage) => void;
         /** The bot's optional output limit, sent under the field this
@@ -439,8 +445,14 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       }
       const requestSignal = opts.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS);
       const livenessAbort = new AbortController();
+      let lastByteAt = Date.now();
+      const noteByte = () => {
+        lastByteAt = Date.now();
+        opts.onAlive?.();
+        opts.onChunk?.();
+      };
       const stopWatching = localEndpoint && opts.stream
-        ? watchLocalModelServer(config.url, apiKey, livenessAbort)
+        ? watchLocalModelServer(config.url, apiKey, livenessAbort, LOCAL_MODEL_PROBE_INTERVAL_MS, () => lastByteAt, opts.onAlive)
         : () => undefined;
       try {
       const signal = localEndpoint && opts.stream
@@ -509,7 +521,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         throw httpErrorFor(res.status, "");
       }
       // headers are progress too: the socket answered
-      opts.onChunk?.();
+      noteByte();
       if (!opts.stream) {
         const json: any = await res.json();
         const msg = json.choices?.[0]?.message;
@@ -593,7 +605,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           }
           // Any bytes at all keep the round's idle clock alive, parsed
           // into a delta or not.
-          opts.onChunk?.();
+          noteByte();
           buf += decoder.decode(value, { stream: true });
           let nl;
           while ((nl = buf.indexOf("\n")) !== -1) {
@@ -667,7 +679,8 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       }
       const turnId = newId();
       const abort = new AbortController();
-      active.set(threadId, { abort, turnId, startedAt: Date.now() });
+      const turnBudget = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget(config.url, config.replyWaitMinutes) };
+      active.set(threadId, { abort, turnId, startedAt: Date.now(), aliveAt: 0, maxMs: turnBudget.wallClockMs });
 
       const openAiTools = turn.tools && turn.tools.length > 0
         ? turn.tools.map((t) => ({
@@ -752,6 +765,10 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
               tools: openAiTools,
               maxOutputTokens: turn.maxOutputTokens,
               onChunk: opts.onChunk,
+              onAlive: () => {
+                const entry = active.get(threadId);
+                if (entry) entry.aliveAt = Date.now();
+              },
               // `onPublished` before the emit: from here this round can
               // never be retried, because a replay would show the person
               // text they already read.  It also feeds the idle clock.
@@ -869,10 +886,17 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           const stuck: string[] = [];
           for (const [threadId, entry] of active) {
             if (entry.startedAt > cutoff) continue;
+            // A configured local wait owns its own wall clock; the loop ends
+            // the turn there.  Only sweep it once that has clearly passed.
+            if (Date.now() - entry.startedAt < entry.maxMs + 60_000) continue;
             stuck.push(threadId);
             entry.abort.abort();
           }
           return stuck;
+        },
+        liveTurnThreadIds: () => {
+          const now = Date.now();
+          return [...active].filter(([, entry]) => now - entry.aliveAt < 2 * LOCAL_MODEL_PROBE_INTERVAL_MS).map(([threadId]) => threadId);
         },
         respondToRequest: async () => "unavailable" as const,
         hasSession: (threadId) => active.has(threadId),

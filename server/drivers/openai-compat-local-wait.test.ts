@@ -84,9 +84,13 @@ it("keeps a slow first token alive while local /models probes keep answering", a
     const completed = recorder.until((event) => event.type === "turn.completed", 200_000);
     for (let attempt = 0; attempt < 20 && !streamController; attempt++) await Promise.resolve();
     expect(streamController).toBeDefined();
-    await vi.advanceTimersByTimeAsync(135_000);
+    await vi.advanceTimersByTimeAsync(90_000);
     expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/models"))).toHaveLength(3);
     expect(recorder.events.some((event) => event.type === "turn.completed")).toBe(false);
+    // The server answered probes, so the stall watchdog is told the silent turn is alive.
+    expect(instance.adapter.liveTurnThreadIds?.()).toEqual(["slow-first-token"]);
+    // A 3-minute-default turn is not force-swept early either.
+    expect(await instance.adapter.sweepStuckTurns?.(1)).toEqual([]);
     const encoder = new TextEncoder();
     streamController!.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"first token"}}]}\n'));
     streamController!.enqueue(encoder.encode("data: [DONE]\n"));
@@ -193,7 +197,7 @@ it("ends a local turn on dead-server probes before the 3-minute default expires"
     for (let attempt = 0; attempt < 10 && !fetchMock.mock.calls.some(([input]) => String(input).endsWith("/chat/completions")); attempt++) {
       await Promise.resolve();
     }
-    await vi.advanceTimersByTimeAsync(135_000);
+    await vi.advanceTimersByTimeAsync(90_000);
     expect(await completed).toMatchObject({ ok: false });
     expect(recorder.events.find((event) => event.type === "runtime.error")).toMatchObject({
       message: expect.stringContaining("stopped answering"),
@@ -203,4 +207,21 @@ it("ends a local turn on dead-server probes before the 3-minute default expires"
     recorder.stop();
     await instance.dispose();
   }
+});
+
+it("skips the liveness probe while response bytes are arriving and reports the server alive", async () => {
+  vi.useFakeTimers();
+  const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
+  const alive = vi.fn();
+  let byteAgeMs = 1_000;
+  const cleanup = watchLocalModelServer("http://127.0.0.1:11434/v1", "synthetic-key", new AbortController(), 30_000, () => Date.now() - byteAgeMs, alive);
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(fetchMock).not.toHaveBeenCalled();
+  expect(alive).toHaveBeenCalledTimes(1);
+  byteAgeMs = 31_000;
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(alive.mock.calls.length).toBeGreaterThanOrEqual(2);
+  cleanup();
 });
