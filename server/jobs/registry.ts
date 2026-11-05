@@ -75,6 +75,7 @@ import {
 import { writeFileAtomic } from "../atomic.ts";
 import { loadHostId } from "../host-id.ts";
 import { HOST_ID_PATTERN, type HostId, type PlacementMode } from "../../shared/placement.ts";
+import type { PlacementControllerBridge } from "../placement-controller-bridge.ts";
 import { redactSecretsInText } from "../redact.ts";
 import { commandLabel, groupAlive, killGroup, signalGroup, startedNear, GROUP_KILL_GRACE_MS } from "../tools/process-group.ts";
 import { modelShellEnv } from "../tools/shell-env.ts";
@@ -332,6 +333,11 @@ export interface JobRegistryDeps {
    *  where the per-host running cap still refuses; in a server mode a job
    *  past that cap queues instead. */
   placementMode?: () => PlacementMode;
+  /** The placement bridge:  in a server mode a job start is a request to the
+   *  controller, so the job is admitted into the controller's own queue and
+   *  this registry keeps no copy of it.  Absent is This Mac Only, where the
+   *  registry runs the job exactly as it always has. */
+  placementBridge?: PlacementControllerBridge;
   /** How long a queued job may wait for a host before it expires unrun.
    *  Absent: DEFAULT_QUEUE_WINDOW_MS, so the queue always expires. */
   queueWindowMs?: number;
@@ -773,12 +779,30 @@ export class JobRegistry {
       }
     }
 
+    const now = this.now();
+    const id = newJobId(now);
+    // In a server mode the controller owns the record:  the job is admitted
+    // into the controller's own queue and this registry keeps no copy of it,
+    // because a second queue outside the authoritative one is exactly what
+    // the plan rejected.  This Mac Only never reaches the bridge's queue.
+    const admission = this.deps.placementBridge?.admit({
+      jobId: id,
+      botId: request.botId,
+      threadId: request.threadId,
+      command,
+      cwd: request.cwd,
+      timeoutMs: minutes * 60_000,
+    });
+    if (admission?.kind === "refused") return { ok: false, error: admission.reason };
+    if (admission?.kind === "queued") {
+      const queuedNote = `Queued: ${admission.queuedReason}.  It will start when a host takes it; use bash instead if the command is short.`;
+      return { ok: true, job: this.snapshot(this.queuedView(admission, request, command, minutes, now)), note: note ? `${note}  ${queuedNote}` : queuedNote };
+    }
+
     const queuedReason = this.queueReasonFor(settings) ?? undefined;
     if (queuedReason && [...this.records.values()].filter((record) => this.ownsPending(record)).length >= this.recordMax) {
       return { ok: false, error: "The background job queue is full; wait for a job to finish or stop a waiting job." };
     }
-    const now = this.now();
-    const id = newJobId(now);
     const record: JobRecord = {
       id,
       botId: request.botId,
@@ -1561,6 +1585,50 @@ export class JobRegistry {
   }
 
   // ── bookkeeping ───────────────────────────────────────────────────────
+
+  /** A view of a job the controller owns.  The record itself lives in the
+   *  controller's store, so this registry holds no copy of it:  the view
+   *  carries no local file, no process and no cursor, because there is
+   *  nothing local about a job this host did not admit. */
+  private queuedView(
+    admission: { jobId: string; queuedReason: string; controllerId: HostId; epoch: number },
+    request: JobStartRequest,
+    command: string,
+    minutes: number,
+    now: number,
+  ): JobRecord {
+    return {
+      id: admission.jobId,
+      botId: request.botId,
+      threadId: request.threadId,
+      turnId: request.turnId,
+      origin: "botfleet",
+      kind: "shell",
+      label: commandLabel(command),
+      cwd: request.cwd,
+      status: "queued",
+      controllerHostId: admission.controllerId,
+      epoch: admission.epoch,
+      queuedReason: admission.queuedReason,
+      exitCode: null,
+      signal: null,
+      startedAt: now,
+      endedAt: null,
+      timeoutMs: minutes * 60_000,
+      onComplete: request.onComplete,
+      notice: "none",
+      pid: null,
+      spawnedAt: now,
+      leaderExited: false,
+      logPath: "",
+      exitPath: "",
+      modelCursor: 0,
+      ownerCursor: 0,
+      droppedBytes: 0,
+      awakeMs: 0,
+      announced: false,
+    };
+  }
 
   private snapshot(record: JobRecord): JobSnapshot {
     const snapshot: JobSnapshot = {

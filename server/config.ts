@@ -575,6 +575,17 @@ const appConfigSchema = z.object({
     // field overrides the file.
     webhookHotDeferMinutes: z.number().int().min(1).max(720).optional(),
   }).optional(),
+  // The placement transport's own two knobs (server/placement-controller-bridge.ts
+  // and the lease service's unreachable window).  Both are optional: an
+  // absent field resolves to the built-in default, and the vault knob of the
+  // same field overrides the file.  `heartbeatSeconds` is the worker's
+  // heartbeat period and `unreachableAfterSeconds` is how long a worker may
+  // go quiet before the controller marks it unreachable, so the second must
+  // be longer than the first or a healthy worker is swept.
+  placement: z.object({
+    heartbeatSeconds: z.number().int().min(1).max(3600).optional(),
+    unreachableAfterSeconds: z.number().int().min(5).max(86400).optional(),
+  }).strict().optional(),
   // How long one computer call waits inside the harness while its desktop
   // is busy (server/computer-call-gate.ts).  Every field is optional: an
   // absent field resolves through the legacy `OMB_COMPUTER_*` env names to
@@ -841,6 +852,15 @@ export interface AppConfig {
     /** Minutes a hot host may park a webhook before the wake dispatches
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;
+  };
+  /** The placement transport's two knobs (server/placement-controller-bridge.ts).
+   *  Absent fields resolve to the built-in defaults. */
+  placement?: {
+    /** How often a worker heartbeats.  Read by the worker runtime. */
+    heartbeatSeconds?: number;
+    /** How long a worker may go quiet before the controller marks it
+     *  unreachable.  Longer than the heartbeat period. */
+    unreachableAfterSeconds?: number;
   };
   /** Computer-call gate waits (server/computer-call-gate.ts).  See the
    *  schema above; absent fields resolve in `computerCallSettings`. */

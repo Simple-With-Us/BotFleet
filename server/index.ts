@@ -119,6 +119,10 @@ import { classifyWorkerRequest } from "../shared/placement-worker-http.mjs";
 import { openRollbackPlacementAuthority, PLACEMENT_ROLLBACK_REFUSAL } from "./placement-readonly.ts";
 import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, type PlacementLeaseAction } from "./placement-leases.ts";
 import { PlacementModeStore, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
+import {
+  PlacementControllerBridge,
+  DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS,
+} from "./placement-controller-bridge.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
 import {
@@ -293,6 +297,7 @@ import {
   ensureDirs,
   instanceConfigs,
   loadConfig,
+  type AppConfig,
   localVmMaxInstances,
   allowedBotComputers,
   infisicalSettings,
@@ -835,8 +840,20 @@ const hostId = loadHostId(DATA_DIR);
 const placementAuthority = openRollbackPlacementAuthority(DATA_DIR, hostId);
 // Immutable for this process: updater unquiesce cannot grant execution authority.
 const placementRollbackReadOnly = placementAuthority.kind === "readonly";
+// The placement transport's two knobs, read live.  The config object is
+// mutated in place on every save and vault refresh, so a holder that points
+// at it always answers with the current value.  It starts empty because the
+// config is loaded further down this file and the lease service is built
+// before that, so nothing may read the config yet.
+let placementConfig: AppConfig | null = null;
+/** How long a worker may go quiet before the controller marks it
+ *  unreachable.  The lease service asks for this every time it judges a
+ *  worker, so a knob change applies without a restart. */
+const placementUnreachableAfterMs = (): number =>
+  (placementConfig?.placement?.unreachableAfterSeconds ?? DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS) * 1000;
 const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeaseService({
   hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
+  unreachableAfterMs: placementUnreachableAfterMs,
 }) : null;
 // The server's copy of the mode record, beside `jobs.json`.  It shares the
 // lease service's epoch and keeps no epoch of its own, so the record can
@@ -848,6 +865,32 @@ const placementModeStore = new PlacementModeStore(join(DATA_DIR, "jobs"), {
     if (!placementLeases) throw new Error("Placement authority is unavailable");
     return placementLeases.controller();
   },
+});
+// The bridge between that record and the job registry (slice T4).  It is
+// built on every host, including one with no writable authority:  a server
+// mode on a host that cannot admit a job refuses the start with a reason,
+// and it never falls through to running the job here.  A bridge that was
+// absent would leave the registry's own path open, which is the one thing
+// the plan refuses.
+const placementBridge = new PlacementControllerBridge({
+  hostId,
+  view: () => {
+    const view = placementModeStore.read();
+    return {
+      mode: view.record.mode,
+      controllerId: view.controller.controllerId,
+      epoch: view.controller.epoch,
+      acknowledged: view.acknowledged,
+    };
+  },
+  enqueue: (message) => {
+    if (!placementLeases) {
+      return { ok: false, reason: "The placement authority on this computer is read-only, so no job is admitted.  Run the command with bash if it is short, or switch to This Mac Only in Settings." };
+    }
+    return placementLeases.enqueue(message);
+  },
+  queuedReason: (jobId) => placementLeases?.job(jobId)?.queuedReason,
+  sweepUnreachable: () => placementLeases?.sweepUnreachable() ?? [],
 });
 const jobHostProbe = createHostProbe({
   storageState: storageGuard?.sample,
@@ -1160,6 +1203,9 @@ const updateDrain = new UpdateDrain({
   log: (line) => console.warn(line),
 });
 const cfg = loadConfig();
+// The placement knobs read this object, and it is mutated in place on every
+// save and vault refresh, so a knob change applies without a restart.
+placementConfig = cfg;
 // Agent CLIs spawn with the Infisical Agent Proxy environment when it is on.  Read
 // from the in-memory `cfg` (mutated in place on every save and vault refresh), so a
 // spawn never re-reads config.json.
@@ -2936,6 +2982,13 @@ const jobRegistry = new JobRegistry({
   dataDir: DATA_DIR,
   probe: jobHostProbe,
   settings: jobSettings,
+  // The bridge to the placement authority (slice T4).  It is always present,
+  // so a server mode can never fall through to running the job on this host.
+  placementBridge,
+  // The mode the record holds, so the per-host cap refuses only in This Mac
+  // Only:  in a server mode the cap is an eligibility input and the job
+  // queues instead.
+  placementMode: () => placementBridge.mode(),
   // A job is a shell the model started: it carries its bot's launch identity
   // the way the engine's own children do (server/launch-identity.ts).
   launchEnv: (botId, threadId) => {
@@ -20605,6 +20658,12 @@ if (!placementRollbackReadOnly) try {
   console.error(`[helpers] could not settle interrupted helpers: ${error instanceof Error ? error.message : String(error)}`);
 }
 jobRegistry.startTimers();
+// The unreachable sweep (slice T4).  It is the one part of the lease service
+// that had no production caller:  a controller runs it to notice a worker
+// that went quiet, and nothing is requeued when it does.  The period is the
+// unreachable window, so a quiet worker is noticed within one window, and a
+// knob change applies on the next tick.
+if (placementLeases) placementBridge.startUnreachableSweep(placementUnreachableAfterMs);
 // Boot is done: the socket has been open since the top of this file, and the
 // full route table takes over from the boot-phase handler on the very next
 // request.  `/api/health` flips to `ready: true`, and the 503 gate lifts.

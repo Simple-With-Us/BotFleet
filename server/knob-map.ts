@@ -182,6 +182,30 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: 720,
   },
   {
+    // The placement transport's own two knobs (server/placement-controller-bridge.ts).
+    // `heartbeatSeconds` is how often a worker says it is alive;  the
+    // controller reads the other one to decide when a silent worker counts as
+    // unreachable, so the second has to stay longer than the first.
+    id: "placement.heartbeatSeconds",
+    label: "Placement worker heartbeat period",
+    section: "placement",
+    path: ["heartbeatSeconds"],
+    infisicalName: "BOTFLEET_PLACEMENT_HEARTBEAT_SECONDS",
+    kind: "int",
+    min: 1,
+    max: 3600,
+  },
+  {
+    id: "placement.unreachableAfterSeconds",
+    label: "Placement unreachable window",
+    section: "placement",
+    path: ["unreachableAfterSeconds"],
+    infisicalName: "BOTFLEET_PLACEMENT_UNREACHABLE_AFTER_SECONDS",
+    kind: "int",
+    min: 5,
+    max: 86400,
+  },
+  {
     id: "observability.tracesSampleRate",
     label: "Sentry traces sample rate",
     section: "observability",
