@@ -23,6 +23,10 @@ describe("patchChangesInfisicalConnection", () => {
   it("flags connection keys and ignores the refresh cadence", () => {
     expect(patchChangesInfisicalConnection({ infisical: { projectId: "abc" } })).toBe(true);
     expect(patchChangesInfisicalConnection({ infisical: { clientSecret: "x" } })).toBe(true);
+    expect(patchChangesInfisicalConnection({ infisical: { authMethod: "machine-identity" } })).toBe(true);
+    expect(patchChangesInfisicalConnection({ infisical: { token: "fake-read" } })).toBe(true);
+    expect(patchChangesInfisicalConnection({ infisical: { writeToken: "fake-write" } })).toBe(true);
+    expect(patchChangesInfisicalConnection({ infisical: { readSources: [] } })).toBe(true);
     expect(patchChangesInfisicalConnection({ infisical: { refreshMinutes: 5 } })).toBe(false);
     expect(patchChangesInfisicalConnection({ infisical: { enabled: false } })).toBe(false);
     expect(patchChangesInfisicalConnection({})).toBe(false);

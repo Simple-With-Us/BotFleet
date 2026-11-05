@@ -275,9 +275,9 @@ test("the shared Infisical action masks every value, warns rather than fails on 
   assert.match(fetcher, /is empty after the Infisical \$\{environment\} export and the GitHub secret fallback/);
   assert.match(fetcher, /required\.has\(name\)/);
   assert.match(fetcher, /Missing required Infisical name\(s\)/);
-  // Never string-interpolate the login body -- a client secret containing
-  // a quote must not be able to reshape the request.
-  assert.match(fetcher, /JSON\.stringify\(\{\s*clientId,\s*clientSecret\s*\}\)/);
+  // Managed CI never authenticates a machine identity.
+  assert.doesNotMatch(fetcher, /universal-auth\/login|loginUniversalAuth/);
+  assert.doesNotMatch(action, /inputs\.client-id|inputs\.client-secret/);
 });
 
 test("retired ios-testflight.yml is gone so hosted ships do not double-upload", () => {

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = join(ROOT, "scripts/ci-scope-diff.sh");
@@ -127,6 +127,116 @@ test("the old base-to-merge-commit diff folded main's newer commits into the sco
     assert.equal(scoped.paths.includes("server/index.ts"), false);
   } finally {
     rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("scope classification needs commit and tree history without historical file blobs", () => {
+  const repo = buildFixture();
+  try {
+    const objects = repo.git("rev-list", "--objects", "--all").stdout.trim().split("\n");
+    let removed = 0;
+    for (const row of objects) {
+      const oid = row.split(" ")[0];
+      if (repo.git("cat-file", "-t", oid).stdout.trim() !== "blob") continue;
+      rmSync(join(repo.dir, ".git", "objects", oid.slice(0, 2), oid.slice(2)));
+      removed += 1;
+    }
+    assert.ok(removed > 0);
+    const scoped = scope(repo, repo.base, repo.head);
+    assert.equal(scoped.status, 0, scoped.stderr);
+    assert.deepEqual(scoped.paths, ["docs/decision.md"]);
+    assert.equal(classify(scoped.paths).ios_changed, "false");
+    assert.equal(classify(scoped.paths).docs_only, "true");
+  } finally {
+    rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("a filtered full-history checkout lazily fetches the historical effort ledger for its guard", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ci-filtered-history-"));
+  const home = join(dir, "home");
+  const seed = join(dir, "seed");
+  const remote = join(dir, "remote.git");
+  const partial = join(dir, "partial");
+  mkdirSync(home);
+
+  const env = {
+    PATH: process.env.PATH,
+    HOME: home,
+    XDG_CONFIG_HOME: join(home, ".config"),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "History Fixture",
+    GIT_AUTHOR_EMAIL: "history-fixture@example.invalid",
+    GIT_COMMITTER_NAME: "History Fixture",
+    GIT_COMMITTER_EMAIL: "history-fixture@example.invalid",
+    CI: "true",
+  };
+  const run = (command, args, cwd, extraEnv = {}) => {
+    const result = spawnSync(command, args, {
+      cwd,
+      encoding: "utf8",
+      env: { ...env, ...extraEnv },
+    });
+    assert.equal(result.status, 0, `${command} ${args.join(" ")}\n${result.stderr}`);
+    return result.stdout.trim();
+  };
+  const git = (cwd, ...args) => run("git", ["-C", cwd, ...args], dir);
+  const write = (root, rel, body) => {
+    const full = join(root, rel);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, body);
+  };
+
+  try {
+    run("git", ["init", "-b", "main", seed], dir);
+    git(seed, "config", "user.name", "History Fixture");
+    git(seed, "config", "user.email", "history-fixture@example.invalid");
+    mkdirSync(join(seed, "scripts"));
+    cpSync(join(ROOT, "scripts/effort-log-integrity.node-test.mjs"), join(seed, "scripts/effort-log-integrity.node-test.mjs"));
+    cpSync(join(ROOT, "scripts/effort-log-integrity-lib.mjs"), join(seed, "scripts/effort-log-integrity-lib.mjs"));
+
+    const seats = ["AG", "CLAUDE", "CODEX", "GROK", "MINIMAX"];
+    const ledger = seats.flatMap((seat) =>
+      Array.from({ length: 100 }, (_, index) => `- **2026-11-03 - ${seat} - fixture ${index}**\n`),
+    ).join("");
+    write(seed, "docs/EFFORT-LOG.md", ledger);
+    git(seed, "add", ".");
+    git(seed, "commit", "-m", "fixture base");
+    const base = git(seed, "rev-parse", "HEAD");
+    const oldBlob = git(seed, "rev-parse", "HEAD:docs/EFFORT-LOG.md");
+
+    git(seed, "checkout", "-b", "fixture-head");
+    write(seed, "docs/EFFORT-LOG.md", `${ledger}- **2026-11-03 - CODEX - added fixture**\n`);
+    git(seed, "commit", "-am", "fixture head");
+    run("git", ["clone", "--bare", seed, remote], dir);
+    git(remote, "config", "uploadpack.allowFilter", "true");
+    run("git", ["clone", "--filter=blob:none", "--no-checkout", pathToFileURL(remote).href, partial], dir);
+    git(partial, "checkout", "fixture-head");
+
+    const noLazyFetch = { GIT_NO_LAZY_FETCH: "1" };
+    const missingBlob = spawnSync("git", ["-C", partial, "cat-file", "-e", oldBlob], {
+      encoding: "utf8",
+      env: { ...env, ...noLazyFetch },
+    });
+    assert.notEqual(missingBlob.status, 0, "historical ledger blob starts absent");
+    assert.equal(git(partial, "merge-base", "origin/main", "HEAD"), base);
+    assert.equal(git(partial, "rev-list", "--count", "HEAD"), "2");
+
+    const guard = spawnSync(process.execPath, ["--test", "scripts/effort-log-integrity.node-test.mjs"], {
+      cwd: partial,
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(guard.status, 0, guard.stderr || guard.stdout);
+    assert.match(guard.stdout, /ℹ tests 6\nℹ suites 0\nℹ pass 6\nℹ fail 0/);
+
+    const fetchedBlob = spawnSync("git", ["-C", partial, "cat-file", "-e", oldBlob], {
+      encoding: "utf8",
+      env: { ...env, ...noLazyFetch },
+    });
+    assert.equal(fetchedBlob.status, 0, "effort guard lazily fetched the historical ledger blob");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

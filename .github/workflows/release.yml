@@ -79,8 +79,7 @@ jobs:
           names: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
           required: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+          token: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
       - id: pin
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -169,9 +168,9 @@ jobs:
       - name: Clean generated output
         run: rm -rf dist dist-server dist-native release
 
-      # Prefer the automation identity's Infisical values and accept the
-      # same-named GitHub secrets as a migration fallback.  A release without
-      # both values cannot be signed, so fail here with the missing names.
+      # Prefer Infisical values from the dedicated release read token and
+      # accept same-named GitHub secrets as a migration fallback; a release
+      # without both values cannot be signed, so fail here with the missing names.
       # (Not optional: with them empty the import step below would decode an
       # empty .p12 and die inside `security import`, and the signature gate
       # after packaging would fail anyway -- a still-empty vault cannot make
