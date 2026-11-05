@@ -127,6 +127,17 @@ describe("steer-queue module", () => {
     expect(run.mock.calls.map((call) => call[2])).toEqual(Array.from({ length: 6 }, (_, chat) => `chat ${chat}`));
   });
 
+  it("never asks the user on an unattended relayed batch", () => {
+    const bot = fakeBot("bot-relayed", "thread-relayed", true);
+    const store = fakeStore([bot]);
+    for (const text of ["one", "two", "three"]) queueSteeredMessage(bot, text, { relayed: true });
+    bot.busy = false;
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0]?.[2]).toBe("one\ntwo\nthree");
+  });
+
   it("lets an update carry a bot's waiting sends off the transcript and put them back in line", () => {
     const interrupted = fakeBot("bot-carry", "thread-carry", true);
     const other = fakeBot("bot-stay", "thread-stay", true);

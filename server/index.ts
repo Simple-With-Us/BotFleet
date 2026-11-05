@@ -16587,6 +16587,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
             linqChatId,
             ...(fromImessage ? { automationSource: "imessage" as const } : {}),
+            relayed: relaySourced,
           });
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           // The same answer a busy bot's queued send gets: the client's
@@ -16699,6 +16700,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
             linqChatId,
             automationSource: fromImessage ? "imessage" : undefined,
+            relayed: relaySourced,
           });
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           return { status: 202, body: { ok: true, queued: true, queueId: queued.id, threadId: targetThreadId } };

@@ -54,6 +54,9 @@ interface QueuedItem {
    * the drained turn keeps running unattended (S8). */
   automationSource?: Message["automationSource"];
   committed?: CommittedBatch;
+  /** The send came over a relay, so its turn runs unattended and must never
+   * stop to ask the user anything (S8). */
+  relayed?: boolean;
 }
 
 interface QueueEntry {
@@ -70,7 +73,7 @@ const queues = new Map<string, QueueEntry>(); // threadId → waiting sends
 export function queueSteeredMessage(
   bot: BotRecord,
   text: string,
-  options: { prompt?: string; replyToId?: string; linqChatId?: string; threadId?: string; automationSource?: Message["automationSource"] } = {},
+  options: { prompt?: string; replyToId?: string; linqChatId?: string; threadId?: string; automationSource?: Message["automationSource"]; relayed?: boolean } = {},
 ): { id: string } {
   // A per-context send holds its words against its own thread, not the
   // active one: the drain already runs one batch per thread per pass, so a
@@ -84,6 +87,7 @@ export function queueSteeredMessage(
     prompt: options.prompt ?? text,
     replyToId: options.replyToId,
     linqChatId: options.linqChatId,
+    ...(options.relayed ? { relayed: true } : {}),
   });
   queues.set(threadId, entry);
   return { id };
@@ -207,7 +211,9 @@ export function drainSteeredMessages(
     // turn while a long tail waits — counting the tail would have it claim a
     // pile it is not answering, and would ask the user to prioritise on every
     // turn of a sequential pipeline instead of once.
-    const backlog = steerBacklogInstruction(batch.length);
+    // An unattended (relayed) batch has nobody to answer an ask: it keeps doing
+    // the work in order, as it did before the backlog instruction existed.
+    const backlog = batch.some((item) => item.relayed) ? null : steerBacklogInstruction(batch.length);
     const prompt = backlog ? `${backlog}\n\n${joined}` : joined;
     void run(
       entry.botId,

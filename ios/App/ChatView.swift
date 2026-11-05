@@ -1273,7 +1273,9 @@ struct ChatView: View {
         let sentText = text
         sending = true
         var delivery = busyDelivery
-        if delivery == nil, current.busy, case .bot = current, busySendDefaultMode() == "queue" {
+        // Until the config loads the client cannot know the workspace default, so it
+        // sends no override and the server's own setting decides.
+        if delivery == nil, current.busy, case .bot = current, session.config != nil, busySendDefaultMode() == "queue" {
             delivery = "queue"
         }
         let task = Task {
