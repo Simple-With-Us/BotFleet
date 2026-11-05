@@ -1,21 +1,26 @@
-import { test, expect, type Page } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+import { test, expect, type Locator, type Page } from '@playwright/test';
 
 // The bot context menu's rows (src/components/Sidebar.tsx) sit on a `bg-card`
-// surface.  A computed-style assertion is NOT enough here and would have passed
-// straight through the bug: `hover:bg-raised/70` really does set a background
-// colour, so `getComputedStyle` changes on hover even when the change is
-// invisible.  In a light skin `--color-raised` and `--color-card` are both
-// #ffffff, so the row paints white@70% over white.
+// surface.  Reported bug: in the light skins `--color-raised` and `--color-card`
+// are both #ffffff, so the old `hover:bg-raised/70` painted white over white
+// and the hovered row did not change at all.
 //
-// So this spec composites the hover fill over the surface in a canvas and
-// asserts on the resulting pixel, which is what a person actually sees.
+// A computed-style assertion would have passed straight through that bug:
+// `hover:bg-raised/70` does set a background colour, so getComputedStyle
+// changes on hover even when the change is invisible.  So this spec moves the
+// real mouse onto each row (which sets the real :hover state, unlike a
+// synthetic mouseover), takes a screenshot, and compares the painted pixel at
+// rest with the painted pixel while hovered.  That is what a person sees.
 //
-// The fixture mounts the real BotContextMenu, so reverting the class in
-// Sidebar.tsx fails this test rather than quietly passing.
+// No screenshot baseline is used.  The check is a measured pixel step, so it
+// needs no generated image and no tolerance of its own.
+//
+// It runs across every skin declared in src/styles.css, so a new skin that
+// repeats the token pairing fails here too.
 
 const LINUX_CHROME_UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
 
 test.use({
   viewport: { width: 520, height: 520 },
@@ -24,130 +29,72 @@ test.use({
   userAgent: LINUX_CHROME_UA,
 });
 
-/** A hover fill has to move the row off the menu surface by a step a person
- *  can see.  5/255 is deliberately below the intended fill (Studio paints
- *  #f1f3f5 on #ffffff, a 14/255 step) and far above anything that reads as
- *  noise.  A composite that lands on the surface exactly scores 0. */
+/** A hover fill has to move the row off its resting colour by a step a person
+ *  can see.  5/255 sits below the weakest intended fill in the current skins
+ *  (14/255) and well above anything that reads as noise.  A fill that paints
+ *  the resting colour exactly scores 0. */
 const MIN_CHANNEL_STEP = 5;
 
-type Row = { label: string; rest: string; hover: string; overSurface: string; step: number };
+// Every `[data-skin="x"]` block in the stylesheet, plus the default skin
+// (no attribute).  Read from the source so the list cannot go stale.
+const SKINS: string[] = [
+  '',
+  ...new Set(
+    [...readFileSync('src/styles.css', 'utf8').matchAll(/^\[data-skin="([a-z0-9-]+)"\]\s*\{/gm)].map(
+      (match) => match[1],
+    ),
+  ),
+];
 
-async function measureRows(page: Page): Promise<{ surface: string; rows: Row[] }> {
-  return page.evaluate(() => {
-    const menu = document.querySelector('[data-bot-menu]');
-    if (!menu) throw new Error('bot menu did not render');
-    const buttons = Array.from(menu.querySelectorAll('button'));
-    if (!buttons.length) throw new Error('bot menu rendered no rows');
-
-    const surface = getComputedStyle(menu).backgroundColor;
-
-    // Parse a computed colour into rgb + alpha.  Chromium resolves the
-    // color-mix() Tailwind emits to `rgb(...)`/`rgba(...)`, but accept the
-    // `color(srgb ...)` form too so the test does not depend on that.
-    function parse(value: string): { rgb: [number, number, number]; a: number } {
-      const srgb = value.match(/color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+))?\)/);
-      if (srgb) {
-        return {
-          rgb: [Number(srgb[1]) * 255, Number(srgb[2]) * 255, Number(srgb[3]) * 255],
-          a: srgb[4] === undefined ? 1 : Number(srgb[4]),
-        };
-      }
-      const nums = value.match(/[\d.]+/g)?.map(Number);
-      if (!nums || nums.length < 3) throw new Error(`unparsed colour: ${value}`);
-      return { rgb: [nums[0], nums[1], nums[2]], a: nums[3] === undefined ? 1 : nums[3] };
-    }
-
-    // Composite `top` over `bottom` the way the compositor does, in a canvas,
-    // so the number below is a painted pixel and not a restatement of the
-    // CSS that produced the bug.
-    function flatten(top: string, bottom: string): string {
-      const t = parse(top);
-      const b = parse(bottom);
-      const canvas = document.createElement('canvas');
-      canvas.width = 1;
-      canvas.height = 1;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error('no 2d context');
-      ctx.fillStyle = `rgb(${b.rgb.map(Math.round).join(',')})`;
-      ctx.fillRect(0, 0, 1, 1);
-      if (t.a < 1) {
-        ctx.globalAlpha = t.a;
-        ctx.fillStyle = `rgb(${t.rgb.map(Math.round).join(',')})`;
-        ctx.fillRect(0, 0, 1, 1);
-      }
-      const d = ctx.getImageData(0, 0, 1, 1).data;
-      return `rgb(${d[0]}, ${d[1]}, ${d[2]})`;
-    }
-
-    const rows: Row[] = [];
-    for (const button of buttons) {
-      if (button.disabled) continue; // a disabled row is painted muted on purpose
-      const label = button.textContent?.trim() ?? '';
-      const rest = getComputedStyle(button).backgroundColor;
-      button.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-      const hover = getComputedStyle(button).backgroundColor;
-      const overSurface = flatten(hover, surface);
-      const painted = parse(overSurface);
-      const base = parse(surface);
-      const step = Math.max(
-        ...painted.rgb.map((channel, i) => Math.abs(channel - base.rgb[i])),
-      );
-      rows.push({ label, rest, hover, overSurface, step });
-    }
-    return { surface, rows };
+/** The painted RGB of a small patch at the right edge of `row`, which no icon
+ *  or label reaches.  Decoded from a real screenshot, not from computed CSS. */
+async function paintedPixel(page: Page, row: Locator): Promise<[number, number, number]> {
+  const box = await row.boundingBox();
+  if (!box) throw new Error('row has no box');
+  const png = await page.screenshot({
+    clip: { x: box.x + box.width - 24, y: box.y + 4, width: 12, height: Math.max(4, box.height - 8) },
+    animations: 'disabled',
   });
+  return page.evaluate(async (base64) => {
+    const bitmap = await createImageBitmap(await (await fetch(`data:image/png;base64,${base64}`)).blob());
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('no 2d context');
+    ctx.drawImage(bitmap, 0, 0);
+    const [r, g, b] = ctx.getImageData(2, 2, 1, 1).data;
+    return [r, g, b] as [number, number, number];
+  }, png.toString('base64'));
 }
 
-test.describe('bot context menu hover fill', () => {
-  test('a hovered row is visibly distinct from the menu surface', async ({ page }) => {
+for (const skin of SKINS) {
+  test(`bot context menu hover is visible in skin "${skin || 'default'}"`, async ({ page }) => {
     await page.goto('/?fixture=sidebar-menu');
+    if (skin) await page.evaluate((name) => document.documentElement.setAttribute('data-skin', name), skin);
     const menu = page.locator('[data-bot-menu]');
     await expect(menu).toBeVisible();
     await expect(page.getByTestId('menu-board')).toContainText('Remove Chief of Staff');
 
-    const { surface, rows } = await measureRows(page);
-    const invisible = rows.filter((row) => row.step < MIN_CHANNEL_STEP);
+    const rows = menu.locator('button:not([disabled])');
+    const count = await rows.count();
+    // Pin, Remove Chief of Staff, Move to Section, Mark as Unread, Edit Profile,
+    // Duplicate, Copy Conversation ID, Delete.  Merge All and Archive are
+    // disabled in this state and are painted muted on purpose.
+    expect(count).toBeGreaterThan(5);
 
-    // Reported in the failure so the numbers are auditable rather than asserted
-    // blind: surface, the raw hover colour, and the composited step per row.
-    expect(
-      invisible.map((row) => ({
-        label: row.label,
-        surface,
-        hover: row.hover,
-        compositedOverSurface: row.overSurface,
-        channelStep: row.step,
-      })),
-      'rows whose hover fill is indistinguishable from the menu surface',
-    ).toEqual([]);
+    const invisible: Array<{ label: string; rest: number[]; hovered: number[]; channelStep: number }> = [];
+    for (let i = 0; i < count; i += 1) {
+      const row = rows.nth(i);
+      const label = ((await row.textContent()) ?? '').trim();
+      await page.mouse.move(2, 2);
+      const rest = await paintedPixel(page, row);
+      await row.hover();
+      const hovered = await paintedPixel(page, row);
+      const channelStep = Math.max(...rest.map((channel, c) => Math.abs(channel - hovered[c])));
+      if (channelStep < MIN_CHANNEL_STEP) invisible.push({ label, rest, hovered, channelStep });
+    }
 
-    // Nothing else here: Archive is intentionally disabled and is skipped above.
-    expect(rows.length).toBeGreaterThan(4);
+    expect(invisible, 'rows whose real-mouse hover paints no visible change').toEqual([]);
   });
-
-  test('the same menu in a dark skin keeps a visible hover', async ({ page }) => {
-    // Midnight gives --color-raised and --color-card different values, so the
-    // old white@70% fill did show there.  This is the control: it proves the
-    // failure above is about token pairing, not about the assertion being
-    // unsatisfiable.
-    await page.goto('/?fixture=sidebar-menu&skin=midnight');
-    await page.evaluate(() => document.documentElement.setAttribute('data-skin', 'midnight'));
-    const menu = page.locator('[data-bot-menu]');
-    await expect(menu).toBeVisible();
-
-    const { rows } = await measureRows(page);
-    const invisible = rows.filter((row) => row.step < MIN_CHANNEL_STEP);
-    expect(
-      invisible.map((row) => ({ label: row.label, compositedOverSurface: row.overSurface, step: row.step })),
-      'rows whose hover fill is indistinguishable in Midnight',
-    ).toEqual([]);
-  });
-
-  test('visual: the menu rows, one hovered', async ({ page }) => {
-    await page.goto('/?fixture=sidebar-menu');
-    const menu = page.locator('[data-bot-menu]');
-    await expect(menu).toBeVisible();
-    await menu.getByRole('button', { name: 'Duplicate' }).hover();
-    await expect(menu).toHaveScreenshot('sidebar-menu-hover.png', { animations: 'disabled', caret: 'hide', maxDiffPixels: 0 });
-  });
-});
+}
