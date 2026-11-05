@@ -54,7 +54,7 @@ for (const bad of [{ teamIdentifier: "FOREIGNTEAM" }, { codeIdentifier: "foreign
   test(`a bad x86 signature (${Object.keys(bad)[0]}) is refused even when arm64 is valid`, () => {
     const f = fixture();
     try { assert.throws(() => verifyNativeHostArtifact({ ...f.options,
-      inspectSignature: (_, arch) => ({ ...signature(), ...(arch === "x86_64" ? bad : {}) }) })); }
+      inspectSignature: (_, arch) => Object.assign(signature(), arch === "x86_64" ? bad : null) })); }
     finally { f.remove(); }
   });
 }
