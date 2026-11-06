@@ -105,8 +105,8 @@ describe("createStsCallRecorder", () => {
     const recorder = createStsCallRecorder();
     // Interleaved the way a real call arrives them, not one side then the other.
     for (let frame = 0; frame < 5; frame += 1) {
-      recorder.write("user", pcm(160, 1000 + frame));
-      recorder.write("bot", pcm(160, -2000 - frame));
+      recorder.write("user", pcm(160, 1000 + frame), RECORDING_SAMPLE_RATE);
+      recorder.write("bot", pcm(160, -2000 - frame), RECORDING_SAMPLE_RATE);
     }
     const recording = recorder.stop();
     expect(recording).not.toBeNull();
@@ -129,9 +129,9 @@ describe("createStsCallRecorder", () => {
     const reused = new ArrayBuffer(160 * 2);
     const reusedView = new DataView(reused);
     reusedView.setInt16(0, 111, true);
-    recorder.write("user", reused);
+    recorder.write("user", reused, RECORDING_SAMPLE_RATE);
     for (let index = 1; index < 160; index += 1) reusedView.setInt16(index * 2, 222, true);
-    recorder.write("bot", pcm(160, 333));
+    recorder.write("bot", pcm(160, 333), RECORDING_SAMPLE_RATE);
 
     const recording = recorder.stop();
     const view = new DataView(recording!.wav);
@@ -157,7 +157,7 @@ describe("createStsCallRecorder", () => {
     const truncated = new ArrayBuffer(7);
     const view = new DataView(truncated);
     for (let index = 0; index < 3; index += 1) view.setInt16(index * 2, index + 1, true);
-    recorder.write("user", truncated);
+    recorder.write("user", truncated, RECORDING_SAMPLE_RATE);
     const recording = recorder.stop();
     expect(readWavHeader(recording!.wav).dataSize).toBe(3 * 4);
     expect(recorder.elapsedSeconds).toBeCloseTo(3 / RECORDING_SAMPLE_RATE, 6);
@@ -165,15 +165,15 @@ describe("createStsCallRecorder", () => {
 
   it("ignores a completely empty frame", () => {
     const recorder = createStsCallRecorder();
-    recorder.write("user", new ArrayBuffer(0));
+    recorder.write("user", new ArrayBuffer(0), RECORDING_SAMPLE_RATE);
     expect(recorder.stop()).toBeNull();
   });
 
   it("is frozen once stopped, so a late frame cannot rewrite the file", () => {
     const recorder = createStsCallRecorder();
-    recorder.write("user", pcm(160, 5));
+    recorder.write("user", pcm(160, 5), RECORDING_SAMPLE_RATE);
     const first = recorder.stop();
-    recorder.write("bot", pcm(160, 9));
+    recorder.write("bot", pcm(160, 9), RECORDING_SAMPLE_RATE);
     const second = recorder.stop();
     // Same object, same bytes: the call view may stop a call more than once.
     expect(second).toBe(first);
@@ -182,9 +182,10 @@ describe("createStsCallRecorder", () => {
 
   it("never throws into the call when a frame is not a buffer", () => {
     const recorder = createStsCallRecorder();
-    recorder.write("user", pcm(160, 1));
-    // SAFETY: a null frame is exactly the bad input this test feeds the recorder.
-    expect(() => recorder.write("bot", null as never)).not.toThrow();
+    recorder.write("user", pcm(160, 1), RECORDING_SAMPLE_RATE);
+    // A null frame is exactly the bad input this test feeds the recorder, and the type check must still reject it.
+    // @ts-expect-error null is not an ArrayBuffer; the runtime guard is what is under test
+    expect(() => recorder.write("bot", null, RECORDING_SAMPLE_RATE)).not.toThrow();
     // The rest of the recording survives the bad frame.
     expect(recorder.stop()).not.toBeNull();
   });
@@ -195,19 +196,19 @@ describe("createStsCallRecorder", () => {
     // both the file's real length and the honest elapsed time.
     const recorder = createStsCallRecorder();
     expect(recorder.elapsedSeconds).toBe(0);
-    recorder.write("user", pcm(RECORDING_SAMPLE_RATE, 0)); // one second
+    recorder.write("user", pcm(RECORDING_SAMPLE_RATE, 0), RECORDING_SAMPLE_RATE); // one second
     expect(recorder.elapsedSeconds).toBeCloseTo(1, 6);
     // Half a second of bot does not shorten the call, and does not lengthen it.
-    recorder.write("bot", pcm(RECORDING_SAMPLE_RATE / 2, 0));
+    recorder.write("bot", pcm(RECORDING_SAMPLE_RATE / 2, 0), RECORDING_SAMPLE_RATE);
     expect(recorder.elapsedSeconds).toBeCloseTo(1, 6);
     // A second and a half of microphone is a second and a half.
-    recorder.write("user", pcm(RECORDING_SAMPLE_RATE / 2, 0));
+    recorder.write("user", pcm(RECORDING_SAMPLE_RATE / 2, 0), RECORDING_SAMPLE_RATE);
     expect(recorder.elapsedSeconds).toBeCloseTo(1.5, 6);
   });
 
   it("names the channels so the UI can say which speaker is which", () => {
     const recording = createStsCallRecorder();
-    recording.write("user", pcm(160, 1));
+    recording.write("user", pcm(160, 1), RECORDING_SAMPLE_RATE);
     expect(recording.stop()!.channels).toEqual({ left: "user", right: "bot" });
   });
 });
@@ -279,28 +280,110 @@ describe("a call where the two sides run at different rates", () => {
   });
 });
 
+describe("a shared clock for both sides", () => {
+  const clock = () => {
+    let ms = 0;
+    return { now: () => ms, at: (value: number) => void (ms = value) };
+  };
+
+  it("pads a late bot reply with silence so it lands after the speech it answers", () => {
+    const time = clock();
+    const recorder = createStsCallRecorder({ now: time.now });
+    // The person speaks for one second from the start; the bot first answers at 1.5 s.
+    time.at(0);
+    recorder.write("user", pcm(RECORDING_SAMPLE_RATE, 1000), RECORDING_SAMPLE_RATE);
+    time.at(1500);
+    recorder.write("bot", pcm(1600, -2000), RECORDING_SAMPLE_RATE);
+    const recording = recorder.stop();
+    const view = new DataView(recording!.wav);
+    // The bot channel is silent for the first 1.5 s and then carries the reply.
+    expect(view.getInt16(frameOffset(0) + 2, true)).toBe(0);
+    expect(view.getInt16(frameOffset(24_000 - 1) + 2, true)).toBe(0);
+    expect(view.getInt16(frameOffset(24_000) + 2, true)).toBe(-2000);
+    // The person's channel ends at one second, the bot's reply at 1.6 s.
+    expect(view.getInt16(frameOffset(15_999), true)).toBe(1000);
+    expect(view.getInt16(frameOffset(16_000), true)).toBe(0);
+    expect(recording!.durationSeconds).toBeCloseTo(1.6, 6);
+  });
+
+  it("leaves small timing jitter alone and queues early frames behind what is there", () => {
+    const time = clock();
+    const recorder = createStsCallRecorder({ now: time.now });
+    time.at(0);
+    recorder.write("bot", pcm(1600, 5), RECORDING_SAMPLE_RATE); // 0.1 s
+    // The next frame arrives 30 ms late (inside the tolerance) and another arrives early.
+    time.at(130);
+    recorder.write("bot", pcm(1600, 6), RECORDING_SAMPLE_RATE);
+    time.at(10);
+    recorder.write("bot", pcm(1600, 7), RECORDING_SAMPLE_RATE);
+    const view = new DataView(recorder.stop()!.wav);
+    expect(view.getInt16(frameOffset(1600) + 2, true)).toBe(6);
+    expect(view.getInt16(frameOffset(3200) + 2, true)).toBe(7);
+  });
+
+  it("refuses a frame whose rate disagrees with its track and counts it", () => {
+    const recorder = createStsCallRecorder();
+    recorder.write("bot", pcm(2400, 1), 24_000);
+    recorder.write("bot", pcm(1600, 9), 16_000); // would be mixed in at the wrong speed
+    expect(recorder.droppedFrames).toBe(1);
+    const recording = recorder.stop();
+    // Only the 24 kHz frame (0.1 s) is in the file.
+    expect(recording!.durationSeconds).toBeCloseTo(0.1, 3);
+  });
+});
+
+describe("stopping", () => {
+  it("freezes an empty recorder too, so a late frame cannot create a recording after the call ended", () => {
+    const recorder = createStsCallRecorder();
+    expect(recorder.stop()).toBeNull();
+    recorder.write("user", pcm(160, 5), RECORDING_SAMPLE_RATE);
+    expect(recorder.stop()).toBeNull();
+    expect(recorder.elapsedSeconds).toBe(0);
+  });
+
+  it("keeps reporting the call's length after the raw audio is released", () => {
+    const recorder = createStsCallRecorder();
+    recorder.write("user", pcm(RECORDING_SAMPLE_RATE, 1), RECORDING_SAMPLE_RATE);
+    const recording = recorder.stop();
+    expect(recorder.elapsedSeconds).toBeCloseTo(1, 6);
+    expect(recorder.stop()).toBe(recording);
+  });
+});
+
 describe("recordingFileName", () => {
   it("sorts by when the call happened", () => {
-    const name = recordingFileName(new Date(2026, 9, 14, 14, 5), "Forge");
-    expect(name).toBe("call-2026-10-14_1405-Forge.wav");
-    const earlier = recordingFileName(new Date(2026, 9, 14, 9, 30), "Forge");
+    const name = recordingFileName(new Date(2026, 9, 14, 14, 5, 7), "Forge", "c1");
+    expect(name).toBe("call-2026-10-14-140507-Forge-c1.wav");
+    const earlier = recordingFileName(new Date(2026, 9, 14, 9, 30, 0), "Forge", "c1");
     expect(earlier < name).toBe(true);
   });
 
   it("strips anything in a bot name that could become a path", () => {
     // A bot name is set by a person, so it cannot be trusted as a file name.
-    const name = recordingFileName(new Date(2026, 0, 2, 3, 4), "../../etc/passwd");
-    expect(name).toBe("call-2026-01-02_0304-etc-passwd.wav");
+    const name = recordingFileName(new Date(2026, 0, 2, 3, 4, 5), "../../etc/passwd", "c1");
+    expect(name).toBe("call-2026-01-02-030405-etc-passwd-c1.wav");
     expect(name).not.toContain("/");
     expect(name).not.toContain("..");
   });
 
   it("falls back to a usable name when the bot name is only punctuation", () => {
-    expect(recordingFileName(new Date(2026, 0, 2, 3, 4), "///")).toBe("call-2026-01-02_0304-bot.wav");
+    expect(recordingFileName(new Date(2026, 0, 2, 3, 4, 5), "///", "c1")).toBe("call-2026-01-02-030405-bot-c1.wav");
   });
 
-  it("pads single-digit months, days, hours and minutes", () => {
-    expect(recordingFileName(new Date(2026, 0, 2, 3, 4), "Bot")).toBe("call-2026-01-02_0304-Bot.wav");
+  it("never gives two calls the same name: the call id ends it", () => {
+    const at = new Date(2026, 0, 2, 3, 4, 5);
+    expect(recordingFileName(at, "Bot", "a1")).not.toBe(recordingFileName(at, "Bot", "b2"));
+    // Bot names that normalise to the same text are told apart by the id too.
+    expect(recordingFileName(at, "A B", "a1")).not.toBe(recordingFileName(at, "A_B", "b2"));
+  });
+
+  it("only uses characters the attachment routes serve (no underscore)", () => {
+    const name = recordingFileName(new Date(2026, 0, 2, 3, 4, 5), "Weird_Name!", "id_9");
+    expect(name).toMatch(/^[A-Za-z0-9-]+\.[A-Za-z0-9]{1,8}$/);
+  });
+
+  it("pads single-digit months, days, hours, minutes and seconds", () => {
+    expect(recordingFileName(new Date(2026, 0, 2, 3, 4, 5), "Bot", "c1")).toBe("call-2026-01-02-030405-Bot-c1.wav");
   });
 });
 

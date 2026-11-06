@@ -32,6 +32,17 @@ export const RECORDING_SAMPLE_RATE = 16_000;
 /** How long BotFleet keeps a recording before deleting it on its own. */
 export const RECORDING_RETENTION_DAYS = 30;
 
+/**
+ * A side that has been silent for longer than this is padded with silence up to
+ * the moment its next frame arrived.  Smaller gaps are timing jitter between
+ * frames and are left alone, so the audio is not chopped up; the two sides can
+ * therefore differ by up to this much in the file.
+ */
+const MAX_UNPADDED_GAP_SECONDS = 0.1;
+
+/** Whether this machine stores a 16-bit sample low byte first, as a WAV file does. */
+const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
 /** What a finished recording is: a stereo WAV plus enough detail to name it. */
 export interface StsRecording {
   /** A complete, playable stereo WAV file. */
@@ -53,13 +64,19 @@ export interface StsCallRecorder {
   /**
    * Append one mono PCM16 frame to that side's track.
    *
-   * `sampleRate` is the rate of *that frame*, which differs per side and per
-   * provider; it is recorded so the track can be brought to the file's rate at
-   * the end.
+   * `sampleRate` is required and is the rate of *that frame*, which differs per
+   * side and per provider (the microphone is 16 kHz, Gemini speaks at 24 kHz).
+   * The first frame sets the track's rate; a later frame at another rate is
+   * refused and counted in `droppedFrames`, because it would be mixed in at the
+   * wrong speed.  Each frame is also placed on a shared clock (see
+   * `createStsCallRecorder`), so a side that pauses is padded with silence
+   * instead of sliding earlier than the other.
    */
-  write(side: RecordingSide, pcm: ArrayBuffer, sampleRate?: number): void;
+  write(side: RecordingSide, pcm: ArrayBuffer, sampleRate: number): void;
   /** Close both tracks and produce the file. Idempotent. */
   stop(): StsRecording | null;
+  /** Frames refused because their rate disagreed with their track's rate. */
+  readonly droppedFrames: number;
   /** Seconds written so far, for the in-call readout. */
   readonly elapsedSeconds: number;
 }
@@ -113,19 +130,35 @@ class Track {
     return this.rate > 0 ? this.samples / this.rate : 0;
   }
 
-  append(pcm: ArrayBuffer, sampleRate: number): void {
-    if (pcm.byteLength === 0) return;
+  /**
+   * Add one frame that arrived `atSeconds` after the recording started.
+   * Returns false when the frame was refused for disagreeing with the track's
+   * rate.  Silence is inserted first when the frame arrives well after the
+   * audio already held ends, so the track stays on the shared clock; a frame
+   * that arrives early (a provider sending faster than real time) simply
+   * queues behind what is there, the way playback does.
+   */
+  append(pcm: ArrayBuffer, sampleRate: number, atSeconds: number): boolean {
+    if (pcm.byteLength === 0) return true;
     // An odd trailing byte is a truncated frame, not a half sample to guess at.
     const usable = pcm.byteLength - (pcm.byteLength % 2);
-    if (usable <= 0) return;
+    if (usable <= 0) return true;
+    if (!(sampleRate > 0)) return false;
+    // The first frame decides the rate.  A frame at another rate would be
+    // resampled against the wrong denominator, so it is refused, not mixed in.
+    if (this.rate !== 0 && sampleRate !== this.rate) return false;
     const copy = new ArrayBuffer(usable);
     new Uint8Array(copy).set(new Uint8Array(pcm, 0, usable));
-    // The first frame decides the rate.  A later frame at a different rate
-    // would be resampled against the wrong denominator, and in practice the
-    // provider cannot change rate mid-call, so this only ever records the truth.
-    if (this.rate === 0 && sampleRate > 0) this.rate = sampleRate;
+    if (this.rate === 0) this.rate = sampleRate;
+    const target = Math.round(Math.max(0, atSeconds) * this.rate);
+    const gap = target - this.samples;
+    if (gap > this.rate * MAX_UNPADDED_GAP_SECONDS) {
+      this.chunks.push(new ArrayBuffer(gap * 2));
+      this.samples += gap;
+    }
     this.chunks.push(copy);
     this.samples += usable / 2;
+    return true;
   }
 
   /** The track as one contiguous Int16 view. */
@@ -143,6 +176,11 @@ class Track {
   /** The track at `rate`, brought there from whatever it was captured at. */
   atRate(rate: number): Int16Array {
     return resamplePcm16(this.view(), this.rate || rate, rate);
+  }
+
+  /** Drop the buffered frames once the file exists; the counts stay for the readout. */
+  release(): void {
+    this.chunks = [];
   }
 }
 
@@ -188,39 +226,53 @@ export function buildStereoWav(
   view.setUint32(40, dataBytes, true);
 
   // Interleaved, left then right, so a player pans each speaker apart.
-  let offset = 44;
-  for (let frame = 0; frame < frames; frame += 1) {
-    const left = frame < user.length ? user[frame]! : 0;
-    const right = frame < bot.length ? bot[frame]! : 0;
-    view.setInt16(offset, left, true);
-    view.setInt16(offset + 2, right, true);
-    offset += 4;
+  if (LITTLE_ENDIAN) {
+    // The data starts at byte 44, which is 2-byte aligned, so a typed view fills it directly.
+    const samples = new Int16Array(buffer, 44, frames * channelCount);
+    for (let frame = 0; frame < frames; frame += 1) {
+      samples[frame * 2] = frame < user.length ? user[frame]! : 0;
+      samples[frame * 2 + 1] = frame < bot.length ? bot[frame]! : 0;
+    }
+  } else {
+    let offset = 44;
+    for (let frame = 0; frame < frames; frame += 1) {
+      view.setInt16(offset, frame < user.length ? user[frame]! : 0, true);
+      view.setInt16(offset + 2, frame < bot.length ? bot[frame]! : 0, true);
+      offset += 4;
+    }
   }
   return buffer;
 }
 
 /**
- * Start a stereo recording.  Returns null when there is nothing to record, so
- * the call view can hide the control rather than offer a toggle that does
- * nothing.
+ * Start a stereo recording.
+ *
+ * Both tracks are placed on one clock that starts here, so the person's speech
+ * and the bot's reply line up in the file the way they happened.  `now` is that
+ * clock in milliseconds and exists so tests can drive it.
  */
-export function createStsCallRecorder(): StsCallRecorder {
+export function createStsCallRecorder(options: { now?: () => number } = {}): StsCallRecorder {
+  const now = options.now ?? (() => Date.now());
+  const origin = now();
   const tracks: Record<RecordingSide, Track> = { user: new Track(), bot: new Track() };
   let closed: StsRecording | null = null;
+  let stopped = false;
+  let dropped = 0;
 
   return {
-    write(side, pcm, sampleRate = RECORDING_SAMPLE_RATE) {
-      // After stop() the tracks are already frozen into a file; a late frame
-      // from a torn-down audio path must not reopen or corrupt them.
-      if (closed) return;
+    write(side, pcm, sampleRate) {
+      // After stop() the call is over, whether or not anything was recorded; a
+      // late frame from a torn-down audio path must not reopen the recording.
+      if (stopped) return;
       try {
-        tracks[side].append(pcm, sampleRate);
+        if (!tracks[side].append(pcm, sampleRate, (now() - origin) / 1000)) dropped += 1;
       } catch {
         // A recording is never worth failing a call over.
       }
     },
     stop() {
-      if (closed) return closed;
+      if (stopped) return closed;
+      stopped = true;
       // Both tracks come out at the file's rate, so the interleave is a
       // frame-for-frame alignment in time rather than a coincidence.
       const user = tracks.user.atRate(RECORDING_SAMPLE_RATE);
@@ -234,7 +286,13 @@ export function createStsCallRecorder(): StsCallRecorder {
         durationSeconds: frames / RECORDING_SAMPLE_RATE,
         channels: { left: "user", right: "bot" },
       };
+      // The raw mono audio is no longer needed once the file exists.
+      tracks.user.release();
+      tracks.bot.release();
       return closed;
+    },
+    get droppedFrames() {
+      return dropped;
     },
     get elapsedSeconds() {
       return Math.max(tracks.user.seconds, tracks.bot.seconds);
@@ -245,19 +303,24 @@ export function createStsCallRecorder(): StsCallRecorder {
 /**
  * A file name for a recording, safe on every platform and stable enough to sort.
  *
- * The call is named for when it happened rather than a random id: the person
- * looking for a call that went wrong at 2pm wants a 2pm file, and a sortable
- * name is what makes "find it" work without opening each one.
+ * The call is named for when it happened (to the second) rather than a random
+ * id: the person looking for a call that went wrong at 2pm wants a 2pm file,
+ * and a sortable name is what makes "find it" work without opening each one.
+ * The call's own id ends the name, so two calls in the same second, or with bot
+ * names that normalise to the same text, never share a file.  Only letters,
+ * digits and dashes are used, which is what the attachment routes serve.
  */
-export function recordingFileName(startedAt: Date, botName: string): string {
-  const pad = (value: number) => String(value).padStart(2, "0");
+export function recordingFileName(startedAt: Date, botName: string, callId: string): string {
+  const pad = (value: number, width = 2) => String(value).padStart(width, "0");
   const stamp =
     `${startedAt.getFullYear()}-${pad(startedAt.getMonth() + 1)}-${pad(startedAt.getDate())}` +
-    `_${pad(startedAt.getHours())}${pad(startedAt.getMinutes())}`;
+    `-${pad(startedAt.getHours())}${pad(startedAt.getMinutes())}${pad(startedAt.getSeconds())}`;
   // Anything that is not a letter, digit or dash could become a path separator
   // or an extension, and a bot name comes from a person.
-  const safeBot = botName.replace(/[^A-Za-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "bot";
-  return `call-${stamp}-${safeBot}.wav`;
+  const clean = (value: string) => value.replace(/[^A-Za-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  const safeBot = clean(botName) || "bot";
+  const safeId = clean(callId).slice(0, 24) || pad(startedAt.getMilliseconds(), 3);
+  return `call-${stamp}-${safeBot}-${safeId}.wav`;
 }
 
 /** Whether a recording is old enough for BotFleet to delete it. */
