@@ -1071,7 +1071,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                   const value = group.remainingPercent == null
                     ? "not reported"
                     : `${group.remainingPercent}% available`;
-                  return `${group.label}: ${value} (5h window)`;
+                  return `${group.label}: ${value} (5-hour window)`;
                 })
               : [
                   // The wildcard cooldown (Cursor's monthly cap, an exhausted
