@@ -296,9 +296,11 @@ export interface RoutineManagerOptions {
    *  already going is not asked, and a person's turn never reaches this. */
   hostHot?: () => string | null;
   /** How long a queued webhook may wait on `hostHot` before it dispatches
-   *  anyway.  Measured from the receipt's `createdAt`.  Absent uses
-   *  `DEFAULT_WEBHOOK_HOT_DEFER_MS` (20 minutes).  Read on each tick so a
-   *  live config refresh applies without rebuilding the scheduler. */
+   *  anyway.  Measured from the tick that first parked it on the host, not
+   *  from `createdAt`, so time already spent on a busy bot or a dead engine
+   *  does not eat the window.  Absent uses `DEFAULT_WEBHOOK_HOT_DEFER_MS`
+   *  (20 minutes).  Read on each tick so a live config refresh applies
+   *  without rebuilding the scheduler. */
   webhookHotDeferMaxMs?: () => number;
   /** One-line operational log.  Absent writes with `console.log`. */
   log?: (line: string) => void;

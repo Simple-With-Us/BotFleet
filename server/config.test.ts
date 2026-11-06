@@ -58,6 +58,7 @@ import {
   applyAgentProxyEnv,
   DEFAULT_AGENT_PROXY_ADDRESS,
   isHttpsUrl,
+  clampPlacementWindow,
   type AppConfig,
 } from "./config.ts";
 import { isSentryDsn as isBrowserSentryDsn } from "../src/lib/observability-config.ts";
@@ -855,6 +856,47 @@ describe("credential env preference", () => {
     expect(process.env.DEEPSEEK_URL).toBe("https://just-saved.example.test");
     syncCredentialEnv({ deepseek: { url: "" } });
     expect(process.env.DEEPSEEK_URL).toBeUndefined();
+  });
+});
+
+describe("the placement knobs", () => {
+  beforeEach(() => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+  afterEach(() => {
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+
+  it("keeps the unreachable window longer than the heartbeat period", () => {
+    // A worker that has not said so for less than one period is healthy, so
+    // an inverted pair would mark a healthy worker unreachable.
+    const clamped = parseStoredConfig({ placement: { heartbeatSeconds: 60, unreachableAfterSeconds: 30 } });
+    expect(clamped.placement).toEqual({ heartbeatSeconds: 60, unreachableAfterSeconds: 61 });
+  });
+
+  it("leaves a pair that already holds the order alone", () => {
+    const kept = parseStoredConfig({ placement: { heartbeatSeconds: 15, unreachableAfterSeconds: 30 } });
+    expect(kept.placement).toEqual({ heartbeatSeconds: 15, unreachableAfterSeconds: 30 });
+  });
+
+  it("raises the window after the vault resolves an inverted pair", () => {
+    expect(clampPlacementWindow({ heartbeatSeconds: 120, unreachableAfterSeconds: 60 })).toEqual({
+      heartbeatSeconds: 120,
+      unreachableAfterSeconds: 121,
+    });
+    expect(clampPlacementWindow({ heartbeatSeconds: 120, unreachableAfterSeconds: 300 })).toEqual({
+      heartbeatSeconds: 120,
+      unreachableAfterSeconds: 300,
+    });
+    expect(clampPlacementWindow({ unreachableAfterSeconds: 30 })).toEqual({ unreachableAfterSeconds: 30 });
+  });
+
+  it("persists the section, so a save of a knob reaches the file", () => {
+    saveConfig({ placement: { heartbeatSeconds: 20, unreachableAfterSeconds: 45 } });
+    const stored = JSON.parse(readFileSync(join(DATA_DIR, "config.json"), "utf8"));
+    expect(stored.placement).toMatchObject({ heartbeatSeconds: 20, unreachableAfterSeconds: 45 });
+    expect(loadConfig().placement).toMatchObject({ heartbeatSeconds: 20, unreachableAfterSeconds: 45 });
   });
 });
 
