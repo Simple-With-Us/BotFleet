@@ -194,7 +194,7 @@ struct SettingsView: View {
 
                     Picker(selection: Binding(
                         get: {
-                            let raw = session.config?.busySendDefault?.lowercased() ?? "steer"
+                            let raw = session.config?.busySendDefault?.lowercased() ?? "queue"
                             return raw == "queue" ? "queue" : "steer"
                         },
                         set: { mode in
