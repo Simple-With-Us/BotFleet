@@ -135,9 +135,38 @@ export function TrajectoryPanel({
       }),
     [shownRows, trajectory.turns, trajectory.bounds, filtering],
   );
+  // Newest at the TOP.  A person watching a bot work wants the step that just
+  // happened, not a scroll down a page that keeps growing; a step arriving at
+  // the top also pushes the rest down, so the thing being watched stays put
+  // under the eye.  Grouping stays in time order on purpose: `groupByTurn`
+  // places a turn with no steps by finding the first group starting after it,
+  // which only means anything against an ascending list.
+  const newestFirstRows = useMemo(() => [...shownRows].reverse(), [shownRows]);
+  const newestFirstGroups = useMemo(
+    () => groups.map((group) => ({ ...group, rows: [...group.rows].reverse() })).reverse(),
+    [groups],
+  );
+  // Earlier steps belong at whichever end the list's oldest row is: the bottom
+  // for the two step lists, and the top for the Calls table, whose order the
+  // sort buttons own.
+  const earlierStepsAtTop = mode === "calls";
 
-  const visible = mode === "calls" ? shownCalls : shownRows;
+  const visible = mode === "calls" ? shownCalls : newestFirstRows;
   const hidden = (mode === "calls" ? calls.length : matching.length) - visible.length;
+  const earlierSteps = hidden > 0 && (
+    <div className="flex justify-center px-5 py-2">
+      <button
+        type="button"
+        onClick={() => setWindowSize((value) => value + STEP_WINDOW)}
+        className={cn(
+          "rounded-full border border-hairline/40 bg-panel px-3 py-1 text-[12.5px] text-ink-secondary hover:bg-raised hover:text-ink",
+          ROW_FOCUS,
+        )}
+      >
+        Show Earlier Steps ({hidden.toLocaleString("en-US")} more)
+      </button>
+    </div>
+  );
   const control: ListControl = {
     threadId,
     expanded,
@@ -259,28 +288,16 @@ export function TrajectoryPanel({
               <p className="px-5 py-6 text-[13px] text-ink-secondary">No steps match “{query.trim()}”.</p>
             ) : (
               <>
-                {hidden > 0 && (
-                  <div className="flex justify-center px-5 py-2">
-                    <button
-                      type="button"
-                      onClick={() => setWindowSize((value) => value + STEP_WINDOW)}
-                      className={cn(
-                        "rounded-full border border-hairline/40 bg-panel px-3 py-1 text-[12.5px] text-ink-secondary hover:bg-raised hover:text-ink",
-                        ROW_FOCUS,
-                      )}
-                    >
-                      Show Earlier Steps ({hidden.toLocaleString("en-US")} more)
-                    </button>
-                  </div>
-                )}
-                {mode === "duration" && <StepList rows={shownRows} control={control} label="Steps" />}
-                {mode === "turns" && <TurnList groups={groups} control={control} />}
+                {earlierStepsAtTop && earlierSteps}
+                {mode === "duration" && <StepList rows={newestFirstRows} control={control} label="Steps" />}
+                {mode === "turns" && <TurnList groups={newestFirstGroups} control={control} />}
                 {mode === "calls" &&
                   (shownCalls.length === 0 ? (
                     <p className="px-5 py-6 text-[13px] text-ink-secondary">No tool calls in this thread yet.</p>
                   ) : (
                     <CallsTable calls={shownCalls} control={control} sort={sort} descending={descending} onSort={onSort} />
                   ))}
+                {!earlierStepsAtTop && earlierSteps}
               </>
             )}
           </>

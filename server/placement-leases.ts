@@ -102,9 +102,10 @@ export interface PlacementLeaseDeps {
   /** Explicit legacy seam; production requires the transactional authority. */
   volatileForTests?: true;
   now?: () => number;
-  /** A worker unseen for this long is unreachable.  Injectable: the plan
-   *  leaves the value to the heartbeat knobs, which are not set yet. */
-  unreachableAfterMs?: number;
+  /** A worker unseen for this long is unreachable.  A getter, like every other
+   *  live value here, so the `placement.unreachableAfterSeconds` knob applies
+   *  without a restart. */
+  unreachableAfterMs?: () => number;
   newLeaseId?: () => string;
 }
 
@@ -137,7 +138,7 @@ export class PlacementLeaseService {
   private readonly jobs = new Map<string, PlacementJob>();
   private readonly pendingStops = new Map<HostId, Set<string>>();
   private readonly now: () => number;
-  private readonly unreachableAfterMs: number;
+  private readonly unreachableAfterMs: () => number;
   private readonly newLeaseId: () => string;
 
   constructor(deps: PlacementLeaseDeps) {
@@ -148,7 +149,7 @@ export class PlacementLeaseService {
     this.controllerStore = deps.controllerStore;
     this.current = { ...(deps.store?.readScope().controller ?? deps.controllerStore?.read() ?? deps.controller) };
     this.now = deps.now ?? Date.now;
-    this.unreachableAfterMs = deps.unreachableAfterMs ?? 30_000;
+    this.unreachableAfterMs = deps.unreachableAfterMs ?? (() => 30_000);
     this.newLeaseId = deps.newLeaseId ?? (() => `lease_${randomUUID()}`);
     if (this.store) {
       this.store.transactionScope({ active: true }, (state) => this.reconcilePayloads(state));
@@ -316,6 +317,21 @@ export class PlacementLeaseService {
       this.loadJobCommand(job);
       return { ...job };
     });
+  }
+
+  /** The jobs this authority still holds, named by their bot and their
+   *  conversation.  In a server mode this is the whole system's placeable
+   *  work, because the controller's queue is the only place a job record
+   *  lives.  The command is never loaded:  a count needs the owner, not the
+   *  payload. */
+  activeJobs(): Array<{ botId: string; threadId: string }> {
+    if (this.store) this.refreshController({ active: true, recent: true });
+    const active: Array<{ botId: string; threadId: string }> = [];
+    for (const job of this.jobs.values()) {
+      if (job.hidden || TERMINAL.includes(job.status)) continue;
+      active.push({ botId: job.botId, threadId: job.threadId });
+    }
+    return active;
   }
 
   /** The epoch fence every state-changing message crosses first: versions
@@ -504,7 +520,7 @@ export class PlacementLeaseService {
     if (!this.store && job.status !== "queued") return refuse(`job ${message.jobId} is ${job.status}, not queued; it is never re-dispatched`);
     const worker = this.workers.get(message.hostId);
     if (!worker) return refuse(`${message.hostId} is not registered with this controller`);
-    if (this.now() - worker.lastSeen > this.unreachableAfterMs) return refuse(`${message.hostId} has not heartbeated within the window`);
+    if (this.now() - worker.lastSeen > this.unreachableAfterMs()) return refuse(`${message.hostId} has not heartbeated within the window`);
     if (!worker.admission.admit) return refuse(worker.admission.reason ?? `${message.hostId} is not admitting work`);
     const existing = job.leaseId ? this.leases.get(job.leaseId) : undefined;
     if (this.store && job.status === "dispatching" && existing?.state === "active" && existing.host === message.hostId
@@ -643,7 +659,7 @@ export class PlacementLeaseService {
     }
     const worker = this.workers.get(lease.host);
     if (!worker) return refuse(`${lease.host} is not registered with this controller`);
-    if (this.now() - worker.lastSeen > this.unreachableAfterMs) return refuse(`${lease.host} has not heartbeated within the window`);
+    if (this.now() - worker.lastSeen > this.unreachableAfterMs()) return refuse(`${lease.host} has not heartbeated within the window`);
     if (!worker.admission.admit) return refuse(worker.admission.reason ?? `${lease.host} is not admitting work`);
     if (!hostCanRunCommand(worker.capabilities, job.command, { cwd: job.cwd })) {
       return refuse(`${lease.host} cannot run this job (${job.requiredReason ?? "capability missing"})`);
@@ -840,7 +856,7 @@ export class PlacementLeaseService {
     for (const job of this.jobs.values()) {
       if (!job.host || (job.status !== "dispatching" && job.status !== "running")) continue;
       const worker = this.workers.get(job.host);
-      if (!worker || at - worker.lastSeen > this.unreachableAfterMs) {
+      if (!worker || at - worker.lastSeen > this.unreachableAfterMs()) {
         job.status = "worker-unreachable";
         changed.push(job.jobId);
       }

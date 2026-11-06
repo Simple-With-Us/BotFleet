@@ -1233,7 +1233,9 @@ struct ChatView: View {
     /// the server's answer (Steer Now) can wait for it instead of guessing
     /// with a sleep.  Callers that do not care discard it.
     private func busySendDefaultMode() -> String {
-        let raw = session.config?.busySendDefault?.lowercased() ?? "steer"
+        // "queue" mirrors DEFAULT_BUSY_SEND_DEFAULT in
+        // shared/busy-send-default.ts — keep the two in step (BF-2442).
+        let raw = session.config?.busySendDefault?.lowercased() ?? "queue"
         return raw == "queue" ? "queue" : "steer"
     }
 
@@ -1271,7 +1273,9 @@ struct ChatView: View {
         let sentText = text
         sending = true
         var delivery = busyDelivery
-        if delivery == nil, current.busy, case .bot = current, busySendDefaultMode() == "queue" {
+        // Until the config loads the client cannot know the workspace default, so it
+        // sends no override and the server's own setting decides.
+        if delivery == nil, current.busy, case .bot = current, session.config != nil, busySendDefaultMode() == "queue" {
             delivery = "queue"
         }
         let task = Task {
