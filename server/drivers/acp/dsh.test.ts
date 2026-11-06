@@ -327,6 +327,8 @@ describe("native DSH ACP turns", () => {
     ]));
     const liveUpdate = recorder!.events.find((event) => event.type === "thread.token-usage.updated");
     expect(liveUpdate).not.toHaveProperty("output");
+    // the fake agent reports size: 128000, carried as the context window
+    expect(liveUpdate).toMatchObject({ contextWindow: 128_000 });
     expect(done).toMatchObject({ ok: true, usage: { input: 1234 } });
     expect(done).not.toHaveProperty("usage.output");
   });

@@ -1,6 +1,6 @@
 // The Trajectory tab's lists: the same steps three ways.
 //
-//   StepList   one compact monospace line per step, newest last; click a line
+//   StepList   one compact monospace line per step, newest first; click a line
 //              to open it in place
 //   TurnList   the same lines grouped under each turn's summary
 //   CallsTable a flat, sortable table of tool calls

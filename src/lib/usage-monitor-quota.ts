@@ -79,12 +79,12 @@ export function antigravityDisplayWindows(
       : typeof fraction === "number" && Number.isFinite(fraction) && fraction >= 0 && fraction <= 1 ? fraction * 100 : null;
     return {
       id: `antigravity-local:${model.modelId}`, provider: "google-antigravity", sourceApp: "antigravity-local",
-      label: `${isGeminiQuotaModel(model) ? "Gemini Models" : "Third-Party Models"} · 5-hour`,
+      label: `${isGeminiQuotaModel(model) ? "Gemini Models" : "Third-Party Models"} · 5-Hour`,
       window: "5h", remainingPercent: percent, resetAt, skip: false, occurredAt,
     };
   });
   return antigravityQuotaWindows(legacy.length > 0 ? legacy : [{
-    id: "antigravity-unreported", provider: "google-antigravity", label: "Gemini Models · 5-hour",
+    id: "antigravity-unreported", provider: "google-antigravity", label: "Gemini Models · 5-Hour",
     window: "5h", remainingPercent: null, resetAt: null, skip: false,
   }]);
 }
@@ -102,7 +102,7 @@ function poolFor(window: UsageMonitorQuotaWindow): AntigravityPool | null {
 function periodFor(window: UsageMonitorQuotaWindow): AntigravityPeriod | null {
   const token = normalized(window.window).replace(/-/g, "");
   if (["weekly", "week", "1w", "7d", "168h", "10080m"].includes(token)) return "weekly";
-  if (["5h", "5hr", "5hours", "300m"].includes(token)) return "5h";
+  if (["5h", "5hr", "5hour", "5hours", "300m"].includes(token)) return "5h";
   const label = window.label.toLowerCase();
   if (label.includes("weekly")) return "weekly";
   if (label.includes("5-hour") || label.includes("5 hour")) return "5h";
@@ -114,7 +114,7 @@ function finitePercent(value: number | null | undefined): number | null {
 }
 
 function periodLabel(period: AntigravityPeriod): string {
-  return period === "5h" ? "5-hour" : "Weekly";
+  return period === "5h" ? "5-Hour" : "Weekly";
 }
 
 function observedAt(window: UsageMonitorQuotaWindow): number | null {
