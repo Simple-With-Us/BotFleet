@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
+import { z } from "zod";
 
 import { spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
@@ -17,12 +18,19 @@ const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
 const PORT = 29800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
 
+const MessageSchema = z.object({ id: z.string(), role: z.string(), kind: z.string().optional(), text: z.string().optional() });
+const BotSnapshotSchema = z.object({ id: z.string(), busy: z.boolean().optional(), messages: z.array(MessageSchema).default([]) });
+const BotsResponseSchema = z.object({ bots: z.array(BotSnapshotSchema) });
+const CreatedBotSchema = z.object({ bot: z.object({ id: z.string() }) });
+const RefusalSchema = z.object({ queued: z.unknown().optional(), error: z.unknown().optional() });
+type BotSnapshot = z.infer<typeof BotSnapshotSchema>;
+
 describe("steer-queue crash journal e2e", () => {
   let child: ChildProcess | null = null;
   let home = "";
   let stderr = "";
 
-  const api = async (method: string, path: string, body?: { text?: string; name?: string; modelSelection?: { instanceId: string; model: string } }): Promise<{ status: number; body: any }> => {
+  const api = async (method: string, path: string, body?: { text?: string; name?: string; modelSelection?: { instanceId: string; model: string } }): Promise<{ status: number; body: unknown }> => {
     const res = await fetch(`${BASE}${path}`, {
       method,
       headers: body ? { "content-type": "application/json" } : undefined,
@@ -30,7 +38,14 @@ describe("steer-queue crash journal e2e", () => {
     });
     return { status: res.status, body: await res.json() };
   };
-  const botById = async (id: string) => (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === id);
+  const botById = async (id: string): Promise<BotSnapshot | undefined> =>
+    BotsResponseSchema.parse((await api("GET", "/api/bots")).body).bots.find((b) => b.id === id);
+  const botOrThrow = async (id: string): Promise<BotSnapshot> => {
+    const found = await botById(id);
+    if (!found) throw new Error(`bot ${id} is not in /api/bots`);
+    return found;
+  };
+  const createBot = async (): Promise<string> => CreatedBotSchema.parse((await api("POST", "/api/bots")).body).bot.id;
   const until = async (probe: () => Promise<boolean>, what: string, timeoutMs = 40_000) => {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
@@ -82,11 +97,11 @@ describe("steer-queue crash journal e2e", () => {
       );
       await start();
 
-      const bot = (await api("POST", "/api/bots")).body.bot;
-      await api("PATCH", `/api/bots/${bot.id}`, { name: "Crashy", modelSelection: { instanceId: "steer", model: "fake-model" } });
-      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "long job" })).status).toBe(202);
-      expect((await botById(bot.id)).busy).toBe(true);
-      const queued = await api("POST", `/api/bots/${bot.id}/messages`, { text: "survive the crash" });
+      const botId = await createBot();
+      await api("PATCH", `/api/bots/${botId}`, { name: "Crashy", modelSelection: { instanceId: "steer", model: "fake-model" } });
+      expect((await api("POST", `/api/bots/${botId}/messages`, { text: "long job" })).status).toBe(202);
+      expect((await botOrThrow(botId)).busy).toBe(true);
+      const queued = await api("POST", `/api/bots/${botId}/messages`, { text: "survive the crash" });
       expect(queued.body).toMatchObject({ ok: true, queued: true });
 
       // accepted means journaled: the words are on disk before the 202 matters
@@ -107,17 +122,17 @@ describe("steer-queue crash journal e2e", () => {
       writeFileSync(gate, "open");
       await start();
       await until(async () => {
-        const snapshot = await botById(bot.id);
-        return Boolean(snapshot) && snapshot.messages.some((m: any) => m.role === "user" && m.text === "survive the crash");
+        const snapshot = await botById(botId);
+        return snapshot !== undefined && snapshot.messages.some((m) => m.role === "user" && m.text === "survive the crash");
       }, "the queued send to come back");
       await until(async () => {
-        const snapshot = await botById(bot.id);
-        return snapshot.messages.some((m: any) => m.role === "bot" && m.kind === "text" && String(m.text).includes("survive the crash"));
+        const snapshot = await botOrThrow(botId);
+        return snapshot.messages.some((m) => m.role === "bot" && m.kind === "text" && String(m.text).includes("survive the crash"));
       }, "the restored send to run");
 
       // exactly one copy, and the journal has been emptied by the drain
-      const final = await botById(bot.id);
-      expect(final.messages.filter((m: any) => m.role === "user" && m.text === "survive the crash")).toHaveLength(1);
+      const final = await botOrThrow(botId);
+      expect(final.messages.filter((m) => m.role === "user" && m.text === "survive the crash")).toHaveLength(1);
       await until(async () => !existsSync(journal), "the journal to empty");
     },
     120_000,
@@ -146,24 +161,25 @@ describe("steer-queue crash journal e2e", () => {
         }),
       );
       await start();
-      const bot = (await api("POST", "/api/bots")).body.bot;
-      await api("PATCH", `/api/bots/${bot.id}`, { name: "NoJournal", modelSelection: { instanceId: "steer", model: "fake-model" } });
-      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "long job" })).status).toBe(202);
-      expect((await botById(bot.id)).busy).toBe(true);
+      const botId = await createBot();
+      await api("PATCH", `/api/bots/${botId}`, { name: "NoJournal", modelSelection: { instanceId: "steer", model: "fake-model" } });
+      expect((await api("POST", `/api/bots/${botId}/messages`, { text: "long job" })).status).toBe(202);
+      expect((await botOrThrow(botId)).busy).toBe(true);
 
       // A directory where the journal file goes makes every journal write fail, as a full disk would.
       mkdirSync(join(home, ".botfleet", STEER_JOURNAL_FILE));
-      const refused = await api("POST", `/api/bots/${bot.id}/messages`, { text: "cannot be saved" });
+      const refused = await api("POST", `/api/bots/${botId}/messages`, { text: "cannot be saved" });
       expect(refused.status).toBe(503);
-      expect(refused.body.queued).toBeUndefined();
-      expect(String(refused.body.error)).toMatch(/could not save/);
+      const refusal = RefusalSchema.parse(refused.body);
+      expect(refusal.queued).toBeUndefined();
+      expect(String(refusal.error)).toMatch(/could not save/);
       // The words are not left behind in memory: nothing queued, nothing in the thread.
-      expect((await botById(bot.id)).messages.some((m: any) => m.text === "cannot be saved")).toBe(false);
+      expect((await botOrThrow(botId)).messages.some((m) => m.text === "cannot be saved")).toBe(false);
       expect(stderr).not.toContain("cannot be saved");
 
       // Once journaling works again the same send is accepted.
       rmSync(join(home, ".botfleet", STEER_JOURNAL_FILE), { recursive: true });
-      const accepted = await api("POST", `/api/bots/${bot.id}/messages`, { text: "cannot be saved" });
+      const accepted = await api("POST", `/api/bots/${botId}/messages`, { text: "cannot be saved" });
       expect(accepted.body).toMatchObject({ ok: true, queued: true });
       expect(readFileSync(join(home, ".botfleet", STEER_JOURNAL_FILE), "utf8")).toContain("cannot be saved");
     },

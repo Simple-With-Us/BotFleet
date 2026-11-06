@@ -1,5 +1,5 @@
 // The steer queue's crash journal: failure, ordering and logging rules.
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -13,8 +13,12 @@ import {
   type SteerStore,
 } from "./steer-queue.ts";
 import {
+  appendHeldWork,
+  carriedWorkIds,
   HELD_SENDS_FILE,
+  journalItemStillOwed,
   readQueueJournal,
+  seedQueuedFirstSeen,
   STEER_JOURNAL_FILE,
   takeHeldWork,
   writeQueueJournal,
@@ -62,6 +66,68 @@ describe("steer queue crash journal", () => {
     // A directory where the temporary file must go makes the write fail the way a full disk does.
     expect(writeQueueJournal(join(dir, "missing"), [entry("lost")])).toBeInstanceOf(Error);
     expect(readFileSync(join(dir, STEER_JOURNAL_FILE), "utf8")).toBe(good);
+  });
+
+  it("never writes through a symlink planted where the temporary file goes", () => {
+    const dir = tmp();
+    const victim = join(dir, "victim.txt");
+    writeFileSync(victim, "untouched");
+    symlinkSync(victim, join(dir, `${STEER_JOURNAL_FILE}.${process.pid}.tmp`));
+    expect(writeQueueJournal(dir, [entry("private words")])).toBeNull();
+    expect(readFileSync(victim, "utf8")).toBe("untouched");
+    expect(readQueueJournal(dir)).toMatchObject([{ items: [{ text: "private words" }] }]);
+
+    const carrier = tmp();
+    const carrierVictim = join(carrier, "victim.txt");
+    writeFileSync(carrierVictim, "untouched");
+    symlinkSync(carrierVictim, join(carrier, `${HELD_SENDS_FILE}.${process.pid}.tmp`));
+    appendHeldWork(carrier, { queued: [entry("carried words")] });
+    expect(readFileSync(carrierVictim, "utf8")).toBe("untouched");
+    expect(takeHeldWork(carrier).queued).toMatchObject([{ items: [{ text: "carried words" }] }]);
+  });
+
+  it("still restores an entry that carries a key this version does not know", () => {
+    const dir = tmp();
+    const future = { ...entry("from a newer build"), addedLater: true };
+    writeFileSync(join(dir, STEER_JOURNAL_FILE), JSON.stringify({ version: 1, sends: [], queued: [future] }));
+    expect(readQueueJournal(dir)).toMatchObject([{ items: [{ text: "from a newer build" }] }]);
+  });
+
+  it("knows a carried committed batch by its queue id and by its transcript line", () => {
+    const committedItem = {
+      messageId: "queue-1",
+      text: "t",
+      prompt: "t",
+      relayed: false,
+      committed: { userMessageId: "line-1", excludeIds: [], relayed: false, heldAt: 1 },
+    };
+    const carried = { sends: [], queued: [{ botId: "bot-1", threadId: "thread-1", heldAt: 1, items: [committedItem] }], rooms: [] };
+    const ids = carriedWorkIds(carried);
+    expect([...ids].sort()).toEqual(["line-1", "queue-1"]);
+    const inThread = new Set<string>();
+    // The same batch in the journal is already carried: it must not run twice, even
+    // though its transcript line exists.
+    expect(journalItemStillOwed(committedItem, ids, inThread, () => true)).toBe(false);
+    // A committed batch nobody carries still runs while its transcript line exists.
+    expect(journalItemStillOwed(committedItem, new Set(), inThread, () => true)).toBe(true);
+    expect(journalItemStillOwed(committedItem, new Set(), inThread, () => false)).toBe(false);
+    // A plain queued item already drained into its thread (its queue id is on a line) is not owed.
+    const plain = { messageId: "queue-2", text: "p", prompt: "p", relayed: false };
+    expect(journalItemStillOwed(plain, new Set(), new Set(["queue-2"]), () => true)).toBe(false);
+    expect(journalItemStillOwed(plain, new Set(), inThread, () => true)).toBe(true);
+  });
+
+  it("seeds a restored send's first-held time from its journal entry, never from now", () => {
+    const firstSeen = new Map<string, number>();
+    const old = { ...entry("waited an hour"), heldAt: 1234 };
+    const committed = {
+      ...entry("already in the thread"),
+      items: [{ messageId: "q9", text: "c", prompt: "c", relayed: false, committed: { userMessageId: "l9", excludeIds: [], relayed: false, heldAt: 77 } }],
+    };
+    seedQueuedFirstSeen(firstSeen, [old, committed]);
+    expect(firstSeen.get("q1")).toBe(1234);
+    // A committed item keeps its own heldAt and is not seeded here.
+    expect(firstSeen.has("q9")).toBe(false);
   });
 
   it("sets an unreadable journal aside and never logs its text", () => {

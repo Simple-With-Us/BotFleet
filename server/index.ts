@@ -125,8 +125,11 @@ import {
   appendHeldWork,
   drainViewOf,
   inFlightCounts,
+  carriedWorkIds,
+  journalItemStillOwed,
   partitionByAge,
   readQueueJournal,
+  seedQueuedFirstSeen,
   takeHeldWork,
   UpdateDrain,
   writeQueueJournal,
@@ -6789,17 +6792,11 @@ setSteerQueueObserver(writeSteerJournal);
  *  up (its `queueId` is on a transcript line), or that an update carried, is
  *  dropped here so nothing runs twice. */
 function takeRecoveredQueueJournal(carried: HeldWork): HeldQueueEntry[] {
-  const carriedIds = new Set<string>([
-    ...carried.sends.map((send) => send.userMessageId),
-    ...carried.queued.flatMap((entry) => entry.items.map((item) => item.messageId)),
-  ]);
+  const carriedIds = carriedWorkIds(carried);
   const recovered: HeldQueueEntry[] = [];
   for (const entry of unrestoredQueueJournal) {
     const inThread = new Set(store.messagesFor(entry.threadId).flatMap((message) => (message.queueId ? [message.queueId] : [])));
-    const items = entry.items.filter((item) =>
-      item.committed
-        ? !carriedIds.has(item.committed.userMessageId) && store.hasMessage(entry.threadId, item.committed.userMessageId)
-        : !carriedIds.has(item.messageId) && !inThread.has(item.messageId));
+    const items = entry.items.filter((item) => journalItemStillOwed(item, carriedIds, inThread, (messageId) => store.hasMessage(entry.threadId, messageId)));
     if (items.length > 0) recovered.push({ ...entry, items });
   }
   unrestoredQueueJournal = [];
@@ -7000,6 +6997,9 @@ function restoreHeldWork(work: HeldWork, context: string) {
   for (const entry of queued.run) {
     if (!store.bot(entry.botId)) continue;
     for (const item of entry.items) if (item.relayed && !item.committed) relayQueuedMessageIds.add(item.messageId);
+    // Keep the send's true age: without this the next journal rewrite would
+    // treat every restored send as first seen now and reset its clock.
+    seedQueuedFirstSeen(queuedFirstSeen, [entry]);
     pending.push({
       heldAt: entry.heldAt,
       entry: {

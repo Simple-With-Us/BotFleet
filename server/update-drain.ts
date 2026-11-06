@@ -40,7 +40,7 @@
 // The harness owns the drain's lifetime.  It carries a deadline past the
 // updater's own window, so an updater killed mid-wait can never leave this
 // Mac holding work: the lease runs out and the drain releases itself.
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 
@@ -415,6 +415,27 @@ function readHeldWorkFile(path: string): HeldWork {
   };
 }
 
+/** Write a private temporary file that cannot be a planted link.  Anything
+ *  already at the path (a leftover, or a symlink someone put there) is removed
+ *  first, then the file is created exclusively without following links and the
+ *  open handle is checked to be a plain single-link file before any byte is
+ *  written, so the words can never be redirected through a link. */
+function writePrivateFile(path: string, text: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // Nothing was there.
+  }
+  const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.nlink !== 1) throw new Error("temporary file is not a plain single-link file");
+    writeFileSync(fd, text);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /** Add held work to the carrier, keeping any an earlier update left behind.
  *  Throws when it cannot write: the caller must then run the work instead,
  *  because a send that is neither on disk nor running would be lost. */
@@ -442,7 +463,7 @@ export function appendHeldWork(dataDir: string, work: Partial<HeldWork>): void {
     }),
   };
   const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+  writePrivateFile(temporary, `${JSON.stringify(file, null, 2)}\n`);
   renameSync(temporary, path);
 }
 
@@ -464,7 +485,7 @@ export function writeQueueJournal(dataDir: string, queued: readonly HeldQueueEnt
     const file = { version: 1, ...HeldWorkSchema.parse({ sends: [], queued: [...queued], rooms: [] }) };
     const temporary = `${path}.${process.pid}.tmp`;
     try {
-      writeFileSync(temporary, `${JSON.stringify(file)}\n`, { mode: 0o600 });
+      writePrivateFile(temporary, `${JSON.stringify(file)}\n`);
       renameSync(temporary, path);
     } catch (error) {
       // A full disk leaves the last good journal in place; do not leave a
@@ -480,6 +501,45 @@ export function writeQueueJournal(dataDir: string, queued: readonly HeldQueueEnt
   } catch (error) {
     return error instanceof Error ? error : new Error(String(error));
   }
+}
+
+/** Remember when each restored queued send was first held, so the next journal
+ *  rewrite does not treat it as first seen now and reset its age.  Committed
+ *  items already carry their own `heldAt`. */
+export function seedQueuedFirstSeen(firstSeen: Map<string, number>, entries: readonly HeldQueueEntry[]): void {
+  for (const entry of entries) {
+    for (const item of entry.items) if (!item.committed) firstSeen.set(item.messageId, entry.heldAt);
+  }
+}
+
+/** Every id that identifies work an update carried, whichever way it is
+ *  named: a plain send by its transcript line, a queued item by its queue id,
+ *  and a committed queued item by BOTH its queue id and its transcript line
+ *  (they differ when the batch was committed after it was queued). */
+export function carriedWorkIds(carried: HeldWork): Set<string> {
+  const ids = new Set<string>();
+  for (const send of carried.sends) ids.add(send.userMessageId);
+  for (const entry of carried.queued) {
+    for (const item of entry.items) {
+      ids.add(item.messageId);
+      if (item.committed) ids.add(item.committed.userMessageId);
+    }
+  }
+  return ids;
+}
+
+/** Whether a journaled item still needs to run after a crash: not already
+ *  carried by an update (under either of its ids), not already drained into
+ *  its thread, and, for a committed batch, its transcript line still there. */
+export function journalItemStillOwed(
+  item: HeldQueueEntry["items"][number],
+  carriedIds: ReadonlySet<string>,
+  queueIdsInThread: ReadonlySet<string>,
+  hasMessage: (messageId: string) => boolean,
+): boolean {
+  if (carriedIds.has(item.messageId)) return false;
+  if (item.committed) return !carriedIds.has(item.committed.userMessageId) && hasMessage(item.committed.userMessageId);
+  return !queueIdsInThread.has(item.messageId);
 }
 
 /** The journal a previous run left, entry by entry; an unreadable file reads
