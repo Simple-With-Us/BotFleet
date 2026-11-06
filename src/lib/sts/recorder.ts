@@ -192,13 +192,13 @@ class Track {
     const out = new Int16Array(this.samples);
     let offset = 0;
     for (const chunk of this.chunks) {
-      if (typeof chunk === "number") {
-        offset += chunk; // already zero
-        continue;
+      if (chunk instanceof ArrayBuffer) {
+        const view = new Int16Array(chunk);
+        out.set(view, offset);
+        offset += view.length;
+      } else {
+        offset += chunk; // silence: the output is already zero
       }
-      const view = new Int16Array(chunk);
-      out.set(view, offset);
-      offset += view.length;
     }
     return out;
   }
@@ -276,7 +276,7 @@ export function buildStereoWav(
 
 /** Monotonic where available, so a system clock step cannot become silence or rejected audio. */
 function defaultClock(): number {
-  return typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now();
+  return globalThis.performance?.now() ?? Date.now();
 }
 
 /**
