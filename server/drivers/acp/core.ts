@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 
 import { z } from "zod";
 
-import { awaitingFirstReply, clearAwaitingFirstReply, markAwaitingFirstReply } from "./first-reply-ledger.ts";
+import { createFirstReplyLedger } from "./first-reply-ledger.ts";
 import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV } from "../../config.ts";
 import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
@@ -862,6 +862,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
        *  bigger budget).  An LRU past SUMMARY_CACHE_MAX_THREADS:  the driver
        *  lives as long as the harness, and one note per thread forever is a
        *  leak. */
+      const firstReplyLedger = createFirstReplyLedger(instanceId);
       const summaryCacheByThread = new Map<string, { summary: string; coveredTurns: number }>();
       const rememberSummary = (threadId: string, entry: { summary: string; coveredTurns: number }) => {
         if (summaryCacheByThread.has(threadId)) summaryCacheByThread.delete(threadId);
@@ -2410,12 +2411,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             } else {
               // Applied after budgeting (below), so its bytes are taken out of
               // the budget here instead of being added past the ceiling.
-              const markerOwed = openedNewSession || (support.promptPrefix !== undefined && sessionId !== null && awaitingFirstReply(instanceId, sessionId));
+              const markerOwed = openedNewSession || (support.promptPrefix !== undefined && sessionId !== null && firstReplyLedger.owed(sessionId));
               const promptPrefix = support.promptPrefix?.(promptTurn, { newSession: markerOwed }) ?? "";
               if (promptPrefix && markerOwed && sessionId) {
                 // Recorded before the prompt goes out: if it fails or is never
                 // answered, the next turn on this cursor owes the marker again.
-                markAwaitingFirstReply(instanceId, sessionId);
+                firstReplyLedger.record(sessionId);
                 markerRecordedFor = sessionId;
               }
               const unreservedBudgetBytes = resolveAcpPromptBudget({
@@ -2597,7 +2598,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               turnConfig.promptIdleMs ?? DEFAULT_PROMPT_IDLE_MS,
             );
             // The agent answered, so this session has had its first prompt.
-            if (markerRecordedFor) clearAwaitingFirstReply(instanceId, markerRecordedFor);
+            if (markerRecordedFor) firstReplyLedger.answered(markerRecordedFor);
             // opencode 1.18.18 reports usage at the result root; grok and
             // gemini put it under _meta. Read both rather than lose the count.
             const usage = result?.usage ?? result?._meta ?? {};
