@@ -117,17 +117,17 @@ describe("first-reply ledger", () => {
     expect(readdirSync(pendingDir()).filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
 
-  it("drops a record only by age, not because other sessions were added", () => {
+  it("never expires a record: a month-old pending session is still owed, whatever else is added", () => {
     const old = ledger();
     old.record("stale");
     const staleFile = join(pendingDir(), readdirSync(pendingDir())[0]);
-    const longAgo = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+    const longAgo = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000);
     utimesSync(staleFile, longAgo, longAgo);
-    // 600 other sessions do not push anything out, since there is no count cap.
     const driver = ledger();
     for (let i = 0; i < 600; i++) driver.record(`bulk-${i}`);
     for (let i = 0; i < 600; i++) expect(ledger().owed(`bulk-${i}`)).toBe(true);
-    // The abandoned month-old one went at the first write after it aged out: the one deliberate loss.
+    expect(ledger().owed("stale")).toBe(true);
+    ledger().answered("stale");
     expect(ledger().owed("stale")).toBe(false);
   });
 });

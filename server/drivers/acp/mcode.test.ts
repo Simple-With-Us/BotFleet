@@ -747,9 +747,15 @@ describe("mcodePromptPrefix", () => {
   const persona = (name: string) => `You are ${name} (display: ${name}), a bot in BotFleet.`;
 
   it("is the bot's configured name, exactly as written, for a new session", () => {
-    for (const name of ["Plumber", "Team Scout", "Zed-9 Prime", "ab-cd Name"]) {
+    for (const name of ["Plumber", "Team Scout", "Zed-9 Prime", "ab-cd Name", "BF-Plumber", "BF Plumber", "BF-BF-Plumber", "GB-Plumber"]) {
       expect(mcodePromptPrefix({ system: persona(name) }, { newSession: true })).toBe(`[${name}]\n\n`);
     }
+  });
+
+  it("shows a name that already carries a prefix exactly once, unchanged", () => {
+    const marker = mcodePromptPrefix({ system: persona("BF-Plumber") }, { newSession: true });
+    expect(marker).toBe("[BF-Plumber]\n\n");
+    expect(marker?.match(/BF/g)).toHaveLength(1);
   });
 
   it("is absent for a session that already has its marker", () => {

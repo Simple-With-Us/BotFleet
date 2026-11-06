@@ -15,19 +15,20 @@
 // as pending, and one session's file can never hide or clobber another's.  A
 // write is a temp file renamed into place, a clear is an unlink, and drivers that
 // touch different sessions touch different files, so concurrent drivers cannot
-// lose each other's updates.  Entries are dropped by age only (a session pending
-// for a month has been abandoned), never by count.
+// lose each other's updates.  Nothing is ever expired: a record leaves only when
+// its prompt is answered.  A session that never gets a reply leaves one tiny file
+// behind, which costs a few bytes; dropping it by age or count could silently
+// lose the identification for a cursor that is resumed later.
 //
 // What it cannot do, stated plainly: if the data directory cannot be written, the
 // record lives in memory for this process only and a restart forgets it.  That
 // is logged (a fixed line, no user text) rather than hidden.
 import { createHash } from "node:crypto";
-import { accessSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { dataDir } from "../../data-dir.ts";
 
-const STALE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_ANSWERED_IN_MEMORY = 5000;
 
 function ledgerDir(): string {
@@ -83,15 +84,6 @@ export function createFirstReplyLedger(instanceId: string, warn: (line: string) 
         writeFileSync(tmp, `${Date.now()}\n`, { mode: 0o600 });
         renameSync(tmp, path);
         pending.delete(sessionId);
-        const cutoff = Date.now() - STALE_AFTER_MS;
-        for (const entry of readdirSync(dir)) {
-          if (!entry.endsWith(".pending")) continue;
-          try {
-            if (statSync(join(dir, entry)).mtimeMs < cutoff) unlinkSync(join(dir, entry));
-          } catch {
-            /* another driver removed it first */
-          }
-        }
         return true;
       } catch {
         warn("[acp] first-reply ledger not writable; a restart before the first reply will forget the session marker");
