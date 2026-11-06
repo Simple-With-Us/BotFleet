@@ -68,15 +68,18 @@ export interface StsCallRecorder {
    * side and per provider (the microphone is 16 kHz, Gemini speaks at 24 kHz).
    * The first frame sets the track's rate; a later frame at another rate is
    * refused and counted in `droppedFrames`, because it would be mixed in at the
-   * wrong speed.  Each frame is also placed on a shared clock (see
-   * `createStsCallRecorder`), so a side that pauses is padded with silence
-   * instead of sliding earlier than the other.
+   * wrong speed.  Frames are placed on a shared clock (see
+   * `createStsCallRecorder`): the bot track, which only has frames while the
+   * provider speaks, is padded with silence after a pause so it does not slide
+   * earlier than the always-on microphone track.
    */
   write(side: RecordingSide, pcm: ArrayBuffer, sampleRate: number): void;
   /** Close both tracks and produce the file. Idempotent. */
   stop(): StsRecording | null;
-  /** Frames refused because their rate disagreed with their track's rate. */
+  /** Every frame refused: a bad or disagreeing sample rate, or a track at its cap. */
   readonly droppedFrames: number;
+  /** The part of `droppedFrames` refused because the track had reached its cap. */
+  readonly cappedFrames: number;
   /** Seconds written so far, for the in-call readout. */
   readonly elapsedSeconds: number;
 }
@@ -109,6 +112,8 @@ export function resamplePcm16(input: Int16Array, from: number, to: number): Int1
 /** Longest a single track may grow: one hour, about 115 MB at 16 kHz and 173 MB at 24 kHz. */
 export const MAX_TRACK_SECONDS = 3600;
 
+type AppendResult = "ok" | "rate" | "cap";
+
 /**
  * One side of the call, buffered as it arrives.
  *
@@ -117,9 +122,19 @@ export const MAX_TRACK_SECONDS = 3600;
  * whatever the buffer holds later.
  */
 class Track {
-  constructor(private readonly maxSeconds: number) {}
+  /**
+   * `padGaps` is true for a track that only has frames while someone is
+   * speaking (the provider's audio).  The microphone forwards every captured
+   * frame, so it is continuous and is never padded: padding it would split the
+   * person's speech on rounding jitter.
+   */
+  constructor(
+    private readonly maxSeconds: number,
+    private readonly padGaps: boolean,
+  ) {}
 
-  private chunks: ArrayBuffer[] = [];
+  /** Audio frames, or a number of silent samples that is never materialised. */
+  private chunks: Array<ArrayBuffer | number> = [];
 
   private samples = 0;
 
@@ -143,32 +158,33 @@ class Track {
    * that arrives early (a provider sending faster than real time) simply
    * queues behind what is there, the way playback does.
    */
-  append(pcm: ArrayBuffer, sampleRate: number, atSeconds: number): boolean {
-    if (pcm.byteLength === 0) return true;
+  append(pcm: ArrayBuffer, sampleRate: number, atSeconds: number): AppendResult {
+    if (pcm.byteLength === 0) return "ok";
     // An odd trailing byte is a truncated frame, not a half sample to guess at.
     const usable = pcm.byteLength - (pcm.byteLength % 2);
-    if (usable <= 0) return true;
-    if (!(sampleRate > 0)) return false;
+    if (usable <= 0) return "ok";
+    if (!(sampleRate > 0)) return "rate";
     // The first frame decides the rate.  A frame at another rate would be
     // resampled against the wrong denominator, so it is refused, not mixed in.
-    if (this.rate !== 0 && sampleRate !== this.rate) return false;
+    if (this.rate !== 0 && sampleRate !== this.rate) return "rate";
     const rate = this.rate === 0 ? sampleRate : this.rate;
     const target = Math.round(Math.max(0, atSeconds) * rate);
     const gap = target - this.samples;
-    const padding = gap > rate * MAX_UNPADDED_GAP_SECONDS ? gap : 0;
+    const padding = this.padGaps && gap > rate * MAX_UNPADDED_GAP_SECONDS ? gap : 0;
     // Bounded memory: past the cap the frame is refused (and counted), so a call
     // that never ends cannot grow the recording without limit.
-    if ((this.samples + padding + usable / 2) / rate > this.maxSeconds) return false;
+    if ((this.samples + padding + usable / 2) / rate > this.maxSeconds) return "cap";
     const copy = new ArrayBuffer(usable);
     new Uint8Array(copy).set(new Uint8Array(pcm, 0, usable));
     if (this.rate === 0) this.rate = sampleRate;
     if (padding > 0) {
-      this.chunks.push(new ArrayBuffer(padding * 2));
+      // Silence is a count, not a buffer: a long pause costs nothing until the file is built.
+      this.chunks.push(padding);
       this.samples += padding;
     }
     this.chunks.push(copy);
     this.samples += usable / 2;
-    return true;
+    return "ok";
   }
 
   /** The track as one contiguous Int16 view. */
@@ -176,6 +192,10 @@ class Track {
     const out = new Int16Array(this.samples);
     let offset = 0;
     for (const chunk of this.chunks) {
+      if (typeof chunk === "number") {
+        offset += chunk; // already zero
+        continue;
+      }
       const view = new Int16Array(chunk);
       out.set(view, offset);
       offset += view.length;
@@ -254,6 +274,11 @@ export function buildStereoWav(
   return buffer;
 }
 
+/** Monotonic where available, so a system clock step cannot become silence or rejected audio. */
+function defaultClock(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now();
+}
+
 /**
  * Start a stereo recording.
  *
@@ -262,13 +287,17 @@ export function buildStereoWav(
  * clock in milliseconds and exists so tests can drive it.
  */
 export function createStsCallRecorder(options: { now?: () => number; maxTrackSeconds?: number } = {}): StsCallRecorder {
-  const now = options.now ?? (() => Date.now());
+  const now = options.now ?? defaultClock;
   const origin = now();
-  const maxTrackSeconds = options.maxTrackSeconds ?? MAX_TRACK_SECONDS;
-  const tracks: Record<RecordingSide, Track> = { user: new Track(maxTrackSeconds), bot: new Track(maxTrackSeconds) };
+  const requestedCap = options.maxTrackSeconds;
+  // A NaN, zero or negative cap would either disable the limit or discard every frame.
+  const maxTrackSeconds =
+    requestedCap !== undefined && Number.isFinite(requestedCap) && requestedCap > 0 ? requestedCap : MAX_TRACK_SECONDS;
+  const tracks: Record<RecordingSide, Track> = { user: new Track(maxTrackSeconds, false), bot: new Track(maxTrackSeconds, true) };
   let closed: StsRecording | null = null;
   let stopped = false;
   let dropped = 0;
+  let capped = 0;
 
   return {
     write(side, pcm, sampleRate) {
@@ -276,7 +305,9 @@ export function createStsCallRecorder(options: { now?: () => number; maxTrackSec
       // late frame from a torn-down audio path must not reopen the recording.
       if (stopped) return;
       try {
-        if (!tracks[side].append(pcm, sampleRate, (now() - origin) / 1000)) dropped += 1;
+        const result = tracks[side].append(pcm, sampleRate, (now() - origin) / 1000);
+        if (result !== "ok") dropped += 1;
+        if (result === "cap") capped += 1;
       } catch {
         // A recording is never worth failing a call over.
       }
@@ -284,26 +315,38 @@ export function createStsCallRecorder(options: { now?: () => number; maxTrackSec
     stop() {
       if (stopped) return closed;
       stopped = true;
-      // Both tracks come out at the file's rate, so the interleave is a
-      // frame-for-frame alignment in time rather than a coincidence.
-      const user = tracks.user.atRate(RECORDING_SAMPLE_RATE);
-      const bot = tracks.bot.atRate(RECORDING_SAMPLE_RATE);
-      // A call where nobody spoke is not a recording, and an empty WAV would
-      // only produce a silent file the person has to open to discover.
-      if (user.length === 0 && bot.length === 0) return null;
-      const frames = Math.max(user.length, bot.length);
-      closed = {
-        wav: buildStereoWav(user, bot),
-        durationSeconds: frames / RECORDING_SAMPLE_RATE,
-        channels: { left: "user", right: "bot" },
-      };
-      // The raw mono audio is no longer needed once the file exists.
-      tracks.user.release();
-      tracks.bot.release();
-      return closed;
+      try {
+        // Both tracks come out at the file's rate, so the interleave is a
+        // frame-for-frame alignment in time rather than a coincidence.
+        const user = tracks.user.atRate(RECORDING_SAMPLE_RATE);
+        const bot = tracks.bot.atRate(RECORDING_SAMPLE_RATE);
+        // The raw chunks are no longer needed: view() and the resample made
+        // independent copies.  Releasing them before the WAV is allocated keeps
+        // the peak at the two tracks plus the file, not the raw chunks as well.
+        tracks.user.release();
+        tracks.bot.release();
+        // A call where nobody spoke is not a recording, and an empty WAV would
+        // only produce a silent file the person has to open to discover.
+        if (user.length === 0 && bot.length === 0) return null;
+        const frames = Math.max(user.length, bot.length);
+        closed = {
+          wav: buildStereoWav(user, bot),
+          durationSeconds: frames / RECORDING_SAMPLE_RATE,
+          channels: { left: "user", right: "bot" },
+        };
+        return closed;
+      } catch {
+        // A failed build (for example an allocation error) must not escape into
+        // call teardown.  The raw audio is already released, so this recording
+        // is lost; later stop() calls answer null rather than retrying.
+        return null;
+      }
     },
     get droppedFrames() {
       return dropped;
+    },
+    get cappedFrames() {
+      return capped;
     },
     get elapsedSeconds() {
       return Math.max(tracks.user.seconds, tracks.bot.seconds);

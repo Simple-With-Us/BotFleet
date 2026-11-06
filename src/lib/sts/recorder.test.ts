@@ -102,7 +102,7 @@ describe("buildStereoWav", () => {
 
 describe("createStsCallRecorder", () => {
   it("records each side to its own channel across many frames", () => {
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     // Interleaved the way a real call arrives them, not one side then the other.
     for (let frame = 0; frame < 5; frame += 1) {
       recorder.write("user", pcm(160, 1000 + frame), RECORDING_SAMPLE_RATE);
@@ -125,7 +125,7 @@ describe("createStsCallRecorder", () => {
   it("does not let a reused decode buffer rewrite earlier audio", () => {
     // The audio paths reuse one buffer per chunk, so a recorder that kept the
     // reference would record the final contents of every frame.
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     const reused = new ArrayBuffer(160 * 2);
     const reusedView = new DataView(reused);
     reusedView.setInt16(0, 111, true);
@@ -146,14 +146,14 @@ describe("createStsCallRecorder", () => {
   it("reports a call where nobody spoke as no recording at all", () => {
     // An empty WAV is a silent file the person has to open to discover is
     // silent, which is worse than showing nothing.
-    expect(createStsCallRecorder().stop()).toBeNull();
+    expect(createStsCallRecorder({ now: () => 0 }).stop()).toBeNull();
   });
 
   it("keeps the whole samples in a truncated frame and drops the half one", () => {
     // A frame cut mid-sample means the sender's buffer was reused under it.
     // The three complete samples are audio; the trailing byte is not a sample
     // and must not be padded into one.
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     const truncated = new ArrayBuffer(7);
     const view = new DataView(truncated);
     for (let index = 0; index < 3; index += 1) view.setInt16(index * 2, index + 1, true);
@@ -164,13 +164,13 @@ describe("createStsCallRecorder", () => {
   });
 
   it("ignores a completely empty frame", () => {
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     recorder.write("user", new ArrayBuffer(0), RECORDING_SAMPLE_RATE);
     expect(recorder.stop()).toBeNull();
   });
 
   it("is frozen once stopped, so a late frame cannot rewrite the file", () => {
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     recorder.write("user", pcm(160, 5), RECORDING_SAMPLE_RATE);
     const first = recorder.stop();
     recorder.write("bot", pcm(160, 9), RECORDING_SAMPLE_RATE);
@@ -181,7 +181,7 @@ describe("createStsCallRecorder", () => {
   });
 
   it("never throws into the call when a frame is not a buffer", () => {
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     recorder.write("user", pcm(160, 1), RECORDING_SAMPLE_RATE);
     // A null frame is exactly the bad input this test feeds the recorder, and the type check must still reject it.
     // @ts-expect-error null is not an ArrayBuffer; the runtime guard is what is under test
@@ -194,7 +194,7 @@ describe("createStsCallRecorder", () => {
     // The microphone streams continuously, so its track is what measures the
     // call; the bot only writes while it speaks.  The longer of the two is
     // both the file's real length and the honest elapsed time.
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     expect(recorder.elapsedSeconds).toBe(0);
     recorder.write("user", pcm(RECORDING_SAMPLE_RATE, 0), RECORDING_SAMPLE_RATE); // one second
     expect(recorder.elapsedSeconds).toBeCloseTo(1, 6);
@@ -207,7 +207,7 @@ describe("createStsCallRecorder", () => {
   });
 
   it("names the channels so the UI can say which speaker is which", () => {
-    const recording = createStsCallRecorder();
+    const recording = createStsCallRecorder({ now: () => 0 });
     recording.write("user", pcm(160, 1), RECORDING_SAMPLE_RATE);
     expect(recording.stop()!.channels).toEqual({ left: "user", right: "bot" });
   });
@@ -255,7 +255,7 @@ describe("a call where the two sides run at different rates", () => {
   it("writes both into the file at one rate, so the bot is not sped up", () => {
     // Gemini speaks back at 24 kHz while the microphone is 16 kHz.  Writing
     // both raw would play the bot fast and an octave high.
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     recorder.write("user", pcm(16_000, 1000), 16_000); // one second
     recorder.write("bot", pcm(24_000, -2000), 24_000); // one second, 1.5x samples
     const recording = recorder.stop();
@@ -274,7 +274,7 @@ describe("a call where the two sides run at different rates", () => {
 
   it("counts a 24 kHz track in seconds, not in samples", () => {
     // 24_000 samples is one second at 24 kHz and one and a half at 16 kHz.
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     recorder.write("bot", pcm(24_000, 0), 24_000);
     expect(recorder.elapsedSeconds).toBeCloseTo(1, 6);
   });
@@ -322,7 +322,7 @@ describe("a shared clock for both sides", () => {
   });
 
   it("refuses a frame whose rate disagrees with its track and counts it", () => {
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     recorder.write("bot", pcm(2400, 1), 24_000);
     recorder.write("bot", pcm(1600, 9), 16_000); // would be mixed in at the wrong speed
     expect(recorder.droppedFrames).toBe(1);
@@ -334,7 +334,7 @@ describe("a shared clock for both sides", () => {
 
 describe("bounded memory", () => {
   it("refuses frames past the track cap and counts them, keeping what fit", () => {
-    const recorder = createStsCallRecorder({ maxTrackSeconds: 1 });
+    const recorder = createStsCallRecorder({ now: () => 0, maxTrackSeconds: 1 });
     recorder.write("user", pcm(RECORDING_SAMPLE_RATE, 1), RECORDING_SAMPLE_RATE); // exactly 1 s
     recorder.write("user", pcm(160, 2), RECORDING_SAMPLE_RATE); // over the cap
     expect(recorder.droppedFrames).toBe(1);
@@ -351,9 +351,52 @@ describe("bounded memory", () => {
   });
 });
 
+describe("review follow-ups", () => {
+  it("never pads the microphone track: its frames are continuous, so a late one is queued, not split", () => {
+    let ms = 0;
+    const recorder = createStsCallRecorder({ now: () => ms });
+    recorder.write("user", pcm(1600, 1), RECORDING_SAMPLE_RATE);
+    ms = 5000; // a late mic frame (scheduling stall)
+    recorder.write("user", pcm(1600, 2), RECORDING_SAMPLE_RATE);
+    expect(recorder.stop()!.durationSeconds).toBeCloseTo(0.2, 6);
+  });
+
+  it("falls back to the default cap for NaN, zero or negative values instead of disabling or discarding", () => {
+    for (const bad of [Number.NaN, 0, -5, Number.POSITIVE_INFINITY]) {
+      const recorder = createStsCallRecorder({ now: () => 0, maxTrackSeconds: bad });
+      recorder.write("user", pcm(1600, 1), RECORDING_SAMPLE_RATE);
+      expect(recorder.droppedFrames).toBe(0);
+      expect(recorder.stop()!.durationSeconds).toBeCloseTo(0.1, 6);
+    }
+  });
+
+  it("counts cap refusals separately from the rate refusals in droppedFrames", () => {
+    const recorder = createStsCallRecorder({ now: () => 0, maxTrackSeconds: 1 });
+    recorder.write("bot", pcm(24_000, 1), 24_000); // fills the cap
+    recorder.write("bot", pcm(240, 1), 24_000); // over the cap
+    recorder.write("bot", pcm(160, 1), 16_000); // wrong rate
+    expect(recorder.droppedFrames).toBe(2);
+    expect(recorder.cappedFrames).toBe(1);
+  });
+
+  it("keeps a long provider pause as a silence count and still builds the right file", () => {
+    let ms = 0;
+    const recorder = createStsCallRecorder({ now: () => ms });
+    recorder.write("bot", pcm(160, 4), RECORDING_SAMPLE_RATE);
+    ms = 120_000; // two minutes of provider silence
+    recorder.write("bot", pcm(160, 9), RECORDING_SAMPLE_RATE);
+    const recording = recorder.stop()!;
+    expect(recording.durationSeconds).toBeCloseTo(120.01, 3);
+    const view = new DataView(recording.wav);
+    expect(view.getInt16(frameOffset(0) + 2, true)).toBe(4);
+    expect(view.getInt16(frameOffset(160) + 2, true)).toBe(0);
+    expect(view.getInt16(frameOffset(120 * RECORDING_SAMPLE_RATE) + 2, true)).toBe(9);
+  });
+});
+
 describe("stopping", () => {
   it("freezes an empty recorder too, so a late frame cannot create a recording after the call ended", () => {
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     expect(recorder.stop()).toBeNull();
     recorder.write("user", pcm(160, 5), RECORDING_SAMPLE_RATE);
     expect(recorder.stop()).toBeNull();
@@ -361,7 +404,7 @@ describe("stopping", () => {
   });
 
   it("keeps reporting the call's length after the raw audio is released", () => {
-    const recorder = createStsCallRecorder();
+    const recorder = createStsCallRecorder({ now: () => 0 });
     recorder.write("user", pcm(RECORDING_SAMPLE_RATE, 1), RECORDING_SAMPLE_RATE);
     const recording = recorder.stop();
     expect(recorder.elapsedSeconds).toBeCloseTo(1, 6);
