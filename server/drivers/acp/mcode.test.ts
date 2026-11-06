@@ -10,7 +10,7 @@ import { removeTempDir } from "../../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import {
   botNameFromPersona,
-  buildMcodePromptText,
+  mcodePromptPrefix,
   MCODE_EFFORT_CONFIG_ID,
   MCODE_M31_EFFORT_LEVELS,
   McodeAgentDriver,
@@ -743,19 +743,21 @@ describe("botNameFromPersona", () => {
   });
 });
 
-describe("mcode thread titles", () => {
-  it("leads the first message with [BF-<bot>] so the title starts there", () => {
-    const first = buildMcodePromptText({ system: "You are Fixer (display: Fixer), a bot in BotFleet.", text: "deploy the thing" });
-    expect(first.startsWith("[BF-Fixer]")).toBe(true);
-    expect(first).toContain("You are Fixer");
-    expect(first.endsWith("deploy the thing")).toBe(true);
+describe("mcodePromptPrefix", () => {
+  const launched = (seat: string | null) => ({ launchIdentity: { seat, session: "t-1" } });
+
+  it("is the launch seat, exactly as given, for a new session", () => {
+    expect(mcodePromptPrefix(launched("SEAT-ONE"), { newSession: true })).toBe("[SEAT-ONE]\n\n");
+    expect(mcodePromptPrefix(launched("Odd seat 9"), { newSession: true })).toBe("[Odd seat 9]\n\n");
   });
 
-  it("leaves a turn with no persona exactly as it was", () => {
-    expect(buildMcodePromptText({ text: "hello" })).toBe("hello");
+  it("is absent for a resumed session or a later turn", () => {
+    expect(mcodePromptPrefix(launched("SEAT-ONE"), { newSession: false })).toBeUndefined();
   });
 
-  it("leaves a non-BotFleet system prompt unmarked", () => {
-    expect(buildMcodePromptText({ system: "Be brief.", text: "hi" })).toBe("Be brief.\n\nhi");
+  it("is absent when the turn carries no seat", () => {
+    expect(mcodePromptPrefix({}, { newSession: true })).toBeUndefined();
+    expect(mcodePromptPrefix(launched(null), { newSession: true })).toBeUndefined();
+    expect(mcodePromptPrefix(launched(""), { newSession: true })).toBeUndefined();
   });
 });

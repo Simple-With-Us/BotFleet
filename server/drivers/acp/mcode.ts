@@ -221,21 +221,30 @@ export function botNameFromPersona(system: string | undefined): string | null {
 }
 
 /** mcode titles a session from its first user message, and this driver's first
- *  user message IS the persona — which is why an engine panel full of BotFleet
- *  threads shows "You are Fixer (display: Fixer), a bot in BotFleet…" repeated
+ *  user message IS the persona, which is why an engine panel full of BotFleet
+ *  threads shows "You are Fixer (display: Fixer), a bot in BotFleet..." repeated
  *  down the sidebar.  mcode's ACP exposes no title surface (`session/new`
  *  returns only sessionId, modes and configOptions, and the advertised config
  *  options are permissionMode, model and thinkingEffort), so the first message
  *  is the only lever a host has.
  *
- *  Leading the message with `[BF-<bot>]` puts the marker at the front of the
- *  title, which is what makes those threads identifiable and sortable in the
- *  mcode sidebar.  Scoped to this driver on purpose: the persona is byte-for-
- *  byte unchanged for every other engine. */
-export function buildMcodePromptText(turn: { system?: string; text: string }): string {
-  if (!turn.system) return turn.text;
-  const name = botNameFromPersona(turn.system);
-  return name ? `[BF-${name}]\n\n${turn.system}\n\n${turn.text}` : `${turn.system}\n\n${turn.text}`;
+ *  The marker is the seat the turn was launched under, read as given from
+ *  `turn.launchIdentity.seat`.  That is the same value the launched child's
+ *  environment carries, resolved and switched elsewhere
+ *  (server/launch-identity.ts), so this file adds no prefix, parses no name and
+ *  holds no roster: whatever the seat is called is what the title shows, and a
+ *  turn with no seat is left unmarked.
+ *
+ *  Only a turn that opens a fresh native session carries it: a resumed session
+ *  already has its title, and later turns of a session must not repeat it.
+ *  It is added by the core after prompt budgeting (`promptPrefix`), not folded
+ *  into the system text, so the budget still sees the real section boundaries. */
+export function mcodePromptPrefix(
+  turn: { launchIdentity?: { seat: string | null } | null },
+  context: { newSession: boolean },
+): string | undefined {
+  const seat = turn.launchIdentity?.seat;
+  return context.newSession && seat ? `[${seat}]\n\n` : undefined;
 }
 
 const support: AcpSupport = {
@@ -285,7 +294,7 @@ const support: AcpSupport = {
   // this instance's HOME, not the server process's: an instance can carry
   // its own, and probing the wrong one reports another account's login
   isAuthenticated: (env) => mcodeAuthenticated(env),
-  buildPromptText: buildMcodePromptText,
+  promptPrefix: mcodePromptPrefix,
   // Reasoning effort.  mcode advertises `thinkingEffort` (default, low, medium,
   // high, xhigh, max) only for M3.1, and `session/set_config_option` sets it
   // for this session without touching config.yaml.

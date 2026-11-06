@@ -364,6 +364,13 @@ export interface AcpSupport {
   classifyError?(error: unknown): ProviderErrorCode | undefined;
   /** Compose the session/prompt text. Default prepends the persona. */
   buildPromptText?(turn: SendTurnInput): string;
+  /** Text put in front of the budgeted prompt, after budgeting, so it never
+   *  changes which system sections the budget sees.  `newSession` is true only
+   *  for the turn whose `session/new` opens the native session, which is the
+   *  one message an engine titles a session from.  A resumed session, and every
+   *  later turn of a session this process opened, get `newSession: false`.
+   *  Return nothing for no prefix.  Never called for a command turn. */
+  promptPrefix?(turn: SendTurnInput, context: { newSession: boolean }): string | undefined;
   /** Rewrite a picker id (`omlx::model`) into the CLI-native id before spawn
    * and session/select. Local inject writers live here so the child sees a
    * model it already knows. */
@@ -2018,6 +2025,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             let sessionResult: any = null;
             let sessionModelsState: z.infer<typeof acpSessionResultModels> | undefined;
             let fallbackNotice: string | undefined;
+            // True when this turn created the native session (session/new), false
+            // when it resumed one.  Read by `support.promptPrefix`.
+            let openedNewSession = false;
             // The harness replay, when a poisoned saved session forces a
             // fresh one (BF-2447): recoveryText carries the conversation so
             // the new session is not blank (Sentry review on #1272).
@@ -2121,6 +2131,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               sessionModelsState = parsedSessionResult.success ? parsedSessionResult.data.models : undefined;
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
+              openedNewSession = true;
             }
             let selectedModel: string | null = null;
             let sessionStarted = false;
@@ -2390,12 +2401,19 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // is never budgeted, so there is nothing to trim or refuse.
               text = engineCommandText(turn.command);
             } else {
-              const budgetBytes = resolveAcpPromptBudget({
+              // Applied after budgeting (below), so its bytes are taken out of
+              // the budget here instead of being added past the ceiling.
+              const promptPrefix = support.promptPrefix?.(promptTurn, { newSession: openedNewSession }) ?? "";
+              const unreservedBudgetBytes = resolveAcpPromptBudget({
                 configuredBytes: turnConfig.promptBudgetBytes,
                 capTokens: turn.contextCapTokens ?? turnConfig.contextCapTokens,
                 model: resolvedModel ?? turn.model,
                 composed,
               }).bytes;
+              const budgetBytes =
+                unreservedBudgetBytes === null
+                  ? null
+                  : Math.max(1, unreservedBudgetBytes - Buffer.byteLength(promptPrefix));  // never 0: zero means unbounded
               // The per-bot turn cap arrives unvalidated (a stored value out of
               // range is honored nowhere else):  decode it at the driver
               // boundary so an out-of-range value reads as absent, the same
@@ -2552,7 +2570,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 retry.compressionBody = trim.text;
                 announceCompression(trim.preview, trim.bytesSaved, trim.text);
               }
-              text = neutralizeLeadingSlash(budgeted.text);
+              text = neutralizeLeadingSlash(promptPrefix + budgeted.text);
               captureTurnPrompt(threadId, turnId, text);
             }
             const result = await request(
