@@ -590,13 +590,19 @@ read_startup_enrollment() {
   data_dir="${data_dir%"${data_dir##*[![:space:]]}"}"
   local preference="${data_dir:-$HOME/.botfleet}/startup-enrollment.json"
   if [ ! -e "$preference" ] && [ ! -L "$preference" ]; then
-    # A host already holding an Infisical identity was enrolled before this
-    # choice existed; it keeps its remote startup. Nothing is read here.
-    if [ -n "${INFISICAL_TOKEN:-}" ] || { [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; }; then
+    # A host that already had an Infisical identity source (environment or the
+    # fleet-secrets helper the old script read) was enrolled before this
+    # choice existed, so it keeps its remote startup.  Nothing is read here.
+    if [ -n "${INFISICAL_TOKEN:-}" ] || { [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; } ||
+       { [ -f "$HOME/.local/bin/fleet-secrets" ] && [ -x "$HOME/.local/bin/fleet-secrets" ]; }; then
       printf '%s' remote
       return 0
     fi
-    printf '%s' missing
+    # No identity source at all: nothing to consent to, and the old script
+    # started this Mac without Infisical here too.  Remote needs an explicit
+    # choice in BotFleet Server Setup.
+    printf '%s' local
+    return 0
     return 0
   fi
   "$NODE" --input-type=module -e '

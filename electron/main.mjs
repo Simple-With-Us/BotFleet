@@ -1323,7 +1323,6 @@ async function readStartupServerTarget({ forceChoice = false } = {}) {
     writeEnrollment: (mode) => writeStartupEnrollment(mode, dataDir),
     legacyFile: fs.existsSync(path.join(app.getPath("userData"), SERVER_TARGET_FILE)),
     forceChoice,
-    interactive: !(process.env.OMB_SMOKE_SERVER_MENU === "1" || process.env.OMB_SMOKE_TEST === "1"),
     hasLegacyEnrollment: async () => (await readKeychainServiceToken()) !== null,
     chooseMode: async () => {
       const { response } = await dialog.showMessageBox({
@@ -2984,16 +2983,29 @@ app.whenReady().then(async () => {
   }
   setupApplicationMenu();
   // Resolve the explicit startup choice before any credential preparation.
-  const serverTargetRead = app.isPackaged
+  let serverTargetRead = app.isPackaged
     ? await readStartupServerTarget().catch((error) => serverTargetFailure(error))
     : null;
+  // A saved choice that cannot be used (a remote choice whose bootstrap token
+  // is gone, say) offers Server Setup instead of failing the same way on
+  // every launch.
+  if (serverTargetRead?.mode === "error" && !serverMenuSmokeEnabled()) {
+    const { response } = await dialog.showMessageBox({
+      type: "error",
+      title: "BotFleet Could Not Complete Server Setup",
+      message: serverTargetRead.message,
+      buttons: ["Open Server Setup", "Quit"],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response === 0) {
+      serverTargetRead = await readStartupServerTarget({ forceChoice: true }).catch((error) => serverTargetFailure(error));
+    }
+  }
   if (serverTargetRead?.mode === "cancelled" || serverTargetRead?.mode === "error") {
-    if (serverTargetRead.mode === "error") {
-      if (serverMenuSmokeEnabled()) {
-        await writeServerMenuSmokeReport({ ...serverMenuSmokeReport(), error: serverTargetRead.message });
-      } else {
-        dialog.showErrorBox("BotFleet Could Not Complete Server Setup", serverTargetRead.message);
-      }
+    if (serverTargetRead.mode === "error" && serverMenuSmokeEnabled()) {
+      await writeServerMenuSmokeReport({ ...serverMenuSmokeReport(), error: serverTargetRead.message });
     }
     app.quit();
     return;

@@ -437,7 +437,22 @@ test("local startup bypasses the Infisical helper", () => {
   }
 });
 
-test("unmarked startup defers before helper access or harness boot", () => {
+test("a host with no identity source and no choice file starts this Mac and reads nothing", () => {
+  const fixture = identityFixture();
+  try {
+    rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+    const result = runIdentity(fixture);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /without Infisical bootstrap/);
+    const got = identityReport(fixture, result);
+    assert.equal(got.INFISICAL_TOKEN, "unset");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a host that already had the fleet-secrets helper keeps remote startup without a choice file", () => {
   const fixture = identityFixture();
   const called = join(fixture.dir, "helper-called");
   try {
@@ -445,9 +460,7 @@ test("unmarked startup defers before helper access or harness boot", () => {
     installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
     const result = runIdentity(fixture);
     assert.equal(result.status, 0);
-    assert.match(result.stdout, /startup setup is required/);
-    assert.equal(existsSync(called), false);
-    assert.equal(existsSync(fixture.report), false);
+    assert.equal(existsSync(called), true);
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
@@ -468,21 +481,15 @@ test("a host already holding an Infisical identity keeps remote startup without 
   }
 });
 
-test("a half identity does not count as legacy enrollment, and an explicit local choice wins over one", () => {
-  const half = identityFixture();
-  try {
-    rmSync(join(half.dataDir, "startup-enrollment.json"));
-    const result = runIdentity(half, { INFISICAL_CLIENT_ID: "id" });
-    assert.match(result.stdout, /startup setup is required/);
-    assert.equal(existsSync(half.report), false);
-  } finally {
-    rmSync(half.dir, { recursive: true, force: true });
-  }
+test("an explicit local choice wins over every legacy identity source", () => {
   const local = identityFixture();
+  const called = join(local.dir, "helper-called");
   try {
     writeFileSync(join(local.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+    installFakeFleetSecrets(local, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
     const result = runIdentity(local, { INFISICAL_TOKEN: "st.legacy" });
     assert.match(result.stdout, /without Infisical bootstrap/);
+    assert.equal(existsSync(called), false);
   } finally {
     rmSync(local.dir, { recursive: true, force: true });
   }

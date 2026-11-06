@@ -58,7 +58,6 @@ export async function resolveEnrolledServerTarget({
   forceChoice = false,
   legacyFile = false,
   hasLegacyEnrollment = async () => false,
-  interactive = true,
 } = {}) {
   let mode;
   let persist = false;
@@ -67,9 +66,10 @@ export async function resolveEnrolledServerTarget({
     // A Mac enrolled before this choice existed keeps working: its Keychain
     // token was the owner's consent.  An explicit file always wins over it.
     if (mode === null && !forceChoice && await hasLegacyEnrollment()) mode = "remote";
-    else if (mode === null && !forceChoice && !interactive) {
-      // Smoke and headless launches cannot answer a dialog and must not
-      // write a preference nobody chose: they run on this Mac, as before.
+    else if (mode === null && !forceChoice) {
+      // No choice and no earlier enrollment: nothing was ever consented to,
+      // so this Mac runs as it always did without reading any credential.
+      // Infisical settings need an explicit choice in Server Setup.
       return { mode: "local", source: "local-preference", legacyFile };
     } else if (mode === null) {
       mode = await chooseMode?.();
