@@ -179,11 +179,12 @@ describe("writeThroughKnobs", () => {
     expect(calls.get("BOTFLEET_AGENT_PROXY_ENV")).toBe("prod");
     expect(calls.get("BOTFLEET_AGENT_PROXY_PATH")).toBe("/agents");
     // 29 includes the computerCall and claudeSession rows migrated from
-    // the OMB_COMPUTER_* / OMB_CLAUDE_SESSION_IDLE_* env names; bump this
+    // the OMB_COMPUTER_* / OMB_CLAUDE_SESSION_IDLE_* env names, and 35 adds
+    // the two placement rows;  bump this
     // deliberately: the count is here so that adding or dropping a knob is
     // a decision someone reads rather than an edit that slips through --
     // it is what caught nineteen rows disappearing at once.
-    expect(KNOB_FIELDS.length).toBe(33);
+    expect(KNOB_FIELDS.length).toBe(35);
   });
 });
 

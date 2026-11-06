@@ -83,9 +83,9 @@ describe("Usage Monitor BotFleet quota integration", () => {
     ]);
 
     expect(rows.map((row) => `${row.label}:${row.window}`)).toEqual([
-      "Gemini Models · 5-hour:5h",
+      "Gemini Models · 5-Hour:5h",
       "Gemini Models · Weekly:weekly",
-      "Third-Party Models · 5-hour:5h",
+      "Third-Party Models · 5-Hour:5h",
       "Third-Party Models · Weekly:weekly",
     ]);
     expect(antigravityQuotaLines(rows).map((line) => line.value)).toEqual(["80%", "75%", "20%", "not reported"]);
@@ -108,9 +108,9 @@ describe("Usage Monitor BotFleet quota integration", () => {
     ]);
 
     expect(rows.map((row) => `${row.label}:${row.remainingPercent}`)).toEqual([
-      "Gemini Models · 5-hour:null",
+      "Gemini Models · 5-Hour:null",
       "Gemini Models · Weekly:null",
-      "Third-Party Models · 5-hour:35",
+      "Third-Party Models · 5-Hour:35",
       "Third-Party Models · Weekly:55",
     ]);
     expect(rows.map((row) => row.label).join(" ")).not.toMatch(/claude|gpt/i);
@@ -152,7 +152,7 @@ describe("Usage Monitor BotFleet quota integration", () => {
     ]);
 
     expect(lines).toHaveLength(4);
-    expect(lines[0]).toContain("Gemini Models · 5-hour 80% available");
+    expect(lines[0]).toContain("Gemini Models · 5-Hour 80% available");
     expect(lines[0]).toContain("resets in 1h");
   });
 
