@@ -30,7 +30,7 @@ const SUPPORT: AcpSupport = {
   isAuthenticated: () => true,
   promptPrefix: (_turn, context) => {
     seen.push(context);
-    return prefixOn ? MARKER : undefined;
+    return prefixOn && context.newSession ? MARKER : undefined;
   },
 };
 const PrefixDriver = createAcpDriver(SUPPORT);
@@ -81,6 +81,41 @@ describe("ACP promptPrefix", () => {
     await instance.adapter.sendTurn({ threadId: "t-prefix-resume", text: "hello", resumeCursor: "fake-acp-session" });
     await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-resume");
     expect(seen).toEqual([{ newSession: false }]);
+  });
+
+  const sessionIdOf = (threadId: string): string => {
+    const started = recorder.events.find((e) => e.type === "session.started" && e.threadId === threadId);
+    if (!started || started.type !== "session.started") throw new Error("no session.started");
+    return String(started.sessionId);
+  };
+
+  it("asks again when the first prompt of a session failed after its cursor was saved", async () => {
+    await create();
+    // Turn 1 opens the session and its prompt fails, so the marker is not known
+    // to have landed.  The cursor is already saved at that point.
+    vi.stubEnv("FAKE_ACP_MODE", "fail-after-text");
+    await instance.adapter.sendTurn({ threadId: "t-prefix-fail", text: "first" });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-fail");
+    const cursor = sessionIdOf("t-prefix-fail");
+    expect(seen).toEqual([{ newSession: true }]);
+
+    // Turn 2 resumes that cursor.  It is a new message, not a replay of turn 1.
+    vi.stubEnv("FAKE_ACP_MODE", "echo-gated");
+    await instance.adapter.sendTurn({ threadId: "t-prefix-fail2", text: "second", resumeCursor: cursor });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-fail2");
+    expect(seen).toEqual([{ newSession: true }, { newSession: true }]);
+    expect(echoed("t-prefix-fail2")).toBe(`${MARKER}second`);
+  });
+
+  it("does not ask again once the first prompt has been answered", async () => {
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-prefix-ok", text: "first" });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-ok");
+    const cursor = sessionIdOf("t-prefix-ok");
+    await instance.adapter.sendTurn({ threadId: "t-prefix-ok2", text: "second", resumeCursor: cursor });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-ok2");
+    expect(seen).toEqual([{ newSession: true }, { newSession: false }]);
+    expect(echoed("t-prefix-ok2")).toBe("second");
   });
 
   it("never asks for a prefix on a command turn", async () => {

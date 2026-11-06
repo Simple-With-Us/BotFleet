@@ -365,11 +365,15 @@ export interface AcpSupport {
   /** Compose the session/prompt text. Default prepends the persona. */
   buildPromptText?(turn: SendTurnInput): string;
   /** Text put in front of the budgeted prompt, after budgeting, so it never
-   *  changes which system sections the budget sees.  `newSession` is true only
-   *  for the turn whose `session/new` opens the native session, which is the
-   *  one message an engine titles a session from.  A resumed session, and every
-   *  later turn of a session this process opened, get `newSession: false`.
-   *  Return nothing for no prefix.  Never called for a command turn. */
+   *  changes which system sections the budget sees.  `newSession` is true for
+   *  the turn whose `session/new` opens the native session, which is the one
+   *  message an engine titles a session from, and for each later turn of a
+   *  session this process opened until the agent has answered a prompt on it
+   *  (a first prompt that failed or went unanswered leaves a saved cursor on a
+   *  session that never carried the marker).  A resumed session that has
+   *  answered a prompt, and any session from before this process started, get
+   *  `newSession: false`.  Return nothing for no prefix.  Never called for a
+   *  command turn. */
   promptPrefix?(turn: SendTurnInput, context: { newSession: boolean }): string | undefined;
   /** Rewrite a picker id (`omlx::model`) into the CLI-native id before spawn
    * and session/select. Local inject writers live here so the child sees a
@@ -857,6 +861,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
        *  bigger budget).  An LRU past SUMMARY_CACHE_MAX_THREADS:  the driver
        *  lives as long as the harness, and one note per thread forever is a
        *  leak. */
+      // Native sessions this process opened whose first prompt has not yet
+      // come back.  A session id is saved when session/new returns, before any
+      // prompt is answered, so a failed or unanswered first prompt leaves a
+      // saved cursor on a session that never carried the marker.  The next turn
+      // resumes it, finds it here, and asks for the marker again.  It is a new
+      // message, so no earlier prompt is replayed, and a marker that did land
+      // the first time only appears once more in the text.  In memory only: a
+      // restart forgets it (see promptPrefix).
+      const sessionsAwaitingFirstReply = new Set<string>();
       const summaryCacheByThread = new Map<string, { summary: string; coveredTurns: number }>();
       const rememberSummary = (threadId: string, entry: { summary: string; coveredTurns: number }) => {
         if (summaryCacheByThread.has(threadId)) summaryCacheByThread.delete(threadId);
@@ -2132,6 +2145,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
               openedNewSession = true;
+              sessionsAwaitingFirstReply.add(sessionId);
             }
             let selectedModel: string | null = null;
             let sessionStarted = false;
@@ -2403,7 +2417,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             } else {
               // Applied after budgeting (below), so its bytes are taken out of
               // the budget here instead of being added past the ceiling.
-              const promptPrefix = support.promptPrefix?.(promptTurn, { newSession: openedNewSession }) ?? "";
+              const promptPrefix = support.promptPrefix?.(promptTurn, {
+                newSession: openedNewSession || (sessionId !== null && sessionsAwaitingFirstReply.has(sessionId)),
+              }) ?? "";
               const unreservedBudgetBytes = resolveAcpPromptBudget({
                 configuredBytes: turnConfig.promptBudgetBytes,
                 capTokens: turn.contextCapTokens ?? turnConfig.contextCapTokens,
@@ -2582,6 +2598,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               turnConfig.promptTimeoutMs ?? DEFAULT_PROMPT_MAX_MS,
               turnConfig.promptIdleMs ?? DEFAULT_PROMPT_IDLE_MS,
             );
+            // The agent answered, so this session has had its first prompt.
+            if (sessionId) sessionsAwaitingFirstReply.delete(sessionId);
             // opencode 1.18.18 reports usage at the result root; grok and
             // gemini put it under _meta. Read both rather than lose the count.
             const usage = result?.usage ?? result?._meta ?? {};
