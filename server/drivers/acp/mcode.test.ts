@@ -744,20 +744,20 @@ describe("botNameFromPersona", () => {
 });
 
 describe("mcodePromptPrefix", () => {
-  const launched = (seat: string | null) => ({ launchIdentity: { seat, session: "t-1" } });
+  const persona = (name: string) => `You are ${name} (display: ${name}), a bot in BotFleet.`;
 
-  it("is the launch seat, exactly as given, for a new session", () => {
-    expect(mcodePromptPrefix(launched("SEAT-ONE"), { newSession: true })).toBe("[SEAT-ONE]\n\n");
-    expect(mcodePromptPrefix(launched("Odd seat 9"), { newSession: true })).toBe("[Odd seat 9]\n\n");
+  it("is the bot's configured name, exactly as written, for a new session", () => {
+    for (const name of ["Plumber", "Team Scout", "Zed-9 Prime", "ab-cd Name"]) {
+      expect(mcodePromptPrefix({ system: persona(name) }, { newSession: true })).toBe(`[${name}]\n\n`);
+    }
   });
 
-  it("is absent for a resumed session or a later turn", () => {
-    expect(mcodePromptPrefix(launched("SEAT-ONE"), { newSession: false })).toBeUndefined();
+  it("is absent for a session that already has its marker", () => {
+    expect(mcodePromptPrefix({ system: persona("Plumber") }, { newSession: false })).toBeUndefined();
   });
 
-  it("is absent when the turn carries no seat", () => {
+  it("is absent without a BotFleet persona", () => {
     expect(mcodePromptPrefix({}, { newSession: true })).toBeUndefined();
-    expect(mcodePromptPrefix(launched(null), { newSession: true })).toBeUndefined();
-    expect(mcodePromptPrefix(launched(""), { newSession: true })).toBeUndefined();
+    expect(mcodePromptPrefix({ system: "Be brief." }, { newSession: true })).toBeUndefined();
   });
 });

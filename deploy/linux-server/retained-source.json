@@ -1346,6 +1346,7 @@
     {"path":"server/drivers/acp/droid.ts","category":"runtime","reason":"Import from server/drivers/builtIn.ts"},
     {"path":"server/drivers/acp/dsh-mcp.ts","category":"runtime","reason":"Import from server/drivers/acp/dsh.ts"},
     {"path":"server/drivers/acp/dsh.ts","category":"runtime","reason":"Import from server/index.ts"},
+    {"path":"server/drivers/acp/first-reply-ledger.ts","category":"runtime","reason":"Import from server/drivers/acp/core.ts"},
     {"path":"server/drivers/acp/grok.ts","category":"runtime","reason":"Import from server/drivers/builtIn.ts"},
     {"path":"server/drivers/acp/hermes.ts","category":"runtime","reason":"Import from server/drivers/builtIn.ts"},
     {"path":"server/drivers/acp/init-deadline.ts","category":"runtime","reason":"Import from server/host-dispatch-hot.ts"},

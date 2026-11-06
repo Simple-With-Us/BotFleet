@@ -228,23 +228,24 @@ export function botNameFromPersona(system: string | undefined): string | null {
  *  options are permissionMode, model and thinkingEffort), so the first message
  *  is the only lever a host has.
  *
- *  The marker is the seat the turn was launched under, read as given from
- *  `turn.launchIdentity.seat`.  That is the same value the launched child's
- *  environment carries, resolved and switched elsewhere
- *  (server/launch-identity.ts), so this file adds no prefix, parses no name and
- *  holds no roster: whatever the seat is called is what the title shows, and a
- *  turn with no seat is left unmarked.
+ *  The marker is the bot's configured name exactly as the persona line
+ *  carries it (`You are <name> (display: <name>)`, written from `bot.name`).
+ *  The app stores no separate seat on a bot: the configured name is what it
+ *  shows and what bots of every family (BF, GB, any other) are called, so using
+ *  it covers every bot without a roster, a switch or a prefix rule.  This file
+ *  adds, strips and matches nothing in the name.
  *
  *  Only a turn that opens a fresh native session carries it: a resumed session
  *  already has its title, and later turns of a session must not repeat it.
  *  It is added by the core after prompt budgeting (`promptPrefix`), not folded
  *  into the system text, so the budget still sees the real section boundaries. */
 export function mcodePromptPrefix(
-  turn: { launchIdentity?: { seat: string | null } | null },
+  turn: { system?: string },
   context: { newSession: boolean },
 ): string | undefined {
-  const seat = turn.launchIdentity?.seat;
-  return context.newSession && seat ? `[${seat}]\n\n` : undefined;
+  if (!context.newSession) return undefined;
+  const name = botNameFromPersona(turn.system);
+  return name ? `[${name}]\n\n` : undefined;
 }
 
 const support: AcpSupport = {

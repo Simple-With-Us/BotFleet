@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 
 import { z } from "zod";
 
+import { awaitingFirstReply, clearAwaitingFirstReply, markAwaitingFirstReply } from "./first-reply-ledger.ts";
 import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV } from "../../config.ts";
 import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
@@ -861,15 +862,6 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
        *  bigger budget).  An LRU past SUMMARY_CACHE_MAX_THREADS:  the driver
        *  lives as long as the harness, and one note per thread forever is a
        *  leak. */
-      // Native sessions this process opened whose first prompt has not yet
-      // come back.  A session id is saved when session/new returns, before any
-      // prompt is answered, so a failed or unanswered first prompt leaves a
-      // saved cursor on a session that never carried the marker.  The next turn
-      // resumes it, finds it here, and asks for the marker again.  It is a new
-      // message, so no earlier prompt is replayed, and a marker that did land
-      // the first time only appears once more in the text.  In memory only: a
-      // restart forgets it (see promptPrefix).
-      const sessionsAwaitingFirstReply = new Set<string>();
       const summaryCacheByThread = new Map<string, { summary: string; coveredTurns: number }>();
       const rememberSummary = (threadId: string, entry: { summary: string; coveredTurns: number }) => {
         if (summaryCacheByThread.has(threadId)) summaryCacheByThread.delete(threadId);
@@ -2041,6 +2033,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // True when this turn created the native session (session/new), false
             // when it resumed one.  Read by `support.promptPrefix`.
             let openedNewSession = false;
+            // The session id recorded as awaiting its first reply this turn.
+            let markerRecordedFor: string | null = null;
             // The harness replay, when a poisoned saved session forces a
             // fresh one (BF-2447): recoveryText carries the conversation so
             // the new session is not blank (Sentry review on #1272).
@@ -2145,7 +2139,6 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
               openedNewSession = true;
-              sessionsAwaitingFirstReply.add(sessionId);
             }
             let selectedModel: string | null = null;
             let sessionStarted = false;
@@ -2417,9 +2410,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             } else {
               // Applied after budgeting (below), so its bytes are taken out of
               // the budget here instead of being added past the ceiling.
-              const promptPrefix = support.promptPrefix?.(promptTurn, {
-                newSession: openedNewSession || (sessionId !== null && sessionsAwaitingFirstReply.has(sessionId)),
-              }) ?? "";
+              const markerOwed = openedNewSession || (support.promptPrefix !== undefined && sessionId !== null && awaitingFirstReply(instanceId, sessionId));
+              const promptPrefix = support.promptPrefix?.(promptTurn, { newSession: markerOwed }) ?? "";
+              if (promptPrefix && markerOwed && sessionId) {
+                // Recorded before the prompt goes out: if it fails or is never
+                // answered, the next turn on this cursor owes the marker again.
+                markAwaitingFirstReply(instanceId, sessionId);
+                markerRecordedFor = sessionId;
+              }
               const unreservedBudgetBytes = resolveAcpPromptBudget({
                 configuredBytes: turnConfig.promptBudgetBytes,
                 capTokens: turn.contextCapTokens ?? turnConfig.contextCapTokens,
@@ -2599,7 +2597,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               turnConfig.promptIdleMs ?? DEFAULT_PROMPT_IDLE_MS,
             );
             // The agent answered, so this session has had its first prompt.
-            if (sessionId) sessionsAwaitingFirstReply.delete(sessionId);
+            if (markerRecordedFor) clearAwaitingFirstReply(instanceId, markerRecordedFor);
             // opencode 1.18.18 reports usage at the result root; grok and
             // gemini put it under _meta. Read both rather than lose the count.
             const usage = result?.usage ?? result?._meta ?? {};

@@ -2,7 +2,8 @@
 // its UTF-8 bytes come out of the budget, a command turn never gets one, and it is
 // told whether the turn opened the native session.  The fake ACP CLI echoes the
 // whole session/prompt text.
-import { chmodSync } from "node:fs";
+import { chmodSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -40,6 +41,7 @@ describe("ACP promptPrefix", () => {
   let recorder: EventRecorder;
 
   beforeEach(() => {
+    vi.stubEnv("OMB_DATA_DIR", mkdtempSync(join(tmpdir(), "acp-first-reply-")));
     ensureDirs();
     chmodSync(FAKE_CLI, 0o755);
     vi.stubEnv("FAKE_ACP_MODE", "echo-gated");
@@ -105,6 +107,31 @@ describe("ACP promptPrefix", () => {
     await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-fail2");
     expect(seen).toEqual([{ newSession: true }, { newSession: true }]);
     expect(echoed("t-prefix-fail2")).toBe(`${MARKER}second`);
+  });
+
+  it("still owes the marker after a server restart that forgot everything in memory", async () => {
+    await create();
+    vi.stubEnv("FAKE_ACP_MODE", "fail-after-text");
+    await instance.adapter.sendTurn({ threadId: "t-prefix-restart", text: "first" });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-restart");
+    const cursor = sessionIdOf("t-prefix-restart");
+
+    // A new driver instance shares nothing with the first except the disk.
+    recorder.stop();
+    await instance.dispose();
+    seen.length = 0;
+    vi.stubEnv("FAKE_ACP_MODE", "echo-gated");
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-prefix-restart2", text: "second", resumeCursor: cursor });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-restart2");
+    expect(seen).toEqual([{ newSession: true }]);
+    expect(echoed("t-prefix-restart2")).toBe(`${MARKER}second`);
+
+    // Answered now, so a further resume is unmarked.
+    await instance.adapter.sendTurn({ threadId: "t-prefix-restart3", text: "third", resumeCursor: cursor });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-restart3");
+    expect(seen).toEqual([{ newSession: true }, { newSession: false }]);
+    expect(echoed("t-prefix-restart3")).toBe("third");
   });
 
   it("does not ask again once the first prompt has been answered", async () => {

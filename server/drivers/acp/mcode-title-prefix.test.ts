@@ -4,7 +4,8 @@
 // budgeted prompt without changing what the budget trims, and that a turn with
 // no recognizable bot is sent as it always was.  The fake ACP CLI echoes the
 // prompt text it receives, which is what is read back here.
-import { chmodSync } from "node:fs";
+import { chmodSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,7 +17,6 @@ import { ACP_PROMPT_SECTION_OMITTED } from "./prompt-budget.ts";
 import { McodeAgentDriver } from "./mcode.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
-const seatOne = { seat: "SEAT-ONE", session: "s" };
 const persona = "You are Plumber (display: Plumber), a bot in BotFleet.";
 
 describe("mcode thread-title marker through the driver", () => {
@@ -24,6 +24,7 @@ describe("mcode thread-title marker through the driver", () => {
   let recorder: EventRecorder;
 
   beforeEach(() => {
+    vi.stubEnv("OMB_DATA_DIR", mkdtempSync(join(tmpdir(), "acp-first-reply-")));
     ensureDirs();
     chmodSync(FAKE_CLI, 0o755);
     vi.stubEnv("FAKE_ACP_MODE", "echo-gated");
@@ -55,9 +56,9 @@ describe("mcode thread-title marker through the driver", () => {
 
   it("marks the turn that opens a session, and only that one", async () => {
     await create();
-    await instance.adapter.sendTurn({ threadId: "t-title-new", text: "first", system: persona, launchIdentity: seatOne });
+    await instance.adapter.sendTurn({ threadId: "t-title-new", text: "first", system: persona });
     await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-title-new");
-    expect(echoes("t-title-new").join("")).toBe(`echo: [SEAT-ONE]\n\n${persona}\n\nfirst`);
+    expect(echoes("t-title-new").join("")).toBe(`echo: [Plumber]\n\n${persona}\n\nfirst`);
   });
 
   it("does not mark a turn that resumes a saved session", async () => {
@@ -67,13 +68,12 @@ describe("mcode thread-title marker through the driver", () => {
       text: "second",
       system: persona,
       resumeCursor: "fake-acp-session",
-      launchIdentity: seatOne,
     });
     await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-title-resumed");
     expect(echoes("t-title-resumed").join("")).toBe(`echo: ${persona}\n\nsecond`);
   });
 
-  it("leaves a turn with no launch seat exactly as before", async () => {
+  it("leaves a turn with no recognizable bot exactly as before", async () => {
     await create();
     await instance.adapter.sendTurn({ threadId: "t-title-plain", text: "hi", system: "Be brief." });
     await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-title-plain");
@@ -88,7 +88,6 @@ describe("mcode thread-title marker through the driver", () => {
     await instance.adapter.sendTurn({
       threadId: "t-title-budget",
       text: "CURRENT",
-      launchIdentity: seatOne,
       system: stable + volOld + volNew,
       systemSections: [
         { id: "persona", text: stable, volatile: false },
@@ -98,7 +97,7 @@ describe("mcode thread-title marker through the driver", () => {
     });
     await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-title-budget");
     const sent = echoes("t-title-budget").join("");
-    expect(sent).toBe(`echo: [SEAT-ONE]\n\n${stable}${ACP_PROMPT_SECTION_OMITTED}${volNew}\n\nCURRENT`);
+    expect(sent).toBe(`echo: [Plumber]\n\n${stable}${ACP_PROMPT_SECTION_OMITTED}${volNew}\n\nCURRENT`);
     expect(recorder.events.some((event) => event.type === "runtime.error" && event.threadId === "t-title-budget")).toBe(false);
   });
 });
