@@ -57,20 +57,34 @@ export async function resolveEnrolledServerTarget({
   readRemoteTarget,
   forceChoice = false,
   legacyFile = false,
+  hasLegacyEnrollment = async () => false,
+  interactive = true,
 } = {}) {
   let mode;
+  let persist = false;
   try {
     mode = forceChoice ? null : await readEnrollment();
-    if (mode === null) {
+    // A Mac enrolled before this choice existed keeps working: its Keychain
+    // token was the owner's consent.  An explicit file always wins over it.
+    if (mode === null && !forceChoice && await hasLegacyEnrollment()) mode = "remote";
+    else if (mode === null && !forceChoice && !interactive) {
+      // Smoke and headless launches cannot answer a dialog and must not
+      // write a preference nobody chose: they run on this Mac, as before.
+      return { mode: "local", source: "local-preference", legacyFile };
+    } else if (mode === null) {
       mode = await chooseMode?.();
       if (mode === null || mode === undefined) {
         return { mode: "cancelled", source: "startup-enrollment", legacyFile };
       }
       parseStartupEnrollment({ version: 1, mode });
-      await writeEnrollment(mode);
+      persist = true;
     } else {
       parseStartupEnrollment({ version: 1, mode });
     }
+    // Local needs no vault read, so its choice is saved now.  A remote choice
+    // is saved only after the vault read works, so a Mac with no bootstrap
+    // token is asked again instead of failing the same way on every launch.
+    if (persist && mode === "local") await writeEnrollment(mode);
   } catch {
     return { mode: "error", source: "startup-enrollment", legacyFile, message: ENROLLMENT_ERROR };
   }
@@ -83,6 +97,11 @@ export async function resolveEnrolledServerTarget({
       legacyFile: target.legacyFile === true,
       message: "Infisical server settings are selected, but this Mac has no bootstrap token.\u00a0 Complete enrollment or choose this Mac in Server Setup.",
     };
+  }
+  if (persist && target?.mode !== "error") {
+    try { await writeEnrollment(mode); } catch {
+      return { mode: "error", source: "startup-enrollment", legacyFile, message: ENROLLMENT_ERROR };
+    }
   }
   return target;
 }

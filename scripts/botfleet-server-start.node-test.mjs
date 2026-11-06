@@ -453,6 +453,41 @@ test("unmarked startup defers before helper access or harness boot", () => {
   }
 });
 
+test("a host already holding an Infisical identity keeps remote startup without a choice file", () => {
+  for (const env of [{ INFISICAL_TOKEN: "st.legacy" }, { INFISICAL_CLIENT_ID: "id", INFISICAL_CLIENT_SECRET: "secret" }]) {
+    const fixture = identityFixture();
+    try {
+      rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+      const result = runIdentity(fixture, env);
+      assert.equal(result.status, 0);
+      assert.doesNotMatch(result.stdout, /startup setup is required/);
+      assert.equal(existsSync(fixture.report), true);
+    } finally {
+      rmSync(fixture.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a half identity does not count as legacy enrollment, and an explicit local choice wins over one", () => {
+  const half = identityFixture();
+  try {
+    rmSync(join(half.dataDir, "startup-enrollment.json"));
+    const result = runIdentity(half, { INFISICAL_CLIENT_ID: "id" });
+    assert.match(result.stdout, /startup setup is required/);
+    assert.equal(existsSync(half.report), false);
+  } finally {
+    rmSync(half.dir, { recursive: true, force: true });
+  }
+  const local = identityFixture();
+  try {
+    writeFileSync(join(local.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+    const result = runIdentity(local, { INFISICAL_TOKEN: "st.legacy" });
+    assert.match(result.stdout, /without Infisical bootstrap/);
+  } finally {
+    rmSync(local.dir, { recursive: true, force: true });
+  }
+});
+
 test("the launcher trims the data override like the desktop resolver", () => {
   const fixture = identityFixture();
   try {

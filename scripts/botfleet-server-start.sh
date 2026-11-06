@@ -590,6 +590,12 @@ read_startup_enrollment() {
   data_dir="${data_dir%"${data_dir##*[![:space:]]}"}"
   local preference="${data_dir:-$HOME/.botfleet}/startup-enrollment.json"
   if [ ! -e "$preference" ] && [ ! -L "$preference" ]; then
+    # A host already holding an Infisical identity was enrolled before this
+    # choice existed; it keeps its remote startup. Nothing is read here.
+    if [ -n "${INFISICAL_TOKEN:-}" ] || { [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; }; then
+      printf '%s' remote
+      return 0
+    fi
     printf '%s' missing
     return 0
   fi

@@ -1323,6 +1323,8 @@ async function readStartupServerTarget({ forceChoice = false } = {}) {
     writeEnrollment: (mode) => writeStartupEnrollment(mode, dataDir),
     legacyFile: fs.existsSync(path.join(app.getPath("userData"), SERVER_TARGET_FILE)),
     forceChoice,
+    interactive: !(process.env.OMB_SMOKE_SERVER_MENU === "1" || process.env.OMB_SMOKE_TEST === "1"),
+    hasLegacyEnrollment: async () => (await readKeychainServiceToken()) !== null,
     chooseMode: async () => {
       const { response } = await dialog.showMessageBox({
         type: "question",
