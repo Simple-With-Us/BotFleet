@@ -106,6 +106,9 @@ export function resamplePcm16(input: Int16Array, from: number, to: number): Int1
   return out;
 }
 
+/** Longest a single track may grow: one hour, about 115 MB at 16 kHz and 173 MB at 24 kHz. */
+export const MAX_TRACK_SECONDS = 3600;
+
 /**
  * One side of the call, buffered as it arrives.
  *
@@ -114,6 +117,8 @@ export function resamplePcm16(input: Int16Array, from: number, to: number): Int1
  * whatever the buffer holds later.
  */
 class Track {
+  constructor(private readonly maxSeconds: number) {}
+
   private chunks: ArrayBuffer[] = [];
 
   private samples = 0;
@@ -147,14 +152,19 @@ class Track {
     // The first frame decides the rate.  A frame at another rate would be
     // resampled against the wrong denominator, so it is refused, not mixed in.
     if (this.rate !== 0 && sampleRate !== this.rate) return false;
+    const rate = this.rate === 0 ? sampleRate : this.rate;
+    const target = Math.round(Math.max(0, atSeconds) * rate);
+    const gap = target - this.samples;
+    const padding = gap > rate * MAX_UNPADDED_GAP_SECONDS ? gap : 0;
+    // Bounded memory: past the cap the frame is refused (and counted), so a call
+    // that never ends cannot grow the recording without limit.
+    if ((this.samples + padding + usable / 2) / rate > this.maxSeconds) return false;
     const copy = new ArrayBuffer(usable);
     new Uint8Array(copy).set(new Uint8Array(pcm, 0, usable));
     if (this.rate === 0) this.rate = sampleRate;
-    const target = Math.round(Math.max(0, atSeconds) * this.rate);
-    const gap = target - this.samples;
-    if (gap > this.rate * MAX_UNPADDED_GAP_SECONDS) {
-      this.chunks.push(new ArrayBuffer(gap * 2));
-      this.samples += gap;
+    if (padding > 0) {
+      this.chunks.push(new ArrayBuffer(padding * 2));
+      this.samples += padding;
     }
     this.chunks.push(copy);
     this.samples += usable / 2;
@@ -251,10 +261,11 @@ export function buildStereoWav(
  * and the bot's reply line up in the file the way they happened.  `now` is that
  * clock in milliseconds and exists so tests can drive it.
  */
-export function createStsCallRecorder(options: { now?: () => number } = {}): StsCallRecorder {
+export function createStsCallRecorder(options: { now?: () => number; maxTrackSeconds?: number } = {}): StsCallRecorder {
   const now = options.now ?? (() => Date.now());
   const origin = now();
-  const tracks: Record<RecordingSide, Track> = { user: new Track(), bot: new Track() };
+  const maxTrackSeconds = options.maxTrackSeconds ?? MAX_TRACK_SECONDS;
+  const tracks: Record<RecordingSide, Track> = { user: new Track(maxTrackSeconds), bot: new Track(maxTrackSeconds) };
   let closed: StsRecording | null = null;
   let stopped = false;
   let dropped = 0;

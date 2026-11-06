@@ -332,6 +332,25 @@ describe("a shared clock for both sides", () => {
   });
 });
 
+describe("bounded memory", () => {
+  it("refuses frames past the track cap and counts them, keeping what fit", () => {
+    const recorder = createStsCallRecorder({ maxTrackSeconds: 1 });
+    recorder.write("user", pcm(RECORDING_SAMPLE_RATE, 1), RECORDING_SAMPLE_RATE); // exactly 1 s
+    recorder.write("user", pcm(160, 2), RECORDING_SAMPLE_RATE); // over the cap
+    expect(recorder.droppedFrames).toBe(1);
+    expect(recorder.stop()!.durationSeconds).toBeCloseTo(1, 6);
+  });
+
+  it("does not let a huge clock jump allocate a huge silence block", () => {
+    let ms = 0;
+    const recorder = createStsCallRecorder({ now: () => ms, maxTrackSeconds: 5 });
+    ms = 10 * 60 * 60 * 1000;
+    recorder.write("bot", pcm(160, 3), RECORDING_SAMPLE_RATE);
+    expect(recorder.droppedFrames).toBe(1);
+    expect(recorder.stop()).toBeNull();
+  });
+});
+
 describe("stopping", () => {
   it("freezes an empty recorder too, so a late frame cannot create a recording after the call ended", () => {
     const recorder = createStsCallRecorder();
