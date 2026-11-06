@@ -262,7 +262,10 @@ export type RuntimeEvent = RuntimeEventBase &
       }
     // Same invariant as turn.completed.usage: `cachedInput` is a subset of
     // `input`, and `output` is optional for the same reason (see there).
-    | { type: "thread.token-usage.updated"; input: number; output?: number; cachedInput?: number }
+    // `contextWindow` is the model's context size in tokens when the driver
+    // learns it live (ACP `usage_update.size`), so `input / contextWindow`
+    // is the occupancy; telemetry records it as gen_ai.request.context_window.
+    | { type: "thread.token-usage.updated"; input: number; output?: number; cachedInput?: number; contextWindow?: number }
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }

@@ -344,6 +344,41 @@ const instanceConfigSchema = z.object({
   config: z.json().optional(),
 });
 const instanceConfigMapSchema = z.record(z.string(), instanceConfigSchema);
+
+/** The placement transport's two knobs, with their own invariant.
+ *
+ *  The unreachable window has to be longer than the heartbeat period:  a
+ *  worker that has not said so for less than one period is healthy, and
+ *  marking it unreachable would stop work that is running fine.  The window
+ *  is raised rather than the heartbeat lowered, because a generous window
+ *  is the safe direction and a short heartbeat only costs a little traffic.
+ *
+ *  The pair is clamped, never rejected:  a knob that fails closed on a typo
+ *  would rather hold its bound than fail the whole configuration file, and
+ *  the store's rule for every other knob is the same one.  The vault can
+ *  hold an inverted pair the file never sees, so `clampPlacementWindow`
+ *  applies the same rule after the vault resolves. */
+export const placementSchema = z.object({
+  heartbeatSeconds: z.number().int().min(1).max(3600).optional(),
+  unreachableAfterSeconds: z.number().int().min(16).max(86400).optional(),
+}).strict().transform((value) => clampPlacementWindow(value));
+
+/** The placement knobs' shape, before the schema's transform. */
+export interface PlacementWindow {
+  heartbeatSeconds?: number;
+  unreachableAfterSeconds?: number;
+}
+
+/** The placement knobs' own invariant, applied to whatever the file and the
+ *  vault hold.  Returns the pair with the window raised above the period. */
+export function clampPlacementWindow(value: PlacementWindow): PlacementWindow {
+  const heartbeat = value.heartbeatSeconds;
+  const unreachable = value.unreachableAfterSeconds;
+  if (heartbeat === undefined || unreachable === undefined) return value;
+  if (unreachable <= heartbeat) return { ...value, unreachableAfterSeconds: heartbeat + 1 };
+  return value;
+}
+
 const appConfigSchema = z.object({
   deleteInstance: optionalText,
   xai: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
@@ -575,6 +610,14 @@ const appConfigSchema = z.object({
     // field overrides the file.
     webhookHotDeferMinutes: z.number().int().min(1).max(720).optional(),
   }).optional(),
+  // The placement transport's own two knobs (server/placement-controller-bridge.ts
+  // and the lease service's unreachable window).  Both are optional: an
+  // absent field resolves to the built-in default, and the vault knob of the
+  // same field overrides the file.  `heartbeatSeconds` is the worker's
+  // heartbeat period and `unreachableAfterSeconds` is how long a worker may
+  // go quiet before the controller marks it unreachable, so the second must
+  // be longer than the first or a healthy worker is swept.
+  placement: placementSchema.optional(),
   // How long one computer call waits inside the harness while its desktop
   // is busy (server/computer-call-gate.ts).  Every field is optional: an
   // absent field resolves through the legacy `OMB_COMPUTER_*` env names to
@@ -842,6 +885,10 @@ export interface AppConfig {
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;
   };
+  /** The placement transport's two knobs (server/placement-controller-bridge.ts).
+   *  Derived from the schema, so the type cannot drift from what the store
+   *  accepts.  Absent fields resolve to the built-in defaults. */
+  placement?: z.infer<typeof placementSchema>;
   /** Computer-call gate waits (server/computer-call-gate.ts).  See the
    *  schema above; absent fields resolve in `computerCallSettings`. */
   computerCall?: {
@@ -2098,6 +2145,10 @@ export function loadConfig(): AppConfig {
   // are no-ops when the store is unconfigured.  Runtime reads never consult
   // the vault — they read this resolved `cfg` from memory.
   resolveKnobFields(cfg, infisicalSnapshot());
+  // The vault can hold a pair the file schema never saw, so the placement
+  // knobs' own invariant is applied here too:  the unreachable window has to
+  // be longer than the heartbeat period, or a healthy worker is swept.
+  if (cfg.placement) cfg.placement = clampPlacementWindow(cfg.placement);
   // Pin pre-MiniMax key-only installs after env and external-secret resolution.
   // Never persist the injected key to config.json in cleartext.
   migrateLegacyElevenLabsTtsProvider(cfg);
@@ -2380,7 +2431,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "githubRequestLog", "zulip", "autoReview", "sts", "computerCall", "claudeSession"] as const) {
+  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "githubRequestLog", "zulip", "autoReview", "sts", "computerCall", "claudeSession", "placement"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
