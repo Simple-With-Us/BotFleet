@@ -2140,6 +2140,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
               openedNewSession = true;
+              // session.started below persists the resume cursor before the
+              // prompt goes out.  Record the pending marker first, so a setup
+              // failure or crash between the two still leaves the first
+              // identification owed on the next turn for this cursor.
+              if (support.promptPrefix !== undefined) firstReplyLedger.record(sessionId);
             }
             let selectedModel: string | null = null;
             let sessionStarted = false;

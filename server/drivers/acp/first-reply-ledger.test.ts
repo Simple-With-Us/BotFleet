@@ -73,6 +73,21 @@ describe("first-reply ledger", () => {
     expect(driver.owed("s1")).toBe(false);
   });
 
+  it("removes its temporary file when the rename fails, and keeps the session owed", () => {
+    const driver = ledger();
+    expect(driver.record("s1")).toBe(true);
+    // Turn the record into a non-empty directory so the next rename onto it fails.
+    const recordPath = join(pendingDir(), readdirSync(pendingDir())[0]);
+    rmSync(recordPath);
+    mkdirSync(recordPath);
+    writeFileSync(join(recordPath, "occupied"), "x");
+    warnings.length = 0;
+    expect(driver.record("s1")).toBe(false);
+    expect(readdirSync(pendingDir()).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    expect(warnings.some((line) => line.includes("not writable"))).toBe(true);
+    expect(driver.owed("s1")).toBe(true);
+  });
+
   it("stops re-marking an answered session even when its record cannot be deleted", () => {
     const driver = ledger();
     driver.record("s1");

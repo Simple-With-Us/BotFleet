@@ -81,8 +81,18 @@ export function createFirstReplyLedger(instanceId: string, warn: (line: string) 
         mkdirSync(dir, { recursive: true });
         const path = fileFor(instanceId, sessionId);
         const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-        writeFileSync(tmp, `${Date.now()}\n`, { mode: 0o600 });
-        renameSync(tmp, path);
+        try {
+          writeFileSync(tmp, `${Date.now()}\n`, { mode: 0o600 });
+          renameSync(tmp, path);
+        } catch (writeError) {
+          // A partial write or failed rename must not leave a stray temp file.
+          try {
+            unlinkSync(tmp);
+          } catch {
+            // Nothing to clean up, or it cannot be removed: keep the original failure.
+          }
+          throw writeError;
+        }
         pending.delete(sessionId);
         return true;
       } catch {

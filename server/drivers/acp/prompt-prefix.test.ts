@@ -153,6 +153,19 @@ describe("ACP promptPrefix", () => {
     expect(seen).toEqual([]);
   });
 
+  it("records a new session as pending as soon as it exists, before its cursor is saved", async () => {
+    await create();
+    // A command turn opens the session and saves its cursor without ever sending the
+    // marker.  The next turn on that cursor must still carry it.
+    await instance.adapter.sendTurn({ threadId: "t-prefix-early", text: "x", command: { name: "compact", args: "a" } });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-early");
+    const cursor = sessionIdOf("t-prefix-early");
+    await instance.adapter.sendTurn({ threadId: "t-prefix-early2", text: "after", resumeCursor: cursor });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-prefix-early2");
+    expect(seen).toEqual([{ newSession: true }]);
+    expect(echoed("t-prefix-early2")).toBe(`${MARKER}after`);
+  });
+
   it("counts the prefix's UTF-8 bytes against the hard ceiling, so a prompt can never be sent past it", async () => {
     // Budget 500 gives a hard ceiling of 1000 bytes.  This protected text is 989
     // bytes on its own (it has no trimmable section), under the ceiling without
