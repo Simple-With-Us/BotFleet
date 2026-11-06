@@ -66,7 +66,7 @@ export function createFirstReplyLedger(instanceId: string, warn: (line: string) 
         accessSync(fileFor(instanceId, sessionId));
         return true;
       } catch (error) {
-        if (String(Reflect.get(Object(error), "code")) === "ENOENT") return false;
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
         warn("[acp] first-reply ledger unreadable; the session marker may be repeated once");
         return true;
       }
@@ -110,7 +110,7 @@ export function createFirstReplyLedger(instanceId: string, warn: (line: string) 
         unlinkSync(fileFor(instanceId, sessionId));
         return true;
       } catch (error) {
-        if (String(Reflect.get(Object(error), "code")) === "ENOENT") return true;
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return true;
         warn("[acp] first-reply ledger entry could not be removed; the session marker may be repeated once after a restart");
         return false;
       }
