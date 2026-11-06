@@ -36,7 +36,7 @@ describe("mcode thread-title marker through the driver", () => {
     await instance?.dispose();
   });
 
-  const create = async (config: Record<string, unknown> = {}) => {
+  const create = async (config: { promptBudgetBytes?: number } = {}) => {
     instance = await McodeAgentDriver.create({
       instanceId: "mcode-title-test",
       displayName: "MiniMax Code",

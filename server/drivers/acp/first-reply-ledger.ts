@@ -39,10 +39,6 @@ function fileFor(instanceId: string, sessionId: string): string {
   return join(ledgerDir(), `${name}.pending`);
 }
 
-function errorCode(error: unknown): string | undefined {
-  return typeof error === "object" && error !== null && "code" in error ? String((error as { code: unknown }).code) : undefined;
-}
-
 export interface FirstReplyLedger {
   /** True when the session's first marked prompt is not known to be answered.
    *  An unreadable ledger answers true: the marker may repeat, never go missing. */
@@ -70,7 +66,7 @@ export function createFirstReplyLedger(instanceId: string, warn: (line: string) 
         accessSync(fileFor(instanceId, sessionId));
         return true;
       } catch (error) {
-        if (errorCode(error) === "ENOENT") return false;
+        if (String(Reflect.get(Object(error), "code")) === "ENOENT") return false;
         warn("[acp] first-reply ledger unreadable; the session marker may be repeated once");
         return true;
       }
@@ -106,12 +102,15 @@ export function createFirstReplyLedger(instanceId: string, warn: (line: string) 
     answered(sessionId) {
       pending.delete(sessionId);
       done.add(sessionId);
-      if (done.size > MAX_ANSWERED_IN_MEMORY) done.delete(done.values().next().value as string);
+      if (done.size > MAX_ANSWERED_IN_MEMORY) {
+        const oldest = done.values().next();
+        if (!oldest.done) done.delete(oldest.value);
+      }
       try {
         unlinkSync(fileFor(instanceId, sessionId));
         return true;
       } catch (error) {
-        if (errorCode(error) === "ENOENT") return true;
+        if (String(Reflect.get(Object(error), "code")) === "ENOENT") return true;
         warn("[acp] first-reply ledger entry could not be removed; the session marker may be repeated once after a restart");
         return false;
       }

@@ -60,7 +60,7 @@ describe("ACP promptPrefix", () => {
       displayName: "Prompt Prefix Test",
       environment: {},
       enabled: true,
-      config: { cli: FAKE_CLI, fullAuto: false, ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }) },
+      config: { cli: FAKE_CLI, fullAuto: false, promptBudgetBytes },
     });
     recorder = recordEvents(instance.adapter);
   };
