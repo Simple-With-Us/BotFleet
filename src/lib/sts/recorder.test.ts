@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   RECORDING_RETENTION_DAYS,
   RECORDING_SAMPLE_RATE,
@@ -391,6 +391,32 @@ describe("review follow-ups", () => {
     expect(view.getInt16(frameOffset(0) + 2, true)).toBe(4);
     expect(view.getInt16(frameOffset(160) + 2, true)).toBe(0);
     expect(view.getInt16(frameOffset(120 * RECORDING_SAMPLE_RATE) + 2, true)).toBe(9);
+  });
+  it("contains a WAV build failure: stop() returns null instead of throwing into teardown", () => {
+    const recorder = createStsCallRecorder({
+      now: () => 0,
+      buildWav: () => {
+        throw new RangeError("Array buffer allocation failed");
+      },
+    });
+    recorder.write("user", pcm(1600, 1), RECORDING_SAMPLE_RATE);
+    expect(() => recorder.stop()).not.toThrow();
+    expect(recorder.stop()).toBeNull();
+  });
+
+  it("defaults to the monotonic clock: a wall-clock step does not change the recording", () => {
+    const monotonic = vi.spyOn(performance, "now").mockReturnValue(1000);
+    const wall = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const recorder = createStsCallRecorder();
+      monotonic.mockReturnValue(1000);
+      wall.mockReturnValue(10 * 60 * 1000); // the system clock steps forward ten minutes
+      recorder.write("bot", pcm(160, 3), RECORDING_SAMPLE_RATE);
+      expect(recorder.stop()!.durationSeconds).toBeCloseTo(0.01, 6);
+    } finally {
+      monotonic.mockRestore();
+      wall.mockRestore();
+    }
   });
 });
 

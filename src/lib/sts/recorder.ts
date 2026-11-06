@@ -286,9 +286,10 @@ function defaultClock(): number {
  * and the bot's reply line up in the file the way they happened.  `now` is that
  * clock in milliseconds and exists so tests can drive it.
  */
-export function createStsCallRecorder(options: { now?: () => number; maxTrackSeconds?: number } = {}): StsCallRecorder {
+export function createStsCallRecorder(options: { now?: () => number; maxTrackSeconds?: number; buildWav?: typeof buildStereoWav } = {}): StsCallRecorder {
   const now = options.now ?? defaultClock;
   const origin = now();
+  const buildWav = options.buildWav ?? buildStereoWav;
   const requestedCap = options.maxTrackSeconds;
   // A NaN, zero or negative cap would either disable the limit or discard every frame.
   const maxTrackSeconds =
@@ -330,7 +331,7 @@ export function createStsCallRecorder(options: { now?: () => number; maxTrackSec
         if (user.length === 0 && bot.length === 0) return null;
         const frames = Math.max(user.length, bot.length);
         closed = {
-          wav: buildStereoWav(user, bot),
+          wav: buildWav(user, bot),
           durationSeconds: frames / RECORDING_SAMPLE_RATE,
           channels: { left: "user", right: "bot" },
         };
