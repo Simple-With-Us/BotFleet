@@ -792,6 +792,8 @@ export interface InstanceInfo {
   instanceId: string;
   driverKind: string;
   displayName: string;
+  localModelWaitAvailable?: boolean;
+  replyWaitMinutes?: number;
   enabled?: boolean;
   snapshot: {
     state: "available" | "unavailable";

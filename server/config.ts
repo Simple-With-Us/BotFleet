@@ -2517,7 +2517,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
 export function patchInstanceConfig(
   cfg: AppConfig,
   instanceId: string,
-  patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }> },
+  patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null },
 ): InstanceCliUpdate {
   const next: AppConfig = structuredClone(cfg);
   const map = instanceConfigs(next);
@@ -2563,6 +2563,11 @@ export function patchInstanceConfig(
     } else {
       delete nextConfig.userModels;
     }
+  }
+
+  if (patch.replyWaitMinutes !== undefined) {
+    if (patch.replyWaitMinutes === null) delete nextConfig.replyWaitMinutes;
+    else nextConfig.replyWaitMinutes = patch.replyWaitMinutes;
   }
 
   if (patch.fullAuto !== undefined) {
