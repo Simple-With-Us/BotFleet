@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { listSecretsRaw, isUnresolvedReference } from "./infisical-audit-fetch.mjs";
 
-const bindings = [
+export const bindings = [
   {
     name: "INFISICAL_IOS_SHIP_READ_TOKEN",
     consumers: [
