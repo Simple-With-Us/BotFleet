@@ -69,8 +69,8 @@ jobs:
           # prove which commit that is.
           fetch-depth: 0
           persist-credentials: false
-      # The shared planner consults App Store Connect, so it authenticates
-      # the same way the iOS plan-build job does (BF-2588).
+      # The shared planner consults App Store Connect, so this job loads
+      # the ASC key with INFISICAL_NATIVE_RELEASE_READ_TOKEN (BF-2588).
       - name: Load the App Store Connect credentials
         uses: ./.github/actions/infisical-secrets
         with:
