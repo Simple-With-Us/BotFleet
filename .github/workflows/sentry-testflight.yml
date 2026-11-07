@@ -9,8 +9,8 @@ on:
     inputs:
       token:
         description: >-
-          Infisical service token for the reporting app.  Optional: a caller
-          that has not migrated yet falls back to the machine identity.
+          Optional Infisical read token for the reporting app.  When empty,
+          the step uses INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN.
         required: false
         default: ""
         type: string
@@ -70,11 +70,7 @@ jobs:
           names: SENTRY_AUTH_TOKEN
           required: SENTRY_AUTH_TOKEN
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          # A caller with a service token passes one; the machine identity
-          # stays for the callers that have not migrated yet.
           token: ${{ inputs.token || secrets.INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
         env:
           GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
       - name: Record the Cocoa release and confirmed TestFlight availability
