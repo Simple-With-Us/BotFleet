@@ -63,16 +63,15 @@ jobs:
           # refuses a shallow clone; this is what lets it not.
           fetch-depth: 0
           persist-credentials: false
-      # The shared planner consults App Store Connect, so this job
-      # authenticates the same way the iOS plan-build job does (BF-2588).
+      # The shared planner consults App Store Connect, so this job loads
+      # the ASC key with INFISICAL_IOS_SHIP_READ_TOKEN (BF-2588).
       - name: Load the App Store Connect credentials
         uses: ./.github/actions/infisical-secrets
         with:
           names: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
           required: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+          token: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
       - id: pin
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
