@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { lstatSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -9,6 +10,17 @@ export const HOST_CAPABILITIES = ["identity-v1", "foreground-service-data-v1", "
 const KEYS = ["schemaVersion", "codeIdentifier", "sourceCommit", "build", "marketingVersion", "capabilities", "distribution", "sourceDirty"];
 const fail = () => { throw new Error("Native host artifact verification refused."); };
 export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
+/** Streamed digest for containers too large to hold in one allocation. */
+export function sha256File(path) {
+  return new Promise((resolveHash, rejectHash) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", rejectHash);
+    stream.on("end", () => resolveHash(hash.digest("hex")));
+  });
+}
 
 export function encodeHostIdentity(identity) {
   if (!identity) fail();
@@ -139,7 +151,8 @@ function system(path) {
 function fileAt(root, path) {
   const info = lstatSync(path);
   const canonical = realpathSync(path);
-  if (!info.isFile() || (info.mode & 0o022) !== 0 || !contained(root, canonical)) fail();
+  // Privilege-mode bits ride with the write bits: setuid/setgid/sticky on a staged file is escalation, not packaging.
+  if (!info.isFile() || (info.mode & 0o6022) !== 0 || !contained(root, canonical)) fail();
   return canonical;
 }
 
@@ -148,11 +161,11 @@ function auditPayload(root, files) {
   const actual = new Set();
   const walk = (directory) => {
     const info = lstatSync(directory);
-    if (!info.isDirectory() || (info.mode & 0o022) !== 0 || !contained(root, realpathSync(directory))) fail();
+    if (!info.isDirectory() || (info.mode & 0o6022) !== 0 || !contained(root, realpathSync(directory))) fail();
     for (const entry of readdirSync(directory)) {
       const path = join(directory, entry), child = lstatSync(path);
       if (child.isDirectory()) walk(path);
-      else if (child.isFile() && (child.mode & 0o022) === 0 && contained(root, realpathSync(path))) actual.add(path);
+      else if (child.isFile() && (child.mode & 0o6022) === 0 && contained(root, realpathSync(path))) actual.add(path);
       else fail();
     }
   };

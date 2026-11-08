@@ -4,7 +4,7 @@ import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, rea
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { encodeHostIdentity, HOST_CAPABILITIES, HOST_CODE_ID, inspectHostMachO, sha256, verifyNativeHostArtifact } from "./native-host-artifact.mjs";
+import { encodeHostIdentity, HOST_CAPABILITIES, HOST_CODE_ID, inspectHostMachO, sha256File, verifyNativeHostArtifact } from "./native-host-artifact.mjs";
 
 function refused() { throw new Error("Native host packaging refused; no distributable artifact was accepted."); }
 export function runHostPackagingCommand(command, args, options = {}) {
@@ -18,7 +18,10 @@ export function runHostPackagingCommand(command, args, options = {}) {
 
 export async function nativeHostNotaryCredentials({ env = process.env, fetchImpl = fetch } = {}) {
   const token = String(env.INFISICAL_NATIVE_RELEASE_READ_TOKEN ?? "").trim();
-  if (!token) refused();
+  if (!token) {
+    console.error("INFISICAL_NATIVE_RELEASE_READ_TOKEN is not set; notarization credentials cannot be read.");
+    refused();
+  }
   try {
     const helper = await import("./infisical-fetch.mjs");
     // The dependency on published #1551 fails closed on the older unscoped helper.
@@ -76,8 +79,10 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
       stage = `${arch} Mach-O identity check`;
       const built = join(binPath, HOST_CODE_ID), slices = inspectHostMachO(readFileSync(built));
       if (slices.length !== 1 || slices[0].arch !== arch || !slices[0].stamp?.equals(stamp)) refused();
-      // This product declares no production resource bundle; a changed graph needs explicit packaging support.
-      if (readdirSync(binPath).some((name) => name.endsWith(".bundle"))) refused();
+      // This product is exactly one Mach-O binary; a changed graph producing
+      // bundles, frameworks or dylibs needs explicit packaging support and is
+      // refused rather than shipped half-verified.
+      if (readdirSync(binPath).some((name) => name !== HOST_CODE_ID)) refused();
       executables.push(built);
     }
     stage = "universal assembly";
@@ -137,7 +142,7 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
       }
     }
     const receipt = { ...verified, distributable: !unsignedDevelopment, artifact: artifact.slice(destination.length + 1),
-      artifactSha256: sha256(readFileSync(artifact)), notice: unsignedDevelopment ? "NOT DISTRIBUTABLE" : "Notarized container; installation is separate" };
+      artifactSha256: await sha256File(artifact), notice: unsignedDevelopment ? "NOT DISTRIBUTABLE" : "Notarized container; installation is separate" };
     writeFileSync(join(destination, "artifact.json"), JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600, flag: "wx" });
     accepted = true;
     return receipt;
