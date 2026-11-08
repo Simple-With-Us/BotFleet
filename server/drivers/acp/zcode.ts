@@ -35,6 +35,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { z } from "zod";
+
 import type { EffortLevel, ModelCatalog } from "../../contracts.ts";
 import { ZCODE_CREDENTIAL_ENV } from "../zcode.ts";
 import { createAcpDriver, type AcpConfig, type AcpSupport } from "./core.ts";
@@ -92,14 +94,42 @@ export const STATIC_ZCODE_ACP_MODELS: ModelCatalog = {
  *  bridge older than the 0.82 line is not known to carry them. */
 const ZCODE_ACP_MINOR_FLOOR = 82;
 
+/** The session's advertised config options, decoded at the boundary:  the list
+ *  is verbatim agent output, and everything this driver reads off it (the
+ *  model option's wire values and labels) is parsed before any field is
+ *  branched on.  Unknown fields pass through; unknown values degrade to
+ *  undefined rather than failing the whole list. */
+export const advertisedConfigOptionsSchema = z
+  .array(
+    z
+      .object({
+        id: z.string().optional().catch(undefined),
+        options: z
+          .array(
+            z
+              .object({
+                value: z.string().optional().catch(undefined),
+                name: z.string().optional().catch(undefined),
+              })
+              .passthrough()
+              // One garbage entry drops itself, not the whole list.
+              .optional()
+              .catch(undefined),
+          )
+          .optional()
+          .catch(undefined),
+      })
+      .passthrough(),
+  )
+  .catch([]);
+
 /** The wire value of one advertised model selection is the provider id and the
  *  model id joined by a single backslash (`builtin:zai-coding-plan\GLM-5.3`;
  *  dist/config/options.js `formatModelValue`), with a colon spelling for
  *  agent-defined providers (`custom:<urlencoded providerId>:<modelId>`,
  *  `parseModelValue`).  Only the model id is decoded here — the provider half
  *  is the user's own login config and is never constructed or compared. */
-export function parseZcodeAcpModelValue(value: unknown): string | null {
-  if (typeof value !== "string") return null;
+export function parseZcodeAcpModelValue(value: string): string | null {
   const custom = /^custom:([^:]+):(.+)$/.exec(value);
   if (custom) {
     try {
@@ -118,19 +148,20 @@ export function parseZcodeAcpModelValue(value: unknown): string | null {
  *  built.  Returns null when the session advertises no model option (the
  *  session keeps its login default and the picker rides it, as before);
  *  throws when a model option exists but the requested model is not in it. */
-export function zcodeAcpModelOptionValue(model: string, advertised: unknown): string | null {
-  const modelOption = (Array.isArray(advertised) ? advertised : []).find(
-    (option: any) => option?.id === "model",
-  ) as { options?: Array<{ value?: unknown; name?: unknown }> } | undefined;
-  if (!modelOption) return null;
-  const available = Array.isArray(modelOption.options) ? modelOption.options : [];
+export function zcodeAcpModelOptionValue(
+  model: string,
+  advertised: z.infer<typeof advertisedConfigOptionsSchema> | undefined,
+): string | null {
+  const modelOption = advertised?.find((option) => option.id === "model");
+  const available = (modelOption?.options ?? []).filter((option) => option !== undefined);
+  if (!modelOption || available.length === 0) return null;
   const wanted = model.trim();
   for (const option of available) {
-    if (parseZcodeAcpModelValue(option?.value) === wanted && typeof option?.value === "string") {
+    if (option.value !== undefined && parseZcodeAcpModelValue(option.value) === wanted) {
       return option.value;
     }
   }
-  const names = available.map((option) => String(option?.name ?? option?.value ?? "?")).join(", ") || "none";
+  const names = available.map((option) => String(option.name ?? option.value ?? "?")).join(", ") || "none";
   throw new Error(`ZCode does not offer ${wanted} for this sign-in — available: ${names}`);
 }
 
@@ -154,6 +185,27 @@ function zcodeAcpCredentialPaths(env: Record<string, string | undefined>) {
  *  table that would drift.  A keyless-but-entitled desktop install therefore
  *  reads not-signed-in from this snapshot, and the per-turn `authenticate`
  *  call — which asks the bridge itself — is what settles those. */
+export const desktopCredentialConfigSchema = z
+  .object({
+    provider: z
+      .record(
+        z.string(),
+        z
+          .object({
+            enabled: z.boolean().optional().catch(undefined),
+            options: z
+              .object({ apiKey: z.string().optional().catch(undefined) })
+              .passthrough()
+              .optional()
+              .catch(undefined),
+          })
+          .passthrough(),
+      )
+      .optional()
+      .catch(undefined),
+  })
+  .passthrough();
+
 export function zcodeAcpAuthenticated(env: Record<string, string | undefined>): boolean {
   const { accounts, desktop } = zcodeAcpCredentialPaths(env);
   if (existsSync(accounts)) return true;
@@ -163,18 +215,21 @@ export function zcodeAcpAuthenticated(env: Record<string, string | undefined>): 
   } catch {
     return false;
   }
-  let parsed: unknown;
+  // Parsed and validated rather than `as`-cast (the muse rule):  a malformed
+  // desktop config is "no credential this driver can see", never a throw out
+  // of a snapshot path.
+  let json: unknown;
   try {
-    parsed = JSON.parse(raw);
+    json = JSON.parse(raw);
   } catch {
     return false;
   }
-  const providers = (parsed as { provider?: unknown } | null)?.provider;
-  if (!providers || typeof providers !== "object") return false;
-  for (const [id, entry] of Object.entries(providers as Record<string, any>)) {
-    const key = entry?.options?.apiKey;
-    if (typeof key === "string" && key.trim()) {
-      if (!id.startsWith("builtin:") || entry?.enabled === true) return true;
+  const parsed = desktopCredentialConfigSchema.safeParse(json);
+  if (!parsed.success) return false;
+  for (const [id, entry] of Object.entries(parsed.data.provider ?? {})) {
+    const key = entry.options?.apiKey;
+    if (key?.trim()) {
+      if (!id.startsWith("builtin:") || entry.enabled === true) return true;
     }
   }
   return false;
@@ -182,12 +237,32 @@ export function zcodeAcpAuthenticated(env: Record<string, string | undefined>): 
 
 /** One `session/set_config_option` reply:  `{ kind, currentValue, options }`
  *  on the bridge, possibly a bare `{}` ACK elsewhere.  Only a *reported*
- *  currentValue is evidence — a bare ACK reports nothing to compare against. */
+ *  currentValue is evidence — a bare ACK reports nothing to compare against.
+ *  The reply is decoded at this boundary; anything else reads as "nothing
+ *  reported". */
+const configOptionReplySchema = z
+  .object({
+    currentValue: z.string().optional().catch(undefined),
+    options: z
+      .array(
+        z
+          .object({
+            id: z.string().optional().catch(undefined),
+            currentValue: z.string().optional().catch(undefined),
+          })
+          .passthrough(),
+      )
+      .optional()
+      .catch(undefined),
+  })
+  .passthrough();
+
 function reportedConfigValue(result: any, configId: string): string | undefined {
-  const options = Array.isArray(result?.options) ? result.options : [];
-  const hit = options.find((option: any) => option?.id === configId);
-  const value = hit?.currentValue ?? result?.currentValue;
-  return typeof value === "string" ? value : undefined;
+  const decoded = configOptionReplySchema.safeParse(result);
+  if (!decoded.success) return undefined;
+  const hit = decoded.data.options?.find((option) => option.id === configId);
+  const value = hit?.currentValue ?? decoded.data.currentValue;
+  return value;
 }
 
 /** JSON-RPC "invalid params": what the bridge answers for an unknown config
@@ -244,8 +319,13 @@ const support: AcpSupport = {
   spawnArgs: () => [],
   selectModel: {
     configId: "model",
-    valueForModel: (model, advertised) => zcodeAcpModelOptionValue(model, advertised),
-    modelForValue: (value) => parseZcodeAcpModelValue(value),
+    // `advertised` is the core's verbatim `configOptions` list; it is decoded
+    // here, at this driver's boundary, before any field is read.
+    valueForModel: (model, advertised) => zcodeAcpModelOptionValue(model, advertisedConfigOptionsSchema.parse(advertised ?? [])),
+    modelForValue: (value) => {
+      const text = z.string().safeParse(value);
+      return text.success ? parseZcodeAcpModelValue(text.data) : null;
+    },
   },
   // Billing hygiene (mirrors the headless driver's strip):  an inherited
   // z.ai/GLM/BigModel key must not flip a turn onto metered API billing, and
@@ -296,10 +376,13 @@ const support: AcpSupport = {
     // bridge's own defaults exactly as before.  undefined means the list is
     // unknown or empty — nothing observed says the option is missing, so a
     // set that comes back -32602 is tolerated (an older bridge) instead of
-    // failing the turn.
+    // failing the turn.  The list is decoded at this boundary; garbage
+    // entries drop themselves, so a list that parses to nothing carries no
+    // evidence either way.
+    const sessionOptions = advertisedConfigOptionsSchema.parse(sessionConfigOptions ?? []);
     const advertised = (configId: string): boolean | undefined => {
-      if (!Array.isArray(sessionConfigOptions) || sessionConfigOptions.length === 0) return undefined;
-      return sessionConfigOptions.some((option) => (option as { id?: unknown } | null)?.id === configId);
+      if (sessionOptions.length === 0) return undefined;
+      return sessionOptions.some((option) => option?.id === configId);
     };
     const modeAdvertised = advertised(ZCODE_ACP_MODE_CONFIG_ID);
     if (modeAdvertised === false) {
@@ -315,6 +398,9 @@ const support: AcpSupport = {
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        // SAFETY: the core attaches `code` to a JSON-RPC error with
+        // Object.assign; any other thrown value has none, and the `?.`
+        // tolerates a non-object.
         const code = (error as { code?: unknown } | null)?.code;
         // A held turn must actually ask and a full-auto turn must actually
         // run:  anything other than an option the session never advertised
@@ -355,6 +441,9 @@ const support: AcpSupport = {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // SAFETY: the core attaches `code` to a JSON-RPC error with
+      // Object.assign; any other thrown value has none, and the `?.`
+      // tolerates a non-object.
       const code = (error as { code?: unknown } | null)?.code;
       // -32602 is only survivable when the session never advertised the
       // option at all (the list was withheld); when it did, a refusal is a

@@ -17,6 +17,7 @@ import { removeTempDir } from "../../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { BUILT_IN_DRIVERS } from "../builtIn.ts";
 import {
+  advertisedConfigOptionsSchema,
   parseZcodeAcpModelValue,
   STATIC_ZCODE_ACP_MODELS,
   ZcodeAcpDriver,
@@ -75,6 +76,8 @@ describe("ZCode ACP driver", () => {
     expect(ZcodeAcpDriver.metadata.displayName).toBe("ZCode");
     expect(ZcodeAcpDriver.metadata.access).toBe("subscription");
     const decoded = ZcodeAcpDriver.defaultConfig();
+    // SAFETY: defaultConfig returns AcpConfig, whose `cli` is the string this
+    // support names; the assertion only reads that field.
     expect((decoded as { cli: string }).cli).toBe("zcode-acp-server");
     // The package installs a second bin (the unified CLI); the picker must
     // find an install that only exposes it.
@@ -124,7 +127,6 @@ describe("ZCode ACP driver", () => {
     // providerId>:<modelId>` (the provider's colons are percent-encoded).
     expect(parseZcodeAcpModelValue("custom:account%3Abigmodel-individual-coding-plan:GLM-5.3")).toBe("GLM-5.3");
     expect(parseZcodeAcpModelValue("GLM-5.3")).toBeNull();
-    expect(parseZcodeAcpModelValue(42)).toBeNull();
   });
 
   it("matches the picker model against the advertised options and returns the wire value verbatim", () => {
@@ -138,6 +140,10 @@ describe("ZCode ACP driver", () => {
       },
     ];
     expect(zcodeAcpModelOptionValue("GLM-5.3", advertised)).toBe(GLM);
+    // Garbage in the list degrades at the boundary instead of throwing.
+    expect(
+      zcodeAcpModelOptionValue("GLM-5.3", advertisedConfigOptionsSchema.parse([{ id: "model", options: [7, null, { value: GLM }] }])),
+    ).toBe(GLM);
     // No model option advertised:  the session keeps its login default and
     // the switch is skipped, exactly as mcode's contract reads.
     expect(zcodeAcpModelOptionValue("GLM-5.3", [{ id: "mode", options: [] }])).toBeNull();
@@ -181,7 +187,8 @@ describe("zcodeAcpAuthenticated", () => {
     const home = scratchDir("botfleet-zcode-acp-auth-");
     const v2 = join(home, ".zcode", "v2");
     mkdirSync(v2, { recursive: true });
-    const write = (config: unknown) => writeFileSync(join(v2, "config.json"), JSON.stringify(config));
+    type DesktopFixture = { provider?: Record<string, { enabled?: boolean; options?: { apiKey?: string } }> };
+    const write = (config: DesktopFixture) => writeFileSync(join(v2, "config.json"), JSON.stringify(config));
     // A user-added provider carrying its own key.
     write({ provider: { "custom:relay": { options: { apiKey: "k" } } } });
     expect(zcodeAcpAuthenticated({ HOME: home })).toBe(true);
@@ -308,7 +315,9 @@ describe("ZCode ACP turns (fake bridge)", () => {
 
     expect(done).toMatchObject({ ok: true });
     expect(configCalls(dump)).toEqual([setConfig("model", GLM), setConfig("mode", "yolo"), setConfig("thought", "high")]);
-    const env = JSON.parse(readFileSync(dump, "utf8")).env as Record<string, string>;
+    // SAFETY: the fake CLI writes the dump itself and its env map carries
+    // only the keys it recorded; this test reads that recorded shape.
+    const env = (JSON.parse(readFileSync(dump, "utf8")) as { env?: Record<string, string> }).env ?? {};
     expect(env.ZCODE_ACP_MODE).toBe("yolo");
     // An inherited z.ai key must not ride along:  it would flip billing off
     // the Coding Plan subscription onto metered API billing.
@@ -324,7 +333,9 @@ describe("ZCode ACP turns (fake bridge)", () => {
 
     expect(done).toMatchObject({ ok: true });
     expect(configCalls(dump)).toEqual([setConfig("model", GLM), setConfig("mode", "build")]);
-    const env = JSON.parse(readFileSync(dump, "utf8")).env as Record<string, string>;
+    // SAFETY: the fake CLI writes the dump itself and its env map carries
+    // only the keys it recorded; this test reads that recorded shape.
+    const env = (JSON.parse(readFileSync(dump, "utf8")) as { env?: Record<string, string> }).env ?? {};
     expect(env.ZCODE_ACP_MODE).toBe("build");
   });
 
@@ -412,11 +423,14 @@ describe("ZCode ACP turns (fake bridge)", () => {
     });
     // The rpc dump is per-launch (each child overwrites it), so this reads
     // the second launch alone — which must resume, not open fresh.
+    // RuntimeEvent carries turnId on every event, so the second wait can
+    // require a completion other than the first turn's.
+    const firstTurnId = first.turnId;
     await recorder!.until(
       (event) =>
         event.type === "turn.completed"
         && event.threadId === "zcode-acp-resume"
-        && event.turnId !== (first as { turnId?: string }).turnId,
+        && event.turnId !== firstTurnId,
       25_000,
     );
 
