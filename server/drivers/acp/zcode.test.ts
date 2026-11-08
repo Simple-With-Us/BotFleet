@@ -163,6 +163,10 @@ describe("ZCode ACP driver", () => {
   it("gates the stock bridge below the 0.82 line and exempts a custom wrapper", () => {
     expect(zcodeAcpVersionCompatibilityReason("0.82.3", { cli: "zcode-acp-server", fullAuto: true })).toBeNull();
     expect(zcodeAcpVersionCompatibilityReason("1.0.0", { cli: "zcode-acp-server", fullAuto: true })).toBeNull();
+    // Forks and wrappers decorate the version; the floor reads major and
+    // minor only.
+    expect(zcodeAcpVersionCompatibilityReason("v0.82.3", { cli: "zcode-acp-server", fullAuto: true })).toBeNull();
+    expect(zcodeAcpVersionCompatibilityReason("0.82.3-beta.1", { cli: "zcode-acp-server", fullAuto: true })).toBeNull();
     const refused = zcodeAcpVersionCompatibilityReason("0.81.2", { cli: "zcode-acp-server", fullAuto: true });
     expect(refused).toMatch(/0\.81\.2/);
     expect(refused).toMatch(/0\.82\.0 or newer/);
@@ -176,11 +180,18 @@ describe("ZCode ACP driver", () => {
 });
 
 describe("zcodeAcpAuthenticated", () => {
-  it("reads the setup accounts file when it exists", () => {
+  it("reads the setup accounts file when it carries at least one entry", () => {
     const home = scratchDir("botfleet-zcode-acp-auth-");
     mkdirSync(join(home, ".zcode", "v2"), { recursive: true });
-    writeFileSync(join(home, ".zcode", "v2", "acp-accounts.json"), "{}");
+    writeFileSync(join(home, ".zcode", "v2", "acp-accounts.json"), JSON.stringify({ "builtin:zai-coding-plan": {} }));
     expect(zcodeAcpAuthenticated({ HOME: home })).toBe(true);
+    // Existence alone proved nothing (the Kody finding):  a zero-byte or
+    // truncated file from an interrupted setup reads as no credential, and
+    // the desktop rung decides.
+    writeFileSync(join(home, ".zcode", "v2", "acp-accounts.json"), "");
+    expect(zcodeAcpAuthenticated({ HOME: home })).toBe(false);
+    writeFileSync(join(home, ".zcode", "v2", "acp-accounts.json"), "{trunc");
+    expect(zcodeAcpAuthenticated({ HOME: home })).toBe(false);
   });
 
   it("accepts a desktop provider key, but only an enabled builtin one", () => {
@@ -217,7 +228,7 @@ describe("zcodeAcpAuthenticated", () => {
   it("follows ZCODE_HOME the way the bridge does", () => {
     const root = scratchDir("botfleet-zcode-acp-auth-root-");
     mkdirSync(join(root, "v2"), { recursive: true });
-    writeFileSync(join(root, "v2", "acp-accounts.json"), "{}");
+    writeFileSync(join(root, "v2", "acp-accounts.json"), JSON.stringify({ "builtin:zai-coding-plan": {} }));
     // HOME points at an empty home; the relocated root is what decides.
     expect(zcodeAcpAuthenticated({ HOME: scratchDir("botfleet-zcode-acp-auth-"), ZCODE_HOME: root })).toBe(true);
   });
@@ -337,6 +348,19 @@ describe("ZCode ACP turns (fake bridge)", () => {
     // only the keys it recorded; this test reads that recorded shape.
     const env = (JSON.parse(readFileSync(dump, "utf8")) as { env?: Record<string, string> }).env ?? {};
     expect(env.ZCODE_ACP_MODE).toBe("build");
+  });
+
+  it("sets the effort on a turn that names no model, using the session's current model", async () => {
+    // GLM-5.3 first, so the session advertises it as current without a
+    // switch call:  a thread on the default model that picks an effort must
+    // not silently run at the backend's level.
+    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([GLM, FLASH]);
+    process.env.FAKE_ACP_REASONING_MODELS = GLM;
+    const dump = dumpTo("default-model-effort.json");
+    await create(true);
+
+    expect(await runTurn({ threadId: "zcode-acp-default-model-effort", effort: "high" })).toMatchObject({ ok: true });
+    expect(configCalls(dump)).toEqual([setConfig("mode", "yolo"), setConfig("thought", "high")]);
   });
 
   it("sends no effort call when the turn picked none, and none for Flash", async () => {

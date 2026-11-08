@@ -31,7 +31,7 @@
 // `providerId\modelId`, with a `custom:` colon spelling for agent-defined
 // providers), and dist/handlers/authenticate.js (the readiness check).
 
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -110,6 +110,7 @@ export const advertisedConfigOptionsSchema = z
               .object({
                 value: z.string().optional().catch(undefined),
                 name: z.string().optional().catch(undefined),
+                currentValue: z.string().optional().catch(undefined),
               })
               .passthrough()
               // One garbage entry drops itself, not the whole list.
@@ -185,6 +186,12 @@ function zcodeAcpCredentialPaths(env: Record<string, string | undefined>) {
  *  table that would drift.  A keyless-but-entitled desktop install therefore
  *  reads not-signed-in from this snapshot, and the per-turn `authenticate`
  *  call — which asks the bridge itself — is what settles those. */
+/** A saved `zcode-acp setup` account file:  one JSON object with at least one
+ *  entry.  Existence alone proved nothing (the Kody finding):  a zero-byte or
+ *  truncated file from an interrupted setup must read as "no credential this
+ *  driver can see", exactly like a missing one. */
+const setupAccountsSchema = z.record(z.string(), z.unknown());
+
 export const desktopCredentialConfigSchema = z
   .object({
     provider: z
@@ -208,7 +215,22 @@ export const desktopCredentialConfigSchema = z
 
 export function zcodeAcpAuthenticated(env: Record<string, string | undefined>): boolean {
   const { accounts, desktop } = zcodeAcpCredentialPaths(env);
-  if (existsSync(accounts)) return true;
+  let accountsRaw: string;
+  try {
+    accountsRaw = readFileSync(accounts, "utf8");
+  } catch {
+    accountsRaw = "";
+  }
+  if (accountsRaw.trim()) {
+    let accountsJson: unknown;
+    try {
+      accountsJson = JSON.parse(accountsRaw);
+    } catch {
+      accountsJson = undefined;
+    }
+    const accounts = setupAccountsSchema.safeParse(accountsJson);
+    if (accounts.success && Object.keys(accounts.data).length > 0) return true;
+  }
   let raw: string;
   try {
     raw = readFileSync(desktop, "utf8");
@@ -417,11 +439,21 @@ const support: AcpSupport = {
       }
     }
 
-    const model = turn.model?.trim();
     // Effort arrives as the shared EffortLevel union already — no trim, or
     // the value widens to string and drops out of the rung check.
     const effort = turn.effort;
-    if (!model || !effort) return;
+    if (!effort) return;
+    // The rung vocabulary is per model, so an explicit effort needs the
+    // model the session will actually run:  the turn's pick, else the model
+    // the session advertises as current, else this driver's default.  A
+    // thread on the default model that picks an effort must not silently run
+    // at the backend's level.
+    const advertisedCurrent = sessionOptions.find((option) => option?.id === "model")?.currentValue;
+    const currentText = z.string().safeParse(advertisedCurrent);
+    const model =
+      turn.model?.trim()
+      ?? (currentText.success ? parseZcodeAcpModelValue(currentText.data) : undefined)
+      ?? STATIC_ZCODE_ACP_MODELS.default;
     const levels = STATIC_ZCODE_ACP_MODELS.options.find((option) => option.id === model)?.effortLevels ?? [];
     if (!levels.includes(effort)) {
       console.warn(`[zcode] ${model} has no effort "${effort}"; running at the session's own level`);
@@ -470,7 +502,9 @@ const support: AcpSupport = {
  *  core skips the gate for it, and the helper answers the same way. */
 export function zcodeAcpVersionCompatibilityReason(version: string, config: AcpConfig): string | null {
   if (config.cli !== "zcode-acp-server") return null;
-  const match = /^(\d+)\.(\d+)(?:\.|$)/.exec(version.trim());
+  // The bridge prints `0.82.3`; a fork or wrapper may print `v0.82.3` or
+  // carry a `-beta` suffix.  The floor reads major and minor only.
+  const match = /^v?(\d+)\.(\d+)(?:[.+-]|$)/.exec(version.trim());
   if (!match) return `\`${config.cli}\` did not report a recognizable version ("${version.trim()}")`;
   const major = Number(match[1]);
   const minor = Number(match[2]);
