@@ -35,7 +35,7 @@ export const SHIPPED_ONE_FILE_PACKS: ReadonlySet<string> = new Set([
 ]);
 
 /** Primary pack basename for each color.  Orange and default share the same file. */
-const PRIMARY_PACK: Readonly<Partial<Record<TVFacePackSkin, string>>> = {
+const PRIMARY_PACK = {
   orange: "tvface-default.webp",
   default: "tvface-default.webp",
   blue: "tvface-blue.webp",
@@ -49,13 +49,13 @@ const PRIMARY_PACK: Readonly<Partial<Record<TVFacePackSkin, string>>> = {
   coral: "tvface-coral.webp",
   white: "tvface-white.webp",
   black: "tvface-black.webp",
-};
+} satisfies Readonly<Partial<Record<TVFacePackSkin, string>>>;
 
 /** Thinking-focused pack (enter/hold/return denser).  Optional per color. */
-const THINKING_PACK: Readonly<Partial<Record<TVFacePackSkin, string>>> = {
+const THINKING_PACK = {
   orange: "tvface-thinking.webp",
   default: "tvface-thinking.webp",
-};
+} satisfies Readonly<Partial<Record<TVFacePackSkin, string>>>;
 
 /** Bot states that prefer the thinking pack when one is registered. */
 const THINKING_PACK_STATES: ReadonlySet<string> = new Set([
@@ -87,8 +87,15 @@ export function tvFaceOneFilePackUrl(color: TVFacePackSkin, state: string): stri
   const key: TVFacePackSkin = color === "default" ? "default" : color;
 
   if (THINKING_PACK_STATES.has(state)) {
-    const thinking = packUrl(THINKING_PACK[key]);
+    // Only the default family ships a thinking pack.
+    const thinking =
+      key === "orange" || key === "default" ? packUrl(THINKING_PACK[key]) : undefined;
     if (thinking) return thinking;
+    // A color without its own thinking pack keeps the multi-GIF tree for
+    // thinking-class states:  the color packs' manifests document only the
+    // default ranges (`*`, working, speaking), so these states would
+    // collapse to the hold loop and lose their dedicated expressions.
+    return null;
   }
 
   return packUrl(PRIMARY_PACK[key]);

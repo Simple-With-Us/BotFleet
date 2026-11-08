@@ -36,6 +36,33 @@ describe("tv-face one-file packs", () => {
     );
   });
 
+  it("keeps thinking-class states on the GIF tree for colors without a thinking pack", () => {
+    // The color packs' manifests document only the default ranges, so a
+    // thinking-class state on a non-orange color must not collapse to the
+    // color pack's hold loop:  null sends the multi-GIF tree, which carries
+    // the dedicated expression.
+    for (const color of [
+      "blue",
+      "green",
+      "purple",
+      "pink",
+      "red",
+      "cyan",
+      "yellow",
+      "teal",
+      "coral",
+      "white",
+      "black",
+    ] as const) {
+      expect(tvFaceOneFilePackUrl(color, "thinking")).toBeNull();
+      expect(tvFaceOneFilePackUrl(color, "tools")).toBeNull();
+    }
+    // The default family keeps its dedicated thinking pack.
+    expect(tvFaceOneFilePackUrl("default", "thinking")).toBe(
+      tvFacePackPublicPath("tvface-thinking.webp"),
+    );
+  });
+
   it("maps each shipped color to its color pack for idle", () => {
     for (const color of [
       "blue",
