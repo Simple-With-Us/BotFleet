@@ -68,7 +68,7 @@ test("the actual CLI refuses a public-key flag without a value rather than accep
 
 // The explicit tool path is provided only for the owned Mac validation fixture.
 // sign_update always receives this synthetic key file, so it never reads Keychain.
-test("pinned Sparkle 2.9.6 sign_update and Node cross-verify raw archive signatures", {
+test("pinned Sparkle 2.10.1 sign_update and Node cross-verify raw archive signatures", {
   skip: !process.env.BOTFLEET_TEST_SPARKLE_SIGN_UPDATE,
 }, () => {
   const directory = mkdtempSync(join(tmpdir(), "bf-sparkle-cross-oracle-"));
