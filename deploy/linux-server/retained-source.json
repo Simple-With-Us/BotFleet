@@ -1356,6 +1356,7 @@
     {"path":"server/drivers/acp/opencode-go.ts","category":"runtime","reason":"Import from server/drivers/builtIn.ts"},
     {"path":"server/drivers/acp/prompt-budget.ts","category":"runtime","reason":"Import from server/drivers/minimax.ts"},
     {"path":"server/drivers/acp/qwen.ts","category":"runtime","reason":"Import from server/drivers/builtIn.ts"},
+    {"path":"server/drivers/acp/zcode.ts","category":"runtime","reason":"Import from server/drivers/builtIn.ts"},
     {"path":"server/drivers/agents-proxy.ts","category":"runtime-asset","reason":"Declared subprocess in server/proxy-paths.ts"},
     {"path":"server/drivers/antigravity.ts","category":"runtime","reason":"Import from server/drivers/builtIn.ts"},
     {"path":"server/drivers/boxagent.ts","category":"runtime","reason":"Import from server/drivers/builtIn.ts"},
