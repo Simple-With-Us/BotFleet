@@ -22,9 +22,8 @@
 //      value is put there, so the harness's own `GH_TOKEN` — or another
 //      seat's — cannot ride along.  A bot with no seat therefore gets no
 //      login at all, rather than somebody else's.
-//   3. The folder is read with the machine identity the server already
-//      has.  No new credential path is introduced; only the project the
-//      request is addressed to changes.
+//   3. The folder is read with its explicitly configured dedicated token
+//      source, scoped to this exact project, environment, and folder.
 //   4. A read that fails is a read that failed.  The child runs without a
 //      login, the turn is not failed over it, and the last good value is
 //      kept rather than thrown away.
@@ -44,8 +43,11 @@ import type { LaunchIdentity } from "./contracts.ts";
 /** The read a CLI login comes from.
  *
  * A seam, so a test can hand in a stub instead of the live manager.  The
- * project is named, never a credential:  the same machine identity reads
- * every project. */
+ * project is named, never a credential.
+ *
+ * A matching source must provide a
+ * token for this exact project and folder; it cannot borrow the primary
+ * project token or activate machine identity. */
 export interface CliLoginVaultReader {
   /** One folder in the named project.  Rejects when the project is not
    * configured on this host, or when the read fails. */

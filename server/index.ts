@@ -307,6 +307,7 @@ import {
   localVmMaxInstances,
   allowedBotComputers,
   infisicalSettings,
+  validateInfisicalConfigPatch,
   observabilitySettings,
   parseConfigPatch,
   publicIngressUrlEffective,
@@ -11470,6 +11471,15 @@ function secretFieldRows() {
   });
 }
 
+function infisicalCredentialPending(): boolean {
+  const settings = infisicalSettings(cfg);
+  if (!settings.enabled || settings.configurationError) return false;
+  if (settings.authMethod === "machine-identity") return workspaceCredentialPending(cfg, "infisicalClientSecret");
+  const dedicatedSource = settings.readSources.some((source) => source.projectId === settings.projectId &&
+    source.environment === settings.environment && source.secretPath === settings.secretPath);
+  return !dedicatedSource && workspaceCredentialPending(cfg, "infisicalReadToken");
+}
+
 function configStatus() {
   const diagnostics = observability.getStatus();
   const vault = infisical.getStatus();
@@ -11652,9 +11662,13 @@ function configStatus() {
     infisical: {
       configured: vault.configured,
       enabled: vault.enabled,
+      enabledSetting: vault.enabledSetting,
+      authMethod: vault.authMethod,
       writeThrough: vault.writeThrough,
       environment: vault.environment,
       hasClientSecret: vault.hasClientSecret,
+      hasToken: vault.hasToken,
+      hasWriteToken: vault.hasWriteToken,
       managedCount: vault.appliedCount,
       lastSyncAt: vault.lastSyncAt,
       stale: vault.stale,
@@ -17680,7 +17694,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         await serializeProviderReload(async () => {
           Object.assign(process.env, plan.env);
           Object.assign(cfg, loadConfig());
-          if (plan.restored.includes("infisicalClientSecret")) {
+          if (plan.restored.some((name) => name === "infisicalClientSecret" ||
+              name === "infisicalReadToken" || name === "infisicalWriteToken")) {
             // Timer semantics refresh the canonical snapshot without nesting
             // a provider reload inside the mutation already holding its fence.
             await infisical.refresh("timer");
@@ -17970,7 +17985,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Sync Now: the one refresh that is allowed to rebuild the fleet, because
     // a person asked for it and is watching.
     if (method === "POST" && path === "/api/infisical/sync") {
-      if (workspaceCredentialPending(cfg, "infisicalClientSecret")) {
+      if (infisicalCredentialPending()) {
         return json(res, 409, { error: "Infisical is waiting for its encrypted credential" });
       }
       // Takes the same fence the two Settings routes take: this is the one
@@ -17996,7 +18011,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Test Connection: proves the identity works without changing what any
     // bot resolves to mid-session — it never reads a value, only names.
     if (method === "POST" && path === "/api/infisical/test") {
-      if (workspaceCredentialPending(cfg, "infisicalClientSecret")) {
+      if (infisicalCredentialPending()) {
         return json(res, 409, { error: "Infisical is waiting for its encrypted credential" });
       }
       return json(res, 200, await infisical.probe());
@@ -19526,6 +19541,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
       const patch = parseConfigPatch(body);
+      validateInfisicalConfigPatch(cfg, patch);
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
       if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
       // The window confirmed a provider disable against its own copy of the
@@ -19934,6 +19950,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           ["tts", "key"],
           ["imageGen", "key"],
           ["infisical", "clientSecret"],
+          ["infisical", "token"],
+          ["infisical", "writeToken"],
         ] as const;
         for (const [section, field] of externalFields) {
           const externalSection = persisted[section] as Record<string, string | undefined> | undefined;
@@ -19942,8 +19960,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           externalSection![field] = "";
           externalCredentialSections[section] = Boolean(supplied.trim());
         }
-        // The one credential the store can never hold for us: its own client
-        // secret.  The client id is a plain identifier and stays readable,
+        // The credentials the store can never hold for us: its own client
+        // secret and service tokens.  The client id stays readable,
         // the way the Access client id does.
         saveConfig(persisted, { externalCredentialSections });
         syncCredentialEnv(patch);

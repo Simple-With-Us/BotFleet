@@ -2521,6 +2521,8 @@ const CREDENTIAL_PATCH = {
   }),
   openaiImageApiKey: (value) => ({ imageGen: { key: value } }),
   infisicalClientSecret: (value) => ({ infisical: { clientSecret: value } }),
+  infisicalReadToken: (value) => ({ infisical: { token: value } }),
+  infisicalWriteToken: (value) => ({ infisical: { writeToken: value } }),
 };
 
 ipcMain.handle("credential:set", async (_event, name, value, provider) => {

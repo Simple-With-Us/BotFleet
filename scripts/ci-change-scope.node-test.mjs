@@ -140,6 +140,19 @@ test("every protected check stays present and takes the same fail-closed scope o
   assert.doesNotMatch(source, /paths-ignore:/);
 });
 
+test("the application checkout keeps full history while filtering blobs within the job ceiling", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const job = workflow.jobs.test;
+  const checkout = job.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+
+  assert.ok(checkout, "application checkout");
+  assert.equal(checkout.with.filter, "blob:none");
+  assert.equal(checkout.with["fetch-depth"], 0);
+  assert.equal(Object.hasOwn(checkout.with, "persist-credentials"), false);
+  assert.equal(job["timeout-minutes"], "${{ matrix.os == 'macos-15' && 35 || 25 }}");
+  assert.equal(job.steps.some((step) => step.run === "pnpm test"), true);
+});
+
 test("the scope is the pull request's own changes,  and both jobs use the one script", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const scopeScript = readFileSync(join(ROOT, "scripts/ci-scope-diff.sh"), "utf8");
