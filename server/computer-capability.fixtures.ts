@@ -57,6 +57,9 @@ export const ENGINE_FIXTURES: readonly EngineFixture[] = [
   { displayName: "Kimi", driverKind: "kimiAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   // ZCode's driver spawns the CLI headless and declares no host MCP wiring.
   { displayName: "ZCode", driverKind: "zcodeAgent", capabilities: {} },
+  // ZCode over the zcode-acp-server bridge mounts MCP like every other ACP
+  // harness (see drivers/acp/zcode.ts).
+  { displayName: "ZCode ACP", driverKind: "zcodeAcp", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Droid", driverKind: "droidAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Cursor", driverKind: "cursorAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "OpenCode", driverKind: "opencodeGo", capabilities: { computerMcp: true, localComputerMcp: true } },
