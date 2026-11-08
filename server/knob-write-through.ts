@@ -76,6 +76,10 @@ export type KnobWriteThroughResult =
  * old project before the connection moves.  `refreshMinutes` is a knob
  * itself and is fine.  The route refuses the combination outright. */
 const INFISICAL_CONNECTION_KEYS = new Set([
+  "authMethod",
+  "token",
+  "writeToken",
+  "readSources",
   "projectId",
   "siteUrl",
   "environment",

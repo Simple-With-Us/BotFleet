@@ -25,7 +25,7 @@ jobs:
   changes:
     name: Classify CI scope
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       docs_only: ${{ steps.scope.outputs.docs_only }}
       ios_changed: ${{ steps.scope.outputs.ios_changed }}
@@ -195,7 +195,7 @@ jobs:
     # This job is not a ruleset context.  It runs only when the classifier
     # says iOS work is in scope, and every step is the real build.
     runs-on: xcode-27
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
@@ -256,7 +256,7 @@ jobs:
     # still produces a failed required check instead of a skip.
     if: ${{ always() && !cancelled() && needs.changes.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -265,6 +265,7 @@ jobs:
           # GitHub treats 0 as false, and a depth-1 checkout does not contain
           # the pull request base commit the replay has to diff.
           fetch-depth: 0
+          # Scope compares commit/tree metadata, without historical file blobs.
           persist-credentials: false
       - name: Prove the iOS build ran or that no iOS paths changed
         shell: bash

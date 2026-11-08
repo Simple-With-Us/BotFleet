@@ -16,12 +16,12 @@ describe("attached workspace credential restoration", () => {
     expect(markExternalInstanceCredentials(marked.config, ["custom"]).changed).toBe(false);
   });
   it("retains current config or vault values and restores only absent credentials", () => {
-    const result = planCredentialRestore({ xaiApiKey: "old", composioApiKey: "saved", infisicalClientSecret: "unlock" }, {
+    const result = planCredentialRestore({ xaiApiKey: "old", composioApiKey: "saved", infisicalClientSecret: "unlock", infisicalReadToken: "read", infisicalWriteToken: "write" }, {
       xai: { key: "canonical" }, composio: { userId: "existing-user", sessionId: "existing-session" },
     });
     expect(result).toEqual({
-      env: { COMPOSIO_API_KEY: "saved", INFISICAL_CLIENT_SECRET: "unlock" },
-      restored: ["composioApiKey", "infisicalClientSecret"], retained: ["xaiApiKey"],
+      env: { COMPOSIO_API_KEY: "saved", INFISICAL_CLIENT_SECRET: "unlock", INFISICAL_TOKEN: "read", INFISICAL_WRITE_TOKEN: "write" },
+      restored: ["composioApiKey", "infisicalClientSecret", "infisicalReadToken", "infisicalWriteToken"], retained: ["xaiApiKey"],
     });
   });
   it.each([null, [], { PATH: "unsafe" }, { xaiApiKey: "" }, { xaiApiKey: 123 }, { xaiApiKey: "x".repeat(16_385) }])(

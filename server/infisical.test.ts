@@ -4,9 +4,10 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { InfisicalSettings } from "./config.ts";
+import { infisicalSettings, type InfisicalSettings } from "./config.ts";
 import { dataDir } from "./data-dir.ts";
 import { infisical } from "./infisical.ts";
+import type { InfisicalError } from "./infisical-client.ts";
 import { fleetOpsProjectId } from "./infisical.ts";
 import { infisicalSnapshot, setInfisicalSnapshot, vaultNames } from "./secret-map.ts";
 
@@ -21,6 +22,7 @@ const SENTINEL_TOKEN = "sentinel-bearer-token-not-real";
 const SENTINEL_VAULT_VALUE = "sentinel-vault-value-not-real";
 
 const BASE_SETTINGS: InfisicalSettings = {
+  authMethod: "machine-identity",
   enabled: true,
   writeThrough: false,
   siteUrl: "https://app.infisical.example",
@@ -44,8 +46,37 @@ function headerBag(init?: RequestInit): Record<string, string> {
   return (init?.headers ?? {}) as Record<string, string>;
 }
 
+let fixtureSettings = BASE_SETTINGS;
+const fixtureTokenFiles = new Map<string, string>();
+const metadataRequests: string[] = [];
+
+// Existing success fixtures supply explicit token metadata separately from their
+// secrets response; security rejection fixtures below stub the whole wire.
+function stubFetch(handler: (url: string, init?: RequestInit) => Promise<Response>): void {
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+    if (!String(url).endsWith("/api/v2/service-token")) return handler(url, init);
+    metadataRequests.push(String(url));
+    const token = (headerBag(init).authorization ?? "").replace(/^Bearer /, "");
+    const scopes: Array<{ projectId: string; environment: string; secretPath: string }> = [];
+    let write = token === fixtureSettings.writeToken && Boolean(token);
+    if (token === fixtureSettings.token || token === fixtureSettings.writeToken) scopes.push(fixtureSettings);
+    for (const source of fixtureSettings.readSources) {
+      const readToken = source.tokenFile ? fixtureTokenFiles.get(source.tokenFile) : process.env[source.tokenEnv];
+      const writeToken = source.writeTokenFile ? fixtureTokenFiles.get(source.writeTokenFile) : process.env[source.writeTokenEnv ?? ""];
+      if (token === readToken || token === writeToken) scopes.push(source);
+      if (token === writeToken) write = true;
+    }
+    return new Response(JSON.stringify({ workspace: scopes[0]?.projectId ?? fixtureSettings.projectId,
+      scopes: scopes.map(({ environment, secretPath }) => ({ environment, secretPath })),
+      permissions: write ? ["write"] : ["read"], expiresAt: null }));
+  });
+}
+
 function withSettings(overrides: Partial<InfisicalSettings>): InfisicalSettings {
-  const merged: InfisicalSettings = { ...BASE_SETTINGS, ...overrides };
+  const defaults = { ...BASE_SETTINGS };
+  if (overrides.token) defaults.authMethod = "service-token";
+  const merged: InfisicalSettings = { ...defaults, ...overrides };
+  fixtureSettings = merged;
   infisical.configure(() => merged);
   return merged;
 }
@@ -85,6 +116,8 @@ const ENV_KEYS = [
 const savedEnv = new Map<string, string | undefined>();
 
 beforeEach(() => {
+  fixtureTokenFiles.clear();
+  metadataRequests.length = 0;
   for (const key of ENV_KEYS) {
     savedEnv.set(key, process.env[key]);
     delete process.env[key];
@@ -104,9 +137,16 @@ afterEach(() => {
 });
 
 describe("refresh: unconfigured and disabled", () => {
+  it("retains partial setup metadata and the raw enabled switch while unconfigured", () => {
+    const settings = withSettings({ authMethod: "service-token", enabled: false, projectId: "partial-project", clientId: "", clientSecret: "" });
+    expect(infisical.getStatus()).toMatchObject({ configured: false, enabled: false, enabledSetting: false,
+      siteUrl: settings.siteUrl, projectId: "partial-project" });
+    settings.enabled = true;
+    expect(infisical.getStatus()).toMatchObject({ configured: false, enabled: false, enabledSetting: true, projectId: "partial-project" });
+  });
   it("makes no request and clears the snapshot when unconfigured", async () => {
     const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch(fetchMock);
     withSettings({ projectId: "", clientId: "", clientSecret: "" });
 
     const status = await infisical.refresh("manual");
@@ -122,7 +162,7 @@ describe("refresh: unconfigured and disabled", () => {
     // Seed a snapshot as if a previous refresh had succeeded, so clearing it is observable.
     setInfisicalSnapshot(new Map([["COMPOSIO_API_KEY", "old-value"]]), ["COMPOSIO_API_KEY"]);
     const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch(fetchMock);
     withSettings({ enabled: false });
 
     const status = await infisical.refresh("settings");
@@ -138,9 +178,7 @@ describe("refresh: unconfigured and disabled", () => {
 describe("refresh: a good sync", () => {
   it("applies only mapped names and reports the rest as unused", async () => {
     withSettings({});
-    vi.stubGlobal(
-      "fetch",
-      loginThenList([
+    stubFetch(loginThenList([
         { secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE },
         { secretKey: "SOME_UNMAPPED_NAME", secretValue: "irrelevant" },
         { secretKey: "PATH", secretValue: "/usr/bin" },
@@ -166,7 +204,7 @@ describe("refresh: a good sync", () => {
     const { calls, impl } = listOnly([
       { secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE },
     ]);
-    vi.stubGlobal("fetch", impl);
+    stubFetch(impl);
 
     const status = await infisical.refresh("manual");
 
@@ -187,9 +225,7 @@ describe("refresh: a good sync", () => {
       writeThrough: true,
     });
     const calls: Array<{ url: string; method: string; authorization: string | undefined }> = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit) => {
+    stubFetch(vi.fn(async (url: string, init?: RequestInit) => {
         const headers = headerBag(init);
         calls.push({
           url: String(url),
@@ -215,7 +251,7 @@ describe("refresh: a good sync", () => {
   it("calls onApplied with the reason on a successful refresh", async () => {
     const applied: string[] = [];
     infisical.configure(() => BASE_SETTINGS, (reason) => applied.push(reason));
-    vi.stubGlobal("fetch", loginThenList([]));
+    stubFetch(loginThenList([]));
 
     await infisical.refresh("timer");
 
@@ -232,7 +268,7 @@ describe("refresh: a good sync", () => {
     // leaving the handler's own rebuild to overlap it.
     const applied: string[] = [];
     infisical.configure(() => BASE_SETTINGS, (reason) => applied.push(reason));
-    vi.stubGlobal("fetch", loginThenList([]));
+    stubFetch(loginThenList([]));
 
     await infisical.refresh("manual");
     await infisical.refresh("settings");
@@ -245,6 +281,38 @@ describe("refresh: a good sync", () => {
 });
 
 describe("refresh: a second caller while one is in flight", () => {
+  it("does not resolve a queued source token or request the vault after being turned off", async () => {
+    const settings = withSettings({ token: SENTINEL_READ_TOKEN,
+      readSources: [{ name: "primary", projectId: "proj-1", environment: "prod", secretPath: "/",
+        tokenEnv: "BF_TEST_QUEUED_READ", tokenFile: "" }],
+    });
+    process.env.BF_TEST_QUEUED_READ = SENTINEL_READ_TOKEN;
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const readStarted = new Promise<void>((resolve) => { started = resolve; });
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; started(); }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    stubFetch(fetchMock);
+    try {
+      const first = infisical.refresh("timer");
+      await readStarted;
+      const queued = infisical.refresh("manual");
+      settings.enabled = false;
+      // Remove the locator credential before the queued operation can start.
+      delete process.env.BF_TEST_QUEUED_READ;
+      finish(new Response(JSON.stringify({ secrets: [] })));
+      await first;
+      expect(await queued).toMatchObject({ enabled: false, stale: false, lastError: null });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(metadataRequests).toHaveLength(1);
+      expect(warn).not.toHaveBeenCalled();
+      expect(infisicalSnapshot()).toBeNull();
+    } finally {
+      delete process.env.BF_TEST_QUEUED_READ;
+      warn.mockRestore();
+    }
+  });
+
   it("queues its own read behind the one going instead of joining it", async () => {
     // The window is real: a timer refresh holds the manager for two HTTP
     // calls (up to 16 s on the default budget) and `preload()`'s losing
@@ -256,9 +324,7 @@ describe("refresh: a second caller while one is in flight", () => {
     // click, so it cannot reflect anything the click was about.
     withSettings({});
     let calls = 0;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => {
+    stubFetch(vi.fn(async (url: string) => {
         calls += 1;
         await new Promise((resolve) => setTimeout(resolve, 10));
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
@@ -289,9 +355,7 @@ describe("refresh: a second caller while one is in flight", () => {
     // costs one extra round trip in total rather than one each.
     withSettings({});
     let calls = 0;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => {
+    stubFetch(vi.fn(async (url: string) => {
         calls += 1;
         await new Promise((resolve) => setTimeout(resolve, 10));
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
@@ -312,12 +376,12 @@ describe("refresh: a second caller while one is in flight", () => {
 describe("refresh: a failure after a good sync", () => {
   it("keeps the previous snapshot and marks the status stale", async () => {
     withSettings({});
-    vi.stubGlobal("fetch", loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]));
+    stubFetch(loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]));
     const good = await infisical.refresh("manual");
     expect(good.lastError).toBeNull();
     expect(good.stale).toBe(false);
 
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 500 })));
+    stubFetch(vi.fn(async () => new Response("nope", { status: 500 })));
     const failed = await infisical.refresh("manual");
 
     expect(failed.stale).toBe(true);
@@ -335,9 +399,7 @@ describe("preload", () => {
     // win the race.  Never a promise that never settles at all -- that would
     // leave this manager's `inFlight` guard stuck for every later test in
     // this file, since nothing would ever reach the `finally` that clears it.
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => {
+    stubFetch(vi.fn(async (url: string) => {
         await new Promise((resolve) => setTimeout(resolve, 100));
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
         return new Response(JSON.stringify({ secrets: [] }), { status: 200 });
@@ -366,9 +428,7 @@ describe("preload", () => {
     // vault is empty" instead of "the boot sync never finished".
     process.env.OMB_INFISICAL_BOOT_TIMEOUT_MS = "20";
     withSettings({});
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => {
+    stubFetch(vi.fn(async (url: string) => {
         await new Promise((resolve) => setTimeout(resolve, 100));
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
         return new Response(JSON.stringify({ secrets: [] }), { status: 200 });
@@ -442,7 +502,7 @@ describe("start", () => {
 describe("probe", () => {
   it("never touches the snapshot, even on success", async () => {
     withSettings({});
-    vi.stubGlobal("fetch", loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]));
+    stubFetch(loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]));
 
     const result = await infisical.probe();
 
@@ -455,7 +515,7 @@ describe("probe", () => {
 
   it("reports a clear error with no request when unconfigured", async () => {
     const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch(fetchMock);
     withSettings({ projectId: "" });
 
     const result = await infisical.probe();
@@ -468,9 +528,9 @@ describe("probe", () => {
 
 describe("readPath", () => {
   it("returns one folder's values to the caller and nowhere else", async () => {
-    withSettings({});
+    withSettings({ secretPath: "/zulip" });
     const fetchMock = loginThenList([{ secretKey: "ZULIP_BF_PLUMBER_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch(fetchMock);
 
     const values = await infisical.readPath("/zulip");
 
@@ -483,31 +543,19 @@ describe("readPath", () => {
     expect(JSON.stringify(infisical.getStatus())).not.toContain(SENTINEL_VAULT_VALUE);
   });
 
-  it("reads another project's environment when the caller names one, with the same identity", async () => {
-    const settings = withSettings({});
-    const fetchMock = loginThenList([{ secretKey: "ZULIP_BF_PLUMBER_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
-    vi.stubGlobal("fetch", fetchMock);
-
-    const values = await infisical.readPath("/zulip", { projectId: "afc-project-id", environment: "staging" });
-
-    expect(values.get("ZULIP_BF_PLUMBER_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
-    const listUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
-    expect(listUrl.searchParams.get("workspaceId")).toBe("afc-project-id");
-    expect(listUrl.searchParams.get("environment")).toBe("staging");
-    expect(listUrl.searchParams.get("secretPath")).toBe("/zulip");
-    // one login, with the harness's own identity
-    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/login"))).toHaveLength(1);
-
-    // blank overrides fall back to the configured project and environment
-    await infisical.readPath("/zulip", { projectId: " ", environment: "" });
-    const ownUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
-    expect(ownUrl.searchParams.get("workspaceId")).toBe(settings.projectId);
-    expect(ownUrl.searchParams.get("environment")).toBe(settings.environment);
+  it("refuses a different project, environment or folder without dedicated credentials", async () => {
+    withSettings({});
+    const fetchMock = vi.fn();
+    stubFetch(fetchMock);
+    await expect(infisical.readPath("/zulip", { projectId: "other", environment: "prod" })).rejects.toThrow(/dedicated/);
+    await expect(infisical.readPath("/", { environment: "staging" })).rejects.toThrow(/dedicated/);
+    await expect(infisical.readPath("/zulip")).rejects.toThrow(/dedicated/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("refuses with no request when Infisical is turned off", async () => {
     const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch(fetchMock);
     withSettings({ enabled: false });
 
     await expect(infisical.readPath("/zulip")).rejects.toThrow(/not configured and turned on/);
@@ -526,6 +574,7 @@ describe("readSources", () => {
     const path = join(dir, "token");
     writeFileSync(path, `${token}\n`);
     chmodSync(path, 0o600);
+    fixtureTokenFiles.set(path, token);
     return path;
   }
   function recordingFetch() {
@@ -549,16 +598,15 @@ describe("readSources", () => {
       ],
     });
     const { calls, impl } = recordingFetch();
-    vi.stubGlobal("fetch", impl);
+    stubFetch(impl);
     const fleet = await infisical.readPath("/zulip", { projectId: "fleet-proj", environment: "prod" });
     expect(fleet.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
     expect(calls.at(-1)?.authorization).toContain(FLEET_TOKEN);
-    const under = await infisical.readPath("/zulip/nested", { projectId: "fleet-proj", environment: "prod" });
-    expect(under.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
+    await expect(infisical.readPath("/zulip/nested", { projectId: "fleet-proj", environment: "prod" })).rejects.toThrow(/dedicated/);
     const named = await infisical.readSource("afc-zulip");
     expect(named.get("AFC_KEY")).toBe("value-for-AFC_KEY");
     expect(calls.at(-1)?.authorization).toContain(AFC_TOKEN);
-    const main = await infisical.readPath("/zulip", { projectId: "proj-1", environment: "prod" });
+    const main = await infisical.readPath("/", { projectId: "proj-1", environment: "prod" });
     expect(main.get("MAIN_KEY")).toBe("value-for-MAIN_KEY");
     expect(calls.at(-1)?.authorization).toContain(SENTINEL_READ_TOKEN);
     expect(infisical.getStatus().readSources.map((s) => [s.name, s.ok])).toEqual([["fleetops-zulip", true], ["afc-zulip", true]]);
@@ -570,7 +618,7 @@ describe("readSources", () => {
       token: SENTINEL_READ_TOKEN,
       readSources: [{ name: "fleetops-zulip", tokenFile: "/tmp/bf-definitely-missing-token-file", tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
     });
-    vi.stubGlobal("fetch", vi.fn());
+    stubFetch(vi.fn());
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       await expect(infisical.readPath("/zulip", { projectId: "fleet-proj", environment: "prod" })).rejects.toThrow(/fleetops-zulip/);
@@ -583,8 +631,8 @@ describe("readSources", () => {
       expect(infisical.getStatus().readSources[0]).toMatchObject({ name: "fleetops-zulip", ok: false });
       // main vault path still works after the failing source
       const { impl } = recordingFetch();
-      vi.stubGlobal("fetch", impl);
-      await expect(infisical.readPath("/other", { projectId: "proj-1", environment: "prod" })).resolves.toBeInstanceOf(Map);
+      stubFetch(impl);
+      await expect(infisical.readPath("/", { projectId: "proj-1", environment: "prod" })).resolves.toBeInstanceOf(Map);
       await expect(infisical.refresh("manual")).resolves.toMatchObject({ lastError: null });
     } finally {
       warn.mockRestore();
@@ -603,9 +651,10 @@ describe("readSources", () => {
     try {
       await expect(infisical.readSource("fleetops-zulip")).rejects.toThrow(/fleetops-zulip/);
       writeFileSync(path, `${FLEET_TOKEN}\n`);
+      fixtureTokenFiles.set(path, FLEET_TOKEN);
       chmodSync(path, 0o600);
       const { impl } = recordingFetch();
-      vi.stubGlobal("fetch", impl);
+      stubFetch(impl);
       const values = await infisical.readSource("fleetops-zulip");
       expect(values.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
       expect(infisical.getStatus().readSources[0]).toMatchObject({ name: "fleetops-zulip", ok: true });
@@ -620,7 +669,7 @@ describe("readSources", () => {
       readSources: [{ name: "fleetops-zulip", tokenFile: tokenFile(FLEET_TOKEN), tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip/" }],
     });
     const { calls, impl } = recordingFetch();
-    vi.stubGlobal("fetch", impl);
+    stubFetch(impl);
     const storedSlash = await infisical.readPath("/zulip", { projectId: "fleet-proj", environment: "prod" });
     expect(storedSlash.get("FLEET_KEY")).toBe("value-for-FLEET_KEY");
     const requestedSlash = await infisical.readPath("/zulip/", { projectId: "fleet-proj", environment: "prod" });
@@ -637,7 +686,7 @@ describe("readSources", () => {
       readSources: [{ name: "fleetops-zulip", tokenFile: tokenFile(FLEET_TOKEN), tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
     });
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ secrets: [{ secretKey: "FLEET_KEY", secretValue: "value-for-FLEET_KEY" }] }), { status: 200 }));
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch(fetchMock);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       await expect(infisical.readSource("fleetops-zulip", "/other")).rejects.toThrow(/fleetops-zulip/);
@@ -650,16 +699,16 @@ describe("readSources", () => {
       expect(warned).toContain("/other");
       expect(warned).not.toContain(FLEET_TOKEN);
       expect(infisical.getStatus().readSources[0]).toMatchObject({ name: "fleetops-zulip", ok: false });
-      // Equal and nested paths are covered.
+      // Only the exact folder is covered.
       await expect(infisical.readSource("fleetops-zulip", "/zulip")).resolves.toBeInstanceOf(Map);
-      await expect(infisical.readSource("fleetops-zulip", "/zulip/nested")).resolves.toBeInstanceOf(Map);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await expect(infisical.readSource("fleetops-zulip", "/zulip/nested")).rejects.toThrow(/not covered/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       warn.mockRestore();
     }
   });
 
-  it("lets a root-scoped read source cover any explicit path, and uses the source's own path when none is given", async () => {
+  it("keeps root scope exact, and uses the source's own path when none is given", async () => {
     withSettings({
       token: SENTINEL_READ_TOKEN,
       readSources: [
@@ -668,9 +717,9 @@ describe("readSources", () => {
       ],
     });
     const { calls, impl } = recordingFetch();
-    vi.stubGlobal("fetch", impl);
-    await expect(infisical.readSource("root-source", "/anything/deep")).resolves.toBeInstanceOf(Map);
-    expect(calls.at(-1)?.url).toContain("secretPath=%2Fanything%2Fdeep");
+    stubFetch(impl);
+    await expect(infisical.readSource("root-source", "/anything/deep")).rejects.toThrow(/not covered/);
+    expect(calls).toHaveLength(0);
     await expect(infisical.readSource("fleetops-zulip")).resolves.toBeInstanceOf(Map);
     expect(calls.at(-1)?.url).toContain("secretPath=%2Fzulip");
     expect(calls.at(-1)?.authorization).toContain(AFC_TOKEN);
@@ -678,7 +727,7 @@ describe("readSources", () => {
 
   it("refuses a token file outside the config directory, a symlink, and a group-readable file", async () => {
     const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch(fetchMock);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const outsideDir = mkdtempSync(join(tmpdir(), "bf-infi-outside-"));
@@ -738,7 +787,7 @@ describe("readSources", () => {
       readSources: [{ name: "fleetops-zulip", tokenFile: path, tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" }],
     });
     const { calls, impl } = recordingFetch();
-    vi.stubGlobal("fetch", impl);
+    stubFetch(impl);
     const fdDir = "/proc/self/fd";
     const openFds = () => (existsSync(fdDir) ? readdirSync(fdDir).length : null);
     const before = openFds();
@@ -756,7 +805,7 @@ describe("readSources", () => {
       token: SENTINEL_READ_TOKEN,
       readSources: [{ name: "afc-zulip", tokenFile: tokenFile(AFC_TOKEN), tokenEnv: "", projectId: "afc-proj", environment: "prod", secretPath: "/zulip" }],
     });
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("no", { status: 401 })));
+    stubFetch(vi.fn(async () => new Response("no", { status: 401 })));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       await expect(infisical.readSource("afc-zulip")).rejects.toThrow(/afc-zulip/);
@@ -771,9 +820,142 @@ describe("readSources", () => {
 });
 
 describe("writeSecret", () => {
-  it("refuses with 409 when write-through is off, without a request", async () => {
+  it.each([
+    { operation: "writeSecret", patchStatus: 200 }, { operation: "writeSource", patchStatus: 200 },
+    { operation: "writeSecret", patchStatus: 404 }, { operation: "writeSource", patchStatus: 404 },
+  ] as const)("preserves the landed state and stops follow-up requests after $operation PATCH $patchStatus finishes disabled", async ({ operation, patchStatus }) => {
+    process.env.BF_TEST_DISABLED_READ = SENTINEL_READ_TOKEN;
+    process.env.BF_TEST_DISABLED_WRITE = SENTINEL_WRITE_TOKEN;
+    const settings = withSettings({ writeThrough: true, token: SENTINEL_READ_TOKEN, writeToken: SENTINEL_WRITE_TOKEN,
+      readSources: [{ name: "primary", projectId: "proj-1", environment: "prod", secretPath: "/",
+        tokenEnv: "BF_TEST_DISABLED_READ", tokenFile: "", writeTokenEnv: "BF_TEST_DISABLED_WRITE" }],
+    });
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const patchStarted = new Promise<void>((resolve) => { started = resolve; });
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; started(); }));
+    stubFetch(fetchMock);
+    try {
+      const write = operation === "writeSecret"
+        ? infisical.writeSecret("COMPOSIO_API_KEY", "new-value")
+        : infisical.writeSource("primary", "COMPOSIO_API_KEY", "new-value");
+      const pending = write.then(() => null, (error: InfisicalError) => error);
+      await patchStarted;
+      settings.enabled = false;
+      finish(new Response("{}", { status: patchStatus }));
+      const error = await pending;
+      expect(error).toMatchObject({ statusCode: 409, writeLanded: patchStatus === 200 });
+      expect(error?.message).toContain(patchStatus === 200 ? "write landed" : "turned off");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(metadataRequests).toHaveLength(1);
+      expect(infisicalSnapshot()).toBeNull();
+    } finally {
+      delete process.env.BF_TEST_DISABLED_READ;
+      delete process.env.BF_TEST_DISABLED_WRITE;
+    }
+  });
+
+  it("does not request secrets after a machine login completes with the connection off", async () => {
+    const settings = withSettings({});
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const loginStarted = new Promise<void>((resolve) => { started = resolve; });
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; started(); }));
+    vi.stubGlobal("fetch", fetchMock);
+    const pending = infisical.probe();
+    await loginStarted;
+    settings.enabled = false;
+    finish(new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN })));
+    expect(await pending).toMatchObject({ ok: false, error: "Infisical is turned off." });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["refresh", "probe", "readPath", "readSource"] as const)
+  ("discards %s values when the connection is disabled during the secrets request", async (operation) => {
+    process.env.BF_TEST_DISABLED_READ = SENTINEL_READ_TOKEN;
+    const settings = withSettings({ token: SENTINEL_READ_TOKEN,
+      readSources: [{ name: "primary", projectId: "proj-1", environment: "prod", secretPath: "/",
+        tokenEnv: "BF_TEST_DISABLED_READ", tokenFile: "" }],
+    });
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const listStarted = new Promise<void>((resolve) => { started = resolve; });
+    stubFetch(vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; started(); })));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const calls = { refresh: () => infisical.refresh("manual"), probe: () => infisical.probe(),
+        readPath: () => infisical.readPath("/"), readSource: () => infisical.readSource("primary") };
+      const pending = calls[operation]().then((value) => ({ value }), (error: InfisicalError) => ({ error }));
+      await listStarted;
+      settings.enabled = false;
+      finish(new Response(JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }] })));
+      const result = await pending;
+      if (operation === "refresh") expect(result).toMatchObject({ value: { enabled: false, stale: false, lastError: null } });
+      else if (operation === "probe") expect(result).toMatchObject({ value: { ok: false, error: "Infisical is turned off." } });
+      else expect(result).toMatchObject({ error: { statusCode: 409 } });
+      expect(infisicalSnapshot()).toBeNull();
+      expect(JSON.stringify(result)).not.toContain(SENTINEL_VAULT_VALUE);
+    } finally {
+      delete process.env.BF_TEST_DISABLED_READ;
+      warn.mockRestore();
+    }
+  });
+
+  it("refuses while disabled even with write-through and credentials configured", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
+    withSettings({ enabled: false, writeThrough: true, token: SENTINEL_READ_TOKEN, writeToken: SENTINEL_WRITE_TOKEN });
+    await expect(infisical.writeSecret("COMPOSIO_API_KEY", "new-value")).rejects.toMatchObject({ statusCode: 409 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["probe", "readPath", "readSource", "writeSecret", "writeSource"] as const)
+  ("stops %s before its vault call when disabled during metadata verification", async (operation) => {
+    process.env.BF_TEST_DISABLED_READ = SENTINEL_READ_TOKEN;
+    process.env.BF_TEST_DISABLED_WRITE = SENTINEL_WRITE_TOKEN;
+    const settings = withSettings({ writeThrough: true, token: SENTINEL_READ_TOKEN, writeToken: SENTINEL_WRITE_TOKEN,
+      readSources: [{ name: "primary", projectId: "proj-1", environment: "prod", secretPath: "/",
+        tokenEnv: "BF_TEST_DISABLED_READ", tokenFile: "", writeTokenEnv: "BF_TEST_DISABLED_WRITE" }],
+    });
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const metadataStarted = new Promise<void>((resolve) => { started = resolve; });
+    const fetchMock = vi.fn((url: string) => {
+      if (String(url).endsWith("/api/v2/service-token")) {
+        return new Promise<Response>((resolve) => { finish = resolve; started(); });
+      }
+      return Promise.resolve(new Response(JSON.stringify({ secrets: [] })));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const calls = {
+        probe: () => infisical.probe(), readPath: () => infisical.readPath("/"),
+        readSource: () => infisical.readSource("primary"),
+        writeSecret: () => infisical.writeSecret("COMPOSIO_API_KEY", "new-value"),
+        writeSource: () => infisical.writeSource("primary", "COMPOSIO_API_KEY", "new-value"),
+      };
+      const outcome = calls[operation]().then((value) => ({ value }), (error: InfisicalError) => ({ error }));
+      await metadataStarted;
+      settings.enabled = false;
+      finish(new Response(JSON.stringify({ workspace: "proj-1", environment: "prod", expiresAt: null,
+        permissions: operation.startsWith("write") ? ["write"] : ["read"],
+        scopes: [{ environment: "prod", secretPath: "/" }],
+      })));
+      const result = await outcome;
+      if (operation === "probe") expect(result).toMatchObject({ value: { ok: false, error: "Infisical is turned off." } });
+      else expect(result).toMatchObject({ error: { statusCode: 409 } });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      delete process.env.BF_TEST_DISABLED_READ;
+      delete process.env.BF_TEST_DISABLED_WRITE;
+      warn.mockRestore();
+    }
+  });
+
+  it("refuses with 409 when write-through is off, without a request", async () => {
+    const fetchMock = vi.fn();
+    stubFetch(fetchMock);
     withSettings({ writeThrough: false });
 
     await expect(infisical.writeSecret("COMPOSIO_API_KEY", "new-value")).rejects.toMatchObject({ statusCode: 409 });
@@ -782,7 +964,7 @@ describe("writeSecret", () => {
 
   it("refuses to clear a managed value even with write-through on", async () => {
     const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch(fetchMock);
     withSettings({ writeThrough: true });
 
     await expect(infisical.writeSecret("COMPOSIO_API_KEY", "")).rejects.toMatchObject({ statusCode: 409 });
@@ -792,9 +974,7 @@ describe("writeSecret", () => {
   it("writes through then refreshes so the new value is what resolves next", async () => {
     withSettings({ writeThrough: true });
     const methods: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit) => {
+    stubFetch(vi.fn(async (url: string, init?: RequestInit) => {
         methods.push(init?.method ?? "GET");
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
         if (init?.method === "PATCH") return new Response("{}", { status: 200 });
@@ -822,9 +1002,7 @@ describe("writeSecret", () => {
     withSettings({ writeThrough: true });
     let listCalls = 0;
     let upserted = false;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit) => {
+    stubFetch(vi.fn(async (url: string, init?: RequestInit) => {
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
         if (init?.method === "PATCH") {
           upserted = true;
@@ -858,9 +1036,7 @@ describe("writeSecret", () => {
   it("rejects writeSecret when the post-upsert verification refresh fails and preserves snapshot", async () => {
     withSettings({ writeThrough: true });
     let patchCount = 0;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit) => {
+    stubFetch(vi.fn(async (url: string, init?: RequestInit) => {
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
         if (init?.method === "PATCH") {
           patchCount += 1;
@@ -882,16 +1058,12 @@ describe("writeSecret", () => {
 
   it("preserves snapshot published before a failed verification refresh", async () => {
     withSettings({ writeThrough: true });
-    vi.stubGlobal(
-      "fetch",
-      loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: "published-canonical" }]),
+    stubFetch(loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: "published-canonical" }]),
     );
     await infisical.refresh("manual");
     expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe("published-canonical");
 
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit) => {
+    stubFetch(vi.fn(async (url: string, init?: RequestInit) => {
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
         if (init?.method === "PATCH") return new Response("{}", { status: 200 });
         return new Response("internal error", { status: 500 });
@@ -913,9 +1085,7 @@ describe("writeSecret", () => {
     const timeoutErr = new Error("The operation was aborted due to timeout");
     timeoutErr.name = "TimeoutError";
 
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit) => {
+    stubFetch(vi.fn(async (url: string, init?: RequestInit) => {
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
         if (init?.method === "PATCH") {
           patchCount += 1;
@@ -939,16 +1109,12 @@ describe("writeSecret", () => {
     const timeoutErr = new Error("The operation was aborted due to timeout");
     timeoutErr.name = "TimeoutError";
 
-    vi.stubGlobal(
-      "fetch",
-      loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: "existing-value" }]),
+    stubFetch(loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: "existing-value" }]),
     );
     await infisical.refresh("manual");
     expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe("existing-value");
 
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit) => {
+    stubFetch(vi.fn(async (url: string, init?: RequestInit) => {
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
         if (init?.method === "PATCH") {
           patchCount += 1;
@@ -967,9 +1133,7 @@ describe("writeSecret", () => {
 
   it("preserves canonical snapshot and rejects with 409 when verification encounters a conflict", async () => {
     withSettings({ writeThrough: true });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit) => {
+    stubFetch(vi.fn(async (url: string, init?: RequestInit) => {
         if (url.includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
         if (init?.method === "PATCH") return new Response("{}", { status: 200 });
         return new Response(
@@ -991,6 +1155,11 @@ describe("writeSecret", () => {
 });
 
 describe("identity source", () => {
+  it("ignores an inactive service-token environment value in machine identity mode", () => {
+    process.env.INFISICAL_TOKEN = "fake-unused-service-token";
+    withSettings({ authMethod: "machine-identity" });
+    expect(infisical.getStatus().source).toBe("config");
+  });
   it("reports config when the identity came from settings, env when it came from process.env", () => {
     withSettings({});
     expect(infisical.getStatus().source).toBe("config");
@@ -1018,7 +1187,7 @@ describe("bootLine", () => {
   it("renders the not-configured and disabled-by-settings forms", async () => {
     withSettings({ projectId: "", clientId: "", clientSecret: "" });
     await infisical.refresh("manual");
-    expect(infisical.bootLine()).toBe("[infisical] disabled: not configured (add a machine identity in Settings > Secrets)");
+    expect(infisical.bootLine()).toBe("[infisical] disabled: not configured (select an auth method and add its credentials in Settings > Secrets)");
 
     withSettings({ enabled: false });
     await infisical.refresh("settings");
@@ -1027,7 +1196,7 @@ describe("bootLine", () => {
 
   it("renders the unavailable form after a failed refresh", async () => {
     withSettings({});
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 500 })));
+    stubFetch(vi.fn(async () => new Response("nope", { status: 500 })));
 
     await infisical.refresh("manual");
 
@@ -1036,7 +1205,7 @@ describe("bootLine", () => {
 
   it("renders the enabled form with names, field ids and counts only", async () => {
     withSettings({});
-    vi.stubGlobal("fetch", loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]));
+    stubFetch(loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]));
 
     await infisical.refresh("manual");
 
@@ -1052,7 +1221,7 @@ describe("bootLineIfChanged", () => {
   it("returns the line the first time, then null while nothing changes", () => {
     withSettings({ projectId: "", clientId: "", clientSecret: "" });
     expect(infisical.bootLineIfChanged()).toBe(
-      "[infisical] disabled: not configured (add a machine identity in Settings > Secrets)",
+      "[infisical] disabled: not configured (select an auth method and add its credentials in Settings > Secrets)",
     );
     expect(infisical.bootLineIfChanged()).toBeNull();
     expect(infisical.bootLineIfChanged()).toBeNull();
@@ -1072,9 +1241,7 @@ describe("bootLineIfChanged", () => {
     try {
       withSettings({});
       let advanceMsPerCall = 5;
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async (url: string) => {
+      stubFetch(vi.fn(async (url: string) => {
           vi.advanceTimersByTime(advanceMsPerCall);
           if (url.includes("/login")) {
             return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
@@ -1116,7 +1283,7 @@ describe("bootLineIfChanged", () => {
 describe("no secret ever leaves this module", () => {
   it("keeps the client secret, bearer token and vault value out of the status view and the boot line", async () => {
     withSettings({});
-    vi.stubGlobal("fetch", loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]));
+    stubFetch(loginThenList([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]));
 
     await infisical.refresh("manual");
     const serialized = JSON.stringify(infisical.getStatus());
@@ -1138,647 +1305,404 @@ describe("no secret ever leaves this module", () => {
 // look identical from the outside unless the manager keeps them apart,
 // which is what these cases pin down.
 // ---------------------------------------------------------------------------
-describe("service token fallback", () => {
-  // A second fake token, distinct from the first:  "which bearer was used"
-  // has to be answerable without a substring reading as a match.
-  const ROTATED_READ_TOKEN = "sentinel-rotated-read-token-not-real";
-
-  type RecordedCall = { url: string; method: string; authorization: string | undefined };
-
-  /** A fetch that records every call, answers the login with a session
-   * token, refuses the named bearers with `status` and answers every other
-   * request with the secrets list. */
-  function refusingList(options: {
-    refused: string[];
-    status: number;
-    secrets?: Array<{ secretKey: string; secretValue: string }>;
-  }) {
-    const calls: RecordedCall[] = [];
-    const impl = vi.fn(async (url: string, init?: RequestInit) => {
-      const headers = headerBag(init);
-      calls.push({
-        url: String(url),
-        method: init?.method ?? "GET",
-        authorization: headers.authorization,
-      });
-      if (String(url).includes("/login")) {
-        return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
-      }
-      const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
-      if (options.refused.includes(bearer)) {
-        return new Response("refused", { status: options.status });
-      }
-      return new Response(JSON.stringify({ secrets: options.secrets ?? [] }), { status: 200 });
-    });
-    return { calls, impl };
-  }
-
-  function listCalls(calls: RecordedCall[]): RecordedCall[] {
-    return calls.filter((call) => !call.url.includes("/login"));
-  }
-
-  function loginCalls(calls: RecordedCall[]): RecordedCall[] {
-    return calls.filter((call) => call.url.includes("/login"));
-  }
-
-  it("falls back to the machine identity when the server refuses the configured service token", async () => {
-    // A revoked service token used to break every vault call on the host.
-    // The install still has a machine identity, so the refresh has to land
-    // on it instead of reporting the vault as gone.
-    withSettings({ token: SENTINEL_READ_TOKEN });
-    const { calls, impl } = refusingList({
-      refused: [SENTINEL_READ_TOKEN],
-      status: 401,
-      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
-    });
-    vi.stubGlobal("fetch", impl);
-
-    const status = await infisical.refresh("manual");
-
-    expect(status.lastError).toBeNull();
-    expect(status.stale).toBe(false);
-    expect(status.appliedFields).toEqual(["composio.apiKey"]);
-    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
-
-    // One login, two lists:  the refused one and the retry.
-    expect(loginCalls(calls)).toHaveLength(1);
-    const lists = listCalls(calls);
-    expect(lists).toHaveLength(2);
-    // The first list carried the configured token and was refused...
-    expect(lists[0]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
-    // ...and the retry carried the machine identity's session token.
-    expect(lists[1]?.authorization ?? "").toContain(SENTINEL_TOKEN);
-    expect(lists[1]?.authorization ?? "").not.toContain(SENTINEL_READ_TOKEN);
-  });
-
-  it("keeps the token configured and the last good snapshot when there is no machine identity", async () => {
-    // A token-only host has nothing to fall back to.  The refusal must not
-    // cost the operator their configuration, and it must not empty a vault
-    // that was already synced.
-    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
-    const good = listOnly([{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
-    vi.stubGlobal("fetch", good.impl);
-    const synced = await infisical.refresh("manual");
-    expect(synced.stale).toBe(false);
-    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
-
-    const { calls, impl } = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
-    vi.stubGlobal("fetch", impl);
-
-    const failed = await infisical.refresh("manual");
-
-    expect(failed.lastError).toMatch(/401/);
-    // The ORIGINAL error is what the caller sees, not a synthesized one.
-    expect(failed.lastError).toMatch(/secrets list failed/i);
-    expect(failed.stale).toBe(true);
-    // No machine identity means no login attempt at all.
-    expect(loginCalls(calls)).toHaveLength(0);
-
-    const status = infisical.getStatus();
-    expect(status.hasToken).toBe(true);
-    expect(status.configured).toBe(true);
-    expect(status.enabled).toBe(true);
-    // The vault that was already synced is still there.
-    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
-  });
-
-  it("does not probe the server again for a token it already knows was refused", async () => {
-    // The remembered refusal answers the question on its own:  re-probing a
-    // credential the server already rejected costs a round trip per refresh
-    // and tells the operator nothing new.
-    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
-    const { calls, impl } = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
-    vi.stubGlobal("fetch", impl);
-
-    const first = await infisical.refresh("manual");
-    expect(first.lastError).toMatch(/401/);
-    expect(listCalls(calls)).toHaveLength(1);
-
-    const second = await infisical.refresh("manual");
-    expect(listCalls(calls)).toHaveLength(1);
-    expect(second.lastError).toMatch(/no machine identity to fall back to/i);
-  });
-
-  it("does not fall back on a transient failure and keeps trying the same token", async () => {
-    // A 503 says the server is unwell, not that the credential is dead.
-    // Falling back there would trade one credential for another over a
-    // network blip, and recording the token as refused would strand the
-    // install on the fallback for good.
-    withSettings({ token: SENTINEL_READ_TOKEN });
-    const { calls, impl } = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 503 });
-    vi.stubGlobal("fetch", impl);
-
-    const first = await infisical.refresh("manual");
-    expect(first.lastError).toMatch(/503/);
-    expect(first.stale).toBe(true);
-    // The token is not removed from the configuration either.
-    expect(first.hasToken).toBe(true);
-    expect(loginCalls(calls)).toHaveLength(0);
-
-    // The second refresh tries the SAME token again:  it was never refused.
-    const second = await infisical.refresh("manual");
-    expect(second.lastError).toMatch(/503/);
-    const lists = listCalls(calls);
-    expect(lists).toHaveLength(2);
-    expect(lists[1]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
-    expect(loginCalls(calls)).toHaveLength(0);
-  });
-
-  it("falls back to the machine identity on a 403, which refuses that request", async () => {
-    // A grant that does not cover what was asked for is final about THAT
-    // request, and the call falls back to the machine identity.  It is not
-    // final about the credential, so the token is not deprioritized for the
-    // rest of the vault:  the scope test below pins that.
-    withSettings({ token: SENTINEL_READ_TOKEN });
-    const { calls, impl } = refusingList({
-      refused: [SENTINEL_READ_TOKEN],
-      status: 403,
-      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
-    });
-    vi.stubGlobal("fetch", impl);
-
-    const status = await infisical.refresh("manual");
-
-    expect(status.lastError).toBeNull();
-    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
-    expect(loginCalls(calls)).toHaveLength(1);
-    const lists = listCalls(calls);
-    expect(lists).toHaveLength(2);
-    expect(lists[1]?.authorization ?? "").toContain(SENTINEL_TOKEN);
-    expect(lists[1]?.authorization ?? "").not.toContain(SENTINEL_READ_TOKEN);
-  });
-
-  it("does not treat a 429 as a refusal of the credential", async () => {
-    // Rate limited is not refused:  the token is still the right one, and
-    // the next refresh has to try it again rather than log in instead.
-    withSettings({ token: SENTINEL_READ_TOKEN });
-    const { calls, impl } = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 429 });
-    vi.stubGlobal("fetch", impl);
-
-    const first = await infisical.refresh("manual");
-    expect(first.lastError).toMatch(/429/);
-    expect(loginCalls(calls)).toHaveLength(0);
-
-    const second = await infisical.refresh("manual");
-    expect(second.lastError).toMatch(/429/);
-    const lists = listCalls(calls);
-    expect(lists).toHaveLength(2);
-    expect(lists[1]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
-    expect(loginCalls(calls)).toHaveLength(0);
-  });
-
-  it("tries a rotated token again after the old one was refused", async () => {
-    // The memory holds the token VALUE, not a flag:  a rotation is a new
-    // value in the same setting, and it has to be tried on its own merits
-    // rather than inherit the old token's rejection.
-    let settings: InfisicalSettings = { ...BASE_SETTINGS, token: SENTINEL_READ_TOKEN };
+describe("explicit auth and scope isolation", () => {
+  it("fails closed for excess resolved token references without trying a primary fallback", async () => {
+    const settings = infisicalSettings({ infisical: { projectId: "p", token: "fake-primary-read", readSources: [
+      { name: "other-read", projectId: "p", secretPath: "/other", tokenEnv: "ANOTHER_READ" },
+    ] } });
+    const fetchMock = vi.fn();
+    stubFetch(fetchMock);
     infisical.configure(() => settings);
-    const { calls, impl } = refusingList({
-      refused: [SENTINEL_READ_TOKEN],
-      status: 401,
-      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
-    });
-    vi.stubGlobal("fetch", impl);
-
-    const first = await infisical.refresh("manual");
-    expect(first.lastError).toBeNull();
-
-    // The operator saves a rotated token.
-    settings = { ...settings, token: ROTATED_READ_TOKEN };
-
-    const second = await infisical.refresh("manual");
-    expect(second.lastError).toBeNull();
-    const lists = listCalls(calls);
-    expect(lists.at(-1)?.authorization ?? "").toContain(ROTATED_READ_TOKEN);
-    expect(lists.at(-1)?.authorization ?? "").not.toContain(SENTINEL_READ_TOKEN);
+    expect((await infisical.refresh("manual")).lastError).toMatch(/one read token reference/);
+    expect((await infisical.probe()).ok).toBe(false);
+    await expect(infisical.readSource("other-read")).rejects.toThrow(/one read token reference/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(infisicalSnapshot()).toBeNull();
   });
-
-  it("forgets a refused token when a new settings source is installed", async () => {
-    // `configure()` installs a new credential source, and the server calls it
-    // at boot:  that source's token has to be tried on its own merits rather
-    // than inherit the previous source's rejection.
-    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
-    const refused = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
-    vi.stubGlobal("fetch", refused.impl);
-    const failed = await infisical.refresh("manual");
-    expect(failed.lastError).toMatch(/401/);
-
-    const accepted = refusingList({
-      refused: [],
-      status: 401,
-      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
+  function record(options: { status?: number; refused?: string[] } = {}) {
+    const calls: Array<{ url: string; authorization: string; method: string; body: string }> = [];
+    const impl = vi.fn(async (url: string, init?: RequestInit) => {
+      const authorization = headerBag(init).authorization ?? "";
+      calls.push({ url: String(url), authorization, method: init?.method ?? "GET", body: String(init?.body ?? "") });
+      if (String(url).includes("/login")) return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }));
+      if (options.refused?.some((token) => authorization === `Bearer ${token}`)) return new Response("refused", { status: options.status ?? 401 });
+      return new Response(JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }] }));
     });
-    vi.stubGlobal("fetch", accepted.impl);
-    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
+    stubFetch(impl);
+    return calls;
+  }
 
-    const status = await infisical.refresh("manual");
-
-    expect(status.lastError).toBeNull();
-    expect(listCalls(accepted.calls)[0]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
-    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
-  });
-
-  it("forgets a refused token when the operator asks for a retry", async () => {
-    // A Sync Now and a Settings save are the operator asking for the
-    // configured token to be tried again.  A grant widened or a path created
-    // in the vault changes neither the token nor the scope, so the memory
-    // cannot notice it on its own:  without the explicit retry the token
-    // would stay deprioritized until the process restarted.
-    withSettings({ clientId: "", clientSecret: "", token: SENTINEL_READ_TOKEN });
-    const refused = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
-    vi.stubGlobal("fetch", refused.impl);
-    const failed = await infisical.refresh("manual");
-    expect(failed.lastError).toMatch(/401/);
-    expect(infisical.getStatus().readTokenRefused).toBe(true);
-
-    const accepted = refusingList({
-      refused: [],
-      status: 401,
-      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
-    });
-    vi.stubGlobal("fetch", accepted.impl);
-
-    infisical.retryRefusedTokens();
-    const status = await infisical.refresh("manual");
-
-    expect(status.lastError).toBeNull();
-    expect(infisical.getStatus().readTokenRefused).toBe(false);
-    expect(listCalls(accepted.calls)[0]?.authorization ?? "").toContain(SENTINEL_READ_TOKEN);
-    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
-  });
-
-  it("reports a refused configured token as a failure, even when a machine identity would have worked", async () => {
-    // The probe is the operator's question about the CONFIGURED credential.
-    // Falling back inside it would answer a different question and turn a
-    // dead token into a green light.
+  it.each([401, 403, 404])("fails closed after scoped token rejection %i even with a machine identity present", async (status) => {
     withSettings({ token: SENTINEL_READ_TOKEN });
-    const { calls, impl } = refusingList({ refused: [SENTINEL_READ_TOKEN], status: 401 });
-    vi.stubGlobal("fetch", impl);
-
-    const result = await infisical.probe();
-
-    expect(result.ok).toBe(false);
-    expect(result.error ?? "").toMatch(/^The configured read service token was refused by the server:/);
-    // No fallback inside a probe.
-    expect(loginCalls(calls)).toHaveLength(0);
+    const calls = record({ status, refused: [SENTINEL_READ_TOKEN] });
+    setInfisicalSnapshot(new Map([["COMPOSIO_API_KEY", "previous"]]), ["COMPOSIO_API_KEY"]);
+    const result = await infisical.refresh("manual");
+    expect(result.stale).toBe(true);
+    expect(result.readTokenRefused).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.authorization).toBe(`Bearer ${SENTINEL_READ_TOKEN}`);
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe("previous");
+    await infisical.refresh("timer");
+    expect(calls).toHaveLength(1);
   });
 
-  it("falls back to the machine identity for a write when the write token is refused", async () => {
-    // The write token is refused the same way the read token is, and the
-    // write has to land on the machine identity rather than be lost.
-    withSettings({
-      token: SENTINEL_READ_TOKEN,
-      writeToken: SENTINEL_WRITE_TOKEN,
-      writeThrough: true,
-    });
-    const calls: RecordedCall[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit) => {
-        const headers = headerBag(init);
-        calls.push({
-          url: String(url),
-          method: init?.method ?? "GET",
-          authorization: headers.authorization,
-        });
-        if (String(url).includes("/login")) {
-          return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
-        }
-        const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
-        if (init?.method === "PATCH") {
-          // The configured write token is refused;  the machine identity is not.
-          if (bearer === SENTINEL_WRITE_TOKEN) return new Response("refused", { status: 401 });
-          return new Response("{}", { status: 200 });
-        }
-        // The verification read after the upsert.
-        return new Response(
-          JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: "written-value" }] }),
-          { status: 200 },
-        );
-      }),
-    );
-
-    await infisical.writeSecret("COMPOSIO_API_KEY", "written-value");
-
-    const patches = calls.filter((call) => call.method === "PATCH");
-    expect(patches).toHaveLength(2);
-    expect(patches[0]?.authorization ?? "").toContain(SENTINEL_WRITE_TOKEN);
-    // The upsert that landed is the one made with the machine identity.
-    expect(patches[1]?.authorization ?? "").toContain(SENTINEL_TOKEN);
-    expect(patches[1]?.authorization ?? "").not.toContain(SENTINEL_WRITE_TOKEN);
-    expect(loginCalls(calls)).toHaveLength(1);
-    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe("written-value");
+  it.each([429, 502, 503, 504])("retries transient failure %i with the same scoped token", async (status) => {
+    withSettings({ token: SENTINEL_READ_TOKEN });
+    const calls = record({ status, refused: [SENTINEL_READ_TOKEN] });
+    const result = await infisical.refresh("manual");
+    await infisical.refresh("timer");
+    expect(result.readTokenRefused).toBe(false);
+    expect(calls.map((call) => call.authorization)).toEqual([`Bearer ${SENTINEL_READ_TOKEN}`, `Bearer ${SENTINEL_READ_TOKEN}`]);
   });
 
-  it("does not probe the server again for a write token it already knows was refused", async () => {
-    withSettings({
-      token: SENTINEL_READ_TOKEN,
-      writeToken: SENTINEL_WRITE_TOKEN,
-      writeThrough: true,
-    });
-    const calls: RecordedCall[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit) => {
-        const headers = headerBag(init);
-        calls.push({
-          url: String(url),
-          method: init?.method ?? "GET",
-          authorization: headers.authorization,
-        });
-        if (String(url).includes("/login")) {
-          return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
-        }
-        const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
-        if (init?.method === "PATCH") {
-          if (bearer === SENTINEL_WRITE_TOKEN) return new Response("refused", { status: 401 });
-          return new Response("{}", { status: 200 });
-        }
-        return new Response(
-          JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: "written-value" }] }),
-          { status: 200 },
-        );
-      }),
-    );
+  it("requires explicit selection before a configured machine identity is used", async () => {
+    const settings = withSettings({ authMethod: undefined });
+    const calls = record();
+    expect((await infisical.refresh("manual")).configured).toBe(false);
+    expect(calls).toHaveLength(0);
+    settings.authMethod = "machine-identity";
+    expect((await infisical.refresh("settings")).stale).toBe(false);
+    expect(calls.filter((call) => call.url.includes("/login"))).toHaveLength(1);
+  });
 
-    await infisical.writeSecret("COMPOSIO_API_KEY", "written-value");
-    await infisical.writeSecret("COMPOSIO_API_KEY", "written-value");
+  it("honors explicit machine identity selection even when unused service tokens remain configured", async () => {
+    withSettings({ authMethod: "machine-identity", token: SENTINEL_READ_TOKEN });
+    const calls = record({ refused: [SENTINEL_READ_TOKEN] });
+    expect((await infisical.refresh("manual")).stale).toBe(false);
+    expect(calls.filter((call) => call.url.includes("/login"))).toHaveLength(1);
+    expect(calls.some((call) => call.authorization.includes(SENTINEL_READ_TOKEN))).toBe(false);
+  });
 
-    const patches = calls.filter((call) => call.method === "PATCH");
-    // One refused probe, then the machine identity for both writes.
-    expect(patches).toHaveLength(3);
-    expect(patches.filter((call) => (call.authorization ?? "").includes(SENTINEL_WRITE_TOKEN))).toHaveLength(1);
-    expect(patches[2]?.authorization ?? "").toContain(SENTINEL_TOKEN);
+  it("never uses a read credential to satisfy a missing write credential", async () => {
+    withSettings({ token: SENTINEL_READ_TOKEN, writeThrough: true, writeToken: "" });
+    const calls = record();
+    await expect(infisical.writeSecret("COMPOSIO_API_KEY", "replacement")).rejects.toThrow(/write service token/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("does not fall back after write credential rejection", async () => {
+    withSettings({ token: SENTINEL_READ_TOKEN, writeToken: SENTINEL_WRITE_TOKEN, writeThrough: true });
+    const calls = record({ refused: [SENTINEL_WRITE_TOKEN], status: 403 });
+    await expect(infisical.writeSecret("COMPOSIO_API_KEY", "replacement")).rejects.toThrow(/403/);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.authorization).toBe(`Bearer ${SENTINEL_WRITE_TOKEN}`);
+    expect(infisical.getStatus().writeTokenRefused).toBe(true);
+  });
+
+  it("tries rotated credentials and operator retries without activating a different auth method", async () => {
+    const settings = withSettings({ token: SENTINEL_READ_TOKEN });
+    const calls = record({ refused: [SENTINEL_READ_TOKEN] });
+    await infisical.refresh("manual");
+    infisical.retryRefusedTokens();
+    await infisical.refresh("manual");
+    expect(calls).toHaveLength(2);
+    settings.token = "fake-rotated-read-token";
+    expect((await infisical.refresh("manual")).stale).toBe(false);
+    expect(calls).toHaveLength(3);
+    expect(calls.some((call) => call.url.includes("/login"))).toBe(false);
+  });
+
+  it("uses distinct scoped read and write locators for the primary vault", async () => {
+    process.env.BF_TEST_SCOPE_READ = SENTINEL_READ_TOKEN;
+    process.env.BF_TEST_SCOPE_WRITE = SENTINEL_WRITE_TOKEN;
+    try {
+      withSettings({ authMethod: "service-token", token: "unused-primary-read", writeToken: "unused-primary-write", writeThrough: true, readSources: [{
+        name: "primary", projectId: "proj-1", environment: "prod", secretPath: "/", tokenEnv: "BF_TEST_SCOPE_READ", tokenFile: "",
+        writeTokenEnv: "BF_TEST_SCOPE_WRITE",
+      }] });
+      const calls = record();
+      await infisical.refresh("manual");
+      await infisical.writeSecret("COMPOSIO_API_KEY", SENTINEL_VAULT_VALUE);
+      expect(calls.map((call) => call.authorization)).toEqual([`Bearer ${SENTINEL_READ_TOKEN}`, `Bearer ${SENTINEL_WRITE_TOKEN}`, `Bearer ${SENTINEL_READ_TOKEN}`]);
+      const status = infisical.getStatus();
+      expect(status.readSources[0]).toMatchObject({ hasReadToken: true, hasWriteToken: true });
+      expect(JSON.stringify(status)).not.toContain(SENTINEL_WRITE_TOKEN);
+      expect(JSON.stringify(status)).not.toContain(SENTINEL_READ_TOKEN);
+    } finally {
+      delete process.env.BF_TEST_SCOPE_READ;
+      delete process.env.BF_TEST_SCOPE_WRITE;
+    }
+  });
+
+  it("refuses a matching source with a missing token instead of borrowing primary credentials", async () => {
+    withSettings({ token: SENTINEL_READ_TOKEN, writeThrough: true, writeToken: SENTINEL_WRITE_TOKEN, readSources: [{
+      name: "primary", projectId: "proj-1", environment: "prod", secretPath: "/", tokenEnv: "BF_TEST_UNSET_TOKEN", tokenFile: "",
+    }] });
+    const calls = record();
+    expect((await infisical.refresh("manual")).stale).toBe(true);
+    await expect(infisical.writeSecret("COMPOSIO_API_KEY", "replacement")).rejects.toThrow(/write/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("writes a secondary source only through its dedicated write locator, without publishing its values", async () => {
+    process.env.BF_TEST_SECONDARY_WRITE = SENTINEL_WRITE_TOKEN;
+    try {
+      withSettings({ writeThrough: true, readSources: [{
+        name: "secondary", projectId: "another-project", environment: "staging", secretPath: "/writes", tokenEnv: "", tokenFile: "",
+        writeTokenEnv: "BF_TEST_SECONDARY_WRITE",
+      }] });
+      const calls = record();
+      setInfisicalSnapshot(new Map([["COMPOSIO_API_KEY", "previous"]]), ["COMPOSIO_API_KEY"]);
+      await infisical.writeSource("secondary", "SECONDARY_KEY", "replacement");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.authorization).toBe(`Bearer ${SENTINEL_WRITE_TOKEN}`);
+      expect(JSON.parse(calls[0]!.body)).toMatchObject({ workspaceId: "another-project", environment: "staging", secretPath: "/writes" });
+      expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe("previous");
+    } finally { delete process.env.BF_TEST_SECONDARY_WRITE; }
+  });
+
+  it("keeps test connection inert when disabled", async () => {
+    withSettings({ enabled: false, token: SENTINEL_READ_TOKEN });
+    const calls = record();
+    expect((await infisical.probe()).ok).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("discards a last-good snapshot when the primary project changes and the new scope fails", async () => {
+    const settings = withSettings({ token: SENTINEL_READ_TOKEN });
+    record();
+    await infisical.refresh("manual");
+    expect(infisicalSnapshot()?.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+    settings.projectId = "different-project";
+    record({ refused: [SENTINEL_READ_TOKEN], status: 403 });
+    expect((await infisical.refresh("settings")).stale).toBe(true);
+    expect(infisicalSnapshot()).toBeNull();
+    expect(infisical.getStatus().lastSyncAt).toBeNull();
+  });
+
+  it("discards a delayed response after the connection scope changes mid-read", async () => {
+    const settings = withSettings({ token: SENTINEL_READ_TOKEN });
+    let finish!: (response: Response) => void;
+    let started!: () => void;
+    const readStarted = new Promise<void>((resolve) => { started = resolve; });
+    stubFetch(vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; started(); })));
+    const pending = infisical.refresh("manual");
+    await readStarted;
+    settings.projectId = "different-project";
+    finish(new Response(JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }] })));
+    const result = await pending;
+    expect(result.stale).toBe(true);
+    expect(result.lastError).toContain("discarded");
+    expect(infisicalSnapshot()).toBeNull();
   });
 });
 
-
-describe("service token refusal: scope and visibility", () => {
-  const REFUSED_TOKEN = "sentinel-refused-token-not-real";
-
-  type RecordedCall = { url: string; authorization: string | undefined };
-
-  /** A fetch that refuses the named bearer with `status` and answers every
-   * other request with the secrets list.  The login endpoint is answered
-   * with a session token when the machine identity is in play. */
-  function refusingFetch(status: number, secrets: Array<{ secretKey: string; secretValue: string }> = []) {
-    const calls: RecordedCall[] = [];
-    const impl = vi.fn(async (url: string, init?: RequestInit) => {
-      const headers = headerBag(init);
-      calls.push({ url: String(url), authorization: headers.authorization });
-      if (String(url).includes("/login")) {
-        return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
-      }
-      const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
-      if (bearer === REFUSED_TOKEN) {
-        return new Response("refused", { status });
-      }
-      return new Response(JSON.stringify({ secrets }), { status: 200 });
-    });
-    return { calls, impl };
-  }
-
-  function bearerOf(call: RecordedCall): string {
-    return (call.authorization ?? "").replace(/^Bearer /, "");
-  }
-
-  it("forgets a refusal when the project it was refused under changes", async () => {
-    // A wrong project id answers 404 and looks exactly like a revoked
-    // token.  Fixing the project id in Settings has to put the token back
-    // in play, or the good token stays deprioritized for the life of the
-    // process.
-    const settings = { ...BASE_SETTINGS, projectId: "proj-1", clientId: "", clientSecret: "", token: REFUSED_TOKEN };
-    infisical.configure(() => settings);
-    const { calls, impl } = refusingFetch(404);
-    vi.stubGlobal("fetch", impl);
-
-    await infisical.refresh("manual");
-    expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(1);
-
-    // The same token, a different project:  the remembered refusal was
-    // about a different request, so the token is tried again.
-    settings.projectId = "proj-2";
-    await infisical.refresh("manual");
-
-    expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(2);
+describe("service token metadata gate", () => {
+  it.each(["//", "///", "/./", "/fleet/../", "/folder//", "/folder/./child", "/folder//child"])
+  ("rejects malformed stored primary folder %s before any network request", async (secretPath) => {
+    withSettings(infisicalSettings({ infisical: { authMethod: "service-token", projectId: "proj-1",
+      secretPath, token: SENTINEL_READ_TOKEN,
+    } }));
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ secrets: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await infisical.refresh("manual");
+    expect(result.lastError).toMatch(/literal folder/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(infisicalSnapshot()).toBeNull();
   });
 
-  /** A fetch that refuses each named bearer with its own status and
-   * answers every other request with the secrets list.  The login endpoint
-   * is answered with a session token when the machine identity is in play. */
-  function perBearerRefusingFetch(statuses: Record<string, number>) {
-    const calls: RecordedCall[] = [];
-    const impl = vi.fn(async (url: string, init?: RequestInit) => {
-      const headers = headerBag(init);
-      calls.push({ url: String(url), authorization: headers.authorization });
-      if (String(url).includes("/login")) {
-        return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
-      }
-      const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
-      const status = statuses[bearer];
-      if (status !== undefined) {
-        return new Response("refused", { status });
-      }
-      return new Response(JSON.stringify({ secrets: [] }), { status: 200 });
-    });
-    return { calls, impl };
+  interface ServiceTokenMetadataFixture {
+    workspace: string;
+    projectId: string;
+    scopes: Array<{ environment: string; secretPath: string } | null>;
+    permissions: string[];
+    expiresAt?: string | null;
   }
+  const grant = (permissions = ["read"], patch: Partial<ServiceTokenMetadataFixture> = {}) => ({
+    workspace: "proj-1", projectId: "proj-1", scopes: [{ environment: "prod", secretPath: "/requested/" }],
+    permissions, expiresAt: null, ...patch,
+  });
+  function wire(readMetadata: ServiceTokenMetadataFixture, writeMetadata: ServiceTokenMetadataFixture = grant(["write"])) {
+    const calls: Array<{ path: string; method: string }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      calls.push({ path, method: init?.method ?? "GET" });
+      if (path === "/api/v2/service-token") {
+        const metadata = headerBag(init).authorization === `Bearer ${SENTINEL_WRITE_TOKEN}` ? writeMetadata : readMetadata;
+        return new Response(JSON.stringify(metadata));
+      }
+      // A permissive/clamping server would answer this request successfully.
+      // Verification must stop rejected scopes before this response is reachable.
+      return new Response(JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }] }));
+    }));
+    return calls;
+  }
+  const settings = () => withSettings({ secretPath: "/requested", token: SENTINEL_READ_TOKEN,
+    writeToken: SENTINEL_WRITE_TOKEN, writeThrough: true });
+  const secretCalls = (calls: Array<{ path: string }>) => calls.filter((call) => call.path.startsWith("/api/v3/secrets"));
 
-  it("keeps the credential-wide refusal when scope-scoped refusals fill the cap", async () => {
-    // A 401 is remembered against EVERY scope, because the bearer is refused
-    // however it is used.  That entry is the one worth keeping under the
-    // cap:  dropping it would let a revoked token be tried again, which is
-    // the whole thing the memory exists to prevent.  Sixteen scope-scoped
-    // refusals for another token must not push it out.
-    const ROTATED_TOKEN = "sentinel-rotated-token-not-real";
-    const settings = {
-      ...BASE_SETTINGS,
-      projectId: "proj-1",
-      clientId: "",
-      clientSecret: "",
-      token: REFUSED_TOKEN,
-    };
-    infisical.configure(() => settings);
-    const { calls, impl } = perBearerRefusingFetch({
-      [REFUSED_TOKEN]: 401,
-      [ROTATED_TOKEN]: 404,
-    });
-    vi.stubGlobal("fetch", impl);
+  it.each([
+    ["wrong project", { workspace: "another-project" }],
+    ["wrong environment", { scopes: [{ environment: "staging", secretPath: "/requested" }] }],
+    ["clamped folder", { scopes: [{ environment: "prod", secretPath: "/granted" }] }],
+    ["root is not a descendant grant", { scopes: [{ environment: "prod", secretPath: "/" }] }],
+    ["wildcard folder", { scopes: [{ environment: "prod", secretPath: "/requested/*" }] }],
+    ["write-capable read token", { permissions: ["read", "write"] }],
+    ["expired token", { expiresAt: "2000-01-01T00:00:00Z" }],
+    ["missing expiry metadata", { expiresAt: undefined }],
+    ["malformed scopes", { scopes: [null] }],
+  ] satisfies Array<[string, Partial<ServiceTokenMetadataFixture>]>)
+  ("prevents secret reads for %s without MI fallback", async (_label, patch) => {
+    settings();
+    const calls = wire(grant(["read"], patch));
+    const result = await infisical.refresh("manual");
+    expect(result.stale).toBe(true);
+    expect(result.lastError).not.toBeNull();
+    expect(secretCalls(calls)).toEqual([]);
+    expect(calls.every((call) => call.path === "/api/v2/service-token")).toBe(true);
+    expect(infisicalSnapshot()).toBeNull();
+  });
 
-    // One 401:  the credential-wide refusal, remembered against every scope.
-    await infisical.refresh("manual");
-    expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(1);
+  it.each([
+    ["wrong project", { workspace: "another-project" }],
+    ["wrong folder", { scopes: [{ environment: "prod", secretPath: "/granted" }] }],
+    ["wrong environment", { scopes: [{ environment: "staging", secretPath: "/requested" }] }],
+    ["read-only write credential", { permissions: ["read"] }],
+    ["expired token", { expiresAt: "2000-01-01T00:00:00Z" }],
+    ["malformed expiry", { expiresAt: "not-a-date" }],
+  ] satisfies Array<[string, Partial<ServiceTokenMetadataFixture>]>)
+  ("prevents writes and reconciliation reads for %s", async (_label, patch) => {
+    settings();
+    const calls = wire(grant(), grant(["write"], patch));
+    await expect(infisical.writeSecret("COMPOSIO_API_KEY", "replacement")).rejects.toBeInstanceOf(Error);
+    expect(calls).toHaveLength(1);
+    expect(secretCalls(calls)).toEqual([]);
+  });
 
-    // Sixteen scope-scoped refusals for the rotated token, one per scope.
-    // Every one of them is a 404, so each is remembered against its own
-    // scope rather than against the credential.
-    settings.token = ROTATED_TOKEN;
-    for (let index = 0; index < 16; index += 1) {
-      settings.projectId = `proj-scoped-${index}`;
+  it("verifies dedicated source credentials before their independent secret read", async () => {
+    const source = withSettings({ token: SENTINEL_READ_TOKEN, readSources: [{
+      name: "secondary", projectId: "another-project", environment: "prod", secretPath: "/requested",
+      tokenEnv: "BF_TEST_METADATA_SOURCE", tokenFile: "",
+    }] });
+    process.env.BF_TEST_METADATA_SOURCE = "fake-secondary-token";
+    const calls = wire(grant());
+    try {
+      await expect(infisical.readSource("secondary")).rejects.toThrow(/configured project/);
+      await expect(infisical.readPath("/requested", { projectId: source.readSources[0].projectId })).rejects.toThrow();
+      expect(secretCalls(calls)).toEqual([]);
+      expect(calls).toHaveLength(1);
+    } finally { delete process.env.BF_TEST_METADATA_SOURCE; }
+  });
+
+  it("caches successful metadata by credential, site, exact scope and role for at most a minute", async () => {
+    const configured = settings();
+    let clock = Date.now();
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const calls = wire(grant());
+    const checks = () => calls.filter((call) => call.path === "/api/v2/service-token").length;
+    try {
       await infisical.refresh("manual");
-    }
-    expect(calls.filter((call) => bearerOf(call) === ROTATED_TOKEN)).toHaveLength(16);
+      await infisical.refresh("timer");
+      expect(checks()).toBe(1);
+      configured.siteUrl = "https://second-vault.example.test";
+      await infisical.refresh("timer");
+      expect(checks()).toBe(2);
+      configured.token = "fake-rotated-read-token";
+      await infisical.refresh("timer");
+      expect(checks()).toBe(3);
+      clock += 60_001;
+      await infisical.refresh("timer");
+      expect(checks()).toBe(4);
+      // A read check never authorizes a write, even at the identical scope.
+      configured.writeToken = SENTINEL_WRITE_TOKEN;
+      await infisical.writeSecret("COMPOSIO_API_KEY", SENTINEL_VAULT_VALUE);
+      expect(checks()).toBe(5);
+    } finally { now.mockRestore(); }
+  });
 
-    // Back to the revoked token.  The credential-wide refusal survived the
-    // cap, so the token is not tried again -- no request carries it.
-    settings.token = REFUSED_TOKEN;
-    settings.projectId = "proj-1";
+  it("never keeps cached verification beyond the token's expiry", async () => {
+    settings();
+    let clock = Date.now();
+    const expiresAt = new Date(clock + 1_000).toISOString();
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const calls = wire(grant(["read"], { expiresAt }));
+    try {
+      await infisical.refresh("manual");
+      clock += 1_001;
+      const result = await infisical.refresh("timer");
+      expect(result.lastError).toMatch(/expired/);
+      expect(secretCalls(calls)).toHaveLength(1);
+      expect(calls.filter((call) => call.path === "/api/v2/service-token")).toHaveLength(2);
+    } finally { now.mockRestore(); }
+  });
+
+  it("evicts the least recently used credential when the 64-entry cache fills", async () => {
+    const configured = settings();
+    const clock = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(clock);
+    const calls = wire(grant());
+    const checks = () => calls.filter((call) => call.path === "/api/v2/service-token").length;
+    const read = async (index: number) => {
+      configured.token = `fake-lru-token-${index}`;
+      expect((await infisical.refresh("manual")).lastError).toBeNull();
+    };
+    try {
+      for (let index = 0; index < 64; index++) await read(index);
+      expect(checks()).toBe(64);
+      await read(0);
+      expect(checks()).toBe(64);
+      await read(64);
+      expect(checks()).toBe(65);
+      await read(0);
+      expect(checks()).toBe(65);
+      await read(1);
+      expect(checks()).toBe(66);
+    } finally { now.mockRestore(); }
+  });
+
+  it("promotes cache hits without extending their original verification lifetime", async () => {
+    settings();
+    let clock = Date.now();
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const calls = wire(grant());
+    const checks = () => calls.filter((call) => call.path === "/api/v2/service-token").length;
+    try {
+      await infisical.refresh("manual");
+      clock += 30_000;
+      await infisical.refresh("timer");
+      expect(checks()).toBe(1);
+      clock += 30_001;
+      await infisical.refresh("timer");
+      expect(checks()).toBe(2);
+    } finally { now.mockRestore(); }
+  });
+
+  it("does not use a cached read-only grant to authorize the same credential for a write", async () => {
+    withSettings({ secretPath: "/requested", token: SENTINEL_READ_TOKEN, writeToken: SENTINEL_READ_TOKEN, writeThrough: true });
+    const calls = wire(grant());
     await infisical.refresh("manual");
-
-    expect(calls.filter((call) => bearerOf(call) === REFUSED_TOKEN)).toHaveLength(1);
-    expect(infisical.getStatus().readTokenRefused).toBe(true);
+    await expect(infisical.writeSecret("COMPOSIO_API_KEY", "replacement")).rejects.toThrow(/write permission/);
+    expect(secretCalls(calls)).toHaveLength(1);
+    expect(calls.filter((call) => call.path === "/api/v2/service-token")).toHaveLength(2);
   });
 
-  it("reports a refused token in the status view and in the boot line", async () => {
-    // A sync that succeeds on the machine identity must not look exactly
-    // like a healthy token:  the refusal is the fact the operator needs.
-    withSettings({ token: REFUSED_TOKEN });
-    const { impl } = refusingFetch(401, [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
-    vi.stubGlobal("fetch", impl);
-
+  it.each([
+    ["projectId", "another-project"], ["environment", "staging"], ["secretPath", "/another-folder"],
+  ] as const)("does not reuse cached metadata after changing %s", async (field, value) => {
+    const configured = settings();
+    const calls = wire(grant());
     await infisical.refresh("manual");
-
-    const status = infisical.getStatus();
-    expect(status.readTokenRefused).toBe(true);
-    expect(status.writeTokenRefused).toBe(false);
-    // The token is still configured:  it was refused, not removed.
-    expect(status.hasToken).toBe(true);
-    expect(status.enabled).toBe(true);
-    expect(infisical.bootLine()).toContain("read-token-refused");
+    configured[field] = value;
+    expect((await infisical.refresh("settings")).lastError).not.toBeNull();
+    expect(secretCalls(calls)).toHaveLength(1);
+    expect(calls.filter((call) => call.path === "/api/v2/service-token")).toHaveLength(2);
   });
 
-  /** A fetch that refuses the named bearer, optionally only for one
-   * secret path, and answers every other request with the secrets list.
-   * The login endpoint answers with a session token when the machine
-   * identity is in play. */
-  function scopedRefusingFetch(options: {
-    status: number;
-    onlyPath?: string;
-    secrets?: Array<{ secretKey: string; secretValue: string }>;
-  }) {
-    const calls: RecordedCall[] = [];
-    const impl = vi.fn(async (url: string, init?: RequestInit) => {
-      const headers = headerBag(init);
-      calls.push({ url: String(url), authorization: headers.authorization });
-      if (String(url).includes("/login")) {
-        return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
-      }
-      const bearer = (headers.authorization ?? "").replace(/^Bearer /, "");
-      if (bearer === REFUSED_TOKEN) {
-        const asked = new URL(String(url)).searchParams.get("secretPath") ?? "";
-        if (!options.onlyPath || asked === options.onlyPath) {
-          return new Response("refused", { status: options.status });
-        }
-      }
-      return new Response(JSON.stringify({ secrets: options.secrets ?? [] }), { status: 200 });
-    });
-    return { calls, impl };
-  }
-
-  it("does not let one missing folder deprioritize the token for the whole vault", async () => {
-    // A 404 is a refusal of the REQUEST, not of the credential:  the
-    // folder the caller asked for does not exist, and the token itself is
-    // still good.  Remembering that refusal against the whole vault would
-    // push a working token aside for the life of the process.
-    withSettings({ token: REFUSED_TOKEN });
-    const { calls, impl } = scopedRefusingFetch({
-      status: 404,
-      onlyPath: "/missing",
-      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
-    });
-    vi.stubGlobal("fetch", impl);
-
-    const values = await infisical.readPath("/missing");
-    expect(values.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
-
-    const refreshed = await infisical.refresh("manual");
-    expect(refreshed.lastError).toBeNull();
-
-    // The refresh reads the vault's own scope, where the token was never
-    // refused, so the token is used again.
-    const lists = calls.filter((call) => !call.url.includes("/login"));
-    expect(bearerOf(lists.at(-1)!)).toBe(REFUSED_TOKEN);
-    expect(infisical.getStatus().readTokenRefused).toBe(false);
-  });
-
-  it("does not let one 403 deprioritize the token for the whole vault", async () => {
-    // A 403 is a refusal of the REQUEST the same way a 404 is:  the grant
-    // does not cover what was asked for, and the token itself is still good.
-    // Remembering it against the whole vault would push a working token
-    // aside for the life of the process.
-    withSettings({ token: REFUSED_TOKEN });
-    const { calls, impl } = scopedRefusingFetch({
-      status: 403,
-      onlyPath: "/zulip",
-      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
-    });
-    vi.stubGlobal("fetch", impl);
-
-    const values = await infisical.readPath("/zulip");
-    expect(values.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
-
-    const refreshed = await infisical.refresh("manual");
-    expect(refreshed.lastError).toBeNull();
-
-    // The refresh reads the vault's own scope, where the token was never
-    // refused, so the token is used again.
-    const lists = calls.filter((call) => !call.url.includes("/login"));
-    expect(bearerOf(lists.at(-1)!)).toBe(REFUSED_TOKEN);
-    expect(infisical.getStatus().readTokenRefused).toBe(false);
-  });
-
-  it("names a refused token on the boot line even when the sync failed", async () => {
-    // The case that matters most is a refused token with no machine identity
-    // to fall back to:  the sync errored, so the boot line reports the
-    // error, and it has to name the refusal as well or the operator cannot
-    // tell a revoked token from a broken vault.
-    withSettings({ clientId: "", clientSecret: "", token: REFUSED_TOKEN });
-    const { impl } = scopedRefusingFetch({
-      status: 401,
-      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
-    });
-    vi.stubGlobal("fetch", impl);
-
+  it("never probes metadata for explicitly selected machine identity or disabled installs", async () => {
+    withSettings({ enabled: false, token: SENTINEL_READ_TOKEN });
+    const noCalls = wire(grant());
     await infisical.refresh("manual");
-
-    const line = infisical.bootLine();
-    expect(line).toContain("unavailable");
-    expect(line).toContain("read-token-refused");
-  });
-
-  it("deprioritizes a revoked token everywhere, not only where it was refused", async () => {
-    // A 401 is a refusal of the CREDENTIAL:  the bearer itself was
-    // rejected, so it is rejected however it is used.  The next refresh
-    // must not try it again.
-    withSettings({ token: REFUSED_TOKEN });
-    const { calls, impl } = scopedRefusingFetch({
-      status: 401,
-      secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }],
-    });
-    vi.stubGlobal("fetch", impl);
-
-    const values = await infisical.readPath("/zulip");
-    expect(values.get("COMPOSIO_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
-
-    const refreshed = await infisical.refresh("manual");
-    expect(refreshed.lastError).toBeNull();
-
-    const lists = calls.filter((call) => !call.url.includes("/login"));
-    expect(lists.at(-1)?.authorization ?? "").not.toContain(REFUSED_TOKEN);
-    expect(infisical.getStatus().readTokenRefused).toBe(true);
-  });
-
-  it("reports no refusal for a token the server never refused", async () => {
-    withSettings({ token: REFUSED_TOKEN });
-    const { impl } = refusingFetch(200, [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
-    vi.stubGlobal("fetch", impl);
-
-    await infisical.refresh("manual");
-
-    const status = infisical.getStatus();
-    expect(status.readTokenRefused).toBe(false);
-    expect(status.writeTokenRefused).toBe(false);
-    expect(infisical.bootLine()).not.toContain("token-refused");
+    expect(noCalls).toEqual([]);
+    withSettings({ authMethod: "machine-identity", token: SENTINEL_READ_TOKEN });
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      calls.push(new URL(String(url)).pathname);
+      return String(url).includes("/login")
+        ? new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }))
+        : new Response(JSON.stringify({ secrets: [] }));
+    }));
+    expect((await infisical.refresh("manual")).lastError).toBeNull();
+    expect(calls).toEqual(["/api/v1/auth/universal-auth/login", "/api/v3/secrets/raw"]);
   });
 });
 
@@ -1797,28 +1721,19 @@ describe("the fleet's project", () => {
 });
 
 describe("readProjectPath", () => {
-  it("addresses the fleet's project with the same machine identity", async () => {
+  it("refuses to borrow the primary machine identity for the fleet project", async () => {
     process.env.INFISICAL_FLEET_OPS_PROJECT_ID = "fleet-ops-project-id";
     withSettings({});
-    const fetchMock = loginThenList([{ secretKey: "GH_TOKEN", secretValue: SENTINEL_VAULT_VALUE }]);
-    vi.stubGlobal("fetch", fetchMock);
-
-    const values = await infisical.readProjectPath("fleet-ops", "/cli-logins/BF-ORACLE");
-
-    expect(values.get("GH_TOKEN")).toBe(SENTINEL_VAULT_VALUE);
-    const listUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
-    expect(listUrl.searchParams.get("workspaceId")).toBe("fleet-ops-project-id");
-    expect(listUrl.searchParams.get("environment")).toBe("prod");
-    expect(listUrl.searchParams.get("secretPath")).toBe("/cli-logins/BF-ORACLE");
-    // One login, with the harness's own identity:  a second project is not a
-    // second credential.
-    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/login"))).toHaveLength(1);
+    const fetchMock = vi.fn();
+    stubFetch(fetchMock);
+    await expect(infisical.readProjectPath("fleet-ops", "/cli-logins/BF-ORACLE")).rejects.toThrow(/dedicated/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("reads BotFleet's own project when the caller names that one", async () => {
     const settings = withSettings({});
     const fetchMock = loginThenList([{ secretKey: "XAI_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch(fetchMock);
 
     await infisical.readProjectPath("botfleet", "/");
 
@@ -1828,7 +1743,7 @@ describe("readProjectPath", () => {
 
   it("refuses with no request when this host has no project id for the fleet's project", async () => {
     const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    stubFetch(fetchMock);
     withSettings({});
     await expect(infisical.readProjectPath("fleet-ops", "/cli-logins/BF-ORACLE")).rejects.toThrow(
       /fleet's Infisical project is not configured/,

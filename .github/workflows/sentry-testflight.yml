@@ -9,8 +9,9 @@ on:
     inputs:
       token:
         description: >-
-          Optional Infisical read token for the reporting app.  When empty,
-          the step uses INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN.
+          Dedicated read-only Infisical service token for this reporting use
+          case.  When empty, the step uses INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN
+          and the same-name GitHub secret fallback when vault access is unavailable.
         required: false
         default: ""
         type: string
@@ -70,6 +71,8 @@ jobs:
           names: SENTRY_AUTH_TOKEN
           required: SENTRY_AUTH_TOKEN
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          # Use the caller's dedicated read token or the existing reporting-token
+          # binding; the same-name GitHub Sentry secret remains the value fallback.
           token: ${{ inputs.token || secrets.INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN }}
         env:
           GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}

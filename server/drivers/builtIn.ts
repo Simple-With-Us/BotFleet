@@ -18,6 +18,7 @@ import { MuseAgentDriver } from "./acp/muse.ts";
 import { OpenAICompatDriver } from "./openai-compat.ts";
 import { PiDriver } from "./pi.ts";
 import { ZcodeDriver } from "./zcode.ts";
+import { ZcodeAcpDriver } from "./acp/zcode.ts";
 import { MinimaxDriver } from "./minimax.ts";
 import { CliWrapperDriver } from "./cli-wrapper.ts";
 
@@ -39,6 +40,7 @@ export const BUILT_IN_DRIVERS: readonly AnyProviderDriver[] = [
   MuseAgentDriver,
   PiDriver,
   ZcodeDriver,
+  ZcodeAcpDriver,
   OpenAICompatDriver,
   ClaudeDriver,
   CodexDriver,

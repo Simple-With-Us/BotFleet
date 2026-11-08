@@ -421,6 +421,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "infisical-auth") {
+  // Visual-spec harness for the explicit Infisical authentication method and
+  // scoped read/write source rows; network status is stubbed by Playwright.
+  void import("./components/SecretsSectionVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "history-compression") {
   // Visual-spec harness (tests/e2e/history-compression.visual.spec.ts):
   // History Compression controls, editable and read-only.
