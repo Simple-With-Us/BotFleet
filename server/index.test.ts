@@ -6996,14 +6996,8 @@ describe("instance CLI override API", () => {
       snapshot?: { state?: string; authenticated?: boolean };
       models?: { options?: Array<{ id: string }> };
     };
-    const isInstanceListItem = (value: unknown): value is CustomEngineListItem =>
-      typeof value === "object" && value !== null
-      && typeof (value as { instanceId?: unknown }).instanceId === "string";
-    const findInstance = (instances: unknown, id: string): CustomEngineListItem | undefined => {
-      if (!Array.isArray(instances)) return undefined;
-      return instances.find((item): item is CustomEngineListItem =>
-        isInstanceListItem(item) && item.instanceId === id);
-    };
+    const findInstance = (instances: CustomEngineListItem[], id: string): CustomEngineListItem | undefined =>
+      instances.find((item) => item.instanceId === id);
 
     const instancesRes = await api("GET", "/api/instances");
     const found = findInstance(instancesRes.body.instances, instanceId);
