@@ -6892,26 +6892,46 @@ describe("instance CLI override API", () => {
     const instanceId = created.body.instanceId;
     expect(instanceId).toContain("custom-ollama-local");
 
+    type CustomEngineListItem = {
+      instanceId: string;
+      replyWaitMinutes?: number;
+      displayName?: string;
+      driverKind?: string;
+      isCustom?: boolean;
+      localModelWaitAvailable?: boolean;
+      snapshot?: { state?: string; authenticated?: boolean };
+      models?: { options?: Array<{ id: string }> };
+    };
+    const isInstanceListItem = (value: unknown): value is CustomEngineListItem =>
+      typeof value === "object" && value !== null
+      && typeof (value as { instanceId?: unknown }).instanceId === "string";
+    const findInstance = (instances: unknown, id: string): CustomEngineListItem | undefined => {
+      if (!Array.isArray(instances)) return undefined;
+      return instances.find((item): item is CustomEngineListItem =>
+        isInstanceListItem(item) && item.instanceId === id);
+    };
+
     const instancesRes = await api("GET", "/api/instances");
-    const found = instancesRes.body.instances.find((i: any) => i.instanceId === instanceId);
+    const found = findInstance(instancesRes.body.instances, instanceId);
     expect(found).toBeDefined();
-    expect(found.displayName).toBe("Ollama Local");
-    expect(found.driverKind).toBe("openai-compat");
-    expect(found.isCustom).toBe(true);
-    expect(found.snapshot.state).toBe("available");
-    expect(found.snapshot.authenticated).toBe(true);
-    expect(found.models.options.map((m: any) => m.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
-    expect(found.localModelWaitAvailable).toBe(true);
+    expect(found?.displayName).toBe("Ollama Local");
+    expect(found?.driverKind).toBe("openai-compat");
+    expect(found?.isCustom).toBe(true);
+    expect(found?.snapshot?.state).toBe("available");
+    expect(found?.snapshot?.authenticated).toBe(true);
+    expect(found?.models?.options?.map((model) => model.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
+    expect(found?.localModelWaitAvailable).toBe(true);
 
     expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 20 })).status).toBe(200);
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 10, unexpected: true })).status).toBe(400);
     const configured = await api("GET", "/api/instances");
-    expect(configured.body.instances.find((i: any) => i.instanceId === instanceId).replyWaitMinutes).toBe(20);
+    expect(findInstance(configured.body.instances, instanceId)?.replyWaitMinutes).toBe(20);
     for (const invalid of [1, 4, 61, 2.5, "20"]) {
       expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: invalid })).status).toBe(400);
     }
     expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: null })).status).toBe(200);
     const reset = await api("GET", "/api/instances");
-    expect(reset.body.instances.find((i: any) => i.instanceId === instanceId)).not.toHaveProperty("replyWaitMinutes");
+    expect(findInstance(reset.body.instances, instanceId)).not.toHaveProperty("replyWaitMinutes");
 
     const botRes = await api("POST", "/api/bots", {
       name: "Local Bot",

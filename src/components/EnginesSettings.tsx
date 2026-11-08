@@ -509,7 +509,7 @@ export function EngineRow({
         )}
         {instance.localModelWaitAvailable && (
           <label className="flex shrink-0 items-center gap-1.5 text-[11.5px] text-ink-secondary">
-            <span>Wait</span>
+            <span>Reply Wait</span>
             <select
               aria-label={`How long to wait for ${instance.displayName} to reply`}
               title="How long to wait for the local model to reply before stopping the turn."
