@@ -6,7 +6,7 @@
 //
 // The fake CLI is a shebang script Windows cannot exec directly; spawnCli
 // resolves it to `node <script>`, so these run everywhere.
-import { chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,6 +39,7 @@ describe("ZcodeDriver turns (fake CLI)", () => {
   let instance: ProviderInstance;
   let recorder: EventRecorder;
   let dir: string;
+  let originalCliMode: number;
 
   const create = async (mode?: string, environment: Record<string, string> = {}) => {
     const childEnv = { ...environment };
@@ -61,13 +62,18 @@ describe("ZcodeDriver turns (fake CLI)", () => {
 
   beforeEach(() => {
     ensureDirs();
+    originalCliMode = statSync(FAKE_CLI).mode & 0o777;
     chmodSync(FAKE_CLI, 0o755);
     dir = mkdtempSync(join(tmpdir(), "omb-zcode-"));
   });
   afterEach(async () => {
-    recorder?.stop();
-    await instance?.dispose();
-    rmSync(dir, { recursive: true, force: true });
+    try {
+      recorder?.stop();
+      await instance?.dispose();
+    } finally {
+      chmodSync(FAKE_CLI, originalCliMode);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("falls back to the app-bundled CLI when zcode is not on PATH", async () => {

@@ -6,13 +6,15 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { listSecretsRaw, maskValue, run, writeGithubEnvValue } from "./infisical-fetch.mjs";
+import { listSecretsRaw, maskValue, run, verifyServiceTokenMetadata, writeGithubEnvValue } from "./infisical-fetch.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = join(ROOT, "scripts", "infisical-fetch.mjs");
 
 const SENTINEL_PRESENT = "sentinel-value-in-vault-9f2c";
 const SENTINEL_FALLBACK = "sentinel-value-fallback-4b1e";
+const MALFORMED_FOLDERS = ["//", "///", "/./", "/../", "/fleet/../", "/fleet/./vercel",
+  "/fleet//vercel", "/fleet/vercel//", "/fleet/.", "/fleet/.."];
 // The shape a `base64 < cert.p12` actually has: wrapped at a column, so the
 // value the vault hands back is several lines long.  A single-line
 // `::add-mask::` registers only the first of them and prints the rest.
@@ -141,6 +143,69 @@ test("verification uses the injected fetch and rejects project, scope, permissio
   }
 });
 
+test("service-token URL preflight rejects insecure, malformed, credentialed, query, and fragment URLs before fetch", async (t) => {
+  const invalidUrls = [
+    "http://infisical.example",
+    "http://127.0.0.1:8080",
+    "https://",
+    "https:///missing-host/path",
+    "https://user:password@infisical.example",
+    "https://@infisical.example",
+    "https://infisical.example/path?token=fixture-secret",
+    "https://infisical.example/path#fragment",
+    "https://infisical.example\\@attacker.example/path",
+    "https://infisical.example/path?",
+    "https://infisical.example/path#",
+  ];
+  for (const siteUrl of invalidUrls) {
+    await t.test(siteUrl.startsWith("http://") ? "insecure URL" : "invalid URL components", async () => {
+      let calls = 0;
+      const options = {
+        siteUrl,
+        token: "st.fixture-only",
+        projectId: "proj",
+        environment: "prod",
+        secretPath: "/",
+        mode: "read",
+        fetchImpl: async () => { calls++; throw new Error("must not fetch"); },
+      };
+      await assert.rejects(verifyServiceTokenMetadata(options), (error) => {
+        assert.match(error.message, /valid HTTPS URL/);
+        assert.ok(!error.message.includes(siteUrl));
+        assert.ok(!error.message.includes("fixture-secret"));
+        return true;
+      });
+      await assert.rejects(listSecretsRaw(options), /valid HTTPS URL/);
+      assert.equal(calls, 0);
+    });
+  }
+});
+
+test("service-token URL preflight preserves HTTPS path prefixes and redirects:error", async () => {
+  const calls = [];
+  const values = await listSecretsRaw({
+    siteUrl: "https://infisical.example/prefix/",
+    token: "st.fixture-only",
+    projectId: "proj",
+    environment: "prod",
+    secretPath: "/",
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      if (String(url).includes("/api/v2/service-token")) {
+        return new Response(JSON.stringify({ workspace: "proj", projectId: "proj",
+          scopes: [{ environment: "prod", secretPath: "/" }], permissions: ["read"], expiresAt: null }));
+      }
+      return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: "fixture-value",
+        workspace: "proj", environment: "prod", secretValueHidden: false }] }));
+    },
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url, "https://infisical.example/prefix/api/v2/service-token");
+  assert.equal(calls[0].init.redirect, "error");
+  assert.equal(new URL(calls[1].url).pathname, "/prefix/api/v3/secrets/raw");
+  assert.equal(values.get("FOO"), "fixture-value");
+});
+
 test("the injected fetch validates serialized exact read scope before secrets", async () => {
   const { dir, path } = tempGithubEnv();
   const order = [];
@@ -169,10 +234,9 @@ test("the injected fetch validates serialized exact read scope before secrets", 
   }
 });
 
-test("matching wildcard request and grant never reach the secret endpoint", async (t) => {
-  for (const character of ["*", "?", "[", "]", "{", "}"]) {
-    await t.test(character, async () => {
-      const secretPath = `/folder/${character}`;
+test("matching nonliteral request and grant never reach the secret endpoint", async (t) => {
+  for (const secretPath of [...MALFORMED_FOLDERS, ...["*", "?", "[", "]", "{", "}"].map((character) => `/folder/${character}`)]) {
+    await t.test(secretPath, async () => {
       const calls = [];
       await assert.rejects(listSecretsRaw({
         siteUrl: "https://infisical.example", token: "st.fixture-only", projectId: "proj",
@@ -190,8 +254,8 @@ test("matching wildcard request and grant never reach the secret endpoint", asyn
 });
 
 test("all metadata folders must be literal even when an exact literal grant is present", async (t) => {
-  for (const character of ["*", "?", "[", "]", "{", "}"]) {
-    await t.test(character, async () => {
+  for (const secretPath of [...MALFORMED_FOLDERS, ...["*", "?", "[", "]", "{", "}"].map((character) => `/other/${character}`)]) {
+    await t.test(secretPath, async () => {
       const calls = [];
       await assert.rejects(listSecretsRaw({
         siteUrl: "https://infisical.example", token: "st.fixture-only", projectId: "proj",
@@ -200,11 +264,37 @@ test("all metadata folders must be literal even when an exact literal grant is p
           calls.push(String(url));
           return new Response(JSON.stringify({ workspace: "proj", permissions: ["read"], expiresAt: null,
             scopes: [{ environment: "prod", secretPath: "/folder" },
-              { environment: "staging", secretPath: `/other/${character}` }],
+              { environment: "staging", secretPath }],
           }));
         },
       }), /metadata is invalid/);
       assert.deepEqual(calls, ["https://infisical.example/api/v2/service-token"]);
+    });
+  }
+});
+
+test("canonical root and non-root folder spellings remain compatible without path decoding", async (t) => {
+  for (const secretPath of ["/", "/folder", "/folder/", "/folder/.hidden/v1..2", "/folder/%2e%2e"]) {
+    await t.test(secretPath, async () => {
+      const grantedPath = secretPath.replace(/\/$/, "") || "/";
+      const calls = [];
+      const values = await listSecretsRaw({
+        siteUrl: "https://infisical.example", token: "st.fixture-only", projectId: "proj",
+        environment: "prod", secretPath,
+        fetchImpl: async (url) => {
+          calls.push(String(url));
+          if (String(url).includes("/api/v2/service-token")) {
+            return new Response(JSON.stringify({ workspace: "proj", permissions: ["read"], expiresAt: null,
+              scopes: [{ environment: "prod", secretPath: grantedPath }],
+            }));
+          }
+          return new Response(JSON.stringify({ secrets: [{ secretKey: "FOO", secretValue: SENTINEL_PRESENT,
+            workspace: "proj", environment: "prod", secretPath: grantedPath, secretValueHidden: false }] }));
+        },
+      });
+      assert.equal(values.get("FOO"), SENTINEL_PRESENT);
+      assert.equal(calls.length, 2);
+      assert.equal(new URL(calls[1]).searchParams.get("secretPath"), secretPath);
     });
   }
 });

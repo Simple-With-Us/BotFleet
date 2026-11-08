@@ -19,6 +19,8 @@ function storedDocument() {
     xaiApiKey: dummy(),
     openaiImageApiKey: dummy(),
     infisicalClientSecret: dummy(),
+    infisicalReadToken: dummy(),
+    infisicalWriteToken: dummy(),
     instanceKeys: { "my-engine": dummy(), "other.engine": dummy() },
   };
 }
@@ -28,6 +30,8 @@ function secretsIn(document) {
     document.xaiApiKey,
     document.openaiImageApiKey,
     document.infisicalClientSecret,
+    document.infisicalReadToken,
+    document.infisicalWriteToken,
     ...Object.values(document.instanceKeys),
   ];
 }

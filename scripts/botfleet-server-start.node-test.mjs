@@ -528,13 +528,13 @@ test("invalid startup preferences fail closed before helper access", () => {
 test("the Infisical identity banner is 7-bit ASCII", () => {
   const line = readFileSync(SCRIPT, "utf8")
     .split("\n")
-    .find((row) => row.includes("the Infisical machine identity"));
+    .find((row) => row.includes("the Infisical service tokens"));
   assert.ok(line, "the identity section banner is missing");
-  assert.match(line, /^# --- the Infisical machine identity/);
+  assert.match(line, /^# --- the Infisical service tokens/);
   assert.equal([...line].some((ch) => ch.charCodeAt(0) > 127), false);
 });
 
-test("documented names are fetched and exported, and nothing else is", () => {
+test("generic machine identity names are never fetched or exported", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -546,15 +546,15 @@ test("documented names are fetched and exported, and nothing else is", () => {
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
-    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
-    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
     assert.equal(got.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
 
-test("a service token from the vault is the identity, and the machine identity stays as the fallback", () => {
+test("only dedicated service tokens are fetched, without a machine identity fallback", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -569,14 +569,9 @@ test("a service token from the vault is the identity, and the machine identity s
     const got = identityReport(fixture, runIdentity(fixture));
     assert.equal(got.INFISICAL_TOKEN, "fixture-read-token");
     assert.equal(got.INFISICAL_WRITE_TOKEN, "fixture-write-token");
-    // The token is what the server uses, but the machine identity is still
-    // fetched and exported: it is the fallback for the two cases a token
-    // cannot cover -- a write with no write token, and a read of a project
-    // other than the token's own.  Returning early on the token would
-    // leave a token-only host with neither, and the write would fail at
-    // login with an error that reads like a broken vault.
-    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
-    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
+    // Dedicated token bootstrap never requests or exports a machine identity.
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
@@ -603,7 +598,7 @@ test("a token-only host still starts, with no machine identity to fall back to",
   }
 });
 
-test("automation file names map onto the env names the harness already resolves", () => {
+test("automation names cannot provision the managed launcher", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -611,14 +606,14 @@ test("automation file names map onto the env names the harness already resolves"
       ["INFISICAL_AUTOMATION_CLIENT_ID=fixture-auto-id", "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto-secret"].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
-    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-auto-id");
-    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-auto-secret");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
 
-test("a documented key wins over the automation name when both are present", () => {
+test("neither generic nor automation names are consulted", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -631,14 +626,14 @@ test("a documented key wins over the automation name when both are present", () 
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
-    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
-    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
 
-test("a blank documented line falls through to the automation name", () => {
+test("blank generic names never activate automation fallback", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -651,8 +646,8 @@ test("a blank documented line falls through to the automation name", () => {
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
-    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-auto-id");
-    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-auto-secret");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }

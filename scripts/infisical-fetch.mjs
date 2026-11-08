@@ -30,21 +30,43 @@ function stripTrailingSlash(url) {
   return String(url ?? "").replace(/\/+$/, "");
 }
 
+function validateInfisicalSiteUrl(siteUrl) {
+  const raw = String(siteUrl ?? "");
+  const invalid = () => new Error("Infisical site URL must be a valid HTTPS URL without userinfo, query, or fragment.");
+  if (!raw || raw !== raw.trim() || /[?#\\]/.test(raw)) throw invalid();
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw invalid();
+  }
+  const authority = raw.match(/^https:\/\/([^/\\?#]*)/i)?.[1];
+  if (parsed.protocol !== "https:" || !parsed.hostname || !authority || authority.includes("@") ||
+      authority.includes("\\") || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw invalid();
+  }
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+}
+
 /** Validate the flat service-token record returned by Infisical before listing
  * secrets.  Keep this helper local so the hosted workflow stays dependency-free
  * and all network access remains injectable through `fetchImpl`. */
 /* oxlint-disable anti-slop/no-runtime-typeof -- These HTTP boundaries validate token and secret metadata without dependencies because CI runs before pnpm install. */
+function isLiteralFolder(path) {
+  return typeof path === "string" && path.startsWith("/") && !/[*?[\]{}]/.test(path) &&
+    !path.includes("//") && !path.split("/").some((segment) => segment === "." || segment === "..");
+}
+
 export async function verifyServiceTokenMetadata({
   siteUrl, token, projectId, environment, secretPath, mode, fetchImpl = fetch, timeoutMs = 30_000,
 }) {
-  const isLiteralFolder = (path) =>
-    typeof path === "string" && path.startsWith("/") && !/[*?[\]{}]/.test(path);
+  const baseUrl = validateInfisicalSiteUrl(siteUrl);
   if (!isLiteralFolder(secretPath)) {
     throw new Error("Infisical service-token scope must use a literal folder.");
   }
   let response;
   try {
-    response = await fetchImpl(`${siteUrl}/api/v2/service-token`, {
+    response = await fetchImpl(`${baseUrl}/api/v2/service-token`, {
       method: "GET",
       headers: { authorization: `Bearer ${token}` },
       redirect: "error",
@@ -126,7 +148,8 @@ export async function listSecretsRaw({
   siteUrl, token, projectId, environment, secretPath, fetchImpl = fetch, timeoutMs = 30_000,
   names, log = () => {},
 }) {
-  await verifyServiceTokenMetadata({ siteUrl, token, projectId, environment, secretPath, mode: "read", fetchImpl, timeoutMs });
+  const baseUrl = validateInfisicalSiteUrl(siteUrl);
+  await verifyServiceTokenMetadata({ siteUrl: baseUrl, token, projectId, environment, secretPath, mode: "read", fetchImpl, timeoutMs });
   const qs = new URLSearchParams({
     workspaceId: projectId,
     environment,
@@ -136,9 +159,10 @@ export async function listSecretsRaw({
     include_imports: "false",
     recursive: "false",
   });
-  const res = await fetchImpl(`${siteUrl}/api/v3/secrets/raw?${qs.toString()}`, {
+  const res = await fetchImpl(`${baseUrl}/api/v3/secrets/raw?${qs.toString()}`, {
     method: "GET",
     headers: { authorization: `Bearer ${token}` },
+    redirect: "error",
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
@@ -158,8 +182,8 @@ export async function listSecretsRaw({
     // v3 requires workspace/environment/hidden, while secretPath is optional on list rows.
     if (secret.workspace !== projectId || secret.environment !== environment ||
         secret.secretValueHidden !== false || typeof secret.secretValue !== "string" ||
-        (secret.secretPath !== undefined && (typeof secret.secretPath !== "string" ||
-          !secret.secretPath.startsWith("/") || normalizeFolder(secret.secretPath) !== normalizeFolder(secretPath)))) {
+        (secret.secretPath !== undefined && (!isLiteralFolder(secret.secretPath) ||
+          normalizeFolder(secret.secretPath) !== normalizeFolder(secretPath)))) {
       log(`::warning::${secret.secretKey} has invalid or out-of-scope Infisical metadata; trying its existing GitHub secret fallback.`);
       continue;
     }

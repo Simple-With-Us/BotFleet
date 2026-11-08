@@ -543,6 +543,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
     case general
     case servers
     case resources
+    case secrets
     case models
     case voice
     case shortcuts
@@ -556,6 +557,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
         case .general: return "General"
         case .servers: return "Servers"
         case .resources: return "Resources"
+        case .secrets: return "Secrets"
         case .models: return "Models"
         case .voice: return "Voice"
         case .shortcuts: return "Shortcuts"
@@ -569,6 +571,7 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
         case .general: return "gearshape"
         case .servers: return "server.rack"
         case .resources: return "gauge.with.dots.needle.33percent"
+        case .secrets: return "key.horizontal"
         case .models: return "cpu"
         case .voice: return "waveform"
         case .shortcuts: return "command"
