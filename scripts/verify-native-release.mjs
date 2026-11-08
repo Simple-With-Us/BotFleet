@@ -37,7 +37,7 @@ export function parseAppcast(text) {
   return { items };
 }
 
-/** Sparkle 2.9.6 signs raw archive bytes with Ed25519; RFC 8410 wraps its raw 32-byte public key. */
+/** Sparkle 2.10.1 signs raw archive bytes with Ed25519; RFC 8410 wraps its raw 32-byte public key. */
 export function verifyNativeArchiveSignature(bytes, signature, publicKey) {
   const fail = () => { throw new Error("Native update Ed25519 signature verification failed."); };
   if (!/^[A-Za-z0-9+/]{43}=$/.test(publicKey ?? "") ||

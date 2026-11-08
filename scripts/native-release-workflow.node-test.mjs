@@ -14,7 +14,7 @@ const localScript = readFileSync(join(ROOT, "scripts/mac-package.sh"), "utf8");
 test("only the native Mac target links Sparkle and retains explicit public update metadata", () => {
   const project = parseYaml(readFileSync(join(ROOT, "ios/project.yml"), "utf8"));
   const mac = project.targets.BotFleetMac;
-  assert.equal(project.packages.Sparkle.exactVersion, "2.9.6");
+  assert.equal(project.packages.Sparkle.exactVersion, "2.10.1");
   assert.ok(mac.dependencies.some((dependency) => dependency.package === "Sparkle"));
   assert.ok(!project.targets.BotFleet.dependencies.some((dependency) => dependency.package === "Sparkle"));
   assert.equal(mac.info.properties.SUFeedURL, "$(BOTFLEET_NATIVE_UPDATE_FEED_URL)");
