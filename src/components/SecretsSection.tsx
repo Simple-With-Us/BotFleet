@@ -307,7 +307,7 @@ export function SecretsSection() {
               <span className="font-medium text-ink">{vault?.lastSyncAt ? new Date(vault.lastSyncAt).toLocaleString() : "Never"}</span>
             </div>
             <div className="flex flex-col rounded-lg border border-hairline/20 bg-inset/20 p-2">
-              <span className="text-ink-secondary">Secrets in vault</span>
+              <span className="text-ink-secondary">Secrets Held</span>
               <span className="font-medium text-ink">{vault?.vaultCount ?? 0}</span>
             </div>
           </div>
@@ -448,7 +448,7 @@ export function SecretsSection() {
                         setSaveOk(false);
                       }}
                       onKeyDown={(e) => e.key === "Enter" && void save()}
-                      placeholder={vault?.hasClientId ? "Saved (paste to replace)" : "Machine identity client ID"}
+                      placeholder={vault?.hasClientId ? "Saved (paste to replace)" : "Machine Identity Client ID"}
                       autoComplete="off"
                       className={secretsInputClass}
                     />
@@ -466,7 +466,7 @@ export function SecretsSection() {
                         setSaveOk(false);
                       }}
                       onKeyDown={(e) => e.key === "Enter" && void save()}
-                      placeholder={vault?.hasClientSecret ? "Saved (paste to replace)" : "Machine identity client secret"}
+                      placeholder={vault?.hasClientSecret ? "Saved (paste to replace)" : "Machine Identity Client Secret"}
                       autoComplete="new-password"
                       className={secretsInputClass}
                     />
@@ -686,7 +686,7 @@ export function SecretsSection() {
                 className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] font-medium text-ink hover:bg-control disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <RefreshCw size={13} className={cn(testing && "animate-spin")} />
-                {testing ? "Testing..." : "Test Connection"}
+                {testing ? "Testing\u2026" : "Test Connection"}
               </button>
               <button
                 type="button"
@@ -695,7 +695,7 @@ export function SecretsSection() {
                 className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] font-medium text-ink hover:bg-control disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <RefreshCw size={13} className={cn(syncing && "animate-spin")} />
-                {syncing ? "Syncing..." : "Sync Now"}
+                {syncing ? "Syncing\u2026" : "Sync Now"}
               </button>
               {saveOk && !saveError && (
                 <span className="flex items-center gap-1 text-[12.5px] text-success">
@@ -763,7 +763,7 @@ export function SecretsSection() {
               {fields.length === 0 && (
                 <tr>
                   <td colSpan={3} className="py-3 text-ink-secondary">
-                    {statusFetchError ? "Failed to load." : "Loading..."}
+                    {statusFetchError ? "Failed to load." : "Loading\u2026"}
                   </td>
                 </tr>
               )}
