@@ -75,8 +75,10 @@ const ZCODE_MODELS: ModelCatalog = {
 };
 
 /** Keys that would silently move a turn off the Coding Plan subscription and
- *  onto metered API billing if inherited. */
-const ZCODE_CREDENTIAL_ENV = [
+ *  onto metered API billing if inherited.  The ACP driver
+ *  (`server/drivers/acp/zcode.ts`) strips this same list from its bridge
+ *  child, so the two engines cannot drift. */
+export const ZCODE_CREDENTIAL_ENV = [
   "Z_AI_API_KEY",
   "ZAI_API_KEY",
   "GLM_API_KEY",

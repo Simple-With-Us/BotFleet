@@ -130,9 +130,14 @@ import {
   appendHeldWork,
   drainViewOf,
   inFlightCounts,
+  carriedWorkIds,
+  journalItemStillOwed,
   partitionByAge,
+  readQueueJournal,
+  seedQueuedFirstSeen,
   takeHeldWork,
   UpdateDrain,
+  writeQueueJournal,
   type UpdateDrainView,
   type HeldQueueEntry,
   type HeldRoomRound,
@@ -302,6 +307,7 @@ import {
   localVmMaxInstances,
   allowedBotComputers,
   infisicalSettings,
+  validateInfisicalConfigPatch,
   observabilitySettings,
   parseConfigPatch,
   publicIngressUrlEffective,
@@ -437,6 +443,8 @@ import {
   restoreJobNotices,
   drainEveryReadyBatch,
   restoreSteeredEntries,
+  setSteerQueueObserver,
+  snapshotSteerQueue,
   takeSteeredEntries,
   type SteerQueueSnapshot,
   type JobNoticeItem,
@@ -6791,6 +6799,76 @@ function drainRoomQueue() {
  *  typed text runs unattended — the conservative reading. */
 const relayQueuedMessageIds = new Set<string>();
 
+/** The steer queue lives in memory, so a crash or kill between accepting a
+ *  queued send and draining it would lose the user's words.  Every change to
+ *  the queue is therefore written to a small journal (steer-queue-journal.json
+ *  in the data directory), and the entries a previous run left are put back at
+ *  boot through the same path an update's held sends take, so the age rule and
+ *  the in-thread notice for a too-old send apply to them too. */
+let unrestoredQueueJournal: HeldQueueEntry[] = placementRollbackReadOnly
+  ? []
+  : readQueueJournal(DATA_DIR, (line) => console.warn(line));
+/** When each live queued send was first journaled, so rewriting the journal
+ *  never makes an old send look new to the age rule. */
+const queuedFirstSeen = new Map<string, number>();
+
+function steerJournalEntries(): HeldQueueEntry[] {
+  const now = Date.now();
+  const live = snapshotSteerQueue().map((entry): HeldQueueEntry => {
+    let heldAt = now;
+    const items = entry.items.map((item): HeldQueueEntry["items"][number] => {
+      const seen = queuedFirstSeen.get(item.messageId) ?? now;
+      queuedFirstSeen.set(item.messageId, seen);
+      heldAt = Math.min(heldAt, item.committed ? item.committed.heldAt : seen);
+      const held: HeldQueueEntry["items"][number] = {
+        messageId: item.messageId,
+        text: item.text,
+        prompt: item.prompt,
+        relayed: item.committed ? item.committed.relayed : Boolean(item.relayed) || relayQueuedMessageIds.has(item.messageId),
+      };
+      if (item.replyToId) held.replyToId = item.replyToId;
+      if (item.linqChatId) held.linqChatId = item.linqChatId;
+      if (item.automationSource) held.automationSource = item.automationSource;
+      if (item.committed) held.committed = { ...item.committed, excludeIds: [...item.committed.excludeIds] };
+      return held;
+    });
+    return { botId: entry.botId, threadId: entry.threadId, heldAt, items };
+  });
+  const liveIds = new Set(live.flatMap((entry) => entry.items.map((item) => item.messageId)));
+  for (const id of queuedFirstSeen.keys()) if (!liveIds.has(id)) queuedFirstSeen.delete(id);
+  return [...live, ...unrestoredQueueJournal];
+}
+
+/** Why the last journal write failed, or null when it succeeded.  A queued
+ *  send is only acknowledged while this is null: a send the journal could not
+ *  save is refused, not accepted into a memory-only queue. */
+let steerJournalFailure: string | null = null;
+function writeSteerJournal() {
+  if (placementRollbackReadOnly) return;
+  const failure = writeQueueJournal(DATA_DIR, steerJournalEntries());
+  // Only the error code is logged: nothing a user wrote ever reaches a log line.
+  // SAFETY: the journal writer only reports fs errors, which carry an optional string code.
+  steerJournalFailure = failure ? ((failure as NodeJS.ErrnoException).code ?? failure.name) : null;
+  if (failure) console.warn(`[steer-queue] could not write the crash journal (${steerJournalFailure})`);
+}
+setSteerQueueObserver(writeSteerJournal);
+
+/** What the last run's journal still holds that is not already running or
+ *  carried: a send that was drained into its thread before the journal caught
+ *  up (its `queueId` is on a transcript line), or that an update carried, is
+ *  dropped here so nothing runs twice. */
+function takeRecoveredQueueJournal(carried: HeldWork): HeldQueueEntry[] {
+  const carriedIds = carriedWorkIds(carried);
+  const recovered: HeldQueueEntry[] = [];
+  for (const entry of unrestoredQueueJournal) {
+    const inThread = new Set(store.messagesFor(entry.threadId).flatMap((message) => (message.queueId ? [message.queueId] : [])));
+    const items = entry.items.filter((item) => journalItemStillOwed(item, carriedIds, inThread, (messageId) => store.hasMessage(entry.threadId, messageId)));
+    if (items.length > 0) recovered.push({ ...entry, items });
+  }
+  unrestoredQueueJournal = [];
+  return recovered;
+}
+
 /** Whether a drained batch carried any relayed line, consuming the marks.
  *  Read back off the transcript lines drain just appended (their `queueId`). */
 function takeRelayMark(threadId: string, excludeIds: readonly string[]): boolean {
@@ -6985,6 +7063,9 @@ function restoreHeldWork(work: HeldWork, context: string) {
   for (const entry of queued.run) {
     if (!store.bot(entry.botId)) continue;
     for (const item of entry.items) if (item.relayed && !item.committed) relayQueuedMessageIds.add(item.messageId);
+    // Keep the send's true age: without this the next journal rewrite would
+    // treat every restored send as first seen now and reset its clock.
+    seedQueuedFirstSeen(queuedFirstSeen, [entry]);
     pending.push({
       heldAt: entry.heldAt,
       entry: {
@@ -6994,6 +7075,7 @@ function restoreHeldWork(work: HeldWork, context: string) {
           const restored: SteerQueueSnapshot["items"][number] = { messageId: item.messageId, text: item.text, prompt: item.prompt };
           if (item.replyToId) restored.replyToId = item.replyToId;
           if (item.linqChatId) restored.linqChatId = item.linqChatId;
+          if (item.relayed && !item.committed) restored.relayed = true;
           if (item.automationSource) {
             // SAFETY: the carrier only ever holds what `persistHeldWork` copied
             // out of a steer-queue item, whose automationSource is this type.
@@ -11389,6 +11471,15 @@ function secretFieldRows() {
   });
 }
 
+function infisicalCredentialPending(): boolean {
+  const settings = infisicalSettings(cfg);
+  if (!settings.enabled || settings.configurationError) return false;
+  if (settings.authMethod === "machine-identity") return workspaceCredentialPending(cfg, "infisicalClientSecret");
+  const dedicatedSource = settings.readSources.some((source) => source.projectId === settings.projectId &&
+    source.environment === settings.environment && source.secretPath === settings.secretPath);
+  return !dedicatedSource && workspaceCredentialPending(cfg, "infisicalReadToken");
+}
+
 function configStatus() {
   const diagnostics = observability.getStatus();
   const vault = infisical.getStatus();
@@ -11571,9 +11662,13 @@ function configStatus() {
     infisical: {
       configured: vault.configured,
       enabled: vault.enabled,
+      enabledSetting: vault.enabledSetting,
+      authMethod: vault.authMethod,
       writeThrough: vault.writeThrough,
       environment: vault.environment,
       hasClientSecret: vault.hasClientSecret,
+      hasToken: vault.hasToken,
+      hasWriteToken: vault.hasWriteToken,
       managedCount: vault.appliedCount,
       lastSyncAt: vault.lastSyncAt,
       stale: vault.stale,
@@ -16652,7 +16747,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
             linqChatId,
             ...(fromImessage ? { automationSource: "imessage" as const } : {}),
+            relayed: relaySourced,
           });
+          if (steerJournalFailure) {
+            // Not durable: refuse rather than acknowledge a send a crash would lose.
+            const failedWith = steerJournalFailure;
+            cancelSteeredMessage(bot.threadId, queued.id);
+            return { status: 503, body: { error: `could not save the queued message (${failedWith}); send it again` } };
+          }
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           // The same answer a busy bot's queued send gets: the client's
           // response schema is strict, and the pending chip is already right.
@@ -16764,7 +16866,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
             linqChatId,
             automationSource: fromImessage ? "imessage" : undefined,
+            relayed: relaySourced,
           });
+          if (steerJournalFailure) {
+            // Not durable: refuse rather than acknowledge a send a crash would lose.
+            const failedWith = steerJournalFailure;
+            cancelSteeredMessage(targetThreadId, queued.id);
+            return { status: 503, body: { error: `could not save the queued message (${failedWith}); send it again` } };
+          }
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           return { status: 202, body: { ok: true, queued: true, queueId: queued.id, threadId: targetThreadId } };
         }
@@ -17585,7 +17694,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         await serializeProviderReload(async () => {
           Object.assign(process.env, plan.env);
           Object.assign(cfg, loadConfig());
-          if (plan.restored.includes("infisicalClientSecret")) {
+          if (plan.restored.some((name) => name === "infisicalClientSecret" ||
+              name === "infisicalReadToken" || name === "infisicalWriteToken")) {
             // Timer semantics refresh the canonical snapshot without nesting
             // a provider reload inside the mutation already holding its fence.
             await infisical.refresh("timer");
@@ -17875,7 +17985,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Sync Now: the one refresh that is allowed to rebuild the fleet, because
     // a person asked for it and is watching.
     if (method === "POST" && path === "/api/infisical/sync") {
-      if (workspaceCredentialPending(cfg, "infisicalClientSecret")) {
+      if (infisicalCredentialPending()) {
         return json(res, 409, { error: "Infisical is waiting for its encrypted credential" });
       }
       // Takes the same fence the two Settings routes take: this is the one
@@ -17901,7 +18011,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Test Connection: proves the identity works without changing what any
     // bot resolves to mid-session — it never reads a value, only names.
     if (method === "POST" && path === "/api/infisical/test") {
-      if (workspaceCredentialPending(cfg, "infisicalClientSecret")) {
+      if (infisicalCredentialPending()) {
         return json(res, 409, { error: "Infisical is waiting for its encrypted credential" });
       }
       return json(res, 200, await infisical.probe());
@@ -19431,6 +19541,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
       const patch = parseConfigPatch(body);
+      validateInfisicalConfigPatch(cfg, patch);
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
       if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
       // The window confirmed a provider disable against its own copy of the
@@ -19839,6 +19950,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           ["tts", "key"],
           ["imageGen", "key"],
           ["infisical", "clientSecret"],
+          ["infisical", "token"],
+          ["infisical", "writeToken"],
         ] as const;
         for (const [section, field] of externalFields) {
           const externalSection = persisted[section] as Record<string, string | undefined> | undefined;
@@ -19847,8 +19960,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           externalSection![field] = "";
           externalCredentialSections[section] = Boolean(supplied.trim());
         }
-        // The one credential the store can never hold for us: its own client
-        // secret.  The client id is a plain identifier and stays readable,
+        // The credentials the store can never hold for us: its own client
+        // secret and service tokens.  The client id stays readable,
         // the way the Access client id does.
         saveConfig(persisted, { externalCredentialSections });
         syncCredentialEnv(patch);
@@ -20808,7 +20921,13 @@ if (!placementRollbackReadOnly) setTimeout(() => {
   void runBootRecovery()
     .catch((error) => console.error("[boot-recovery] failed:", error))
     .finally(() => {
-      restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-held");
+      const carried = takeHeldWork(DATA_DIR, (line) => console.warn(line));
+      const recovered = takeRecoveredQueueJournal(carried);
+      if (recovered.length > 0) console.warn(`[boot-recovery] ${recovered.length} queued send batch(es) survived a crash in the journal`);
+      restoreHeldWork({ ...carried, queued: [...carried.queued, ...recovered] }, "update-held");
+      // The journal must now say what is in memory, even when nothing changed
+      // the queue (a too-old send was written into its thread instead).
+      writeSteerJournal();
       drainQueuedSends();
       drainRoomQueue();
     });
