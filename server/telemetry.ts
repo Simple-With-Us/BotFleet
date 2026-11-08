@@ -242,6 +242,9 @@ const PROVIDER_BY_ENGINE = new Map<string, string>(Object.entries({
   kimi: "moonshot",
   moonshot: "moonshot",
   zcode: "zcode",
+  // The ACP variant (driverKind zcodeAcp normalizes to zcodeacp) bills the
+  // same GLM Coding Plan, so it attributes to the same provider.
+  zcodeacp: "zcode",
   zai: "zcode",
   glm: "zcode",
   cursor: "cursor",
