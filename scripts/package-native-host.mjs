@@ -31,7 +31,11 @@ export async function nativeHostNotaryCredentials({ env = process.env, fetchImpl
     const values = await helper.listSecretsRaw({ siteUrl: "https://app.infisical.com", token,
       projectId: "836aebe2-c8f7-4e09-978e-7e3e82500bce", environment: "prod", secretPath: "/",
       names, fetchImpl, log: () => {} });
-    for (const name of names) if (!values.get(name) || helper.isUnresolvedReference(values.get(name))) refused();
+    for (const name of names) {
+      if (values.get(name) && !helper.isUnresolvedReference(values.get(name))) continue;
+      console.error(`${name} is missing or unresolved in Infisical; notarization credentials cannot be read.`);
+      refused();
+    }
     const encoded = values.get(names[0]).replace(/\r?\n/g, "");
     const p8 = Buffer.from(encoded, "base64");
     if (p8.toString("base64") !== encoded || !p8.toString("utf8").includes("-----BEGIN PRIVATE KEY-----")) refused();

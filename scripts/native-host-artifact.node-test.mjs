@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { inspectHostMachO, verifyNativeHostArtifact, sha256 } from "./native-host-artifact.mjs";
-import { packageNativeHost } from "./package-native-host.mjs";
+import { nativeHostNotaryCredentials, packageNativeHost } from "./package-native-host.mjs";
 import { build, identity, source, thin, universal } from "./native-host-macho.fixture.mjs";
 
 const signature = () => ({ codeIdentifier: "BotFleetNativeHost", teamIdentifier: "CC8UTF7ATG", adHoc: false, hardenedRuntime: true });
@@ -123,6 +123,30 @@ test("a resource symlink cannot point outside the staged tree", { skip: process.
   const load = "@loader_path/../lib.dylib", f = fixture(universal(thin({ loads: [load] }), thin({ arch: "x86_64", loads: [load] })));
   try { symlinkSync(process.execPath, join(f.root, "lib.dylib")); assert.throws(() => verifyNativeHostArtifact(f.options)); }
   finally { f.remove(); }
+});
+test("setuid files and sticky directories are refused like writable ones", { skip: process.platform === "win32" }, () => {
+  const f = fixture();
+  try {
+    assert.equal(verifyNativeHostArtifact(f.options).files.length, 1);
+    chmodSync(f.executable, 0o4755);
+    assert.throws(() => verifyNativeHostArtifact(f.options));
+    chmodSync(f.executable, 0o755);
+    chmodSync(join(f.root, "bin"), 0o1755);
+    assert.throws(() => verifyNativeHostArtifact(f.options));
+  } finally { f.remove(); }
+});
+test("a missing notarization secret is named without printing any value", async (t) => {
+  const logged = t.mock.method(console, "error", () => {});
+  const printed = () => logged.mock.calls.map((call) => String(call.arguments[0])).join("\n");
+  await assert.rejects(nativeHostNotaryCredentials({ env: {}, fetchImpl: () => assert.fail("No token reached the network") }), /packaging refused/);
+  assert.match(printed(), /INFISICAL_NATIVE_RELEASE_READ_TOKEN/);
+  const scope = { workspace: "836aebe2-c8f7-4e09-978e-7e3e82500bce", environment: "prod" };
+  const fetchImpl = async (url) => new Response(JSON.stringify(String(url).includes("/service-token")
+    ? { workspace: scope.workspace, scopes: [{ environment: "prod", secretPath: "/" }], permissions: ["read"], expiresAt: null }
+    : { secrets: [{ ...scope, secretKey: "APPLE_API_KEY_ID", secretValueHidden: false, secretValue: "fixture-key-id" }] }));
+  await assert.rejects(nativeHostNotaryCredentials({ env: { INFISICAL_NATIVE_RELEASE_READ_TOKEN: "fixture" }, fetchImpl }), /packaging refused/);
+  assert.match(printed(), /APPLE_API_KEY_P8_BASE64 is missing or unresolved/);
+  assert.doesNotMatch(printed(), /fixture-key-id/);
 });
 test("explicit unsigned-development mode remains nondistributable and never inspects credentials/signing", () => {
   const stamp = identity({ distribution: "unsigned-development", sourceDirty: true });

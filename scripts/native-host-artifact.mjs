@@ -152,7 +152,7 @@ function fileAt(root, path) {
   const info = lstatSync(path);
   const canonical = realpathSync(path);
   // Privilege-mode bits ride with the write bits: setuid/setgid/sticky on a staged file is escalation, not packaging.
-  if (!info.isFile() || (info.mode & 0o6022) !== 0 || !contained(root, canonical)) fail();
+  if (!info.isFile() || (info.mode & 0o7022) !== 0 || !contained(root, canonical)) fail();
   return canonical;
 }
 
@@ -161,11 +161,11 @@ function auditPayload(root, files) {
   const actual = new Set();
   const walk = (directory) => {
     const info = lstatSync(directory);
-    if (!info.isDirectory() || (info.mode & 0o6022) !== 0 || !contained(root, realpathSync(directory))) fail();
+    if (!info.isDirectory() || (info.mode & 0o7022) !== 0 || !contained(root, realpathSync(directory))) fail();
     for (const entry of readdirSync(directory)) {
       const path = join(directory, entry), child = lstatSync(path);
       if (child.isDirectory()) walk(path);
-      else if (child.isFile() && (child.mode & 0o6022) === 0 && contained(root, realpathSync(path))) actual.add(path);
+      else if (child.isFile() && (child.mode & 0o7022) === 0 && contained(root, realpathSync(path))) actual.add(path);
       else fail();
     }
   };
