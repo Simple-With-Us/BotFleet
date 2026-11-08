@@ -82,7 +82,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 |---|---|
 | `server/infisical.ts`, `infisical-client.ts`, `secret-map.ts` | `InfisicalResolver` BF-2506 |
 | `server/cli-logins.ts` | Seat-scoped CLI login read for one launched child (the fleet project's `/cli-logins/<SEAT>` folder) → `InfisicalResolver` BF-2506 for the vault read, with the launch identity's seat carried by `EngineDriver` BF-2504; the optional Linux server retains the read under the Linux preservation gate. |
-| `server/knob-map.ts`, `knob-write-through.ts`, `config.ts`, `config-reload-keys.ts`, `server/feature-flags.ts` + `feature-flags.json` | `InfisicalResolver` + app settings BF-2506; flags migrate to native settings store |
+| `server/knob-map.ts`, `knob-write-through.ts`, `config.ts`, `instance-patch.ts`, `config-reload-keys.ts`, `server/feature-flags.ts` + `feature-flags.json` | `InfisicalResolver` + app settings BF-2506; flags migrate to native settings store; instance PATCH validation stays with the settings owner (BF-2640 reply-wait knob rides it) |
 | `server/peer-approval-key.ts`, `permission-allow-key.ts`, `provider-tool-allow.ts`, `peer-approval.ts`, `server/tools/approvals.ts`, `server/auto-approve.ts`, `command-guard.ts`, `path-containment.ts`, `tool-policy.ts`, `review-watch.ts`, `auto-review.ts` | Approval/permission policy → `EngineDriver` turn lane BF-2504 (policy tables port as data) |
 | `server/env-path.ts` | GUI-launch PATH augmentation → app startup BF-2497 (Finder-launch env) |
 | `server/proxy-paths.ts`, `server/runtime-identity.ts` | Runtime path/identity → app startup BF-2497 |

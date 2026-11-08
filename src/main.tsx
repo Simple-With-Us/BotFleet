@@ -85,6 +85,15 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "local-model-wait") {
+  void import("./components/LocalModelWaitVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "provider-icons") {
   // Visual-spec harness (tests/e2e/provider-icons.visual.spec.ts): the
   // changed `ProviderMark` cases (muse, mcode) and the EngineQuotasPanel that

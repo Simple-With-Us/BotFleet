@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as sentryAi from "../sentry-ai.ts";
 import { recordEvents } from "../testing/events.ts";
 import { startFakeOpenAiServer, type FakeOpenAiServer } from "../testing/fake-openai-server.ts";
-import { OpenAICompatDriver, sentryProviderForUrl } from "./openai-compat.ts";
+import { OpenAICompatDriver, isLocalModelEndpoint, replyWaitTimeoutMs, replyWaitTurnBudget, sentryProviderForUrl, usesUnboundedFetchForReplyWait } from "./openai-compat.ts";
+import { DEFAULT_TURN_LOOP_BUDGET } from "./chat-completions/loop.ts";
 import { VOLATILE_CONTEXT_NOTE_PREFIX } from "./prompt-split.ts";
 
 describe("OpenAICompatDriver", () => {
@@ -502,6 +503,56 @@ describe("OpenAICompatDriver", () => {
 
     recorder.stop();
     await inst.dispose();
+  });
+});
+
+describe("local OpenAI-compatible reply wait", () => {
+  it("accepts optional whole-minute waits from 5 to 60 and rejects invalid values", () => {
+    expect(OpenAICompatDriver.decodeConfig({ url: "http://127.0.0.1:11434/v1", replyWaitMinutes: 20 })).toMatchObject({ replyWaitMinutes: 20 });
+    expect(OpenAICompatDriver.decodeConfig({ url: "http://127.0.0.1:11434/v1" })).not.toHaveProperty("replyWaitMinutes");
+    for (const value of [1, 4, 61, 2.5, "20", null]) {
+      expect(() => OpenAICompatDriver.decodeConfig({ url: "http://127.0.0.1:11434/v1", replyWaitMinutes: value })).toThrow(/replyWaitMinutes/);
+    }
+  });
+
+  it("keeps the 3-minute local default and the 2-minute cloud timeout", () => {
+    expect(replyWaitTimeoutMs("http://127.0.0.1:11434/v1")).toBe(180_000);
+    expect(replyWaitTimeoutMs("http://127.0.0.1:11434/v1", 5)).toBe(300_000);
+    expect(replyWaitTimeoutMs("http://127.0.0.1:11434/v1", 60)).toBe(3_600_000);
+    expect(replyWaitTimeoutMs("https://api.example.test/v1", 20)).toBe(120_000);
+  });
+
+  it("gives a configured 60-minute local wait bounded request and turn headroom", () => {
+    const localDefault = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("http://127.0.0.1:11434/v1") };
+    expect(localDefault.requestTimeoutMs).toBe(DEFAULT_TURN_LOOP_BUDGET.requestTimeoutMs);
+    expect(localDefault.wallClockMs).toBe(DEFAULT_TURN_LOOP_BUDGET.wallClockMs);
+
+    const local60 = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("http://127.0.0.1:11434/v1", 60) };
+    expect(local60.requestIdleMs).toBe(3_600_000);
+    expect(local60.requestTimeoutMs).toBeGreaterThan(local60.requestIdleMs);
+    expect(local60.requestTimeoutMs).toBe(3_900_000);
+    expect(local60.wallClockMs).toBeGreaterThan(local60.requestTimeoutMs);
+    expect(local60.wallClockMs).toBe(4_500_000);
+
+    const cloud60 = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("https://api.example.test/v1", 60) };
+    expect(cloud60).toEqual(DEFAULT_TURN_LOOP_BUDGET);
+  });
+
+  it("recognizes loopback and private network endpoints without classifying cloud hosts", () => {
+    for (const url of [
+      "http://localhost:11434/v1", "http://127.0.0.1:11434/v1", "http://[::1]:8080/v1",
+      "http://[::ffff:127.0.0.1]:11434/v1", "http://[::ffff:7f00:1]:11434/v1",
+      "http://192.168.1.20:11434/v1", "http://10.0.0.5/v1", "http://172.20.1.2/v1", "http://studio.local:1234/v1",
+    ]) expect(isLocalModelEndpoint(url), url).toBe(true);
+    for (const url of ["https://openrouter.ai/api/v1", "https://api.example.test/v1", "http://172.32.0.1/v1", "not a url"]) {
+      expect(isLocalModelEndpoint(url), url).toBe(false);
+    }
+  });
+
+  it("bypasses Node's no-byte fetch limit only for local waits of at least five minutes", () => {
+    expect(usesUnboundedFetchForReplyWait("http://127.0.0.1:11434/v1", 299_999)).toBe(false);
+    expect(usesUnboundedFetchForReplyWait("http://127.0.0.1:11434/v1", 300_000)).toBe(true);
+    expect(usesUnboundedFetchForReplyWait("https://api.example.test/v1", 3_600_000)).toBe(false);
   });
 });
 
