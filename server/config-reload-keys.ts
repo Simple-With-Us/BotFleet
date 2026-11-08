@@ -24,6 +24,10 @@ export const CONFIG_KEYS_WITHOUT_PROVIDER_RELOAD: ReadonlySet<string> = new Set(
   "vps",
   "rooms",
   "jobs",
+  // The placement transport's knobs are read live by the registry bridge and
+  // the lease service (server/placement-controller-bridge.ts); no driver
+  // reads the section, so a save must never rebuild the fleet.
+  "placement",
   "localVm",
   "autoUpdate",
   "ingress",

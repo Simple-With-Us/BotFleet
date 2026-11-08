@@ -333,8 +333,10 @@ describe("RoutineManager", () => {
 
   it("measures hot-host defer cap from the first hot tick, not enqueue time", async () => {
     const h = harness();
+    const logs: string[] = [];
     const hostReason = "Host is busy (load 12 per core, swap 91%)";
     const capMs = 5 * 60_000;
+    h.options.log = (line) => logs.push(line);
     h.options.webhookHotDeferMaxMs = () => capMs;
     h.options.hostHot = () => hostReason;
     let busy = true;
@@ -367,6 +369,8 @@ describe("RoutineManager", () => {
     h.setNow(hotAt + capMs);
     await h.manager.tick();
     expect(h.triggerSources).toEqual(["webhook"]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("waited 5 min");
   });
 
   it("does not probe the host while no webhook is queued", async () => {
@@ -438,7 +442,8 @@ describe("RoutineManager", () => {
       receivedAt: queuedAt,
     });
     await h.manager.tick();
-    h.setNow(queuedAt + 19 * 60_000);
+    expect(h.started).toHaveLength(0);
+    h.setNow(queuedAt + DEFAULT_WEBHOOK_HOT_DEFER_MS - 1);
     await h.manager.tick();
     expect(h.started).toHaveLength(0);
     h.setNow(queuedAt + DEFAULT_WEBHOOK_HOT_DEFER_MS);
@@ -2227,6 +2232,23 @@ describe("Sentry Crons check-ins", () => {
     expect(reloaded.listRuns()[0]).toMatchObject({ status: "failed", outcomeCode: "runtime_restart" });
     expect(h.checkInFinishes).toHaveLength(1);
     expect(h.checkInFinishes[0]).toMatchObject({ checkInId: "check-in-1", ok: false });
+  });
+
+  it("preserves interrupted scheduler evidence and check-ins in a passive placement bridge", async () => {
+    const h = harness();
+    const routine = h.manager.create({ name: "Held bridge", prompt: "never rerun", botId: "maus-1", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick(); h.manager.flushNow(); h.manager.stop();
+    const before = readFileSync(h.options.file!);
+    const started = h.started.length;
+    const options = { ...h.options, passive: true };
+    const bridge = new RoutineManager(options);
+    options.passive = false;
+    bridge.start(); await bridge.tick(); bridge.stop();
+    expect(bridge.listRuns()[0]).toMatchObject({ status: "running", sentryCheckInId: "check-in-1" });
+    expect(h.started).toHaveLength(started);
+    expect(h.checkInFinishes).toHaveLength(0);
+    expect(readFileSync(h.options.file!)).toEqual(before);
   });
 
   it("persists pendingClose until Sentry delivery confirmation, then deletes it", async () => {

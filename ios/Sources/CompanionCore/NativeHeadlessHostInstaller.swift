@@ -266,8 +266,8 @@ public struct NativeHeadlessHostInstaller: Sendable {
         var dictionary: [String: Any] = [
             managedMarkerKey: true,
             "Label": label,
-            // Matches the BotFleetNativeHost executable contract: exactly `--service-data <root>`.
-            "ProgramArguments": [executable.path, "--service-data", serviceDataRoot.path],
+            // launchd always requests automatic startup so an owner Stop survives a reboot.
+            "ProgramArguments": [executable.path, "--service-data", serviceDataRoot.path, "--automatic"],
             "RunAtLoad": true,
             "KeepAlive": ["SuccessfulExit": false],
             "ThrottleInterval": 5,
@@ -317,7 +317,8 @@ public struct NativeHeadlessHostInstaller: Sendable {
     private func isOurPlist(_ dictionary: [String: Any]) -> Bool {
         guard dictionary["Label"] as? String == configuration.label,
               let arguments = dictionary["ProgramArguments"] as? [String],
-              arguments.count == 3, arguments[1] == "--service-data" else { return false }
+              (arguments.count == 3 || arguments.count == 4 && arguments[3] == "--automatic"),
+              arguments[1] == "--service-data" else { return false }
         if dictionary[Self.managedMarkerKey] as? Bool == true { return true }
         return arguments[0] == configuration.executable.standardizedFileURL.path &&
             arguments[2] == configuration.serviceDataRoot.standardizedFileURL.path

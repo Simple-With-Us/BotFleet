@@ -39,14 +39,15 @@
 //   - Redaction: labels and output pass `redactSecretsInText` on their way
 //     out, and a read never ends inside a line when it can end at one, so a
 //     secret is never split across two reads where neither half matches;
-//     the raw command is never written to disk.
+//     raw commands are confined to the bounded private pending-command spool
+//     approved for restart recovery (BF-2604), never the public record file.
 //
 // What this file does NOT do: decide whether to wake a bot (server/jobs/
 // wake.ts), or ask anyone for approval (the tool host, behind the per-turn
 // grant).  It never publishes on the runtime bus either: a job's events must
 // not touch the 20-minute stall watchdog or fold into a turn.
 
-import { existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, closeSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { constants, existsSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, closeSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { join } from "node:path";
 
@@ -74,12 +75,14 @@ import {
 import { writeFileAtomic } from "../atomic.ts";
 import { loadHostId } from "../host-id.ts";
 import { HOST_ID_PATTERN, type HostId, type PlacementMode } from "../../shared/placement.ts";
+import type { PlacementControllerBridge } from "../placement-controller-bridge.ts";
 import { redactSecretsInText } from "../redact.ts";
 import { commandLabel, groupAlive, killGroup, signalGroup, startedNear, GROUP_KILL_GRACE_MS } from "../tools/process-group.ts";
 import { modelShellEnv } from "../tools/shell-env.ts";
 import { createHostProbe, DEFAULT_ADMISSION, pressureRefusal, type AdmissionThresholds, type HostProbe } from "./admission.ts";
 import { readExitFile, spawnJobProcess, type JobSpawnResult, type JobSpawnSpec } from "./runner.ts";
 import { createJobProcessLister, type JobProcessLister } from "./sweep.ts";
+import { PendingCommandSpool, PENDING_COMMAND_MAX_CHARS } from "./pending-spool.ts";
 
 /** The live settings the registry reads on every decision. */
 export interface JobsSettings {
@@ -93,6 +96,7 @@ export interface JobsSettings {
   defaultMinutes: number;
   /** The most a bot may ask for: 240 unless the owner raised it (≤ 360). */
   maxMinutes: number;
+  queueWaitMinutes: number;
   admission: AdmissionThresholds;
   /** Cores' worth of CPU time a job may average over its run limit before
    *  `ulimit -t` ends it. */
@@ -105,6 +109,7 @@ export const DEFAULT_JOBS_SETTINGS: JobsSettings = {
   cliLanes: true,
   defaultMinutes: JOB_DEFAULT_MINUTES,
   maxMinutes: JOB_MODEL_MAX_MINUTES,
+  queueWaitMinutes: 24 * 60,
   admission: DEFAULT_ADMISSION,
   cpuCores: 2,
 };
@@ -119,6 +124,7 @@ export interface JobsConfigInput {
   cliLanes?: boolean;
   defaultMinutes?: number;
   maxMinutes?: number;
+  queueWaitMinutes?: number;
   // The three headroom knobs arrive as `number | null` on the wire (`null`
   // clears back to unset); `finite` below already reads null as absent, so
   // resolution keeps emitting `number | undefined` and every downstream
@@ -160,6 +166,7 @@ export function resolveJobsSettings(input: JobsConfigInput | undefined): JobsSet
     cliLanes: input?.cliLanes !== false,
     defaultMinutes,
     maxMinutes,
+    queueWaitMinutes: finite(input?.queueWaitMinutes) ? Math.min(10080, Math.max(1, Math.floor(input.queueWaitMinutes))) : DEFAULT_JOBS_SETTINGS.queueWaitMinutes,
     admission,
     cpuCores: finite(input?.cpuCores) ? Math.min(64, Math.max(1, input.cpuCores)) : DEFAULT_JOBS_SETTINGS.cpuCores,
   };
@@ -168,6 +175,8 @@ export function resolveJobsSettings(input: JobsConfigInput | undefined): JobsSet
 /** A job as the registry keeps it: the snapshot every client sees, plus what
  *  only the harness needs.  The raw command is deliberately absent. */
 interface JobRecord extends JobSnapshot {
+  /** Local private payload ownership; no command is stored in this record. */
+  pendingCommand?: boolean;
   /** The wrapper shell's pid, which is also the job's process-group id. */
   pid: number | null;
   /** Wall time the spawn was recorded, to recognise the leader at boot. */
@@ -204,6 +213,7 @@ const RecordFile = z.array(
     epoch: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     placedReason: z.string().optional(),
     queuedReason: z.string().optional(),
+    pendingCommand: z.boolean().optional(),
     exitCode: z.number().int().nullable(),
     signal: z.string().nullable(),
     startedAt: z.number(),
@@ -265,6 +275,9 @@ export interface OwnerOutput {
 }
 
 export interface JobRegistryDeps {
+  /** Immutable rollback capability, established before any startup recovery.
+   * Passive registries observe records without claiming, settling, or killing. */
+  passive?: boolean;
   /** `<data folder>/jobs`. */
   dir: string;
   /** The data folder itself — whose disk admission measures. */
@@ -320,6 +333,17 @@ export interface JobRegistryDeps {
    *  where the per-host running cap still refuses; in a server mode a job
    *  past that cap queues instead. */
   placementMode?: () => PlacementMode;
+  /** The placement bridge:  in a server mode a job start is a request to the
+   *  controller, so the job is admitted into the controller's own queue and
+   *  this registry keeps no copy of it.  Absent is This Mac Only, where the
+   *  registry runs the job exactly as it always has. */
+  placementBridge?: PlacementControllerBridge;
+  /** The jobs the controller's queue still holds, named by their bot and
+   *  their conversation.  In a server mode this registry keeps no copy of a
+   *  controller-owned job, so the per-bot and per-thread caps count them
+   *  from there.  Absent is This Mac Only, where the local records are the
+   *  only ones and the caps count them alone. */
+  placementActiveJobs?: () => Array<{ botId: string; threadId: string }>;
   /** How long a queued job may wait for a host before it expires unrun.
    *  Absent: DEFAULT_QUEUE_WINDOW_MS, so the queue always expires. */
   queueWindowMs?: number;
@@ -347,11 +371,8 @@ const FORGET_CHECK_MS = 60_000;
 export const JOB_FINISHED_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
 export const JOB_FINISHED_LOG_BUDGET_BYTES = 256 * 1024 * 1024;
 
-/** How long a queued job waits for a host when no explicit window is set: as
- *  long as the longest run any job is allowed, so a legitimately busy host
- *  never expires a waiter, but sustained pressure can never accumulate queued
- *  jobs (memory, `pending` entries, `jobs.json` rows) without limit. */
-export const DEFAULT_QUEUE_WINDOW_MS = JOB_MODEL_MAX_MINUTES * 60_000;
+/** A waiting deadline independent of the execution timeout. */
+export const DEFAULT_QUEUE_WINDOW_MS = DEFAULT_JOBS_SETTINGS.queueWaitMinutes * 60_000;
 
 /** A finished job whose process could have left strays that matter this long
  *  after it ended.  Past it the sweep has had every chance to stop them. */
@@ -504,6 +525,7 @@ function utf8Boundary(buffer: Buffer, length: number): number {
 }
 
 export class JobRegistry {
+  private readonly passive: boolean;
   private readonly records = new Map<string, JobRecord>();
   private readonly deps: JobRegistryDeps;
   private readonly now: () => number;
@@ -526,11 +548,9 @@ export class JobRegistry {
   private readonly endWaiters = new Map<string, Set<() => void>>();
   /** Kills in flight, so a second Stop joins the first. */
   private readonly stopping = new Map<string, Promise<void>>();
-  /** What a queued job will run when a slot frees.  In memory only: the raw
-   *  command is never written to disk, so a queued job this process did not
-   *  accept (read back from `jobs.json` after a restart) cannot be launched
-   *  from here and stays queued for its controller. */
+  /** Accepted local waiters with validated private recovery payloads. */
   private readonly pending = new Map<string, { command: string; minutes: number }>();
+  private readonly spool: PendingCommandSpool | null;
   private draining = false;
   /** Records read from `jobs.json` at construction that `adopt()` has not
    *  settled yet.  Loaded at construction, not in `adopt()`, so a job that
@@ -553,6 +573,7 @@ export class JobRegistry {
 
   constructor(deps: JobRegistryDeps) {
     this.deps = deps;
+    this.passive = deps.passive === true;
     this.now = deps.now ?? Date.now;
     this.awakeNow = deps.awakeNow ?? (() => performance.now());
     this.probe = deps.probe ?? createHostProbe();
@@ -571,8 +592,18 @@ export class JobRegistry {
     this.finishedMaxAgeMs = deps.finishedMaxAgeMs ?? JOB_FINISHED_MAX_AGE_MS;
     this.lastTick = this.awakeNow();
     this.lastLogCheck = this.awakeNow();
+    if (this.passive) {
+      this.spool = null;
+      this.load();
+      return;
+    }
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
+    try { this.spool = new PendingCommandSpool(deps.dir, this.recordMax); }
+    catch { this.spool = null; this.deps.log?.("[jobs] private pending command storage is unavailable"); }
     this.load();
+    try {
+      this.spool?.reconcile(new Set([...this.records.values()].filter((record) => this.ownsPending(record)).map((record) => record.id)));
+    } catch { this.deps.log?.("[jobs] private pending command cleanup failed"); }
   }
 
   /** Read `jobs.json` into memory.  Settling what an earlier run left
@@ -649,21 +680,36 @@ export class JobRegistry {
    *  that could never start; `start()` asks it again, because the answer can
    *  change while a card waits. */
   refusal(request: Pick<JobStartRequest, "botId" | "threadId">): string | null {
+    if (this.passive) return "Background jobs are held by this read-only placement rollback build.";
     if (this.platform === "win32") {
       return "Background jobs are not available on Windows yet: BotFleet cannot reliably stop every process a job starts there.  Run short commands with bash instead.";
     }
     const settings = this.deps.settings();
     if (!settings.enabled) return "Background jobs are turned off in BotFleet's settings.";
-    // A queued job this process never accepted (restart-read: its command is
-    // memory-only and was never written to disk) can never run here, so it
-    // holds no thread or bot slot; it stays queued for its controller.
+    // Locally accepted waiters retain their caps across restart; legacy and
+    // foreign controller-owned waiters hold no local slot.
     const active = [...this.records.values()].filter(
-      (record) => isJobActive(record) && (record.status !== "queued" || this.pending.has(record.id)),
+      (record) => isJobActive(record) && (record.status !== "queued" || this.ownsPending(record)),
     );
-    if (active.filter((record) => record.threadId === request.threadId).length >= JOB_CAP_PER_THREAD) {
+    // In a server mode this registry holds no copy of a job the controller
+    // owns, so the bot's and the conversation's caps are counted there
+    // instead:  the controller's queue is the only place a job record lives.
+    const placed = this.mode() === "localOnly" ? [] : (this.deps.placementActiveJobs?.() ?? []);
+    // A bridged job goes into the controller's queue, and that queue is
+    // bounded by the authority's own unresolved-record limit.  The registry's
+    // queue bound below never sees a bridged job, because the job never
+    // reaches `this.records`.
+    if (placed.length >= JOB_RECORD_MAX) {
+      return "The controller's placement queue is full; wait for a job to finish or stop a waiting job.";
+    }
+    const threadJobs = active.filter((record) => record.threadId === request.threadId).length
+      + placed.filter((job) => job.threadId === request.threadId).length;
+    if (threadJobs >= JOB_CAP_PER_THREAD) {
       return `This conversation already has ${JOB_CAP_PER_THREAD} jobs running, the most it may.  Wait for one to finish, or stop one with job_kill.`;
     }
-    if (active.filter((record) => record.botId === request.botId).length >= JOB_CAP_PER_BOT) {
+    const botJobs = active.filter((record) => record.botId === request.botId).length
+      + placed.filter((job) => job.botId === request.botId).length;
+    if (botJobs >= JOB_CAP_PER_BOT) {
       return `You already have ${JOB_CAP_PER_BOT} jobs running, the most a bot may.  Wait for one to finish, or stop one with job_kill.`;
     }
     // The per-host cap refuses only in This Mac Only; in a server mode it is
@@ -694,6 +740,10 @@ export class JobRegistry {
    *  null when it starts now: the per-host cap in a server mode, or memory
    *  and storage pressure in every mode. */
   private queueReasonFor(settings: JobsSettings): string | null {
+    if ([...this.adoptable].some((id) => {
+      const record = this.records.get(id);
+      return record !== undefined && this.ownsPending(record);
+    })) return "Previously accepted background jobs are being recovered";
     if (this.mode() !== "localOnly" && this.runningLike().length >= JOB_CAP_PER_HOST) {
       return `This computer already runs ${JOB_CAP_PER_HOST} background jobs, the most BotFleet allows`;
     }
@@ -703,7 +753,21 @@ export class JobRegistry {
   /** The queue window in force: an explicit knob when the owner set one,
    *  else the fail-safe default, so a queued job always expires. */
   private queueWindowMs(): number {
-    return this.deps.queueWindowMs ?? DEFAULT_QUEUE_WINDOW_MS;
+    return this.deps.queueWindowMs ?? this.deps.settings().queueWaitMinutes * 60_000;
+  }
+
+  private ownsPending(record: JobRecord): boolean {
+    return record.status === "queued" && record.pendingCommand === true && record.host === this.hostId && record.controllerHostId === this.hostId;
+  }
+
+  private discardPending(record: JobRecord): boolean {
+    try {
+      if (!this.spool) return false;
+      this.spool.remove(record.id);
+      this.pending.delete(record.id);
+      return true;
+    }
+    catch { this.deps.log?.("[jobs] private pending command cleanup failed"); return false; }
   }
 
   /** Fire-and-forget a stop from a periodic pass: a rejection must never
@@ -716,12 +780,14 @@ export class JobRegistry {
   }
 
   start(request: JobStartRequest): JobStartResult {
+    // Give recovered waiters the first eligible slots before accepting new work.
+    this.drainQueue();
     const settings = this.deps.settings();
     const refused = this.refusal(request);
     if (refused) return { ok: false, error: refused };
     const command = request.command.trim();
     if (!command) return { ok: false, error: "command must be a non-empty string" };
-    if (command.length > 16_000) return { ok: false, error: "command is too long (16,000 characters at most)." };
+    if (command.length > PENDING_COMMAND_MAX_CHARS) return { ok: false, error: "command is too long (16,000 characters at most)." };
     if (!existsSync(request.cwd)) return { ok: false, error: `The working folder ${request.cwd} does not exist.` };
 
     let minutes = settings.defaultMinutes;
@@ -734,9 +800,30 @@ export class JobRegistry {
       }
     }
 
-    const queuedReason = this.queueReasonFor(settings) ?? undefined;
     const now = this.now();
     const id = newJobId(now);
+    // In a server mode the controller owns the record:  the job is admitted
+    // into the controller's own queue and this registry keeps no copy of it,
+    // because a second queue outside the authoritative one is exactly what
+    // the plan rejected.  This Mac Only never reaches the bridge's queue.
+    const admission = this.deps.placementBridge?.admit({
+      jobId: id,
+      botId: request.botId,
+      threadId: request.threadId,
+      command,
+      cwd: request.cwd,
+      timeoutMs: minutes * 60_000,
+    });
+    if (admission?.kind === "refused") return { ok: false, error: admission.reason };
+    if (admission?.kind === "queued") {
+      const queuedNote = `Queued: ${admission.queuedReason}.  It will start when a host takes it; use bash instead if the command is short.`;
+      return { ok: true, job: this.snapshot(this.queuedView(admission, request, command, minutes, now)), note: note ? `${note}  ${queuedNote}` : queuedNote };
+    }
+
+    const queuedReason = this.queueReasonFor(settings) ?? undefined;
+    if (queuedReason && [...this.records.values()].filter((record) => this.ownsPending(record)).length >= this.recordMax) {
+      return { ok: false, error: "The background job queue is full; wait for a job to finish or stop a waiting job." };
+    }
     const record: JobRecord = {
       id,
       botId: request.botId,
@@ -748,6 +835,7 @@ export class JobRegistry {
       cwd: request.cwd,
       status: queuedReason ? "queued" : "running",
       queuedReason,
+      pendingCommand: queuedReason ? true : undefined,
       controllerHostId: this.hostId,
       host: this.hostId,
       placedReason: this.platform === "darwin" ? "Running on this Mac" : "Running on this server",
@@ -774,16 +862,32 @@ export class JobRegistry {
     // process carrying that id can.
     this.records.set(id, record);
     this.prune();
-    this.save();
-
     if (queuedReason) {
+      try {
+        if (!this.spool) throw new Error();
+        this.spool.put(record, command);
+        if (!this.save(true)) throw new Error();
+      } catch {
+        this.records.delete(id);
+        this.discardPending(record);
+        this.save();
+        return { ok: false, error: "Private pending command storage is unavailable; the job was not queued." };
+      }
       this.pending.set(id, { command, minutes });
-      this.save();
       this.changed(record.threadId);
       const queuedNote = `Queued: ${queuedReason}.  It will start when a slot frees; use bash instead if the command is short.`;
       return { ok: true, job: this.snapshot(record), note: note ? `${note}  ${queuedNote}` : queuedNote };
     }
-    const spawnError = this.launch(record, command, minutes, settings);
+    this.save();
+    let spawnError: string | null;
+    try { spawnError = this.launch(record, command, minutes, settings); }
+    catch {
+      // The executor may already have started a child: retain its record for
+      // the stray sweep, never retry its command, and never expose its error.
+      record.reason = "The background job launch could not be confirmed";
+      this.finish(record, "lost");
+      return { ok: false, error: record.reason };
+    }
     if (spawnError) {
       this.records.delete(id);
       this.removeFiles(record);
@@ -798,6 +902,7 @@ export class JobRegistry {
   /** Spawn a record's process and mark it running.  Returns the spawn
    *  error, or null once the leader exists. */
   private launch(record: JobRecord, command: string, minutes: number, settings: JobsSettings): string | null {
+    if (this.passive) return "Background jobs are held by this read-only placement rollback build.";
     const spawned = this.spawnJob({
       command,
       cwd: record.cwd,
@@ -823,11 +928,13 @@ export class JobRegistry {
    *  earlier one that is still waiting, while another bot's job may pass a
    *  bot whose own caps are full.  Runs on the tick and whenever a job ends. */
   drainQueue(): void {
+    if (this.passive) return;
     if (this.draining) return;
     this.draining = true;
     try {
       if (this.deps.spendBlocked()) return;
       const settings = this.deps.settings();
+      if (!settings.enabled) return;
       const pressure = pressureRefusal(this.probe, settings.admission, this.deps.dataDir);
       // One scan and sort per drain: launching changes running counts but
       // never `startedAt` order, so rebuilding and re-sorting after every
@@ -848,11 +955,24 @@ export class JobRegistry {
       }
       const blockedBots = new Set<string>();
       for (const record of queued) {
+        if (this.ownsPending(record)) {
+          const stopped = this.deps.stopReason?.(this.snapshot(record));
+          if (stopped) {
+            this.stopInBackground(this.kill(record.id, "system", stopped.reason).then(() => {
+              if (stopped.forget) this.forget([record.id]);
+            }), "queued stop");
+            continue;
+          }
+        }
+        if (this.now() - record.startedAt >= this.queueWindowMs() && this.ownsPending(record)) {
+          this.discardPending(record);
+          record.reason = "The background job queue wait window expired";
+          this.finish(record, "lost");
+          continue;
+        }
         if (this.runningLike().length >= JOB_CAP_PER_HOST) return;
         if (blockedBots.has(record.botId)) continue;
-        // A queued job this process never accepted has no command (memory
-        // only, never on disk): it stays queued for its controller, never
-        // launches here, and never blocks its bot's other queued jobs.
+        // Legacy/foreign controller-owned waiters have no local payload.
         const pending = this.pending.get(record.id);
         if (!pending) continue;
         const running = this.runningLike();
@@ -863,10 +983,26 @@ export class JobRegistry {
           blockedBots.add(record.botId);
           continue;
         }
+        let command: string | null = null;
+        try { command = this.spool?.claim(record) ?? null; } catch { /* never spawn without a durable claim */ }
         this.pending.delete(record.id);
-        const error = this.launch(record, pending.command, pending.minutes, settings);
+        if (command === null) {
+          this.discardPending(record);
+          record.reason = "The private pending command could not be claimed safely";
+          this.finish(record, "lost");
+          continue;
+        }
+        let error: string | null;
+        try { error = this.launch(record, command, pending.minutes, settings); }
+        catch {
+          // A thrown executor may have created a child before failing.
+          // The claim stays consumed and the record remains sweepable.
+          record.reason = "The queued background job launch could not be confirmed";
+          this.finish(record, "lost");
+          continue;
+        }
         if (error) {
-          record.reason = error;
+          record.reason = "The queued background job could not be started";
           this.finish(record, "failed");
         } else {
           this.save();
@@ -982,6 +1118,7 @@ export class JobRegistry {
    *  Resolves once it is settled.  `model` suppresses the notice; `owner`
    *  and `system` tell the bot without waking it; `timeout` wakes it. */
   async kill(id: string, by: JobKilledBy, reason?: string): Promise<{ ok: boolean; job: JobSnapshot | null; error?: string }> {
+    if (this.passive) return { ok: false, job: this.get(id), error: "This read-only rollback build cannot change or stop placement-owned jobs." };
     const record = this.records.get(id);
     if (!record) return { ok: false, job: null, error: "no such job" };
     const inFlight = this.stopping.get(id);
@@ -991,14 +1128,10 @@ export class JobRegistry {
     }
     if (!isJobActive(record)) return { ok: false, job: this.snapshot(record), error: "the job already ended" };
     if (record.status === "queued") {
-      // A queued job this process never accepted has no command (memory
-      // only, never on disk): this process can never launch it, so it stays
-      // queued for its controller and kill leaves it unchanged — the way a
-      // foreign leased job is left to its host.
-      if (!this.pending.has(id)) {
+      if (!this.ownsPending(record)) {
         return { ok: false, job: this.snapshot(record), error: "the job is queued for its controller and this process holds no local command for it; the job was left unchanged" };
       }
-      this.pending.delete(id);
+      if (!this.discardPending(record)) return { ok: false, job: this.snapshot(record), error: "The private pending command could not be removed safely; try Stop again." };
       record.killedBy = by;
       if (reason) record.reason = reason;
       record.onComplete = by === "model" ? "none" : "notice";
@@ -1039,6 +1172,7 @@ export class JobRegistry {
    *  the way deleting a conversation deletes its transcript.  Resolves with
    *  how many were running. */
   async killWhere(match: (job: JobSnapshot) => boolean, reason: string, options: { forget?: boolean } = {}): Promise<number> {
+    if (this.passive) return 0;
     const targets = [...this.records.values()].filter((record) => match(this.snapshot(record)));
     const running = targets.filter(isJobActive);
     await Promise.all(running.map((record) => this.kill(record.id, "system", reason)));
@@ -1134,6 +1268,7 @@ export class JobRegistry {
 
   /** The bot was told; it is never told again. */
   markNoticesDelivered(ids: readonly string[]): void {
+    if (this.passive) return;
     let dirty = false;
     for (const id of ids) {
       const record = this.records.get(id);
@@ -1153,6 +1288,7 @@ export class JobRegistry {
    *  it ever does: a late tick on a loaded Mac still credits every awake
    *  second, and a sleep never expires a job. */
   tick(): void {
+    if (this.passive) return;
     const awake = this.awakeNow();
     const credit = Math.max(0, Math.min(awake - this.lastTick, this.maxTickCreditMs));
     this.lastTick = awake;
@@ -1167,7 +1303,7 @@ export class JobRegistry {
       if (record.status === "queued") {
         const windowMs = this.queueWindowMs();
         if (this.now() - record.startedAt >= windowMs) {
-          this.pending.delete(record.id);
+          if (this.ownsPending(record)) this.discardPending(record);
           record.reason = `no host could take it within ${Math.max(1, Math.round(windowMs / 60_000))} minutes`;
           this.finish(record, "lost");
           continue;
@@ -1208,6 +1344,7 @@ export class JobRegistry {
    *  and stop one printing faster than any log is read.  Between two 5 s
    *  ticks a runaway (`yes`, an error loop) can write gigabytes. */
   checkLogs(): void {
+    if (this.passive) return;
     const awake = this.awakeNow();
     const seconds = Math.max(0.001, (awake - this.lastLogCheck) / 1000);
     this.lastLogCheck = awake;
@@ -1278,6 +1415,7 @@ export class JobRegistry {
   /** Stop every process still carrying the id of a job of ours that is
    *  over.  Resolves with how many it stopped. */
   async sweep(): Promise<number> {
+    if (this.passive) return 0;
     // Listing every process's environment is the expensive part, and there
     // is nothing to find unless a job of ours ended lately (or was deleted).
     if (!this.mayHaveStrays()) return 0;
@@ -1318,6 +1456,7 @@ export class JobRegistry {
 
   /** Start the tick and the sweep, and stop every job if the process exits. */
   startTimers(sweepMs: number = this.deps.sweepMs ?? 5 * 60_000): void {
+    if (this.passive) return;
     this.lastTick = this.awakeNow();
     this.lastLogCheck = this.awakeNow();
     this.tickTimer ??= setInterval(() => this.tick(), this.tickMs);
@@ -1357,6 +1496,7 @@ export class JobRegistry {
    *  updater's ordinary quiesce, which can still be rolled back — a job
    *  killed for a restart that never came would be work lost for nothing. */
   async quiesce(reason = JOB_STOPPED_REASON): Promise<number> {
+    if (this.passive) return 0;
     const active = [...this.records.values()].filter((record) => this.ownsLocalProcess(record));
     await Promise.all(
       active.map(async (record) => {
@@ -1374,6 +1514,7 @@ export class JobRegistry {
   /** The process is exiting: there is no time for a grace period, so every
    *  running job's group is SIGKILLed now and the job marked lost on disk. */
   shutdownSync(): void {
+    if (this.passive) return;
     let dirty = false;
     for (const record of this.records.values()) {
       if (!this.ownsLocalProcess(record)) continue;
@@ -1393,12 +1534,27 @@ export class JobRegistry {
    *  read at construction).  Wakes nobody: a settled job's notice waits for
    *  the bot's next turn. */
   async adopt(): Promise<{ settled: number; lost: number }> {
+    if (this.passive) return { settled: 0, lost: 0 };
     const loaded = [...this.adoptable].map((id) => this.records.get(id)).filter((record) => record !== undefined);
     this.adoptable.clear();
     let settled = 0;
     let lost = 0;
     let leaderless = false;
     for (const record of loaded) {
+      if (this.ownsPending(record)) {
+        const expired = this.now() - record.startedAt >= this.queueWindowMs();
+        const command = expired ? null : this.spool?.read(record) ?? null;
+        if (command !== null && this.pending.size < this.recordMax) {
+          this.pending.set(record.id, { command, minutes: record.timeoutMs / 60_000 });
+          continue;
+        }
+        this.discardPending(record);
+        record.reason = expired ? "The background job queue wait window expired" : "BotFleet restarted without a safe unclaimed pending command";
+        record.onComplete = record.onComplete === "none" ? "none" : "notice";
+        this.finish(record, "lost", true);
+        lost += 1;
+        continue;
+      }
       // Placement states await their controller, including queued jobs without a
       // worker host; treating those as local processes would destroy the queue.
       if (isJobActive(record) && !this.ownsLocalProcess(record)) continue;
@@ -1450,6 +1606,50 @@ export class JobRegistry {
   }
 
   // ── bookkeeping ───────────────────────────────────────────────────────
+
+  /** A view of a job the controller owns.  The record itself lives in the
+   *  controller's store, so this registry holds no copy of it:  the view
+   *  carries no local file, no process and no cursor, because there is
+   *  nothing local about a job this host did not admit. */
+  private queuedView(
+    admission: { jobId: string; queuedReason: string; controllerId: HostId; epoch: number },
+    request: JobStartRequest,
+    command: string,
+    minutes: number,
+    now: number,
+  ): JobRecord {
+    return {
+      id: admission.jobId,
+      botId: request.botId,
+      threadId: request.threadId,
+      turnId: request.turnId,
+      origin: "botfleet",
+      kind: "shell",
+      label: commandLabel(command),
+      cwd: request.cwd,
+      status: "queued",
+      controllerHostId: admission.controllerId,
+      epoch: admission.epoch,
+      queuedReason: admission.queuedReason,
+      exitCode: null,
+      signal: null,
+      startedAt: now,
+      endedAt: null,
+      timeoutMs: minutes * 60_000,
+      onComplete: request.onComplete,
+      notice: "none",
+      pid: null,
+      spawnedAt: now,
+      leaderExited: false,
+      logPath: "",
+      exitPath: "",
+      modelCursor: 0,
+      ownerCursor: 0,
+      droppedBytes: 0,
+      awakeMs: 0,
+      announced: false,
+    };
+  }
 
   private snapshot(record: JobRecord): JobSnapshot {
     const snapshot: JobSnapshot = {
@@ -1537,6 +1737,7 @@ export class JobRegistry {
   }
 
   private removeFiles(record: JobRecord): void {
+    if (record.pendingCommand) this.discardPending(record);
     for (const path of [record.logPath, record.exitPath, `${record.exitPath}.tmp`]) {
       try {
         unlinkSync(path);
@@ -1546,7 +1747,8 @@ export class JobRegistry {
     }
   }
 
-  private save(): void {
+  private save(durable = false): boolean {
+    if (this.passive) return false;
     const records = [...this.records.values()].map((record) => {
       // file paths are derived from the id on load; never persisted
       const { logPath: _log, exitPath: _exit, ...stored } = record;
@@ -1556,8 +1758,14 @@ export class JobRegistry {
     });
     try {
       writeFileAtomic(join(this.deps.dir, "jobs.json"), JSON.stringify(records), { mode: 0o600 });
+      if (durable) {
+        const fd = openSync(this.deps.dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      }
+      return true;
     } catch (error) {
       this.deps.log?.(`[jobs] could not save jobs.json: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
     }
   }
 

@@ -90,6 +90,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: 360,
   },
   {
+    id: "jobs.queueWaitMinutes",
+    label: "Maximum job queue wait",
+    section: "jobs",
+    path: ["queueWaitMinutes"],
+    infisicalName: "BOTFLEET_JOBS_QUEUE_WAIT_MINUTES",
+    kind: "int",
+    min: 1,
+    max: 10080,
+  },
+  {
     id: "jobs.cpuCores",
     label: "Job CPU cores",
     section: "jobs",
@@ -170,6 +180,32 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     kind: "int",
     min: 1,
     max: 720,
+  },
+  {
+    // The placement transport's own two knobs (server/placement-controller-bridge.ts).
+    // `heartbeatSeconds` is how often a worker says it is alive, and the
+    // controller's sweep runs at the same cadence.  The other one is how
+    // long a worker may go quiet before the controller marks it unreachable,
+    // so the window has to stay longer than the period:  the pair is clamped
+    // to that order in `server/config.ts`, after the vault resolves as well.
+    id: "placement.heartbeatSeconds",
+    label: "Placement worker heartbeat period",
+    section: "placement",
+    path: ["heartbeatSeconds"],
+    infisicalName: "BOTFLEET_PLACEMENT_HEARTBEAT_SECONDS",
+    kind: "int",
+    min: 1,
+    max: 3600,
+  },
+  {
+    id: "placement.unreachableAfterSeconds",
+    label: "Placement unreachable window",
+    section: "placement",
+    path: ["unreachableAfterSeconds"],
+    infisicalName: "BOTFLEET_PLACEMENT_UNREACHABLE_AFTER_SECONDS",
+    kind: "int",
+    min: 16,
+    max: 86400,
   },
   {
     id: "observability.tracesSampleRate",

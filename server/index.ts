@@ -21,7 +21,7 @@ import { z } from "zod";
 import { instanceModelsSchema } from "./instance-models.ts";
 import { ScreenPollers } from "./screen-poller.ts";
 import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
-import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
+import { BOT_AVATAR_CROPS, botAvatarRecolorableSchema, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, lowerRoomLabels, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
@@ -113,17 +113,31 @@ import { workspaceCredentialPending } from "../electron/workspace-credentials.mj
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
 import { loadHostId } from "./host-id.ts";
 import { createHostResourcesResponder } from "./host-resources.ts";
-import { loadControllerEpoch, placementIdentityResponse } from "./placement-identity.ts";
+import { placementIdentityResponse } from "./placement-identity.ts";
+import { createWorkerRequestBoundary, privateWorkerAuthorizationSource } from "./placement-worker-auth.ts";
+import { classifyWorkerRequest } from "../shared/placement-worker-http.mjs";
+import { openRollbackPlacementAuthority, PLACEMENT_ROLLBACK_REFUSAL } from "./placement-readonly.ts";
 import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, type PlacementLeaseAction } from "./placement-leases.ts";
+import { PlacementModeStore, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
+import {
+  PlacementControllerBridge,
+  DEFAULT_PLACEMENT_HEARTBEAT_SECONDS,
+  DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS,
+} from "./placement-controller-bridge.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
 import {
   appendHeldWork,
   drainViewOf,
   inFlightCounts,
+  carriedWorkIds,
+  journalItemStillOwed,
   partitionByAge,
+  readQueueJournal,
+  seedQueuedFirstSeen,
   takeHeldWork,
   UpdateDrain,
+  writeQueueJournal,
   type UpdateDrainView,
   type HeldQueueEntry,
   type HeldRoomRound,
@@ -289,6 +303,7 @@ import {
   ensureDirs,
   instanceConfigs,
   loadConfig,
+  type AppConfig,
   localVmMaxInstances,
   allowedBotComputers,
   infisicalSettings,
@@ -331,6 +346,7 @@ import {
   startIdleLiveTranscriptSweeps,
   startOrphanTranscriptSweeps,
   startTranscriptRetentionSweeps,
+  startVolumeTranscriptSweeps,
   sweepTranscriptRetention,
   removeTranscriptLogs,
 } from "./transcript-retention.ts";
@@ -426,6 +442,8 @@ import {
   restoreJobNotices,
   drainEveryReadyBatch,
   restoreSteeredEntries,
+  setSteerQueueObserver,
+  snapshotSteerQueue,
   takeSteeredEntries,
   type SteerQueueSnapshot,
   type JobNoticeItem,
@@ -827,8 +845,68 @@ if (storageGuard && !storageGuard.initial.online) {
 }
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 const hostId = loadHostId(DATA_DIR);
-const placementController = loadControllerEpoch(DATA_DIR, hostId);
-const placementLeases = new PlacementLeaseService({ hostId, controller: placementController });
+const placementAuthority = openRollbackPlacementAuthority(DATA_DIR, hostId);
+// Immutable for this process: updater unquiesce cannot grant execution authority.
+const placementRollbackReadOnly = placementAuthority.kind === "readonly";
+// The placement transport's two knobs, read live.  The config object is
+// mutated in place on every save and vault refresh, so a holder that points
+// at it always answers with the current value.  It starts empty because the
+// config is loaded further down this file and the lease service is built
+// before that, so nothing may read the config yet.
+let placementConfig: AppConfig | null = null;
+/** How long a worker may go quiet before the controller marks it
+ *  unreachable.  The lease service asks for this every time it judges a
+ *  worker, so a knob change applies without a restart. */
+const placementUnreachableAfterMs = (): number =>
+  (placementConfig?.placement?.unreachableAfterSeconds ?? DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS) * 1000;
+/** How often a worker says it is alive.  The controller's sweep runs at the
+ *  same cadence:  the sweep exists to notice that a worker's heartbeat
+ *  stopped, so the controller re-checks liveness as often as workers report
+ *  it, and a quiet worker is marked unreachable within one period of the
+ *  window closing rather than within a whole window. */
+const placementHeartbeatMs = (): number =>
+  (placementConfig?.placement?.heartbeatSeconds ?? DEFAULT_PLACEMENT_HEARTBEAT_SECONDS) * 1000;
+const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeaseService({
+  hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
+  unreachableAfterMs: placementUnreachableAfterMs,
+}) : null;
+// The server's copy of the mode record, beside `jobs.json`.  It shares the
+// lease service's epoch and keeps no epoch of its own, so the record can
+// never name a fence the controller does not hold.
+const placementModeStore = new PlacementModeStore(join(DATA_DIR, "jobs"), {
+  hostId,
+  controller: () => {
+    if (placementAuthority.kind === "readonly") return placementAuthority.reader.controller();
+    if (!placementLeases) throw new Error("Placement authority is unavailable");
+    return placementLeases.controller();
+  },
+});
+// The bridge between that record and the job registry (slice T4).  It is
+// built on every host, including one with no writable authority:  a server
+// mode on a host that cannot admit a job refuses the start with a reason,
+// and it never falls through to running the job here.  A bridge that was
+// absent would leave the registry's own path open, which is the one thing
+// the plan refuses.
+const placementBridge = new PlacementControllerBridge({
+  hostId,
+  view: () => {
+    const view = placementModeStore.read();
+    return {
+      mode: view.record.mode,
+      controllerId: view.controller.controllerId,
+      epoch: view.controller.epoch,
+      acknowledged: view.acknowledged,
+    };
+  },
+  enqueue: (message) => {
+    if (!placementLeases) {
+      return { ok: false, reason: "The placement authority on this computer is read-only, so no job is admitted.  Run the command with bash if it is short, or switch to This Mac Only in Settings." };
+    }
+    return placementLeases.enqueue(message);
+  },
+  queuedReason: (jobId) => placementLeases?.job(jobId)?.queuedReason,
+  sweepUnreachable: () => placementLeases?.sweepUnreachable() ?? [],
+});
 const jobHostProbe = createHostProbe({
   storageState: storageGuard?.sample,
   // The Mac memory-pressure probe runs only while a memory-headroom knob
@@ -897,13 +975,26 @@ function handleBootRequest(req: IncomingMessage, res: ServerResponse): void {
   return json(res, 503, { error: "booting" });
 }
 
+const workerRequestBoundary = createWorkerRequestBoundary({
+  audience: hostId, source: privateWorkerAuthorizationSource(DATA_DIR), readBody,
+});
 const server = createServer((req, res) => {
-  if (booting || !handleRequest) return handleBootRequest(req, res);
-  void Promise.resolve(handleRequest(req, res)).catch((error: unknown) => {
+  void (async () => {
+    if (!isLoopbackHost(req.headers.host)) return json(res, 403, { error: "forbidden: loopback host required" });
+    if (await workerRequestBoundary(req, res)) return;
+    if (booting || !handleRequest) return handleBootRequest(req, res);
+    await handleRequest(req, res);
+  })().catch((error: unknown) => {
     console.error("[request] unhandled route failure:", error);
     if (!res.headersSent) json(res, 500, { error: "internal error" });
     else res.destroy();
   });
+});
+// No worker WebSocket protocol exists; an upgrade cannot bypass the HTTP guard.
+server.on("upgrade", (req, socket) => {
+  if (classifyWorkerRequest(req).kind !== "none") {
+    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+  } else socket.destroy();
 });
 server.on("error", (error: NodeJS.ErrnoException) => {
   if (listenErrorDisposition(error) === "named-exit") {
@@ -929,7 +1020,9 @@ server.listen(PORT, "127.0.0.1", () => {
 // it now rather than at recovery time also means a crash DURING recovery
 // cannot replay the record on the next boot — the surviving
 // `inflightThreadId` markers are the fallback, and they are evidence enough.
-const interruptedAtLastStop = takeInterruptedTurns(DATA_DIR);
+const interruptedAtLastStop = placementRollbackReadOnly
+  ? { version: 1 as const, recordedAt: 0, turns: [], failures: [] }
+  : takeInterruptedTurns(DATA_DIR);
 /** `botId:threadId` of every resume that already failed terminally.  Mirrors
  * the on-disk list so the common dispatch touches no disk at all. */
 const rememberedResumeFailures = new Set(
@@ -940,7 +1033,7 @@ const rememberedResumeFailures = new Set(
 // (server/tools/process-group.ts), so they no longer die with this process
 // the way launchd's job cleanup used to make them.  Groups a crashed or
 // killed run recorded and never saw end are stopped now, before any turn.
-void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
+if (!placementRollbackReadOnly) void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
   console.error("could not stop process groups an earlier run left running", error);
 });
 
@@ -1125,6 +1218,9 @@ const updateDrain = new UpdateDrain({
   log: (line) => console.warn(line),
 });
 const cfg = loadConfig();
+// The placement knobs read this object, and it is mutated in place on every
+// save and vault refresh, so a knob change applies without a restart.
+placementConfig = cfg;
 // Agent CLIs spawn with the Infisical Agent Proxy environment when it is on.  Read
 // from the in-memory `cfg` (mutated in place on every save and vault refresh), so a
 // spawn never re-reads config.json.
@@ -1806,6 +1902,7 @@ function dispatchHoldFor(
   runOn: RoutineRunOn,
   opts: { count?: boolean } = {},
 ): DispatchHold | undefined {
+  if (placementRollbackReadOnly) return { reason: PLACEMENT_ROLLBACK_REFUSAL };
   const bot = store.bot(botId);
   if (!bot) return undefined;
   const task = threadId ? store.taskByThread(bot.id, threadId) : undefined;
@@ -2895,10 +2992,22 @@ function jobStopReason(job: JobSnapshot): { reason: string; forget: boolean } | 
   return null;
 }
 const jobRegistry = new JobRegistry({
+  passive: placementRollbackReadOnly,
   dir: join(DATA_DIR, "jobs"),
   dataDir: DATA_DIR,
   probe: jobHostProbe,
   settings: jobSettings,
+  // The bridge to the placement authority (slice T4).  It is always present,
+  // so a server mode can never fall through to running the job on this host.
+  placementBridge,
+  // The mode the record holds, so the per-host cap refuses only in This Mac
+  // Only:  in a server mode the cap is an eligibility input and the job
+  // queues instead.
+  placementMode: () => placementBridge.mode(),
+  // The jobs the controller's queue still holds.  In a server mode the
+  // registry keeps no copy of them, so the per-bot and per-thread caps count
+  // them from there.
+  placementActiveJobs: () => placementLeases?.activeJobs() ?? [],
   // A job is a shell the model started: it carries its bot's launch identity
   // the way the engine's own children do (server/launch-identity.ts).
   launchEnv: (botId, threadId) => {
@@ -2916,7 +3025,7 @@ const jobWakeUsage = new JobWakeUsage(join(DATA_DIR, "jobs"));
 // a bot deleted while the harness was down has no row to keep
 jobWakeUsage.retainBots((botId) => Boolean(store.bot(botId)));
 const jobWakes = new JobWakeCoordinator({
-  wakeEnabled: () => jobSettings().wake,
+  wakeEnabled: () => !placementRollbackReadOnly && jobSettings().wake,
   isRoom: (threadId) => Boolean(store.groupByThread(threadId)),
   botBusy: (botId) => Boolean(store.bot(botId)?.busy),
   // The engine the bot is on NOW: it may have been switched since the job
@@ -3126,6 +3235,21 @@ const stopOrphanTranscriptSweeps = startOrphanTranscriptSweeps(transcriptDirs, l
 // generations at the full cap forever.  The idle sweep trims one that has
 // been quiet, and skips a turn that is open right now.
 const stopIdleLiveTranscriptSweeps = startIdleLiveTranscriptSweeps(
+  transcriptDirs,
+  liveThreadIds,
+  inFlightThreadIds,
+  console.log,
+  {
+    dryRun: retentionDryRun,
+    hold: () => cleanupHoldReason(DATA_DIR),
+  },
+);
+// Data-volume budget (BF-2463): every transcript log together stays under
+// ~8.4 GB.  Boot run is deferred off the request path (the starter's initial
+// delay), then daily alongside the other retention timers.  What is still
+// over budget is reported through describeVolumeSweep, never taken from
+// live data.  No per-file cap or admission change here.
+const stopVolumeTranscriptSweeps = startVolumeTranscriptSweeps(
   transcriptDirs,
   liveThreadIds,
   inFlightThreadIds,
@@ -6623,7 +6747,7 @@ bus.subscribe((event: RuntimeEvent) => {
 function drainRoomQueue() {
   // Held for an update, like the steer queue: released or carried, never
   // started into a fence that would refuse it.
-  if (updateDrain.active || runtimeQuiescing) return;
+  if (placementRollbackReadOnly || updateDrain.active || runtimeQuiescing) return;
   drainRoomRounds(store, Date.now(), (round) => {
     credentialPendingRoomRounds.delete(`${round.groupId}:${round.threadId}:${round.botId}`);
     // The drained round runs on the room's operation queue, behind any
@@ -6673,6 +6797,76 @@ function drainRoomQueue() {
  *  back off the drained batch's `queueId`s so a batch that mixes relayed and
  *  typed text runs unattended — the conservative reading. */
 const relayQueuedMessageIds = new Set<string>();
+
+/** The steer queue lives in memory, so a crash or kill between accepting a
+ *  queued send and draining it would lose the user's words.  Every change to
+ *  the queue is therefore written to a small journal (steer-queue-journal.json
+ *  in the data directory), and the entries a previous run left are put back at
+ *  boot through the same path an update's held sends take, so the age rule and
+ *  the in-thread notice for a too-old send apply to them too. */
+let unrestoredQueueJournal: HeldQueueEntry[] = placementRollbackReadOnly
+  ? []
+  : readQueueJournal(DATA_DIR, (line) => console.warn(line));
+/** When each live queued send was first journaled, so rewriting the journal
+ *  never makes an old send look new to the age rule. */
+const queuedFirstSeen = new Map<string, number>();
+
+function steerJournalEntries(): HeldQueueEntry[] {
+  const now = Date.now();
+  const live = snapshotSteerQueue().map((entry): HeldQueueEntry => {
+    let heldAt = now;
+    const items = entry.items.map((item): HeldQueueEntry["items"][number] => {
+      const seen = queuedFirstSeen.get(item.messageId) ?? now;
+      queuedFirstSeen.set(item.messageId, seen);
+      heldAt = Math.min(heldAt, item.committed ? item.committed.heldAt : seen);
+      const held: HeldQueueEntry["items"][number] = {
+        messageId: item.messageId,
+        text: item.text,
+        prompt: item.prompt,
+        relayed: item.committed ? item.committed.relayed : Boolean(item.relayed) || relayQueuedMessageIds.has(item.messageId),
+      };
+      if (item.replyToId) held.replyToId = item.replyToId;
+      if (item.linqChatId) held.linqChatId = item.linqChatId;
+      if (item.automationSource) held.automationSource = item.automationSource;
+      if (item.committed) held.committed = { ...item.committed, excludeIds: [...item.committed.excludeIds] };
+      return held;
+    });
+    return { botId: entry.botId, threadId: entry.threadId, heldAt, items };
+  });
+  const liveIds = new Set(live.flatMap((entry) => entry.items.map((item) => item.messageId)));
+  for (const id of queuedFirstSeen.keys()) if (!liveIds.has(id)) queuedFirstSeen.delete(id);
+  return [...live, ...unrestoredQueueJournal];
+}
+
+/** Why the last journal write failed, or null when it succeeded.  A queued
+ *  send is only acknowledged while this is null: a send the journal could not
+ *  save is refused, not accepted into a memory-only queue. */
+let steerJournalFailure: string | null = null;
+function writeSteerJournal() {
+  if (placementRollbackReadOnly) return;
+  const failure = writeQueueJournal(DATA_DIR, steerJournalEntries());
+  // Only the error code is logged: nothing a user wrote ever reaches a log line.
+  // SAFETY: the journal writer only reports fs errors, which carry an optional string code.
+  steerJournalFailure = failure ? ((failure as NodeJS.ErrnoException).code ?? failure.name) : null;
+  if (failure) console.warn(`[steer-queue] could not write the crash journal (${steerJournalFailure})`);
+}
+setSteerQueueObserver(writeSteerJournal);
+
+/** What the last run's journal still holds that is not already running or
+ *  carried: a send that was drained into its thread before the journal caught
+ *  up (its `queueId` is on a transcript line), or that an update carried, is
+ *  dropped here so nothing runs twice. */
+function takeRecoveredQueueJournal(carried: HeldWork): HeldQueueEntry[] {
+  const carriedIds = carriedWorkIds(carried);
+  const recovered: HeldQueueEntry[] = [];
+  for (const entry of unrestoredQueueJournal) {
+    const inThread = new Set(store.messagesFor(entry.threadId).flatMap((message) => (message.queueId ? [message.queueId] : [])));
+    const items = entry.items.filter((item) => journalItemStillOwed(item, carriedIds, inThread, (messageId) => store.hasMessage(entry.threadId, messageId)));
+    if (items.length > 0) recovered.push({ ...entry, items });
+  }
+  unrestoredQueueJournal = [];
+  return recovered;
+}
 
 /** Whether a drained batch carried any relayed line, consuming the marks.
  *  Read back off the transcript lines drain just appended (their `queueId`). */
@@ -6736,7 +6930,7 @@ function drainQueuedSends() {
   // new work, so it stays queued.  It is either released (`releaseHeldWork`)
   // or carried across the restart (`persistHeldWork`) —
   // never started into a fence that would refuse it.
-  if (!updateDrain.active && !runtimeQuiescing) {
+  if (!placementRollbackReadOnly && !updateDrain.active && !runtimeQuiescing) {
     drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId, carried) =>
       runQueuedSend(
         {
@@ -6868,6 +7062,9 @@ function restoreHeldWork(work: HeldWork, context: string) {
   for (const entry of queued.run) {
     if (!store.bot(entry.botId)) continue;
     for (const item of entry.items) if (item.relayed && !item.committed) relayQueuedMessageIds.add(item.messageId);
+    // Keep the send's true age: without this the next journal rewrite would
+    // treat every restored send as first seen now and reset its clock.
+    seedQueuedFirstSeen(queuedFirstSeen, [entry]);
     pending.push({
       heldAt: entry.heldAt,
       entry: {
@@ -6877,6 +7074,7 @@ function restoreHeldWork(work: HeldWork, context: string) {
           const restored: SteerQueueSnapshot["items"][number] = { messageId: item.messageId, text: item.text, prompt: item.prompt };
           if (item.replyToId) restored.replyToId = item.replyToId;
           if (item.linqChatId) restored.linqChatId = item.linqChatId;
+          if (item.relayed && !item.committed) restored.relayed = true;
           if (item.automationSource) {
             // SAFETY: the carrier only ever holds what `persistHeldWork` copied
             // out of a steer-queue item, whose automationSource is this type.
@@ -6974,6 +7172,7 @@ async function startTurn(
     command?: EngineCommandRun;
   },
 ) {
+  if (placementRollbackReadOnly) throw Object.assign(new Error(PLACEMENT_ROLLBACK_REFUSAL), { status: 503 });
   if (runtimeQuiescing) {
     throw Object.assign(new Error("BotFleet is quiescing for an update"), { status: 503 });
   }
@@ -8259,6 +8458,7 @@ const webhookRequestLog = createRequestLog({
 });
 webhookRequestLog.replay();
 routines = new RoutineManager({
+  passive: placementRollbackReadOnly,
   emit: (event) => {
     webhookRequestLog.routineSubscriber(event);
     broadcast(event);
@@ -8270,7 +8470,7 @@ routines = new RoutineManager({
   // then tick them after the authenticated credential has landed.
   // An update drain holds every run here too: routine, webhook and resource
   // receipts stay `queued` in routines.json, which a restart keeps as-is.
-  admit: () => !runtimeQuiescing && !providerConfigBusy && !updateDrain.active,
+  admit: () => !placementRollbackReadOnly && !runtimeQuiescing && !providerConfigBusy && !updateDrain.active,
   // Defer new webhook wakes while the host is hot, and say so on the
   // receipt.  The probe is the jobs admission swap cache (non-blocking)
   // plus the ACP init load reading.  Resource wakes are not shed: that is
@@ -8907,7 +9107,7 @@ async function probeIngressUrl(raw: string): Promise<IngressProbeResult> {
 
 const resourceTriggers = new ResourceTriggerManager({
   emit: broadcast,
-  admit: () => !runtimeQuiescing,
+  admit: () => !placementRollbackReadOnly && !runtimeQuiescing,
   botState: (botId) => {
     const bot = store.bot(botId);
     return !bot ? "missing" : botIsOff(bot) ? "off" : bot.busy ? "busy" : "ready";
@@ -9325,6 +9525,9 @@ export async function executeRoutineRequestRequest(input: {
 
 // Handoffs a previous process queued, and turns a restart cut, live in
 // runtime.db.  Open reconciles them, then the legacy queue is imported once.
+// Passive rollback must not open runtime.db or boot its queued dispatcher:
+// a refused startTurn would otherwise settle retained assignments as failed.
+if (!placementRollbackReadOnly) {
 jobHost = createJobHost({
   store,
   commsBus,
@@ -9351,6 +9554,7 @@ jobHost = createJobHost({
   },
 });
 jobHost.boot();
+}
 
 // Auto-resume only when a previous process died mid-turn.  An external-only
 // custom credential can arrive after the standalone harness starts; keep that
@@ -9725,6 +9929,7 @@ async function runGroupMemberTurn(
   // it has its own dispatch path and its own `sendTurn` call).
   toolPolicy?: ToolPolicy,
 ): Promise<boolean> {
+  if (placementRollbackReadOnly) return false;
   if (isCancelled?.()) return false;
   const group = store.group(groupId);
   const bot = store.bot(botId);
@@ -10738,6 +10943,7 @@ function markConnectorResumeFailed(threadId: string, resumeKey: string, error: s
 }
 
 function dispatchConnectorResume(entry: { botId: string; threadId: string; resumeKey: string; labels: string[] }) {
+  if (placementRollbackReadOnly) return;
   const owner = connectorThread(entry.botId, entry.threadId);
   if (!owner) return;
   if (providerReloadInProgress) {
@@ -10808,6 +11014,7 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
 }
 
 function maybeResumeConnectors(botId: string, threadId: string, resumeKey: string) {
+  if (placementRollbackReadOnly) return false;
   const cards = connectorCards(threadId, resumeKey);
   if (!cards.length || cards.some((message) => message.connector?.dismissed || message.connector?.status !== "connected")) return false;
   if (cards.every((message) => message.connector?.resumed)) return true;
@@ -10820,6 +11027,7 @@ function maybeResumeConnectors(botId: string, threadId: string, resumeKey: strin
 }
 
 function drainConnectorResumes() {
+  if (placementRollbackReadOnly) return;
   for (const [key, entry] of pendingConnectorResumes) {
     if (store.bot(entry.botId)?.busy) continue;
     pendingConnectorResumes.delete(key);
@@ -12580,7 +12788,7 @@ function settleWorkForOffBot(botId: string): void {
 }
 
 function beginUpdateAdmission(): (() => void) | null {
-  if (runtimeQuiescing) return null;
+  if (placementRollbackReadOnly || runtimeQuiescing) return null;
   activeUpdateAdmissions += 1;
   let released = false;
   return () => {
@@ -12727,6 +12935,7 @@ function resumePausedWork(
   context: string,
   extra: { runs?: readonly RoutineRun[]; bots?: readonly InterruptedBotResumeEntry[] } = {},
 ): Promise<void> | null {
+  if (placementRollbackReadOnly) return null;
   const path = join(DATA_DIR, PENDING_RESUME_FILE);
   const saved = readResumeSnapshot();
   const paused = mergeResumeSnapshots(saved, extra.runs ?? [], extra.bots ?? []);
@@ -12916,6 +13125,7 @@ function releaseAfterDrain() {
  *  inside a route answers before the turns it lets loose start, and a no-op
  *  while something still holds them (the fence, or a drain). */
 function releaseHeldWork() {
+  if (placementRollbackReadOnly) return;
   queueMicrotask(() => {
     if (runtimeQuiescing || updateDrain.active) return;
     restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-released");
@@ -13368,6 +13578,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (mutatingApiRequest && arrivedViaCloudflareTunnel(req)) {
       return json(res, 403, { error: NAMED_TUNNEL_MUTATION_FORBIDDEN });
     }
+    // A bridge offers diagnostics and an update check, but cannot install a
+    // replacement that would escape the immutable hold without artifact proof.
+    if (placementRollbackReadOnly && mutatingApiRequest && !path.startsWith("/api/placement/") &&
+        path !== "/api/runtime/quiesce" && path !== "/api/update/check") {
+      return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
+    }
     if (runtimeQuiescing && path.startsWith("/api/") && path !== "/api/runtime" && path !== "/api/runtime/quiesce" &&
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: controlShutdownPending ? "server shutdown is in progress" : "BotFleet is quiescing for an update" });
@@ -13379,7 +13595,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         : { error: UNSUPPORTED_JSON_BODY });
     }
     let ownAdmissionActive = false;
-    if (mutatingApiRequest) {
+    if (mutatingApiRequest && !placementRollbackReadOnly) {
       const releaseAdmission = beginUpdateAdmission();
       if (!releaseAdmission) return json(res, 503, { error: "BotFleet is quiescing for an update" });
       ownAdmissionActive = true;
@@ -15875,9 +16091,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // not a guard.  The six organize fields are parsed together.
       // From a paired phone (the sidecar stamps `x-botfleet-companion`) the
       // body may carry the six organize fields and nothing else.
+      if (!botAvatarRecolorableSchema.safeParse(body.recolorable).success) {
+        return json(res, 400, { error: "recolorable must be a boolean" });
+      }
       const organize = checkBotOrganizeBody(body, req.headers["x-botfleet-companion"] === "1");
       if (!organize.ok) return json(res, organize.status, { error: organize.error });
-      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
+      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "recolorable", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       if (normalizedSelection) {
@@ -16514,7 +16733,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
             linqChatId,
             ...(fromImessage ? { automationSource: "imessage" as const } : {}),
+            relayed: relaySourced,
           });
+          if (steerJournalFailure) {
+            // Not durable: refuse rather than acknowledge a send a crash would lose.
+            const failedWith = steerJournalFailure;
+            cancelSteeredMessage(bot.threadId, queued.id);
+            return { status: 503, body: { error: `could not save the queued message (${failedWith}); send it again` } };
+          }
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           // The same answer a busy bot's queued send gets: the client's
           // response schema is strict, and the pending chip is already right.
@@ -16626,7 +16852,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
             linqChatId,
             automationSource: fromImessage ? "imessage" : undefined,
+            relayed: relaySourced,
           });
+          if (steerJournalFailure) {
+            // Not durable: refuse rather than acknowledge a send a crash would lose.
+            const failedWith = steerJournalFailure;
+            cancelSteeredMessage(targetThreadId, queued.id);
+            return { status: 503, body: { error: `could not save the queued message (${failedWith}); send it again` } };
+          }
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           return { status: 202, body: { ok: true, queued: true, queueId: queued.id, threadId: targetThreadId } };
         }
@@ -17478,6 +17711,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!isLoopbackAddress(req.socket.remoteAddress) || !authorizedRuntime(harnessOwner, req.headers.authorization)) {
         return json(res, 401, { error: "unauthorized" });
       }
+      if (placementRollbackReadOnly) {
+        // Neither force, drain, lease expiry nor DELETE may claim old work or
+        // release the immutable bridge capability or claim existing jobs.
+        return json(res, 200, {
+          ...runtimeBuildIdentity, pid: process.pid, ...currentRuntimeReadiness(),
+          quiescing: true, fencing: false, placementReadOnly: true, lease: null,
+          placementController: placementAuthority.kind === "readonly" ? placementAuthority.reader.controller() : null,
+          dataOwner: { pid: harnessOwner.pid, port: harnessOwner.port },
+        });
+      }
       // What a quiesce or release asks for, checked against a strict shape:
       // a malformed flag or window is refused with 400, never read loosely
       // into drain, fence or lease state.
@@ -17630,6 +17873,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // The same owner boundary as placement identity and host resources.
       // No worker-scoped credential class exists yet (the plan's open
       // question 3), so these routes invent none.
+      if (!placementLeases) {
+        if (!isLoopbackAddress(req.socket.remoteAddress) || req.headers["x-botfleet-companion"] !== undefined || arrivedViaCloudflareTunnel(req)) {
+          return json(res, 403, { error: "Placement routes are available only through the local owner or authenticated server gate" });
+        }
+        return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
+      }
       // SAFETY: the guard above accepted only segments in
       // PLACEMENT_LEASE_ACTIONS, so this slice is one of them.
       const action = path.slice("/api/placement/".length) as PlacementLeaseAction;
@@ -17654,7 +17903,36 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         localOwner: isLoopbackAddress(req.socket.remoteAddress),
         fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
         viaNamedTunnel: arrivedViaCloudflareTunnel(req),
-      }, { hostId, controller: placementController, platform: process.platform });
+      }, { hostId, controller: () => {
+        if (placementAuthority.kind === "readonly") return placementAuthority.reader.controller();
+        if (!placementLeases) throw new Error("Placement authority is unavailable");
+        return placementLeases.controller();
+      }, platform: process.platform });
+      return json(res, response.status, response.body);
+    }
+    if ((method === "GET" || method === "PUT") && path === "/api/placement/mode") {
+      // The same owner boundary as placement identity and host resources:
+      // the local owner or the authenticated server gate, never the companion
+      // lane or the named tunnel.
+      const caller = {
+        localOwner: isLoopbackAddress(req.socket.remoteAddress),
+        fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
+        viaNamedTunnel: arrivedViaCloudflareTunnel(req),
+      };
+      if (method === "GET") {
+        const response = placementModeRead(caller, placementModeStore);
+        return json(res, response.status, response.body);
+      }
+      // A rollback build holds placement state:  it reads the mode record and
+      // never writes one.
+      if (placementRollbackReadOnly) return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
+      let body: unknown;
+      try {
+        body = await readBody(req);
+      } catch {
+        return json(res, 400, { error: "invalid placement mode message" });
+      }
+      const response = placementModeWrite(caller, body, placementModeStore);
       return json(res, response.status, response.body);
     }
     // Saved data that could not be read or used, for the notice at the top of the app.  File base names
@@ -20148,6 +20426,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
       }
       if (m[3] === "status" && method === "GET") {
+        if (placementRollbackReadOnly) {
+          return json(res, 200, {
+            connected: connector.status === "connected", pending: connector.status === "authorizing",
+            status: connector.status, placementReadOnly: true,
+          });
+        }
         const state = (await composio.connectionStatus(cfg, [connector.slug]))[connector.slug];
         const failed = /failed|expired|revoked|error/i.test(state?.status ?? "");
         const next = {
@@ -20404,7 +20688,7 @@ if (!process.env.OMB_DISABLE_GROK_QUOTA) {
 // Post-update resumption: If an update quiesced active work and rebooted successfully,
 // clear all bot snoozes, requeue interrupted runs, and resume routines on this new build.
 const pendingResumePath = join(DATA_DIR, "pending-update-resume.json");
-if (existsSync(pendingResumePath)) {
+if (!placementRollbackReadOnly && existsSync(pendingResumePath)) {
   try {
     const raw = readFileSync(pendingResumePath, "utf-8");
     const resumeState = JSON.parse(raw);
@@ -20474,13 +20758,19 @@ await localVmStartupProbe.catch(() => {});
 await jobRegistry.adopt().catch((error) => {
   console.error(`[jobs] could not settle earlier jobs: ${error instanceof Error ? error.message : String(error)}`);
 });
-try {
+if (!placementRollbackReadOnly) try {
   const interrupted = store.settleInterruptedHelpers(Date.now());
   if (interrupted > 0) console.log(`[helpers] boot: ${interrupted} helper(s) stopped by the restart`);
 } catch (error) {
   console.error(`[helpers] could not settle interrupted helpers: ${error instanceof Error ? error.message : String(error)}`);
 }
 jobRegistry.startTimers();
+// The unreachable sweep (slice T4).  It is the one part of the lease service
+// that had no production caller:  a controller runs it to notice a worker
+// that went quiet, and nothing is requeued when it does.  The period is the
+// heartbeat period, so the controller looks as often as workers report, and
+// a knob change applies on the next tick.
+if (placementLeases) placementBridge.startUnreachableSweep(placementHeartbeatMs);
 // Boot is done: the socket has been open since the top of this file, and the
 // full route table takes over from the boot-phase handler on the very next
 // request.  `/api/health` flips to `ready: true`, and the 503 gate lifts.
@@ -20517,7 +20807,7 @@ zulipHub = new ZulipHub({
   },
   busyThread: (botId) => store.bot(botId)?.inflightThreadId,
   turnStarter: (threadId) => zulipTurnStarter(store.activePath(threadId))?.id,
-  dispatchHeld: () => !bootRecoveryDone,
+  dispatchHeld: () => placementRollbackReadOnly || !bootRecoveryDone,
   startTurn: async (botId, text, conversation) => {
     const bot = store.bot(botId);
     if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
@@ -20603,7 +20893,7 @@ zulipHub.start();
 // Everything the recovery coordinator reads now exists: the store, the
 // provider fleet, the shutdown record read at the top of this file, and the
 // post-update snapshot folded into it a few lines above.
-setTimeout(() => {
+if (!placementRollbackReadOnly) setTimeout(() => {
   // Messages an update held for this restart (update-held-sends.json) go
   // back in their bots' queues only now: after `jobRegistry.adopt()` settled
   // the jobs an earlier run left (no turn starts before that), and after
@@ -20613,7 +20903,13 @@ setTimeout(() => {
   void runBootRecovery()
     .catch((error) => console.error("[boot-recovery] failed:", error))
     .finally(() => {
-      restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-held");
+      const carried = takeHeldWork(DATA_DIR, (line) => console.warn(line));
+      const recovered = takeRecoveredQueueJournal(carried);
+      if (recovered.length > 0) console.warn(`[boot-recovery] ${recovered.length} queued send batch(es) survived a crash in the journal`);
+      restoreHeldWork({ ...carried, queued: [...carried.queued, ...recovered] }, "update-held");
+      // The journal must now say what is in memory, even when nothing changed
+      // the queue (a too-old send was written into its thread instead).
+      writeSteerJournal();
       drainQueuedSends();
       drainRoomQueue();
     });
@@ -20673,7 +20969,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     // is settled below, after bus.flush(), and a stop whose drain never
     // finishes leaves a record that cannot license a replay.
     const interrupted: InterruptedTurnRecord[] = [];
-    for (const bot of store.bots) {
+    for (const bot of placementRollbackReadOnly ? [] : store.bots) {
       if (!bot.busy) continue;
       const threadId = bot.inflightThreadId ?? bot.threadId;
       // Room turns are not re-dispatchable (startGroupTurn always appends the
@@ -20704,6 +21000,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     stopTranscriptSweeps();
     stopOrphanTranscriptSweeps();
     stopIdleLiveTranscriptSweeps();
+    stopVolumeTranscriptSweeps();
     // A flush that throws (disk full, data dir gone) must not skip the rest
     // of shutdown — above all bus.flush() below — so each one is guarded.
     const flushOnShutdown = (label: string, flush: () => void) => {

@@ -32,16 +32,16 @@
 // mistaking nearly-done for done.  Cancelled and duplicate are not landed
 // either: the replacement never existed, so deleting the code it was to
 // replace stops the bots.  Refresh the state file from Linear at run time
-// (board api query ... project issues) rather than editing it by hand; a
-// stale all-Done file is the one input that defeats the guard, so the CLI
-// prints the age of the file it read when it can stat it.
+// (board api query ... project issues) rather than editing it by hand.
+// The final CLI additionally requires a private, hashed receipt bundle bound
+// to the explicitly selected source, build and signed artifact.
 //
-// The state file is the trust boundary: it decides whether an irreversible
-// deletion may happen, so it is parsed against a strict schema and only the
-// validated result reaches evaluateGates.
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+// The state file remains a strict, pure prerequisite check, not runtime
+// evidence or owner approval; booleans alone cannot pass the final CLI.
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { checkFinalEvidenceBundle, readPrivateEvidenceFile } from "./decommission-evidence-bundle.mjs";
 
 /** Issue states that mean the replacement actually landed. */
 const COMPLETED = new Set(["done", "completed", "complete"]);
@@ -233,27 +233,31 @@ function isEntryModule() {
 }
 
 if (isEntryModule()) {
-  const [, , statePath] = process.argv;
-  if (!statePath || !existsSync(statePath)) {
+  const [statePath, ...args] = process.argv.slice(2);
+  const options = new Map();
+  const flags = ["--bundle", "--source-sha", "--build", "--artifact-sha256"];
+  for (let index = 0; index < args.length; index += 2) {
+    if (!flags.includes(args[index]) || !args[index + 1] || options.has(args[index])) {
+      console.error("Invalid final evidence arguments");
+      process.exit(2);
+    }
+    options.set(args[index], args[index + 1]);
+  }
+  if (!statePath) {
     console.error(
-      "usage: node scripts/check-decommission-gates.mjs <state.json>\n" +
+      "usage: node scripts/check-decommission-gates.mjs <state.json> --bundle <bundle.json> --source-sha <sha> --build <build> --artifact-sha256 <sha256>\n" +
         'state.json: {"issues": {"BF-2510": "Done", ...}, "evidence": {"soak-24h-no-node": true, "control-disposition": true, ...}, "macLocalHarness": {"present": false, "retained": {"deploy/linux-server/": "optional server deployment (BF-2544)"}}}\n' +
         "the deletion order this gate protects: docs/native-rewrite-decommission-runbook.md",
     );
     process.exit(2);
   }
-  const ageHours = (Date.now() - statSync(statePath).mtimeMs) / 3_600_000;
-  if (ageHours > 24) {
-    console.error(
-      `warning: ${statePath} is ${Math.floor(ageHours)}h old; refresh it from Linear before trusting this verdict`,
-    );
-  }
   let raw;
+  let stateBytes;
   try {
-    raw = JSON.parse(readFileSync(statePath, "utf8"));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`error: ${statePath} is not valid JSON: ${message}`);
+    stateBytes = readPrivateEvidenceFile(statePath);
+    raw = JSON.parse(stateBytes.toString("utf8"));
+  } catch {
+    console.error("error: state must be bounded private single-link valid JSON");
     process.exit(2);
   }
   const parsed = StateSchema.safeParse(raw);
@@ -265,12 +269,22 @@ if (isEntryModule()) {
     process.exit(2);
   }
   const verdict = evaluateGates(parsed.data);
+  if (!options.get("--bundle")) {
+    verdict.blockers.push("final evidence bundle: required; issue states and evidence booleans alone cannot permit deletion");
+  } else {
+    const evidence = checkFinalEvidenceBundle(options.get("--bundle"), {
+      statePath, stateBytes,
+      candidate: { sourceSha: options.get("--source-sha"), build: options.get("--build"), artifactSha256: options.get("--artifact-sha256") },
+    });
+    verdict.blockers.push(...evidence.blockers);
+  }
+  verdict.ok = verdict.blockers.length === 0;
   if (!verdict.ok) {
     console.error("Phase 6 decommission is BLOCKED:");
     for (const blocker of verdict.blockers) console.error(`  - ${blocker}`);
     process.exit(1);
   }
-  console.log("Phase 6 decommission gates: all green. Deletion may proceed; the reboot check still belongs to BF-2515.");
+  console.log("Phase 6 evidence bindings and assertions are consistent.\u00A0 This offline check does not authenticate receipts or establish their truth; deletion still requires the recorded owner's authorization and post-deletion reboot verification.");
   console.log(
     `Scope: the Mac-local Node harness only (${MAC_LOCAL_ROOTS.join(", ")}).\u00A0 ` +
       "The optional server deployment (deploy/linux-server/, BF-2544) is retained, and its shared source has a separate preservation evidence gate.",

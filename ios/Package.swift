@@ -44,6 +44,32 @@ let package = Package(
             dependencies: ["CompanionCore"],
             path: "Scripts/MacPerfHarness"
         ),
+        // The import parity probe (BF-2648).  It imports an Electron-era Node
+        // store into the native store and writes the parity report the
+        // decommission evidence bundle reads.  The importer computes the
+        // verdict and a `Codable` struct does not carry a computed property,
+        // so the probe writes the verdict into the report itself.
+        // Run with
+        // `swift run --package-path ios StoreImportParityProbe -- --source <node-store> --out <report.json>`.
+        .executableTarget(
+            name: "StoreImportParityProbe",
+            dependencies: ["CompanionCore"],
+            path: "Scripts/StoreImportParityProbe"
+        ),
+        // The replay parity probe (BF-2647).  It replays each engine's
+        // recorded turns through the native drivers and writes the
+        // per-engine report the decommission evidence bundle reads.  The
+        // engine list comes from the bundle request, so the probe and the
+        // receipt cannot disagree about which engines are in scope, and an
+        // engine with no replay family behind it earns a failing check with
+        // the reason named rather than a passing one.
+        // Run with
+        // `swift run --package-path ios EngineReplayParityProbe -- --request <bundle-request.json> --out <report.json>`.
+        .executableTarget(
+            name: "EngineReplayParityProbe",
+            dependencies: ["CompanionCore"],
+            path: "Scripts/EngineReplayParityProbe"
+        ),
     ],
     swiftLanguageModes: [.v5]
 )
