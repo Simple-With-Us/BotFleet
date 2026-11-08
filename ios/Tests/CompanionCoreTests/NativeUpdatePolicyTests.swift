@@ -67,6 +67,16 @@ final class NativeUpdatePolicyTests: XCTestCase {
         )
     }
 
+    func testRepeatedFailuresSaturateAtTheBackoffThreshold() {
+        var throttle = NativeUpdateThrottle()
+        for _ in 0..<100 {
+            throttle.recordCheck(now: t0, fingerprint: "app-a", failureClass: "feed")
+        }
+        XCTAssertEqual(throttle.failureStreak, NativeUpdateThrottle.failureStreakThreshold)
+        XCTAssertFalse(throttle.shouldAutoCheck(now: t0.addingTimeInterval(6 * 3600), fingerprint: "app-a"))
+        XCTAssertTrue(throttle.shouldAutoCheck(now: t0.addingTimeInterval(24 * 3600), fingerprint: "app-a"))
+    }
+
     func testSuccessClearsTheStreak() {
         var throttle = NativeUpdateThrottle()
         throttle.recordCheck(now: t0, fingerprint: "app-a", failureClass: "feed-5xx")

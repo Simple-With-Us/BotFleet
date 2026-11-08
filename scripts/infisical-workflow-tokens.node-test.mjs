@@ -17,7 +17,10 @@ const STEP_CONSUMERS = {
     "Load the Developer ID certificate": "native-mac-developer-id-certificate",
     "Load the Sentry DSN (optional)": "native-mac-sentry",
     "Load the notarization credentials": "native-mac-notarization",
-    "Load the Sparkle EdDSA key (optional)": "native-mac-sparkle-appcast",
+    // The EdDSA key step is required now (native-mac-release.yml renames it
+    // and passes a conditional `required`); the binding stays tolerant for
+    // the explicitly unverified unsigned draft.
+    "Load the Sparkle EdDSA key": "native-mac-sparkle-appcast",
   },
   "release.yml": {
     "Load the App Store Connect credentials": "electron-build-plan",

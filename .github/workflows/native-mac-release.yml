@@ -33,6 +33,11 @@ on:
         required: false
         type: boolean
         default: false
+      unsigned-draft:
+        description: "Build an explicitly unverified artifact only; never attach it to a release"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -171,12 +176,22 @@ jobs:
           bash scripts/ios-install-xcodegen.sh
           cd ios
           xcodegen generate
+      - name: Verify canonical native update configuration
+        env:
+          INFISICAL_NATIVE_RELEASE_READ_TOKEN: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+          MIRROR_BOTFLEET_NATIVE_UPDATE_FEED_URL: ${{ vars.BOTFLEET_NATIVE_UPDATE_FEED_URL }}
+          MIRROR_BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY: ${{ vars.BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY }}
+        run: |
+          node scripts/native-update-release-config.mjs --output "$RUNNER_TEMP/native-update.env"
+          cat "$RUNNER_TEMP/native-update.env" >> "$GITHUB_ENV"
       - name: Archive BotFleetMac
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           BUILD: ${{ needs.prepare.outputs.build }}
           SENTRY_DSN: ${{ env.SENTRY_DSN }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.sha }}
+          BOTFLEET_NATIVE_UPDATE_FEED_URL: ${{ env.BOTFLEET_NATIVE_UPDATE_FEED_URL }}
+          BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY: ${{ env.BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY }}
         run: |
           build="$BUILD"
           if [ -n "${SENTRY_DSN:-}" ]; then
@@ -193,6 +208,8 @@ jobs:
             CURRENT_PROJECT_VERSION="$build" \
             SENTRY_DSN="$SENTRY_DSN" \
             SOURCE_COMMIT="$SOURCE_COMMIT" \
+            BOTFLEET_NATIVE_UPDATE_FEED_URL="$BOTFLEET_NATIVE_UPDATE_FEED_URL" \
+            BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY="$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Developer ID Application" \
             DEVELOPMENT_TEAM=CC8UTF7ATG
@@ -280,14 +297,13 @@ jobs:
           echo "$out" | grep -q "status: Accepted" || { echo "::error::notarization not Accepted for the DMG"; exit 1; }
           xcrun stapler staple "native-upload/BotFleetMac-$VERSION.dmg"
           xcrun stapler validate "native-upload/BotFleetMac-$VERSION.dmg"
-      # Best-effort by design: until the owner provisions the EdDSA key in
-      # Infisical (Phase 6 owner action), the appcast ships unsigned and the
-      # verify step below runs without --require-signature.  An app carrying
-      # SUPublicEDKey refuses unsigned items, so this fails closed.
-      - name: Load the Sparkle EdDSA key (optional)
+      # Trusted artifacts require an actual signature; only an explicitly
+      # unverified draft can proceed without one and cannot join a release.
+      - name: Load the Sparkle EdDSA key
         uses: ./.github/actions/infisical-secrets
         with:
           names: SPARKLE_EDDSA_PRIVATE_KEY_B64
+          required: ${{ !inputs.unsigned-draft && 'SPARKLE_EDDSA_PRIVATE_KEY_B64' || '' }}
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           token: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
       - name: Generate and verify the appcast over the final bytes
@@ -295,6 +311,8 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           BUILD: ${{ needs.prepare.outputs.build }}
           SPARKLE_EDDSA_PRIVATE_KEY_B64: ${{ env.SPARKLE_EDDSA_PRIVATE_KEY_B64 }}
+          BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY: ${{ env.BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY }}
+          UNSIGNED_DRAFT: ${{ inputs.unsigned-draft }}
         run: |
           zip="native-upload/BotFleetMac-$VERSION.zip"
           if [ -n "${SPARKLE_EDDSA_PRIVATE_KEY_B64:-}" ]; then
@@ -320,11 +338,12 @@ jobs:
             rm "$key"
             echo "Sparkle update signed"
           else
-            echo "::warning::no Sparkle EdDSA signing (key unprovisioned); appcast is an unsigned draft"
+            test "$UNSIGNED_DRAFT" = true || { echo "::error::trusted artifacts require Sparkle signing"; exit 1; }
+            echo "::warning::UNVERIFIED DRAFT: not activatable and cannot be attached to a release"
           fi
           node scripts/native-appcast.mjs native-upload "$VERSION" "v${VERSION}-${BUILD}${NATIVE_TAG_SUFFIX}" --build "$BUILD"
           if [ -f "$zip.edsig" ]; then
-            node scripts/verify-native-release.mjs native-upload "$VERSION" --build "$BUILD" --require-signature
+            node scripts/verify-native-release.mjs native-upload "$VERSION" --build "$BUILD" --require-signature --public-key "$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"
             rm "$zip.edsig"
           else
             node scripts/verify-native-release.mjs native-upload "$VERSION" --build "$BUILD"
@@ -352,9 +371,18 @@ jobs:
           path: assets
       - name: Verify the appcast against the actual bytes
         env:
+          INFISICAL_NATIVE_RELEASE_READ_TOKEN: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
           BUILD: ${{ needs.prepare.outputs.build }}
-        run: node scripts/verify-native-release.mjs assets "$VERSION" --build "$BUILD"
+          UNSIGNED_DRAFT: ${{ inputs.unsigned-draft }}
+        run: |
+          if [ "$UNSIGNED_DRAFT" = true ]; then
+            node scripts/verify-native-release.mjs assets "$VERSION" --build "$BUILD"
+          else
+            node scripts/native-update-release-config.mjs --output "$RUNNER_TEMP/assembled-native-update.env"
+            while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/assembled-native-update.env"
+            node scripts/verify-native-release.mjs assets "$VERSION" --build "$BUILD" --require-signature --public-key "$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: botfleet-native-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.sha }}
@@ -364,7 +392,7 @@ jobs:
 
   draft:
     name: Attach the native assets to the draft release
-    if: ${{ inputs.draft }}
+    if: ${{ inputs.draft && !inputs.unsigned-draft }}
     needs: [prepare, assemble]
     runs-on: ubuntu-26.04
     timeout-minutes: 15
