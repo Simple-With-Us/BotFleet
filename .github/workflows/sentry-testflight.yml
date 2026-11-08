@@ -9,9 +9,9 @@ on:
     inputs:
       token:
         description: >-
-          Dedicated read-only Infisical service token for this reporting use case,
-          with the existing reporting-token binding used when omitted and the
-          same-name GitHub secret fallback retained when vault access is unavailable.
+          Dedicated read-only Infisical service token for this reporting use
+          case.  When empty, the step uses INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN
+          and the same-name GitHub secret fallback when vault access is unavailable.
         required: false
         default: ""
         type: string

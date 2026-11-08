@@ -333,8 +333,10 @@ describe("RoutineManager", () => {
 
   it("measures hot-host defer cap from the first hot tick, not enqueue time", async () => {
     const h = harness();
+    const logs: string[] = [];
     const hostReason = "Host is busy (load 12 per core, swap 91%)";
     const capMs = 5 * 60_000;
+    h.options.log = (line) => logs.push(line);
     h.options.webhookHotDeferMaxMs = () => capMs;
     h.options.hostHot = () => hostReason;
     let busy = true;
@@ -367,6 +369,8 @@ describe("RoutineManager", () => {
     h.setNow(hotAt + capMs);
     await h.manager.tick();
     expect(h.triggerSources).toEqual(["webhook"]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("waited 5 min");
   });
 
   it("does not probe the host while no webhook is queued", async () => {
@@ -438,7 +442,8 @@ describe("RoutineManager", () => {
       receivedAt: queuedAt,
     });
     await h.manager.tick();
-    h.setNow(queuedAt + 19 * 60_000);
+    expect(h.started).toHaveLength(0);
+    h.setNow(queuedAt + DEFAULT_WEBHOOK_HOT_DEFER_MS - 1);
     await h.manager.tick();
     expect(h.started).toHaveLength(0);
     h.setNow(queuedAt + DEFAULT_WEBHOOK_HOT_DEFER_MS);

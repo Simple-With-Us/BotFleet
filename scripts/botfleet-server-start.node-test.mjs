@@ -18,6 +18,9 @@ const SCRIPT = join(ROOT, "scripts/botfleet-server-start.sh");
 
 function makeFixture({ withDependencies = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "botfleet-server-start-test-"));
+  const dataDir = join(dir, "data");
+  mkdirSync(dataDir);
+  writeFileSync(join(dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
   const serverRoot = join(dir, "root");
   mkdirSync(join(serverRoot, "server"), { recursive: true });
   writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
@@ -29,10 +32,13 @@ function makeFixture({ withDependencies = false } = {}) {
   // (18799 was tried) collided with something else already listening on
   // it, making health() see a false positive and every test past it fail.
   const port = 20000 + Math.floor(Math.random() * 20000);
-  return { dir, serverRoot, ledger: join(dir, "ledger"), marker: join(dir, "stopped.marker"), disabled: join(dir, "startup-disabled.marker"), enabled: join(dir, "startup-enabled.marker"), session: join(dir, "startup-session"), port };
+  const node = join(dir, "node-stub");
+  writeFileSync(node, `#!/bin/sh\nif [ "$1" = "--input-type=module" ]; then exec ${JSON.stringify(process.execPath)} "$@"; fi\nprintf '%s\\n' "$*"\n`);
+  chmodSync(node, 0o755);
+  return { dir, dataDir, node, serverRoot, ledger: join(dir, "ledger"), marker: join(dir, "stopped.marker"), disabled: join(dir, "startup-disabled.marker"), enabled: join(dir, "startup-enabled.marker"), session: join(dir, "startup-session"), port };
 }
 
-function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = "/bin/echo", xpcServiceName = "" } = {}) {
+function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = fixture.node, xpcServiceName = "" } = {}) {
   return spawnSync("bash", [SCRIPT, ...args], {
     encoding: "utf8",
     env: {
@@ -40,6 +46,7 @@ function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = 
       BOTFLEET_SERVER_ROOT: fixture.serverRoot,
       BOTFLEET_PORT: String(fixture.port),
       BOTFLEET_NODE: node,
+      OMB_DATA_DIR: fixture.dataDir,
       BOTFLEET_PNPM: join(fixture.dir, "pnpm-does-not-exist"),
       BOTFLEET_HEAL_STAMP: join(fixture.serverRoot, ".botfleet-heal-stamp"),
       BOTFLEET_FAIL_LEDGER: fixture.ledger,
@@ -320,7 +327,7 @@ function writeIdentityNode(dir) {
       "writeFileSync(report, lines.join('\\n') + '\\n');",
     ].join("\n"),
   );
-  writeFileSync(stub, "#!/bin/sh\nexec " + JSON.stringify(process.execPath) + " " + JSON.stringify(recorder) + ' "$@"\n');
+  writeFileSync(stub, "#!/bin/sh\nif [ \"$1\" = \"--input-type=module\" ]; then exec " + JSON.stringify(process.execPath) + ' "$@"; fi\nexec ' + JSON.stringify(process.execPath) + " " + JSON.stringify(recorder) + ' "$@"\n');
   chmodSync(stub, 0o755);
   return stub;
 }
@@ -333,10 +340,14 @@ function identityFixture() {
   writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
   const home = join(dir, "home");
   mkdirSync(join(home, ".local", "bin"), { recursive: true });
+  const dataDir = join(home, ".botfleet");
+  mkdirSync(dataDir);
+  writeFileSync(join(dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "remote" }));
   return {
     dir,
     serverRoot,
     home,
+    dataDir,
     keys: join(dir, "fake-store"),
     bin: join(home, ".local", "bin", "fleet-secrets"),
     report: join(dir, "env-report"),
@@ -364,7 +375,7 @@ function installFakeFleetSecrets(fixture, script) {
   chmodSync(fixture.bin, 0o755);
 }
 
-function runIdentity(fixture, extraEnv = {}) {
+function runIdentity(fixture, extraEnv = {}, { dataDir = fixture.dataDir } = {}) {
   const env = { ...process.env };
   for (const key of Object.keys(env)) {
     if (key.startsWith("INFISICAL_")) delete env[key];
@@ -375,6 +386,7 @@ function runIdentity(fixture, extraEnv = {}) {
       ...env,
       ...extraEnv,
       HOME: fixture.home,
+      OMB_DATA_DIR: dataDir,
       BOTFLEET_ENV_REPORT: fixture.report,
       BOTFLEET_SERVER_ROOT: fixture.serverRoot,
       BOTFLEET_PORT: String(fixture.port),
@@ -410,7 +422,110 @@ function identityReport(fixture, result) {
   );
 }
 
-test("the Infisical service token banner is 7-bit ASCII", () => {
+test("local startup bypasses the Infisical helper", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(existsSync(called), false);
+    assert.equal(got.INFISICAL_TOKEN, "unset");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a host with no identity source and no choice file starts this Mac and reads nothing", () => {
+  const fixture = identityFixture();
+  try {
+    rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+    const result = runIdentity(fixture);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /without Infisical bootstrap/);
+    const got = identityReport(fixture, result);
+    assert.equal(got.INFISICAL_TOKEN, "unset");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a host that already had the fleet-secrets helper keeps remote startup without a choice file", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(fixture);
+    assert.equal(result.status, 0);
+    assert.equal(existsSync(called), true);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a host already holding an Infisical identity keeps remote startup without a choice file", () => {
+  for (const env of [{ INFISICAL_TOKEN: "st.legacy" }, { INFISICAL_CLIENT_ID: "id", INFISICAL_CLIENT_SECRET: "secret" }]) {
+    const fixture = identityFixture();
+    try {
+      rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+      const result = runIdentity(fixture, env);
+      assert.equal(result.status, 0);
+      assert.doesNotMatch(result.stdout, /startup setup is required/);
+      assert.equal(existsSync(fixture.report), true);
+    } finally {
+      rmSync(fixture.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("an explicit local choice wins over every legacy identity source", () => {
+  const local = identityFixture();
+  const called = join(local.dir, "helper-called");
+  try {
+    writeFileSync(join(local.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+    installFakeFleetSecrets(local, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(local, { INFISICAL_TOKEN: "st.legacy" });
+    assert.match(result.stdout, /without Infisical bootstrap/);
+    assert.equal(existsSync(called), false);
+  } finally {
+    rmSync(local.dir, { recursive: true, force: true });
+  }
+});
+
+test("the launcher trims the data override like the desktop resolver", () => {
+  const fixture = identityFixture();
+  try {
+    writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+    const got = identityReport(fixture, runIdentity(fixture, {}, { dataDir: `  ${fixture.dataDir}  ` }));
+    assert.equal(got.INFISICAL_TOKEN, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("invalid startup preferences fail closed before helper access", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    for (const body of ["{", "x".repeat(1025), "null", JSON.stringify({ version: 2, mode: "remote" }),
+      JSON.stringify({ version: 1, mode: "remote", extra: true })]) {
+      writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), body);
+      const result = runIdentity(fixture);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /startup choice is invalid/);
+      assert.equal(existsSync(called), false);
+      assert.equal(existsSync(fixture.report), false);
+    }
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the Infisical identity banner is 7-bit ASCII", () => {
   const line = readFileSync(SCRIPT, "utf8")
     .split("\n")
     .find((row) => row.includes("the Infisical service tokens"));

@@ -168,9 +168,10 @@ jobs:
       - name: Clean generated output
         run: rm -rf dist dist-server dist-native release
 
-      # Prefer Infisical values from the dedicated release read token and
-      # accept same-named GitHub secrets as a migration fallback; a release
-      # without both values cannot be signed, so fail here with the missing names.
+      # Prefer Infisical values from the dedicated release read token
+      # (INFISICAL_RELEASE_READ_TOKEN) and accept same-named GitHub secrets as a
+      # migration fallback; a release without both values cannot be signed, so
+      # fail here with the missing names.
       # (Not optional: with them empty the import step below would decode an
       # empty .p12 and die inside `security import`, and the signature gate
       # after packaging would fail anyway -- a still-empty vault cannot make

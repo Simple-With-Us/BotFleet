@@ -1420,6 +1420,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // Reuse the live process when it is idle, unchanged, and is the session
       // the harness wants resumed. Anything else: close it and spawn fresh
       // (with --resume, so the conversation continues in the new process).
+      // One user turn announces turn.started exactly once, even when a reused
+      // session fails its stdin write and the turn falls through to a fresh spawn.
+      let turnStartedEmitted = false;
       const live = sessions.get(threadId);
       if (live && !live.turn && !live.unsolicited && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
@@ -1441,25 +1444,30 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           broker: live.broker,
         });
         emit({ ...base(threadId, turnId), type: "turn.started" });
+        turnStartedEmitted = true;
         const plan = planTurnText(live.sessionId ?? sessionId ?? newSessionId!);
         live.pendingReceipt = plan.pending;
         const written = await writeUser(live, threadId, plan.text, plan.bare);
-        if (!written) {
-          live.pendingReceipt = null;
-          active.delete(threadId);
-          live.turn = null;
-          closeSession(threadId, "stdin write failed");
-          throw new Error("claude session stdin is not writable");
+        if (written) {
+          // the MCP config was for the first spawn; nothing to clean here
+          if (mcpConfigPath) {
+            try {
+              rmSync(dirname(mcpConfigPath), { recursive: true, force: true });
+            } catch {}
+          }
+          return { turnId };
         }
-        // the MCP config was for the first spawn; nothing to clean here
-        if (mcpConfigPath) {
-          try {
-            rmSync(dirname(mcpConfigPath), { recursive: true, force: true });
-          } catch {}
-        }
-        return { turnId };
+        // BOTFLEET-S: a retained CLI can report exitCode=null while stdin is
+        // already closed (half-dead after a SessionEnd hook / prior SIGTERM).
+        // Failing the turn here was the whole incident. Drop the dead session
+        // and spawn fresh the way a spawn-contract change already does.
+        live.pendingReceipt = null;
+        active.delete(threadId);
+        live.turn = null;
+        closeSession(threadId, "stdin write failed");
+      } else if (live) {
+        closeSession(threadId, live.unsolicited ? "engine is running its own turn" : "spawn contract changed");
       }
-      if (live) closeSession(threadId, live.unsolicited ? "engine is running its own turn" : "spawn contract changed");
 
       // Only create a broker for a new process. A compatible retained process
       // keeps its existing proxy connection and broker across turns.
@@ -2191,7 +2199,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         killCliTree(child);
       };
       active.set(threadId, { stop, turnId, broker });
-      emit({ ...base(threadId, turnId), type: "turn.started" });
+      if (!turnStartedEmitted) emit({ ...base(threadId, turnId), type: "turn.started" });
 
       // prompt over stdin as a stream-json message — never argv (ARG_MAX).
       // stdin stays OPEN: that is what keeps the session alive for a
