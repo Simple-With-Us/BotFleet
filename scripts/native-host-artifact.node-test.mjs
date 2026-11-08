@@ -134,6 +134,32 @@ test("explicit unsigned-development mode remains nondistributable and never insp
     assert.equal(receipt.distributable, false);
   } finally { f.remove(); }
 });
+const swiftIntermediates = ["BotFleetNativeHost.build", "BotFleetNativeHost.product", "CompanionCore.build", "CompanionCore.swiftmodule", "Modules", "description.json"];
+async function packageWithBinPathEntries(entries) {
+  const root = mkdtempSync(join(tmpdir(), "bf-host-binpath-")), repo = join(root, "repo");
+  mkdirSync(repo);
+  const run = (command, args) => {
+    if (command === "git") return args.includes("rev-parse") ? source : "";
+    if (command === "/usr/bin/lipo") throw new Error("reached universal assembly");
+    if (command !== "swift" || !args.includes("--show-bin-path")) return "";
+    const arch = args[args.indexOf("--arch") + 1], binPath = join(root, `bin-${arch}`);
+    mkdirSync(binPath);
+    writeFileSync(join(binPath, "BotFleetNativeHost"), thin({ arch, stamp: identity({ distribution: "unsigned-development" }) }));
+    for (const entry of entries) mkdirSync(join(binPath, entry));
+    return `${binPath}\n`;
+  };
+  try {
+    await packageNativeHost({ repoRoot: repo, output: join(root, "artifact"), build, platform: "darwin", unsignedDevelopment: true, run });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+test("SwiftPM intermediates beside the executable do not refuse packaging", async () => {
+  await assert.rejects(packageWithBinPathEntries(swiftIntermediates), /reached universal assembly/);
+});
+for (const product of ["Host_Core.bundle", "Core.framework", "libCore.dylib"]) {
+  test(`an unpackaged ${product} product is refused before universal assembly`, async () => {
+    await assert.rejects(packageWithBinPathEntries([...swiftIntermediates, product]), /packaging refused/);
+  });
+}
 test("packaging refuses a symlinked output parent or dangling output before invoking a build", async () => {
   const root = mkdtempSync(join(tmpdir(), "bf-host-output-"));
   try {

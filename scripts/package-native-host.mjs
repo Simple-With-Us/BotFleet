@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { encodeHostIdentity, HOST_CAPABILITIES, HOST_CODE_ID, inspectHostMachO, sha256File, verifyNativeHostArtifact } from "./native-host-artifact.mjs";
 
+const UNPACKAGED_RUNTIME_PRODUCT = /\.(bundle|resources|framework|xcframework|dylib|so)$/i;
 function refused() { throw new Error("Native host packaging refused; no distributable artifact was accepted."); }
 export function runHostPackagingCommand(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...options });
@@ -81,8 +82,10 @@ export async function packageNativeHost({ repoRoot, output, build, unsignedDevel
       if (slices.length !== 1 || slices[0].arch !== arch || !slices[0].stamp?.equals(stamp)) refused();
       // This product is exactly one Mach-O binary; a changed graph producing
       // bundles, frameworks or dylibs needs explicit packaging support and is
-      // refused rather than shipped half-verified.
-      if (readdirSync(binPath).some((name) => name !== HOST_CODE_ID)) refused();
+      // refused rather than shipped half-verified.  SwiftPM keeps intermediates
+      // (*.build, Modules, description.json) in this directory, so only runtime
+      // product shapes count.
+      if (readdirSync(binPath).some((name) => UNPACKAGED_RUNTIME_PRODUCT.test(name))) refused();
       executables.push(built);
     }
     stage = "universal assembly";
