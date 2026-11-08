@@ -18,7 +18,7 @@ import { isIP } from "node:net";
 import { extname, join } from "node:path";
 
 import { z } from "zod";
-import { instanceModelsSchema } from "./instance-models.ts";
+import { InstancePatchBodySchema, InstancePatchRestoreBodySchema, instancePatchInputError } from "./instance-patch.ts";
 import { ScreenPollers } from "./screen-poller.ts";
 import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
 import { BOT_AVATAR_CROPS, botAvatarRecolorableSchema, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
@@ -415,6 +415,7 @@ import { TurnStatsTracker } from "./turn-stats.ts";
 import { ChildSessionIds } from "./child-session-ids.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
+import { isLocalModelEndpoint, ReplyWaitMinutesSchema } from "./drivers/openai-compat.ts";
 // Read-only probe for the Secrets card: whether ~/.mmx/config.json holds a
 // MiniMax key at all.  The driver's own resolver is the authority on
 // precedence; this only reports what the secret map structurally cannot see.
@@ -2401,8 +2402,23 @@ function presentInstances<T extends Parameters<typeof presentDescribedInstances>
 }
 
 function instancesPayload(described: DescribedInstance[]) {
+  const configs = instanceConfigs(cfg);
+  const instances = presentInstances(described).map((instance) => {
+    const entry = configs[instance.instanceId];
+    if (entry?.driver !== "openai-compat") return instance;
+    const config = z.object({
+      url: z.string().optional(),
+      replyWaitMinutes: ReplyWaitMinutesSchema.optional(),
+    }).safeParse(entry.config);
+    if (!config.success || !config.data.url || !isLocalModelEndpoint(config.data.url)) return instance;
+    const available = Object.assign({}, instance, { localModelWaitAvailable: true });
+    if (config.data.replyWaitMinutes !== undefined) {
+      Object.assign(available, { replyWaitMinutes: config.data.replyWaitMinutes });
+    }
+    return available;
+  });
   return {
-    instances: presentInstances(described),
+    instances,
     describedAt: registry.describedAtOf(described),
     ...(registry.describeWasStale() ? { stale: true } : {}),
   };
@@ -4514,6 +4530,7 @@ function scheduleStalledTurnRelease(
 const watchdog = new TurnWatchdog({
   stallMs: TURN_STALL_MS,
   checkMs: 60_000,
+  liveThreadIds: () => registry.instances().flatMap((instance) => instance.adapter.liveTurnThreadIds?.() ?? []),
   onSweep: () => {
     for (const instance of registry.instances()) {
       const sweep = instance.adapter.sweepStuckTurns;
@@ -18406,35 +18423,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const body = await readBody(req);
-      const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }> } = {};
-
-      if (body?.cli !== undefined) {
-        if (typeof body.cli !== "string") return json(res, 400, { error: "cli must be a string" });
-        if (/[\n\r]/.test(body.cli)) return json(res, 400, { error: "cli must not contain newlines" });
-        patchOptions.cli = body.cli;
-      }
-
-      if (body?.models !== undefined) {
-        const parsedModels = instanceModelsSchema.safeParse(body.models);
-        if (!parsedModels.success) return json(res, 400, { error: "models must contain at most 100 unique IDs with valid labels" });
-        patchOptions.models = parsedModels.data;
-      }
-
-      if (body?.fullAuto !== undefined) {
-        if (typeof body.fullAuto !== "boolean") return json(res, 400, { error: "fullAuto must be a boolean" });
-        patchOptions.fullAuto = body.fullAuto;
-      }
-
-      if (body?.enabled !== undefined) {
-        if (typeof body.enabled !== "boolean") return json(res, 400, { error: "enabled must be a boolean" });
-        patchOptions.enabled = body.enabled;
-      }
-
-      if (body?.key !== undefined) {
-        if (typeof body.key !== "string") return json(res, 400, { error: "key must be a string" });
-        if (/[\n\r]/.test(body.key)) return json(res, 400, { error: "key must not contain newlines" });
-        patchOptions.key = body.key;
-      }
 
       if (url.searchParams.get("restore") === "1") {
         if (!isLoopbackAddress(req.socket.remoteAddress) || !authorizedRuntime(harnessOwner, req.headers.authorization)) {
@@ -18447,9 +18435,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // same table the live override rides on, so a replay can never push a
         // key into an engine that has nowhere to read it from.
         const restoreKeyEnv = INSTANCE_API_KEY_ENV.get(current.driver);
-        if (!restoreKeyEnv || !body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => key !== "key") || !patchOptions.key?.trim() || patchOptions.key.length > 16_384) {
+        const restoredBody = InstancePatchRestoreBodySchema.safeParse(body);
+        const restoreKey = restoredBody.success ? restoredBody.data.key : "";
+        if (!restoreKeyEnv || !restoreKey.trim() || restoreKey.length > 16_384) {
           return json(res, 400, { error: "Invalid instance credential restore payload" });
         }
+        const patchOptions = { key: restoreKey };
         const configuredKey = current.config && typeof current.config === "object" && "key" in current.config ? current.config.key : undefined;
         if (configuredKey || current.environment?.[restoreKeyEnv]) return json(res, 200, { retained: true });
         if (!currentRuntimeReadiness(ownAdmissionActive, true).safeToRestart) return json(res, 409, { error: "Credential restoration waits for current work to finish" });
@@ -18469,6 +18460,21 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 503, { error: "Instance credential restoration could not refresh provider readiness" });
         } finally { providerConfigBusy = false; }
       }
+
+      const parsedBody = InstancePatchBodySchema.safeParse(body);
+      if (!parsedBody.success) {
+        return json(res, 400, { error: instancePatchInputError(parsedBody.error) });
+      }
+      const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null } = { ...parsedBody.data };
+
+      if (patchOptions.replyWaitMinutes !== undefined) {
+        const configured = instanceConfigs(cfg)[instancePatch[1]];
+        if (!configured) return json(res, 404, { error: `unknown instance "${instancePatch[1]}"` });
+        if (configured.driver !== "openai-compat") {
+          return json(res, 400, { error: "replyWaitMinutes is available for OpenAI-compatible servers only" });
+        }
+      }
+
       if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
       providerConfigBusy = true;
       try {
