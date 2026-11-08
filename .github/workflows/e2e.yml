@@ -69,6 +69,10 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
+      # The tv-face visual fixture plays the blue skin's real GIFs; they are
+      # git-LFS pointers without this pull (the onError chain then settles on
+      # a still and the spec's first-paint assertions fail).
+      - run: git lfs pull --include "public/tv-face/skins/blue/**"
       - uses: actions/setup-node@v7
         with:
           node-version: "26"
