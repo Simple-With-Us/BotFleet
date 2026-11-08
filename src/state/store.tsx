@@ -687,9 +687,14 @@ export interface ConfigStatus {
   infisical?: {
     configured: boolean;
     enabled: boolean;
+    /** Persisted operator toggle, independent of whether credentials are configured. */
+    enabledSetting?: boolean;
     writeThrough: boolean;
+    authMethod?: "service-token" | "machine-identity";
     environment: string;
     hasClientSecret: boolean;
+    hasToken?: boolean;
+    hasWriteToken?: boolean;
     managedCount: number;
     lastSyncAt: string | null;
     stale: boolean;
@@ -2753,7 +2758,10 @@ export interface InfisicalStatusPayload {
   infisical: {
     configured: boolean;
     enabled: boolean;
+    /** Persisted operator toggle, independent of whether credentials are configured. */
+    enabledSetting?: boolean;
     writeThrough: boolean;
+    authMethod: "service-token" | "machine-identity";
     source: "env" | "config" | "none";
     siteUrl: string | null;
     projectId: string | null;
@@ -2761,6 +2769,8 @@ export interface InfisicalStatusPayload {
     secretPath: string;
     hasClientId: boolean;
     hasClientSecret: boolean;
+    hasToken: boolean;
+    hasWriteToken: boolean;
     refreshMinutes: number;
     lastSyncAt: string | null;
     lastAttemptAt: string | null;
@@ -2773,7 +2783,20 @@ export interface InfisicalStatusPayload {
     appliedCount: number;
     appliedFields: string[];
     unusedVaultNames: string[];
-    readSources?: Array<{ name: string; projectId: string; environment: string; secretPath: string; ok: boolean; error: string | null }>;
+    readSources?: Array<{
+      name: string;
+      projectId: string;
+      environment: string;
+      secretPath: string;
+      tokenFile?: string;
+      tokenEnv?: string;
+      writeTokenFile?: string;
+      writeTokenEnv?: string;
+      hasReadToken: boolean;
+      hasWriteToken: boolean;
+      ok: boolean;
+      error: string | null;
+    }>;
   };
   fields: SecretFieldRow[];
 }
