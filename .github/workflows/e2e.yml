@@ -81,14 +81,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec vite build
       - run: pnpm exec playwright install --with-deps chromium
-      - run: pnpm exec playwright test --update-snapshots=changed
-      - name: Upload regenerated snapshots
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: regenerated-snapshots
-          path: tests/e2e/**/*.png
-          retention-days: 7
+      - run: pnpm exec playwright test
       - name: Upload screenshot diffs on failure
         if: failure()
         uses: actions/upload-artifact@v7
