@@ -39,10 +39,9 @@ PY
   echo "::error title=post-sync tf-ready::failed to read BotFleet app metadata from ${FLEET_DIR}/apps.json"
   exit 1
 fi
-mapfile -t _APP_META <<<"$_APP_META_RAW"
-BUNDLE_ID="${_APP_META[0]:-}"
-MARKETING="${_APP_META[1]:-}"
-APPLE_ID="${_APP_META[2]:-}"
+BUNDLE_ID="$(printf '%s\n' "$_APP_META_RAW" | sed -n '1p')"
+MARKETING="$(printf '%s\n' "$_APP_META_RAW" | sed -n '2p')"
+APPLE_ID="$(printf '%s\n' "$_APP_META_RAW" | sed -n '3p')"
 if [[ -z "$BUNDLE_ID" || -z "$MARKETING" || -z "$APPLE_ID" ]]; then
   echo "::error title=post-sync tf-ready::incomplete BotFleet app metadata (bundle, marketing, or apple id)"
   exit 1

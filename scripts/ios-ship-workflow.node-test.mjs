@@ -948,7 +948,6 @@ test("standing-tester sync is followed by a post-sync ensure-tf-ready summary st
   assert.match(postStep, /steps\.ship\.outputs\.uploaded == 'true'/);
   assert.match(yml, /iOS ship summary \(TestFlight readiness after sync\)/);
   const postSh = read("scripts/ios-post-sync-tf-ready.sh");
-  assert.match(postSh, /mapfile -t _APP_META/);
   assert.match(postSh, /failed to read BotFleet app metadata/);
   assert.match(postSh, /incomplete BotFleet app metadata/);
   assert.doesNotMatch(postSh, /GITHUB_STEP_SUMMARY/);
@@ -1019,6 +1018,13 @@ test("ios-observe-ship matches upload markers after a large log tail", () => {
     rmSync(fakeShip, { force: true });
     rmSync(outFile, { force: true });
   }
+});
+
+test("post-sync tf-ready avoids bash 4+ syntax (mapfile, readarray, associative arrays)", () => {
+  const postSh = read("scripts/ios-post-sync-tf-ready.sh");
+  assert.doesNotMatch(postSh, /\bmapfile\b/);
+  assert.doesNotMatch(postSh, /\breadarray\b/);
+  assert.doesNotMatch(postSh, /declare -A/);
 });
 
 test("post-sync tf-ready fails fast when apps.json metadata is incomplete", () => {
