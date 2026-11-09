@@ -960,7 +960,7 @@ test("ios-observe-ship marks gate-skip as not uploaded", async () => {
   const outFile = join(ROOT, "scripts", ".tmp-github-output.txt");
   writeFileSync(
     fakeShip,
-    '#!/bin/sh\necho "ship-gate: exiting 0 before any build number is consumed (sequence untouched)"\nexit 0\n',
+    '#!/bin/sh\necho "[ios-ship] ship-gate: exiting 0 before any build number is consumed (sequence untouched)"\nexit 0\n',
     { mode: 0o755 },
   );
   try {
@@ -1002,7 +1002,7 @@ test("ios-observe-ship matches upload markers after a large log tail", () => {
   const outFile = join(ROOT, "scripts", ".tmp-github-output-biglog.txt");
   writeFileSync(
     fakeShip,
-    '#!/bin/sh\nfor i in $(seq 1 8000); do echo "noise line $i padding"; done\necho "upload submitted; watch TestFlight processing"\nexit 0\n',
+    '#!/bin/sh\nfor i in $(seq 1 8000); do echo "noise line $i padding"; done\necho "[ios-ship] upload submitted; watch TestFlight processing for app.botfleet.ios build 202501011201"\nexit 0\n',
     { mode: 0o755 },
   );
   try {
@@ -1017,6 +1017,61 @@ test("ios-observe-ship matches upload markers after a large log tail", () => {
   } finally {
     rmSync(fakeShip, { force: true });
     rmSync(outFile, { force: true });
+  }
+});
+
+test("ios-observe-ship upload/skip regexes match ship-testflight.sh log() output", () => {
+  const observe = read("scripts/ios-observe-ship.mjs");
+  assert.doesNotMatch(observe, /const uploadedRe =[^\n]*\^/);
+  assert.doesNotMatch(observe, /const skippedRe =[^\n]*\^/);
+  const ship = read("scripts/ios-fleet/ship-testflight.sh");
+  assert.match(ship, /log\(\) \{ echo "\[ios-ship\] \$\*"; \}/);
+  const cases = [
+    { line: "[ios-ship] upload path succeeded via xcodebuild export (destination=upload)", wantUpload: true },
+    {
+      line: "[ios-ship] build 1.0.5 (202501011201) submitted for app.botfleet.ios",
+      wantUpload: true,
+    },
+    {
+      line: "[ios-ship] upload submitted; watch TestFlight processing for app.botfleet.ios build 202501011201",
+      wantUpload: true,
+    },
+    {
+      line: "[ios-ship] ship-gate: exiting 0 before any build number is consumed (sequence untouched)",
+      wantSkip: true,
+    },
+  ];
+  try {
+    for (const { line, wantUpload, wantSkip } of cases) {
+      const fake = join(ROOT, "scripts", ".tmp-prefixed-ship.sh");
+      const outFile = join(ROOT, "scripts", `.tmp-github-output-prefixed-${wantUpload ? "up" : "skip"}.txt`);
+      writeFileSync(
+        fake,
+        `#!/bin/sh
+cat <<'EOF'
+${line}
+EOF
+exit 0
+`,
+        { mode: 0o755 },
+      );
+      const r = spawnSync("node", ["scripts/ios-observe-ship.mjs", "sh", fake], {
+        cwd: ROOT,
+        env: { ...process.env, GITHUB_OUTPUT: outFile },
+      });
+      assert.equal(r.status, 0, line);
+      const out = readFileSync(outFile, "utf8");
+      if (wantUpload) {
+        assert.match(out, /uploaded=true/, line);
+      } else if (wantSkip) {
+        assert.match(out, /uploaded=false/, line);
+        assert.match(out, /ship_observed=skipped/, line);
+      }
+      rmSync(fake, { force: true });
+      rmSync(outFile, { force: true });
+    }
+  } finally {
+    rmSync(join(ROOT, "scripts", ".tmp-prefixed-ship.sh"), { force: true });
   }
 });
 
