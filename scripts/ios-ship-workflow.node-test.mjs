@@ -949,6 +949,8 @@ test("standing-tester sync is followed by a post-sync ensure-tf-ready summary st
   assert.match(yml, /iOS ship summary \(TestFlight readiness after sync\)/);
   const postSh = read("scripts/ios-post-sync-tf-ready.sh");
   assert.match(postSh, /mapfile -t _APP_META/);
+  assert.match(postSh, /failed to read BotFleet app metadata/);
+  assert.match(postSh, /incomplete BotFleet app metadata/);
   assert.doesNotMatch(postSh, /GITHUB_STEP_SUMMARY/);
   assert.match(yml, /IOS_DEFER_SENTRY_RECEIPT/);
   assert.match(yml, /steps\.post_sync_tf\.outputs\.sentry_receipt/);
@@ -971,9 +973,68 @@ test("ios-observe-ship marks gate-skip as not uploaded", async () => {
     const out = readFileSync(outFile, "utf8");
     assert.match(out, /uploaded=false/);
     assert.match(out, /ship_observed=skipped/);
+    assert.match(out, /ship_exit_code=0/);
   } finally {
     rmSync(fakeShip, { force: true });
     rmSync(outFile, { force: true });
+  }
+});
+
+test("ios-observe-ship spawn failure writes uploaded=false and nonzero exit code", () => {
+  const outFile = join(ROOT, "scripts", ".tmp-github-output-spawn.txt");
+  try {
+    const r = spawnSync(
+      "node",
+      ["scripts/ios-observe-ship.mjs", "/no/such/ios-observe-ship-binary"],
+      { cwd: ROOT, env: { ...process.env, GITHUB_OUTPUT: outFile } },
+    );
+    assert.notEqual(r.status, 0);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /uploaded=false/);
+    assert.match(out, /ship_observed=spawn_error/);
+    assert.match(out, /ship_exit_code=1/);
+  } finally {
+    rmSync(outFile, { force: true });
+  }
+});
+
+test("ios-observe-ship matches upload markers after a large log tail", () => {
+  const fakeShip = join(ROOT, "scripts", ".tmp-big-log-ship.sh");
+  const outFile = join(ROOT, "scripts", ".tmp-github-output-biglog.txt");
+  writeFileSync(
+    fakeShip,
+    '#!/bin/sh\nfor i in $(seq 1 8000); do echo "noise line $i padding"; done\necho "upload submitted; watch TestFlight processing"\nexit 0\n',
+    { mode: 0o755 },
+  );
+  try {
+    const r = spawnSync("node", ["scripts/ios-observe-ship.mjs", "sh", fakeShip], {
+      cwd: ROOT,
+      env: { ...process.env, GITHUB_OUTPUT: outFile },
+    });
+    assert.equal(r.status, 0);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /uploaded=true/);
+    assert.match(out, /ship_observed=uploaded/);
+  } finally {
+    rmSync(fakeShip, { force: true });
+    rmSync(outFile, { force: true });
+  }
+});
+
+test("post-sync tf-ready fails fast when apps.json metadata is incomplete", () => {
+  const appsPath = join(ROOT, "scripts/ios-fleet/apps.json");
+  const saved = readFileSync(appsPath, "utf8");
+  writeFileSync(appsPath, JSON.stringify({ apps: { botfleet: { bundleId: "" } } }));
+  try {
+    const r = spawnSync("bash", ["scripts/ios-post-sync-tf-ready.sh", "202501011201"], {
+      cwd: ROOT,
+      encoding: "utf8",
+    });
+    assert.notEqual(r.status, 0);
+    const combined = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    assert.match(combined, /post-sync tf-ready/);
+  } finally {
+    writeFileSync(appsPath, saved);
   }
 });
 

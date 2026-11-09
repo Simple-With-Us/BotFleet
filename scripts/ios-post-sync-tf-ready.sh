@@ -12,18 +12,41 @@ FLEET_DIR="${ROOT}/scripts/ios-fleet"
 # shellcheck source=scripts/ios-fleet/tf-ready-rc.sh
 source "${FLEET_DIR}/tf-ready-rc.sh"
 
-mapfile -t _APP_META < <(python3 - "${FLEET_DIR}/apps.json" <<'PY'
+if ! _APP_META_RAW="$(
+  python3 - "${FLEET_DIR}/apps.json" <<'PY'
 import json, sys
-app = json.load(open(sys.argv[1]))["apps"]["botfleet"]
-marketing = app.get("fixedMarketingVersion") or app.get("marketingVersionDefault") or "0.1.0"
-print(app["bundleId"])
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+apps = data.get("apps") or {}
+app = apps.get("botfleet")
+if not isinstance(app, dict):
+    raise SystemExit(f"missing apps.botfleet in {path}")
+bundle = app.get("bundleId")
+apple_id = app.get("appleId")
+marketing = app.get("fixedMarketingVersion") or app.get("marketingVersionDefault") or ""
+if not bundle or not str(bundle).strip():
+    raise SystemExit("missing bundleId")
+if apple_id is None or str(apple_id).strip() == "":
+    raise SystemExit("missing appleId")
+if not str(marketing).strip():
+    raise SystemExit("missing marketing version")
+print(bundle)
 print(marketing)
-print(app["appleId"])
+print(apple_id)
 PY
-)
+)"; then
+  echo "::error title=post-sync tf-ready::failed to read BotFleet app metadata from ${FLEET_DIR}/apps.json"
+  exit 1
+fi
+mapfile -t _APP_META <<<"$_APP_META_RAW"
 BUNDLE_ID="${_APP_META[0]:-}"
 MARKETING="${_APP_META[1]:-}"
 APPLE_ID="${_APP_META[2]:-}"
+if [[ -z "$BUNDLE_ID" || -z "$MARKETING" || -z "$APPLE_ID" ]]; then
+  echo "::error title=post-sync tf-ready::incomplete BotFleet app metadata (bundle, marketing, or apple id)"
+  exit 1
+fi
 
 [[ "$BUILD_NUM" =~ ^[1-9][0-9]{11}$ ]] || {
   echo "::error::post-sync tf-ready: build '${BUILD_NUM}' is not a 12-digit merge-stamp build"
