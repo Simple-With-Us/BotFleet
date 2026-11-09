@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { JsonValue } from "./schema.ts";
 import {
+  githubHeadStateKey,
   githubPrStateKey,
   PR_STATE_DEDUPE_MS,
   shouldIgnoreWebhookEvent,
@@ -2215,5 +2216,92 @@ describe("GitHub PR state dedupe for classify wakes", () => {
 
     manager.update(webhook.id, { enabled: false });
     expect(manager.isEventIgnoredAtEdge(webhook.endpointId, "workflow_run")).toBe(false);
+  });
+});
+
+describe("GitHub head state dedupe for Compile gates", () => {
+  const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet", default_branch: "main" };
+  const HEAD_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const HEAD_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const compileGates = {
+    name: "Compile gates GitHub",
+    prompt: "You are Compiler. Watch failed workflow_run events on main.",
+    botId: "compiler-1",
+  };
+  const workflowEvent = (
+    deliveryId: string,
+    overrides?: { headSha?: string; conclusion?: string; name?: string },
+  ) => ({
+    eventName: "workflow_run",
+    deliveryId,
+    payload: {
+      action: "completed",
+      repository,
+      workflow_run: {
+        head_sha: overrides?.headSha ?? HEAD_A,
+        conclusion: overrides?.conclusion ?? "failure",
+        status: "completed",
+        name: overrides?.name ?? "test",
+        head_branch: "main",
+      },
+    },
+  });
+
+  it("builds a head state key without a pull request number", () => {
+    const key = githubHeadStateKey(workflowEvent("k1"));
+    expect(key).toBe(
+      `head|Simple-With-Us/BotFleet|${HEAD_A}|workflow_run|completed|failure`,
+    );
+    expect(githubPrStateKey(workflowEvent("k1"))).toBeUndefined();
+  });
+
+  it("ignores a second Compile gates delivery for the same failed head", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...compileGates });
+    const first = h.manager.receive(webhook.endpointId, secret, workflowEvent("cg-1"));
+    expect(first).toMatchObject({ duplicate: false, runId: "run-1" });
+    expect(first.ignored).toBeUndefined();
+
+    const second = h.manager.receive(
+      webhook.endpointId,
+      secret,
+      workflowEvent("cg-2", { name: "lint" }),
+    );
+    expect(second).toEqual({ deliveryId: "cg-2", duplicate: false, ignored: true });
+    expect(h.queued).toHaveLength(1);
+    expect(h.manager.listAttempts().at(-1)).toMatchObject({
+      outcome: "ignored",
+      reason: `GitHub head state already handled: workflow_run completed on Simple-With-Us/BotFleet at ${HEAD_A.slice(0, 7)} (run run-1)`,
+    });
+  });
+
+  it("accepts a new head SHA for Compile gates", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...compileGates });
+    expect(h.manager.receive(webhook.endpointId, secret, workflowEvent("cg-head-1")).runId).toBe(
+      "run-1",
+    );
+    const second = h.manager.receive(
+      webhook.endpointId,
+      secret,
+      workflowEvent("cg-head-2", { headSha: HEAD_B }),
+    );
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("does not dedupe a non-compile trigger on head state", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({
+      name: "Release notes",
+      prompt: "Draft release notes for the pull request.",
+      botId: "maus-1",
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, workflowEvent("rel-1")).runId).toBe("run-1");
+    const second = h.manager.receive(webhook.endpointId, secret, workflowEvent("rel-2"));
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
   });
 });
