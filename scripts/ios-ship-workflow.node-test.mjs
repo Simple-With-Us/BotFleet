@@ -1020,11 +1020,36 @@ test("ios-observe-ship matches upload markers after a large log tail", () => {
   }
 });
 
-test("ios-observe-ship feedLog scans only the rolling window (no per-line double pass)", () => {
+test("ios-observe-ship keeps separate rolling tails for stdout and stderr", () => {
   const src = read("scripts/ios-observe-ship.mjs");
-  const feedBody = src.slice(src.indexOf("function feedLog"), src.indexOf("function writeShipOutputs"));
-  assert.doesNotMatch(feedBody, /\.split\("\\n"\)/);
-  assert.match(feedBody, /const window = tail \+ text/);
+  assert.match(src, /function createStreamFeeder/);
+  assert.match(src, /const stdoutFeed = createStreamFeeder/);
+  assert.match(src, /const stderrFeed = createStreamFeeder/);
+  const feeder = src.slice(src.indexOf("function createStreamFeeder"), src.indexOf("function writeShipOutputs"));
+  assert.doesNotMatch(feeder, /\.split\("\\n"\)/);
+  assert.match(feeder, /const window = tail \+ text/);
+});
+
+test("ios-observe-ship does not match upload marker stitched across stdout and stderr", () => {
+  const fakeShip = join(ROOT, "scripts", ".tmp-cross-stream-ship.sh");
+  const outFile = join(ROOT, "scripts", ".tmp-github-output-cross-stream.txt");
+  writeFileSync(
+    fakeShip,
+    "#!/bin/sh\nprintf 'upload submit'\nprintf 'ted; watch TestFlight processing' >&2\nexit 0\n",
+    { mode: 0o755 },
+  );
+  try {
+    const r = spawnSync("node", ["scripts/ios-observe-ship.mjs", "sh", fakeShip], {
+      cwd: ROOT,
+      env: { ...process.env, GITHUB_OUTPUT: outFile },
+    });
+    assert.equal(r.status, 0);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /uploaded=false/);
+  } finally {
+    rmSync(fakeShip, { force: true });
+    rmSync(outFile, { force: true });
+  }
 });
 
 test("post-sync tf-ready avoids bash 4+ syntax (mapfile, readarray, associative arrays)", () => {

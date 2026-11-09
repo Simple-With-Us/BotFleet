@@ -21,22 +21,35 @@ if (cmd.length === 0) {
 
 const outputs = process.env.GITHUB_OUTPUT?.trim();
 
-let uploadedSeen = false;
-let skippedSeen = false;
 let spawnErrored = false;
-let tail = "";
 
-/** @param {string} text */
-function feedLog(text) {
-  const window = tail + text;
-  if (!uploadedSeen && uploadedRe.test(window)) {
-    uploadedSeen = true;
-  }
-  if (!skippedSeen && skippedRe.test(window)) {
-    skippedSeen = true;
-  }
-  tail = window.slice(-MAX_TAIL);
+/** @returns {{ feed: (text: string) => void; uploadedSeen: boolean; skippedSeen: boolean }} */
+function createStreamFeeder() {
+  let tail = "";
+  let uploadedSeen = false;
+  let skippedSeen = false;
+  return {
+    feed(text) {
+      const window = tail + text;
+      if (!uploadedSeen && uploadedRe.test(window)) {
+        uploadedSeen = true;
+      }
+      if (!skippedSeen && skippedRe.test(window)) {
+        skippedSeen = true;
+      }
+      tail = window.slice(-MAX_TAIL);
+    },
+    get uploadedSeen() {
+      return uploadedSeen;
+    },
+    get skippedSeen() {
+      return skippedSeen;
+    },
+  };
 }
+
+const stdoutFeed = createStreamFeeder();
+const stderrFeed = createStreamFeeder();
 
 /** @param {{ uploaded: boolean; observed: string; exitCode: number }} arg */
 function writeShipOutputs({ uploaded, observed, exitCode }) {
@@ -54,11 +67,11 @@ const child = spawn(cmd[0], cmd.slice(1), {
 });
 
 child.stdout.on("data", (chunk) => {
-  feedLog(chunk.toString());
+  stdoutFeed.feed(chunk.toString());
   process.stdout.write(chunk);
 });
 child.stderr.on("data", (chunk) => {
-  feedLog(chunk.toString());
+  stderrFeed.feed(chunk.toString());
   process.stderr.write(chunk);
 });
 
@@ -75,7 +88,7 @@ const exitPromise = new Promise((resolve) => {
     spawnErrored = true;
     const msg = `ios-observe-ship: spawn error: ${err?.message ?? err}\n`;
     process.stderr.write(msg);
-    feedLog(msg);
+    stderrFeed.feed(msg);
     finish({ code: 1, signal: null });
   });
   child.on("close", (code, signal) => {
@@ -84,6 +97,9 @@ const exitPromise = new Promise((resolve) => {
 });
 
 const { code } = await exitPromise;
+
+const uploadedSeen = stdoutFeed.uploadedSeen || stderrFeed.uploadedSeen;
+const skippedSeen = stdoutFeed.skippedSeen || stderrFeed.skippedSeen;
 
 const uploaded = uploadedSeen;
 const skipped = skippedSeen;
