@@ -59,10 +59,13 @@ export function isCompileGatesWake(input: {
   const name = input.name ?? "";
   const instructions = input.instructions ?? "";
   const id = input.id ?? "";
+  // Name/id use the compile-gates phrase.  Instructions stay on the narrow
+  // "own compile gates" / "bf-compiler" forms so an unrelated webhook whose
+  // prompt merely mentions compile gates does not inherit the pre-filter or
+  // head-SHA dedupe (same shape as the previous inline pre-filter).
   return (
     COMPILE_GATES.test(name) ||
     COMPILE_GATES.test(id) ||
-    COMPILE_GATES.test(instructions) ||
     COMPILE_GATES_PROMPT.test(instructions)
   );
 }

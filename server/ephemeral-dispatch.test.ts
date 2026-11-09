@@ -110,6 +110,10 @@ describe("isCompileGatesWake", () => {
       name: "Housekeeper",
       instructions: "Clean regenerable caches when disk is high.",
     })).toBe(false);
+    expect(isCompileGatesWake({
+      name: "Status digest",
+      instructions: "Summarize whether compile gates are green today.",
+    })).toBe(false);
   });
 });
 
