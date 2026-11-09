@@ -8,8 +8,17 @@ set -euo pipefail
 BUILD_NUM="${1:?12-digit CFBundleVersion}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# IOS_FLEET_DIR is for isolated unit tests only; hosted ios-ship uses the in-repo fleet.
-FLEET_DIR="${IOS_FLEET_DIR:-${ROOT}/scripts/ios-fleet}"
+DEFAULT_FLEET_DIR="${ROOT}/scripts/ios-fleet"
+FLEET_DIR="$DEFAULT_FLEET_DIR"
+if [[ -n "${IOS_FLEET_DIR:-}" && "${GITHUB_ACTIONS:-}" != "true" && "${IOS_POST_SYNC_TEST_MODE:-}" == "1" ]]; then
+  _fleet_candidate="${IOS_FLEET_DIR}"
+  if [[ -d "$_fleet_candidate" && -f "$_fleet_candidate/apps.json" && -f "$_fleet_candidate/tf-ready-rc.sh" ]]; then
+    FLEET_DIR="$_fleet_candidate"
+  else
+    echo "::error title=post-sync tf-ready::IOS_FLEET_DIR must be a directory containing apps.json and tf-ready-rc.sh"
+    exit 1
+  fi
+fi
 # shellcheck source=scripts/ios-fleet/tf-ready-rc.sh
 source "${FLEET_DIR}/tf-ready-rc.sh"
 

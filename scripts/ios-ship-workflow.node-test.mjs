@@ -950,7 +950,8 @@ test("standing-tester sync is followed by a post-sync ensure-tf-ready summary st
   const postSh = read("scripts/ios-post-sync-tf-ready.sh");
   assert.match(postSh, /failed to read BotFleet app metadata/);
   assert.match(postSh, /incomplete BotFleet app metadata/);
-  assert.match(postSh, /IOS_FLEET_DIR/);
+  assert.match(postSh, /IOS_POST_SYNC_TEST_MODE/);
+  assert.match(postSh, /GITHUB_ACTIONS/);
   assert.doesNotMatch(postSh, /GITHUB_STEP_SUMMARY/);
   assert.match(yml, /IOS_DEFER_SENTRY_RECEIPT/);
   assert.match(yml, /steps\.post_sync_tf\.outputs\.sentry_receipt/);
@@ -1021,10 +1022,22 @@ test("ios-observe-ship matches upload markers after a large log tail", () => {
   }
 });
 
+function observeRegexDecl(source, name) {
+  const start = source.indexOf(`const ${name} =`);
+  assert.ok(start >= 0, name);
+  const end = source.indexOf(";", start);
+  assert.ok(end > start, name);
+  return source.slice(start, end + 1);
+}
+
 test("ios-observe-ship upload/skip regexes match ship-testflight.sh log() output", () => {
   const observe = read("scripts/ios-observe-ship.mjs");
-  assert.doesNotMatch(observe, /const uploadedRe =[^\n]*\^/);
-  assert.doesNotMatch(observe, /const skippedRe =[^\n]*\^/);
+  const uploadedDecl = observeRegexDecl(observe, "uploadedRe");
+  const skippedDecl = observeRegexDecl(observe, "skippedRe");
+  for (const decl of [uploadedDecl, skippedDecl]) {
+    assert.doesNotMatch(decl, /\/(?:\\.|[^/])*\^/);
+    assert.match(decl, /\\\[ios-ship\\\]/);
+  }
   const ship = read("scripts/ios-fleet/ship-testflight.sh");
   assert.match(ship, /log\(\) \{ echo "\[ios-ship\] \$\*"; \}/);
   const cases = [
@@ -1073,6 +1086,28 @@ exit 0
     }
   } finally {
     rmSync(join(ROOT, "scripts", ".tmp-prefixed-ship.sh"), { force: true });
+  }
+});
+
+test("ios-observe-ship ignores bare upload markers without [ios-ship] log prefix", () => {
+  const fakeShip = join(ROOT, "scripts", ".tmp-bare-marker-ship.sh");
+  const outFile = join(ROOT, "scripts", ".tmp-github-output-bare.txt");
+  writeFileSync(
+    fakeShip,
+    "#!/bin/sh\ncat <<'EOF'\nupload submitted; watch TestFlight processing for app.botfleet.ios build 202501011201\nEOF\nexit 0\n",
+    { mode: 0o755 },
+  );
+  try {
+    const r = spawnSync("node", ["scripts/ios-observe-ship.mjs", "sh", fakeShip], {
+      cwd: ROOT,
+      env: { ...process.env, GITHUB_OUTPUT: outFile },
+    });
+    assert.equal(r.status, 0);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /uploaded=false/);
+  } finally {
+    rmSync(fakeShip, { force: true });
+    rmSync(outFile, { force: true });
   }
 });
 
@@ -1125,7 +1160,12 @@ test("post-sync tf-ready fails fast when apps.json metadata is incomplete", () =
     const r = spawnSync("bash", ["scripts/ios-post-sync-tf-ready.sh", "202501011201"], {
       cwd: ROOT,
       encoding: "utf8",
-      env: { ...process.env, IOS_FLEET_DIR: fleetDir },
+      env: {
+        ...process.env,
+        IOS_FLEET_DIR: fleetDir,
+        IOS_POST_SYNC_TEST_MODE: "1",
+        GITHUB_ACTIONS: "",
+      },
     });
     assert.notEqual(r.status, 0);
     const combined = `${r.stdout ?? ""}${r.stderr ?? ""}`;

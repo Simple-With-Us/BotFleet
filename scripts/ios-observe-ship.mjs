@@ -6,11 +6,11 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 
-// Substring match (not line-anchored): ship-testflight.sh log() prefixes "[ios-ship] ".
+// Require ship-testflight.sh log() prefix so xcodebuild/altool noise cannot match.
 const uploadedRe =
-  /upload path succeeded via xcodebuild export \(destination=upload\)|build .+ submitted for |upload submitted; watch TestFlight processing/;
+  /\[ios-ship\] upload path succeeded via xcodebuild export \(destination=upload\)|\[ios-ship\] build .+ submitted for |\[ios-ship\] upload submitted; watch TestFlight processing/;
 const skippedRe =
-  /ship-gate: exiting 0 before any build number is consumed \(sequence untouched\)/;
+  /\[ios-ship\] ship-gate: exiting 0 before any build number is consumed \(sequence untouched\)/;
 
 const MAX_TAIL = 8192;
 
