@@ -7,7 +7,7 @@ import { z } from "zod";
 import { writeFileAtomic } from "./atomic.ts";
 import { extractRequestMetadata, type WebhookRequestMetadata } from "./request-log.ts";
 import { DATA_DIR } from "./config.ts";
-import { isClassifyOrUiPassWake, isUiPassWake } from "./ephemeral-dispatch.ts";
+import { isClassifyOrUiPassWake, isCompileGatesWake, isUiPassWake } from "./ephemeral-dispatch.ts";
 import type { RoutineRunOn } from "./routines.ts";
 import { parseJson, schemaIssue, type JsonValue } from "./schema.ts";
 import {
@@ -849,8 +849,7 @@ export function shouldIgnoreWebhookEvent(
   }
 
   // 2. GitHub Compile Gates Pre-Filter (only applies to verified GitHub payloads)
-  const isCompileGatesTrigger =
-    /\bcompile[\s-]*gates?\b/i.test(name) || /\b(?:own compile gates|bf-compiler)\b/i.test(prompt);
+  const isCompileGatesTrigger = isCompileGatesWake({ name, instructions: prompt, id: trigger.id });
   if (isCompileGatesTrigger && isGithubWebhookPayload(payload)) {
     const eventName = event.eventName;
     const root = asRecord(payload);
@@ -1365,6 +1364,50 @@ export function githubPrStateKey(event: WebhookEvent): string | undefined {
   return githubPrStateParts(event)?.key;
 }
 
+/** A stable key for one GitHub head SHA state that does not require a pull
+ *  request number.  Compile gates mostly see default-branch `workflow_run`
+ *  failures, which often carry no `pull_requests` array, so the PR-state key
+ *  never arms for them. */
+export function githubHeadStateKey(event: WebhookEvent): string | undefined {
+  if (!isGithubWebhookPayload(event.payload)) return undefined;
+  const root = asRecord(event.payload);
+  if (!root) return undefined;
+  const repo = pickStr(asRecord(root.repository), "full_name");
+  if (!repo) return undefined;
+  const pullRequest = asRecord(root.pull_request);
+  const headSha =
+    pickStr(asRecord(pullRequest?.head), "sha") ??
+    pickStr(asRecord(root.check_run), "head_sha") ??
+    pickStr(asRecord(root.check_suite), "head_sha") ??
+    pickStr(asRecord(root.workflow_run), "head_sha") ??
+    pickStr(root, "sha");
+  if (!headSha) return undefined;
+  const eventName = event.eventName ?? "";
+  const action = pickStr(root, "action") ?? "";
+  const parts: string[] = [`head`, repo, headSha, eventName, action];
+  if (eventName === "check_run" || eventName === "check_suite" || eventName === "workflow_run") {
+    parts.push(pickStr(asRecord(root[eventName]), "conclusion") ?? "");
+  }
+  return parts.join("|");
+}
+
+/** Which GitHub state key, if any, this trigger uses for ingress dedupe. */
+export function webhookGithubStateDedupeKey(
+  trigger: { name: string; prompt: string; id?: string },
+  event: WebhookEvent,
+): { key: string; kind: "pr" | "head" } | undefined {
+  const meta = { name: trigger.name, instructions: trigger.prompt, id: trigger.id };
+  if (isClassifyOrUiPassWake(meta)) {
+    const key = githubPrStateKey(event);
+    return key ? { key, kind: "pr" } : undefined;
+  }
+  if (isCompileGatesWake(meta)) {
+    const key = githubHeadStateKey(event);
+    return key ? { key, kind: "head" } : undefined;
+  }
+  return undefined;
+}
+
 /** The one decision every per-trigger filter makes, in one pure function so
  *  it can be tested without a delivery.  A filter that is not set never
  *  ignores anything. */
@@ -1769,13 +1812,12 @@ export class WebhookManager {
 
     const now = this.now();
 
-    // A classify wake for a PR state already handled in the window is
-    // ignored here, before rate limiting.  Other triggers still run for
-    // every delivery.
-    const prStateKey = isClassifyOrUiPassWake({ name: trigger.name, instructions: trigger.prompt, id: trigger.id })
-      ? githubPrStateKey(event)
-      : undefined;
-    if (prStateKey) {
+    // A classify/UI-pass or Compile gates wake for a GitHub state already
+    // handled in the window is ignored here, before rate limiting.  Other
+    // triggers still run for every delivery.
+    const stateDedupe = webhookGithubStateDedupeKey(trigger, event);
+    const prStateKey = stateDedupe?.key;
+    if (prStateKey && stateDedupe) {
       const prior = this.deliveries.find(
         (delivery) =>
           delivery.key.startsWith(`${trigger.endpointId}:`) &&
@@ -1785,13 +1827,17 @@ export class WebhookManager {
       );
       if (prior) {
         const deliveryId = requestedDeliveryId || randomUUID();
-        const [repo, prNumber, headSha, eventName, action] = prStateKey.split("|");
-        this.recordIgnoredAttempt(
-          trigger,
-          event,
-          deliveryId,
-          `GitHub PR state already handled: ${eventName || "unknown"} ${action || "unknown"} on ${repo}#${prNumber} at ${(headSha ?? "").slice(0, 7)} (run ${prior.runId})`,
-        );
+        const reason =
+          stateDedupe.kind === "head"
+            ? (() => {
+                const [, repo, headSha, eventName, action] = prStateKey.split("|");
+                return `GitHub head state already handled: ${eventName || "unknown"} ${action || "unknown"} on ${repo} at ${(headSha ?? "").slice(0, 7)} (run ${prior.runId})`;
+              })()
+            : (() => {
+                const [repo, prNumber, headSha, eventName, action] = prStateKey.split("|");
+                return `GitHub PR state already handled: ${eventName || "unknown"} ${action || "unknown"} on ${repo}#${prNumber} at ${(headSha ?? "").slice(0, 7)} (run ${prior.runId})`;
+              })();
+        this.recordIgnoredAttempt(trigger, event, deliveryId, reason);
         return { deliveryId, duplicate: false, ignored: true };
       }
     }
@@ -1819,8 +1865,9 @@ export class WebhookManager {
       deliveryId,
       receivedAt: now,
     });
-    // Only classify wakes store a stateKey.  A cancelled run did not
-    // handle the state, so it stores none either.  A later delivery for the same state can still run.
+    // Only classify/UI-pass and Compile gates wakes store a stateKey.  A
+    // cancelled run did not handle the state, so it stores none either.  A
+    // later delivery for the same state can still run.
     const receipt: DeliveryReceipt = { key: `${trigger.endpointId}:${deliveryId}`, runId: run.id, at: now };
     if (prStateKey && run.status !== "cancelled") receipt.stateKey = prStateKey;
     this.deliveries.push(receipt);

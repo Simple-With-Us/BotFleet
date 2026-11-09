@@ -5,6 +5,7 @@ import {
   ephemeralPromptSections,
   formatEphemeralResultMessage,
   isClassifyOrUiPassWake,
+  isCompileGatesWake,
   SCHEDULE_ZULIP_POST_NOTE,
   scheduleAutomationNote,
   stripEphemeralToolPrefix,
@@ -81,6 +82,31 @@ describe("isClassifyOrUiPassWake", () => {
       instructions: "Watch check runs",
     })).toBe(false);
     expect(isClassifyOrUiPassWake({
+      name: "Housekeeper",
+      instructions: "Clean regenerable caches when disk is high.",
+    })).toBe(false);
+  });
+});
+
+describe("isCompileGatesWake", () => {
+  it("flags Compile gates by name, id, or saved instructions", () => {
+    expect(isCompileGatesWake({ name: "Compile gates GitHub" })).toBe(true);
+    expect(isCompileGatesWake({ name: "compile-gates" })).toBe(true);
+    expect(isCompileGatesWake({ id: "compile-gates-main" })).toBe(true);
+    expect(isCompileGatesWake({
+      name: "CI watcher",
+      instructions: "You own compile gates for the fleet.",
+    })).toBe(true);
+    expect(isCompileGatesWake({
+      name: "CI watcher",
+      instructions: "You are BF-COMPILER for failed checks.",
+    })).toBe(true);
+  });
+
+  it("does not flag UI Pass or ordinary triggers", () => {
+    expect(isCompileGatesWake({ name: "GitHub UI Pass" })).toBe(false);
+    expect(isCompileGatesWake({ name: "Designer classify" })).toBe(false);
+    expect(isCompileGatesWake({
       name: "Housekeeper",
       instructions: "Clean regenerable caches when disk is high.",
     })).toBe(false);
