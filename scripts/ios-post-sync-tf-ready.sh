@@ -8,7 +8,8 @@ set -euo pipefail
 BUILD_NUM="${1:?12-digit CFBundleVersion}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FLEET_DIR="${ROOT}/scripts/ios-fleet"
+# IOS_FLEET_DIR is for isolated unit tests only; hosted ios-ship uses the in-repo fleet.
+FLEET_DIR="${IOS_FLEET_DIR:-${ROOT}/scripts/ios-fleet}"
 # shellcheck source=scripts/ios-fleet/tf-ready-rc.sh
 source "${FLEET_DIR}/tf-ready-rc.sh"
 

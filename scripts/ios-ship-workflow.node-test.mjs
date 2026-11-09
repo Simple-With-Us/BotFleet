@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, readFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -950,6 +950,7 @@ test("standing-tester sync is followed by a post-sync ensure-tf-ready summary st
   const postSh = read("scripts/ios-post-sync-tf-ready.sh");
   assert.match(postSh, /failed to read BotFleet app metadata/);
   assert.match(postSh, /incomplete BotFleet app metadata/);
+  assert.match(postSh, /IOS_FLEET_DIR/);
   assert.doesNotMatch(postSh, /GITHUB_STEP_SUMMARY/);
   assert.match(yml, /IOS_DEFER_SENTRY_RECEIPT/);
   assert.match(yml, /steps\.post_sync_tf\.outputs\.sentry_receipt/);
@@ -1116,25 +1117,20 @@ test("post-sync tf-ready avoids bash 4+ syntax (mapfile, readarray, associative 
 
 test("post-sync tf-ready fails fast when apps.json metadata is incomplete", () => {
   const dir = mkdtempSync(join(tmpdir(), "ios-bad-apps-"));
-  const appsPath = join(dir, "apps.json");
-  writeFileSync(appsPath, JSON.stringify({ apps: { botfleet: { bundleId: "" } } }));
+  const fleetDir = join(dir, "fleet");
+  mkdirSync(fleetDir, { recursive: true });
+  writeFileSync(join(fleetDir, "apps.json"), JSON.stringify({ apps: { botfleet: { bundleId: "" } } }));
+  copyFileSync(join(ROOT, "scripts/ios-fleet/tf-ready-rc.sh"), join(fleetDir, "tf-ready-rc.sh"));
   try {
-    const py = spawnSync("bash", ["-c", `python3 - "${appsPath}" <<'PY'
-import json, sys
-path = sys.argv[1]
-with open(path, encoding="utf-8") as f:
-    data = json.load(f)
-app = data.get("apps", {}).get("botfleet")
-if not isinstance(app, dict):
-    raise SystemExit("missing")
-bundle = app.get("bundleId")
-if not bundle or not str(bundle).strip():
-    raise SystemExit("missing bundleId")
-PY
-`], { cwd: ROOT, encoding: "utf8" });
-    assert.notEqual(py.status, 0);
-    const postSh = read("scripts/ios-post-sync-tf-ready.sh");
-    assert.match(postSh, /missing bundleId/);
+    const r = spawnSync("bash", ["scripts/ios-post-sync-tf-ready.sh", "202501011201"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: { ...process.env, IOS_FLEET_DIR: fleetDir },
+    });
+    assert.notEqual(r.status, 0);
+    const combined = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    assert.match(combined, /post-sync tf-ready/);
+    assert.match(combined, /failed to read BotFleet app metadata|missing bundleId/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
