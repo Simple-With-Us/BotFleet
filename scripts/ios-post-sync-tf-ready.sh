@@ -12,8 +12,7 @@ FLEET_DIR="${ROOT}/scripts/ios-fleet"
 # shellcheck source=scripts/ios-fleet/tf-ready-rc.sh
 source "${FLEET_DIR}/tf-ready-rc.sh"
 
-read -r BUNDLE_ID MARKETING APPLE_ID <<EOF
-$(python3 - <<'PY' "$FLEET_DIR/apps.json"
+mapfile -t _APP_META < <(python3 - "${FLEET_DIR}/apps.json" <<'PY'
 import json, sys
 app = json.load(open(sys.argv[1]))["apps"]["botfleet"]
 marketing = app.get("fixedMarketingVersion") or app.get("marketingVersionDefault") or "0.1.0"
@@ -22,7 +21,9 @@ print(marketing)
 print(app["appleId"])
 PY
 )
-EOF
+BUNDLE_ID="${_APP_META[0]:-}"
+MARKETING="${_APP_META[1]:-}"
+APPLE_ID="${_APP_META[2]:-}"
 
 [[ "$BUILD_NUM" =~ ^[1-9][0-9]{11}$ ]] || {
   echo "::error::post-sync tf-ready: build '${BUILD_NUM}' is not a 12-digit merge-stamp build"
@@ -45,18 +46,12 @@ handle_ensure_tf_ready_rc "$rc"
 summary="$(tf_ready_rc_summary_label "$rc")"
 log "post-sync readiness for BotFleet (${BUNDLE_ID} build ${BUILD_NUM}): rc=${rc} — ${summary}"
 
-summary_block="## TestFlight readiness (after standing-tester sync)
-
-- BotFleet (${BUNDLE_ID} build ${BUILD_NUM}): rc=${rc} — ${summary}
-"
-if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-  printf '%s\n' "$summary_block" >>"$GITHUB_STEP_SUMMARY"
-fi
-
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   {
     echo "tf_ready_rc=${rc}"
     echo "tf_ready_summary=${summary}"
+    echo "tf_ready_bundle=${BUNDLE_ID}"
+    echo "tf_ready_build=${BUILD_NUM}"
   } >>"$GITHUB_OUTPUT"
 fi
 

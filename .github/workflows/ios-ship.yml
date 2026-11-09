@@ -46,6 +46,7 @@ on:
       - 'scripts/sentry-report-testflight.mjs'
       - 'scripts/sentry-testflight-receipt.mjs'
       - 'scripts/ios-post-sync-tf-ready.sh'
+      - 'scripts/ios-observe-ship.mjs'
       - 'scripts/ios-fleet/**'
       - 'scripts/ios-ship-testflight.sh'
       - 'scripts/ios-appstore-gm-prepare.sh'
@@ -172,6 +173,7 @@ jobs:
             --path-prefix 'scripts/sentry-report-testflight.mjs' \
             --path-prefix 'scripts/sentry-testflight-receipt.mjs' \
             --path-prefix 'scripts/ios-post-sync-tf-ready.sh' \
+            --path-prefix 'scripts/ios-observe-ship.mjs' \
             --path-prefix 'scripts/ios-fleet/**' \
             --path-prefix 'scripts/ios-ship-testflight.sh' \
             --path-prefix 'scripts/ios-appstore-gm-prepare.sh' \
@@ -278,7 +280,7 @@ jobs:
           # passed for that one step.  The publisher refuses GITHUB_TOKEN
           # outright, and it never arms auto-merge with one.
           GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: bash scripts/ios-ship-testflight.sh --build "${{ needs.plan-build.outputs.build }}"
+        run: node scripts/ios-observe-ship.mjs bash scripts/ios-ship-testflight.sh --build "${{ needs.plan-build.outputs.build }}"
 
       # Standing TestFlight testers (asc-standing-testers skill): make sure the
       # three standing emails are in BotFleet's external beta group and the new
@@ -318,7 +320,7 @@ jobs:
       # (OPS-1052 / BF-2552).
       - name: Re-check TestFlight readiness after tester sync
         id: post_sync_tf
-        if: success() && steps.gate.outputs.should_ship == '1'
+        if: success() && steps.gate.outputs.should_ship == '1' && steps.ship.outputs.uploaded == 'true'
         continue-on-error: true
         timeout-minutes: 15
         env:
@@ -329,6 +331,21 @@ jobs:
           build="${{ needs.plan-build.outputs.build }}"
           [[ "$build" =~ ^[1-9][0-9]{11}$ ]] || { echo "::error::missing planned build for post-sync tf-ready recheck"; exit 1; }
           bash "$GITHUB_WORKSPACE/scripts/ios-post-sync-tf-ready.sh" "$build"
+
+      - name: iOS ship summary (TestFlight readiness after sync)
+        if: always() && steps.gate.outputs.should_ship == '1'
+        run: |
+          set -euo pipefail
+          {
+            echo "## TestFlight readiness (after standing-tester sync)"
+            if [ "${{ steps.ship.outputs.uploaded }}" != "true" ]; then
+              echo "- BotFleet: no TestFlight upload this run (ship gate skip or no new build); post-sync readiness not evaluated."
+            elif [ -n "${{ steps.post_sync_tf.outputs.tf_ready_summary }}" ]; then
+              echo "- BotFleet (${{ steps.post_sync_tf.outputs.tf_ready_bundle }} build ${{ steps.post_sync_tf.outputs.tf_ready_build }}): rc=${{ steps.post_sync_tf.outputs.tf_ready_rc }} — ${{ steps.post_sync_tf.outputs.tf_ready_summary }}"
+            else
+              echo "- BotFleet: post-sync readiness check did not run or produced no summary"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   report-sentry-deployment:
     needs: ship

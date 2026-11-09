@@ -118,7 +118,7 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.match(yml, /fetch-depth:\s*0/);
   assert.match(yml, /cancel-in-progress:\s*false/);
   assert.match(yml, /github\.event\.repository\.fork == false/);
-  assert.match(yml, /bash scripts\/ios-ship-testflight\.sh/);
+  assert.match(yml, /ios-observe-ship\.mjs bash scripts\/ios-ship-testflight\.sh/);
   assert.doesNotMatch(yml, /--force-ship/);
   assert.match(yml, /ios-appstore-gm-prepare\.sh/);
   // Signing material comes from Infisical prod, through the shared
@@ -945,9 +945,36 @@ test("standing-tester sync is followed by a post-sync ensure-tf-ready summary st
   assert.match(postStep, /ios-post-sync-tf-ready\.sh/);
   assert.match(postStep, /continue-on-error:\s*true/);
   assert.match(postStep, /IOS_TF_READY_TIMEOUT_SEC/);
-  assert.match(read("scripts/ios-post-sync-tf-ready.sh"), /GITHUB_STEP_SUMMARY/);
+  assert.match(postStep, /steps\.ship\.outputs\.uploaded == 'true'/);
+  assert.match(yml, /iOS ship summary \(TestFlight readiness after sync\)/);
+  const postSh = read("scripts/ios-post-sync-tf-ready.sh");
+  assert.match(postSh, /mapfile -t _APP_META/);
+  assert.doesNotMatch(postSh, /GITHUB_STEP_SUMMARY/);
   assert.match(yml, /IOS_DEFER_SENTRY_RECEIPT/);
   assert.match(yml, /steps\.post_sync_tf\.outputs\.sentry_receipt/);
+});
+
+test("ios-observe-ship marks gate-skip as not uploaded", async () => {
+  const fakeShip = join(ROOT, "scripts", ".tmp-fake-ship.sh");
+  const outFile = join(ROOT, "scripts", ".tmp-github-output.txt");
+  writeFileSync(
+    fakeShip,
+    '#!/bin/sh\necho "ship-gate: exiting 0 before any build number is consumed (sequence untouched)"\nexit 0\n',
+    { mode: 0o755 },
+  );
+  try {
+    const r = spawnSync("node", ["scripts/ios-observe-ship.mjs", "sh", fakeShip], {
+      cwd: ROOT,
+      env: { ...process.env, GITHUB_OUTPUT: outFile },
+    });
+    assert.equal(r.status, 0);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /uploaded=false/);
+    assert.match(out, /ship_observed=skipped/);
+  } finally {
+    rmSync(fakeShip, { force: true });
+    rmSync(outFile, { force: true });
+  }
 });
 
 test("externalInstallability defers tester-read failures behind public links and counts missing-flag groups as external", async () => {
