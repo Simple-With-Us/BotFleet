@@ -98,8 +98,13 @@ export function isAvatarRecolorable(
   return value === true || value === "shell" || value === "full";
 }
 
+/** Stored recolorable value before normalisation (legacy boolean or enum). */
+export type BotAvatarRecolorableInput = BotAvatarRecolorable | boolean | null | undefined;
+
 /** Coerce legacy boolean or enum storage into the enum, or undefined. */
-export function normalizeAvatarRecolorable(value: unknown): BotAvatarRecolorable | undefined {
+export function normalizeAvatarRecolorable(
+  value: BotAvatarRecolorableInput,
+): BotAvatarRecolorable | undefined {
   const parsed = botAvatarRecolorableSchema.safeParse(value);
   return parsed.success ? parsed.data : undefined;
 }
