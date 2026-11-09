@@ -35,17 +35,6 @@ function feedLog(text) {
   if (!skippedSeen && skippedRe.test(window)) {
     skippedSeen = true;
   }
-  for (const line of text.split("\n")) {
-    if (!line) {
-      continue;
-    }
-    if (!uploadedSeen && uploadedRe.test(line)) {
-      uploadedSeen = true;
-    }
-    if (!skippedSeen && skippedRe.test(line)) {
-      skippedSeen = true;
-    }
-  }
   tail = window.slice(-MAX_TAIL);
 }
 

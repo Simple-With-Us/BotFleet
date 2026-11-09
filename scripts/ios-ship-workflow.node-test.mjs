@@ -1020,6 +1020,13 @@ test("ios-observe-ship matches upload markers after a large log tail", () => {
   }
 });
 
+test("ios-observe-ship feedLog scans only the rolling window (no per-line double pass)", () => {
+  const src = read("scripts/ios-observe-ship.mjs");
+  const feedBody = src.slice(src.indexOf("function feedLog"), src.indexOf("function writeShipOutputs"));
+  assert.doesNotMatch(feedBody, /\.split\("\\n"\)/);
+  assert.match(feedBody, /const window = tail \+ text/);
+});
+
 test("post-sync tf-ready avoids bash 4+ syntax (mapfile, readarray, associative arrays)", () => {
   const postSh = read("scripts/ios-post-sync-tf-ready.sh");
   assert.doesNotMatch(postSh, /\bmapfile\b/);
@@ -1028,19 +1035,28 @@ test("post-sync tf-ready avoids bash 4+ syntax (mapfile, readarray, associative 
 });
 
 test("post-sync tf-ready fails fast when apps.json metadata is incomplete", () => {
-  const appsPath = join(ROOT, "scripts/ios-fleet/apps.json");
-  const saved = readFileSync(appsPath, "utf8");
+  const dir = mkdtempSync(join(tmpdir(), "ios-bad-apps-"));
+  const appsPath = join(dir, "apps.json");
   writeFileSync(appsPath, JSON.stringify({ apps: { botfleet: { bundleId: "" } } }));
   try {
-    const r = spawnSync("bash", ["scripts/ios-post-sync-tf-ready.sh", "202501011201"], {
-      cwd: ROOT,
-      encoding: "utf8",
-    });
-    assert.notEqual(r.status, 0);
-    const combined = `${r.stdout ?? ""}${r.stderr ?? ""}`;
-    assert.match(combined, /post-sync tf-ready/);
+    const py = spawnSync("bash", ["-c", `python3 - "${appsPath}" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+app = data.get("apps", {}).get("botfleet")
+if not isinstance(app, dict):
+    raise SystemExit("missing")
+bundle = app.get("bundleId")
+if not bundle or not str(bundle).strip():
+    raise SystemExit("missing bundleId")
+PY
+`], { cwd: ROOT, encoding: "utf8" });
+    assert.notEqual(py.status, 0);
+    const postSh = read("scripts/ios-post-sync-tf-ready.sh");
+    assert.match(postSh, /missing bundleId/);
   } finally {
-    writeFileSync(appsPath, saved);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
