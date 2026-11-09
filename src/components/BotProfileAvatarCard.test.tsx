@@ -27,7 +27,7 @@ describe("BotProfileAvatarCard", () => {
   });
 
   it("shows no Color row on the animated crop, which draws no color", () => {
-    const html = render({ avatarCrop: "animated", avatarUrl: "/api/avatar/synthetic.webp", recolorable: true });
+    const html = render({ avatarCrop: "animated", avatarUrl: "/api/avatar/synthetic.webp", recolorable: "shell" });
     expect(html).not.toContain(">Color<");
   });
 

@@ -32,3 +32,8 @@ Orange and `default` share `tvface-default.webp`.  Thinking/working-class bot st
 4. Embed the AVAT manifest (same frame ranges as default; `name` = `tvface-<color>`).
 
 Multi-GIF color skins under `public/tv-face/skins/{color}/` remain for desktop bundles and as a fallback when a one-file pack is not registered in `SHIPPED_ONE_FILE_PACKS`.
+
+
+## Size budget (BF-2627)
+
+Every shipped pack under `public/tv-face/packs/` must stay under 2 MB.  Packs that were slightly over were re-encoded lossy at 256×256 (quality ~70) with the same frame count and AVAT ranges re-embedded.  Expanding to the full TVFACE_MANIFEST expression set still requires a Mac seat running `scripts/avatar-build.ts` against the multi-GIF art.

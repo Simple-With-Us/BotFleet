@@ -71,8 +71,35 @@ export function botAvatarProfile(value: BotAvatarProfileInput): BotAvatarProfile
   return profile;
 }
 
-/** Whether an uploaded / shipped avatar can take the Color row.
- *  Manifest one-file WebPs (TV-Face shell packs) set this true on upload.
- *  Plain images set false.  Mascot and TV-Face crops always show Color. */
-export const botAvatarRecolorableSchema = z.boolean().optional();
-export type BotAvatarRecolorable = z.infer<typeof botAvatarRecolorableSchema>;
+/**
+ * How much of an uploaded / shipped avatar can take the Color row.
+ *
+ * - none:  fixed art (plain image, single-colour style).
+ * - shell: recolour the body / bezel; glyphs stay authored (TV-Face).
+ * - full:  every pixel may recolour.
+ *
+ * Manifest one-file WebPs that ship as shell packs set `shell` on upload.
+ * Plain images set `none`.  Mascot and TV-Face crops always show Color.
+ * Boolean true/false from older records still parse (true → shell, false → none).
+ */
+export const BOT_AVATAR_RECOLORABLE_MODES = ["none", "shell", "full"] as const;
+export type BotAvatarRecolorable = (typeof BOT_AVATAR_RECOLORABLE_MODES)[number];
+
+export const botAvatarRecolorableSchema = z.preprocess((value) => {
+  if (value === true) return "shell";
+  if (value === false) return "none";
+  return value;
+}, z.enum(BOT_AVATAR_RECOLORABLE_MODES).optional());
+
+/** True when Color may recolour some part of the avatar (shell or full). */
+export function isAvatarRecolorable(
+  value: BotAvatarRecolorable | boolean | null | undefined,
+): boolean {
+  return value === true || value === "shell" || value === "full";
+}
+
+/** Coerce legacy boolean or enum storage into the enum, or undefined. */
+export function normalizeAvatarRecolorable(value: unknown): BotAvatarRecolorable | undefined {
+  const parsed = botAvatarRecolorableSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
