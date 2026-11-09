@@ -45,6 +45,7 @@ on:
       - '.github/workflows/sentry-testflight.yml'
       - 'scripts/sentry-report-testflight.mjs'
       - 'scripts/sentry-testflight-receipt.mjs'
+      - 'scripts/ios-post-sync-tf-ready.sh'
       - 'scripts/ios-fleet/**'
       - 'scripts/ios-ship-testflight.sh'
       - 'scripts/ios-appstore-gm-prepare.sh'
@@ -132,8 +133,8 @@ jobs:
     runs-on: xcode-27
     timeout-minutes: 90
     outputs:
-      sentry_receipt: ${{ steps.ship.outputs.sentry_receipt }}
-      sentry_receipt_error: ${{ steps.ship.outputs.sentry_receipt_error }}
+      sentry_receipt: ${{ steps.post_sync_tf.outputs.sentry_receipt }}
+      sentry_receipt_error: ${{ steps.post_sync_tf.outputs.sentry_receipt_error }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
@@ -170,6 +171,7 @@ jobs:
             --path-prefix '.github/workflows/sentry-testflight.yml' \
             --path-prefix 'scripts/sentry-report-testflight.mjs' \
             --path-prefix 'scripts/sentry-testflight-receipt.mjs' \
+            --path-prefix 'scripts/ios-post-sync-tf-ready.sh' \
             --path-prefix 'scripts/ios-fleet/**' \
             --path-prefix 'scripts/ios-ship-testflight.sh' \
             --path-prefix 'scripts/ios-appstore-gm-prepare.sh' \
@@ -262,6 +264,8 @@ jobs:
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
           IOS_MANUAL_SIGN: "1"  # 2026-10-07: API profiles; no Xcode provisioning service
+          # Receipt uses the post-sync ensure-tf-ready pass, not the in-ship check.
+          IOS_DEFER_SENTRY_RECEIPT: "1"
           # fleet-icon-audit.mjs is a Mac-side fleet tool not vendored in
           # this repo, so the hosted ship cannot run it; hand runs on the
           # Mac keep the publisher's default block gate.
@@ -307,6 +311,24 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             echo "::warning title=TestFlight standing testers::tester sync exited ${rc}; see the standing-testers lines above.  The TestFlight upload itself succeeded."
           fi
+
+      # The in-ship ensure-tf-ready runs before standing-tester sync, so rc=5
+      # is common when the external group is not ready yet.  Re-check after sync
+      # so the job summary and Sentry receipt reflect post-sync installability
+      # (OPS-1052 / BF-2552).
+      - name: Re-check TestFlight readiness after tester sync
+        id: post_sync_tf
+        if: success() && steps.gate.outputs.should_ship == '1'
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          IOS_TF_READY_TIMEOUT_SEC: "300"
+          IOS_SHIP_ARCHIVE_PATH: ${{ steps.ship.outputs.ios_ship_archive_path }}
+          IOS_SHIP_ARCHIVE_COMMIT: ${{ steps.ship.outputs.ios_ship_commit }}
+        run: |
+          build="${{ needs.plan-build.outputs.build }}"
+          [[ "$build" =~ ^[1-9][0-9]{11}$ ]] || { echo "::error::missing planned build for post-sync tf-ready recheck"; exit 1; }
+          bash "$GITHUB_WORKSPACE/scripts/ios-post-sync-tf-ready.sh" "$build"
 
   report-sentry-deployment:
     needs: ship

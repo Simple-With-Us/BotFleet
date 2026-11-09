@@ -901,20 +901,15 @@ test("the ship readiness is external installability, and never prints a false su
   assert.doesNotMatch(readyBranch, /countInternalTesters\(/);
   assert.match(readyBranch, /externalInstallability\(/);
   assert.match(readyBranch, /process\.exit\(nobody \? 5 : reach\.ok \? 0 : 6\)/);
-  // The wrapper turns rc=5 into a warning plus a CI annotation, not a success line.
-  const rc5 = sh.slice(sh.indexOf("if [[ $rc -eq 5 ]]"), sh.indexOf("if [[ $rc -eq 6 ]]"));
-  assert.match(rc5, /no external TestFlight group with testers or a public link/);
-  assert.match(rc5, /::warning title=TestFlight has no reachable external tester::/);
-  assert.doesNotMatch(rc5, /can install this build/);
-  // An unreadable read (rc=6) must not print the success line either.
-  const rc6 = sh.slice(sh.indexOf("if [[ $rc -eq 6 ]]"), sh.indexOf("if [[ $rc -eq 3 ]]"));
-  assert.match(rc6, /installability is unverified/);
-  assert.match(rc6, /::warning title=TestFlight installability unverified::/);
-  assert.doesNotMatch(rc6, /can install this build/);
-  // The only success line is the rc=0 branch, and it names external testing.
-  // The readiness step runs before the sync assigns the build, so the rc=0
-  // line states exactly what was verified: the app's external install path.
-  assert.equal(sh.split("TestFlight external install path is live for ${BUNDLE_ID} (an external group has testers or an enabled public link); the standing-testers sync assigns and verifies this build next").length - 1, 1);
+  const rcSh = read("scripts/ios-fleet/tf-ready-rc.sh");
+  assert.match(rcSh, /no external TestFlight group with testers or a public link/);
+  assert.match(rcSh, /::warning title=TestFlight has no reachable external tester::/);
+  assert.doesNotMatch(rcSh, /can install this build/);
+  assert.match(rcSh, /installability is unverified/);
+  assert.match(rcSh, /::warning title=TestFlight installability unverified::/);
+  assert.match(sh, /source "\$\{FLEET_DIR\}\/tf-ready-rc\.sh"/);
+  assert.match(sh, /handle_ensure_tf_ready_rc "\$rc"/);
+  assert.equal(rcSh.split("TestFlight external install path is live for ${BUNDLE_ID} (an external group has testers or an enabled public link); the standing-testers sync assigns and verifies this build next").length - 1, 1);
   assert.doesNotMatch(sh, /TestFlight external testers can install this build/);
   assert.doesNotMatch(sh, /TestFlight internal testers can install this build/);
   // The sync step must NOT re-create the internal group; it deletes leftovers.
@@ -939,6 +934,20 @@ test("the ship readiness is external installability, and never prints a false su
   // ensureInternalTesterGroup stays exported: this repo's own suite is its
   // living consumer (see the behavior tests above).
   assert.match(mjs, /export async function ensureInternalTesterGroup\(/);
+});
+
+test("standing-tester sync is followed by a post-sync ensure-tf-ready summary step", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const syncAt = yml.indexOf("name: Sync standing TestFlight testers");
+  const postAt = yml.indexOf("name: Re-check TestFlight readiness after tester sync");
+  assert.ok(syncAt > -1 && postAt > syncAt, "post-sync readiness follows tester sync");
+  const postStep = yml.slice(postAt).split(/\n\s+- name:/)[0];
+  assert.match(postStep, /ios-post-sync-tf-ready\.sh/);
+  assert.match(postStep, /continue-on-error:\s*true/);
+  assert.match(postStep, /IOS_TF_READY_TIMEOUT_SEC/);
+  assert.match(read("scripts/ios-post-sync-tf-ready.sh"), /GITHUB_STEP_SUMMARY/);
+  assert.match(yml, /IOS_DEFER_SENTRY_RECEIPT/);
+  assert.match(yml, /steps\.post_sync_tf\.outputs\.sentry_receipt/);
 });
 
 test("externalInstallability defers tester-read failures behind public links and counts missing-flag groups as external", async () => {
