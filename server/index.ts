@@ -16122,14 +16122,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // not a guard.  The six organize fields are parsed together.
       // From a paired phone (the sidecar stamps `x-botfleet-companion`) the
       // body may carry the six organize fields and nothing else.
-      if (!botAvatarRecolorableSchema.safeParse(body.recolorable).success) {
-        return json(res, 400, { error: "recolorable must be a boolean" });
+      const recolorableParsed = botAvatarRecolorableSchema.safeParse(body.recolorable);
+      if (!recolorableParsed.success) {
+        return json(res, 400, { error: "recolorable must be none, shell, full, or a legacy boolean" });
       }
       const organize = checkBotOrganizeBody(body, req.headers["x-botfleet-companion"] === "1");
       if (!organize.ok) return json(res, organize.status, { error: organize.error });
-      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "recolorable", "pinned", "hidden"] as const) {
+      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
+      // Store the normalised enum (true→shell, false→none) so clients never
+      // see a bare boolean after the none|shell|full upgrade.
+      if (body.recolorable !== undefined) patch.recolorable = recolorableParsed.data;
       if (normalizedSelection) {
         patch.modelSelection = normalizedSelection;
         patch.activeModelSelection = normalizedSelection;

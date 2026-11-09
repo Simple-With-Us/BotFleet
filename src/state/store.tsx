@@ -20,7 +20,7 @@ import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { AccessTokenState } from "../../server/recall-access.ts";
 import type { ComputerReach } from "../../server/computer-capability.ts";
 import type { BotColor, BotMotion } from "@/lib/mascot";
-import type { BotAvatarCrop } from "../../shared/bot-avatar";
+import type { BotAvatarCrop, BotAvatarRecolorable } from "../../shared/bot-avatar";
 import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import type { Attachment } from "@/lib/composer-attachments";
@@ -368,8 +368,8 @@ export interface Bot {
   avatarUrl?: string | null;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
-  /** When true, an animated one-file pack may use the Color row (shell recolor). */
-  recolorable?: boolean;
+  /** none | shell | full — how much of the avatar the Color row may recolour. */
+  recolorable?: BotAvatarRecolorable;
   unread: boolean;
   busy?: boolean;
   activityStartedAt?: number;

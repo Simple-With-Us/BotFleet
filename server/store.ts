@@ -18,7 +18,7 @@ import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId, type TurnBillingMode } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
-import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
+import { botAvatarProfile, type BotAvatarCrop, type BotAvatarRecolorable } from "../shared/bot-avatar.ts";
 import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { withoutNestedFallbacks } from "../shared/model-limits.ts";
 import type { BotVoices } from "../shared/bot-voice.ts";
@@ -644,8 +644,8 @@ export interface BotRecord {
   avatarUrl?: string;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
-  /** Animated one-file packs that accept the Color row. */
-  recolorable?: boolean;
+  /** none | shell | full — how much of the avatar the Color row may recolour. */
+  recolorable?: BotAvatarRecolorable;
   unread: boolean;
   modelSelection: ModelSelection;
   /** The model selection that actually ran on the most recent turn (post-fallback). */
