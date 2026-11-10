@@ -51,21 +51,13 @@ struct ComposerMultilineField: UIViewRepresentable {
             let location = min(selectedRange.location, length)
             let rangeLength = min(selectedRange.length, length - location)
             uiView.selectedRange = NSRange(location: location, length: rangeLength)
-            // Scroll exactly when the draft passes the 8-line cap.  Decide and
-            // toggle before restoring the offset so the toggle cannot discard
-            // it, and only on an actual change so typing at the cap cannot
-            // flip the scroll state back and forth.
-            let insets = uiView.textContainerInset.top + uiView.textContainerInset.bottom
-            let lineHeight = uiView.font?.lineHeight ?? UIFont.preferredFont(forTextStyle: .body).lineHeight
-            let maxLines = max(uiView.textContainer.maximumNumberOfLines, 1)
-            let maxHeight = ceil(lineHeight * CGFloat(maxLines) + insets)
-            let contentHeight = uiView.sizeThatFits(CGSize(width: uiView.bounds.width, height: .greatestFiniteMagnitude)).height
-            let shouldScroll = uiView.bounds.width > 0 && contentHeight > maxHeight
-            if uiView.isScrollEnabled != shouldScroll {
-                uiView.isScrollEnabled = shouldScroll
-            }
-            uiView.contentOffset = contentOffset
+            (uiView as? ComposerTextView)?.reconcileScrollState()
+            uiView.contentOffset = uiView.isScrollEnabled ? contentOffset : .zero
+            (uiView as? ComposerTextView)?.ensureSelectionVisible()
         }
+        // A typed edit already matches the binding. It must still reconcile
+        // growth and shrinkage, independently of programmatic text assignment.
+        (uiView as? ComposerTextView)?.reconcileScrollState()
         uiView.isEditable = isEditable
         uiView.isSelectable = isEditable
         // Announce the placeholder only while the draft is empty; once there is
@@ -84,7 +76,6 @@ struct ComposerMultilineField: UIViewRepresentable {
             // reload so the Hide bar appears or disappears immediately.
             uiView.reloadInputViews()
         }
-        uiView.invalidateIntrinsicContentSize()
     }
 }
 
@@ -92,19 +83,65 @@ struct ComposerMultilineField: UIViewRepresentable {
 /// 8-line maximum so a long draft expands the composer instead of scrolling
 /// inside a one-line strip.
 private final class ComposerTextView: UITextView {
-    override var intrinsicContentSize: CGSize {
+    private var measuredText: String?
+    private var measuredWidth: CGFloat = 0
+    private var measuredFont: UIFont?
+    private var measuredInsets: UIEdgeInsets = .zero
+    private var measuredMaxLines: Int = 0
+    private var measuredHeight: CGFloat = 44
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // Rotation and parent resizing can cross the cap without a text edit.
+        reconcileScrollState()
+    }
+
+    func reconcileScrollState() {
         let width = bounds.width > 0 ? bounds.width : frame.width
-        guard width > 0, let font else {
-            return CGSize(width: UIView.noIntrinsicMetric, height: 44)
-        }
-        let contentHeight = sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
-        let insets = textContainerInset.top + textContainerInset.bottom
-        let lineHeight = font.lineHeight
-        let minHeight = ceil(lineHeight + insets)
+        guard width > 0, let font else { return }
+        let currentText = text ?? ""
         let maxLines = max(textContainer.maximumNumberOfLines, 1)
-        let maxHeight = ceil(lineHeight * CGFloat(maxLines) + insets)
-        let height = min(max(contentHeight, minHeight), maxHeight)
-        return CGSize(width: UIView.noIntrinsicMetric, height: height)
+        guard measuredText != currentText || measuredWidth != width
+            || measuredFont != font || measuredInsets != textContainerInset
+            || measuredMaxLines != maxLines else { return }
+        // Cache before toggling, since UIKit may request layout synchronously.
+        measuredText = currentText
+        measuredWidth = width
+        measuredFont = font
+        measuredInsets = textContainerInset
+        measuredMaxLines = maxLines
+        let insets = textContainerInset.top + textContainerInset.bottom
+        let minHeight = ceil(font.lineHeight + insets)
+        let maxHeight = ceil(font.lineHeight * CGFloat(maxLines) + insets)
+        let contentHeight = ceil(sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height)
+        let previousHeight = measuredHeight
+        measuredHeight = min(max(contentHeight, minHeight), maxHeight)
+        let shouldScroll = contentHeight > maxHeight
+        if isScrollEnabled != shouldScroll {
+            let savedOffset = contentOffset
+            isScrollEnabled = shouldScroll
+            contentOffset = shouldScroll ? savedOffset : .zero
+            ensureSelectionVisible()
+        }
+        if previousHeight != measuredHeight {
+            invalidateIntrinsicContentSize()
+        }
+    }
+
+    func ensureSelectionVisible() {
+        guard isScrollEnabled, let selectedTextRange else { return }
+        let selectionRect = selectedTextRange.isEmpty
+            ? caretRect(for: selectedTextRange.start)
+            : firstRect(for: selectedTextRange)
+        let visibleRect = CGRect(origin: contentOffset, size: bounds.size)
+        if !visibleRect.contains(selectionRect) {
+            scrollRangeToVisible(selectedRange)
+        }
+    }
+
+    override var intrinsicContentSize: CGSize {
+        reconcileScrollState()
+        return CGSize(width: UIView.noIntrinsicMetric, height: measuredHeight)
     }
 }
 
@@ -142,6 +179,7 @@ final class Coordinator: NSObject, UITextViewDelegate {
     }
 
     func textViewDidChange(_ textView: UITextView) {
+        (textView as? ComposerTextView)?.reconcileScrollState()
         let value = textView.text ?? ""
         if text.wrappedValue != value {
             text.wrappedValue = value
