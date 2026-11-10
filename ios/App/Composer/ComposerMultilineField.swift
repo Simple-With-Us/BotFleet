@@ -51,6 +51,19 @@ struct ComposerMultilineField: UIViewRepresentable {
             let location = min(selectedRange.location, length)
             let rangeLength = min(selectedRange.length, length - location)
             uiView.selectedRange = NSRange(location: location, length: rangeLength)
+            // Scroll exactly when the draft passes the 8-line cap.  Decide and
+            // toggle before restoring the offset so the toggle cannot discard
+            // it, and only on an actual change so typing at the cap cannot
+            // flip the scroll state back and forth.
+            let insets = uiView.textContainerInset.top + uiView.textContainerInset.bottom
+            let lineHeight = uiView.font?.lineHeight ?? UIFont.preferredFont(forTextStyle: .body).lineHeight
+            let maxLines = max(uiView.textContainer.maximumNumberOfLines, 1)
+            let maxHeight = ceil(lineHeight * CGFloat(maxLines) + insets)
+            let contentHeight = uiView.sizeThatFits(CGSize(width: uiView.bounds.width, height: .greatestFiniteMagnitude)).height
+            let shouldScroll = uiView.bounds.width > 0 && contentHeight > maxHeight
+            if uiView.isScrollEnabled != shouldScroll {
+                uiView.isScrollEnabled = shouldScroll
+            }
             uiView.contentOffset = contentOffset
         }
         uiView.isEditable = isEditable
@@ -71,14 +84,6 @@ struct ComposerMultilineField: UIViewRepresentable {
             // reload so the Hide bar appears or disappears immediately.
             uiView.reloadInputViews()
         }
-        // Scroll only once the draft passes the 8-line cap, so longer content
-        // stays reachable instead of clipping under the fixed height.
-        let insets = uiView.textContainerInset.top + uiView.textContainerInset.bottom
-        let lineHeight = uiView.font?.lineHeight ?? UIFont.preferredFont(forTextStyle: .body).lineHeight
-        let maxLines = max(uiView.textContainer.maximumNumberOfLines, 1)
-        let maxHeight = ceil(lineHeight * CGFloat(maxLines) + insets)
-        let contentHeight = uiView.sizeThatFits(CGSize(width: uiView.bounds.width, height: .greatestFiniteMagnitude)).height
-        uiView.isScrollEnabled = uiView.bounds.width > 0 && contentHeight > maxHeight
         uiView.invalidateIntrinsicContentSize()
     }
 }
