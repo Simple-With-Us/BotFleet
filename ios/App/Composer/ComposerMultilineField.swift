@@ -41,7 +41,8 @@ struct ComposerMultilineField: UIViewRepresentable {
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
         guard let view = uiView as? ComposerTextView,
               let width = proposal.width, width > 0 else { return nil }
-        return CGSize(width: width, height: view.fittedHeight(width: width))
+        let naturalHeight = view.fittedHeight(width: width)
+        return CGSize(width: width, height: min(naturalHeight, proposal.height ?? naturalHeight))
     }
 
     func updateUIView(_ uiView: UITextView, context: Context) {
@@ -149,9 +150,15 @@ private final class ComposerTextView: UITextView {
             ? caretRect(for: selectedTextRange.start)
             : firstRect(for: selectedTextRange)
         let visibleRect = CGRect(origin: contentOffset, size: bounds.size)
-        if !visibleRect.contains(selectionRect) {
-            scrollRangeToVisible(selectedRange)
-        }
+        guard bounds.height > 0, !visibleRect.contains(selectionRect) else { return }
+        // scrollRangeToVisible can defer to UIKit's responder/animation state.
+        // Reconcile immediately, including a programmatic edit in an unfocused
+        // field, using the actual laid-out caret rect and viewport.
+        let top = selectionRect.minY - textContainerInset.top
+        let bottom = selectionRect.maxY + textContainerInset.bottom - bounds.height
+        let desiredY = selectionRect.minY < visibleRect.minY ? top : bottom
+        let maxY = max(0, contentSize.height - bounds.height)
+        setContentOffset(CGPoint(x: contentOffset.x, y: min(max(0, desiredY), maxY)), animated: false)
     }
 
     func fittedHeight(width: CGFloat) -> CGFloat {
@@ -359,7 +366,7 @@ struct ComposerScrollRegressionPreview: View {
         } else {
             checks["programmatic cursor remains visible"] = false
         }
-        capture("Programmatic shortening: clamped end cursor is visible")
+        capture("Programmatic shortening: twelve lines, end selection")
         field.insertText("\nAnother typed line while scrolling")
         field.delegate?.textViewDidChange?(field)
         await settle()
@@ -372,7 +379,7 @@ struct ComposerScrollRegressionPreview: View {
         } else {
             checks["height-only resize keeps the cursor visible"] = false
         }
-        capture("Height-only resize: smaller viewport keeps end cursor visible")
+        capture("Height-only resize: seventy-point viewport, end selection")
         writeResult(checks, captures: captures)
         summary = checks.values.allSatisfy { $0 } ? "PASS: composer regression" : "FAIL: composer regression"
     }
