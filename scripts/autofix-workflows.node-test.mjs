@@ -88,7 +88,11 @@ test("PR Autofix is not pinned to a reusable revision that deadlocks", () => {
 
 test("autofix callers keep their least-privilege and fork guards", () => {
   const autofix = read(".github/workflows/autofix.yml");
-  assert.match(autofix, /^permissions: \{\}\s*$/m, "autofix.yml grants nothing at workflow level");
+  // Workflow-level grants are exactly the owner-approved caller grants
+  // (owner 2026-10-21, re-approved 2026-11-10 for PR #1644): the reusable's
+  // GITHUB_TOKEN is capped by these, and any other workflow-level permission
+  // added to autofix.yml must update this guard in the same change.
+  assert.match(autofix, /^permissions:\n {2}contents: write\n {2}pull-requests: read\n {2}issues: write\s*$/m, "autofix.yml workflow-level grants are exactly the approved caller grants");
   assert.match(autofix, /^ {6}contents: write\n {6}pull-requests: read\n/m);
   // The caller delegates identity enforcement to the pinned reusable.  Its
   // local gate must still control invocation and reject closed/non-PR events.
