@@ -127,6 +127,7 @@ expected = {
     "programmatic edit clamps the selection", "programmatic cursor remains visible",
     "typed growth viewport is capped at eight lines", "editing while scrolling preserves capped height",
     "height-only resize uses the smaller viewport", "height-only resize keeps the cursor visible",
+    "unchanged layout preserves intentional reading offset", "horizontal drift recovers visible cursor",
 }
 checks = report.get("checks", {})
 print(json.dumps(report, sort_keys=True))

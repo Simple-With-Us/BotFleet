@@ -98,13 +98,28 @@ private final class ComposerTextView: UITextView {
     private var measuredInsets: UIEdgeInsets = .zero
     private var measuredHeight: CGFloat = 44
 
+    private var lastLayoutSize: CGSize = .zero
+    private var lastLayoutSelection: NSRange?
+    private var lastLayoutText: String?
+
     override func layoutSubviews() {
+        let oldSize = lastLayoutSize
+        let oldVisible = CGRect(origin: contentOffset, size: oldSize)
+        let oldCaret = selectedTextRange.map { caretRect(for: $0.start) }
+        let selectionChanged = lastLayoutSelection != selectedRange
+        let textChanged = lastLayoutText != text
         super.layoutSubviews()
-        // Rotation and parent resizing can cross the cap without a text edit.
         reconcileScrollState()
-        // Height-only viewport changes do not require remeasurement, but can
-        // hide the caret even when text and width are unchanged.
-        ensureSelectionVisible()
+        // Offset-only layouts include the person's deliberate scroll gesture.
+        // Follow edits/selection movement, or a resize that hid a caret that
+        // was visible before it, never an unchanged offscreen selection.
+        if selectionChanged || textChanged ||
+            (oldSize != bounds.size && oldCaret.map { oldVisible.contains($0) } == true) {
+            ensureSelectionVisible()
+        }
+        lastLayoutSize = bounds.size
+        lastLayoutSelection = selectedRange
+        lastLayoutText = text
     }
 
     func reconcileScrollState(width proposedWidth: CGFloat? = nil) {
@@ -150,15 +165,23 @@ private final class ComposerTextView: UITextView {
             ? caretRect(for: selectedTextRange.start)
             : firstRect(for: selectedTextRange)
         let visibleRect = CGRect(origin: contentOffset, size: bounds.size)
-        guard bounds.height > 0, !visibleRect.contains(selectionRect) else { return }
-        // scrollRangeToVisible can defer to UIKit's responder/animation state.
-        // Reconcile immediately, including a programmatic edit in an unfocused
-        // field, using the actual laid-out caret rect and viewport.
-        let top = selectionRect.minY - textContainerInset.top
-        let bottom = selectionRect.maxY + textContainerInset.bottom - bounds.height
-        let desiredY = selectionRect.minY < visibleRect.minY ? top : bottom
+        guard bounds.width > 0, bounds.height > 0, !visibleRect.contains(selectionRect) else { return }
+        // Use actual laid-out geometry, independent of responder/animation
+        // state, and only change axes where the selection is out of view.
+        var desired = contentOffset
+        if selectionRect.minY < visibleRect.minY {
+            desired.y = selectionRect.minY - textContainerInset.top
+        } else if selectionRect.maxY > visibleRect.maxY {
+            desired.y = selectionRect.maxY + textContainerInset.bottom - bounds.height
+        }
+        if selectionRect.minX < visibleRect.minX {
+            desired.x = selectionRect.minX - textContainerInset.left
+        } else if selectionRect.maxX > visibleRect.maxX {
+            desired.x = selectionRect.maxX + textContainerInset.right - bounds.width
+        }
         let maxY = max(0, contentSize.height - bounds.height)
-        setContentOffset(CGPoint(x: contentOffset.x, y: min(max(0, desiredY), maxY)), animated: false)
+        let maxX = max(0, contentSize.width - bounds.width)
+        setContentOffset(CGPoint(x: min(max(0, desired.x), maxX), y: min(max(0, desired.y), maxY)), animated: false)
     }
 
     func fittedHeight(width: CGFloat) -> CGFloat {
@@ -380,6 +403,20 @@ struct ComposerScrollRegressionPreview: View {
             checks["height-only resize keeps the cursor visible"] = false
         }
         capture("Height-only resize: seventy-point viewport, end selection")
+        field.contentOffset = .zero
+        let readingOffset = field.contentOffset
+        field.setNeedsLayout()
+        field.layoutIfNeeded()
+        await settle()
+        checks["unchanged layout preserves intentional reading offset"] = abs(field.contentOffset.y - readingOffset.y) <= 1
+        field.contentOffset = CGPoint(x: 30, y: field.contentOffset.y)
+        field.ensureSelectionVisible()
+        await settle()
+        if let selection = field.selectedTextRange {
+            checks["horizontal drift recovers visible cursor"] = CGRect(origin: field.contentOffset, size: field.bounds.size).contains(field.caretRect(for: selection.start))
+        } else {
+            checks["horizontal drift recovers visible cursor"] = false
+        }
         writeResult(checks, captures: captures)
         summary = checks.values.allSatisfy { $0 } ? "PASS: composer regression" : "FAIL: composer regression"
     }
