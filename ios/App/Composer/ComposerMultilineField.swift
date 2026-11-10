@@ -3,6 +3,8 @@ import UIKit
 import CompanionCore
 
 /// Multi-line composer field with a keyboard `inputAccessoryView` Hide control.
+/// Grows from one line up to the 8-line cap instead of scrolling internally,
+/// matching the TextField with `lineLimit(1...8)` it replaced.
 struct ComposerMultilineField: UIViewRepresentable {
     @Binding var text: String
     @Binding var isFocused: Bool
@@ -20,16 +22,15 @@ struct ComposerMultilineField: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UITextView {
-        let view = UITextView()
+        let view = ComposerTextView()
         view.backgroundColor = .clear
         view.font = UIFont.preferredFont(forTextStyle: .body)
         view.textContainerInset = UIEdgeInsets(top: 11, left: 10, bottom: 11, right: 10)
         view.textContainer.lineFragmentPadding = 0
-        view.isScrollEnabled = true
+        view.isScrollEnabled = false
         view.textContainer.maximumNumberOfLines = 8
         view.delegate = context.coordinator
         view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        view.accessibilityLabel = placeholder
         context.coordinator.textView = view
         context.coordinator.applyAccessory(to: view, enabled: usesKeyboardAccessory)
         return view
@@ -37,70 +38,113 @@ struct ComposerMultilineField: UIViewRepresentable {
 
     func updateUIView(_ uiView: UITextView, context: Context) {
         context.coordinator.onHideKeyboard = onHideKeyboard
+        let accessoryChanged = context.coordinator.accessoryEnabled != usesKeyboardAccessory
         context.coordinator.applyAccessory(to: uiView, enabled: usesKeyboardAccessory)
         if uiView.text != text {
+            let selectedRange = uiView.selectedRange
+            let contentOffset = uiView.contentOffset
             uiView.text = text
+            // Reassigning text discards the selection and the scroll position,
+            // so restore both (clamped to the new length) to keep the cursor
+            // where the user left it during programmatic draft edits.
+            let length = (text as NSString).length
+            let location = min(selectedRange.location, length)
+            let rangeLength = min(selectedRange.length, length - location)
+            uiView.selectedRange = NSRange(location: location, length: rangeLength)
+            uiView.contentOffset = contentOffset
         }
         uiView.isEditable = isEditable
         uiView.isSelectable = isEditable
-        uiView.accessibilityLabel = placeholder
-        if isEditable {
-            if isFocused, !uiView.isFirstResponder {
-                uiView.becomeFirstResponder()
-            } else if !isFocused, uiView.isFirstResponder {
-                uiView.resignFirstResponder()
+        // Announce the placeholder only while the draft is empty; once there is
+        // typed content, a nil label lets VoiceOver read the text itself.
+        uiView.accessibilityLabel = text.isEmpty ? placeholder : nil
+        // Reconcile first-responder state unconditionally: when editing is
+        // disabled (dictation hand-off), a lingering first responder would
+        // leave a stale isFocused binding behind.
+        if isFocused, isEditable, !uiView.isFirstResponder {
+            uiView.becomeFirstResponder()
+        } else if !isFocused || !isEditable, uiView.isFirstResponder {
+            uiView.resignFirstResponder()
+        }
+        if accessoryChanged, uiView.isFirstResponder {
+            // Assigning inputAccessoryView does not refresh a visible keyboard;
+            // reload so the Hide bar appears or disappears immediately.
+            uiView.reloadInputViews()
+        }
+        uiView.invalidateIntrinsicContentSize()
+    }
+}
+
+/// UITextView whose intrinsic height grows with the draft, capped at the
+/// 8-line maximum so a long draft expands the composer instead of scrolling
+/// inside a one-line strip.
+private final class ComposerTextView: UITextView {
+    override var intrinsicContentSize: CGSize {
+        guard !isScrollEnabled else { return super.intrinsicContentSize }
+        let width = bounds.width > 0 ? bounds.width : frame.width
+        guard width > 0, let font else {
+            return CGSize(width: UIView.noIntrinsicMetric, height: 44)
+        }
+        let contentHeight = sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
+        let insets = textContainerInset.top + textContainerInset.bottom
+        let lineHeight = font.lineHeight
+        let minHeight = ceil(lineHeight + insets)
+        let maxLines = max(textContainer.maximumNumberOfLines, 1)
+        let maxHeight = ceil(lineHeight * CGFloat(maxLines) + insets)
+        let height = min(max(contentHeight, minHeight), maxHeight)
+        return CGSize(width: UIView.noIntrinsicMetric, height: height)
+    }
+}
+
+final class Coordinator: NSObject, UITextViewDelegate {
+    var text: Binding<String>
+    var isFocused: Binding<Bool>
+    var onHideKeyboard: () -> Void
+    weak var textView: UITextView?
+    private var accessoryView: ComposerKeyboardAccessoryView?
+    private(set) var accessoryEnabled = false
+
+    init(text: Binding<String>, isFocused: Binding<Bool>, onHideKeyboard: @escaping () -> Void) {
+        self.text = text
+        self.isFocused = isFocused
+        self.onHideKeyboard = onHideKeyboard
+    }
+
+    func applyAccessory(to textView: UITextView, enabled: Bool) {
+        if enabled {
+            if accessoryView == nil {
+                let bar = ComposerKeyboardAccessoryView()
+                bar.onHide = { [weak self] in
+                    guard let self else { return }
+                    self.isFocused.wrappedValue = false
+                    self.textView?.resignFirstResponder()
+                    self.onHideKeyboard()
+                }
+                accessoryView = bar
             }
+            textView.inputAccessoryView = accessoryView
+        } else {
+            textView.inputAccessoryView = nil
+        }
+        accessoryEnabled = enabled
+    }
+
+    func textViewDidChange(_ textView: UITextView) {
+        let value = textView.text ?? ""
+        if text.wrappedValue != value {
+            text.wrappedValue = value
         }
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate {
-        var text: Binding<String>
-        var isFocused: Binding<Bool>
-        var onHideKeyboard: () -> Void
-        weak var textView: UITextView?
-        private var accessoryView: ComposerKeyboardAccessoryView?
-
-        init(text: Binding<String>, isFocused: Binding<Bool>, onHideKeyboard: @escaping () -> Void) {
-            self.text = text
-            self.isFocused = isFocused
-            self.onHideKeyboard = onHideKeyboard
+    func textViewDidBeginEditing(_ textView: UITextView) {
+        if !isFocused.wrappedValue {
+            isFocused.wrappedValue = true
         }
+    }
 
-        func applyAccessory(to textView: UITextView, enabled: Bool) {
-            if enabled {
-                if accessoryView == nil {
-                    let bar = ComposerKeyboardAccessoryView()
-                    bar.onHide = { [weak self] in
-                        guard let self else { return }
-                        self.isFocused.wrappedValue = false
-                        self.textView?.resignFirstResponder()
-                        self.onHideKeyboard()
-                    }
-                    accessoryView = bar
-                }
-                textView.inputAccessoryView = accessoryView
-            } else {
-                textView.inputAccessoryView = nil
-            }
-        }
-
-        func textViewDidChange(_ textView: UITextView) {
-            let value = textView.text ?? ""
-            if text.wrappedValue != value {
-                text.wrappedValue = value
-            }
-        }
-
-        func textViewDidBeginEditing(_ textView: UITextView) {
-            if !isFocused.wrappedValue {
-                isFocused.wrappedValue = true
-            }
-        }
-
-        func textViewDidEndEditing(_ textView: UITextView) {
-            if isFocused.wrappedValue {
-                isFocused.wrappedValue = false
-            }
+    func textViewDidEndEditing(_ textView: UITextView) {
+        if isFocused.wrappedValue {
+            isFocused.wrappedValue = false
         }
     }
 }
