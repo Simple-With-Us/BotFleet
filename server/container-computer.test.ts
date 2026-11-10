@@ -1394,6 +1394,43 @@ describe("wakeContainerComputer", () => {
   });
 });
 
+describe("shellWord", () => {
+  it("leaves bare shell tokens alone", () => {
+    expect(shellWord("docker")).toBe("docker");
+    expect(shellWord("type=bind,source=/srv/x,target=/guest")).toBe(
+      "type=bind,source=/srv/x,target=/guest",
+    );
+  });
+
+  it("quotes an empty word so it cannot vanish from the pasted command", () => {
+    expect(shellWord("", "linux")).toBe("''");
+    expect(shellWord("", "win32")).toBe('""');
+  });
+
+  it("quotes bracket globs and cmd.exe percent and caret", () => {
+    expect(shellWord("/srv/[a]", "linux")).toBe(`'/srv/[a]'`);
+    expect(shellWord("/srv/%PATH%", "win32")).toBe('"/srv/%PATH%"');
+    expect(shellWord("a^b", "win32")).toBe('"a^b"');
+  });
+
+  it("leaves a backslash or tilde bare, as Windows paths have always printed", () => {
+    expect(shellWord("C:\\Users\\jay", "linux")).toBe("C:\\Users\\jay");
+    expect(shellWord("~~workspace", "linux")).toBe("~~workspace");
+    expect(shellWord("C:\\Users\\my dir", "win32")).toBe(`"C:\\Users\\my dir"`);
+    // A trailing backslash must not escape the closing quote.
+    expect(shellWord("C:\\Program Files\\", "win32")).toBe(`"C:\\Program Files\\\\"`);
+  });
+
+  it("single-quotes POSIX words with spaces and escapes single quotes", () => {
+    expect(shellWord('/srv/my dir', 'linux')).toBe(`'/srv/my dir'`);
+    expect(shellWord("/srv/o'brien", 'linux')).toBe(`'/srv/o'\\''brien'`);
+  });
+
+  it("double-quotes cmd.exe words because cmd ignores single quotes", () => {
+    expect(shellWord('/srv/my dir', 'win32')).toBe('"/srv/my dir"');
+    expect(shellWord('/srv/o"brien', 'win32')).toBe('"/srv/o""brien"');
+  });
+});
 describe("setupCommands", () => {
   it("derives opaque, distinct per-bot container and workspace identities", () => {
     const a = perBotLocalVmTarget("bot-a");
@@ -1451,14 +1488,14 @@ describe("setupCommands", () => {
     expect(command).toContain(`--label ${WORKSPACE_LABEL}=1`);
     expect(command).toContain(`--hostname ${CONTAINER}`);
     expect(command).toContain(
-      `--mount ${shellWord(`type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST}`)}`,
+      `--mount type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST}`,
     );
   });
 
   it("asks rootless Podman to map and privately relabel the durable workspace", () => {
     const command = setupCommands("podman", "linux").run!;
     expect(command).toContain(
-      `--mount ${shellWord(`type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST},relabel=private,U=true`)}`,
+      `--mount type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST},relabel=private,U=true`,
     );
   });
 
