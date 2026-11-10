@@ -2010,8 +2010,10 @@ export function shellWord(word: string, platform: NodeJS.Platform = process.plat
     ? /[\s!"'`$&;|<>()*?{}#[\]^%]/
     : /[\s!"'`$&;|<>()*?{}#[\]]/;
   if (!trigger.test(word)) return word;
+  // A trailing backslash run would escape the closing quote under the
+  // Windows argv parser, so the run is doubled before the quote is added.
   return platform === "win32"
-    ? `"${word.replace(/"/g, '""')}"`
+    ? `"${word.replace(/"/g, '""').replace(/(\\+)$/, "$1$1")}"`
     : `'${word.replace(/'/g, `'\\''`)}'`;
 }
 

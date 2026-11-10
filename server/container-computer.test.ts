@@ -1417,6 +1417,8 @@ describe("shellWord", () => {
     expect(shellWord("C:\\Users\\jay", "linux")).toBe("C:\\Users\\jay");
     expect(shellWord("~~workspace", "linux")).toBe("~~workspace");
     expect(shellWord("C:\\Users\\my dir", "win32")).toBe(`"C:\\Users\\my dir"`);
+    // A trailing backslash must not escape the closing quote.
+    expect(shellWord("C:\\Program Files\\", "win32")).toBe(`"C:\\Program Files\\\\"`);
   });
 
   it("single-quotes POSIX words with spaces and escapes single quotes", () => {
