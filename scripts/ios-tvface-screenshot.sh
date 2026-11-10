@@ -125,6 +125,8 @@ expected = {
     "typed input reached the binding", "typed shrink disables scrolling",
     "narrow width enables overflow scrolling", "wider width disables overflow scrolling",
     "programmatic edit clamps the selection", "programmatic cursor remains visible",
+    "typed growth viewport is capped at eight lines", "editing while scrolling preserves capped height",
+    "height-only resize uses the smaller viewport", "height-only resize keeps the cursor visible",
 }
 checks = report.get("checks", {})
 print(json.dumps(report, sort_keys=True))

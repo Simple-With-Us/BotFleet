@@ -38,6 +38,12 @@ struct ComposerMultilineField: UIViewRepresentable {
         return view
     }
 
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        guard let view = uiView as? ComposerTextView,
+              let width = proposal.width, width > 0 else { return nil }
+        return CGSize(width: width, height: view.fittedHeight(width: width))
+    }
+
     func updateUIView(_ uiView: UITextView, context: Context) {
         context.coordinator.onHideKeyboard = onHideKeyboard
         let accessoryChanged = context.coordinator.accessoryEnabled != usesKeyboardAccessory
@@ -95,10 +101,13 @@ private final class ComposerTextView: UITextView {
         super.layoutSubviews()
         // Rotation and parent resizing can cross the cap without a text edit.
         reconcileScrollState()
+        // Height-only viewport changes do not require remeasurement, but can
+        // hide the caret even when text and width are unchanged.
+        ensureSelectionVisible()
     }
 
-    func reconcileScrollState() {
-        let width = bounds.width > 0 ? bounds.width : frame.width
+    func reconcileScrollState(width proposedWidth: CGFloat? = nil) {
+        let width = proposedWidth ?? (bounds.width > 0 ? bounds.width : frame.width)
         guard width > 0, let font else { return }
         let currentText = text ?? ""
         let maxLines = 8
@@ -112,7 +121,14 @@ private final class ComposerTextView: UITextView {
         let insets = textContainerInset.top + textContainerInset.bottom
         let minHeight = ceil(font.lineHeight + insets)
         let maxHeight = ceil(font.lineHeight * CGFloat(maxLines) + insets)
+        // UITextView's scrolling fit can use the current viewport. Measure the
+        // full draft independently, then restore the final scroll mode/offset.
+        let savedOffset = contentOffset
+        let wasScrolling = isScrollEnabled
+        if wasScrolling { isScrollEnabled = false }
         let contentHeight = ceil(sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height)
+        if wasScrolling { isScrollEnabled = true }
+        contentOffset = savedOffset
         let previousHeight = measuredHeight
         measuredHeight = min(max(contentHeight, minHeight), maxHeight)
         let shouldScroll = contentHeight > maxHeight
@@ -136,6 +152,11 @@ private final class ComposerTextView: UITextView {
         if !visibleRect.contains(selectionRect) {
             scrollRangeToVisible(selectedRange)
         }
+    }
+
+    func fittedHeight(width: CGFloat) -> CGFloat {
+        reconcileScrollState(width: width)
+        return measuredHeight
     }
 
     override var intrinsicContentSize: CGSize {
@@ -252,6 +273,7 @@ struct ComposerScrollRegressionPreview: View {
     @State private var draft = ""
     @State private var focused = false
     @State private var fieldWidth: CGFloat = 320
+    @State private var fieldHeight: CGFloat?
     @State private var summary = "Composer regression running"
 
     var body: some View {
@@ -261,7 +283,7 @@ struct ComposerScrollRegressionPreview: View {
                 text: $draft, isFocused: $focused, placeholder: "Synthetic draft",
                 isEditable: true, usesKeyboardAccessory: false, onHideKeyboard: {}
             )
-            .frame(width: fieldWidth)
+            .frame(width: fieldWidth, height: fieldHeight)
             .frame(minHeight: 44)
             .border(.secondary)
         }
@@ -304,6 +326,8 @@ struct ComposerScrollRegressionPreview: View {
         field.delegate?.textViewDidChange?(field)
         await settle()
         checks["typed growth enables scrolling"] = field.isScrollEnabled
+        let cap = ceil((field.font?.lineHeight ?? 0) * 8 + field.textContainerInset.top + field.textContainerInset.bottom)
+        checks["typed growth viewport is capped at eight lines"] = field.bounds.height <= cap + 1 && field.bounds.height >= cap - 1
         checks["typed input reached the binding"] = draft == field.text
         capture("Typed growth: fourteen lines, scrolling enabled")
         field.selectedRange = NSRange(location: 0, length: (field.text as NSString).length)
@@ -336,6 +360,19 @@ struct ComposerScrollRegressionPreview: View {
             checks["programmatic cursor remains visible"] = false
         }
         capture("Programmatic shortening: clamped end cursor is visible")
+        field.insertText("\nAnother typed line while scrolling")
+        field.delegate?.textViewDidChange?(field)
+        await settle()
+        checks["editing while scrolling preserves capped height"] = field.isScrollEnabled && abs(field.bounds.height - cap) <= 1
+        fieldHeight = 70
+        await settle()
+        checks["height-only resize uses the smaller viewport"] = abs(field.bounds.height - 70) <= 1
+        if let selection = field.selectedTextRange {
+            checks["height-only resize keeps the cursor visible"] = CGRect(origin: field.contentOffset, size: field.bounds.size).contains(field.caretRect(for: selection.start))
+        } else {
+            checks["height-only resize keeps the cursor visible"] = false
+        }
+        capture("Height-only resize: smaller viewport keeps end cursor visible")
         writeResult(checks, captures: captures)
         summary = checks.values.allSatisfy { $0 } ? "PASS: composer regression" : "FAIL: composer regression"
     }
